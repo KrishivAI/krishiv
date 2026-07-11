@@ -8,6 +8,20 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Added
 
+- **Benchmark yardstick baselines** (Phase 51 close-out, 2026-07-11).
+  First recorded, reproducible performance baselines in
+  `docs/BENCHMARKING.md` ("Recorded baselines"): TPC-H SF1/SF10 ladder
+  (embedded + coordinated), streaming per-batch latency, IVM tick at
+  50 k–10 M accumulated rows, and Nexmark. New
+  `crates/krishiv-bench/benches/tpch_overhead.rs` target measures the
+  audit-§2b engine tax (same queries via raw DataFusion vs embedded
+  `SqlEngine` vs `InProcessCluster`): **4.5–8.9× over raw DataFusion**,
+  root-caused to `SqlEngine::new()`'s `target_partitions = 1` default —
+  the tracked budget for the Phase 52 batch-hot-path work. The IVM ladder
+  gained the 10 M-row point (`KRISHIV_BENCH_IVM_MAX_ROWS` caps it on
+  small machines); `just bench-tpch` / `just bench-nexmark` recipes now
+  exist (BENCHMARKING.md referenced them but they were never wired).
+
 - **Property-test suites for the correctness-critical crates** (Phase 51
   audit §14, 2026-07-11). `krishiv-delta/tests/proptest_zset.rs` checks the
   Z-set laws against an independent model (consolidation = model addition,

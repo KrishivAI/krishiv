@@ -50,11 +50,21 @@ const NUM_REGIONS: i64 = 100;
 /// Rows added per incremental step. Kept well under any of the `TOTAL_ROWS`
 /// scale points so the O(delta) vs O(n) gap is visible even at the smallest.
 const BATCH_SIZE: i64 = 5_000;
-/// Accumulated-table sizes to benchmark at. Kept modest (max 1M rows) to fit
-/// comfortably in a resource-constrained sandbox — the O(delta) vs O(n)
-/// shape is scale-invariant, so this doesn't need enterprise-scale data to
-/// demonstrate.
-const TOTAL_ROWS: &[i64] = &[50_000, 200_000, 500_000, 1_000_000];
+/// Accumulated-table sizes to benchmark at. The 10M point exists because the
+/// Phase 51 yardstick records IVM tick latency at 1M *and* 10M rows; it
+/// needs roughly 2 GB of headroom for its untimed per-iteration setup, so
+/// on smaller machines set `KRISHIV_BENCH_IVM_MAX_ROWS=1000000` to stop the
+/// ladder at 1M.
+const TOTAL_ROWS: &[i64] = &[50_000, 200_000, 500_000, 1_000_000, 10_000_000];
+
+/// The `TOTAL_ROWS` ladder truncated to `KRISHIV_BENCH_IVM_MAX_ROWS` (if set).
+fn total_rows_ladder() -> Vec<i64> {
+    let cap = std::env::var("KRISHIV_BENCH_IVM_MAX_ROWS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(i64::MAX);
+    TOTAL_ROWS.iter().copied().filter(|&n| n <= cap).collect()
+}
 
 fn orders_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -116,7 +126,7 @@ fn seeded_flow(rt: &tokio::runtime::Runtime, baseline_rows: i64) -> IncrementalF
 fn bench_ivm_incremental_feed(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let mut group = c.benchmark_group("ivm_incremental_feed");
-    for &total in TOTAL_ROWS {
+    for total in total_rows_ladder() {
         let baseline = total - BATCH_SIZE;
         group.bench_with_input(
             BenchmarkId::from_parameter(total),
@@ -145,7 +155,7 @@ fn bench_ivm_incremental_feed(c: &mut Criterion) {
 fn bench_full_recompute(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let mut group = c.benchmark_group("full_recompute");
-    for &total in TOTAL_ROWS {
+    for total in total_rows_ladder() {
         group.bench_with_input(BenchmarkId::from_parameter(total), &total, |b, &total| {
             b.iter_batched(
                 || orders_batch(0, total),

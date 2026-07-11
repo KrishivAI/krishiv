@@ -15,6 +15,10 @@ name = "tpch_distributed"
 harness = false
 
 [[bench]]
+name = "tpch_overhead"
+harness = false
+
+[[bench]]
 name = "nexmark"
 harness = false
 

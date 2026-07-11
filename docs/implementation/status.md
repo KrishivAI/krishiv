@@ -1,5 +1,44 @@
 # Krishiv Implementation Status
 
+## 2026-07-11 (leg 3) — Phase 51 COMPLETE: benchmark yardstick recorded; engine tax = 4.5–8.9× (root-caused)
+
+Final Phase 51 leg (task #173 closes with this entry). Baselines recorded in
+`docs/BENCHMARKING.md` § "Recorded baselines / 2026-07-11" — commit,
+hardware, dataset generator, and reproduce commands included; raw criterion
+output + machine manifest archived at `target/bench-results-20260711/`.
+
+- **Datasets**: TPC-H SF1 (345 MB) + SF10 (3.7 GB) Parquet generated with
+  `tpchgen-cli` v3.0.0 into `/home/krishiv-bench-data/tpch/{sf1,sf10}`.
+- **TPC-H ladder** (embedded, cold session per iteration): Q1 0.52 s/5.50 s
+  (SF1/SF10) … Q18 0.91 s/13.05 s; coordinated within ±9 % of embedded.
+- **New `tpch_overhead` bench** (audit §2b, the spec'd raw-DF leg didn't
+  exist): raw DataFusion vs embedded vs coordinated on Q1/Q6/Q3. **Finding:
+  embedded is 4.5–8.9× raw DF and the tax scales with data** — root cause
+  is `SqlEngine::new()` defaulting `target_partitions` to 1 while raw DF
+  uses all 8 cores (worst ratio ≈ core count on scan-bound Q6); the
+  coordinated hop adds ≈ nothing. Tracked budget for Phase 52 #194
+  (target ≤ 1.2× after the batch hot path work). Deliberately NOT flipping
+  the default in this leg: it's #194's scope and would invalidate the
+  baseline being recorded.
+- **Streaming latency**: embedded 148 µs/batch (target < 1 ms ✓);
+  single-node 11.7 ms/batch (**misses the documented < 5 ms target 2.3×**
+  → Phase 55 #195); shuffle IPC round-trip 79 µs; no distributed-placement
+  latency bench exists yet (also #195).
+- **IVM tick ladder extended to 10 M rows** (spec requires 1 M/10 M;
+  `KRISHIV_BENCH_IVM_MAX_ROWS` caps it on small boxes): tick 15.7 ms @1 M,
+  140 ms @10 M vs recompute 28.4 ms/297.9 ms — IVM wins ≥ 1 M (crossover
+  ≈ 0.7 M rows, vs ≈ 23 M projected pre-G14). The 9× tick growth for the
+  same 5 000-row delta shows a state-size-dependent step component →
+  Phase 57 #196.
+- **Nexmark** (embedded, 100 k batch): Q1 1.61 ms, Q2 4.86 ms, Q5 3.80 ms,
+  Q8 1.66 ms.
+- **Harness fixes**: `just bench-tpch`/`bench-nexmark` recipes added
+  (BENCHMARKING.md referenced them; they didn't exist).
+
+Validation: all six bench targets exit 0 on the quiet box (parallel session
+idle); fmt clean; bench crate is outside the clippy/test gates by design.
+Next: Phase 52 (task #174) — distributed batch v2.
+
 ## 2026-07-11 (leg 2) — Phase 51 audit §14 closed: proptests, external tier, coverage, flake quarantine; 2 real bugs fixed
 
 Second Phase 51 leg (audit §14 / task #204 complete; task #173 now has only

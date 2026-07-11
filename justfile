@@ -319,6 +319,18 @@ bench-compare name:
     {{ cargo }} bench -p krishiv-bench \
         -- --baseline {{ name }}
 
+# TPC-H batch SQL ladder (embedded engine + in-process cluster overhead).
+# Set KRISHIV_TPCH_DATA_DIR_SF1/_SF10/_SF100 to Parquet dirs (tpchgen-cli);
+# unset scale factors are skipped with a notice.
+bench-tpch:
+    {{ cargo }} bench -p krishiv-bench --bench tpch_sf10
+    {{ cargo }} bench -p krishiv-bench --bench tpch_distributed
+    {{ cargo }} bench -p krishiv-bench --bench tpch_overhead
+
+# Nexmark streaming queries (Q1/Q2/Q5/Q8) through the embedded SqlEngine.
+bench-nexmark:
+    {{ cargo }} bench -p krishiv-bench --bench nexmark
+
 # ── Project hygiene ────────────────────────────────────────────────────────────
 
 # Validate repository scripts, local documentation links, and release metadata.
