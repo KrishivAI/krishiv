@@ -78,9 +78,12 @@ under the same `TypedTaskFragment`, not by inventing a parallel envelope.
 - Custom leaves (shuffle reads) are extension nodes serialized through a
   Krishiv `PhysicalExtensionCodec`; the reduce-side fragment's shuffle
   input is part of the plan, not a side-channel table registration.
-- One task per *output partition* of the stage subtree: the assignment's
-  existing partition addressing (`ShuffleWriteConfig`/`ShuffleReadConfig`)
-  names which partition of the decoded plan `execute(partition, ctx)` runs.
+- One task per *output partition* of the stage subtree: the body carries
+  the partition index explicitly — `dfplan:v1:<partition>:<b64>` — so the
+  fragment alone determines which partition of the decoded plan
+  `execute(partition, ctx)` runs. `ShuffleWriteConfig`/`ShuffleReadConfig`
+  on the assignment address the *shuffle data* (where map output goes and
+  which reduce input to fetch), not the plan partition.
 - Inline base64 IPC tables (`BatchSqlInlineTable` /
   `InputPartitionDescriptor::InlineIpc`) remain **only** for small
   client-supplied tables; they are not a data-plane transport between
