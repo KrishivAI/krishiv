@@ -104,11 +104,19 @@ the supported surface. They are **not** in any shipping preset (`local`, `full`,
 | sql | `rest-catalog` | `iceberg-catalog-rest` `RestCatalogConfig` / `RestCatalog::new` now private |
 | sql | `unity-catalog` | depends on `rest-catalog` |
 | sql | `glue-catalog` | depends on `rest-catalog` |
-| sql | `postgres-catalog` | `iceberg` `FileWrite`/`FileRead` trait bounds + `TableCommit::into_parts` changed |
 
 **To un-quarantine:** fix the connector/catalog against its current dependency
 API, drop it from the `--exclude-features` list in `just lint-features`, and the
 guard will enforce it from then on. Track each as its own follow-up task.
+
+`postgres-catalog` was similarly rotted (`FileWrite`/`FileRead` trait bounds,
+`TableCommit::into_parts`, `FileIOBuilder` factory injection, `TableCommit`
+builder privatised) and **has been fixed** (Phase 51, 2026-07-11): it now uses
+`KrishivStorageFactory`, `TableCommit::apply`, and one-shot `OutputFile::write`
+/ `InputFile::read`; its two integration tests run against live Postgres in
+the `test-external` CI tier. The fix also added an advisory lock around
+`migrate()` — concurrent `CREATE TABLE IF NOT EXISTS` from two booting nodes
+races on Postgres's `pg_type` catalog.
 
 The `iceberg` / `iceberg-datafusion` / `local-catalog` path was similarly rotted
 (sqlparser 0.61 `FromTable`/`Statement::Delete`/`Update` changes) and **has been

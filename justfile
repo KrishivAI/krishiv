@@ -187,6 +187,27 @@ test-doc:
         --exclude krishiv-python \
         --exclude krishiv-chaos
 
+# External-service tests (audit §14 TEST-6): runs the `#[ignore = "requires …"]`
+# tests against provisioned backends instead of leaving them false-green.
+# Start/stop the services with `scripts/external-test-services.sh {up,down}`
+# (docker compose: postgres :5439, MinIO :9102, OTLP collector :4319); every
+# endpoint below can be overridden with the same env var the test reads.
+# The two live-cluster tests (mode_conformance :9090, api :50051) stay out
+# until Phase 58's real multi-executor harness exists (docs/implementation/ci-tiers.md).
+test-external:
+    KRISHIV_TEST_DATABASE_URL="${KRISHIV_TEST_DATABASE_URL:-postgres://krishiv:krishiv@127.0.0.1:5439/krishiv_test}" \
+        {{ sccache_env }} {{ cargo }} test -p krishiv-sql --features postgres-catalog --lib -- --ignored postgres_catalog
+    AWS_ENDPOINT_URL="${AWS_ENDPOINT_URL:-http://127.0.0.1:9102}" \
+    AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-minio}" \
+    AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-minio12345}" \
+    AWS_REGION="${AWS_REGION:-us-east-1}" \
+    AWS_ALLOW_HTTP=true \
+    KRISHIV_TEST_S3_BUCKET="${KRISHIV_TEST_S3_BUCKET:-krishiv-test}" \
+        {{ sccache_env }} {{ cargo }} test -p krishiv-sql --features postgres-catalog --lib -- --ignored s3_round_trip
+    OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://127.0.0.1:4319}" \
+        {{ sccache_env }} {{ cargo }} test -p krishiv-metrics --lib -- --ignored otlp_integration
+    {{ sccache_env }} {{ cargo }} test -p krishiv-runtime --lib -- --ignored do_action_rejects_response_exceeding_size_cap
+
 # Tests that must pass with only embedded features enabled
 test-embedded:
     {{ sccache_env }} {{ cargo }} test -p krishiv --no-default-features --features embedded --lib
@@ -207,6 +228,19 @@ test-connectors:
 # SQL engine tests
 test-sql:
     {{ sccache_env }} {{ cargo }} test -p krishiv-sql --lib
+
+# Line-coverage measurement (audit §14 TEST-4) over the same scope as the
+# required test gate: lib + integration tests, python/chaos/bench excluded
+# (see docs/implementation/ci-tiers.md). Prints the per-crate summary table;
+# coverage.yml runs this nightly and publishes the number to the job summary.
+# Install: cargo binstall cargo-llvm-cov
+coverage:
+    {{ sccache_env }} {{ cargo }} llvm-cov --workspace \
+        --exclude krishiv-python \
+        --exclude krishiv-chaos \
+        --exclude krishiv-bench \
+        --lib --tests \
+        --summary-only
 
 # ── Quality ───────────────────────────────────────────────────────────────────
 
@@ -229,13 +263,15 @@ lint:
 # Quarantined features (pre-existing dependency-API rot in optional, non-preset
 # integrations; tracked in docs/feature-graph.md → "Quarantined features"):
 #   connectors: pulsar-source, cassandra, elasticsearch, vortex, cloud
-#   sql:        postgres-catalog, rest-catalog, unity-catalog, glue-catalog
+#   sql:        rest-catalog, unity-catalog, glue-catalog
+#   (postgres-catalog un-quarantined 2026-07-11: fixed against iceberg 0.9.1,
+#    live-verified by `just test-external`)
 lint-features:
     @command -v cargo-hack >/dev/null 2>&1 || {{ cargo }} install cargo-hack --locked
     {{ cargo }} hack check --each-feature --no-dev-deps -p krishiv-connectors \
         --exclude-features pulsar-source,cassandra,elasticsearch,vortex,cloud
     {{ cargo }} hack check --each-feature --no-dev-deps -p krishiv-sql \
-        --exclude-features postgres-catalog,rest-catalog,unity-catalog,glue-catalog
+        --exclude-features rest-catalog,unity-catalog,glue-catalog
     @echo "✓ per-feature builds clean (quarantined features: see docs/feature-graph.md)"
 
 # Format then lint in one shot

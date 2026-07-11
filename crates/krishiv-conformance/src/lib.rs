@@ -125,8 +125,7 @@ impl Drop for SessionDriver {
 }
 
 impl SessionDriver {
-    async fn spawn_flight_server()
-    -> Result<(String, tokio::task::JoinHandle<()>), DriverError> {
+    async fn spawn_flight_server() -> Result<(String, tokio::task::JoinHandle<()>), DriverError> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| DriverError(format!("bind: {e}")))?;
@@ -168,7 +167,11 @@ impl SessionDriver {
     }
 
     pub async fn single_node() -> Result<Self, DriverError> {
-        Self::build(krishiv_api::ExecutionMode::SingleNode, "krishiv-single-node").await
+        Self::build(
+            krishiv_api::ExecutionMode::SingleNode,
+            "krishiv-single-node",
+        )
+        .await
     }
 
     pub async fn distributed_in_process() -> Result<Self, DriverError> {

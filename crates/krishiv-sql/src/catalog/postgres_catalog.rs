@@ -25,18 +25,20 @@
 //! );
 //! ```
 
-#![cfg(feature = "postgres-catalog")]
+// Feature-gated at the module declaration in `catalog/mod.rs`
+// (`#[cfg(feature = "postgres-catalog")]`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use iceberg::io::{FileIO, FileIOBuilder};
 use iceberg::spec::TableMetadataBuilder;
 use iceberg::table::Table;
 use iceberg::{
-    Catalog, Namespace, NamespaceIdent, Result as IcebergResult, TableCommit, TableCreation,
-    TableIdent,
+    Catalog, MetadataLocation, Namespace, NamespaceIdent, Result as IcebergResult, TableCommit,
+    TableCreation, TableIdent,
 };
 use sqlx::PgPool;
 
@@ -75,16 +77,38 @@ impl PostgresCatalog {
     }
 
     /// Create catalog tables if they do not exist.
+    ///
+    /// Runs inside a transaction holding an advisory lock: `CREATE TABLE IF
+    /// NOT EXISTS` is not concurrency-safe in Postgres (two sessions creating
+    /// the same table race on the `pg_type` catalog and one fails with a
+    /// `pg_type_typname_nsp_index` duplicate-key error), so two engine nodes
+    /// booting against the same catalog database must serialize here.
     pub async fn migrate(&self) -> Result<(), CatalogError> {
+        /// Arbitrary constant identifying "krishiv catalog migration"
+        /// (ASCII "krishiv" as an integer).
+        const MIGRATION_LOCK_KEY: i64 = 0x006b_7269_7368_6976;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(migrate_err("migrate begin"))?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(MIGRATION_LOCK_KEY)
+            .execute(&mut *tx)
+            .await
+            .map_err(migrate_err("migrate lock"))?;
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS krishiv_namespaces (
                  namespace_name TEXT PRIMARY KEY,
                  properties     JSONB NOT NULL DEFAULT '{}'
              )",
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
-        .map_err(pg_err("migrate namespaces"))?;
+        .map_err(migrate_err("migrate namespaces"))?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS krishiv_tables (
@@ -97,20 +121,26 @@ impl PostgresCatalog {
                  PRIMARY KEY (namespace, table_name)
              )",
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
-        .map_err(pg_err("migrate tables"))?;
+        .map_err(migrate_err("migrate tables"))?;
 
+        tx.commit().await.map_err(migrate_err("migrate commit"))?;
         Ok(())
     }
 
     /// Default table location URI for `{namespace}/{table_name}`.
     fn table_location(&self, namespace: &NamespaceIdent, table_name: &str) -> String {
-        let ns = namespace.inner().join("/");
+        let ns = namespace.as_ref().join("/");
         // Strip trailing slash from warehouse for clean joins.
         let base = self.warehouse.trim_end_matches('/');
         format!("{base}/{ns}/{table_name}")
     }
+}
+
+/// Dotted namespace key used as the Postgres primary-key component.
+fn ns_key(namespace: &NamespaceIdent) -> String {
+    namespace.as_ref().join(".")
 }
 
 #[async_trait]
@@ -141,7 +171,7 @@ impl Catalog for PostgresCatalog {
         namespace: &NamespaceIdent,
         properties: HashMap<String, String>,
     ) -> IcebergResult<Namespace> {
-        let name = namespace.inner().join(".");
+        let name = ns_key(namespace);
         let props = serde_json::to_value(&properties)
             .map_err(|e| iceberg_err(format!("serialize properties: {e}")))?;
         sqlx::query(
@@ -159,7 +189,7 @@ impl Catalog for PostgresCatalog {
     }
 
     async fn get_namespace(&self, namespace: &NamespaceIdent) -> IcebergResult<Namespace> {
-        let name = namespace.inner().join(".");
+        let name = ns_key(namespace);
         let props_json: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT properties FROM krishiv_namespaces WHERE namespace_name = $1",
         )
@@ -179,7 +209,7 @@ impl Catalog for PostgresCatalog {
     }
 
     async fn namespace_exists(&self, namespace: &NamespaceIdent) -> IcebergResult<bool> {
-        let name = namespace.inner().join(".");
+        let name = ns_key(namespace);
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM krishiv_namespaces WHERE namespace_name = $1)",
         )
@@ -195,7 +225,7 @@ impl Catalog for PostgresCatalog {
         namespace: &NamespaceIdent,
         properties: HashMap<String, String>,
     ) -> IcebergResult<()> {
-        let name = namespace.inner().join(".");
+        let name = ns_key(namespace);
         let props = serde_json::to_value(&properties)
             .map_err(|e| iceberg_err(format!("serialize: {e}")))?;
         sqlx::query("UPDATE krishiv_namespaces SET properties = $2 WHERE namespace_name = $1")
@@ -208,7 +238,7 @@ impl Catalog for PostgresCatalog {
     }
 
     async fn drop_namespace(&self, namespace: &NamespaceIdent) -> IcebergResult<()> {
-        let name = namespace.inner().join(".");
+        let name = ns_key(namespace);
         sqlx::query("DELETE FROM krishiv_namespaces WHERE namespace_name = $1")
             .bind(&name)
             .execute(&self.pool)
@@ -220,7 +250,7 @@ impl Catalog for PostgresCatalog {
     // ── Tables ────────────────────────────────────────────────────────────────
 
     async fn list_tables(&self, namespace: &NamespaceIdent) -> IcebergResult<Vec<TableIdent>> {
-        let ns = namespace.inner().join(".");
+        let ns = ns_key(namespace);
         let rows = sqlx::query_scalar::<_, String>(
             "SELECT table_name FROM krishiv_tables WHERE namespace = $1 ORDER BY table_name",
         )
@@ -240,14 +270,17 @@ impl Catalog for PostgresCatalog {
         namespace: &NamespaceIdent,
         creation: TableCreation,
     ) -> IcebergResult<Table> {
-        let ns = namespace.inner().join(".");
+        let ns = ns_key(namespace);
         let table_name = creation.name.clone();
         let location = creation
             .location
             .clone()
             .unwrap_or_else(|| self.table_location(namespace, &table_name));
 
-        // Build initial Iceberg table metadata.
+        // Build initial Iceberg table metadata. `from_table_creation` rejects
+        // a creation without a location, so inject the computed default.
+        let mut creation = creation;
+        creation.location = Some(location.clone());
         let metadata = TableMetadataBuilder::from_table_creation(creation)
             .map_err(|e| iceberg_err(e.to_string()))?
             .build()
@@ -257,32 +290,14 @@ impl Catalog for PostgresCatalog {
         // Serialise and write metadata.json to the warehouse.
         let metadata_json = serde_json::to_string_pretty(&metadata)
             .map_err(|e| iceberg_err(format!("serialize metadata: {e}")))?;
-        let metadata_location = format!(
-            "{}/metadata/00000-{}.metadata.json",
-            location,
-            uuid::Uuid::new_v4()
-        );
+        let metadata_location = MetadataLocation::new_with_table_location(&location).to_string();
 
-        let output = self
-            .file_io
+        self.file_io
             .new_output(&metadata_location)
-            .map_err(|e| iceberg_err(e.to_string()))?;
-        {
-            use iceberg::io::OutputFile;
-            let mut writer = output
-                .writer()
-                .await
-                .map_err(|e| iceberg_err(e.to_string()))?;
-            use tokio::io::AsyncWriteExt;
-            writer
-                .write_all(metadata_json.as_bytes())
-                .await
-                .map_err(|e| iceberg_err(format!("write metadata: {e}")))?;
-            writer
-                .shutdown()
-                .await
-                .map_err(|e| iceberg_err(format!("flush metadata: {e}")))?;
-        }
+            .map_err(|e| iceberg_err(e.to_string()))?
+            .write(Bytes::from(metadata_json))
+            .await
+            .map_err(|e| iceberg_err(format!("write metadata: {e}")))?;
 
         // Insert pointer into Postgres.
         sqlx::query(
@@ -302,7 +317,7 @@ impl Catalog for PostgresCatalog {
     }
 
     async fn load_table(&self, table: &TableIdent) -> IcebergResult<Table> {
-        let ns = table.namespace().inner().join(".");
+        let ns = ns_key(table.namespace());
         let metadata_location: Option<String> = sqlx::query_scalar(
             "SELECT metadata_location FROM krishiv_tables
               WHERE namespace = $1 AND table_name = $2",
@@ -317,24 +332,13 @@ impl Catalog for PostgresCatalog {
             .ok_or_else(|| iceberg_err(format!("table not found: {}", table.name())))?;
 
         // Read the metadata JSON from the warehouse.
-        let input = self
+        let bytes = self
             .file_io
             .new_input(&metadata_location)
-            .map_err(|e| iceberg_err(e.to_string()))?;
-        let bytes = {
-            use iceberg::io::InputFile;
-            use tokio::io::AsyncReadExt;
-            let mut reader = input
-                .reader()
-                .await
-                .map_err(|e| iceberg_err(e.to_string()))?;
-            let mut buf = Vec::new();
-            reader
-                .read_to_end(&mut buf)
-                .await
-                .map_err(|e| iceberg_err(format!("read metadata: {e}")))?;
-            buf
-        };
+            .map_err(|e| iceberg_err(e.to_string()))?
+            .read()
+            .await
+            .map_err(|e| iceberg_err(format!("read metadata: {e}")))?;
 
         let metadata: iceberg::spec::TableMetadata = serde_json::from_slice(&bytes)
             .map_err(|e| iceberg_err(format!("deserialize metadata: {e}")))?;
@@ -349,7 +353,7 @@ impl Catalog for PostgresCatalog {
     }
 
     async fn drop_table(&self, table: &TableIdent) -> IcebergResult<()> {
-        let ns = table.namespace().inner().join(".");
+        let ns = ns_key(table.namespace());
         sqlx::query("DELETE FROM krishiv_tables WHERE namespace = $1 AND table_name = $2")
             .bind(&ns)
             .bind(table.name())
@@ -360,7 +364,7 @@ impl Catalog for PostgresCatalog {
     }
 
     async fn table_exists(&self, table: &TableIdent) -> IcebergResult<bool> {
-        let ns = table.namespace().inner().join(".");
+        let ns = ns_key(table.namespace());
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(
                 SELECT 1 FROM krishiv_tables
@@ -376,8 +380,8 @@ impl Catalog for PostgresCatalog {
     }
 
     async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> IcebergResult<()> {
-        let src_ns = src.namespace().inner().join(".");
-        let dest_ns = dest.namespace().inner().join(".");
+        let src_ns = ns_key(src.namespace());
+        let dest_ns = ns_key(dest.namespace());
         sqlx::query(
             "UPDATE krishiv_tables
                 SET namespace = $3, table_name = $4, updated_at = NOW()
@@ -398,7 +402,7 @@ impl Catalog for PostgresCatalog {
         table: &TableIdent,
         metadata_location: String,
     ) -> IcebergResult<Table> {
-        let ns = table.namespace().inner().join(".");
+        let ns = ns_key(table.namespace());
         sqlx::query(
             "INSERT INTO krishiv_tables (namespace, table_name, metadata_location)
              VALUES ($1, $2, $3)
@@ -416,7 +420,7 @@ impl Catalog for PostgresCatalog {
 
     async fn update_table(&self, commit: TableCommit) -> IcebergResult<Table> {
         let ident = commit.identifier().clone();
-        let ns = ident.namespace().inner().join(".");
+        let ns = ns_key(ident.namespace());
 
         // Read current metadata_location to verify we're updating the right version.
         let current_location: Option<String> = sqlx::query_scalar(
@@ -432,56 +436,25 @@ impl Catalog for PostgresCatalog {
         let current_location = current_location
             .ok_or_else(|| iceberg_err(format!("table not found: {}", ident.name())))?;
 
-        // Load current table, apply commit requirements & updates.
+        // Load the current table, then let the commit validate its
+        // requirements and apply its updates; `TableCommit::apply` also
+        // computes the next versioned metadata location.
         let table = self.load_table(&ident).await?;
-        let (requirements, updates) = commit.into_parts();
-
-        let mut metadata_builder = table.metadata().clone().into_builder(None);
-        for req in requirements {
-            req.check(Some(table.metadata()))
-                .map_err(|e| iceberg_err(format!("commit requirement: {e}")))?;
-        }
-        for update in updates {
-            metadata_builder = update
-                .apply(metadata_builder)
-                .map_err(|e| iceberg_err(format!("apply update: {e}")))?;
-        }
-        let new_metadata = metadata_builder
-            .build()
-            .map_err(|e| iceberg_err(format!("build metadata: {e}")))?
-            .metadata;
+        let updated = commit.apply(table)?;
+        let new_location = updated
+            .metadata_location()
+            .ok_or_else(|| iceberg_err("updated table has no metadata location"))?
+            .to_string();
 
         // Write new metadata.json.
-        let table_location = table.metadata().location();
-        let new_metadata_json = serde_json::to_string_pretty(&new_metadata)
+        let new_metadata_json = serde_json::to_string_pretty(updated.metadata())
             .map_err(|e| iceberg_err(format!("serialize: {e}")))?;
-        let version = new_metadata.last_sequence_number();
-        let new_location = format!(
-            "{}/metadata/{:05}-{}.metadata.json",
-            table_location,
-            version,
-            uuid::Uuid::new_v4()
-        );
-        let output = self
-            .file_io
+        self.file_io
             .new_output(&new_location)
-            .map_err(|e| iceberg_err(e.to_string()))?;
-        {
-            use iceberg::io::OutputFile;
-            use tokio::io::AsyncWriteExt;
-            let mut writer = output
-                .writer()
-                .await
-                .map_err(|e| iceberg_err(e.to_string()))?;
-            writer
-                .write_all(new_metadata_json.as_bytes())
-                .await
-                .map_err(|e| iceberg_err(format!("write: {e}")))?;
-            writer
-                .shutdown()
-                .await
-                .map_err(|e| iceberg_err(e.to_string()))?;
-        }
+            .map_err(|e| iceberg_err(e.to_string()))?
+            .write(Bytes::from(new_metadata_json))
+            .await
+            .map_err(|e| iceberg_err(format!("write: {e}")))?;
 
         // Atomic CAS update — if another writer updated concurrently, this returns 0 rows.
         let rows_updated: u64 = sqlx::query(
@@ -517,28 +490,29 @@ fn iceberg_err(msg: impl Into<String>) -> iceberg::Error {
     iceberg::Error::new(iceberg::ErrorKind::Unexpected, msg.into())
 }
 
-fn pg_err(op: &'static str) -> impl Fn(sqlx::Error) -> iceberg::Error {
-    move |e| iceberg_err(format!("{op}: {e}"))
+fn migrate_err(op: &'static str) -> impl Fn(sqlx::Error) -> CatalogError {
+    move |e| CatalogError::Transport {
+        operation: op.into(),
+        message: e.to_string(),
+    }
 }
 
 fn build_file_io(warehouse: &str) -> Result<FileIO, CatalogError> {
-    if warehouse.starts_with("s3://") || warehouse.starts_with("s3a://") {
-        FileIOBuilder::new("s3")
-            .build()
-            .map_err(|e| CatalogError::Iceberg(e.to_string()))
-    } else if warehouse.starts_with("abfs://") || warehouse.starts_with("abfss://") {
-        FileIOBuilder::new("abfs")
-            .build()
-            .map_err(|e| CatalogError::Iceberg(e.to_string()))
-    } else if warehouse.starts_with("gs://") || warehouse.starts_with("gcs://") {
-        FileIOBuilder::new("gcs")
-            .build()
-            .map_err(|e| CatalogError::Iceberg(e.to_string()))
-    } else {
-        FileIOBuilder::new("file")
-            .build()
-            .map_err(|e| CatalogError::Iceberg(e.to_string()))
+    // KrishivStorage dispatches `file://`/bare paths and `s3://`/`s3a://`
+    // (env-configured object_store); other schemes are not wired up.
+    if ["abfs://", "abfss://", "gs://", "gcs://"]
+        .iter()
+        .any(|scheme| warehouse.starts_with(scheme))
+    {
+        return Err(CatalogError::Iceberg(format!(
+            "unsupported warehouse scheme for the postgres catalog: {warehouse} \
+             (supported: file://, s3://)"
+        )));
     }
+    Ok(FileIOBuilder::new(Arc::new(
+        crate::catalog::object_store_io::KrishivStorageFactory,
+    ))
+    .build())
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -618,6 +592,9 @@ mod tests {
 
         let ns = NamespaceIdent::new("conflict_test".to_string());
         let _ = c1.create_namespace(&ns, HashMap::new()).await;
+        // The catalog database persists across runs — clear any leftover row.
+        let stale = TableIdent::new(ns.clone(), "t".to_string());
+        let _ = c1.drop_table(&stale).await;
         let creation = TableCreation::builder()
             .name("t".to_string())
             .schema(sample_schema())
@@ -626,30 +603,49 @@ mod tests {
 
         let ident = TableIdent::new(ns, "t".to_string());
 
-        // Both catalogs load the same table at version 0.
+        // Both catalogs load the same table at version 0. (`TableCommit` is
+        // no longer publicly constructible — commits go through
+        // `Transaction`, which drives `Catalog::update_table` internally.)
+        use iceberg::transaction::{ApplyTransactionAction as _, Transaction};
         let t1 = c1.load_table(&ident).await.unwrap();
         let t2 = c2.load_table(&ident).await.unwrap();
 
         // c1 commits first — should succeed.
-        let commit1 = TableCommit::builder()
-            .ident(ident.clone())
-            .updates(vec![])
-            .requirements(vec![])
-            .build();
-        c1.update_table(commit1)
-            .await
-            .expect("first commit should succeed");
+        let tx1 = Transaction::new(&t1);
+        let tx1 = tx1
+            .update_table_properties()
+            .set("writer-c1".to_string(), "yes".to_string())
+            .apply(tx1)
+            .unwrap();
+        tx1.commit(&c1).await.expect("first commit should succeed");
 
-        // c2 now tries to commit on stale version — should fail with conflict.
-        let commit2 = TableCommit::builder()
-            .ident(ident.clone())
-            .updates(vec![])
-            .requirements(vec![])
-            .build();
-        let result = c2.update_table(commit2).await;
-        assert!(
-            result.is_err(),
-            "concurrent commit should fail with conflict error"
+        // c2 commits from its stale snapshot. The catalog's CAS pointer
+        // update rejects the stale attempt; `Transaction::commit` then
+        // retries against refreshed metadata and re-applies the action on
+        // top of c1's commit. The property under test is **no lost update**:
+        // c1's change must survive c2's retried commit. (A broken CAS would
+        // let c2's stale metadata clobber c1's.)
+        let tx2 = Transaction::new(&t2);
+        let tx2 = tx2
+            .update_table_properties()
+            .set("writer-c2".to_string(), "yes".to_string())
+            .apply(tx2)
+            .unwrap();
+        tx2.commit(&c2)
+            .await
+            .expect("retried commit should succeed on refreshed metadata");
+
+        let final_table = c1.load_table(&ident).await.unwrap();
+        let props = final_table.metadata().properties();
+        assert_eq!(
+            props.get("writer-c1").map(String::as_str),
+            Some("yes"),
+            "c1's committed change was lost to c2's stale commit — CAS conflict handling is broken"
+        );
+        assert_eq!(
+            props.get("writer-c2").map(String::as_str),
+            Some("yes"),
+            "c2's retried commit did not apply"
         );
     }
 }

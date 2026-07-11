@@ -93,6 +93,10 @@ jobs:
     name: Tests
     runs-on: ubuntu-latest
     needs: [fmt-lint]
+    env:
+      # Flake quarantine: retries scoped to the sleep-sync crates, flaky
+      # results surfaced in the summary (.config/nextest.toml, audit §14).
+      NEXTEST_PROFILE: ci
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-setup
@@ -104,6 +108,26 @@ jobs:
       # rationale per exclusion: docs/implementation/ci-tiers.md
       - run: just test-integration
       - run: just test-doc
+
+  # ── External-service tests (audit §14 TEST-6) ────────────────────────────────
+  # Runs the `#[ignore = "requires …"]` tests against real provisioned services
+  # (postgres, MinIO, OTLP collector) so they are exercised on every PR instead
+  # of rotting behind the ignore attribute. The two live-cluster tests stay out
+  # until Phase 58's multi-executor harness (docs/implementation/ci-tiers.md).
+  test-external:
+    name: External-service Tests
+    runs-on: ubuntu-latest
+    needs: [fmt-lint]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: test-external
+      - uses: taiki-e/install-action@just
+      - run: scripts/external-test-services.sh up
+      - run: just test-external
+      - if: always()
+        run: scripts/external-test-services.sh down
 
   # ── Python binding tests ─────────────────────────────────────────────────────
   test-python:

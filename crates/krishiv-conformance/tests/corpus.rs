@@ -12,7 +12,9 @@ use std::path::PathBuf;
 use krishiv_conformance::{EmbeddedDriver, SessionDriver};
 
 fn corpus_files(tier: &str) -> Vec<PathBuf> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpus").join(tier);
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("corpus")
+        .join(tier);
     let mut files = Vec::new();
     let mut stack = vec![root];
     while let Some(dir) = stack.pop() {

@@ -1,0 +1,21 @@
+# Nextest configuration (used automatically by `just test` / `just
+# test-integration` when cargo-nextest is installed).
+#
+# Flakiness quarantine (audit §14 TEST-5): the scheduler/executor/api/shuffle
+# suites still contain sleep-based synchronization (55 sites at audit time),
+# so a loaded runner can lose a race and fail a correct build.  Until those
+# sites are converted to event-based sync — routed to Phases 52/53/55, which
+# rewrite the affected subsystems — the CI profile retries only those crates'
+# tests.  A retried-then-passing test is reported as FLAKY in the nextest
+# summary (visible in the job log), not silently green, so the flake budget
+# stays observable.
+#
+# Local runs use the default profile and never retry: developers should see
+# every flake.
+
+[profile.ci]
+fail-fast = false
+
+[[profile.ci.overrides]]
+filter = 'package(krishiv-scheduler) or package(krishiv-executor) or package(krishiv-api) or package(krishiv-shuffle)'
+retries = 2
