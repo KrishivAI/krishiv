@@ -8,6 +8,33 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Added
 
+- **Property-test suites for the correctness-critical crates** (Phase 51
+  audit §14, 2026-07-11). `krishiv-delta/tests/proptest_zset.rs` checks the
+  Z-set laws against an independent model (consolidation = model addition,
+  commutativity, additive inverse, idempotence, positive-part multiset
+  expansion, serialization round-trip, `Trace` snapshot under arbitrary
+  chunking); `krishiv-state/tests/proptest_checkpoint_kill.rs` kills the
+  checkpoint write sequence after arbitrary prefixes and flips bytes in
+  sealed epochs, asserting recovery always lands on the last sealed epoch
+  with byte-exact snapshots; `krishiv-ivm/tests/proptest_ivm.rs` replays
+  random multi-tick insert/retract histories and asserts incremental ==
+  diff-based == one-shot DataFusion recompute == plain-Rust model.
+- **External-service CI tier** (Phase 51 audit §14, 2026-07-11).
+  `just test-external` + `tests/external/docker-compose.yml` +
+  `scripts/external-test-services.sh` run the `#[ignore = "requires …"]`
+  tests against real Postgres/MinIO/OTLP backends; a required
+  `test-external` job in ci.yml runs them on every PR. The two live-cluster
+  tests join Phase 58's multi-executor harness (see ci-tiers.md).
+- **Coverage measurement** (Phase 51 audit §14, 2026-07-11). `just coverage`
+  (cargo-llvm-cov over the exact required-gate scope) + nightly
+  `coverage.yml` publishing the per-crate table and lcov artifact. First
+  measured baseline (core crates common/delta/state/ivm): **77.95 % line /
+  79.20 % region** coverage.
+- **Flake quarantine** (Phase 51 audit §14, 2026-07-11).
+  `.config/nextest.toml` `ci` profile retries (2×) scoped to the four
+  sleep-based-sync crates (scheduler/executor/api/shuffle); retried-then-
+  passed tests surface as FLAKY. Sleep→event conversions ride the Phase
+  52/53/55 subsystem rewrites.
 - **SQL correctness corpus across the three placements** (Phase 51,
   2026-07-11). New `krishiv-conformance` crate: sqllogictest 0.29 suites
   under `corpus/` run against embedded, single-node, and distributed
@@ -105,6 +132,26 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Fixed
 
+- **Checkpoint recovery could miss the newest sealed epoch** (Phase 51
+  audit §14, 2026-07-11; found by the new kill-model property test). A
+  crash between `write_manifest` and `write_epoch_hint` left the hint
+  naming the *previous* (still valid) epoch, and `latest_valid_epoch`
+  trusted it — hiding the newer sealed epoch from recovery (re-committing
+  exactly-once sink transactions on replay) and letting a restarted
+  coordinator overwrite the sealed epoch's metadata through the
+  monotonicity guard. Recovery now ignores the hint and validates epochs
+  newest-first, also skipping corrupt epochs instead of erroring out when
+  an older sealed epoch exists. The hint file is still written for
+  tooling.
+- **`postgres-catalog` un-quarantined and live-verified** (Phase 51,
+  2026-07-11). Fixed the feature's iceberg-0.9.1 rot (`TableCommit::apply`,
+  one-shot `OutputFile::write`/`InputFile::read`, `KrishivStorageFactory`
+  injection, explicit creation location) and rewrote the concurrent-commit
+  test through `Transaction` as a no-lost-update check. En route the live
+  run caught a real bug: concurrent `migrate()` from two booting nodes
+  races on Postgres's `pg_type` catalog (`CREATE TABLE IF NOT EXISTS` is
+  not concurrency-safe) — migration now holds an advisory lock. Both tests
+  run against real Postgres in `just test-external`.
 - **IVM view-on-view double count** (Phase 51, 2026-07-11). A freshly
   built incremental aggregate over an upstream view seeded from the
   upstream's post-tick output and then applied the same tick's delta —

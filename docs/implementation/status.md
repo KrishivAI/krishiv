@@ -1,5 +1,61 @@
 # Krishiv Implementation Status
 
+## 2026-07-11 (leg 2) — Phase 51 audit §14 closed: proptests, external tier, coverage, flake quarantine; 2 real bugs fixed
+
+Second Phase 51 leg (audit §14 / task #204 complete; task #173 now has only
+the benchmark yardstick left):
+
+- **Property tests** (TEST-3): Z-set algebraic laws vs an independent model
+  (`krishiv-delta/tests/proptest_zset.rs`, 8 properties incl. `Trace`
+  snapshot under arbitrary LSM chunking); checkpoint commit-or-abort across
+  kill + bit-flip fencing (`krishiv-state/tests/proptest_checkpoint_kill.rs`);
+  incremental == diff-based == DataFusion recompute == model over random
+  insert/retract histories (`krishiv-ivm/tests/proptest_ivm.rs`).
+- **Real bug #1 (found by the kill model before it ran)**:
+  `latest_valid_epoch` trusted the epoch hint — a crash between manifest
+  and hint left the newest *sealed* epoch hidden behind a stale-but-valid
+  hint (exactly-once sinks re-commit on replay; monotonicity guard lets a
+  restarted coordinator overwrite the sealed epoch's metadata). Recovery
+  now ignores the hint, validates newest-first, and skips corrupt epochs
+  instead of erroring while an older sealed epoch exists. Pinned by
+  `stale_valid_hint_does_not_hide_newer_sealed_epoch`.
+- **External-service tier** (TEST-6): `just test-external` +
+  `tests/external/docker-compose.yml` (postgres :5439, MinIO :9102, OTLP
+  :4319) + required ci.yml job. All five containerizable `#[ignore]` tests
+  verified live: postgres catalog ×2, S3 round-trip, OTLP span export, TCP
+  size-cap. The two live-cluster tests are routed to Phase 58's harness;
+  bare `#[ignore]` at dfs_backend.rs now carries its reason.
+- **postgres-catalog un-quarantined**: fixed iceberg-0.9.1 rot
+  (`TableCommit::apply`, one-shot `write`/`read`, `KrishivStorageFactory`,
+  explicit creation location; conflict test rewritten via `Transaction` as
+  a no-lost-update assertion) and returned it to the `lint-features`
+  guarded surface. **Real bug #2 (found by the live run)**: concurrent
+  `migrate()` races on Postgres's `pg_type` catalog — now serialized by an
+  advisory lock.
+- **Coverage** (TEST-4): `just coverage` + nightly `coverage.yml` (summary
+  table + lcov artifact). First measured baseline, core crates
+  common/delta/state/ivm: **77.95 % line / 79.20 % region**; the full
+  workspace number lands with coverage.yml's first scheduled run.
+- **Flake quarantine** (TEST-5): `.config/nextest.toml` ci profile,
+  retries=2 scoped to scheduler/executor/api/shuffle, FLAKY surfaced in the
+  summary; sleep→event conversion rides the Phase 52/53/55 rewrites
+  (recorded in ci-tiers.md). Also: `KRISHIV_BLESS_CORPUS` added to the
+  registry scan allowlist (leg-1 miss caught by the full gate).
+
+Validation: `just fmt` + `just lint` clean; `just test` 4,049 passed;
+`just test-integration` 4,261 passed; `just test-doc` clean;
+`just test-external` 5/5 live; `cargo hack --each-feature` green with
+postgres-catalog included. Ops notes: `/` filled twice (freed
+platform-repo target 40G + engine incremental); external MinIO moved to
+:9102 (:9100 taken by the long-lived `kmini` container).
+
+**Phase 51 remaining (final leg)**: benchmark yardstick only — TPC-H
+ladder baselines (generate SF1/SF10 Parquet via tpchgen-cli; no datasets
+on disk today), streaming + IVM-tick baselines, engine-overhead
+microbench into `docs/BENCHMARKING.md`. Needs a quiet machine (parallel
+session compiles skew numbers) and ~25 G disk headroom for the release
+bench build.
+
 ## 2026-07-11 — Phase 51 engine baseline: 7 commits (wire-or-delete → corpus); chunks 7-8 remain
 
 Track 6 Phase 51, first leg (all pushed to main, every commit gated on
