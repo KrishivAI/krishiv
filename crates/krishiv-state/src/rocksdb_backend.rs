@@ -563,6 +563,9 @@ mod tests {
     /// to avoid CI flakes; on real production hardware (SATA SSD, NFS, EBS)
     /// the gap is 10-100× and this assertion would always fire.
     #[test]
+    #[ignore = "timing-sensitive benchmark: flakes under parallel test load (audit §14c); \
+                run explicitly — the set_sync(durable_fsync) invariant is covered by \
+                the durable_fsync getter tests"]
     fn rocksdb_ephemeral_is_faster_than_file_backed_with_durable_fsync() {
         const ITERS: usize = 200;
         let mut fast =

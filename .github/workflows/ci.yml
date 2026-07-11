@@ -99,6 +99,11 @@ jobs:
       - uses: taiki-e/install-action@cargo-nextest
       - uses: taiki-e/install-action@just
       - run: just test
+      # Phase 51 CI honesty: integration suites (tests/*.rs) and doctests are
+      # part of the required gate, not a silent --lib accident. Tier map with
+      # rationale per exclusion: docs/implementation/ci-tiers.md
+      - run: just test-integration
+      - run: just test-doc
 
   # ── Python binding tests ─────────────────────────────────────────────────────
   test-python:

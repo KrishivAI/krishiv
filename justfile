@@ -164,8 +164,26 @@ undeploy-k8s:
 # Run all workspace lib tests.
 # Uses cargo-nextest automatically if installed (parallel, faster output).
 # Install nextest: cargo binstall nextest
+#
+# Required-tier companion recipes (Phase 51 CI honesty — the PR gate is
+# `test` + `test-integration` + `test-doc`; the tier map with a named
+# rationale per exclusion lives in docs/implementation/ci-tiers.md):
 test:
     {{ sccache_env }} {{ cargo_test }} --workspace --lib \
+        --exclude krishiv-python \
+        --exclude krishiv-chaos
+
+# All crates' tests/*.rs integration suites. External-service tests inside
+# them are `#[ignore = "requires …"]`-gated and stay opt-in (see ci-tiers.md).
+test-integration:
+    {{ sccache_env }} {{ cargo_test }} --workspace --tests \
+        --exclude krishiv-python \
+        --exclude krishiv-chaos \
+        --exclude krishiv-bench
+
+# Documentation examples compile and run.
+test-doc:
+    {{ sccache_env }} {{ cargo }} test --workspace --doc \
         --exclude krishiv-python \
         --exclude krishiv-chaos
 

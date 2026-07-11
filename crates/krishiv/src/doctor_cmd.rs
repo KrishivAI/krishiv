@@ -179,9 +179,25 @@ fn render_report(lookup: &dyn Fn(&str) -> Option<String>, coordinator: &Coordina
 
     // ── Validation ────────────────────────────────────────────────────────────
     let mut warnings: Vec<String> = Vec::new();
-    // Registry validation: unknown flags, type mismatches, deprecated aliases.
+    // Registry validation of every visible flag value (through the injected
+    // lookup, so it is testable without touching the process env).
+    for spec in krishiv_common::env_registry::FLAGS {
+        if let Some(v) = get(spec.name)
+            && let Some(issue) = krishiv_common::env_registry::validate_value(spec, &v)
+        {
+            warnings.push(issue.to_string());
+        }
+    }
+    // Unknown / deprecated-alias detection needs to enumerate the real
+    // process environment; value validation above already covered the rest.
     for issue in krishiv_common::validate_env() {
-        warnings.push(issue.to_string());
+        if matches!(
+            issue,
+            krishiv_common::EnvIssue::Unknown { .. }
+                | krishiv_common::EnvIssue::DeprecatedAlias { .. }
+        ) {
+            warnings.push(issue.to_string());
+        }
     }
     if mode == Mode::Unknown {
         warnings.push(format!(
@@ -265,7 +281,11 @@ mod tests {
             &CoordinatorMode::Local,
         );
         assert!(report.contains("not recognized"), "{report}");
-        assert!(report.contains("not a positive integer"), "{report}");
+        // Registry validation message for a non-integer value on a UInt flag.
+        assert!(
+            report.contains("does not parse as unsigned integer"),
+            "{report}"
+        );
     }
 
     #[test]

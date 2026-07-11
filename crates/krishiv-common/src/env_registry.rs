@@ -487,6 +487,66 @@ impl std::fmt::Display for EnvIssue {
     }
 }
 
+/// Validate one raw value against a flag's declared kind (pure — no env
+/// access), so callers holding values from another source (e.g. `doctor`'s
+/// injected lookup) can reuse the exact validation rules.
+pub fn validate_value(spec: &FlagSpec, value: &str) -> Option<EnvIssue> {
+    let bad = |kind: &'static str, hint: String| EnvIssue::Invalid {
+        name: spec.name.to_string(),
+        kind,
+        value_hint: hint,
+    };
+    let trimmed = value.trim();
+    match spec.kind {
+        FlagKind::Bool => {
+            if !is_truthy(trimmed) && !is_falsy(trimmed) {
+                return Some(bad(
+                    "bool (1/true/yes/on or 0/false/no/off)",
+                    format!("{trimmed:?} will be treated as false"),
+                ));
+            }
+        }
+        FlagKind::UInt => {
+            if !trimmed.is_empty() && trimmed.parse::<u64>().is_err() {
+                return Some(bad("unsigned integer", format!("{trimmed:?}")));
+            }
+        }
+        FlagKind::Int => {
+            if !trimmed.is_empty() && trimmed.parse::<i64>().is_err() {
+                return Some(bad("integer", format!("{trimmed:?}")));
+            }
+        }
+        FlagKind::Float => {
+            if !trimmed.is_empty() && trimmed.parse::<f64>().is_err() {
+                return Some(bad("number", format!("{trimmed:?}")));
+            }
+        }
+        FlagKind::SocketAddr => {
+            if !trimmed.is_empty() && trimmed.parse::<std::net::SocketAddr>().is_err() {
+                return Some(bad("host:port socket address", format!("{trimmed:?}")));
+            }
+        }
+        FlagKind::Enum(allowed) => {
+            let norm = trimmed.to_ascii_lowercase();
+            // Enum flags historically accept short/underscore aliases;
+            // only report values that no reader would recognize.
+            let recognized = allowed.iter().any(|a| {
+                norm == *a || norm.replace('_', "-") == *a || a.starts_with(norm.as_str())
+            });
+            if !trimmed.is_empty() && !recognized {
+                return Some(bad(
+                    "one of the documented values",
+                    format!("{trimmed:?} (expected one of {allowed:?})"),
+                ));
+            }
+        }
+        // Free-form kinds: nothing to validate without touching the
+        // filesystem / network. Secrets are deliberately not inspected.
+        FlagKind::Text | FlagKind::Path | FlagKind::Url | FlagKind::List | FlagKind::Secret => {}
+    }
+    None
+}
+
 /// Scan the process environment for `KRISHIV_*` issues.
 pub fn validate_env() -> Vec<EnvIssue> {
     let mut issues = Vec::new();
@@ -504,59 +564,8 @@ pub fn validate_env() -> Vec<EnvIssue> {
                 canonical: COORDINATOR_URL_ENV,
             });
         }
-        let bad = |kind: &'static str, hint: String| EnvIssue::Invalid {
-            name: name.clone(),
-            kind,
-            value_hint: hint,
-        };
-        let trimmed = value.trim();
-        match spec.kind {
-            FlagKind::Bool => {
-                if !is_truthy(trimmed) && !is_falsy(trimmed) {
-                    issues.push(bad(
-                        "bool (1/true/yes/on or 0/false/no/off)",
-                        format!("{trimmed:?} will be treated as false"),
-                    ));
-                }
-            }
-            FlagKind::UInt => {
-                if !trimmed.is_empty() && trimmed.parse::<u64>().is_err() {
-                    issues.push(bad("unsigned integer", format!("{trimmed:?}")));
-                }
-            }
-            FlagKind::Int => {
-                if !trimmed.is_empty() && trimmed.parse::<i64>().is_err() {
-                    issues.push(bad("integer", format!("{trimmed:?}")));
-                }
-            }
-            FlagKind::Float => {
-                if !trimmed.is_empty() && trimmed.parse::<f64>().is_err() {
-                    issues.push(bad("number", format!("{trimmed:?}")));
-                }
-            }
-            FlagKind::SocketAddr => {
-                if !trimmed.is_empty()
-                    && trimmed.parse::<std::net::SocketAddr>().is_err()
-                {
-                    issues.push(bad("host:port socket address", format!("{trimmed:?}")));
-                }
-            }
-            FlagKind::Enum(allowed) => {
-                let norm = trimmed.to_ascii_lowercase();
-                // Enum flags historically accept short/underscore aliases;
-                // only report values that no reader would recognize.
-                let recognized = allowed.iter().any(|a| {
-                    norm == *a
-                        || norm.replace('_', "-") == *a
-                        || a.starts_with(norm.as_str())
-                });
-                if !trimmed.is_empty() && !recognized {
-                    issues.push(bad("one of the documented values", format!("{trimmed:?} (expected one of {allowed:?})")));
-                }
-            }
-            // Free-form kinds: nothing to validate without touching the
-            // filesystem / network. Secrets are deliberately not inspected.
-            FlagKind::Text | FlagKind::Path | FlagKind::Url | FlagKind::List | FlagKind::Secret => {}
+        if let Some(issue) = validate_value(spec, &value) {
+            issues.push(issue);
         }
     }
     issues.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
