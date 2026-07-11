@@ -34,6 +34,7 @@ pub mod cluster_control;
 pub mod continuous_stream_http;
 pub mod coordinator_daemon;
 pub mod coordinator_sharded;
+pub mod distributed_batch;
 pub mod heartbeat;
 pub mod in_process;
 pub mod ivm;
@@ -88,6 +89,7 @@ pub use coordinator_daemon::{
     parse_job_coordinator_daemon_config, run_cluster_control_plane, run_clusterd_daemon,
     run_job_coordinator_daemon, run_standalone_coordinator, spawn_coordinator_sidecars,
 };
+pub use distributed_batch::plan_staged_batch_stages;
 pub use error::{SchedulerError, SchedulerResult, TaskUpdateOutcome};
 #[cfg(feature = "etcd")]
 pub use etcd_lease::{DEFAULT_CCP_LEADER_KEY, EtcdLeaseElection};

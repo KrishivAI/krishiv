@@ -15,6 +15,9 @@ thiserror = { workspace = true }
 krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
 krishiv-dataflow = { path = "../krishiv-dataflow", version = "0.1.0" }
 krishiv-executor = { path = "../krishiv-executor", version = "0.1.0" }
+# In-memory shuffle store for Phase 52 staged (partition-parallel) batch jobs
+# on the in-process cluster.
+krishiv-shuffle = { path = "../krishiv-shuffle", version = "0.1.0" }
 krishiv-scheduler = { path = "../krishiv-scheduler", version = "0.1.0" }
 krishiv-proto = { path = "../krishiv-proto", version = "0.1.0" }
 krishiv-common = { path = "../krishiv-common", version = "0.1.0" }

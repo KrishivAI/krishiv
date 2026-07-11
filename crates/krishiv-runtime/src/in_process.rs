@@ -87,6 +87,12 @@ pub struct InProcessStreamingRuntime {
     job_counter: Arc<AtomicU64>,
     /// Per-cluster suffix used in coordinator/executor ids.
     suffix: u64,
+    /// Stage count of the most recently submitted terminal-task job.
+    /// Observability for Phase 52 execution-mode honesty: >1 means the job
+    /// ran partition-parallel staged; 1 means the single-task path
+    /// (completed jobs are evicted from the coordinator registry, so this
+    /// is the only after-the-fact record of the mode).
+    last_batch_job_stage_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl InProcessStreamingRuntime {
@@ -169,7 +175,12 @@ impl InProcessStreamingRuntime {
             ExecutorTaskRunner::new(inbox.clone())
                 .with_executor_id(executor_id.clone())
                 .with_continuous_drainer(drainer)
-                .with_shared_parquet_cache(parquet_cache),
+                .with_shared_parquet_cache(parquet_cache)
+                // Phase 52: staged (partition-parallel) batch jobs move data
+                // between stages through the in-memory shuffle store.
+                .with_inmem_shuffle(Arc::new(krishiv_shuffle::ShuffleBackend::InMemory(
+                    Arc::new(krishiv_shuffle::InMemoryShuffleStore::new()),
+                ))),
         );
         let bridge = InProcessCoordinatorBridge::new(
             Arc::clone(&coordinator),
@@ -185,7 +196,16 @@ impl InProcessStreamingRuntime {
             _executor_id: executor_id,
             job_counter: Arc::new(AtomicU64::new(1)),
             suffix,
+            last_batch_job_stage_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
+    }
+
+    /// Stage count of the most recently submitted terminal-task job
+    /// (Phase 52 execution-mode observability; see the field docs).
+    #[doc(hidden)]
+    pub fn last_batch_job_stage_count(&self) -> usize {
+        self.last_batch_job_stage_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Per-cluster job id generator (C1) — replaces the legacy process-global counter.
@@ -557,18 +577,50 @@ impl InProcessStreamingRuntime {
         sink_contract: Option<&str>,
     ) -> RuntimeResult<Vec<RecordBatch>> {
         let job_id = self.next_job_id()?;
-        let task_id = TaskId::try_new("task-0").map_err(|e| RuntimeError::InvalidState {
-            message: e.to_string(),
-        })?;
-        let stage_id = StageId::try_new("stage-0").map_err(|e| RuntimeError::InvalidState {
-            message: e.to_string(),
-        })?;
-        let mut task_spec = TaskSpec::new(task_id.clone(), fragment.to_string());
-        if let Some(contract) = sink_contract {
-            task_spec = task_spec.with_sink_contract(contract);
-        }
-        let job_spec = JobSpec::new(job_id.clone(), fragment.to_string(), kind)
-            .with_stage(StageSpec::new(stage_id, "stage-0").with_task(task_spec));
+
+        // Phase 52: attempt partition-parallel staged execution for plain
+        // batch SELECTs over local parquet tables. Any query, table, or plan
+        // shape the stage builder cannot prove correct yields None and the
+        // job runs on the single-task `sql:` path exactly as before.
+        let staged_stages =
+            if kind == JobKind::Batch && sink_contract.is_none() && stream_partitions.is_empty() {
+                fragment.strip_prefix("sql: ").and_then(|query| {
+                    let table_refs: Vec<(String, std::path::PathBuf)> = tables
+                        .iter()
+                        .map(|t| (t.table_name.clone(), t.path.clone()))
+                        .collect();
+                    block_on(krishiv_scheduler::plan_staged_batch_stages(
+                        query,
+                        &table_refs,
+                    ))
+                })
+            } else {
+                None
+            };
+
+        let job_spec = if let Some(stages) = staged_stages {
+            stages.into_iter().fold(
+                JobSpec::new(job_id.clone(), fragment.to_string(), kind),
+                |spec, stage| spec.with_stage(stage),
+            )
+        } else {
+            let task_id = TaskId::try_new("task-0").map_err(|e| RuntimeError::InvalidState {
+                message: e.to_string(),
+            })?;
+            let stage_id = StageId::try_new("stage-0").map_err(|e| RuntimeError::InvalidState {
+                message: e.to_string(),
+            })?;
+            let mut task_spec = TaskSpec::new(task_id, fragment.to_string());
+            if let Some(contract) = sink_contract {
+                task_spec = task_spec.with_sink_contract(contract);
+            }
+            JobSpec::new(job_id.clone(), fragment.to_string(), kind)
+                .with_stage(StageSpec::new(stage_id, "stage-0").with_task(task_spec))
+        };
+        self.last_batch_job_stage_count.store(
+            job_spec.stages().len(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         {
             let mut coord = self
@@ -617,6 +669,13 @@ impl InProcessStreamingRuntime {
         // injected as a WatermarkHint into the first assignment of the next stage.
         let mut stage_watermark_ms: Option<i64> = None;
 
+        // Assignments launched by the previous iteration's coordinator tick.
+        // The sync tick marks those tasks launch-in-flight and returns them
+        // for the caller to dispatch; without carrying them into the next
+        // iteration, upstream-gated stages (Phase 52 staged batch jobs) would
+        // hang: the tick already consumed their one launch.
+        let mut tick_assignments: Vec<krishiv_proto::ExecutorTaskAssignment> = Vec::new();
+
         block_on(async {
             loop {
                 if iter_count >= MAX_STAGE_ITERATIONS {
@@ -630,7 +689,7 @@ impl InProcessStreamingRuntime {
                 // O4: Merge launch_assigned_task_assignments + job_snapshot into
                 // one lock acquisition (previously two separate locks per iteration).
                 // coordinator_tick is kept after task execution below.
-                let (mut assignments, is_terminal) = {
+                let (mut assignments, job_state) = {
                     let mut coord = self.coordinator.lock().map_err(|_| {
                         RuntimeError::transport(
                             "coordinator lock poisoned during task assignment launch",
@@ -639,16 +698,34 @@ impl InProcessStreamingRuntime {
                     let assignments = coord
                         .launch_assigned_task_assignments(&job_id)
                         .map_err(|e| RuntimeError::transport(e.to_string()))?;
-                    let is_terminal = coord
-                        .job_snapshot(&job_id)
-                        .map(|s| s.state().is_terminal())
-                        .unwrap_or(false);
-                    (assignments, is_terminal)
+                    let job_state = coord.job_snapshot(&job_id).map(|s| s.state()).ok();
+                    (assignments, job_state)
                 };
+                // Dispatch assignments the previous tick launched (they are
+                // already launch-in-flight, so the call above cannot return
+                // them again).
+                assignments.extend(
+                    std::mem::take(&mut tick_assignments)
+                        .into_iter()
+                        .filter(|a| a.job_id() == &job_id),
+                );
 
                 if assignments.is_empty() {
-                    if is_terminal {
-                        return Ok(());
+                    if let Some(state) = job_state
+                        && state.is_terminal()
+                    {
+                        // A job that failed or was cancelled must not read as
+                        // an empty-but-successful result set.
+                        return if matches!(
+                            state,
+                            krishiv_proto::JobState::Failed | krishiv_proto::JobState::Cancelled
+                        ) {
+                            Err(RuntimeError::transport(format!(
+                                "job {job_id} finished in state {state:?}"
+                            )))
+                        } else {
+                            Ok(())
+                        };
                     }
                     // First iteration: coordinator never produced assignments.
                     if iter_count == 1 {
@@ -760,7 +837,10 @@ impl InProcessStreamingRuntime {
                             .map_err(|_| RuntimeError::InvalidState {
                                 message: "coordinator lock poisoned during coordinator tick".into(),
                             })?;
-                    let _ = coord.coordinator_tick();
+                    // The tick may launch newly-eligible tasks (stages whose
+                    // upstream shuffle dependencies just completed); it hands
+                    // them back for dispatch on the next loop iteration.
+                    tick_assignments = coord.coordinator_tick().unwrap_or_default();
                 }
             }
         })?;
@@ -1093,6 +1173,138 @@ mod tests {
         runtime.push_continuous_input("j2", vec![batch]).unwrap();
         let _ = runtime.drain_continuous_job("j1").unwrap();
         let _ = runtime.drain_continuous_job("j2").unwrap();
+    }
+
+    // ── Phase 52: staged (partition-parallel) batch execution ────────────────
+
+    /// Write a 4-file parquet dataset (1000 rows) so scans genuinely have
+    /// multiple partitions and the staged map stage gets multiple tasks.
+    #[allow(clippy::unwrap_used)]
+    fn write_staged_test_parquet(dir: &std::path::Path) -> std::path::PathBuf {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let table_dir = dir.join("t");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        for file_index in 0..4i64 {
+            let ids: Vec<i64> = (0..250).map(|i| file_index * 250 + i).collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(ids.clone())),
+                    Arc::new(StringArray::from(
+                        ids.iter()
+                            .map(|i| match i % 3 {
+                                0 => "red",
+                                1 => "green",
+                                _ => "blue",
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        ids.iter().map(|i| i * 3).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let file = std::fs::File::create(table_dir.join(format!("part-{file_index}.parquet")))
+                .unwrap();
+            let mut writer =
+                parquet::arrow::ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        table_dir
+    }
+
+    #[allow(clippy::unwrap_used)]
+    fn render_sorted_rows(batches: &[RecordBatch]) -> Vec<String> {
+        let mut rows: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows()).map(move |r| {
+                    (0..b.num_columns())
+                        .map(|c| {
+                            arrow::util::display::array_value_to_string(b.column(c), r).unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// Phase 52 end-to-end: a GROUP BY over a multi-file parquet dataset
+    /// runs through the coordinator as a staged (map + result) job — dfplan
+    /// task bodies, in-memory shuffle between stages — and returns exactly
+    /// what the inline single-engine path returns.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn staged_batch_sql_matches_inline_execution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = write_staged_test_parquet(tmp.path());
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let tables = vec![BatchSqlTable {
+            table_name: "t".into(),
+            path: table_dir,
+            ipc_b64: String::new(),
+        }];
+        let query = "SELECT category, COUNT(*) AS n, SUM(amount) AS total \
+                     FROM t GROUP BY category";
+
+        let staged = runtime
+            .execute_batch_sql_via_coordinator(query, &tables)
+            .expect("staged coordinator execution");
+        // Prove the job actually ran multi-stage (not the single-task
+        // fallback): the runtime records the submitted stage count because
+        // completed jobs are evicted from the coordinator registry.
+        assert!(
+            runtime.last_batch_job_stage_count() > 1,
+            "GROUP BY over a multi-file table must run staged, got {} stage(s)",
+            runtime.last_batch_job_stage_count()
+        );
+        let inline = runtime
+            .execute_batch_sql(query, &tables, false)
+            .expect("inline execution");
+        assert_eq!(
+            render_sorted_rows(&staged),
+            render_sorted_rows(&inline),
+            "staged execution must match inline execution"
+        );
+    }
+
+    /// Disabling stage splitting routes the same query through the
+    /// single-task `sql:` fallback and still returns correct results.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn staged_batch_sql_falls_back_when_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = write_staged_test_parquet(tmp.path());
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let tables = vec![BatchSqlTable {
+            table_name: "t".into(),
+            path: table_dir,
+            ipc_b64: String::new(),
+        }];
+        // A query shape the stage builder declines (no exchange after
+        // optimization): scan+filter only. Must run via the fallback.
+        let query = "SELECT id, amount FROM t WHERE id < 5";
+        let via_coord = runtime
+            .execute_batch_sql_via_coordinator(query, &tables)
+            .expect("fallback coordinator execution");
+        assert_eq!(
+            runtime.last_batch_job_stage_count(),
+            1,
+            "scan-only query must not be stage-split"
+        );
+        let inline = runtime
+            .execute_batch_sql(query, &tables, false)
+            .expect("inline execution");
+        assert_eq!(render_sorted_rows(&via_coord), render_sorted_rows(&inline));
     }
 
     // ── New N-series fixes ────────────────────────────────────────────────────

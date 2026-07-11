@@ -138,6 +138,21 @@ pub(crate) async fn execute_batch_fragment(
         }
     }
 
+    // Phase 52 (ADR-0003): proto-encoded physical-plan stage fragment. Must
+    // be dispatched before the generic `shuffle_write` config branch below —
+    // dfplan map tasks carry a ShuffleWriteConfig too, but their body is a
+    // plan partition, not a `sql:` query.
+    if krishiv_sql::distributed_plan::is_dfplan_body(fragment) {
+        return execute_dfplan_fragment(
+            runner,
+            assignment,
+            fragment,
+            udf_limits.clone(),
+            engine_memory_limit,
+        )
+        .await;
+    }
+
     #[cfg(feature = "kafka")]
     if fragment == KAFKA_TO_PARQUET_FRAGMENT {
         return execute_source_to_sink_pipeline(runner, assignment).await;
@@ -731,6 +746,212 @@ async fn execute_shuffle_write_fragment(
 }
 
 /// Execute a typed R4a shuffle-write task backed by `InMemoryShuffleStore`.
+/// Shuffle reads for decoded dfplan fragments: in-memory store lookups keyed
+/// by the `shuffle_stage_key(stage, map_task)` wire contract shared with the
+/// coordinator's staged-job builder.
+///
+/// A missing partition reads as empty. That is correct only while all
+/// upstream map tasks wrote to this executor's store — which holds today
+/// because staged jobs are emitted only where coordinator and executor share
+/// one process. Remote (multi-executor) fetch lands with the shuffle-flight
+/// wiring leg of Phase 52.
+struct InmemDfplanShuffleReader {
+    store: std::sync::Arc<krishiv_shuffle::ShuffleBackend>,
+    job_id: String,
+}
+
+// Manual impl: `ShuffleBackend` itself does not derive Debug.
+impl std::fmt::Debug for InmemDfplanShuffleReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InmemDfplanShuffleReader")
+            .field("job_id", &self.job_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl krishiv_sql::distributed_plan::ShufflePartitionReader for InmemDfplanShuffleReader {
+    fn read_partition(
+        &self,
+        upstream_stage_index: usize,
+        map_task_index: usize,
+        partition: usize,
+    ) -> futures::future::BoxFuture<'static, Result<Vec<arrow::record_batch::RecordBatch>, String>>
+    {
+        use krishiv_shuffle::{PartitionId, ShuffleStore as _};
+        let partition = match u32::try_from(partition) {
+            Ok(p) => p,
+            Err(_) => {
+                return Box::pin(async move {
+                    Err(format!("shuffle partition index {partition} exceeds u32"))
+                });
+            }
+        };
+        let id = PartitionId {
+            job_id: self.job_id.clone(),
+            stage_id: krishiv_sql::distributed_plan::shuffle_stage_key(
+                upstream_stage_index,
+                map_task_index,
+            ),
+            partition,
+        };
+        let store = std::sync::Arc::clone(&self.store);
+        Box::pin(async move {
+            store
+                .read_partition(&id)
+                .await
+                .map(|found| found.map(|p| p.batches).unwrap_or_default())
+                .map_err(|e| e.to_string())
+        })
+    }
+}
+
+/// Execute a Phase 52 `dfplan:v1:` fragment: one output partition of a
+/// proto-encoded physical-plan stage subtree (ADR-0003).
+///
+/// Map tasks (the assignment carries a `ShuffleWriteConfig`) hash-partition
+/// the partition's output into the in-memory shuffle store under the task's
+/// sub-stage key; Result tasks stream through the inline/spool decision
+/// exactly like `sql:` results. No SQL is parsed or planned here — the plan
+/// arrives fully optimized from the coordinator.
+async fn execute_dfplan_fragment(
+    runner: &ExecutorTaskRunner,
+    assignment: &ExecutorTaskAssignment,
+    fragment: &str,
+    udf_limits: ResourceLimits,
+    engine_memory_limit: Option<usize>,
+) -> ExecutorResult<ExecutorTaskOutput> {
+    use krishiv_shuffle::{HashPartitioner, PartitionId, ShufflePartition, ShuffleStore as _};
+
+    let store = runner
+        .inmem_shuffle
+        .clone()
+        .ok_or_else(|| ExecutorError::InvalidAssignment {
+            message: String::from(
+                "dfplan fragment requires an in-memory shuffle store but none is configured",
+            ),
+        })?;
+    // The engine supplies the runtime environment (memory pool, spill) the
+    // decoded plan executes under; no tables are registered on it.
+    let engine = Arc::new(
+        krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
+            .with_udf_limits(udf_limits),
+    );
+    let job_id = assignment.job_id().as_str();
+    let reader: Arc<dyn krishiv_sql::distributed_plan::ShufflePartitionReader> =
+        Arc::new(InmemDfplanShuffleReader {
+            store: Arc::clone(&store),
+            job_id: job_id.to_owned(),
+        });
+    let (schema, mut stream) = krishiv_sql::distributed_plan::execute_dfplan_body(
+        fragment,
+        engine.session_context(),
+        Some(reader),
+    )
+    .map_err(|e| ExecutorError::InvalidAssignment {
+        message: format!("dfplan fragment: {e}"),
+    })?;
+
+    if let Some(write_cfg) = assignment.shuffle_write() {
+        // Map task: hash-partition the stream into the shuffle store under
+        // this task's sub-stage key (mirrors `execute_inmem_shuffle_write`,
+        // which owns the `sql:`-body variant of the same protocol).
+        let num_partitions = write_cfg.num_partitions.max(1) as u32;
+        let key_column = write_cfg.key_columns.first().map(String::as_str);
+        let partitioner = key_column.map(|col| {
+            HashPartitioner::new(col, num_partitions).with_seed(shuffle_seed_from_job_id(job_id))
+        });
+        let mut partition_batches: Vec<Vec<arrow::record_batch::RecordBatch>> =
+            vec![Vec::new(); num_partitions as usize];
+        let mut total_rows = 0usize;
+        while let Some(result) = stream.next().await {
+            let batch = result.map_err(|e| ExecutorError::LocalExecution {
+                message: e.to_string(),
+            })?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            total_rows += batch.num_rows();
+            if let Some(p) = &partitioner {
+                let buckets = p
+                    .partition(&batch)
+                    .map_err(|e| ExecutorError::LocalExecution {
+                        message: format!("dfplan hash partition failed: {e}"),
+                    })?;
+                for (bucket_idx, bucket_batch) in buckets.into_iter().enumerate() {
+                    if bucket_batch.num_rows() > 0
+                        && let Some(v) = partition_batches.get_mut(bucket_idx)
+                    {
+                        v.push(bucket_batch);
+                    }
+                }
+            } else if let Some(v) = partition_batches.first_mut() {
+                v.push(batch);
+            }
+        }
+
+        let mut outputs: Vec<krishiv_proto::ShufflePartitionOutput> =
+            Vec::with_capacity(num_partitions as usize);
+        for (p, part_batches) in partition_batches.into_iter().enumerate() {
+            let p = p as u32;
+            let part_schema = part_batches
+                .first()
+                .map(|b| b.schema())
+                .unwrap_or_else(|| Arc::clone(&schema));
+            let size_bytes: u64 = part_batches
+                .iter()
+                .map(|b| b.get_array_memory_size() as u64)
+                .sum();
+            let part_batches = if part_batches.len() > 1 {
+                arrow::compute::concat_batches(&part_schema, &part_batches)
+                    .map(|b| vec![b])
+                    .unwrap_or(part_batches)
+            } else {
+                part_batches
+            };
+            store
+                .write_partition(
+                    ShufflePartition {
+                        id: PartitionId {
+                            job_id: job_id.to_owned(),
+                            stage_id: write_cfg.stage_id.as_str().to_owned(),
+                            partition: p,
+                        },
+                        schema: part_schema,
+                        batches: part_batches,
+                    },
+                    write_cfg.lease_token,
+                )
+                .await
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: format!("dfplan shuffle write failed for partition {p}: {e}"),
+                })?;
+            outputs.push(krishiv_proto::ShufflePartitionOutput::inline(p, size_bytes));
+        }
+        return Ok(ExecutorTaskOutput::shuffle_write(total_rows, outputs));
+    }
+
+    // Result task: stream through the inline/spool decision (Phase 2.10).
+    let (drained, shape) = crate::runner::result_spool::drain_stream_with_spool(
+        stream,
+        crate::runner::result_spool::inline_result_max_bytes(),
+    )
+    .await?;
+    let output = ExecutorTaskOutput::sql(shape.row_count, shape.batch_count, shape.column_count);
+    Ok(match drained {
+        crate::runner::result_spool::DrainedResult::Inline(batches) => {
+            output.with_record_batches(batches)
+        }
+        crate::runner::result_spool::DrainedResult::Spooled(spool) => {
+            tracing::info!(
+                total_bytes = spool.total_bytes(),
+                rows = shape.row_count,
+                "dfplan result exceeded inline threshold; spooled to disk"
+            );
+            output.with_spooled_result(std::sync::Arc::new(spool))
+        }
+    })
+}
+
 async fn execute_inmem_shuffle_write(
     assignment: &ExecutorTaskAssignment,
     write_cfg: &krishiv_proto::ShuffleWriteConfig,

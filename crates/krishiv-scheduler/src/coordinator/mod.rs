@@ -1356,7 +1356,17 @@ impl Coordinator {
             .collect()
     }
 
-    pub fn coordinator_tick(&mut self) -> SchedulerResult<()> {
+    /// Advance the sync coordinator state machine one tick.
+    ///
+    /// Launches newly-eligible assigned tasks (e.g. stages whose upstream
+    /// shuffle dependencies completed since the last tick) and returns those
+    /// assignments: the sync tick has no transport, so the *caller* owns
+    /// dispatch. The launched tasks are marked in-flight and will not be
+    /// re-launched — dropping the return value loses them permanently
+    /// (upstream-gated stages then hang in `Scheduling` forever).
+    pub fn coordinator_tick(
+        &mut self,
+    ) -> SchedulerResult<Vec<krishiv_proto::ExecutorTaskAssignment>> {
         let lost = self.advance_heartbeat_clock(1)?;
         // H-5: Mirror JCP executor-loss handling (same logic as the async
         // `SharedCoordinator::advance_heartbeat_tick`). Without this the JCP's
@@ -1367,15 +1377,16 @@ impl Coordinator {
             }
         }
         let job_ids: Vec<JobId> = self.job_coordinators.keys().cloned().collect();
+        let mut launched = Vec::new();
         for job_id in &job_ids {
-            let _ = self.launch_assigned_task_assignments(job_id)?;
+            launched.extend(self.launch_assigned_task_assignments(job_id)?);
         }
         // R5: Stall detection — reset Running tasks whose executor is still
         // alive (heartbeating) but the task itself has not progressed past
         // TaskState::Running for longer than the stall timeout. This catches
         // deadlocked operators that block a thread without crashing the executor.
         self.detect_and_reset_stalled_tasks();
-        Ok(())
+        Ok(launched)
     }
 
     /// R5: Collect stalled Running tasks that have exceeded the configured

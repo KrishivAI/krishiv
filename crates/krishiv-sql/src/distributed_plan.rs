@@ -212,6 +212,82 @@ pub fn is_dfplan_body(body: &str) -> bool {
     body.starts_with(DFPLAN_BODY_PREFIX)
 }
 
+/// Decode a dfplan body and execute its assigned partition (executor seam).
+///
+/// Keeps DataFusion types out of the executor crate: the result streams as
+/// the crate-level [`crate::SqlStream`]. `session` supplies the runtime
+/// environment (memory pool, object stores); the decoded plan needs no
+/// tables registered on it. Map-stage plans read upstream shuffle data
+/// through `reader`; passing `None` leaves any [`ShuffleReadExec`] leaves
+/// unexecutable (coordinator-side decode).
+pub fn execute_dfplan_body(
+    body: &str,
+    session: &SessionContext,
+    reader: Option<Arc<dyn ShufflePartitionReader>>,
+) -> SqlResult<(SchemaRef, crate::SqlStream)> {
+    let codec = match reader {
+        Some(reader) => KrishivPhysicalCodec::executor(reader),
+        None => KrishivPhysicalCodec::coordinator(),
+    };
+    let task_ctx = session.task_ctx();
+    let (partition, plan) = decode_dfplan_task(body, &task_ctx, &codec)?;
+    let partition_count = plan.output_partitioning().partition_count();
+    if partition >= partition_count {
+        return Err(SqlError::DataFusion {
+            message: format!(
+                "dfplan partition {partition} out of range: decoded plan has \
+                 {partition_count} partitions"
+            ),
+        });
+    }
+    let schema = plan.schema();
+    let stream = plan
+        .execute(partition, task_ctx)
+        .map_err(|e| SqlError::DataFusion {
+            message: format!("dfplan execute (partition {partition}): {e}"),
+        })?;
+    let stream = stream.map_err(|e| SqlError::DataFusion {
+        message: e.to_string(),
+    });
+    Ok((schema, Box::pin(stream)))
+}
+
+/// Plan a query over local parquet tables and cut it into stages
+/// (coordinator seam — keeps DataFusion types out of the scheduler crate).
+///
+/// `tables` are `(table_name, path)` pairs; a path may be a single parquet
+/// file or a directory dataset. Planning happens on a fresh
+/// [`planning_session_context`], so krishiv SQL extensions (streaming
+/// windows, catalog DML, UDFs) fail to plan here and surface as `Err` —
+/// callers treat any error as "fall back to the single-task path".
+pub async fn build_stages_for_parquet_query(
+    query: &str,
+    tables: &[(String, String)],
+) -> SqlResult<Option<DistributedStagePlan>> {
+    let ctx = planning_session_context(stage_target_partitions_from_env());
+    for (name, path) in tables {
+        ctx.register_parquet(
+            name,
+            path,
+            datafusion::prelude::ParquetReadOptions::default(),
+        )
+        .await
+        .map_err(|e| SqlError::DataFusion {
+            message: format!("staged planning: register '{name}': {e}"),
+        })?;
+    }
+    let df = ctx.sql(query).await.map_err(|e| SqlError::DataFusion {
+        message: format!("staged planning: {e}"),
+    })?;
+    let plan = df
+        .create_physical_plan()
+        .await
+        .map_err(|e| SqlError::DataFusion {
+            message: format!("staged physical planning: {e}"),
+        })?;
+    build_distributed_stages(plan)
+}
+
 // ── Shuffle partition reader (executor-injected) ───────────────────────────
 
 /// Executor-side access to upstream shuffle partitions.

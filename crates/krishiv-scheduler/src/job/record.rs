@@ -298,7 +298,17 @@ impl JobRecord {
                     // submission time — they stayed on the TaskSpec but were
                     // never forwarded to ExecutorTaskAssignment.
                     if let Some(write_cfg) = task.spec.shuffle_write() {
-                        let effective_num_partitions = skew_partition_override
+                        // dfplan stages bake the reduce-side partition count
+                        // into the encoded plan (ShuffleReadExec), so the skew
+                        // override must never resize them: map output written
+                        // beyond that count would silently be dropped.
+                        let skew_override =
+                            if krishiv_sql::distributed_plan::is_dfplan_body(&task_body) {
+                                None
+                            } else {
+                                skew_partition_override
+                            };
+                        let effective_num_partitions = skew_override
                             .map(|n| n as usize)
                             .unwrap_or(write_cfg.num_partitions)
                             .max(1);
