@@ -1,0 +1,22 @@
+[package]
+name = "krishiv-conformance"
+version = "0.1.0"
+edition = "2024"
+license = "BUSL-1.1"
+publish = false
+description = "SQL correctness corpus (sqllogictest) run across the three execution placements"
+
+[dependencies]
+arrow = { workspace = true }
+async-trait = { workspace = true }
+krishiv-api = { path = "../krishiv-api", version = "0.1.0" }
+krishiv-flight-sql = { path = "../krishiv-flight-sql", version = "0.1.0" }
+krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
+sqllogictest = "0.29"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+
+[lints]
+workspace = true

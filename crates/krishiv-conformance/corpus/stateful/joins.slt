@@ -1,0 +1,50 @@
+# Join shapes: inner, left, semi-style EXISTS/IN, cross.
+
+statement ok
+CREATE TABLE cust(id BIGINT, name VARCHAR)
+
+statement ok
+CREATE TABLE ord(cid BIGINT, total BIGINT)
+
+statement ok
+INSERT INTO cust VALUES (1, 'ann'), (2, 'bob'), (3, 'cat')
+
+statement ok
+INSERT INTO ord VALUES (1, 100), (1, 50), (2, 75)
+
+query TI rowsort
+SELECT c.name, o.total FROM cust c JOIN ord o ON c.id = o.cid
+----
+ann 100
+ann 50
+bob 75
+
+query TI rowsort
+SELECT c.name, o.total FROM cust c LEFT JOIN ord o ON c.id = o.cid
+----
+ann 100
+ann 50
+bob 75
+cat NULL
+
+query T rowsort
+SELECT name FROM cust WHERE id IN (SELECT cid FROM ord)
+----
+ann
+bob
+
+query T rowsort
+SELECT name FROM cust c WHERE NOT EXISTS (SELECT 1 FROM ord o WHERE o.cid = c.id)
+----
+cat
+
+query I
+SELECT count(*) FROM cust CROSS JOIN ord
+----
+9
+
+query TI rowsort
+SELECT c.name, sum(o.total) FROM cust c JOIN ord o ON c.id = o.cid GROUP BY c.name
+----
+ann 150
+bob 75

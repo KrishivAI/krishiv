@@ -1,0 +1,75 @@
+# ORDER BY, LIMIT/OFFSET, set operations, window functions.
+
+statement ok
+CREATE TABLE t(k VARCHAR, v BIGINT)
+
+statement ok
+INSERT INTO t VALUES ('a', 3), ('b', 1), ('c', 2), ('d', 1)
+
+query T
+SELECT k FROM t ORDER BY v ASC, k DESC LIMIT 1
+----
+d
+
+query T
+SELECT k FROM t ORDER BY v DESC LIMIT 1
+----
+a
+
+query TI
+SELECT k, v FROM t ORDER BY v, k LIMIT 2 OFFSET 1
+----
+d 1
+c 2
+
+query I rowsort
+SELECT v FROM t UNION SELECT 9
+----
+1
+2
+3
+9
+
+query I rowsort
+SELECT v FROM t UNION ALL SELECT 1
+----
+1
+1
+1
+2
+3
+
+query I
+SELECT v FROM t INTERSECT SELECT 1
+----
+1
+
+query I
+SELECT v FROM t EXCEPT SELECT 1 ORDER BY 1
+----
+2
+3
+
+query TII
+SELECT k, v, row_number() OVER (ORDER BY v, k) FROM t ORDER BY v, k
+----
+b 1 1
+d 1 2
+c 2 3
+a 3 4
+
+query TII
+SELECT k, v, rank() OVER (ORDER BY v) FROM t ORDER BY v, k
+----
+b 1 1
+d 1 1
+c 2 3
+a 3 4
+
+query TII
+SELECT k, v, sum(v) OVER (ORDER BY v, k ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t ORDER BY v, k
+----
+b 1 1
+d 1 2
+c 2 4
+a 3 7

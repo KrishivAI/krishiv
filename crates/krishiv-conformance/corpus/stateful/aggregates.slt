@@ -1,0 +1,52 @@
+# Aggregates, GROUP BY, HAVING, DISTINCT.
+
+statement ok
+CREATE TABLE sales(region VARCHAR, amount BIGINT)
+
+statement ok
+INSERT INTO sales VALUES ('east', 10), ('east', 20), ('west', 5), ('west', 5), ('north', NULL)
+
+query I
+SELECT count(*) FROM sales
+----
+5
+
+query TI rowsort
+SELECT region, sum(amount) FROM sales GROUP BY region
+----
+east 30
+north NULL
+west 10
+
+query TI rowsort
+SELECT region, count(DISTINCT amount) FROM sales GROUP BY region
+----
+east 2
+north 0
+west 1
+
+query T rowsort
+SELECT region FROM sales GROUP BY region HAVING sum(amount) > 9
+----
+east
+west
+
+query I
+SELECT min(amount) FROM sales
+----
+5
+
+query I
+SELECT max(amount) FROM sales
+----
+20
+
+query R
+SELECT avg(amount) FROM sales WHERE region = 'east'
+----
+15.0
+
+query I
+SELECT count(DISTINCT region) FROM sales
+----
+3

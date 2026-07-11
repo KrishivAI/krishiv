@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/krishiv",
+    "crates/krishiv-conformance",
     "crates/krishiv-ivm",
     "crates/krishiv-api",
     "crates/krishiv-common",
@@ -28,6 +29,7 @@ members = [
 ]
 default-members = [
     "crates/krishiv",
+    "crates/krishiv-conformance",
     "crates/krishiv-ivm",
     "crates/krishiv-api",
     "crates/krishiv-common",

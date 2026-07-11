@@ -1,0 +1,64 @@
+# TPC-H-derived query shapes on tiny inline data (pricing summary,
+# revenue-by-customer, top-N). Q1/Q3/Q5-style aggregation + join trees.
+
+statement ok
+CREATE TABLE lineitem(l_quantity BIGINT, l_extendedprice DOUBLE, l_discount DOUBLE, l_returnflag VARCHAR, l_linestatus VARCHAR)
+
+statement ok
+INSERT INTO lineitem VALUES
+  (17, 1000.0, 0.04, 'N', 'O'),
+  (36, 2000.0, 0.09, 'N', 'O'),
+  (8,  500.0,  0.10, 'R', 'F'),
+  (28, 1500.0, 0.05, 'A', 'F'),
+  (24, 1200.0, 0.10, 'R', 'F')
+
+# Q1-style pricing summary
+query TTIRR rowsort
+SELECT l_returnflag, l_linestatus, sum(l_quantity),
+       sum(l_extendedprice * (1 - l_discount)),
+       avg(l_discount)
+FROM lineitem
+GROUP BY l_returnflag, l_linestatus
+----
+A F 28 1425.0 0.05
+N O 53 2780.0 0.065
+R F 32 1530.0 0.1
+
+statement ok
+CREATE TABLE customer(c_custkey BIGINT, c_name VARCHAR, c_nationkey BIGINT)
+
+statement ok
+CREATE TABLE orders(o_orderkey BIGINT, o_custkey BIGINT, o_totalprice DOUBLE)
+
+statement ok
+INSERT INTO customer VALUES (1, 'alpha', 10), (2, 'beta', 10), (3, 'gamma', 20)
+
+statement ok
+INSERT INTO orders VALUES (100, 1, 400.0), (101, 1, 100.0), (102, 2, 250.0)
+
+# Q3-style revenue per customer, top-N
+query TR
+SELECT c_name, sum(o_totalprice) AS revenue
+FROM customer JOIN orders ON c_custkey = o_custkey
+GROUP BY c_name
+ORDER BY revenue DESC
+LIMIT 2
+----
+alpha 500.0
+beta 250.0
+
+# Q5-style join + filter + group
+query IR rowsort
+SELECT c_nationkey, sum(o_totalprice)
+FROM customer JOIN orders ON c_custkey = o_custkey
+WHERE o_totalprice > 150
+GROUP BY c_nationkey
+----
+10 650.0
+
+# correlated scalar subquery
+query T rowsort
+SELECT c_name FROM customer c
+WHERE (SELECT count(*) FROM orders o WHERE o.o_custkey = c.c_custkey) > 1
+----
+alpha

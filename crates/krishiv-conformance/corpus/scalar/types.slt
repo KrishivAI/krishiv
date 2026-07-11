@@ -1,0 +1,76 @@
+# Integer, float, boolean, string scalar semantics.
+
+query I
+SELECT 1 + 1
+----
+2
+
+query I
+SELECT 9223372036854775806 + 1
+----
+9223372036854775807
+
+query R
+SELECT 1.5 * 2
+----
+3.0
+
+query T
+SELECT CAST(1.5 AS VARCHAR)
+----
+1.5
+
+query I
+SELECT CAST('42' AS BIGINT)
+----
+42
+
+query T
+SELECT 'a' || 'b'
+----
+ab
+
+query ?
+SELECT 1 < 2
+----
+true
+
+query ?
+SELECT CAST('NaN' AS DOUBLE) IS DISTINCT FROM CAST('NaN' AS DOUBLE)
+----
+false
+
+query I
+SELECT CASE WHEN true THEN 1 ELSE 2 END
+----
+1
+
+query T
+SELECT upper('hello')
+----
+HELLO
+
+query I
+SELECT length('hello')
+----
+5
+
+query I
+SELECT abs(-5)
+----
+5
+
+query R
+SELECT round(2.567, 2)
+----
+2.57
+
+query I
+SELECT 7 % 3
+----
+1
+
+query I
+SELECT 10 / 3
+----
+3

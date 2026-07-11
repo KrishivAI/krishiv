@@ -1,0 +1,31 @@
+# NULL semantics: three-valued logic, aggregates, coalesce, ordering.
+
+query T
+SELECT NULL
+----
+(empty)
+
+query ?
+SELECT NULL = NULL
+----
+NULL
+
+query ?
+SELECT NULL IS NULL
+----
+true
+
+query ?
+SELECT NULL IS DISTINCT FROM NULL
+----
+false
+
+query I
+SELECT coalesce(NULL, 2)
+----
+2
+
+query I
+SELECT nullif(3, 3)
+----
+NULL
