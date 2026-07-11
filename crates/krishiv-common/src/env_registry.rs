@@ -173,6 +173,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "DataFusion execution batch size (rows per record batch).",
     ),
     rt(
+        "KRISHIV_BENCH_IVM_MAX_ROWS",
+        FlagKind::UInt,
+        "unset",
+        "Caps the IVM-vs-recompute benchmark row ladder; unset runs the full ladder.",
+    ),
+    rt(
         "KRISHIV_BATCH_SQL_TIMEOUT_SECS",
         FlagKind::UInt,
         "300",
@@ -761,6 +767,18 @@ pub static FLAGS: &[FlagSpec] = &[
         "Shuffle backend URI (file://, s3://, tiered://local;s3://…).",
     ),
     rt(
+        "KRISHIV_STAGE_SPLIT",
+        FlagKind::Bool,
+        "on",
+        "Distributed batch stage splitting (Phase 52); off/0/false runs batch SQL single-task.",
+    ),
+    rt(
+        "KRISHIV_STAGE_TARGET_PARTITIONS",
+        FlagKind::UInt,
+        "4",
+        "Planning-time partition count for distributed batch stages (scan + shuffle fan-out).",
+    ),
+    rt(
         "KRISHIV_STATE_DIR",
         FlagKind::Path,
         "unset",
@@ -801,6 +819,12 @@ pub static FLAGS: &[FlagSpec] = &[
         FlagKind::UInt,
         "CPU-derived",
         "Executor task slots; unset derives from available CPU cores.",
+    ),
+    rt(
+        "KRISHIV_TASK_TARGET_PARALLELISM",
+        FlagKind::UInt,
+        "cores/slots",
+        "DataFusion parallelism per executor task engine; unset = per-slot share of cores.",
     ),
     rt(
         "KRISHIV_TLS_CERT",

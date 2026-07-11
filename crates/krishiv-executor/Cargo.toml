@@ -37,6 +37,7 @@ krishiv-shuffle = { path = "../krishiv-shuffle", version = "0.1.0" }
 krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
 krishiv-state = { path = "../krishiv-state", version = "0.1.0" }
 object_store = { workspace = true }
+parquet = { workspace = true, features = ["async", "object_store"] }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -50,7 +51,6 @@ tracing.workspace = true
 arrow.workspace = true
 krishiv-scheduler = { path = "../krishiv-scheduler", version = "0.1.0" }
 krishiv-shuffle = { path = "../krishiv-shuffle", version = "0.1.0" }
-parquet.workspace = true
 tempfile.workspace = true
 
 [[bin]]

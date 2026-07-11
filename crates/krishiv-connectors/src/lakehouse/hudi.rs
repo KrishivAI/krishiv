@@ -155,6 +155,14 @@ impl HudiSnapshotReader {
         Ok(files.into_iter().collect())
     }
 
+    /// List the parquet files this reader's query would scan, without
+    /// reading them. Streaming readers (Phase 52 #194) use this to scan one
+    /// file at a time instead of materializing the whole table.
+    pub fn parquet_files(&self) -> LakehouseResult<Vec<PathBuf>> {
+        let commits = self.commits_for_scan()?;
+        self.parquet_files_for_commits(&commits)
+    }
+
     /// Scan matching Parquet files.
     pub fn scan_batches(&self) -> LakehouseResult<Vec<RecordBatch>> {
         let commits = self.commits_for_scan()?;

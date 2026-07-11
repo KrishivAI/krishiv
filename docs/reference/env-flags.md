@@ -16,6 +16,7 @@ Regenerate with:
 | `KRISHIV_API_KEYS` | secret | `unset` | Comma-separated set of accepted Flight SQL API keys (server side). |
 | `KRISHIV_BARRIER_GRPC_ADDR` | host:port | `unset` | Executor barrier-transport gRPC listen address (aligned window join / checkpoint barriers). |
 | `KRISHIV_BATCH_SIZE` | uint | `8192` | DataFusion execution batch size (rows per record batch). |
+| `KRISHIV_BENCH_IVM_MAX_ROWS` | uint | `unset` | Caps the IVM-vs-recompute benchmark row ladder; unset runs the full ladder. |
 | `KRISHIV_BATCH_SQL_TIMEOUT_SECS` | uint | `300` | Coordinator-mode batch SQL completion timeout in seconds. |
 | `KRISHIV_CA_CERT` | path | `unset` | CA certificate path used by gRPC clients to verify TLS server certs. |
 | `KRISHIV_CHECKPOINT_DIR` | path | `unset` | Local checkpoint directory for embedded/single-node sessions. |
@@ -113,6 +114,8 @@ Regenerate with:
 | `KRISHIV_SHUFFLE_TOKEN_FILE` | path | `unset` | File containing the shuffle bearer token; hot-reloaded. |
 | `KRISHIV_SHUFFLE_TOKEN_RELOAD_SECS` | uint | `30` | Interval for re-reading the shuffle token file. |
 | `KRISHIV_SHUFFLE_URI` | url | `unset` | Shuffle backend URI (file://, s3://, tiered://local;s3://…). |
+| `KRISHIV_STAGE_SPLIT` | bool | `on` | Distributed batch stage splitting (Phase 52); off/0/false runs batch SQL single-task. |
+| `KRISHIV_STAGE_TARGET_PARTITIONS` | uint | `4` | Planning-time partition count for distributed batch stages (scan + shuffle fan-out). |
 | `KRISHIV_STATE_DIR` | path | `unset` | Executor state-backend directory (RocksDB window/operator state). |
 | `KRISHIV_STREAMING_TASK_TIMEOUT_SECS` | uint | `unset` | Watchdog timeout for streaming task cycles; unset = disabled. |
 | `KRISHIV_STREAM_EARLY_FIRE_MS` | uint | `unset` | Speculative early-fire interval for open windows (embedded loop; distributed wiring is Phase 55). |
@@ -120,6 +123,7 @@ Regenerate with:
 | `KRISHIV_TARGET_PARALLELISM` | uint | `cores` | DataFusion target partition count for local execution. |
 | `KRISHIV_TASK_GRPC_ADDR` | host:port | `127.0.0.1:50052` | Executor task gRPC listen address. |
 | `KRISHIV_TASK_SLOTS` | uint | `CPU-derived` | Executor task slots; unset derives from available CPU cores. |
+| `KRISHIV_TASK_TARGET_PARALLELISM` | uint | `cores/slots` | DataFusion parallelism per executor task engine; unset = per-slot share of cores. |
 | `KRISHIV_TLS_CERT` | path | `unset` | TLS certificate path for coordinator/executor gRPC servers. |
 | `KRISHIV_TLS_KEY` | path | `unset` | TLS private-key path for coordinator/executor gRPC servers. |
 | `KRISHIV_UI_TOKEN` | secret | `unset` | Bearer token protecting the embedded web UI. |

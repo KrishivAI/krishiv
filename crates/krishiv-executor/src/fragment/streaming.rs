@@ -883,10 +883,10 @@ pub(crate) async fn execute_streaming_fragment(
         // share of the executor process budget until the fragment returns.
         let (engine_memory_limit, _process_memory_reservation) =
             crate::fragment::common::reserve_task_engine_memory(&memory_budget);
-        let engine = Arc::new(
-            krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
-                .with_udf_limits(udf_limits),
-        );
+        let engine = Arc::new(crate::fragment::common::task_sql_engine(
+            engine_memory_limit,
+            udf_limits,
+        ));
 
         // Continuous SQL queries must use execute_stream to avoid blocking and buffering forever.
         let dataframe = engine

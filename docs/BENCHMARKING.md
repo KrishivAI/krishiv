@@ -142,3 +142,37 @@ cargo bench -p krishiv-bench --bench streaming_latency
 cargo bench -p krishiv-bench --bench ivm_vs_full_recompute   # 10M point needs ~2 GB free RAM
 cargo bench -p krishiv-bench --bench nexmark
 ```
+
+### 2026-07-11 — Phase 52 #194 batch hot path (overhead budget closed)
+
+- **Revision**: the Phase 52 Leg 4 commit carrying this entry. Same
+  hardware, datasets, and method as the Phase 51 yardstick above;
+  `tpch_overhead` re-run at SF1 only (medians below).
+- **What changed**: (1) `SqlEngine::with_target_parallelism` was a no-op —
+  it set a field the built `SessionContext` never saw, so every caller ran
+  DataFusion at `target_partitions = 1`; it now writes through to the live
+  session state. (2) `SqlEngine::new()` defaults to available CPU
+  parallelism (`KRISHIV_TARGET_PARALLELISM` override); executor task
+  engines scale down to their per-slot share. (3) The engine no longer
+  forces `parquet.pushdown_filters = true` — attribution measured it at
+  ~2.2× on scan-heavy Q6 (268 ms → 121 ms, SF1); parquet options now stay
+  at DataFusion defaults, opt in per session via `SET`.
+
+**Engine-overhead microbenchmark** (`--bench tpch_overhead`, SF1 medians,
+seconds per iteration):
+
+| Query/SF | raw DataFusion | embedded | coordinated | embedded ÷ raw |
+|----------|---------------:|---------:|------------:|---------------:|
+| Q1 SF1   | 0.097          | 0.091    | 0.126       | 0.94×          |
+| Q6 SF1   | 0.076          | 0.067    | 0.094       | 0.87×          |
+| Q3 SF1   | 0.130          | 0.128    | 0.223       | 0.98×          |
+
+Findings tracked from this entry:
+
+1. **The #194 budget (embedded ÷ raw ≤ 1.2×) is met** — embedded now sits
+   at 0.87–0.98× raw DataFusion on all three shapes (was 4.5–8.9×).
+2. **The coordinated hop is now the visible remainder**: +23 % to +71 %
+   over embedded at SF1 (fixed per-job cost — spec build, coordinator
+   lifecycle, result collection — that Phase 51 could not see under the
+   4.5–8.9× session tax). Tracked as input to the Phase 53 scheduler-v2
+   work (task #175/#199).

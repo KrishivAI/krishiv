@@ -26,7 +26,11 @@ pub struct DeltaTableHandle {
 impl DeltaTableHandle {
     pub async fn open(path: impl Into<String>, version: Option<i64>) -> LakehouseResult<Self> {
         let path = path.into();
-        let _ = local_delta::read_table(&path, version.map(|v| v as u64))?;
+        // Validate by resolving the snapshot's file list from the log only —
+        // reading the actual data here materialized the whole table on every
+        // open (Phase 52 #194) while surfacing the same missing/corrupt-log
+        // errors.
+        let _ = local_delta::list_table_data_files(&path, version.map(|v| v as u64))?;
         Ok(Self { path, version })
     }
 

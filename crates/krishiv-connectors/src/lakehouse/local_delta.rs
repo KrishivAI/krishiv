@@ -388,6 +388,14 @@ fn existing_table_schema(root: &Path) -> LakehouseResult<Option<SchemaRef>> {
     Ok(Some(reader.schema().clone()))
 }
 
+/// List the active data files for a table snapshot without reading them.
+///
+/// Streaming readers (Phase 52 #194) use this to scan one parquet file at a
+/// time instead of materializing the whole table via [`read_table`].
+pub fn list_table_data_files(path: &str, version: Option<u64>) -> LakehouseResult<Vec<PathBuf>> {
+    list_data_files(Path::new(path), version)
+}
+
 pub fn read_table(path: &str, version: Option<u64>) -> LakehouseResult<Vec<RecordBatch>> {
     let root = Path::new(path);
     let files = list_data_files(root, version)?;

@@ -406,8 +406,12 @@ fn build_single_node_session_config(
             "datafusion.optimizer.enable_round_robin_repartition",
             tp > 1,
         );
-    config.options_mut().execution.parquet.pushdown_filters = true;
-    config.options_mut().execution.parquet.enable_page_index = true;
+    // Parquet scan options stay at DataFusion's defaults (`pushdown_filters`
+    // off, `enable_page_index` on). Forcing `pushdown_filters = true` here
+    // cost ~2.2× on scan-heavy queries (Phase 52 #194 attribution probe,
+    // TPC-H Q6 SF1: 268 ms → 121 ms); workloads that benefit from row-level
+    // late materialization can opt in per session via
+    // `SET datafusion.execution.parquet.pushdown_filters = true`.
     if let Some(limit) = memory_limit_bytes {
         let scaled = (limit / 4).clamp(
             MIN_SORT_SPILL_RESERVATION_BYTES,
@@ -508,8 +512,11 @@ impl SqlEngine {
     /// `tracing::warn!` is emitted. Use [`SqlEngine::try_new`] when callers
     /// need to surface the registration error.
     ///
-    /// DataFusion `target_partitions` defaults to 1 (single-threaded local
-    /// execution). Use [`SqlEngine::with_target_parallelism`] to override.
+    /// DataFusion `target_partitions` defaults to the machine's available CPU
+    /// parallelism (matching a bare `datafusion::SessionContext`), overridable
+    /// via `KRISHIV_TARGET_PARALLELISM` or [`SqlEngine::with_target_parallelism`].
+    /// Executor task engines deliberately scale this down to their per-slot
+    /// share so concurrent tasks don't oversubscribe the machine.
     pub fn new() -> Self {
         Self::new_with_memory_limit(query_memory_limit_from_env())
     }
@@ -526,10 +533,11 @@ impl SqlEngine {
     /// Shares [`SqlEngine::new`]'s fallback behavior for window helper UDF
     /// registration failures.
     pub fn new_with_memory_limit(memory_limit_bytes: Option<usize>) -> Self {
+        let parallelism = default_parallelism_from_env();
         match Self::build_local(
             None,
             WindowFnRegistration::Register,
-            NonZeroUsize::MIN,
+            parallelism,
             memory_limit_bytes,
         ) {
             Ok(engine) => engine,
@@ -542,7 +550,7 @@ impl SqlEngine {
                 Self::build_local(
                     None,
                     WindowFnRegistration::Skip,
-                    NonZeroUsize::MIN,
+                    parallelism,
                     memory_limit_bytes,
                 )
                 .unwrap_or_else(|err| {
@@ -551,8 +559,8 @@ impl SqlEngine {
                         "memory-limited DataFusion runtime construction failed; \
                          falling back to an unbounded engine"
                     );
-                    Self::build_local(None, WindowFnRegistration::Skip, NonZeroUsize::MIN, None)
-                        .unwrap_or_else(|_| Self::build_absolute_minimal(NonZeroUsize::MIN))
+                    Self::build_local(None, WindowFnRegistration::Skip, parallelism, None)
+                        .unwrap_or_else(|_| Self::build_absolute_minimal(parallelism))
                 })
             }
         }
@@ -566,7 +574,7 @@ impl SqlEngine {
         Self::build_local(
             None,
             WindowFnRegistration::Register,
-            NonZeroUsize::MIN,
+            default_parallelism_from_env(),
             query_memory_limit_from_env(),
         )
     }
@@ -586,7 +594,7 @@ impl SqlEngine {
         Self::build_local(
             Some(catalog),
             WindowFnRegistration::Register,
-            NonZeroUsize::MIN,
+            default_parallelism_from_env(),
             query_memory_limit_from_env(),
         )
     }
@@ -595,11 +603,33 @@ impl SqlEngine {
     ///
     /// Higher values allow DataFusion to parallelise hash-join build,
     /// aggregation spilling, and parquet scans across more threads.
-    /// Default: 1 (single-threaded). Recommended: `available_parallelism()`.
+    /// Default: [`default_parallelism_from_env`] (available CPU parallelism,
+    /// `KRISHIV_TARGET_PARALLELISM` override).
+    ///
+    /// The new level applies to queries planned after this call; plans already
+    /// produced (or cached logical plans re-planned physically) pick it up at
+    /// physical planning time.
     #[must_use]
     pub fn with_target_parallelism(mut self, n: NonZeroUsize) -> Self {
         self.target_parallelism = n;
+        self.apply_target_partitions(n);
         self
+    }
+
+    /// Write `n` back into the live session state so DataFusion actually
+    /// plans with it.
+    ///
+    /// `SessionConfig` is baked into the `SessionState` at construction;
+    /// setting only the `target_parallelism` field would leave physical
+    /// planning at the construction-time partition count (the Phase 51
+    /// 4.5–8.9× embedded-overhead finding was exactly this: every
+    /// `with_target_parallelism` caller silently kept running single-threaded).
+    fn apply_target_partitions(&self, n: NonZeroUsize) {
+        let state_ref = self.context.state_ref();
+        let mut state = state_ref.write();
+        let options = state.config_mut().options_mut();
+        options.execution.target_partitions = n.get();
+        options.optimizer.enable_round_robin_repartition = n.get() > 1;
     }
 
     /// Return the configured `target_partitions` parallelism level.
@@ -711,21 +741,12 @@ impl SqlEngine {
         let streaming_sources: Arc<RwLock<std::collections::HashSet<String>>> =
             Arc::new(RwLock::new(std::collections::HashSet::new()));
 
-        let dummy_state = datafusion::execution::session_state::SessionStateBuilder::new()
-            .with_default_features()
-            .build();
-        let mut table_factories = dummy_state.table_factories().clone();
-        crate::connector_table::register_connector_table_factories(
-            &mut table_factories,
-            streaming_sources.clone(),
-        );
         let mut state_builder = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
             .with_config(build_single_node_session_config(
                 target_partitions,
                 memory_limit_bytes,
-            ))
-            .with_table_factories(table_factories);
+            ));
         if let Some(limit) = memory_limit_bytes {
             // A FairSpillPool shares the limit across concurrently running
             // operators and lets spill-capable operators (sort, hash join,
@@ -744,7 +765,14 @@ impl SqlEngine {
                 })?;
             state_builder = state_builder.with_runtime_env(runtime_env);
         }
-        let state = state_builder.build();
+        let mut state = state_builder.build();
+        // Connector factories layer on top of the defaults the builder already
+        // installed; mutating in place avoids building a second throwaway
+        // SessionState just to harvest the default factory map.
+        crate::connector_table::register_connector_table_factories(
+            state.table_factories_mut(),
+            streaming_sources.clone(),
+        );
         let context = SessionContext::new_with_state(state);
         if let Some(catalog) = &krishiv_catalog {
             context.register_catalog(
@@ -789,19 +817,14 @@ impl SqlEngine {
     fn build_absolute_minimal(target_partitions: NonZeroUsize) -> Self {
         let streaming_sources: Arc<RwLock<std::collections::HashSet<String>>> =
             Arc::new(RwLock::new(std::collections::HashSet::new()));
-        let dummy_state = datafusion::execution::session_state::SessionStateBuilder::new()
-            .with_default_features()
-            .build();
-        let mut table_factories = dummy_state.table_factories().clone();
-        crate::connector_table::register_connector_table_factories(
-            &mut table_factories,
-            streaming_sources.clone(),
-        );
-        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+        let mut state = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
             .with_config(build_single_node_session_config(target_partitions, None))
-            .with_table_factories(table_factories)
             .build();
+        crate::connector_table::register_connector_table_factories(
+            state.table_factories_mut(),
+            streaming_sources.clone(),
+        );
         let context = SessionContext::new_with_state(state);
         Self {
             context,

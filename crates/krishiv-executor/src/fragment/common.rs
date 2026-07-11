@@ -496,38 +496,176 @@ pub(crate) fn iceberg_sink_descriptor(
     }
 }
 
-/// Write `batches` as a single Parquet object at `object_path` under the
-/// `base_dir` object-store prefix. Overwrites any existing object at the same
-/// path (idempotent re-run of the same task attempt).
-async fn write_parquet_object(
-    base_dir: &str,
-    object_path: &str,
-    batches: &[arrow::record_batch::RecordBatch],
-) -> ExecutorResult<()> {
-    use std::sync::Arc;
+/// Streaming object-parquet sink writer (Phase 52 #194, zero-materialization).
+///
+/// Consumes result batches one at a time, routing each through the Hive
+/// partition split and appending to an incremental async parquet writer per
+/// output object. Sink tasks therefore never hold the full result set: the
+/// previous path collected every batch, then buffered the entire parquet
+/// encoding in memory before one atomic put — and failed outright past the
+/// buffer's 256 MiB pending cap. Memory here is bounded by the writers' open
+/// row groups instead of the result size.
+///
+/// Writers upload via the object store's multipart protocol, so a task that
+/// fails mid-write can leave a partial object. Staged contracts are immune
+/// (only job-success publication moves staged files into the destination);
+/// legacy direct writes trade the old all-or-nothing put for unbounded
+/// result sizes, and a retried attempt overwrites its own object anyway.
+pub(crate) struct ObjectParquetSinkStream {
+    spec: krishiv_common::write_commit::SinkWriteSpec,
+    store: Arc<dyn object_store::ObjectStore>,
+    /// One incremental writer per output object, keyed by the object's
+    /// relative path. `BTreeMap` keeps deterministic staged-path ordering.
+    writers: std::collections::BTreeMap<
+        String,
+        parquet::arrow::AsyncArrowWriter<parquet::arrow::async_writer::ParquetObjectWriter>,
+    >,
+    /// `Some` when the staged commit protocol applies: `(job_id, task_id, attempt)`
+    /// name the staged part files. `None` = legacy direct write to `dest_path`.
+    staged_identity: Option<(String, String, u32)>,
+    row_count: usize,
+    batch_count: usize,
+    column_count: usize,
+}
 
-    use krishiv_connectors::{Sink, s3::S3Sink};
-    use object_store::local::LocalFileSystem;
-    use object_store::path::Path as ObjectPath;
-
-    let store = Arc::new(LocalFileSystem::new_with_prefix(base_dir).map_err(|error| {
-        ExecutorError::LocalExecution {
-            message: format!("failed to open object store prefix '{base_dir}': {error}"),
-        }
-    })?);
-    let mut sink = S3Sink::new(store, ObjectPath::from(object_path));
-    for batch in batches {
-        sink.write_batch(batch.clone())
-            .await
-            .map_err(|error| ExecutorError::LocalExecution {
-                message: format!("object-parquet sink write failed: {error}"),
-            })?;
+impl ObjectParquetSinkStream {
+    /// Open a sink stream for `assignment`'s object-parquet output contract.
+    pub(crate) fn open(assignment: &krishiv_proto::ExecutorTaskAssignment) -> ExecutorResult<Self> {
+        let spec = parse_object_parquet_sink_spec(assignment.output_contract())?;
+        let staged_identity = spec.staged.then(|| {
+            (
+                assignment.job_id().as_str().to_owned(),
+                assignment.task_id().as_str().to_owned(),
+                assignment.attempt_id().as_u32(),
+            )
+        });
+        Self::open_with_spec(spec, staged_identity)
     }
-    sink.flush()
-        .await
-        .map_err(|error| ExecutorError::LocalExecution {
-            message: format!("object-parquet sink flush failed: {error}"),
+
+    fn open_with_spec(
+        spec: krishiv_common::write_commit::SinkWriteSpec,
+        staged_identity: Option<(String, String, u32)>,
+    ) -> ExecutorResult<Self> {
+        // Ensure the object-store prefix exists before opening it: the
+        // destination directory may not have been created yet on this executor.
+        std::fs::create_dir_all(&spec.base_dir).map_err(|error| ExecutorError::LocalExecution {
+            message: format!(
+                "failed to create sink base directory '{}': {error}",
+                spec.base_dir
+            ),
+        })?;
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(&spec.base_dir).map_err(
+                |error| ExecutorError::LocalExecution {
+                    message: format!(
+                        "failed to open object store prefix '{}': {error}",
+                        spec.base_dir
+                    ),
+                },
+            )?,
+        );
+        Ok(Self {
+            spec,
+            store,
+            writers: std::collections::BTreeMap::new(),
+            staged_identity,
+            row_count: 0,
+            batch_count: 0,
+            column_count: 0,
         })
+    }
+
+    /// The object path a slice with `hive_path` writes to.
+    fn object_rel_path(&self, hive_path: &str) -> String {
+        match &self.staged_identity {
+            Some((job_id, task_id, attempt)) => self
+                .spec
+                .staged_file_rel(job_id, hive_path, task_id, *attempt),
+            None => self.spec.dest_path.clone(),
+        }
+    }
+
+    /// Route one result batch into the per-object writers.
+    pub(crate) async fn write(
+        &mut self,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> ExecutorResult<()> {
+        use krishiv_common::write_commit::split_batches_by_partition_columns;
+
+        // Zero-row batches still flow through: they carry the schema, and the
+        // pre-streaming path wrote a schema-only parquet object for them.
+        self.row_count += batch.num_rows();
+        self.batch_count += 1;
+        self.column_count = self.column_count.max(batch.num_columns());
+
+        let partition_by = if self.staged_identity.is_some() {
+            self.spec.partition_by.clone()
+        } else {
+            // Legacy direct writes never split: everything lands in dest_path.
+            Vec::new()
+        };
+        let slices =
+            split_batches_by_partition_columns(std::slice::from_ref(&batch), &partition_by)
+                .map_err(|error| ExecutorError::LocalExecution {
+                    message: format!("staged sink partition split failed: {error}"),
+                })?;
+        for slice in slices {
+            let rel = self.object_rel_path(&slice.hive_path);
+            for slice_batch in slice.batches {
+                let writer = match self.writers.entry(rel.clone()) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        let object_writer = parquet::arrow::async_writer::ParquetObjectWriter::new(
+                            Arc::clone(&self.store),
+                            object_store::path::Path::from(rel.as_str()),
+                        );
+                        let writer = parquet::arrow::AsyncArrowWriter::try_new(
+                            object_writer,
+                            slice_batch.schema(),
+                            None,
+                        )
+                        .map_err(|error| {
+                            ExecutorError::LocalExecution {
+                                message: format!(
+                                    "failed to create parquet sink writer '{rel}': {error}"
+                                ),
+                            }
+                        })?;
+                        entry.insert(writer)
+                    }
+                };
+                writer.write(&slice_batch).await.map_err(|error| {
+                    ExecutorError::LocalExecution {
+                        message: format!("object-parquet sink write failed ('{rel}'): {error}"),
+                    }
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Close every writer and return the staged relative paths (empty for
+    /// legacy direct writes) plus the accumulated result shape
+    /// `(rows, batches, columns)`.
+    pub(crate) async fn finish(self) -> ExecutorResult<(Vec<String>, (usize, usize, usize))> {
+        let staged = self.staged_identity.is_some();
+        let mut staged_paths = Vec::new();
+        for (rel, writer) in self.writers {
+            writer
+                .close()
+                .await
+                .map_err(|error| ExecutorError::LocalExecution {
+                    message: format!("object-parquet sink flush failed ('{rel}'): {error}"),
+                })?;
+            if staged {
+                staged_paths.push(rel);
+            }
+        }
+        Ok((
+            staged_paths,
+            (self.row_count, self.batch_count, self.column_count),
+        ))
+    }
 }
 
 /// Legacy direct object-parquet sink write (no staging, no commit protocol).
@@ -536,7 +674,11 @@ pub(crate) async fn write_object_parquet_sink(
     batches: &[arrow::record_batch::RecordBatch],
 ) -> ExecutorResult<()> {
     let spec = parse_object_parquet_sink_spec(contract)?;
-    write_parquet_object(&spec.base_dir, &spec.dest_path, batches).await
+    let mut sink = ObjectParquetSinkStream::open_with_spec(spec, None)?;
+    for batch in batches {
+        sink.write(batch.clone()).await?;
+    }
+    sink.finish().await.map(|_| ())
 }
 
 /// Execute an object-parquet sink write for a task, dispatching between the
@@ -556,44 +698,13 @@ pub(crate) async fn write_object_parquet_sink_for_task(
     assignment: &krishiv_proto::ExecutorTaskAssignment,
     batches: &[arrow::record_batch::RecordBatch],
 ) -> ExecutorResult<Vec<String>> {
-    use krishiv_common::write_commit::split_batches_by_partition_columns;
-
-    let spec = parse_object_parquet_sink_spec(assignment.output_contract())?;
-    if !spec.staged {
-        write_object_parquet_sink(assignment.output_contract(), batches).await?;
-        return Ok(Vec::new());
+    let mut sink = ObjectParquetSinkStream::open(assignment)?;
+    for batch in batches {
+        sink.write(batch.clone()).await?;
     }
-
-    // Ensure the object-store prefix exists before opening it: the staged
-    // destination directory may not have been created yet on this executor.
-    std::fs::create_dir_all(&spec.base_dir).map_err(|error| ExecutorError::LocalExecution {
-        message: format!(
-            "failed to create sink base directory '{}': {error}",
-            spec.base_dir
-        ),
-    })?;
-
-    let slices =
-        split_batches_by_partition_columns(batches, &spec.partition_by).map_err(|error| {
-            ExecutorError::LocalExecution {
-                message: format!("staged sink partition split failed: {error}"),
-            }
-        })?;
-
-    let job_id = assignment.job_id().as_str();
-    let task_id = assignment.task_id().as_str();
-    let attempt = assignment.attempt_id().as_u32();
-
-    let mut staged_paths = Vec::new();
-    for slice in slices {
-        if slice.batches.is_empty() {
-            continue;
-        }
-        let rel = spec.staged_file_rel(job_id, &slice.hive_path, task_id, attempt);
-        write_parquet_object(&spec.base_dir, &rel, &slice.batches).await?;
-        staged_paths.push(rel);
-    }
-    Ok(staged_paths)
+    sink.finish()
+        .await
+        .map(|(staged_paths, _shape)| staged_paths)
 }
 
 /// Fetch all `shuffle-flight:` input partitions via Arrow IPC over TCP and return
@@ -710,6 +821,54 @@ pub(crate) fn task_engine_memory_limit(
         .limit()
         .map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX))
         .or_else(krishiv_sql::query_memory_limit_from_env)
+}
+
+/// DataFusion `target_partitions` for engines created inside a task slot.
+///
+/// [`krishiv_sql::SqlEngine::new`] defaults to the machine's full CPU
+/// parallelism — right for the embedded placement, but an executor runs up
+/// to `slots` fragments concurrently, so each per-task engine gets its
+/// per-slot share instead: `max(1, available_parallelism / slots)`, where
+/// `slots` mirrors the CLI's capacity derivation (`KRISHIV_TASK_SLOTS`, else
+/// available parallelism — which makes the default share exactly 1).
+/// `KRISHIV_TASK_TARGET_PARALLELISM` overrides the computed share directly.
+pub(crate) fn task_engine_parallelism() -> std::num::NonZeroUsize {
+    let explicit = std::env::var("KRISHIV_TASK_TARGET_PARALLELISM")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .and_then(std::num::NonZeroUsize::new);
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    let slots = std::env::var("KRISHIV_TASK_SLOTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0);
+    task_engine_parallelism_share(explicit, cores, slots)
+}
+
+/// Pure per-slot share computation behind [`task_engine_parallelism`].
+fn task_engine_parallelism_share(
+    explicit: Option<std::num::NonZeroUsize>,
+    cores: usize,
+    slots: Option<usize>,
+) -> std::num::NonZeroUsize {
+    if let Some(explicit) = explicit {
+        return explicit;
+    }
+    let slots = slots.unwrap_or(cores).max(1);
+    std::num::NonZeroUsize::new((cores / slots).max(1)).unwrap_or(std::num::NonZeroUsize::MIN)
+}
+
+/// Build the per-task SQL engine: the task's engine memory limit, its job's
+/// UDF resource limits, and the per-slot parallelism share.
+pub(crate) fn task_sql_engine(
+    engine_memory_limit: Option<usize>,
+    udf_limits: krishiv_plan::udf::ResourceLimits,
+) -> krishiv_sql::SqlEngine {
+    krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
+        .with_target_parallelism(task_engine_parallelism())
+        .with_udf_limits(udf_limits)
 }
 
 /// Environment variable: whole-process memory budget for this executor,
@@ -1049,6 +1208,38 @@ mod tests {
         assert_eq!(
             super::task_engine_memory_limit(&budget),
             Some(256 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn task_engine_parallelism_share_defaults_to_one_per_slot() {
+        // Slots default to the core count → each task gets a share of 1.
+        assert_eq!(
+            super::task_engine_parallelism_share(None, 16, None).get(),
+            1
+        );
+        assert_eq!(super::task_engine_parallelism_share(None, 1, None).get(), 1);
+    }
+
+    #[test]
+    fn task_engine_parallelism_share_divides_cores_across_capped_slots() {
+        assert_eq!(
+            super::task_engine_parallelism_share(None, 16, Some(2)).get(),
+            8
+        );
+        // Oversubscribed slot counts floor at 1, never 0.
+        assert_eq!(
+            super::task_engine_parallelism_share(None, 4, Some(32)).get(),
+            1
+        );
+    }
+
+    #[test]
+    fn task_engine_parallelism_share_explicit_override_wins() {
+        assert_eq!(
+            super::task_engine_parallelism_share(std::num::NonZeroUsize::new(6), 16, Some(16))
+                .get(),
+            6
         );
     }
 

@@ -5,13 +5,11 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use arrow::datatypes::{Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use datafusion::catalog::TableProviderFactory;
 use datafusion::catalog::streaming::StreamingTable;
-use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::CreateExternalTable;
 use datafusion::physical_plan::ExecutionPlan;
@@ -226,7 +224,7 @@ async fn create_kafka_table_provider(
     Ok(Arc::new(table))
 }
 
-/// Bounded scan provider that materializes all connector batches at scan time.
+/// Bounded scan provider that streams connector batches at execution time.
 struct BoundedConnectorProvider {
     registry: Arc<ConnectorRegistry>,
     config: ConnectorConfig,
@@ -268,90 +266,88 @@ impl TableProvider for BoundedConnectorProvider {
         filters: &[datafusion::logical_expr::Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let mut source = self
-            .registry
-            .open_source(&self.config)
-            .await
-            .map_err(connector_error)?;
-
-        // T7: apply the user's projection and limit eagerly. The previous
-        // implementation drained the entire source into a `MemTable` and
-        // deferred the projection and limit to DataFusion's
-        // `MemTable::scan`. That is correct but forces the connector to
-        // materialise every row and every column before any predicate
-        // runs, defeating Parquet column-pruning and file-pruning for any
-        // sink that does not have a `DataSourceExec` shim. Eager
-        // projection and limit short-circuits here bring the connector's
-        // behaviour closer to the `DataSourceExec` path and significantly
-        // reduce memory pressure for large bounded sources.
-        //
-        // Filter pushdown to the connector remains a follow-up: the
-        // connector `Source` trait does not yet accept filter
-        // expressions, and DataFusion's physical-expression builder is
-        // version-sensitive. For now, filters are still applied by
-        // DataFusion's downstream `MemTable::scan` so the result is
-        // identical — just less memory-efficient than a connector that
-        // accepts pushdown filters.
-        let projection_columns: Option<Vec<String>> = projection.map(|idxs| {
-            idxs.iter()
-                .map(|&i| self.schema.field(i).name().clone())
-                .collect()
+        // Zero-materialization scan (Phase 52 #194): the source is opened
+        // lazily at execution time and its batches flow straight into the
+        // query pipeline. The previous implementation drained the entire
+        // source into a `MemTable` at scan time — projection and limit are
+        // now applied per batch by `StreamingTableExec` and DataFusion's
+        // limit operator, which also cancels the source early by dropping
+        // the stream. Filter pushdown to the connector remains a follow-up
+        // (the `Source` trait does not accept filter expressions); filters
+        // run in DataFusion's downstream `FilterExec` exactly as before.
+        let partition = Arc::new(BoundedConnectorPartitionStream {
+            registry: Arc::clone(&self.registry),
+            config: self.config.clone(),
+            schema: Arc::clone(&self.schema),
         });
-        let mut batches: Vec<RecordBatch> = Vec::new();
-        let mut rows_accumulated: usize = 0;
-        let limit_threshold: Option<usize> = limit;
-        loop {
-            let batch = source.read_batch_dyn().await.map_err(connector_error)?;
-            let Some(batch) = batch else { break };
-            let batch = project_batch(&batch, &self.schema)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            // Project to the user-requested columns.
-            let batch = match &projection_columns {
-                Some(cols) => project_to_columns(&batch, cols)
-                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
-                None => batch,
-            };
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            // Honour the limit by truncating the last batch.
-            let batch = match limit_threshold {
-                Some(threshold) if rows_accumulated + batch.num_rows() > threshold => {
-                    let take = threshold.saturating_sub(rows_accumulated);
-                    batch.slice(0, take)
-                }
-                _ => batch,
-            };
-            rows_accumulated += batch.num_rows();
-            batches.push(batch);
-            if let Some(threshold) = limit_threshold
-                && rows_accumulated >= threshold
-            {
-                break;
-            }
-        }
-
-        let table = MemTable::try_new(Arc::clone(&self.schema), vec![batches])?;
+        let table = StreamingTable::try_new(Arc::clone(&self.schema), vec![partition])?;
         table.scan(state, projection, filters, limit).await
     }
 }
 
-/// T7: project a batch down to the named columns.
-fn project_to_columns(
-    batch: &RecordBatch,
-    columns: &[String],
-) -> arrow::error::Result<RecordBatch> {
-    if columns.is_empty() {
-        return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
+/// Lazily streams a bounded connector source, one `read_batch` at a time.
+///
+/// Each execution opens a fresh source from the registry (sources are
+/// single-pass); raw connector batches are normalized to the declared table
+/// schema per batch. Zero-row batches are dropped, matching the drained
+/// implementation this replaces.
+struct BoundedConnectorPartitionStream {
+    registry: Arc<ConnectorRegistry>,
+    config: ConnectorConfig,
+    schema: SchemaRef,
+}
+
+impl std::fmt::Debug for BoundedConnectorPartitionStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundedConnectorPartitionStream")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
     }
-    let mut cols = Vec::with_capacity(columns.len());
-    let mut fields = Vec::with_capacity(columns.len());
-    for name in columns {
-        let idx = batch.schema().index_of(name)?;
-        cols.push(batch.column(idx).clone());
-        fields.push(batch.schema().field(idx).clone());
+}
+
+impl datafusion::physical_plan::streaming::PartitionStream for BoundedConnectorPartitionStream {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
     }
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)
+
+    fn execute(
+        &self,
+        _ctx: Arc<datafusion::execution::TaskContext>,
+    ) -> datafusion::physical_plan::SendableRecordBatchStream {
+        use futures::{StreamExt as _, TryStreamExt as _};
+
+        let registry = Arc::clone(&self.registry);
+        let config = self.config.clone();
+        let schema = Arc::clone(&self.schema);
+        let batch_schema = Arc::clone(&self.schema);
+        let stream = futures::stream::once(async move {
+            let source = registry
+                .open_source(&config)
+                .await
+                .map_err(connector_error)?;
+            Ok::<_, DataFusionError>(futures::stream::try_unfold(source, move |mut source| {
+                let schema = Arc::clone(&batch_schema);
+                async move {
+                    loop {
+                        match source.read_batch_dyn().await.map_err(connector_error)? {
+                            Some(batch) => {
+                                let batch = project_batch(&batch, &schema)
+                                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                                if batch.num_rows() == 0 {
+                                    continue;
+                                }
+                                return Ok(Some((batch, source)));
+                            }
+                            None => return Ok(None),
+                        }
+                    }
+                }
+            }))
+        })
+        .try_flatten()
+        .boxed();
+        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
+    }
 }
 
 #[cfg(test)]
@@ -396,36 +392,5 @@ mod tests {
             ),
             Some("orders".to_string())
         );
-    }
-
-    /// T7: `project_to_columns` must keep column order and tolerate an
-    /// empty column list (returns an empty projection with the original
-    /// schema).
-    #[test]
-    fn project_to_columns_preserves_order_and_handles_empty() {
-        use arrow::array::Int64Array;
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int64, false),
-            Field::new("b", DataType::Int64, false),
-            Field::new("c", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2])) as _,
-                Arc::new(Int64Array::from(vec![3, 4])) as _,
-                Arc::new(Int64Array::from(vec![5, 6])) as _,
-            ],
-        )
-        .unwrap();
-        // Reorder: c, a
-        let projected = super::project_to_columns(&batch, &[String::from("c"), String::from("a")])
-            .expect("project must succeed");
-        assert_eq!(projected.num_columns(), 2);
-        assert_eq!(projected.schema().field(0).name(), "c");
-        assert_eq!(projected.schema().field(1).name(), "a");
-        // No-op projection.
-        let no_op = super::project_to_columns(&batch, &[]).expect("no-op projection must succeed");
-        assert_eq!(no_op.num_columns(), 0);
     }
 }

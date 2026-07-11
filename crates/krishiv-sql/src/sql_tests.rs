@@ -42,6 +42,46 @@ mod tests {
         );
     }
 
+    /// Phase 52 #194 regression: `with_target_parallelism` must write through
+    /// to the live DataFusion session state. Before the fix it only set a
+    /// struct field, so every caller silently kept the construction-time
+    /// partition count — the root cause of the 4.5–8.9× embedded overhead
+    /// recorded in Phase 51.
+    #[test]
+    fn with_target_parallelism_applies_to_live_session_state() {
+        let engine = crate::SqlEngine::new()
+            .with_target_parallelism(std::num::NonZeroUsize::new(7).unwrap());
+        let options = engine.session_context().state().config().options().clone();
+        assert_eq!(options.execution.target_partitions, 7);
+        assert!(options.optimizer.enable_round_robin_repartition);
+
+        // Scaling back down to 1 also disables round-robin repartitioning.
+        let engine = engine.with_target_parallelism(std::num::NonZeroUsize::MIN);
+        let options = engine.session_context().state().config().options().clone();
+        assert_eq!(options.execution.target_partitions, 1);
+        assert!(!options.optimizer.enable_round_robin_repartition);
+    }
+
+    /// The embedded default matches DataFusion's own (available CPU
+    /// parallelism, `KRISHIV_TARGET_PARALLELISM` override) instead of the
+    /// old single-threaded 1.
+    #[test]
+    fn engine_default_parallelism_derives_from_environment() {
+        let engine = crate::SqlEngine::new();
+        let expected = crate::default_parallelism_from_env().get();
+        assert_eq!(engine.target_parallelism().get(), expected);
+        assert_eq!(
+            engine
+                .session_context()
+                .state()
+                .config()
+                .options()
+                .execution
+                .target_partitions,
+            expected
+        );
+    }
+
     #[test]
     fn dataframe_alias_parser_ignores_nested_as_tokens() {
         assert_eq!(crate::top_level_alias_index("CAST(value AS BIGINT)"), None);

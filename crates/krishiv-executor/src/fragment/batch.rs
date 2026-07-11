@@ -16,7 +16,6 @@ use super::common::{
     HotKeyAccumulator, parse_local_parquet_partitions, read_connector_parquet_partitions,
     read_inline_ipc_partitions, read_object_parquet_partitions, read_registry_partitions,
     read_shuffle_flight_partitions, sql_query_from_fragment, task_fragment_body,
-    write_object_parquet_sink_for_task,
 };
 use crate::runner::{
     ExecutorTaskOutput, ExecutorTaskRunner, OBJECT_PARQUET_SINK_PREFIX, RestoredSourceOffset,
@@ -205,10 +204,10 @@ pub(crate) async fn execute_batch_fragment(
         // Create a new SQL engine with UDF limits and the task's memory limit
         // for this task execution. The memory limit bounds DataFusion's pool
         // so sorts/joins/aggregations spill instead of growing unbounded.
-        let engine = Arc::new(
-            krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
-                .with_udf_limits(udf_limits),
-        );
+        let engine = Arc::new(crate::fragment::common::task_sql_engine(
+            engine_memory_limit,
+            udf_limits,
+        ));
         // Resolve governed `catalog.namespace.table` references (coordinator-mode
         // catalog support): register the platform Iceberg REST catalog from
         // KRISHIV_ICEBERG_REST_* if configured. Non-fatal — a query that does not
@@ -295,17 +294,27 @@ pub(crate) async fn execute_batch_fragment(
                 .starts_with(OBJECT_PARQUET_SINK_PREFIX);
 
         if is_object_sink {
-            // Sink writes need the full batch set for partition splitting;
-            // the staged-commit write path owns its own memory profile.
-            let (batches, sql_stats) = dataframe.collect_with_stats().await.map_err(|error| {
-                ExecutorError::LocalExecution {
+            // Zero-materialization sink path (#194): stream result batches
+            // straight into per-partition incremental parquet writers instead
+            // of collecting the full result first. Sink jobs deliver rows
+            // through the sink contract, not inline (execute_batch_sql_sink
+            // discards report batches), so none ride the task report.
+            let (mut stream, stats_handle) =
+                dataframe
+                    .execute_stream_with_stats()
+                    .await
+                    .map_err(|error| ExecutorError::LocalExecution {
+                        message: error.to_string(),
+                    })?;
+            let mut sink = crate::fragment::common::ObjectParquetSinkStream::open(assignment)?;
+            while let Some(batch) = stream.next().await {
+                let batch = batch.map_err(|error| ExecutorError::LocalExecution {
                     message: error.to_string(),
-                }
-            })?;
-            let sink_staged_files =
-                write_object_parquet_sink_for_task(assignment, &batches).await?;
-            let row_count = batches.iter().map(|batch| batch.num_rows()).sum();
-            let column_count = batches.first().map_or(0, |batch| batch.num_columns());
+                })?;
+                sink.write(batch).await?;
+            }
+            let (sink_staged_files, (row_count, batch_count, column_count)) = sink.finish().await?;
+            let sql_stats = stats_handle.stats();
             if sql_stats.spill_bytes > 0 {
                 krishiv_metrics::global_metrics()
                     .record_spill(sql_stats.spill_bytes, sql_stats.spill_count);
@@ -319,8 +328,7 @@ pub(crate) async fn execute_batch_fragment(
                 serialized_bytes: 0,
             };
             return Ok(
-                ExecutorTaskOutput::sql(row_count, batches.len(), column_count)
-                    .with_record_batches(batches)
+                ExecutorTaskOutput::sql(row_count, batch_count, column_count)
                     .with_runtime_stats(runtime_stats)
                     .with_sink_staged_files(sink_staged_files),
             );
@@ -522,10 +530,10 @@ async fn execute_shuffle_write_fragment(
         })?;
 
     // Create a new SQL engine with UDF limits and the task's memory limit.
-    let limited_engine = Arc::new(
-        krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
-            .with_udf_limits(udf_limits),
-    );
+    let limited_engine = Arc::new(crate::fragment::common::task_sql_engine(
+        engine_memory_limit,
+        udf_limits,
+    ));
     // Coordinator-mode catalog support: register the platform Iceberg REST
     // catalog from KRISHIV_ICEBERG_REST_* so governed tables resolve. Non-fatal.
     if let Err(error) = limited_engine
@@ -859,10 +867,10 @@ async fn execute_dfplan_fragment(
         })?;
     // The engine supplies the runtime environment (memory pool, spill) the
     // decoded plan executes under; no tables are registered on it.
-    let engine = Arc::new(
-        krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
-            .with_udf_limits(udf_limits),
-    );
+    let engine = Arc::new(crate::fragment::common::task_sql_engine(
+        engine_memory_limit,
+        udf_limits,
+    ));
     let job_id = assignment.job_id().as_str();
     // This executor's advertised shuffle endpoint: partitions recorded under
     // it (or under no endpoint) are local; everything else is fetched.
@@ -1024,10 +1032,10 @@ async fn execute_inmem_shuffle_write(
 
     let fragment_body = task_fragment_body(assignment.plan_fragment().description())?;
     // Create a new SQL engine with UDF limits and the task's memory limit.
-    let limited_engine = Arc::new(
-        krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
-            .with_udf_limits(udf_limits),
-    );
+    let limited_engine = Arc::new(crate::fragment::common::task_sql_engine(
+        engine_memory_limit,
+        udf_limits,
+    ));
     // Coordinator-mode catalog support: register the platform Iceberg REST
     // catalog from KRISHIV_ICEBERG_REST_* so governed tables resolve. Non-fatal.
     if let Err(error) = limited_engine

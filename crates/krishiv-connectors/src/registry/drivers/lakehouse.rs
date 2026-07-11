@@ -14,9 +14,8 @@ use crate::capabilities::ConnectorCapabilities;
 use crate::config::ConnectorConfig;
 use crate::error::{ConnectorError, ConnectorResult};
 use crate::lakehouse::{
-    DeltaTableHandle, DeltaWriteMode, HudiCowWriter, HudiSnapshotReader, IcebergFsTable,
-    IcebergScanOptions, IcebergTableRef, LakehouseError, LakehouseTable, SchemaVersion,
-    write_delta,
+    DeltaWriteMode, HudiCowWriter, HudiSnapshotReader, IcebergFsTable, IcebergScanOptions,
+    IcebergTableRef, LakehouseError, LakehouseTable, SchemaVersion, write_delta,
 };
 use crate::registry::descriptor::ConnectorDescriptor;
 use crate::registry::driver::{SinkDriver, SourceDriver};
@@ -32,6 +31,65 @@ fn map_lh(e: LakehouseError) -> ConnectorError {
 
 fn require_path(config: &ConnectorConfig) -> ConnectorResult<PathBuf> {
     Ok(PathBuf::from(config.required("path")?))
+}
+
+/// Streams a snapshot's parquet files one batch at a time (Phase 52 #194).
+///
+/// Holds the resolved file list and at most one open file reader, so a
+/// bounded lakehouse scan never materializes the whole table the way the
+/// previous scan-everything-at-open sources did. `rewind` restarts from the
+/// first file, making the advertised rewindable capability real.
+struct ParquetFilesSource {
+    files: Vec<PathBuf>,
+    next_file: usize,
+    current: Option<parquet::arrow::arrow_reader::ParquetRecordBatchReader>,
+}
+
+impl ParquetFilesSource {
+    fn new(files: Vec<PathBuf>) -> Self {
+        Self {
+            files,
+            next_file: 0,
+            current: None,
+        }
+    }
+
+    fn next_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let io_err = |e: String| ConnectorError::Io(std::io::Error::other(e));
+        loop {
+            if let Some(reader) = self.current.as_mut() {
+                match reader.next() {
+                    Some(batch) => return batch.map(Some).map_err(|e| io_err(e.to_string())),
+                    None => {
+                        self.current = None;
+                        continue;
+                    }
+                }
+            }
+            let Some(path) = self.files.get(self.next_file).cloned() else {
+                return Ok(None);
+            };
+            self.next_file += 1;
+            // A file listed by the snapshot but since vacuumed is skipped,
+            // matching the pre-streaming read path.
+            if !path.exists() {
+                continue;
+            }
+            let file = std::fs::File::open(&path).map_err(|e| io_err(e.to_string()))?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+                .map_err(|e| io_err(e.to_string()))?
+                .build()
+                .map_err(|e| io_err(e.to_string()))?;
+            self.current = Some(reader);
+        }
+    }
+
+    fn rewind(&mut self) {
+        self.next_file = 0;
+        self.current = None;
+    }
 }
 
 // ── Iceberg ──────────────────────────────────────────────────────────────────
@@ -193,17 +251,17 @@ impl SinkDriver for IcebergSinkDriver {
 // ── Delta ─────────────────────────────────────────────────────────────────────
 
 struct DeltaSource {
-    batches: std::collections::VecDeque<RecordBatch>,
+    files: ParquetFilesSource,
 }
 
 impl DeltaSource {
     async fn open(path: PathBuf) -> ConnectorResult<Self> {
-        let handle = DeltaTableHandle::open(path.to_string_lossy().as_ref(), None)
-            .await
+        // Resolve the current snapshot's file list from the log; batches
+        // stream out one file at a time instead of being scanned up front.
+        let files = crate::lakehouse::list_table_data_files(path.to_string_lossy().as_ref(), None)
             .map_err(map_lh)?;
-        let batches = handle.scan_batches().await.map_err(map_lh)?;
         Ok(Self {
-            batches: batches.into(),
+            files: ParquetFilesSource::new(files),
         })
     }
 }
@@ -216,12 +274,16 @@ impl crate::source::Source for DeltaSource {
     }
 
     fn read_batch(&mut self) -> impl Future<Output = ConnectorResult<Option<RecordBatch>>> + Send {
-        let batch = self.batches.pop_front();
-        async move { Ok(batch) }
+        let batch = self.files.next_batch();
+        async move { batch }
     }
 
     fn current_offset(&self) -> Option<Box<dyn std::any::Any + Send>> {
         None
+    }
+
+    fn reset(&mut self) {
+        self.files.rewind();
     }
 }
 
@@ -326,15 +388,17 @@ impl SinkDriver for DeltaSinkDriver {
 // ── Hudi ──────────────────────────────────────────────────────────────────────
 
 struct HudiSource {
-    batches: std::collections::VecDeque<RecordBatch>,
+    files: ParquetFilesSource,
 }
 
 impl HudiSource {
     fn open(path: PathBuf) -> ConnectorResult<Self> {
+        // Resolve the snapshot's file list from commit metadata; batches
+        // stream out one file at a time instead of being scanned up front.
         let reader = HudiSnapshotReader::open(&path);
-        let batches = reader.scan_batches().map_err(map_lh)?;
+        let files = reader.parquet_files().map_err(map_lh)?;
         Ok(Self {
-            batches: batches.into(),
+            files: ParquetFilesSource::new(files),
         })
     }
 }
@@ -347,12 +411,16 @@ impl crate::source::Source for HudiSource {
     }
 
     fn read_batch(&mut self) -> impl Future<Output = ConnectorResult<Option<RecordBatch>>> + Send {
-        let batch = self.batches.pop_front();
-        async move { Ok(batch) }
+        let batch = self.files.next_batch();
+        async move { batch }
     }
 
     fn current_offset(&self) -> Option<Box<dyn std::any::Any + Send>> {
         None
+    }
+
+    fn reset(&mut self) {
+        self.files.rewind();
     }
 }
 

@@ -48,7 +48,8 @@ pub use iceberg_fs::IcebergFsTable;
 #[cfg(feature = "iceberg")]
 pub use iceberg_native::IcebergNativeTwoPhaseCommit;
 pub use local_delta::{
-    DeltaStageHandle, LocalDeltaTwoPhaseCommitSink, read_table_at_timestamp, vacuum_table,
+    DeltaStageHandle, LocalDeltaTwoPhaseCommitSink, list_table_data_files, read_table_at_timestamp,
+    vacuum_table,
 };
 pub use partition_spec::{PartitionField, PartitionSpecResolver, PartitionSpecVersion};
 #[cfg(feature = "iceberg")]
