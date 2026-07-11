@@ -3751,6 +3751,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-proto"
+version = "54.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9dd15a1ba5d3af93808241065c6c44dbca8296a189845e8a587c45c07bf0ffae"
+dependencies = [
+ "arrow 58.3.0",
+ "chrono",
+ "datafusion-catalog 54.0.0",
+ "datafusion-catalog-listing 54.0.0",
+ "datafusion-common 54.0.0",
+ "datafusion-datasource 54.0.0",
+ "datafusion-datasource-arrow 54.0.0",
+ "datafusion-datasource-csv 54.0.0",
+ "datafusion-datasource-json 54.0.0",
+ "datafusion-datasource-parquet 54.0.0",
+ "datafusion-execution 54.0.0",
+ "datafusion-expr 54.0.0",
+ "datafusion-functions-table 54.0.0",
+ "datafusion-physical-expr 54.0.0",
+ "datafusion-physical-expr-common 54.0.0",
+ "datafusion-physical-plan 54.0.0",
+ "datafusion-proto-common",
+ "object_store 0.13.2",
+ "prost 0.14.4",
+]
+
+[[package]]
+name = "datafusion-proto-common"
+version = "54.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90042982cf9462eb06a0b81f92efa4188dae871e7ea3ab8dc61aa9c9349b2530"
+dependencies = [
+ "arrow 58.3.0",
+ "datafusion-common 54.0.0",
+ "prost 0.14.4",
+]
+
+[[package]]
 name = "datafusion-pruning"
 version = "52.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6115,10 +6153,12 @@ version = "0.1.0"
 dependencies = [
  "arrow 58.3.0",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "dashmap",
  "datafusion 54.0.0",
+ "datafusion-proto",
  "futures",
  "iceberg",
  "iceberg-catalog-rest",

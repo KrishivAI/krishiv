@@ -63,6 +63,7 @@ pub mod cep_sql;
 
 pub mod connector_table;
 pub mod create_function_ddl;
+pub mod distributed_plan;
 pub mod grammar;
 pub mod incremental_view;
 pub mod introspection_sql;
@@ -609,6 +610,15 @@ impl SqlEngine {
     /// Return the DataFusion memory pool limit for this engine, if bounded.
     pub fn memory_limit_bytes(&self) -> Option<usize> {
         self.memory_limit_bytes
+    }
+
+    /// Direct access to the underlying DataFusion session context.
+    ///
+    /// Used by the distributed stage builder (ADR-0003) to create and
+    /// round-trip physical plans; general query execution should go through
+    /// [`SqlEngine::sql`] so engine-level rewrites and governance apply.
+    pub fn session_context(&self) -> &SessionContext {
+        &self.context
     }
 
     /// Return the current `shuffle.partitions` override, if set via `SET shuffle.partitions = N`.
