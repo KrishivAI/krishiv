@@ -546,15 +546,10 @@ impl AuthContext {
     pub fn subject(&self) -> String {
         match self {
             Self::Anonymous => "anonymous".to_owned(),
-            Self::Bearer { subject } => {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                subject.hash(&mut hasher);
-                // 16 hex chars of a keyed hash: enough to correlate a caller
-                // across log lines, far too little to recover a high-entropy
-                // bearer token.
-                format!("bearer:{:016x}", hasher.finish())
-            }
+            // Shared redaction (Phase 51): a 16-hex-char hash — enough to
+            // correlate a caller across log lines, far too little to recover
+            // a high-entropy bearer token.
+            Self::Bearer { subject } => krishiv_common::redact_token(subject),
         }
     }
 }
@@ -584,18 +579,11 @@ macro_rules! require_auth {
 
 /// Extract an `AuthContext` from the gRPC request metadata.
 pub fn extract_auth_context(metadata: &tonic::metadata::MetadataMap) -> AuthContext {
-    let header = metadata
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    if let Some(token) = header.strip_prefix("Bearer ") {
-        let token = token.trim();
-        if !token.is_empty() {
-            return AuthContext::Bearer {
-                subject: token.to_owned(),
-            };
-        }
+    let header = metadata.get("authorization").and_then(|v| v.to_str().ok());
+    if let Some(token) = krishiv_common::bearer_token(header) {
+        return AuthContext::Bearer {
+            subject: token.to_owned(),
+        };
     }
     AuthContext::Anonymous
 }

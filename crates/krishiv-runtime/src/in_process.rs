@@ -1,5 +1,9 @@
 //! In-process coordinator + executor over shared mpsc/inbox transport (ADR-12.4).
 
+// Deliberate sync-over-async boundary module (Phase 51 async contract):
+// block_on here bridges a synchronous public surface to the async core.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

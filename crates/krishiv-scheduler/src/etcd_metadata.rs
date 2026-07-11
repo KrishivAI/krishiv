@@ -14,6 +14,10 @@
 //! | `/krishiv/history/<job_id>` | JSON-encoded terminal `JobHistoryRecord` |
 //!
 //! Events are not persisted — they are audit-only and kept in-memory.
+
+// Deliberate sync-over-async boundary module (Phase 51 async contract):
+// block_on here bridges the sync MetadataStore trait to the async etcd client.
+#![allow(clippy::disallowed_methods)]
 //!
 //! # Persist mechanism
 //!

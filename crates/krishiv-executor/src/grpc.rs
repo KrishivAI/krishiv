@@ -133,12 +133,7 @@ fn configured_executor_task_bearer_token() -> Option<String> {
 }
 
 pub fn bearer_token_from_metadata(metadata: &tonic::metadata::MetadataMap) -> Option<&str> {
-    metadata
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|header| header.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
+    krishiv_common::bearer_token(metadata.get("authorization").and_then(|v| v.to_str().ok()))
 }
 
 #[tonic::async_trait]

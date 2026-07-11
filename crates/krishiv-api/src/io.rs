@@ -1,5 +1,9 @@
 //! Typed, lazy reader and writer builders.
 
+// Deliberate sync-over-async boundary module (Phase 51 async contract):
+// block_on here bridges a synchronous public surface to the async core.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};

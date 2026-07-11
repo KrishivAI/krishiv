@@ -1,5 +1,9 @@
 //! Sink configuration types and `krishiv.sinks` submodule.
 
+// Deliberate sync-over-async boundary module (Phase 51 async contract):
+// block_on here bridges a synchronous public surface to the async core.
+#![allow(clippy::disallowed_methods)]
+
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 

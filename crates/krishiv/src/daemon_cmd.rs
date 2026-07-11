@@ -1,5 +1,9 @@
 //! Long-running daemon subcommands (`krishiv coordinator`, `krishiv executor`, …).
 
+// Deliberate sync-over-async boundary module (Phase 51 async contract):
+// block_on here bridges a synchronous public surface to the async core.
+#![allow(clippy::disallowed_methods)]
+
 use krishiv_common::async_util::block_on;
 use krishiv_scheduler::{
     CoordinatorSidecarFn, SharedCoordinator, coordinator_daemon_help, job_coordinator_daemon_help,

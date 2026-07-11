@@ -467,12 +467,11 @@ fn check_bearer_token(
         .read()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if let Some(tok) = guard.as_ref() {
-        let auth_header = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let expected = format!("Bearer {tok}");
-        if !constant_time_eq(auth_header.as_bytes(), expected.as_bytes()) {
+        let presented = krishiv_common::bearer_token(
+            headers.get("authorization").and_then(|v| v.to_str().ok()),
+        )
+        .unwrap_or("");
+        if !constant_time_eq(presented.as_bytes(), tok.as_bytes()) {
             return Err(StatusCode::UNAUTHORIZED);
         }
     }

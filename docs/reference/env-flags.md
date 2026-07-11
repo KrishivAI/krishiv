@@ -71,6 +71,7 @@ Regenerate with:
 | `KRISHIV_JOB_SPEC_JSON` | text | `unset` | Inline JSON job spec submitted at startup in job-mode. |
 | `KRISHIV_LEADER_BACKEND` | single \| etcd | `single` | Coordinator leader-election backend. |
 | `KRISHIV_LEADER_LEASE_SECS` | uint | `15` | Leader lease TTL for etcd-backed election. |
+| `KRISHIV_LOG_FORMAT` | json \| pretty \| compact | `json` | Log/stderr output format for the tracing subscriber (json = daemon default). |
 | `KRISHIV_LOCAL_DATA_DIR` | path | `~/.krishiv/local` | Data directory for `krishiv local` single-node deployments. |
 | `KRISHIV_LOCAL_HTTP_ADDR` | host:port | `127.0.0.1:8080` | HTTP address for `krishiv local` status endpoints. |
 | `KRISHIV_MATCH_RECOGNIZE_STREAMING_LIMIT` | uint | `engine default` | Row cap for MATCH_RECOGNIZE evaluation over streaming inputs. |

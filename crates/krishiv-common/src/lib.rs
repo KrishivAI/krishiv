@@ -17,6 +17,7 @@
 //! - [`stream_quality`] — streaming quality hook trait
 
 pub mod async_util;
+pub mod auth_util;
 pub mod backpressure;
 #[cfg(feature = "chaos")]
 pub mod chaos;
@@ -35,6 +36,7 @@ pub mod validate;
 pub mod write_commit;
 
 pub use backpressure::BackpressureSignal;
+pub use auth_util::{bearer_token, redact_token};
 pub use env_registry::{
     EnvIssue, FlagKind, FlagScope, FlagSpec, coordinator_url_env, env_u64, env_usize,
     log_env_issues, truthy_env, validate_env,

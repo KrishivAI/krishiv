@@ -149,6 +149,9 @@ pub fn build_shared_coordinator(
 
 /// Synchronous entry used by binaries; etcd metadata uses a blocking connect.
 /// Attach metadata store with durability-aware fail-closed write semantics.
+// Deliberate sync-over-async bridge (Phase 51 async contract): the etcd
+// connect happens once at startup from a sync binary entry.
+#[allow(clippy::disallowed_methods)]
 fn attach_metadata_store(
     coord: Coordinator,
     store: impl MetadataStore + 'static,

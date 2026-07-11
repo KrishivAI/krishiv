@@ -1,5 +1,9 @@
 //! `krishiv table read` — lakehouse table scans.
 
+// Deliberate sync-over-async boundary module (Phase 51 async contract):
+// block_on here bridges a synchronous public surface to the async core.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::PathBuf;
 
 use krishiv_api::{QueryResult, Session, SessionBuilder};

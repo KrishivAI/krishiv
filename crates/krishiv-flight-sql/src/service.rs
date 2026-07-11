@@ -260,13 +260,13 @@ impl KrishivFlightSqlService {
             }
             return Ok(None);
         };
-        let token = req
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(str::to_owned)
-            .ok_or_else(|| Status::unauthenticated("missing Bearer token"))?;
+        let token = krishiv_common::bearer_token(
+            req.metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+        )
+        .map(str::to_owned)
+        .ok_or_else(|| Status::unauthenticated("missing Bearer token"))?;
         auth.authenticate(&token)
             .map(Some)
             .ok_or_else(|| Status::unauthenticated("invalid API key"))

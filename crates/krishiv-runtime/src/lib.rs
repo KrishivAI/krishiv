@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+// Deliberate sync-over-async boundary module (Phase 51 async contract):
+// block_on here bridges a synchronous public surface to the async core.
+#![allow(clippy::disallowed_methods)]
 
 //! Runtime traits and local backends for Krishiv.
 //!

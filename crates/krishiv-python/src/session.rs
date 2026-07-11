@@ -1,5 +1,9 @@
 //! `Session` factory methods and SQL entry points.
 
+// Deliberate sync-over-async boundary module (Phase 51 async contract):
+// block_on here bridges a synchronous public surface to the async core.
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 
 use krishiv_api::StreamBatch;
@@ -1689,7 +1693,6 @@ mod tests {
     #[test]
     fn jwt_auth_rejects_invalid_token() {
         use crate::session::JwtAuth;
-        use krishiv_plan::governance::AuthProvider;
         // A minimal RSA JWK set — keys list is empty so any JWT is rejected.
         let empty_jwks = r#"{"keys":[]}"}"#;
         let result = JwtAuth::from_jwks_json(empty_jwks, "aud".into(), None);

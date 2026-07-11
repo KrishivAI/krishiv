@@ -1,5 +1,9 @@
 //! Typed catalog, namespace, table, view, and function identifiers.
 
+// Deliberate sync-over-async boundary module (Phase 51 async contract):
+// block_on here bridges a synchronous public surface to the async core.
+#![allow(clippy::disallowed_methods)]
+
 use arrow::datatypes::SchemaRef;
 
 use crate::{DataFrame, KrishivError, Result, Session};

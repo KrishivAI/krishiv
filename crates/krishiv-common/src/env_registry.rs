@@ -217,6 +217,8 @@ pub static FLAGS: &[FlagSpec] = &[
        "Coordinator leader-election backend."),
     rt("KRISHIV_LEADER_LEASE_SECS", FlagKind::UInt, "15",
        "Leader lease TTL for etcd-backed election."),
+    rt("KRISHIV_LOG_FORMAT", FlagKind::Enum(&["json", "pretty", "compact"]), "json",
+       "Log/stderr output format for the tracing subscriber (json = daemon default)."),
     rt("KRISHIV_LOCAL_DATA_DIR", FlagKind::Path, "~/.krishiv/local",
        "Data directory for `krishiv local` single-node deployments."),
     rt("KRISHIV_LOCAL_HTTP_ADDR", FlagKind::SocketAddr, "127.0.0.1:8080",

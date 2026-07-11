@@ -1,5 +1,9 @@
 //! Incremental delta log for live tables (ADR-R14-01).
 
+// Deliberate sync-over-async boundary module (Phase 51 async contract):
+// block_on here bridges a synchronous public surface to the async core.
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Mutex;
 
 use arrow::ipc::reader::StreamReader;

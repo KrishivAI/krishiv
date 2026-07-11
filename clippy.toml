@@ -1,0 +1,10 @@
+# Phase 51 async-hygiene: sync-over-async bridging is policed by lint, not
+# convention. `async_util::block_on` may only be called from deliberate
+# sync-surface boundary modules (blocking API wrappers, CLI commands, pyo3
+# bindings, sync-trait-over-async-client adapters) — those files carry a
+# `#![allow(clippy::disallowed_methods)]` with a justification. Everything
+# else must stay async end-to-end. Threading contract:
+# docs/implementation/async-contract.md
+disallowed-methods = [
+  { path = "krishiv_common::async_util::block_on", reason = "sync-over-async bridge: only allow-listed boundary modules may call this; async code must await instead (docs/implementation/async-contract.md)" },
+]

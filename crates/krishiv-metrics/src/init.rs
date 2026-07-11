@@ -1,5 +1,6 @@
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -180,11 +181,25 @@ pub fn init(config: MetricsConfig) -> Result<MetricsHandle, MetricsError> {
 
     opentelemetry::global::set_tracer_provider(tracer_provider.clone());
 
+    // Log output format: JSON stays the daemon default (structured ingestion),
+    // but KRISHIV_LOG_FORMAT=pretty|compact gives local CLI use human-readable
+    // stderr instead of one JSON object per event (Phase 51, audit §11).
+    let fmt_layer = match std::env::var("KRISHIV_LOG_FORMAT")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "pretty" => tracing_subscriber::fmt::layer().pretty().boxed(),
+        "compact" => tracing_subscriber::fmt::layer().compact().boxed(),
+        _ => tracing_subscriber::fmt::layer().json().boxed(),
+    };
+
     // try_init is safe to call multiple times; it returns Err when a subscriber is
     // already set, which we intentionally ignore so tests can call init() repeatedly.
     let _ = tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer().json())
+        .with(fmt_layer)
         .with(tracing_opentelemetry::layer().with_tracer(tracer))
         .try_init();
 

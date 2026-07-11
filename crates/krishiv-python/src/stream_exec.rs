@@ -1,5 +1,9 @@
 //! Execute a Python [`StreamPipeline`] through the unified session execution runtime.
 
+// Deliberate sync-over-async boundary module (Phase 51 async contract):
+// block_on here bridges a synchronous public surface to the async core.
+#![allow(clippy::disallowed_methods)]
+
 use krishiv_api::{AggExpr, AggFunction, LocalWindowExecutionSpec, LocalWindowKind};
 use pyo3::prelude::*;
 
