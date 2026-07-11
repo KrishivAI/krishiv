@@ -8,6 +8,36 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Added
 
+- **SQL correctness corpus across the three placements** (Phase 51,
+  2026-07-11). New `krishiv-conformance` crate: sqllogictest 0.29 suites
+  under `corpus/` run against embedded, single-node, and distributed
+  placements (the non-embedded ones over an in-process Flight SQL
+  coordinator). Scalar tier runs everywhere; the stateful (DDL/DML) tier is
+  embedded-only until the Phase 60 SQL front door makes remote session
+  state persist across statements — a divergence the corpus caught on its
+  first run. Part of the required `just test-integration` CI tier.
+- **Typed `KRISHIV_*` flag registry** (Phase 51, 2026-07-11).
+  `krishiv_common::env_registry` declares all 135 runtime flags once with
+  type/default/doc; daemon startups warn on unknown/ill-typed flags;
+  `docs/reference/env-flags.md` is generated with a drift test and a
+  source-scan test keeps the registry complete in both directions.
+  `KRISHIV_COORDINATOR_URL` is canonical (deprecated aliases warn); one
+  boolean parser (`truthy_env`) replaces four skewed definitions;
+  `KRISHIV_LOG_FORMAT=json|pretty|compact` selects log output.
+- **Shared bearer parsing + redaction** (Phase 51, 2026-07-11).
+  `krishiv_common::auth_util::{bearer_token, redact_token}` replace four
+  per-site implementations; a source-scan guard fails the build if
+  hand-rolled Bearer parsing reappears.
+- **CI tiers** (Phase 51): the required gate now also runs
+  `just test-integration` (all tests/*.rs) and `just test-doc`; tier map
+  with per-exclusion rationale at `docs/implementation/ci-tiers.md`.
+  `clippy::disallowed-methods` denies `async_util::block_on` outside
+  allow-listed boundary modules (`docs/implementation/async-contract.md`).
+- **DataFusion 53.1 → 54.0** (Phase 51 version train, 2026-07-11);
+  arrow/parquet stay 58.3 (DF 54's pin), iceberg stays 0.9.1 until 0.10
+  releases (#163). Operator pool executors no longer pin
+  `KRISHIV_TASK_SLOTS=2` (Option; unset derives from CPU).
+
 - **Per-view delta statistics on IVM jobs** (#94, 2026-07-10). Every IVM
   tick path (structural `step_with`, the DataFusion publish loop, and the
   coordinator-authoritative `apply_computed_tick` offload) now counts each
@@ -74,6 +104,17 @@ Semantic Versioning as described in `docs/RELEASE.md`.
     `streaming_sink` tests.
 
 ### Fixed
+
+- **IVM view-on-view double count** (Phase 51, 2026-07-11). A freshly
+  built incremental aggregate over an upstream view seeded from the
+  upstream's post-tick output and then applied the same tick's delta —
+  COUNT over a filtered view returned 2 instead of 1. Operators now seed
+  from frozen pre-tick snapshots; regression tests in krishiv-ivm and
+  krishiv-api.
+- Re-enabled two silently-disabled live Flight tests (missing dev-dep
+  edges behind the `__disabled_flight_test` pseudo-feature): the
+  krishiv-runtime distributed submit and krishiv-api remote-execution
+  tests now run and pass. (Phase 51, 2026-07-11)
 
 - **Continuous-cycle Iceberg sink epochs commit at cycle end** (G8,
   2026-07-10). Sink-attached continuous (`stream:loop:`) jobs staged every

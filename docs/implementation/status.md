@@ -1,5 +1,61 @@
 # Krishiv Implementation Status
 
+## 2026-07-11 — Phase 51 engine baseline: 7 commits (wire-or-delete → corpus); chunks 7-8 remain
+
+Track 6 Phase 51, first leg (all pushed to main, every commit gated on
+fmt+clippy+tests):
+
+- **afa72616 wire-or-delete**: disposition register
+  (`docs/implementation/wire-or-delete-2026-07.md`) — every parked
+  subsystem has a recorded decision; deleted dead `dataflow/fusion.rs` and
+  the write-only IVM `enable_disk_spill` knob (+`snapshot_store.rs`);
+  audit corrections (tiered_store/lease_persistence are wired).
+- **55d0c291 config**: typed registry for all 135 `KRISHIV_*` flags
+  (`krishiv_common::env_registry`) with startup validation, generated
+  `docs/reference/env-flags.md` (drift test), bidirectional source-scan
+  completeness test; one boolean parser; `KRISHIV_COORDINATOR_URL`
+  canonical + deprecated aliases; operator task-slots pin bug fixed
+  (Option, CPU-derived default); `__disabled_flight_test` re-enabled in
+  krishiv-runtime (missing dev-dep edge was the cause).
+- **eae62a9a hygiene**: `auth_util::{bearer_token, redact_token}` replace
+  4 per-site bearer implementations + source-scan guard; `block_on` in
+  clippy disallowed-methods with 22 justified boundary allows +
+  `docs/implementation/async-contract.md`; `KRISHIV_LOG_FORMAT` selector.
+- **ae34fcd7 ivm fix (real bug)**: view-on-view double count — new
+  incremental operators seeded from post-tick upstream output then applied
+  the same tick's delta (COUNT over filtered view = 2, expected 1). Found
+  by running the full lib gate; fixed by freezing pre-tick seed snapshots;
+  regression tests both crates. Also re-enabled the api remote-execution
+  Flight test (same disabled-feature disease).
+- **16740a89 CI honesty**: required gate = test + test-integration +
+  test-doc; `docs/implementation/ci-tiers.md` documents the tier split.
+  The new tier caught a doctor regression (fixed via pure
+  `env_registry::validate_value`) and a timing-flake
+  (rocksdb ephemeral-vs-fsync 2× wall-clock assert → quarantined).
+- **374c0b28 version train**: DataFusion 53.1→54.0 (breakage: as_any left
+  the provider traits — 7 impls removed); arrow/parquet stay 58.3 (DF 54's
+  pin); iceberg 0.9.1 pinned (0.10 unreleased, #163) — its duplicate
+  DF-52 stack in Cargo.lock is the recorded residual. Gates green: lib
+  4049/4049, integration 4246/4246.
+- **d07a575e corpus**: `krishiv-conformance` crate — sqllogictest 0.29
+  across three placements (embedded / single-node / distributed over an
+  in-process Flight coordinator). **Finding**: remote statements plan in a
+  fresh context, so DDL state does not persist across Flight statements —
+  stateful tier is embedded-only until the Phase 60 front door (#197);
+  recorded in corpus/stateful/README.md.
+
+**Validation**: `just tidy && just test && just test-integration &&
+just test-doc` all green on DF 54.
+
+**Phase 51 remaining** (next session): coverage measurement
+(cargo-llvm-cov) + property tests (delta/state/ivm) + de-flake sleeps +
+testcontainers tier (audit §14, task #204); benchmark yardstick
+(TPC-H SF10 / streaming / IVM tick baselines + engine-overhead
+microbench, needs datasets). Ops notes: disk pressure — target/ hit 100%
+twice (rm incremental/ + stale release/ frees ~50G); push via
+`git -c credential.helper='!gh auth git-credential' push https://github.com/KrishivAI/krishiv.git main`
+(SSH key dead).
+
 ## 2026-07-10 (day, follow-up 5) — external security/durability review triaged → Phase 63 GATE 0 (P0)
 
 User relayed an external engine review claiming the engine isn't ready
