@@ -1,5 +1,49 @@
 # Krishiv Implementation Status
 
+## 2026-07-12 (leg 2) — Phase 53 COMPLETE: scheduler v2 (all legs in one cycle)
+
+Closes tasks #175 + #199. Commits aa7a4007 (rack_id locality identity)
++ d2a04f46 (scheduler v2); pushed 8e7df8c0..d2a04f46 to main.
+
+- **Locality live**: LocalityScheduler out of cfg(test) — NODE→RACK→ANY
+  tiers + delay scheduling (`locality_wait_ms` 3s default); reduce stages
+  prefer the node holding the majority of upstream shuffle bytes; node =
+  descriptor host, rack = new proto field via `KRISHIV_RACK_ID`.
+- **Fair pools GA**: real min-share + weighted largest-remainder quotas
+  (the old code read weights into `let _`); coordinator pool config +
+  namespace→pool mapping; assignment round distributes free slots by
+  pool quota in priority order. 2:1 weights ⇒ 4:2 of 6 slots under
+  saturation (unit + coordinator-level tests).
+- **Speculation fixed (#199)**: CancelTask to the original BEFORE the
+  Pending reset (stall-path pattern); relaunch bumps attempt ⇒ late
+  updates from the cancelled original fenced StaleTaskAttempt; first
+  completion wins; sink-contract tasks never speculated. Residual: a
+  wedged executor that never receives the cancel burns its slot until
+  stall/lease reaping (results stay fenced).
+- **Strict capacity (#199)**: saturation no longer resets slot budgets
+  to full (silent oversubscription eliminated); overflow → pending
+  backlog drained on task completion / executor registration;
+  coordinator in-flight overlay closes the heartbeat-lag window;
+  failure retries back off exponentially (1s→30s, configurable).
+- **Indexing (#199)**: 500ms launch tick consumes a dirty-job set
+  (O(dirty), full sweep every 8th tick); recovery streaming checks are
+  one O(cluster) scan; the O(all jobs)-per-executor variant deleted.
+- **Observability**: per-tier placement + speculation counters on the
+  metrics endpoint. **Scale proof**: 10,000 tasks placed + launched
+  across 100 executors in **3.34 s**, exactly 100 per 100-slot executor.
+- Whole-phase sweep: full workspace --no-fail-fast green (one fix: proto
+  proptest strategy gained rack_id), just lint green (visibility +
+  dead-code + nonminimal-bool cleanups), krishiv-python check green,
+  env-flags reference regenerated. Scheduler crate 425 tests green;
+  behavior change absorbed in two retry tests (eager backlog re-placement
+  after failure is the new contract).
+- Exit-gate honesty: 3-node NODE_LOCAL TPC-H run blocked(hardware), G4
+  precedent; recorded evidence = the named unit/integration tests.
+
+Validation: `cargo test --workspace --no-fail-fast` · `just lint` ·
+`cargo test -p krishiv-scheduler` · `cargo check -p krishiv-python
+--all-targets`. Next: Phase 54 (#176) — AQE + statistics.
+
 ## 2026-07-12 — Phase 52 COMPLETE: distributed batch v2 (Legs 5–7 landed in one cycle, whole-phase sweep green)
 
 Closes tasks #191, #192, #174. Commits 75e1ccca (Leg 5), 3cb0f9eb (Leg 6),
