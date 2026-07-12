@@ -13,6 +13,12 @@ Regenerate with:
 | `KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS` | bool | `false` | Permit native (full-privilege) scalar UDF registration under restrictive durability profiles. |
 | `KRISHIV_ALLOW_LEGACY_FRAGMENTS` | bool | `false` | Permit untyped legacy task fragments (stream:*, raw SQL strings) outside dev-local. |
 | `KRISHIV_API_KEY` | secret | `unset` | Single Flight SQL API key presented by clients (fallback for KRISHIV_FLIGHT_API_KEY). |
+| `KRISHIV_AQE` | bool | `on` | Adaptive query execution master switch (Phase 54). `off` disables every stage-boundary rewrite (coalescing, skew split) and the placeholder-plan hint pass; per-mechanism flags refine it. |
+| `KRISHIV_AQE_COALESCE` | bool | `on` | AQE reduce-partition coalescing: merge small measured shuffle partitions into fewer reduce tasks (dfplan multi-partition bodies). Subordinate to KRISHIV_AQE. |
+| `KRISHIV_AQE_SKEW_FACTOR` | float | `4.0` | A reduce partition is skewed when its measured bytes exceed this factor x the median partition size (and KRISHIV_AQE_SKEW_MIN_BYTES). |
+| `KRISHIV_AQE_SKEW_MIN_BYTES` | uint | `134217728` | Absolute floor (bytes) below which a reduce partition is never treated as skewed (default 128 MiB). |
+| `KRISHIV_AQE_SKEW_SPLIT` | bool | `on` | AQE skew handling: split a skewed reduce partition into map-task-range sub-tasks (split-safe plans only). Subordinate to KRISHIV_AQE. |
+| `KRISHIV_AQE_TARGET_PARTITION_BYTES` | uint | `67108864` | Target upstream shuffle bytes per reduce task for AQE coalescing and skew-split sizing (default 64 MiB). |
 | `KRISHIV_API_KEYS` | secret | `unset` | Comma-separated set of accepted Flight SQL API keys (server side). |
 | `KRISHIV_BARRIER_GRPC_ADDR` | host:port | `unset` | Executor barrier-transport gRPC listen address (aligned window join / checkpoint barriers). |
 | `KRISHIV_BATCH_SIZE` | uint | `8192` | DataFusion execution batch size (rows per record batch). |
@@ -102,6 +108,7 @@ Regenerate with:
 | `KRISHIV_RESULT_SPOOL_MAX_BYTES` | uint | `1073741824` | Cap on total spooled result bytes per node. |
 | `KRISHIV_ROCKSDB_MAX_OPEN_FILES` | int | `rocksdb default` | RocksDB max_open_files for state/metadata stores (-1 = unlimited). |
 | `KRISHIV_ROCKSDB_WRITE_BUFFER_MB` | uint | `rocksdb default` | RocksDB write-buffer (memtable) size in MiB. |
+| `KRISHIV_RUNTIME_FILTERS` | bool | `on` | DataFusion dynamic (runtime) filters: TopK / join / aggregate predicates pushed into probe-side file scans at execution time (Phase 54). `off` disables all three via the DataFusion master switch. |
 | `KRISHIV_SHUFFLE_ADDR` | host:port | `127.0.0.1:50060` | Shuffle service HTTP listen address. |
 | `KRISHIV_SHUFFLE_DIR` | path | `temp dir` | Local-disk shuffle store directory. |
 | `KRISHIV_SHUFFLE_FETCH_CONCURRENCY` | uint | `4` | Reduce-side concurrent shuffle partition fetches. |

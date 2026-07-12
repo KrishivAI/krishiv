@@ -155,6 +155,42 @@ pub static FLAGS: &[FlagSpec] = &[
         "Single Flight SQL API key presented by clients (fallback for KRISHIV_FLIGHT_API_KEY).",
     ),
     rt(
+        "KRISHIV_AQE",
+        FlagKind::Bool,
+        "on",
+        "Adaptive query execution master switch (Phase 54). `off` disables every stage-boundary rewrite (coalescing, skew split) and the placeholder-plan hint pass; per-mechanism flags refine it.",
+    ),
+    rt(
+        "KRISHIV_AQE_COALESCE",
+        FlagKind::Bool,
+        "on",
+        "AQE reduce-partition coalescing: merge small measured shuffle partitions into fewer reduce tasks (dfplan multi-partition bodies). Subordinate to KRISHIV_AQE.",
+    ),
+    rt(
+        "KRISHIV_AQE_SKEW_FACTOR",
+        FlagKind::Float,
+        "4.0",
+        "A reduce partition is skewed when its measured bytes exceed this factor x the median partition size (and KRISHIV_AQE_SKEW_MIN_BYTES).",
+    ),
+    rt(
+        "KRISHIV_AQE_SKEW_MIN_BYTES",
+        FlagKind::UInt,
+        "134217728",
+        "Absolute floor (bytes) below which a reduce partition is never treated as skewed (default 128 MiB).",
+    ),
+    rt(
+        "KRISHIV_AQE_SKEW_SPLIT",
+        FlagKind::Bool,
+        "on",
+        "AQE skew handling: split a skewed reduce partition into map-task-range sub-tasks (split-safe plans only). Subordinate to KRISHIV_AQE.",
+    ),
+    rt(
+        "KRISHIV_AQE_TARGET_PARTITION_BYTES",
+        FlagKind::UInt,
+        "67108864",
+        "Target upstream shuffle bytes per reduce task for AQE coalescing and skew-split sizing (default 64 MiB).",
+    ),
+    rt(
         "KRISHIV_API_KEYS",
         FlagKind::Secret,
         "unset",
@@ -693,6 +729,12 @@ pub static FLAGS: &[FlagSpec] = &[
         FlagKind::UInt,
         "rocksdb default",
         "RocksDB write-buffer (memtable) size in MiB.",
+    ),
+    rt(
+        "KRISHIV_RUNTIME_FILTERS",
+        FlagKind::Bool,
+        "on",
+        "DataFusion dynamic (runtime) filters: TopK / join / aggregate predicates pushed into probe-side file scans at execution time (Phase 54). `off` disables all three via the DataFusion master switch.",
     ),
     rt(
         "KRISHIV_SHUFFLE_ADDR",

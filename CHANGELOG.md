@@ -8,6 +8,44 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Added
 
+- **Adaptive query execution + statistics** (Phase 54, 2026-07-12). The
+  coordinator now re-optimizes real distributed stages at stage
+  boundaries from measured shuffle output: small reduce partitions are
+  **coalesced** into fewer tasks (`dfplan:v1:p1,p2,…` multi-partition
+  bodies; default target 64 MiB per task,
+  `KRISHIV_AQE_TARGET_PARTITION_BYTES`), and a **skewed** partition
+  (≥ `KRISHIV_AQE_SKEW_FACTOR` × median and ≥
+  `KRISHIV_AQE_SKEW_MIN_BYTES`) is split into map-task-range sub-tasks
+  (`dfplan:v1:p/s0m2-4:…`) so one hot key no longer serializes the reduce
+  stage — gated on a structural split-safety proof of the decoded plan
+  (inner joins/filters/projections only; blocking operators fail closed).
+  Every decision lands in the per-job adaptive decision log
+  (`partition-coalesce` / `skew-split`) and new
+  `krishiv_aqe_*` metrics; everything is disableable
+  (`KRISHIV_AQE=off` master, `KRISHIV_AQE_COALESCE`,
+  `KRISHIV_AQE_SKEW_SPLIT`) and result-neutral by construction and by
+  test. Statistics collection is real: `ANALYZE TABLE <ref> [FOR COLUMNS
+  (…)]` scans once (COUNT(*), per-column approx-NDV/min/max/null-count)
+  and feeds the engine row-count registry plus a new process-global
+  `TableStatsRegistry` (also auto-fed by Iceberg CTAS/DELETE row counts);
+  the coordinator's AQE cost model now consumes it
+  (`default_aqe_optimizer_with_stats`). DataFusion's native runtime
+  (dynamic) filters are wired behind `KRISHIV_RUNTIME_FILTERS` (default
+  on; the off switch clears the master **and** per-operator options —
+  the master switch alone does not suppress them) with a probe-scan
+  pruning proof (10 000-row fact scan emits 100 rows on a 3-key star
+  join) and a dedicated runtime-filters-off corpus dual-run binary.
+
+### Fixed
+
+- **Assignment no longer demotes completed stages** (Phase 54). Applying
+  task assignments used to stomp every stage's state to `Scheduling`,
+  including `Succeeded` upstream stages — any post-success assignment
+  (Phase 53 eager backlog drains, retries, AQE rewrites) permanently hid
+  upstream success from the launch loop's upstream-ready check and
+  wedged downstream tasks. Stage state now only moves for stages that
+  actually received an assignment, and never out of a terminal state.
+
 - **Scheduler v2 — locality, fair pools, safe speculation, strict capacity**
   (Phase 53, 2026-07-12). Placement is now locality-aware and live: reduce
   stages prefer the node holding the majority of their upstream shuffle
