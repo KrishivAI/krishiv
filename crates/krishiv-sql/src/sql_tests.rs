@@ -388,6 +388,228 @@ mod tests {
             "expected 3 rows from registered table, got {total_rows} (stats: {stats:?})"
         );
     }
+    // ── Phase 54: ANALYZE TABLE + statistics registries ──────────────────
+
+    #[tokio::test]
+    async fn analyze_table_collects_and_registers_statistics() {
+        let engine = SqlEngine::new();
+        engine
+            .sql(
+                "CREATE TABLE aqe_stats_probe_t AS SELECT * FROM (VALUES \
+                 (1, 'red'), (2, 'green'), (3, 'red'), (4, NULL)) AS v(id, color)",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let df = engine
+            .sql("ANALYZE TABLE aqe_stats_probe_t FOR COLUMNS (id, color)")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let row = batches.iter().find(|b| b.num_rows() > 0).expect("summary row");
+        let cell = |col: usize| {
+            arrow::util::display::array_value_to_string(row.column(col), 0).unwrap()
+        };
+        assert_eq!(cell(0), "aqe_stats_probe_t");
+        assert_eq!(cell(1), "4", "row_count");
+        assert_eq!(cell(3), "2", "columns_analyzed");
+
+        let stats = krishiv_plan::optimizer::global_table_stats()
+            .get("aqe_stats_probe_t")
+            .expect("registry entry");
+        assert_eq!(stats.row_count, Some(4));
+        let id = stats
+            .columns
+            .iter()
+            .find(|c| c.name == "id")
+            .expect("id column stats");
+        assert_eq!(id.ndv, Some(4), "approx_distinct is exact at this scale");
+        assert_eq!(id.min.as_deref(), Some("1"));
+        assert_eq!(id.max.as_deref(), Some("4"));
+        assert_eq!(id.null_count, Some(0));
+        let color = stats
+            .columns
+            .iter()
+            .find(|c| c.name == "color")
+            .expect("color column stats");
+        assert_eq!(color.null_count, Some(1));
+        assert_eq!(color.ndv, Some(2));
+
+        // The BroadcastAutoRule feed sees the analyzed count too.
+        let counts = engine.table_row_counts();
+        let counts = counts.read().unwrap();
+        assert_eq!(counts.get("aqe_stats_probe_t"), Some(&4));
+    }
+
+    #[tokio::test]
+    async fn analyze_table_rejects_garbage_trailing_clause() {
+        let engine = SqlEngine::new();
+        engine
+            .sql("CREATE TABLE aqe_stats_bad_t AS SELECT 1 AS x")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let err = engine
+            .sql("ANALYZE TABLE aqe_stats_bad_t WITH CHEESE")
+            .await
+            .err()
+            .expect("trailing clause must error");
+        assert!(err.to_string().contains("unexpected trailing clause"));
+    }
+
+    /// Phase 54 runtime filters: DataFusion dynamic-filter pushdown is ON
+    /// by default in engine sessions, a selective star join returns results
+    /// identical with the filters on and off (the AQE corpus-neutrality
+    /// rule), and the probe-side parquet scan demonstrably emits fewer rows
+    /// when the join dynamic filter is active.
+    #[tokio::test]
+    async fn runtime_filters_prune_probe_scan_and_preserve_results() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::prelude::{SessionConfig, SessionContext};
+        use std::sync::Arc;
+
+        // Engine sessions expose the master switch ON by default.
+        let engine = SqlEngine::new();
+        let shown = engine
+            .sql("SHOW datafusion.optimizer.enable_dynamic_filter_pushdown")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let shown_text = shown
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows()).map(move |r| {
+                    (0..b.num_columns())
+                        .map(|c| {
+                            arrow::util::display::array_value_to_string(b.column(c), r).unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("=")
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+        assert!(
+            shown_text.contains("true"),
+            "engine default must enable dynamic filter pushdown, got {shown_text}"
+        );
+
+        // Fact table: 10 000 rows sorted by key in 100-row row groups so
+        // min/max pruning has boundaries to work with.
+        let tmp = tempfile::tempdir().unwrap();
+        let fact_path = tmp.path().join("fact.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let keys: Vec<i64> = (0..10_000).collect();
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(keys.clone())),
+                Arc::new(Int64Array::from(
+                    keys.iter().map(|k| k * 2).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(&fact_path).unwrap();
+        let props = datafusion::parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_size(100)
+            .build();
+        let mut writer =
+            datafusion::parquet::arrow::ArrowWriter::try_new(file, schema.clone(), Some(props))
+                .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let query = "SELECT f.k, f.v FROM fact f JOIN dim d ON f.k = d.k ORDER BY f.k";
+        let run = |enable: bool| {
+            let fact_path = fact_path.clone();
+            async move {
+                let mut config = SessionConfig::new().with_target_partitions(2);
+                // Mirror the engine's KRISHIV_RUNTIME_FILTERS wiring: the
+                // master switch alone does not disable the per-operator
+                // options, so all four move together.
+                config.options_mut().optimizer.enable_dynamic_filter_pushdown = enable;
+                config
+                    .options_mut()
+                    .optimizer
+                    .enable_join_dynamic_filter_pushdown = enable;
+                config
+                    .options_mut()
+                    .optimizer
+                    .enable_topk_dynamic_filter_pushdown = enable;
+                config
+                    .options_mut()
+                    .optimizer
+                    .enable_aggregate_dynamic_filter_pushdown = enable;
+                let ctx = SessionContext::new_with_config(config);
+                ctx.register_parquet(
+                    "fact",
+                    fact_path.to_str().unwrap(),
+                    datafusion::prelude::ParquetReadOptions::default(),
+                )
+                .await
+                .unwrap();
+                ctx.sql(
+                    "CREATE TABLE dim AS SELECT * FROM (VALUES (9900), (9901), (9902)) AS v(k)",
+                )
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+                let plan = ctx
+                    .sql(query)
+                    .await
+                    .unwrap()
+                    .create_physical_plan()
+                    .await
+                    .unwrap();
+                let batches =
+                    datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+                        .await
+                        .unwrap();
+                let rows: Vec<String> = batches
+                    .iter()
+                    .flat_map(|b| {
+                        (0..b.num_rows()).map(move |r| {
+                            (0..b.num_columns())
+                                .map(|c| {
+                                    arrow::util::display::array_value_to_string(b.column(c), r)
+                                        .unwrap()
+                                })
+                                .collect::<Vec<_>>()
+                                .join("|")
+                        })
+                    })
+                    .collect();
+                (rows, crate::sql_tests::parquet_scan_output_rows(&plan))
+            }
+        };
+
+        let (rows_on, scan_on) = run(true).await;
+        let (rows_off, scan_off) = run(false).await;
+        assert_eq!(
+            rows_on, rows_off,
+            "runtime filters must be result-neutral (AQE corpus rule)"
+        );
+        assert_eq!(rows_on.len(), 3, "three dim keys match");
+        assert_eq!(scan_off, 10_000, "without runtime filters the scan reads everything");
+        assert!(
+            scan_on < scan_off,
+            "dynamic join filter must prune the probe scan: on={scan_on} off={scan_off}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1369,4 +1591,37 @@ mod iceberg_catalog_tests {
             .value(0);
         assert_eq!(updated, 0, "empty table: no rows to update");
     }
+
+}
+
+/// Sum the `output_rows` metric across parquet `DataSourceExec` nodes of an
+/// executed physical plan (Phase 54 runtime-filter evidence).
+#[cfg(test)]
+fn parquet_scan_output_rows(
+    plan: &std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+) -> u64 {
+    fn walk(
+        node: &std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        total: &mut u64,
+        found: &mut bool,
+    ) {
+        let display = format!(
+            "{}",
+            datafusion::physical_plan::displayable(node.as_ref()).one_line()
+        );
+        if display.contains("DataSourceExec") && display.contains("parquet") {
+            if let Some(rows) = node.metrics().and_then(|m| m.output_rows()) {
+                *total += rows as u64;
+                *found = true;
+            }
+        }
+        for child in node.children() {
+            walk(child, total, found);
+        }
+    }
+    let mut total = 0;
+    let mut found = false;
+    walk(plan, &mut total, &mut found);
+    assert!(found, "no parquet DataSourceExec with metrics found in plan");
+    total
 }

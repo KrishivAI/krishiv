@@ -346,6 +346,40 @@ pub fn query_memory_limit_from_env() -> Option<usize> {
 
 pub use krishiv_common::cgroup_memory_limit_bytes;
 
+/// Programmatic override for [`runtime_filters_enabled_from_env`]
+/// (`u8::MAX` = unset). Exists because `std::env::set_var` is `unsafe`
+/// under edition 2024 and the workspace forbids unsafe code, so the
+/// corpus dual-run (AQE/runtime-filters off) cannot toggle the env var.
+static RUNTIME_FILTERS_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// Test/diagnostic hook: force runtime filters on (`true`) or off (`false`)
+/// for every engine built in this process afterwards.
+#[doc(hidden)]
+pub fn set_runtime_filters_for_tests(enabled: bool) {
+    RUNTIME_FILTERS_OVERRIDE.store(u8::from(enabled), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Phase 54: DataFusion's native dynamic ("runtime") filters — TopK, join,
+/// and aggregate predicates pushed sideways into probe-side file scans at
+/// execution time. On by default; `KRISHIV_RUNTIME_FILTERS=off` disables
+/// them all (the AQE dual-run switch for result-identity verification).
+pub fn runtime_filters_enabled_from_env() -> bool {
+    match RUNTIME_FILTERS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    !matches!(
+        std::env::var("KRISHIV_RUNTIME_FILTERS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "off" | "0" | "false" | "disabled"
+    )
+}
+
 /// Resolve the batch size from `KRISHIV_BATCH_SIZE` env var.
 ///
 /// Falls back to DataFusion's default (8192) if unset or invalid.
@@ -405,6 +439,26 @@ fn build_single_node_session_config(
         .set_bool(
             "datafusion.optimizer.enable_round_robin_repartition",
             tp > 1,
+        )
+        // Phase 54 runtime filters: DataFusion's master switch does NOT
+        // suppress the per-operator options when set to false (it only
+        // force-enables them when true), so `KRISHIV_RUNTIME_FILTERS=off`
+        // must clear all four together.
+        .set_bool(
+            "datafusion.optimizer.enable_dynamic_filter_pushdown",
+            runtime_filters_enabled_from_env(),
+        )
+        .set_bool(
+            "datafusion.optimizer.enable_join_dynamic_filter_pushdown",
+            runtime_filters_enabled_from_env(),
+        )
+        .set_bool(
+            "datafusion.optimizer.enable_topk_dynamic_filter_pushdown",
+            runtime_filters_enabled_from_env(),
+        )
+        .set_bool(
+            "datafusion.optimizer.enable_aggregate_dynamic_filter_pushdown",
+            runtime_filters_enabled_from_env(),
         );
     // Parquet scan options stay at DataFusion's defaults (`pushdown_filters`
     // off, `enable_page_index` on). Forcing `pushdown_filters = true` here
@@ -2008,6 +2062,25 @@ impl SqlEngine {
             return Ok(self.attach_query_metadata(self.make_sql_df("call", dataframe), query));
         }
 
+        // ── Intercept ANALYZE TABLE <ref> [FOR COLUMNS (c1, …)] ──────────────
+        // Phase 54 statistics collection: one scan (COUNT(*) plus optional
+        // per-column approx_distinct/min/max/null-count) feeding the engine's
+        // row-count registry (BroadcastAutoRule) and the process-global
+        // TableStatsRegistry (CBO / AQE cost model).
+        if trimmed
+            .get(..14)
+            .is_some_and(|p| p.eq_ignore_ascii_case("ANALYZE TABLE "))
+        {
+            let result = self.dispatch_analyze_table(trimmed).await?;
+            let res_table = next_ephemeral_name("analyze_result");
+            lakehouse::register_scan_batches(&self.context, &res_table, vec![result]).await?;
+            let dataframe = self
+                .context
+                .sql(&format!("SELECT * FROM {res_table}"))
+                .await?;
+            return Ok(self.attach_query_metadata(self.make_sql_df("analyze", dataframe), query));
+        }
+
         // ── Intercept DELETE FROM <iceberg-table> [WHERE …] ──────────────────
         // Route to copy-on-write iceberg_delete_where when the table is tracked
         // by a registered KrishivCatalog. Falls through to DataFusion otherwise.
@@ -2028,6 +2101,8 @@ impl SqlEngine {
             .map_err(|e| SqlError::DataFusion {
                 message: e.to_string(),
             })?;
+            // Phase 54 auto-stats: keep any known row count in step.
+            self.adjust_table_row_count_stat(&table_ref, -(deleted as i64));
             let schema = Arc::new(Schema::new(vec![Field::new(
                 "deleted_rows",
                 DataType::Int64,
@@ -2337,6 +2412,8 @@ impl SqlEngine {
         })?;
         // The target table (or its schema) changed under any cached plan.
         self.invalidate_plan_cache();
+        // Phase 54 auto-stats: the landing report gives an exact row count.
+        self.record_table_row_count_stat(&parsed_ctas.table_ref, report.rows as u64);
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("rows_written", DataType::Int64, false),
@@ -2360,6 +2437,215 @@ impl SqlEngine {
             .sql(&format!("SELECT * FROM {res_table}"))
             .await?;
         Ok(self.attach_query_metadata(self.make_sql_df("ctas", dataframe), query))
+    }
+
+    /// Phase 54 auto-stats: record an absolute `row_count` for `table_ref`
+    /// in both the engine row-count registry and the process-global stats
+    /// registry. Called from write paths (Iceberg CTAS) so planner
+    /// statistics stay warm without an explicit `ANALYZE TABLE` run.
+    fn record_table_row_count_stat(&self, table_ref: &str, row_count: u64) {
+        let registry = krishiv_plan::optimizer::global_table_stats();
+        let mut names = vec![table_ref];
+        let bare = table_ref.rsplit('.').next().unwrap_or(table_ref);
+        if bare != table_ref {
+            names.push(bare);
+        }
+        for name in &names {
+            let mut stats = registry
+                .get(name)
+                .unwrap_or_else(|| krishiv_plan::optimizer::TableCboStats::new(*name));
+            stats.row_count = Some(row_count);
+            registry.put(stats);
+        }
+        if let Ok(mut counts) = self.table_row_counts.write() {
+            for name in &names {
+                counts.insert((*name).to_owned(), row_count);
+            }
+        }
+    }
+
+    /// Phase 54 auto-stats: apply a signed row-count delta (Iceberg DELETE)
+    /// to any existing statistic for `table_ref`. Tables never analyzed or
+    /// written through this engine are left alone — a delta without a base
+    /// count would fabricate data.
+    #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+    fn adjust_table_row_count_stat(&self, table_ref: &str, delta: i64) {
+        let registry = krishiv_plan::optimizer::global_table_stats();
+        let mut names = vec![table_ref];
+        let bare = table_ref.rsplit('.').next().unwrap_or(table_ref);
+        if bare != table_ref {
+            names.push(bare);
+        }
+        for name in &names {
+            if let Some(mut stats) = registry.get(name)
+                && let Some(current) = stats.row_count
+            {
+                stats.row_count = Some(current.saturating_add_signed(delta));
+                registry.put(stats);
+            }
+        }
+        if let Ok(mut counts) = self.table_row_counts.write() {
+            for name in &names {
+                if let Some(current) = counts.get(*name).copied() {
+                    counts.insert((*name).to_owned(), current.saturating_add_signed(delta));
+                }
+            }
+        }
+    }
+
+    /// Execute `ANALYZE TABLE <ref> [COMPUTE STATISTICS] [FOR COLUMNS (c1, …)]`
+    /// (Phase 54).
+    ///
+    /// Runs one aggregation scan over the table: `COUNT(*)` always, plus
+    /// `approx_distinct` / `min` / `max` / non-null count per requested
+    /// column. Results land in the engine's `table_row_counts` registry
+    /// (the `BroadcastAutoRule` feed) and the process-global
+    /// [`krishiv_plan::optimizer::TableStatsRegistry`]; the returned batch
+    /// summarizes what was collected. `avg_row_bytes` is taken from the
+    /// provider's own statistics when it reports byte sizes (Parquet does).
+    async fn dispatch_analyze_table(&self, stmt: &str) -> SqlResult<RecordBatch> {
+        use arrow::array::{ArrayRef, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let rest = stmt
+            .get(14..)
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        let (table_ref, tail) = match rest.split_once(char::is_whitespace) {
+            Some((t, tail)) => (t.trim(), tail.trim()),
+            None => (rest, ""),
+        };
+        if table_ref.is_empty() {
+            return Err(SqlError::DataFusion {
+                message: String::from("ANALYZE TABLE: table reference is required"),
+            });
+        }
+        // Optional noise word (Spark compatibility), then optional column list.
+        let mut tail = tail;
+        if tail
+            .get(..18)
+            .is_some_and(|p| p.eq_ignore_ascii_case("COMPUTE STATISTICS"))
+        {
+            tail = tail.get(18..).unwrap_or("").trim();
+        }
+        let columns: Vec<String> = if tail
+            .get(..11)
+            .is_some_and(|p| p.eq_ignore_ascii_case("FOR COLUMNS"))
+        {
+            tail.get(11..)
+                .unwrap_or("")
+                .trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .split(',')
+                .map(|c| c.trim().trim_matches('"').to_owned())
+                .filter(|c| !c.is_empty())
+                .collect()
+        } else if tail.is_empty() {
+            Vec::new()
+        } else {
+            return Err(SqlError::DataFusion {
+                message: format!("ANALYZE TABLE: unexpected trailing clause: {tail}"),
+            });
+        };
+
+        // One scan: COUNT(*) plus four aggregates per analyzed column.
+        let mut projections = vec![String::from("count(*)")];
+        for c in &columns {
+            projections.push(format!("approx_distinct(\"{c}\")"));
+            projections.push(format!("min(\"{c}\")"));
+            projections.push(format!("max(\"{c}\")"));
+            projections.push(format!("count(\"{c}\")"));
+        }
+        let scan_sql = format!("SELECT {} FROM {table_ref}", projections.join(", "));
+        let batches = self.context.sql(&scan_sql).await?.collect().await?;
+        let row = batches
+            .iter()
+            .find(|b| b.num_rows() > 0)
+            .ok_or_else(|| SqlError::DataFusion {
+                message: format!("ANALYZE TABLE {table_ref}: aggregation returned no rows"),
+            })?;
+        let cell_string = |col: usize| -> Option<String> {
+            let column = row.columns().get(col)?;
+            if column.is_null(0) {
+                return None;
+            }
+            arrow::util::display::array_value_to_string(column, 0).ok()
+        };
+        let cell_u64 = |col: usize| -> Option<u64> { cell_string(col)?.parse().ok() };
+        let row_count = cell_u64(0).ok_or_else(|| SqlError::DataFusion {
+            message: format!("ANALYZE TABLE {table_ref}: COUNT(*) unreadable"),
+        })?;
+
+        let mut column_stats = Vec::with_capacity(columns.len());
+        for (i, name) in columns.iter().enumerate() {
+            let base = 1 + i * 4;
+            let non_null = cell_u64(base + 3);
+            column_stats.push(krishiv_plan::optimizer::ColumnCboStats {
+                name: name.clone(),
+                ndv: cell_u64(base),
+                min: cell_string(base + 1),
+                max: cell_string(base + 2),
+                null_count: non_null.map(|n| row_count.saturating_sub(n)),
+            });
+        }
+
+        // Provider-reported byte sizes give avg_row_bytes when available.
+        let avg_row_bytes = match self.context.table_provider(table_ref).await {
+            Ok(provider) => provider.statistics().and_then(|s| {
+                let rows = s.num_rows.get_value().copied()?;
+                let bytes = s.total_byte_size.get_value().copied()?;
+                (rows > 0).then(|| (bytes / rows) as u64)
+            }),
+            Err(_) => None,
+        };
+
+        let mut stats = krishiv_plan::optimizer::TableCboStats::new(table_ref)
+            .with_row_count(row_count);
+        if let Some(bytes) = avg_row_bytes {
+            stats = stats.with_avg_row_bytes(bytes);
+        }
+        if let Some(max_ndv) = column_stats.iter().filter_map(|c| c.ndv).max() {
+            // Table-level NDV proxy: the widest column NDV (join-key upper bound).
+            stats = stats.with_ndv(max_ndv);
+        }
+        stats.columns = column_stats;
+        let registry = krishiv_plan::optimizer::global_table_stats();
+        // Register under the full reference AND the bare table name — scan
+        // nodes may carry either depending on how the table was registered.
+        let bare = table_ref.rsplit('.').next().unwrap_or(table_ref);
+        if bare != table_ref {
+            let mut bare_stats = stats.clone();
+            bare_stats.table = bare.to_owned();
+            registry.put(bare_stats);
+        }
+        let analyzed_columns = stats.columns.len();
+        registry.put(stats);
+        if let Ok(mut counts) = self.table_row_counts.write() {
+            counts.insert(table_ref.to_owned(), row_count);
+            if bare != table_ref {
+                counts.insert(bare.to_owned(), row_count);
+            }
+        }
+        self.invalidate_plan_cache();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("table_name", DataType::Utf8, false),
+            Field::new("row_count", DataType::Int64, false),
+            Field::new("avg_row_bytes", DataType::Int64, true),
+            Field::new("columns_analyzed", DataType::Int64, false),
+        ]));
+        let columns_out: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![table_ref.to_owned()])),
+            Arc::new(Int64Array::from(vec![row_count as i64])),
+            Arc::new(Int64Array::from(vec![avg_row_bytes.map(|b| b as i64)])),
+            Arc::new(Int64Array::from(vec![analyzed_columns as i64])),
+        ];
+        RecordBatch::try_new(schema, columns_out).map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })
     }
 
     /// Dispatch a `CALL system.<proc>(...)` statement to the appropriate

@@ -12,6 +12,19 @@ use crate::{LogicalPlan, NodeOp};
 
 use super::CostModel;
 
+/// Per-column statistics collected by `ANALYZE TABLE … FOR COLUMNS`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct ColumnCboStats {
+    pub name: String,
+    /// Approximate number of distinct values (HLL-based).
+    pub ndv: Option<u64>,
+    /// Rendered minimum value (display form; type-erased on purpose).
+    pub min: Option<String>,
+    /// Rendered maximum value.
+    pub max: Option<String>,
+    pub null_count: Option<u64>,
+}
+
 /// Catalog statistics the cost model needs for one table.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TableCboStats {
@@ -19,6 +32,9 @@ pub struct TableCboStats {
     pub row_count: Option<u64>,
     pub ndv: Option<u64>,
     pub avg_row_bytes: Option<u64>,
+    /// Column-level stats (empty unless ANALYZE ran with FOR COLUMNS).
+    #[serde(default)]
+    pub columns: Vec<ColumnCboStats>,
 }
 
 impl TableCboStats {
@@ -51,6 +67,18 @@ impl TableCboStats {
 #[derive(Debug, Default, Clone)]
 pub struct TableStatsRegistry {
     inner: Arc<RwLock<HashMap<String, TableCboStats>>>,
+}
+
+/// Process-global table statistics registry (Phase 54).
+///
+/// Written by the SQL layer (`ANALYZE TABLE`, Iceberg CTAS/DML auto-stats)
+/// and read by cost-based consumers — [`CboCostModel`] behind
+/// `default_aqe_optimizer_with_stats` on the coordinator, and any
+/// planning-time rule that wants row counts beyond the per-engine
+/// row-count registry. Clones share the same underlying map.
+pub fn global_table_stats() -> &'static TableStatsRegistry {
+    static GLOBAL: std::sync::OnceLock<TableStatsRegistry> = std::sync::OnceLock::new();
+    GLOBAL.get_or_init(TableStatsRegistry::new)
 }
 
 impl TableStatsRegistry {

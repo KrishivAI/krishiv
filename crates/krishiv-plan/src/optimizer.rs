@@ -34,7 +34,9 @@ pub use join_reorder::JoinReorderRule;
 pub use predicate_pushdown::PredicatePushdownRule;
 pub use skew_join::{DEFAULT_SALT_FACTOR, DEFAULT_SKEW_THRESHOLD, SkewAdvice, SkewJoinRule};
 pub use small_file::{FileStats, SmallFilePlanner, SplitPlanAdvice};
-pub use stats::{CboCostModel, TableCboStats, TableStatsRegistry};
+pub use stats::{
+    CboCostModel, ColumnCboStats, TableCboStats, TableStatsRegistry, global_table_stats,
+};
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -648,4 +650,14 @@ pub fn default_aqe_optimizer() -> AqeOptimizer {
         DEFAULT_SKEW_THRESHOLD,
     )));
     optimizer
+}
+
+/// [`default_aqe_optimizer`] backed by the process-global table statistics
+/// registry (Phase 54): cold-start estimates use [`CboCostModel`] over
+/// stats collected by `ANALYZE TABLE` / Iceberg auto-stats instead of the
+/// static per-operator coefficients.
+pub fn default_aqe_optimizer_with_stats() -> AqeOptimizer {
+    default_aqe_optimizer().with_cost_model(std::sync::Arc::new(CboCostModel {
+        registry: stats::global_table_stats().clone(),
+    }))
 }
