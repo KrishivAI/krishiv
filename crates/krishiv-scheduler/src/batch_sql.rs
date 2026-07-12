@@ -154,7 +154,8 @@ pub async fn execute_batch_sql_sink_coordinated(
     sink_contract: &str,
 ) -> SchedulerResult<JobId> {
     let job_id =
-        submit_batch_sql_job_inner(coordinator, query, tables, false, Some(sink_contract)).await?;
+        submit_batch_sql_job_inner(coordinator, query, tables, &[], false, Some(sink_contract))
+            .await?;
 
     let notify = {
         let coord = coordinator.read().await;
@@ -231,13 +232,34 @@ pub async fn submit_batch_sql_job(
     tables: &[BatchSqlInlineTable],
     is_streaming: bool,
 ) -> SchedulerResult<JobId> {
-    submit_batch_sql_job_inner(coordinator, query, tables, is_streaming, None).await
+    submit_batch_sql_job_inner(coordinator, query, tables, &[], is_streaming, None).await
+}
+
+/// [`submit_batch_sql_job`] with additional path-registered tables.
+///
+/// Path tables require every executor (and the coordinator, which plans the
+/// stages) to read `path` directly — a shared filesystem or single-node
+/// daemon. In exchange, plain SELECTs over them are eligible for
+/// partition-parallel staged execution (Phase 52): the coordinator cuts the
+/// physical plan at shuffle boundaries and pins each map task to a subset of
+/// the parquet files. Queries the stage builder declines run single-task
+/// with the path tables attached as `LocalParquet` inputs, exactly like the
+/// inline path.
+pub async fn submit_batch_sql_job_with_paths(
+    coordinator: &SharedCoordinator,
+    query: &str,
+    tables: &[BatchSqlInlineTable],
+    path_tables: &[BatchSqlTable],
+    is_streaming: bool,
+) -> SchedulerResult<JobId> {
+    submit_batch_sql_job_inner(coordinator, query, tables, path_tables, is_streaming, None).await
 }
 
 async fn submit_batch_sql_job_inner(
     coordinator: &SharedCoordinator,
     query: &str,
     tables: &[BatchSqlInlineTable],
+    path_tables: &[BatchSqlTable],
     is_streaming: bool,
     sink_contract: Option<&str>,
 ) -> SchedulerResult<JobId> {
@@ -256,30 +278,57 @@ async fn submit_batch_sql_job_inner(
         message: error.to_string(),
     })?;
 
-    let stage_id = StageId::try_new("stage-sql").map_err(|error| SchedulerError::InvalidJob {
-        message: error.to_string(),
-    })?;
-    let task_id = TaskId::try_new("task-sql").map_err(|error| SchedulerError::InvalidJob {
-        message: error.to_string(),
-    })?;
+    // Phase 52: attempt partition-parallel staged execution for plain batch
+    // SELECTs over path-registered parquet tables. The stage builder pins
+    // the parquet scans into each map task's plan, so staged jobs need no
+    // input partitions. Inline IPC tables cannot be stage-split; any query
+    // or plan shape the builder declines falls back to the single-task
+    // `sql:` path exactly as before (capability honesty).
+    let staged_stages =
+        if !is_streaming && sink_contract.is_none() && tables.is_empty() && !path_tables.is_empty()
+        {
+            let table_refs: Vec<(String, std::path::PathBuf)> = path_tables
+                .iter()
+                .map(|t| (t.table_name.clone(), t.path.clone()))
+                .collect();
+            crate::distributed_batch::plan_staged_batch_stages(query, &table_refs).await
+        } else {
+            None
+        };
 
-    let fragment = format!("sql: {query}");
-    let mut task = TaskSpec::new(task_id, fragment);
-    if let Some(contract) = sink_contract {
-        if contract.trim().is_empty() {
-            return Err(SchedulerError::InvalidJob {
-                message: String::from("batch SQL sink contract cannot be empty"),
-            });
-        }
-        task = task.with_sink_contract(contract.trim());
-    }
-    let stage = StageSpec::new(stage_id, "batch-sql").with_task(task);
     let job_kind = if is_streaming {
         JobKind::Streaming
     } else {
         JobKind::Batch
     };
-    let spec = JobSpec::new(job_id.clone(), "batch-sql", job_kind).with_stage(stage);
+    let is_staged = staged_stages.is_some();
+    let spec = if let Some(stages) = staged_stages {
+        stages.into_iter().fold(
+            JobSpec::new(job_id.clone(), "batch-sql", job_kind),
+            |spec, stage| spec.with_stage(stage),
+        )
+    } else {
+        let stage_id =
+            StageId::try_new("stage-sql").map_err(|error| SchedulerError::InvalidJob {
+                message: error.to_string(),
+            })?;
+        let task_id = TaskId::try_new("task-sql").map_err(|error| SchedulerError::InvalidJob {
+            message: error.to_string(),
+        })?;
+
+        let fragment = format!("sql: {query}");
+        let mut task = TaskSpec::new(task_id, fragment);
+        if let Some(contract) = sink_contract {
+            if contract.trim().is_empty() {
+                return Err(SchedulerError::InvalidJob {
+                    message: String::from("batch SQL sink contract cannot be empty"),
+                });
+            }
+            task = task.with_sink_contract(contract.trim());
+        }
+        let stage = StageSpec::new(stage_id, "batch-sql").with_task(task);
+        JobSpec::new(job_id.clone(), "batch-sql", job_kind).with_stage(stage)
+    };
 
     // OPTIMIZATION OPPORTUNITY: In the embedded in-process path, the caller
     // already has RecordBatch values in memory. Routing them through Base64 +
@@ -324,6 +373,19 @@ async fn submit_batch_sql_job_inner(
             },
         ));
     }
+    // Path tables ride along as LocalParquet inputs on the single-task path;
+    // staged plans pin their parquet scans and need no input partitions.
+    if !is_staged {
+        for (idx, t) in path_tables.iter().enumerate() {
+            input_partitions.push(InputPartition::typed(
+                format!("local-parquet-{idx}"),
+                InputPartitionDescriptor::LocalParquet {
+                    table_name: t.table_name.clone(),
+                    path: t.path.to_string_lossy().into_owned(),
+                },
+            ));
+        }
+    }
 
     let mut coord = coordinator.write().await;
     coord.ensure_active()?;
@@ -351,4 +413,320 @@ pub fn decode_inline_record_batches(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coordinator::{Coordinator, SharedCoordinator};
+    use arrow::array::{Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    fn write_test_parquet(dir: &std::path::Path) -> PathBuf {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+        let table_dir = dir.join("t");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        for file_index in 0..2i64 {
+            let ids: Vec<i64> = (0..100).map(|i| file_index * 100 + i).collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(ids.clone())),
+                    Arc::new(StringArray::from(
+                        ids.iter()
+                            .map(|i| if i % 2 == 0 { "even" } else { "odd" })
+                            .collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let file = std::fs::File::create(table_dir.join(format!("part-{file_index}.parquet")))
+                .unwrap();
+            let mut writer =
+                parquet::arrow::ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        table_dir
+    }
+
+    /// Phase 52 Leg 7: the daemon submission path stage-splits plain
+    /// SELECTs over path-registered parquet tables (previously only the
+    /// in-process runtime staged; every daemon job was single-task).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn path_table_group_by_submits_staged_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = write_test_parquet(tmp.path());
+        let coordinator = SharedCoordinator::new(Coordinator::new_active(None).unwrap());
+        let path_tables = vec![BatchSqlTable {
+            table_name: "t".into(),
+            path: table_dir,
+        }];
+
+        let job_id = submit_batch_sql_job_with_paths(
+            &coordinator,
+            "SELECT category, COUNT(*) AS n FROM t GROUP BY category",
+            &[],
+            &path_tables,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let coord = coordinator.read().await;
+        let snapshot = coord.job_snapshot(&job_id).unwrap();
+        assert!(
+            snapshot.stage_count() > 1,
+            "GROUP BY over a path table must be stage-split, got {} stage(s)",
+            snapshot.stage_count()
+        );
+    }
+
+    /// A query shape the stage builder declines still submits — as the
+    /// single-task fallback with the path table attached as a LocalParquet
+    /// input (capability honesty, no hard failure).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn path_table_scan_only_falls_back_to_single_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = write_test_parquet(tmp.path());
+        let coordinator = SharedCoordinator::new(Coordinator::new_active(None).unwrap());
+        let path_tables = vec![BatchSqlTable {
+            table_name: "t".into(),
+            path: table_dir,
+        }];
+
+        let job_id = submit_batch_sql_job_with_paths(
+            &coordinator,
+            "SELECT id FROM t WHERE id < 5",
+            &[],
+            &path_tables,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let coord = coordinator.read().await;
+        let snapshot = coord.job_snapshot(&job_id).unwrap();
+        assert_eq!(
+            snapshot.stage_count(),
+            1,
+            "scan-only query must use the single-task path"
+        );
+    }
+
+    /// Chaos (Phase 52 Leg 7): losing the executor that produced a staged
+    /// job's map output must invalidate its shuffle partitions and reset the
+    /// producing map tasks for re-execution — the reduce stage must never
+    /// consume vanished data, and the job must recover rather than fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn executor_loss_after_map_invalidates_shuffle_and_reruns_maps() {
+        use krishiv_proto::{
+            ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobState,
+            LeaseGeneration, ShufflePartitionOutput, TaskOutputMetadata, TaskState,
+            TaskStatusUpdate,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = write_test_parquet(tmp.path());
+        let mut coord = Coordinator::new_active(None).unwrap();
+        let exec_id = ExecutorId::try_new("chaos-exec").unwrap();
+        coord
+            .register_executor(ExecutorDescriptor::new(exec_id.clone(), "localhost", 8))
+            .unwrap();
+        coord
+            .executor_heartbeat(
+                ExecutorHeartbeat::new(exec_id.clone(), ExecutorState::Healthy)
+                    .with_lease_generation(LeaseGeneration::initial()),
+            )
+            .unwrap();
+        let coordinator = SharedCoordinator::new(coord);
+
+        let path_tables = vec![BatchSqlTable {
+            table_name: "t".into(),
+            path: table_dir,
+        }];
+        let job_id = submit_batch_sql_job_with_paths(
+            &coordinator,
+            "SELECT category, COUNT(*) AS n FROM t GROUP BY category",
+            &[],
+            &path_tables,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Assign + launch the runnable (map) tasks, then report each
+        // succeeded with shuffle outputs attributed to the executor.
+        let assignments = {
+            let mut coord = coordinator.write().await;
+            coord.assign_pending_tasks(&job_id).unwrap();
+            coord.launch_assigned_task_assignments(&job_id).unwrap()
+        };
+        assert!(!assignments.is_empty(), "map tasks must be assignable");
+        let map_tasks = assignments.len();
+        for assignment in &assignments {
+            let succeeded = TaskStatusUpdate::new(
+                job_id.clone(),
+                assignment.stage_id().clone(),
+                assignment.task_id().clone(),
+                assignment.executor_id().clone(),
+                TaskState::Succeeded,
+                assignment.attempt_id().as_u32(),
+            )
+            .with_lease_generation(assignment.lease_generation())
+            .with_output_metadata(
+                // A non-empty flight endpoint marks the partition as served
+                // from the executor's process (the daemon path); an empty
+                // endpoint means co-located in-process data, which cannot
+                // outlive the coordinator and is exempt from invalidation.
+                TaskOutputMetadata::new("shuffle_write", 1, 0, 1).with_shuffle_partitions(vec![
+                    ShufflePartitionOutput::new(0, 64, "127.0.0.1:19999".to_string()),
+                ]),
+            );
+            let mut coord = coordinator.write().await;
+            coord.apply_task_update(succeeded).unwrap();
+            let _ = coord.take_pending_sink_finalize();
+        }
+        {
+            let coord = coordinator.read().await;
+            let snapshot = coord.job_snapshot(&job_id).unwrap();
+            assert_eq!(snapshot.succeeded_task_count(), map_tasks);
+        }
+
+        // Kill the executor: its shuffle outputs vanish with it.
+        coordinator
+            .write()
+            .await
+            .mark_executor_lost(&exec_id)
+            .unwrap();
+
+        let coord = coordinator.read().await;
+        let snapshot = coord.job_snapshot(&job_id).unwrap();
+        assert_eq!(
+            snapshot.succeeded_task_count(),
+            0,
+            "map results on the lost executor must be invalidated, not trusted"
+        );
+        assert!(
+            !matches!(snapshot.state(), JobState::Failed | JobState::Cancelled),
+            "the job must recover by re-running maps, not fail (state: {:?})",
+            snapshot.state()
+        );
+    }
+
+    /// Chaos (Phase 52 Leg 7), reduce side: a consumer task that fails
+    /// because upstream shuffle partitions vanished must re-queue the
+    /// producing map tasks (invalidate-specific path), not fail the job.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reduce_missing_partition_report_reruns_producing_maps() {
+        use krishiv_proto::{
+            ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobState,
+            LeaseGeneration, MissingShufflePartition, ShufflePartitionOutput, TaskOutputMetadata,
+            TaskState, TaskStatusUpdate,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = write_test_parquet(tmp.path());
+        let mut coord = Coordinator::new_active(None).unwrap();
+        let exec_id = ExecutorId::try_new("chaos-exec-2").unwrap();
+        coord
+            .register_executor(ExecutorDescriptor::new(exec_id.clone(), "localhost", 8))
+            .unwrap();
+        coord
+            .executor_heartbeat(
+                ExecutorHeartbeat::new(exec_id.clone(), ExecutorState::Healthy)
+                    .with_lease_generation(LeaseGeneration::initial()),
+            )
+            .unwrap();
+        let coordinator = SharedCoordinator::new(coord);
+
+        let path_tables = vec![BatchSqlTable {
+            table_name: "t".into(),
+            path: table_dir,
+        }];
+        let job_id = submit_batch_sql_job_with_paths(
+            &coordinator,
+            "SELECT category, COUNT(*) AS n FROM t GROUP BY category",
+            &[],
+            &path_tables,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Round 1: maps run and succeed with shuffle outputs.
+        let map_assignments = {
+            let mut coord = coordinator.write().await;
+            coord.assign_pending_tasks(&job_id).unwrap();
+            coord.launch_assigned_task_assignments(&job_id).unwrap()
+        };
+        assert!(!map_assignments.is_empty());
+        let map_stage_id = map_assignments[0].stage_id().clone();
+        for assignment in &map_assignments {
+            let succeeded = TaskStatusUpdate::new(
+                job_id.clone(),
+                assignment.stage_id().clone(),
+                assignment.task_id().clone(),
+                assignment.executor_id().clone(),
+                TaskState::Succeeded,
+                assignment.attempt_id().as_u32(),
+            )
+            .with_lease_generation(assignment.lease_generation())
+            .with_output_metadata(
+                TaskOutputMetadata::new("shuffle_write", 1, 0, 1).with_shuffle_partitions(vec![
+                    ShufflePartitionOutput::new(0, 64, "127.0.0.1:19999".to_string()),
+                ]),
+            );
+            let mut coord = coordinator.write().await;
+            coord.apply_task_update(succeeded).unwrap();
+            let _ = coord.take_pending_sink_finalize();
+        }
+
+        // Round 2: the reduce task launches, then fails reporting the
+        // upstream partitions as missing (producer data vanished).
+        let reduce_assignments = {
+            let mut coord = coordinator.write().await;
+            coord.assign_pending_tasks(&job_id).unwrap();
+            coord.launch_assigned_task_assignments(&job_id).unwrap()
+        };
+        assert!(
+            !reduce_assignments.is_empty(),
+            "reduce stage must become runnable once maps succeeded"
+        );
+        let reduce = &reduce_assignments[0];
+        let failed = TaskStatusUpdate::new(
+            job_id.clone(),
+            reduce.stage_id().clone(),
+            reduce.task_id().clone(),
+            reduce.executor_id().clone(),
+            TaskState::Failed,
+            reduce.attempt_id().as_u32(),
+        )
+        .with_lease_generation(reduce.lease_generation())
+        .with_missing_shuffle_partitions(vec![MissingShufflePartition::new(
+            map_stage_id.clone(),
+            0,
+        )]);
+        {
+            let mut coord = coordinator.write().await;
+            coord.apply_task_update(failed).unwrap();
+            let _ = coord.take_pending_sink_finalize();
+        }
+
+        let coord = coordinator.read().await;
+        let snapshot = coord.job_snapshot(&job_id).unwrap();
+        assert!(
+            snapshot.succeeded_task_count() < map_assignments.len(),
+            "producers of the missing partitions must be re-queued"
+        );
+        assert!(
+            !matches!(snapshot.state(), JobState::Failed | JobState::Cancelled),
+            "the job must recover by re-running producers, not fail (state: {:?})",
+            snapshot.state()
+        );
+    }
 }

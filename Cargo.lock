@@ -6101,6 +6101,7 @@ dependencies = [
  "krishiv-shuffle",
  "krishiv-sql",
  "krishiv-state",
+ "parquet 58.3.0",
  "reqwest 0.13.4",
  "rocksdb",
  "serde",

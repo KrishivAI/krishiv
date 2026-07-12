@@ -8,6 +8,46 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Added
 
+- **Distributed batch v2 — partition-parallel stages over a real shuffle**
+  (Phase 52, 2026-07-12). Plain batch SELECTs are now cut at hash-exchange
+  boundaries into ShuffleMap → Result stages (`dfplan:v1:` proto-encoded
+  physical-plan fragments, ADR-0003), task-per-partition, with map outputs
+  hash-partitioned into the shuffle store and fetched by downstream tasks —
+  locally or over Arrow Flight when the map ran on another executor. The
+  daemon submission path stages too: `POST /api/v1/batch-sql/submit` accepts
+  `table_paths` (parquet paths readable cluster-wide) and stage-splits
+  eligible queries; anything the stage builder cannot prove correct falls
+  back to the single-task `sql:` path unchanged. Executor loss after a map
+  completes invalidates that executor's shuffle partitions and re-runs the
+  producing maps (chaos-tested). Batch hot path rebuilt in the same phase
+  (#194): `target_partitions` defaults to available cores everywhere (was
+  silently 1 — the Phase 51 4.5–8.9× finding), zero-materialization scans
+  and sinks, engine overhead budget closed at 0.87–0.98× vs raw DataFusion
+  (SF1 Q1/Q6/Q3; docs/BENCHMARKING.md); staged TPC-H Q1 verified
+  byte-identical to inline execution.
+- **`PARTITIONED BY` for Iceberg tables + partition-aware writes** (Phase 52
+  #191, 2026-07-12). `CREATE TABLE … PARTITIONED BY (region, day(ts),
+  bucket(16, id), truncate(4, s)) AS SELECT …` creates a real Iceberg
+  partition spec and fans the landing stream out per partition value —
+  spec-exact transform math reused from iceberg-rust (murmur3 bucketing
+  included), hive-style data paths, bounded memory via largest-buffer-first
+  flushing. Every rewrite path (DML copy-on-write, compaction, replace) now
+  preserves the table's partition spec instead of silently recreating tables
+  unpartitioned. `PARTITIONED BY` on a non-Iceberg target is a hard error,
+  not a silent drop. See docs/partitioning-design.md (Domain C).
+- **Table maintenance v2** (Phase 52 #192, 2026-07-12).
+  `CALL system.compact_data_files` is now a partition-aware bin-pack: small
+  files are merged within their partition value into ~target-size files, one
+  bin in memory at a time; files already at target (and lone small files)
+  are carried over untouched, and a no-op compaction commits nothing. The
+  swap is guarded by a snapshot conflict check — a concurrent commit aborts
+  the compaction (parts cleaned up) instead of being silently discarded; the
+  remaining check-to-swap window closes with the iceberg-rust 0.10 atomic
+  rewrite (#163). Tables with delete files are refused rather than silently
+  dropped. New `CALL system.maintain_table('ns.tbl'[, '7 days'[, bytes[,
+  retain]]])` runs compact → expire_snapshots → remove_orphan_files as the
+  schedulable maintenance entry point.
+
 - **Benchmark yardstick baselines** (Phase 51 close-out, 2026-07-11).
   First recorded, reproducible performance baselines in
   `docs/BENCHMARKING.md` ("Recorded baselines"): TPC-H SF1/SF10 ladder

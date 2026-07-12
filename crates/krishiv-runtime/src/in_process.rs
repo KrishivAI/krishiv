@@ -1277,6 +1277,58 @@ mod tests {
         );
     }
 
+    /// Phase 52 scale gate: staged execution must return byte-identical
+    /// results to the inline single-engine path on a real TPC-H dataset.
+    ///
+    /// Ignored by default — needs TPC-H parquet data. Run with:
+    /// `KRISHIV_TPCH_DATA_DIR=/home/krishiv-bench-data/tpch/sf10 \
+    ///  cargo test -p krishiv-runtime --release -- --ignored tpch_q1`
+    #[test]
+    #[ignore = "requires TPC-H parquet data via KRISHIV_TPCH_DATA_DIR"]
+    #[allow(clippy::unwrap_used)]
+    fn staged_tpch_q1_matches_inline_at_scale() {
+        let dir = std::env::var("KRISHIV_TPCH_DATA_DIR").expect("set KRISHIV_TPCH_DATA_DIR");
+        let lineitem = std::path::PathBuf::from(dir).join("lineitem.parquet");
+        assert!(lineitem.exists(), "missing {}", lineitem.display());
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let tables = vec![BatchSqlTable {
+            table_name: "lineitem".into(),
+            path: lineitem,
+            ipc_b64: String::new(),
+        }];
+        // TPC-H Q1 (pricing summary report), the classic aggregation gate.
+        let query = "SELECT l_returnflag, l_linestatus, \
+                     SUM(l_quantity) AS sum_qty, \
+                     SUM(l_extendedprice) AS sum_base_price, \
+                     SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price, \
+                     SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, \
+                     AVG(l_quantity) AS avg_qty, \
+                     AVG(l_extendedprice) AS avg_price, \
+                     AVG(l_discount) AS avg_disc, \
+                     COUNT(*) AS count_order \
+                     FROM lineitem \
+                     WHERE l_shipdate <= DATE '1998-09-02' \
+                     GROUP BY l_returnflag, l_linestatus \
+                     ORDER BY l_returnflag, l_linestatus";
+
+        let staged = runtime
+            .execute_batch_sql_via_coordinator(query, &tables)
+            .expect("staged coordinator execution");
+        assert!(
+            runtime.last_batch_job_stage_count() > 1,
+            "Q1 must run staged, got {} stage(s)",
+            runtime.last_batch_job_stage_count()
+        );
+        let inline = runtime
+            .execute_batch_sql(query, &tables, false)
+            .expect("inline execution");
+        assert_eq!(
+            render_sorted_rows(&staged),
+            render_sorted_rows(&inline),
+            "staged TPC-H Q1 must match inline byte-for-byte"
+        );
+    }
+
     /// Disabling stage splitting routes the same query through the
     /// single-task `sql:` fallback and still returns correct results.
     #[test]

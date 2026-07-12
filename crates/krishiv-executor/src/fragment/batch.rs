@@ -1770,3 +1770,96 @@ fn shuffle_seed_from_job_id(job_id: &str) -> u64 {
     hasher.write(job_id.as_bytes());
     hasher.finish()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use krishiv_shuffle::{
+        InMemoryShuffleStore, LocalDiskShuffleStore, PartitionId, ShuffleBackend, ShufflePartition,
+        ShuffleStore as _,
+    };
+    use krishiv_sql::distributed_plan::{ShufflePartitionReader as _, shuffle_stage_key};
+
+    fn shuffle_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7, 8, 9]))]).unwrap()
+    }
+
+    /// Leg 3 residual: partitions whose map task ran on another executor
+    /// must arrive over Arrow Flight from the coordinator-attached endpoint
+    /// — a local read would silently return empty and corrupt results.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::unwrap_used)]
+    async fn dfplan_reader_fetches_remote_partition_over_flight() {
+        let stage_key = shuffle_stage_key(0, 0);
+
+        // "Remote" executor: a disk shuffle store served over Flight.
+        let dir = tempfile::tempdir().unwrap();
+        let remote_store = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+        let batch = shuffle_batch();
+        let id = PartitionId {
+            job_id: "job-dfplan-flight".to_owned(),
+            stage_id: stage_key.clone(),
+            partition: 3,
+        };
+        remote_store
+            .register_partition_lease(id.clone(), 1)
+            .await
+            .unwrap();
+        remote_store
+            .write_partition(
+                ShufflePartition {
+                    id,
+                    schema: batch.schema(),
+                    batches: vec![batch],
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let (addr, server) = krishiv_shuffle::flight::serve(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&remote_store),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // "Local" executor: empty local store; the coordinator attached the
+        // remote location for (sub-stage, partition).
+        let reader = InmemDfplanShuffleReader {
+            store: Arc::new(ShuffleBackend::InMemory(Arc::new(
+                InMemoryShuffleStore::new(),
+            ))),
+            job_id: "job-dfplan-flight".to_owned(),
+            remote_endpoints: std::collections::HashMap::from([(
+                (stage_key, 3u32),
+                addr.to_string(),
+            )]),
+        };
+        let batches = reader.read_partition(0, 0, 3).await.unwrap();
+        server.abort();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 3);
+    }
+
+    /// Partitions with no remote location read from the local store, where a
+    /// miss is empty by contract (map tasks write every partition, including
+    /// empty ones).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::unwrap_used)]
+    async fn dfplan_reader_local_miss_reads_empty() {
+        let reader = InmemDfplanShuffleReader {
+            store: Arc::new(ShuffleBackend::InMemory(Arc::new(
+                InMemoryShuffleStore::new(),
+            ))),
+            job_id: "job-dfplan-local".to_owned(),
+            remote_endpoints: std::collections::HashMap::new(),
+        };
+        let batches = reader.read_partition(0, 0, 0).await.unwrap();
+        assert!(batches.is_empty());
+    }
+}

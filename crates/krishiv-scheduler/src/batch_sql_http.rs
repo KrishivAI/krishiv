@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::SharedCoordinator;
-use crate::batch_sql::{BatchSqlInlineTable, submit_batch_sql_job};
+use crate::batch_sql::{BatchSqlInlineTable, BatchSqlTable, submit_batch_sql_job_with_paths};
 
 #[derive(Debug, Deserialize)]
 pub struct BatchSqlRequest {
@@ -15,6 +15,12 @@ pub struct BatchSqlRequest {
     /// Data travels in-band so executor pods need no shared filesystem.
     #[serde(default)]
     pub tables: Vec<BatchSqlInlineTable>,
+    /// Input tables as parquet file paths readable by the coordinator and
+    /// every executor (shared filesystem or single-node daemon). Plain
+    /// SELECTs over path tables are eligible for partition-parallel staged
+    /// execution (Phase 52).
+    #[serde(default)]
+    pub table_paths: Vec<BatchSqlTable>,
     #[serde(default)]
     pub is_streaming: bool,
 }
@@ -37,12 +43,18 @@ pub async fn api_batch_sql_submit(
     if body.query.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let job_id = submit_batch_sql_job(&coordinator, &body.query, &body.tables, body.is_streaming)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = ?e, "submit_batch_sql_job failed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let job_id = submit_batch_sql_job_with_paths(
+        &coordinator,
+        &body.query,
+        &body.tables,
+        &body.table_paths,
+        body.is_streaming,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(error = ?e, "submit_batch_sql_job failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     Ok(Json(BatchSqlSubmitResponse {
         job_id: job_id.as_str().to_owned(),
     }))
