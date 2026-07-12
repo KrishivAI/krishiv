@@ -1,5 +1,54 @@
 # Krishiv Implementation Status
 
+## 2026-07-12 — Phase 52 COMPLETE: distributed batch v2 (Legs 5–7 landed in one cycle, whole-phase sweep green)
+
+Closes tasks #191, #192, #174. Commits 75e1ccca (Leg 5), 3cb0f9eb (Leg 6),
+6d1ffce5 (Leg 7), 2478f5c2 (krishiv-python fixes); pushed
+4ab7f203..2478f5c2 to main.
+
+- **#191 partitioned Iceberg writes** (75e1ccca): `PARTITIONED BY
+  (identity | bucket(n,c) | truncate(w,c) | year/month/day/hour(c))` on
+  Iceberg CTAS — real partition spec, per-partition-value fanout using
+  iceberg-rust's own transform functions (spec-exact murmur3), hive-style
+  paths, bounded-memory landing (largest-buffer-first flush). All rewrite
+  paths (DML copy-on-write, overwrite, restore) preserve the spec —
+  previously every rewrite silently recreated tables unpartitioned.
+  Gotcha fixed: string `Datum` Display quotes values → raw
+  `PrimitiveLiteral::String` render for paths.
+- **#192 maintenance v2** (3cb0f9eb): compact_data_files → partition-aware
+  bin-pack (bounded memory, kept files from manifest metadata, no-op ⇒ no
+  commit) under a G3-style conflict check; delete-file tables refused
+  honestly; new `maintain_table` + `CALL system.maintain_table`.
+  Residuals: check-to-swap TOCTOU closes with iceberg 0.10 atomic rewrite
+  (#163); delete-file compaction converges #163/#171.
+- **Leg 7** (6d1ffce5): daemon staged submission (`table_paths` on
+  POST /api/v1/batch-sql/submit; staged plans pin parquet scans into
+  `dfplan:v1:` bodies; inline IPC keeps single-task fallback), dfplan
+  flight-fetch tests, chaos tests both directions (map-executor loss ⇒
+  invalidation + re-run; reduce `MissingShufflePartition` ⇒ producers
+  re-queued; contract: only non-empty flight endpoints are invalidatable),
+  TPC-H **SF10 staged-vs-inline byte-identity** green
+  (`staged_tpch_q1_matches_inline_at_scale`, 15.5 s).
+- **Whole-phase sweep** (new process: all legs at once, one sweep):
+  full-workspace `cargo test --no-fail-fast` green after fixing what it
+  surfaced — `KRISHIV_TPCH_DATA_DIR` reused instead of minting an
+  undeclared flag (env-registry gate), and two pre-existing
+  krishiv-python breaks (2478f5c2, CI blindspot): stale SUM-is-Float64
+  assertion (SUM(Int64) is Int64) + 13 Python doc snippets compiled as
+  Rust doc-tests → ```python fences. `just lint` green after
+  indexing_slicing fixes in the new fanout/compaction/clause-scanner
+  code. Lakehouse 196, sql ctas/maintain 8, scheduler batch_sql 4,
+  python 49 — all green.
+- **Exit-gate honesty**: 3-node TPC-H run stays blocked(hardware) (G4
+  precedent); achievable evidence = staged in-process path (stage_count
+  > 1), flight fetch, chaos both directions, SF10 identity, corpus
+  distributed placement (scalar tier).
+
+Validation: `cargo test --workspace --no-fail-fast` · `just lint` ·
+`cargo test -p krishiv-python` · `KRISHIV_TPCH_DATA_DIR=… cargo test -p
+krishiv-runtime --release -- --ignored staged_tpch_q1`.
+Next: Phase 53 scheduler v2 (#175 + #199 control-plane fixes).
+
 ## 2026-07-11 (leg 3) — Phase 51 COMPLETE: benchmark yardstick recorded; engine tax = 4.5–8.9× (root-caused)
 
 Final Phase 51 leg (task #173 closes with this entry). Baselines recorded in
