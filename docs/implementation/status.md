@@ -1,5 +1,79 @@
 # Krishiv Implementation Status
 
+## 2026-07-12 (leg 3) — Phase 54 COMPLETE: AQE + statistics (all legs in one cycle)
+
+Closes task #176. Commits ca866d9b (dfplan partition-spec grammar),
+e3e2188d (scheduler AQE rewrites + stage-demotion fix), 0ac83a07
+(ANALYZE + stats + runtime filters), 9f44d9e9 (flags + corpus dual-run);
+pushed cfef243a..9f44d9e9 to main.
+
+- **Partition coalescing (real path)**: at ShuffleMap-stage success the
+  coordinator groups small reduce partitions by measured
+  `ShufflePartitionOutput` bytes (target 64 MiB,
+  `KRISHIV_AQE_TARGET_PARTITION_BYTES`) and rewrites the Result stage's
+  unlaunched dfplan tasks to multi-partition bodies
+  (`dfplan:v1:0,1:<b64>`), removing surplus tasks. Proven: coordinator
+  test 4→2 tasks + launch; execution-equality test (coalesced union ==
+  per-partition union); the Phase 52 staged runtime tests now run WITH
+  coalescing live and stay green.
+- **Skew split GA**: a partition ≥ factor×median (and ≥ min bytes) splits
+  into map-task-range sub-tasks (`dfplan:v1:5/s0m2-4:<b64>`) over its
+  dominant upstream — Spark's OptimizeSkewedJoin shape. Gated on a
+  structural split-safety proof of the decoded plan (ShuffleRead /
+  Projection / Filter / CoalesceBatches / INNER HashJoin only; blocking
+  ops and undecodable payloads fail closed — tested). Split-vs-unsplit
+  execution equality proven per partition on a partitioned inner join.
+  Every decision → adaptive decision log (`partition-coalesce`,
+  `skew-split`) + `krishiv_aqe_*` metrics.
+- **Statistics**: `ANALYZE TABLE <ref> [FOR COLUMNS (…)]` (one scan:
+  COUNT(*) + approx-NDV/min/max/null-count) feeds `table_row_counts`
+  (BroadcastAutoRule) + new process-global `TableStatsRegistry` with
+  per-column stats; Iceberg CTAS/DELETE auto-feed row counts. The
+  registry finally has consumers: `default_aqe_optimizer_with_stats`
+  (CboCostModel) at both coordinator AQE call sites.
+- **Runtime filters**: DataFusion 54 native dynamic-filter pushdown wired
+  behind `KRISHIV_RUNTIME_FILTERS` (default on). Gotcha: DF's master
+  switch does NOT suppress the per-operator options when false — the off
+  path must clear all four (verified empirically). Exit-gate evidence:
+  3-key star join over 10 000-row/100-row-group fact scans **100 rows
+  with filters on vs 10 000 off**, identical results.
+- **Bug found + fixed** (e3e2188d): `apply_assignments` stomped every
+  stage to `Scheduling`, including Succeeded upstreams — any post-success
+  assignment (Phase 53 eager backlog drain, retries) permanently wedged
+  downstream launches on the upstream-ready check. Now only stages that
+  received an assignment move, never out of terminal states.
+- **Corpus dual-run**: dedicated test binary replays the embedded corpus
+  with runtime filters off (own process; programmatic override because
+  set_var is unsafe under edition 2024); AQE off-switch covered by
+  coordinator tests (off ⇒ zero rewrites ⇒ Phase 52 semantics).
+- Exit-gate honesty: coalescing reduce-task reduction PROVEN; runtime
+  filter probe pruning PROVEN; corpus green on+off PROVEN; skew-split
+  mechanism + result-identity proven, but the "hot key ≥50% without
+  straggler domination" wall-clock demonstration needs a multi-node
+  cluster — blocked(hardware), G4 precedent.
+- Residuals / deliberate deviations: (1) dynamic join strategy at dfplan
+  stage boundary NOT implemented — the stage cut is static; promote/demote
+  needs re-cutting remaining stages at the boundary (design noted;
+  planning-time broadcast uses DF-native stats + ANALYZE-fed
+  BroadcastAutoRule). (2) `SaltedHashPartitioner` stays unwired by
+  DECISION: write-side salting needs hot-key foreknowledge + downstream
+  merge-metadata plumbing; the reactive map-range split achieves the same
+  straggler elimination from measured sizes with no wire changes — salting
+  remains the tool for pre-known hot keys (Phase 55+ streaming feed).
+  (3) Coalesce/skew restricted to Result-kind stages (rewriting a
+  ShuffleMap stage breaks the s{i}.m{t} sub-stage-key wire contract) —
+  multi-level interior stages keep builder parallelism. (4) Distributed
+  cross-stage runtime filters + Iceberg partition-level DPP: needs
+  min/max key reporting in shuffle outputs + probe-launch gating (#158
+  seam) — residual. (5) INSERT INTO auto-stats and Iceberg-persisted
+  ANALYZE stats (registry is process-local) — residual.
+
+Validation: `cargo test --workspace --no-fail-fast` (4 446 passed / 0
+failed, 85 targets) · `just lint` green (one fix: deprecated
+`CoalesceBatchesExec` type match → name match) · `cargo test -p
+krishiv-conformance --test corpus_dual_run` · `cargo check -p
+krishiv-python --all-targets`. Next: Phase 55 (#177, #195) — streaming v2.
+
 ## 2026-07-12 (leg 2) — Phase 53 COMPLETE: scheduler v2 (all legs in one cycle)
 
 Closes tasks #175 + #199. Commits aa7a4007 (rack_id locality identity)
