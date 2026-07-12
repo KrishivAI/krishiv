@@ -1,12 +1,13 @@
 //! Iceberg table maintenance operations (Phase J6).
 //!
-//! Three maintenance procedures:
+//! Maintenance procedures:
 //!
 //! | Procedure | SQL CALL | Effect |
 //! |-----------|----------|--------|
 //! | `expire_snapshots` | `CALL system.expire_snapshots('ns.tbl', '7 days', 5)` | Remove old snapshots and their orphaned files |
 //! | `remove_orphan_files` | `CALL system.remove_orphan_files('ns.tbl', '1 day')` | Delete data files not in any live snapshot |
-//! | `compact_data_files` | `CALL system.compact_data_files('ns.tbl', 134217728)` | Merge small Parquet files into larger ones |
+//! | `compact_data_files` | `CALL system.compact_data_files('ns.tbl', 134217728)` | Bin-pack small Parquet files per partition |
+//! | `maintain_table` | `CALL system.maintain_table('ns.tbl', '7 days')` | Compact, then expire, then remove orphans |
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -331,27 +332,72 @@ pub async fn remove_orphan_files(
 
 // ── compact_data_files ────────────────────────────────────────────────────────
 
-/// Merge small Parquet files into a single larger file to improve query performance.
+/// Read every batch of one Parquet data file via parquet 58.x (avoids the
+/// iceberg-datafusion DataFusion version conflict).
+async fn read_parquet_file(
+    file_io: &iceberg::io::FileIO,
+    path: &str,
+) -> Result<Vec<arrow::array::RecordBatch>, LakehouseError> {
+    let input = file_io
+        .new_input(path)
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+    let bytes = input
+        .read()
+        .await
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .map_err(|e| LakehouseError::Io(e.to_string()))?
+        .build()
+        .map_err(|e| LakehouseError::Io(e.to_string()))?;
+    reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| LakehouseError::Io(e.to_string()))
+}
+
+/// Compact small Parquet data files into larger ones, partition by partition.
 ///
-/// Reads all Parquet files via iceberg `plan_files()` + parquet 58.x reader
-/// (avoids iceberg-datafusion DataFusion version conflict). Returns the number
-/// of files rewritten (0 if no data, 1 if compaction occurred).
+/// Files are bin-packed within their partition value: files smaller than
+/// `target_file_size_bytes` are grouped into bins of roughly the target size
+/// and each bin is rewritten as one Parquet file. Memory stays bounded — one
+/// bin (~target size) is read at a time. Files already at or above the
+/// target, and lone small files with nothing to merge with, are carried over
+/// untouched.
+///
+/// The metadata swap is drop+recreate preserving the partition spec
+/// (iceberg-rust 0.9.1 exposes no public rewrite/replace snapshot action;
+/// a true atomic rewrite commit lands with the 0.10 bump, task #163),
+/// guarded by a G3-style conflict check: immediately before the swap the
+/// table is reloaded, and if any snapshot was committed after planning the
+/// compaction aborts (cleaning up its part files) instead of silently
+/// discarding the concurrent writer's commit.
+///
+/// Returns the number of newly written (compacted) data files; 0 when there
+/// is nothing to compact, in which case the table is left untouched.
 pub async fn compact_data_files(
     catalog: Arc<dyn Catalog + Send + Sync>,
     table_ident: &TableIdent,
     target_file_size_bytes: u64,
 ) -> Result<usize, LakehouseError> {
+    use crate::lakehouse::dml::{PendingPart, fanout_into_buffers, write_ctas_part};
+    use crate::lakehouse::partitioned_write::{PartitionFanout, transforms_from_metadata};
+    use iceberg::TableCreation;
+    use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+
     let table = catalog
         .load_table(table_ident)
         .await
         .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
 
     // Nothing to compact if table is empty.
-    if table.metadata().current_snapshot().is_none() {
+    let Some(planned_snapshot) = table.metadata().current_snapshot().map(|s| s.snapshot_id())
+    else {
         return Ok(0);
-    }
+    };
 
-    // Enumerate Parquet files via iceberg scan plan (avoids arrow 57/58 mismatch).
+    // Enumerate data files via the iceberg scan plan (avoids arrow 57/58
+    // mismatch); the manifest entries carry size, row count and partition.
     let scan = table
         .scan()
         .build()
@@ -360,55 +406,300 @@ pub async fn compact_data_files(
         .plan_files()
         .await
         .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
-
     let tasks: Vec<iceberg::scan::FileScanTask> = task_stream
         .try_collect()
         .await
         .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
-
     if tasks.is_empty() {
         return Ok(0);
     }
 
-    let file_io = table.file_io().clone();
-
-    // Read all Parquet files using parquet 58.x (arrow 58.x RecordBatch).
-    let mut all_batches: Vec<arrow::array::RecordBatch> = Vec::new();
-    for task in &tasks {
-        let path = task.data_file_path();
-        let input = file_io
-            .new_input(path)
-            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
-        let bytes = input
-            .read()
-            .await
-            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
-
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
-            .map_err(|e| LakehouseError::Io(e.to_string()))?
-            .build()
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
-        for batch in reader {
-            all_batches.push(batch.map_err(|e| LakehouseError::Io(e.to_string()))?);
-        }
+    // This engine's writers never produce delete files today; refuse rather
+    // than silently drop deletes a foreign writer may have committed.
+    if tasks.iter().any(|t| !t.deletes.is_empty()) {
+        return Err(LakehouseError::Iceberg(format!(
+            "compact_data_files: {table_ident} has delete files; compaction over delete files \
+             is not supported yet"
+        )));
     }
 
-    let total_rows: usize = all_batches.iter().map(|b| b.num_rows()).sum();
-    if total_rows == 0 {
+    // Group files by partition value, then bin-pack the small ones within
+    // each partition. A file without a manifest row count cannot be carried
+    // over (its DataFile descriptor needs the count), so it is always
+    // rewritten.
+    let mut groups: std::collections::BTreeMap<String, Vec<&iceberg::scan::FileScanTask>> =
+        std::collections::BTreeMap::new();
+    for task in &tasks {
+        let key = format!("{:?}", task.partition);
+        groups.entry(key).or_default().push(task);
+    }
+
+    let mut bins: Vec<Vec<&iceberg::scan::FileScanTask>> = Vec::new();
+    let mut kept: Vec<&iceberg::scan::FileScanTask> = Vec::new();
+    for (_, mut files) in groups {
+        files.sort_by_key(|t| t.file_size_in_bytes);
+        let mut bin: Vec<&iceberg::scan::FileScanTask> = Vec::new();
+        let mut bin_bytes = 0u64;
+        for task in files {
+            if task.file_size_in_bytes >= target_file_size_bytes && task.record_count.is_some() {
+                kept.push(task);
+                continue;
+            }
+            bin_bytes += task.file_size_in_bytes.max(1);
+            bin.push(task);
+            if bin_bytes >= target_file_size_bytes {
+                bins.push(std::mem::take(&mut bin));
+                bin_bytes = 0;
+            }
+        }
+        if !bin.is_empty() {
+            bins.push(bin);
+        }
+    }
+    // A one-file bin with a known row count gains nothing from a rewrite.
+    bins.retain(|bin| match bin.as_slice() {
+        [only] if only.record_count.is_some() => {
+            kept.push(only);
+            false
+        }
+        _ => true,
+    });
+    if bins.is_empty() {
         return Ok(0);
     }
 
-    // Rewrite all data into a single file via drop+recreate overwrite.
-    let _ = crate::lakehouse::dml::overwrite_table_pub(catalog, table_ident, all_batches).await?;
+    let file_io = table.file_io().clone();
+    let table_location = table.metadata().location().to_string();
+    let iceberg_schema = table.metadata().current_schema().clone();
+    let partition_by = transforms_from_metadata(table.metadata())?;
+    let unbound_spec = if partition_by.is_empty() {
+        None
+    } else {
+        Some(
+            table
+                .metadata()
+                .default_partition_spec()
+                .as_ref()
+                .clone()
+                .into_unbound(),
+        )
+    };
+
+    // Rewrite each bin into (normally) one part per partition value, one bin
+    // in memory at a time. The fanout re-derives partition values from the
+    // rows, so a file whose contents disagree with its manifest partition is
+    // corrected rather than propagated.
+    let mut pending: Vec<PendingPart> = Vec::new();
+    let mut replaced: Vec<String> = Vec::new();
+    for bin in &bins {
+        let mut buffers = std::collections::BTreeMap::new();
+        let mut fanout: Option<PartitionFanout> = None;
+        for task in bin {
+            let batches = read_parquet_file(&file_io, task.data_file_path()).await?;
+            for batch in &batches {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let f = match &fanout {
+                    Some(f) => f,
+                    None => fanout.get_or_insert(PartitionFanout::try_new(
+                        batch.schema().as_ref(),
+                        &partition_by,
+                    )?),
+                };
+                fanout_into_buffers(f, batch, &mut buffers)?;
+            }
+            replaced.push(task.data_file_path().to_string());
+        }
+        for (_, buf) in buffers {
+            pending.push(
+                write_ctas_part(
+                    &file_io,
+                    &table_location,
+                    &buf.path,
+                    buf.partition,
+                    buf.batches,
+                )
+                .await?,
+            );
+        }
+    }
+
+    // G3-style conflict check: abort (and clean up our parts) if anything
+    // committed since planning. A small window remains between this check
+    // and the drop below — closing it needs the 0.10 atomic rewrite (#163).
+    let current = catalog
+        .load_table(table_ident)
+        .await
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+    let now_snapshot = current
+        .metadata()
+        .current_snapshot()
+        .map(|s| s.snapshot_id());
+    if now_snapshot != Some(planned_snapshot) {
+        for part in &pending {
+            if let Err(e) = file_io.delete(&part.dest).await {
+                tracing::warn!(path = %part.dest, error = %e,
+                    "compact_data_files: failed to clean up part after conflict abort");
+            }
+        }
+        return Err(LakehouseError::Iceberg(format!(
+            "compact_data_files: concurrent commit detected on {table_ident} \
+             (snapshot {planned_snapshot} -> {now_snapshot:?}); compaction aborted, retry later"
+        )));
+    }
+
+    // Metadata swap: drop + recreate at the same location with the same
+    // schema and partition spec, then commit kept + compacted files.
+    catalog
+        .drop_table(table_ident)
+        .await
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+    let creation = || {
+        TableCreation::builder()
+            .name(table_ident.name().to_string())
+            .schema((*iceberg_schema).clone())
+            .partition_spec_opt(unbound_spec.clone())
+            .location(table_location.clone())
+            .build()
+    };
+    let new_table = match catalog
+        .create_table(table_ident.namespace(), creation())
+        .await
+    {
+        Ok(t) => t,
+        Err(create_err) => {
+            if let Err(restore_err) = catalog
+                .create_table(table_ident.namespace(), creation())
+                .await
+            {
+                tracing::error!(
+                    table = %table_ident,
+                    create_error = %create_err,
+                    restore_error = %restore_err,
+                    "CRITICAL: table is invisible after failed compaction swap and restore \
+                     attempt; manual intervention required"
+                );
+            }
+            return Err(LakehouseError::Iceberg(create_err.to_string()));
+        }
+    };
+
+    let spec_id = new_table.metadata().default_partition_spec_id();
+    let mut data_files = Vec::with_capacity(kept.len() + pending.len());
+    for task in &kept {
+        let record_count = task.record_count.ok_or_else(|| {
+            LakehouseError::Iceberg(format!(
+                "compact_data_files: kept file {} lost its record count",
+                task.data_file_path()
+            ))
+        })?;
+        data_files.push(
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(task.data_file_path().to_string())
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(task.file_size_in_bytes)
+                .record_count(record_count)
+                .partition(task.partition.clone().unwrap_or_else(Struct::empty))
+                .partition_spec_id(spec_id)
+                .build()
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?,
+        );
+    }
+    let compacted = pending.len();
+    for part in pending {
+        data_files.push(part.into_data_file(spec_id)?);
+    }
+
+    let tx = Transaction::new(&new_table);
+    let action = tx.fast_append().add_data_files(data_files);
+    let tx = action
+        .apply(tx)
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+    let committed = tx
+        .commit(&*catalog)
+        .await
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+
+    // Keep the local-FS version hint current so the compaction survives a
+    // restart (CONN-4).
+    if let Some(loc) = committed.metadata_location() {
+        let table_root = std::path::Path::new(table_location.trim_start_matches("file://"));
+        if let Err(e) = super::iceberg_native::native::write_version_hint(table_root, loc) {
+            tracing::warn!(
+                table = %table_ident,
+                location = loc,
+                error = %e,
+                "version hint update failed after compaction commit; hint may be stale"
+            );
+        }
+    }
+
+    // The new snapshot no longer references the rewritten files: delete them
+    // (best effort — a failed delete only leaves an orphan).
+    let mut removed = 0usize;
+    for path in &replaced {
+        match file_io.delete(path).await {
+            Ok(()) => removed += 1,
+            Err(e) => {
+                tracing::warn!(table = %table_ident, path, error = %e,
+                    "compact_data_files: failed to delete rewritten file (orphaned)");
+            }
+        }
+    }
 
     tracing::info!(
         table = %table_ident,
         target_bytes = target_file_size_bytes,
-        "compact_data_files: rewrote table into single file"
+        rewritten = replaced.len(),
+        removed,
+        compacted,
+        kept = kept.len(),
+        "compact_data_files: bin-packed small files per partition"
     );
 
-    Ok(1)
+    Ok(compacted)
+}
+
+// ── maintain_table ────────────────────────────────────────────────────────────
+
+/// Outcome of one [`maintain_table`] run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceReport {
+    /// Newly written compacted data files.
+    pub compacted_files: usize,
+    /// Snapshots removed from the table history.
+    pub expired_snapshots: usize,
+    /// Orphaned files deleted from storage.
+    pub removed_orphans: usize,
+}
+
+/// One-call table maintenance, in the order that lets each step feed the
+/// next: compact small files (commits a new snapshot), expire old snapshots
+/// (frees the pre-compaction history), then remove orphaned files.
+///
+/// This is the schedulable entry point — `CALL system.maintain_table(…)` —
+/// for platform-driven periodic maintenance jobs. Errors propagate (nothing
+/// is swallowed); a compaction conflict with a concurrent writer surfaces as
+/// an error and the scheduler simply retries on its next tick.
+pub async fn maintain_table(
+    catalog: Arc<dyn Catalog + Send + Sync>,
+    table_ident: &TableIdent,
+    target_file_size_bytes: u64,
+    older_than: Duration,
+    retain_last: usize,
+) -> Result<MaintenanceReport, LakehouseError> {
+    let compacted_files =
+        compact_data_files(Arc::clone(&catalog), table_ident, target_file_size_bytes).await?;
+    let expired_snapshots =
+        expire_snapshots(Arc::clone(&catalog), table_ident, older_than, retain_last).await?;
+    let removed_orphans = remove_orphan_files(catalog, table_ident, older_than).await?;
+    Ok(MaintenanceReport {
+        compacted_files,
+        expired_snapshots,
+        removed_orphans,
+    })
 }
 
 #[cfg(test)]
@@ -478,5 +769,149 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(removed, 0, "fresh table has no orphan files");
+    }
+
+    #[tokio::test]
+    async fn compact_fresh_table_returns_zero() {
+        let (catalog, ident, _dir) = empty_catalog_table().await;
+        let compacted = compact_data_files(catalog, &ident, 128 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(compacted, 0, "fresh table has nothing to compact");
+    }
+
+    #[tokio::test]
+    async fn compact_bin_packs_small_files_per_partition() {
+        use crate::lakehouse::dml::land_ctas_with_target;
+        use crate::lakehouse::partitioned_write::parse_partition_transform;
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+
+        let dir = tempfile::tempdir().unwrap();
+        let warehouse = url::Url::from_file_path(dir.path()).unwrap().to_string();
+        let catalog: Arc<dyn Catalog + Send + Sync> = Arc::new(
+            MemoryCatalogBuilder::default()
+                .with_storage_factory(Arc::new(LocalFsStorageFactory))
+                .load(
+                    "mem",
+                    HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
+                )
+                .await
+                .unwrap(),
+        );
+        let ident = TableIdent::new(NamespaceIdent::new("ns".into()), "part_compact".into());
+
+        // Two stream batches + a 1-byte roll threshold ⇒ every batch flushes
+        // per partition: 4 small files (2 per region).
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        let make_batch = |ids: &[i64], regions: &[&str]| {
+            arrow::array::RecordBatch::try_new(
+                Arc::clone(&arrow_schema),
+                vec![
+                    Arc::new(Int64Array::from(ids.to_vec())),
+                    Arc::new(StringArray::from(regions.to_vec())),
+                ],
+            )
+            .unwrap()
+        };
+        let batches = vec![
+            make_batch(&[1, 2], &["eu", "us"]),
+            make_batch(&[3, 4, 5], &["eu", "us", "eu"]),
+        ];
+        let ctx = SessionContext::new();
+        let mem = MemTable::try_new(Arc::clone(&arrow_schema), vec![batches]).unwrap();
+        let stream = ctx
+            .read_table(Arc::new(mem))
+            .unwrap()
+            .execute_stream()
+            .await
+            .unwrap();
+        let partition_by = vec![parse_partition_transform("region").unwrap()];
+        let report = land_ctas_with_target(
+            Arc::clone(&catalog),
+            &ident,
+            false,
+            &partition_by,
+            stream,
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.rows, 5);
+        assert_eq!(report.data_files, 4, "two small files per region");
+
+        // Compaction merges each region's files into one, keeping the spec.
+        let compacted = compact_data_files(Arc::clone(&catalog), &ident, 128 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(compacted, 2, "one merged file per region");
+
+        let table = catalog.load_table(&ident).await.unwrap();
+        let spec = table.metadata().default_partition_spec();
+        assert_eq!(spec.fields().len(), 1, "compaction must preserve the spec");
+        assert_eq!(spec.fields()[0].name, "region");
+
+        let tasks: Vec<iceberg::scan::FileScanTask> = table
+            .scan()
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 2);
+        let mut rows = 0usize;
+        for task in &tasks {
+            assert!(
+                task.data_file_path().contains("region="),
+                "path: {}",
+                task.data_file_path()
+            );
+            let batches = read_parquet_file(table.file_io(), task.data_file_path())
+                .await
+                .unwrap();
+            rows += batches.iter().map(|b| b.num_rows()).sum::<usize>();
+        }
+        assert_eq!(rows, 5, "compaction must not lose rows");
+
+        // Already compact: a second run is a no-op that commits nothing.
+        let snapshot_before = table.metadata().current_snapshot().unwrap().snapshot_id();
+        let again = compact_data_files(Arc::clone(&catalog), &ident, 128 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(again, 0, "nothing left to merge");
+        let reloaded = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(
+            reloaded
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .snapshot_id(),
+            snapshot_before,
+            "no-op compaction must not commit a new snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintain_table_fresh_table_reports_all_zero() {
+        let (catalog, ident, _dir) = empty_catalog_table().await;
+        let report = maintain_table(catalog, &ident, 128 * 1024 * 1024, Duration::days(7), 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            MaintenanceReport {
+                compacted_files: 0,
+                expired_snapshots: 0,
+                removed_orphans: 0
+            }
+        );
     }
 }
