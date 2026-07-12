@@ -6,12 +6,24 @@
 //! module owns the `dfplan:` body kind — encoding on the coordinator (stage
 //! builder) and decoding on the executor.
 //!
-//! Body format: `dfplan:v1:<partition>:<base64(plan proto bytes)>` where
-//! `<partition>` is the output partition of the decoded plan this task
-//! executes (task-per-partition). The `v1` segment is independent of the
-//! envelope version so plan-proto evolution (e.g. a DataFusion upgrade that
-//! changes the proto) is detected explicitly instead of failing deep inside
-//! prost decoding.
+//! Body format: `dfplan:v1:<partspec>:<base64(plan proto bytes)>` where
+//! `<partspec>` names the output partition(s) of the decoded plan this task
+//! executes. The stage builder emits one partition per task
+//! (`dfplan:v1:3:<b64>`); Phase 54 AQE rewrites extend the grammar:
+//!
+//! - **Coalescing**: `dfplan:v1:1,4,7:<b64>` — the task executes each listed
+//!   root partition and concatenates the streams. Correct for any plan
+//!   shape: root partitions are independent (each is a complete hash
+//!   group), so the union of a task group's outputs equals the union the
+//!   original one-task-per-partition layout would produce.
+//! - **Skew split**: `dfplan:v1:5/s0m2-4:<b64>` — the task executes root
+//!   partition 5 but, for upstream stage 0, reads only map tasks `[2, 4)`.
+//!   Splitting is only correct when nothing above the shuffle read blocks
+//!   on seeing the whole partition (see [`dfplan_body_is_split_safe`]).
+//!
+//! The `v1` segment is independent of the envelope version so plan-proto
+//! evolution (e.g. a DataFusion upgrade that changes the proto) is detected
+//! explicitly instead of failing deep inside prost decoding.
 //!
 //! # Stage building
 //!
@@ -117,13 +129,74 @@ pub fn encode_dfplan_bytes(
         })
 }
 
+/// Restriction of a task's shuffle reads to a subrange of one upstream
+/// stage's map tasks (Phase 54 skew split).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DfplanMapRange {
+    /// Builder index of the upstream stage whose reads are restricted.
+    pub upstream_stage_index: usize,
+    /// First map-task index read (inclusive).
+    pub start: usize,
+    /// One past the last map-task index read (exclusive).
+    pub end: usize,
+}
+
+/// Parsed partition assignment of a `dfplan:v1:` task body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DfplanTaskSpec {
+    /// Root output partitions this task executes (non-empty, in order).
+    pub partitions: Vec<usize>,
+    /// Optional skew-split map-task restriction.
+    pub map_range: Option<DfplanMapRange>,
+}
+
+impl DfplanTaskSpec {
+    /// Single-partition spec (the stage builder's default shape).
+    pub fn single(partition: usize) -> Self {
+        Self {
+            partitions: vec![partition],
+            map_range: None,
+        }
+    }
+
+    /// Render the partition segment of the body grammar.
+    fn render(&self) -> String {
+        let mut out = self
+            .partitions
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        if let Some(range) = &self.map_range {
+            out.push_str(&format!(
+                "/s{}m{}-{}",
+                range.upstream_stage_index, range.start, range.end
+            ));
+        }
+        out
+    }
+}
+
 /// Assemble the per-task fragment body: `dfplan:v1:<partition>:<b64>`.
 pub fn dfplan_task_body(plan_bytes_b64: &str, partition: usize) -> String {
     format!("{DFPLAN_BODY_PREFIX}{partition}:{plan_bytes_b64}")
 }
 
-/// Split a `dfplan:v1:` body into (partition index, plan proto bytes).
-pub fn parse_dfplan_body(body: &str) -> SqlResult<(usize, Vec<u8>)> {
+/// Assemble a fragment body executing several root partitions (coalescing).
+pub fn dfplan_task_body_for_spec(plan_bytes_b64: &str, spec: &DfplanTaskSpec) -> String {
+    format!("{DFPLAN_BODY_PREFIX}{}:{plan_bytes_b64}", spec.render())
+}
+
+/// Rewrite an existing dfplan body to a new partition spec, preserving the
+/// encoded plan bytes verbatim (no proto decode — coordinator-side AQE
+/// rewrites reuse the b64 payload untouched).
+pub fn dfplan_body_with_spec(body: &str, spec: &DfplanTaskSpec) -> SqlResult<String> {
+    let (_, b64) = split_dfplan_body(body)?;
+    Ok(format!("{DFPLAN_BODY_PREFIX}{}:{b64}", spec.render()))
+}
+
+/// Split a body into its raw (partition segment, b64 payload) halves.
+fn split_dfplan_body(body: &str) -> SqlResult<(&str, &str)> {
     let rest = body
         .strip_prefix(DFPLAN_BODY_PREFIX)
         .ok_or_else(|| SqlError::DataFusion {
@@ -132,24 +205,87 @@ pub fn parse_dfplan_body(body: &str) -> SqlResult<(usize, Vec<u8>)> {
                 body.chars().take(48).collect::<String>()
             ),
         })?;
-    let (partition, b64) = rest.split_once(':').ok_or_else(|| SqlError::DataFusion {
+    rest.split_once(':').ok_or_else(|| SqlError::DataFusion {
         message: String::from("dfplan body missing partition segment"),
-    })?;
-    let partition = partition
-        .trim()
-        .parse::<usize>()
-        .map_err(|e| SqlError::DataFusion {
-            message: format!("dfplan partition index: {e}"),
-        })?;
+    })
+}
+
+fn parse_partition_segment(segment: &str) -> SqlResult<DfplanTaskSpec> {
+    let (list, range) = match segment.split_once('/') {
+        Some((list, range_str)) => {
+            // `/s<stage>m<start>-<end>`
+            let rest = range_str
+                .strip_prefix('s')
+                .ok_or_else(|| SqlError::DataFusion {
+                    message: format!("dfplan map range missing 's' prefix: {range_str}"),
+                })?;
+            let (stage, span) = rest.split_once('m').ok_or_else(|| SqlError::DataFusion {
+                message: format!("dfplan map range missing 'm' separator: {range_str}"),
+            })?;
+            let (start, end) = span.split_once('-').ok_or_else(|| SqlError::DataFusion {
+                message: format!("dfplan map range missing '-' separator: {range_str}"),
+            })?;
+            let parse = |s: &str, what: &str| {
+                s.trim().parse::<usize>().map_err(|e| SqlError::DataFusion {
+                    message: format!("dfplan map range {what}: {e}"),
+                })
+            };
+            let range = DfplanMapRange {
+                upstream_stage_index: parse(stage, "stage")?,
+                start: parse(start, "start")?,
+                end: parse(end, "end")?,
+            };
+            if range.start >= range.end {
+                return Err(SqlError::DataFusion {
+                    message: format!(
+                        "dfplan map range is empty: m{}-{}",
+                        range.start, range.end
+                    ),
+                });
+            }
+            (list, Some(range))
+        }
+        None => (segment, None),
+    };
+    let partitions = list
+        .split(',')
+        .map(|p| {
+            p.trim().parse::<usize>().map_err(|e| SqlError::DataFusion {
+                message: format!("dfplan partition index: {e}"),
+            })
+        })
+        .collect::<SqlResult<Vec<_>>>()?;
+    if partitions.is_empty() {
+        return Err(SqlError::DataFusion {
+            message: String::from("dfplan body has no partitions"),
+        });
+    }
+    Ok(DfplanTaskSpec {
+        partitions,
+        map_range: range,
+    })
+}
+
+/// Parse the partition spec of a body without decoding the plan payload
+/// (cheap coordinator-side inspection).
+pub fn dfplan_body_partition_spec(body: &str) -> SqlResult<DfplanTaskSpec> {
+    let (segment, _) = split_dfplan_body(body)?;
+    parse_partition_segment(segment)
+}
+
+/// Split a `dfplan:v1:` body into (partition spec, plan proto bytes).
+pub fn parse_dfplan_body(body: &str) -> SqlResult<(DfplanTaskSpec, Vec<u8>)> {
+    let (segment, b64) = split_dfplan_body(body)?;
+    let spec = parse_partition_segment(segment)?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.as_bytes())
         .map_err(|e| SqlError::DataFusion {
             message: format!("dfplan base64 decode: {e}"),
         })?;
-    Ok((partition, bytes))
+    Ok((spec, bytes))
 }
 
-/// Decode a `dfplan:v1:` fragment body into (partition index, plan).
+/// Decode a `dfplan:v1:` fragment body into (partition spec, plan).
 ///
 /// `ctx` supplies the runtime environment (object stores, UDFs) the decoded
 /// plan executes under; it does not need the original tables registered —
@@ -158,15 +294,15 @@ pub fn decode_dfplan_task(
     body: &str,
     ctx: &TaskContext,
     codec: &dyn PhysicalExtensionCodec,
-) -> SqlResult<(usize, Arc<dyn ExecutionPlan>)> {
-    let (partition, bytes) = parse_dfplan_body(body)?;
+) -> SqlResult<(DfplanTaskSpec, Arc<dyn ExecutionPlan>)> {
+    let (spec, bytes) = parse_dfplan_body(body)?;
     let plan =
         datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec(&bytes, ctx, codec)
             .map_err(|e| SqlError::DataFusion {
                 message: format!("physical plan proto decode: {e}"),
             })?;
     let plan = pin_file_scans_to_partitions(plan)?;
-    Ok((partition, plan))
+    Ok((spec, plan))
 }
 
 /// Force strict file-group↔partition binding on every file scan.
@@ -225,31 +361,115 @@ pub fn execute_dfplan_body(
     session: &SessionContext,
     reader: Option<Arc<dyn ShufflePartitionReader>>,
 ) -> SqlResult<(SchemaRef, crate::SqlStream)> {
+    // Peek the spec first: a skew-split map range wraps the reader BEFORE
+    // codec construction so every ShuffleReadExec decoded from this body
+    // sees the restricted view.
+    let spec_peek = dfplan_body_partition_spec(body)?;
+    let reader = match (&spec_peek.map_range, reader) {
+        (Some(range), Some(inner)) => Some(Arc::new(MapRangeShuffleReader {
+            inner,
+            range: range.clone(),
+        }) as Arc<dyn ShufflePartitionReader>),
+        (_, reader) => reader,
+    };
     let codec = match reader {
         Some(reader) => KrishivPhysicalCodec::executor(reader),
         None => KrishivPhysicalCodec::coordinator(),
     };
     let task_ctx = session.task_ctx();
-    let (partition, plan) = decode_dfplan_task(body, &task_ctx, &codec)?;
+    let (spec, plan) = decode_dfplan_task(body, &task_ctx, &codec)?;
     let partition_count = plan.output_partitioning().partition_count();
-    if partition >= partition_count {
+    if let Some(&bad) = spec.partitions.iter().find(|&&p| p >= partition_count) {
         return Err(SqlError::DataFusion {
             message: format!(
-                "dfplan partition {partition} out of range: decoded plan has \
+                "dfplan partition {bad} out of range: decoded plan has \
                  {partition_count} partitions"
             ),
         });
     }
     let schema = plan.schema();
-    let stream = plan
-        .execute(partition, task_ctx)
-        .map_err(|e| SqlError::DataFusion {
-            message: format!("dfplan execute (partition {partition}): {e}"),
-        })?;
-    let stream = stream.map_err(|e| SqlError::DataFusion {
-        message: e.to_string(),
-    });
-    Ok((schema, Box::pin(stream)))
+    // Execute each listed root partition and chain the streams. Root
+    // partitions are independent hash groups, so concatenation is exactly
+    // the union the original one-task-per-partition layout produces.
+    let mut streams = Vec::with_capacity(spec.partitions.len());
+    for &partition in &spec.partitions {
+        let stream = plan
+            .execute(partition, Arc::clone(&task_ctx))
+            .map_err(|e| SqlError::DataFusion {
+                message: format!("dfplan execute (partition {partition}): {e}"),
+            })?;
+        streams.push(stream.map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        }));
+    }
+    let chained = futures::stream::iter(streams).flatten();
+    Ok((schema, Box::pin(chained)))
+}
+
+/// Reader wrapper implementing the skew-split map-task restriction: reads
+/// of the restricted upstream stage outside `[start, end)` return empty
+/// (those map tasks belong to sibling split tasks); every other read passes
+/// through untouched.
+#[derive(Debug)]
+struct MapRangeShuffleReader {
+    inner: Arc<dyn ShufflePartitionReader>,
+    range: DfplanMapRange,
+}
+
+impl ShufflePartitionReader for MapRangeShuffleReader {
+    fn read_partition(
+        &self,
+        upstream_stage_index: usize,
+        map_task_index: usize,
+        partition: usize,
+    ) -> futures::future::BoxFuture<'static, Result<Vec<arrow::record_batch::RecordBatch>, String>>
+    {
+        if upstream_stage_index == self.range.upstream_stage_index
+            && !(self.range.start..self.range.end).contains(&map_task_index)
+        {
+            return Box::pin(async { Ok(Vec::new()) });
+        }
+        self.inner
+            .read_partition(upstream_stage_index, map_task_index, partition)
+    }
+}
+
+/// True when a dfplan body's decoded plan may be split by map-task ranges
+/// (Phase 54 skew split) without changing results.
+///
+/// Splitting hands each split task a disjoint subset of the skewed
+/// upstream's map outputs, so any operator that must observe the WHOLE
+/// partition before emitting (final-mode aggregation, sort, window, limit,
+/// distinct) would produce partial results per split. Safe plans are
+/// whitelisted structurally: shuffle reads, projections, filters, batch
+/// coalescing, and INNER hash joins (each row of the restricted side lands
+/// in exactly one split and joins against the other side read in full, so
+/// every match pair appears exactly once across splits; outer joins are
+/// excluded — unmatched-row padding would be emitted per split).
+pub fn dfplan_body_is_split_safe(body: &str) -> bool {
+    let ctx = SessionContext::new();
+    let codec = KrishivPhysicalCodec::coordinator();
+    let Ok((_, plan)) = decode_dfplan_task(body, &ctx.task_ctx(), &codec) else {
+        return false;
+    };
+    plan_is_split_safe(&plan)
+}
+
+fn plan_is_split_safe(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    use datafusion::physical_plan::filter::FilterExec;
+    use datafusion::physical_plan::joins::HashJoinExec;
+    use datafusion::physical_plan::projection::ProjectionExec;
+    let safe = if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
+        *join.join_type() == datafusion::logical_expr::JoinType::Inner
+    } else {
+        plan.is::<ShuffleReadExec>()
+            || plan.is::<ProjectionExec>()
+            || plan.is::<FilterExec>()
+            // Name match: the concrete type is deprecated in DataFusion 54
+            // (BatchCoalescer replaces it) but still appears in plans.
+            || plan.name() == "CoalesceBatchesExec"
+    };
+    safe && plan.children().iter().all(|c| plan_is_split_safe(c))
 }
 
 /// Plan a query over local parquet tables and cut it into stages
@@ -833,9 +1053,9 @@ mod tests {
         // Decode on a FRESH context with no tables registered — the executor
         // side never re-registers coordinator tables.
         let exec_ctx = SessionContext::new();
-        let (partition, decoded) =
+        let (spec, decoded) =
             decode_dfplan_task(&body, &exec_ctx.task_ctx(), &codec).expect("decode");
-        assert_eq!(partition, 0);
+        assert_eq!(spec, DfplanTaskSpec::single(0));
         assert_eq!(
             original_display,
             displayable(decoded.as_ref()).indent(true).to_string(),
@@ -969,11 +1189,11 @@ mod tests {
         let exec_ctx = SessionContext::new();
         let exec_codec = KrishivPhysicalCodec::executor(Arc::new(Arc::clone(&store)));
         for (task_index, body) in map_stage.task_bodies.iter().enumerate() {
-            let (partition, plan) =
+            let (spec, plan) =
                 decode_dfplan_task(body, &exec_ctx.task_ctx(), &exec_codec).expect("decode map");
-            assert_eq!(partition, task_index);
+            assert_eq!(spec, DfplanTaskSpec::single(task_index));
             let stream = plan
-                .execute(partition, exec_ctx.task_ctx())
+                .execute(task_index, exec_ctx.task_ctx())
                 .expect("execute map partition");
             let batches: Vec<_> = futures::TryStreamExt::try_collect(stream)
                 .await
@@ -1000,11 +1220,11 @@ mod tests {
         // Execute the result stage through ShuffleReadExec.
         let mut staged_results = Vec::new();
         for (task_index, body) in result_stage.task_bodies.iter().enumerate() {
-            let (partition, plan) =
+            let (spec, plan) =
                 decode_dfplan_task(body, &exec_ctx.task_ctx(), &exec_codec).expect("decode result");
-            assert_eq!(partition, task_index);
+            assert_eq!(spec, DfplanTaskSpec::single(task_index));
             let stream = plan
-                .execute(partition, exec_ctx.task_ctx())
+                .execute(task_index, exec_ctx.task_ctx())
                 .expect("execute result partition");
             let batches: Vec<_> = futures::TryStreamExt::try_collect(stream)
                 .await
@@ -1127,11 +1347,11 @@ mod tests {
         let mut staged_results = Vec::new();
         for (stage_index, stage) in staged.stages.iter().enumerate() {
             for (task_index, body) in stage.task_bodies.iter().enumerate() {
-                let (partition, plan) = decode_dfplan_task(body, &exec_ctx.task_ctx(), &exec_codec)
+                let (spec, plan) = decode_dfplan_task(body, &exec_ctx.task_ctx(), &exec_codec)
                     .expect("decode stage task");
-                assert_eq!(partition, task_index);
+                assert_eq!(spec, DfplanTaskSpec::single(task_index));
                 let stream = plan
-                    .execute(partition, exec_ctx.task_ctx())
+                    .execute(task_index, exec_ctx.task_ctx())
                     .expect("execute stage partition");
                 let batches: Vec<_> = futures::TryStreamExt::try_collect(stream)
                     .await
@@ -1191,6 +1411,352 @@ mod tests {
             render(&staged_results),
             render(&direct),
             "staged join must match direct execution"
+        );
+    }
+
+    // ── Phase 54: partition-spec grammar ─────────────────────────────────
+
+    #[test]
+    fn partition_spec_grammar_round_trips() {
+        let multi = DfplanTaskSpec {
+            partitions: vec![1, 4, 7],
+            map_range: None,
+        };
+        let body = dfplan_task_body_for_spec("QUJD", &multi);
+        assert_eq!(body, "dfplan:v1:1,4,7:QUJD");
+        assert_eq!(dfplan_body_partition_spec(&body).expect("parse"), multi);
+
+        let split = DfplanTaskSpec {
+            partitions: vec![5],
+            map_range: Some(DfplanMapRange {
+                upstream_stage_index: 0,
+                start: 2,
+                end: 4,
+            }),
+        };
+        let body = dfplan_task_body_for_spec("QUJD", &split);
+        assert_eq!(body, "dfplan:v1:5/s0m2-4:QUJD");
+        assert_eq!(dfplan_body_partition_spec(&body).expect("parse"), split);
+
+        // Legacy single-partition form parses as a single spec.
+        assert_eq!(
+            dfplan_body_partition_spec("dfplan:v1:3:QUJD").expect("parse"),
+            DfplanTaskSpec::single(3)
+        );
+    }
+
+    #[test]
+    fn partition_spec_rewrite_preserves_payload() {
+        let original = dfplan_task_body("cGF5bG9hZA==", 2);
+        let rewritten = dfplan_body_with_spec(
+            &original,
+            &DfplanTaskSpec {
+                partitions: vec![0, 2],
+                map_range: None,
+            },
+        )
+        .expect("rewrite");
+        assert_eq!(rewritten, "dfplan:v1:0,2:cGF5bG9hZA==");
+    }
+
+    #[test]
+    fn partition_spec_rejects_malformed_segments() {
+        assert!(dfplan_body_partition_spec("dfplan:v1::QUJD").is_err());
+        assert!(dfplan_body_partition_spec("dfplan:v1:x:QUJD").is_err());
+        assert!(dfplan_body_partition_spec("dfplan:v1:1/s0m4-4:QUJD").is_err());
+        assert!(dfplan_body_partition_spec("dfplan:v1:1/m0-2:QUJD").is_err());
+    }
+
+    /// Coalescing correctness: a Result-stage task executing SEVERAL root
+    /// partitions produces exactly the union the one-task-per-partition
+    /// layout produces (the exit-gate mechanism for AQE coalescing).
+    #[tokio::test]
+    async fn coalesced_result_stage_matches_direct_execution() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write_test_parquet(tmp.path()).await;
+        let plan_ctx = planning_session_context(4);
+        plan_ctx
+            .register_parquet(
+                "t",
+                path.to_str().expect("utf8 path"),
+                datafusion::prelude::ParquetReadOptions::default(),
+            )
+            .await
+            .expect("register parquet");
+        let query =
+            "SELECT category, COUNT(*) AS n, SUM(amount) AS total FROM t GROUP BY category";
+        let df = plan_ctx.sql(query).await.expect("sql");
+        let plan = df.create_physical_plan().await.expect("physical plan");
+        let staged = build_distributed_stages(plan)
+            .expect("build stages")
+            .expect("splittable");
+        let map_stage = staged.stages.first().expect("map stage");
+        let result_stage = staged.stages.get(1).expect("result stage");
+        let shuffle = map_stage.shuffle.as_ref().expect("map shuffles");
+
+        // Run the map stage into the test store (as in the staged tests).
+        let store = Arc::new(TestShuffleStore::default());
+        let exec_ctx = SessionContext::new();
+        for (task_index, body) in map_stage.task_bodies.iter().enumerate() {
+            let reader: Arc<dyn ShufflePartitionReader> = Arc::new(Arc::clone(&store));
+            let (_, mut stream) =
+                execute_dfplan_body(body, &exec_ctx, Some(reader)).expect("map exec");
+            while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                let batch = batch.expect("map batch");
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                for (bucket, part) in partition_batch_by_key(
+                    &batch,
+                    &shuffle.key_columns[0],
+                    shuffle.num_output_partitions,
+                )
+                .into_iter()
+                .enumerate()
+                {
+                    if part.num_rows() > 0 {
+                        store.write(0, task_index, bucket, part);
+                    }
+                }
+            }
+        }
+
+        // ONE coalesced task executing every result partition.
+        let all_partitions: Vec<usize> = (0..result_stage.task_count()).collect();
+        let coalesced_body = dfplan_body_with_spec(
+            result_stage.task_bodies.first().expect("result body"),
+            &DfplanTaskSpec {
+                partitions: all_partitions,
+                map_range: None,
+            },
+        )
+        .expect("coalesce rewrite");
+        let reader: Arc<dyn ShufflePartitionReader> = Arc::new(Arc::clone(&store));
+        let (_, stream) =
+            execute_dfplan_body(&coalesced_body, &exec_ctx, Some(reader)).expect("coalesced exec");
+        let coalesced: Vec<RecordBatch> = futures::TryStreamExt::try_collect(stream)
+            .await
+            .expect("coalesced results");
+
+        // Per-partition baseline through the ORIGINAL bodies.
+        let mut baseline = Vec::new();
+        for body in &result_stage.task_bodies {
+            let reader: Arc<dyn ShufflePartitionReader> = Arc::new(Arc::clone(&store));
+            let (_, stream) =
+                execute_dfplan_body(body, &exec_ctx, Some(reader)).expect("baseline exec");
+            let batches: Vec<RecordBatch> = futures::TryStreamExt::try_collect(stream)
+                .await
+                .expect("baseline results");
+            baseline.extend(batches);
+        }
+
+        let render = |batches: &[RecordBatch]| {
+            let mut rows: Vec<String> = batches
+                .iter()
+                .flat_map(|b| {
+                    (0..b.num_rows()).map(move |r| {
+                        (0..b.num_columns())
+                            .map(|c| {
+                                arrow::util::display::array_value_to_string(b.column(c), r)
+                                    .expect("cell")
+                            })
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    })
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(
+            render(&coalesced),
+            render(&baseline),
+            "coalesced task must produce the same union as per-partition tasks"
+        );
+        assert!(!coalesced.is_empty(), "group-by must produce rows");
+    }
+
+    /// Skew-split correctness: splitting a Result-stage partition of a pure
+    /// inner join into map-task ranges yields the same union as the unsplit
+    /// task (the exit-gate mechanism for AQE skew handling), and the
+    /// split-safety gate admits the join while rejecting an aggregation.
+    #[tokio::test]
+    async fn skew_split_result_tasks_match_unsplit_execution() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write_test_parquet(tmp.path()).await;
+
+        let mut config = SessionConfig::new().with_target_partitions(4);
+        config
+            .options_mut()
+            .optimizer
+            .enable_round_robin_repartition = false;
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold = 0;
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold_rows = 0;
+        let plan_ctx = SessionContext::new_with_config(config);
+        for name in ["a", "b"] {
+            plan_ctx
+                .register_parquet(
+                    name,
+                    path.to_str().expect("utf8 path"),
+                    datafusion::prelude::ParquetReadOptions::default(),
+                )
+                .await
+                .expect("register parquet");
+        }
+        // Pure inner join — no blocking operator above the shuffle reads.
+        let query = "SELECT a.id, a.category, b.amount FROM a JOIN b ON a.id = b.id";
+        let df = plan_ctx.sql(query).await.expect("sql");
+        let plan = df.create_physical_plan().await.expect("physical plan");
+        let staged = build_distributed_stages(plan)
+            .expect("build stages")
+            .expect("partitioned join must split");
+        let result_stage = staged.stages.last().expect("result stage");
+        assert!(result_stage.shuffle.is_none());
+        let result_body = result_stage.task_bodies.first().expect("result body");
+        assert!(
+            dfplan_body_is_split_safe(result_body),
+            "pure inner join result stage must be split-safe"
+        );
+
+        // Execute all map stages into the store.
+        let store = Arc::new(TestShuffleStore::default());
+        let exec_ctx = SessionContext::new();
+        let mut probe_map_tasks = 0usize;
+        for (stage_index, stage) in staged.stages.iter().enumerate() {
+            let Some(shuffle) = &stage.shuffle else {
+                continue;
+            };
+            if stage_index == 0 {
+                probe_map_tasks = stage.task_count();
+            }
+            for (task_index, body) in stage.task_bodies.iter().enumerate() {
+                let reader: Arc<dyn ShufflePartitionReader> = Arc::new(Arc::clone(&store));
+                let (_, stream) =
+                    execute_dfplan_body(body, &exec_ctx, Some(reader)).expect("map exec");
+                let batches: Vec<RecordBatch> = futures::TryStreamExt::try_collect(stream)
+                    .await
+                    .expect("map results");
+                for batch in batches {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    for (bucket, part) in partition_batch_by_key(
+                        &batch,
+                        &shuffle.key_columns[0],
+                        shuffle.num_output_partitions,
+                    )
+                    .into_iter()
+                    .enumerate()
+                    {
+                        if part.num_rows() > 0 {
+                            store.write(stage_index, task_index, bucket, part);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            probe_map_tasks >= 2,
+            "need >=2 map tasks to split, got {probe_map_tasks}"
+        );
+
+        let collect_body = |body: String| {
+            let store = Arc::clone(&store);
+            let exec_ctx = exec_ctx.clone();
+            async move {
+                let reader: Arc<dyn ShufflePartitionReader> = Arc::new(store);
+                let (_, stream) =
+                    execute_dfplan_body(&body, &exec_ctx, Some(reader)).expect("exec");
+                let batches: Vec<RecordBatch> = futures::TryStreamExt::try_collect(stream)
+                    .await
+                    .expect("results");
+                batches
+            }
+        };
+
+        let render = |batches: &[RecordBatch]| {
+            let mut rows: Vec<String> = batches
+                .iter()
+                .flat_map(|b| {
+                    (0..b.num_rows()).map(move |r| {
+                        (0..b.num_columns())
+                            .map(|c| {
+                                arrow::util::display::array_value_to_string(b.column(c), r)
+                                    .expect("cell")
+                            })
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    })
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+
+        // Every result partition: unsplit baseline vs two map-range splits
+        // of upstream stage 0 (the probe side in builder order).
+        for (partition, body) in result_stage.task_bodies.iter().enumerate() {
+            let baseline = collect_body(body.clone()).await;
+            let mid = probe_map_tasks / 2;
+            let mut split_union = Vec::new();
+            for (start, end) in [(0, mid), (mid, probe_map_tasks)] {
+                let split_body = dfplan_body_with_spec(
+                    body,
+                    &DfplanTaskSpec {
+                        partitions: vec![partition],
+                        map_range: Some(DfplanMapRange {
+                            upstream_stage_index: 0,
+                            start,
+                            end,
+                        }),
+                    },
+                )
+                .expect("split rewrite");
+                split_union.extend(collect_body(split_body).await);
+            }
+            assert_eq!(
+                render(&split_union),
+                render(&baseline),
+                "partition {partition}: split union must equal unsplit output"
+            );
+        }
+
+        // The safety gate must reject a plan with a blocking aggregation.
+        let agg_ctx = planning_session_context(4);
+        agg_ctx
+            .register_parquet(
+                "t",
+                path.to_str().expect("utf8 path"),
+                datafusion::prelude::ParquetReadOptions::default(),
+            )
+            .await
+            .expect("register parquet");
+        let agg_plan = agg_ctx
+            .sql("SELECT category, COUNT(*) FROM t GROUP BY category")
+            .await
+            .expect("sql")
+            .create_physical_plan()
+            .await
+            .expect("plan");
+        let agg_staged = build_distributed_stages(agg_plan)
+            .expect("build stages")
+            .expect("splittable");
+        let agg_body = agg_staged
+            .stages
+            .last()
+            .expect("result stage")
+            .task_bodies
+            .first()
+            .expect("body");
+        assert!(
+            !dfplan_body_is_split_safe(agg_body),
+            "final aggregation must NOT be split-safe"
         );
     }
 }
