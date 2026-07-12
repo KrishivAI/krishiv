@@ -614,10 +614,11 @@ impl Coordinator {
                     })
                     .unwrap_or(true); // default to true for backwards-compat with unlabelled stages
                 if is_shuffle_map
+                    && self.config.aqe_enabled()
                     && !stats.is_empty()
                     && stats.iter().any(|s| s.serialized_bytes > 0)
                 {
-                    let aqe = krishiv_plan::optimizer::default_aqe_optimizer();
+                    let aqe = krishiv_plan::optimizer::default_aqe_optimizer_with_stats();
                     // T1: synthesize a minimal physical plan from the stats
                     // so the AQE rules have at least one node to rewrite.
                     // The scheduler doesn't preserve the original physical
@@ -687,6 +688,13 @@ impl Coordinator {
                             );
                         }
                     }
+                }
+                // Phase 54: the REAL stage-boundary rewrite — coalesce small
+                // reduce partitions / split skewed ones on the downstream
+                // Result stage's dfplan bodies, from measured shuffle sizes.
+                // (The placeholder-plan pass above only records hints.)
+                if self.config.aqe_enabled() {
+                    let _ = self.apply_stage_boundary_aqe(&job_id, &stage_id);
                 }
             }
         }
@@ -1002,7 +1010,7 @@ impl Coordinator {
         job_id: JobId,
         plan: &PhysicalPlan,
     ) -> SchedulerResult<SubmitOutcome> {
-        let aqe = krishiv_plan::optimizer::default_aqe_optimizer();
+        let aqe = krishiv_plan::optimizer::default_aqe_optimizer_with_stats();
         let (optimized, _applied) = aqe.apply(plan.clone(), &[])?;
         self.submit_job(job_spec_from_physical_plan(job_id, &optimized)?)
     }

@@ -13,6 +13,10 @@ pub enum AdaptiveDecisionKind {
     Repartition,
     SourceThrottle,
     SlowSinkDetected,
+    /// Phase 54 AQE: small reduce partitions merged into fewer tasks.
+    PartitionCoalesce,
+    /// Phase 54 AQE: a skewed reduce partition split into map-range tasks.
+    SkewSplit,
 }
 
 impl fmt::Display for AdaptiveDecisionKind {
@@ -22,6 +26,8 @@ impl fmt::Display for AdaptiveDecisionKind {
             Self::Repartition => f.write_str("repartition"),
             Self::SourceThrottle => f.write_str("source-throttle"),
             Self::SlowSinkDetected => f.write_str("slow-sink"),
+            Self::PartitionCoalesce => f.write_str("partition-coalesce"),
+            Self::SkewSplit => f.write_str("skew-split"),
         }
     }
 }

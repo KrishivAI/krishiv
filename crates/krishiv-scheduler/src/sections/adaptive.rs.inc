@@ -425,3 +425,293 @@ fn assignment_flood_protection_basic() {
         "flood protection machinery should detect bad executor"
     );
 }
+
+// ── Phase 54: AQE stage-boundary rewrites ────────────────────────────────────
+
+/// Phase 54 exit gate (coalescing): when a ShuffleMap stage succeeds with
+/// measured per-partition sizes, the coordinator merges small reduce
+/// partitions into fewer dfplan tasks — demonstrably reducing the
+/// reduce-task count — and records a partition-coalesce adaptive decision.
+#[test]
+fn aqe_coalesces_pending_reduce_tasks_from_measured_sizes() {
+    use krishiv_proto::{
+        ShufflePartitionOutput, StageKind, TaskOutputMetadata, TaskState, TaskStatusUpdate,
+    };
+
+    let config = crate::CoordinatorConfig::default()
+        .with_aqe_enabled(true)
+        .with_aqe_mechanisms(true, true)
+        .with_aqe_target_partition_bytes(25);
+    let mut coordinator = Coordinator::active_with_config(
+        CoordinatorId::try_new("coord-aqe-coalesce").unwrap(),
+        config,
+    );
+    let executor_id = ExecutorId::try_new("exec-aqe").unwrap();
+    let lease = coordinator
+        .register_executor(ExecutorDescriptor::new(executor_id.clone(), "host-aqe", 16))
+        .unwrap();
+
+    let map_stage = StageId::try_new("dist-s0").unwrap();
+    let reduce_stage = StageId::try_new("dist-s1").unwrap();
+    let mut reduce = StageSpec::new(reduce_stage.clone(), "reduce")
+        .with_kind(StageKind::Result)
+        .with_upstream_stage(map_stage.clone());
+    for p in 0..4 {
+        reduce = reduce.with_task(TaskSpec::new(
+            TaskId::try_new(format!("dist-s1-t{p}")).unwrap(),
+            format!("dfplan:v1:{p}:QUJD"),
+        ));
+    }
+    let spec = JobSpec::new(JobId::try_new("job-aqe").unwrap(), "aqe", JobKind::Batch)
+        .with_stage(
+            StageSpec::new(map_stage.clone(), "map")
+                .with_kind(StageKind::ShuffleMap)
+                .with_task(TaskSpec::new(TaskId::try_new("dist-s0-t0").unwrap(), "sql: m"))
+                .with_task(TaskSpec::new(TaskId::try_new("dist-s0-t1").unwrap(), "sql: m")),
+        )
+        .with_stage(reduce);
+    let job_id = spec.job_id().clone();
+    coordinator.submit_job(spec).unwrap();
+
+    // Only the map tasks launch (reduce is upstream-gated).
+    let launched = coordinator
+        .launch_assigned_task_assignments(&job_id)
+        .unwrap();
+    assert_eq!(launched.len(), 2, "map tasks launch first");
+
+    // Each map task reports 5 bytes into every reduce partition — combined
+    // 10 bytes per partition against a 25-byte target ⇒ groups {0,1}, {2,3}.
+    for a in &launched {
+        let meta = TaskOutputMetadata::new("shuffle", 10, 1, 1).with_shuffle_partitions(
+            (0..4u32)
+                .map(|p| ShufflePartitionOutput::new(p, 5, ""))
+                .collect::<Vec<_>>(),
+        );
+        coordinator
+            .apply_task_update(
+                TaskStatusUpdate::new(
+                    job_id.clone(),
+                    a.stage_id().clone(),
+                    a.task_id().clone(),
+                    executor_id.clone(),
+                    TaskState::Succeeded,
+                    a.attempt_id().as_u32(),
+                )
+                .with_lease_generation(lease)
+                .with_output_metadata(meta),
+            )
+            .unwrap();
+    }
+
+    let record = coordinator
+        .job_coordinators
+        .get(&job_id)
+        .map(|jc| jc.read_record())
+        .expect("job record");
+    let reduce = record
+        .stages()
+        .iter()
+        .find(|s| s.stage_id() == &reduce_stage)
+        .expect("reduce stage");
+    assert_eq!(
+        reduce.tasks().len(),
+        2,
+        "AQE must coalesce 4 reduce partitions into 2 tasks"
+    );
+    let bodies: Vec<String> = reduce
+        .tasks()
+        .iter()
+        .map(|t| krishiv_plan::TypedTaskFragment::decode_or_legacy(t.spec.description()).body)
+        .collect();
+    assert_eq!(
+        bodies,
+        vec![
+            String::from("dfplan:v1:0,1:QUJD"),
+            String::from("dfplan:v1:2,3:QUJD"),
+        ],
+        "coalesced bodies must carry grouped partition lists"
+    );
+    assert!(
+        reduce
+            .tasks()
+            .iter()
+            .all(|t| t.task_id().as_str().contains("-aqe-")),
+        "rewritten tasks carry AQE-derived ids"
+    );
+    drop(record);
+
+    let log = coordinator.adaptive_decision_log(&job_id);
+    assert!(
+        log.iter().any(|entry| matches!(
+            entry.kind,
+            crate::AdaptiveDecisionKind::PartitionCoalesce
+        ) && entry.applied),
+        "an applied partition-coalesce decision must be recorded, got {log:?}"
+    );
+
+    // The rewritten tasks flow through normal assignment + launch.
+    let launched = coordinator
+        .launch_assigned_task_assignments(&job_id)
+        .unwrap();
+    assert_eq!(launched.len(), 2, "both coalesced reduce tasks launch");
+}
+
+/// Phase 54: `KRISHIV_AQE=off` (config master switch) leaves the reduce
+/// stage untouched — the off switch is testable and tested.
+#[test]
+fn aqe_master_switch_off_leaves_reduce_tasks_untouched() {
+    use krishiv_proto::{
+        ShufflePartitionOutput, StageKind, TaskOutputMetadata, TaskState, TaskStatusUpdate,
+    };
+
+    let config = crate::CoordinatorConfig::default()
+        .with_aqe_enabled(false)
+        .with_aqe_target_partition_bytes(25);
+    let mut coordinator = Coordinator::active_with_config(
+        CoordinatorId::try_new("coord-aqe-off").unwrap(),
+        config,
+    );
+    let executor_id = ExecutorId::try_new("exec-aqe-off").unwrap();
+    let lease = coordinator
+        .register_executor(ExecutorDescriptor::new(executor_id.clone(), "host-off", 16))
+        .unwrap();
+
+    let map_stage = StageId::try_new("dist-s0").unwrap();
+    let reduce_stage = StageId::try_new("dist-s1").unwrap();
+    let mut reduce = StageSpec::new(reduce_stage.clone(), "reduce")
+        .with_kind(StageKind::Result)
+        .with_upstream_stage(map_stage.clone());
+    for p in 0..4 {
+        reduce = reduce.with_task(TaskSpec::new(
+            TaskId::try_new(format!("dist-s1-t{p}")).unwrap(),
+            format!("dfplan:v1:{p}:QUJD"),
+        ));
+    }
+    let spec = JobSpec::new(
+        JobId::try_new("job-aqe-off").unwrap(),
+        "aqe-off",
+        JobKind::Batch,
+    )
+    .with_stage(
+        StageSpec::new(map_stage.clone(), "map")
+            .with_kind(StageKind::ShuffleMap)
+            .with_task(TaskSpec::new(TaskId::try_new("dist-s0-t0").unwrap(), "sql: m")),
+    )
+    .with_stage(reduce);
+    let job_id = spec.job_id().clone();
+    coordinator.submit_job(spec).unwrap();
+    let launched = coordinator
+        .launch_assigned_task_assignments(&job_id)
+        .unwrap();
+    let map_assignment = launched.first().expect("map assignment");
+    let meta = TaskOutputMetadata::new("shuffle", 10, 1, 1).with_shuffle_partitions(
+        (0..4u32)
+            .map(|p| ShufflePartitionOutput::new(p, 5, ""))
+            .collect::<Vec<_>>(),
+    );
+    coordinator
+        .apply_task_update(
+            TaskStatusUpdate::new(
+                job_id.clone(),
+                map_assignment.stage_id().clone(),
+                map_assignment.task_id().clone(),
+                executor_id.clone(),
+                TaskState::Succeeded,
+                map_assignment.attempt_id().as_u32(),
+            )
+            .with_lease_generation(lease)
+            .with_output_metadata(meta),
+        )
+        .unwrap();
+
+    let record = coordinator
+        .job_coordinators
+        .get(&job_id)
+        .map(|jc| jc.read_record())
+        .expect("job record");
+    let reduce = record
+        .stages()
+        .iter()
+        .find(|s| s.stage_id() == &reduce_stage)
+        .expect("reduce stage");
+    assert_eq!(reduce.tasks().len(), 4, "AQE off ⇒ no rewrite");
+    assert!(
+        coordinator.adaptive_decision_log(&job_id).is_empty(),
+        "AQE off ⇒ no adaptive decisions"
+    );
+}
+
+/// Phase 54 safety: a skew-eligible partition whose plan cannot be proven
+/// split-safe (undecodable payload here) is NOT split — the safety gate
+/// fails closed and only coalescing applies.
+#[test]
+fn aqe_skew_split_fails_closed_on_unsafe_plans() {
+    use krishiv_proto::{ShufflePartitionOutput, StageKind, TaskOutputMetadata, TaskState};
+
+    let map_stage = StageId::try_new("dist-s0").unwrap();
+    let reduce_stage = StageId::try_new("dist-s1").unwrap();
+    let mut reduce = StageSpec::new(reduce_stage.clone(), "reduce")
+        .with_kind(StageKind::Result)
+        .with_upstream_stage(map_stage.clone());
+    for p in 0..4 {
+        reduce = reduce.with_task(TaskSpec::new(
+            TaskId::try_new(format!("dist-s1-t{p}")).unwrap(),
+            format!("dfplan:v1:{p}:QUJD"),
+        ));
+    }
+    let spec = JobSpec::new(
+        JobId::try_new("job-aqe-skew").unwrap(),
+        "aqe-skew",
+        JobKind::Batch,
+    )
+    .with_stage(
+        StageSpec::new(map_stage.clone(), "map")
+            .with_kind(StageKind::ShuffleMap)
+            .with_task(TaskSpec::new(TaskId::try_new("dist-s0-t0").unwrap(), "sql: m"))
+            .with_task(TaskSpec::new(TaskId::try_new("dist-s0-t1").unwrap(), "sql: m")),
+    )
+    .with_stage(reduce);
+    let mut record = crate::JobRecord::from_spec(spec, 1);
+    let executor_id = ExecutorId::try_new("exec-skew").unwrap();
+    for stage in record.stages_mut() {
+        if stage.stage_id() != &map_stage {
+            continue;
+        }
+        for task in stage.tasks_mut() {
+            task.state = TaskState::Succeeded;
+            task.assigned_executor = Some(executor_id.clone());
+            // Partition 2 is heavily skewed: 1000 bytes vs 10-byte median.
+            task.output_metadata = Some(
+                TaskOutputMetadata::new("shuffle", 10, 1, 1).with_shuffle_partitions(vec![
+                    ShufflePartitionOutput::new(0, 5, ""),
+                    ShufflePartitionOutput::new(1, 5, ""),
+                    ShufflePartitionOutput::new(2, 500, ""),
+                    ShufflePartitionOutput::new(3, 5, ""),
+                ]),
+            );
+        }
+        stage.refresh_state();
+    }
+    let thresholds = crate::coordinator::aqe::AqeThresholds {
+        coalesce: true,
+        skew_split: true,
+        target_partition_bytes: 25,
+        skew_factor: 4.0,
+        skew_min_bytes: 100,
+    };
+    let rewrites = crate::coordinator::aqe::plan_aqe_rewrites(&record, &map_stage, &thresholds);
+    let rewrite = rewrites.first().expect("coalesce rewrite still planned");
+    assert!(
+        rewrite.skew_split_partitions.is_empty(),
+        "undecodable plan payload must fail the split-safety gate closed"
+    );
+    assert_eq!(
+        rewrite.bodies,
+        vec![
+            String::from("dfplan:v1:0,1:QUJD"),
+            String::from("dfplan:v1:2:QUJD"),
+            String::from("dfplan:v1:3:QUJD"),
+        ],
+        "coalescing still groups the small partitions around the big one"
+    );
+}

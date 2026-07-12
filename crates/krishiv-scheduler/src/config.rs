@@ -101,6 +101,53 @@ pub struct CoordinatorConfig {
 
     /// Cap for the task retry backoff delay. Default: `30_000` (30 s).
     task_retry_backoff_cap_ms: u64,
+
+    /// Phase 54 AQE master switch. Default: `KRISHIV_AQE` env (on unless
+    /// `off`/`0`/`false`). Gates every stage-boundary rewrite.
+    aqe_enabled: bool,
+
+    /// Phase 54: reduce-partition coalescing. Default: `KRISHIV_AQE_COALESCE`.
+    aqe_coalesce_enabled: bool,
+
+    /// Phase 54: skewed-partition map-range splitting. Default:
+    /// `KRISHIV_AQE_SKEW_SPLIT`.
+    aqe_skew_split_enabled: bool,
+
+    /// Phase 54: target bytes of upstream shuffle output per reduce task
+    /// when coalescing. Default: `KRISHIV_AQE_TARGET_PARTITION_BYTES` or
+    /// 64 MiB.
+    aqe_target_partition_bytes: u64,
+
+    /// Phase 54: a partition is skewed when its size exceeds this factor ×
+    /// the median partition size (and `aqe_skew_min_bytes`). Default:
+    /// `KRISHIV_AQE_SKEW_FACTOR` or 4.0.
+    aqe_skew_factor: f64,
+
+    /// Phase 54: absolute floor below which a partition is never treated as
+    /// skewed. Default: `KRISHIV_AQE_SKEW_MIN_BYTES` or 128 MiB.
+    aqe_skew_min_bytes: u64,
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    !matches!(
+        std::env::var(name).unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+        "off" | "0" | "false" | "disabled"
+    )
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|f: &f64| f.is_finite() && *f >= 1.0)
+        .unwrap_or(default)
 }
 
 impl CoordinatorConfig {
@@ -130,6 +177,15 @@ impl CoordinatorConfig {
             locality_wait_ms: 3_000,
             task_retry_backoff_base_ms: 1_000,
             task_retry_backoff_cap_ms: 30_000,
+            aqe_enabled: env_flag_enabled("KRISHIV_AQE"),
+            aqe_coalesce_enabled: env_flag_enabled("KRISHIV_AQE_COALESCE"),
+            aqe_skew_split_enabled: env_flag_enabled("KRISHIV_AQE_SKEW_SPLIT"),
+            aqe_target_partition_bytes: env_u64(
+                "KRISHIV_AQE_TARGET_PARTITION_BYTES",
+                64 * 1024 * 1024,
+            ),
+            aqe_skew_factor: env_f64("KRISHIV_AQE_SKEW_FACTOR", 4.0),
+            aqe_skew_min_bytes: env_u64("KRISHIV_AQE_SKEW_MIN_BYTES", 128 * 1024 * 1024),
         }
     }
 
@@ -322,6 +378,66 @@ impl CoordinatorConfig {
     pub fn with_task_retry_backoff(mut self, base_ms: u64, cap_ms: u64) -> Self {
         self.task_retry_backoff_base_ms = base_ms.max(1);
         self.task_retry_backoff_cap_ms = cap_ms.max(base_ms.max(1));
+        self
+    }
+
+    /// Phase 54 AQE master switch (`KRISHIV_AQE`).
+    pub fn aqe_enabled(&self) -> bool {
+        self.aqe_enabled
+    }
+
+    /// Phase 54: reduce-partition coalescing enabled.
+    pub fn aqe_coalesce_enabled(&self) -> bool {
+        self.aqe_enabled && self.aqe_coalesce_enabled
+    }
+
+    /// Phase 54: skew map-range splitting enabled.
+    pub fn aqe_skew_split_enabled(&self) -> bool {
+        self.aqe_enabled && self.aqe_skew_split_enabled
+    }
+
+    /// Phase 54: coalescing target bytes per reduce task.
+    pub fn aqe_target_partition_bytes(&self) -> u64 {
+        self.aqe_target_partition_bytes
+    }
+
+    /// Phase 54: skew factor over the median partition size.
+    pub fn aqe_skew_factor(&self) -> f64 {
+        self.aqe_skew_factor
+    }
+
+    /// Phase 54: absolute skew floor in bytes.
+    pub fn aqe_skew_min_bytes(&self) -> u64 {
+        self.aqe_skew_min_bytes
+    }
+
+    /// Override the AQE master switch (tests / embedding).
+    #[must_use]
+    pub fn with_aqe_enabled(mut self, enabled: bool) -> Self {
+        self.aqe_enabled = enabled;
+        self
+    }
+
+    /// Override per-mechanism AQE switches.
+    #[must_use]
+    pub fn with_aqe_mechanisms(mut self, coalesce: bool, skew_split: bool) -> Self {
+        self.aqe_coalesce_enabled = coalesce;
+        self.aqe_skew_split_enabled = skew_split;
+        self
+    }
+
+    /// Override the coalescing target bytes per reduce task.
+    #[must_use]
+    pub fn with_aqe_target_partition_bytes(mut self, bytes: u64) -> Self {
+        self.aqe_target_partition_bytes = bytes.max(1);
+        self
+    }
+
+    /// Override the skew detection thresholds.
+    #[must_use]
+    pub fn with_aqe_skew_thresholds(mut self, factor: f64, min_bytes: u64) -> Self {
+        self.aqe_skew_factor = factor.max(1.0);
+        self.aqe_skew_min_bytes = min_bytes;
         self
     }
 }

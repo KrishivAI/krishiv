@@ -2069,6 +2069,7 @@ impl Coordinator {
     }
 }
 
+pub(crate) mod aqe;
 mod checkpoint_ops;
 mod executor_ops;
 mod heartbeat_mapping;

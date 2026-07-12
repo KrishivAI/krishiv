@@ -139,8 +139,8 @@ impl JobRecord {
         self.state = JobState::Running;
         let _job_id_str = self.job_id().to_string();
         for stage in &mut self.stages {
-            stage.state = StageState::Scheduling;
             let _stage_id_str = stage.stage_id().to_string();
+            let mut stage_received_assignment = false;
             for task in &mut stage.tasks {
                 if let Some(assignment) = assignments
                     .iter()
@@ -150,7 +150,20 @@ impl JobRecord {
                     task.state = TaskState::Assigned;
                     task.pending_since_ms = None;
                     task.retry_backoff_until_ms = None;
+                    stage_received_assignment = true;
                 }
+            }
+            // Only stages that actually received an assignment move to
+            // Scheduling, and never out of a terminal state. The previous
+            // unconditional stomp demoted SUCCEEDED upstream stages whenever
+            // any other stage's tasks were (re)assigned later (Phase 53
+            // eager backlog drains, Phase 54 AQE rewrites), which made the
+            // launch loop's upstream-ready check fail forever — downstream
+            // tasks assigned after upstream success could never launch.
+            if stage_received_assignment
+                && !matches!(stage.state, StageState::Succeeded | StageState::Failed)
+            {
+                stage.state = StageState::Scheduling;
             }
         }
     }
@@ -871,6 +884,15 @@ impl StageRecord {
     }
 
     /// Task records.
+    /// Phase 54 AQE: replace this stage's tasks wholesale.
+    ///
+    /// Callers must have verified that no task has been launched (Pending or
+    /// Assigned-but-unlaunched only) — replacement drops the old records.
+    pub(crate) fn replace_tasks(&mut self, tasks: Vec<TaskRecord>) {
+        self.tasks = tasks;
+        self.refresh_state();
+    }
+
     pub fn tasks(&self) -> &[TaskRecord] {
         &self.tasks
     }

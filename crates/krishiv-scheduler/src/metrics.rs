@@ -77,6 +77,12 @@ pub static PLACEMENTS_DEFERRED_TOTAL: LazyLock<AtomicU64> = LazyLock::new(|| Ato
 pub static SPECULATION_DETECTED_TOTAL: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
 /// Straggler originals cancelled + re-queued by the speculation pass.
 pub static SPECULATION_PREEMPTED_TOTAL: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
+/// Phase 54: stages whose reduce tasks were coalesced by the AQE pass.
+pub static AQE_STAGES_COALESCED_TOTAL: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
+/// Phase 54: reduce tasks eliminated by AQE partition coalescing.
+pub static AQE_TASKS_COALESCED_TOTAL: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
+/// Phase 54: skewed reduce partitions split into map-range sub-tasks.
+pub static AQE_SKEW_SPLITS_TOTAL: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
 
 /// Record per-tier locality counts from one placement round.
 pub fn record_locality_tier_counts(
@@ -108,6 +114,10 @@ pub struct SchedulerMetrics {
     pub placements_deferred_total: u64,
     pub speculation_detected_total: u64,
     pub speculation_preempted_total: u64,
+    /// Phase 54: AQE stage-boundary re-optimization outcomes.
+    pub aqe_stages_coalesced_total: u64,
+    pub aqe_tasks_coalesced_total: u64,
+    pub aqe_skew_splits_total: u64,
 }
 
 /// Read the current scheduler metrics snapshot.
@@ -125,6 +135,9 @@ pub fn scheduler_metrics() -> SchedulerMetrics {
         placements_deferred_total: PLACEMENTS_DEFERRED_TOTAL.load(AtomicOrdering::Relaxed),
         speculation_detected_total: SPECULATION_DETECTED_TOTAL.load(AtomicOrdering::Relaxed),
         speculation_preempted_total: SPECULATION_PREEMPTED_TOTAL.load(AtomicOrdering::Relaxed),
+        aqe_stages_coalesced_total: AQE_STAGES_COALESCED_TOTAL.load(AtomicOrdering::Relaxed),
+        aqe_tasks_coalesced_total: AQE_TASKS_COALESCED_TOTAL.load(AtomicOrdering::Relaxed),
+        aqe_skew_splits_total: AQE_SKEW_SPLITS_TOTAL.load(AtomicOrdering::Relaxed),
     }
 }
 
@@ -160,7 +173,16 @@ pub fn render_prometheus_metrics() -> String {
          krishiv_speculation_detected_total {spec_detected}\n\
          # HELP krishiv_speculation_preempted_total Straggler originals cancelled and re-queued.\n\
          # TYPE krishiv_speculation_preempted_total counter\n\
-         krishiv_speculation_preempted_total {spec_preempted}\n",
+         krishiv_speculation_preempted_total {spec_preempted}\n\
+         # HELP krishiv_aqe_stages_coalesced_total Stages whose reduce tasks were coalesced by AQE.\n\
+         # TYPE krishiv_aqe_stages_coalesced_total counter\n\
+         krishiv_aqe_stages_coalesced_total {aqe_stages}\n\
+         # HELP krishiv_aqe_tasks_coalesced_total Reduce tasks eliminated by AQE partition coalescing.\n\
+         # TYPE krishiv_aqe_tasks_coalesced_total counter\n\
+         krishiv_aqe_tasks_coalesced_total {aqe_tasks}\n\
+         # HELP krishiv_aqe_skew_splits_total Skewed reduce partitions split into map-range sub-tasks.\n\
+         # TYPE krishiv_aqe_skew_splits_total counter\n\
+         krishiv_aqe_skew_splits_total {aqe_skews}\n",
         jobs = m.jobs_submitted_total,
         epochs = m.checkpoint_epochs_total,
         tasks = m.tasks_assigned_total,
@@ -172,5 +194,8 @@ pub fn render_prometheus_metrics() -> String {
         deferred = m.placements_deferred_total,
         spec_detected = m.speculation_detected_total,
         spec_preempted = m.speculation_preempted_total,
+        aqe_stages = m.aqe_stages_coalesced_total,
+        aqe_tasks = m.aqe_tasks_coalesced_total,
+        aqe_skews = m.aqe_skew_splits_total,
     )
 }
