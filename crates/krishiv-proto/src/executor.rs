@@ -12,6 +12,7 @@ pub struct ExecutorDescriptor {
     slots: usize,
     task_endpoint: Option<String>,
     barrier_endpoint: Option<String>,
+    rack_id: Option<String>,
 }
 
 impl ExecutorDescriptor {
@@ -23,6 +24,7 @@ impl ExecutorDescriptor {
             slots,
             task_endpoint: None,
             barrier_endpoint: None,
+            rack_id: None,
         }
     }
 
@@ -80,6 +82,24 @@ impl ExecutorDescriptor {
     /// Optional executor-owned barrier service endpoint.
     pub fn barrier_endpoint(&self) -> Option<&str> {
         self.barrier_endpoint.as_deref()
+    }
+
+    /// Attach the rack identifier for RACK_LOCAL placement (Phase 53).
+    ///
+    /// Node identity for NODE_LOCAL placement is `host`; the rack is a
+    /// coarser failure/latency domain grouping several hosts.
+    #[must_use]
+    pub fn with_rack_id(mut self, rack_id: impl Into<String>) -> Self {
+        let rack_id = rack_id.into();
+        if !rack_id.trim().is_empty() {
+            self.rack_id = Some(rack_id);
+        }
+        self
+    }
+
+    /// Optional rack identifier for locality-aware placement.
+    pub fn rack_id(&self) -> Option<&str> {
+        self.rack_id.as_deref()
     }
 }
 

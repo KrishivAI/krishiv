@@ -42,6 +42,9 @@ message ExecutorDescriptor {
   string task_endpoint = 4;
   // gRPC endpoint for BarrierService (ADR-R16.1); empty = derive from task_endpoint host.
   string barrier_endpoint = 5;
+  // Rack identifier for RACK_LOCAL placement (Phase 53); empty = unknown rack.
+  // Node identity for NODE_LOCAL placement is `host`.
+  string rack_id = 6;
 }
 
 message RegisterExecutorRequest {

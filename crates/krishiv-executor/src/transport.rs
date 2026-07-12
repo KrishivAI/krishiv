@@ -190,6 +190,13 @@ impl ExecutorConfig {
         if let Some(ep) = &self.barrier_endpoint {
             d = d.with_barrier_endpoint(ep);
         }
+        // Phase 53: advertise the rack for RACK_LOCAL placement. Node
+        // identity is `host`; the rack comes from deployment topology.
+        if let Ok(rack) = std::env::var("KRISHIV_RACK_ID")
+            && !rack.trim().is_empty()
+        {
+            d = d.with_rack_id(rack);
+        }
         d
     }
 }

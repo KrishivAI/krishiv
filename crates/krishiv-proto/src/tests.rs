@@ -978,15 +978,17 @@ mod wire_fuzz {
                 any::<u64>(),
                 arb_string(),
                 arb_string(),
+                arb_string(),
             )
                 .prop_map(
-                    |(executor_id, host, slots, task_endpoint, barrier_endpoint)| {
+                    |(executor_id, host, slots, task_endpoint, barrier_endpoint, rack_id)| {
                         v1::ExecutorDescriptor {
                             executor_id,
                             host,
                             slots,
                             task_endpoint,
                             barrier_endpoint,
+                            rack_id,
                         }
                     },
                 ),

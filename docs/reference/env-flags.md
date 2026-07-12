@@ -95,6 +95,7 @@ Regenerate with:
 | `KRISHIV_PRODUCTION` | bool | `false` | Production mode: tightens defaults (fail-closed metadata, auth requirements, connector restrictions). |
 | `KRISHIV_PYTHON_UDF_TIMEOUT_MS` | uint | `30000` | Per-call timeout for sandboxed Python UDF execution. |
 | `KRISHIV_QUERY_MEMORY_LIMIT_BYTES` | uint | `cgroup-derived` | Per-query FairSpillPool budget for embedded/IVM sessions. |
+| `KRISHIV_RACK_ID` | text | `unset` | Rack identifier the executor advertises for RACK_LOCAL placement (Phase 53). Node identity is the executor host. |
 | `KRISHIV_REMOTE_EXEC` | bool | `mode-dependent` | Force remote (coordinator) execution on or off for API sessions. |
 | `KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH` | bool | `profile-dependent` | Require bearer auth on executor task gRPC even in dev profiles. |
 | `KRISHIV_RESULT_SPOOL_DIR` | path | `temp dir` | Directory for disk-spooled large query results. |

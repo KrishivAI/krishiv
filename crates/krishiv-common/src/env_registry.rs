@@ -653,6 +653,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "Per-query FairSpillPool budget for embedded/IVM sessions.",
     ),
     rt(
+        "KRISHIV_RACK_ID",
+        FlagKind::Text,
+        "unset",
+        "Rack identifier the executor advertises for RACK_LOCAL placement (Phase 53). Node identity is the executor host.",
+    ),
+    rt(
         "KRISHIV_REMOTE_EXEC",
         FlagKind::Bool,
         "mode-dependent",
