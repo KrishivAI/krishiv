@@ -416,9 +416,11 @@ impl PySession {
     /// on the registered tokio runtime and yields control to the Python
     /// event loop until the future completes.
     ///
-    ///     df = await session.sql_async("SELECT 1 AS n")
-    ///     result = await df.collect_async()
-    ///     print(result.pretty())
+    /// ```python
+    /// df = await session.sql_async("SELECT 1 AS n")
+    /// result = await df.collect_async()
+    /// print(result.pretty())
+    /// ```
     pub fn sql_async<'py>(&self, py: Python<'py>, query: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -430,11 +432,13 @@ impl PySession {
     /// Submit a SQL query and return a ``QueryHandle`` for lifecycle management.
     ///
     /// The handle gives access to status, progress, and cancellation.
-    /// ``await handle.collect_async()`` retrieves the result::
+    /// ``await handle.collect_async()`` retrieves the result:
     ///
-    ///     handle = session.submit_async("SELECT count(*) FROM t")
-    ///     print(handle.status())  # "running"
-    ///     result = await handle.collect_async()
+    /// ```python
+    /// handle = session.submit_async("SELECT count(*) FROM t")
+    /// print(handle.status())  # "running"
+    /// result = await handle.collect_async()
+    /// ```
     pub fn submit_async(&self, py: Python<'_>, query: String) -> PyResult<PyQueryHandle> {
         let df = self.inner.sql(&query).map_err(map_krishiv_error)?;
         // `DataFrame::submit_async` uses a bare `tokio::spawn`, which requires
@@ -455,13 +459,15 @@ impl PySession {
     /// The engine (batch / incremental / streaming) is inferred from the declared
     /// connectors and whether the transform is windowed — the Python surface does
     /// not pick the engine, exactly as the Rust and SQL front-ends do not. This
-    /// is the Python entry point to ``Session::submit_sql``::
+    /// is the Python entry point to ``Session::submit_sql``:
     ///
-    ///     handle = session.submit_sql(
-    ///         "CREATE SOURCE orders FROM parquet(path='/in.parquet');"
-    ///         "CREATE SINK out FROM orders INTO parquet(path='/out.parquet');"
-    ///     )
-    ///     print(handle.status)  # "completed"
+    /// ```python
+    /// handle = session.submit_sql(
+    ///     "CREATE SOURCE orders FROM parquet(path='/in.parquet');"
+    ///     "CREATE SINK out FROM orders INTO parquet(path='/out.parquet');"
+    /// )
+    /// print(handle.status)  # "completed"
+    /// ```
     pub fn submit_sql(
         &self,
         py: Python<'_>,
@@ -481,11 +487,13 @@ impl PySession {
     /// The script's windowed transform infers the streaming engine; the job
     /// keeps draining its source on a background task — emitting closed windows
     /// and checkpointing — until ``handle.stop()`` is called. This is the Python
-    /// entry point to ``Session::submit_streaming``::
+    /// entry point to ``Session::submit_streaming``:
     ///
-    ///     handle = session.submit_streaming_sql(script)
-    ///     ...                      # job runs continuously
-    ///     status = handle.stop()   # "completed"
+    /// ```python
+    /// handle = session.submit_streaming_sql(script)
+    /// ...                      # job runs continuously
+    /// status = handle.stop()   # "completed"
+    /// ```
     pub fn submit_streaming_sql(
         &self,
         py: Python<'_>,

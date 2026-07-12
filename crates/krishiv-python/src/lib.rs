@@ -248,12 +248,14 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// RemoteStreamingJob
 ///     Handle to the remote streaming job.
 ///
-/// Example::
+/// Example:
 ///
-///     import krishiv
-///     job = krishiv.connect_streaming("http://coordinator:8080", "etl-job")
-///     job.push([batch])
-///     results = job.drain()
+/// ```python
+/// import krishiv
+/// job = krishiv.connect_streaming("http://coordinator:8080", "etl-job")
+/// job.push([batch])
+/// results = job.drain()
+/// ```
 #[pyo3::pyfunction]
 pub fn connect_streaming(
     coordinator_url: String,

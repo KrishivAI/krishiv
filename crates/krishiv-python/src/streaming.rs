@@ -363,11 +363,13 @@ impl PyDataStreamWriter {
 ///
 /// All methods are synchronous wrappers that run on the shared Tokio runtime.
 ///
-/// Example::
+/// Example:
 ///
-///     job = krishiv.connect_streaming("http://coordinator:8080", "etl-job")
-///     job.push([batch1, batch2])
-///     results = job.drain()
+/// ```python
+/// job = krishiv.connect_streaming("http://coordinator:8080", "etl-job")
+/// job.push([batch1, batch2])
+/// results = job.drain()
+/// ```
 #[pyclass(name = "RemoteStreamingJob")]
 pub struct PyRemoteStreamingJob {
     inner: RemoteStreamingJob,

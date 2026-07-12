@@ -58,19 +58,21 @@ impl PyScoredChunk {
 ///
 /// Supports upsert, delete, and cosine-similarity nearest-neighbor queries.
 ///
-/// Example::
+/// Example:
 ///
-///     import krishiv.ai as ai
-///     sink = ai.InMemoryVectorSink()
-///     sink.upsert_batch(
-///         doc_ids=["doc1", "doc2"],
-///         vectors=[[1.0, 0.0], [0.0, 1.0]],
-///         payloads=[{"text": "hello"}, {"text": "world"}],
-///         epoch=1,
-///     )
-///     results = sink.query_nearest(vector=[1.0, 0.0], top_k=5)
-///     for r in results:
-///         print(r.doc_id, r.score)
+/// ```python
+/// import krishiv.ai as ai
+/// sink = ai.InMemoryVectorSink()
+/// sink.upsert_batch(
+///     doc_ids=["doc1", "doc2"],
+///     vectors=[[1.0, 0.0], [0.0, 1.0]],
+///     payloads=[{"text": "hello"}, {"text": "world"}],
+///     epoch=1,
+/// )
+/// results = sink.query_nearest(vector=[1.0, 0.0], top_k=5)
+/// for r in results:
+///     print(r.doc_id, r.score)
+/// ```
 #[pyclass(name = "InMemoryVectorSink")]
 pub struct PyInMemoryVectorSink {
     inner: Arc<InMemoryVectorSink>,

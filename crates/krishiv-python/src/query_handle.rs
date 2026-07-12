@@ -15,15 +15,19 @@ use crate::query_result::PyQueryResult;
 /// A handle to a running or completed Krishiv query.
 ///
 /// Obtain one via ``Session.submit_async()`` or ``DataFrame.submit_async()``.
-/// The handle can be ``await``-ed in Python asyncio code::
+/// The handle can be ``await``-ed in Python asyncio code:
 ///
-///     handle = session.submit_async("SELECT 1 AS n")
-///     result = await handle.collect_async()
-///     print(result.pretty())
+/// ```python
+/// handle = session.submit_async("SELECT 1 AS n")
+/// result = await handle.collect_async()
+/// print(result.pretty())
+/// ```
 ///
-/// Or cancelled::
+/// Or cancelled:
 ///
-///     handle.cancel()
+/// ```python
+/// handle.cancel()
+/// ```
 #[pyclass(name = "QueryHandle")]
 pub struct PyQueryHandle {
     // Arc<Mutex<Option<...>>> lets us take the handle out in `&self` async methods
@@ -95,9 +99,11 @@ impl PyQueryHandle {
     /// Await completion and return a ``QueryResult``.
     ///
     /// Returns a Python coroutine that resolves to ``QueryResult`` on success
-    /// or raises ``RuntimeError`` on failure or cancellation::
+    /// or raises ``RuntimeError`` on failure or cancellation:
     ///
-    ///     result = await handle.collect_async()
+    /// ```python
+    /// result = await handle.collect_async()
+    /// ```
     pub async fn collect_async(&self) -> PyResult<PyQueryResult> {
         // Take the handle out of the Option before the first await point.
         let handle = {

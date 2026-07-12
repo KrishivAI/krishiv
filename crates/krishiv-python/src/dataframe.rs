@@ -524,9 +524,11 @@ impl PyDataFrame {
 
     /// Return the schema as a list of `(column_name, arrow_type)` pairs.
     ///
-    /// Example::
+    /// Example:
     ///
-    ///     df.schema()  # => [("id", "Int64"), ("name", "Utf8")]
+    /// ```python
+    /// df.schema()  # => [("id", "Int64"), ("name", "Utf8")]
+    /// ```
     pub fn schema(&self) -> PyResult<Vec<(String, String)>> {
         self.inner
             .schema()

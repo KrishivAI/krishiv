@@ -7,12 +7,14 @@ use pyo3::types::PyDict;
 ///
 /// The returned string can be exposed on an HTTP ``/metrics`` endpoint.
 ///
-/// Example::
+/// Example:
 ///
-///     import krishiv
-///     text = krishiv.metrics.render_prometheus()
-///     # e.g. expose via a simple HTTP server
-///     print(text[:200])
+/// ```python
+/// import krishiv
+/// text = krishiv.metrics.render_prometheus()
+/// # e.g. expose via a simple HTTP server
+/// print(text[:200])
+/// ```
 #[pyfunction]
 pub fn render_prometheus(py: Python<'_>) -> PyResult<String> {
     py.detach(|| Ok(krishiv_metrics::global_metrics().render_prometheus()))
@@ -27,10 +29,12 @@ pub fn render_prometheus(py: Python<'_>) -> PyResult<String> {
 /// Per-job labeled counters (checkpoint epochs, task attempts, etc.) are
 /// exposed only via :py:func:`render_prometheus`.
 ///
-/// Example::
+/// Example:
 ///
-///     snap = krishiv.metrics.snapshot()
-///     print(snap["tasks_succeeded"])
+/// ```python
+/// snap = krishiv.metrics.snapshot()
+/// print(snap["tasks_succeeded"])
+/// ```
 #[pyfunction]
 pub fn snapshot(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let m = krishiv_metrics::global_metrics();

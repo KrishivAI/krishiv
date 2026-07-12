@@ -389,14 +389,13 @@ mod tests {
 
         let out = sink.collect().unwrap();
         assert_eq!(out.len(), 1, "sink should collect one snapshot batch");
-        let total = out[0]
-            .record_batch()
-            .column(0)
+        let col = out[0].record_batch().column(0).clone();
+        let total = col
             .as_any()
-            .downcast_ref::<arrow::array::Float64Array>()
-            .expect("SUM is Float64")
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap_or_else(|| panic!("SUM(Int64) should be Int64, got {}", col.data_type()))
             .value(0);
-        assert_eq!(total, 150.0);
+        assert_eq!(total, 150);
     }
 
     #[test]
