@@ -317,6 +317,16 @@ message OutputContractDescriptor {
   string iceberg_mode = 8;
   repeated string iceberg_key_columns = 9;
   string iceberg_op_column = 10;
+  // Transactional Kafka sink target (Phase 55, sink descriptors beyond
+  // Iceberg): output produced between checkpoint barriers is written inside a
+  // Kafka transaction prepared at the barrier and committed by the
+  // checkpoint-complete notification (read_committed consumers see
+  // exactly-once output).
+  string kafka_bootstrap_servers = 11;
+  string kafka_topic = 12;
+  // Prefix for the sink transactional.id; the executor appends the job/task
+  // identity so concurrent subtasks fence independently.
+  string kafka_transactional_id_prefix = 13;
 }
 
 message TaskStatusRequest {
@@ -482,6 +492,7 @@ enum OutputContractDescriptorKind {
   OUTPUT_CONTRACT_DESCRIPTOR_KIND_OBJECT_PARQUET_SINK = 4;
   OUTPUT_CONTRACT_DESCRIPTOR_KIND_PARQUET_SINK = 5;
   OUTPUT_CONTRACT_DESCRIPTOR_KIND_ICEBERG_SINK = 6;
+  OUTPUT_CONTRACT_DESCRIPTOR_KIND_KAFKA_SINK = 7;
 }
 
 enum OutputContractKind {

@@ -5774,6 +5774,7 @@ dependencies = [
  "ahash",
  "arrow 58.3.0",
  "async-stream",
+ "base64 0.22.1",
  "dashmap",
  "futures",
  "indexmap 2.14.0",

@@ -39,6 +39,77 @@ pub struct ContinuousRegisterRequest {
     /// checkpoint epochs and committed by the checkpoint lifecycle.
     #[serde(default)]
     pub sink: Option<ContinuousSinkSpec>,
+    /// Phase 55: number of run-loop subtasks. `1` (default) with the default
+    /// mode keeps the certified cycle-push model; values > 1 require (and
+    /// imply) the run-loop model.
+    #[serde(default)]
+    pub parallelism: Option<u32>,
+    /// Phase 55 execution model: `"cycle"` (default — coordinator-fenced
+    /// cycle-push, the G8-certified path) or `"run-loop"` (promoted
+    /// long-lived barrier-loop tasks).
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Phase 55: registry connector sources the run-loop subtasks own
+    /// directly (kind + table + connector config). Ignored for cycle mode.
+    #[serde(default)]
+    pub sources: Vec<ContinuousRegistrySource>,
+    /// Phase 55: barrier checkpoint interval for run-loop jobs (ms). Enables
+    /// the coordinator-driven barrier pipeline; requires
+    /// `checkpoint_storage_path`.
+    #[serde(default)]
+    pub checkpoint_interval_ms: Option<u64>,
+    /// Checkpoint storage path (file: URI or directory) for run-loop jobs.
+    #[serde(default)]
+    pub checkpoint_storage_path: Option<String>,
+}
+
+/// One registry connector source owned by run-loop subtasks (Phase 55).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuousRegistrySource {
+    /// Connector kind (e.g. `kafka`, `parquet-dir`).
+    pub kind: String,
+    /// Logical table/topic name.
+    pub table: String,
+    /// Connector properties (broker addresses, topic, paths, …).
+    #[serde(default)]
+    pub config: std::collections::BTreeMap<String, String>,
+}
+
+/// Phase 55 execution model for a continuous job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuousJobMode {
+    /// Coordinator-fenced cycle-push (the G8-certified escape hatch).
+    Cycle,
+    /// Promoted long-lived run-loop tasks (`stream:rloop:`).
+    RunLoop,
+}
+
+impl ContinuousJobMode {
+    fn parse(mode: Option<&str>, parallelism: u32) -> Result<Self, String> {
+        match mode.map(str::trim) {
+            None | Some("") | Some("cycle") | Some("cycle-push") => {
+                if parallelism > 1 {
+                    Err(format!(
+                        "parallelism {parallelism} requires mode \"run-loop\"; \
+                         the cycle model is single-subtask by contract"
+                    ))
+                } else {
+                    Ok(Self::Cycle)
+                }
+            }
+            Some("run-loop") | Some("barrier-loop") | Some("rloop") => Ok(Self::RunLoop),
+            Some(other) => Err(format!(
+                "unknown continuous mode '{other}' (expected \"cycle\" or \"run-loop\")"
+            )),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cycle => "cycle-push",
+            Self::RunLoop => "run-loop",
+        }
+    }
 }
 
 /// Streaming Iceberg sink target for a continuous job (G7).
@@ -125,6 +196,14 @@ pub struct ContinuousJobView {
 /// coordinator can actually see — never an aspirational claim.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContinuousDeliveryView {
+    /// Phase 55 execution model: `"cycle-push"` (coordinator-fenced cycles)
+    /// or `"run-loop"` (promoted long-lived barrier-loop tasks). Registry
+    /// delivery metadata labels the model per the honesty rule.
+    #[serde(default = "default_delivery_model")]
+    pub model: String,
+    /// Number of run-loop subtasks (1 for cycle-push jobs).
+    #[serde(default = "default_delivery_parallelism")]
+    pub parallelism: u32,
     /// Sink kind (`"iceberg"`) when the job writes through a two-phase sink;
     /// absent when results are only drained from coordinator memory.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -140,8 +219,33 @@ pub struct ContinuousDeliveryView {
     pub effective: String,
 }
 
+fn default_delivery_model() -> String {
+    String::from("cycle-push")
+}
+
+fn default_delivery_parallelism() -> u32 {
+    1
+}
+
 fn continuous_delivery_view(record: &crate::JobRecord) -> ContinuousDeliveryView {
     use krishiv_connectors::{DeliveryGuarantee, iceberg_streaming_sink_capabilities};
+    let shape = decode_continuous_job_shape(record).ok();
+    let (model, parallelism) = shape
+        .as_ref()
+        .map(|s| (s.mode.as_str().to_owned(), s.parallelism))
+        .unwrap_or_else(|| (default_delivery_model(), 1));
+    let kafka_sink = record
+        .spec
+        .stages()
+        .first()
+        .and_then(|stage| stage.tasks().first())
+        .and_then(|task| task.sink_contract())
+        .and_then(|contract| {
+            match krishiv_proto::OutputContractDescriptor::parse_kafka_sink(contract) {
+                Some(Ok(descriptor)) => Some(descriptor),
+                _ => None,
+            }
+        });
     let iceberg_sink = record
         .spec
         .stages()
@@ -159,13 +263,30 @@ fn continuous_delivery_view(record: &crate::JobRecord) -> ContinuousDeliveryView
     if iceberg_sink.is_some() {
         let guarantee = iceberg_streaming_sink_capabilities().delivery_guarantee();
         ContinuousDeliveryView {
+            model,
+            parallelism,
             sink: Some("iceberg".into()),
             sink_guarantee: Some(guarantee.as_str().into()),
             source_offsets_in_sink_transaction: true,
             effective: guarantee.as_str().into(),
         }
+    } else if kafka_sink.is_some() {
+        // Transactional Kafka sink under the epoch/2PC contract: committed
+        // output is exactly-once for `read_committed` consumers; source
+        // offsets do NOT ride in the Kafka transaction (they live in the
+        // checkpoint), so the honest end-to-end label is effectively-once.
+        ContinuousDeliveryView {
+            model,
+            parallelism,
+            sink: Some("kafka".into()),
+            sink_guarantee: Some("exactly-once".into()),
+            source_offsets_in_sink_transaction: false,
+            effective: "effectively-once".into(),
+        }
     } else {
         ContinuousDeliveryView {
+            model,
+            parallelism,
             sink: None,
             sink_guarantee: None,
             source_offsets_in_sink_transaction: false,
@@ -211,6 +332,21 @@ fn invalid_continuous_job(job_id: &JobId, message: impl Into<String>) -> Schedul
 fn decode_continuous_job_spec(
     record: &crate::JobRecord,
 ) -> crate::SchedulerResult<WindowExecutionSpec> {
+    decode_continuous_job_shape(record).map(|shape| shape.spec)
+}
+
+/// Decoded identity of a continuous job: its window spec plus the Phase 55
+/// execution model and parallelism.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ContinuousJobShape {
+    pub spec: WindowExecutionSpec,
+    pub mode: ContinuousJobMode,
+    pub parallelism: u32,
+}
+
+fn decode_continuous_job_shape(
+    record: &crate::JobRecord,
+) -> crate::SchedulerResult<ContinuousJobShape> {
     let job_id = record.job_id();
     let fragment = record
         .spec
@@ -221,14 +357,42 @@ fn decode_continuous_job_spec(
         .ok_or_else(|| invalid_continuous_job(job_id, "has no continuous task fragment"))?;
     let typed = TypedTaskFragment::decode(fragment)
         .ok_or_else(|| invalid_continuous_job(job_id, "typed fragment decode failed"))?;
-    let prefix = format!("stream:loop:{}|", job_id.as_str());
-    let encoded = typed
-        .body
-        .strip_prefix(&prefix)
-        .ok_or_else(|| invalid_continuous_job(job_id, "does not use a stream:loop fragment"))?;
-    decode_window_execution_spec(encoded).map_err(|error| {
-        invalid_continuous_job(job_id, format!("window spec decode failed: {error}"))
-    })
+    let cycle_prefix = format!("stream:loop:{}|", job_id.as_str());
+    let rloop_prefix = format!("stream:rloop:{}|", job_id.as_str());
+    if let Some(encoded) = typed.body.strip_prefix(&cycle_prefix) {
+        let spec = decode_window_execution_spec(encoded).map_err(|error| {
+            invalid_continuous_job(job_id, format!("window spec decode failed: {error}"))
+        })?;
+        return Ok(ContinuousJobShape {
+            spec,
+            mode: ContinuousJobMode::Cycle,
+            parallelism: 1,
+        });
+    }
+    if let Some(rest) = typed.body.strip_prefix(&rloop_prefix) {
+        // `<subtask>/<parallelism>|<window_spec>`
+        let (subtask_segment, encoded) = rest.split_once('|').ok_or_else(|| {
+            invalid_continuous_job(job_id, "run-loop fragment missing subtask segment")
+        })?;
+        let parallelism = subtask_segment
+            .split_once('/')
+            .and_then(|(_, p)| p.trim().parse::<u32>().ok())
+            .ok_or_else(|| {
+                invalid_continuous_job(job_id, "run-loop fragment has a malformed subtask segment")
+            })?;
+        let spec = decode_window_execution_spec(encoded).map_err(|error| {
+            invalid_continuous_job(job_id, format!("window spec decode failed: {error}"))
+        })?;
+        return Ok(ContinuousJobShape {
+            spec,
+            mode: ContinuousJobMode::RunLoop,
+            parallelism,
+        });
+    }
+    Err(invalid_continuous_job(
+        job_id,
+        "does not use a stream:loop or stream:rloop fragment",
+    ))
 }
 
 fn continuous_job_view(
@@ -246,12 +410,26 @@ fn continuous_job_view(
     }
     let spec = decode_continuous_job_spec(&record)?;
     let detail = record.detail_snapshot();
-    let last_watermark_ms = detail
+    let shape = decode_continuous_job_shape(&record).ok();
+    let subtask_watermarks = detail
         .stages()
         .iter()
         .flat_map(|stage| stage.tasks().iter())
-        .filter_map(|task| task.last_watermark_ms())
-        .max();
+        .filter_map(|task| task.last_watermark_ms());
+    // Watermarks v2 (Phase 55): a parallel run-loop job's global watermark is
+    // the MIN across its subtasks — a max would let one fast subtask drag the
+    // watermark past a lagging sibling and late-drop its rows. Subtasks that
+    // have never reported are skipped (source idleness is handled per-split
+    // inside each subtask). Cycle jobs keep max (single task; historical
+    // behavior).
+    let last_watermark_ms = if shape
+        .as_ref()
+        .is_some_and(|s| s.mode == ContinuousJobMode::RunLoop)
+    {
+        subtask_watermarks.min()
+    } else {
+        subtask_watermarks.max()
+    };
     let persisted = coordinator.load_continuous_snapshot(job_id.as_str());
     Ok(ContinuousJobView {
         job_id: job_id.to_string(),
@@ -274,42 +452,28 @@ pub async fn api_continuous_register(
     State(coordinator): State<SharedCoordinator>,
     Json(body): Json<ContinuousRegisterRequest>,
 ) -> Result<Json<ContinuousRegisterResponse>, StatusCode> {
-    use krishiv_plan::ExecutionKind;
-    use krishiv_plan::window::encode_window_execution_spec;
-    use krishiv_proto::{JobSpec, StageId, StageSpec, TaskId, TaskSpec};
-    let job_id = JobId::try_new(&body.job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let stage_id = StageId::try_new("stage-streaming").map_err(|_| StatusCode::BAD_REQUEST)?;
-    let task_id = TaskId::try_new("task-streaming").map_err(|_| StatusCode::BAD_REQUEST)?;
-
     // Encode/spec errors are a client fault -> 400 (unlike the SQL entrypoint,
     // whose caller already compiled a valid spec).
-    let encoded_spec =
-        encode_window_execution_spec(&body.spec).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let loop_fragment = format!("stream:loop:{}|{encoded_spec}", body.job_id);
-    let fragment = TypedTaskFragment::new(ExecutionKind::Streaming, loop_fragment)
-        .encode()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let mut task = TaskSpec::new(task_id, fragment);
-    if let Some(sink) = &body.sink {
-        let contract = sink
-            .contract_string()
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
-        task = task.with_sink_contract(contract);
+    if JobId::try_new(&body.job_id).is_err()
+        || krishiv_plan::window::encode_window_execution_spec(&body.spec).is_err()
+    {
+        return Err(StatusCode::BAD_REQUEST);
     }
-    let stage = StageSpec::new(stage_id, "continuous-streaming").with_task(task);
-    let spec =
-        JobSpec::new(job_id.clone(), "continuous-streaming", JobKind::Streaming).with_stage(stage);
-
-    // Same convergent (upsert) path as the SQL entrypoint: re-register is
-    // idempotent when the spec matches and self-heals a limbo job of the same id.
-    let mut coord = coordinator.write().await;
-    coord
-        .ensure_active()
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    upsert_continuous_streaming_job(&mut coord, &job_id, &body.spec, spec)
+    let options = ContinuousRegistrationOptions {
+        sink: body.sink.clone(),
+        parallelism: body.parallelism,
+        mode: body.mode.clone(),
+        sources: body.sources.clone(),
+        checkpoint_interval_ms: body.checkpoint_interval_ms,
+        checkpoint_storage_path: body.checkpoint_storage_path.clone(),
+    };
+    register_continuous_stream_with_options(&coordinator, &body.job_id, &body.spec, &options)
         .await
-        .map_err(|error| scheduler_status(&error))?;
-
+        .map_err(|error| match error {
+            ContinuousStreamError::Scheduler(e) => scheduler_status(&e),
+            ContinuousStreamError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
     Ok(Json(ContinuousRegisterResponse { success: true }))
 }
 
@@ -322,6 +486,19 @@ pub struct ContinuousRegisterSqlRequest {
     /// Optional streaming Iceberg sink (G7).
     #[serde(default)]
     pub sink: Option<ContinuousSinkSpec>,
+    /// Phase 55: run-loop subtask count (see [`ContinuousRegisterRequest`]).
+    #[serde(default)]
+    pub parallelism: Option<u32>,
+    /// Phase 55: `"cycle"` (default) or `"run-loop"`.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Phase 55: registry connector sources for run-loop subtasks.
+    #[serde(default)]
+    pub sources: Vec<ContinuousRegistrySource>,
+    #[serde(default)]
+    pub checkpoint_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub checkpoint_storage_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -344,17 +521,21 @@ pub async fn api_continuous_register_sql(
             tracing::warn!(error = %error, "continuous-register-sql: compile failed");
             StatusCode::BAD_REQUEST
         })?;
-    register_continuous_stream_with_sink(
-        &coordinator,
-        &body.job_id,
-        &plan.spec,
-        body.sink.as_ref(),
-    )
-    .await
-    .map_err(|error| match error {
-        ContinuousStreamError::Scheduler(e) => scheduler_status(&e),
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    })?;
+    let options = ContinuousRegistrationOptions {
+        sink: body.sink.clone(),
+        parallelism: body.parallelism,
+        mode: body.mode.clone(),
+        sources: body.sources.clone(),
+        checkpoint_interval_ms: body.checkpoint_interval_ms,
+        checkpoint_storage_path: body.checkpoint_storage_path.clone(),
+    };
+    register_continuous_stream_with_options(&coordinator, &body.job_id, &plan.spec, &options)
+        .await
+        .map_err(|error| match error {
+            ContinuousStreamError::Scheduler(e) => scheduler_status(&e),
+            ContinuousStreamError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
     Ok(Json(ContinuousRegisterSqlResponse {
         success: true,
         source: plan.source,
@@ -506,6 +687,184 @@ pub struct ContinuousPushResponse {
     pub success: bool,
 }
 
+/// Ingest/egress targets of a run-loop job: `(task_id, endpoint)` per
+/// subtask. `None` when the job is not a run-loop job.
+fn run_loop_targets(
+    coord: &Coordinator,
+    job_id: &JobId,
+) -> crate::SchedulerResult<Option<Vec<(String, String)>>> {
+    let Some(jc) = coord.job_coordinator(job_id) else {
+        return Err(crate::SchedulerError::UnknownJob {
+            job_id: job_id.clone(),
+        });
+    };
+    let record = jc.read_record();
+    if record.spec.kind() != JobKind::Streaming {
+        return Ok(None);
+    }
+    let shape = decode_continuous_job_shape(&record)?;
+    if shape.mode != ContinuousJobMode::RunLoop {
+        return Ok(None);
+    }
+    let mut targets = Vec::new();
+    for stage in record.stages() {
+        for task in stage.tasks() {
+            let Some(executor_id) = task.assigned_executor() else {
+                continue;
+            };
+            if let Some(endpoint) = coord.find_executor_endpoint(executor_id) {
+                targets.push((task.task_id().as_str().to_owned(), endpoint));
+            }
+        }
+    }
+    Ok(Some(targets))
+}
+
+/// Monotonic round-robin cursor for external pushes into run-loop jobs.
+static RUN_LOOP_PUSH_CURSOR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Push external input into a run-loop job: the bytes go straight to ONE
+/// subtask executor over `push_continuous_input` (round-robin); the keyed
+/// exchange re-routes rows to their owning subtasks. The coordinator never
+/// buffers the data — control-plane-only (Phase 55).
+async fn push_run_loop_input(
+    coordinator: &SharedCoordinator,
+    job_id: &JobId,
+    targets: Vec<(String, String)>,
+    ipc_bytes: Vec<u8>,
+) -> Result<(), ContinuousStreamError> {
+    use krishiv_proto::{TaskId, TransportVersion, wire};
+    if targets.is_empty() {
+        return Err(ContinuousStreamError::Unavailable(format!(
+            "run-loop job {job_id} has no launched subtasks to push to"
+        )));
+    }
+    let cursor =
+        RUN_LOOP_PUSH_CURSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % targets.len();
+    let Some((task_id, endpoint)) = targets.get(cursor).cloned() else {
+        return Err(ContinuousStreamError::Unavailable(String::from(
+            "run-loop push target selection failed",
+        )));
+    };
+    if crate::is_in_process_task_endpoint(&endpoint) {
+        return Err(ContinuousStreamError::Unavailable(String::from(
+            "run-loop push cannot reach an in-process-only executor over gRPC",
+        )));
+    }
+    let channels = coordinator.read().await.executor_channels.clone();
+    let channel = Coordinator::get_or_connect_channel_on_map(&channels, &endpoint)
+        .await
+        .map_err(ContinuousStreamError::Scheduler)?;
+    let max = krishiv_proto::max_grpc_message_bytes();
+    let mut client = wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
+        channel,
+        crate::coordinator::task_assignment::inject_executor_task_request_context
+            as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+    )
+    .max_decoding_message_size(max)
+    .max_encoding_message_size(max);
+    let request = krishiv_proto::task::PushContinuousInputRequest {
+        version: TransportVersion::CURRENT,
+        job_id: job_id.clone(),
+        task_id: TaskId::try_new(&task_id).map_err(|e| invalid_registration(e.to_string()))?,
+        ipc_bytes,
+    };
+    client
+        .push_continuous_input(wire::push_continuous_input_request_to_wire(request))
+        .await
+        .map_err(|status| {
+            ContinuousStreamError::Unavailable(format!(
+                "run-loop push to {endpoint} failed: {status}"
+            ))
+        })?;
+    Ok(())
+}
+
+/// Drain a run-loop job's egress: fan `drain_continuous_output` out to each
+/// distinct executor hosting a subtask and concatenate the IPC payloads.
+async fn drain_run_loop_output(
+    coordinator: &SharedCoordinator,
+    job_id: &JobId,
+    targets: Vec<(String, String)>,
+) -> Result<Vec<Vec<u8>>, ContinuousStreamError> {
+    use krishiv_proto::{TaskId, TransportVersion, wire};
+    let channels = coordinator.read().await.executor_channels.clone();
+    let mut seen_endpoints = std::collections::BTreeSet::new();
+    let mut payloads = Vec::new();
+    for (task_id, endpoint) in targets {
+        if !seen_endpoints.insert(endpoint.clone()) {
+            continue;
+        }
+        if crate::is_in_process_task_endpoint(&endpoint) {
+            continue;
+        }
+        let channel = Coordinator::get_or_connect_channel_on_map(&channels, &endpoint)
+            .await
+            .map_err(ContinuousStreamError::Scheduler)?;
+        let max = krishiv_proto::max_grpc_message_bytes();
+        let mut client = wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
+            channel,
+            crate::coordinator::task_assignment::inject_executor_task_request_context
+                as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+        )
+        .max_decoding_message_size(max)
+        .max_encoding_message_size(max);
+        let request = krishiv_proto::task::DrainContinuousOutputRequest {
+            version: TransportVersion::CURRENT,
+            job_id: job_id.clone(),
+            task_id: TaskId::try_new(&task_id)
+                .map_err(|e| invalid_registration(e.to_string()))?,
+        };
+        let response = client
+            .drain_continuous_output(wire::drain_continuous_output_request_to_wire(request))
+            .await
+            .map_err(|status| {
+                ContinuousStreamError::Unavailable(format!(
+                    "run-loop drain from {endpoint} failed: {status}"
+                ))
+            })?
+            .into_inner();
+        let decoded = wire::drain_continuous_output_response_from_wire(response)
+            .map_err(|e| invalid_registration(e.to_string()))?;
+        if !decoded.ipc_bytes.is_empty() {
+            payloads.push(decoded.ipc_bytes);
+        }
+    }
+    Ok(payloads)
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContinuousStopWithSavepointResponse {
+    pub job_id: String,
+    /// Savepoint epoch the barrier carries; the job stops once it commits.
+    pub savepoint_epoch: u64,
+}
+
+/// Phase 55 Leg H: stop a continuous job with a savepoint — the rescale cut.
+///
+/// Triggers `stop_job_with_savepoint`: a savepoint barrier flows through the
+/// job like a normal checkpoint; when every task acks and the epoch commits
+/// (copied into the immutable savepoints area), the coordinator cancels the
+/// job. Changing parallelism = stop-with-savepoint → re-register → restore
+/// (the key-group redistribution mechanism lands in Phase 56).
+pub async fn api_continuous_stop_with_savepoint(
+    State(coordinator): State<SharedCoordinator>,
+    Path(job_id): Path<String>,
+) -> Result<Json<ContinuousStopWithSavepointResponse>, StatusCode> {
+    let job_id = JobId::try_new(&job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut coord = coordinator.write().await;
+    // 404 unknown / 409 non-streaming, matching the other continuous routes.
+    continuous_job_view(&coord, &job_id).map_err(|error| scheduler_status(&error))?;
+    let epoch = coord
+        .stop_job_with_savepoint(&job_id, Some(String::from("continuous-stop")))
+        .map_err(|error| scheduler_status(&error))?;
+    Ok(Json(ContinuousStopWithSavepointResponse {
+        job_id: job_id.to_string(),
+        savepoint_epoch: epoch,
+    }))
+}
+
 /// Dispatch one serialized input cycle through the job's retained window state.
 ///
 /// The coordinator fences concurrent pushes, attaches the input as an InlineIpc
@@ -530,6 +889,23 @@ pub async fn api_continuous_push(
 
     let job_id =
         krishiv_proto::JobId::try_new(&body.job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // Phase 55: run-loop jobs receive pushes directly on their executors —
+    // no coordinator fencing, no coordinator-buffered data (control-plane-
+    // only invariant). The push is ingest API, never the execution driver.
+    let run_loop = {
+        let coord = coordinator.read().await;
+        run_loop_targets(&coord, &job_id).map_err(|error| scheduler_status(&error))?
+    };
+    if let Some(targets) = run_loop {
+        push_run_loop_input(&coordinator, &job_id, targets, ipc_bytes)
+            .await
+            .map_err(|error| match error {
+                ContinuousStreamError::Scheduler(e) => scheduler_status(&e),
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            })?;
+        return Ok(Json(ContinuousPushResponse { success: true }));
+    }
 
     let partition = InputPartition::typed(
         "continuous-input",
@@ -624,6 +1000,23 @@ pub async fn api_continuous_drain(
     let job_id =
         krishiv_proto::JobId::try_new(&body.job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
+    // Phase 55: run-loop jobs serve their egress buffers from the executors.
+    let run_loop = {
+        let coord = coordinator.read().await;
+        run_loop_targets(&coord, &job_id).map_err(|error| scheduler_status(&error))?
+    };
+    if let Some(targets) = run_loop {
+        let payloads = drain_run_loop_output(&coordinator, &job_id, targets)
+            .await
+            .map_err(|error| match error {
+                ContinuousStreamError::Scheduler(e) => scheduler_status(&e),
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            })?;
+        return Ok(Json(ContinuousDrainResponse {
+            inline_record_batch_ipc: payloads,
+        }));
+    }
+
     let batches = {
         let mut coord = coordinator.write().await;
         let snapshot = coord
@@ -698,60 +1091,289 @@ pub async fn register_continuous_stream_with_sink(
     spec: &krishiv_plan::window::WindowExecutionSpec,
     sink: Option<&ContinuousSinkSpec>,
 ) -> Result<(), ContinuousStreamError> {
+    let options = ContinuousRegistrationOptions {
+        sink: sink.cloned(),
+        ..Default::default()
+    };
+    register_continuous_stream_with_options(coordinator, job_id, spec, &options).await
+}
+
+/// Full registration options for a continuous streaming job (Phase 55).
+#[derive(Debug, Clone, Default)]
+pub struct ContinuousRegistrationOptions {
+    /// Optional streaming Iceberg sink (G7 cycle model / barrier model).
+    pub sink: Option<ContinuousSinkSpec>,
+    /// Run-loop subtask count (defaults to 1).
+    pub parallelism: Option<u32>,
+    /// `"cycle"` (default) or `"run-loop"`.
+    pub mode: Option<String>,
+    /// Registry connector sources owned by run-loop subtasks.
+    pub sources: Vec<ContinuousRegistrySource>,
+    /// Barrier checkpoint interval (run-loop jobs).
+    pub checkpoint_interval_ms: Option<u64>,
+    /// Checkpoint storage path (run-loop jobs).
+    pub checkpoint_storage_path: Option<String>,
+}
+
+fn invalid_registration(message: impl Into<String>) -> ContinuousStreamError {
+    ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
+        message: message.into(),
+    })
+}
+
+/// Build the JobSpec for a continuous job: one `stream:loop:` task in cycle
+/// mode, or N `stream:rloop:` subtasks (`task-streaming-<i>`) in run-loop
+/// mode. Subtask index order == task order in the stage, so the launch path's
+/// `key_group_range_for_task(task_index, stage_parallelism)` stamps exactly
+/// the range the run-loop's exchange routes by.
+fn build_continuous_job_spec(
+    job_id: &krishiv_proto::JobId,
+    spec: &WindowExecutionSpec,
+    mode: ContinuousJobMode,
+    parallelism: u32,
+    options: &ContinuousRegistrationOptions,
+) -> Result<krishiv_proto::JobSpec, ContinuousStreamError> {
+    use krishiv_plan::ExecutionKind;
     use krishiv_plan::window::encode_window_execution_spec;
-    use krishiv_plan::{ExecutionKind, TypedTaskFragment};
-    use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
+    use krishiv_proto::{JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
 
-    let job_id_typed = JobId::try_new(job_id).map_err(|e| {
-        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
-            message: e.to_string(),
-        })
-    })?;
-    let stage_id = StageId::try_new("stage-streaming").map_err(|e| {
-        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
-            message: e.to_string(),
-        })
-    })?;
-    let task_id = TaskId::try_new("task-streaming").map_err(|e| {
-        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
-            message: e.to_string(),
-        })
-    })?;
-    let encoded_spec = encode_window_execution_spec(spec).map_err(|e| {
-        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
-            message: e.to_string(),
-        })
-    })?;
-    let loop_fragment = format!("stream:loop:{job_id}|{encoded_spec}");
-    let fragment = TypedTaskFragment::new(ExecutionKind::Streaming, loop_fragment)
-        .encode()
-        .map_err(|e| {
-            ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
-                message: e.to_string(),
-            })
-        })?;
-    let mut task = TaskSpec::new(task_id, fragment);
-    if let Some(sink) = sink {
-        let contract = sink
-            .contract_string()
-            .map_err(ContinuousStreamError::Scheduler)?;
-        task = task.with_sink_contract(contract);
+    let stage_id = StageId::try_new("stage-streaming")
+        .map_err(|e| invalid_registration(e.to_string()))?;
+    let encoded_spec = encode_window_execution_spec(spec)
+        .map_err(|e| invalid_registration(e.to_string()))?;
+    let sink_contract = match &options.sink {
+        Some(sink) => Some(
+            sink.contract_string()
+                .map_err(ContinuousStreamError::Scheduler)?,
+        ),
+        None => None,
+    };
+
+    let mut stage = StageSpec::new(stage_id, "continuous-streaming");
+    match mode {
+        ContinuousJobMode::Cycle => {
+            let task_id = TaskId::try_new("task-streaming")
+                .map_err(|e| invalid_registration(e.to_string()))?;
+            let body = format!("stream:loop:{}|{encoded_spec}", job_id.as_str());
+            let fragment = TypedTaskFragment::new(ExecutionKind::Streaming, body)
+                .encode()
+                .map_err(|e| invalid_registration(e.to_string()))?;
+            let mut task = TaskSpec::new(task_id, fragment);
+            if let Some(contract) = &sink_contract {
+                task = task.with_sink_contract(contract.clone());
+            }
+            stage = stage.with_task(task);
+        }
+        ContinuousJobMode::RunLoop => {
+            for subtask in 0..parallelism {
+                let task_id = TaskId::try_new(format!("task-streaming-{subtask}"))
+                    .map_err(|e| invalid_registration(e.to_string()))?;
+                let body = format!(
+                    "stream:rloop:{}|{subtask}/{parallelism}|{encoded_spec}",
+                    job_id.as_str()
+                );
+                let fragment = TypedTaskFragment::new(ExecutionKind::Streaming, body)
+                    .encode()
+                    .map_err(|e| invalid_registration(e.to_string()))?;
+                let mut task = TaskSpec::new(task_id, fragment);
+                if let Some(contract) = &sink_contract {
+                    task = task.with_sink_contract(contract.clone());
+                }
+                stage = stage.with_task(task);
+            }
+        }
     }
-    let stage = StageSpec::new(stage_id, "continuous-streaming").with_task(task);
-    let job_spec = JobSpec::new(
-        job_id_typed.clone(),
-        "continuous-streaming",
-        JobKind::Streaming,
-    )
-    .with_stage(stage);
 
-    let mut coord = coordinator.write().await;
-    coord
-        .ensure_active()
-        .map_err(ContinuousStreamError::Scheduler)?;
-    upsert_continuous_streaming_job(&mut coord, &job_id_typed, spec, job_spec)
+    let mut job_spec = JobSpec::new(job_id.clone(), "continuous-streaming", JobKind::Streaming)
+        .with_stage(stage);
+    if let (Some(interval), Some(path)) = (
+        options.checkpoint_interval_ms,
+        options.checkpoint_storage_path.as_deref(),
+    ) {
+        job_spec = job_spec.with_checkpoint(interval, path);
+    }
+    Ok(job_spec)
+}
+
+/// Register a continuous streaming job with full Phase 55 options. Run-loop
+/// jobs are additionally assigned + launched here — the tasks start once and
+/// run until stopped (the coordinator stays control-plane-only afterwards).
+pub async fn register_continuous_stream_with_options(
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+    spec: &krishiv_plan::window::WindowExecutionSpec,
+    options: &ContinuousRegistrationOptions,
+) -> Result<(), ContinuousStreamError> {
+    use krishiv_proto::JobId;
+
+    let parallelism = options.parallelism.unwrap_or(1).max(1);
+    let mode = ContinuousJobMode::parse(options.mode.as_deref(), parallelism)
+        .map_err(invalid_registration)?;
+    if mode == ContinuousJobMode::RunLoop
+        && options.checkpoint_interval_ms.is_some() != options.checkpoint_storage_path.is_some()
+    {
+        return Err(invalid_registration(
+            "run-loop checkpointing requires BOTH checkpoint_interval_ms and              checkpoint_storage_path (or neither)",
+        ));
+    }
+    let job_id_typed =
+        JobId::try_new(job_id).map_err(|e| invalid_registration(e.to_string()))?;
+    let job_spec = build_continuous_job_spec(&job_id_typed, spec, mode, parallelism, options)?;
+
+    let freshly_submitted = {
+        let mut coord = coordinator.write().await;
+        coord
+            .ensure_active()
+            .map_err(ContinuousStreamError::Scheduler)?;
+        upsert_continuous_streaming_job(
+            &mut coord,
+            &job_id_typed,
+            spec,
+            mode,
+            parallelism,
+            job_spec,
+        )
+        .await
+        .map_err(ContinuousStreamError::Scheduler)?
+    };
+
+    if mode == ContinuousJobMode::RunLoop && freshly_submitted {
+        launch_run_loop_job(coordinator, &job_id_typed, &options.sources).await?;
+    }
+    Ok(())
+}
+
+/// Assign, wire, and launch a freshly registered run-loop job's subtasks.
+///
+/// Each subtask's input partitions carry (a) the peer table for the keyed
+/// exchange (`stream-peers:` — subtask index, task id, executor endpoint) and
+/// (b) every registry source descriptor (the subtask filters to the splits it
+/// owns). The tasks launch once; from here on the coordinator is
+/// control-plane-only for this job.
+async fn launch_run_loop_job(
+    coordinator: &SharedCoordinator,
+    job_id: &krishiv_proto::JobId,
+    sources: &[ContinuousRegistrySource],
+) -> Result<(), ContinuousStreamError> {
+    let (targets, channels, target_count) = {
+        let mut coord = coordinator.write().await;
+        coord
+            .assign_pending_tasks(job_id)
+            .map_err(ContinuousStreamError::Scheduler)?;
+
+        // Peer table: every stream:rloop task must be assigned with a
+        // resolvable endpoint before launch — the exchange fails closed
+        // otherwise.
+        let mut peers: Vec<(usize, String, String)> = Vec::new();
+        {
+            let jc = coord.job_coordinator(job_id).ok_or_else(|| {
+                ContinuousStreamError::Scheduler(crate::SchedulerError::UnknownJob {
+                    job_id: job_id.clone(),
+                })
+            })?;
+            let job = jc.read_record();
+            for stage in job.spec.stages() {
+                for (index, task) in stage.tasks().iter().enumerate() {
+                    let typed = TypedTaskFragment::decode(task.description());
+                    let is_rloop = typed
+                        .as_ref()
+                        .is_some_and(|t| t.body.starts_with("stream:rloop:"));
+                    if !is_rloop {
+                        continue;
+                    }
+                    let assigned = job
+                        .stages
+                        .iter()
+                        .flat_map(|s| s.tasks())
+                        .find(|t| t.task_id() == task.task_id())
+                        .and_then(|t| t.assigned_executor().cloned());
+                    let Some(executor_id) = assigned else {
+                        return Err(ContinuousStreamError::Unavailable(format!(
+                            "run-loop job {job_id} subtask {index} has no executor                              (register more executors and retry)"
+                        )));
+                    };
+                    let endpoint = coord
+                        .find_executor_endpoint(&executor_id)
+                        .ok_or_else(|| {
+                            ContinuousStreamError::Unavailable(format!(
+                                "run-loop job {job_id}: executor {executor_id} has no                                  task endpoint"
+                            ))
+                        })?;
+                    peers.push((index, task.task_id().as_str().to_owned(), endpoint));
+                }
+            }
+        }
+        if peers.is_empty() {
+            return Err(invalid_registration(format!(
+                "job {job_id} has no stream:rloop tasks to launch"
+            )));
+        }
+
+        let peer_entries: Vec<String> = peers
+            .iter()
+            .map(|(subtask, task_id, endpoint)| format!("{subtask}={task_id}@{endpoint}"))
+            .collect();
+        let peers_partition = krishiv_proto::InputPartition::new(
+            "stream-peers",
+            format!("stream-peers:{}", peer_entries.join(";")),
+        );
+        let mut source_partitions: Vec<krishiv_proto::InputPartition> = Vec::new();
+        for (index, source) in sources.iter().enumerate() {
+            let config_json = serde_json::to_string(&source.config).map_err(|e| {
+                invalid_registration(format!("source config for '{}': {e}", source.table))
+            })?;
+            source_partitions.push(krishiv_proto::InputPartition::new(
+                format!("registry-src-{index}"),
+                format!(
+                    "registry-connector:{}:{}:{config_json}",
+                    source.kind.trim(),
+                    source.table.trim()
+                ),
+            ));
+        }
+
+        let mut per_task: std::collections::HashMap<
+            krishiv_proto::TaskId,
+            Vec<krishiv_proto::InputPartition>,
+        > = std::collections::HashMap::new();
+        for (_, task_id, _) in &peers {
+            let task_id = krishiv_proto::TaskId::try_new(task_id)
+                .map_err(|e| invalid_registration(e.to_string()))?;
+            let mut partitions = vec![peers_partition.clone()];
+            partitions.extend(source_partitions.iter().cloned());
+            per_task.insert(task_id, partitions);
+        }
+        coord
+            .job_task_input_partitions
+            .insert(job_id.clone(), per_task);
+
+        let assignments = coord
+            .launch_assigned_task_assignments(job_id)
+            .map_err(ContinuousStreamError::Scheduler)?;
+        if assignments.is_empty() {
+            return Err(ContinuousStreamError::Unavailable(format!(
+                "run-loop job {job_id} produced no launchable assignments"
+            )));
+        }
+        let targets = coord
+            .resolve_assignment_targets(assignments)
+            .map_err(ContinuousStreamError::Scheduler)?;
+        let count = targets.len();
+        (targets, coord.executor_channels.clone(), count)
+    };
+
+    let responses = Coordinator::deliver_assignment_targets_with_channels(channels, targets)
         .await
         .map_err(ContinuousStreamError::Scheduler)?;
+    let mut coord = coordinator.write().await;
+    let accepted = coord.apply_assignment_dispatch_responses(job_id, &responses);
+    // In-process targets are filtered before delivery (tests drive their
+    // inboxes directly), so only remote responses are counted here.
+    if accepted < responses.len() {
+        return Err(ContinuousStreamError::Unavailable(format!(
+            "run-loop job {job_id}: {accepted}/{target_count} subtask launches accepted"
+        )));
+    }
     Ok(())
 }
 
@@ -778,13 +1400,15 @@ async fn upsert_continuous_streaming_job(
     coord: &mut Coordinator,
     job_id: &JobId,
     desired_spec: &WindowExecutionSpec,
+    desired_mode: ContinuousJobMode,
+    desired_parallelism: u32,
     job_spec: krishiv_proto::JobSpec,
-) -> crate::SchedulerResult<()> {
+) -> crate::SchedulerResult<bool> {
     let existing = coord.job_coordinator(job_id).map(|jc| {
         let record = jc.read_record();
         let is_streaming = record.spec.kind() == JobKind::Streaming;
         let terminal = record.state().is_terminal();
-        let decoded = decode_continuous_job_spec(&record).ok();
+        let decoded = decode_continuous_job_shape(&record).ok();
         (is_streaming, terminal, decoded)
     });
     if let Some((is_streaming, terminal, decoded)) = existing {
@@ -794,9 +1418,15 @@ async fn upsert_continuous_streaming_job(
             });
         }
         let healthy = !terminal && decoded.is_some();
-        if healthy && decoded.as_ref() == Some(desired_spec) {
-            // Already running the desired spec — nothing to do.
-            return Ok(());
+        let desired_shape = ContinuousJobShape {
+            spec: desired_spec.clone(),
+            mode: desired_mode,
+            parallelism: desired_parallelism,
+        };
+        if healthy && decoded.as_ref() == Some(&desired_shape) {
+            // Already running the desired spec/mode/parallelism — nothing to
+            // do; a steady-state reconcile must not reset window state.
+            return Ok(false);
         }
         // Terminal, limbo, or spec changed: retire the old incarnation so the id
         // is free for a clean re-submit.
@@ -815,7 +1445,7 @@ async fn upsert_continuous_streaming_job(
     }
 
     coord.submit_job(job_spec)?;
-    Ok(())
+    Ok(true)
 }
 
 /// Push one cycle of IPC bytes as input for a continuous streaming job.
@@ -836,6 +1466,15 @@ pub async fn push_continuous_input_coordinated(
             message: e.to_string(),
         })
     })?;
+
+    // Phase 55: run-loop jobs receive pushes directly on their executors.
+    let run_loop = {
+        let coord = coordinator.read().await;
+        run_loop_targets(&coord, &job_id_typed).map_err(ContinuousStreamError::Scheduler)?
+    };
+    if let Some(targets) = run_loop {
+        return push_run_loop_input(coordinator, &job_id_typed, targets, ipc_bytes).await;
+    }
 
     let partition = InputPartition::typed(
         "continuous-input",
@@ -943,6 +1582,15 @@ pub async fn drain_continuous_stream_coordinated(
             message: e.to_string(),
         })
     })?;
+
+    // Phase 55: run-loop jobs serve their egress buffers from the executors.
+    let run_loop = {
+        let coord = coordinator.read().await;
+        run_loop_targets(&coord, &job_id_typed).map_err(ContinuousStreamError::Scheduler)?
+    };
+    if let Some(targets) = run_loop {
+        return drain_run_loop_output(coordinator, &job_id_typed, targets).await;
+    }
 
     let mut coord = coordinator.write().await;
     let snapshot = coord
@@ -1114,6 +1762,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn continuous_mode_parse_rejects_parallel_cycle() {
+        assert!(ContinuousJobMode::parse(None, 1).unwrap() == ContinuousJobMode::Cycle);
+        assert!(
+            ContinuousJobMode::parse(Some("run-loop"), 3).unwrap() == ContinuousJobMode::RunLoop
+        );
+        assert!(ContinuousJobMode::parse(None, 3).is_err());
+        assert!(ContinuousJobMode::parse(Some("bogus"), 1).is_err());
+    }
+
+    /// Phase 55: run-loop registration produces N `stream:rloop:` subtasks
+    /// whose fragment identity round-trips through the shape decoder, and the
+    /// delivery metadata labels the model honestly.
+    #[tokio::test]
+    async fn run_loop_registration_builds_parallel_subtasks() {
+        let coordinator = make_coordinator_with_executor("rloop-reg").await;
+        let options = ContinuousRegistrationOptions {
+            parallelism: Some(3),
+            mode: Some(String::from("run-loop")),
+            ..Default::default()
+        };
+        register_continuous_stream_with_options(
+            &coordinator,
+            "rloop-reg-job",
+            &tumbling_spec(),
+            &options,
+        )
+        .await
+        .expect("run-loop registration must succeed");
+
+        let coord = coordinator.read().await;
+        let job_id = krishiv_proto::JobId::try_new("rloop-reg-job").unwrap();
+        let jc = coord.job_coordinator(&job_id).unwrap();
+        let record = jc.read_record();
+        let tasks: Vec<_> = record
+            .spec
+            .stages()
+            .iter()
+            .flat_map(|stage| stage.tasks())
+            .collect();
+        assert_eq!(tasks.len(), 3, "parallelism 3 registers three subtasks");
+        for (index, task) in tasks.iter().enumerate() {
+            let body = TypedTaskFragment::decode(task.description()).unwrap().body;
+            assert!(
+                body.starts_with(&format!("stream:rloop:rloop-reg-job|{index}/3|")),
+                "subtask {index} fragment carries its identity: {body}"
+            );
+        }
+        let shape = decode_continuous_job_shape(&record).unwrap();
+        assert_eq!(shape.mode, ContinuousJobMode::RunLoop);
+        assert_eq!(shape.parallelism, 3);
+        assert_eq!(shape.spec, tumbling_spec());
+
+        let view = continuous_job_view(&coord, &job_id).unwrap();
+        assert_eq!(view.delivery.model, "run-loop");
+        assert_eq!(view.delivery.parallelism, 3);
+        assert_eq!(view.task_count, 3);
+    }
+
+    /// Phase 55: re-registering the same shape is an idempotent no-op, while
+    /// a parallelism change retires the old incarnation and resubmits.
+    #[tokio::test]
+    async fn run_loop_reregistration_is_convergent() {
+        let coordinator = make_coordinator_with_executor("rloop-upsert").await;
+        let options = ContinuousRegistrationOptions {
+            parallelism: Some(2),
+            mode: Some(String::from("run-loop")),
+            ..Default::default()
+        };
+        register_continuous_stream_with_options(
+            &coordinator,
+            "rloop-upsert-job",
+            &tumbling_spec(),
+            &options,
+        )
+        .await
+        .unwrap();
+        // Same shape → no-op (must not error, must keep 2 tasks).
+        register_continuous_stream_with_options(
+            &coordinator,
+            "rloop-upsert-job",
+            &tumbling_spec(),
+            &options,
+        )
+        .await
+        .unwrap();
+        {
+            let coord = coordinator.read().await;
+            let job_id = krishiv_proto::JobId::try_new("rloop-upsert-job").unwrap();
+            let jc = coord.job_coordinator(&job_id).unwrap();
+        let record = jc.read_record();
+            assert_eq!(record.spec.task_count(), 2);
+        }
+        // Parallelism change → retire + fresh submit at the new parallelism.
+        let rescaled = ContinuousRegistrationOptions {
+            parallelism: Some(3),
+            mode: Some(String::from("run-loop")),
+            ..Default::default()
+        };
+        register_continuous_stream_with_options(
+            &coordinator,
+            "rloop-upsert-job",
+            &tumbling_spec(),
+            &rescaled,
+        )
+        .await
+        .unwrap();
+        let coord = coordinator.read().await;
+        let job_id = krishiv_proto::JobId::try_new("rloop-upsert-job").unwrap();
+        let jc = coord.job_coordinator(&job_id).unwrap();
+        let record = jc.read_record();
+        assert_eq!(record.spec.task_count(), 3, "rescale re-registers at 3");
+    }
+
+    /// Phase 55: cycle-mode registration is bit-for-bit unchanged (the G8
+    /// path) — one stream:loop task, delivery model "cycle-push".
+    #[tokio::test]
+    async fn cycle_registration_shape_is_unchanged() {
+        let coordinator = make_coordinator_with_executor("cycle-shape").await;
+        register_continuous_stream_coordinated(&coordinator, "cycle-shape-job", &tumbling_spec())
+            .await
+            .unwrap();
+        let coord = coordinator.read().await;
+        let job_id = krishiv_proto::JobId::try_new("cycle-shape-job").unwrap();
+        let jc = coord.job_coordinator(&job_id).unwrap();
+        let record = jc.read_record();
+        let shape = decode_continuous_job_shape(&record).unwrap();
+        assert_eq!(shape.mode, ContinuousJobMode::Cycle);
+        assert_eq!(shape.parallelism, 1);
+        let view = continuous_job_view(&coord, &job_id).unwrap();
+        assert_eq!(view.delivery.model, "cycle-push");
+        assert_eq!(view.task_count, 1);
+    }
+
+    #[tokio::test]
     async fn register_succeeds_and_drain_returns_empty() {
         let coordinator = make_coordinator_with_executor("reg-drain").await;
 
@@ -1121,6 +1903,11 @@ mod tests {
             job_id: "cs-test-job".to_string(),
             spec: tumbling_spec(),
             sink: None,
+            parallelism: None,
+            mode: None,
+            sources: Vec::new(),
+            checkpoint_interval_ms: None,
+            checkpoint_storage_path: None,
         };
         let response = api_continuous_register(State(coordinator.clone()), Json(register_req))
             .await
@@ -1173,6 +1960,11 @@ mod tests {
                 job_id: "cs-list-job".into(),
                 spec: tumbling_spec(),
                 sink: None,
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
             }),
         )
         .await
@@ -1238,6 +2030,11 @@ mod tests {
                 job_id: "cs-delivery-drain".into(),
                 spec: tumbling_spec(),
                 sink: None,
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
             }),
         )
         .await
@@ -1254,6 +2051,11 @@ mod tests {
                     key_columns: Vec::new(),
                     op_column: None,
                 }),
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
             }),
         )
         .await
@@ -1293,6 +2095,11 @@ mod tests {
             job_id: "cs-push-job".to_string(),
             spec: tumbling_spec(),
             sink: None,
+            parallelism: None,
+            mode: None,
+            sources: Vec::new(),
+            checkpoint_interval_ms: None,
+            checkpoint_storage_path: None,
         };
         let _ = api_continuous_register(State(coordinator.clone()), Json(register_req))
             .await
@@ -1322,6 +2129,11 @@ mod tests {
                 job_id: "cs-restore-job".into(),
                 spec: tumbling_spec(),
                 sink: None,
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
             }),
         )
         .await
@@ -1399,6 +2211,11 @@ mod tests {
                 job_id: "cs-in-process-job".into(),
                 spec: tumbling_spec(),
                 sink: None,
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
             }),
         )
         .await
@@ -1429,6 +2246,11 @@ mod tests {
             job_id: "".to_string(), // empty id is invalid
             spec: tumbling_spec(),
             sink: None,
+            parallelism: None,
+            mode: None,
+            sources: Vec::new(),
+            checkpoint_interval_ms: None,
+            checkpoint_storage_path: None,
         };
         let result = api_continuous_register(State(coordinator.clone()), Json(req)).await;
         assert!(result.is_err(), "empty job_id must be rejected");
@@ -1446,6 +2268,11 @@ mod tests {
                 job_id: "cs-invalid-window".into(),
                 spec,
                 sink: None,
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
             }),
         )
         .await
@@ -1470,6 +2297,11 @@ mod tests {
             job_id: "cs-idempotent-job".to_string(),
             spec: tumbling_spec(),
             sink: None,
+            parallelism: None,
+            mode: None,
+            sources: Vec::new(),
+            checkpoint_interval_ms: None,
+            checkpoint_storage_path: None,
         };
         let first = api_continuous_register(State(coordinator.clone()), Json(request()))
             .await
@@ -1501,6 +2333,11 @@ mod tests {
             job_id: "cs-replace-job".to_string(),
             spec: tumbling_spec(),
             sink: None,
+            parallelism: None,
+            mode: None,
+            sources: Vec::new(),
+            checkpoint_interval_ms: None,
+            checkpoint_storage_path: None,
         };
         let _ = api_continuous_register(State(coordinator.clone()), Json(first))
             .await
@@ -1512,6 +2349,11 @@ mod tests {
             job_id: "cs-replace-job".to_string(),
             spec: changed.clone(),
             sink: None,
+            parallelism: None,
+            mode: None,
+            sources: Vec::new(),
+            checkpoint_interval_ms: None,
+            checkpoint_storage_path: None,
         };
         let resp = api_continuous_register(State(coordinator.clone()), Json(second))
             .await
@@ -1554,6 +2396,11 @@ mod tests {
                 job_id: "cs-collision-id".to_string(),
                 spec: tumbling_spec(),
                 sink: None,
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
             }),
         )
         .await
@@ -1574,6 +2421,11 @@ mod tests {
                 job_id: "cs-dereg-fresh".into(),
                 spec: tumbling_spec(),
                 sink: None,
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
             }),
         )
         .await
@@ -1629,6 +2481,11 @@ mod tests {
                 job_id: "cs-busy-job".into(),
                 spec: tumbling_spec(),
                 sink: None,
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
             }),
         )
         .await
@@ -1658,6 +2515,11 @@ mod tests {
                 job_id: "cs-cycle-job".into(),
                 spec: tumbling_spec(),
                 sink: None,
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
             }),
         )
         .await
@@ -1753,6 +2615,11 @@ mod tests {
                 job_id: "cs-lost-job".into(),
                 spec: tumbling_spec(),
                 sink: None,
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
             }),
         )
         .await
@@ -1819,6 +2686,11 @@ mod tests {
                 job_id: "cs-reassign-job".into(),
                 spec: tumbling_spec(),
                 sink: None,
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
             }),
         )
         .await

@@ -493,6 +493,10 @@ pub fn coordinator_http_router(
             post(crate::continuous_stream_http::api_continuous_restore),
         )
         .route(
+            "/api/v1/continuous/{job_id}/stop-with-savepoint",
+            post(crate::continuous_stream_http::api_continuous_stop_with_savepoint),
+        )
+        .route(
             "/api/v1/continuous-register",
             post(crate::continuous_stream_http::api_continuous_register),
         )

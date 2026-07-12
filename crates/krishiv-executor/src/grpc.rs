@@ -36,6 +36,11 @@ pub struct ExecutorTaskInboxService {
     pub(crate) loop_executors: SharedLoopExecutors,
     /// Per-job pending input batches for distributed continuous push.
     pub(crate) continuous_inputs: SharedContinuousInputs,
+    /// Phase 55: per-job run-loop egress buffers — shared with the task runner.
+    pub(crate) continuous_outputs: crate::runner::SharedContinuousOutputs,
+    /// Phase 55: per-buffer-key input notifies — shared with the task runner
+    /// so a push wakes a blocked run-loop within microseconds.
+    pub(crate) input_notify: crate::runner::SharedContinuousNotify,
 }
 
 impl ExecutorTaskInboxService {
@@ -45,6 +50,8 @@ impl ExecutorTaskInboxService {
             inbox,
             loop_executors: Arc::new(DashMap::new()),
             continuous_inputs: Arc::new(DashMap::new()),
+            continuous_outputs: Arc::new(DashMap::new()),
+            input_notify: Arc::new(DashMap::new()),
         }
     }
 
@@ -58,7 +65,22 @@ impl ExecutorTaskInboxService {
             inbox,
             loop_executors,
             continuous_inputs,
+            continuous_outputs: Arc::new(DashMap::new()),
+            input_notify: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Share the run-loop egress buffers and input notifies with the runner
+    /// (Phase 55: push wakes the run-loop; drain serves its egress buffer).
+    #[must_use]
+    pub fn with_run_loop_state(
+        mut self,
+        continuous_outputs: crate::runner::SharedContinuousOutputs,
+        input_notify: crate::runner::SharedContinuousNotify,
+    ) -> Self {
+        self.continuous_outputs = continuous_outputs;
+        self.input_notify = input_notify;
+        self
     }
 
     /// Assignment inbox backing this service.
@@ -194,19 +216,52 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         // fresh incarnation, not swallowed as an at-least-once duplicate or
         // insta-cancelled by the stale tombstone.
         let job_id = request.job_id();
-        if self.loop_executors.remove(job_id.as_str()).is_some() {
+        // Run-loop subtasks key their state by `{job}#…`; a cancel for the
+        // job (or any of its subtasks) retires the whole composite family.
+        let rloop_prefix = format!("{}#", job_id.as_str());
+        let composite_keys: Vec<String> = self
+            .loop_executors
+            .iter()
+            .filter(|e| e.key().starts_with(&rloop_prefix))
+            .map(|e| e.key().clone())
+            .collect();
+        let had_cycle_executor = self.loop_executors.remove(job_id.as_str()).is_some();
+        let had_rloop = !composite_keys.is_empty();
+        for key in &composite_keys {
+            self.loop_executors.remove(key);
+        }
+        if had_cycle_executor || had_rloop {
             self.continuous_inputs.remove(job_id.as_str());
+            self.continuous_inputs
+                .retain(|k, _| !k.starts_with(&rloop_prefix));
+            self.continuous_outputs.remove(job_id.as_str());
+            // Wake any run-loop blocked in its idle wait so it observes the
+            // cancellation immediately instead of on the fallback tick, then
+            // drop the notify entries.
+            for entry in self.input_notify.iter() {
+                if entry.key() == job_id.as_str() || entry.key().starts_with(&rloop_prefix) {
+                    entry.value().notify_waiters();
+                }
+            }
+            self.input_notify
+                .retain(|k, _| k != job_id.as_str() && !k.starts_with(&rloop_prefix));
             let purged = self
                 .inbox
                 .forget_job(job_id)
                 .map_err(|error| tonic::Status::internal(error.to_string()))?;
-            self.inbox
-                .clear_cancelled_task(request.task_id())
-                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+            // Run-loop tasks poll `is_task_cancelled` to exit — their
+            // tombstone is cleared by the loop itself after it stops, so only
+            // cycle-model tombstones are cleared eagerly here.
+            if had_cycle_executor && !had_rloop {
+                self.inbox
+                    .clear_cancelled_task(request.task_id())
+                    .map_err(|error| tonic::Status::internal(error.to_string()))?;
+            }
             tracing::debug!(
                 job_id = %job_id,
                 purged_dedupe_entries = purged,
-                "continuous job cancelled — loop executor dropped and inbox identity retired"
+                run_loop_subtasks = composite_keys.len(),
+                "continuous job cancelled — stateful executors dropped and inbox identity retired"
             );
         }
         let response = if removed {
@@ -228,17 +283,39 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         // Decode Arrow IPC bytes into RecordBatches.
         let batches = decode_ipc_batches(&req.ipc_bytes)?;
 
-        // Enforce per-job capacity to prevent unbounded memory growth (M1).
+        // Phase 55: a push addressed at a registered run-loop subtask buffer
+        // (`{job}#{task}` — the keyed-exchange path) lands task-scoped;
+        // everything else keeps the per-job buffer (cycle model + external
+        // ingest, which any subtask may claim and re-route by key group).
+        let task_key = format!("{job_id}#{}", req.task_id.as_str());
+        let buffer_key = if self.input_notify.contains_key(&task_key) {
+            task_key
+        } else {
+            job_id.clone()
+        };
+
+        // Enforce per-buffer capacity to prevent unbounded memory growth (M1).
         const MAX_PENDING_BATCHES: usize = 64;
-        let mut entry = self.continuous_inputs.entry(job_id).or_default();
-        if entry.len() + batches.len() > MAX_PENDING_BATCHES {
-            return Err(tonic::Status::resource_exhausted(format!(
-                "continuous input buffer for job {} exceeded capacity ({MAX_PENDING_BATCHES}); \
-                 slow down the producer or increase the drain rate",
-                entry.len() + batches.len(),
-            )));
+        {
+            let mut entry = self.continuous_inputs.entry(buffer_key.clone()).or_default();
+            if entry.len() + batches.len() > MAX_PENDING_BATCHES {
+                return Err(tonic::Status::resource_exhausted(format!(
+                    "continuous input buffer for job {} exceeded capacity ({MAX_PENDING_BATCHES}); \
+                     slow down the producer or increase the drain rate",
+                    entry.len() + batches.len(),
+                )));
+            }
+            entry.extend(batches);
         }
-        entry.extend(batches);
+        // Wake a blocked run-loop within microseconds of arrival.
+        if let Some(notify) = self.input_notify.get(&buffer_key) {
+            notify.notify_waiters();
+        }
+        if buffer_key != job_id
+            && let Some(notify) = self.input_notify.get(&job_id)
+        {
+            notify.notify_waiters();
+        }
 
         Ok(tonic::Response::new(TaskStatusResponse::new(
             TransportDisposition::Accepted,
@@ -254,6 +331,22 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
 
         let req = request.into_inner();
         let job_id = req.job_id.as_str();
+
+        // Phase 55: run-loop jobs emit into a per-job egress buffer as they
+        // run — drain serves (and clears) it without driving any execution.
+        if let Some(mut egress) = self.continuous_outputs.get_mut(job_id) {
+            let batches: Vec<RecordBatch> = egress.drain(..).collect();
+            drop(egress);
+            let ipc_bytes = encode_ipc_batches(&batches)
+                .map_err(|e| tonic::Status::internal(e.to_string()))?;
+            return Ok(tonic::Response::new(
+                krishiv_proto::task::DrainContinuousOutputResponse {
+                    version: krishiv_proto::TransportVersion::CURRENT,
+                    disposition: TransportDisposition::Accepted,
+                    ipc_bytes,
+                },
+            ));
+        }
 
         // Check executor FIRST to avoid losing input batches on early return.
         let executor_entry = match self.loop_executors.get(job_id) {
@@ -506,8 +599,30 @@ pub fn executor_task_grpc_server_with_continuous(
     continuous_inputs: SharedContinuousInputs,
     auth: Option<ExecutorTaskAuthConfig>,
 ) -> wire::v1::executor_task_server::ExecutorTaskServer<ExecutorTaskGrpcService> {
+    executor_task_grpc_server_with_run_loop(
+        inbox,
+        loop_executors,
+        continuous_inputs,
+        Arc::new(DashMap::new()),
+        Arc::new(DashMap::new()),
+        auth,
+    )
+}
+
+/// Build the generated tonic server sharing the FULL continuous-streaming
+/// state with a runner, including the Phase 55 run-loop egress buffers and
+/// input notifies (so pushes wake run-loops and drains serve their egress).
+pub fn executor_task_grpc_server_with_run_loop(
+    inbox: ExecutorAssignmentInbox,
+    loop_executors: SharedLoopExecutors,
+    continuous_inputs: SharedContinuousInputs,
+    continuous_outputs: crate::runner::SharedContinuousOutputs,
+    input_notify: crate::runner::SharedContinuousNotify,
+    auth: Option<ExecutorTaskAuthConfig>,
+) -> wire::v1::executor_task_server::ExecutorTaskServer<ExecutorTaskGrpcService> {
     let inner =
-        ExecutorTaskInboxService::new_with_continuous(inbox, loop_executors, continuous_inputs);
+        ExecutorTaskInboxService::new_with_continuous(inbox, loop_executors, continuous_inputs)
+            .with_run_loop_state(continuous_outputs, input_notify);
     let auth = auth.unwrap_or_else(ExecutorTaskAuthConfig::from_env);
     let auth_misconfiguration = (auth.require_auth() && !auth.has_bearer_token()).then(|| {
         format!(

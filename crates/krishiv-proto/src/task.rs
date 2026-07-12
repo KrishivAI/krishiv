@@ -1165,6 +1165,24 @@ pub enum OutputContractDescriptor {
         /// The column is stripped before rows reach the table.
         op_column: Option<String>,
     },
+    /// Stream continuous output into a Kafka topic through the checkpoint-
+    /// aligned two-phase commit registry (Phase 55, sink descriptors beyond
+    /// Iceberg).
+    ///
+    /// Output produced between barriers is written inside an open Kafka
+    /// transaction prepared at the barrier and committed by the
+    /// checkpoint-complete notification, so `read_committed` consumers observe
+    /// exactly-once output. Requires the engine to be built with the `kafka`
+    /// connector feature.
+    KafkaSink {
+        /// Kafka bootstrap servers (`host:port[,host:port…]`).
+        bootstrap_servers: String,
+        /// Destination topic.
+        topic: String,
+        /// Prefix for the producer `transactional.id`; the executor appends
+        /// the job/task identity so concurrent subtasks fence independently.
+        transactional_id_prefix: String,
+    },
 }
 
 /// Row-level write semantics for a streaming Iceberg sink.
@@ -1203,6 +1221,9 @@ impl fmt::Display for IcebergSinkMode {
 /// Description prefix for the legacy string form of an Iceberg sink contract.
 pub const ICEBERG_SINK_PREFIX: &str = "iceberg-sink:";
 
+/// Description prefix for the legacy string form of a Kafka sink contract.
+pub const KAFKA_SINK_PREFIX: &str = "kafka-sink:";
+
 impl OutputContractDescriptor {
     /// Build a legacy-compatible human-readable output descriptor.
     pub fn legacy_description(&self) -> String {
@@ -1231,7 +1252,62 @@ impl OutputContractDescriptor {
                 }
                 out
             }
+            Self::KafkaSink {
+                bootstrap_servers,
+                topic,
+                transactional_id_prefix,
+            } => format!(
+                "{KAFKA_SINK_PREFIX}{bootstrap_servers}|{topic}|txid={transactional_id_prefix}"
+            ),
         }
+    }
+
+    /// Parse the legacy string form of a Kafka sink contract
+    /// (`kafka-sink:<bootstrap_servers>|<topic>[|txid=<prefix>]`).
+    ///
+    /// Returns `None` when `description` does not carry the prefix; returns an
+    /// error string when it does but is malformed, so callers can fail the
+    /// task instead of silently discarding output.
+    pub fn parse_kafka_sink(description: &str) -> Option<Result<Self, String>> {
+        let payload = description.trim().strip_prefix(KAFKA_SINK_PREFIX)?;
+        let mut parts = payload.split('|');
+        let bootstrap_servers = match parts.next().map(str::trim) {
+            Some(s) if !s.is_empty() => s.to_owned(),
+            _ => return Some(Err("kafka-sink contract missing bootstrap servers".into())),
+        };
+        let topic = match parts.next().map(str::trim) {
+            Some(t) if !t.is_empty() => t.to_owned(),
+            _ => return Some(Err("kafka-sink contract missing topic".into())),
+        };
+        let mut transactional_id_prefix = String::from("krishiv-sink");
+        for field in parts {
+            let field = field.trim();
+            if field.is_empty() {
+                continue;
+            }
+            let Some((k, v)) = field.split_once('=') else {
+                return Some(Err(format!(
+                    "kafka-sink contract field '{field}' must be key=value"
+                )));
+            };
+            match k.trim() {
+                "txid" => {
+                    let v = v.trim();
+                    if v.is_empty() {
+                        return Some(Err("kafka-sink txid prefix cannot be empty".into()));
+                    }
+                    transactional_id_prefix = v.to_owned();
+                }
+                other => {
+                    return Some(Err(format!("unknown kafka-sink contract field '{other}'")));
+                }
+            }
+        }
+        Some(Ok(Self::KafkaSink {
+            bootstrap_servers,
+            topic,
+            transactional_id_prefix,
+        }))
     }
 
     /// Parse the legacy string form of an Iceberg sink contract

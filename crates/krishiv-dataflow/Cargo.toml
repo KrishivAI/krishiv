@@ -24,6 +24,7 @@ krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
 krishiv-state = { path = "../krishiv-state", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+base64 = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }
 async-stream = "0.3.6"

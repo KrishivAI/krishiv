@@ -141,6 +141,100 @@ impl PerKeyIntervalJoin {
         }
     }
 
+    /// Serialize every buffered event (both sides, all keys) for durable
+    /// checkpoints (Phase 55 / G5): the join's exit contract is restore with
+    /// exact pre-kill accumulations, so the buffers must travel in the
+    /// snapshot — the earlier "re-derive from source replay" shortcut lost
+    /// any event the source had already compacted past.
+    ///
+    /// Format: JSON array of `{key, side, ts, ipc}` with the single-row batch
+    /// as base64 Arrow IPC. Buffer sizes are bounded by the join window.
+    pub fn snapshot_buffered_events(&self) -> Result<Vec<u8>, String> {
+        use base64::Engine as _;
+        let mut entries = Vec::new();
+        for (key, buffers) in &self.states {
+            for (side, buf) in [("l", &buffers.left), ("r", &buffers.right)] {
+                for event in buf {
+                    let mut ipc = Vec::new();
+                    {
+                        let mut writer = arrow::ipc::writer::StreamWriter::try_new(
+                            &mut ipc,
+                            &event.batch.schema(),
+                        )
+                        .map_err(|e| format!("join snapshot IPC writer: {e}"))?;
+                        writer
+                            .write(&event.batch)
+                            .map_err(|e| format!("join snapshot IPC write: {e}"))?;
+                        writer
+                            .finish()
+                            .map_err(|e| format!("join snapshot IPC finish: {e}"))?;
+                    }
+                    entries.push(serde_json::json!({
+                        "key": key,
+                        "side": side,
+                        "ts": event.event_time_ms,
+                        "ipc": base64::engine::general_purpose::STANDARD.encode(&ipc),
+                    }));
+                }
+            }
+        }
+        serde_json::to_vec(&entries).map_err(|e| format!("join snapshot encode: {e}"))
+    }
+
+    /// Restore buffered events serialized by [`Self::snapshot_buffered_events`],
+    /// replacing any current buffers.
+    pub fn restore_buffered_events(&mut self, bytes: &[u8]) -> Result<(), String> {
+        use base64::Engine as _;
+        let entries: Vec<serde_json::Value> =
+            serde_json::from_slice(bytes).map_err(|e| format!("join restore decode: {e}"))?;
+        self.states.clear();
+        self.access_order.clear();
+        for entry in entries {
+            let key = entry
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or("join restore: missing key")?
+                .to_owned();
+            let side = entry
+                .get("side")
+                .and_then(|v| v.as_str())
+                .ok_or("join restore: missing side")?;
+            let ts = entry
+                .get("ts")
+                .and_then(|v| v.as_i64())
+                .ok_or("join restore: missing ts")?;
+            let ipc = base64::engine::general_purpose::STANDARD
+                .decode(
+                    entry
+                        .get("ipc")
+                        .and_then(|v| v.as_str())
+                        .ok_or("join restore: missing ipc")?,
+                )
+                .map_err(|e| format!("join restore base64: {e}"))?;
+            let reader =
+                arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc), None)
+                    .map_err(|e| format!("join restore IPC: {e}"))?;
+            for batch in reader {
+                let batch = batch.map_err(|e| format!("join restore batch: {e}"))?;
+                let buffers = self
+                    .states
+                    .entry(key.clone())
+                    .or_insert_with(IntervalJoinBuffers::new);
+                let target = if side == "l" {
+                    &mut buffers.left
+                } else {
+                    &mut buffers.right
+                };
+                target.push_back(BufferedEvent {
+                    event_time_ms: ts,
+                    batch: Arc::new(batch),
+                });
+            }
+            self.access_order.insert(key, ());
+        }
+        Ok(())
+    }
+
     /// Push an event onto the left side for `key`.
     ///
     /// Returns matched pairs as `(left, right)` `Arc<RecordBatch>` tuples so

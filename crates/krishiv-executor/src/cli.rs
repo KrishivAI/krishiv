@@ -423,19 +423,28 @@ async fn heartbeat_loop(
     let shared_loop_executors = Arc::new(DashMap::new());
     let shared_continuous_inputs: Arc<DashMap<String, Vec<arrow::record_batch::RecordBatch>>> =
         Arc::new(DashMap::new());
+    // Phase 55 run-loop state: egress buffers + input notifies, shared
+    // between the gRPC service (push/drain) and the run-loop fragments.
+    let shared_continuous_outputs: crate::runner::SharedContinuousOutputs =
+        Arc::new(DashMap::new());
+    let shared_input_notify: crate::runner::SharedContinuousNotify = Arc::new(DashMap::new());
 
     // Now spawn the task and barrier servers.  No more re-registers required.
     if let Some(listener) = task_listener {
         let server_inbox = inbox.clone();
         let grpc_loop_executors = Arc::clone(&shared_loop_executors);
         let grpc_continuous_inputs = Arc::clone(&shared_continuous_inputs);
+        let grpc_continuous_outputs = Arc::clone(&shared_continuous_outputs);
+        let grpc_input_notify = Arc::clone(&shared_input_notify);
         tokio::spawn(async move {
-            use crate::transport::serve_executor_task_grpc_with_listener_and_continuous;
-            if let Err(e) = serve_executor_task_grpc_with_listener_and_continuous(
+            use crate::transport::serve_executor_task_grpc_with_run_loop;
+            if let Err(e) = serve_executor_task_grpc_with_run_loop(
                 listener,
                 server_inbox,
                 grpc_loop_executors,
                 grpc_continuous_inputs,
+                grpc_continuous_outputs,
+                grpc_input_notify,
             )
             .await
             {
@@ -495,7 +504,14 @@ async fn heartbeat_loop(
         .with_executor_id(runtime.config().executor_id().clone())
         .with_udf_limits(krishiv_plan::udf::ResourceLimits::default())
         .with_shared_loop_executors(shared_loop_executors)
-        .with_shared_continuous_inputs(shared_continuous_inputs);
+        .with_shared_continuous_inputs(shared_continuous_inputs)
+        .with_shared_continuous_outputs(shared_continuous_outputs)
+        .with_shared_continuous_notify(shared_input_notify);
+    // The run-loop short-circuits exchange deliveries to co-located peers by
+    // matching the advertised task endpoint.
+    if let Some(endpoint) = runtime.config().task_endpoint() {
+        runner_builder = runner_builder.with_own_task_endpoint(endpoint);
+    }
     // Wire durable state dir so stream:loop: window operators use file-backed state.
     if let Some(ref dir) = state_dir {
         runner_builder = runner_builder.with_state_dir(dir.clone());
@@ -611,6 +627,16 @@ async fn heartbeat_loop(
         .config_mut()
         .set_progress_buffer(Arc::clone(&progress_buffer));
 
+    // Phase 55 Leg C: run-loop fragments drive barrier alignment at their own
+    // iteration boundaries — hand them the state fallback, checkpoint storage
+    // and a dyn-erased coordinator client.
+    runner_builder = runner_builder.with_barrier_context(crate::runner::RunLoopBarrierContext {
+        state: state_backend.clone(),
+        storage: Arc::clone(&checkpoint_storage),
+        coordinator: crate::runner::SharedCoordinatorClient(coord_service.clone()
+            as Arc<dyn krishiv_proto::CoordinatorExecutorService>),
+    });
+
     let runner = Arc::new(runner_builder);
     readiness.mark_backends_ready();
 
@@ -725,7 +751,7 @@ async fn heartbeat_loop(
 
                 // Drain any pending barriers from the gRPC injector before
                 // picking up the next task assignment.
-                runner_loop
+                let _ = runner_loop
                     .drain_pending_barriers(
                         backend.clone(),
                         Arc::clone(&storage)

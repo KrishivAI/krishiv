@@ -842,13 +842,19 @@ pub static FLAGS: &[FlagSpec] = &[
         "KRISHIV_STREAM_EARLY_FIRE_MS",
         FlagKind::UInt,
         "unset",
-        "Speculative early-fire interval for open windows (embedded loop; distributed wiring is Phase 55).",
+        "Speculative early-fire interval for open windows (embedded loop; the state-backed operator accessor is a known gap).",
+    ),
+    rt(
+        "KRISHIV_STREAM_LINGER_MS",
+        FlagKind::UInt,
+        "profile",
+        "Run-loop batch/linger before each drain in ms; overrides the KRISHIV_STREAM_PROFILE default (0 low-latency, 5 throughput).",
     ),
     rt(
         "KRISHIV_STREAM_PROFILE",
         FlagKind::Enum(&["low-latency", "throughput"]),
         "low-latency",
-        "Embedded streaming loop profile (checkpoint cadence, batching).",
+        "Streaming loop profile: embedded checkpoint cadence and the distributed run-loop batch/linger dial (Phase 55).",
     ),
     rt(
         "KRISHIV_TARGET_PARALLELISM",
@@ -915,6 +921,12 @@ pub static FLAGS: &[FlagSpec] = &[
         FlagKind::Secret,
         "unset",
         "Bearer token for Unity Catalog.",
+    ),
+    rt(
+        "KRISHIV_WATERMARK_IDLE_MS",
+        FlagKind::UInt,
+        "30000",
+        "Run-loop per-split watermark idleness timeout: a silent split is excluded from the min-combine after this long (Phase 55 watermarks v2).",
     ),
     rt(
         "KRISHIV_WAREHOUSE_ROOT",

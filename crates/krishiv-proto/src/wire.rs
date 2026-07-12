@@ -1467,6 +1467,17 @@ fn output_contract_descriptor_to_wire(
             iceberg_op_column: op_column.clone().unwrap_or_default(),
             ..Default::default()
         },
+        OutputContractDescriptor::KafkaSink {
+            bootstrap_servers,
+            topic,
+            transactional_id_prefix,
+        } => v1::OutputContractDescriptor {
+            kind: v1::OutputContractDescriptorKind::KafkaSink as i32,
+            kafka_bootstrap_servers: bootstrap_servers.clone(),
+            kafka_topic: topic.clone(),
+            kafka_transactional_id_prefix: transactional_id_prefix.clone(),
+            ..Default::default()
+        },
     }
 }
 
@@ -1524,6 +1535,19 @@ fn output_contract_descriptor_from_wire(
                 mode,
                 key_columns: value.iceberg_key_columns,
                 op_column: non_empty_string(value.iceberg_op_column),
+            })
+        }
+        v1::OutputContractDescriptorKind::KafkaSink => {
+            require_non_empty(&value.kafka_bootstrap_servers, "kafka sink bootstrap servers")?;
+            require_non_empty(&value.kafka_topic, "kafka sink topic")?;
+            require_non_empty(
+                &value.kafka_transactional_id_prefix,
+                "kafka sink transactional id prefix",
+            )?;
+            Ok(OutputContractDescriptor::KafkaSink {
+                bootstrap_servers: value.kafka_bootstrap_servers,
+                topic: value.kafka_topic,
+                transactional_id_prefix: value.kafka_transactional_id_prefix,
             })
         }
     }

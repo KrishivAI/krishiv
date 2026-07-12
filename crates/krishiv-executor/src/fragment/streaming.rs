@@ -348,12 +348,20 @@ fn execute_cep_fragment(
     Ok(output)
 }
 
-/// ST8: Execute a `window-join:` fragment using [`WatermarkWindowJoinOperator`].
+/// ST8 / Phase 55 (G5, closes platform #88): Execute a `window-join:`
+/// fragment using a **persistent** [`WatermarkWindowJoinOperator`].
 ///
 /// Fragment format: `window-join:<json>` where `<json>` is a serialised
 /// `WatermarkWindowJoinSpec`.  Input partitions with even indices are treated
 /// as the left stream; odd indices as the right stream.
+///
+/// The operator is retained across cycles in `runner.join_executors` — the
+/// historical implementation rebuilt it every cycle, losing all buffered join
+/// state by construction. Each cycle's output now also carries the operator
+/// snapshot so the coordinator holds a restorable checkpoint, and a barrier
+/// checkpoint captures buffered state via the task's state binding.
 fn execute_window_join_fragment(
+    runner: &ExecutorTaskRunner,
     assignment: &ExecutorTaskAssignment,
     fragment: &str,
 ) -> ExecutorResult<ExecutorTaskOutput> {
@@ -369,6 +377,53 @@ fn execute_window_join_fragment(
         serde_json::from_str(json).map_err(|e| ExecutorError::InvalidAssignment {
             message: format!("window-join: invalid spec JSON: {e}"),
         })?;
+    let job_id = assignment.job_id().as_str();
+
+    // Fetch or create the persistent operator; seed from a pending restore
+    // directive when one arrived before the first cycle.
+    let operator_arc = {
+        let entry = runner
+            .join_executors
+            .entry(job_id.to_owned())
+            .or_try_insert_with(|| {
+                let mut op = krishiv_dataflow::WatermarkWindowJoinOperator::new(spec.clone());
+                if let Some((_, restored)) = runner.pending_restores.remove(job_id)
+                    && let Some(bytes) = restored.snapshots.iter().find(|b| !b.is_empty())
+                {
+                    op = krishiv_dataflow::WatermarkWindowJoinOperator::restore_from_bytes(bytes)
+                        .map_err(|e| ExecutorError::LocalExecution {
+                            message: format!(
+                                "window-join restore from checkpoint epoch {} failed: {e}",
+                                restored.epoch
+                            ),
+                        })?;
+                }
+                Ok::<_, ExecutorError>(Arc::new(Mutex::new(op)))
+            })?;
+        Arc::clone(entry.value())
+    };
+    // Bind the task's barrier snapshots to this operator (per-task, so a
+    // barrier on the job captures buffered join state).
+    runner.task_state_bindings.insert(
+        assignment.task_id().as_str().to_owned(),
+        crate::runner::TaskStateBinding::Join(job_id.to_owned()),
+    );
+    if let Some((snapshot_bytes, _)) =
+        read_continuous_restore_hint(assignment.input_partitions())
+    {
+        let restored =
+            krishiv_dataflow::WatermarkWindowJoinOperator::restore_from_bytes(&snapshot_bytes)
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: format!("window-join restore hint failed: {e}"),
+                })?;
+        let mut guard = operator_arc
+            .lock()
+            .map_err(|_| ExecutorError::LocalExecution {
+                message: format!("window-join operator lock poisoned for job {job_id}"),
+            })?;
+        *guard = restored;
+        runner.pending_restores.remove(job_id);
+    }
 
     // Partition input into left (even indices) and right (odd indices).
     let all_partitions =
@@ -386,22 +441,70 @@ fn execute_window_join_fragment(
     let left: Vec<_> = left_batches.into_iter().map(|(_, b)| b).collect();
     let right: Vec<_> = right_batches.into_iter().map(|(_, b)| b).collect();
 
-    let out =
-        krishiv_dataflow::execute_window_join(&left, &right, spec, i64::MAX).map_err(|e| {
-            ExecutorError::LocalExecution {
-                message: format!("window-join: execution error: {e}"),
+    // Advance the watermark from observed event times minus the window
+    // half-width (state older than `wm − window_ms` can no longer match) —
+    // NOT i64::MAX, which would flush every buffer and defeat retention.
+    let mut max_event_time = i64::MIN;
+    let (out, state_snapshot, watermark_ms) = {
+        let mut op = operator_arc
+            .lock()
+            .map_err(|_| ExecutorError::LocalExecution {
+                message: format!(
+                    "window-join operator lock poisoned for job {job_id}; \
+                     join state is inconsistent — restart the job"
+                ),
+            })?;
+        let mut out: Vec<arrow::record_batch::RecordBatch> = Vec::new();
+        for batch in &left {
+            if let Some(ts) = crate::fragment::run_loop::batch_max_event_time(
+                batch,
+                &spec.time_column,
+            ) {
+                max_event_time = max_event_time.max(ts);
             }
-        })?;
+            out.extend(op.process_left(batch));
+        }
+        for batch in &right {
+            if let Some(ts) = crate::fragment::run_loop::batch_max_event_time(
+                batch,
+                &spec.time_column,
+            ) {
+                max_event_time = max_event_time.max(ts);
+            }
+            out.extend(op.process_right(batch));
+        }
+        let watermark_ms = if max_event_time > i64::MIN {
+            let wm = max_event_time;
+            op.advance_watermark(wm);
+            Some(wm)
+        } else {
+            None
+        };
+        let state_snapshot = op
+            .snapshot_bytes()
+            .ok()
+            .filter(|bytes| !bytes.is_empty());
+        (out, state_snapshot, watermark_ms)
+    };
 
     let total_rows: usize = out.iter().map(|b| b.num_rows()).sum();
     let total_batches = out.len();
     let column_count = out.first().map(|b| b.num_columns()).unwrap_or(0);
-    Ok(ExecutorTaskOutput::streaming_window(
+    let mut output = ExecutorTaskOutput::streaming_window(
         total_rows,
         total_batches,
         column_count,
         out,
-    ))
+    );
+    if let Some(wm) = watermark_ms {
+        output = output.with_watermark_ms(wm);
+    }
+    // G5: ship the post-cycle join state so the coordinator has a restorable
+    // checkpoint after every cycle (matches the stream:loop contract).
+    if let Some(bytes) = state_snapshot {
+        output = output.with_state_snapshot(bytes);
+    }
+    Ok(output)
 }
 
 /// Execute a `stream:loop:` fragment using `ContinuousWindowExecutor` (GAP-6).
@@ -969,15 +1072,24 @@ pub(crate) async fn execute_streaming_fragment(
         return execute_cep_fragment(runner, assignment, fragment);
     }
 
+    // Phase 55: stream:rloop: fragments run the promoted long-lived loop —
+    // the task launches once, owns its splits, and exits only on cancel.
+    if fragment.starts_with(crate::fragment::run_loop::STREAM_RLOOP_PREFIX) {
+        return crate::fragment::run_loop::execute_run_loop_fragment(runner, assignment, fragment)
+            .await;
+    }
+
     // GAP-6: stream:loop: fragments use a stateful ContinuousWindowExecutor
     // shared across drain cycles via runner.loop_executors.
     if fragment.starts_with(STREAM_LOOP_PREFIX) {
         return execute_loop_fragment(runner, assignment, fragment).await;
     }
 
-    // ST8: watermark-bounded stream-to-stream join.
+    // ST8: watermark-bounded stream-to-stream join. Phase 55 (G5/#88): the
+    // operator is retained across cycles in `runner.join_executors` so
+    // buffered join state survives between inputs and is barrier-snapshottable.
     if fragment.starts_with(WINDOW_JOIN_PREFIX) {
-        return execute_window_join_fragment(assignment, fragment);
+        return execute_window_join_fragment(runner, assignment, fragment);
     }
 
     let mut plan_spec =

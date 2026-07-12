@@ -10,6 +10,16 @@ const LATENCY_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// µs-resolution bucket bounds (in seconds) for the streaming ingest→emit
+/// record-latency histogram (Phase 55 exit gate). The shared
+/// [`LATENCY_BUCKETS`] bottom out at 5 ms — too coarse to resolve the
+/// continuous loop's sub-millisecond target — so this family carries its own
+/// per-metric bucket set: 50 µs → 1 s.
+const STREAM_RECORD_LATENCY_BUCKETS: &[f64] = &[
+    0.000_05, 0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
+    0.5, 1.0,
+];
+
 /// Escape a Prometheus label value per the text exposition format: `\`, `"`,
 /// and `\n` must be escaped so a malicious or unusual label cannot break the
 /// exposition format or inject metric lines.
@@ -50,6 +60,49 @@ impl Default for KrishivHistogram {
 }
 
 impl KrishivHistogram {
+    /// Create a histogram with a custom static bucket set.
+    ///
+    /// Use for metric families whose latency scale the shared
+    /// [`LATENCY_BUCKETS`] cannot resolve (e.g. the µs-scale streaming
+    /// record-latency histogram).
+    pub fn with_buckets(buckets: &'static [f64]) -> Self {
+        let counts = (0..=buckets.len()).map(|_| AtomicU64::new(0)).collect();
+        Self {
+            buckets,
+            counts,
+            sum_micros: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    /// Bucket upper bounds (seconds) this histogram observes into.
+    pub fn bucket_bounds(&self) -> &'static [f64] {
+        self.buckets
+    }
+
+    /// Approximate quantile from the recorded bucket counts (linear
+    /// interpolation inside the winning bucket; the overflow bucket reports
+    /// its lower bound). Returns `None` when nothing has been recorded.
+    pub fn quantile(&self, q: f64) -> Option<f64> {
+        let (count, _, counts, _) = self.snapshot();
+        if count == 0 {
+            return None;
+        }
+        let rank = (q.clamp(0.0, 1.0) * count as f64).ceil().max(1.0) as u64;
+        let mut cumulative = 0u64;
+        for (i, c) in counts.iter().enumerate() {
+            cumulative += c;
+            if cumulative >= rank {
+                return Some(match self.buckets.get(i) {
+                    Some(&upper) => upper,
+                    // Overflow bucket: report the largest finite bound.
+                    None => self.buckets.last().copied().unwrap_or(f64::INFINITY),
+                });
+            }
+        }
+        self.buckets.last().copied()
+    }
+
     /// Record a duration observation in seconds.
     ///
     /// Non-finite or negative durations are dropped: the sum is stored as
@@ -170,6 +223,10 @@ pub struct KrishivMetrics {
     sink_abort_duration: dashmap::DashMap<String, KrishivHistogram>,
     /// Backpressure duration in microseconds (labeled by job_id).
     backpressure_duration_us: dashmap::DashMap<String, AtomicU64>,
+    /// Streaming ingest→emit record latency (labeled by job_id) — µs-scale
+    /// buckets ([`STREAM_RECORD_LATENCY_BUCKETS`]), Phase 55 exit-gate
+    /// instrument. Measures source-read to operator-emit inside the engine.
+    stream_record_latency: dashmap::DashMap<String, KrishivHistogram>,
 }
 
 #[derive(Debug, Default)]
@@ -566,6 +623,7 @@ impl KrishivMetrics {
         self.checkpoint_upload_duration.remove(job_id);
         self.restore_duration.remove(job_id);
         self.source_read_duration.remove(job_id);
+        self.stream_record_latency.remove(job_id);
         self.checkpoint_alignment_duration.remove(job_id);
         self.output_buffer_flushes.clear();
         self.sink_prepare_duration.clear();
@@ -600,6 +658,23 @@ impl KrishivMetrics {
             .entry(source_id.to_string())
             .or_default()
             .observe(duration_secs);
+    }
+
+    /// Record one ingest→emit record latency observation for a streaming job
+    /// (seconds; µs-resolution buckets — Phase 55 exit-gate instrument).
+    pub fn observe_stream_record_latency(&self, job_id: &str, duration_secs: f64) {
+        self.stream_record_latency
+            .entry(job_id.to_string())
+            .or_insert_with(|| KrishivHistogram::with_buckets(STREAM_RECORD_LATENCY_BUCKETS))
+            .observe(duration_secs);
+    }
+
+    /// Approximate quantile of the ingest→emit latency for a job (seconds).
+    /// `None` when the job has no recorded observations.
+    pub fn stream_record_latency_quantile(&self, job_id: &str, q: f64) -> Option<f64> {
+        self.stream_record_latency
+            .get(job_id)
+            .and_then(|h| h.quantile(q))
     }
 
     /// Record an output buffer flush with a reason.
@@ -1206,6 +1281,14 @@ impl KrishivMetrics {
             &self.source_read_duration,
         )?;
 
+        render_histogram(
+            &mut out,
+            "krishiv_stream_record_latency_seconds",
+            "Streaming ingest-to-emit record latency in seconds (µs-resolution buckets)",
+            "job_id",
+            &self.stream_record_latency,
+        )?;
+
         let flush_entries: BTreeMap<String, u64> = self
             .output_buffer_flushes
             .iter()
@@ -1391,26 +1474,30 @@ fn render_histogram(
     for entry in map.iter() {
         let key = entry.key().clone();
         let (count, sum, counts, _) = entry.value().snapshot();
-        entries.insert(key, (count, sum, counts));
+        // Per-metric bucket sets (e.g. the µs-scale stream-record-latency
+        // family) carry their own bounds; the default family shares
+        // LATENCY_BUCKETS.
+        let bounds = entry.value().bucket_bounds();
+        entries.insert(key, (count, sum, counts, bounds));
     }
     if entries.is_empty() {
         return Ok(());
     }
     writeln!(out, "# HELP {metric} {help}")?;
     writeln!(out, "# TYPE {metric} histogram")?;
-    for (label_value, (count, sum, counts)) in &entries {
+    for (label_value, (count, sum, counts, bounds)) in &entries {
         let value = escape_label_value(label_value);
         writeln!(out, "{metric}_sum{{{label}=\"{value}\"}} {:.6}", sum)?;
         writeln!(out, "{metric}_count{{{label}=\"{value}\"}} {count}")?;
         let mut cumulative = 0u64;
-        for (i, &bucket) in LATENCY_BUCKETS.iter().enumerate() {
+        for (i, &bucket) in bounds.iter().enumerate() {
             cumulative += counts.get(i).copied().unwrap_or(0);
             writeln!(
                 out,
                 "{metric}_bucket{{{label}=\"{value}\",le=\"{bucket}\"}} {cumulative}"
             )?;
         }
-        cumulative += counts.get(LATENCY_BUCKETS.len()).copied().unwrap_or(0);
+        cumulative += counts.get(bounds.len()).copied().unwrap_or(0);
         writeln!(
             out,
             "{metric}_bucket{{{label}=\"{value}\",le=\"+Inf\"}} {cumulative}"

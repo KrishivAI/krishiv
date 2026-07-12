@@ -37,6 +37,109 @@ use super::task_runner::{
 pub(crate) type SharedContinuousConnectorSources =
     Arc<DashMap<String, Arc<tokio::sync::Mutex<Box<dyn krishiv_connectors::DynSource>>>>>;
 
+/// Shared per-job egress buffers for run-loop (`stream:rloop:`) jobs.
+///
+/// The run-loop appends emitted windows here; `drain_continuous_output`
+/// serves and clears them. Bounded (drop-oldest) — durable consumption goes
+/// through the transactional sink or queryable state, per the DUR-5 contract.
+pub type SharedContinuousOutputs = Arc<DashMap<String, Vec<RecordBatch>>>;
+
+/// Shared per-buffer-key wakeup notifies for pushed continuous input.
+///
+/// `push_continuous_input` notifies the key it appended under so a run-loop
+/// blocked in its idle wait wakes within microseconds instead of the fallback
+/// tick (the embedded loop's `data_notify` discipline, promoted).
+pub type SharedContinuousNotify = Arc<DashMap<String, Arc<tokio::sync::Notify>>>;
+
+/// Which stateful operator a running task's barrier snapshots must capture.
+///
+/// Bound by the run-loop / stateful join fragments at start; consulted by the
+/// checkpoint fanout so each subtask snapshots ITS operator instead of a
+/// per-job singleton (the H-6 fix carried through the checkpoint path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskStateBinding {
+    /// `loop_executors` key of a continuous window executor.
+    Window(String),
+    /// `join_executors` key of a continuous two-input window join operator.
+    Join(String),
+}
+
+/// Dyn-erased coordinator client so long-lived fragments (the run-loop) can
+/// drive barrier checkpoints without the generic `S: CoordinatorExecutorService`
+/// parameter infecting fragment signatures.
+#[derive(Clone)]
+pub struct SharedCoordinatorClient(pub Arc<dyn CoordinatorExecutorService>);
+
+impl std::fmt::Debug for SharedCoordinatorClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SharedCoordinatorClient")
+    }
+}
+
+#[tonic::async_trait]
+impl CoordinatorExecutorService for SharedCoordinatorClient {
+    async fn register_executor(
+        &self,
+        request: tonic::Request<krishiv_proto::RegisterExecutorRequest>,
+    ) -> Result<tonic::Response<krishiv_proto::RegisterExecutorResponse>, tonic::Status> {
+        self.0.register_executor(request).await
+    }
+
+    async fn deregister_executor(
+        &self,
+        request: tonic::Request<krishiv_proto::DeregisterExecutorRequest>,
+    ) -> Result<tonic::Response<krishiv_proto::DeregisterExecutorResponse>, tonic::Status> {
+        self.0.deregister_executor(request).await
+    }
+
+    async fn executor_heartbeat(
+        &self,
+        request: tonic::Request<krishiv_proto::ExecutorHeartbeatRequest>,
+    ) -> Result<tonic::Response<krishiv_proto::ExecutorHeartbeatResponse>, tonic::Status> {
+        self.0.executor_heartbeat(request).await
+    }
+
+    async fn task_status(
+        &self,
+        request: tonic::Request<TaskStatusRequest>,
+    ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
+        self.0.task_status(request).await
+    }
+
+    async fn checkpoint_ack(
+        &self,
+        request: tonic::Request<CheckpointAckRequest>,
+    ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
+        self.0.checkpoint_ack(request).await
+    }
+
+    async fn push_task_result(
+        &self,
+        request: tonic::Request<krishiv_proto::services::TaskResultChunkStream>,
+    ) -> Result<tonic::Response<krishiv_proto::PushTaskResultResponse>, tonic::Status> {
+        self.0.push_task_result(request).await
+    }
+}
+
+/// Everything a long-lived run-loop fragment needs to drive barrier
+/// checkpoints from inside its own iteration boundary (Leg C of Phase 55):
+/// the generic state fallback, checkpoint storage, and a coordinator client.
+/// Wired by the executor CLI where all three live.
+#[derive(Clone)]
+pub struct RunLoopBarrierContext {
+    pub state: CheckpointStateHandle,
+    pub storage: Arc<dyn CheckpointStorage>,
+    pub coordinator: SharedCoordinatorClient,
+}
+
+impl fmt::Debug for RunLoopBarrierContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RunLoopBarrierContext")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Minimal R3.1 stage-local task runner skeleton.
 #[derive(Clone)]
 pub struct ExecutorTaskRunner {
@@ -165,6 +268,37 @@ pub struct ExecutorTaskRunner {
     /// the window operator's state after each batch so external callers can
     /// perform point lookups via the REST API without stopping the job.
     pub(crate) queryable_state: Option<Arc<krishiv_state::QueryableStateStore>>,
+
+    /// Phase 55: per-job egress buffers for run-loop jobs (bounded; served by
+    /// `drain_continuous_output` so results never park in coordinator memory).
+    pub(crate) continuous_outputs: SharedContinuousOutputs,
+
+    /// Phase 55: per-buffer-key input notifies shared with the gRPC service —
+    /// the run-loop's µs-scale wakeup on pushed input.
+    pub(crate) continuous_input_notify: SharedContinuousNotify,
+
+    /// Phase 55: which stateful operator each running task's barrier snapshot
+    /// must capture (per-subtask window executors, continuous join operators).
+    pub(crate) task_state_bindings: Arc<DashMap<String, TaskStateBinding>>,
+
+    /// Phase 55: per-job stateful two-input join operators (`window-join:`
+    /// fragments retain state across cycles — closes G5/#88 state loss).
+    pub(crate) join_executors:
+        Arc<DashMap<String, Arc<Mutex<krishiv_dataflow::WatermarkWindowJoinOperator>>>>,
+
+    /// Phase 55: credit-gated executor→executor exchange for keyed run-loop
+    /// parallelism. All runner clones share the peer channel map.
+    pub(crate) stream_exchange: crate::stream_exchange::StreamExchange,
+
+    /// This executor's advertised task endpoint, used to short-circuit
+    /// exchange deliveries to co-located peer subtasks.
+    pub(crate) own_task_endpoint: Option<String>,
+
+    /// Phase 55: barrier-drive context for run-loop fragments (state fallback
+    /// + checkpoint storage + coordinator client). `None` outside the CLI
+    /// runtime — the slot loop in `cli.rs` then remains the only barrier
+    /// drainer, as before.
+    pub(crate) barrier_context: Option<RunLoopBarrierContext>,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -239,7 +373,79 @@ impl ExecutorTaskRunner {
             transaction_log: crate::transactions::TwoPhaseSinkRegistry::new(),
             connector_registry: Arc::new(krishiv_connectors::registry::default_registry()),
             queryable_state: None,
+            continuous_outputs: Arc::new(DashMap::new()),
+            continuous_input_notify: Arc::new(DashMap::new()),
+            task_state_bindings: Arc::new(DashMap::new()),
+            join_executors: Arc::new(DashMap::new()),
+            stream_exchange: crate::stream_exchange::StreamExchange::default(),
+            own_task_endpoint: None,
+            barrier_context: None,
         }
+    }
+
+    /// Share pre-allocated run-loop egress buffers with the gRPC service.
+    pub fn with_shared_continuous_outputs(mut self, outputs: SharedContinuousOutputs) -> Self {
+        self.continuous_outputs = outputs;
+        self
+    }
+
+    /// Share pre-allocated input notifies with the gRPC service.
+    pub fn with_shared_continuous_notify(mut self, notify: SharedContinuousNotify) -> Self {
+        self.continuous_input_notify = notify;
+        self
+    }
+
+    /// Shared run-loop egress buffers for wiring with the gRPC service.
+    pub fn shared_continuous_outputs(&self) -> SharedContinuousOutputs {
+        Arc::clone(&self.continuous_outputs)
+    }
+
+    /// Shared input notifies for wiring with the gRPC service.
+    pub fn shared_continuous_notify(&self) -> SharedContinuousNotify {
+        Arc::clone(&self.continuous_input_notify)
+    }
+
+    /// Record this executor's advertised task endpoint so exchange deliveries
+    /// to co-located peer subtasks short-circuit through shared memory.
+    pub fn with_own_task_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.own_task_endpoint = Some(endpoint.into());
+        self
+    }
+
+    /// Attach the barrier-drive context so run-loop fragments align barriers
+    /// at their own iteration boundaries (Phase 55 Leg C).
+    pub fn with_barrier_context(mut self, context: RunLoopBarrierContext) -> Self {
+        self.barrier_context = Some(context);
+        self
+    }
+
+    /// Wake-up handle for one continuous-input buffer key, creating it on
+    /// first use. `push_continuous_input` notifies this handle after append.
+    pub(crate) fn notify_handle(&self, key: &str) -> Arc<tokio::sync::Notify> {
+        Arc::clone(
+            self.continuous_input_notify
+                .entry(key.to_owned())
+                .or_default()
+                .value(),
+        )
+    }
+
+    /// Notify any run-loop waiting on `key` that input arrived.
+    pub(crate) fn notify_continuous_input(&self, key: &str) {
+        if let Some(notify) = self.continuous_input_notify.get(key) {
+            notify.notify_waiters();
+        }
+    }
+
+    /// Drain pending barriers through the attached [`RunLoopBarrierContext`].
+    /// Returns the number of barriers processed (0 when no context is wired —
+    /// the CLI slot loop then remains the only barrier drainer).
+    pub(crate) async fn drain_barriers_via_context(&self) -> usize {
+        let Some(ctx) = self.barrier_context.clone() else {
+            return 0;
+        };
+        self.drain_pending_barriers(ctx.state, ctx.storage, ctx.coordinator)
+            .await
     }
 
     /// Attach the coordinator's queryable-state registry.
@@ -327,14 +533,15 @@ impl ExecutorTaskRunner {
     }
 
     fn clear_continuous_connector_sources_for_job(&self, job_id: &str) {
-        let prefix = format!("{job_id}|");
+        // Cycle-model sources key by `{job}|…`; run-loop subtasks key by
+        // `{job}#<subtask>|…` — clear both families on restore/teardown.
+        let cycle_prefix = format!("{job_id}|");
+        let rloop_prefix = format!("{job_id}#");
         let keys: Vec<String> = self
             .continuous_connector_sources
             .iter()
             .filter_map(|entry| {
-                entry
-                    .key()
-                    .starts_with(&prefix)
+                (entry.key().starts_with(&cycle_prefix) || entry.key().starts_with(&rloop_prefix))
                     .then(|| entry.key().clone())
             })
             .collect();
@@ -578,6 +785,8 @@ impl ExecutorTaskRunner {
         )
         .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         let is_continuous_cycle = fragment_body.starts_with("stream:loop:");
+        let is_run_loop =
+            fragment_body.starts_with(crate::fragment::run_loop::STREAM_RLOOP_PREFIX);
 
         // Build resource limits from assignment (propagated from job spec).
         let udf_limits = krishiv_plan::udf::ResourceLimits {
@@ -607,6 +816,13 @@ impl ExecutorTaskRunner {
                         message: format!("task timed out after {} seconds", timeout_secs),
                     }),
                 }
+            }
+            crate::ExecutionModel::Streaming if is_run_loop => {
+                // Phase 55 run-loop: the task IS a long-lived loop that exits
+                // only on cancellation — a wall-clock timeout would kill a
+                // healthy streaming job, so none applies.
+                execute_streaming_fragment(self, &assignment, udf_limits.clone(), memory_budget)
+                    .await
             }
             crate::ExecutionModel::Streaming => {
                 // Streaming tasks run a bounded-window loop. A safety timeout
@@ -711,14 +927,23 @@ impl ExecutorTaskRunner {
         // collect this cycle's output while keeping the logical job active for
         // the next push. Other reattachable streaming operators remain Running
         // continuously.
-        let terminal_state = if is_continuous_cycle {
+        let run_loop_cancelled = is_run_loop
+            && output.kind() == crate::runner::ExecutorTaskOutputKind::Cancelled;
+        let terminal_state = if run_loop_cancelled {
+            // A run-loop returns only when cancelled: report Cancelled so the
+            // coordinator's teardown observes the stop instead of a phantom
+            // success.
+            TaskState::Cancelled
+        } else if is_continuous_cycle {
             TaskState::Succeeded
         } else if model == crate::ExecutionModel::Streaming && typed_requires_reattach {
             TaskState::Running
         } else {
             TaskState::Succeeded
         };
-        let terminal_message = if is_continuous_cycle {
+        let terminal_message = if run_loop_cancelled {
+            "run-loop task cancelled"
+        } else if is_continuous_cycle {
             "continuous input cycle completed"
         } else if terminal_state == TaskState::Running {
             "streaming operator active"
@@ -783,7 +1008,7 @@ impl ExecutorTaskRunner {
             terminal_state,
         )?;
 
-        if terminal_state == TaskState::Succeeded {
+        if matches!(terminal_state, TaskState::Succeeded | TaskState::Cancelled) {
             self.clear_running_attempt(&assignment);
         }
 
@@ -958,6 +1183,36 @@ impl ExecutorTaskRunner {
         }
     }
 
+    /// Effective checkpoint-state source for one running task attempt.
+    ///
+    /// Phase 55: run-loop subtasks and stateful join tasks bind their own
+    /// operator (`task_state_bindings`), so a barrier snapshot on a
+    /// parallelism-N job captures each subtask's key-group slice instead of a
+    /// per-job singleton. Falls back to the job-level lookup (cycle model)
+    /// and then to the generic backend.
+    pub fn checkpoint_state_for_task(
+        &self,
+        job_id: &str,
+        task_id: &str,
+        fallback: CheckpointStateHandle,
+    ) -> CheckpointStateHandle {
+        if let Some(binding) = self.task_state_bindings.get(task_id) {
+            match binding.value() {
+                TaskStateBinding::Window(key) => {
+                    if let Some(entry) = self.loop_executors.get(key) {
+                        return CheckpointStateHandle::ContinuousWindow(Arc::clone(entry.value()));
+                    }
+                }
+                TaskStateBinding::Join(key) => {
+                    if let Some(entry) = self.join_executors.get(key) {
+                        return CheckpointStateHandle::WindowJoin(Arc::clone(entry.value()));
+                    }
+                }
+            }
+        }
+        self.checkpoint_state_for_job(job_id, fallback)
+    }
+
     /// Handle a checkpoint initiation request and deliver the ack to the coordinator (P1-17).
     pub async fn initiate_checkpoint_and_deliver_ack<S>(
         &self,
@@ -1062,9 +1317,17 @@ impl ExecutorTaskRunner {
                 })?;
         }
 
-        // Continuous window jobs snapshot the per-job loop executor — the
-        // generic backend would persist vacuous state for them.
-        let state = self.checkpoint_state_for_job(req.job_id.as_str(), fallback_state);
+        // Continuous window jobs snapshot their stateful operator — the
+        // generic backend would persist vacuous state for them. Resolution is
+        // per-attempt (Phase 55): a parallelism-N run-loop job snapshots each
+        // subtask's own key-group slice via `task_state_bindings`.
+        let state_for_attempt = |task_id: &TaskId| {
+            self.checkpoint_state_for_task(
+                req.job_id.as_str(),
+                task_id.as_str(),
+                fallback_state.clone(),
+            )
+        };
 
         // Fan out concurrently: each attempt has a distinct task_id (and thus a
         // distinct `checkpoint_runners` entry / TaskRunner mutex), so the
@@ -1091,7 +1354,7 @@ impl ExecutorTaskRunner {
             );
 
             let req = req.clone();
-            let state = state.clone();
+            let state = state_for_attempt(assignment.task_id());
             let storage = Arc::clone(&storage);
             let coordinator = coordinator.clone();
             acks.push(async move {
@@ -1251,6 +1514,18 @@ impl ExecutorTaskRunner {
             snapshots.push(bytes);
         }
 
+        // Run-loop subtask executors key by `{job}#<subtask>`. With exactly
+        // one local subtask the restore applies directly; with several, the
+        // per-subtask snapshot↔key-group redistribution is Phase 56 scope
+        // (rescaling) — stash the snapshots and surface the gap loudly
+        // instead of merging sibling key-groups into the wrong operator.
+        let rloop_prefix = format!("{job_id}#");
+        let rloop_execs: Vec<_> = self
+            .loop_executors
+            .iter()
+            .filter(|e| e.key().starts_with(&rloop_prefix))
+            .map(|e| Arc::clone(e.value()))
+            .collect();
         if let Some(loop_exec) = self
             .loop_executors
             .get(job_id)
@@ -1263,6 +1538,32 @@ impl ExecutorTaskRunner {
             )
             .map_err(|e| restore_err(format!("restore window state for {job_id}: {e}")))?;
             self.pending_restores.remove(job_id);
+        } else if rloop_execs.len() == 1 {
+            let Some(loop_exec) = rloop_execs.into_iter().next() else {
+                unreachable!("len checked above");
+            };
+            apply_snapshots_to_state(
+                &CheckpointStateHandle::ContinuousWindow(loop_exec),
+                &snapshots,
+            )
+            .map_err(|e| restore_err(format!("restore run-loop state for {job_id}: {e}")))?;
+            self.pending_restores.remove(job_id);
+        } else if rloop_execs.len() > 1 {
+            tracing::error!(
+                job_id,
+                subtasks = rloop_execs.len(),
+                epoch = cmd.epoch,
+                "restore for a multi-subtask run-loop job requires key-group \
+                 redistribution (Phase 56); snapshots stashed, subtask state NOT rolled back"
+            );
+            self.pending_restores.insert(
+                job_id.to_owned(),
+                RestoredJobCheckpoint {
+                    epoch: cmd.epoch,
+                    fencing_token: cmd.fencing_token.as_u64(),
+                    snapshots: snapshots.clone(),
+                },
+            );
         } else {
             // No loop executor yet (fresh process): stash the snapshots so the
             // executor created by the first `stream:loop:` fragment is seeded
@@ -1367,19 +1668,24 @@ impl ExecutorTaskRunner {
     }
 
     /// Drain all pending barriers from the shared injector and initiate
-    /// checkpoints for each one.  Called from the runner loop in `cli.rs`.
+    /// checkpoints for each one.  Called from the runner loop in `cli.rs` and
+    /// from run-loop iteration boundaries (Phase 55 Leg C). Returns the
+    /// number of barriers processed.
     pub async fn drain_pending_barriers<S>(
         &self,
         fallback_state: CheckpointStateHandle,
         storage: Arc<dyn CheckpointStorage>,
         coordinator: S,
-    ) where
+    ) -> usize
+    where
         S: CoordinatorExecutorService + Clone + 'static,
     {
         let Some(ref injector) = self.barrier_injector else {
-            return;
+            return 0;
         };
+        let mut processed = 0usize;
         while let Some(barrier) = injector.next_barrier() {
+            processed = processed.saturating_add(1);
             let Ok(job_id) = JobId::try_new(&barrier.job_id) else {
                 continue;
             };
@@ -1431,5 +1737,6 @@ impl ExecutorTaskRunner {
                 );
             }
         }
+        processed
     }
 }

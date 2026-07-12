@@ -362,7 +362,9 @@ impl JobRecord {
                     )
                     .with_input_partitions(input_partitions)
                     .with_key_group_range(key_group_range_for_task(task_index, stage_parallelism));
-                    if task_body.starts_with("stream:loop:") {
+                    if task_body.starts_with("stream:loop:")
+                        || task_body.starts_with("stream:rloop:")
+                    {
                         assignment = assignment.with_requires_reattach(true);
                     }
                     if let Some(secs) = task_timeout_secs {

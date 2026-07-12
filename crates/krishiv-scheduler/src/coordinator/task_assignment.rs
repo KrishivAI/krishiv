@@ -685,6 +685,18 @@ impl Coordinator {
         Ok(assignments)
     }
 
+    /// Task endpoint advertised by one executor, if known.
+    pub(crate) fn find_executor_endpoint(
+        &self,
+        executor_id: &krishiv_proto::ExecutorId,
+    ) -> Option<String> {
+        self.exec
+            .executors
+            .find_executor(executor_id)
+            .ok()
+            .and_then(|record| record.descriptor().task_endpoint().map(str::to_owned))
+    }
+
     /// Resolve executor task endpoints for launched assignments.
     pub fn resolve_assignment_targets(
         &self,

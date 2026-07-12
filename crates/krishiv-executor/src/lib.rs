@@ -20,6 +20,7 @@ pub mod grpc;
 pub mod grpc_client;
 pub mod runner;
 pub mod source_throttle;
+pub mod stream_exchange;
 pub mod transactions;
 pub mod transport;
 

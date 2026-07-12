@@ -2081,4 +2081,4 @@ pub mod observability;
 mod recovery;
 mod snapshots;
 mod streaming;
-mod task_assignment;
+pub(crate) mod task_assignment;

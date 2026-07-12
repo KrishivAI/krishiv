@@ -115,6 +115,11 @@ impl ExecutorConfig {
     }
 
     #[must_use]
+    /// Advertised task gRPC endpoint, when one has been bound.
+    pub fn task_endpoint(&self) -> Option<&str> {
+        self.task_endpoint.as_deref()
+    }
+
     pub fn with_task_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         let endpoint = endpoint.into();
         if !endpoint.trim().is_empty() {
@@ -730,6 +735,34 @@ pub async fn serve_executor_task_grpc_with_listener_and_continuous(
                 inbox,
                 loop_executors,
                 continuous_inputs,
+                None,
+            ),
+            krishiv_metrics::grpc::extract_trace_context,
+        ))
+        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+        .await
+}
+
+/// Serve the executor task gRPC endpoint sharing the FULL continuous state
+/// with the runner, including Phase 55 run-loop egress buffers and input
+/// notifies (push wakes run-loops; drain serves their egress buffers).
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_executor_task_grpc_with_run_loop(
+    listener: tokio::net::TcpListener,
+    inbox: ExecutorAssignmentInbox,
+    loop_executors: SharedLoopExecutors,
+    continuous_inputs: SharedContinuousInputs,
+    continuous_outputs: crate::runner::SharedContinuousOutputs,
+    input_notify: crate::runner::SharedContinuousNotify,
+) -> Result<(), tonic::transport::Error> {
+    tonic::transport::Server::builder()
+        .add_service(tonic::service::interceptor::InterceptedService::new(
+            crate::grpc::executor_task_grpc_server_with_run_loop(
+                inbox,
+                loop_executors,
+                continuous_inputs,
+                continuous_outputs,
+                input_notify,
                 None,
             ),
             krishiv_metrics::grpc::extract_trace_context,

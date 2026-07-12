@@ -166,22 +166,30 @@ impl WatermarkWindowJoinOperator {
         self.join.active_key_count()
     }
 
-    /// Serialize operator state (spec + watermark) as JSON bytes.
+    /// Serialize operator state (spec + watermark + **buffered join events**)
+    /// as JSON bytes.
     ///
-    /// This is a lightweight snapshot: buffered join events are NOT persisted
-    /// (they can be re-derived from the source replay on recovery).
+    /// Phase 55 / G5: buffered events travel in the snapshot. The earlier
+    /// lightweight form ("re-derive from source replay") could not meet the
+    /// restore-with-exact-pre-kill-accumulations contract — a source that
+    /// compacted past the buffered offsets lost join state permanently.
     pub fn snapshot_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        use base64::Engine as _;
+        let buffered = self.join.snapshot_buffered_events().map_err(|message| {
+            serde::ser::Error::custom(format!("buffered join events: {message}"))
+        })?;
+        let buffered_b64 = base64::engine::general_purpose::STANDARD.encode(&buffered);
         let snap = serde_json::json!({
             "spec": self.spec,
             "watermark_ms": self.watermark_ms,
+            "buffered_b64": buffered_b64,
         });
         serde_json::to_vec(&snap)
     }
 
-    /// Restore from a snapshot produced by [`snapshot_bytes`].
-    ///
-    /// Buffered events are cleared — callers must replay source data to
-    /// rebuild them.
+    /// Restore from a snapshot produced by [`snapshot_bytes`], including
+    /// buffered join events (snapshots from older builds without the
+    /// `buffered_b64` field restore with empty buffers, as before).
     pub fn restore_from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         let val: serde_json::Value = serde_json::from_slice(bytes)?;
         let spec: WatermarkWindowJoinSpec =
@@ -192,6 +200,15 @@ impl WatermarkWindowJoinOperator {
             .unwrap_or(i64::MIN);
         let mut op = Self::new(spec);
         op.watermark_ms = watermark_ms;
+        if let Some(encoded) = val.get("buffered_b64").and_then(|v| v.as_str()) {
+            use base64::Engine as _;
+            let buffered = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|e| serde::de::Error::custom(format!("buffered_b64: {e}")))?;
+            op.join
+                .restore_buffered_events(&buffered)
+                .map_err(serde::de::Error::custom)?;
+        }
         Ok(op)
     }
 

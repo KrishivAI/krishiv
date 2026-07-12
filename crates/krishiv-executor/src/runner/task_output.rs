@@ -410,6 +410,11 @@ impl ExecutorTaskOutput {
 
     /// Attach serialized continuous operator state from this cycle (G5).
     #[must_use]
+    /// G5: the post-cycle stateful-operator snapshot, when one was captured.
+    pub fn state_snapshot(&self) -> Option<&[u8]> {
+        self.state_snapshot.as_deref()
+    }
+
     pub(crate) fn with_state_snapshot(mut self, bytes: Vec<u8>) -> Self {
         self.state_snapshot = Some(bytes);
         self
@@ -512,6 +517,10 @@ pub enum CheckpointStateHandle {
     Backend(Arc<std::sync::Mutex<Box<dyn StateBackend>>>),
     /// Stateful continuous window executor owned by a `stream:loop:` job.
     ContinuousWindow(Arc<std::sync::Mutex<krishiv_dataflow::ContinuousWindowExecutor>>),
+    /// Stateful two-input window join operator owned by a `window-join:` job
+    /// (Phase 55 / G5: the operator retains state across cycles and its
+    /// barrier snapshots capture buffered join state).
+    WindowJoin(Arc<std::sync::Mutex<krishiv_dataflow::WatermarkWindowJoinOperator>>),
 }
 
 impl fmt::Debug for CheckpointStateHandle {
@@ -519,6 +528,7 @@ impl fmt::Debug for CheckpointStateHandle {
         match self {
             Self::Backend(_) => f.write_str("CheckpointStateHandle::Backend"),
             Self::ContinuousWindow(_) => f.write_str("CheckpointStateHandle::ContinuousWindow"),
+            Self::WindowJoin(_) => f.write_str("CheckpointStateHandle::WindowJoin"),
         }
     }
 }
@@ -548,6 +558,16 @@ impl CheckpointStateHandle {
                     message: format!("continuous window snapshot: {e}"),
                     source: None,
                 }),
+            Self::WindowJoin(op) => op
+                .lock()
+                .map_err(|e| krishiv_state::StateError::LockPoisoned {
+                    message: e.to_string(),
+                })?
+                .snapshot_bytes()
+                .map_err(|e| krishiv_state::StateError::BackendUnavailable {
+                    message: format!("window join snapshot: {e}"),
+                    source: None,
+                }),
         }
     }
 
@@ -571,6 +591,21 @@ impl CheckpointStateHandle {
                     message: format!("continuous window restore: {e}"),
                     source: None,
                 }),
+            Self::WindowJoin(op) => {
+                let restored =
+                    krishiv_dataflow::WatermarkWindowJoinOperator::restore_from_bytes(bytes)
+                        .map_err(|e| krishiv_state::StateError::BackendUnavailable {
+                            message: format!("window join restore: {e}"),
+                            source: None,
+                        })?;
+                let mut guard =
+                    op.lock()
+                        .map_err(|e| krishiv_state::StateError::LockPoisoned {
+                            message: e.to_string(),
+                        })?;
+                *guard = restored;
+                Ok(())
+            }
         }
     }
 
@@ -603,6 +638,12 @@ impl CheckpointStateHandle {
                     message: format!("continuous window merge restore: {e}"),
                     source: None,
                 }),
+            // The join operator serializes its whole state as one snapshot;
+            // additive merge across snapshots has no defined semantics.
+            Self::WindowJoin(_) => Err(krishiv_state::StateError::BackendUnavailable {
+                message: "window join state does not support additive snapshot merge".into(),
+                source: None,
+            }),
         }
     }
 }

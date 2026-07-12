@@ -126,8 +126,9 @@ Regenerate with:
 | `KRISHIV_STAGE_TARGET_PARTITIONS` | uint | `4` | Planning-time partition count for distributed batch stages (scan + shuffle fan-out). |
 | `KRISHIV_STATE_DIR` | path | `unset` | Executor state-backend directory (RocksDB window/operator state). |
 | `KRISHIV_STREAMING_TASK_TIMEOUT_SECS` | uint | `unset` | Watchdog timeout for streaming task cycles; unset = disabled. |
-| `KRISHIV_STREAM_EARLY_FIRE_MS` | uint | `unset` | Speculative early-fire interval for open windows (embedded loop; distributed wiring is Phase 55). |
-| `KRISHIV_STREAM_PROFILE` | low-latency \| throughput | `low-latency` | Embedded streaming loop profile (checkpoint cadence, batching). |
+| `KRISHIV_STREAM_EARLY_FIRE_MS` | uint | `unset` | Speculative early-fire interval for open windows (embedded loop; the state-backed operator accessor is a known gap). |
+| `KRISHIV_STREAM_LINGER_MS` | uint | `profile` | Run-loop batch/linger before each drain in ms; overrides the KRISHIV_STREAM_PROFILE default (0 low-latency, 5 throughput). |
+| `KRISHIV_STREAM_PROFILE` | low-latency \| throughput | `low-latency` | Streaming loop profile: embedded checkpoint cadence and the distributed run-loop batch/linger dial (Phase 55). |
 | `KRISHIV_TARGET_PARALLELISM` | uint | `cores` | DataFusion target partition count for local execution. |
 | `KRISHIV_TASK_GRPC_ADDR` | host:port | `127.0.0.1:50052` | Executor task gRPC listen address. |
 | `KRISHIV_TASK_SLOTS` | uint | `CPU-derived` | Executor task slots; unset derives from available CPU cores. |
@@ -139,6 +140,7 @@ Regenerate with:
 | `KRISHIV_UNITY_CATALOG_NAME` | text | `main` | Catalog name to register the Unity Catalog integration under. |
 | `KRISHIV_UNITY_HOST` | url | `unset` | Unity Catalog host URL; presence activates the integration. |
 | `KRISHIV_UNITY_TOKEN` | secret | `unset` | Bearer token for Unity Catalog. |
+| `KRISHIV_WATERMARK_IDLE_MS` | uint | `30000` | Run-loop per-split watermark idleness timeout: a silent split is excluded from the min-combine after this long (Phase 55 watermarks v2). |
 | `KRISHIV_WAREHOUSE_ROOT` | path | `.` | Root path for connector-table warehouse storage. |
 
 ## Test-only flags

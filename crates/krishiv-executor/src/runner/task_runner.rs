@@ -46,6 +46,20 @@ impl TaskRunner {
     }
 
     /// Set generic connector source offsets for checkpoint.
+    /// Insert or replace one source offset by partition id (run-loop path:
+    /// offsets accumulate incrementally per owned split instead of being
+    /// replaced wholesale each cycle).
+    pub fn upsert_source_offset(&mut self, offset: CheckpointSourceOffset) {
+        match self
+            .source_offsets
+            .iter_mut()
+            .find(|existing| existing.partition_id == offset.partition_id)
+        {
+            Some(existing) => *existing = offset,
+            None => self.source_offsets.push(offset),
+        }
+    }
+
     pub fn with_source_offsets(mut self, offsets: Vec<CheckpointSourceOffset>) -> Self {
         self.source_offsets = offsets;
         self
