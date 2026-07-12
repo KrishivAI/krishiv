@@ -67,6 +67,33 @@ by "partitions" in the Spark sense.
 
 **Status: Fully automatic.** See phases below.
 
+### Domain C — Iceberg storage partitioning (`PARTITIONED BY`)
+
+Controls how table data is laid out in the warehouse — the only domain that is
+deliberately **user-declared**, because it encodes query patterns the engine
+cannot infer (e.g. "dashboards always filter on `day(event_time)`").
+
+```sql
+CREATE TABLE cat.ns.events
+PARTITIONED BY (region, day(event_time), bucket(16, user_id))
+AS SELECT … ;
+```
+
+**Status: Implemented (Phase 52, #191).** Transforms follow the Iceberg spec —
+`identity`, `bucket(n, col)`, `truncate(w, col)`, `year|month|day|hour(col)` —
+and reuse iceberg-rust's own transform functions, so partition values are
+spec-exact (murmur3 bucketing included). The CTAS landing path fans the result
+stream out per partition value with a global memory bound (largest buffer
+flushes first); every rewrite path (DML copy-on-write, compaction, replace)
+preserves the table's partition spec. Compaction (`CALL
+system.compact_data_files` or the schedulable `CALL system.maintain_table`)
+bin-packs small files within each partition under a snapshot-conflict check.
+
+Files: `krishiv-connectors/src/lakehouse/partitioned_write.rs` (transforms +
+fanout), `dml.rs` (CTAS landing, spec-preserving overwrite),
+`maintenance.rs` (partition-aware compaction), `krishiv-sql/src/lib.rs`
+(`PARTITIONED BY` extraction + routing).
+
 ---
 
 ## Architecture: How Auto-Partitioning Works End-to-End

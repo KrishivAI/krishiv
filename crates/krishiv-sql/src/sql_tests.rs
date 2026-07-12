@@ -961,6 +961,43 @@ mod iceberg_catalog_tests {
         assert_eq!(count, 0, "fresh table has no snapshots to expire");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn call_system_maintain_table_reports_three_columns() {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog = Arc::new(KrishivCatalog::local(dir.path()).await.unwrap());
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+        catalog
+            .create_table("myns", "orders", schema, "")
+            .await
+            .unwrap();
+        let engine = SqlEngine::new().with_iceberg_catalog(Arc::clone(&catalog), "mycat");
+        let df = engine
+            .sql("CALL system.maintain_table('myns.orders', '7 days')")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(0).name(), "compacted_files");
+        assert_eq!(schema.field(1).name(), "expired_snapshots");
+        assert_eq!(schema.field(2).name(), "removed_orphans");
+        for col in 0..3 {
+            let v = batches[0]
+                .column(col)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .value(0);
+            assert_eq!(v, 0, "fresh table: column {col} must be 0");
+        }
+    }
+
     // ── CTAS (durable CREATE TABLE … AS SELECT) ──────────────────────────────
 
     async fn count_rows(engine: &SqlEngine, sql: &str) -> usize {
@@ -1080,6 +1117,105 @@ mod iceberg_catalog_tests {
         assert!(crate::parse_ctas("CREATE TABLE ns.t (id INT)").is_none());
         // Non-CREATE statements are not CTAS.
         assert!(crate::parse_ctas("SELECT 1").is_none());
+    }
+
+    #[test]
+    fn parse_ctas_partitioned_by_shapes() {
+        // Transforms are lifted out before sqlparser sees the statement.
+        let parsed = crate::parse_ctas(
+            "CREATE TABLE cat.ns.t PARTITIONED BY (region, bucket(4, id), day(ts)) \
+             AS SELECT * FROM src",
+        )
+        .expect("must parse");
+        assert_eq!(parsed.table_ref, "cat.ns.t");
+        assert_eq!(
+            parsed.partition_by,
+            vec!["region", "bucket(4, id)", "day(ts)"]
+        );
+        assert!(parsed.inner_query.to_uppercase().starts_with("SELECT"));
+
+        // Case-insensitive keywords.
+        let lower = crate::parse_ctas(
+            "create or replace table ns.t partitioned by (day(ts)) as select 1 as ts",
+        )
+        .expect("must parse");
+        assert!(lower.or_replace);
+        assert_eq!(lower.partition_by, vec!["day(ts)"]);
+
+        // No clause → empty list.
+        let plain = crate::parse_ctas("CREATE TABLE ns.t AS SELECT 1").expect("must parse");
+        assert!(plain.partition_by.is_empty());
+
+        // The keywords inside a string literal are not a clause.
+        let literal = crate::parse_ctas("CREATE TABLE ns.t AS SELECT 'PARTITIONED BY (x)' AS note")
+            .expect("must parse");
+        assert!(literal.partition_by.is_empty());
+        assert!(literal.inner_query.contains("PARTITIONED BY (x)"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ctas_partitioned_by_fans_out_partitions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog = Arc::new(KrishivCatalog::local(dir.path()).await.unwrap());
+        let engine = SqlEngine::new().with_iceberg_catalog(catalog, "mycat");
+
+        let df = engine
+            .sql(
+                "CREATE TABLE mycat.pipe.events PARTITIONED BY (status) AS \
+                 SELECT * FROM (VALUES (1, 'ok'), (2, 'ok'), (3, 'bad')) AS t(id, status)",
+            )
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        assert_eq!(first_i64(&batches, "rows_written"), 3);
+        assert_eq!(
+            first_i64(&batches, "data_files"),
+            2,
+            "one data file per distinct status"
+        );
+
+        let rows = count_rows(&engine, "SELECT * FROM mycat.pipe.events").await;
+        assert_eq!(rows, 3, "partitioned table must be queryable");
+        let ok_rows = count_rows(
+            &engine,
+            "SELECT * FROM mycat.pipe.events WHERE status = 'ok'",
+        )
+        .await;
+        assert_eq!(ok_rows, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ctas_partitioned_by_requires_iceberg_target() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog = Arc::new(KrishivCatalog::local(dir.path()).await.unwrap());
+        let engine = SqlEngine::new().with_iceberg_catalog(catalog, "mycat");
+
+        // One-part name resolves to a session table, where PARTITIONED BY
+        // would be silently meaningless — must error, not fall through.
+        let err = engine
+            .sql(
+                "CREATE TABLE scratch PARTITIONED BY (id) AS \
+                 SELECT * FROM (VALUES (1), (2)) AS t(id)",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Iceberg"),
+            "must name the constraint, got: {err}"
+        );
+
+        // Unknown transform errors with a parse message.
+        let err = engine
+            .sql(
+                "CREATE TABLE mycat.pipe.bad PARTITIONED BY (soundex(id)) AS \
+                 SELECT * FROM (VALUES (1)) AS t(id)",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("soundex") || err.to_string().contains("transform"),
+            "got: {err}"
+        );
     }
 
     // ── DELETE / UPDATE helpers ───────────────────────────────────────────────

@@ -1974,55 +1974,24 @@ impl SqlEngine {
         #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
         if trimmed.to_ascii_uppercase().starts_with("CREATE ")
             && let Some(parsed_ctas) = parse_ctas(trimmed)
-            && let Some((iceberg_catalog, table_ident)) =
-                self.resolve_iceberg_table(&parsed_ctas.table_ref)
         {
-            use arrow::array::{ArrayRef, Int64Array};
-            use arrow::datatypes::{DataType, Field, Schema};
-
-            let dataframe = self.context.sql(&parsed_ctas.inner_query).await?;
-            let stream = dataframe
-                .execute_stream()
-                .await
-                .map_err(|e| SqlError::DataFusion {
-                    message: e.to_string(),
-                })?;
-            let report = krishiv_connectors::lakehouse::dml::land_ctas(
-                iceberg_catalog,
-                &table_ident,
-                parsed_ctas.or_replace,
-                stream,
-            )
-            .await
-            .map_err(|e| SqlError::DataFusion {
-                message: e.to_string(),
-            })?;
-            // The target table (or its schema) changed under any cached plan.
-            self.invalidate_plan_cache();
-
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("rows_written", DataType::Int64, false),
-                Field::new("bytes_written", DataType::Int64, false),
-                Field::new("data_files", DataType::Int64, false),
-                Field::new("snapshot_id", DataType::Int64, false),
-            ]));
-            let columns: Vec<ArrayRef> = vec![
-                Arc::new(Int64Array::from(vec![report.rows as i64])),
-                Arc::new(Int64Array::from(vec![report.bytes as i64])),
-                Arc::new(Int64Array::from(vec![report.data_files as i64])),
-                Arc::new(Int64Array::from(vec![report.snapshot_id])),
-            ];
-            let batch =
-                RecordBatch::try_new(schema, columns).map_err(|e| SqlError::DataFusion {
-                    message: e.to_string(),
-                })?;
-            let res_table = next_ephemeral_name("ctas_result");
-            lakehouse::register_scan_batches(&self.context, &res_table, vec![batch]).await?;
-            let dataframe = self
-                .context
-                .sql(&format!("SELECT * FROM {res_table}"))
-                .await?;
-            return Ok(self.attach_query_metadata(self.make_sql_df("ctas", dataframe), query));
+            let resolved = self.resolve_iceberg_table(&parsed_ctas.table_ref);
+            // PARTITIONED BY only has meaning for Iceberg targets; erroring
+            // beats silently creating an unpartitioned session table.
+            if resolved.is_none() && !parsed_ctas.partition_by.is_empty() {
+                return Err(SqlError::DataFusion {
+                    message: format!(
+                        "PARTITIONED BY requires an Iceberg catalog table; `{}` does not \
+                         resolve to a registered Iceberg catalog",
+                        parsed_ctas.table_ref
+                    ),
+                });
+            }
+            if let Some((iceberg_catalog, table_ident)) = resolved {
+                return self
+                    .execute_iceberg_ctas(iceberg_catalog, table_ident, parsed_ctas, query)
+                    .await;
+            }
         }
 
         // ── Intercept CALL system.<proc> ──────────────────────────────────────
@@ -2322,6 +2291,77 @@ impl SqlEngine {
         Some((catalog_arc.as_iceberg(), ident))
     }
 
+    /// Execute a durable Iceberg CTAS: run the inner query on this engine
+    /// and land the result stream directly in the Iceberg table (rolling
+    /// Parquet parts fanned out per `PARTITIONED BY` value + one snapshot
+    /// commit). The result is a single row of landing counts — the full
+    /// result set never crosses a wire (gap G17).
+    #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+    async fn execute_iceberg_ctas(
+        &self,
+        iceberg_catalog: Arc<dyn iceberg::Catalog + Send + Sync>,
+        table_ident: iceberg::TableIdent,
+        parsed_ctas: ParsedCtas,
+        query: &str,
+    ) -> SqlResult<SqlDataFrame> {
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use krishiv_connectors::lakehouse::partitioned_write::parse_partition_transform;
+
+        let partition_by = parsed_ctas
+            .partition_by
+            .iter()
+            .map(|item| parse_partition_transform(item))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
+
+        let dataframe = self.context.sql(&parsed_ctas.inner_query).await?;
+        let stream = dataframe
+            .execute_stream()
+            .await
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
+        let report = krishiv_connectors::lakehouse::dml::land_ctas(
+            iceberg_catalog,
+            &table_ident,
+            parsed_ctas.or_replace,
+            &partition_by,
+            stream,
+        )
+        .await
+        .map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })?;
+        // The target table (or its schema) changed under any cached plan.
+        self.invalidate_plan_cache();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("rows_written", DataType::Int64, false),
+            Field::new("bytes_written", DataType::Int64, false),
+            Field::new("data_files", DataType::Int64, false),
+            Field::new("snapshot_id", DataType::Int64, false),
+        ]));
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![report.rows as i64])),
+            Arc::new(Int64Array::from(vec![report.bytes as i64])),
+            Arc::new(Int64Array::from(vec![report.data_files as i64])),
+            Arc::new(Int64Array::from(vec![report.snapshot_id])),
+        ];
+        let batch = RecordBatch::try_new(schema, columns).map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })?;
+        let res_table = next_ephemeral_name("ctas_result");
+        lakehouse::register_scan_batches(&self.context, &res_table, vec![batch]).await?;
+        let dataframe = self
+            .context
+            .sql(&format!("SELECT * FROM {res_table}"))
+            .await?;
+        Ok(self.attach_query_metadata(self.make_sql_df("ctas", dataframe), query))
+    }
+
     /// Dispatch a `CALL system.<proc>(...)` statement to the appropriate
     /// Iceberg maintenance function on the first registered KrishivCatalog.
     #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
@@ -2364,6 +2404,45 @@ impl SqlEngine {
             message: format!("CALL {proc_name}: table reference argument is required"),
         })?;
         let table_ident = iceberg_table_ident(table_ref)?;
+
+        // maintain_table returns a three-column report, unlike the single
+        // counters below: CALL system.maintain_table('ns.tbl'[, '7 days'
+        // [, target_file_bytes [, retain_last]]]).
+        if proc_name == "MAINTAIN_TABLE" {
+            let older_than = parse_call_duration(args.get(1).map_or("7 days", |s| s.as_str()))?;
+            let target_bytes = args
+                .get(2)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(128 * 1024 * 1024);
+            let retain_last = args
+                .get(3)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1);
+            let report = krishiv_connectors::lakehouse::maintenance::maintain_table(
+                iceberg_catalog,
+                &table_ident,
+                target_bytes,
+                older_than,
+                retain_last,
+            )
+            .await
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("compacted_files", DataType::Int64, false),
+                Field::new("expired_snapshots", DataType::Int64, false),
+                Field::new("removed_orphans", DataType::Int64, false),
+            ]));
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(vec![report.compacted_files as i64])),
+                Arc::new(Int64Array::from(vec![report.expired_snapshots as i64])),
+                Arc::new(Int64Array::from(vec![report.removed_orphans as i64])),
+            ];
+            return RecordBatch::try_new(schema, columns).map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            });
+        }
 
         let count: i64 = match proc_name {
             "EXPIRE_SNAPSHOTS" => {
@@ -4234,9 +4313,162 @@ struct ParsedCtas {
     or_replace: bool,
     /// The inner query text (sqlparser AST rendering of the AS body).
     inner_query: String,
+    /// Raw `PARTITIONED BY` items (`region`, `bucket(4, id)`, `day(ts)`),
+    /// empty for unpartitioned tables.
+    partition_by: Vec<String>,
 }
 
-/// Parse `CREATE [OR REPLACE] TABLE <ref> AS <query>` using the sqlparser AST.
+/// Lift a `PARTITIONED BY (…)` clause out of a CREATE TABLE statement.
+///
+/// Iceberg partition transforms (`bucket(4, id)`, `day(ts)`) are not valid
+/// column definitions in sqlparser's Hive-style `PARTITIONED BY` list, so
+/// the clause is extracted textually before the statement is parsed: the
+/// keywords are matched case-insensitively outside single-quoted strings and
+/// double-quoted identifiers, and the balanced-paren list that follows is
+/// split on top-level commas. Returns the statement with the clause removed
+/// plus the raw items; `None` when no clause is present.
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+fn extract_partitioned_by(stmt: &str) -> Option<(String, Vec<String>)> {
+    let bytes = stmt.as_bytes();
+    let upper = stmt.to_ascii_uppercase();
+    let upper_bytes = upper.as_bytes();
+    const NEEDLE: &[u8] = b"PARTITIONED";
+
+    fn is_ident_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+    // Advance past a quoted region starting at `i` (index of the opening
+    // quote); `''` / `""` escapes stay inside the region.
+    fn skip_quoted(bytes: &[u8], mut i: usize, quote: u8) -> usize {
+        i += 1;
+        while let Some(&b) = bytes.get(i) {
+            if b == quote {
+                if bytes.get(i + 1) == Some(&quote) {
+                    i += 2;
+                    continue;
+                }
+                return i + 1;
+            }
+            i += 1;
+        }
+        i
+    }
+
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            b'\'' | b'"' => i = skip_quoted(bytes, i, b),
+            _ => {
+                let at_needle = upper_bytes
+                    .get(i..)
+                    .is_some_and(|rest| rest.starts_with(NEEDLE))
+                    && (i == 0
+                        || !i
+                            .checked_sub(1)
+                            .and_then(|p| upper_bytes.get(p))
+                            .copied()
+                            .is_some_and(is_ident_byte));
+                if at_needle {
+                    let mut j = i + NEEDLE.len();
+                    while bytes.get(j).is_some_and(u8::is_ascii_whitespace) {
+                        j += 1;
+                    }
+                    // Require whitespace between the keywords and `BY` to not
+                    // be part of a longer identifier.
+                    if j > i + NEEDLE.len()
+                        && upper_bytes
+                            .get(j..)
+                            .is_some_and(|rest| rest.starts_with(b"BY"))
+                        && !upper_bytes.get(j + 2).copied().is_some_and(is_ident_byte)
+                    {
+                        let mut k = j + 2;
+                        while bytes.get(k).is_some_and(u8::is_ascii_whitespace) {
+                            k += 1;
+                        }
+                        if bytes.get(k) == Some(&b'(') {
+                            // Find the balanced close, respecting quotes.
+                            let mut depth = 0i32;
+                            let mut c = k;
+                            let close = loop {
+                                match bytes.get(c) {
+                                    // unbalanced: let sqlparser reject it
+                                    None => return None,
+                                    Some(b'(') => depth += 1,
+                                    Some(b')') => {
+                                        depth -= 1;
+                                        if depth == 0 {
+                                            break c;
+                                        }
+                                    }
+                                    Some(&(q @ b'\'' | q @ b'"')) => {
+                                        c = skip_quoted(bytes, c, q);
+                                        continue;
+                                    }
+                                    Some(_) => {}
+                                }
+                                c += 1;
+                            };
+                            let body = stmt.get(k + 1..close)?;
+                            let head = stmt.get(..i)?.trim_end();
+                            let tail = stmt.get(close + 1..)?.trim_start();
+                            let items = split_top_level_commas(body);
+                            let mut remainder = String::with_capacity(stmt.len());
+                            remainder.push_str(head);
+                            remainder.push(' ');
+                            remainder.push_str(tail);
+                            return Some((remainder, items));
+                        }
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Split a parenthesized list body on commas at paren depth zero, skipping
+/// quoted regions. Empty items are dropped.
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let bytes = s.as_bytes();
+    let mut items = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'\'' | b'"' => {
+                i += 1;
+                while bytes.get(i).is_some_and(|&c| c != b) {
+                    i += 1;
+                }
+            }
+            b',' if depth == 0 => {
+                if let Some(item) = s.get(start..i).map(str::trim)
+                    && !item.is_empty()
+                {
+                    items.push(item.to_string());
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if let Some(last) = s.get(start..).map(str::trim)
+        && !last.is_empty()
+    {
+        items.push(last.to_string());
+    }
+    items
+}
+
+/// Parse `CREATE [OR REPLACE] TABLE <ref> [PARTITIONED BY (…)] AS <query>`
+/// using the sqlparser AST (with the PARTITIONED BY clause lifted out
+/// textually first — see [`extract_partitioned_by`]).
 ///
 /// Returns `None` for anything else — plain column-list CREATE TABLE,
 /// CREATE EXTERNAL/TEMPORARY TABLE (DataFusion's own DDL), multi-statement
@@ -4247,7 +4479,11 @@ fn parse_ctas(stmt: &str) -> Option<ParsedCtas> {
     use datafusion::sql::sqlparser::dialect::GenericDialect;
     use datafusion::sql::sqlparser::parser::Parser;
 
-    let mut stmts = Parser::parse_sql(&GenericDialect {}, stmt).ok()?;
+    let (stripped, partition_by) = match extract_partitioned_by(stmt) {
+        Some((remainder, items)) => (remainder, items),
+        None => (stmt.to_string(), Vec::new()),
+    };
+    let mut stmts = Parser::parse_sql(&GenericDialect {}, &stripped).ok()?;
     if stmts.len() != 1 {
         return None;
     }
@@ -4262,6 +4498,7 @@ fn parse_ctas(stmt: &str) -> Option<ParsedCtas> {
         table_ref: create.name.to_string(),
         or_replace: create.or_replace,
         inner_query,
+        partition_by,
     })
 }
 

@@ -20,6 +20,9 @@ mod local_delta;
 #[cfg(feature = "iceberg")]
 pub mod maintenance;
 mod partition_spec;
+/// Phase 52 #191: `PARTITIONED BY` transforms + partition-aware fanout writes.
+#[cfg(feature = "iceberg")]
+pub mod partitioned_write;
 /// G7: checkpoint-aligned streaming Iceberg sink (append + row-level upsert).
 #[cfg(feature = "iceberg")]
 pub mod streaming_sink;

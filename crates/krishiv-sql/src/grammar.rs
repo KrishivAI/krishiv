@@ -383,9 +383,16 @@ static FEATURES: &[FeatureEntry] = &[
         "ddl.create_table_as",
         "DDL",
         "CREATE TABLE … AS SELECT (CTAS)",
-        P,
+        S,
     )
-    .with_note("supported via INSERT OVERWRITE or external-table pattern"),
+    .with_note("durable Iceberg landing when the target resolves to a registered Iceberg catalog; session table otherwise"),
+    FeatureEntry::new(
+        "ddl.partitioned_by",
+        "DDL",
+        "CREATE TABLE … PARTITIONED BY (col | bucket(n, col) | truncate(w, col) | year/month/day/hour(col)) AS SELECT",
+        S,
+    )
+    .with_note("Iceberg catalog tables only; transforms follow the Iceberg partition spec"),
     FeatureEntry::new(
         "ddl.alter_table",
         "DDL",

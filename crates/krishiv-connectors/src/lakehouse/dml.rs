@@ -24,6 +24,7 @@
 //!
 //! All three functions return `(rows_affected, new_snapshot_id)`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 #[cfg(feature = "iceberg")]
@@ -40,6 +41,10 @@ use parquet::arrow::ArrowWriter;
 use tokio::task;
 
 use crate::lakehouse::LakehouseError;
+use crate::lakehouse::partitioned_write::{
+    PartitionFanout, PartitionTransformField, build_unbound_partition_spec,
+    transforms_from_metadata,
+};
 use krishiv_common::sql_util::quote_identifier;
 
 // ── internal scan helper ──────────────────────────────────────────────────────
@@ -331,6 +336,23 @@ pub async fn overwrite_table_pub(
     let table_location = table.metadata().location().to_string();
     let file_io = table.file_io().clone();
 
+    // Preserve the table's partitioning across the drop+recreate rewrite:
+    // recover the transforms for the fanout writer and carry the existing
+    // default spec (exact field ids/names) onto the recreated table.
+    let partition_by = transforms_from_metadata(table.metadata())?;
+    let unbound_spec = if partition_by.is_empty() {
+        None
+    } else {
+        Some(
+            table
+                .metadata()
+                .default_partition_spec()
+                .as_ref()
+                .clone()
+                .into_unbound(),
+        )
+    };
+
     let has_rows = batches.iter().any(|b| b.num_rows() > 0);
 
     if !has_rows {
@@ -342,6 +364,7 @@ pub async fn overwrite_table_pub(
         let creation = TableCreation::builder()
             .name(ident.name().to_string())
             .schema((*iceberg_schema).clone())
+            .partition_spec_opt(unbound_spec)
             .location(table_location)
             .build();
         let new_table = catalog
@@ -357,73 +380,37 @@ pub async fn overwrite_table_pub(
             .unwrap_or(-1));
     }
 
-    // Write surviving rows to a local Parquet file (blocking), then read bytes.
+    // Fan the surviving rows out per partition value and write one Parquet
+    // part per partition group, uploaded via FileIO before any metadata
+    // mutation. (DML copy-on-write already holds the surviving rows in
+    // memory, so no roll threshold applies here.)
     let arrow_schema = batches
         .first()
         .ok_or_else(|| LakehouseError::Iceberg("empty batches".to_string()))?
         .schema();
-    let (file_bytes, file_size, record_count) = task::spawn_blocking({
-        let arrow_schema = arrow_schema.clone();
-        let batches = batches.clone();
-        move || -> Result<(Vec<u8>, u64, u64), LakehouseError> {
-            let tmp =
-                tempfile::NamedTempFile::new().map_err(|e| LakehouseError::Io(e.to_string()))?;
-            let tmp_path = tmp.path().to_path_buf();
-            let file =
-                std::fs::File::create(&tmp_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
-            let mut writer = ArrowWriter::try_new(file, arrow_schema, None)
-                .map_err(|e| LakehouseError::Io(e.to_string()))?;
-            let mut row_count = 0u64;
-            for batch in &batches {
-                row_count += batch.num_rows() as u64;
-                writer
-                    .write(batch)
-                    .map_err(|e| LakehouseError::Io(e.to_string()))?;
-            }
-            let inner = writer
-                .into_inner()
-                .map_err(|e| LakehouseError::Io(e.to_string()))?;
-            let size = inner
-                .metadata()
-                .map_err(|e| LakehouseError::Io(e.to_string()))?
-                .len();
-            drop(inner);
-
-            let bytes = std::fs::read(&tmp_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
-            // tmp drops here, auto-deleting the temp file
-            Ok((bytes, size, row_count))
+    let fanout = PartitionFanout::try_new(arrow_schema.as_ref(), &partition_by)?;
+    let mut buffers: BTreeMap<String, PartBuffer> = BTreeMap::new();
+    for batch in &batches {
+        if batch.num_rows() == 0 {
+            continue;
         }
-    })
-    .await
-    .map_err(|e| LakehouseError::Io(e.to_string()))??;
+        fanout_into_buffers(&fanout, batch, &mut buffers)?;
+    }
+    let mut pending: Vec<PendingPart> = Vec::new();
+    for (_, buf) in buffers {
+        pending.push(
+            write_ctas_part(
+                &file_io,
+                &table_location,
+                &buf.path,
+                buf.partition,
+                buf.batches,
+            )
+            .await?,
+        );
+    }
 
-    // Upload via iceberg FileIO.
-    let dest = format!(
-        "{}/data/{}.parquet",
-        table_location.trim_end_matches('/'),
-        uuid::Uuid::new_v4()
-    );
-    let output = file_io
-        .new_output(&dest)
-        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
-    output
-        .write(Bytes::from(file_bytes))
-        .await
-        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
-
-    // Build iceberg DataFile descriptor.
-    let data_file = DataFileBuilder::default()
-        .content(DataContentType::Data)
-        .file_path(dest)
-        .file_format(DataFileFormat::Parquet)
-        .file_size_in_bytes(file_size)
-        .record_count(record_count)
-        .partition(Struct::empty())
-        .partition_spec_id(0)
-        .build()
-        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
-
-    // Drop old table and recreate so the new snapshot references ONLY our file.
+    // Drop old table and recreate so the new snapshot references ONLY our files.
     catalog
         .drop_table(ident)
         .await
@@ -435,6 +422,7 @@ pub async fn overwrite_table_pub(
             TableCreation::builder()
                 .name(ident.name().to_string())
                 .schema((*iceberg_schema).clone())
+                .partition_spec_opt(unbound_spec.clone())
                 .location(table_location.clone())
                 .build(),
         )
@@ -451,6 +439,7 @@ pub async fn overwrite_table_pub(
                     TableCreation::builder()
                         .name(ident.name().to_string())
                         .schema((*iceberg_schema).clone())
+                        .partition_spec_opt(unbound_spec.clone())
                         .location(table_location.clone())
                         .build(),
                 )
@@ -467,9 +456,15 @@ pub async fn overwrite_table_pub(
         }
     };
 
-    // Commit the single data file via fast_append.
+    // Stamp the parts with the recreated table's spec id and commit them
+    // via fast_append.
+    let spec_id = new_table.metadata().default_partition_spec_id();
+    let data_files = pending
+        .into_iter()
+        .map(|p| p.into_data_file(spec_id))
+        .collect::<Result<Vec<_>, LakehouseError>>()?;
     let tx = Transaction::new(&new_table);
-    let action = tx.fast_append().add_data_files(vec![data_file]);
+    let action = tx.fast_append().add_data_files(data_files);
     let tx = action
         .apply(tx)
         .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
@@ -640,13 +635,83 @@ fn normalize_batch_for_iceberg(batch: &RecordBatch) -> Result<RecordBatch, Lakeh
         .map_err(|e| LakehouseError::Iceberg(e.to_string()))
 }
 
+/// A durable Parquet part file waiting for its `DataFile` descriptor.
+///
+/// The partition-spec id is only known once the destination table handle
+/// exists (for replaces, after the recreate), so parts carry their partition
+/// value and are stamped into `DataFile`s at commit time.
+pub(crate) struct PendingPart {
+    pub(crate) dest: String,
+    pub(crate) file_size: u64,
+    pub(crate) record_count: u64,
+    pub(crate) partition: Struct,
+}
+
+impl PendingPart {
+    pub(crate) fn into_data_file(
+        self,
+        spec_id: i32,
+    ) -> Result<iceberg::spec::DataFile, LakehouseError> {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(self.dest)
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(self.file_size)
+            .record_count(self.record_count)
+            .partition(self.partition)
+            .partition_spec_id(spec_id)
+            .build()
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))
+    }
+}
+
+/// In-memory accumulation for one partition value during fanout writes.
+pub(crate) struct PartBuffer {
+    pub(crate) path: String,
+    pub(crate) partition: Struct,
+    pub(crate) batches: Vec<RecordBatch>,
+    pub(crate) bytes: usize,
+}
+
+/// Fan batches out into per-partition-value buffers keyed by canonical
+/// partition key. Batches are normalized for Iceberg (timestamp units,
+/// Date64) before the transforms run; zero-row groups are dropped.
+pub(crate) fn fanout_into_buffers(
+    fanout: &PartitionFanout,
+    batch: &RecordBatch,
+    buffers: &mut BTreeMap<String, PartBuffer>,
+) -> Result<usize, LakehouseError> {
+    let batch = normalize_batch_for_iceberg(batch)?;
+    let mut added = 0usize;
+    for group in fanout.split(&batch)? {
+        if group.batch.num_rows() == 0 {
+            continue;
+        }
+        let size = group.batch.get_array_memory_size();
+        added += size;
+        let buf = buffers.entry(group.key).or_insert_with(|| PartBuffer {
+            path: group.path,
+            partition: group.partition,
+            batches: Vec::new(),
+            bytes: 0,
+        });
+        buf.bytes += size;
+        buf.batches.push(group.batch);
+    }
+    Ok(added)
+}
+
 /// Write one Parquet part file from buffered batches and upload it via the
-/// table's FileIO. Returns the Iceberg `DataFile` descriptor.
-async fn write_ctas_part(
+/// table's FileIO. `path_prefix` is a hive-style partition directory
+/// (`region=eu`) or empty; `partition` is the Iceberg partition value the
+/// rows share under the destination table's default spec.
+pub(crate) async fn write_ctas_part(
     file_io: &iceberg::io::FileIO,
     table_location: &str,
+    path_prefix: &str,
+    partition: Struct,
     batches: Vec<RecordBatch>,
-) -> Result<iceberg::spec::DataFile, LakehouseError> {
+) -> Result<PendingPart, LakehouseError> {
     let arrow_schema = batches
         .first()
         .ok_or_else(|| LakehouseError::Iceberg("empty part".to_string()))?
@@ -676,9 +741,15 @@ async fn write_ctas_part(
         .await
         .map_err(|e| LakehouseError::Io(e.to_string()))??;
 
+    let subdir = if path_prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", path_prefix.trim_matches('/'))
+    };
     let dest = format!(
-        "{}/data/{}.parquet",
+        "{}/data/{}{}.parquet",
         table_location.trim_end_matches('/'),
+        subdir,
         uuid::Uuid::new_v4()
     );
     let output = file_io
@@ -689,16 +760,12 @@ async fn write_ctas_part(
         .await
         .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
 
-    DataFileBuilder::default()
-        .content(DataContentType::Data)
-        .file_path(dest)
-        .file_format(DataFileFormat::Parquet)
-        .file_size_in_bytes(file_size)
-        .record_count(record_count)
-        .partition(Struct::empty())
-        .partition_spec_id(0)
-        .build()
-        .map_err(|e| LakehouseError::Iceberg(e.to_string()))
+    Ok(PendingPart {
+        dest,
+        file_size,
+        record_count,
+        partition,
+    })
 }
 
 /// Durably land a `CREATE [OR REPLACE] TABLE … AS SELECT` result stream in an
@@ -727,9 +794,18 @@ pub async fn land_ctas(
     catalog: Arc<dyn Catalog + Send + Sync>,
     ident: &TableIdent,
     or_replace: bool,
+    partition_by: &[PartitionTransformField],
     stream: datafusion::execution::SendableRecordBatchStream,
 ) -> Result<CtasLandingReport, LakehouseError> {
-    land_ctas_with_target(catalog, ident, or_replace, stream, ctas_target_file_bytes()).await
+    land_ctas_with_target(
+        catalog,
+        ident,
+        or_replace,
+        partition_by,
+        stream,
+        ctas_target_file_bytes(),
+    )
+    .await
 }
 
 /// [`land_ctas`] with an explicit per-part roll threshold (bytes of buffered
@@ -739,6 +815,7 @@ pub async fn land_ctas_with_target(
     catalog: Arc<dyn Catalog + Send + Sync>,
     ident: &TableIdent,
     or_replace: bool,
+    partition_by: &[PartitionTransformField],
     mut stream: datafusion::execution::SendableRecordBatchStream,
     target_bytes: usize,
 ) -> Result<CtasLandingReport, LakehouseError> {
@@ -774,6 +851,12 @@ pub async fn land_ctas_with_target(
     }
 
     let iceberg_schema = arrow_schema_to_iceberg_schema(stream.schema().as_ref())?;
+    let unbound_spec = if partition_by.is_empty() {
+        None
+    } else {
+        Some(build_unbound_partition_spec(partition_by, &iceberg_schema)?)
+    };
+    let fanout = PartitionFanout::try_new(stream.schema().as_ref(), partition_by)?;
 
     // Where the part files go, and the FileIO to write them with. For a
     // replace we write under the existing location before touching metadata;
@@ -822,6 +905,7 @@ pub async fn land_ctas_with_target(
                 TableCreation::builder()
                     .name(ident.name().to_string())
                     .schema(iceberg_schema.clone())
+                    .partition_spec_opt(unbound_spec.clone())
                     .build(),
             )
             .await
@@ -833,10 +917,14 @@ pub async fn land_ctas_with_target(
         )
     };
 
-    // Consume the stream into rolling part files.
-    let mut buffered: Vec<RecordBatch> = Vec::new();
+    // Consume the stream into rolling part files, fanned out per partition
+    // value. Memory stays bounded globally: whenever the total buffered Arrow
+    // size crosses `target_bytes`, the largest partition buffer is flushed to
+    // its own Parquet part, so peak memory stays near one part regardless of
+    // how many partition values the stream produces.
+    let mut buffers: BTreeMap<String, PartBuffer> = BTreeMap::new();
     let mut buffered_bytes = 0usize;
-    let mut data_files: Vec<iceberg::spec::DataFile> = Vec::new();
+    let mut pending: Vec<PendingPart> = Vec::new();
     let mut total_rows = 0u64;
     let mut total_bytes = 0u64;
     while let Some(next) = stream.next().await {
@@ -844,23 +932,41 @@ pub async fn land_ctas_with_target(
         if batch.num_rows() == 0 {
             continue;
         }
-        let batch = normalize_batch_for_iceberg(&batch)?;
         total_rows += batch.num_rows() as u64;
-        buffered_bytes += batch.get_array_memory_size();
-        buffered.push(batch);
-        if buffered_bytes >= target_bytes {
-            let part =
-                write_ctas_part(&file_io, &table_location, std::mem::take(&mut buffered)).await?;
-            buffered_bytes = 0;
-            total_bytes += part.file_size_in_bytes();
-            data_files.push(part);
+        buffered_bytes += fanout_into_buffers(&fanout, &batch, &mut buffers)?;
+        while buffered_bytes >= target_bytes {
+            let largest = buffers
+                .iter()
+                .max_by_key(|(_, b)| b.bytes)
+                .map(|(k, _)| k.clone());
+            let Some(key) = largest else { break };
+            let Some(buf) = buffers.remove(&key) else {
+                break;
+            };
+            buffered_bytes = buffered_bytes.saturating_sub(buf.bytes);
+            let part = write_ctas_part(
+                &file_io,
+                &table_location,
+                &buf.path,
+                buf.partition,
+                buf.batches,
+            )
+            .await?;
+            total_bytes += part.file_size;
+            pending.push(part);
         }
     }
-    if !buffered.is_empty() {
-        let part =
-            write_ctas_part(&file_io, &table_location, std::mem::take(&mut buffered)).await?;
-        total_bytes += part.file_size_in_bytes();
-        data_files.push(part);
+    for (_, buf) in buffers {
+        let part = write_ctas_part(
+            &file_io,
+            &table_location,
+            &buf.path,
+            buf.partition,
+            buf.batches,
+        )
+        .await?;
+        total_bytes += part.file_size;
+        pending.push(part);
     }
 
     // Metadata swap: for a replace, drop + recreate at the same location so
@@ -880,6 +986,7 @@ pub async fn land_ctas_with_target(
             TableCreation::builder()
                 .name(ident.name().to_string())
                 .schema(iceberg_schema.clone())
+                .partition_spec_opt(unbound_spec.clone())
                 .location(table_location.clone())
                 .build()
         };
@@ -901,11 +1008,18 @@ pub async fn land_ctas_with_target(
         }
     };
 
-    let files_count = data_files.len();
-    let snapshot_id = if data_files.is_empty() {
+    let files_count = pending.len();
+    let snapshot_id = if pending.is_empty() {
         // Empty result: the (re)created table with no snapshot is the answer.
         -1
     } else {
+        // Parts are stamped with the (re)created table's default spec id —
+        // it is only assigned by the catalog once the table handle exists.
+        let spec_id = table.metadata().default_partition_spec_id();
+        let data_files = pending
+            .into_iter()
+            .map(|p| p.into_data_file(spec_id))
+            .collect::<Result<Vec<_>, LakehouseError>>()?;
         let tx = Transaction::new(&table);
         let action = tx.fast_append().add_data_files(data_files);
         let tx = action
@@ -1097,7 +1211,7 @@ mod tests {
             "SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) AS t(id, name)",
         )
         .await;
-        let report = land_ctas(Arc::clone(&catalog), &ident, false, stream)
+        let report = land_ctas(Arc::clone(&catalog), &ident, false, &[], stream)
             .await
             .unwrap();
         assert_eq!(report.rows, 3);
@@ -1120,13 +1234,13 @@ mod tests {
         let ident = TableIdent::new(NamespaceIdent::new("pipe".into()), "out".into());
 
         let first = stream_of(&ctx, "SELECT * FROM (VALUES (1), (2)) AS t(id)").await;
-        land_ctas(Arc::clone(&catalog), &ident, false, first)
+        land_ctas(Arc::clone(&catalog), &ident, false, &[], first)
             .await
             .unwrap();
 
         // CREATE without OR REPLACE on an existing table must fail.
         let dup = stream_of(&ctx, "SELECT * FROM (VALUES (9)) AS t(id)").await;
-        let err = land_ctas(Arc::clone(&catalog), &ident, false, dup)
+        let err = land_ctas(Arc::clone(&catalog), &ident, false, &[], dup)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already exists"), "got: {err}");
@@ -1137,7 +1251,7 @@ mod tests {
             "SELECT * FROM (VALUES (10, 'x'), (20, 'y'), (30, 'z')) AS t(id, tag)",
         )
         .await;
-        let report = land_ctas(Arc::clone(&catalog), &ident, true, second)
+        let report = land_ctas(Arc::clone(&catalog), &ident, true, &[], second)
             .await
             .unwrap();
         assert_eq!(report.rows, 3);
@@ -1178,7 +1292,7 @@ mod tests {
         let mem = MemTable::try_new(Arc::clone(&schema), vec![batches]).unwrap();
         ctx.register_table("src", Arc::new(mem)).unwrap();
         let stream = stream_of(&ctx, "SELECT id FROM src").await;
-        let report = land_ctas_with_target(Arc::clone(&catalog), &ident, false, stream, 1)
+        let report = land_ctas_with_target(Arc::clone(&catalog), &ident, false, &[], stream, 1)
             .await
             .unwrap();
 
@@ -1224,7 +1338,7 @@ mod tests {
         }
 
         let first = stream_of(&ctx, "SELECT * FROM (VALUES (1), (2)) AS t(id)").await;
-        land_ctas(Arc::clone(&catalog), &ident, false, first)
+        land_ctas(Arc::clone(&catalog), &ident, false, &[], first)
             .await
             .unwrap();
         assert_eq!(parquet_count(dir.path()), 1);
@@ -1233,7 +1347,7 @@ mod tests {
         // no orphan accumulation across refresh cycles.
         for round in 0..3 {
             let stream = stream_of(&ctx, "SELECT * FROM (VALUES (10), (20)) AS t(id)").await;
-            land_ctas(Arc::clone(&catalog), &ident, true, stream)
+            land_ctas(Arc::clone(&catalog), &ident, true, &[], stream)
                 .await
                 .unwrap();
             assert_eq!(
@@ -1258,7 +1372,7 @@ mod tests {
         let ident = TableIdent::new(NamespaceIdent::new("pipe".into()), "empty".into());
 
         let stream = stream_of(&ctx, "SELECT 1 AS id WHERE FALSE").await;
-        let report = land_ctas(Arc::clone(&catalog), &ident, false, stream)
+        let report = land_ctas(Arc::clone(&catalog), &ident, false, &[], stream)
             .await
             .unwrap();
         assert_eq!(report.rows, 0);
@@ -1268,6 +1382,118 @@ mod tests {
             catalog.table_exists(&ident).await.unwrap(),
             "empty CTAS must still create the table"
         );
+    }
+
+    // ── partitioned writes (#191) ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn land_ctas_partitioned_writes_one_file_per_partition() {
+        use crate::lakehouse::partitioned_write::parse_partition_transform;
+
+        let (catalog, _dir) = make_empty_catalog().await;
+        let ctx = SessionContext::new();
+        let ident = TableIdent::new(NamespaceIdent::new("pipe".into()), "part_out".into());
+
+        let stream = stream_of(
+            &ctx,
+            "SELECT * FROM (VALUES (1, 'eu'), (2, 'us'), (3, 'eu'), (4, 'apac')) \
+             AS t(id, region)",
+        )
+        .await;
+        let partition_by = vec![parse_partition_transform("region").unwrap()];
+        let report = land_ctas(Arc::clone(&catalog), &ident, false, &partition_by, stream)
+            .await
+            .unwrap();
+        assert_eq!(report.rows, 4);
+        assert_eq!(report.data_files, 3, "one part per distinct region");
+
+        let table = catalog.load_table(&ident).await.unwrap();
+        let spec = table.metadata().default_partition_spec();
+        assert_eq!(spec.fields().len(), 1, "spec must carry the identity field");
+        assert_eq!(spec.fields()[0].name, "region");
+
+        // Every data file lands under a hive-style region=… directory.
+        let scan = table.scan().build().unwrap();
+        let tasks: Vec<iceberg::scan::FileScanTask> = scan
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 3);
+        for t in &tasks {
+            assert!(
+                t.data_file_path().contains("/data/region="),
+                "path: {}",
+                t.data_file_path()
+            );
+        }
+
+        let rows: usize = table_rows(&catalog, &ident, &ctx)
+            .await
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 4, "read back all landed rows");
+    }
+
+    #[tokio::test]
+    async fn dml_overwrite_preserves_partition_spec() {
+        use crate::lakehouse::partitioned_write::parse_partition_transform;
+
+        let (catalog, _dir) = make_empty_catalog().await;
+        let ctx = SessionContext::new();
+        let ident = TableIdent::new(NamespaceIdent::new("pipe".into()), "part_dml".into());
+
+        let stream = stream_of(
+            &ctx,
+            "SELECT * FROM (VALUES (1, 'eu'), (2, 'us'), (3, 'eu')) AS t(id, region)",
+        )
+        .await;
+        let partition_by = vec![parse_partition_transform("region").unwrap()];
+        land_ctas(Arc::clone(&catalog), &ident, false, &partition_by, stream)
+            .await
+            .unwrap();
+
+        // DELETE routes through overwrite_table_pub (copy-on-write rewrite).
+        let (deleted, snap) = iceberg_delete_where(Arc::clone(&catalog), &ident, "id = 2", &ctx)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert!(snap > 0);
+
+        let table = catalog.load_table(&ident).await.unwrap();
+        let spec = table.metadata().default_partition_spec();
+        assert_eq!(
+            spec.fields().len(),
+            1,
+            "rewrite must preserve the partition spec, not recreate unpartitioned"
+        );
+        assert_eq!(spec.fields()[0].name, "region");
+
+        // Survivors are both region=eu → exactly one partitioned file remains.
+        let scan = table.scan().build().unwrap();
+        let tasks: Vec<iceberg::scan::FileScanTask> = scan
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 1, "one surviving partition group");
+        assert!(
+            tasks[0].data_file_path().contains("region=eu"),
+            "path: {}",
+            tasks[0].data_file_path()
+        );
+
+        let rows: usize = table_rows(&catalog, &ident, &ctx)
+            .await
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 2, "only the eu rows survive");
     }
 
     #[test]
