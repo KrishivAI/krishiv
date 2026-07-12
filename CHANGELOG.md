@@ -8,6 +8,29 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Added
 
+- **Scheduler v2 — locality, fair pools, safe speculation, strict capacity**
+  (Phase 53, 2026-07-12). Placement is now locality-aware and live: reduce
+  stages prefer the node holding the majority of their upstream shuffle
+  bytes, with NODE→RACK→ANY tiers and delay scheduling (bounded wait for a
+  local slot, `locality_wait_ms`, default 3 s); executors advertise node
+  identity via `host` and an optional rack via `KRISHIV_RACK_ID`. Fair
+  pools are real: per-pool weight/min-share quotas (largest-remainder
+  weighted split) bound each assignment round, so two pools with 2:1
+  weights converge to a 2:1 slot split under saturation. Speculative
+  execution is now safe to enable: stragglers receive a `CancelTask`
+  before being re-queued under a new attempt id — first completion wins,
+  late updates from the cancelled original are fenced, and sink-contract
+  tasks are never speculated. Saturation semantics are strict: placement
+  stops at free-slot capacity (no silent oversubscription), overflow tasks
+  wait in a pending backlog drained when slots free, a coordinator-side
+  in-flight overlay closes the heartbeat-lag over-assignment window, and
+  failure retries back off exponentially (`task_retry_backoff_*`). The
+  500 ms launch tick is O(dirty jobs) with a periodic full-sweep fallback,
+  and recovery-path streaming checks are one O(cluster) scan instead of
+  per-executor scans. New observability: per-tier placement counters,
+  speculation detected/preempted counters on the metrics endpoint. Scale
+  proof: 10 000 tasks placed and launched across 100 executors in 3.3 s.
+
 - **Distributed batch v2 — partition-parallel stages over a real shuffle**
   (Phase 52, 2026-07-12). Plain batch SELECTs are now cut at hash-exchange
   boundaries into ShuffleMap → Result stages (`dfplan:v1:` proto-encoded

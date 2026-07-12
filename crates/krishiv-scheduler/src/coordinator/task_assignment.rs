@@ -1,8 +1,8 @@
 use super::{
     Arc, AtomicOrdering, AttemptId, Coordinator, DashMap, ExecutorTaskAssignment, JobId, JobKind,
-    JobSpec, JobState, SchedulerError, SchedulerResult, SlotAwareScheduler, TASKS_ASSIGNED_TOTAL,
-    TaskAttemptRef, TaskCancellationRequest, TaskId, TaskState, TaskStatusResponse,
-    is_in_process_task_endpoint, wire,
+    JobSpec, JobState, SchedulerError, SchedulerResult, TASKS_ASSIGNED_TOTAL, TaskAttemptRef,
+    TaskCancellationRequest, TaskId, TaskState, TaskStatusResponse, is_in_process_task_endpoint,
+    wire,
 };
 
 /// Shared per-endpoint gRPC channel cache.
@@ -139,6 +139,24 @@ impl Coordinator {
     /// before placement so that tasks with a large memory requirement are only
     /// placed on executors that have enough headroom.
     pub fn assign_pending_tasks(&mut self, job_id: &JobId) -> SchedulerResult<usize> {
+        self.assign_pending_tasks_capped(job_id, None)
+    }
+
+    /// Like [`assign_pending_tasks`] but assigns at most `max_tasks` tasks
+    /// this round (used by the fair-pool allocator to enforce pool quotas).
+    ///
+    /// Phase 53: placement is locality-aware with delay scheduling — reduce
+    /// stages prefer the node holding the majority of their upstream shuffle
+    /// bytes, waiting up to `config.locality_wait_ms` for a local slot before
+    /// falling back. Failure-retried tasks respect their exponential backoff
+    /// window. Free-slot budgets overlay the coordinator's own in-flight
+    /// (Assigned+Running) view on heartbeat counts so back-to-back rounds
+    /// cannot over-assign inside one heartbeat interval.
+    pub(crate) fn assign_pending_tasks_capped(
+        &mut self,
+        job_id: &JobId,
+        max_tasks: Option<usize>,
+    ) -> SchedulerResult<usize> {
         self.ensure_active()?;
 
         // Fast-path: if NO executor is schedulable at all, bail early.
@@ -157,58 +175,182 @@ impl Coordinator {
             }
         }
 
-        // SC10: collect (stage_index, pending_task_ids, resource_profile) tuples
-        // so we can filter executors per-stage.
-        let stage_work: Vec<(Vec<TaskId>, Option<krishiv_proto::ResourceProfile>)> = {
-            let job = self.find_job(job_id)?;
+        let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+        let locality_wait_ms = self.config.locality_wait_ms();
+        let executor_hosts = self.exec.executors.executor_hosts();
+        let inflight = self.inflight_tasks_by_executor();
+
+        // SC10: collect (pending_task_ids, locality prefs, resource_profile)
+        // per stage so we can filter executors per-stage. Also stamp
+        // `pending_since_ms` on first consideration (delay-scheduling anchor)
+        // and skip tasks still inside their retry backoff window.
+        struct StageWork {
+            pending: Vec<TaskId>,
+            prefs: Vec<crate::LocalityPreference>,
+            profile: Option<krishiv_proto::ResourceProfile>,
+        }
+        let stage_work: Vec<StageWork> = {
+            let mut job = self.find_job_mut(job_id)?;
+            let preferred_nodes = job.preferred_nodes_by_stage(&executor_hosts);
             job.stages
-                .iter()
+                .iter_mut()
                 .map(|s| {
-                    let pending: Vec<TaskId> = s
-                        .tasks()
-                        .iter()
-                        .filter(|t| t.state() == TaskState::Pending)
-                        .map(|t| t.task_id().clone())
-                        .collect();
-                    let profile = s.spec.resource_profile().cloned();
-                    (pending, profile)
+                    let preferred_node = preferred_nodes.get(s.stage_id()).cloned();
+                    let mut pending = Vec::new();
+                    let mut prefs = Vec::new();
+                    for t in s.tasks_mut() {
+                        if t.state() != TaskState::Pending {
+                            continue;
+                        }
+                        if t.retry_backoff_until_ms.is_some_and(|until| until > now_ms) {
+                            continue;
+                        }
+                        if t.pending_since_ms.is_none() {
+                            t.pending_since_ms = Some(now_ms);
+                        }
+                        pending.push(t.task_id().clone());
+                        prefs.push(crate::LocalityPreference {
+                            node_id: preferred_node.clone(),
+                            rack_id: None,
+                            pending_since_ms: t.pending_since_ms,
+                        });
+                    }
+                    StageWork {
+                        pending,
+                        prefs,
+                        profile: s.spec.resource_profile().cloned(),
+                    }
                 })
                 .collect()
         };
 
+        let budget = max_tasks.unwrap_or(usize::MAX);
+        let eligible_total: usize = stage_work.iter().map(|w| w.pending.len()).sum();
         let mut total = 0usize;
-        for (pending_task_ids, profile) in stage_work {
-            if pending_task_ids.is_empty() {
+        let mut tier_totals = crate::LocalityTierCounts::default();
+        for work in stage_work {
+            if work.pending.is_empty() || total >= budget {
                 continue;
             }
             // SC10: use profile-filtered executor pool for this stage.
-            let executors = self
+            let mut executors = self
                 .exec
                 .executors
-                .schedulable_placements_for_profile(profile.as_ref());
+                .schedulable_placements_for_profile(work.profile.as_ref());
             if executors.is_empty() {
                 // No executor satisfies this stage's resource requirements yet;
                 // leave the tasks Pending for the next dispatch tick.
                 continue;
             }
-            let assignments =
-                SlotAwareScheduler::place_task_ids_with_load(&pending_task_ids, &executors)?;
-            let mut job = self.find_job_mut(job_id)?;
-            for task_id in &pending_task_ids {
-                if let Some(assignment) = assignments.iter().find(|a| a.task_id() == task_id) {
-                    job.apply_assignments(vec![assignment.clone()]);
-                    total += 1;
+            // Overlay coordinator-side in-flight load (heartbeat-lag guard).
+            for placement in &mut executors {
+                if let Some(&n) = inflight.get(&placement.executor_id) {
+                    placement.raise_active_tasks_to(n);
                 }
             }
+            let take = work.pending.len().min(budget - total);
+            let (Some(take_ids), Some(take_prefs)) =
+                (work.pending.get(..take), work.prefs.get(..take))
+            else {
+                continue;
+            };
+            let outcome = crate::LocalityScheduler::place_tiered(
+                take_ids,
+                &executors,
+                take_prefs,
+                now_ms,
+                locality_wait_ms,
+            )?;
+            tier_totals.node_local += outcome.tier_counts.node_local;
+            tier_totals.rack_local += outcome.tier_counts.rack_local;
+            tier_totals.any += outcome.tier_counts.any;
+            tier_totals.deferred += outcome.tier_counts.deferred;
+            if outcome.assignments.is_empty() {
+                continue;
+            }
+            let mut job = self.find_job_mut(job_id)?;
+            total += outcome.assignments.len();
+            job.apply_assignments(outcome.assignments);
         }
+        crate::metrics::record_locality_tier_counts(
+            tier_totals.node_local,
+            tier_totals.rack_local,
+            tier_totals.any,
+            tier_totals.deferred,
+        );
 
+        // Phase 53 bookkeeping: jobs with leftover pending work go to the
+        // capacity backlog (drained when slots free); assigned work marks the
+        // job launch-dirty for the next drive tick.
+        if total < eligible_total {
+            self.pending_backlog_jobs.insert(job_id.clone());
+        } else {
+            self.pending_backlog_jobs.remove(job_id);
+        }
         if total > 0 {
+            self.launch_dirty_jobs.insert(job_id.clone());
             self.persist_job_record(
                 job_id,
                 krishiv_common::profile_requires_fail_closed_metadata(self.durability_profile),
             )?;
         }
         Ok(total)
+    }
+
+    /// Phase 53: try to assign backlog jobs' pending tasks — called when
+    /// capacity frees (a task completed, an executor registered) so overflow
+    /// work flows without an O(all jobs) scan.
+    pub(crate) fn drain_pending_backlog(&mut self) {
+        if self.pending_backlog_jobs.is_empty() {
+            return;
+        }
+        let jobs: Vec<JobId> = self.pending_backlog_jobs.iter().cloned().collect();
+        for job_id in jobs {
+            match self.assign_pending_tasks(&job_id) {
+                Ok(0) | Err(SchedulerError::NoExecutors) => {}
+                Ok(count) => {
+                    tracing::debug!(
+                        job_id = %job_id,
+                        task_count = count,
+                        "assigned backlog tasks after capacity freed"
+                    );
+                    self.exec.notify.notify_waiters();
+                }
+                Err(SchedulerError::UnknownJob { .. }) => {
+                    self.pending_backlog_jobs.remove(&job_id);
+                }
+                Err(error) => {
+                    tracing::warn!(job_id = %job_id, error = %error, "backlog assignment failed");
+                }
+            }
+        }
+    }
+
+    /// Phase 53 (audit §3b): the coordinator's own view of in-flight tasks
+    /// per executor — Assigned or Running task records across non-terminal
+    /// jobs. Overlaid on heartbeat-reported active counts at placement time
+    /// to close the heartbeat-lag over-assignment window.
+    pub(crate) fn inflight_tasks_by_executor(
+        &self,
+    ) -> std::collections::HashMap<krishiv_proto::ExecutorId, usize> {
+        let mut counts: std::collections::HashMap<krishiv_proto::ExecutorId, usize> =
+            std::collections::HashMap::new();
+        for jc in self.job_coordinators.values() {
+            let record = jc.read_record();
+            if record.state().is_terminal() {
+                continue;
+            }
+            for stage in record.stages() {
+                for task in stage.tasks() {
+                    if matches!(task.state(), TaskState::Assigned | TaskState::Running)
+                        && let Some(eid) = task.assigned_executor()
+                    {
+                        *counts.entry(eid.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        counts
     }
 
     /// Launch all assigned tasks for a job.

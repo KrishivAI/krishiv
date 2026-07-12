@@ -443,11 +443,14 @@ impl Coordinator {
         // Mirror the recovery path (recovery.rs) and hand the protected set to
         // `advance_clock_excluding` instead.
         let protected: std::collections::HashSet<ExecutorId> = if in_grace_period {
+            // Phase 53: one O(cluster) scan for the whole executor list
+            // instead of an O(all jobs) scan per candidate executor.
+            let streaming = self.executors_with_streaming_running_tasks();
             self.exec
                 .executors
                 .executors
                 .keys()
-                .filter(|id| self.executor_has_streaming_running_tasks(id))
+                .filter(|id| streaming.contains(*id))
                 .cloned()
                 .collect()
         } else {
@@ -701,35 +704,95 @@ impl Coordinator {
         if let Err(error) = self.admit_queued_jobs() {
             tracing::warn!(error = %error, "failed to admit queued jobs");
         }
-        let job_ids: Vec<JobId> = self
+        // Phase 53 fair pools: one assignment round distributes the free-slot
+        // budget across pools by min-share + weight, then jobs draw from
+        // their pool's quota in priority order. With no pool config every
+        // namespace is its own equal-weight pool, which degrades to the old
+        // priority-ordered behavior under strict capacity.
+        struct JobDemand {
+            job_id: JobId,
+            priority: u8,
+            pool: String,
+            pending: usize,
+        }
+        let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+        let mut jobs: Vec<JobDemand> = self
             .job_coordinators
             .iter()
             .filter_map(|(job_id, job_coordinator)| {
-                let state = job_coordinator.read_record().state();
+                let record = job_coordinator.read_record();
+                let state = record.state();
                 if state.is_terminal() || state == JobState::Queued {
-                    None
-                } else {
-                    Some(job_id.clone())
+                    return None;
                 }
+                let pending = record
+                    .stages()
+                    .iter()
+                    .flat_map(|s| s.tasks())
+                    .filter(|t| {
+                        t.state() == TaskState::Pending
+                            && t.retry_backoff_until_ms.is_none_or(|until| until <= now_ms)
+                    })
+                    .count();
+                let pool = self.pool_for_namespace(record.spec.namespace_id());
+                Some(JobDemand {
+                    job_id: job_id.clone(),
+                    priority: record.spec.priority(),
+                    pool,
+                    pending,
+                })
             })
             .collect();
-
-        for job_id in &job_ids {
-            match self.assign_pending_tasks(job_id) {
-                Ok(0) | Err(SchedulerError::NoExecutors) => {}
-                Ok(count) => {
-                    tracing::debug!(
-                        job_id = %job_id,
-                        task_count = count,
-                        "assigned pending tasks after executor registration"
-                    );
+        jobs.retain(|j| j.pending > 0);
+        if !jobs.is_empty() {
+            let inflight = self.inflight_tasks_by_executor();
+            let mut placements = self.exec.executors.schedulable_executor_placements();
+            for p in &mut placements {
+                if let Some(&n) = inflight.get(&p.executor_id) {
+                    p.raise_active_tasks_to(n);
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        job_id = %job_id,
-                        error = %error,
-                        "failed to assign pending tasks after executor registration"
-                    );
+            }
+            let total_free: usize = placements.iter().map(|p| p.free_slots()).sum();
+            let mut demand: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for j in &jobs {
+                *demand.entry(j.pool.clone()).or_insert(0) += j.pending;
+            }
+            let mut remaining_by_pool = crate::FairScheduler::compute_pool_quotas(
+                total_free,
+                &demand,
+                &self.scheduler_pools,
+            );
+            jobs.sort_by(|a, b| {
+                b.priority
+                    .cmp(&a.priority)
+                    .then_with(|| a.job_id.cmp(&b.job_id))
+            });
+            for j in &jobs {
+                let quota = remaining_by_pool.get_mut(&j.pool).copied().unwrap_or(0);
+                if quota == 0 {
+                    continue;
+                }
+                match self.assign_pending_tasks_capped(&j.job_id, Some(quota)) {
+                    Ok(0) | Err(SchedulerError::NoExecutors) => {}
+                    Ok(count) => {
+                        if let Some(rem) = remaining_by_pool.get_mut(&j.pool) {
+                            *rem = rem.saturating_sub(count);
+                        }
+                        tracing::debug!(
+                            job_id = %j.job_id,
+                            task_count = count,
+                            pool = %j.pool,
+                            "assigned pending tasks (pool round)"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            job_id = %j.job_id,
+                            error = %error,
+                            "failed to assign pending tasks (pool round)"
+                        );
+                    }
                 }
             }
         }

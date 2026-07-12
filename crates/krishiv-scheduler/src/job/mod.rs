@@ -7,8 +7,9 @@ mod snapshot;
 pub use record::{JobRecord, StageRecord, TaskRecord};
 pub(crate) use scheduler::{ExecutorPlacement, validate_job};
 pub use scheduler::{
-    NamespaceQuotaSnapshot, ResourceUsage, SlotAwareScheduler, StaticScheduler, SubmitOutcome,
-    job_spec_from_logical_plan, job_spec_from_physical_plan,
+    FairScheduler, LocalityOutcome, LocalityPreference, LocalityScheduler, LocalityTierCounts,
+    NamespaceQuotaSnapshot, PoolSpec, ResourceUsage, SlotAwareScheduler, StaticScheduler,
+    SubmitOutcome, job_spec_from_logical_plan, job_spec_from_physical_plan,
 };
 pub use snapshot::{JobDetailSnapshot, JobSnapshot, StabilityMetrics, StageSnapshot, TaskSnapshot};
 

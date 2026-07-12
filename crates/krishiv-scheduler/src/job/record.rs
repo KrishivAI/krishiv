@@ -38,6 +38,11 @@ pub struct JobRecord {
     pub(crate) spec: JobSpec,
     pub(crate) state: JobState,
     pub(crate) max_stage_retries: u32,
+    /// Phase 53: base delay for exponential backoff between task retry
+    /// attempts (doubles per failure, capped at `retry_backoff_cap_ms`).
+    pub(crate) retry_backoff_base_ms: u64,
+    /// Phase 53: upper bound for the retry backoff delay.
+    pub(crate) retry_backoff_cap_ms: u64,
     pub(crate) stages: Vec<StageRecord>,
     /// Shuffle partition availability metadata per producing stage.
     /// Updated when tasks report ShufflePartitionOutput in TaskOutputMetadata.
@@ -69,10 +74,19 @@ impl JobRecord {
             spec,
             state: JobState::Accepted,
             max_stage_retries,
+            retry_backoff_base_ms: 1_000,
+            retry_backoff_cap_ms: 30_000,
             stages,
             shuffle_output: HashMap::new(),
             resource_usage: ResourceUsage::default(),
         }
+    }
+
+    /// Phase 53: override the task retry backoff policy (base doubles per
+    /// failure, capped).
+    pub(crate) fn set_retry_backoff(&mut self, base_ms: u64, cap_ms: u64) {
+        self.retry_backoff_base_ms = base_ms.max(1);
+        self.retry_backoff_cap_ms = cap_ms.max(base_ms);
     }
 
     pub(crate) fn mark_queued(&mut self) {
@@ -134,6 +148,8 @@ impl JobRecord {
                 {
                     task.assigned_executor = Some(assignment.executor_id().clone());
                     task.state = TaskState::Assigned;
+                    task.pending_since_ms = None;
+                    task.retry_backoff_until_ms = None;
                 }
             }
         }
@@ -413,7 +429,12 @@ impl JobRecord {
                 stage_id: stage_id.clone(),
             })?;
 
-        let outcome = stage.apply_task_update(update, self.max_stage_retries)?;
+        let outcome = stage.apply_task_update(
+            update,
+            self.max_stage_retries,
+            self.retry_backoff_base_ms,
+            self.retry_backoff_cap_ms,
+        )?;
 
         // Accumulate resource stats from successfully-completed tasks.
         if outcome != TaskUpdateOutcome::Duplicate
@@ -713,6 +734,63 @@ impl JobRecord {
         affected
     }
 
+    /// Phase 53: preferred placement node per stage, derived from where the
+    /// upstream stages' shuffle output actually lives.
+    ///
+    /// For each stage with upstream dependencies, finds the executor host
+    /// holding the largest share of upstream shuffle bytes (Succeeded
+    /// upstream tasks, weighted by `ShufflePartitionOutput::size_bytes`;
+    /// weight 1 when sizes are unreported). Stages without upstreams (scans)
+    /// get no preference. Returns `stage_id → preferred host`.
+    pub(crate) fn preferred_nodes_by_stage(
+        &self,
+        executor_hosts: &HashMap<ExecutorId, String>,
+    ) -> HashMap<StageId, String> {
+        let mut result = HashMap::new();
+        for stage in &self.stages {
+            let upstreams = stage.spec.upstream_stage_ids();
+            if upstreams.is_empty() {
+                continue;
+            }
+            let mut bytes_by_host: HashMap<&str, u64> = HashMap::new();
+            for upstream in self
+                .stages
+                .iter()
+                .filter(|s| upstreams.contains(s.stage_id()))
+            {
+                for task in upstream.tasks() {
+                    if task.state() != TaskState::Succeeded {
+                        continue;
+                    }
+                    let Some(host) = task
+                        .assigned_executor()
+                        .and_then(|eid| executor_hosts.get(eid))
+                    else {
+                        continue;
+                    };
+                    let weight: u64 = task
+                        .output_metadata()
+                        .map(|m| {
+                            m.shuffle_partitions()
+                                .iter()
+                                .map(|p| p.size_bytes.max(1))
+                                .sum()
+                        })
+                        .filter(|&w: &u64| w > 0)
+                        .unwrap_or(1);
+                    *bytes_by_host.entry(host.as_str()).or_insert(0) += weight;
+                }
+            }
+            if let Some((host, _)) = bytes_by_host
+                .into_iter()
+                .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+            {
+                result.insert(stage.stage_id().clone(), host.to_owned());
+            }
+        }
+        result
+    }
+
     /// Collect per-task serialized shuffle bytes for a completed stage.
     ///
     /// Called after a shuffle stage succeeds to gather AQE re-optimization inputs.
@@ -811,6 +889,8 @@ impl StageRecord {
         &mut self,
         update: TaskStatusUpdate,
         max_stage_retries: u32,
+        retry_backoff_base_ms: u64,
+        retry_backoff_cap_ms: u64,
     ) -> SchedulerResult<TaskUpdateOutcome> {
         let max_task_attempts = self.spec.max_task_attempts();
 
@@ -856,6 +936,15 @@ impl StageRecord {
                 task.state = TaskState::Pending;
                 task.assigned_executor = None;
                 task.launch_in_flight = false;
+                // Phase 53: exponential backoff before re-assignment —
+                // base * 2^(failures-1), capped. Failure-driven retries only;
+                // executor-loss and speculation resets stay immediate.
+                let exp = task_failure_count.saturating_sub(1).min(16);
+                let delay_ms = retry_backoff_base_ms
+                    .saturating_mul(1u64 << exp)
+                    .min(retry_backoff_cap_ms);
+                let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+                task.retry_backoff_until_ms = Some(now_ms.saturating_add(delay_ms));
                 self.refresh_state();
                 return Ok(TaskUpdateOutcome::Applied);
             }
@@ -996,6 +1085,14 @@ pub struct TaskRecord {
     /// duration for a stage without requiring `assigned_at_ms` (which is
     /// cleared on task completion).
     pub(crate) completed_duration_ms: Option<u64>,
+    /// Phase 53: wall-clock ms before which a failure-retried task must not
+    /// be re-assigned (exponential backoff on task-reported failures).
+    /// Transient — not persisted; a coordinator restart resets the backoff.
+    pub(crate) retry_backoff_until_ms: Option<u64>,
+    /// Phase 53 delay scheduling: wall-clock ms when this task was first
+    /// considered for assignment while Pending. Anchors the locality-wait
+    /// budget; cleared on assignment.
+    pub(crate) pending_since_ms: Option<u64>,
 }
 
 impl TaskRecord {
@@ -1015,6 +1112,8 @@ impl TaskRecord {
             assigned_at_ms: None,
             last_progress_ms: None,
             completed_duration_ms: None,
+            retry_backoff_until_ms: None,
+            pending_since_ms: None,
         }
     }
 

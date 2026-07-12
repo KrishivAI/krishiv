@@ -88,6 +88,19 @@ pub struct CoordinatorConfig {
     /// task assignments are issued during this period so the cluster can stabilise.
     /// Default: `60_000` (60 s).
     cascade_cooldown_ms: u64,
+
+    // ── Phase 53: locality + retry policy ──────────────────────────────────
+    /// Delay-scheduling budget: how long a task with a locality preference
+    /// waits for a local slot before falling back to ANY placement.
+    /// `0` disables delay scheduling. Default: `3_000` (3 s).
+    locality_wait_ms: u64,
+
+    /// Base delay for exponential backoff between task retry attempts
+    /// (doubles per failure). Default: `1_000` (1 s).
+    task_retry_backoff_base_ms: u64,
+
+    /// Cap for the task retry backoff delay. Default: `30_000` (30 s).
+    task_retry_backoff_cap_ms: u64,
 }
 
 impl CoordinatorConfig {
@@ -114,6 +127,9 @@ impl CoordinatorConfig {
             cascade_failure_threshold: 5,
             cascade_window_ms: 30_000,
             cascade_cooldown_ms: 60_000,
+            locality_wait_ms: 3_000,
+            task_retry_backoff_base_ms: 1_000,
+            task_retry_backoff_cap_ms: 30_000,
         }
     }
 
@@ -274,6 +290,38 @@ impl CoordinatorConfig {
     #[must_use]
     pub fn with_cascade_cooldown_ms(mut self, ms: u64) -> Self {
         self.cascade_cooldown_ms = ms.max(1);
+        self
+    }
+
+    // ── Phase 53: locality + retry policy ──────────────────────────────────
+
+    /// Delay-scheduling budget in ms (0 disables delay scheduling).
+    pub fn locality_wait_ms(&self) -> u64 {
+        self.locality_wait_ms
+    }
+
+    /// Override the delay-scheduling budget.
+    #[must_use]
+    pub fn with_locality_wait_ms(mut self, ms: u64) -> Self {
+        self.locality_wait_ms = ms;
+        self
+    }
+
+    /// Base delay for exponential task-retry backoff.
+    pub fn task_retry_backoff_base_ms(&self) -> u64 {
+        self.task_retry_backoff_base_ms
+    }
+
+    /// Cap for the task-retry backoff delay.
+    pub fn task_retry_backoff_cap_ms(&self) -> u64 {
+        self.task_retry_backoff_cap_ms
+    }
+
+    /// Override the task-retry backoff policy.
+    #[must_use]
+    pub fn with_task_retry_backoff(mut self, base_ms: u64, cap_ms: u64) -> Self {
+        self.task_retry_backoff_base_ms = base_ms.max(1);
+        self.task_retry_backoff_cap_ms = cap_ms.max(base_ms.max(1));
         self
     }
 }

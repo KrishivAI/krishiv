@@ -975,3 +975,429 @@ fn resource_profile_assign_pending_respects_profile_after_retry() {
         "task must remain Pending when no executor can satisfy the resource profile"
     );
 }
+
+// ── Phase 53: scheduler v2 named tests ───────────────────────────────────────
+
+/// Phase 53 speculation state machine: first completion wins — a straggler
+/// that finishes while its speculative cancel is in flight keeps its result
+/// (the preempt re-check skips it), and after a real preempt+relaunch a late
+/// status update from the cancelled original attempt is fenced as stale.
+#[test]
+fn speculation_first_completion_wins_and_stale_original_is_fenced() {
+    use krishiv_proto::StageKind;
+
+    allow_anonymous_for_tests();
+    let exec_id = ExecutorId::try_new("exec-spec2").unwrap();
+    let config = CoordinatorConfig::default()
+        .with_speculative_execution(true)
+        .with_speculative_min_completed_tasks(1)
+        .with_task_retry_backoff(1, 1);
+    let mut coordinator =
+        Coordinator::active_with_config(CoordinatorId::try_new("coord-spec2").unwrap(), config);
+    let lease_gen = coordinator
+        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-spec2", 8))
+        .unwrap();
+
+    let job_id = JobId::try_new("job-spec2").unwrap();
+    let stage_id = StageId::try_new("stage-spec2").unwrap();
+    let fast = TaskId::try_new("t-fast").unwrap();
+    let slow = TaskId::try_new("t-slow").unwrap();
+    coordinator
+        .submit_job(
+            JobSpec::new(job_id.clone(), "spec2", JobKind::Batch).with_stage(
+                StageSpec::new(stage_id.clone(), "map")
+                    .with_kind(StageKind::ShuffleMap)
+                    .with_task(TaskSpec::new(fast.clone(), "sql: SELECT 1"))
+                    .with_task(TaskSpec::new(slow.clone(), "sql: SELECT 1")),
+            ),
+        )
+        .unwrap();
+    let assignments = coordinator
+        .launch_assigned_task_assignments(&job_id)
+        .unwrap();
+    let slow_assign = assignments
+        .iter()
+        .find(|a| a.task_id() == &slow)
+        .unwrap()
+        .clone();
+
+    // One fast completion establishes the median; make the slow task a
+    // straggler with injected timing.
+    let fast_assign = assignments.iter().find(|a| a.task_id() == &fast).unwrap();
+    coordinator
+        .apply_task_update(
+            TaskStatusUpdate::new(
+                job_id.clone(),
+                stage_id.clone(),
+                fast.clone(),
+                exec_id.clone(),
+                TaskState::Succeeded,
+                fast_assign.attempt_id().as_u32(),
+            )
+            .with_lease_generation(lease_gen),
+        )
+        .unwrap();
+    {
+        let jc = coordinator.job_coordinators.get(&job_id).unwrap();
+        let mut rec = jc.write_record();
+        for stage in rec.stages_mut() {
+            for task in stage.tasks_mut() {
+                if task.task_id() == &fast {
+                    task.completed_duration_ms = Some(100);
+                } else if task.task_id() == &slow {
+                    task.state = TaskState::Running;
+                    task.assigned_at_ms = Some(0);
+                }
+            }
+            stage.refresh_state();
+        }
+    }
+    let work = coordinator.collect_speculation_work_at(10_000);
+    assert!(
+        work.iter().any(|w| w.task_id == slow),
+        "slow task must be detected as a straggler"
+    );
+
+    // FIRST-COMPLETION-WINS: the original finishes before the preempt is
+    // applied (models a completion racing the CancelTask RPC window).
+    coordinator
+        .apply_task_update(
+            TaskStatusUpdate::new(
+                job_id.clone(),
+                stage_id.clone(),
+                slow.clone(),
+                exec_id.clone(),
+                TaskState::Succeeded,
+                slow_assign.attempt_id().as_u32(),
+            )
+            .with_lease_generation(lease_gen),
+        )
+        .unwrap();
+    coordinator.apply_speculation_preempts(&work);
+    {
+        let jc = coordinator.job_coordinators.get(&job_id).unwrap();
+        let rec = jc.read_record();
+        let t = rec
+            .stages()
+            .iter()
+            .flat_map(|s| s.tasks())
+            .find(|t| t.task_id() == &slow)
+            .unwrap();
+        assert_eq!(
+            t.state(),
+            TaskState::Succeeded,
+            "a straggler that completed before the preempt keeps its result"
+        );
+    }
+
+    // SECOND SCENARIO (fresh job): the preempt applies while the original is
+    // still Running; relaunch bumps the attempt and the original's late
+    // update is fenced.
+    let job2 = JobId::try_new("job-spec2b").unwrap();
+    let stage2 = StageId::try_new("stage-spec2b").unwrap();
+    let slow2 = TaskId::try_new("t-slow2").unwrap();
+    coordinator
+        .submit_job(
+            JobSpec::new(job2.clone(), "spec2b", JobKind::Batch).with_stage(
+                StageSpec::new(stage2.clone(), "map")
+                    .with_kind(StageKind::ShuffleMap)
+                    .with_task(TaskSpec::new(slow2.clone(), "sql: SELECT 1")),
+            ),
+        )
+        .unwrap();
+    let assignments2 = coordinator
+        .launch_assigned_task_assignments(&job2)
+        .unwrap();
+    let old_attempt = assignments2
+        .iter()
+        .find(|a| a.task_id() == &slow2)
+        .unwrap()
+        .attempt_id()
+        .as_u32();
+    {
+        let jc = coordinator.job_coordinators.get(&job2).unwrap();
+        let mut rec = jc.write_record();
+        for stage in rec.stages_mut() {
+            for task in stage.tasks_mut() {
+                task.state = TaskState::Running;
+                task.assigned_at_ms = Some(0);
+            }
+            stage.refresh_state();
+        }
+    }
+    let preempt = vec![crate::coordinator::SpeculativeWork {
+        job_id: job2.clone(),
+        stage_id: stage2.clone(),
+        task_id: slow2.clone(),
+        attempt: old_attempt,
+        executor_endpoint: None,
+        running_ms: 10_000,
+        median_ms: 100,
+    }];
+    coordinator.apply_speculation_preempts(&preempt);
+    // Relaunch: assignment bumps the attempt id.
+    coordinator.assign_pending_tasks(&job2).unwrap();
+    let relaunched = coordinator
+        .launch_assigned_task_assignments(&job2)
+        .unwrap();
+    let new_attempt = relaunched
+        .iter()
+        .find(|a| a.task_id() == &slow2)
+        .expect("straggler must relaunch")
+        .attempt_id()
+        .as_u32();
+    assert!(new_attempt > old_attempt, "relaunch must bump the attempt id");
+    // The cancelled original's late completion is fenced as stale.
+    let stale = coordinator.apply_task_update(
+        TaskStatusUpdate::new(
+            job2.clone(),
+            stage2.clone(),
+            slow2.clone(),
+            exec_id.clone(),
+            TaskState::Succeeded,
+            old_attempt,
+        )
+        .with_lease_generation(lease_gen),
+    );
+    assert!(
+        matches!(stale, Err(SchedulerError::StaleTaskAttempt { .. })),
+        "late update from the cancelled original attempt must be fenced, got {stale:?}"
+    );
+}
+
+/// Phase 53 sink gate: tasks carrying a sink contract are never speculated,
+/// even in a Running ShuffleMap stage that otherwise qualifies.
+#[test]
+fn speculation_skips_tasks_with_sink_contracts() {
+    use krishiv_proto::StageKind;
+
+    allow_anonymous_for_tests();
+    let exec_id = ExecutorId::try_new("exec-spec3").unwrap();
+    let config = CoordinatorConfig::default()
+        .with_speculative_execution(true)
+        .with_speculative_min_completed_tasks(1);
+    let mut coordinator =
+        Coordinator::active_with_config(CoordinatorId::try_new("coord-spec3").unwrap(), config);
+    coordinator
+        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-spec3", 8))
+        .unwrap();
+    let job_id = JobId::try_new("job-spec3").unwrap();
+    let stage_id = StageId::try_new("stage-spec3").unwrap();
+    let done = TaskId::try_new("t-done3").unwrap();
+    let sink = TaskId::try_new("t-sink3").unwrap();
+    coordinator
+        .submit_job(
+            JobSpec::new(job_id.clone(), "spec3", JobKind::Batch).with_stage(
+                StageSpec::new(stage_id.clone(), "map")
+                    .with_kind(StageKind::ShuffleMap)
+                    .with_task(TaskSpec::new(done.clone(), "sql: SELECT 1"))
+                    .with_task(
+                        TaskSpec::new(sink.clone(), "sql: SELECT 1")
+                            .with_sink_contract("parquet-dir:v1:/tmp/out"),
+                    ),
+            ),
+        )
+        .unwrap();
+    coordinator
+        .launch_assigned_task_assignments(&job_id)
+        .unwrap();
+    {
+        let jc = coordinator.job_coordinators.get(&job_id).unwrap();
+        let mut rec = jc.write_record();
+        for stage in rec.stages_mut() {
+            for task in stage.tasks_mut() {
+                if task.task_id() == &done {
+                    task.state = TaskState::Succeeded;
+                    task.completed_duration_ms = Some(100);
+                } else {
+                    task.state = TaskState::Running;
+                    task.assigned_at_ms = Some(0);
+                }
+            }
+            stage.refresh_state();
+        }
+    }
+    let work = coordinator.collect_speculation_work_at(10_000);
+    assert!(
+        work.iter().all(|w| w.task_id != sink),
+        "sink-contract task must never be speculated: {work:?}"
+    );
+}
+
+/// Phase 53 exit gate: two pools with 2:1 weights under saturation converge
+/// to a 2:1 slot split (coordinator-level, through the live pool round).
+#[test]
+fn fair_pools_two_to_one_split_under_saturation() {
+    allow_anonymous_for_tests();
+    let mut coordinator =
+        Coordinator::active(CoordinatorId::try_new("coord-pools").unwrap());
+    let mut pools = std::collections::HashMap::new();
+    pools.insert(
+        "heavy".to_string(),
+        crate::PoolSpec {
+            weight: 2,
+            min_share: 0,
+        },
+    );
+    pools.insert(
+        "light".to_string(),
+        crate::PoolSpec {
+            weight: 1,
+            min_share: 0,
+        },
+    );
+    coordinator.set_scheduler_pools(pools, std::collections::HashMap::new());
+
+    // Submit BEFORE any executor exists: all tasks stay Pending.
+    let mk_job = |id: &str, ns: &str| {
+        let mut stage = StageSpec::new(StageId::try_new(format!("{id}-s")).unwrap(), "s");
+        for i in 0..6 {
+            stage = stage.with_task(TaskSpec::new(
+                TaskId::try_new(format!("{id}-t{i}")).unwrap(),
+                "sql: SELECT 1",
+            ));
+        }
+        JobSpec::new(JobId::try_new(id).unwrap(), id, JobKind::Batch)
+            .with_namespace(ns)
+            .with_stage(stage)
+    };
+    coordinator.submit_job(mk_job("job-heavy", "heavy")).unwrap();
+    coordinator.submit_job(mk_job("job-light", "light")).unwrap();
+
+    // One 6-slot executor registers: 12 tasks demanded, 6 slots → the pool
+    // round must split 4:2 by weight.
+    coordinator
+        .register_executor(ExecutorDescriptor::new(
+            ExecutorId::try_new("exec-pools").unwrap(),
+            "pod-pools",
+            6,
+        ))
+        .unwrap();
+    let count_assigned = |job: &str| {
+        let jid = JobId::try_new(job).unwrap();
+        coordinator
+            .job_detail_snapshot(&jid)
+            .unwrap()
+            .stages()
+            .iter()
+            .flat_map(|s| s.tasks().to_vec())
+            .filter(|t| t.state() == TaskState::Assigned)
+            .count()
+    };
+    assert_eq!(
+        (count_assigned("job-heavy"), count_assigned("job-light")),
+        (4, 2),
+        "2:1 pool weights must yield a 4:2 split of 6 slots under saturation"
+    );
+}
+
+/// Phase 53 locality: a reduce stage prefers the node holding the majority
+/// of its upstream shuffle bytes.
+#[test]
+fn reduce_stage_prefers_upstream_shuffle_node() {
+    use krishiv_proto::{ShufflePartitionOutput, StageKind, TaskOutputMetadata};
+
+    let map_stage = StageId::try_new("map-loc").unwrap();
+    let reduce_stage = StageId::try_new("reduce-loc").unwrap();
+    let spec = JobSpec::new(JobId::try_new("job-loc").unwrap(), "loc", JobKind::Batch)
+        .with_stage(
+            StageSpec::new(map_stage.clone(), "map")
+                .with_kind(StageKind::ShuffleMap)
+                .with_task(TaskSpec::new(TaskId::try_new("m0").unwrap(), "sql: m"))
+                .with_task(TaskSpec::new(TaskId::try_new("m1").unwrap(), "sql: m")),
+        )
+        .with_stage(
+            StageSpec::new(reduce_stage.clone(), "reduce")
+                .with_upstream_stage(map_stage.clone())
+                .with_task(TaskSpec::new(TaskId::try_new("r0").unwrap(), "sql: r")),
+        );
+    let mut record = crate::JobRecord::from_spec(spec, 1);
+    let exec_a = ExecutorId::try_new("exec-loc-a").unwrap();
+    let exec_b = ExecutorId::try_new("exec-loc-b").unwrap();
+    for stage in record.stages_mut() {
+        if stage.stage_id() != &map_stage {
+            continue;
+        }
+        for (i, task) in stage.tasks_mut().iter_mut().enumerate() {
+            task.state = TaskState::Succeeded;
+            let (eid, bytes) = if i == 0 {
+                (exec_a.clone(), 1_000u64)
+            } else {
+                (exec_b.clone(), 10u64)
+            };
+            task.assigned_executor = Some(eid);
+            task.output_metadata = Some(
+                TaskOutputMetadata::new("shuffle", 1, 1, 1).with_shuffle_partitions(vec![
+                    ShufflePartitionOutput::new(i as u32, bytes, "http://x"),
+                ]),
+            );
+        }
+    }
+    let hosts = std::collections::HashMap::from([
+        (exec_a, "node-a".to_string()),
+        (exec_b, "node-b".to_string()),
+    ]);
+    let prefs = record.preferred_nodes_by_stage(&hosts);
+    assert_eq!(
+        prefs.get(&reduce_stage).map(String::as_str),
+        Some("node-a"),
+        "reduce must prefer the node holding the larger shuffle output"
+    );
+    assert!(
+        !prefs.contains_key(&map_stage),
+        "scan/map stages without upstreams get no preference"
+    );
+}
+
+/// Phase 53 scale proof: 100 executors, one 10k-task job — full assignment
+/// and launch complete within budget and place every task exactly once.
+#[test]
+fn scale_100_executors_10k_tasks_assignment() {
+    allow_anonymous_for_tests();
+    let mut coordinator =
+        Coordinator::active(CoordinatorId::try_new("coord-scale").unwrap());
+    for i in 0..100 {
+        coordinator
+            .register_executor(
+                ExecutorDescriptor::new(
+                    ExecutorId::try_new(format!("exec-scale-{i}")).unwrap(),
+                    format!("node-{}", i % 10),
+                    100,
+                )
+                .with_task_endpoint(crate::IN_PROCESS_TASK_ENDPOINT),
+            )
+            .unwrap();
+    }
+    let mut stage = StageSpec::new(StageId::try_new("scale-s").unwrap(), "s");
+    for i in 0..10_000 {
+        stage = stage.with_task(TaskSpec::new(
+            TaskId::try_new(format!("scale-t{i}")).unwrap(),
+            "sql: SELECT 1",
+        ));
+    }
+    let spec = JobSpec::new(JobId::try_new("job-scale").unwrap(), "scale", JobKind::Batch)
+        .with_stage(stage);
+    let job_id = spec.job_id().clone();
+
+    let start = std::time::Instant::now();
+    coordinator.submit_job(spec).unwrap();
+    let launched = coordinator
+        .launch_assigned_task_assignments(&job_id)
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(launched.len(), 10_000, "all 10k tasks must be launched");
+    let mut per_exec: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for a in &launched {
+        *per_exec.entry(a.executor_id().as_str()).or_insert(0) += 1;
+    }
+    assert_eq!(per_exec.len(), 100, "placement must use all 100 executors");
+    assert!(
+        per_exec.values().all(|&n| n == 100),
+        "strict capacity: exactly 100 tasks per 100-slot executor"
+    );
+    println!("scale proof: submit+assign+launch 10k tasks on 100 executors in {elapsed:?}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "10k-task assignment must finish within budget, took {elapsed:?}"
+    );
+}

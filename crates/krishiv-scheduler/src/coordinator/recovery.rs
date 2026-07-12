@@ -190,13 +190,16 @@ impl Coordinator {
         // give them time to re-register. Protect them from this immediate sweep;
         // they are still evicted later by a grace-aware tick if they never come
         // back.
+        // Phase 53: one O(cluster) scan for the whole executor list instead
+        // of an O(all jobs) scan per candidate executor.
+        let streaming = self.executors_with_streaming_running_tasks();
         let protected_streaming: std::collections::HashSet<ExecutorId> = self
             .exec
             .executors
             .list()
             .into_iter()
             .map(|record| record.executor_id().clone())
-            .filter(|id| self.executor_has_streaming_running_tasks(id))
+            .filter(|id| streaming.contains(id))
             .collect();
         let stale_ids = self
             .exec

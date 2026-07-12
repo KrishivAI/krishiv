@@ -254,6 +254,21 @@ impl ExecutorRegistry {
             .collect()
     }
 
+    /// Phase 53: executor id → host (node identity) for locality preferences.
+    pub(crate) fn executor_hosts(
+        &self,
+    ) -> std::collections::HashMap<krishiv_proto::ExecutorId, String> {
+        self.executors
+            .values()
+            .map(|executor| {
+                (
+                    executor.executor_id().clone(),
+                    executor.descriptor().host().to_owned(),
+                )
+            })
+            .collect()
+    }
+
     pub(crate) fn schedulable_executors(&self) -> Vec<&ExecutorDescriptor> {
         self.executors
             .values()
@@ -286,10 +301,12 @@ impl ExecutorRegistry {
                     .and_then(|snapshot| snapshot.active_task_count)
                     .map(|count| count as usize)
                     .unwrap_or_else(|| executor.running_tasks.len());
-                ExecutorPlacement::new(
+                ExecutorPlacement::with_locality(
                     executor.executor_id().clone(),
                     executor.descriptor().slots(),
                     active_tasks,
+                    Some(executor.descriptor().host().to_owned()),
+                    executor.descriptor().rack_id().map(str::to_owned),
                 )
             })
             .collect();
@@ -364,10 +381,12 @@ impl ExecutorRegistry {
                     .and_then(|snapshot| snapshot.active_task_count)
                     .map(|c| c as usize)
                     .unwrap_or_else(|| executor.running_tasks.len());
-                ExecutorPlacement::new(
+                ExecutorPlacement::with_locality(
                     executor.executor_id().clone(),
                     executor.descriptor().slots(),
                     active_tasks,
+                    Some(executor.descriptor().host().to_owned()),
+                    executor.descriptor().rack_id().map(str::to_owned),
                 )
             })
             .collect();

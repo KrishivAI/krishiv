@@ -864,6 +864,11 @@ impl TryFrom<PersistedJobRecord> for JobRecord {
                 .collect::<SchedulerResult<Vec<_>>>()?,
             shuffle_output,
             resource_usage: value.resource_usage.unwrap_or_default(),
+            // Phase 53: retry backoff policy is coordinator config, not
+            // persisted state; the restore path re-applies the configured
+            // values via `set_retry_backoff` (defaults here are the same).
+            retry_backoff_base_ms: 1_000,
+            retry_backoff_cap_ms: 30_000,
         })
     }
 }
@@ -948,6 +953,11 @@ impl TryFrom<PersistedTaskRecord> for TaskRecord {
             assigned_at_ms: None,
             last_progress_ms: None,
             completed_duration_ms: None,
+            // Phase 53: backoff/delay-scheduling anchors are transient — a
+            // coordinator restart resets them (backoff restarts, locality
+            // wait re-anchors on the next assignment attempt).
+            retry_backoff_until_ms: None,
+            pending_since_ms: None,
         })
     }
 }

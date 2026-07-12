@@ -63,6 +63,34 @@ pub fn record_task_assignment_duration_ms(duration_ms: u64) {
     TASK_ASSIGNMENT_DURATION_MS_SUM.fetch_add(duration_ms, AtomicOrdering::Relaxed);
 }
 
+// ── Phase 53: scheduling observability ───────────────────────────────────────
+
+/// Tasks placed on their preferred node (NODE_LOCAL tier).
+pub static PLACEMENTS_NODE_LOCAL_TOTAL: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
+/// Tasks placed on their preferred rack (RACK_LOCAL tier).
+pub static PLACEMENTS_RACK_LOCAL_TOTAL: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
+/// Tasks placed with no locality match (ANY tier).
+pub static PLACEMENTS_ANY_TOTAL: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
+/// Tasks deferred by delay scheduling (waiting for a local slot).
+pub static PLACEMENTS_DEFERRED_TOTAL: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
+/// Straggler tasks detected by the speculation pass.
+pub static SPECULATION_DETECTED_TOTAL: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
+/// Straggler originals cancelled + re-queued by the speculation pass.
+pub static SPECULATION_PREEMPTED_TOTAL: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
+
+/// Record per-tier locality counts from one placement round.
+pub fn record_locality_tier_counts(
+    node_local: usize,
+    rack_local: usize,
+    any: usize,
+    deferred: usize,
+) {
+    PLACEMENTS_NODE_LOCAL_TOTAL.fetch_add(node_local as u64, AtomicOrdering::Relaxed);
+    PLACEMENTS_RACK_LOCAL_TOTAL.fetch_add(rack_local as u64, AtomicOrdering::Relaxed);
+    PLACEMENTS_ANY_TOTAL.fetch_add(any as u64, AtomicOrdering::Relaxed);
+    PLACEMENTS_DEFERRED_TOTAL.fetch_add(deferred as u64, AtomicOrdering::Relaxed);
+}
+
 /// Snapshot of scheduler-level metrics counters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchedulerMetrics {
@@ -73,6 +101,13 @@ pub struct SchedulerMetrics {
     pub checkpoint_epoch_gauge: u64,
     /// Rolling sum of task assignment latency in milliseconds.
     pub task_assignment_duration_ms_sum: u64,
+    /// Phase 53: per-tier placement counters + speculation outcomes.
+    pub placements_node_local_total: u64,
+    pub placements_rack_local_total: u64,
+    pub placements_any_total: u64,
+    pub placements_deferred_total: u64,
+    pub speculation_detected_total: u64,
+    pub speculation_preempted_total: u64,
 }
 
 /// Read the current scheduler metrics snapshot.
@@ -84,6 +119,12 @@ pub fn scheduler_metrics() -> SchedulerMetrics {
         checkpoint_epoch_gauge: CHECKPOINT_EPOCH_GAUGE.load(AtomicOrdering::Relaxed),
         task_assignment_duration_ms_sum: TASK_ASSIGNMENT_DURATION_MS_SUM
             .load(AtomicOrdering::Relaxed),
+        placements_node_local_total: PLACEMENTS_NODE_LOCAL_TOTAL.load(AtomicOrdering::Relaxed),
+        placements_rack_local_total: PLACEMENTS_RACK_LOCAL_TOTAL.load(AtomicOrdering::Relaxed),
+        placements_any_total: PLACEMENTS_ANY_TOTAL.load(AtomicOrdering::Relaxed),
+        placements_deferred_total: PLACEMENTS_DEFERRED_TOTAL.load(AtomicOrdering::Relaxed),
+        speculation_detected_total: SPECULATION_DETECTED_TOTAL.load(AtomicOrdering::Relaxed),
+        speculation_preempted_total: SPECULATION_PREEMPTED_TOTAL.load(AtomicOrdering::Relaxed),
     }
 }
 
@@ -107,11 +148,29 @@ pub fn render_prometheus_metrics() -> String {
          krishiv_checkpoint_epoch_gauge {epoch_gauge}\n\
          # HELP krishiv_task_assignment_duration_ms_sum Rolling sum of task assignment latency (ms).\n\
          # TYPE krishiv_task_assignment_duration_ms_sum counter\n\
-         krishiv_task_assignment_duration_ms_sum {duration_sum}\n",
+         krishiv_task_assignment_duration_ms_sum {duration_sum}\n\
+         # HELP krishiv_placements_total Task placements by locality tier.\n\
+         # TYPE krishiv_placements_total counter\n\
+         krishiv_placements_total{{tier=\"node_local\"}} {node_local}\n\
+         krishiv_placements_total{{tier=\"rack_local\"}} {rack_local}\n\
+         krishiv_placements_total{{tier=\"any\"}} {any}\n\
+         krishiv_placements_total{{tier=\"deferred\"}} {deferred}\n\
+         # HELP krishiv_speculation_detected_total Straggler tasks detected by the speculation pass.\n\
+         # TYPE krishiv_speculation_detected_total counter\n\
+         krishiv_speculation_detected_total {spec_detected}\n\
+         # HELP krishiv_speculation_preempted_total Straggler originals cancelled and re-queued.\n\
+         # TYPE krishiv_speculation_preempted_total counter\n\
+         krishiv_speculation_preempted_total {spec_preempted}\n",
         jobs = m.jobs_submitted_total,
         epochs = m.checkpoint_epochs_total,
         tasks = m.tasks_assigned_total,
         epoch_gauge = m.checkpoint_epoch_gauge,
         duration_sum = m.task_assignment_duration_ms_sum,
+        node_local = m.placements_node_local_total,
+        rack_local = m.placements_rack_local_total,
+        any = m.placements_any_total,
+        deferred = m.placements_deferred_total,
+        spec_detected = m.speculation_detected_total,
+        spec_preempted = m.speculation_preempted_total,
     )
 }

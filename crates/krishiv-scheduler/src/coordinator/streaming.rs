@@ -91,30 +91,42 @@ impl Coordinator {
         }
     }
 
-    /// Returns true if the executor owns at least one Running task in a streaming job.
-    pub(crate) fn executor_has_streaming_running_tasks(&self, executor_id: &ExecutorId) -> bool {
+    /// Phase 53 (audit §3b): executors owning at least one Running streaming
+    /// task (or a completed continuous `stream:loop` identity), computed in
+    /// one O(cluster state) scan for a whole executor list — this replaced
+    /// the per-executor `executor_has_streaming_running_tasks` check, which
+    /// was O(all jobs) per candidate on recovery paths.
+    pub(crate) fn executors_with_streaming_running_tasks(
+        &self,
+    ) -> std::collections::HashSet<ExecutorId> {
         let profile = self.durability_profile;
-        self.job_coordinators
-            .values()
-            .map(|jc| jc.read_record())
-            .any(|job| {
-                job.spec.kind() == JobKind::Streaming
-                    && job.stages.iter().any(|stage| {
-                        stage.tasks().iter().any(|task| {
-                            if task.assigned_executor() != Some(executor_id) {
-                                return false;
-                            }
-                            if task.state() == TaskState::Running {
-                                return true;
-                            }
-                            task.state() == TaskState::Succeeded
-                                && krishiv_plan::task_body_for_profile(
-                                    task.spec.description(),
-                                    profile,
-                                )
-                                .is_ok_and(|body| body.starts_with("stream:loop:"))
-                        })
-                    })
-            })
+        let mut set = std::collections::HashSet::new();
+        for jc in self.job_coordinators.values() {
+            let job = jc.read_record();
+            if job.spec.kind() != JobKind::Streaming {
+                continue;
+            }
+            for stage in &job.stages {
+                for task in stage.tasks() {
+                    let Some(eid) = task.assigned_executor() else {
+                        continue;
+                    };
+                    if set.contains(eid) {
+                        continue;
+                    }
+                    let counts = task.state() == TaskState::Running
+                        || (task.state() == TaskState::Succeeded
+                            && krishiv_plan::task_body_for_profile(
+                                task.spec.description(),
+                                profile,
+                            )
+                            .is_ok_and(|body| body.starts_with("stream:loop:")));
+                    if counts {
+                        set.insert(eid.clone());
+                    }
+                }
+            }
+        }
+        set
     }
 }

@@ -132,6 +132,25 @@ pub struct Coordinator {
         HashMap<JobId, std::collections::VecDeque<AdaptiveDecisionLog>>,
     /// Manual override config for adaptive behaviors.
     pub(crate) adaptive_override: AdaptiveOverrideConfig,
+    /// Phase 53: jobs known to still have unassigned `Pending` tasks after
+    /// their last assignment round (capacity backlog). Drained when slots
+    /// free (task completion, executor registration) instead of scanning
+    /// every job.
+    pub(crate) pending_backlog_jobs: std::collections::HashSet<JobId>,
+    /// Phase 53: jobs with launch-ready work since the last drive tick.
+    /// `drive_pending_task_launches` consumes this set so the 500 ms launch
+    /// tick is O(dirty jobs), not O(all jobs); a periodic full sweep guards
+    /// against missed marks.
+    pub(crate) launch_dirty_jobs: std::collections::HashSet<JobId>,
+    /// Phase 53: monotonically increasing drive-tick counter used to pace
+    /// the full-sweep fallback of the dirty-job launch path.
+    pub(crate) launch_sweep_counter: std::sync::atomic::AtomicU64,
+    /// Phase 53: scheduler pool specs (weight/min-share) keyed by pool name.
+    /// Empty = every namespace is its own pool with default weight 1.
+    pub(crate) scheduler_pools: HashMap<String, crate::PoolSpec>,
+    /// Phase 53: namespace → pool mapping. Unmapped namespaces use the
+    /// namespace id itself as the pool name ("" for the default namespace).
+    pub(crate) namespace_pools: HashMap<String, String>,
     /// P1.1: O(1) index from streaming task id to (job_id, stage_id) for heartbeat lookup.
     /// Populated when tasks are assigned; entries removed on task completion/failure.
     pub(crate) streaming_task_index: HashMap<TaskId, (JobId, StageId)>,
@@ -690,12 +709,26 @@ impl SharedCoordinator {
         coord.apply_stall_resets(&work);
     }
 
-    /// Run one speculative-execution tick: collect stragglers and reset them to
-    /// `Pending` so they can be rescheduled to a different executor.
+    /// Run one speculative-execution tick.
+    ///
+    /// Phase 53 (audit §3b) — the correct straggler protocol on the stall
+    /// machinery: the running original receives a `CancelTask` RPC **before**
+    /// the coordinator resets the task to `Pending`; the relaunch then bumps
+    /// the attempt id, so no two executors ever run the same task/attempt
+    /// concurrently and late status updates from the cancelled original are
+    /// fenced as `StaleTaskAttempt`. First completion wins: the preempt
+    /// re-checks `Running` at the observed attempt under the write lock, so a
+    /// straggler that finished while the cancel was in flight keeps its
+    /// result and is not re-run. Residual: a cancel RPC that never reaches a
+    /// wedged executor leaves it burning a slot until stall detection or
+    /// lease expiry reaps it — its results remain fenced either way.
     ///
     /// No-op when `speculative_execution_enabled` is `false`.  Called alongside
     /// `detect_and_cancel_stalled_tasks` in the daemon heartbeat loop.
     pub async fn run_speculative_execution(&self) {
+        use crate::coordinator::task_assignment::inject_executor_task_request_context;
+        use crate::in_process::is_in_process_task_endpoint;
+
         let work: Vec<SpeculativeWork> = {
             let coord = self.inner.read().await;
             coord.collect_speculation_work()
@@ -703,18 +736,78 @@ impl SharedCoordinator {
         if work.is_empty() {
             return;
         }
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            for item in &work {
-                tracing::debug!(
-                    job_id = %item.job_id,
-                    stage_id = %item.stage_id,
-                    task_id = %item.task_id,
-                    running_ms = item.running_ms,
-                    median_ms = item.median_ms,
-                    "speculative preemption: resetting straggler task to Pending"
-                );
-            }
+        crate::metrics::SPECULATION_DETECTED_TOTAL
+            .fetch_add(work.len() as u64, AtomicOrdering::Relaxed);
+        for item in &work {
+            tracing::info!(
+                job_id = %item.job_id,
+                stage_id = %item.stage_id,
+                task_id = %item.task_id,
+                running_ms = item.running_ms,
+                median_ms = item.median_ms,
+                "speculation: straggler detected — cancelling original before re-queue"
+            );
         }
+
+        // Send CancelTask RPCs to the straggler originals — outside any lock,
+        // mirroring the stall-cancel three-phase pattern.
+        let channels = {
+            let coord = self.inner.read().await;
+            coord.executor_channels.clone()
+        };
+        let mut cancel_futures = futures::stream::FuturesUnordered::new();
+        for item in &work {
+            let Some(ref endpoint) = item.executor_endpoint else {
+                continue;
+            };
+            if is_in_process_task_endpoint(endpoint) {
+                continue;
+            }
+            let endpoint = endpoint.clone();
+            let channels = channels.clone();
+            let attempt_id = match AttemptId::try_new(item.attempt) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            let req = TaskCancellationRequest::new(TaskAttemptRef::new(
+                item.job_id.clone(),
+                item.stage_id.clone(),
+                item.task_id.clone(),
+                attempt_id,
+            ))
+            .with_reason("speculative preemption: straggler re-queued to another executor");
+            cancel_futures.push(async move {
+                let channel =
+                    match Coordinator::get_or_connect_channel_on_map(&channels, &endpoint).await {
+                        Ok(c) => c,
+                        Err(err) => {
+                            tracing::warn!(endpoint = %endpoint, error = %err, "speculation-cancel: connect failed");
+                            return;
+                        }
+                    };
+                let max = krishiv_proto::max_grpc_message_bytes();
+                let mut client = wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
+                    channel,
+                    inject_executor_task_request_context
+                        as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+                )
+                .max_decoding_message_size(max)
+                .max_encoding_message_size(max);
+                if let Err(err) = client
+                    .cancel_task(wire::task_cancellation_request_to_wire(req))
+                    .await
+                {
+                    tracing::warn!(endpoint = %endpoint, error = %err, "speculation-cancel: cancel_task rpc failed");
+                }
+            });
+        }
+        use futures::stream::StreamExt as _;
+        while cancel_futures.next().await.is_some() {}
+
+        // Apply preempt-resets under write lock after the cancels: the reset
+        // re-checks Running-at-attempt, so an original that completed while
+        // the cancel was in flight wins (its Succeeded update was applied
+        // before the write lock was taken).
         let mut coord = self.inner.write().await;
         coord.apply_speculation_preempts(&work);
     }
@@ -730,12 +823,43 @@ impl SharedCoordinator {
     pub async fn drive_pending_task_launches(&self) -> SchedulerResult<usize> {
         tracing::debug!("driving pending task launches for non-terminal jobs");
 
+        // Phase 53: consume the dirty-job set so the 500 ms launch tick is
+        // O(dirty jobs); every 8th tick falls back to a full sweep as a
+        // safety net against missed dirty marks.
+        let sweep = {
+            let coord = self.read().await;
+            coord
+                .launch_sweep_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % 8
+                == 0
+        };
+        let dirty: Option<std::collections::HashSet<JobId>> = if sweep {
+            let mut coord = self.write().await;
+            coord.launch_dirty_jobs.clear();
+            None
+        } else {
+            let mut coord = self.write().await;
+            let taken = std::mem::take(&mut coord.launch_dirty_jobs);
+            Some(taken)
+        };
+        if let Some(d) = &dirty
+            && d.is_empty()
+        {
+            return Ok(0);
+        }
+
         // Build the list of jobs to drive, sorted by priority descending so
         // higher-priority jobs consume executor slots first.
         let job_ids = {
             let coord = self.read().await;
             let mut id_pairs: Vec<(u8, JobId)> = Vec::new();
             for (job_id, jc) in coord.job_coordinators.iter() {
+                if let Some(d) = &dirty
+                    && !d.contains(job_id)
+                {
+                    continue;
+                }
                 let (is_terminal, priority) = {
                     let record = jc.read_record();
                     (record.state().is_terminal(), record.spec.priority())
@@ -1120,6 +1244,11 @@ impl Coordinator {
             gc_ready_jobs: VecDeque::new(),
             adaptive_decision_log: HashMap::new(),
             adaptive_override: AdaptiveOverrideConfig::default(),
+            pending_backlog_jobs: HashSet::new(),
+            launch_dirty_jobs: HashSet::new(),
+            launch_sweep_counter: std::sync::atomic::AtomicU64::new(0),
+            scheduler_pools: HashMap::new(),
+            namespace_pools: HashMap::new(),
             streaming_task_index: HashMap::new(),
             streaming_job_task_index: HashMap::new(),
             executor_channels: Arc::new(DashMap::new()),
@@ -1153,6 +1282,26 @@ impl Coordinator {
     /// Returns an error if id generation fails.
     pub fn new_standby(config: Option<CoordinatorConfig>) -> SchedulerResult<Self> {
         Self::try_new_standby(config)
+    }
+
+    /// Phase 53: configure scheduler pools (weight/min-share) and the
+    /// namespace → pool mapping. Unmapped namespaces pool by namespace id.
+    pub fn set_scheduler_pools(
+        &mut self,
+        pools: HashMap<String, crate::PoolSpec>,
+        namespace_pools: HashMap<String, String>,
+    ) {
+        self.scheduler_pools = pools;
+        self.namespace_pools = namespace_pools;
+    }
+
+    /// Phase 53: resolve the pool a namespace belongs to.
+    pub(crate) fn pool_for_namespace(&self, namespace: Option<&str>) -> String {
+        let ns = namespace.unwrap_or_default();
+        self.namespace_pools
+            .get(ns)
+            .cloned()
+            .unwrap_or_else(|| ns.to_owned())
     }
 
     /// Create a new active coordinator, returning an error if id generation fails.
@@ -1546,6 +1695,13 @@ impl Coordinator {
                     if task.state() != krishiv_proto::TaskState::Running {
                         continue;
                     }
+                    // Sink gate (Phase 53): never speculate a task that owns a
+                    // side-effecting sink contract. ShuffleMap stages should
+                    // not carry sinks, but the check makes the precondition
+                    // explicit rather than conventional.
+                    if task.spec.sink_contract().is_some() {
+                        continue;
+                    }
                     let Some(started_ms) = task.assigned_at_ms else {
                         continue;
                     };
@@ -1603,8 +1759,12 @@ impl Coordinator {
                         median_ms = item.median_ms,
                         "speculative preemption: re-scheduling straggler task"
                     );
+                    crate::metrics::SPECULATION_PREEMPTED_TOTAL
+                        .fetch_add(1, AtomicOrdering::Relaxed);
                     // Reset to Pending without incrementing failure_count so
-                    // the per-task retry budget is not consumed.
+                    // the per-task retry budget is not consumed. The relaunch
+                    // bumps the attempt id, fencing late updates from the
+                    // cancelled original.
                     task.state = krishiv_proto::TaskState::Pending;
                     task.assigned_executor = None;
                     task.launch_in_flight = false;

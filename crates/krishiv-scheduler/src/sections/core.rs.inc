@@ -1612,18 +1612,31 @@ fn task_failure_retries_entire_stage_before_terminal_failure() {
 
     let snapshot = coordinator.job_snapshot(&job_id).unwrap();
     assert_eq!(snapshot.state(), JobState::Running);
-    // P1.24: After retry, tasks are Pending (not Assigned), so assigned_task_count = 0.
-    assert_eq!(snapshot.assigned_task_count(), 0);
     assert_eq!(snapshot.failed_task_count(), 0);
 
     let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
     assert_eq!(detail.stages()[0].retry_count(), 1);
-    // P1.24: Retried tasks must be Pending so the scheduler can re-queue them.
-    assert_eq!(detail.stages()[0].tasks()[0].state(), TaskState::Pending);
-    assert_eq!(detail.stages()[0].tasks()[1].state(), TaskState::Pending);
+    // P1.24 + Phase 53: the stage retry resets tasks to Pending and the
+    // capacity-freed backlog drain re-places them through the normal
+    // placement path in the same apply — so tasks are Pending or already
+    // re-Assigned, never stuck on the failed attempt.
+    for task in detail.stages()[0].tasks() {
+        assert!(
+            matches!(task.state(), TaskState::Pending | TaskState::Assigned),
+            "retried task {} must be re-queued, got {:?}",
+            task.task_id(),
+            task.state()
+        );
+    }
 
-    // Re-assign then launch (simulates the scheduler's next planning cycle).
-    assert_eq!(coordinator.assign_pending_tasks(&job_id).unwrap(), 2);
+    // Re-assign whatever the eager drain did not already place, then launch.
+    let already_assigned = detail.stages()[0]
+        .tasks()
+        .iter()
+        .filter(|t| t.state() == TaskState::Assigned)
+        .count();
+    let newly_assigned = coordinator.assign_pending_tasks(&job_id).unwrap();
+    assert_eq!(already_assigned + newly_assigned, 2);
     assert_eq!(coordinator.launch_assigned_tasks(&job_id).unwrap(), 2);
     let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
     assert_eq!(detail.stages()[0].tasks()[0].attempt(), 2);

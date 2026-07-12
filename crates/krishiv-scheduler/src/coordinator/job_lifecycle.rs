@@ -79,6 +79,10 @@ impl Coordinator {
             .map(|s| s.to_owned())
             .unwrap_or_default();
         let mut record = JobRecord::from_spec(spec, self.config.max_stage_retries());
+        record.set_retry_backoff(
+            self.config.task_retry_backoff_base_ms(),
+            self.config.task_retry_backoff_cap_ms(),
+        );
         if is_queued {
             record.mark_queued();
         } else if !executors.is_empty() {
@@ -120,6 +124,24 @@ impl Coordinator {
         }
         // P1.1: Index streaming tasks for O(1) heartbeat lookup.
         self.index_streaming_tasks(&inserted_job_id);
+        // Phase 53: new work is launch-dirty; strict-capacity leftovers go to
+        // the pending backlog for assignment when slots free.
+        if !is_queued {
+            self.launch_dirty_jobs.insert(inserted_job_id.clone());
+            let has_pending = self
+                .job_coordinators
+                .get(&inserted_job_id)
+                .is_some_and(|jc| {
+                    jc.read_record()
+                        .stages()
+                        .iter()
+                        .flat_map(|s| s.tasks())
+                        .any(|t| t.state() == TaskState::Pending)
+                });
+            if has_pending {
+                self.pending_backlog_jobs.insert(inserted_job_id.clone());
+            }
+        }
         // GAP-OB-01: Increment jobs_submitted counter.
         JOBS_SUBMITTED_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
         krishiv_metrics::global_metrics().inc_tasks_submitted();
@@ -768,6 +790,22 @@ impl Coordinator {
             .unwrap_or(false);
         if is_terminal {
             self.remove_streaming_task_index(&job_id);
+            self.pending_backlog_jobs.remove(&job_id);
+            self.launch_dirty_jobs.remove(&job_id);
+        } else {
+            // Phase 53: a task transition can create launch-ready work
+            // (failure retry reset it to Pending, a stage boundary opened
+            // the next stage) — mark this job for the next drive tick.
+            self.launch_dirty_jobs.insert(job_id.clone());
+        }
+        // Phase 53 (strict capacity): a completed task frees a slot — flow
+        // backlog work into it now instead of oversubscribing at placement
+        // time. This job's own retry resets also (re)enter the backlog here.
+        if matches!(terminal_state, TaskState::Succeeded | TaskState::Failed) {
+            if !is_terminal {
+                self.pending_backlog_jobs.insert(job_id.clone());
+            }
+            self.drain_pending_backlog();
         }
         Ok(outcome)
     }

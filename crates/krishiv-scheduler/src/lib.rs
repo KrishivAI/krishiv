@@ -119,7 +119,8 @@ pub use in_process::{
     IN_PROCESS_TASK_ENDPOINT, InProcessCoordinatorBridge, is_in_process_task_endpoint,
 };
 pub use job::{
-    JobDetailSnapshot, JobRecord, JobSnapshot, NamespaceQuotaSnapshot, ResourceUsage,
+    FairScheduler, JobDetailSnapshot, JobRecord, JobSnapshot, LocalityOutcome, LocalityPreference,
+    LocalityScheduler, LocalityTierCounts, NamespaceQuotaSnapshot, PoolSpec, ResourceUsage,
     SlotAwareScheduler, StabilityMetrics, StageRecord, StageSnapshot, StaticScheduler,
     SubmitOutcome, TaskRecord, TaskSnapshot, job_spec_from_logical_plan,
     job_spec_from_physical_plan,

@@ -36,20 +36,31 @@ fn retried_tasks_are_pending_and_become_schedulable() {
     let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
     assert_eq!(detail.stages()[0].retry_count(), 1);
 
-    // All tasks must be Pending — not Assigned — so placement runs again.
+    // P1.24 + Phase 53: the retry resets tasks to Pending and the
+    // capacity-freed backlog drain may re-place them through the normal
+    // placement path in the same apply — tasks are Pending or re-Assigned
+    // (with a fresh placement), never stuck on the failed attempt.
     for task in detail.stages()[0].tasks() {
-        assert_eq!(
-            task.state(),
-            TaskState::Pending,
-            "retried task {} must be Pending, got {:?}",
+        assert!(
+            matches!(task.state(), TaskState::Pending | TaskState::Assigned),
+            "retried task {} must be re-queued, got {:?}",
             task.task_id(),
             task.state()
         );
     }
 
     // assign_pending_tasks + launch confirms tasks are re-schedulable.
+    let already_assigned = detail.stages()[0]
+        .tasks()
+        .iter()
+        .filter(|t| t.state() == TaskState::Assigned)
+        .count();
     let assigned = coordinator.assign_pending_tasks(&job_id).unwrap();
-    assert_eq!(assigned, 2, "both tasks must be re-assigned after retry");
+    assert_eq!(
+        already_assigned + assigned,
+        2,
+        "both tasks must be re-assigned after retry"
+    );
     let launched = coordinator.launch_assigned_tasks(&job_id).unwrap();
     assert_eq!(
         launched, 2,
