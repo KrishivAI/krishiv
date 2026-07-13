@@ -895,18 +895,48 @@ static EXECUTOR_PROCESS_BUDGET: std::sync::LazyLock<Arc<krishiv_common::MemoryBu
         krishiv_common::MemoryBudget::from_limit(limit)
     });
 
+/// Phase 56 (SH7): the executor-wide unified memory arbiter — one pool with
+/// Shuffle/Execution/State soft regions (Spark's model) instead of
+/// per-subsystem budget islands that overcommit against each other. Present
+/// only when `KRISHIV_EXECUTOR_MEMORY_LIMIT_BYTES` bounds the process; the
+/// unbounded dev default keeps the historical pass-through behavior.
+static EXECUTOR_UNIFIED_MEMORY: std::sync::LazyLock<
+    Option<Arc<krishiv_common::UnifiedMemoryManager>>,
+> = std::sync::LazyLock::new(|| {
+    std::env::var(EXECUTOR_MEMORY_LIMIT_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(krishiv_common::UnifiedMemoryManager::with_total)
+});
+
+/// The executor-wide unified memory arbiter, when the process is bounded.
+pub(crate) fn executor_unified_memory() -> Option<&'static Arc<krishiv_common::UnifiedMemoryManager>>
+{
+    EXECUTOR_UNIFIED_MEMORY.as_ref()
+}
+
 /// RAII guard for a task's share of the executor process memory budget.
 ///
 /// Releases the reservation when the task finishes (drop), so concurrent
 /// slots see freed capacity immediately.
 pub(crate) struct ProcessMemoryReservation {
     bytes: u64,
+    /// Reserved through the unified arbiter's Execution region (Phase 56)
+    /// rather than the legacy flat process budget.
+    unified: bool,
 }
 
 impl Drop for ProcessMemoryReservation {
     fn drop(&mut self) {
         if self.bytes > 0 {
-            EXECUTOR_PROCESS_BUDGET.release(self.bytes);
+            if self.unified {
+                if let Some(manager) = executor_unified_memory() {
+                    manager.release(krishiv_common::MemoryRegion::Execution, self.bytes);
+                }
+            } else {
+                EXECUTOR_PROCESS_BUDGET.release(self.bytes);
+            }
         }
     }
 }
@@ -940,11 +970,59 @@ pub(crate) fn reserve_task_engine_memory(
         .unwrap_or(process_limit)
         .min(process_limit);
 
+    // Phase 56 (SH7): task engine pools draw from the unified arbiter's
+    // Execution region — shuffle buffers created inside task execution ride
+    // this reservation; state backends reserve from the State region at
+    // checkpoint time. `try_reserve` failure drives the same shrink-then-
+    // minimum-grant ladder as the legacy flat budget.
+    if let Some(manager) = executor_unified_memory() {
+        use krishiv_common::MemoryRegion;
+        if manager.try_reserve(MemoryRegion::Execution, want) {
+            let granted = usize::try_from(want).unwrap_or(usize::MAX);
+            return (
+                Some(granted),
+                Some(ProcessMemoryReservation {
+                    bytes: want,
+                    unified: true,
+                }),
+            );
+        }
+        let remaining = manager
+            .available_for_region(MemoryRegion::Execution)
+            .min(want);
+        if remaining >= MIN_TASK_ENGINE_MEMORY_BYTES
+            && manager.try_reserve(MemoryRegion::Execution, remaining)
+        {
+            tracing::warn!(
+                requested = want,
+                granted = remaining,
+                "unified executor memory under pressure; task granted reduced engine limit"
+            );
+            let granted = usize::try_from(remaining).unwrap_or(usize::MAX);
+            return (
+                Some(granted),
+                Some(ProcessMemoryReservation {
+                    bytes: remaining,
+                    unified: true,
+                }),
+            );
+        }
+        tracing::warn!(
+            requested = want,
+            granted = MIN_TASK_ENGINE_MEMORY_BYTES,
+            "unified executor memory exhausted; task granted minimum engine limit"
+        );
+        return (
+            Some(usize::try_from(MIN_TASK_ENGINE_MEMORY_BYTES).unwrap_or(usize::MAX)),
+            None,
+        );
+    }
+
     if process.try_reserve(want) {
         let granted = usize::try_from(want).unwrap_or(usize::MAX);
         return (
             Some(granted),
-            Some(ProcessMemoryReservation { bytes: want }),
+            Some(ProcessMemoryReservation { bytes: want, unified: false }),
         );
     }
 
@@ -959,7 +1037,7 @@ pub(crate) fn reserve_task_engine_memory(
         let granted = usize::try_from(remaining).unwrap_or(usize::MAX);
         return (
             Some(granted),
-            Some(ProcessMemoryReservation { bytes: remaining }),
+            Some(ProcessMemoryReservation { bytes: remaining, unified: false }),
         );
     }
 
@@ -1276,7 +1354,7 @@ mod tests {
         // The Drop impl on ProcessMemoryReservation calls release on the
         // global EXECUTOR_PROCESS_BUDGET, which is unlimited in tests; verify
         // dropping a guard with zero bytes is a no-op and does not panic.
-        drop(super::ProcessMemoryReservation { bytes: 0 });
+        drop(super::ProcessMemoryReservation { bytes: 0, unified: false });
     }
 
     #[derive(Clone)]

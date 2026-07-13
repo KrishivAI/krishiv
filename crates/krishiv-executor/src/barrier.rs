@@ -130,6 +130,23 @@ mod tests {
     }
 
     #[test]
+    fn queued_barriers_drain_fifo_through_barrier_source() {
+        let sim = BarrierSimulator::new();
+        assert!(sim.next_barrier().is_none());
+        sim.queue_barrier(CheckpointBarrier {
+            epoch: 1,
+            ..Default::default()
+        });
+        sim.queue_barrier(CheckpointBarrier {
+            epoch: 2,
+            ..Default::default()
+        });
+        assert_eq!(sim.next_barrier().map(|b| b.epoch), Some(1));
+        assert_eq!(sim.next_barrier().map(|b| b.epoch), Some(2));
+        assert!(sim.next_barrier().is_none());
+    }
+
+    #[test]
     fn process_barrier_first_epoch() {
         let mut sim = BarrierSimulator::new();
         sim.process_barrier(1, 1000, 2).unwrap();

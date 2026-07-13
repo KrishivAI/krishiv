@@ -259,5 +259,6 @@ mod executor_tests {
     include!("sections/gap6.rs.inc");
     include!("sections/stream_loop.rs.inc");
     include!("sections/run_loop_v2.rs.inc");
+    include!("sections/state_v2.rs.inc");
     include!("sections/recovery.rs.inc");
 }

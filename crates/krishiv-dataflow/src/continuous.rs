@@ -244,6 +244,16 @@ impl WindowOperatorState {
         }
     }
 
+    /// Borrow the operator's state backend, when it has one.
+    fn state_backend(&self) -> Option<&dyn krishiv_state::StateBackend> {
+        match self {
+            Self::Tumbling(op) => Some(op.state_backend()),
+            Self::Sliding(op) => Some(op.state_backend()),
+            Self::Session(op) => Some(op.state_backend()),
+            Self::Count(_) => None,
+        }
+    }
+
     /// Merge a snapshot additively (existing entries preserved).
     fn merge_snapshot_bytes(&mut self, bytes: &[u8]) -> krishiv_state::StateResult<()> {
         match self {
@@ -616,6 +626,22 @@ impl ContinuousWindowExecutor {
         !self.watermark.source_lags.is_empty()
     }
 
+    /// Phase 56: run `f` against the operator's concrete RocksDB state
+    /// backend, when the executor is file-backed. Returns `None` for
+    /// in-memory / not-yet-initialised operators — callers fall back to the
+    /// portable full snapshot. Call [`Self::checkpoint`] first so the live
+    /// window panes are actually in the backend the SST checkpoint captures.
+    pub fn with_rocksdb_state<R>(
+        &self,
+        f: impl FnOnce(&krishiv_state::RocksDbStateBackend) -> R,
+    ) -> Option<R> {
+        self.operator
+            .as_ref()
+            .and_then(|op| op.state_backend())
+            .and_then(|backend| backend.as_rocksdb())
+            .map(f)
+    }
+
     /// C3: Persist operator state to the state backend for crash recovery.
     ///
     /// Delegates to the underlying operator's `checkpoint()` which writes
@@ -643,7 +669,12 @@ impl ContinuousWindowExecutor {
                 op.snapshot_state_bytes()
                     .map_err(|e| ExecError::InvalidWindowConfig(format!("snapshot failed: {e}")))
             }
-            None => Ok(Vec::new()),
+            // Phase 56: a snapshot taken between restore and the first batch
+            // (the operator initializes lazily) must carry the restored state
+            // forward — returning empty here let a barrier in that window
+            // persist an EMPTY checkpoint that would wipe the job's state on
+            // the next restore.
+            None => Ok(self.pending_restore.clone().unwrap_or_default()),
         }
     }
 
@@ -656,7 +687,9 @@ impl ContinuousWindowExecutor {
             Some(op) => op
                 .snapshot_state_bytes()
                 .map_err(|e| ExecError::InvalidWindowConfig(format!("peek snapshot failed: {e}"))),
-            None => Ok(Vec::new()),
+            // See `snapshot`: restored-but-not-yet-consumed state must not
+            // read back as empty.
+            None => Ok(self.pending_restore.clone().unwrap_or_default()),
         }
     }
 

@@ -57,6 +57,7 @@ Regenerate with:
 | `KRISHIV_FLIGHT_MAX_CONCURRENT_QUERIES` | uint | `16` | Maximum concurrently executing Flight SQL queries. |
 | `KRISHIV_FLIGHT_MAX_RESULT_BYTES` | uint | `unset` | Per-query Flight SQL result-size cap; unset = unlimited. |
 | `KRISHIV_FLIGHT_PREPARED_STMT_CAPACITY` | uint | `128` | Maximum cached prepared statements per Flight SQL session. |
+| `KRISHIV_FULL_SNAPSHOT_EVERY` | uint | `8` | Every Nth checkpoint epoch takes a full portable snapshot in incremental mode (bounds the SST manifest chain). |
 | `KRISHIV_GLUE_CATALOG_ID` | text | `unset` | AWS Glue catalog ID (account) for the Glue catalog integration. |
 | `KRISHIV_GLUE_DATABASE` | text | `default` | AWS Glue database name for the Glue catalog integration. |
 | `KRISHIV_GRPC_ADDR` | host:port | `127.0.0.1:50051` | Coordinator gRPC listen address. |
@@ -70,6 +71,7 @@ Regenerate with:
 | `KRISHIV_ICEBERG_REST_URI` | url | `unset` | Iceberg REST catalog endpoint; presence activates the REST catalog. |
 | `KRISHIV_ICEBERG_REST_WAREHOUSE` | text | `empty` | Warehouse location/name passed to the Iceberg REST catalog. |
 | `KRISHIV_IDLE_TICK_MS` | uint | `engine default` | Continuous-engine idle tick interval in milliseconds. |
+| `KRISHIV_INCREMENTAL_CHECKPOINTS` | bool | `true` | RocksDB-backed window state checkpoints SST deltas instead of full snapshots (Phase 56). |
 | `KRISHIV_INLINE_IPC_MAX_BYTES` | uint | `4194304` | Maximum inline base64 Arrow IPC payload accepted in batch SQL requests. |
 | `KRISHIV_INLINE_RESULT_MAX_BYTES` | uint | `8388608` | Result size above which executor task output spools to disk instead of inlining. |
 | `KRISHIV_IVM_SHARDS` | uint | `1` | Shard count for coordinator-resident IVM flows. |
@@ -124,6 +126,8 @@ Regenerate with:
 | `KRISHIV_SHUFFLE_URI` | url | `unset` | Shuffle backend URI (file://, s3://, tiered://local;s3://…). |
 | `KRISHIV_STAGE_SPLIT` | bool | `on` | Distributed batch stage splitting (Phase 52); off/0/false runs batch SQL single-task. |
 | `KRISHIV_STAGE_TARGET_PARTITIONS` | uint | `4` | Planning-time partition count for distributed batch stages (scan + shuffle fan-out). |
+| `KRISHIV_STATE_BACKEND` | rocksdb \| disaggregated | `rocksdb` | Executor generic state backend; disaggregated = DFS-primary with local cache (requires KRISHIV_STATE_DFS_ROOT). |
+| `KRISHIV_STATE_DFS_ROOT` | path | `unset` | DFS/object-store root for the disaggregated state backend. |
 | `KRISHIV_STATE_DIR` | path | `unset` | Executor state-backend directory (RocksDB window/operator state). |
 | `KRISHIV_STREAMING_TASK_TIMEOUT_SECS` | uint | `unset` | Watchdog timeout for streaming task cycles; unset = disabled. |
 | `KRISHIV_STREAM_EARLY_FIRE_MS` | uint | `unset` | Speculative early-fire interval for open windows (embedded loop; the state-backed operator accessor is a known gap). |

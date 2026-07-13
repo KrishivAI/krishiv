@@ -145,6 +145,30 @@ impl DisaggregatedStateBackend {
         ))
     }
 
+    /// Encode a DFS record: `[u32 LE key_len][key][value]`. Storing the real
+    /// key (filenames only carry its hash) keeps `list_keys`/`snapshot`
+    /// lossless on a cold cache.
+    fn encode_dfs_record(key: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(4 + key.len() + value.len());
+        buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(key);
+        buf.extend_from_slice(value);
+        buf
+    }
+
+    /// Decode a DFS record written by [`Self::encode_dfs_record`].
+    fn decode_dfs_record(data: &[u8]) -> StateResult<(Vec<u8>, Vec<u8>)> {
+        let corrupt = || StateError::BackendUnavailable {
+            message: "corrupt DFS record: truncated key header".into(),
+            source: None,
+        };
+        let header = data.get(..4).ok_or_else(corrupt)?;
+        let key_len = u32::from_le_bytes(header.try_into().map_err(|_| corrupt())?) as usize;
+        let key = data.get(4..4 + key_len).ok_or_else(corrupt)?.to_vec();
+        let value = data.get(4 + key_len..).ok_or_else(corrupt)?.to_vec();
+        Ok((key, value))
+    }
+
     /// Write data to DFS (local filesystem in dev mode, object store in prod).
     fn write_to_dfs(&self, path: &Path, data: &[u8]) -> StateResult<()> {
         if let Some(parent) = path.parent() {
@@ -373,20 +397,21 @@ impl StateBackend for DisaggregatedStateBackend {
         if let Some(data) = self.read_from_cache(namespace, key)? {
             return Ok(Some(data));
         }
-        // 2. Fetch from DFS
+        // 2. Fetch from DFS (records carry `[key_len][key][value]`)
         let dfs_path = self.dfs_path(namespace, key);
-        if let Some(data) = self.read_from_dfs(&dfs_path)? {
-            // Populate local cache
-            let _ = self.write_to_cache(namespace, key, &data);
-            return Ok(Some(data));
+        if let Some(record) = self.read_from_dfs(&dfs_path)? {
+            let (_, value) = Self::decode_dfs_record(&record)?;
+            // Populate local cache with the raw value
+            let _ = self.write_to_cache(namespace, key, &value);
+            return Ok(Some(value));
         }
         Ok(None)
     }
 
     fn put(&mut self, namespace: &Namespace, key: Vec<u8>, value: Vec<u8>) -> StateResult<()> {
-        // 1. Write to DFS (primary storage)
+        // 1. Write to DFS (primary storage; record embeds the real key)
         let dfs_path = self.dfs_path(namespace, &key);
-        self.write_to_dfs(&dfs_path, &value)?;
+        self.write_to_dfs(&dfs_path, &Self::encode_dfs_record(&key, &value))?;
         // 2. Write to local cache (write-through)
         let _ = self.write_to_cache(namespace, &key, &value);
         Ok(())
@@ -415,8 +440,13 @@ impl StateBackend for DisaggregatedStateBackend {
     }
 
     fn clear_namespace(&mut self, namespace: &Namespace) -> StateResult<()> {
-        // Remove all DFS files for this namespace
-        let ns_prefix = format!("{}__", namespace.operator_id());
+        // Remove all DFS files for this namespace (operator AND state name —
+        // an operator-only prefix would clear sibling states too)
+        let ns_prefix = format!(
+            "{}__{}__",
+            namespace.operator_id(),
+            namespace.state_name()
+        );
         if let Ok(entries) = std::fs::read_dir(&self.config.dfs_root) {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str()
@@ -485,8 +515,27 @@ impl StateBackend for DisaggregatedStateBackend {
     }
 
     fn list_keys(&self, namespace: &Namespace) -> StateResult<Vec<Vec<u8>>> {
-        // For DFS backends, we'd need a key index. For now, scan local cache.
+        // DFS is primary: enumerate its records (which embed the real key) so
+        // a fresh instance with a cold cache sees the full keyspace.
         let mut keys = Vec::new();
+        let ns_prefix = format!(
+            "{}__{}__",
+            namespace.operator_id(),
+            namespace.state_name()
+        );
+        if let Ok(entries) = std::fs::read_dir(&self.config.dfs_root) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str()
+                    && name.starts_with(&ns_prefix)
+                    && name.ends_with(".dat")
+                    && let Ok(record) = std::fs::read(entry.path())
+                {
+                    let (key, _) = Self::decode_dfs_record(&record)?;
+                    keys.push(key);
+                }
+            }
+        }
+        // Union with cached entries (covers writes racing directory scans).
         if let Ok(index) = self.cache_index.read() {
             for ((ns, key), _) in index.iter() {
                 if ns == namespace {
@@ -495,6 +544,7 @@ impl StateBackend for DisaggregatedStateBackend {
             }
         }
         keys.sort();
+        keys.dedup();
         Ok(keys)
     }
 
@@ -517,15 +567,15 @@ impl StateBackend for DisaggregatedStateBackend {
                     && let Some(rest) = name.strip_suffix(".dat")
                 {
                     let parts: Vec<&str> = rest.splitn(3, "__").collect();
-                    if let [op_id, state_name, hash] = parts.as_slice() {
-                        if let Ok(data) = std::fs::read(entry.path()) {
-                            // Extract key hash from filename
-                            let key_hash = hash.as_bytes().to_vec();
+                    if let [op_id, state_name, _hash] = parts.as_slice() {
+                        if let Ok(record) = std::fs::read(entry.path()) {
+                            // Records embed the real key: `[key_len][key][value]`
+                            let (key, value) = Self::decode_dfs_record(&record)?;
                             entries.push((
                                 (*op_id).to_string(),
                                 (*state_name).to_string(),
-                                key_hash,
-                                data,
+                                key,
+                                value,
                             ));
                         }
                     }
@@ -780,9 +830,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "DFS snapshots store key hashes, not original keys, so load_snapshot cannot \
-                reconstruct get()-able entries — known design limitation (audit §14 TEST-6); \
-                unignore if the snapshot format ever records original keys"]
     fn snapshot_round_trip() {
         let config = temp_config();
         let mut backend = DisaggregatedStateBackend::new(config.clone()).unwrap();
@@ -801,6 +848,48 @@ mod tests {
 
         assert_eq!(backend2.get(&ns, b"k1").unwrap(), Some(b"v1".to_vec()));
         assert_eq!(backend2.get(&ns, b"k2").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn fresh_instance_recovers_from_dfs_without_state_download() {
+        // Phase 56 exit gate: recovery on the disaggregated profile is cache
+        // rehydration, not a download-before-start — a FRESH backend over the
+        // same DFS root (empty local cache) serves reads immediately, pulling
+        // entries lazily on access.
+        let dfs = tempfile::tempdir().unwrap();
+        let cache_a = tempfile::tempdir().unwrap();
+        let ns = Namespace::new("op", "state");
+        {
+            let mut backend = DisaggregatedStateBackend::new(DisaggregatedConfig {
+                dfs_root: dfs.path().to_path_buf(),
+                local_cache_dir: cache_a.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap();
+            for i in 0..32u8 {
+                backend.put(&ns, vec![i], vec![i, i]).unwrap();
+            }
+        }
+        // "Kill": the first instance (and its cache) is gone. The fresh
+        // instance starts with ZERO local cache bytes — no download phase.
+        let cache_b = tempfile::tempdir().unwrap();
+        let recovered = DisaggregatedStateBackend::new(DisaggregatedConfig {
+            dfs_root: dfs.path().to_path_buf(),
+            local_cache_dir: cache_b.path().to_path_buf(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(recovered.cache_size_bytes(), 0, "no state download at start");
+        assert_eq!(recovered.get(&ns, &[7]).unwrap(), Some(vec![7, 7]));
+        assert!(
+            recovered.cache_size_bytes() > 0,
+            "read rehydrates the cache lazily"
+        );
+        assert_eq!(
+            recovered.list_keys(&ns).unwrap().len(),
+            32,
+            "full keyspace visible from DFS"
+        );
     }
 
     #[test]

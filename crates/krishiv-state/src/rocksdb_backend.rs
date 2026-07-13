@@ -257,6 +257,10 @@ fn read_u64_le(buf: &[u8], pos: &mut usize) -> Option<u64> {
 }
 
 impl StateBackend for RocksDbStateBackend {
+    fn as_rocksdb(&self) -> Option<&RocksDbStateBackend> {
+        Some(self)
+    }
+
     fn get(&self, namespace: &Namespace, key: &[u8]) -> StateResult<Option<Vec<u8>>> {
         let rk = Self::rocksdb_key(namespace, key);
         self.db.get(&rk).map_err(db_err)

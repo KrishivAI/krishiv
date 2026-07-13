@@ -58,6 +58,13 @@ macro_rules! state_backed_window_op {
                 self.inner.$flush_method(watermark_ms)
             }
 
+            /// Borrow the underlying state backend (Phase 56: the incremental
+            /// SST checkpointer downcasts to the RocksDB backend via
+            /// `StateBackend::as_rocksdb`).
+            pub fn state_backend(&self) -> &dyn StateBackend {
+                self.state.as_ref()
+            }
+
             pub fn checkpoint(&mut self) -> ExecResult<()> {
                 self.inner
                     .persist_to_state(self.state.as_mut(), &self.namespace)

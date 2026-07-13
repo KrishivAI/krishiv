@@ -5,7 +5,7 @@ mod executor_task_runner;
 mod partition;
 pub(crate) mod result_spool;
 mod task_output;
-mod task_runner;
+pub(crate) mod task_runner;
 
 #[cfg(test)]
 mod runner_tests;

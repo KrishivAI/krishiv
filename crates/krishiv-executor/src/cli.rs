@@ -486,10 +486,42 @@ async fn heartbeat_loop(
     let checkpoint_storage: Arc<dyn CheckpointStorage> =
         open_checkpoint_storage_from_uri(&checkpoint_uri)
             .map_err(|e| format!("checkpoint storage at {checkpoint_uri}: {e}"))?;
-    let state_backend = crate::runner::CheckpointStateHandle::from_backend(
-        RocksDbStateBackend::open_for_profile(durability_profile, state_dir.as_deref())
-            .map_err(|e| format!("state backend: {e}"))?,
-    );
+    // Phase 56: KRISHIV_STATE_BACKEND=disaggregated puts the generic state
+    // backend DFS-primary with a local working cache (Flink 2.0 / ForSt
+    // model): checkpoint durability rides the DFS writes (metadata flip) and
+    // recovery is cache rehydration, not a state download-before-start.
+    // Window operators keep RocksDB working state (their SST checkpoints are
+    // the incremental path); DFS-primary window operators are Phase 57+.
+    let state_backend = match std::env::var("KRISHIV_STATE_BACKEND")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "disaggregated" => {
+            let dfs_root = std::env::var("KRISHIV_STATE_DFS_ROOT").map_err(|_| {
+                String::from(
+                    "KRISHIV_STATE_BACKEND=disaggregated requires KRISHIV_STATE_DFS_ROOT",
+                )
+            })?;
+            let cache_dir = state_dir
+                .clone()
+                .unwrap_or_else(|| std::env::temp_dir().join("krishiv-state-cache"));
+            let config = krishiv_state::DisaggregatedConfig {
+                dfs_root: std::path::PathBuf::from(dfs_root),
+                local_cache_dir: cache_dir,
+                ..Default::default()
+            };
+            crate::runner::CheckpointStateHandle::from_backend(
+                krishiv_state::DisaggregatedStateBackend::new(config)
+                    .map_err(|e| format!("disaggregated state backend: {e}"))?,
+            )
+        }
+        _ => crate::runner::CheckpointStateHandle::from_backend(
+            RocksDbStateBackend::open_for_profile(durability_profile, state_dir.as_deref())
+                .map_err(|e| format!("state backend: {e}"))?,
+        ),
+    };
 
     // Shuffle store: required for `shuffle-write:` fragments and for streaming
     // operators that exchange partitions between executors.

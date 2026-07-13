@@ -419,6 +419,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "Maximum cached prepared statements per Flight SQL session.",
     ),
     rt(
+        "KRISHIV_FULL_SNAPSHOT_EVERY",
+        FlagKind::UInt,
+        "8",
+        "Every Nth checkpoint epoch takes a full portable snapshot in incremental mode (bounds the SST manifest chain).",
+    ),
+    rt(
         "KRISHIV_GLUE_CATALOG_ID",
         FlagKind::Text,
         "unset",
@@ -495,6 +501,12 @@ pub static FLAGS: &[FlagSpec] = &[
         FlagKind::UInt,
         "engine default",
         "Continuous-engine idle tick interval in milliseconds.",
+    ),
+    rt(
+        "KRISHIV_INCREMENTAL_CHECKPOINTS",
+        FlagKind::Bool,
+        "true",
+        "RocksDB-backed window state checkpoints SST deltas instead of full snapshots (Phase 56).",
     ),
     rt(
         "KRISHIV_INLINE_IPC_MAX_BYTES",
@@ -825,6 +837,18 @@ pub static FLAGS: &[FlagSpec] = &[
         FlagKind::UInt,
         "4",
         "Planning-time partition count for distributed batch stages (scan + shuffle fan-out).",
+    ),
+    rt(
+        "KRISHIV_STATE_BACKEND",
+        FlagKind::Enum(&["rocksdb", "disaggregated"]),
+        "rocksdb",
+        "Executor generic state backend; disaggregated = DFS-primary with local cache (requires KRISHIV_STATE_DFS_ROOT).",
+    ),
+    rt(
+        "KRISHIV_STATE_DFS_ROOT",
+        FlagKind::Path,
+        "unset",
+        "DFS/object-store root for the disaggregated state backend.",
     ),
     rt(
         "KRISHIV_STATE_DIR",

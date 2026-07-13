@@ -299,6 +299,12 @@ pub struct ExecutorTaskRunner {
     /// runtime — the slot loop in `cli.rs` then remains the only barrier
     /// drainer, as before.
     pub(crate) barrier_context: Option<RunLoopBarrierContext>,
+
+    /// Phase 56: job → declared run-loop parallelism, registered by each
+    /// subtask at start. Restore uses it as the key-group redistribution
+    /// target so a process hosting a SUBSET of subtasks still routes by the
+    /// job-wide ranges.
+    pub(crate) rloop_parallelism: Arc<DashMap<String, usize>>,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -380,6 +386,7 @@ impl ExecutorTaskRunner {
             stream_exchange: crate::stream_exchange::StreamExchange::default(),
             own_task_endpoint: None,
             barrier_context: None,
+            rloop_parallelism: Arc::new(DashMap::new()),
         }
     }
 
@@ -1498,7 +1505,10 @@ impl ExecutorTaskRunner {
                 .insert(job_id.to_owned(), kafka_offsets);
         }
 
-        // Operator state: read every snapshot referenced by the checkpoint.
+        // Operator state: read every snapshot referenced by the checkpoint,
+        // then materialize incremental SST pointer blobs into portable
+        // snapshots (Phase 56) so all downstream restore paths keep working
+        // on one format.
         let mut snapshots = Vec::with_capacity(metadata.operator_snapshots.len());
         for snap_ref in &metadata.operator_snapshots {
             let bytes = storage
@@ -1513,6 +1523,8 @@ impl ExecutorTaskRunner {
                 })?;
             snapshots.push(bytes);
         }
+        let snapshots =
+            crate::runner::task_runner::materialize_portable_snapshots(snapshots, storage)?;
 
         // Run-loop subtask executors key by `{job}#<subtask>`. With exactly
         // one local subtask the restore applies directly; with several, the
@@ -1549,21 +1561,58 @@ impl ExecutorTaskRunner {
             .map_err(|e| restore_err(format!("restore run-loop state for {job_id}: {e}")))?;
             self.pending_restores.remove(job_id);
         } else if rloop_execs.len() > 1 {
-            tracing::error!(
+            // Phase 56: key-group redistribution — every checkpointed entry
+            // is routed to the subtask that owns its key group at the JOB's
+            // parallelism, then each locally hosted subtask loads its share.
+            // Cross-node rescale requires shared checkpoint storage so every
+            // executor sees the full snapshot set (the Flink model).
+            let parallelism = self
+                .rloop_parallelism
+                .get(job_id)
+                .map(|entry| *entry.value())
+                .unwrap_or(rloop_execs.len());
+            let redistributed = krishiv_state::redistribute_snapshots(
+                &snapshots,
+                parallelism as u32,
+                krishiv_state::EntryRouting::WindowGroupKey,
+            )
+            .map_err(|e| {
+                restore_err(format!("key-group redistribution for {job_id}: {e}"))
+            })?;
+            let mut applied = 0usize;
+            for entry in self.loop_executors.iter() {
+                let Some(subtask) = entry
+                    .key()
+                    .strip_prefix(&rloop_prefix)
+                    .and_then(|suffix| suffix.parse::<usize>().ok())
+                else {
+                    continue;
+                };
+                let Some(share) = redistributed.get(subtask) else {
+                    return Err(restore_err(format!(
+                        "restore for {job_id}: subtask {subtask} outside redistribution \
+                         range {parallelism}"
+                    )));
+                };
+                apply_snapshots_to_state(
+                    &CheckpointStateHandle::ContinuousWindow(Arc::clone(entry.value())),
+                    std::slice::from_ref(share),
+                )
+                .map_err(|e| {
+                    restore_err(format!(
+                        "restore run-loop subtask {subtask} state for {job_id}: {e}"
+                    ))
+                })?;
+                applied += 1;
+            }
+            tracing::info!(
                 job_id,
-                subtasks = rloop_execs.len(),
                 epoch = cmd.epoch,
-                "restore for a multi-subtask run-loop job requires key-group \
-                 redistribution (Phase 56); snapshots stashed, subtask state NOT rolled back"
+                parallelism,
+                local_subtasks = applied,
+                "restored run-loop job via key-group redistribution"
             );
-            self.pending_restores.insert(
-                job_id.to_owned(),
-                RestoredJobCheckpoint {
-                    epoch: cmd.epoch,
-                    fencing_token: cmd.fencing_token.as_u64(),
-                    snapshots: snapshots.clone(),
-                },
-            );
+            self.pending_restores.remove(job_id);
         } else {
             // No loop executor yet (fresh process): stash the snapshots so the
             // executor created by the first `stream:loop:` fragment is seeded

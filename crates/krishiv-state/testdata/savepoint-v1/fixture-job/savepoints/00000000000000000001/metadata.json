@@ -1,0 +1,32 @@
+{
+  "version": 3,
+  "epoch": 1,
+  "job_id": "fixture-job",
+  "fencing_token": 1,
+  "timestamp_ms": 1716000000000,
+  "source_offsets": [
+    {
+      "partition_id": "partition-0",
+      "offset": 42,
+      "encoded_offset": [
+        42,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  ],
+  "operator_snapshots": [
+    {
+      "operator_id": "op-0",
+      "task_id": "task-0",
+      "snapshot_path": "fixture-job/checkpoints/00000000000000000001/op-0/task-0/state.bin"
+    }
+  ],
+  "is_savepoint": true,
+  "savepoint_label": "v1-compat-fixture"
+}

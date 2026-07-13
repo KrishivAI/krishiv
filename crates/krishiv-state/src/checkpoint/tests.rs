@@ -2093,3 +2093,100 @@ async fn object_store_checkpoint_missing_returns_none() {
     let result = storage.read_bytes_async("no/such/file.bin").await.unwrap();
     assert!(result.is_none(), "missing file must return None");
 }
+
+// ── Phase 56: savepoint compatibility window ────────────────────────────────
+
+/// Absolute path of the committed savepoint-format fixture.
+fn savepoint_fixture_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata")
+        .join("savepoint-v1")
+}
+
+/// One-shot generator for the committed savepoint fixture. Run manually with
+/// `cargo test -p krishiv-state generate_v1_savepoint_fixture -- --ignored`
+/// ONLY when cutting a new fixture version; the generated tree is committed.
+#[test]
+#[ignore = "fixture generator — run manually, output is committed"]
+fn generate_v1_savepoint_fixture() {
+    let dir = savepoint_fixture_dir();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let s = LocalFsCheckpointStorage::new(&dir).unwrap();
+
+    let state = crate::encode_snapshot_entries(&[
+        (
+            String::from("continuous-window"),
+            String::from("tumbling"),
+            b"tw:key-a".to_vec(),
+            b"41".to_vec(),
+        ),
+        (
+            String::from("continuous-window"),
+            String::from("tumbling"),
+            b"wm:".to_vec(),
+            9_000_i64.to_le_bytes().to_vec(),
+        ),
+    ]);
+    let meta = sample_metadata_for_job("fixture-job", 1);
+    write_operator_snapshot(&s, "fixture-job", 1, "op-0", "task-0", &state).unwrap();
+    write_epoch_metadata(&s, "fixture-job", 1, &meta).unwrap();
+    let mut manifest = IntegrityManifest::new();
+    manifest.insert_bytes("metadata.json", &serde_json::to_vec_pretty(&meta).unwrap());
+    manifest.insert_bytes("op-0/task-0/state.bin", &state);
+    write_manifest(&s, "fixture-job", 1, &manifest).unwrap();
+    create_savepoint(&s, "fixture-job", Some("v1-compat-fixture")).unwrap();
+}
+
+/// Phase 56 exit gate: the committed old-format savepoint restores on every
+/// build — the documented N→N+1 compatibility window. A failure here means a
+/// durable-format change broke restore of existing savepoints and needs a
+/// migration in `migration.rs` (plus a NEW versioned fixture), not a silent
+/// format bump.
+#[test]
+fn committed_v1_savepoint_fixture_restores() {
+    let fixture = savepoint_fixture_dir();
+    assert!(
+        fixture.join("savepoints").exists() || fixture.join("fixture-job").exists(),
+        "committed savepoint fixture missing at {} — regenerate with the \
+         ignored generator test and commit it",
+        fixture.display()
+    );
+    // Restore mutates the active checkpoint area, so work on a temp copy of
+    // the committed fixture.
+    let work = tempfile::tempdir().unwrap();
+    copy_dir_recursive(&fixture, work.path());
+    let s = LocalFsCheckpointStorage::new(work.path()).unwrap();
+
+    let restored = restore_savepoint(&s, "fixture-job", 1, 5)
+        .expect("v1 savepoint fixture must restore under the compatibility window");
+    assert!(restored.is_savepoint);
+    assert_eq!(restored.savepoint_label.as_deref(), Some("v1-compat-fixture"));
+    restored.validate().expect("restored metadata validates");
+    assert!(
+        validate_epoch(&s, "fixture-job", 1).unwrap(),
+        "restored checkpoint must validate with the rebuilt manifest"
+    );
+    // The restored snapshot must still decode as portable entries (the
+    // format every restore consumer operates on).
+    let snapshot = s
+        .read_bytes(&snapshot_path("fixture-job", 1, "op-0", "task-0"))
+        .unwrap()
+        .expect("restored snapshot present");
+    let entries = crate::decode_snapshot_entries(&snapshot).unwrap();
+    assert_eq!(entries.len(), 2);
+}
+
+fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) {
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            std::fs::create_dir_all(&target).unwrap();
+            copy_dir_recursive(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+

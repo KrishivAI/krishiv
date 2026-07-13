@@ -96,6 +96,14 @@ pub trait StateBackend: Send + Sync {
     /// TTL expiry ignore the watermark.
     fn set_watermark(&mut self, _watermark_ms: i64) {}
 
+    /// Downcast hook to the concrete RocksDB backend, when this backend is
+    /// (or wraps) one (Phase 56: the incremental SST checkpointer needs the
+    /// native `create_rocksdb_checkpoint`; portable snapshots stay the
+    /// fallback for every other backend). Default: `None`.
+    fn as_rocksdb(&self) -> Option<&crate::rocksdb_backend::RocksDbStateBackend> {
+        None
+    }
+
     /// Force any buffered writes to durable storage.
     ///
     /// Backends that batch writes for throughput (e.g.

@@ -569,6 +569,11 @@ pub(crate) async fn execute_run_loop_fragment(
     runner
         .task_state_bindings
         .insert(task_id.clone(), TaskStateBinding::Window(state_key.clone()));
+    // Phase 56: restore-time key-group redistribution routes by the job's
+    // declared parallelism, not by however many subtasks this process hosts.
+    runner
+        .rloop_parallelism
+        .insert(job_id.to_owned(), parsed.parallelism);
     // Egress buffer + input notifies must exist before the first push races us.
     runner.continuous_outputs.entry(job_id.to_owned()).or_default();
     let own_notify = runner.notify_handle(&input_key);

@@ -105,6 +105,10 @@ impl<B: StateBackend> TtlStateBackend<B> {
 }
 
 impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
+    fn as_rocksdb(&self) -> Option<&crate::rocksdb_backend::RocksDbStateBackend> {
+        self.inner.as_rocksdb()
+    }
+
     fn get(&self, namespace: &Namespace, key: &[u8]) -> StateResult<Option<Vec<u8>>> {
         match self.inner.get(namespace, key)? {
             None => Ok(None),

@@ -85,6 +85,7 @@ impl SstEpochManifest {
 /// Maintains an in-memory set of filenames known to be in storage so repeated
 /// epochs within the same process run never re-upload unchanged SST files.
 /// After a restart, the previous epoch's manifest is consulted to seed the set.
+#[derive(Debug, Clone)]
 pub struct RocksDbIncrementalCheckpointer {
     work_dir: PathBuf,
     /// Filenames already uploaded to storage during this run.
