@@ -1,237 +1,407 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
-import type { ReactNode } from 'react';
+import { ArrowIcon } from '@/components/InteriorPage';
+import { LandingCodeDemo } from '@/components/LandingCodeDemo';
 import { SiteShell } from '@/components/Shell';
 import { githubUrl } from '@/lib/site';
 
 export const metadata: Metadata = {
-  title: 'Krishiv — Engine developer preview. Platform coming soon.',
+  title: 'Krishiv — Open compute for data that moves',
   description:
-    'Krishiv Engine is an Apache-2.0 Rust compute framework with available batch SQL, Preview streaming, and Experimental incremental processing. Platform is coming soon.',
+    'Build with the Apache-2.0 Krishiv Engine for batch SQL and Preview stateful streaming. Krishiv Platform, an integrated self-hosted control plane, is coming soon.',
   alternates: { canonical: 'https://krishiv.ai' },
   openGraph: {
-    title: 'Krishiv — Engine developer preview. Platform coming soon.',
+    title: 'Krishiv — Open compute for data that moves',
     description:
-      'Start with the Apache-2.0 Krishiv Engine. Grow into the upcoming self-hosted Krishiv Platform.',
+      'Start with an inspectable Rust-native compute engine. Add the upcoming self-hosted control plane when your team needs it.',
   },
 };
 
-function Arrow({ diagonal = false }: { diagonal?: boolean }) {
-  return (
-    <svg viewBox="0 0 20 20" aria-hidden="true">
-      {diagonal ? <path d="M5 15 15 5m-7 0h7v7" /> : <path d="M4 10h12m-5-5 5 5-5 5" />}
-    </svg>
-  );
-}
+const evidence = [
+  { label: 'License', value: 'Apache-2.0 Engine' },
+  { label: 'Runtime', value: 'Rust + Tokio' },
+  { label: 'Data model', value: 'Apache Arrow' },
+  { label: 'Planning', value: 'DataFusion' },
+  { label: 'Current path', value: 'Source-built preview' },
+];
 
-function Github() {
-  return (
-    <svg viewBox="0 0 20 20" aria-hidden="true" fill="currentColor">
-      <path d="M10 .9a9.1 9.1 0 0 0-2.9 17.7c.46.08.63-.2.63-.44v-1.6c-2.57.56-3.11-1.1-3.11-1.1-.42-1.07-1.03-1.35-1.03-1.35-.84-.58.06-.57.06-.57.93.07 1.42.96 1.42.96.83 1.41 2.18 1 2.71.77.08-.6.32-1 .59-1.23-2.05-.23-4.2-1.02-4.2-4.55 0-1 .36-1.83.95-2.47-.1-.24-.41-1.18.09-2.44 0 0 .78-.25 2.5.94A8.7 8.7 0 0 1 10 5.2c.77 0 1.54.1 2.27.3 1.72-1.19 2.5-.94 2.5-.94.5 1.26.19 2.2.1 2.44.59.64.94 1.46.94 2.47 0 3.54-2.16 4.31-4.21 4.54.33.29.63.85.63 1.72v2.55c0 .25.17.53.64.44A9.1 9.1 0 0 0 10 .9Z" />
-    </svg>
-  );
-}
+const workloads = [
+  {
+    index: '01',
+    status: 'Available',
+    title: 'Batch SQL',
+    copy: 'Plan finite SQL and DataFrame work over Arrow data, then collect RecordBatch results.',
+    detail: 'Finite input · bounded result',
+  },
+  {
+    index: '02',
+    status: 'Preview',
+    title: 'Stateful streaming',
+    copy: 'Model event-time windows, watermarks, keyed state, checkpoints, and continuous joins.',
+    detail: 'Long-lived · stateful',
+  },
+  {
+    index: '03',
+    status: 'Experimental',
+    title: 'Incremental views',
+    copy: 'Propagate weighted inserts and retractions through local-first maintained computations.',
+    detail: 'Changing input · delta-driven',
+  },
+];
 
-function StatusPill({ children, muted = false }: { children: ReactNode; muted?: boolean }) {
-  return <span className={`mk-status${muted ? ' mk-status-muted' : ''}`}><i />{children}</span>;
-}
+const docsRoutes = [
+  {
+    index: '01',
+    title: 'Run your first query',
+    copy: 'Build the CLI and execute embedded SQL from a source checkout.',
+    href: '/docs/engine/getting-started',
+  },
+  {
+    index: '02',
+    title: 'Choose a placement',
+    copy: 'Compare embedded, single-node, and distributed runtime boundaries.',
+    href: '/docs/engine/concepts/execution-modes',
+  },
+  {
+    index: '03',
+    title: 'Configure the runtime',
+    copy: 'Resolve placement, state, checkpoints, authentication, and tuning.',
+    href: '/docs/engine/reference/configuration',
+  },
+  {
+    index: '04',
+    title: 'Verify feature maturity',
+    copy: 'Separate available paths from Preview and Experimental surfaces.',
+    href: '/docs/engine/maturity',
+  },
+];
 
-function SystemMap() {
+const maturity = [
+  { label: 'Available', value: 'Batch and local placement', tone: 'available' },
+  { label: 'Preview', value: 'Streaming and distributed paths', tone: 'preview' },
+  { label: 'Experimental', value: 'Incremental view maintenance', tone: 'experimental' },
+  { label: 'Coming soon', value: 'Krishiv Platform', tone: 'planned' },
+];
+
+function HeroRuntime() {
   return (
-    <div className="mk-system" role="img" aria-label="Krishiv product architecture">
-      <div className="mk-system-topline">
-        <span>One data system</span>
-        <span className="mk-live"><i /> Engine preview</span>
+    <figure className="lp-runtime">
+      <figcaption className="sr-only">
+        A query enters Krishiv Engine through a public API, is planned with DataFusion,
+        executes over Arrow, and returns a RecordBatch result.
+      </figcaption>
+      <div className="lp-runtime-head">
+        <div><i /><i /><i /></div>
+        <span>engine / execution trace</span>
+        <b><i /> source-built</b>
       </div>
-      <div className="mk-inputs" aria-label="Engine interfaces">
-        <span>SQL</span><span>Rust</span><span>Python</span><span>Flight</span>
+      <div className="lp-runtime-inputs">
+        <span className="is-active">SQL</span><span>Rust</span><span>Python</span><span>Flight</span>
       </div>
-      <div className="mk-flow-line" aria-hidden="true"><i /><i /><i /></div>
-      <div className="mk-engine-node">
-        <div>
-          <small>Apache-2.0 compute layer</small>
-          <strong>Krishiv Engine</strong>
+      <div className="lp-runtime-path">
+        <div className="lp-runtime-node">
+          <span>01 / Entry</span>
+          <strong>Session + catalog</strong>
+          <small>Public API boundary</small>
         </div>
+        <div className="lp-runtime-connector"><i /><span>parse · bind</span></div>
+        <div className="lp-runtime-node is-accent">
+          <span>02 / Plan</span>
+          <strong>DataFusion + Krishiv</strong>
+          <small>Logical → physical plan</small>
+        </div>
+        <div className="lp-runtime-connector"><i /><span>execute</span></div>
+        <div className="lp-runtime-node">
+          <span>03 / Compute</span>
+          <strong>Arrow operators</strong>
+          <small>Explicit placement</small>
+        </div>
+      </div>
+      <div className="lp-runtime-output">
+        <div><span>answer</span><small>Int64</small></div>
+        <strong>42</strong>
+        <b>1 RecordBatch</b>
+      </div>
+      <div className="lp-runtime-foot">
+        <span>Rust</span><i />
+        <span>Arrow</span><i />
+        <span>DataFusion</span><i />
+        <span>Tokio</span>
+      </div>
+    </figure>
+  );
+}
+
+function PlacementMap() {
+  return (
+    <ol className="lp-placement-map" role="list">
+      <li>
+        <div className="lp-placement-marker"><span>01</span><i /></div>
+        <div className="lp-placement-card">
+          <div><span>Available</span><b>In process</b></div>
+          <h3>Embedded</h3>
+          <p>Planner and execution run inside your Rust or Python application.</p>
+          <small>No network boundary required</small>
+        </div>
+      </li>
+      <li>
+        <div className="lp-placement-marker"><span>02</span><i /></div>
+        <div className="lp-placement-card">
+          <div><span>Available</span><b>One host</b></div>
+          <h3>Single node</h3>
+          <p>Coordinator, executor, HTTP, and Flight boundaries share one machine.</p>
+          <small>Service seams without a cluster</small>
+        </div>
+      </li>
+      <li>
+        <div className="lp-placement-marker is-muted"><span>03</span><i /></div>
+        <div className="lp-placement-card is-preview">
+          <div><span>Preview</span><b>Remote workers</b></div>
+          <h3>Distributed</h3>
+          <p>Work is assigned through an explicit coordinator and executor topology.</p>
+          <small>Evaluation path · not an HA claim</small>
+        </div>
+      </li>
+    </ol>
+  );
+}
+
+function FoundationVisual() {
+  return (
+    <div className="lp-foundation" role="img" aria-label="Shared Engine foundation for batch, streaming, and incremental workloads">
+      <div className="lp-foundation-label"><span>Shared execution spine</span><b>Engine</b></div>
+      <div className="lp-foundation-interfaces"><span>SQL</span><span>Rust</span><span>Python</span><span>Flight SQL</span></div>
+      <div className="lp-foundation-line"><i /><i /><i /></div>
+      <div className="lp-foundation-core">
+        <small>Open compute layer</small>
+        <strong>Krishiv Engine</strong>
         <span>Developer preview</span>
       </div>
-      <div className="mk-primitives">
-        <span>Batch SQL</span>
-        <span>Streaming</span>
-        <span>Incremental</span>
+      <div className="lp-foundation-modules">
+        <span>Planner</span><span>Operators</span><span>Shuffle</span><span>State</span><span>Checkpoints</span><span>Connectors</span>
       </div>
-      <div className="mk-foundation">
-        <span>Arrow</span><b>+</b><span>DataFusion</span><b>+</b><span>Tokio</span>
-      </div>
-      <div className="mk-platform-node">
-        <div>
-          <small>Workspace + control plane</small>
-          <strong>Krishiv Platform</strong>
-        </div>
-        <span>Coming soon</span>
-      </div>
+      <div className="lp-foundation-base"><span>Apache Arrow</span><i>+</i><span>DataFusion</span><i>+</i><span>Tokio</span></div>
     </div>
   );
 }
 
-const workloadItems = [
-  {
-    number: '01',
-    title: 'Batch',
-    text: 'Plan DataFusion SQL over Arrow data in process or on one host, with an explicit distributed Preview path.',
-    detail: 'Finite input · Arrow results',
-  },
-  {
-    number: '02',
-    title: 'Streaming',
-    text: 'Build event-time pipelines with windows, watermarks, stateful operators, and checkpoints.',
-    detail: 'Preview · Stateful',
-  },
-  {
-    number: '03',
-    title: 'Incremental',
-    text: 'Maintain changing results with weighted inserts and retractions instead of recomputing everything.',
-    detail: 'Experimental · Delta-driven',
-  },
-];
-
 export default function HomePage() {
   return (
     <SiteShell>
-      <main className="mk-page">
-        <section className="mk-hero">
-          <div className="mk-wrap mk-hero-grid">
-            <div className="mk-hero-copy">
-              <div className="mk-eyebrow"><i /> Rust-native data infrastructure</div>
-              <h1>One foundation for data that moves.</h1>
-              <p>
-                Krishiv Engine brings batch, streaming, and incremental compute into one
-                Rust-native runtime. Krishiv Platform will add the workspace around it.
+      <main className="lp-page">
+        <section className="lp-hero">
+          <div className="mk-wrap lp-hero-grid">
+            <div className="lp-hero-copy">
+              <p className="lp-eyebrow"><i /> Open compute / explicit control</p>
+              <h1>Run data workloads on an engine <span>you can inspect.</span></h1>
+              <p className="lp-hero-lead">
+                Krishiv Engine brings batch SQL and Preview stateful streaming onto one
+                Rust-native foundation. Start from source today; add the upcoming Platform
+                control plane only when your team needs it.
               </p>
-              <div className="mk-actions">
-                <Link className="mk-button mk-button-primary" href="/engine">
-                  Explore Engine <Arrow />
+              <div className="lp-actions">
+                <Link className="mk-button mk-button-primary" href="/docs/engine/getting-started">
+                  Build from source <ArrowIcon />
                 </Link>
-                <Link className="mk-button mk-button-secondary" href="/docs/engine">
-                  Read the docs
+                <Link className="mk-button mk-button-secondary" href="/architecture">
+                  Explore architecture
                 </Link>
-                <a className="mk-text-link" href={githubUrl}>
-                  <Github /> GitHub
-                </a>
+                <a className="lp-text-link" href={githubUrl}>View on GitHub <ArrowIcon /></a>
               </div>
-              <div className="mk-hero-note">
-                <StatusPill>Engine: open-source preview</StatusPill>
-                <StatusPill muted>Platform: coming soon</StatusPill>
+              <div className="lp-hero-status">
+                <span><i /> Engine · Apache-2.0 developer preview</span>
+                <span className="is-muted"><i /> Platform · coming soon</span>
               </div>
             </div>
-            <SystemMap />
+            <HeroRuntime />
           </div>
         </section>
 
-        <section className="mk-products" id="products">
+        <section className="lp-evidence" aria-label="Engine foundations">
+          <div className="mk-wrap lp-evidence-grid">
+            {evidence.map((item, index) => (
+              <div key={item.label}>
+                <span>0{index + 1} / {item.label}</span>
+                <strong>{item.value}</strong>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="lp-section lp-products" id="products">
           <div className="mk-wrap">
-            <div className="mk-section-heading">
+            <div className="lp-section-head">
               <div>
-                <p className="mk-kicker">The product family</p>
-                <h2>Start with compute. Add the control plane when you need it.</h2>
+                <p className="lp-kicker">01 / Product system</p>
+                <h2>Open compute first. An integrated control plane later.</h2>
               </div>
               <p>
-                Engine stays useful on its own. Platform is a separate product built on
-                public Engine interfaces—not a requirement or a fork.
+                Two products with a clean public boundary. Engine stands alone; Platform
+                will consume the same interfaces available to every Engine user.
               </p>
             </div>
-            <div className="mk-product-grid">
-              <article className="mk-product-card mk-product-card-engine">
-                <div className="mk-product-card-top">
-                  <span className="mk-product-index">01 / Engine</span>
-                  <StatusPill>Open-source preview</StatusPill>
+
+            <div className="lp-product-grid">
+              <article className="lp-product-card lp-engine-card">
+                <div className="lp-product-top">
+                  <span>Krishiv Engine</span>
+                  <b><i /> Developer preview</b>
                 </div>
-                <h3>Own the compute layer.</h3>
-                <p>
-                  An Apache-2.0 Rust engine for teams that want one runtime boundary
-                  across batch SQL, streaming pipelines, and experimental incremental views.
-                </p>
-                <ul className="mk-check-list">
-                  <li>Apache Arrow data model</li>
-                  <li>DataFusion SQL planning</li>
-                  <li>Embedded and single-node paths</li>
-                  <li>Rust, Python, CLI, and service interfaces</li>
-                </ul>
-                <Link className="mk-card-link" href="/engine">Explore Krishiv Engine <Arrow diagonal /></Link>
+                <div className="lp-product-title">
+                  <p>Apache-2.0 compute layer</p>
+                  <h3>Own the runtime boundary.</h3>
+                  <p>Plan, execute, move, and maintain data through public Engine contracts.</p>
+                </div>
+                <div className="lp-engine-surface">
+                  <div><span>Batch SQL</span><b>Available</b></div>
+                  <div><span>Stateful streaming</span><b>Preview</b></div>
+                  <div><span>Incremental views</span><b>Experimental</b></div>
+                  <div><span>Embedded</span><b>Available</b></div>
+                  <div><span>Single node</span><b>Available</b></div>
+                  <div><span>Distributed</span><b>Preview</b></div>
+                </div>
+                <div className="lp-product-actions">
+                  <Link href="/engine">Explore Engine <ArrowIcon /></Link>
+                  <Link href="/docs/engine">Read Engine docs</Link>
+                </div>
               </article>
-              <article className="mk-product-card mk-product-card-platform">
-                <div className="mk-product-card-top">
-                  <span className="mk-product-index">02 / Platform</span>
-                  <StatusPill muted>Coming soon</StatusPill>
+
+              <article className="lp-product-card lp-platform-card">
+                <div className="lp-product-top">
+                  <span>Krishiv Platform</span>
+                  <b className="is-muted"><i /> Coming soon</b>
                 </div>
-                <h3>Bring the team around it.</h3>
-                <p>
-                  An upcoming self-hosted, source-available workspace for SQL,
-                  Iceberg, pipelines, jobs, governance, operations, and governed MCP.
-                </p>
-                <ul className="mk-check-list">
-                  <li>Integrated SQL workspace</li>
-                  <li>Catalog and governance</li>
-                  <li>Pipeline and job orchestration</li>
-                  <li>One console, API, CLI, and MCP boundary</li>
+                <div className="lp-product-title">
+                  <p>Self-hosted control plane</p>
+                  <h3>Bring the team around the Engine.</h3>
+                  <p>A planned workspace for SQL, catalog administration, jobs, governance, and operations.</p>
+                </div>
+                <ul className="lp-platform-list">
+                  <li><span>Workspace</span><b>Console · API · CLI · MCP</b></li>
+                  <li><span>Data</span><b>SQL · catalog · pipelines</b></li>
+                  <li><span>Operations</span><b>Jobs · governance · audit</b></li>
                 </ul>
-                <Link className="mk-card-link" href="/platform">Preview the direction <Arrow diagonal /></Link>
+                <p className="lp-platform-note">No download, public preview, or availability date is being announced.</p>
+                <Link className="lp-product-link" href="/platform">See the product direction <ArrowIcon /></Link>
               </article>
             </div>
           </div>
         </section>
 
-        <section className="mk-workloads">
+        <section className="lp-section lp-placement" id="placement">
           <div className="mk-wrap">
-            <div className="mk-section-heading mk-section-heading-compact">
+            <div className="lp-section-head">
               <div>
-                <p className="mk-kicker">One execution spine</p>
-                <h2>Different workload shapes. Shared primitives.</h2>
+                <p className="lp-kicker">02 / Placement</p>
+                <h2>Change the topology, not the front door.</h2>
               </div>
+              <p>
+                Start with an in-process session. Exercise service boundaries on one host.
+                Move remote only when the Preview distributed path fits the evaluation.
+              </p>
             </div>
-            <div className="mk-workload-list">
-              {workloadItems.map((item) => (
-                <article key={item.title} className="mk-workload-row">
-                  <span>{item.number}</span>
-                  <h3>{item.title}</h3>
-                  <p>{item.text}</p>
-                  <small>{item.detail}</small>
-                </article>
+            <PlacementMap />
+            <div className="lp-placement-foot">
+              <span>Same public session model</span>
+              <div><i /><i /><i /></div>
+              <Link href="/docs/engine/concepts/execution-modes">Compare execution modes <ArrowIcon /></Link>
+            </div>
+          </div>
+        </section>
+
+        <section className="lp-section lp-workloads" id="workloads">
+          <div className="mk-wrap">
+            <div className="lp-section-head">
+              <div>
+                <p className="lp-kicker">03 / Workload model</p>
+                <h2>Three shapes. One execution spine.</h2>
+              </div>
+              <p>
+                Workloads share Arrow data, planning, runtime, state, and connector seams
+                while retaining explicit maturity boundaries.
+              </p>
+            </div>
+            <div className="lp-workload-layout">
+              <div className="lp-workload-list">
+                {workloads.map((workload) => (
+                  <article key={workload.title}>
+                    <div><span>{workload.index}</span><b>{workload.status}</b></div>
+                    <h3>{workload.title}</h3>
+                    <p>{workload.copy}</p>
+                    <small>{workload.detail}</small>
+                  </article>
+                ))}
+              </div>
+              <FoundationVisual />
+            </div>
+          </div>
+        </section>
+
+        <section className="lp-section lp-developer" id="developer">
+          <div className="mk-wrap">
+            <div className="lp-section-head">
+              <div>
+                <p className="lp-kicker">04 / Developer proof</p>
+                <h2>A real query, through documented APIs.</h2>
+              </div>
+              <p>
+                These examples use the current source-built CLI and public Rust and Python
+                facades. No fictional package command or hosted endpoint is implied.
+              </p>
+            </div>
+            <LandingCodeDemo />
+
+            <div className="lp-docs-head">
+              <div><span>Continue in the docs</span><p>Choose the contract you need next.</p></div>
+              <Link href="/docs/engine">View all Engine docs <ArrowIcon /></Link>
+            </div>
+            <div className="lp-docs-grid">
+              {docsRoutes.map((route) => (
+                <Link href={route.href} key={route.title}>
+                  <span>{route.index}</span>
+                  <h3>{route.title}</h3>
+                  <p>{route.copy}</p>
+                  <b>Open guide <ArrowIcon /></b>
+                </Link>
               ))}
             </div>
           </div>
         </section>
 
-        <section className="mk-continuity">
-          <div className="mk-wrap mk-continuity-grid">
-            <div>
-              <p className="mk-kicker">Local-to-remote continuity</p>
-              <h2>Change placement, not your mental model.</h2>
-              <p className="mk-section-copy">
-                Start in process. Exercise service boundaries on one node. Move to an
-                explicit remote coordinator when the distributed path fits your evaluation.
+        <section className="lp-section lp-maturity" id="maturity">
+          <div className="mk-wrap lp-maturity-layout">
+            <div className="lp-maturity-copy">
+              <p className="lp-kicker">05 / Evidence over claims</p>
+              <h2>Maturity stays visible.</h2>
+              <p>
+                A capability can exist without being a stable operating contract. Every
+                public surface keeps its current status attached.
               </p>
-              <Link className="mk-button mk-button-secondary" href="/docs/engine/concepts/execution-modes">
-                Compare execution modes <Arrow />
-              </Link>
+              <Link className="mk-button mk-button-secondary" href="/product/maturity">Review the full maturity map <ArrowIcon /></Link>
             </div>
-            <ol className="mk-mode-list">
-              <li><span>01</span><div><strong>Embedded</strong><p>Planner and execution live inside your process.</p></div><b>Available</b></li>
-              <li><span>02</span><div><strong>Single node</strong><p>Coordinator, executor, and services on one host.</p></div><b>Available</b></li>
-              <li><span>03</span><div><strong>Distributed</strong><p>Explicit remote coordination and workers.</p></div><b>Preview</b></li>
-            </ol>
+            <div className="lp-maturity-grid">
+              {maturity.map((item, index) => (
+                <div className={`is-${item.tone}`} key={item.label}>
+                  <span>0{index + 1}</span>
+                  <i />
+                  <strong>{item.label}</strong>
+                  <p>{item.value}</p>
+                </div>
+              ))}
+            </div>
           </div>
         </section>
 
-        <section className="mk-cta">
-          <div className="mk-wrap mk-cta-inner">
+        <section className="lp-final">
+          <div className="mk-wrap lp-final-inner">
             <div>
-              <p className="mk-kicker">Build from the source of truth</p>
-              <h2>Evaluate the Engine with honest maturity labels.</h2>
-              <p>Every public doc distinguishes available paths, previews, experiments, and work still in progress.</p>
+              <p className="lp-kicker">Start with what exists</p>
+              <h2>Build the Engine from source.</h2>
+              <p>Pin a revision, run an embedded query, and expand placement only when the workload requires it.</p>
             </div>
-            <div className="mk-actions">
-              <Link className="mk-button mk-button-primary" href="/docs/engine/getting-started">Get started <Arrow /></Link>
-              <Link className="mk-button mk-button-secondary" href="/docs/engine/maturity">Feature maturity</Link>
+            <div className="lp-actions">
+              <Link className="mk-button mk-button-primary" href="/docs/engine/getting-started">Run the quickstart <ArrowIcon /></Link>
+              <a className="mk-button mk-button-secondary" href={githubUrl}>Inspect the repository</a>
             </div>
           </div>
         </section>
