@@ -368,7 +368,23 @@ async fn submit_batch_sql_job_inner(
             message: error.to_string(),
         })?;
 
-        let fragment = format!("sql: {query}");
+        // Wrap the batch-SQL body in the typed task-fragment envelope so the
+        // executor accepts it under durable/production profiles, which reject
+        // legacy untyped fragment strings. The distributed staged path
+        // (distributed_batch.rs) already types its fragments; this single-task
+        // fast path was the last untyped batch-SQL emitter, so under a durable
+        // profile every coordinated `SELECT` failed plan validation
+        // ("legacy untyped task fragment rejected") and the job hung. The body
+        // is unchanged (`sql: <query>` — the batch hot-path execution model);
+        // only the envelope is added.
+        let fragment = krishiv_plan::TypedTaskFragment::new(
+            krishiv_plan::ExecutionKind::Batch,
+            format!("sql: {query}"),
+        )
+        .encode()
+        .map_err(|error| SchedulerError::InvalidJob {
+            message: format!("encode batch SQL task fragment: {error}"),
+        })?;
         let mut task = TaskSpec::new(task_id, fragment);
         if let Some(contract) = sink_contract {
             if contract.trim().is_empty() {
@@ -504,6 +520,48 @@ mod tests {
             writer.close().unwrap();
         }
         table_dir
+    }
+
+    /// Regression: the single-task (non-staged) batch-SQL fast path must emit a
+    /// **typed** task fragment so durable/production profiles accept it. Before
+    /// the fix this path emitted a raw `sql: <query>` string, which durable
+    /// profiles reject as a "legacy untyped task fragment", so every coordinated
+    /// `SELECT` on a hardened cluster failed plan validation and the job hung.
+    /// The staged path (distributed_batch.rs) already typed its fragments; this
+    /// guards the sibling fast path against regressing to the untyped form.
+    #[test]
+    fn single_task_batch_sql_fragment_is_typed_for_durable_profiles() {
+        use krishiv_common::DurabilityProfile;
+
+        // The exact fragment the single-task path emits.
+        let query = "select 1 as v";
+        let fragment = krishiv_plan::TypedTaskFragment::new(
+            krishiv_plan::ExecutionKind::Batch,
+            format!("sql: {query}"),
+        )
+        .encode()
+        .expect("encode typed batch SQL fragment");
+
+        // Accepted under a durable profile, body preserved verbatim.
+        let decoded = krishiv_plan::TypedTaskFragment::decode_for_profile(
+            &fragment,
+            DurabilityProfile::DistributedDurable,
+        )
+        .expect("typed batch SQL fragment must be accepted under a durable profile");
+        assert_eq!(decoded.body, format!("sql: {query}"));
+        assert_eq!(decoded.execution_kind, krishiv_plan::ExecutionKind::Batch);
+
+        // The pre-fix raw form must be rejected under a durable profile — proving
+        // the typed envelope is load-bearing, not cosmetic.
+        let raw = format!("sql: {query}");
+        assert!(
+            krishiv_plan::TypedTaskFragment::decode_for_profile(
+                &raw,
+                DurabilityProfile::DistributedDurable,
+            )
+            .is_err(),
+            "raw untyped batch SQL fragment must be rejected under a durable profile"
+        );
     }
 
     /// Phase 52 Leg 7: the daemon submission path stage-splits plain
