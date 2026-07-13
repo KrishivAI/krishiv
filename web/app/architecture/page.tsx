@@ -9,13 +9,13 @@ import {
 } from '@/components/ArchitectureDiagrams';
 
 export const metadata: Metadata = {
-  title: 'Architecture',
+  title: 'Engine Architecture',
   description:
-    'Krishiv architecture: one Rust-native compute engine running as embedded library, single-node daemon, or distributed cluster with coordinator and executors.',
+    'How Krishiv Engine is organized across available embedded and single-node placements and a Preview distributed path.',
   openGraph: {
-    title: 'Krishiv Architecture — One Engine, Three Shapes',
+    title: 'Krishiv Engine Architecture',
     description:
-      'How Krishiv runs the same batch SQL, streaming, and incremental processing code in embedded, single-node, and distributed modes.',
+      'The Rust, Arrow, and DataFusion foundations behind Krishiv Engine execution modes.',
   },
   alternates: {
     canonical: 'https://krishiv.ai/architecture',
@@ -28,28 +28,28 @@ export default function Architecture() {
       <main className="container">
         <section className="page-hero">
           <Badge tone="blue">Architecture</Badge>
-          <h1 className="gradient-text">One engine, three shapes, the same APIs.</h1>
+          <h1 className="gradient-text">Engine boundaries, from one process to a preview cluster.</h1>
           <p className="lead">
-            Krishiv runs the same SQL, Python, and Rust APIs in three forms: as a library
-            inside your process, as a daemon on a single host, and as a coordinator-plus-executors
-            cluster. The same plan flows through all three. The same code that runs locally
-            runs at scale.
+            Krishiv Engine has explicit embedded and single-node placements. The repository
+            also contains coordinator, scheduler, executor, and transport foundations for a
+            distributed placement, which remains Preview. Each path builds on Rust, Arrow,
+            and DataFusion, but their operational maturity is not the same.
           </p>
           <p className="lead" style={{ color: 'var(--muted)', fontSize: 15 }}>
             This page is the mental model. For crate boundaries and design invariants, see
-            the <a href="/docs/latest/concepts/architecture">architecture reference</a> in
+            the <a href="/docs/engine/concepts/architecture">architecture reference</a> in
             the docs.
           </p>
         </section>
 
         <Section
           eyebrow="The three shapes"
-          title="Run Krishiv the way that fits the workload"
+          title="Choose a placement, then check its maturity"
         >
           <p style={{ color: 'var(--muted-strong)', maxWidth: 720 }}>
-            You pick the shape at startup. There is no silent fall-through from local to
-            distributed, and no surprise network calls when you only want a library.
-            The same code paths run in all three.
+            Execution mode is an explicit configuration choice. Embedded and single-node
+            operation are available in the source workspace; distributed operation is a
+            Preview path that still needs end-to-end operational certification.
           </p>
           <div className="diagram">
             <TopologyDiagram />
@@ -58,25 +58,25 @@ export default function Architecture() {
             <div className="card">
               <h3 style={{ color: 'var(--text)', margin: '0 0 8px' }}>Embedded</h3>
               <p>
-                <code>Session.embedded()</code> runs Krishiv in your process. No daemon,
-                no cluster. Ideal for notebooks, scripts, tests, and libraries that need
-                SQL or DataFrame ops inline. Results are returned as in-memory Arrow buffers.
+                Runs Engine in your process without a remote coordinator. It is the clearest
+                starting point for local SQL, DataFrame work, tests, and API evaluation.
+                Batch results use Arrow <code>RecordBatch</code> values.
               </p>
             </div>
             <div className="card">
               <h3 style={{ color: 'var(--text)', margin: '0 0 8px' }}>Single-node</h3>
               <p>
-                A local Krishiv daemon owns durable state, checkpoints, and one or more
-                task slots. Use it when you want a long-running pipeline with restarts but
-                do not need to scale out across hosts. Connects over Arrow Flight.
+                Places the Engine control and data-plane components on one host. State,
+                checkpoint, and restart behavior depend on the configured backends and
+                durability profile; they are not implied by the placement alone.
               </p>
             </div>
             <div className="card">
               <h3 style={{ color: 'var(--text)', margin: '0 0 8px' }}>Distributed</h3>
               <p>
-                A coordinator schedules jobs across <em>N</em> executors. Each executor is
-                a replaceable worker; the coordinator is the single source of truth for
-                job state. Shuffle, state, and checkpoints live on a shared object store.
+                Coordinator and executor code establishes a remote execution path across
+                workers. This mode is Preview: use it to evaluate the architecture, not as
+                a promise of high availability, elastic scale, or production readiness.
               </p>
             </div>
           </div>
@@ -87,9 +87,9 @@ export default function Architecture() {
           title="A query, from your code to a result"
         >
           <p style={{ color: 'var(--muted-strong)', maxWidth: 720 }}>
-            The same flow runs whether you are calling from a Jupyter notebook or a
-            coordinator handling a thousand tasks. Stages you can ignore most of the
-            time, and the stages you can hook into when you need to.
+            A batch request enters a session, is planned through DataFusion, and runs over
+            Arrow data. Streaming and distributed paths extend that foundation, but remain
+            subject to their own Preview maturity and connector constraints.
           </p>
           <div className="diagram">
             <RequestFlowDiagram />
@@ -102,18 +102,18 @@ export default function Architecture() {
             </li>
             <li>
               <strong style={{ color: 'var(--text)' }}>Plan and optimize.</strong> The logical
-              plan is rewritten with cost-based rules, then fragmented into a physical plan
-              that can be split across executors when running distributed.
+              plan is rewritten and lowered to physical execution. Preview distributed
+              paths add runtime placement and task boundaries.
             </li>
             <li>
               <strong style={{ color: 'var(--text)' }}>Execute.</strong> The plan is run as a
-              graph of Arrow operators. State, shuffle, and checkpoint hooks are wired in
-              here. Streaming pipelines add windows, watermarks, and timers.
+              graph of Arrow operators. State, shuffle, and checkpoint abstractions connect
+              here; streaming paths add their own stateful operators.
             </li>
             <li>
               <strong style={{ color: 'var(--text)' }}>Return.</strong> Batch results come
-              back as one or more <code>RecordBatch</code>es. Streaming results come as a
-              <code> RecordBatchStream</code> you iterate.
+              back as one or more <code>RecordBatch</code> values. Streaming APIs expose
+              incremental results through their job and stream interfaces.
             </li>
           </ol>
         </Section>
@@ -123,10 +123,10 @@ export default function Architecture() {
           title="Control plane above, data plane below"
         >
           <p style={{ color: 'var(--muted-strong)', maxWidth: 720 }}>
-            The coordinator is the only component that owns job state. Executors are
-            replaceable workers — losing one means restarting the tasks it was running,
-            not losing the job. State and checkpoints are pulled out of the workers
-            into a shared store so executors can be added or removed freely.
+            The Preview distributed design separates coordination from execution. The
+            repository includes scheduling, metadata, shuffle, state, checkpoint, and
+            transport abstractions. Recovery and durability depend on the exact configured
+            stores and connector combination; this diagram is a boundary map, not an SLA.
           </p>
           <div className="diagram">
             <DataPlaneDiagram />
@@ -135,18 +135,17 @@ export default function Architecture() {
             <div className="card">
               <h3 style={{ color: 'var(--text)', margin: '0 0 8px' }}>Coordinator</h3>
               <p>
-                Owns the job catalog, schedules tasks, holds leadership for exactly one
-                active coordinator per job, and applies committed state changes from
-                executors. It does not run data.
+                Scheduler and coordinator modules expose job/task lifecycle, metadata,
+                leadership, and remote-control paths. Their presence does not by itself
+                imply a certified highly available control plane.
               </p>
             </div>
             <div className="card">
               <h3 style={{ color: 'var(--text)', margin: '0 0 8px' }}>Executors</h3>
               <p>
-                Run tasks, hold local state, and report progress. Each executor registers
-                with the coordinator and runs whatever tasks it is offered. They do not
-                talk to each other directly — all communication routes through the
-                coordinator or shared shuffle.
+                Executor modules run assigned work and connect to state, shuffle, and
+                checkpoint interfaces. Transport and failure-recovery behavior remain part
+                of the distributed Preview surface.
               </p>
             </div>
           </div>
@@ -157,9 +156,9 @@ export default function Architecture() {
           title="The pipeline lifecycle"
         >
           <p style={{ color: 'var(--muted-strong)', maxWidth: 720 }}>
-            Whether you submit a SQL batch query or a streaming pipeline, the lifecycle
-            is the same five steps. The differences (continuous vs one-shot, recovery
-            vs restart) show up in the last two stages.
+            The repository represents validation, planning, scheduling, execution, and
+            completion as distinct concerns. Batch and streaming do not have identical
+            recovery semantics, and connector guarantees must be evaluated end to end.
           </p>
           <div className="diagram">
             <LifecycleDiagram />
@@ -177,8 +176,8 @@ export default function Architecture() {
             </li>
             <li>
               <strong style={{ color: 'var(--text)' }}>Run</strong> streams or batches data
-              through the plan. On failure, executors restart from the last committed
-              checkpoint — they do not re-run from the source.
+              through the plan. On failure, behavior depends on the selected execution
+              mode, state backend, checkpoint store, source, and sink.
             </li>
           </ul>
         </Section>
@@ -194,14 +193,14 @@ export default function Architecture() {
           </p>
           <ul className="prose" style={{ color: 'var(--muted-strong)' }}>
             <li>
-              <strong style={{ color: 'var(--text)' }}>Available:</strong> in-process batch
-              and streaming SQL, the Python and Rust APIs, single-node deployment, the
-              Iceberg and Parquet connectors.
+              <strong style={{ color: 'var(--text)' }}>Available:</strong> batch SQL,
+              DataFusion planning, Arrow data, embedded and single-node execution, and
+              source-built Rust and core Python APIs.
             </li>
             <li>
-              <strong style={{ color: 'var(--text)' }}>Preview:</strong> distributed
-              execution and end-to-end pipeline exactly-once. The shape is right; the
-              tuning and certification are still in progress.
+              <strong style={{ color: 'var(--text)' }}>Preview:</strong> stateful streaming,
+              distributed execution, checkpoint/state integrations, and Kafka, Parquet,
+              S3, and Iceberg paths. Guarantees are combination-specific.
             </li>
             <li>
               <strong style={{ color: 'var(--text)' }}>Experimental:</strong> incremental
@@ -209,10 +208,10 @@ export default function Architecture() {
             </li>
           </ul>
           <div className="actions">
-            <Link className="btn btn-primary" href="/docs/latest/concepts/architecture">
+            <Link className="btn btn-primary" href="/docs/engine/concepts/architecture">
               Architecture reference
             </Link>
-            <Link className="btn btn-secondary" href="/docs/latest/concepts/distributed-mode">
+            <Link className="btn btn-secondary" href="/docs/engine/operations/distributed">
               Distributed mode
             </Link>
             <Link className="btn btn-secondary" href="/product/maturity">

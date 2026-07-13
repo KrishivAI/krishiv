@@ -1,0 +1,47 @@
+---
+title: Checkpoints and savepoints
+description: Understand state snapshots, recovery boundaries, and the connector contract.
+status: preview
+---
+
+Checkpoints capture the coordinated progress of a stateful job. Savepoints are
+operator-triggered snapshots intended for controlled stop, migration, or restore
+workflows.
+
+## CLI surfaces
+
+```bash
+krishiv checkpoints --help
+krishiv savepoint --help
+krishiv restore --help
+krishiv state --help
+```
+
+Run the help from the same pinned Engine build you operate; command flags and
+metadata are pre-release.
+
+## End-to-end boundary
+
+A recovery point is valid only when these parts agree:
+
+1. source positions or offsets;
+2. operator state and timers;
+3. in-flight data/barriers;
+4. sink prepare/commit state;
+5. durable checkpoint metadata.
+
+If a source cannot restore an offset or a sink cannot coordinate commits, an
+Engine state snapshot alone cannot create exactly-once delivery.
+
+## Operational rules
+
+- Store durable profiles on storage that survives the process or host failure you test.
+- Retain multiple completed checkpoints before pruning.
+- Test restore into a clean process, not only checkpoint creation.
+- Record the Engine revision and state schema with every savepoint.
+- Treat state/schema migration as a versioned operation.
+
+<Callout type="warn" title="No blanket exactly-once claim">
+  The repository defines candidate source/sink/checkpoint combinations, but no
+  global guarantee applies to every connector or topology.
+</Callout>

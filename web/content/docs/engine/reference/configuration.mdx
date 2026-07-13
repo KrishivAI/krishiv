@@ -1,0 +1,125 @@
+---
+title: Configuration reference
+description: Configure placement, durability, state, authentication, and runtime tuning through validated environment flags.
+status: available
+---
+
+Krishiv declares its `KRISHIV_*` environment variables in a typed registry.
+Environment-aware APIs such as `Session::from_env()` and daemon entry points
+consume the relevant subset. CLI subcommands have their own parsers and do not
+read every registry value, so use the explicit flags in the CLI reference. The
+canonical generated inventory is `docs/reference/env-flags.md` in the Engine
+repository.
+
+## Placement
+
+| Variable | Values | Default | Purpose |
+| --- | --- | --- | --- |
+| `KRISHIV_MODE` | `embedded`, `single-node`, `distributed`, `bare-metal`, `k8s` | `embedded` | Select mode for `Session::from_env()` and environment-aware services; `krishiv sql` uses `--mode` instead. |
+| `KRISHIV_COORDINATOR_URL` | URL | unset | Process-specific coordinator address: SQL sessions expect Flight SQL, executors expect control-plane gRPC, and IVM management paths expect HTTP. |
+| `KRISHIV_REMOTE_EXEC` | Boolean | mode-dependent | Explicitly force remote execution on or off. |
+| `KRISHIV_TARGET_PARALLELISM` | Positive integer | available cores | Set local target partitions for environment-aware sessions; the SQL CLI does not currently read it. |
+
+For `krishiv sql`, an explicit `--coordinator` value takes precedence over the
+environment variable. The local cluster reports separate gRPC, HTTP, and Flight
+URLs; copy the endpoint for the process you are configuring instead of assuming
+that one protocol or port serves all three.
+
+The examples below are for environment-aware sessions. For the SQL CLI, always
+pass `--mode` explicitly.
+
+<Tabs items={["Embedded", "Single node", "Distributed"]}>
+  <Tab value="Embedded">
+
+```bash
+export KRISHIV_MODE=embedded
+export KRISHIV_LOG_FORMAT=pretty
+```
+
+CLI equivalent: `cargo run -p krishiv -- sql --mode embedded --query "SELECT 42 AS answer"`.
+
+  </Tab>
+  <Tab value="Single node">
+
+```bash
+export KRISHIV_MODE=single-node
+export KRISHIV_COORDINATOR_URL=http://127.0.0.1:2003
+```
+
+Replace the example URL with the exact `Flight:` URL printed by `krishiv local
+start` or `krishiv local status`; the command selects the first free port at or
+above 2003.
+
+  </Tab>
+  <Tab value="Distributed">
+
+```bash
+export KRISHIV_MODE=distributed
+export KRISHIV_COORDINATOR_URL=https://coordinator.example:2003
+export KRISHIV_DURABILITY_PROFILE=distributed-durable
+```
+
+These variables only select intent. A distributed durable deployment also
+needs authenticated transport, durable metadata/checkpoints, object storage,
+and tested source/sink recovery.
+
+  </Tab>
+</Tabs>
+
+## Durability profiles
+
+| `KRISHIV_DURABILITY_PROFILE` | Intended backing services |
+| --- | --- |
+| `dev-local` | Memory or ephemeral local services for development. |
+| `single-node-durable` | Local durable metadata, RocksDB state, and filesystem checkpoints. |
+| `distributed-durable` | Consensus metadata, restart-durable shuffle/state recovery, and shared checkpoint storage. |
+
+`KRISHIV_CHECKPOINT_DIR` selects a local checkpoint directory.
+`KRISHIV_CHECKPOINT_STORAGE` accepts a configured storage URI; durable profiles
+reject ephemeral memory storage.
+
+## State and streaming
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `KRISHIV_STATE_BACKEND` | `rocksdb` | Select `rocksdb` or the preview `disaggregated` backend. |
+| `KRISHIV_STATE_DFS_ROOT` | unset | Required root for disaggregated state. |
+| `KRISHIV_INCREMENTAL_CHECKPOINTS` | `true` | Store SST deltas for eligible RocksDB-backed window state. |
+| `KRISHIV_FULL_SNAPSHOT_EVERY` | `8` | Bound the incremental checkpoint chain with a portable full snapshot. |
+| `KRISHIV_STREAM_PROFILE` | `low-latency` | Select `low-latency` or `throughput` run-loop defaults. |
+| `KRISHIV_STREAM_LINGER_MS` | profile-dependent | Override run-loop batching delay. |
+| `KRISHIV_WATERMARK_IDLE_MS` | `30000` | Exclude a silent split from watermark min-combination after this interval. |
+
+## Authentication and TLS
+
+| Variable | Purpose |
+| --- | --- |
+| `KRISHIV_COORDINATOR_BEARER_TOKEN` | Token presented by coordinator clients. |
+| `KRISHIV_COORDINATOR_BEARER_TOKEN_FILE` | Mount one server token from a reloadable file. |
+| `KRISHIV_COORDINATOR_BEARER_TOKENS_FILE` | Mount a reloadable accepted-token set. |
+| `KRISHIV_EXECUTOR_TASK_BEARER_TOKEN` | Separate token for coordinator-to-executor task calls. |
+| `KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH` | Require task-call authentication even in a development profile. |
+| `KRISHIV_CA_CERT` | CA certificate used by gRPC clients to verify TLS. |
+
+<Callout type="warn" title="Keep secrets out of command history">
+  Prefer mounted token files or a secret manager for long-lived services. Do
+  not commit bearer tokens, object-store credentials, or catalog tokens.
+</Callout>
+
+## Query and executor tuning
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `KRISHIV_BATCH_SIZE` | `8192` | Rows per DataFusion execution batch. |
+| `KRISHIV_EXECUTOR_MEMORY_LIMIT_BYTES` | unset / unlimited | Process-wide executor reservation budget; a separate per-query fallback can derive a cgroup limit. |
+| `KRISHIV_AQE` | `on` | Master switch for supported adaptive stage rewrites. |
+| `KRISHIV_RUNTIME_FILTERS` | `on` | Enable DataFusion runtime-filter pushdown paths. |
+| `KRISHIV_LOG_FORMAT` | `json` | Select `json`, `pretty`, or `compact` tracing output. |
+
+Change one tuning control at a time and record the query, data, hardware, and
+Engine commit. Defaults are not performance promises.
+
+Across current readers, the portable Boolean spellings are `1/true/on` and
+`0/false/off`. Some flags accept additional words, but those are not consistent
+for AQE and runtime filters. Daemon startup validates registered values;
+deprecated aliases may warn, so prefer the canonical names on this page.

@@ -1,0 +1,62 @@
+---
+title: Krishiv Engine
+description: Rust-native compute for batch SQL, streaming, and experimental incremental processing.
+status: preview
+---
+
+Krishiv Engine is a pre-release compute engine built in Rust around Apache Arrow,
+DataFusion, and Tokio. It gives batch, streaming, and incremental workloads a
+shared data model and runtime boundary.
+
+<Callout type="warn" title="Pre-release software">
+  Krishiv has not reached a stable release. Use it for evaluation, prototyping,
+  and development. APIs, storage metadata, and wire protocols can still change.
+</Callout>
+
+## Choose a path
+
+<Cards>
+  <Card
+    title="Run your first query"
+    description="Build from source and execute SQL in embedded mode."
+    href="/docs/engine/getting-started"
+  />
+  <Card
+    title="Understand the engine"
+    description="See how sessions, planning, runtimes, and workers fit together."
+    href="/docs/engine/concepts/architecture"
+  />
+  <Card
+    title="Check feature maturity"
+    description="Separate available paths from previews and experiments."
+    href="/docs/engine/maturity"
+  />
+  <Card
+    title="Deploy one node"
+    description="Start a local coordinator, executor, and Flight SQL endpoint."
+    href="/docs/engine/guides/single-node"
+  />
+</Cards>
+
+## What the engine owns
+
+- **Batch SQL** over registered Arrow and Parquet-style sources.
+- **Streaming execution** with event-time windows, watermarks, and stateful operators.
+- **Incremental processing** through weighted change batches and `IncrementalFlow`.
+- **Runtime placement** from an embedded process to explicit remote coordinator/executor paths.
+- **Data-system primitives** for shuffle, state, checkpoints, connectors, and observability.
+
+Krishiv Engine does not require Krishiv Platform. The upcoming Platform product
+will consume Engine through its public APIs and protocols.
+
+## How to read these docs
+
+Every page carries a maturity label. “Available” means the path exists in the
+current source tree; it does not mean the project is stable or production-ready.
+Preview and experimental paths need extra validation before you rely on them.
+
+<Cards>
+  <Card title="Installation" href="/docs/engine/installation" />
+  <Card title="CLI reference" href="/docs/engine/reference/cli" />
+  <Card title="Connectors" href="/docs/engine/reference/connectors" />
+</Cards>

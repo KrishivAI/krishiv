@@ -1,543 +1,240 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
-import type { JSX, ReactNode } from 'react';
+import type { ReactNode } from 'react';
 import { SiteShell } from '@/components/Shell';
-import { CodeTabs } from '@/components/CodeTabs';
 import { githubUrl } from '@/lib/site';
 
 export const metadata: Metadata = {
-  title: {
-    default: 'Krishiv — Rust-native batch, streaming & incremental compute',
-    template: '%s | Krishiv',
-  },
+  title: 'Krishiv — Engine developer preview. Platform coming soon.',
   description:
-    'Krishiv is a Rust-native compute engine for batch SQL, streaming pipelines, and incremental view maintenance. Apache Arrow data model, DataFusion SQL, embedded to distributed.',
+    'Krishiv Engine is an Apache-2.0 Rust compute framework with available batch SQL, Preview streaming, and Experimental incremental processing. Platform is coming soon.',
+  alternates: { canonical: 'https://krishiv.ai' },
   openGraph: {
-    title: 'Krishiv — Rust-native batch, streaming & incremental compute',
+    title: 'Krishiv — Engine developer preview. Platform coming soon.',
     description:
-      'One Rust-native engine for batch SQL, streaming pipelines, and incremental view maintenance. Apache Arrow + DataFusion. Embedded, single-node, or distributed.',
-  },
-  twitter: {
-    card: 'summary_large_image',
-    title: 'Krishiv — Rust-native batch, streaming & incremental compute',
-    description:
-      'One Rust-native engine for batch SQL, streaming pipelines, and incremental view maintenance. Apache Arrow + DataFusion.',
-  },
-  alternates: {
-    canonical: 'https://krishiv.ai',
+      'Start with the Apache-2.0 Krishiv Engine. Grow into the upcoming self-hosted Krishiv Platform.',
   },
 };
 
-/* ── Icons ────────────────────────────────────────────────────────────────── */
-
-type IconName =
-  | 'bolt' | 'delta' | 'cube' | 'server' | 'cluster' | 'arrow-right'
-  | 'check' | 'x' | 'minus' | 'sql' | 'rust' | 'python'
-  | 'iceberg' | 'kafka' | 'parquet' | 's3' | 'arrow-icon'
-  | 'datafusion' | 'tokio' | 'shield' | 'code' | 'terminal'
-  | 'users' | 'cpu' | 'database' | 'cloud' | 'clock' | 'zap';
-
-const iconPaths: Record<IconName, JSX.Element> = {
-  bolt: <path d="m11 2-7 9h5l-1 7 8-10h-5l0-6Z"/>,
-  delta: <><path d="M15 5 5 15"/><path d="M5 5h10v10"/><circle cx="5" cy="15" r="2"/><circle cx="15" cy="5" r="2"/></>,
-  cube: <><path d="m10 2.8 6 3.4v7.2l-6 3.8-6-3.8V6.2Z"/><path d="m4 6.2 6 3.5 6-3.5"/><path d="M10 9.7v7.5"/></>,
-  server: <><rect x="3" y="3" width="14" height="5" rx="1.4"/><rect x="3" y="12" width="14" height="5" rx="1.4"/><path d="M6 5.5h.1"/><path d="M6 14.5h.1"/><path d="M8.5 5.5H14"/><path d="M8.5 14.5H14"/></>,
-  cluster: <><rect x="4" y="3" width="5" height="4" rx="1"/><rect x="11" y="3" width="5" height="4" rx="1"/><rect x="7.5" y="13" width="5" height="4" rx="1"/><path d="M6.5 7v3h7V7"/><path d="M10 10v3"/></>,
-  'arrow-right': <path d="M5 12h14m-7-7 7 7-7 7"/>,
-  check: <path d="m4 10 4 4 8-9"/>,
-  x: <><path d="m15 9-6 6"/><path d="m9 9 6 6"/></>,
-  minus: <path d="M5 12h14"/>,
-  sql: <><path d="M4 6.5 7 9l-3 2.5"/><path d="M9 12h4"/><rect x="2.5" y="3" width="15" height="14" rx="2"/></>,
-  rust: <><path d="M10 3.2v2"/><path d="M10 14.8v2"/><path d="m5.2 5.2 1.4 1.4"/><path d="m13.4 13.4 1.4 1.4"/><path d="M3.2 10h2"/><path d="M14.8 10h2"/><path d="m5.2 14.8 1.4-1.4"/><path d="m13.4 6.6 1.4-1.4"/><circle cx="10" cy="10" r="4.2"/><path d="M8.5 12.1V7.9h2.1a1.2 1.2 0 0 1 0 2.4H8.5"/><path d="m10.7 10.3 1.5 1.8"/></>,
-  python: <><path d="M10 3.2H7.4A2.4 2.4 0 0 0 5 5.6v2.1h5.9A2.1 2.1 0 0 1 13 9.8v4.6a2.4 2.4 0 0 1-2.4 2.4H8"/><path d="M10 16.8h2.6a2.4 2.4 0 0 0 2.4-2.4v-2.1H9.1A2.1 2.1 0 0 1 7 10.2V5.6a2.4 2.4 0 0 1 2.4-2.4H12"/><path d="M8.2 5.3h.1"/><path d="M11.8 14.7h.1"/></>,
-  iceberg: <><path d="M10 2 3 14h14L10 2Z"/><path d="M6 14l4-6 4 6"/></>,
-  kafka: <><circle cx="10" cy="10" r="1.5"/><circle cx="5" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/><circle cx="5" cy="15" r="1.5"/><circle cx="15" cy="15" r="1.5"/><path d="M8.9 8.9 6.1 6.1"/><path d="m11.1 8.9 2.8-2.8"/><path d="m8.9 11.1-2.8 2.8"/><path d="m11.1 11.1 2.8 2.8"/></>,
-  parquet: <><path d="m4 12 8-8"/><path d="m7 15 8-8"/><path d="M5.5 5.5h8v8h-8Z"/></>,
-  s3: <path d="M6.5 16h8a3.5 3.5 0 0 0 .4-7 5 5 0 0 0-9.6-1.5A4.3 4.3 0 0 0 6.5 16Z"/>,
-  'arrow-icon': <><path d="m4 11 6-8"/><path d="M8 11h8l-6 6"/><path d="m8.6 7.5 2.8 2.5-2.8 2.5"/></>,
-  datafusion: <><circle cx="10" cy="10" r="6"/><path d="M10 4v12"/><path d="M4 10h12"/></>,
-  tokio: <><circle cx="10" cy="10" r="8"/><path d="M10 6v4l3 3"/></>,
-  shield: <path d="M10 2.5 16 5v4.7c0 3.7-2.4 6.5-6 7.8-3.6-1.3-6-4.1-6-7.8V5Z"/>,
-  code: <><path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/></>,
-  terminal: <><path d="M4 6.5 7 9l-3 2.5"/><path d="M9 12h4"/><rect x="2.5" y="3" width="15" height="14" rx="2"/></>,
-  users: <><circle cx="9" cy="7" r="3"/><path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"/><circle cx="15" cy="7" r="3"/><path d="M19 21v-1.5a3 3 0 0 0-3-3h-1"/></>,
-  cpu: <><rect x="4" y="4" width="12" height="12" rx="2"/><rect x="8" y="8" width="4" height="4" rx="1"/><path d="M8 2v2"/><path d="M12 2v2"/><path d="M8 16v2"/><path d="M12 16v2"/><path d="M2 8h2"/><path d="M2 12h2"/><path d="M16 8h2"/><path d="M16 12h2"/></>,
-  database: <><ellipse cx="10" cy="4.5" rx="6" ry="2.5"/><path d="M4 4.5v11c0 1.4 2.7 2.5 6 2.5s6-1.1 6-2.5v-11"/><path d="M4 10c0 1.4 2.7 2.5 6 2.5s6-1.1 6-2.5"/></>,
-  cloud: <path d="M6.5 16h8a3.5 3.5 0 0 0 .4-7 5 5 0 0 0-9.6-1.5A4.3 4.3 0 0 0 6.5 16Z"/>,
-  clock: <><circle cx="10" cy="10" r="8"/><path d="M10 6v4l3 3"/></>,
-  zap: <path d="m13 2-7 9h5l-1 7 8-10h-5l0-6Z"/>,
-};
-
-function Icon({ name, className = '' }: { name: IconName; className?: string }) {
-  return <svg className={className} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{iconPaths[name]}</svg>;
-}
-
-/* ── Hero ─────────────────────────────────────────────────────────────────── */
-
-function Hero() {
+function Arrow({ diagonal = false }: { diagonal?: boolean }) {
   return (
-    <section className="hero-new" id="product">
-      <div className="hero-new-inner">
-        <div className="hero-new-copy">
-          <div className="hero-badge">Rust-native Unified Compute Engine</div>
-          <h1>One Rust engine for batch SQL and streaming pipelines</h1>
-          <p className="hero-lead">
-            Krishiv runs batch, streaming, and incremental workloads on one Apache Arrow / DataFusion runtime. Write SQL, Rust, or Python and deploy from embedded to distributed.
-          </p>
-          <div className="hero-actions">
-            <Link className="btn btn-primary" href="/docs/latest/getting-started">
-              Get Started <Icon name="arrow-right" />
-            </Link>
-            <Link className="btn btn-secondary" href="/docs/latest">
-              Documentation
-            </Link>
-            <a className="btn btn-secondary" href={githubUrl}>
-              <GithubIcon /> GitHub
-            </a>
-          </div>
-        </div>
-        <div className="hero-new-viz">
-          <HeroTerminal />
-        </div>
-      </div>
-    </section>
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      {diagonal ? <path d="M5 15 15 5m-7 0h7v7" /> : <path d="M4 10h12m-5-5 5 5-5 5" />}
+    </svg>
   );
 }
 
-function GithubIcon() {
-  return <svg viewBox="0 0 20 20" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M10 .9a9.1 9.1 0 0 0-2.9 17.7c.46.08.63-.2.63-.44v-1.6c-2.57.56-3.11-1.1-3.11-1.1-.42-1.07-1.03-1.03-1.03-1.03-.84-.58.06-.57.06-.57.93.07 1.42.96 1.42.96.83 1.41 2.18 1 2.71.77.08-.6.32-1 .59-1.23-2.05-.23-4.2-1.02-4.2-4.55 0-1 .36-1.83.95-2.47-.1-.24-.41-1.18.09-2.44 0 0 .78-.25 2.5.94A8.7 8.7 0 0 1 10 5.2c.77 0 1.54.1 2.27.3 1.72-1.19 2.5-.94 2.5-.94.5 1.26.19 2.2.1 2.44.59.64.94 1.46.94 2.47 0 3.54-2.16 4.31-4.21 4.54.33.29.63.85.63 1.72v2.55c0 .25.17.53.64.44A9.1 9.1 0 0 0 10 .9Z"/></svg>;
+function Github() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true" fill="currentColor">
+      <path d="M10 .9a9.1 9.1 0 0 0-2.9 17.7c.46.08.63-.2.63-.44v-1.6c-2.57.56-3.11-1.1-3.11-1.1-.42-1.07-1.03-1.35-1.03-1.35-.84-.58.06-.57.06-.57.93.07 1.42.96 1.42.96.83 1.41 2.18 1 2.71.77.08-.6.32-1 .59-1.23-2.05-.23-4.2-1.02-4.2-4.55 0-1 .36-1.83.95-2.47-.1-.24-.41-1.18.09-2.44 0 0 .78-.25 2.5.94A8.7 8.7 0 0 1 10 5.2c.77 0 1.54.1 2.27.3 1.72-1.19 2.5-.94 2.5-.94.5 1.26.19 2.2.1 2.44.59.64.94 1.46.94 2.47 0 3.54-2.16 4.31-4.21 4.54.33.29.63.85.63 1.72v2.55c0 .25.17.53.64.44A9.1 9.1 0 0 0 10 .9Z" />
+    </svg>
+  );
 }
 
-/* ── Hero terminal ────────────────────────────────────────────────────────── */
+function StatusPill({ children, muted = false }: { children: ReactNode; muted?: boolean }) {
+  return <span className={`mk-status${muted ? ' mk-status-muted' : ''}`}><i />{children}</span>;
+}
 
-function HeroTerminal() {
+function SystemMap() {
   return (
-    <div className="hero-terminal" aria-label="Krishiv quickstart in a terminal">
-      <div className="hero-terminal-bar" aria-hidden="true">
-        <i /><i /><i />
-        <span>python</span>
+    <div className="mk-system" aria-label="Krishiv product architecture">
+      <div className="mk-system-topline">
+        <span>One data system</span>
+        <span className="mk-live"><i /> Engine preview</span>
       </div>
-      <div className="hero-terminal-body">
-        <span className="t-line"><span className="t-prompt">$ </span><span className="t-cmd">pip install krishiv</span></span>
-        <span className="t-line"><span className="t-prompt">$ </span><span className="t-cmd">python</span></span>
-        <span className="t-line"><span className="t-prompt">&gt;&gt;&gt; </span><span className="t-kw">import</span><span className="t-cmd"> krishiv </span><span className="t-kw">as</span><span className="t-cmd"> ks</span></span>
-        <span className="t-line"><span className="t-prompt">&gt;&gt;&gt; </span><span className="t-cmd">session = ks.Session.embedded()</span></span>
-        <span className="t-line"><span className="t-prompt">&gt;&gt;&gt; </span><span className="t-cmd">session.sql(</span><span className="t-str">{'"""'}SELECT customer_id,</span></span>
-        <span className="t-line"><span className="t-str">...   SUM(amount) FROM orders</span></span>
-        <span className="t-line"><span className="t-str">...   GROUP BY customer_id{'"""'}</span><span className="t-cmd">).show()</span></span>
-        <span className="t-line t-out">┌─────────────┬─────────────┐</span>
-        <span className="t-line t-out">│ customer_id │ sum(amount) │</span>
-        <span className="t-line t-out">├─────────────┼─────────────┤</span>
-        <span className="t-line t-out">│         104 │     8421.50 │</span>
-        <span className="t-line t-out">│         117 │     6390.00 │</span>
-        <span className="t-line t-out">└─────────────┴─────────────┘</span>
-        <span className="t-line"><span className="t-dim"># same session runs streaming & incremental jobs</span></span>
+      <div className="mk-inputs" aria-label="Engine interfaces">
+        <span>SQL</span><span>Rust</span><span>Python</span><span>Flight</span>
+      </div>
+      <div className="mk-flow-line" aria-hidden="true"><i /><i /><i /></div>
+      <div className="mk-engine-node">
+        <div>
+          <small>Apache-2.0 compute layer</small>
+          <strong>Krishiv Engine</strong>
+        </div>
+        <span>Developer preview</span>
+      </div>
+      <div className="mk-primitives">
+        <span>Batch SQL</span>
+        <span>Streaming</span>
+        <span>Incremental</span>
+      </div>
+      <div className="mk-foundation">
+        <span>Arrow</span><b>+</b><span>DataFusion</span><b>+</b><span>Tokio</span>
+      </div>
+      <div className="mk-platform-node">
+        <div>
+          <small>Workspace + control plane</small>
+          <strong>Krishiv Platform</strong>
+        </div>
+        <span>Coming soon</span>
       </div>
     </div>
   );
 }
 
-/* ── Why Krishiv ──────────────────────────────────────────────────────────── */
-
-function WhyKrishiv() {
-  const problems = [
-    {
-      icon: 'zap' as IconName,
-      title: 'No separate engines',
-      desc: 'Batch and streaming run on the same code path. No Spark for batch, Flink for streaming, glue code in between.',
-    },
-    {
-      icon: 'delta' as IconName,
-      title: 'Incremental by default',
-      desc: 'DeltaBatch and IncrementalFlow maintain views incrementally. No full recomputation on every tick.',
-    },
-    {
-      icon: 'server' as IconName,
-      title: 'Embedded to distributed',
-      desc: 'One API. Start in-process, scale to a coordinator-plus-executors cluster. No rewrite when you outgrow your laptop.',
-    },
-  ];
-
-  return (
-    <section className="section-dark" aria-label="Why Krishiv exists">
-      <div className="section-container">
-        <p className="section-eyebrow">Why Krishiv</p>
-        <h2>The compute engine that does not make you choose</h2>
-        <p className="section-subtitle">
-          Most teams run separate systems for batch, streaming, and incremental work.
-          Krishiv eliminates the seams between them.
-        </p>
-        <div className="problems-grid">
-          {problems.map((p) => (
-            <article className="problem-card" key={p.title}>
-              <div className="problem-icon"><Icon name={p.icon} /></div>
-              <h3>{p.title}</h3>
-              <p>{p.desc}</p>
-            </article>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/* ── Code Examples ────────────────────────────────────────────────────────── */
-
-function CodeExamples() {
-  return (
-    <section className="section-light" aria-label="Code examples">
-      <div className="section-container">
-        <p className="section-eyebrow">Developer Experience</p>
-        <h2>Same workload. Three APIs. One engine.</h2>
-        <p className="section-subtitle">
-          Read data, run a query, get results. The exact same logic in SQL, Rust, and Python.
-        </p>
-        <div className="code-showcase">
-          <CodeTabs
-            tabs={[
-              {
-                id: 'sql',
-                label: 'SQL',
-                language: 'sql',
-                code: `-- Read Iceberg table, aggregate, write back
-SELECT
-  customer_id,
-  SUM(amount) AS total_spend,
-  COUNT(*) AS order_count
-FROM orders
-WHERE event_time >= NOW() - INTERVAL '1' DAY
-GROUP BY customer_id
-ORDER BY total_spend DESC
-LIMIT 10;`,
-              },
-              {
-                id: 'rust',
-                label: 'Rust',
-                language: 'rust',
-                code: `use krishiv_api::{Session, col, lit, sum, Result};
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let session = Session::embedded().await?;
-
-    let df = session
-        .read_iceberg("catalog", "orders").await?
-        .filter(col("event_time").gt(lit("2026-06-30")))?
-        .group_by(vec![col("customer_id")])?
-        .agg(vec![
-            sum(col("amount")).alias("total_spend"),
-            count(col("order_id")).alias("order_count"),
-        ])?
-        .sort(vec![col("total_spend").desc()])?
-        .limit(10);
-
-    df.show().await?;
-    Ok(())
-}`,
-              },
-              {
-                id: 'python',
-                label: 'Python',
-                language: 'python',
-                code: `import krishiv as ks
-from krishiv.functions import col, lit, sum, count
-
-session = ks.Session.embedded()
-
-df = (session.read_iceberg("catalog", "orders")
-        .filter(col("event_time") > lit("2026-06-30"))
-        .group_by(["customer_id"])
-        .agg([
-            sum(col("amount")).alias("total_spend"),
-            count(col("order_id")).alias("order_count"),
-        ])
-        .order_by(["total_spend"], ascending=False)
-        .limit(10))
-
-df.show()`,
-              },
-            ]}
-          />
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/* ── Comparison Table ─────────────────────────────────────────────────────── */
-
-function ComparisonTable() {
-  const features = [
-    { name: 'Batch SQL', k: true, s: true, f: true },
-    { name: 'Streaming', k: true, s: true, f: true },
-    { name: 'Incremental Processing', k: true, s: false, f: false },
-    { name: 'Rust API', k: true, s: false, f: false },
-    { name: 'Python API', k: true, s: true, f: true },
-    { name: 'SQL', k: true, s: true, f: true },
-    { name: 'Embedded Mode', k: true, s: false, f: false },
-    { name: 'Distributed Mode', k: true, s: true, f: true },
-    { name: 'Lakehouse Native (Iceberg)', k: true, s: true, f: false },
-    { name: 'Arrow Columnar Memory', k: true, s: false, f: false },
-    { name: 'Zero-Copy Between Operators', k: true, s: false, f: false },
-  ];
-
-  function Cell({ v }: { v: boolean }) {
-    return v
-      ? <td className="cmp-yes"><Icon name="check" /></td>
-      : <td className="cmp-no"><Icon name="minus" /></td>;
-  }
-
-  return (
-    <section className="section-dark" aria-label="Comparison">
-      <div className="section-container">
-        <p className="section-eyebrow">Comparison</p>
-        <h2>How Krishiv compares</h2>
-        <p className="section-subtitle">
-          Factual comparison with Apache Spark and Apache Flink. No marketing spin.
-        </p>
-        <div className="cmp-table-wrap">
-          <table className="cmp-table">
-            <thead>
-              <tr>
-                <th>Feature</th>
-                <th className="cmp-highlight">Krishiv</th>
-                <th>Spark</th>
-                <th>Flink</th>
-              </tr>
-            </thead>
-            <tbody>
-              {features.map((f) => (
-                <tr key={f.name}>
-                  <td className="cmp-feature">{f.name}</td>
-                  <Cell v={f.k} />
-                  <Cell v={f.s} />
-                  <Cell v={f.f} />
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/* ── Deployment Modes ─────────────────────────────────────────────────────── */
-
-function DeploymentModes() {
-  const modes = [
-    {
-      icon: 'terminal' as IconName,
-      title: 'Embedded',
-      tag: 'Available',
-      tagColor: 'green',
-      desc: 'Run in your process. No daemon, no cluster. Ideal for notebooks, scripts, tests, and libraries.',
-      code: 'Session::embedded().await?',
-    },
-    {
-      icon: 'server' as IconName,
-      title: 'Single Node',
-      tag: 'Available',
-      tagColor: 'green',
-      desc: 'Local daemon with RocksDB state, checkpoints, and Flight SQL endpoint. One host, durable.',
-      code: 'krishiv local start',
-    },
-    {
-      icon: 'cluster' as IconName,
-      title: 'Distributed',
-      tag: 'Preview',
-      tagColor: 'blue',
-      desc: 'Coordinator schedules across N executors. Shared object store. Scale when you need to.',
-      code: 'krishiv clusterd',
-    },
-  ];
-
-  return (
-    <section className="section-light" aria-label="Deployment modes">
-      <div className="section-container">
-        <p className="section-eyebrow">Deployment</p>
-        <h2>Start small. Scale when ready.</h2>
-        <p className="section-subtitle">
-          One API. One engine. Three deployment shapes. No rewrite needed.
-        </p>
-        <div className="deploy-cards">
-          {modes.map((m, i) => (
-            <article className="deploy-card" key={m.title}>
-              <div className="deploy-card-top">
-                <Icon name={m.icon} />
-                <span className={`badge badge-${m.tagColor}`}>{m.tag}</span>
-              </div>
-              <h3>{m.title}</h3>
-              <p>{m.desc}</p>
-              <code className="deploy-code">{m.code}</code>
-              {i < modes.length - 1 && <span className="deploy-arrow" aria-hidden="true">→</span>}
-            </article>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/* ── Ecosystem ────────────────────────────────────────────────────────────── */
-
-function Ecosystem() {
-  const items: Array<{ icon: IconName; name: string }> = [
-    { icon: 'arrow-icon', name: 'Apache Arrow' },
-    { icon: 'datafusion', name: 'DataFusion' },
-    { icon: 'iceberg', name: 'Apache Iceberg' },
-    { icon: 'kafka', name: 'Kafka' },
-    { icon: 'parquet', name: 'Parquet' },
-    { icon: 's3', name: 'S3 / ADLS / GCS' },
-    { icon: 'tokio', name: 'Tokio' },
-    { icon: 'shield', name: 'Apache 2.0' },
-  ];
-
-  return (
-    <section className="section-dark" aria-label="Ecosystem">
-      <div className="section-container">
-        <p className="section-eyebrow">Ecosystem</p>
-        <h2>Built on the open data stack</h2>
-        <div className="eco-grid">
-          {items.map((item) => (
-            <div className="eco-item" key={item.name}>
-              <Icon name={item.icon} />
-              <span>{item.name}</span>
-            </div>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/* ── Audience ─────────────────────────────────────────────────────────────── */
-
-function Audience() {
-  const roles = [
-    { icon: 'database' as IconName, title: 'Data Engineers', desc: 'Unified batch and streaming pipelines with exactly-once semantics.' },
-    { icon: 'cpu' as IconName, title: 'AI Engineers', desc: 'Feature pipelines, vector sinks, and incremental view maintenance for ML.' },
-    { icon: 'users' as IconName, title: 'ML Platform Teams', desc: 'Embedded compute for feature stores, training data, and online inference.' },
-    { icon: 'code' as IconName, title: 'Analytics Engineers', desc: 'SQL-first incremental views. Live dashboards without recomputation.' },
-    { icon: 'cloud' as IconName, title: 'Infrastructure Teams', desc: 'Rust-native, Kubernetes-ready, CRD-driven deployment.' },
-    { icon: 'shield' as IconName, title: 'SaaS Builders', desc: 'Embedded analytics engine. Add SQL to your product without a separate database.' },
-  ];
-
-  return (
-    <section className="section-light" aria-label="Who Krishiv is for">
-      <div className="section-container">
-        <p className="section-eyebrow">Who It Is For</p>
-        <h2>Built for the teams building the data stack</h2>
-        <div className="audience-grid">
-          {roles.map((r) => (
-            <article className="audience-card" key={r.title}>
-              <Icon name={r.icon} />
-              <h3>{r.title}</h3>
-              <p>{r.desc}</p>
-            </article>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/* ── FAQ ──────────────────────────────────────────────────────────────────── */
-
-const faqItems = [
+const workloadItems = [
   {
-    q: 'What is Krishiv?',
-    a: 'Krishiv is a Rust-native compute engine that unifies batch SQL, streaming pipelines, and incremental view maintenance under one Apache Arrow / DataFusion runtime. It runs as an embedded library, a single-node daemon, or a distributed coordinator-plus-executors cluster.',
+    number: '01',
+    title: 'Batch',
+    text: 'Plan DataFusion SQL over Arrow data in process or on one host, with an explicit distributed Preview path.',
+    detail: 'Finite input · Arrow results',
   },
   {
-    q: 'How does Krishiv compare to Apache Spark?',
-    a: 'Krishiv uses Apache Arrow as its in-memory data model (zero-copy between operators) and DataFusion for SQL planning, rather than Spark\'s JVM-based model. Krishiv runs natively in Rust with Tokio async, offering lower latency and smaller memory footprint. It supports embedded mode, single-node, and distributed deployment.',
+    number: '02',
+    title: 'Streaming',
+    text: 'Build event-time pipelines with windows, watermarks, stateful operators, and checkpoints.',
+    detail: 'Preview · Stateful',
   },
   {
-    q: 'How does Krishiv compare to Apache Flink?',
-    a: 'Krishiv unifies batch and streaming in one engine with shared Arrow batches and shared planning. It adds incremental view maintenance (DeltaBatch / IncrementalFlow) which Flink does not natively provide. Both support stateful processing, windowing, and exactly-once semantics.',
-  },
-  {
-    q: 'Is Krishiv production-ready?',
-    a: 'Batch SQL, the Rust/Python APIs, embedded and single-node modes, and Iceberg/Parquet connectors are Available. Distributed mode, Kafka, and checkpoint storage are Preview. Incremental view maintenance is Experimental. See the Feature Maturity page.',
-  },
-  {
-    q: 'How do I install Krishiv?',
-    a: 'Docker: docker pull ghcr.io/krishivai/krishiv:latest. Rust: krishiv = "0.1" on crates.io. Python: pip install krishiv. See the Getting Started guide for details.',
+    number: '03',
+    title: 'Incremental',
+    text: 'Maintain changing results with weighted inserts and retractions instead of recomputing everything.',
+    detail: 'Experimental · Delta-driven',
   },
 ];
 
-function FaqSection() {
-  const faqJsonLd = {
-    '@context': 'https://schema.org',
-    '@type': 'FAQPage',
-    mainEntity: faqItems.map((item) => ({
-      '@type': 'Question',
-      name: item.q,
-      acceptedAnswer: {
-        '@type': 'Answer',
-        text: item.a,
-      },
-    })),
-  };
-
-  return (
-    <section className="section-light" aria-label="Frequently Asked Questions">
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(faqJsonLd) }} />
-      <div className="section-container">
-        <p className="section-eyebrow">FAQ</p>
-        <h2>Frequently Asked Questions</h2>
-        <div className="faq-list">
-          {faqItems.map((item) => (
-            <details key={item.q} className="faq-item">
-              <summary>{item.q}</summary>
-              <p>{item.a}</p>
-            </details>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/* ── Final CTA ────────────────────────────────────────────────────────────── */
-
-function FinalCTA() {
-  return (
-    <section className="section-cta" aria-label="Get started">
-      <div className="section-container" style={{ textAlign: 'center' }}>
-        <h2>Ready to build?</h2>
-        <p className="section-subtitle" style={{ maxWidth: 520, margin: '0 auto 28px' }}>
-          Start with a single query. Scale to a cluster. No rewrite needed.
-        </p>
-        <div style={{ display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
-          <Link className="btn btn-primary btn-lg" href="/docs/latest/getting-started">
-            Get Started <Icon name="arrow-right" />
-          </Link>
-          <a className="btn btn-secondary btn-lg" href={githubUrl}>
-            <GithubIcon /> Star on GitHub
-          </a>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/* ── Page ─────────────────────────────────────────────────────────────────── */
-
-export default function Home() {
+export default function HomePage() {
   return (
     <SiteShell>
-      <main>
-        <Hero />
-        <WhyKrishiv />
-        <CodeExamples />
-        <ComparisonTable />
-        <DeploymentModes />
-        <Ecosystem />
-        <Audience />
-        <FaqSection />
-        <FinalCTA />
+      <main className="mk-page">
+        <section className="mk-hero">
+          <div className="mk-wrap mk-hero-grid">
+            <div className="mk-hero-copy">
+              <div className="mk-eyebrow"><i /> Rust-native data infrastructure</div>
+              <h1>One foundation for data that moves.</h1>
+              <p>
+                Krishiv Engine brings batch, streaming, and incremental compute into one
+                Rust-native runtime. Krishiv Platform will add the workspace around it.
+              </p>
+              <div className="mk-actions">
+                <Link className="mk-button mk-button-primary" href="/engine">
+                  Explore Engine <Arrow />
+                </Link>
+                <Link className="mk-button mk-button-secondary" href="/docs/engine">
+                  Read the docs
+                </Link>
+                <a className="mk-text-link" href={githubUrl}>
+                  <Github /> GitHub
+                </a>
+              </div>
+              <div className="mk-hero-note">
+                <StatusPill>Engine: open-source preview</StatusPill>
+                <StatusPill muted>Platform: coming soon</StatusPill>
+              </div>
+            </div>
+            <SystemMap />
+          </div>
+        </section>
+
+        <section className="mk-products" id="products">
+          <div className="mk-wrap">
+            <div className="mk-section-heading">
+              <div>
+                <p className="mk-kicker">The product family</p>
+                <h2>Start with compute. Add the control plane when you need it.</h2>
+              </div>
+              <p>
+                Engine stays useful on its own. Platform is a separate product built on
+                public Engine interfaces—not a requirement or a fork.
+              </p>
+            </div>
+            <div className="mk-product-grid">
+              <article className="mk-product-card mk-product-card-engine">
+                <div className="mk-product-card-top">
+                  <span className="mk-product-index">01 / Engine</span>
+                  <StatusPill>Open-source preview</StatusPill>
+                </div>
+                <h3>Own the compute layer.</h3>
+                <p>
+                  An Apache-2.0 Rust engine for teams that want one runtime boundary
+                  across batch SQL, streaming pipelines, and experimental incremental views.
+                </p>
+                <ul className="mk-check-list">
+                  <li>Apache Arrow data model</li>
+                  <li>DataFusion SQL planning</li>
+                  <li>Embedded and single-node paths</li>
+                  <li>Rust, Python, CLI, and service interfaces</li>
+                </ul>
+                <Link className="mk-card-link" href="/engine">Explore Krishiv Engine <Arrow diagonal /></Link>
+              </article>
+              <article className="mk-product-card mk-product-card-platform">
+                <div className="mk-product-card-top">
+                  <span className="mk-product-index">02 / Platform</span>
+                  <StatusPill muted>Coming soon</StatusPill>
+                </div>
+                <h3>Bring the team around it.</h3>
+                <p>
+                  An upcoming self-hosted, source-available workspace for SQL,
+                  Iceberg, pipelines, jobs, governance, operations, and governed MCP.
+                </p>
+                <ul className="mk-check-list">
+                  <li>Integrated SQL workspace</li>
+                  <li>Catalog and governance</li>
+                  <li>Pipeline and job orchestration</li>
+                  <li>One console, API, CLI, and MCP boundary</li>
+                </ul>
+                <Link className="mk-card-link" href="/platform">Preview the direction <Arrow diagonal /></Link>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section className="mk-workloads">
+          <div className="mk-wrap">
+            <div className="mk-section-heading mk-section-heading-compact">
+              <div>
+                <p className="mk-kicker">One execution spine</p>
+                <h2>Different workload shapes. Shared primitives.</h2>
+              </div>
+            </div>
+            <div className="mk-workload-list">
+              {workloadItems.map((item) => (
+                <article key={item.title} className="mk-workload-row">
+                  <span>{item.number}</span>
+                  <h3>{item.title}</h3>
+                  <p>{item.text}</p>
+                  <small>{item.detail}</small>
+                </article>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        <section className="mk-continuity">
+          <div className="mk-wrap mk-continuity-grid">
+            <div>
+              <p className="mk-kicker">Local-to-remote continuity</p>
+              <h2>Change placement, not your mental model.</h2>
+              <p className="mk-section-copy">
+                Start in process. Exercise service boundaries on one node. Move to an
+                explicit remote coordinator when the distributed path fits your evaluation.
+              </p>
+              <Link className="mk-button mk-button-secondary" href="/docs/engine/concepts/execution-modes">
+                Compare execution modes <Arrow />
+              </Link>
+            </div>
+            <ol className="mk-mode-list">
+              <li><span>01</span><div><strong>Embedded</strong><p>Planner and execution live inside your process.</p></div><b>Available</b></li>
+              <li><span>02</span><div><strong>Single node</strong><p>Coordinator, executor, and services on one host.</p></div><b>Available</b></li>
+              <li><span>03</span><div><strong>Distributed</strong><p>Explicit remote coordination and workers.</p></div><b>Preview</b></li>
+            </ol>
+          </div>
+        </section>
+
+        <section className="mk-cta">
+          <div className="mk-wrap mk-cta-inner">
+            <div>
+              <p className="mk-kicker">Build from the source of truth</p>
+              <h2>Evaluate the Engine with honest maturity labels.</h2>
+              <p>Every public doc distinguishes available paths, previews, experiments, and work still in progress.</p>
+            </div>
+            <div className="mk-actions">
+              <Link className="mk-button mk-button-primary" href="/docs/engine/getting-started">Get started <Arrow /></Link>
+              <Link className="mk-button mk-button-secondary" href="/docs/engine/maturity">Feature maturity</Link>
+            </div>
+          </div>
+        </section>
       </main>
     </SiteShell>
   );

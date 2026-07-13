@@ -1,0 +1,40 @@
+---
+title: Krishiv Platform
+description: The upcoming source-available, self-hosted control plane and workspace for Krishiv Engine.
+status: coming-soon
+---
+
+<Callout type="info" title="Coming soon">
+  Krishiv Platform is not available yet. This page reserves its documentation
+  home; installation, preview, and production guidance will arrive only when a
+  supported release is available.
+</Callout>
+
+Krishiv Platform is being developed as the workspace and control layer around
+Krishiv Engine. Engine remains the compute layer for batch SQL, streaming, and
+incremental view maintenance. Platform is intended to bring the surrounding
+catalog, orchestration, governance, and operator experience into one place.
+
+## Planned scope
+
+- A web workspace for SQL, query history, and Iceberg catalog administration.
+- Declarative data pipelines and scheduled SQL, Rust, and Python jobs.
+- Team access controls, audit history, and governed MCP access.
+- API and CLI surfaces for self-hosted operation around Krishiv Engine.
+
+Krishiv Platform is source-available under the Business Source License 1.1 and
+is intended for self-hosting. It is a separate product from the Apache-2.0
+licensed Krishiv Engine.
+
+<Cards>
+  <Card
+    title="Platform overview"
+    description="See the product direction and current availability status."
+    href="/platform"
+  />
+  <Card
+    title="Engine documentation"
+    description="Read the current documentation for the Krishiv compute engine."
+    href="/docs/engine"
+  />
+</Cards>

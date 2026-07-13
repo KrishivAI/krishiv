@@ -1,0 +1,47 @@
+---
+title: Incremental processing
+description: Maintain results from weighted inserts and retractions instead of full recomputation.
+status: experimental
+---
+
+Incremental processing represents change as weighted Arrow rows. Positive
+weights insert values; negative weights retract values. Operators propagate
+those deltas so a materialized result can be updated without reading the entire
+source again.
+
+## DeltaBatch
+
+`DeltaBatch` pairs an Arrow batch with row weights. It is the exchange type for
+incremental operators and can represent inserts, deletes, and updates expressed
+as a retraction plus an insertion.
+
+## IncrementalFlow
+
+`IncrementalFlow` registers sources and views, accepts deltas, advances the graph
+with `step`, and exposes view changes or snapshots. Partitioning and checkpoint
+hooks exist in the current API.
+
+```text
+source delta
+     │
+     ▼
+incremental operators ──► view delta
+     │
+     └──────────────────► materialized snapshot
+```
+
+## Where it fits
+
+Use incremental computation when inputs arrive as changes and the maintained
+result is much smaller than a full recomputation. It is not automatically better
+for every query: unsupported operators, high retraction rates, or large state can
+erase the advantage.
+
+<Callout type="warn" title="Experimental and local-first">
+  Incremental APIs can change. Distributed executor-side IVM is not a complete
+  product contract, so validate locally and pin a commit before building on it.
+</Callout>
+
+Do not confuse Engine IVM primitives with Krishiv Platform availability. Platform
+is a separate, upcoming product that will orchestrate Engine capabilities through
+public interfaces.

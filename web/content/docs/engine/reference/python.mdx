@@ -1,0 +1,120 @@
+---
+title: Python API
+description: Build the PyO3 extension from source and query Engine through synchronous Python objects.
+status: preview
+---
+
+The `krishiv` Python extension wraps the public Engine APIs with PyO3. Build it
+from a pinned source checkout; these docs do not assume a stable PyPI package.
+
+<Steps>
+  <Step>
+
+### Create an environment
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install maturin
+```
+
+  </Step>
+  <Step>
+
+### Build the extension
+
+```bash
+maturin develop --manifest-path crates/krishiv-python/Cargo.toml
+```
+
+Run this command from the Engine repository root.
+
+  </Step>
+  <Step>
+
+### Run a query
+
+```python
+import krishiv as ks
+
+session = ks.Session.embedded()
+session.sql("SELECT 42 AS answer").show()
+```
+
+  </Step>
+</Steps>
+
+## Session constructors
+
+| Constructor | Placement |
+| --- | --- |
+| `Session()` | Default embedded session. |
+| `Session.embedded()` | Explicit embedded session. |
+| `Session.local()` | Alias for embedded execution; it does **not** connect to a daemon. |
+| `Session.single_node(url)` | Connect to an existing single-node Flight service. |
+| `Session.connect(url)` | Connect to a remote coordinator. |
+| `Session.from_env()` | Read mode and endpoint configuration from the environment. |
+
+## DataFrames and results
+
+```python
+df = session.read_parquet("./events.parquet")
+result = (
+    df.filter("amount > 100")
+      .select(["customer_id", "amount"])
+      .collect()
+)
+
+print(result.row_count)
+print(result.pretty())
+```
+
+Common actions include `collect()`, `show()`, `explain()`, and
+`write_parquet(path)`. `QueryResult.batches()` returns Engine `Batch` objects;
+`to_arrow()` and `to_pandas()` require PyArrow and pandas respectively.
+
+## Register PyArrow data
+
+```bash
+python -m pip install pyarrow
+```
+
+```python
+import pyarrow as pa
+import krishiv as ks
+
+session = ks.Session.embedded()
+arrow_batch = pa.record_batch({
+    "region": ["eu", "us", "eu"],
+    "amount": [10, 25, 5],
+})
+
+session.register_record_batches("orders", [ks.Batch(arrow_batch)])
+session.sql("""
+    SELECT region, SUM(amount) AS total
+    FROM orders
+    GROUP BY region
+    ORDER BY region
+""").show()
+```
+
+## Files and catalog entries
+
+```python
+session.register_parquet("events", "./events.parquet")
+session.sql("SELECT COUNT(*) AS n FROM events").show()
+
+csv_df = session.read_csv("./events.csv")
+json_df = session.read_json("./events.ndjson")
+```
+
+Connector availability is fixed at build time. The current native extension
+enables several families in its dependency declaration and adds others through
+Python-crate Cargo features. An importable class does not by itself establish
+an end-to-end delivery guarantee.
+
+<Callout type="warn" title="Preview bindings">
+  Python follows the Rust API where practical, but names, signatures, and
+  behavior can change before 1.0. Pin the Engine commit and rebuild the
+  extension when upgrading.
+</Callout>

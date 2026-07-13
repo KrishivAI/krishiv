@@ -136,3 +136,102 @@
   border-radius: 4px;
   font-size: 12px;
 }
+
+/* Fumadocs product-aware docs theme */
+.dark {
+  --color-fd-background: #050505;
+  --color-fd-foreground: #efeff1;
+  --color-fd-muted: #111113;
+  --color-fd-muted-foreground: #9d9da8;
+  --color-fd-popover: #0e0e10;
+  --color-fd-popover-foreground: #efeff1;
+  --color-fd-card: #0e0e10;
+  --color-fd-card-foreground: #efeff1;
+  --color-fd-border: rgba(255,255,255,.1);
+  --color-fd-primary: #ff8a2a;
+  --color-fd-primary-foreground: #080808;
+  --color-fd-secondary: #18181b;
+  --color-fd-secondary-foreground: #efeff1;
+  --color-fd-accent: rgba(255,138,42,.11);
+  --color-fd-accent-foreground: #ffc08f;
+  --color-fd-ring: #ff8a2a;
+}
+
+#nd-docs-layout {
+  --fd-layout-width: 1540px;
+  background: var(--color-fd-background);
+}
+
+.docs-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  font-weight: 680;
+  letter-spacing: -.035em;
+}
+
+.docs-brand img { border-radius: 8px; }
+
+.docs-brand-label {
+  margin-left: 2px;
+  padding-left: 10px;
+  border-left: 1px solid var(--color-fd-border);
+  color: var(--color-fd-muted-foreground);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.docs-page-kicker {
+  min-height: 26px;
+  margin-bottom: 14px;
+}
+
+.docs-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 9px;
+  border: 1px solid rgba(255,138,42,.28);
+  border-radius: 999px;
+  background: rgba(255,138,42,.08);
+  color: #ffc08f;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .055em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.docs-status > span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.docs-status-preview,
+.docs-status-in-progress {
+  border-color: rgba(88,166,218,.3);
+  background: rgba(88,166,218,.08);
+  color: #82bde4;
+}
+
+.docs-status-experimental {
+  border-color: rgba(167,139,217,.3);
+  background: rgba(167,139,217,.08);
+  color: #b8a3df;
+}
+
+.docs-status-coming-soon {
+  border-color: var(--color-fd-border);
+  background: var(--color-fd-muted);
+  color: var(--color-fd-muted-foreground);
+}
+
+#nd-page h1 { letter-spacing: -.045em; }
+#nd-page h2 { letter-spacing: -.025em; }
+
+@media (max-width: 640px) {
+  .docs-brand-label { display: none; }
+}

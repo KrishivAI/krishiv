@@ -2,16 +2,17 @@ import type { Metadata } from 'next';
 import type { ReactNode } from 'react';
 import './global.css';
 import './docs.css';
+import { Providers } from '@/components/Providers';
 
 const siteUrl = 'https://krishiv.ai';
 const siteName = 'Krishiv';
 const defaultDescription =
-  'Krishiv is a Rust-native compute engine for batch SQL, streaming pipelines, and incremental view maintenance. Apache Arrow data model, DataFusion SQL, embedded to distributed.';
+  'Krishiv builds Rust-native data infrastructure: an Apache-2.0 compute engine available in developer preview, with an integrated self-hosted platform coming soon.';
 
 export const metadata: Metadata = {
   metadataBase: new URL(siteUrl),
   title: {
-    default: `${siteName} — Rust-native batch, streaming & incremental compute`,
+    default: `${siteName} — Engine developer preview. Platform coming soon.`,
     template: `%s | ${siteName}`,
   },
   description: defaultDescription,
@@ -22,16 +23,13 @@ export const metadata: Metadata = {
     'incremental processing',
     'Apache Arrow',
     'DataFusion',
-    'lakehouse engine',
-    'Iceberg compute',
-    'distributed SQL',
+    'stateful streaming',
+    'incremental view maintenance',
     'stream processing',
     'Rust DataFrame',
     'Python DataFrame',
     'data pipeline engine',
-    'analytics engine',
-    'Spark alternative',
-    'Flink alternative',
+    'self-hosted data platform',
   ],
   authors: [{ name: 'KrishivAI', url: siteUrl }],
   creator: 'KrishivAI',
@@ -46,22 +44,13 @@ export const metadata: Metadata = {
     locale: 'en_US',
     url: siteUrl,
     siteName,
-    title: `${siteName} — Rust-native batch, streaming & incremental compute`,
+    title: `${siteName} — Engine developer preview. Platform coming soon.`,
     description: defaultDescription,
-    images: [
-      {
-        url: '/brand/og-image.png',
-        width: 1200,
-        height: 630,
-        alt: `${siteName} — Rust-native compute engine`,
-      },
-    ],
   },
   twitter: {
-    card: 'summary_large_image',
-    title: `${siteName} — Rust-native batch, streaming & incremental compute`,
+    card: 'summary',
+    title: `${siteName} — Engine developer preview. Platform coming soon.`,
     description: defaultDescription,
-    images: ['/brand/og-image.png'],
     creator: '@krishivai',
   },
   robots: {
@@ -117,54 +106,44 @@ const websiteJsonLd = {
     name: siteName,
     logo: `${siteUrl}/brand/logo-mark.svg`,
   },
-  potentialAction: {
-    '@type': 'SearchAction',
-    target: {
-      '@type': 'EntryPoint',
-      urlTemplate: `${siteUrl}/docs/latest?q={search_term_string}`,
-    },
-    'query-input': 'required name=search_term_string',
-  },
 };
 
 const softwareJsonLd = {
   '@context': 'https://schema.org',
   '@type': 'SoftwareApplication',
-  name: siteName,
-  description: defaultDescription,
-  url: siteUrl,
+  name: 'Krishiv Engine',
+  description:
+    'Apache-2.0, Rust-native compute for batch SQL and preview stateful streaming, with experimental incremental view maintenance.',
+  url: `${siteUrl}/engine`,
   applicationCategory: 'DeveloperApplication',
-  operatingSystem: 'Linux, macOS, Windows',
+  operatingSystem: 'Linux, macOS',
   offers: {
     '@type': 'Offer',
     price: '0',
     priceCurrency: 'USD',
   },
-  softwareVersion: '0.1.0',
+  softwareVersion: 'Developer preview',
   programmingLanguage: ['Rust', 'Python'],
-  runtimePlatform: 'Linux, macOS, Windows',
-  downloadUrl: 'https://github.com/KrishivAI/krishiv/releases',
-  installUrl: `${siteUrl}/docs/latest/getting-started`,
-  screenshot: `${siteUrl}/brand/og-image.png`,
+  downloadUrl: 'https://github.com/KrishivAI/krishiv',
+  installUrl: `${siteUrl}/docs/engine/getting-started`,
   featureList: [
     'Batch SQL execution',
-    'Streaming pipelines',
-    'Incremental view maintenance',
-    'Apache Arrow columnar memory',
-    'DataFusion SQL engine',
-    'Apache Iceberg lakehouse',
-    'Embedded, single-node, and distributed modes',
+    'Preview stateful streaming',
+    'Experimental incremental view maintenance',
+    'Apache Arrow data model',
+    'DataFusion SQL planning and local execution',
+    'Embedded and single-node execution',
+    'Preview distributed execution',
     'Python and Rust APIs',
-    'Kafka, Parquet, S3 connectors',
   ],
-  keywords: 'Rust, compute engine, SQL, streaming, batch, Arrow, DataFusion, Iceberg, lakehouse',
+  keywords: 'Rust, compute engine, SQL, streaming, batch, Arrow, DataFusion',
   license: 'https://github.com/KrishivAI/krishiv/blob/main/LICENSE',
   codeRepository: 'https://github.com/KrishivAI/krishiv',
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en">
+    <html lang="en" className="dark" suppressHydrationWarning>
       <head>
         <link rel="preconnect" href="https://github.com" crossOrigin="anonymous" />
         <link rel="dns-prefetch" href="https://github.com" />
@@ -182,7 +161,9 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           dangerouslySetInnerHTML={{ __html: JSON.stringify(softwareJsonLd) }}
         />
       </head>
-      <body>{children}</body>
+      <body className="flex min-h-screen flex-col">
+        <Providers>{children}</Providers>
+      </body>
     </html>
   );
 }

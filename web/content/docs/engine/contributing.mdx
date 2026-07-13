@@ -1,0 +1,48 @@
+---
+title: Contributing
+description: Make focused Engine changes while preserving public contracts and maturity truth.
+status: available
+---
+
+Krishiv Engine is Apache-2.0 and developed in the open. Start with the repository's
+`CONTRIBUTING.md` and local agent instructions before editing code.
+
+## Development loop
+
+```bash
+git clone https://github.com/KrishivAI/krishiv.git
+cd krishiv
+cargo fmt --all --check
+cargo check --workspace
+cargo test --workspace --exclude krishiv-python
+```
+
+Use the narrowest relevant crate test while iterating, then run the repository's
+required workspace checks before opening a pull request.
+
+## Preserve boundaries
+
+- Add user-facing behavior through public Engine APIs and protocols.
+- Keep control-plane and data-plane ownership explicit.
+- Do not make a remote runtime silently execute locally.
+- Version serialized plans, state, metadata, and wire contracts.
+- Update maturity labels only with end-to-end evidence.
+
+## Documentation changes
+
+Public docs should be built from current APIs, CLI help, normative contracts,
+examples, and tests. Implementation plans and session logs are research inputs,
+not user-facing promises.
+
+When adding a doc page:
+
+1. place it in `web/content/docs/engine`;
+2. add it to the nearest `meta.json`;
+3. give it a `status` frontmatter label;
+4. use Fumadocs Callouts, Cards, Steps, and Tabs rather than raw HTML;
+5. verify source generation, types, links, and the static build.
+
+<Cards>
+  <Card title="Engine repository" href="https://github.com/KrishivAI/krishiv" external />
+  <Card title="Feature maturity" href="/docs/engine/maturity" />
+</Cards>

@@ -2,14 +2,12 @@ import Image from 'next/image';
 import Link from 'next/link';
 import type { ReactNode } from 'react';
 import { githubUrl } from '@/lib/site';
-import { SearchButton } from '@/components/Search';
 
 export const navItems = [
-  { label: 'Product', href: '/#product' },
-  { label: 'Documentation', href: '/docs/latest' },
-  { label: 'Examples', href: '/docs/latest/recipes' },
+  { label: 'Engine', href: '/engine' },
+  { label: 'Platform', href: '/platform' },
+  { label: 'Docs', href: '/docs/engine' },
   { label: 'Blog', href: '/blog' },
-  { label: 'Roadmap', href: '/product/maturity' },
 ];
 
 export function BrandLogo({ compact = false }: { compact?: boolean }) {
@@ -43,16 +41,15 @@ export function Header() {
         {navItems.map((item) => <Link key={item.href} href={item.href}>{item.label}</Link>)}
       </nav>
       <div className="nav-actions">
-        <SearchButton/>
         <a className="icon-link" href={githubUrl} aria-label="GitHub"><GithubIcon/></a>
-        <Link className="btn btn-primary small" href="/docs/latest/getting-started">Get Started</Link>
+        <Link className="btn btn-primary small" href="/docs/engine/getting-started">Get started</Link>
       </div>
       <details className="mobile-menu">
         <summary aria-label="Open menu"><span/><span/><span/></summary>
         <div>
           {navItems.map((item) => <Link key={item.href} href={item.href}>{item.label}</Link>)}
           <a href={githubUrl}>GitHub</a>
-          <Link className="btn btn-primary small" href="/docs/latest/getting-started">Get Started</Link>
+          <Link className="btn btn-primary small" href="/docs/engine/getting-started">Get started</Link>
         </div>
       </details>
     </header>
@@ -65,24 +62,23 @@ export function Footer() {
       <div className="footer-grid">
         <div className="footer-brand">
           <strong>Krishiv</strong>
-          <p>Rust-native compute for batch SQL, streaming pipelines, and incremental processing. Apache&nbsp;Arrow · DataFusion · Tokio.</p>
-          <p className="footer-facts">Open source · Apache 2.0 · Rust native · no JVM</p>
+          <p>Data systems with one path from open compute to an integrated workspace.</p>
+          <p className="footer-facts">Engine: Apache 2.0 · Platform: coming soon</p>
         </div>
         <div className="footer-col">
-          <h4>Product</h4>
-          <Link href="/#product">Overview</Link>
+          <h4>Products</h4>
+          <Link href="/engine">Krishiv Engine</Link>
+          <Link href="/platform">Krishiv Platform</Link>
           <Link href="/architecture">Architecture</Link>
           <Link href="/product/maturity">Feature Maturity</Link>
-          <Link href="/docs/latest/recipes">Examples</Link>
-          <a href={`${githubUrl}/releases`}>Releases</a>
         </div>
         <div className="footer-col">
           <h4>Developers</h4>
-          <Link href="/docs/latest">Documentation</Link>
-          <Link href="/docs/latest/getting-started">Getting Started</Link>
-          <Link href="/docs/latest/python">Python API</Link>
-          <Link href="/docs/latest/rust">Rust API</Link>
-          <Link href="/docs/latest/sql">SQL Reference</Link>
+          <Link href="/docs/engine">Engine docs</Link>
+          <Link href="/docs/engine/getting-started">Getting started</Link>
+          <Link href="/docs/engine/reference/python">Python API</Link>
+          <Link href="/docs/engine/reference/rust">Rust API</Link>
+          <Link href="/docs/engine/reference/sql">SQL reference</Link>
         </div>
         <div className="footer-col">
           <h4>Community</h4>
@@ -94,7 +90,7 @@ export function Footer() {
         </div>
         <div className="footer-col">
           <h4>Resources</h4>
-          <Link href="/release-notes">Release Notes</Link>
+          <Link href="/release-notes">Development releases</Link>
           <a href={`${githubUrl}/blob/main/LICENSE`}>License</a>
           <a href={`${githubUrl}/blob/main/SECURITY.md`}>Security</a>
           <a href="/feed.xml" type="application/rss+xml">RSS</a>
@@ -102,9 +98,9 @@ export function Footer() {
         </div>
       </div>
       <div className="footer-bottom">
-        <span>&copy; {new Date().getFullYear()} KrishivAI. Apache License 2.0.</span>
+        <span>&copy; {new Date().getFullYear()} KrishivAI.</span>
         <div className="footer-links-bottom">
-          <Link href="/docs/latest">Docs</Link>
+          <Link href="/docs/engine">Docs</Link>
           <Link href="/architecture">Architecture</Link>
           <a href={githubUrl}>GitHub</a>
         </div>

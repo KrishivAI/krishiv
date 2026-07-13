@@ -1,0 +1,121 @@
+---
+title: CLI reference
+description: Run SQL, inspect plans, and manage local Engine processes from a source checkout.
+status: available
+---
+
+The `krishiv` binary is the command-line front door for queries, local
+development, and daemon operations. Krishiv is pre-release, so the commands
+below run the binary from a source checkout rather than assuming a published
+package is available.
+
+<Steps>
+  <Step>
+
+### Build and inspect the command surface
+
+```bash
+cargo build -p krishiv
+cargo run -p krishiv -- --help
+```
+
+  </Step>
+  <Step>
+
+### Run an embedded query
+
+```bash
+cargo run -p krishiv -- sql --query "SELECT 42 AS answer"
+```
+
+  </Step>
+</Steps>
+
+## Core commands
+
+| Command | Purpose |
+| --- | --- |
+| `sql` | Plan and run SQL. Embedded mode is the default. |
+| `explain` | Show logical and physical plan information. |
+| `table` | Work with Parquet and optional lakehouse table paths. |
+| `stream` | Register, push to, and poll continuous stream jobs. |
+| `ivm` | Operate experimental incremental-view jobs. |
+| `pipeline` | Work with declarative source-to-sink pipelines. |
+| `doctor` | Print the effective deployment configuration. |
+| `local` | Start, inspect, or stop a single-host development cluster. |
+| `cluster` | Operate a process-managed distributed topology. |
+| `state`, `checkpoints`, `savepoint`, `restore` | Inspect and control stateful jobs. |
+
+Use `cargo run -p krishiv -- <command> --help` for the options compiled into
+your checkout.
+
+## SQL options
+
+```text
+krishiv sql --query <SQL> [OPTIONS]
+
+-q, --query <SQL>       SQL statement or semicolon-separated statements
+--mode <MODE>           embedded, single-node, or distributed
+--parquet <NAME=PATH>   register a local Parquet file; repeatable
+--local                 force the local execution entry point
+--remote                use the configured remote coordinator
+--timeout <SECONDS>     accepted for forward compatibility; not yet enforced
+--api-key <KEY>         use the policy-enforced SQL entry point
+```
+
+For `sql`, the top-level `-c, --coordinator <URL>` option overrides the
+canonical `KRISHIV_COORDINATOR_URL` setting. The `explain` dispatcher does not
+currently receive that top-level override; set `KRISHIV_COORDINATOR_URL` if you
+deliberately inspect a remote plan. A parsed `--timeout` does not currently
+cancel work, so do not use it as an operational safeguard.
+
+<Tabs items={["Parquet", "Multi-statement", "Remote"]}>
+  <Tab value="Parquet">
+
+```bash
+cargo run -p krishiv -- sql \
+  --parquet events=./events.parquet \
+  --query "SELECT kind, COUNT(*) AS n FROM events GROUP BY kind"
+```
+
+The registration exists only for this process.
+
+  </Tab>
+  <Tab value="Multi-statement">
+
+```bash
+cargo run -p krishiv -- sql --query \
+  "CREATE TABLE t AS SELECT 1 AS id; SELECT * FROM t"
+```
+
+Earlier statements run for side effects. Only the last result is printed.
+
+  </Tab>
+  <Tab value="Remote">
+
+```bash
+cargo run -p krishiv -- \
+  --coordinator http://127.0.0.1:2003 \
+  sql --remote --query "SELECT 42 AS answer"
+```
+
+The endpoint must already expose a compatible Engine service.
+
+  </Tab>
+</Tabs>
+
+## Local development cluster
+
+```bash
+cargo run -p krishiv -- local start --data-dir /tmp/krishiv-local
+cargo run -p krishiv -- local status --data-dir /tmp/krishiv-local
+cargo run -p krishiv -- local stop --data-dir /tmp/krishiv-local
+```
+
+<Callout type="warn" title="CLI process lifetime">
+  In-process job and catalog state does not survive a CLI invocation. Use a
+  long-lived session or coordinator-backed lifecycle for persistent jobs.
+</Callout>
+
+The CLI and its configuration are preview APIs. Pin a commit when automating
+commands, and check command help again when upgrading.

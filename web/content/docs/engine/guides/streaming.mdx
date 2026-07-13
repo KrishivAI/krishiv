@@ -1,0 +1,67 @@
+---
+title: Build a windowed stream
+description: Create a bounded memory stream and apply event-time session windows in Python.
+status: preview
+---
+
+This source-built Python example follows the current `Session` API. It uses a
+bounded in-memory input so you can inspect event-time behavior without operating
+a broker or a durable coordinator.
+
+## Prepare the Python extension
+
+Follow [Installation](/docs/engine/installation), then install PyArrow in the
+same environment used to build the extension.
+
+## Create windowed data
+
+```python
+import pyarrow as pa
+import krishiv as ks
+
+session = ks.Session.from_env()
+
+batch = pa.RecordBatch.from_pydict({
+    "timestamp": [1000, 5000, 8000, 20000],
+    "user_id": ["alice", "alice", "alice", "alice"],
+})
+
+stream = session.memory_stream(
+    "clicks",
+    [ks.Batch(batch)],
+    watermark_column="timestamp",
+    max_lateness_ms=2000,
+)
+
+windowed = (
+    stream
+    .key_by("user_id")
+    .window(ks.windows.session(10000))
+)
+
+for result in windowed.collect():
+    print(result.to_arrow())
+```
+
+The 10-second inactivity gap separates the final event from the earlier session.
+The watermark setting bounds how late event-time data is expected to arrive.
+
+## Move to a continuous lifecycle
+
+A continuous job should live in one long-running session or behind a coordinator.
+The Engine API exposes job submission, input push, result poll, status, and
+checkpoint surfaces.
+
+<Callout type="warn" title="Preview semantics">
+  Stateful streaming exists, but recovery and delivery certification are still
+  connector- and topology-specific. Test process loss, checkpoint restore, late
+  data, and sink commits for your exact pipeline.
+</Callout>
+
+## Design checklist
+
+- Choose a stable event-time column and unit.
+- Define an explicit lateness policy.
+- Bound keyed state with windows, TTL, or both.
+- Size checkpoint intervals against recovery time and sink cost.
+- Do not claim exactly-once behavior without a certified end-to-end combination.

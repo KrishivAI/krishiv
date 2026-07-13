@@ -1,0 +1,49 @@
+---
+title: Distributed deployment
+description: Evaluate explicit coordinator/executor placement and understand the current limits.
+status: preview
+---
+
+Distributed mode separates clients, coordination, and data-plane workers. It is a
+Preview: transport and deployment assets exist, while operational certification
+and full-plan scale-out coverage continue.
+
+## Topology
+
+```text
+client
+  │ Flight SQL / control API
+  ▼
+cluster control plane
+  │ task assignments + barriers
+  ├──────────────┐
+  ▼              ▼
+executor A   executor B
+  └──── shuffle ─┘
+```
+
+## Required properties
+
+- The client has an explicit coordinator endpoint.
+- Executors advertise routable task, barrier, and shuffle endpoints.
+- Coordinator and executor control traffic is authenticated outside dev-local.
+- Metadata, state, checkpoints, and shuffle use storage matching the durability profile.
+- Every enabled connector is configured on the process that owns its data movement.
+
+## Plan coverage
+
+Supported batch plans can be partitioned and shuffled across executors.
+Unsupported plans take conservative paths; do not assume every query scales out.
+Inspect plans and executor metrics for the workload you test.
+
+## Kubernetes
+
+Kubernetes manifests and operator/CRD code exist under `deploy/k8s`. They are
+implementation assets, not a production support statement. Pin images and CRDs,
+test upgrades, and verify advertised pod addresses and persistent storage.
+
+<Callout type="warn" title="Preview only">
+  Do not use “highly available,” “production-ready,” or “exactly-once” as blanket
+  descriptions of this topology. Validate failover and recovery against explicit
+  acceptance criteria.
+</Callout>

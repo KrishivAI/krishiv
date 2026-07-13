@@ -1,0 +1,48 @@
+---
+title: Maintain an incremental view
+description: Run the experimental IVM CLI over change files and materialize a net result.
+status: experimental
+---
+
+The `ivm` command drives an incremental view from one or more change sources.
+It can run embedded or against a configured coordinator.
+
+## Run a local view
+
+```bash
+krishiv ivm run \
+  --job-id sales-by-key \
+  --sql "SELECT k, SUM(v) AS total FROM changes GROUP BY k" \
+  --source changes=./changes.csv \
+  --source-format csv \
+  --sink ./sales-by-key.ndjson \
+  --sink-format json
+```
+
+This ordinary CSV input is treated as an insert delta. CDC-aware readers can
+also carry update and delete row kinds; do not infer those semantics from a CSV
+file alone. The output file contains the net materialized result for the view.
+
+## Remote coordinator
+
+```bash
+krishiv -c http://127.0.0.1:2002 ivm run \
+  --job-id sales-by-key \
+  --sql "SELECT k, SUM(v) AS total FROM changes GROUP BY k" \
+  --source changes=./changes.csv \
+  --sink ./sales-by-key.ndjson
+```
+
+Remote IVM paths exist, but distributed executor behavior is not a stable product
+contract. Keep the evaluation local unless you are testing that boundary itself.
+
+## Expect visible fallback
+
+Some plans can propagate deltas operator by operator. Other plans fall back to
+recomputation. Treat fallback as a correctness path, then measure whether it
+still meets the workload goal.
+
+<Callout type="warn" title="Experimental API">
+  Pin the Engine commit and retain input data that can rebuild the view. Operator
+  support, checkpoint metadata, and public APIs may change before a stable release.
+</Callout>

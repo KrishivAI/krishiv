@@ -1,0 +1,42 @@
+---
+title: Batch execution
+description: Understand how finite inputs become planned tasks and Arrow results.
+status: available
+---
+
+A batch query consumes finite inputs and produces a finite result. Krishiv uses
+DataFusion for SQL planning and Arrow batches for data exchange.
+
+## Lifecycle
+
+1. A session registers tables, files, or providers in its catalog.
+2. SQL or a DataFrame expression becomes a logical plan.
+3. Optimization produces a physical plan.
+4. The runtime chooses local or remote placement.
+5. Operators emit Arrow `RecordBatch` values.
+6. The caller collects, streams, prints, or stores the result.
+
+## Registration is explicit
+
+Names in SQL resolve through the session catalog. A CLI `--parquet` registration
+lasts for that process; a long-lived service can own a longer-lived catalog.
+
+## Local and remote results
+
+Embedded execution can return results directly. Remote execution uses public
+Flight/gRPC and coordinator control paths. Keep result size and lifetime in mind:
+large results should be consumed as batches or written to a sink instead of
+materialized into one client-side object.
+
+## Multi-statement SQL
+
+The CLI accepts semicolon-separated statements. Earlier statements run for side
+effects; only the final statement result is printed.
+
+```bash
+krishiv sql --query \
+  "CREATE TABLE t (id INT); INSERT INTO t VALUES (1); SELECT * FROM t"
+```
+
+SQL surface and DDL behavior are pre-release. Pin the Engine version when you
+store scripts outside the repository.

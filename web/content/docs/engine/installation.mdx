@@ -1,0 +1,73 @@
+---
+title: Installation
+description: Build the Engine CLI, Rust crates, or Python extension from source.
+status: available
+---
+
+Krishiv is pre-release. These docs deliberately use source builds instead of
+assuming a stable package or container release exists.
+
+## Requirements
+
+- Git
+- A current stable Rust toolchain with Cargo
+- A C/C++ build toolchain required by native dependencies
+- Python and Maturin only when building the Python extension
+
+## CLI
+
+```bash
+git clone https://github.com/KrishivAI/krishiv.git
+cd krishiv
+cargo build --release -p krishiv
+./target/release/krishiv --help
+```
+
+The default developer build includes local Engine capabilities. Cargo features
+select compiled integrations; execution mode is still selected at runtime.
+
+## Rust library
+
+Inside the workspace, depend on the public facade or the smallest public crate
+that owns the API you need:
+
+```toml
+[dependencies]
+krishiv-api = { path = "crates/krishiv-api" }
+```
+
+For another repository, pin a specific Git revision until stable crates are
+published. Do not depend on private crate internals or a moving branch in a
+production build.
+
+## Python extension
+
+From the repository root:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install maturin
+maturin develop --manifest-path crates/krishiv-python/Cargo.toml
+python -c "import krishiv; print(krishiv.__doc__)"
+```
+
+The current Python crate dependency always compiles Kafka, Schema Registry,
+lakehouse/Iceberg/Hudi, and the base vector-sink family. Python Cargo features
+add Kinesis, Pulsar, Cassandra, Elasticsearch, HBase, Qdrant, and pgvector.
+Those flags do not currently produce a minimal connector build.
+
+<Callout type="info" title="Reproducible builds">
+  Pin the Engine commit, Cargo lockfile, native toolchain, and enabled feature set
+  together. Pre-release APIs and protocol versions can change between commits.
+</Callout>
+
+## Verify the checkout
+
+```bash
+cargo check --workspace
+cargo test --workspace --exclude krishiv-python
+```
+
+The full workspace test suite is larger than the quickstart and may require
+optional services for integration tests.

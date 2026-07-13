@@ -1,0 +1,68 @@
+---
+title: Architecture
+description: Follow a request from the public API through planning, placement, and execution.
+status: available
+---
+
+Krishiv keeps its public APIs, control plane, and data plane behind explicit
+crate and protocol boundaries. The same Arrow `RecordBatch` model crosses batch,
+streaming, and incremental paths.
+
+```text
+SQL · Rust · Python · Flight SQL · MCP
+                 │
+          Session + catalog
+                 │
+      DataFusion + Krishiv plans
+                 │
+          ExecutionRuntime
+        ┌────────┼──────────┐
+   embedded   single node   remote
+        └────────┼──────────┘
+             coordinator
+                 │
+          executor task runner
+                 │
+  operators · shuffle · state · connectors
+```
+
+## Front doors
+
+The CLI, Rust API, Python bindings, Flight SQL service, and MCP server all enter
+through public session/runtime seams. A frontend should not create a second
+execution engine or reach into scheduler internals.
+
+## Planning
+
+DataFusion supplies SQL parsing, logical planning, expressions, and local
+execution. Krishiv adds plan types and policies needed to place work, represent
+streaming/incremental operations, and move tasks across runtime boundaries.
+
+## Control plane
+
+The scheduler owns coordinator responsibilities: job and task lifecycle,
+executor registration, metadata, leadership, and control APIs. A distributed
+session requires an explicit remote endpoint and must not silently fall back to
+local execution.
+
+## Data plane
+
+Executors run task fragments and interact with shuffle, state, checkpoint, and
+connector services. Delivery and recovery guarantees depend on the selected
+durability profile and the capabilities of every source and sink in the path.
+
+## Crate boundaries
+
+| Area | Owning crate family |
+| --- | --- |
+| Public sessions and DataFrames | `krishiv-api` |
+| SQL integration | `krishiv-sql`, `krishiv-plan` |
+| Runtime placement | `krishiv-runtime` |
+| Coordination and execution | `krishiv-scheduler`, `krishiv-executor` |
+| Operators | `krishiv-dataflow` |
+| State and checkpoints | `krishiv-state` |
+| Connectors | `krishiv-connectors` |
+| Wire contracts | `krishiv-proto` |
+
+The upcoming Krishiv Platform sits above these boundaries and consumes public
+Engine interfaces; Engine remains usable on its own.

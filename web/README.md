@@ -1,6 +1,7 @@
 # Krishiv Web
 
-Production-oriented Next.js App Router site for the Krishiv landing page, documentation, architecture pages, blog, and release notes.
+Next.js App Router site for the Krishiv product family, Fumadocs documentation,
+architecture pages, blog, and release notes.
 
 ## Local development
 
@@ -17,16 +18,19 @@ pnpm typecheck
 pnpm build
 ```
 
-## Cloudflare Workers deployment
+`pnpm build` produces a static site in `out/`. Fumadocs source files are generated
+automatically during the build.
 
-The app is configured for OpenNext on Cloudflare Workers and intentionally does not use static `output: "export"`.
+## Cloudflare Pages deployment
+
+The site uses Next.js static export and deploys the `out/` directory to Cloudflare Pages.
+Response headers are configured in `public/_headers` because Next.js runtime
+`headers()` are not available in a static export.
 
 ```bash
 pnpm preview
 pnpm deploy
 ```
-
-Configuration lives in `open-next.config.ts` and `wrangler.jsonc`.
 
 ## Environment variables
 
@@ -34,15 +38,28 @@ No runtime environment variables are required for the current marketing/docs sit
 
 ## Content creation
 
-Docs are versioned under `content/docs/<version>/` for maintainers and mirrored by the central docs navigation config in `lib/versions.ts`. Keep website claims aligned with `PRODUCT_FACTS.md`, repository docs, examples, tests, and public crate APIs.
+Docs live under product roots in `content/docs/`:
 
-## Adding a docs version
+- `engine/` contains the public Engine manual.
+- `platform/` contains only an availability notice until Platform has a public preview.
 
-1. Add a new entry to `lib/versions.ts`.
-2. Add a matching `content/docs/<version>/` folder.
-3. Populate pages with source-backed copy.
-4. Run `pnpm typecheck` and `pnpm build`.
+Fumadocs builds navigation from each folder's `meta.json`. Keep claims aligned
+with public APIs, CLI help, normative contracts, examples, and tests.
+
+## Adding a docs page
+
+1. Add an MDX file below the correct product root.
+2. Add it to the nearest `meta.json` navigation list.
+3. Set a validated `status` in frontmatter.
+4. Prefer Fumadocs Cards, Callouts, Steps, and Tabs to custom HTML.
+5. Run `pnpm typecheck` and `pnpm build`.
 
 ## Writing docs safely
 
-Do not claim support solely because a dependency appears in `Cargo.toml`. Prefer these labels: `Available`, `Experimental`, `In Progress`, `Planned`, and `Preview`. Avoid global exactly-once claims unless a source/sink/checkpoint combination is certified in the engine contracts.
+Do not claim support solely because a dependency appears in `Cargo.toml`. The
+validated labels are `available`, `preview`, `experimental`, `in-progress`, and
+`coming-soon`. Avoid global exactly-once or production-readiness claims.
+
+The old duplicated `latest`/`v0.1` routes remain as generated compatibility
+aliases, but canonical docs live at `/docs/engine/...`. Add real versioned docs
+only when a frozen release manual exists.

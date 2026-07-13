@@ -1,0 +1,95 @@
+---
+title: Connector reference
+description: Select sources and sinks by role, compiled feature, maturity, and delivery contract.
+status: preview
+---
+
+Connectors move Arrow batches between Engine and external systems. Every
+registered driver has a role, maturity descriptor, and capability metadata;
+standalone `Source` and `Sink` implementations only require capabilities.
+Capability flags describe what a connector can participate in; they do not
+independently prove an end-to-end guarantee.
+
+## Documentation maturity
+
+These are conservative public documentation labels based on checked-in
+contracts and validation evidence. An internal registry descriptor alone does
+not raise a connector's public maturity.
+
+| Connector family | Role | Maturity | Important boundary |
+| --- | --- | --- | --- |
+| Parquet | Source and sink | Preview | Bounded; local write helpers are not atomic distributed writes. |
+| S3/object-store paths | Source, sink, storage | Preview | The named registry driver currently opens a local object-store root; AWS construction requires the separate `cloud` feature. |
+| CSV/NDJSON | File source | Preview (docs) | Best effort when input files can change; NDJSON has no registry maturity descriptor. |
+| Avro | File source and sink | Preview | Optional feature with bounded file semantics. |
+| Kafka | Source and sink | Preview | Checkpoint and transaction paths exist; external failure certification is pending. |
+| Schema Registry | Decoder integration | Preview (docs) | Supports a documented Avro/Protobuf compatibility subset; it has no standalone registry maturity descriptor. |
+| Iceberg | Lakehouse source and sink | Preview | Primary lakehouse target; a two-phase path exists. |
+| Local two-phase Parquet | Sink | Preview | Publication uses a same-filesystem rename; it is not an S3 two-phase implementation. |
+| Delta Lake, Hudi | Lakehouse compatibility | Experimental | Drivers compile through the top-level `lakehouse` dependency but remain experimental. |
+| Kinesis, Pulsar | Streaming sources | Experimental (docs) | Registry descriptors say Preview, while external recovery contracts remain incomplete. |
+| CDC readers | Streaming sources | Experimental (docs) | Reader-specific row kinds exist; no standalone registry maturity is published. |
+| Search and database sinks | Optional sinks | Experimental (docs) | Several registry descriptors say Preview; public contract validation remains incomplete. |
+| Vector sinks | Optional sinks | Experimental (docs) | Registry maturity is mixed; external-system validation remains incomplete. |
+
+<Callout type="warn" title="No connector is certified globally">
+  The reusable external-system failure matrix is still incomplete. Do not turn
+  “transactional,” “idempotent,” or “checkpoint-aware” into an unconditional
+  exactly-once claim.
+</Callout>
+
+## Delivery is compositional
+
+The observable guarantee is the weakest part of the complete path:
+
+```text
+source restorability
+        × checkpoint durability
+        × runtime profile
+        × sink publication
+        = end-to-end delivery behavior
+```
+
+| Combination | Safe description |
+| --- | --- |
+| Source that is neither rewindable nor checkpoint-capable + any sink | Best effort after source or task failure. |
+| Rewindable source + non-idempotent sink | At least once; replay can duplicate output. |
+| Rewindable source + idempotent keys | Effectively once when repeated writes converge. |
+| Checkpoint source + two-phase sink + durable checkpoint | Preview exactly-once candidate; certify the exact systems and versions. |
+
+## Features are compile-time capabilities
+
+Cargo features select optional dependency families. Runtime mode is chosen
+separately through `SessionBuilder`, `Session::from_env()`, or the CLI's
+explicit `--mode` flag.
+
+The top-level Engine crate always enables the connector `lakehouse` family,
+which registers Iceberg, Delta, and Hudi compatibility drivers. Its `full`
+preset also enables primary Kafka and Iceberg dependency paths, but not vector
+sinks or the `cloud` object-store backend:
+
+```bash
+cargo check -p krishiv --no-default-features --features full
+```
+
+Feature names are crate-specific. Inspect `crates/krishiv/Cargo.toml` and
+`crates/krishiv-connectors/Cargo.toml` in the pinned checkout before composing a
+custom build.
+
+<Callout type="warn" title="Object-store boundary">
+  The registry's driver named `S3` currently uses a local filesystem-backed
+  object store. AWS S3 construction exists behind the connector crate's
+  `cloud` feature, which is not included in the standard `full` presets. Verify
+  the actual storage factory and build features before documenting remote S3.
+</Callout>
+
+## Connector author contract
+
+A source should declare boundedness, return Arrow `RecordBatch` values, honor
+backpressure, and capture an exact durable position before claiming restore.
+A sink should declare idempotent/transactional behavior, define what `flush`
+means, and implement prepare/commit/abort when it participates in two-phase
+checkpoint publication.
+
+Keep credentials outside SQL strings and source control. Use the configuration
+mechanism expected by the selected driver and durability profile.

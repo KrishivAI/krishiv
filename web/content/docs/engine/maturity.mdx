@@ -1,0 +1,44 @@
+---
+title: Feature maturity
+description: Read Krishiv capability labels without confusing implementation with stability.
+status: preview
+---
+
+Krishiv separates feature presence from release stability. The entire Engine is
+pre-release even when an individual path is marked **Available**.
+
+## Labels
+
+| Label | Meaning |
+| --- | --- |
+| Available | Implemented in the current source tree with a usable public path. |
+| Preview | Implemented, but certification, compatibility, or operational hardening is incomplete. |
+| Experimental | An opt-in design or API that can change substantially. |
+| In progress | Some code exists, but the end-to-end product contract is incomplete. |
+| Coming soon | Reserved for a product or surface that is not available. |
+
+## Current Engine map
+
+| Area | Maturity | Safe expectation |
+| --- | --- | --- |
+| Batch SQL | Available | DataFusion-backed SQL over registered Arrow/Parquet-style sources. |
+| Embedded mode | Available | In-process sessions for development, tests, and library use. |
+| Single-node mode | Available | Coordinator, executor, and local services on one host. |
+| Streaming APIs | Preview | Windowed and stateful paths exist; recovery certification continues. |
+| IncrementalFlow / IVM | Experimental | Weighted deltas, steps, snapshots, and watches; local-first. |
+| Distributed deployment | Preview | Explicit remote transport exists; operational certification continues. |
+| Shuffle and state | Preview | Multiple backends and checkpoint primitives exist; profiles matter. |
+| Kafka, Parquet, object-store paths, Iceberg | Preview | Implementations exist; remote cloud storage and guarantees depend on the exact build and combination. |
+| Global exactly-once | In progress | Never assume it globally; use only a certified source/sink/checkpoint matrix. |
+
+<Callout type="warn" title="No production-readiness claim">
+  A green unit test or an implementation crate is not a support promise. Evaluate
+  failure recovery, durability, upgrades, and connector semantics for your exact
+  deployment before relying on them.
+</Callout>
+
+## When docs and code differ
+
+Treat the public Rust API, CLI help, checked-in contracts, examples, and tests as
+the source of truth—in that order for the interface you are using. Open an issue
+when a documented command or guarantee cannot be reproduced.

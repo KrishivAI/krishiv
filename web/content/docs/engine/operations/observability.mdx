@@ -1,0 +1,54 @@
+---
+title: Observability
+description: Use health endpoints, metrics, tracing, and job status without confusing telemetry with guarantees.
+status: preview
+---
+
+Krishiv includes operational building blocks for status, metrics, tracing, and
+debugging. Endpoint availability depends on the process and compiled features.
+
+## Coordinator HTTP surface
+
+A coordinator or `clusterd` HTTP listener exposes the core probes:
+
+| Path | Purpose |
+| --- | --- |
+| `/healthz` | Process health. |
+| `/readyz` | Readiness to receive work. |
+| `/metrics` | Prometheus-style metrics when enabled. |
+
+Use readiness—not only process liveness—when routing traffic.
+
+## Effective configuration
+
+```bash
+krishiv doctor
+```
+
+`doctor` resolves deployment-related environment values and reports
+misconfiguration without starting a session or contacting a coordinator.
+
+## Logs and traces
+
+Set a narrow Rust log filter first, then expand the module that owns the issue:
+
+```bash
+RUST_LOG=info krishiv local start
+```
+
+Include job, task, attempt, checkpoint, and executor identifiers when exporting
+logs. Those identifiers are needed to reconstruct a distributed lifecycle.
+
+## What to alert on
+
+- readiness and leadership changes;
+- executor registration loss or repeated task attempts;
+- checkpoint age, duration, and failure;
+- growing state or shuffle storage;
+- source lag and sink commit errors;
+- query latency and result failures by workload class.
+
+<Callout type="warn" title="Preview operations">
+  Metrics and dashboards are observability tools, not proof of recovery or
+  production readiness. Exercise failure paths and verify the signals they emit.
+</Callout>

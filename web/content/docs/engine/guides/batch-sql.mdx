@@ -1,0 +1,85 @@
+---
+title: Run batch SQL
+description: Register finite data, execute a query, inspect its plan, and handle the result.
+status: available
+---
+
+This guide uses the CLI in embedded mode. It creates one session, registers a
+Parquet file, executes SQL, prints the result, and exits.
+
+## Register and query a file
+
+```bash
+cargo run -p krishiv -- sql \
+  --parquet orders=./orders.parquet \
+  --query "
+    SELECT region, COUNT(*) AS orders, SUM(amount) AS revenue
+    FROM orders
+    GROUP BY region
+    ORDER BY revenue DESC
+  "
+```
+
+The `orders=./orders.parquet` pair creates a table named `orders` for this CLI
+process. Register more files by repeating `--parquet table=path`.
+
+## Inspect before executing
+
+```bash
+cargo run -p krishiv -- explain \
+  --parquet orders=./orders.parquet \
+  --query "SELECT region, SUM(amount) FROM orders GROUP BY region"
+```
+
+An explain plan is useful when you need to confirm projection, filtering,
+aggregation, or placement behavior. It is not a performance guarantee.
+
+## Choose placement
+
+<Tabs groupId="batch-mode" items={['Embedded', 'Single node', 'Distributed']}>
+  <Tab value="Embedded">
+
+```bash
+krishiv sql --mode embedded --query "SELECT 42 AS answer"
+```
+
+Runs entirely in the CLI process.
+
+  </Tab>
+  <Tab value="Single node">
+
+```bash
+krishiv sql --mode single-node --query "SELECT 42 AS answer"
+```
+
+Requires a configured local coordinator/Flight endpoint. See the
+[single-node guide](/docs/engine/guides/single-node).
+
+  </Tab>
+  <Tab value="Distributed">
+
+```bash
+krishiv -c http://coordinator.example:2003 \
+  sql --mode distributed --query "SELECT 42 AS answer"
+```
+
+The distributed path is Preview. An endpoint is mandatory; Krishiv rejects a
+silent local fallback.
+
+  </Tab>
+</Tabs>
+
+## Multi-statement scripts
+
+```bash
+krishiv sql --query \
+  "CREATE TABLE t (id INT); INSERT INTO t VALUES (1); SELECT * FROM t"
+```
+
+Statements before the final one run for side effects. The CLI prints only the
+last statement's result.
+
+<Callout type="info" title="Large results">
+  Prefer streaming result batches or writing to a sink when output is large.
+  Collecting an entire result in a client shifts its memory cost to that client.
+</Callout>

@@ -15,7 +15,7 @@ export default function NotFound() {
             <Link className="btn btn-primary" href="/">
               Go Home
             </Link>
-            <Link className="btn btn-secondary" href="/docs/latest">
+            <Link className="btn btn-secondary" href="/docs/engine">
               Documentation
             </Link>
             <a className="btn btn-secondary" href="https://github.com/KrishivAI/krishiv">

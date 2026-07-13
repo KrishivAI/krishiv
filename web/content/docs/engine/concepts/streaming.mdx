@@ -1,0 +1,42 @@
+---
+title: Streaming execution
+description: Event time, watermarks, windows, state, and long-lived query lifecycles.
+status: preview
+---
+
+Streaming execution processes a sequence of Arrow batches without requiring the
+logical input to be finite. A stream job owns a longer lifecycle than one batch
+query and may hold operator state between inputs.
+
+## Event time and watermarks
+
+An event-time column assigns records to logical time. A watermark describes the
+runtime's progress through that time and lets window operators decide when a
+result can close. The configured lateness bound determines how late records are
+handled.
+
+## Windows
+
+Krishiv exposes tumbling, sliding, and session window paths. Window choice affects
+state size, output cadence, and late-data behavior.
+
+- **Tumbling** windows do not overlap.
+- **Sliding** windows overlap at a configured slide interval.
+- **Session** windows group activity separated by an inactivity gap.
+
+## Stateful operators
+
+Keyed aggregation, joins, timers, and process functions store data across input
+batches. State may be in memory or backed by a durable store, depending on build
+features and runtime configuration.
+
+## Checkpoints are a protocol
+
+A checkpoint is useful only when sources, operators, state storage, and sinks
+agree on offsets and commit behavior. Krishiv exposes checkpoint primitives, but
+does not claim global exactly-once behavior for every connector combination.
+
+<Callout type="info" title="Process lifetime matters">
+  In-process CLI stream jobs disappear when the CLI exits. Use a long-lived
+  session or coordinator-backed lifecycle when the job must survive a client.
+</Callout>

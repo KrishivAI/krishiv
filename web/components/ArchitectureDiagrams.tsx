@@ -148,11 +148,11 @@ export function TopologyDiagram(): JSX.Element {
         Single-node
       </text>
       <text x={450} y={46} textAnchor="middle" fontSize={11} fill={muted}>
-        one host, durable
+        one host
       </text>
       <Box x={350} y={70} w={200} h={56} label="Your app" sub="Rust / Python / SQL" />
       <Box x={350} y={150} w={200} h={84} label="Krishiv daemon" sub="coordinator + executor" accent />
-      <Box x={350} y={258} w={200} h={56} label="Local disk / S3" sub="durable state" />
+      <Box x={350} y={258} w={200} h={56} label="Configured storage" sub="state + checkpoints" />
       <Arrow x1={450} y1={126} x2={450} y2={150} />
       <Arrow x1={450} y1={234} x2={450} y2={258} />
 
@@ -162,13 +162,13 @@ export function TopologyDiagram(): JSX.Element {
         Distributed
       </text>
       <text x={750} y={46} textAnchor="middle" fontSize={11} fill={muted}>
-        coordinator + N executors
+        coordinator + executors · Preview
       </text>
       <Box x={650} y={70} w={200} h={56} label="Your app" sub="thin client" />
       <Box x={650} y={150} w={200} h={56} label="Coordinator" sub="job & task lifecycle" accent />
       <Box x={650} y={220} w={94} h={56} label="Executor 1" sub="data plane" />
       <Box x={756} y={220} w={94} h={56} label="Executor N" sub="data plane" />
-      <Box x={650} y={290} w={200} h={40} label="Shared object store" sub="S3 / ADLS / GCS" />
+      <Box x={650} y={290} w={200} h={40} label="Shared storage" sub="S3 / object store" />
       <Arrow x1={750} y1={126} x2={750} y2={150} />
       <Arrow x1={750} y1={206} x2={697} y2={220} />
       <Arrow x1={750} y1={206} x2={803} y2={220} />
@@ -215,7 +215,7 @@ export function RequestFlowDiagram(): JSX.Element {
         schema, types, UDFs
       </text>
       <text x={450} y={170} textAnchor="middle" fontSize={10.5} fill={muted}>
-        cost-based rules
+        supported planning rules
       </text>
       <text x={640} y={170} textAnchor="middle" fontSize={10.5} fill={muted}>
         shuffle + state
@@ -243,7 +243,7 @@ export function DataPlaneDiagram(): JSX.Element {
         CONTROL PLANE
       </text>
 
-      <Box x={140} y={70} w={620} h={70} label="Coordinator" sub="owns job and task state, schedules, recovers" accent />
+      <Box x={140} y={70} w={620} h={70} label="Coordinator" sub="job and task lifecycle · Preview" accent />
       <text x={450} y={155} textAnchor="middle" fontSize={10.5} fill={muted}>
         task offers
       </text>
@@ -297,7 +297,7 @@ export function LifecycleDiagram(): JSX.Element {
         catalog
       </text>
       <text x={390} y={60} textAnchor="middle" fontSize={10.5} fill={muted}>
-        cost model
+        planning rules
       </text>
       <text x={550} y={60} textAnchor="middle" fontSize={10.5} fill={muted}>
         placement
@@ -315,7 +315,7 @@ export function LifecycleDiagram(): JSX.Element {
         markerEnd="url(#arrowhead)"
       />
       <text x={550} y={172} textAnchor="middle" fontSize={10.5} fill={muted}>
-        on failure: restore from last checkpoint
+        recovery depends on the end-to-end path
       </text>
     </svg>
   );

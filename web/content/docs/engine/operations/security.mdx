@@ -1,0 +1,42 @@
+---
+title: Security
+description: Protect coordinator and executor control paths during evaluation.
+status: preview
+---
+
+Production-shaped coordinator and executor task-control gRPC paths support bearer
+tokens. Anonymous operation is intended only for local development.
+
+## Coordinator token
+
+```bash
+export KRISHIV_COORDINATOR_BEARER_TOKEN='replace-with-a-secret'
+```
+
+Coordinators can accept a startup rotation window through
+`KRISHIV_COORDINATOR_BEARER_TOKENS`. Long-lived processes can reload mounted token
+files when the token-file and reload-interval settings are configured.
+
+## Executor task token
+
+```bash
+export KRISHIV_EXECUTOR_TASK_BEARER_TOKEN='replace-with-a-different-secret'
+```
+
+Keep coordinator-client and coordinator-executor credentials separate. Do not put
+tokens in command history, images, manifests committed to Git, or public logs.
+
+## Bind addresses deliberately
+
+Development defaults may bind local interfaces. In a remote topology:
+
+- expose only required ports;
+- use network policy or host firewalls;
+- terminate TLS at a trusted boundary until native transport requirements are set;
+- advertise routable executor addresses, never `0.0.0.0`;
+- isolate metadata, shuffle, checkpoint, and object-store credentials.
+
+<Callout type="warn" title="Security surface is pre-release">
+  Bearer authentication is one control, not a complete security program. Perform
+  a threat-model and deployment review for any environment with sensitive data.
+</Callout>

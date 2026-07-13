@@ -1,0 +1,111 @@
+---
+title: Rust API
+description: Build sessions, run DataFrames, and select execution placement through the public Rust facade.
+status: preview
+---
+
+`krishiv-api` owns the primary Rust session, DataFrame, streaming, and
+incremental entry points. Build it from the same pinned source checkout as the
+rest of Engine; stable crates are not assumed by these docs.
+
+```toml
+[dependencies]
+krishiv-api = { path = "../krishiv/crates/krishiv-api" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+Adjust the path for your workspace layout and keep the Engine `Cargo.lock` and
+commit pinned together.
+
+## First query
+
+<Tabs items={["Synchronous", "Asynchronous"]}>
+  <Tab value="Synchronous">
+
+```rust
+use krishiv_api::{Result, Session};
+
+fn main() -> Result<()> {
+    let session = Session::builder().build()?;
+    let result = session.sql("SELECT 42 AS answer")?.collect()?;
+    println!("{}", result.pretty()?);
+    Ok(())
+}
+```
+
+  </Tab>
+  <Tab value="Asynchronous">
+
+```rust
+use krishiv_api::{Result, Session};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let session = Session::builder().build()?;
+    let result = session
+        .sql_async("SELECT 42 AS answer")
+        .await?
+        .collect_async()
+        .await?;
+    println!("{}", result.pretty()?);
+    Ok(())
+}
+```
+
+  </Tab>
+</Tabs>
+
+Use the async methods when the caller already runs on Tokio. The synchronous
+methods are deliberate sync-over-async boundaries for blocking applications.
+
+## Register and query Parquet
+
+```rust
+use krishiv_api::{Result, Session};
+
+fn query_file() -> Result<()> {
+    let session = Session::builder().build()?;
+    session.register_parquet("events", "./events.parquet")?;
+
+    let result = session
+        .sql("SELECT kind, COUNT(*) AS n FROM events GROUP BY kind")?
+        .collect()?;
+    println!("{}", result.pretty()?);
+    Ok(())
+}
+```
+
+`Session::sql` returns a lazy `DataFrame`; `collect`, a streaming execution
+method, or a writer triggers work.
+
+## Choose placement
+
+| Entry point | Use |
+| --- | --- |
+| `Session::builder().build()` | Default embedded session. |
+| `Session::from_env()` | Build from `KRISHIV_MODE` and coordinator configuration. |
+| `with_execution_mode(...)` | Select the user-visible mode explicitly. |
+| `with_local_cluster(url)` | Connect to a single-host Flight endpoint. |
+| `with_coordinator(url)` | Set the required remote coordinator endpoint. |
+
+Distributed mode fails closed when no coordinator is configured; it does not
+silently run the query inside the client.
+
+## Public data types
+
+The facade re-exports the Arrow types needed by public APIs, including
+`RecordBatch`, `Schema`, `Field`, and `DataType`. In-memory tables are registered
+as a vector of batches:
+
+```rust
+session.register_record_batches("events", vec![batch])?;
+```
+
+The API also exposes streaming builders, checkpoint-aware job handles, and
+experimental `IncrementalFlow`/IVM types. Check the maturity page before using
+those surfaces as durable application contracts.
+
+<Callout type="info" title="Compatibility">
+  The Rust API is preview software. Public items can change in a pre-1.0 minor
+  release; pin a revision and review migration notes before upgrading.
+</Callout>

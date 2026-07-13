@@ -1,0 +1,22 @@
+{
+  "title": "Engine",
+  "description": "Build and operate with the Krishiv compute engine.",
+  "root": true,
+  "pages": [
+    "index",
+    "---Start here---",
+    "getting-started",
+    "installation",
+    "maturity",
+    "---Core concepts---",
+    "...concepts",
+    "---Guides---",
+    "...guides",
+    "---Reference---",
+    "...reference",
+    "---Operations---",
+    "...operations",
+    "---Project---",
+    "contributing"
+  ]
+}

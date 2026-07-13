@@ -1,0 +1,83 @@
+---
+title: Getting started
+description: Build Krishiv from source and run a first embedded SQL query.
+status: available
+---
+
+The shortest reliable path today is to build the CLI from the Engine repository.
+This guide uses embedded mode, so it does not start a daemon or require a cluster.
+
+<Steps>
+  <Step>
+
+### Clone the repository
+
+```bash
+git clone https://github.com/KrishivAI/krishiv.git
+cd krishiv
+```
+
+  </Step>
+  <Step>
+
+### Build the CLI
+
+```bash
+cargo build -p krishiv
+```
+
+The first build compiles the Rust workspace and its Arrow/DataFusion dependencies.
+
+  </Step>
+  <Step>
+
+### Run SQL
+
+```bash
+cargo run -p krishiv -- sql --query "SELECT 42 AS answer"
+```
+
+The CLI creates an embedded session, plans the query, executes it in process,
+and prints an Arrow result.
+
+  </Step>
+</Steps>
+
+## Query a Parquet file
+
+Register a file as a table at invocation time:
+
+```bash
+cargo run -p krishiv -- sql \
+  --parquet events=./events.parquet \
+  --query "SELECT kind, COUNT(*) AS events FROM events GROUP BY kind"
+```
+
+The `table=path` registration is scoped to that CLI process.
+
+## Inspect a plan
+
+```bash
+cargo run -p krishiv -- explain \
+  --query "SELECT 42 AS answer"
+```
+
+## Where to go next
+
+<Cards>
+  <Card
+    title="Batch SQL guide"
+    description="Register data, query it, and understand result lifecycles."
+    href="/docs/engine/guides/batch-sql"
+  />
+  <Card
+    title="Single-node mode"
+    description="Move the same CLI to a local coordinator and executor."
+    href="/docs/engine/guides/single-node"
+  />
+  <Card
+    title="Python API"
+    description="Build the native extension from the same source checkout."
+    href="/docs/engine/reference/python"
+  />
+</Cards>

@@ -1,0 +1,96 @@
+---
+title: SQL reference
+description: Use the DataFusion-backed SQL surface and understand Krishiv-specific boundaries.
+status: preview
+---
+
+Krishiv uses DataFusion for SQL parsing, expressions, planning, and local
+execution, then adds Engine-owned paths for placement, streaming, and
+lakehouse operations. The dialect is broad but pre-release; it is not described
+as universally compatible with another database.
+
+## Run the same query from each public API
+
+<Tabs items={["CLI", "Rust", "Python"]}>
+  <Tab value="CLI">
+
+```bash
+cargo run -p krishiv -- sql \
+  --query "SELECT 42 AS answer"
+```
+
+  </Tab>
+  <Tab value="Rust">
+
+```rust
+let result = session
+    .sql("SELECT 42 AS answer")?
+    .collect()?;
+println!("{}", result.pretty()?);
+```
+
+  </Tab>
+  <Tab value="Python">
+
+```python
+session.sql("SELECT 42 AS answer").show()
+```
+
+  </Tab>
+</Tabs>
+
+The query is self-contained in all three examples. Names in data-backed queries
+resolve through the current session catalog, so register a table, file, or
+provider before referencing it.
+
+## Query surface
+
+The checked-in SQL feature matrix covers these commonly used families:
+
+- projection, filtering, sorting, limits, aliases, and `DISTINCT`;
+- inner and outer joins, subqueries, and common table expressions;
+- `GROUP BY`, aggregate functions, grouping sets, `ROLLUP`, and `CUBE`;
+- ranking, offset, and value window functions;
+- `UNION`, `INTERSECT`, and `EXCEPT`;
+- table/view DDL and `INSERT INTO`;
+- prepared statements through supported APIs and Flight SQL.
+
+Use `explain` before relying on a complex query shape:
+
+```bash
+cargo run -p krishiv -- explain \
+  --parquet orders=./orders.parquet \
+  --query "SELECT customer_id, SUM(amount) FROM orders GROUP BY customer_id"
+```
+
+## Engine extensions
+
+| Extension | Current boundary |
+| --- | --- |
+| `TUMBLE`, `HOP`, session windows | Streaming paths; event-time and watermark configuration still determine behavior. |
+| `ANALYZE TABLE ... [FOR COLUMNS (...)]` | Collects row and optional column statistics for planning. |
+| `CREATE TABLE ... AS SELECT` | Creates a session table or a durable Iceberg landing when an Iceberg catalog resolves the target. |
+| `PARTITIONED BY (...)` | Iceberg CTAS only; unsupported targets fail instead of ignoring the clause. |
+| `DELETE`, `UPDATE`, `MERGE` | Table-format-specific behavior; validate the selected connector and feature set. |
+| `CREATE SOURCE`, `CREATE SINK`, `START PIPELINE` | Declarative pipeline metadata and execution paths. |
+| `MATCH_RECOGNIZE` | A preview streaming CEP subset, not the complete Oracle/Flink grammar. |
+
+## Result and write semantics
+
+- A successful batch result means all required stages completed.
+- Plain files are not snapshot-consistent if they change during planning or
+  execution.
+- Client-side collect-and-write helpers are local conveniences, not atomic
+  distributed writes.
+- Distributed writes require a commit-capable sink.
+- Streaming delivery is only as strong as the source, checkpoint storage,
+  durability profile, and sink together.
+
+<Callout type="warn" title="No blanket exactly-once claim">
+  Transaction and checkpoint code existing in the tree does not make every SQL
+  pipeline exactly-once. Consult the connector maturity matrix and validate the
+  exact source/checkpoint/sink combination.
+</Callout>
+
+SQL behavior follows the Engine compatibility policy and can change before the
+first stable release.

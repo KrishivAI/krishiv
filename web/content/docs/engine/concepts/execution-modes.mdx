@@ -1,0 +1,55 @@
+---
+title: Execution modes
+description: Choose embedded, single-node, or distributed placement explicitly.
+status: preview
+---
+
+Execution mode describes the user-visible topology. Placement describes where
+the data-plane work is actually allowed to run. Krishiv keeps those decisions
+explicit so a remote request cannot quietly execute inside the client process.
+
+## Embedded
+
+The session, planner, and execution path live in one process.
+
+Use it for:
+
+- library integration and unit tests;
+- local data exploration;
+- reproducing a plan without operating services.
+
+Embedded state and job lifetime are tied to the process unless you configure a
+durable backend.
+
+## Single node
+
+A coordinator, executor, and optional Flight SQL service run on one host. This
+exercises service boundaries while keeping operations local.
+
+Use it for development, integration testing, and evaluation of the daemon path.
+See [Run a single node](/docs/engine/guides/single-node).
+
+## Distributed
+
+Clients send work to an explicit remote coordinator, which assigns task
+fragments to executors. Executors need routable task, barrier, and shuffle
+addresses.
+
+<Callout type="warn" title="Preview">
+  Distributed transport and deployment assets exist, but end-to-end operational
+  certification is still in progress. Do not present this mode as production-ready.
+</Callout>
+
+## Durability profiles
+
+Krishiv names durability intent instead of inferring it from topology:
+
+| Profile | Intended use |
+| --- | --- |
+| `dev-local` | Fast iteration with process-local or ephemeral state. |
+| `single-node-durable` | Durable metadata and state on one host. |
+| `distributed-durable` | Remote coordination and durable shared services. |
+
+Profiles are configuration, not a guarantee by themselves. Sources, sinks,
+checkpoint storage, metadata, and recovery tests must all support the promised
+behavior.

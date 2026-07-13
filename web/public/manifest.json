@@ -1,7 +1,7 @@
 {
   "name": "Krishiv",
   "short_name": "Krishiv",
-  "description": "Rust-native compute engine for batch SQL, streaming pipelines, and incremental view maintenance",
+  "description": "Krishiv Engine developer preview, with a self-hosted data platform coming soon",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#050505",

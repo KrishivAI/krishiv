@@ -1,0 +1,80 @@
+---
+title: Run a single node
+description: Start a local coordinator, executor, status API, and Flight SQL endpoint.
+status: available
+---
+
+Single-node mode exercises service and transport boundaries on one machine. It is
+useful for integration testing before evaluating the distributed Preview.
+
+<Steps>
+  <Step>
+
+### Build the CLI
+
+```bash
+cargo build -p krishiv
+```
+
+  </Step>
+  <Step>
+
+### Start local services
+
+```bash
+cargo run -p krishiv -- local start \
+  --data-dir ./.krishiv-single-node \
+  --http-addr 127.0.0.1:2002
+```
+
+The status UI and HTTP health surface listen on the configured address. The
+local command manages the coordinator and executor processes together. It also
+prints separate gRPC, HTTP, and Flight URLs; Flight uses the first free port at
+or above 2003.
+
+  </Step>
+  <Step>
+
+### Check status
+
+```bash
+cargo run -p krishiv -- local status \
+  --data-dir ./.krishiv-single-node
+
+curl http://127.0.0.1:2002/healthz
+curl http://127.0.0.1:2002/readyz
+```
+
+  </Step>
+  <Step>
+
+### Point clients at Flight SQL
+
+```bash
+export KRISHIV_COORDINATOR_URL=http://127.0.0.1:2003
+
+cargo run -p krishiv -- sql \
+  --mode single-node \
+  --query "SELECT 42 AS answer"
+```
+
+Replace the example value with the exact `Flight:` URL printed by `local start`
+or `local status`; do not assume that port 2003 was free.
+
+  </Step>
+  <Step>
+
+### Stop the node
+
+```bash
+cargo run -p krishiv -- local stop \
+  --data-dir ./.krishiv-single-node
+```
+
+  </Step>
+</Steps>
+
+<Callout type="info" title="Evaluation topology">
+  Single-node mode is not evidence of high availability. Back up any durable
+  metadata/state paths and test restore behavior before retaining important data.
+</Callout>
