@@ -113,6 +113,8 @@ Regenerate with:
 | `KRISHIV_ROCKSDB_MAX_OPEN_FILES` | int | `rocksdb default` | RocksDB max_open_files for state/metadata stores (-1 = unlimited). |
 | `KRISHIV_ROCKSDB_WRITE_BUFFER_MB` | uint | `rocksdb default` | RocksDB write-buffer (memtable) size in MiB. |
 | `KRISHIV_RUNTIME_FILTERS` | bool | `on` | DataFusion dynamic (runtime) filters: TopK / join / aggregate predicates pushed into probe-side file scans at execution time (Phase 54). `off` disables all three via the DataFusion master switch. |
+| `KRISHIV_SESSION_IDLE_TIMEOUT_SECS` | uint | `0` | Phase 59 session hardening: evict a Flight SQL session's per-session bookkeeping after this many seconds with no active statements; 0 (default) disables idle eviction. |
+| `KRISHIV_SESSION_MAX_CONCURRENT_STATEMENTS` | uint | `0` | Phase 59 session hardening: maximum statements a single Flight SQL session (authenticated subject) may execute concurrently before further statements are rejected with resource_exhausted; 0 (default) disables the per-session cap. Complements the global KRISHIV_FLIGHT_MAX_CONCURRENT_QUERIES. |
 | `KRISHIV_SHUFFLE_ADDR` | host:port | `127.0.0.1:50060` | Shuffle service HTTP listen address. |
 | `KRISHIV_SHUFFLE_DIR` | path | `temp dir` | Local-disk shuffle store directory. |
 | `KRISHIV_SHUFFLE_FETCH_CONCURRENCY` | uint | `4` | Reduce-side concurrent shuffle partition fetches. |

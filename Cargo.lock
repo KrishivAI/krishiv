@@ -5874,6 +5874,7 @@ dependencies = [
  "hex",
  "krishiv-api",
  "krishiv-common",
+ "krishiv-metrics",
  "krishiv-plan",
  "krishiv-proto",
  "krishiv-runtime",

@@ -5,12 +5,14 @@
 mod actions;
 mod host;
 mod service;
+mod session_limits;
 
 pub use host::FlightExecutionHost;
 pub use service::{
     KrishivFlightSqlService, make_flight_sql_server, run_flight_server, run_flight_server_from_env,
     run_flight_server_with_host,
 };
+pub use session_limits::SessionRegistry;
 
 #[cfg(test)]
 mod tests {

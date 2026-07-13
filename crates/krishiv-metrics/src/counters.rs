@@ -190,6 +190,15 @@ pub struct KrishivMetrics {
     /// Total spill events / spill files written (counter).
     spill_files_total: AtomicU64,
     job_queue_depth: AtomicU64,
+    /// Phase 59 session hardening: number of currently-tracked Flight SQL
+    /// sessions (subjects with recent activity) — gauge.
+    active_sessions: AtomicU64,
+    /// Phase 59 session hardening: total statements admitted across all
+    /// sessions — counter.
+    session_statements_total: AtomicU64,
+    /// Phase 59 session hardening: statements rejected because a session
+    /// exceeded its per-session concurrent-statement cap — counter.
+    session_statements_rejected_total: AtomicU64,
     /// Peak memory observed per operator kind (gauge, keyed by operator label).
     operator_memory_bytes: dashmap::DashMap<String, AtomicU64>,
     /// Current committed checkpoint epoch per job_id (gauge, keyed by job_id).
@@ -445,6 +454,41 @@ impl KrishivMetrics {
     /// Set job queue depth gauge.
     pub fn set_job_queue_depth(&self, depth: u64) {
         self.job_queue_depth.store(depth, Ordering::Relaxed);
+    }
+
+    // ── Phase 59 session-hardening metrics ───────────────────────────────────
+
+    /// Set the active-sessions gauge (subjects with recent Flight SQL activity).
+    pub fn set_active_sessions(&self, count: u64) {
+        self.active_sessions.store(count, Ordering::Relaxed);
+    }
+
+    /// Record one admitted session statement.
+    pub fn inc_session_statements(&self) {
+        self.session_statements_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one statement rejected by a per-session concurrent-statement cap.
+    pub fn inc_session_statements_rejected(&self) {
+        self.session_statements_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Current active-sessions gauge value.
+    pub fn active_sessions(&self) -> u64 {
+        self.active_sessions.load(Ordering::Relaxed)
+    }
+
+    /// Total admitted session statements.
+    pub fn session_statements_total(&self) -> u64 {
+        self.session_statements_total.load(Ordering::Relaxed)
+    }
+
+    /// Total statements rejected by a per-session cap.
+    pub fn session_statements_rejected_total(&self) -> u64 {
+        self.session_statements_rejected_total
+            .load(Ordering::Relaxed)
     }
 
     // Labeled per-job checkpoint metrics
@@ -977,6 +1021,37 @@ impl KrishivMetrics {
         )?;
         writeln!(out, "# TYPE krishiv_job_queue_depth gauge")?;
         writeln!(out, "krishiv_job_queue_depth {queue_depth}")?;
+
+        // Phase 59 session-hardening metrics.
+        let active_sessions = self.active_sessions.load(Ordering::Relaxed);
+        writeln!(
+            out,
+            "# HELP krishiv_active_sessions Tracked Flight SQL sessions with recent activity"
+        )?;
+        writeln!(out, "# TYPE krishiv_active_sessions gauge")?;
+        writeln!(out, "krishiv_active_sessions {active_sessions}")?;
+        let session_stmts = self.session_statements_total.load(Ordering::Relaxed);
+        writeln!(
+            out,
+            "# HELP krishiv_session_statements_total Statements admitted across all sessions"
+        )?;
+        writeln!(out, "# TYPE krishiv_session_statements_total counter")?;
+        writeln!(out, "krishiv_session_statements_total {session_stmts}")?;
+        let session_rejected = self
+            .session_statements_rejected_total
+            .load(Ordering::Relaxed);
+        writeln!(
+            out,
+            "# HELP krishiv_session_statements_rejected_total Statements rejected by a per-session concurrency cap"
+        )?;
+        writeln!(
+            out,
+            "# TYPE krishiv_session_statements_rejected_total counter"
+        )?;
+        writeln!(
+            out,
+            "krishiv_session_statements_rejected_total {session_rejected}"
+        )?;
 
         let spill_bytes = self.spill_bytes_total.load(Ordering::Relaxed);
         writeln!(

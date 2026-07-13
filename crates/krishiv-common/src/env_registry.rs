@@ -766,6 +766,24 @@ pub static FLAGS: &[FlagSpec] = &[
         "DataFusion dynamic (runtime) filters: TopK / join / aggregate predicates pushed into probe-side file scans at execution time (Phase 54). `off` disables all three via the DataFusion master switch.",
     ),
     rt(
+        "KRISHIV_SESSION_IDLE_TIMEOUT_SECS",
+        FlagKind::UInt,
+        "0",
+        "Phase 59 session hardening: evict a Flight SQL session's per-session \
+         bookkeeping after this many seconds with no active statements; 0 \
+         (default) disables idle eviction.",
+    ),
+    rt(
+        "KRISHIV_SESSION_MAX_CONCURRENT_STATEMENTS",
+        FlagKind::UInt,
+        "0",
+        "Phase 59 session hardening: maximum statements a single Flight SQL \
+         session (authenticated subject) may execute concurrently before \
+         further statements are rejected with resource_exhausted; 0 (default) \
+         disables the per-session cap. Complements the global \
+         KRISHIV_FLIGHT_MAX_CONCURRENT_QUERIES.",
+    ),
+    rt(
         "KRISHIV_SHUFFLE_ADDR",
         FlagKind::SocketAddr,
         "127.0.0.1:50060",

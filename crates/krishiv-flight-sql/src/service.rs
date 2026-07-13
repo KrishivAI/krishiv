@@ -160,6 +160,10 @@ pub struct KrishivFlightSqlService {
     /// API-1: Maximum total bytes for a single DoGet result. Exceeding it
     /// returns `resource_exhausted` to prevent server OOM.
     max_result_bytes: usize,
+    /// Phase 59 session hardening: per-session concurrent-statement cap, idle
+    /// eviction, and session metrics. Complements the *global* `inflight_queries`
+    /// semaphore with a *per-subject* dimension.
+    session_limits: Arc<crate::session_limits::SessionRegistry>,
 }
 
 const FLIGHT_PREPARED_STMT_CAPACITY_ENV: &str = "KRISHIV_FLIGHT_PREPARED_STMT_CAPACITY";
@@ -221,6 +225,7 @@ impl KrishivFlightSqlService {
             transactions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             inflight_queries: limit.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
             max_result_bytes: read_max_result_bytes(),
+            session_limits: crate::session_limits::SessionRegistry::from_env(),
         })
     }
 
@@ -236,7 +241,18 @@ impl KrishivFlightSqlService {
             transactions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             inflight_queries: limit.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
             max_result_bytes: read_max_result_bytes(),
+            session_limits: crate::session_limits::SessionRegistry::from_env(),
         }
+    }
+
+    /// Override the per-session limit registry programmatically (tests / custom
+    /// wiring). By default the registry is built from the environment.
+    pub fn with_session_registry(
+        mut self,
+        registry: Arc<crate::session_limits::SessionRegistry>,
+    ) -> Self {
+        self.session_limits = registry;
+        self
     }
 
     /// Override the concurrent-query cap programmatically. `0` disables the cap.
@@ -454,6 +470,12 @@ impl FlightSqlService for KrishivFlightSqlService {
         // Authenticate if an auth provider is configured (default-deny for
         // auth-without-policy is enforced inside authenticate_request, SEC-2).
         let subject = self.authenticate_request(&request)?;
+
+        // Phase 59 session hardening: admit this statement against the caller's
+        // per-session concurrent-statement cap. The guard releases the slot on
+        // drop — including on early return or future cancellation — so it is
+        // held across `execute_sql`, the actual statement-execution window.
+        let _session_guard = self.session_limits.begin_statement(subject.as_deref())?;
 
         // Decode the ticket. Two encodings are supported:
         //   * Prefixed: `[4-byte big-endian txn_len][txn_id][query]`, produced by
