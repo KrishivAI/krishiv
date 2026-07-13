@@ -242,6 +242,14 @@ pub struct Coordinator {
     /// Wall-clock timestamp at which the cascade circuit breaker was last tripped.
     /// `None` means the breaker is closed (normal operation).
     pub(crate) cascade_tripped_at_ms: Option<u64>,
+
+    /// Phase 59 (observability gap-a): monotonic submit instant per job, used to
+    /// observe whole-query wall-clock latency at job terminal. Set in
+    /// `submit_job`, read+removed in `on_job_terminal` (batch jobs only —
+    /// streaming submit→terminal is job lifetime, not query latency). Bounded by
+    /// the number of concurrently in-flight jobs; also cleared on eviction so a
+    /// job that never reaches `on_job_terminal` cannot leak an entry.
+    pub(crate) job_submit_instants: HashMap<JobId, std::time::Instant>,
 }
 
 /// Describes a stalled task that must be cancelled and reset.
@@ -1287,6 +1295,7 @@ impl Coordinator {
             executor_job_watermarks: HashMap::new(),
             cascade_loss_timestamps: std::collections::VecDeque::new(),
             cascade_tripped_at_ms: None,
+            job_submit_instants: HashMap::new(),
         }
     }
 

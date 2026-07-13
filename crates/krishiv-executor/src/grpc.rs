@@ -186,7 +186,10 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
                     "executor assignment queue full (current={current}, max={max})"
                 )))
             }
-            Err(other) => Err(tonic::Status::internal(other.to_string())),
+            Err(other) => Err(krishiv_metrics::grpc::internal_status(
+                "handle task assignment",
+                &other,
+            )),
         }
     }
 
@@ -205,7 +208,7 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         let removed = self
             .inbox
             .cancel_task(request.task_id())
-            .map_err(|error| tonic::Status::internal(error.to_string()))?;
+            .map_err(|error| krishiv_metrics::grpc::internal_status("cancel task", &error))?;
         // A cancel for a job with a registered `stream:loop` executor is a
         // continuous-job teardown (the only producer of continuous cancels is
         // job-level deregister/cancel). Retire the whole job identity on this
@@ -248,14 +251,14 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
             let purged = self
                 .inbox
                 .forget_job(job_id)
-                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+                .map_err(|error| krishiv_metrics::grpc::internal_status("forget cancelled job", &error))?;
             // Run-loop tasks poll `is_task_cancelled` to exit — their
             // tombstone is cleared by the loop itself after it stops, so only
             // cycle-model tombstones are cleared eagerly here.
             if had_cycle_executor && !had_rloop {
                 self.inbox
                     .clear_cancelled_task(request.task_id())
-                    .map_err(|error| tonic::Status::internal(error.to_string()))?;
+                    .map_err(|error| krishiv_metrics::grpc::internal_status("clear cancelled task tombstone", &error))?;
             }
             tracing::debug!(
                 job_id = %job_id,
@@ -338,7 +341,7 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
             let batches: Vec<RecordBatch> = egress.drain(..).collect();
             drop(egress);
             let ipc_bytes = encode_ipc_batches(&batches)
-                .map_err(|e| tonic::Status::internal(e.to_string()))?;
+                .map_err(|e| krishiv_metrics::grpc::internal_status("encode continuous output", &e))?;
             return Ok(tonic::Response::new(
                 krishiv_proto::task::DrainContinuousOutputResponse {
                     version: krishiv_proto::TransportVersion::CURRENT,
@@ -376,11 +379,11 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
                 .lock()
                 .map_err(|_| tonic::Status::internal("loop executor lock poisoned"))?;
             exec.drain(input_batches)
-                .map_err(|e| tonic::Status::internal(e.to_string()))?
+                .map_err(|e| krishiv_metrics::grpc::internal_status("drain continuous executor", &e))?
         };
 
         let ipc_bytes = encode_ipc_batches(&output_batches)
-            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+            .map_err(|e| krishiv_metrics::grpc::internal_status("encode continuous output", &e))?;
 
         Ok(tonic::Response::new(
             krishiv_proto::task::DrainContinuousOutputResponse {

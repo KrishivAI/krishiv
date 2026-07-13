@@ -21,6 +21,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use opentelemetry::propagation::{Extractor, TextMapPropagator};
@@ -100,6 +102,49 @@ pub fn extract_trace_context(
 /// tonic request extensions by [`extract_trace_context`].
 #[derive(Clone, Debug)]
 pub struct RemoteSpanContext(pub opentelemetry::Context);
+
+// Internal-error surfacing (Phase 59 error taxonomy, gap-d)
+
+/// Per-process error-reference seed, derived once from wall-clock time so that
+/// references minted by different daemon runs do not collide in a shared log
+/// index. No new dependency: `SystemTime` is enough entropy for a correlation
+/// token that is never security-sensitive.
+fn error_ref_seed() -> u64 {
+    static SEED: OnceLock<u64> = OnceLock::new();
+    *SEED.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+            // Mix so two daemons started in the same millisecond still differ.
+            ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    })
+}
+
+/// Monotonic per-process counter distinguishing individual internal errors.
+static ERROR_REF_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Classify an internal error for client surfacing (Phase 59 error taxonomy).
+///
+/// gRPC handlers must not return `Status::internal(err.to_string())`: the raw
+/// error can leak table names, file paths, backend addresses, or SQL fragments
+/// to an unauthenticated caller. Instead, log the full error server-side at
+/// ERROR with a short correlation `error_ref`, and return an **opaque** status
+/// carrying only that reference. An operator greps the logs for the ref; the
+/// client learns nothing about engine internals.
+///
+/// ```ignore
+/// .map_err(|e| internal_status("commit checkpoint", &e))?
+/// ```
+pub fn internal_status(context: &str, error: &dyn std::fmt::Display) -> tonic::Status {
+    let n = ERROR_REF_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let error_ref = format!("{:08x}-{:06x}", error_ref_seed() & 0xFFFF_FFFF, n & 0xFF_FFFF);
+    // Full detail stays server-side, keyed by the ref the client receives.
+    tracing::error!(error_ref = %error_ref, context, error = %error, "internal error");
+    tonic::Status::internal(format!(
+        "internal error (ref {error_ref}); contact the operator with this reference"
+    ))
+}
 
 // GrpcDurationLayer
 
@@ -214,5 +259,30 @@ mod tests {
         assert!(result.is_ok());
         // Verify request can be consumed
         let _req = result.unwrap();
+    }
+
+    #[test]
+    fn internal_status_does_not_leak_error_detail() {
+        let secret = "table reference.payroll at s3://internal-bucket/secret/path.parquet";
+        let status = internal_status("scan table", &secret);
+        assert_eq!(status.code(), tonic::Code::Internal);
+        let msg = status.message();
+        // The opaque client-facing message must not echo any internal detail.
+        assert!(!msg.contains("payroll"), "leaked table name: {msg}");
+        assert!(!msg.contains("s3://"), "leaked backend path: {msg}");
+        assert!(!msg.contains("secret"), "leaked path fragment: {msg}");
+        // …but it must carry a correlation ref the operator can grep.
+        assert!(msg.contains("ref "), "missing correlation ref: {msg}");
+    }
+
+    #[test]
+    fn internal_status_refs_are_unique_per_call() {
+        let a = internal_status("ctx", &"boom");
+        let b = internal_status("ctx", &"boom");
+        assert_ne!(
+            a.message(),
+            b.message(),
+            "each internal error must get a distinct correlation ref"
+        );
     }
 }

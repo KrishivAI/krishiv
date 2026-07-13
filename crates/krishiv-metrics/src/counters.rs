@@ -20,6 +20,26 @@ const STREAM_RECORD_LATENCY_BUCKETS: &[f64] = &[
     0.5, 1.0,
 ];
 
+/// µs-resolution bucket bounds (in seconds) for the per-RPC gRPC call-duration
+/// histogram (Phase 59 observability gap-b). The shared [`LATENCY_BUCKETS`]
+/// start at 5 ms, which floors every intra-cluster control-plane RPC (task
+/// dispatch, barrier acks, shuffle metadata) into the first bucket and makes
+/// tail-latency SLOs unreadable. This set resolves from 100 µs to 10 s.
+const GRPC_LATENCY_BUCKETS: &[f64] = &[
+    0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+    2.5, 5.0, 10.0,
+];
+
+/// Wide bucket bounds (in seconds) for whole-query wall-clock latency
+/// (Phase 59 observability gap-a). A batch/distributed query spans from
+/// sub-second interactive lookups to multi-minute analytical scans, so this
+/// family needs a much wider dynamic range than the RPC or record-latency
+/// sets: 1 ms → 600 s.
+const QUERY_LATENCY_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+    600.0,
+];
+
 /// Escape a Prometheus label value per the text exposition format: `\`, `"`,
 /// and `\n` must be escaped so a malicious or unusual label cannot break the
 /// exposition format or inject metric lines.
@@ -227,6 +247,11 @@ pub struct KrishivMetrics {
     /// buckets ([`STREAM_RECORD_LATENCY_BUCKETS`]), Phase 55 exit-gate
     /// instrument. Measures source-read to operator-emit inside the engine.
     stream_record_latency: dashmap::DashMap<String, KrishivHistogram>,
+    /// Whole-query wall-clock latency (labeled by query kind, e.g. `batch` /
+    /// `distributed_batch`) — wide buckets ([`QUERY_LATENCY_BUCKETS`]),
+    /// Phase 59 observability gap-a. Measures job submit → terminal, the
+    /// number an operator dashboards for query-latency SLOs.
+    query_latency: dashmap::DashMap<String, KrishivHistogram>,
 }
 
 #[derive(Debug, Default)]
@@ -635,11 +660,32 @@ impl KrishivMetrics {
     // Duration observation histograms
 
     /// Record a gRPC call duration in seconds.
+    ///
+    /// Uses [`GRPC_LATENCY_BUCKETS`] (µs-resolution) rather than the shared
+    /// 5 ms-floored [`LATENCY_BUCKETS`], so intra-cluster control-plane RPCs
+    /// (task dispatch, barrier acks, shuffle metadata) do not all collapse
+    /// into the first bucket (Phase 59 gap-b).
     pub fn observe_grpc_duration(&self, path: &str, duration_secs: f64) {
         self.grpc_call_duration
             .entry(path.to_string())
-            .or_default()
+            .or_insert_with(|| KrishivHistogram::with_buckets(GRPC_LATENCY_BUCKETS))
             .observe(duration_secs);
+    }
+
+    /// Record a whole-query wall-clock latency observation in seconds, labeled
+    /// by query `kind` (e.g. `batch`, `distributed_batch`). Phase 59 gap-a:
+    /// the top-line query-latency SLO instrument, observed at job terminal.
+    pub fn observe_query_latency(&self, kind: &str, duration_secs: f64) {
+        self.query_latency
+            .entry(kind.to_string())
+            .or_insert_with(|| KrishivHistogram::with_buckets(QUERY_LATENCY_BUCKETS))
+            .observe(duration_secs);
+    }
+
+    /// Approximate quantile of whole-query latency for a query `kind`
+    /// (seconds). `None` when nothing has been recorded for that kind.
+    pub fn query_latency_quantile(&self, kind: &str, q: f64) -> Option<f64> {
+        self.query_latency.get(kind).and_then(|h| h.quantile(q))
     }
 
     /// Record a checkpoint commit duration in seconds.
@@ -1265,6 +1311,13 @@ impl KrishivMetrics {
         )?;
         render_histogram(
             &mut out,
+            "krishiv_query_latency_seconds",
+            "Whole-query wall-clock latency in seconds by query kind",
+            "kind",
+            &self.query_latency,
+        )?;
+        render_histogram(
+            &mut out,
             "krishiv_checkpoint_commit_duration_seconds",
             "Checkpoint commit duration per phase in seconds",
             "phase",
@@ -1596,6 +1649,46 @@ mod tests {
         let body = m.render_prometheus();
         assert!(body.contains("# HELP krishiv_checkpoint_epoch"));
         assert!(body.contains("# TYPE krishiv_checkpoint_epoch gauge"));
+    }
+
+    #[test]
+    fn query_latency_records_and_renders_wide_buckets() {
+        let m = KrishivMetrics::default();
+        // A fast interactive query and a multi-minute analytical scan.
+        m.observe_query_latency("batch", 0.42);
+        m.observe_query_latency("batch", 137.0);
+        let body = m.render_prometheus();
+        assert!(body.contains("# TYPE krishiv_query_latency_seconds histogram"));
+        assert!(body.contains(r#"krishiv_query_latency_seconds_count{kind="batch"} 2"#));
+        // The 300 s and 600 s buckets exist only in QUERY_LATENCY_BUCKETS, not
+        // in the shared LATENCY_BUCKETS — proves the per-metric bucket set is in
+        // effect and can resolve multi-minute queries.
+        assert!(
+            body.contains(r#"le="300""#),
+            "query-latency histogram must carry the wide bucket set: {body}"
+        );
+        // p50 falls in the sub-second bucket, p99 in the multi-minute bucket.
+        assert_eq!(m.query_latency_quantile("batch", 0.5), Some(0.5));
+        assert!(m.query_latency_quantile("batch", 0.99).unwrap() >= 120.0);
+    }
+
+    #[test]
+    fn grpc_duration_uses_microsecond_resolution_buckets() {
+        let m = KrishivMetrics::default();
+        // A 300 µs control-plane RPC — below the shared LATENCY_BUCKETS' 5 ms
+        // floor, so with the old buckets it would be indistinguishable from a
+        // 4 ms RPC. The µs buckets must resolve it.
+        m.observe_grpc_duration("/krishiv.Task/Assign", 0.000_3);
+        let body = m.render_prometheus();
+        // 100 µs / 250 µs / 500 µs bounds exist only in GRPC_LATENCY_BUCKETS.
+        assert!(
+            body.contains(r#"le="0.0001""#) && body.contains(r#"le="0.0005""#),
+            "grpc histogram must use the µs-resolution bucket set: {body}"
+        );
+        // The 300 µs sample lands above the 250 µs bound and at/under 500 µs.
+        assert!(body.contains(
+            r#"krishiv_grpc_call_duration_seconds_bucket{path="/krishiv.Task/Assign",le="0.0005"} 1"#
+        ));
     }
 }
 

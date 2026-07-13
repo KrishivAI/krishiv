@@ -444,6 +444,7 @@ pub(crate) async fn serve_with_token<S: ShuffleStore + Send + Sync + 'static>(
     );
     let handle = tokio::spawn(async move {
         if let Err(error) = Server::builder()
+            .layer(krishiv_metrics::grpc::GrpcDurationLayer)
             .add_service(intercepted)
             .serve_with_incoming(incoming)
             .await

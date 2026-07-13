@@ -324,9 +324,10 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
                         aborted,
                     );
                 }
-                return Err(tonic::Status::internal(format!(
-                    "checkpoint commit failed: {e}"
-                )));
+                return Err(krishiv_metrics::grpc::internal_status(
+                    "checkpoint commit",
+                    &e,
+                ));
             }
 
             // Phase 3: finalize commit under checkpoint inner lock, then sync
@@ -353,7 +354,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
                     );
                 }
                 finalize_result.map_err(|error| {
-                    tonic::Status::internal(format!("checkpoint finalize failed: {error}"))
+                    krishiv_metrics::grpc::internal_status("checkpoint finalize", &error)
                 })?;
                 // Post-commit: preserve savepoint epochs and drive
                 // stop-with-savepoint, mirroring the sync ack path.
@@ -474,7 +475,7 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
                 Some(coord) => {
                     let epochs = coord
                         .list_epochs()
-                        .map_err(|e| tonic::Status::internal(e.to_string()))?;
+                        .map_err(|e| krishiv_metrics::grpc::internal_status("list checkpoint epochs", &e))?;
                     (epochs, Some(Arc::clone(&coord.storage)))
                 }
             }
@@ -539,7 +540,7 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
             req.job_id.as_str(),
         )
         .await
-        .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        .map_err(|e| krishiv_metrics::grpc::internal_status("list checkpoint epochs for state inspection", &e))?;
 
         let mut snapshots = Vec::new();
         for epoch in epochs.into_iter().rev().take(20) {
@@ -549,7 +550,7 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
                 epoch,
             )
             .await
-            .map_err(|e| tonic::Status::internal(e.to_string()))?
+            .map_err(|e| krishiv_metrics::grpc::internal_status("read checkpoint epoch metadata", &e))?
             else {
                 continue;
             };

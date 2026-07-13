@@ -467,6 +467,7 @@ async fn heartbeat_loop(
         .with_auth_config(task_auth);
         tokio::spawn(async move {
             if let Err(e) = Server::builder()
+                .layer(krishiv_metrics::grpc::GrpcDurationLayer)
                 .add_service(tonic::service::interceptor::InterceptedService::new(
                     executor_barrier_grpc_server(barrier_service),
                     krishiv_metrics::grpc::extract_trace_context,

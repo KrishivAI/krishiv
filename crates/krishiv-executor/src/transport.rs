@@ -568,7 +568,7 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
             .into_inner();
         Ok(tonic::Response::new(
             wire::register_executor_response_from_wire(response)
-                .map_err(|e| tonic::Status::internal(e.to_string()))?,
+                .map_err(|e| krishiv_metrics::grpc::internal_status("decode register_executor response", &e))?,
         ))
     }
 
@@ -585,7 +585,7 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
             .into_inner();
         Ok(tonic::Response::new(
             wire::deregister_executor_response_from_wire(response)
-                .map_err(|e| tonic::Status::internal(e.to_string()))?,
+                .map_err(|e| krishiv_metrics::grpc::internal_status("decode deregister_executor response", &e))?,
         ))
     }
 
@@ -603,7 +603,7 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
             .await?
             .into_inner();
         let decoded = wire::executor_heartbeat_response_from_wire(response)
-            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+            .map_err(|e| krishiv_metrics::grpc::internal_status("decode executor_heartbeat response", &e))?;
         // Coordinator's authoritative lease — propagate immediately.
         self.pool.set_lease_generation(decoded.lease_generation());
         Ok(tonic::Response::new(decoded))
@@ -623,7 +623,7 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
             .into_inner();
         Ok(tonic::Response::new(
             wire::task_status_response_from_wire(response)
-                .map_err(|e| tonic::Status::internal(e.to_string()))?,
+                .map_err(|e| krishiv_metrics::grpc::internal_status("decode task_status response", &e))?,
         ))
     }
 
@@ -639,7 +639,7 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
             .into_inner();
         Ok(tonic::Response::new(
             wire::checkpoint_ack_response_from_wire(response)
-                .map_err(|e| tonic::Status::internal(e.to_string()))?,
+                .map_err(|e| krishiv_metrics::grpc::internal_status("decode checkpoint_ack response", &e))?,
         ))
     }
 
@@ -684,7 +684,7 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
         let response = result?.into_inner();
         Ok(tonic::Response::new(
             wire::push_task_result_response_from_wire(response)
-                .map_err(|e| tonic::Status::internal(e.to_string()))?,
+                .map_err(|e| krishiv_metrics::grpc::internal_status("decode push_task_result response", &e))?,
         ))
     }
 }
@@ -695,6 +695,7 @@ pub async fn serve_executor_task_grpc(
     inbox: ExecutorAssignmentInbox,
 ) -> Result<(), tonic::transport::Error> {
     tonic::transport::Server::builder()
+        .layer(krishiv_metrics::grpc::GrpcDurationLayer)
         .add_service(tonic::service::interceptor::InterceptedService::new(
             executor_task_grpc_server(inbox),
             krishiv_metrics::grpc::extract_trace_context,
@@ -709,6 +710,7 @@ pub async fn serve_executor_task_grpc_with_listener(
     inbox: ExecutorAssignmentInbox,
 ) -> Result<(), tonic::transport::Error> {
     tonic::transport::Server::builder()
+        .layer(krishiv_metrics::grpc::GrpcDurationLayer)
         .add_service(tonic::service::interceptor::InterceptedService::new(
             executor_task_grpc_server(inbox),
             krishiv_metrics::grpc::extract_trace_context,
@@ -730,6 +732,7 @@ pub async fn serve_executor_task_grpc_with_listener_and_continuous(
     continuous_inputs: SharedContinuousInputs,
 ) -> Result<(), tonic::transport::Error> {
     tonic::transport::Server::builder()
+        .layer(krishiv_metrics::grpc::GrpcDurationLayer)
         .add_service(tonic::service::interceptor::InterceptedService::new(
             executor_task_grpc_server_with_continuous(
                 inbox,
@@ -756,6 +759,7 @@ pub async fn serve_executor_task_grpc_with_run_loop(
     input_notify: crate::runner::SharedContinuousNotify,
 ) -> Result<(), tonic::transport::Error> {
     tonic::transport::Server::builder()
+        .layer(krishiv_metrics::grpc::GrpcDurationLayer)
         .add_service(tonic::service::interceptor::InterceptedService::new(
             crate::grpc::executor_task_grpc_server_with_run_loop(
                 inbox,

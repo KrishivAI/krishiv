@@ -104,6 +104,15 @@ impl Coordinator {
         }
         let inserted_job_id = record.job_id().clone();
 
+        // Phase 59 (observability gap-a): stamp the submit instant for batch
+        // jobs so `on_job_terminal` can record whole-query wall-clock latency.
+        // Streaming submit→terminal is job lifetime, not query latency, so it is
+        // deliberately not tracked.
+        if record.spec.kind() == JobKind::Batch {
+            self.job_submit_instants
+                .insert(inserted_job_id.clone(), std::time::Instant::now());
+        }
+
         // Track B (two-tier CCP/JCP): create the owning JobCoordinator for this job.
         // The JCP holds the Arc<RwLock<JobRecord>> and will progressively own per-job
         // launch decisions, heartbeat windows, checkpoint coordination, and recovery.
@@ -868,6 +877,16 @@ impl Coordinator {
         }
         self.gc_ready_jobs.push_back(job_id.clone());
         self.ckpt.coordinators.remove(job_id);
+
+        // Phase 59 (observability gap-a): observe whole-query wall-clock latency
+        // exactly once per batch job. This block is self-gated by the
+        // `gc_ready_jobs.contains` guard above, so it never double-counts across
+        // the DUR-1 `Committing` re-entry path. Non-batch jobs never inserted an
+        // instant, so the map lookup is simply absent for them.
+        if let Some(submit_instant) = self.job_submit_instants.remove(job_id) {
+            krishiv_metrics::global_metrics()
+                .observe_query_latency("batch", submit_instant.elapsed().as_secs_f64());
+        }
         // Free inline input data (InlineIpc partitions for batch-sql and
         // bounded-window jobs) — executors have already consumed this by the
         // time the job reaches a terminal state.
@@ -991,6 +1010,9 @@ impl Coordinator {
         self.skew_repartition_overrides.remove(job_id);
         self.streaming_advisory_partitions.remove(job_id);
         self.aqe_coalesce_hints.retain(|(jid, _), _| jid != job_id);
+        // Phase 59 (observability gap-a): drop any submit instant not already
+        // consumed by `on_job_terminal` so an evicted job cannot leak an entry.
+        self.job_submit_instants.remove(job_id);
         // Recovery control-plane state for the completed job.
         self.ckpt.restore_directives.remove(job_id);
         self.ckpt.pending_stop_after_savepoint.remove(job_id);
