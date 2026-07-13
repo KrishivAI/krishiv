@@ -47,6 +47,25 @@ pub trait TwoPhaseCommitSink: Send {
 
     /// Discard the staged output for `handle` without making it visible.
     fn abort(&mut self, handle: Self::Handle) -> ConnectorResult<()>;
+
+    /// DUR-2 recovery: finalize a transaction that was prepared before a crash,
+    /// reconstructing it from its durable `prepare_path` because the in-memory
+    /// [`Self::Handle`] does not survive an executor restart. `commit` replays
+    /// the two-phase second phase (make the staged output visible); `!commit`
+    /// discards the staged output. Must be idempotent — recovery may re-run.
+    ///
+    /// The default rejects recovery: a sink that does not persist enough at
+    /// `prepare` time to reconstruct the transaction cannot provide exactly-once
+    /// output across a restart and must not be used under a durable profile.
+    fn finalize_prepared(&mut self, prepare_path: &str, commit: bool) -> ConnectorResult<()> {
+        let _ = commit;
+        Err(ConnectorError::Unsupported {
+            message: format!(
+                "sink does not support prepared-transaction recovery (path {prepare_path}); \
+                 it cannot deliver exactly-once output across a restart under a durable profile"
+            ),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +337,29 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
             ))),
         }
     }
+
+    /// DUR-2 recovery: the staging file written at `prepare` is durable on disk,
+    /// so a prepared transaction is fully reconstructable from its staging path
+    /// after a crash. The final target is the staging path with the `.tmp`
+    /// suffix removed (see `prepare`), so `commit`/`abort` — both idempotent —
+    /// can finalize it without the original in-memory handle.
+    fn finalize_prepared(&mut self, prepare_path: &str, commit: bool) -> ConnectorResult<()> {
+        let final_str = prepare_path.strip_suffix(".tmp").ok_or_else(|| {
+            ConnectorError::Parquet(format!(
+                "parquet 2pc recovery: staging path {prepare_path} does not end in .tmp"
+            ))
+        })?;
+        let handle = ParquetCommitHandle {
+            epoch: 0,
+            staging_path: std::path::PathBuf::from(prepare_path),
+            final_path: std::path::PathBuf::from(final_str),
+        };
+        if commit {
+            self.commit(handle)
+        } else {
+            self.abort(handle)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -511,6 +553,54 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    /// DUR-2: after a crash the in-memory handle is gone but the durable
+    /// staging file survives, so `finalize_prepared` reconstructs the txn from
+    /// its staging path and commits (publish) or aborts (delete) idempotently.
+    #[test]
+    fn parquet_finalize_prepared_recovers_across_crash() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Prepare, capture the staging path, then DROP the sink (simulated crash).
+        let staging_commit = {
+            let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path());
+            let h = sink.prepare(7, &make_batch()).unwrap();
+            h.staging_path.to_string_lossy().into_owned()
+        };
+        assert!(
+            std::path::Path::new(&staging_commit).exists(),
+            "staging file must survive the crash"
+        );
+        let final_commit = staging_commit.strip_suffix(".tmp").unwrap().to_string();
+
+        // A fresh sink (post-restart) recovers the prepared txn by commit.
+        let mut recovered = LocalParquetTwoPhaseCommitSink::new(dir.path());
+        recovered.finalize_prepared(&staging_commit, true).unwrap();
+        assert!(
+            std::path::Path::new(&final_commit).exists(),
+            "recovery-commit must publish the output"
+        );
+        assert!(!std::path::Path::new(&staging_commit).exists());
+        // Idempotent: re-running recovery-commit is a no-op.
+        recovered.finalize_prepared(&staging_commit, true).unwrap();
+
+        // A separate prepared txn is aborted on recovery.
+        let staging_abort = {
+            let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path());
+            sink.prepare(8, &make_batch())
+                .unwrap()
+                .staging_path
+                .to_string_lossy()
+                .into_owned()
+        };
+        let final_abort = staging_abort.strip_suffix(".tmp").unwrap().to_string();
+        recovered.finalize_prepared(&staging_abort, false).unwrap();
+        assert!(!std::path::Path::new(&staging_abort).exists());
+        assert!(
+            !std::path::Path::new(&final_abort).exists(),
+            "aborted txn must never be published"
+        );
     }
 
     // ── EpochTransactionLog lifecycle ───────────────────────────────────────
