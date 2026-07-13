@@ -90,10 +90,15 @@ fn generate_coordinator_id() -> SchedulerResult<CoordinatorId> {
 /// streaming jobs: surviving executors must roll back too, otherwise their
 /// post-checkpoint state would double-count the source data that rewound
 /// sources re-deliver.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreDirective {
     pub epoch: u64,
     pub fencing_token: u64,
+    /// DUR-2 recovery: prepared-sink transactions the restored executors must
+    /// commit vs abort, computed from the checkpoint's `sink_transactions` and
+    /// the restored epoch by `krishiv_proto::plan_sink_transaction_recovery`.
+    pub sink_commit: Vec<krishiv_proto::SinkTransactionRef>,
+    pub sink_abort: Vec<krishiv_proto::SinkTransactionRef>,
 }
 
 /// Active coordinator.

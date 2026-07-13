@@ -590,9 +590,26 @@ impl Coordinator {
                     "cannot activate checkpoint epoch {restored_epoch} for job {job_id}: {e}"
                 ),
             })?;
+        // DUR-2: compute the prepared-sink recovery plan for this restore so the
+        // restored executors commit output that belongs to the restored epoch
+        // and abort rolled-back output (converting the checkpoint's sink refs to
+        // the wire/domain type).
+        let prepared: Vec<krishiv_proto::SinkTransactionRef> = metadata
+            .sink_transactions
+            .iter()
+            .map(|s| krishiv_proto::SinkTransactionRef {
+                sink_id: s.sink_id.clone(),
+                epoch: s.epoch,
+                prepare_path: s.prepare_path.clone(),
+                committed: s.committed,
+            })
+            .collect();
+        let recovery = krishiv_proto::plan_sink_transaction_recovery(&prepared, restored_epoch);
         let directive = RestoreDirective {
             epoch: restored_epoch,
             fencing_token: coord.fencing_token().as_u64(),
+            sink_commit: recovery.commit,
+            sink_abort: recovery.abort,
         };
         self.ckpt.notify_sent.retain(|(jid, _, _)| jid != job_id);
         self.ckpt.barrier_sent.retain(|(jid, _)| jid != job_id);
@@ -759,7 +776,7 @@ impl Coordinator {
 
     /// Active restore directive for a job, if any.
     pub fn restore_directive(&self, job_id: &JobId) -> Option<RestoreDirective> {
-        self.ckpt.restore_directives.get(job_id).copied()
+        self.ckpt.restore_directives.get(job_id).cloned()
     }
 
     // ── R6a: Out-of-band barrier trigger ──────────────────────────────────────
@@ -929,7 +946,7 @@ impl Coordinator {
             .ckpt
             .restore_directives
             .iter()
-            .map(|(job_id, directive)| (job_id.clone(), *directive))
+            .map(|(job_id, directive)| (job_id.clone(), directive.clone()))
             .collect();
         for (job_id, directive) in directives {
             if !self.executor_has_active_task_in_job(executor_id, &job_id) {
@@ -952,6 +969,8 @@ impl Coordinator {
                 job_id: job_id.clone(),
                 epoch: directive.epoch,
                 fencing_token,
+                sink_commit: directive.sink_commit.clone(),
+                sink_abort: directive.sink_abort.clone(),
             });
             self.ckpt.restore_notify_sent.insert(key);
             prune_sent_set(&mut self.ckpt.restore_notify_sent);

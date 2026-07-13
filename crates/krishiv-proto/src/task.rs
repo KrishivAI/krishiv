@@ -691,6 +691,12 @@ pub struct RestoreFromCheckpointCommand {
     pub job_id: JobId,
     pub epoch: u64,
     pub fencing_token: FencingToken,
+    /// DUR-2 recovery: prepared-sink transactions to commit on restore (their
+    /// output belongs to the restored epoch; replay the two-phase second phase).
+    pub sink_commit: Vec<crate::checkpoint::SinkTransactionRef>,
+    /// DUR-2 recovery: prepared-sink transactions to abort on restore (output
+    /// from epochs after the restore point, rolled back).
+    pub sink_abort: Vec<crate::checkpoint::SinkTransactionRef>,
 }
 
 /// Executor heartbeat response sent from coordinator to executor.

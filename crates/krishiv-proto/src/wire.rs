@@ -344,6 +344,8 @@ pub fn executor_heartbeat_response_to_wire(
                 job_id: cmd.job_id.as_str().to_owned(),
                 epoch: cmd.epoch,
                 fencing_token: cmd.fencing_token.as_u64(),
+                sink_commit: cmd.sink_commit.iter().map(sink_txn_ref_to_wire).collect(),
+                sink_abort: cmd.sink_abort.iter().map(sink_txn_ref_to_wire).collect(),
             })
             .collect(),
         source_throttles: value
@@ -444,6 +446,8 @@ pub fn executor_heartbeat_response_from_wire(
                     job_id,
                     epoch: cmd.epoch,
                     fencing_token,
+                    sink_commit: cmd.sink_commit.into_iter().map(sink_txn_ref_from_wire).collect(),
+                    sink_abort: cmd.sink_abort.into_iter().map(sink_txn_ref_from_wire).collect(),
                 })
             })
             .collect::<WireResult<Vec<_>>>()?;
@@ -1754,6 +1758,26 @@ pub fn checkpoint_ack_request_from_wire(
             })
             .collect(),
     })
+}
+
+/// DUR-2: domain → wire for a prepared-sink transaction reference.
+fn sink_txn_ref_to_wire(s: &SinkTransactionRef) -> v1::SinkTransactionRef {
+    v1::SinkTransactionRef {
+        sink_id: s.sink_id.clone(),
+        epoch: s.epoch,
+        prepare_path: s.prepare_path.clone(),
+        committed: s.committed,
+    }
+}
+
+/// DUR-2: wire → domain for a prepared-sink transaction reference.
+fn sink_txn_ref_from_wire(s: v1::SinkTransactionRef) -> SinkTransactionRef {
+    SinkTransactionRef {
+        sink_id: s.sink_id,
+        epoch: s.epoch,
+        prepare_path: s.prepare_path,
+        committed: s.committed,
+    }
 }
 
 /// Convert a domain checkpoint ack response to protobuf.

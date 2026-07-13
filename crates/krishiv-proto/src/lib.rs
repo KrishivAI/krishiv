@@ -31,7 +31,8 @@ mod tests;
 
 pub use checkpoint::{
     CheckpointAckRequest, CheckpointAckResponse, CheckpointAlignment, CheckpointSourceOffset,
-    InitiateCheckpointRequest, SinkTransactionRef, UnalignedBufferRef,
+    InitiateCheckpointRequest, SinkRecoveryPlan, SinkTransactionRef, UnalignedBufferRef,
+    plan_sink_transaction_recovery,
 };
 pub use executor::{
     DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor, ExecutorHeartbeat,

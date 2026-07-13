@@ -161,6 +161,12 @@ message RestoreFromCheckpointCommand {
   string job_id = 1;
   uint64 epoch = 2;
   uint64 fencing_token = 3;
+  // DUR-2 recovery: prepared-sink transactions to finalize on restore. The
+  // executor commits `sink_commit` (replay the two-phase second phase for
+  // output that belongs to the restored epoch) and aborts `sink_abort`
+  // (roll back output from epochs after the restore point).
+  repeated SinkTransactionRef sink_commit = 4;
+  repeated SinkTransactionRef sink_abort = 5;
 }
 
 message ExecutorHeartbeatResponse {

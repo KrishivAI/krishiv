@@ -401,6 +401,13 @@ impl Coordinator {
                         RestoreDirective {
                             epoch,
                             fencing_token: coord.fencing_token().as_u64(),
+                            // Executor-loss rollback (coordinator still alive):
+                            // prepared-sink commits are driven by the normal
+                            // checkpoint-complete flow, so no recovery plan is
+                            // attached here. DUR-2's coordinator-restart path
+                            // (restore_from_checkpoint) computes the plan.
+                            sink_commit: Vec::new(),
+                            sink_abort: Vec::new(),
                         },
                     );
                     tracing::warn!(

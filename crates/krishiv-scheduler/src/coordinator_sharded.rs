@@ -227,7 +227,7 @@ impl CheckpointInner {
 
     /// Active restore directive for a job, if any.
     pub fn restore_directive(&self, job_id: &JobId) -> Option<RestoreDirective> {
-        self.restore_directives.get(job_id).copied()
+        self.restore_directives.get(job_id).cloned()
     }
 
     /// Checkpoint-complete notifications to deliver to `executor_id`.
@@ -275,7 +275,7 @@ impl CheckpointInner {
         let directives: Vec<(JobId, RestoreDirective)> = self
             .restore_directives
             .iter()
-            .map(|(job_id, directive)| (job_id.clone(), *directive))
+            .map(|(job_id, directive)| (job_id.clone(), directive.clone()))
             .collect();
         for (job_id, directive) in directives {
             if !is_active(&job_id) {
@@ -298,6 +298,8 @@ impl CheckpointInner {
                 job_id: job_id.clone(),
                 epoch: directive.epoch,
                 fencing_token,
+                sink_commit: directive.sink_commit.clone(),
+                sink_abort: directive.sink_abort.clone(),
             });
             self.restore_notify_sent.insert(key);
             prune_sent_set(&mut self.restore_notify_sent);
