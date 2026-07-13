@@ -266,6 +266,21 @@ impl Coordinator {
     }
 
     /// Mark an executor lost and release its running task assignments for retry.
+    /// Find the id of a currently-known executor advertising `endpoint` as its
+    /// task gRPC endpoint. Used to fast-fail an executor whose task dispatch
+    /// failed at the transport layer (connection refused / repeated timeout =
+    /// the pod is gone), so its tasks are reassigned on the next launch tick
+    /// instead of waiting out the heartbeat timeout (#206).
+    pub(crate) fn executor_id_for_task_endpoint(&self, endpoint: &str) -> Option<ExecutorId> {
+        self.exec.executors.list().into_iter().find_map(|record| {
+            if record.descriptor().task_endpoint() == Some(endpoint) {
+                Some(record.executor_id().clone())
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn mark_executor_lost(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()> {
         self.ensure_active()?;
         self.prune_executor_channel(executor_id);
@@ -862,5 +877,37 @@ impl Coordinator {
             }
         }
         global
+    }
+}
+
+#[cfg(test)]
+mod endpoint_lookup_tests {
+    use super::*;
+    use krishiv_proto::{ExecutorDescriptor, ExecutorId};
+
+    /// The reverse endpoint→executor lookup used by the #206 fast-reassignment
+    /// path must resolve a registered executor by its advertised task endpoint
+    /// and return `None` for an unknown endpoint.
+    #[test]
+    fn executor_id_for_task_endpoint_resolves_registered_executor() {
+        let mut coord = Coordinator::new_active(None).unwrap();
+        let exec_id = ExecutorId::try_new("exec-206").unwrap();
+        coord
+            .register_executor(
+                ExecutorDescriptor::new(exec_id.clone(), "10.0.0.7", 4)
+                    .with_task_endpoint("http://10.0.0.7:2005"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            coord.executor_id_for_task_endpoint("http://10.0.0.7:2005"),
+            Some(exec_id),
+            "a registered executor must be found by its task endpoint"
+        );
+        assert_eq!(
+            coord.executor_id_for_task_endpoint("http://10.0.0.7:9999"),
+            None,
+            "an unknown endpoint must not resolve to any executor"
+        );
     }
 }

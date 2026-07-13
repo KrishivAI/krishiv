@@ -1044,6 +1044,35 @@ impl SharedCoordinator {
                             );
                         }
                     }
+                    Err(SchedulerError::ExecutorUnavailable { endpoint, reason }) => {
+                        // The executor was unreachable after the delivery retry
+                        // budget (connection refused / repeated timeout = the
+                        // pod is gone). Proactively mark it lost so its assigned
+                        // tasks are reset and reassigned to a healthy executor
+                        // on the next launch tick, instead of re-dispatching to
+                        // the dead endpoint every 500ms until the heartbeat
+                        // timeout eventually detects the loss (#206 — reproduced
+                        // as transient query failures under executor churn on
+                        // the k3s chaos cert). Reuses the existing, tested
+                        // `mark_executor_lost` recovery path, just on an earlier
+                        // signal.
+                        tracing::warn!(
+                            job_id = %job_id,
+                            endpoint = %endpoint,
+                            reason = %reason,
+                            "task launch delivery failed; marking unreachable executor lost for fast reassignment"
+                        );
+                        coord.clear_launch_in_flight_for_job(&job_id);
+                        if let Some(executor_id) = coord.executor_id_for_task_endpoint(&endpoint) {
+                            if let Err(e) = coord.mark_executor_lost(&executor_id) {
+                                tracing::debug!(
+                                    executor = %executor_id,
+                                    error = %e,
+                                    "mark_executor_lost after delivery failure was a no-op (already lost)"
+                                );
+                            }
+                        }
+                    }
                     Err(error) => {
                         tracing::warn!(
                             job_id = %job_id,

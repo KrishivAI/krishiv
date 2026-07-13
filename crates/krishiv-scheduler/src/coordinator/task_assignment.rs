@@ -798,7 +798,15 @@ impl Coordinator {
                 Ok(channel) => channel,
                 Err(error) => {
                     if final_attempt {
-                        return Err(error);
+                        // Could not establish a connection after the full retry
+                        // budget — the executor is unreachable. Return a
+                        // liveness-typed error so the launch loop can fast-fail
+                        // it and reassign its tasks (#206) instead of waiting
+                        // for the heartbeat timeout.
+                        return Err(SchedulerError::ExecutorUnavailable {
+                            endpoint: endpoint.clone(),
+                            reason: error.to_string(),
+                        });
                     }
                     tracing::warn!(
                         endpoint = %endpoint,
@@ -878,9 +886,10 @@ impl Coordinator {
                     assignment_retry_backoff(attempt_idx).await;
                 }
                 Err(_elapsed) => {
-                    return Err(SchedulerError::Transport {
-                        message: format!(
-                            "assign_task to {endpoint} timed out after {}s",
+                    return Err(SchedulerError::ExecutorUnavailable {
+                        endpoint: endpoint.clone(),
+                        reason: format!(
+                            "assign_task timed out after {}s (all attempts)",
                             ASSIGNMENT_DELIVERY_TIMEOUT.as_secs()
                         ),
                     });
@@ -888,8 +897,9 @@ impl Coordinator {
             }
         }
 
-        Err(SchedulerError::Transport {
-            message: format!("assign_task to {endpoint}: retry loop exhausted"),
+        Err(SchedulerError::ExecutorUnavailable {
+            endpoint: endpoint.clone(),
+            reason: String::from("assign_task retry budget exhausted"),
         })
     }
 
