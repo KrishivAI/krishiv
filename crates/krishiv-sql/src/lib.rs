@@ -84,6 +84,7 @@ pub mod streaming;
 pub mod streaming_tvf;
 pub mod streaming_window_plan;
 mod udf;
+mod json_functions;
 mod window_functions;
 
 pub use cep_sql::{
@@ -841,6 +842,11 @@ impl SqlEngine {
                 }
             })?;
         }
+        // Phase 60: Spark-reference JSON scalar functions are always available on
+        // the batch SQL front door (get_json_object, json_array_length).
+        json_functions::register_json_functions(&context).map_err(|e| SqlError::DataFusion {
+            message: format!("failed to register JSON UDFs: {e}"),
+        })?;
         Ok(Self {
             context,
             target_parallelism: target_partitions,
