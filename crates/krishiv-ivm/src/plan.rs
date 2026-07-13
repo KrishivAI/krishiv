@@ -141,6 +141,28 @@ impl ViewPlan {
         }
     }
 
+    /// AUD-9 (loud degradation): a short human description of how this view
+    /// executes, surfaced on the `debug-info` endpoint so an operator can see —
+    /// and act on — a view silently running full-recompute instead of O(Δ).
+    pub fn describe(&self) -> &'static str {
+        match self {
+            ViewPlan::Aggregate { .. } => {
+                "incremental aggregate — retract/insert only the changed groups per delta"
+            }
+            ViewPlan::Distinct { .. } => {
+                "incremental DISTINCT — multiset add/remove per delta"
+            }
+            ViewPlan::Join { .. } => {
+                "incremental equi-join — symmetric hash trace; probes only the delta rows"
+            }
+            ViewPlan::DiffBased => {
+                "full recompute (DiffBased) — no O(Δ) plan matched this view shape (needs a \
+                 single-source GROUP BY aggregate, DISTINCT, or equi-join with supported \
+                 per-side filters); the tick re-runs the whole view SQL and diffs the result"
+            }
+        }
+    }
+
     /// Serialize the operator's internal accumulator state, or `None` when the
     /// operator has none (`DiffBased` is stateless). A caller that gets `None`
     /// falls back to [`seed_from_snapshots`](Self::seed_from_snapshots).

@@ -305,6 +305,12 @@ pub struct ExecutorTaskRunner {
     /// target so a process hosting a SUBSET of subtasks still routes by the
     /// job-wide ranges.
     pub(crate) rloop_parallelism: Arc<DashMap<String, usize>>,
+
+    /// Phase 57 (AUD-6): executor-resident IVM flows, keyed by IVM job id.
+    /// State attaches once; every tick afterwards feeds deltas into the same
+    /// warm flow (cached ctx + compiled plans + operator accumulators) and
+    /// returns output deltas.
+    pub(crate) ivm_flows: crate::fragment::ivm::ResidentIvmFlows,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -387,6 +393,7 @@ impl ExecutorTaskRunner {
             own_task_endpoint: None,
             barrier_context: None,
             rloop_parallelism: Arc::new(DashMap::new()),
+            ivm_flows: Arc::new(DashMap::new()),
         }
     }
 
@@ -860,16 +867,30 @@ impl ExecutorTaskRunner {
                 }
             }
             crate::ExecutionModel::DeltaBatch => {
-                // Stateless IVM tick (coordinator-authoritative): the executor
-                // runs one tick on a transient flow and returns each view's
-                // full output. No per-job state is retained on the executor.
+                // Phase 57 (AUD-6): resident-protocol fragments run against the
+                // executor's persistent per-job flow (attach/tick/ckpt/detach).
+                // The legacy `delta:step:` stateless tick is kept for
+                // rolling-upgrade compatibility with older coordinators.
                 let timeout_secs = assignment
                     .task_timeout_secs()
                     .unwrap_or(DEFAULT_BATCH_TASK_TIMEOUT_SECS);
                 let fragment_body = fragment_body.to_string();
+                let is_resident =
+                    crate::fragment::ivm::is_resident_ivm_fragment(&fragment_body);
+                let ivm_future = async {
+                    if is_resident {
+                        crate::fragment::ivm::execute_resident_ivm_fragment(
+                            &self.ivm_flows,
+                            &fragment_body,
+                        )
+                        .await
+                    } else {
+                        crate::fragment::ivm::execute_ivm_fragment(&fragment_body).await
+                    }
+                };
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
-                    crate::fragment::ivm::execute_ivm_fragment(&fragment_body),
+                    ivm_future,
                 )
                 .await
                 {

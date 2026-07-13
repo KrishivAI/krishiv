@@ -216,6 +216,41 @@ impl IncrementalView {
         Ok(delta)
     }
 
+    /// Apply an **output delta** to the view's materialized state (AUD-6).
+    ///
+    /// Used by the coordinator to mirror a tick computed on a resident
+    /// executor: both the diff baseline (`full_output`) and, for materialized
+    /// views, the `snapshot` advance by the delta, keeping them in lockstep
+    /// with the executor's flow without ever shipping the full output. The
+    /// delta is also published to subscribers and stored as `last_output`.
+    pub fn apply_output_delta(&self, delta: &DeltaBatch) -> DeltaResult<()> {
+        {
+            let mut fo = self
+                .full_output
+                .lock()
+                .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
+            let updated = crate::operators::stream::apply_delta(fo.take(), delta)?;
+            *fo = Some(updated);
+        }
+        if self.spec.is_materialized {
+            let mut snap = self
+                .snapshot
+                .lock()
+                .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
+            let updated = crate::operators::stream::apply_delta(snap.take(), delta)?;
+            *snap = Some(updated);
+        }
+        {
+            let mut lo = self
+                .last_output
+                .lock()
+                .map_err(|_| DeltaError::Operator("view output lock poisoned".into()))?;
+            *lo = Some(delta.clone());
+        }
+        let _ = self.sender.send(Some(delta.clone()));
+        Ok(())
+    }
+
     /// Restore previously checkpointed view state (`snapshot` + `full_output`).
     ///
     /// Used to seed a transient flow on a remote executor so its single tick

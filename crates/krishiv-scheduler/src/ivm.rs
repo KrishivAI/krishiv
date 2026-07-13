@@ -117,6 +117,23 @@ impl IvmJob {
         }
     }
 
+    /// AUD-9 (loud degradation): classify how a view executes —
+    /// `(incremental, human_reason)`, `None` if not registered. A partitioned
+    /// job only ever exists because its view lowered to an incremental
+    /// key-group aggregate, so it reports incremental directly.
+    pub fn view_plan_classification(&self, view: &str) -> IvmResult<Option<(bool, String)>> {
+        match self {
+            IvmJob::Single(f) => f.view_plan_classification(view),
+            IvmJob::Partitioned(p) => Ok(p.view_spec(view)?.map(|_| {
+                (
+                    true,
+                    "incremental — key-group partitioned aggregate (one flow per shard)"
+                        .to_string(),
+                )
+            })),
+        }
+    }
+
     /// Cumulative insert/retract counters for a view (#94); summed across
     /// shards when partitioned.
     pub fn view_delta_stats(&self, view: &str) -> IvmResult<Option<krishiv_ivm::ViewDeltaStats>> {
@@ -244,6 +261,36 @@ fn default_ivm_shards() -> usize {
     resolve_ivm_shards(env.as_deref(), parallelism)
 }
 
+/// Phase 57 (AUD-6): one recorded dispatch decision for an IVM tick.
+///
+/// Every route a tick can take — resident executor, central because no
+/// executors are live, central because the job is partitioned, or central
+/// fallback after a resident dispatch failure — is recorded here and exposed
+/// via `GET /api/v1/ivm/jobs/{job}/dispatch`. There are no silent fallbacks.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IvmDispatchRecord {
+    /// Flow tick this decision applied to.
+    pub tick: u64,
+    /// "resident" | "central-fallback" | "central-no-executors" |
+    /// "central-partitioned".
+    pub mode: String,
+    /// Human-readable reason (error text for fallbacks; empty for resident).
+    pub reason: String,
+    /// Unix millis when the decision was recorded.
+    pub at_unix_ms: i64,
+}
+
+/// Phase 57 (AUD-6): resident-dispatch bookkeeping for one IVM job.
+#[derive(Debug, Clone, Default)]
+pub struct IvmDispatchState {
+    /// True while a resident executor flow is believed attached.
+    pub attached: bool,
+    /// Last fence acknowledged by the resident executor.
+    pub fence: u64,
+    /// Most recent dispatch decision.
+    pub last: Option<IvmDispatchRecord>,
+}
+
 /// Registry of IVM jobs hosted on this coordinator process.
 #[derive(Debug)]
 pub struct IvmJobRegistry {
@@ -255,6 +302,8 @@ pub struct IvmJobRegistry {
     /// the tick counter. Each job gets its own lock (created lazily, removed on
     /// `delete`) so unrelated jobs never contend.
     step_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Phase 57: per-job resident dispatch state (fence, attach, last decision).
+    dispatch: Mutex<HashMap<String, IvmDispatchState>>,
 }
 
 impl std::fmt::Debug for IvmJob {
@@ -272,6 +321,7 @@ impl Default for IvmJobRegistry {
             jobs: Mutex::new(HashMap::new()),
             default_shards: default_ivm_shards(),
             step_locks: Mutex::new(HashMap::new()),
+            dispatch: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -287,7 +337,26 @@ impl IvmJobRegistry {
             jobs: Mutex::new(HashMap::new()),
             default_shards: default_shards.max(1),
             step_locks: Mutex::new(HashMap::new()),
+            dispatch: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Snapshot the resident-dispatch state for a job (default when unset).
+    pub fn dispatch_state(&self, job_id: &str) -> IvmDispatchState {
+        self.dispatch
+            .lock()
+            .ok()
+            .and_then(|m| m.get(job_id).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Mutate the resident-dispatch state for a job (created if absent).
+    pub fn update_dispatch(&self, job_id: &str, f: impl FnOnce(&mut IvmDispatchState)) {
+        let mut map = match self.dispatch.lock() {
+            Ok(m) => m,
+            Err(p) => p.into_inner(),
+        };
+        f(map.entry(job_id.to_string()).or_default());
     }
 
     /// Return the per-job async step lock (creating it if absent).
@@ -371,6 +440,8 @@ impl IvmJobRegistry {
             .unwrap_or(false);
         // Drop the per-job step lock so a recreated same-id job gets a fresh one.
         let _ = self.step_locks.lock().map(|mut l| l.remove(job_id));
+        // Drop dispatch bookkeeping (a recreated job starts unattached).
+        let _ = self.dispatch.lock().map(|mut d| d.remove(job_id));
         removed
     }
 

@@ -21,7 +21,7 @@
 /// view's full output as task output. The executor is **stateless**: each tick
 /// runs on a transient flow seeded from a coordinator-shipped state snapshot,
 /// so executors remain replaceable workers. The coordinator is the single
-/// source of truth (see `submit_distributed_ivm_step` in `krishiv-scheduler`).
+/// source of truth (see `submit_resident_ivm_step` in `krishiv-scheduler`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionModel {
     /// Task runs to completion and returns terminal output.

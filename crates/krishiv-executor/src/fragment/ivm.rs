@@ -19,7 +19,7 @@
 //! No per-job state is retained on the executor: it is a replaceable worker.
 //! If the executor fails or is reassigned mid-tick, the coordinator re-feeds
 //! the pending deltas and computes centrally — so state can never diverge or
-//! be lost. See `submit_distributed_ivm_step` in `krishiv-scheduler`.
+//! be lost. See `submit_resident_ivm_step` in `krishiv-scheduler`.
 //!
 //! # Fragment format
 //!
@@ -113,10 +113,213 @@ fn empty_batch(schema: SchemaRef) -> RecordBatch {
         .unwrap_or_else(|_| RecordBatch::new_empty(std::sync::Arc::new(Schema::empty())))
 }
 
-// ── fragment prefix ───────────────────────────────────────────────────────────
+// ── fragment prefixes ─────────────────────────────────────────────────────────
 
-/// Prefix for IVM step fragments.
+/// Prefix for legacy stateless IVM step fragments (full state per tick).
 pub const IVM_FRAGMENT_PREFIX: &str = "delta:step:";
+/// Resident protocol (AUD-6): create/replace a resident flow (state ships once).
+pub const IVM_ATTACH_PREFIX: &str = "delta:attach:";
+/// Resident protocol: feed deltas + step the resident flow (fence-guarded).
+pub const IVM_TICK_PREFIX: &str = "delta:tick:";
+/// Resident protocol: return `checkpoint_full` bytes of the resident flow.
+pub const IVM_CKPT_PREFIX: &str = "delta:ckpt:";
+/// Resident protocol: drop the resident flow.
+pub const IVM_DETACH_PREFIX: &str = "delta:detach:";
+
+/// True when `body` is any resident-protocol IVM fragment.
+pub fn is_resident_ivm_fragment(body: &str) -> bool {
+    body.starts_with(IVM_ATTACH_PREFIX)
+        || body.starts_with(IVM_TICK_PREFIX)
+        || body.starts_with(IVM_CKPT_PREFIX)
+        || body.starts_with(IVM_DETACH_PREFIX)
+}
+
+// ── resident flows (AUD-6) ────────────────────────────────────────────────────
+
+/// One executor-resident IVM flow plus its dispatch fence.
+///
+/// The flow persists across ticks — cached `SessionContext`, compiled view
+/// plans, and operator accumulators all stay warm (the exact state the old
+/// stateless path rebuilt from a shipped snapshot every tick). The fence is
+/// the coordinator's tick number: a tick is accepted only when
+/// `fence == last_fence + 1`, so replays and gaps error instead of silently
+/// double-applying or skipping deltas.
+pub struct ResidentIvmFlow {
+    pub flow: IncrementalFlow,
+    pub fence: u64,
+}
+
+/// Executor-wide map of resident IVM flows, keyed by IVM job id.
+///
+/// The per-entry async mutex serializes ticks for one job (matching the
+/// coordinator's per-job step lock) while independent jobs run in parallel.
+pub type ResidentIvmFlows =
+    std::sync::Arc<dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<ResidentIvmFlow>>>>;
+
+fn register_specs_on_flow(flow: &IncrementalFlow, view_specs: &[ViewSpecJson]) -> Result<(), String> {
+    for vs in view_specs {
+        if let Some(schema) = parse_schema_fields(&vs.output_schema_fields) {
+            let spec = IncrementalViewSpec {
+                name: vs.name.clone(),
+                body_sql: vs.body_sql.clone(),
+                output_schema: schema,
+                is_materialized: vs.is_materialized,
+                is_recursive: vs.is_recursive,
+                lateness: vs.lateness.clone(),
+            };
+            flow.register_view(spec).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_specs_b64(specs_b64: &str) -> Result<Vec<ViewSpecJson>, String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let specs_json = b64
+        .decode(specs_b64)
+        .map_err(|e| format!("specs b64: {e}"))?;
+    let specs_str = std::str::from_utf8(&specs_json).map_err(|e| format!("specs utf8: {e}"))?;
+    serde_json::from_str(specs_str).map_err(|e| format!("specs json: {e}"))
+}
+
+fn decode_deltas_b64(deltas_b64: &str) -> Result<Vec<PendingDeltaJson>, String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let deltas_json = b64
+        .decode(deltas_b64)
+        .map_err(|e| format!("deltas b64: {e}"))?;
+    let deltas_str = std::str::from_utf8(&deltas_json).map_err(|e| format!("deltas utf8: {e}"))?;
+    serde_json::from_str(deltas_str).map_err(|e| format!("deltas json: {e}"))
+}
+
+/// Execute a resident-protocol IVM fragment against the executor's flow map.
+///
+/// Returns `(StepSummary, Option<blob>)` like [`execute_ivm_fragment`]. The
+/// blob is:
+/// - `delta:tick:`   → per-view **output-delta** map (`encode_delta_map`)
+/// - `delta:ckpt:`   → `checkpoint_full` bytes of the resident flow
+/// - `delta:attach:` / `delta:detach:` → `None`
+pub async fn execute_resident_ivm_fragment(
+    flows: &ResidentIvmFlows,
+    fragment_body: &str,
+) -> Result<(krishiv_ivm::StepSummary, Option<Vec<u8>>), String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    if let Some(rest) = fragment_body.strip_prefix(IVM_ATTACH_PREFIX) {
+        // delta:attach:{job}|{specs_b64}|{state_b64}|{fence}
+        let parts: Vec<&str> = rest.splitn(4, '|').collect();
+        let [job, specs_b64, state_b64, fence_s] = parts.as_slice() else {
+            return Err("invalid delta:attach fragment: expected 4 parts".into());
+        };
+        let fence: u64 = fence_s
+            .parse()
+            .map_err(|e| format!("attach fence parse: {e}"))?;
+        let view_specs = decode_specs_b64(specs_b64)?;
+        let state_bytes = b64
+            .decode(state_b64)
+            .map_err(|e| format!("state b64: {e}"))?;
+
+        // A resident flow uses cached incremental plans across ticks — this is
+        // the point of residency, so `force_diff_based` is deliberately NOT set
+        // (the accumulators live here and never need to transfer per tick).
+        let flow = IncrementalFlow::new();
+        register_specs_on_flow(&flow, &view_specs)?;
+        if !state_bytes.is_empty() {
+            flow.restore_full(&state_bytes)
+                .map_err(|e| format!("attach restore_full: {e}"))?;
+        }
+        flows.insert(
+            (*job).to_owned(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(ResidentIvmFlow { flow, fence })),
+        );
+        tracing::info!(job = %job, fence, state_bytes = state_bytes.len(),
+            "resident IVM flow attached");
+        return Ok((krishiv_ivm::StepSummary::default(), None));
+    }
+
+    if let Some(rest) = fragment_body.strip_prefix(IVM_TICK_PREFIX) {
+        // delta:tick:{job}|{deltas_b64}|{fence}
+        let parts: Vec<&str> = rest.splitn(3, '|').collect();
+        let [job, deltas_b64, fence_s] = parts.as_slice() else {
+            return Err("invalid delta:tick fragment: expected 3 parts".into());
+        };
+        let fence: u64 = fence_s
+            .parse()
+            .map_err(|e| format!("tick fence parse: {e}"))?;
+        let entry = flows
+            .get(*job)
+            .map(|e| e.value().clone())
+            .ok_or_else(|| format!("no resident IVM flow for job '{job}' (needs attach)"))?;
+        let mut resident = entry.lock().await;
+        if fence != resident.fence + 1 {
+            return Err(format!(
+                "fence mismatch for job '{job}': expected {}, got {fence} \
+                 (replay or gap — coordinator must re-attach)",
+                resident.fence + 1
+            ));
+        }
+        let pending = decode_deltas_b64(deltas_b64)?;
+        for pd in &pending {
+            let ipc_bytes = b64
+                .decode(&pd.delta_b64)
+                .map_err(|e| format!("base64 decode delta for '{}': {e}", pd.source))?;
+            let delta = deserialize_delta_batch(&ipc_bytes)
+                .map_err(|e| e.to_string())?
+                .drop_zeros()
+                .map_err(|e| e.to_string())?;
+            resident
+                .flow
+                .feed(pd.source.clone(), delta)
+                .map_err(|e| e.to_string())?;
+        }
+        let summary = resident
+            .flow
+            .step_datafusion()
+            .await
+            .map_err(|e| e.to_string())?;
+        resident.fence = fence;
+
+        // AUD-6 exit contract: return per-view OUTPUT DELTAS, never snapshots.
+        let mut outputs: HashMap<String, krishiv_ivm::DeltaBatch> = HashMap::new();
+        for name in resident.flow.view_names().map_err(|e| e.to_string())? {
+            if let Some(delta) = resident
+                .flow
+                .take_step_output(&name)
+                .map_err(|e| e.to_string())?
+            {
+                outputs.insert(name, delta);
+            }
+        }
+        let blob = krishiv_ivm::encode_delta_map(&outputs).map_err(|e| e.to_string())?;
+        return Ok((summary, Some(blob)));
+    }
+
+    if let Some(job) = fragment_body.strip_prefix(IVM_CKPT_PREFIX) {
+        let entry = flows
+            .get(job)
+            .map(|e| e.value().clone())
+            .ok_or_else(|| format!("no resident IVM flow for job '{job}' (needs attach)"))?;
+        let resident = entry.lock().await;
+        let bytes = resident
+            .flow
+            .checkpoint_full()
+            .map_err(|e| e.to_string())?;
+        return Ok((krishiv_ivm::StepSummary::default(), Some(bytes)));
+    }
+
+    if let Some(job) = fragment_body.strip_prefix(IVM_DETACH_PREFIX) {
+        flows.remove(job);
+        tracing::info!(job = %job, "resident IVM flow detached");
+        return Ok((krishiv_ivm::StepSummary::default(), None));
+    }
+
+    Err(format!(
+        "not a resident IVM fragment: {}",
+        fragment_body.chars().take(40).collect::<String>()
+    ))
+}
 
 // ── execution ─────────────────────────────────────────────────────────────────
 
@@ -283,6 +486,110 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .unwrap()
             .value(0)
+    }
+
+    /// Phase 57 (AUD-6) resident protocol: state attaches ONCE, ticks carry
+    /// deltas + fences only, results are per-view OUTPUT DELTAS, and state
+    /// accumulates across ticks on the executor (the whole point of residency).
+    /// A replayed fence is rejected instead of double-applying.
+    #[tokio::test]
+    async fn resident_flow_accumulates_across_ticks_and_returns_deltas() {
+        use krishiv_ivm::{
+            decode_delta_map, encode_ivm_attach_fragment, encode_ivm_ckpt_fragment,
+            encode_ivm_detach_fragment, encode_ivm_tick_fragment,
+        };
+
+        let flows: super::ResidentIvmFlows = Arc::new(dashmap::DashMap::new());
+        let specs = vec![sum_view_spec()];
+
+        // Attach with EMPTY state (fresh job promotion) at fence 0.
+        let attach = encode_ivm_attach_fragment("job-r", &specs, &[], 0).unwrap();
+        super::execute_resident_ivm_fragment(&flows, &attach)
+            .await
+            .unwrap();
+
+        let tick = |amounts: Vec<f64>, fence: u64| {
+            let mut pending = std::collections::HashMap::new();
+            pending.insert(
+                "sales".to_string(),
+                DeltaBatch::from_inserts(sales_batch(&amounts)).unwrap(),
+            );
+            encode_ivm_tick_fragment("job-r", &pending, fence).unwrap()
+        };
+
+        // Tick 1: 100+200 → total 300 (all-insert first output).
+        let (_s1, blob1) = super::execute_resident_ivm_fragment(&flows, &tick(vec![100.0, 200.0], 1))
+            .await
+            .unwrap();
+        let d1 = decode_delta_map(blob1.as_ref().unwrap()).unwrap();
+        let out1 = d1.get("total_sales").expect("view emitted a delta");
+        assert!(
+            out1.weights().iter().flatten().any(|w| w > 0),
+            "first tick output must contain an insertion"
+        );
+
+        // Tick 2: +50 → the RESIDENT state accumulates: retract 300, insert 350.
+        let (_s2, blob2) = super::execute_resident_ivm_fragment(&flows, &tick(vec![50.0], 2))
+            .await
+            .unwrap();
+        let d2 = decode_delta_map(blob2.as_ref().unwrap()).unwrap();
+        let out2 = d2.get("total_sales").expect("second tick delta");
+        let data = out2.data_batch();
+        let weights = out2.weights();
+        let totals = data
+            .column_by_name("total")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let mut retract_300 = false;
+        let mut insert_350 = false;
+        for i in 0..data.num_rows() {
+            let (w, t) = (weights.value(i), totals.value(i));
+            if w < 0 && (t - 300.0).abs() < 1e-9 {
+                retract_300 = true;
+            }
+            if w > 0 && (t - 350.0).abs() < 1e-9 {
+                insert_350 = true;
+            }
+        }
+        assert!(
+            retract_300 && insert_350,
+            "resident state must accumulate across ticks (retract 300, insert 350); got {out2:?}"
+        );
+
+        // Fence replay (2 again) and gap (5) are both rejected.
+        let replay = super::execute_resident_ivm_fragment(&flows, &tick(vec![1.0], 2)).await;
+        assert!(replay.is_err(), "fence replay must be rejected");
+        let gap = super::execute_resident_ivm_fragment(&flows, &tick(vec![1.0], 5)).await;
+        assert!(gap.is_err(), "fence gap must be rejected");
+
+        // Checkpoint returns restorable full-state bytes.
+        let (_sc, ckpt) = super::execute_resident_ivm_fragment(
+            &flows,
+            &encode_ivm_ckpt_fragment("job-r"),
+        )
+        .await
+        .unwrap();
+        let restored = IncrementalFlow::new();
+        restored.register_view(sum_view_spec()).unwrap();
+        restored.restore_full(ckpt.as_ref().unwrap()).unwrap();
+        let snap = restored.snapshot("total_sales").unwrap().unwrap();
+        let total = snap
+            .column_by_name("total")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        assert!((total - 350.0).abs() < 1e-9, "ckpt restores 350, got {total}");
+
+        // Detach drops the flow; the next tick errors (needs re-attach).
+        super::execute_resident_ivm_fragment(&flows, &encode_ivm_detach_fragment("job-r"))
+            .await
+            .unwrap();
+        let after = super::execute_resident_ivm_fragment(&flows, &tick(vec![1.0], 3)).await;
+        assert!(after.is_err(), "tick after detach must error");
     }
 
     /// The stateless fragment round-trip: encode a tick on the coordinator side,

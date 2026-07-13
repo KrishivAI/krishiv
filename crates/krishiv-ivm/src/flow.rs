@@ -111,6 +111,50 @@ fn delta_insert_retract_counts(delta: &DeltaBatch) -> (u64, u64) {
     (inserts, retracts)
 }
 
+/// AUD-8 (retention): the maximum epoch-millisecond value in a timestamp column,
+/// or `None` if the column is empty, all-null, or not a supported timestamp type.
+///
+/// The LATENESS contract is an `Int64` epoch-ms column or a millisecond
+/// `Timestamp` (the engine's canonical `event_time`; see the kafka-bridge
+/// protocol). Other timestamp units are not observed here — advancing a
+/// millisecond watermark from a nanosecond column would misplace it by 10^6 —
+/// so they are ignored rather than mis-scaled.
+fn max_epoch_ms(arr: &dyn arrow::array::Array) -> Option<i64> {
+    use arrow::array::{Int64Array, TimestampMillisecondArray};
+    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+        return arrow::compute::max(a);
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampMillisecondArray>() {
+        return arrow::compute::max(a);
+    }
+    None
+}
+
+/// AUD-8 (retention): advance a source's LATENESS watermark from a fed batch.
+///
+/// No-op unless the source has a registered [`WatermarkTracker`]. Retraction
+/// rows carry event times that were necessarily observed on their earlier
+/// insertion, so taking the column max over all rows never moves the watermark
+/// backward — the tracker itself is monotonic (`observe` only raises it).
+fn observe_source_watermark(inner: &mut IncrementalFlowInner, source_name: &str, batch: &DeltaBatch) {
+    let Some(column) = inner
+        .watermark_trackers
+        .get(source_name)
+        .map(|t| t.lateness_column().to_string())
+    else {
+        return;
+    };
+    let data = batch.data_batch();
+    let Ok(idx) = data.schema().index_of(&column) else {
+        return;
+    };
+    if let Some(max_ts) = max_epoch_ms(data.column(idx).as_ref())
+        && let Some(tracker) = inner.watermark_trackers.get_mut(source_name)
+    {
+        tracker.observe(max_ts);
+    }
+}
+
 /// One incremental view's failure during a step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewError {
@@ -419,6 +463,37 @@ impl IncrementalFlow {
         if let Some(deps) = extract_sql_table_refs(&spec.body_sql) {
             inner.view_deps.insert(spec.name.clone(), deps);
         }
+
+        // AUD-8 (retention): activate LATENESS. Each declared spec creates a
+        // watermark tracker so the tick loop's per-plan `gc_watermark` actually
+        // advances and prunes stale join/aggregate trace entries instead of the
+        // mechanism sitting inert with zero callers. A bare `LatenessSpec` names
+        // only the timestamp column, so it is associated with the view's source
+        // — unambiguous for a single-source view. Multi-source association needs
+        // an explicit source qualifier (view-spec / SQL surface, Phase 60) and
+        // is skipped with a warning rather than guessed.
+        if !spec.lateness.is_empty() {
+            match inner.view_deps.get(&spec.name) {
+                Some(deps) if deps.len() == 1 => {
+                    let source = deps.iter().next().cloned().unwrap_or_default();
+                    for l in &spec.lateness {
+                        inner
+                            .watermark_trackers
+                            .entry(source.clone())
+                            .or_insert_with(|| WatermarkTracker::new(l.clone()));
+                    }
+                }
+                other => {
+                    tracing::warn!(
+                        view = %spec.name,
+                        sources = other.map(|d| d.len()).unwrap_or(0),
+                        "LATENESS declared but the source is ambiguous (need exactly \
+                         one source dependency); watermark tracker not created"
+                    );
+                }
+            }
+        }
+
         inner.view_registry.register(spec).map_err(delta_err)
     }
 
@@ -454,6 +529,32 @@ impl IncrementalFlow {
             .get(source_name)
             .map(|t| t.watermark())
             .unwrap_or(i64::MIN))
+    }
+
+    /// AUD-9 (loud degradation): classify how a registered view currently
+    /// executes — `(incremental, human_reason)` — so a view silently running
+    /// full recompute is visible instead of hidden behind a tracing log.
+    ///
+    /// Returns `None` if the view isn't registered. The O(Δ) plan is built
+    /// lazily on the first tick, so before any step the view is reported as
+    /// not-yet-planned (`incremental = false`, with an explanatory reason).
+    pub fn view_plan_classification(&self, view: &str) -> IvmResult<Option<(bool, String)>> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        if inner.view_registry.get(view).is_err() {
+            return Ok(None);
+        }
+        Ok(Some(match inner.view_plans.get(view) {
+            None => (
+                false,
+                "not yet planned — no tick has executed; the O(Δ) plan is built lazily on \
+                 the first step, after which this view will report its true strategy"
+                    .to_string(),
+            ),
+            Some(plan) => (
+                matches!(plan.kind(), ViewPlanKind::Incremental),
+                plan.describe().to_string(),
+            ),
+        }))
     }
 
     // ── Source-ordinal skip-if-unchanged ──────────────────────────────────────
@@ -549,6 +650,9 @@ impl IncrementalFlow {
             return Ok(());
         }
 
+        // AUD-8 (retention): advance this source's LATENESS watermark.
+        observe_source_watermark(&mut inner, &source_name, &batch);
+
         // Accumulate for delta checkpoints.
         if inner.delta_checkpoint_enabled {
             inner
@@ -576,6 +680,8 @@ impl IncrementalFlow {
         if batch.is_empty() {
             return Ok(());
         }
+        // AUD-8 (retention): advance this source's LATENESS watermark.
+        observe_source_watermark(&mut inner, &source_name, &batch);
         inner.pending.insert(source_name, vec![batch]);
         Ok(())
     }
@@ -1590,6 +1696,80 @@ impl IncrementalFlow {
         })
     }
 
+    /// Apply a tick computed on a **resident** executor (AUD-6).
+    ///
+    /// Unlike [`apply_computed_tick`], the executor returns per-view **output
+    /// deltas** (O(Δ)), not full outputs. The coordinator mirrors the tick:
+    /// source snapshots advance by the input deltas, each view's snapshot and
+    /// diff baseline advance by its output delta, and the tick counter bumps.
+    /// After this call the coordinator's materialized state matches the
+    /// resident flow's exactly, which is what makes central fallback and
+    /// re-attach (from `checkpoint_full` of this mirror) correct.
+    pub fn apply_remote_tick(
+        &self,
+        local_pending: HashMap<String, Vec<DeltaBatch>>,
+        view_output_deltas: HashMap<String, DeltaBatch>,
+    ) -> IvmResult<StepSummary> {
+        let inputs = coalesce_pending(local_pending)?;
+        let mut inner = self.inner.lock().map_err(lock_err)?;
+
+        // Advance source snapshots deterministically (mirrors step_datafusion).
+        for (name, delta) in &inputs {
+            let current = inner.source_snapshots.remove(name);
+            let updated = apply_delta(current, delta).map_err(delta_err)?;
+            inner.source_snapshots.insert(name.clone(), updated);
+        }
+
+        inner.tick += 1;
+        inner.last_step_outputs.clear();
+        let mut total_output_rows = 0usize;
+        let mut total_inserted_rows = 0u64;
+        let mut total_retracted_rows = 0u64;
+        let mut active_views = 0usize;
+        for (name, delta) in view_output_deltas {
+            if delta.is_empty() {
+                continue;
+            }
+            if let Ok(view) = inner.view_registry.get(&name) {
+                view.apply_output_delta(&delta).map_err(delta_err)?;
+                total_output_rows += delta.num_rows();
+                active_views += 1;
+                let (inserts, retracts) = delta_insert_retract_counts(&delta);
+                total_inserted_rows += inserts;
+                total_retracted_rows += retracts;
+                let stats = inner.view_delta_stats.entry(name.clone()).or_default();
+                stats.rows_inserted_total += inserts;
+                stats.rows_retracted_total += retracts;
+                stats.last_tick_inserts = inserts;
+                stats.last_tick_retracts = retracts;
+                inner.last_step_outputs.insert(name, delta);
+            }
+        }
+        Ok(StepSummary {
+            total_output_rows,
+            total_inserted_rows,
+            total_retracted_rows,
+            active_views,
+            degraded_views: Vec::new(),
+            errored_views: Vec::new(),
+        })
+    }
+
+    /// Drop all cached incremental view plans (and their accumulator state).
+    ///
+    /// AUD-6: when a job is promoted to a resident executor, the executor's
+    /// flow owns the live accumulators. The coordinator's cached plans go
+    /// stale from that point; invalidating them forces any later central tick
+    /// (fallback) to rebuild plans and seed from the mirrored snapshots
+    /// instead of applying deltas to a stale accumulator.
+    pub fn invalidate_view_plans(&self) -> IvmResult<()> {
+        let mut inner = self.inner.lock().map_err(lock_err)?;
+        inner.view_plans.clear();
+        inner.view_plan_sqls.clear();
+        inner.pending_plan_state.clear();
+        Ok(())
+    }
+
     /// Serialize source snapshots **and** view state (snapshot + full-output
     /// baseline) to a self-contained byte blob.
     ///
@@ -2168,6 +2348,49 @@ pub fn decode_batch_map(bytes: &[u8]) -> IvmResult<HashMap<String, RecordBatch>>
     Ok(map)
 }
 
+// ── Delta-map framing (resident executor → coordinator, AUD-6) ────────────────
+
+/// Magic prefix distinguishing a per-view **output-delta** map from the legacy
+/// full-output batch map returned by the stateless `delta:step:` path.
+const DELTA_MAP_MAGIC: &[u8; 5] = b"IVMD1";
+
+/// Encode a `view → output DeltaBatch` map as a length-framed binary blob.
+///
+/// AUD-6: a resident executor tick returns **deltas, not snapshots** — this is
+/// the O(Δ) wire format for the `delta:tick:` result. Format:
+/// `b"IVMD1" || u32 count || (u32 name_len || name || u32 ipc_len || delta_ipc)*`
+pub fn encode_delta_map(map: &HashMap<String, DeltaBatch>) -> IvmResult<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(DELTA_MAP_MAGIC);
+    out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+    for (name, delta) in map {
+        let ipc = serialize_delta_batch(delta).map_err(delta_err)?;
+        out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&(ipc.len() as u32).to_le_bytes());
+        out.extend_from_slice(&ipc);
+    }
+    Ok(out)
+}
+
+/// Decode a blob produced by [`encode_delta_map`].
+pub fn decode_delta_map(bytes: &[u8]) -> IvmResult<HashMap<String, DeltaBatch>> {
+    let rest = bytes
+        .strip_prefix(DELTA_MAP_MAGIC.as_slice())
+        .ok_or_else(|| IvmError::execution("blob is not an IVM delta map (missing magic)"))?;
+    let mut pos = 0usize;
+    let n = read_u32(rest, &mut pos)? as usize;
+    let mut map = HashMap::with_capacity(n);
+    for _ in 0..n {
+        let name = decode_name(rest, &mut pos)?;
+        let len = read_u32(rest, &mut pos)? as usize;
+        let data = rest.get(pos..pos + len).ok_or_else(slice_err)?;
+        pos += len;
+        map.insert(name, deserialize_delta_batch(data).map_err(delta_err)?);
+    }
+    Ok(map)
+}
+
 // ── Fragment encoding helpers (coordinator-authoritative executor dispatch) ───
 
 /// Encode a coordinator-authoritative IVM dispatch fragment.
@@ -2236,6 +2459,111 @@ pub fn encode_ivm_step_fragment(
     Ok(format!(
         "delta:step:{job_id}|{deltas_b64}|{specs_b64}|{state_b64}"
     ))
+}
+
+// ── Resident-executor fragment encoding (AUD-6) ───────────────────────────────
+//
+// The resident protocol replaces the per-tick full-state round trip with four
+// ops. State ships ONCE at attach; every tick afterwards carries only deltas
+// plus a fence:
+//
+// ```text
+// delta:attach:{job}|{specs_b64}|{state_b64}|{fence}   create/replace resident flow
+// delta:tick:{job}|{deltas_b64}|{fence}                feed Δ, step, return Δ-map
+// delta:ckpt:{job}                                     checkpoint_full of resident flow
+// delta:detach:{job}                                   drop resident flow
+// ```
+//
+// The fence is a per-job monotonically increasing tick number. A resident
+// executor accepts a tick only when `fence == last_fence + 1`; anything else
+// (replay after a retry, a gap after a missed tick, a tick landing on an
+// executor that never attached) errors, and the coordinator re-attaches from
+// its state mirror. This makes placement drift self-healing without hard
+// executor pinning.
+
+fn encode_specs_b64(specs: &[IncrementalViewSpec]) -> IvmResult<String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let spec_entries: Vec<serde_json::Value> = specs
+        .iter()
+        .map(|s| {
+            let fields: Vec<serde_json::Value> = s
+                .output_schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "name": f.name(),
+                        "data_type": format!("{:?}", f.data_type()),
+                        "nullable": f.is_nullable()
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "name": s.name,
+                "body_sql": s.body_sql,
+                "output_schema_fields": fields,
+                "is_materialized": s.is_materialized,
+                "is_recursive": s.is_recursive,
+                "lateness": s.lateness,
+            })
+        })
+        .collect();
+    let specs_json =
+        serde_json::to_string(&spec_entries).map_err(|e| IvmError::execution(e.to_string()))?;
+    Ok(b64.encode(specs_json))
+}
+
+fn encode_deltas_b64(pending: &HashMap<String, DeltaBatch>) -> IvmResult<String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let delta_entries: Vec<serde_json::Value> = pending
+        .iter()
+        .map(|(source, delta)| {
+            let ipc = serialize_delta_batch(delta).map_err(delta_err)?;
+            let enc = b64.encode(&ipc);
+            Ok(serde_json::json!({ "source": source, "delta_b64": enc }))
+        })
+        .collect::<IvmResult<_>>()?;
+    let deltas_json =
+        serde_json::to_string(&delta_entries).map_err(|e| IvmError::execution(e.to_string()))?;
+    Ok(b64.encode(deltas_json))
+}
+
+/// Encode a `delta:attach:` fragment (ships full state ONCE at promotion).
+pub fn encode_ivm_attach_fragment(
+    job_id: &str,
+    specs: &[IncrementalViewSpec],
+    state_bytes: &[u8],
+    fence: u64,
+) -> IvmResult<String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let specs_b64 = encode_specs_b64(specs)?;
+    let state_b64 = b64.encode(state_bytes);
+    Ok(format!(
+        "delta:attach:{job_id}|{specs_b64}|{state_b64}|{fence}"
+    ))
+}
+
+/// Encode a `delta:tick:` fragment (deltas + fence only — no state).
+pub fn encode_ivm_tick_fragment(
+    job_id: &str,
+    pending: &HashMap<String, DeltaBatch>,
+    fence: u64,
+) -> IvmResult<String> {
+    let deltas_b64 = encode_deltas_b64(pending)?;
+    Ok(format!("delta:tick:{job_id}|{deltas_b64}|{fence}"))
+}
+
+/// Encode a `delta:ckpt:` fragment (resident flow → `checkpoint_full` bytes).
+pub fn encode_ivm_ckpt_fragment(job_id: &str) -> String {
+    format!("delta:ckpt:{job_id}")
+}
+
+/// Encode a `delta:detach:` fragment (drop the resident flow).
+pub fn encode_ivm_detach_fragment(job_id: &str) -> String {
+    format!("delta:detach:{job_id}")
 }
 
 // ── Integration tests (3d) ────────────────────────────────────────────────────
@@ -2398,6 +2726,127 @@ mod integration_tests {
             (totals.value(0) - 350.0).abs() < 1e-9,
             "expected total=350.0, got {}",
             totals.value(0)
+        );
+    }
+
+    /// AUD-8 (retention): a LATENESS annotation on a single-source view creates
+    /// a watermark tracker at registration, and every `feed` advances it from
+    /// the batch's timestamp column. Previously the whole mechanism sat inert
+    /// (zero callers), so join/aggregate traces grew without bound.
+    #[tokio::test]
+    async fn lateness_watermark_activates_and_advances() {
+        use arrow::array::{Array, Float64Array, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use krishiv_delta::{DeltaBatch, LatenessSpec};
+
+        let flow = IncrementalFlow::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_time", DataType::Int64, false),
+            Field::new("amount", DataType::Float64, false),
+        ]));
+        // Single-source view → LATENESS binds unambiguously to `events`.
+        flow.register_view(krishiv_delta::IncrementalViewSpec {
+            name: "recent".into(),
+            body_sql: "SELECT event_time, amount FROM events".into(),
+            output_schema: schema.clone(),
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![LatenessSpec::new("event_time", 1_000)],
+        })
+        .unwrap();
+
+        // No data yet → watermark unset.
+        assert_eq!(flow.watermark_for("events").unwrap(), i64::MIN);
+
+        let batch = |ts: &[i64], amt: &[f64]| {
+            DeltaBatch::from_inserts(
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(ts.to_vec())) as Arc<dyn Array>,
+                        Arc::new(Float64Array::from(amt.to_vec())) as Arc<dyn Array>,
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+
+        // watermark = max_ts(12_000) − lateness(1_000).
+        flow.feed("events", batch(&[10_000, 12_000], &[1.0, 2.0]))
+            .unwrap();
+        assert_eq!(flow.watermark_for("events").unwrap(), 11_000);
+
+        // A later batch advances it.
+        flow.feed("events", batch(&[20_000], &[3.0])).unwrap();
+        assert_eq!(flow.watermark_for("events").unwrap(), 19_000);
+
+        // An older batch never moves the watermark backward (monotonic).
+        flow.feed("events", batch(&[5_000], &[4.0])).unwrap();
+        assert_eq!(
+            flow.watermark_for("events").unwrap(),
+            19_000,
+            "watermark must be monotonic"
+        );
+    }
+
+    /// AUD-9 (loud degradation): `view_plan_classification` reports a view as
+    /// unplanned before its first tick, incremental once an O(Δ) plan is cached,
+    /// and `None` for an unregistered view — so a silent full-recompute fallback
+    /// is visible on the debug surface.
+    #[tokio::test]
+    async fn view_plan_classification_reports_incremental_after_tick() {
+        use arrow::array::Float64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use krishiv_delta::DeltaBatch;
+
+        let flow = IncrementalFlow::new();
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "total",
+            DataType::Float64,
+            true,
+        )]));
+        flow.register_view(krishiv_delta::IncrementalViewSpec {
+            name: "total_sales".into(),
+            body_sql: "SELECT SUM(amount) AS total FROM sales".into(),
+            output_schema,
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        })
+        .unwrap();
+
+        // Unregistered view → None.
+        assert!(flow.view_plan_classification("nope").unwrap().is_none());
+
+        // Before any tick the plan is lazy → not-yet-planned, not incremental.
+        let (incr, reason) = flow.view_plan_classification("total_sales").unwrap().unwrap();
+        assert!(!incr, "pre-tick view must not claim incremental");
+        assert!(
+            reason.contains("not yet planned"),
+            "pre-tick reason should say so, got: {reason}"
+        );
+
+        // Feed + step so the O(Δ) aggregate plan is built and cached.
+        let sales_schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Float64,
+            false,
+        )]));
+        let sales_batch = RecordBatch::try_new(
+            sales_schema,
+            vec![Arc::new(Float64Array::from(vec![100.0_f64, 200.0]))],
+        )
+        .unwrap();
+        flow.feed("sales", DeltaBatch::from_inserts(sales_batch).unwrap())
+            .unwrap();
+        flow.step_datafusion().await.unwrap();
+
+        let (incr, reason) = flow.view_plan_classification("total_sales").unwrap().unwrap();
+        assert!(incr, "aggregate view must report incremental after tick");
+        assert!(
+            reason.contains("incremental aggregate"),
+            "reason should describe the incremental strategy, got: {reason}"
         );
     }
 
@@ -2839,6 +3288,85 @@ mod integration_tests {
             central_summary.total_output_rows, applied_summary.total_output_rows,
             "offloaded tick summary must match the central tick summary"
         );
+    }
+
+    /// Phase 57 (AUD-6): `apply_remote_tick` — mirroring a RESIDENT executor
+    /// tick from output DELTAS — converges the coordinator to exactly the
+    /// central result, including view snapshot, source snapshots, and a later
+    /// central fallback tick (which must rebuild plans from the mirror, not a
+    /// stale accumulator).
+    #[tokio::test]
+    async fn apply_remote_tick_mirrors_central_and_supports_fallback() {
+        let setup = |flow: &IncrementalFlow| {
+            flow.register_view(sum_view_spec()).unwrap();
+            flow.feed(
+                "sales",
+                DeltaBatch::from_inserts(sales_batch(&[100.0, 200.0, 50.0])).unwrap(),
+            )
+            .unwrap();
+        };
+        let central = IncrementalFlow::new();
+        let auth = IncrementalFlow::new();
+        setup(&central);
+        setup(&auth);
+        central.step_datafusion().await.unwrap();
+        auth.step_datafusion().await.unwrap();
+
+        // Promote: the resident flow starts from the coordinator's mirror.
+        let resident = IncrementalFlow::new();
+        for spec in auth.view_specs().unwrap() {
+            resident.register_view(spec).unwrap();
+        }
+        resident.restore_full(&auth.checkpoint_full().unwrap()).unwrap();
+        auth.invalidate_view_plans().unwrap();
+
+        // Tick 2 via the resident protocol: deltas out, output deltas back.
+        let delta = DeltaBatch::from_inserts(sales_batch(&[25.0, 10.0])).unwrap();
+        central.feed("sales", delta.clone()).unwrap();
+        auth.feed("sales", delta).unwrap();
+        central.step_datafusion().await.unwrap();
+
+        let local_pending = auth.take_pending().unwrap();
+        for (src, batches) in &local_pending {
+            for b in batches {
+                resident.feed(src, b.clone()).unwrap();
+            }
+        }
+        resident.step_datafusion().await.unwrap();
+        let mut view_deltas: HashMap<String, DeltaBatch> = HashMap::new();
+        for name in resident.view_names().unwrap() {
+            if let Some(d) = resident.take_step_output(&name).unwrap() {
+                view_deltas.insert(name, d);
+            }
+        }
+        assert!(!view_deltas.is_empty(), "resident tick produced deltas");
+
+        // Delta-map framing round-trips.
+        let blob = super::encode_delta_map(&view_deltas).unwrap();
+        let view_deltas = super::decode_delta_map(&blob).unwrap();
+
+        let summary = auth.apply_remote_tick(local_pending, view_deltas).unwrap();
+        assert!(summary.total_output_rows > 0);
+        assert!(
+            (sum_total(&auth) - 385.0).abs() < 1e-9,
+            "mirrored total {} != 385",
+            sum_total(&auth)
+        );
+        assert_eq!(auth.tick().unwrap(), central.tick().unwrap());
+
+        // Central FALLBACK after residency: the mirror must be a valid basis —
+        // one more delta computed centrally lands on the same total as central.
+        let d3 = DeltaBatch::from_inserts(sales_batch(&[15.0])).unwrap();
+        central.feed("sales", d3.clone()).unwrap();
+        auth.feed("sales", d3).unwrap();
+        central.step_datafusion().await.unwrap();
+        auth.step_datafusion().await.unwrap();
+        assert!(
+            (sum_total(&auth) - 400.0).abs() < 1e-9,
+            "fallback tick total {} != 400",
+            sum_total(&auth)
+        );
+        assert!((sum_total(&auth) - sum_total(&central)).abs() < 1e-9);
     }
 
     /// A failed offload that re-feeds pending must leave the flow able to compute

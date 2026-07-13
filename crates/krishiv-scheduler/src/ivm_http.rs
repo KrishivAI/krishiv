@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use krishiv_ivm::{
     DeltaBatch, IncrementalFlow, IncrementalViewSpec, coalesce_pending, deserialize_delta_batch,
-    encode_ivm_step_fragment, serialize_delta_batch,
+    serialize_delta_batch,
 };
 use krishiv_proto::{JobId, JobKind, JobSpec, JobState, StageId, StageSpec, TaskId, TaskSpec};
 
@@ -170,8 +170,24 @@ pub struct DeleteJobResponse {
 
 pub async fn api_ivm_delete_job(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
 ) -> Json<DeleteJobResponse> {
+    // Best-effort detach of the resident executor flow (Phase 57): fire the
+    // detach fragment in the background so job deletion never blocks on an
+    // executor round trip. If it fails, the orphaned flow is bounded by the
+    // executor process lifetime and a re-created same-id job re-attaches
+    // (replacing the entry) anyway.
+    if registry.dispatch_state(&job_id).attached {
+        let coordinator = coordinator.clone();
+        let detach = krishiv_ivm::encode_ivm_detach_fragment(&job_id);
+        let job = job_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_ivm_fragment_job(&coordinator, detach, "ivm-detach").await {
+                tracing::warn!(job_id = %job, error = %e, "resident IVM detach failed");
+            }
+        });
+    }
     Json(DeleteJobResponse {
         deleted: registry.delete(&job_id),
     })
@@ -344,23 +360,38 @@ pub async fn api_ivm_step(
         .filter(|e| e.state().can_accept_work())
         .count();
 
-    // Route to executor offload only for single-flow jobs with live executors.
+    // Phase 57 (AUD-6): single-flow jobs with live executors run RESIDENT —
+    // state lives on the executor, the wire carries deltas + a fence only.
     // Partitioned jobs always compute centrally (their shards already run in
-    // parallel in-process), so this handler can never return 501 for them.
+    // parallel in-process). Every route is recorded as a queryable dispatch
+    // decision; nothing falls back silently.
     let summary = if executor_count > 0 && matches!(flow, crate::ivm::IvmJob::Single(_)) {
         let crate::ivm::IvmJob::Single(inner_flow) = &flow else {
             unreachable!("matched above")
         };
-        match submit_distributed_ivm_step(&coordinator, inner_flow, &job_id).await {
+        match submit_resident_ivm_step(&coordinator, &registry, inner_flow, &job_id).await {
             Ok(sum) => sum,
             Err(step_err) => {
-                // submit_distributed_ivm_step re-feeds pending before failing,
-                // so this central fallback observes the same input.
+                // Recorded central fallback: submit_resident_ivm_step re-feeds
+                // pending before failing, so this tick observes the same input.
+                // The resident flow (if any) is now considered detached — the
+                // next step re-attaches from the coordinator's state mirror.
                 tracing::warn!(
                     job_id = %job_id,
                     error = %step_err,
-                    "IVM distributed dispatch failed; falling back to central compute"
+                    "IVM resident dispatch failed; computing this tick centrally \
+                     (recorded; job will re-attach)"
                 );
+                let tick = flow.tick().unwrap_or(0);
+                registry.update_dispatch(&job_id, |d| {
+                    d.attached = false;
+                    d.last = Some(crate::ivm::IvmDispatchRecord {
+                        tick,
+                        mode: "central-fallback".to_owned(),
+                        reason: step_err.clone(),
+                        at_unix_ms: krishiv_common::async_util::unix_now_ms(),
+                    });
+                });
                 flow.step_datafusion().await.map_err(|e| {
                     tracing::error!("IVM central fallback error for job {job_id}: {e}");
                     StatusCode::INTERNAL_SERVER_ERROR
@@ -368,6 +399,20 @@ pub async fn api_ivm_step(
             }
         }
     } else {
+        let mode = if matches!(flow, crate::ivm::IvmJob::Partitioned(_)) {
+            "central-partitioned"
+        } else {
+            "central-no-executors"
+        };
+        let tick = flow.tick().unwrap_or(0);
+        registry.update_dispatch(&job_id, |d| {
+            d.last = Some(crate::ivm::IvmDispatchRecord {
+                tick,
+                mode: mode.to_owned(),
+                reason: String::new(),
+                at_unix_ms: krishiv_common::async_util::unix_now_ms(),
+            });
+        });
         flow.step_datafusion().await.map_err(|e| {
             tracing::error!("IVM step error for job {job_id}: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
@@ -382,127 +427,51 @@ pub async fn api_ivm_step(
     }))
 }
 
-/// Maximum serialized state shipped to an executor in one tick (16 MiB).
-/// Larger views compute centrally to stay within the fragment budget.
-const MAX_IVM_OFFLOAD_STATE_BYTES: usize = 16 * 1024 * 1024;
-/// Timeout for a dispatched IVM tick before falling back to central compute.
+/// Timeout for a dispatched IVM fragment before falling back to central compute.
 const IVM_DISPATCH_TIMEOUT_SECS: u64 = 300;
 
-/// Dispatch one IVM tick to a registered executor (coordinator-authoritative).
+/// Submit one IVM fragment as a scheduler batch job, await its terminal state,
+/// and return the inline result blob (if any).
 ///
-/// The coordinator remains the single source of truth:
-/// 1. Drain pending into a **local** variable — never lost: re-fed on failure.
-/// 2. Snapshot full flow state (sources + view baselines) via `checkpoint_full`.
-/// 3. Encode a stateless `delta:step:` fragment and submit a batch job.
-/// 4. On success the executor returns each view's full output; the coordinator
-///    applies them via `apply_computed_tick` (replaces view state wholesale,
-///    advances source snapshots deterministically — so a later central tick
-///    cannot drift).
-/// 5. On any failure (timeout, job failed, decode error), re-feed pending and
-///    return `Err`; the caller falls back to central `step_datafusion`.
-///
-/// Size guard: if the state payload exceeds [`MAX_IVM_OFFLOAD_STATE_BYTES`],
-/// dispatch is skipped (pending re-fed) so large views stay correct without
-/// blowing the fragment budget.
-async fn submit_distributed_ivm_step(
+/// The fragment is wrapped in the Phase-52 typed task-fragment envelope
+/// (`ExecutionKind::DeltaBatch`) so durable profiles accept it.
+async fn run_ivm_fragment_job(
     coordinator: &SharedCoordinator,
-    flow: &std::sync::Arc<IncrementalFlow>,
-    ivm_job_id: &str,
-) -> Result<krishiv_ivm::StepSummary, String> {
-    // 1. Drain pending locally.
-    let local_pending = flow.take_pending().map_err(|e| e.to_string())?;
-    let dispatch_deltas = coalesce_pending(local_pending.clone()).map_err(|e| e.to_string())?;
-
-    // Nothing to compute: advance the tick structurally and return.
-    if dispatch_deltas.is_empty() {
-        flow.step_with(|_| Ok(HashMap::new()))
-            .map_err(|e| e.to_string())?;
-        return Ok(krishiv_ivm::StepSummary::default());
-    }
-
-    // 2. Snapshot full flow state (sources + view baselines) for the transient
-    //    executor flow, so the remote diff is computed against the right state.
-    let state_bytes = flow.checkpoint_full().map_err(|e| {
-        let _ = flow.re_feed(local_pending.clone());
-        format!("checkpoint_full: {e}")
-    })?;
-    if state_bytes.len() > MAX_IVM_OFFLOAD_STATE_BYTES {
-        tracing::warn!(
-            job_id = %ivm_job_id,
-            state_bytes = state_bytes.len(),
-            budget_bytes = MAX_IVM_OFFLOAD_STATE_BYTES,
-            "IVM offload skipped: state payload exceeds budget; falling back to central compute. \
-             Increase MAX_IVM_OFFLOAD_STATE_BYTES or reduce view materialization size."
-        );
-        flow.re_feed(local_pending).map_err(|e| e.to_string())?;
-        return Err(format!(
-            "ivm state payload {} bytes exceeds offload budget of {}; central compute",
-            state_bytes.len(),
-            MAX_IVM_OFFLOAD_STATE_BYTES
-        ));
-    }
-
-    // 3. Encode the stateless dispatch fragment and submit the batch job.
-    let specs = flow.view_specs().map_err(|e| {
-        let _ = flow.re_feed(local_pending.clone());
-        e.to_string()
-    })?;
-    let fragment = encode_ivm_step_fragment(ivm_job_id, &dispatch_deltas, &specs, &state_bytes)
-        .map_err(|e| {
-            let _ = flow.re_feed(local_pending.clone());
-            e.to_string()
-        })?;
+    fragment_body: String,
+    label: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let fragment = krishiv_plan::task_fragment::TypedTaskFragment::new(
+        krishiv_plan::ExecutionKind::DeltaBatch,
+        fragment_body,
+    )
+    .encode()
+    .map_err(|e| format!("encode typed fragment: {e}"))?;
 
     let sched_job_id = JobId::try_new(format!(
-        "ivm-step-{}",
+        "{label}-{}",
         krishiv_common::async_util::unix_now_ms()
     ))
-    .map_err(|e| {
-        let _ = flow.re_feed(local_pending.clone());
-        e.to_string()
-    })?;
-    let task = TaskSpec::new(
-        TaskId::try_new("task-ivm").map_err(|e| {
-            let _ = flow.re_feed(local_pending.clone());
-            e.to_string()
-        })?,
-        fragment,
-    );
-    let stage = StageSpec::new(
-        StageId::try_new("stage-ivm").map_err(|e| {
-            let _ = flow.re_feed(local_pending.clone());
-            e.to_string()
-        })?,
-        "ivm-step",
-    )
-    .with_task(task);
-    let spec = JobSpec::new(sched_job_id.clone(), "ivm-step", JobKind::Batch).with_stage(stage);
+    .map_err(|e| e.to_string())?;
+    let task = TaskSpec::new(TaskId::try_new("task-ivm").map_err(|e| e.to_string())?, fragment);
+    let stage = StageSpec::new(StageId::try_new("stage-ivm").map_err(|e| e.to_string())?, label)
+        .with_task(task);
+    let spec = JobSpec::new(sched_job_id.clone(), label, JobKind::Batch).with_stage(stage);
 
     let notify = {
         let mut coord = coordinator.write().await;
-        coord.submit_job(spec).map_err(|e| {
-            let _ = flow.re_feed(local_pending.clone());
-            e.to_string()
-        })?;
+        coord.submit_job(spec).map_err(|e| e.to_string())?;
         coord.notify().clone()
     };
 
-    // 4. Poll until terminal (bounded by IVM_DISPATCH_TIMEOUT_SECS).
-    //
-    // H-20 (audit): the prior `tokio::sync::Notify`-based poll could miss
-    // notifications that fired between two `notified()` calls. Replace the
-    // one-shot Notify with a `tokio::sync::watch::Receiver<bool>` driven
-    // by the same job-state transitions that fire the original notify;
-    // the `watch` channel is designed for repeated polling and retains the
-    // latest value, eliminating the missed-notification race. Falls back
-    // to a 100ms sleep on each iteration as before.
+    // Poll until terminal (bounded by IVM_DISPATCH_TIMEOUT_SECS). The recheck
+    // right before sleeping closes the missed-Notify gap (H-20).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(IVM_DISPATCH_TIMEOUT_SECS);
     let succeeded = loop {
         if tokio::time::Instant::now() >= deadline {
             tracing::error!(
                 job_id = %sched_job_id,
                 timeout_secs = IVM_DISPATCH_TIMEOUT_SECS,
-                "IVM distributed step timed out"
+                "IVM dispatch job timed out"
             );
             break false;
         }
@@ -517,9 +486,6 @@ async fn submit_distributed_ivm_step(
             JobState::Succeeded => break true,
             JobState::Failed | JobState::Cancelled => break false,
             _ => {
-                // Re-check state right before sleeping so a transition
-                // that fired between the prior poll and this iteration is
-                // observed here, not lost by a missed Notify.
                 let recheck = {
                     let coord = coordinator.read().await;
                     coord
@@ -533,11 +499,6 @@ async fn submit_distributed_ivm_step(
                 ) {
                     continue;
                 }
-                // Best-effort: race a fresh `notified()` (so we wake as
-                // soon as the next transition fires) against a 100ms
-                // safety timer. The Notify still has the missed-signal
-                // gap documented above; the recheck above is the
-                // correctness lever.
                 let state_changed = notify.notified();
                 tokio::select! {
                     _ = state_changed => {}
@@ -549,29 +510,138 @@ async fn submit_distributed_ivm_step(
 
     if !succeeded {
         let _ = coordinator.write().await.cancel_job(&sched_job_id);
-        flow.re_feed(local_pending).map_err(|e| e.to_string())?;
-        return Err(format!("ivm-step job {sched_job_id} did not succeed"));
+        return Err(format!("{label} job {sched_job_id} did not succeed"));
     }
 
-    // 5. Decode the executor's returned view outputs and apply them to the
-    //    authoritative coordinator flow.
-    let blob: Vec<u8> = {
+    let blob = {
         let mut coord = coordinator.write().await;
         coord
             .take_job_inline_results(&sched_job_id)
             .and_then(|mut v| v.pop())
-            .ok_or_else(|| {
-                let _ = flow.re_feed(local_pending.clone());
-                "ivm-step produced no inline result blob".to_string()
-            })?
     };
-    let view_outputs = krishiv_ivm::decode_batch_map(&blob).map_err(|e| {
-        let _ = flow.re_feed(local_pending.clone());
-        format!("decode ivm output: {e}")
-    })?;
+    Ok(blob)
+}
 
-    flow.apply_computed_tick(local_pending, view_outputs)
-        .map_err(|e| e.to_string())
+/// Phase 57 (AUD-6): dispatch one IVM tick to a **resident** executor flow.
+///
+/// State ships to the executor ONCE, at attach; every tick afterwards the
+/// wire carries only the input deltas plus a fence, and the executor returns
+/// per-view **output deltas** — never full snapshots. The old 16 MiB
+/// `MAX_IVM_OFFLOAD_STATE_BYTES` cliff is gone: large state is exactly what
+/// residency is for.
+///
+/// The coordinator stays authoritative by *mirroring* the tick: it applies
+/// the same input deltas to its source snapshots and the returned output
+/// deltas to its view state (`apply_remote_tick`), so central fallback and
+/// re-attach (both from this mirror) are always correct. The fence makes
+/// placement drift self-healing: a tick that lands on an executor without
+/// the flow (or replays after a retry) errors instead of corrupting state,
+/// and the caller re-attaches.
+async fn submit_resident_ivm_step(
+    coordinator: &SharedCoordinator,
+    registry: &SharedIvmJobRegistry,
+    flow: &std::sync::Arc<IncrementalFlow>,
+    ivm_job_id: &str,
+) -> Result<krishiv_ivm::StepSummary, String> {
+    // 1. Drain pending locally — never lost: re-fed on any failure below.
+    let local_pending = flow.take_pending().map_err(|e| e.to_string())?;
+    let dispatch_deltas = coalesce_pending(local_pending.clone()).map_err(|e| e.to_string())?;
+
+    // Nothing to compute: advance the tick structurally and return.
+    if dispatch_deltas.is_empty() {
+        flow.step_with(|_| Ok(HashMap::new()))
+            .map_err(|e| e.to_string())?;
+        return Ok(krishiv_ivm::StepSummary::default());
+    }
+
+    let refeed = |e: String| -> String {
+        let _ = flow.re_feed(local_pending.clone());
+        e
+    };
+
+    // 2. Attach if needed: ship the full state mirror once.
+    let mut disp = registry.dispatch_state(ivm_job_id);
+    if !disp.attached {
+        let state_bytes = flow
+            .checkpoint_full()
+            .map_err(|e| refeed(format!("checkpoint_full: {e}")))?;
+        let specs = flow.view_specs().map_err(|e| refeed(e.to_string()))?;
+        let attach = krishiv_ivm::encode_ivm_attach_fragment(
+            ivm_job_id,
+            &specs,
+            &state_bytes,
+            disp.fence,
+        )
+        .map_err(|e| refeed(e.to_string()))?;
+        run_ivm_fragment_job(coordinator, attach, "ivm-attach")
+            .await
+            .map_err(refeed)?;
+        // The executor's flow owns the live accumulators from here on; the
+        // coordinator's cached plans are stale and must never apply another
+        // delta (a later central fallback rebuilds + reseeds from the mirror).
+        flow.invalidate_view_plans().map_err(|e| e.to_string())?;
+        registry.update_dispatch(ivm_job_id, |d| d.attached = true);
+        disp.attached = true;
+        tracing::info!(
+            job_id = %ivm_job_id,
+            state_bytes = state_bytes.len(),
+            fence = disp.fence,
+            "IVM job attached to resident executor flow"
+        );
+    }
+
+    // 3. Tick: deltas + fence only (O(Δ) wire, both directions).
+    let fence = disp.fence + 1;
+    let tick_fragment = krishiv_ivm::encode_ivm_tick_fragment(ivm_job_id, &dispatch_deltas, fence)
+        .map_err(|e| refeed(e.to_string()))?;
+    let blob = run_ivm_fragment_job(coordinator, tick_fragment, "ivm-tick")
+        .await
+        .map_err(refeed)?
+        .ok_or_else(|| refeed("ivm-tick produced no inline result blob".to_owned()))?;
+    let view_deltas =
+        krishiv_ivm::decode_delta_map(&blob).map_err(|e| refeed(format!("decode delta map: {e}")))?;
+
+    // 4. Mirror the tick on the coordinator's authoritative state.
+    let summary = flow
+        .apply_remote_tick(local_pending, view_deltas)
+        .map_err(|e| e.to_string())?;
+    let tick = flow.tick().unwrap_or(0);
+    registry.update_dispatch(ivm_job_id, |d| {
+        d.fence = fence;
+        d.last = Some(crate::ivm::IvmDispatchRecord {
+            tick,
+            mode: "resident".to_owned(),
+            reason: String::new(),
+            at_unix_ms: krishiv_common::async_util::unix_now_ms(),
+        });
+    });
+    Ok(summary)
+}
+
+// ── GET /api/v1/ivm/jobs/{job_id}/dispatch ───────────────────────────────────
+
+/// Queryable dispatch decision for a job (Phase 57 quality gate: no silent
+/// fallbacks — the last route every tick took is recorded here).
+#[derive(Debug, Serialize)]
+pub struct DispatchStateResponse {
+    pub attached: bool,
+    pub fence: u64,
+    pub last: Option<crate::ivm::IvmDispatchRecord>,
+}
+
+pub async fn api_ivm_dispatch_state(
+    State(registry): State<SharedIvmJobRegistry>,
+    Path(job_id): Path<String>,
+) -> Result<Json<DispatchStateResponse>, StatusCode> {
+    registry
+        .get(&job_id)
+        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let d = registry.dispatch_state(&job_id);
+    Ok(Json(DispatchStateResponse {
+        attached: d.attached,
+        fence: d.fence,
+        last: d.last,
+    }))
 }
 
 // ── GET /api/v1/ivm/jobs/{job_id}/views/{view_name}/snap ─────────────────────
@@ -698,6 +768,12 @@ pub struct ViewDebugInfo {
     pub snapshot_num_rows: usize,
     pub has_last_output: bool,
     pub last_output_num_rows: usize,
+    /// AUD-9 (loud degradation): `true` when the view executes O(Δ) incrementally,
+    /// `false` when it fell back to full recompute (or has not been planned yet).
+    pub plan_incremental: bool,
+    /// Human-readable explanation of the plan choice — makes a silent
+    /// full-recompute fallback visible and actionable.
+    pub plan_reason: String,
 }
 
 pub async fn api_ivm_view_debug_info(
@@ -719,12 +795,18 @@ pub async fn api_ivm_view_debug_info(
     let last_output = job.view_output_peek(&view_name).map_err(ivm_err)?;
     let has_last_output = last_output.is_some();
     let last_output_num_rows = last_output.map(|d| d.num_rows()).unwrap_or(0);
+    let (plan_incremental, plan_reason) = job
+        .view_plan_classification(&view_name)
+        .map_err(ivm_err)?
+        .unwrap_or((false, "view not registered".to_string()));
     Ok(Json(ViewDebugInfo {
         is_materialized,
         has_snapshot,
         snapshot_num_rows,
         has_last_output,
         last_output_num_rows,
+        plan_incremental,
+        plan_reason,
     }))
 }
 
@@ -976,6 +1058,10 @@ pub fn ivm_router(state: IvmRouterState) -> Router<()> {
             post(api_ivm_feed_stream_delta),
         )
         .route("/api/v1/ivm/jobs/{job_id}/step", post(api_ivm_step))
+        .route(
+            "/api/v1/ivm/jobs/{job_id}/dispatch",
+            get(api_ivm_dispatch_state),
+        )
         .route(
             "/api/v1/ivm/jobs/{job_id}/views/{view_name}/snap",
             get(api_ivm_snapshot),

@@ -16,13 +16,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ahash::AHashMap;
-use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::row::{RowConverter, SortField};
 
 use crate::delta_batch::{DeltaBatch, WEIGHT_COLUMN};
 use crate::error::{DeltaError, DeltaResult};
-use crate::operators::key_util::{scalar_to_key as scalar_to_group_key, scalar_to_string};
 
 // ── Aggregation specification ──────────────────────────────────────────────────
 
@@ -169,89 +169,81 @@ struct AggState {
     min_max_set: BTreeMap<OrdF64, i64>,
 }
 
-impl AggState {
-    /// Parse a validated-numeric input string to f64 for the MIN/MAX multiset
-    /// key. `kind == Int` values are exact up to 2^53; that is fine for ordering.
-    fn parse_numeric(input_val_str: &str, kind: NumKind) -> f64 {
-        match kind {
-            NumKind::Int => input_val_str
-                .parse::<i64>()
-                .map(|v| v as f64)
-                .unwrap_or(0.0),
-            NumKind::Float => input_val_str.parse::<f64>().unwrap_or(0.0),
-        }
-    }
+/// One row's typed aggregate input value (AUD-7 / audit §5c): read directly
+/// from the Arrow array — no per-row stringify + re-parse. `Null` is a SQL
+/// NULL (or a value the safe cast could not represent, e.g. a `UInt64` above
+/// `i64::MAX`, which arrow's safe cast nulls out); `None` means the
+/// aggregation has no input column (`COUNT(*)`).
+#[derive(Debug, Clone, Copy)]
+enum AggInput {
+    None,
+    Null,
+    I64(i64),
+    F64(f64),
+}
 
+impl AggState {
     /// Apply one row's delta. `kind` is `Some` for numeric aggregates
     /// (SUM/AVG/MIN/MAX) and `None` for COUNT, decided from the column's Arrow
-    /// type in `IncrementalAggOp::new`.
+    /// type in `IncrementalAggOp::new`. The value arrives typed (AUD-7): the
+    /// old string round-trip — and its `.unwrap_or(0.0)` silent-zero bug on
+    /// unparseable values — no longer exists.
     fn apply_delta_for_agg(
         &mut self,
         agg: &Aggregation,
         kind: Option<NumKind>,
-        input_val_str: &str,
+        value: AggInput,
         weight: i64,
     ) {
         match agg {
             Aggregation::Sum { .. } => {
-                // SQL: null inputs are excluded from SUM.
-                if input_val_str == "NULL" {
-                    return;
-                }
-                match kind {
-                    Some(NumKind::Int) => {
-                        let v = input_val_str.parse::<i64>().unwrap_or(0);
+                match value {
+                    // SQL: null inputs are excluded from SUM.
+                    AggInput::Null | AggInput::None => return,
+                    AggInput::I64(v) => {
                         self.sum_i64 = self.sum_i64.saturating_add(v.saturating_mul(weight));
                     }
-                    _ => {
-                        let numeric = input_val_str.parse::<f64>().unwrap_or(0.0);
-                        self.sum += numeric * weight as f64;
-                    }
+                    AggInput::F64(v) => self.sum += v * weight as f64,
                 }
                 self.count += weight;
             }
             Aggregation::Count { input_col, .. } => {
                 // IVM-6: COUNT(col) excludes nulls; COUNT(*) counts all rows.
-                // When `input_col` is `Some`, the caller has already converted
-                // null values to the "NULL" sentinel via `scalar_to_string`.
-                if input_col.is_some() && input_val_str == "NULL" {
+                if input_col.is_some() && matches!(value, AggInput::Null) {
                     return;
                 }
                 self.count += weight;
             }
             Aggregation::Avg { .. } => {
-                // SQL: null inputs are excluded from AVG.
-                if input_val_str == "NULL" {
-                    return;
-                }
-                // AUD-3: strategy is fixed by the column's declared type, not by
-                // per-row string sniffing. Integer inputs accumulate exactly in
-                // i64; float inputs accumulate in f64.
-                match kind {
-                    Some(NumKind::Int) => {
+                // AUD-3: strategy is fixed by the column's declared type.
+                // Integer inputs accumulate exactly in i64; float in f64.
+                match value {
+                    // SQL: null inputs are excluded from AVG.
+                    AggInput::Null | AggInput::None => return,
+                    AggInput::I64(v) => {
                         self.avg_is_integer = true;
-                        let v = input_val_str.parse::<i64>().unwrap_or(0);
                         self.avg_sum_i64 =
                             self.avg_sum_i64.saturating_add(v.saturating_mul(weight));
                     }
-                    _ => {
+                    AggInput::F64(v) => {
                         self.avg_is_integer = false;
-                        let numeric = input_val_str.parse::<f64>().unwrap_or(0.0);
-                        self.sum += numeric * weight as f64;
+                        self.sum += v * weight as f64;
                     }
                 }
                 self.avg_count_i64 += weight;
                 self.count += weight;
             }
             Aggregation::Min { .. } | Aggregation::Max { .. } => {
-                // SQL: null inputs do not affect MIN/MAX.
-                if input_val_str == "NULL" {
-                    return;
-                }
-                let key = OrdF64(Self::parse_numeric(
-                    input_val_str,
-                    kind.unwrap_or(NumKind::Float),
-                ));
+                let v = match value {
+                    // SQL: null inputs do not affect MIN/MAX.
+                    AggInput::Null | AggInput::None => return,
+                    // `kind == Int` values are exact up to 2^53 as f64 keys;
+                    // that is fine for ordering.
+                    AggInput::I64(v) => v as f64,
+                    AggInput::F64(v) => v,
+                };
+                let _ = kind; // ordering strategy is value-driven now
+                let key = OrdF64(v);
                 let entry = self.min_max_set.entry(key).or_insert(0);
                 *entry += weight;
                 if *entry == 0 {
@@ -300,11 +292,103 @@ fn scalar_of(v: f64, kind: Option<NumKind>) -> AggScalar {
 }
 
 /// `group_key → per-aggregation running state`.
-/// Keys are `Vec<Option<String>>` where `None` represents a SQL null group member.
-type GroupStateMap = AHashMap<Vec<Option<String>>, Vec<AggState>>;
+///
+/// AUD-7: keys are arrow **row-format** bytes — a single opaque, order-preserving
+/// encoding of the group-by columns produced by the op's shared [`RowConverter`],
+/// replacing the old `Vec<Option<String>>` that allocated a `String` for every
+/// group column of every delta row. `Box<[u8]>` keeps the key heap-compact.
+type GroupStateMap = AHashMap<Box<[u8]>, Vec<AggState>>;
 
-/// Before/after snapshot map used within a single `apply` tick.
-type TouchedMap = AHashMap<Vec<Option<String>>, (Option<Vec<AggState>>, ())>;
+/// Before-snapshot map used within a single `apply` tick: `group_key → state as
+/// it was before the tick's deltas` (`None` = the group did not exist yet).
+type TouchedMap = AHashMap<Box<[u8]>, Option<Vec<AggState>>>;
+
+/// AUD-7: per-aggregation typed column reader. Casts an aggregation's input
+/// column to its accumulation array **once per delta batch** (Int64 / Float64),
+/// so [`IncrementalAggOp::apply`] reads a typed value per row with no per-row
+/// stringify + re-parse (the root of the old `.unwrap_or(0.0)` silent-zero bug).
+enum ValueReader {
+    /// `COUNT(*)` — no input column; every row contributes.
+    NoInput,
+    /// Aggregation references a column absent from the delta schema → every row
+    /// reads as SQL NULL (excluded from SUM/AVG/MIN/MAX; not counted).
+    Missing,
+    /// `COUNT(col)`: only nullness matters (`col` may be non-numeric).
+    NullMask(ArrayRef),
+    /// Numeric input accumulated as i64 (integer-typed column).
+    Int(Int64Array),
+    /// Numeric input accumulated as f64 (float-typed column).
+    Float(Float64Array),
+}
+
+impl ValueReader {
+    fn build(data: &RecordBatch, agg: &Aggregation, kind: Option<NumKind>) -> DeltaResult<Self> {
+        let Some(name) = agg.input_col() else {
+            return Ok(ValueReader::NoInput); // COUNT(*)
+        };
+        let idx = match data.schema().index_of(name) {
+            Ok(i) => i,
+            Err(_) => return Ok(ValueReader::Missing),
+        };
+        let col = data.column(idx);
+        match kind {
+            // COUNT(col): keep the original array, we only probe its null mask.
+            None => Ok(ValueReader::NullMask(col.clone())),
+            // Cast once per batch. arrow's default (safe) cast nulls out values
+            // that don't fit (e.g. UInt64 > i64::MAX), which then read as NULL —
+            // strictly better than the old parse path that coerced them to 0.
+            Some(NumKind::Int) => {
+                let arr = compute::cast(col, &DataType::Int64)?;
+                let arr = arr
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| DeltaError::Operator("int64 cast produced wrong type".into()))?
+                    .clone();
+                Ok(ValueReader::Int(arr))
+            }
+            Some(NumKind::Float) => {
+                let arr = compute::cast(col, &DataType::Float64)?;
+                let arr = arr
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        DeltaError::Operator("float64 cast produced wrong type".into())
+                    })?
+                    .clone();
+                Ok(ValueReader::Float(arr))
+            }
+        }
+    }
+
+    fn value(&self, row: usize) -> AggInput {
+        match self {
+            ValueReader::NoInput => AggInput::None,
+            ValueReader::Missing => AggInput::Null,
+            ValueReader::NullMask(a) => {
+                if a.is_null(row) {
+                    AggInput::Null
+                } else {
+                    // COUNT(col) ignores the magnitude; any non-null marker works.
+                    AggInput::I64(0)
+                }
+            }
+            ValueReader::Int(a) => {
+                if a.is_null(row) {
+                    AggInput::Null
+                } else {
+                    AggInput::I64(a.value(row))
+                }
+            }
+            ValueReader::Float(a) => {
+                if a.is_null(row) {
+                    AggInput::Null
+                } else {
+                    AggInput::F64(a.value(row))
+                }
+            }
+        }
+    }
+}
 
 // ── IncrementalAggOp ──────────────────────────────────────────────────────────
 
@@ -316,6 +400,15 @@ pub struct IncrementalAggOp {
     /// `None` for COUNT (no numeric input to accumulate).
     input_kinds: Vec<Option<NumKind>>,
     output_schema: SchemaRef,
+    /// AUD-7: shared row-format encoder for group-by keys, built once from the
+    /// group columns' declared types and reused across every tick. Reuse is what
+    /// keeps a value's encoding stable when a group column is dictionary-encoded
+    /// — a per-tick converter would re-intern and could drift, splitting one
+    /// logical group across two keys.
+    group_converter: RowConverter,
+    /// Declared arrow types of the group-by columns, in order. Used to rebuild
+    /// the converter after a restore and to name the reconstructed group columns.
+    group_field_types: Vec<DataType>,
     /// state[group_key] → per-aggregation running state (one entry per aggregation)
     state: GroupStateMap,
 }
@@ -401,11 +494,32 @@ impl IncrementalAggOp {
 
         let output_schema = Arc::new(Schema::new(out_fields));
 
+        // AUD-7: build the shared row-format encoder for the group-by columns
+        // from their declared source types (validated as present above).
+        let group_field_types: Vec<DataType> = group_by
+            .iter()
+            .map(|name| {
+                input_schema
+                    .field_with_name(name)
+                    .map(|f| f.data_type().clone())
+                    .map_err(|_| DeltaError::ColumnNotFound(name.clone()))
+            })
+            .collect::<DeltaResult<Vec<_>>>()?;
+        let group_converter = RowConverter::new(
+            group_field_types
+                .iter()
+                .map(|dt| SortField::new(dt.clone()))
+                .collect(),
+        )
+        .map_err(DeltaError::Arrow)?;
+
         Ok(Self {
             group_by,
             aggregations,
             input_kinds,
             output_schema,
+            group_converter,
+            group_field_types,
             state: GroupStateMap::default(),
         })
     }
@@ -500,106 +614,115 @@ impl IncrementalAggOp {
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
-        // Track which groups were touched, and their before/after states.
+        // AUD-7: encode every group-by column to a single row-format key in one
+        // pass (no per-cell String alloc). A global aggregate (no GROUP BY) has
+        // one implicit group keyed by the empty byte string.
+        let group_rows = if group_col_indices.is_empty() {
+            None
+        } else {
+            let group_arrays: Vec<ArrayRef> = group_col_indices
+                .iter()
+                .map(|&idx| data.column(idx).clone())
+                .collect();
+            Some(
+                self.group_converter
+                    .convert_columns(&group_arrays)
+                    .map_err(DeltaError::Arrow)?,
+            )
+        };
+
+        // AUD-7: cast each aggregation's input column to its typed accumulation
+        // array once for the whole batch, replacing the per-row stringify+parse.
+        let value_readers: Vec<ValueReader> = self
+            .aggregations
+            .iter()
+            .zip(self.input_kinds.iter())
+            .map(|(agg, kind)| ValueReader::build(&data, agg, *kind))
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        // Track which groups were touched and their before-tick state.
         let mut touched: TouchedMap = AHashMap::new();
 
         for row in 0..data.num_rows() {
-            let group_key: Vec<Option<String>> = group_col_indices
-                .iter()
-                .map(|&idx| scalar_to_group_key(data.column(idx), row))
-                .collect();
+            let key: Box<[u8]> = match &group_rows {
+                Some(rows) => rows.row(row).as_ref().into(),
+                None => Box::<[u8]>::default(),
+            };
 
-            // Record state before this row's delta
-            if !touched.contains_key(&group_key) {
-                let before = self.state.get(&group_key).cloned();
-                touched.insert(group_key.clone(), (before, ()));
+            // Record state before this row's delta (once per group per tick).
+            if !touched.contains_key(&key) {
+                let before = self.state.get(&key).cloned();
+                touched.insert(key.clone(), before);
             }
 
             let w = weights.value(row);
 
-            // Apply delta to each aggregation's state independently.
-            // Each aggregation has its own AggState, so [Count, Sum] does not
+            // Apply delta to each aggregation's state independently. Each
+            // aggregation has its own AggState, so [Count, Sum] does not
             // double-count and Sum + Min do not cross-contaminate.
             let group_state = self
                 .state
-                .entry(group_key.clone())
+                .entry(key.clone())
                 .or_insert_with(|| vec![AggState::default(); self.aggregations.len()]);
 
-            // Ensure the state vector matches the aggregation count
-            // (handles the case where a new aggregation was added after state was created)
+            // Ensure the state vector matches the aggregation count (handles a
+            // new aggregation added after state was created).
             if group_state.len() < self.aggregations.len() {
                 group_state.resize(self.aggregations.len(), AggState::default());
             }
 
-            for ((state, agg), kind) in group_state
+            for (((state, agg), kind), reader) in group_state
                 .iter_mut()
                 .zip(self.aggregations.iter())
                 .zip(self.input_kinds.iter())
+                .zip(value_readers.iter())
             {
-                let input_val_str = match agg.input_col() {
-                    Some(col) => {
-                        if let Ok(idx) = data.schema().index_of(col) {
-                            scalar_to_string(data.column(idx), row)
-                        } else {
-                            "NULL".to_string()
-                        }
-                    }
-                    None => "".to_string(),
-                };
-                state.apply_delta_for_agg(agg, *kind, &input_val_str, w);
+                state.apply_delta_for_agg(agg, *kind, reader.value(row), w);
             }
 
-            // GC empty groups: a group is empty when ALL its per-agg states are empty
-            if let Some(states) = self.state.get(&group_key) {
-                let all_empty = states.iter().all(|s| s.count == 0);
-                if all_empty {
-                    self.state.remove(&group_key);
-                }
+            // GC empty groups: a group is empty when ALL its per-agg states are.
+            if let Some(states) = self.state.get(&key)
+                && states.iter().all(|s| s.count == 0)
+            {
+                self.state.remove(&key);
             }
         }
 
-        // Build output: retraction of old agg + insertion of new agg for each touched group
-        let mut out_group_rows: Vec<Vec<Option<String>>> = Vec::new();
+        // Build output: retract old agg + insert new agg for each touched group.
+        let mut out_keys: Vec<Box<[u8]>> = Vec::new();
         let mut out_weights: Vec<i64> = Vec::new();
         let mut agg_values: Vec<Vec<Option<AggScalar>>> = Vec::new();
 
-        for (group_key, (before_states, ())) in &touched {
+        for (key, before_states) in &touched {
             let has_before = before_states
                 .as_ref()
                 .map(|s| s.iter().any(|a| a.count != 0))
                 .unwrap_or(false);
             let has_after = self
                 .state
-                .get(group_key)
+                .get(key)
                 .map(|s| s.iter().any(|a| a.count != 0))
                 .unwrap_or(false);
 
             if has_before && let Some(states) = before_states.as_ref() {
                 let vals = compute_agg_values(states, &self.aggregations, &self.input_kinds);
-                out_group_rows.push(group_key.clone());
+                out_keys.push(key.clone());
                 out_weights.push(-1);
                 agg_values.push(vals);
             }
-            if has_after && let Some(after_states) = self.state.get(group_key) {
+            if has_after && let Some(after_states) = self.state.get(key) {
                 let vals = compute_agg_values(after_states, &self.aggregations, &self.input_kinds);
-                out_group_rows.push(group_key.clone());
+                out_keys.push(key.clone());
                 out_weights.push(1);
                 agg_values.push(vals);
             }
         }
 
-        if out_group_rows.is_empty() {
+        if out_keys.is_empty() {
             return DeltaBatch::empty(self.output_schema.clone());
         }
 
-        build_output_batch(
-            &out_group_rows,
-            &out_weights,
-            &agg_values,
-            &self.group_by,
-            &self.aggregations,
-            &self.output_schema,
-        )
+        self.build_output_batch(&out_keys, &out_weights, &agg_values)
     }
 
     /// Serialize the per-group accumulator state to a self-contained blob.
@@ -611,28 +734,54 @@ impl IncrementalAggOp {
     /// AVG needs. Persisting the accumulator directly is the only lossless way
     /// to restore an incremental aggregate across a coordinator restart (G6/F4).
     ///
-    /// Format (all little-endian): `u32 n_groups || (group)*` where a group is
-    /// `u32 n_key_cols || (u8 present || u32 len || utf8)* || u32 n_states ||
-    /// (state)*` and a state is `f64 sum || i64 sum_i64 || i64 count ||
-    /// i64 avg_sum_i64 || i64 avg_count_i64 || u8 avg_is_integer ||
-    /// u32 n_minmax || (f64 key || i64 weight)*`.
+    /// Format **v2** (AUD-7): group keys are now opaque arrow row-format bytes,
+    /// which are not stable across arrow encoding changes, so the group *values*
+    /// are serialized as a portable Arrow IPC batch of the group columns instead
+    /// of raw key bytes. Layout (little-endian):
+    ///   `MAGIC "AGGS2" || u8 has_group_cols || u32 n_groups ||
+    ///    [ u32 ipc_len || ipc(group columns) ]  (only if has_group_cols && n>0) ||
+    ///    (u32 n_states || (state)*){n_groups}`
+    /// States are written in the same order as the IPC batch rows. A blob that
+    /// does not begin with `MAGIC` fails [`restore_state_bytes`], so an
+    /// incompatible/older blob falls back (loudly) to seed-from-snapshots.
     pub fn state_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&(self.state.len() as u32).to_le_bytes());
-        for (group_key, states) in &self.state {
-            out.extend_from_slice(&(group_key.len() as u32).to_le_bytes());
-            for col in group_key {
-                match col {
-                    Some(s) => {
-                        out.push(1u8);
-                        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                        out.extend_from_slice(s.as_bytes());
-                    }
-                    None => out.push(0u8),
+        let entries: Vec<(&[u8], &Vec<AggState>)> =
+            self.state.iter().map(|(k, v)| (&k[..], v)).collect();
+        let has_group_cols = !self.group_field_types.is_empty();
+
+        // Reconstruct group key columns (portable IPC) when there are group
+        // columns AND at least one live group. If reconstruction fails, emit an
+        // empty blob so restore falls back to seed-from-snapshots rather than
+        // installing wrong state.
+        let group_ipc: Option<Vec<u8>> = if has_group_cols && !entries.is_empty() {
+            match self
+                .group_columns_batch(entries.iter().map(|(k, _)| *k))
+                .and_then(|b| encode_batch_ipc(&b))
+            {
+                Ok(ipc) => Some(ipc),
+                Err(_) => {
+                    let mut out = Vec::new();
+                    out.extend_from_slice(AGG_STATE_MAGIC_V2);
+                    out.push(1u8);
+                    out.extend_from_slice(&0u32.to_le_bytes());
+                    return out;
                 }
             }
+        } else {
+            None
+        };
+
+        let mut out = Vec::new();
+        out.extend_from_slice(AGG_STATE_MAGIC_V2);
+        out.push(has_group_cols as u8);
+        out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        if let Some(ipc) = &group_ipc {
+            out.extend_from_slice(&(ipc.len() as u32).to_le_bytes());
+            out.extend_from_slice(ipc);
+        }
+        for (_key, states) in &entries {
             out.extend_from_slice(&(states.len() as u32).to_le_bytes());
-            for st in states {
+            for st in *states {
                 st.write_bytes(&mut out);
             }
         }
@@ -642,31 +791,50 @@ impl IncrementalAggOp {
     /// Replace the accumulator state with one previously produced by
     /// [`state_bytes`](Self::state_bytes). The group-by / aggregation shape is
     /// taken from `self` (rebuilt from the view SQL), so only the running
-    /// values are transferred.
+    /// values are transferred. An unrecognized (non-v2) blob errors so the
+    /// caller can fall back to seed-from-snapshots.
     pub fn restore_state_bytes(&mut self, bytes: &[u8]) -> DeltaResult<()> {
-        let mut pos = 0usize;
+        if !bytes.starts_with(AGG_STATE_MAGIC_V2) {
+            return Err(DeltaError::Operator(
+                "aggregate state blob is not format v2 (AUD-7); restore falls back to \
+                 seed-from-snapshots"
+                    .into(),
+            ));
+        }
+        let mut pos = AGG_STATE_MAGIC_V2.len();
+        let has_group_cols = read_u8(bytes, &mut pos)? == 1;
         let n_groups = read_u32(bytes, &mut pos)? as usize;
+
+        // Rebuild the per-group row keys.
+        let keys: Vec<Box<[u8]>> = if !has_group_cols {
+            // Global aggregate: 0 or 1 group with the empty key.
+            (0..n_groups).map(|_| Box::<[u8]>::default()).collect()
+        } else if n_groups == 0 {
+            Vec::new()
+        } else {
+            let ipc_len = read_u32(bytes, &mut pos)? as usize;
+            let ipc = bytes
+                .get(pos..pos + ipc_len)
+                .ok_or_else(|| DeltaError::Operator("agg state truncated (group ipc)".into()))?;
+            pos += ipc_len;
+            let batch = decode_batch_ipc(ipc)?;
+            let rows = self
+                .group_converter
+                .convert_columns(batch.columns())
+                .map_err(DeltaError::Arrow)?;
+            (0..batch.num_rows())
+                .map(|i| rows.row(i).as_ref().into())
+                .collect()
+        };
+
+        if keys.len() != n_groups {
+            return Err(DeltaError::Operator(
+                "agg state group-count mismatch on restore".into(),
+            ));
+        }
+
         let mut state: GroupStateMap = AHashMap::with_capacity(n_groups);
-        for _ in 0..n_groups {
-            let n_key = read_u32(bytes, &mut pos)? as usize;
-            let mut key: Vec<Option<String>> = Vec::with_capacity(n_key);
-            for _ in 0..n_key {
-                let present = read_u8(bytes, &mut pos)?;
-                if present == 1 {
-                    let len = read_u32(bytes, &mut pos)? as usize;
-                    let raw = bytes
-                        .get(pos..pos + len)
-                        .ok_or_else(|| DeltaError::Operator("agg state truncated".into()))?;
-                    key.push(Some(
-                        std::str::from_utf8(raw)
-                            .map_err(|e| DeltaError::Operator(e.to_string()))?
-                            .to_string(),
-                    ));
-                    pos += len;
-                } else {
-                    key.push(None);
-                }
-            }
+        for key in keys {
             let n_states = read_u32(bytes, &mut pos)? as usize;
             let mut states: Vec<AggState> = Vec::with_capacity(n_states);
             for _ in 0..n_states {
@@ -677,6 +845,134 @@ impl IncrementalAggOp {
         self.state = state;
         Ok(())
     }
+
+    /// Rebuild the group-by columns as a `RecordBatch` from a sequence of
+    /// row-format keys, using the shared converter (AUD-7). Shared by
+    /// `state_bytes` (for portable serialization) and `build_output_batch`
+    /// (for emitting the group columns natively, no string cast).
+    fn group_columns_batch<'a>(
+        &self,
+        keys: impl Iterator<Item = &'a [u8]>,
+    ) -> DeltaResult<RecordBatch> {
+        let parser = self.group_converter.parser();
+        let rows: Vec<_> = keys.map(|k| parser.parse(k)).collect();
+        let arrays = self
+            .group_converter
+            .convert_rows(rows)
+            .map_err(DeltaError::Arrow)?;
+        let fields: Vec<Field> = self
+            .group_by
+            .iter()
+            .zip(self.group_field_types.iter())
+            .map(|(name, dt)| Field::new(name, dt.clone(), true))
+            .collect();
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(DeltaError::from)
+    }
+
+    /// AUD-7: build the retract/insert output batch, rebuilding the group-by
+    /// columns natively from row-format keys (no `String`→cast round trip) and
+    /// emitting aggregate columns in the declared output types.
+    fn build_output_batch(
+        &self,
+        group_keys: &[Box<[u8]>],
+        weights: &[i64],
+        agg_values: &[Vec<Option<AggScalar>>],
+    ) -> DeltaResult<DeltaBatch> {
+        let n_group = self.group_by.len();
+
+        let mut cols: Vec<ArrayRef> = if n_group == 0 {
+            Vec::new()
+        } else {
+            let batch = self.group_columns_batch(group_keys.iter().map(|k| &k[..]))?;
+            // Cast a group column only if the declared output type differs from
+            // the source column type (rare; `new_with_output_schema` never
+            // re-types group columns, but a view may declare a widened type).
+            batch
+                .columns()
+                .iter()
+                .enumerate()
+                .map(|(gi, arr)| {
+                    let target = self.output_schema.field(gi).data_type();
+                    if arr.data_type() == target {
+                        Ok(arr.clone())
+                    } else {
+                        compute::cast(arr, target).map_err(DeltaError::from)
+                    }
+                })
+                .collect::<DeltaResult<Vec<_>>>()?
+        };
+
+        // Aggregate columns, typed to the declared output schema (AUD-3):
+        // integer SUM/MIN/MAX/COUNT emit Int64 exactly; AVG and float aggregates
+        // emit Float64.
+        for ai in 0..self.aggregations.len() {
+            let target = self.output_schema.field(n_group + ai).data_type();
+            let col: ArrayRef = match target {
+                DataType::Int64 => {
+                    let vals: Int64Array = agg_values
+                        .iter()
+                        .map(|row| {
+                            row.get(ai).copied().flatten().map(|s| match s {
+                                AggScalar::I64(v) => v,
+                                AggScalar::F64(v) => v as i64,
+                            })
+                        })
+                        .collect();
+                    Arc::new(vals)
+                }
+                _ => {
+                    let vals: Float64Array = agg_values
+                        .iter()
+                        .map(|row| {
+                            row.get(ai).copied().flatten().map(|s| match s {
+                                AggScalar::I64(v) => v as f64,
+                                AggScalar::F64(v) => v,
+                            })
+                        })
+                        .collect();
+                    Arc::new(vals)
+                }
+            };
+            cols.push(col);
+        }
+
+        // Weight column.
+        cols.push(Arc::new(Int64Array::from(weights.to_vec())));
+
+        let mut full_fields: Vec<_> = self.output_schema.fields().iter().cloned().collect();
+        full_fields.push(Arc::new(Field::new(WEIGHT_COLUMN, DataType::Int64, false)));
+        let full_schema = Arc::new(Schema::new(full_fields));
+
+        let inner = RecordBatch::try_new(full_schema, cols)?;
+        DeltaBatch::from_weighted(inner)
+    }
+}
+
+/// Magic prefix for the version-2 aggregate-state blob (AUD-7).
+const AGG_STATE_MAGIC_V2: &[u8; 5] = b"AGGS2";
+
+/// Serialize a `RecordBatch` to a bare Arrow IPC stream (no magic — this is an
+/// internal, length-framed payload inside the aggregate-state blob).
+fn encode_batch_ipc(batch: &RecordBatch) -> DeltaResult<Vec<u8>> {
+    use arrow::ipc::writer::StreamWriter;
+    let mut buf = Vec::new();
+    {
+        let mut w = StreamWriter::try_new(&mut buf, &batch.schema())?;
+        w.write(batch)?;
+        w.finish()?;
+    }
+    Ok(buf)
+}
+
+/// Inverse of [`encode_batch_ipc`].
+fn decode_batch_ipc(bytes: &[u8]) -> DeltaResult<RecordBatch> {
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+    let mut reader = StreamReader::try_new(Cursor::new(bytes), None)?;
+    reader
+        .next()
+        .ok_or_else(|| DeltaError::Operator("empty group-columns IPC stream".into()))?
+        .map_err(DeltaError::from)
 }
 
 fn read_u8(bytes: &[u8], pos: &mut usize) -> DeltaResult<u8> {
@@ -765,88 +1061,32 @@ fn compute_agg_values(
         .collect()
 }
 
-fn build_output_batch(
-    group_rows: &[Vec<Option<String>>],
-    weights: &[i64],
-    agg_values: &[Vec<Option<AggScalar>>],
-    group_by: &[String],
-    aggregations: &[Aggregation],
-    output_schema: &SchemaRef,
-) -> DeltaResult<DeltaBatch> {
-    let n_group = group_by.len();
-
-    // Build group-by columns with their native types.
-    // Group keys are stored as Option<String> (None = SQL null); cast to the
-    // output schema's declared type so downstream operators see correct types.
-    let mut cols: Vec<Arc<dyn Array>> = Vec::new();
-    for gi in 0..n_group {
-        let vals: Vec<Option<&str>> = group_rows
-            .iter()
-            .map(|r| r.get(gi).and_then(|s| s.as_deref()))
-            .collect();
-        let string_col: Arc<dyn Array> = Arc::new(StringArray::from(vals));
-        let target = output_schema.field(gi).data_type();
-        if target == &DataType::Utf8 || target == &DataType::LargeUtf8 {
-            cols.push(string_col);
-        } else {
-            cols.push(compute::cast(&string_col, target)?);
-        }
-    }
-
-    // Build aggregate columns to match the declared output-schema type (AUD-3:
-    // integer SUM/MIN/MAX/COUNT emit Int64 exactly; AVG and float aggregates
-    // emit Float64).
-    for ai in 0..aggregations.len() {
-        let target = output_schema.field(n_group + ai).data_type();
-        let col: Arc<dyn Array> = match target {
-            DataType::Int64 => {
-                let vals: Int64Array = agg_values
-                    .iter()
-                    .map(|row| {
-                        row.get(ai).copied().flatten().map(|s| match s {
-                            AggScalar::I64(v) => v,
-                            AggScalar::F64(v) => v as i64,
-                        })
-                    })
-                    .collect();
-                Arc::new(vals)
-            }
-            _ => {
-                let vals: Float64Array = agg_values
-                    .iter()
-                    .map(|row| {
-                        row.get(ai).copied().flatten().map(|s| match s {
-                            AggScalar::I64(v) => v as f64,
-                            AggScalar::F64(v) => v,
-                        })
-                    })
-                    .collect();
-                Arc::new(vals)
-            }
-        };
-        cols.push(col);
-    }
-
-    // Weight column
-    cols.push(Arc::new(Int64Array::from(weights.to_vec())));
-
-    let mut full_fields: Vec<_> = output_schema.fields().iter().cloned().collect();
-    full_fields.push(Arc::new(Field::new(WEIGHT_COLUMN, DataType::Int64, false)));
-    let full_schema = Arc::new(Schema::new(full_fields));
-
-    // Re-type group-by columns to match output_schema field types
-    let inner = RecordBatch::try_new(full_schema, cols)?;
-    DeltaBatch::from_weighted(inner)
-}
-
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Float64Array;
+    use arrow::array::{Float64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
+
+    /// Read the single positive (weight `+1`) row's `col` value as f64 from an
+    /// aggregate output whose touched group ended non-empty. AUD-7 tests assert
+    /// on the emitted batch instead of reaching into the (now opaque) row keys.
+    fn positive_f64(out: &DeltaBatch, col: &str) -> Option<f64> {
+        let pos = out.filter_positive().ok()?;
+        if pos.num_rows() == 0 {
+            return None;
+        }
+        let arr = pos.column_by_name(col)?;
+        if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
+            Some(a.value(0))
+        } else {
+            arr.as_any()
+                .downcast_ref::<Int64Array>()
+                .map(|a| a.value(0) as f64)
+        }
+    }
 
     fn order_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -924,14 +1164,9 @@ mod tests {
         .unwrap();
 
         let d1 = DeltaBatch::from_inserts(order_batch(&["c1", "c1"], &[10.0, 20.0])).unwrap();
-        op.apply(d1).unwrap();
-        // Count for c1 should be 2
-        assert_eq!(
-            op.state
-                .get(&vec![Some("c1".to_string())])
-                .map(|s| s[0].count),
-            Some(2)
-        );
+        let out = op.apply(d1).unwrap();
+        // Count for c1 should be 2 (single group → one positive output row).
+        assert_eq!(positive_f64(&out, "cnt"), Some(2.0));
     }
 
     #[test]
@@ -963,16 +1198,10 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        op.apply(insert).unwrap();
+        let out = op.apply(insert).unwrap();
 
-        // Current min for "g" should be 1.2
-        let group_key = vec![Some("g".to_string())];
-        let min_val = op
-            .state
-            .get(&group_key)
-            .and_then(|s| s.first())
-            .and_then(|s| s.min_max_set.keys().next())
-            .map(|k| k.0);
+        // Current min for "g" should be 1.2 (the positive output row).
+        let min_val = positive_f64(&out, "min_v");
         assert!(
             (min_val.unwrap_or(f64::NAN) - 1.2).abs() < 1e-9,
             "min before retraction should be 1.2, got {min_val:?}"
@@ -990,15 +1219,10 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        op.apply(retract).unwrap();
+        let out = op.apply(retract).unwrap();
 
-        // Min should now be 2.7, not 0.0
-        let min_after = op
-            .state
-            .get(&group_key)
-            .and_then(|s| s.first())
-            .and_then(|s| s.min_max_set.keys().next())
-            .map(|k| k.0);
+        // Min should now be 2.7, not 0.0 (the new positive output row).
+        let min_after = positive_f64(&out, "min_v");
         assert!(
             (min_after.unwrap_or(f64::NAN) - 2.7).abs() < 1e-9,
             "min after retracting 1.2 should be 2.7, got {min_after:?}"
@@ -1048,14 +1272,9 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        op.apply(retract).unwrap();
+        let out = op.apply(retract).unwrap();
 
-        let max_after = op
-            .state
-            .get(&vec![Some("g".to_string())])
-            .and_then(|s| s.first())
-            .and_then(|s| s.min_max_set.keys().next_back())
-            .map(|k| k.0);
+        let max_after = positive_f64(&out, "max_v");
         assert!(
             (max_after.unwrap_or(f64::NAN) - 2.7).abs() < 1e-9,
             "max after retracting 3.5 should be 2.7, got {max_after:?}"
@@ -1078,16 +1297,14 @@ mod tests {
             }],
         )
         .unwrap();
-        op.apply(DeltaBatch::from_inserts(order_batch(&["c1", "c1"], &[10.0, 10.5])).unwrap())
+        let out = op
+            .apply(DeltaBatch::from_inserts(order_batch(&["c1", "c1"], &[10.0, 10.5])).unwrap())
             .unwrap();
-        let states = op.state.get(&vec![Some("c1".to_string())]).unwrap();
-        let avg = states[0]
-            .current_value(&op.aggregations[0], op.input_kinds[0])
-            .unwrap();
-        match avg {
-            AggScalar::F64(v) => assert!((v - 10.25).abs() < 1e-9, "avg should be 10.25, got {v}"),
-            other => panic!("avg must be F64, got {other:?}"),
-        }
+        let avg = positive_f64(&out, "avg_amt");
+        assert!(
+            (avg.unwrap_or(f64::NAN) - 10.25).abs() < 1e-9,
+            "avg should be 10.25, got {avg:?}"
+        );
     }
 
     /// AUD-3: SUM over an integer column emits an Int64 output column (SQL

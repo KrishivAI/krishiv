@@ -60,12 +60,12 @@ impl TypedTaskFragment {
         if fragment.starts_with("stream:") {
             return ExecutionKind::Streaming;
         }
-        // Stateless IVM tick shipped by the coordinator's distributed dispatch
-        // (`submit_distributed_ivm_step`). The body is a raw
-        // `delta:step:{job}|{deltas}|{specs}|{state}` string; without this the
-        // executor infers Batch and the batch dispatcher rejects it as an
-        // "unsupported batch fragment type", forcing central-compute fallback.
-        if fragment.starts_with("delta:step:") {
+        // IVM fragments shipped by the coordinator's distributed dispatch:
+        // the legacy stateless `delta:step:` tick plus the Phase 57 resident
+        // protocol (`delta:attach:` / `delta:tick:` / `delta:ckpt:` /
+        // `delta:detach:`). Without this the executor infers Batch and the
+        // batch dispatcher rejects the fragment, forcing central fallback.
+        if fragment.starts_with("delta:") {
             return ExecutionKind::DeltaBatch;
         }
         if let Some(op) = crate::lowering::decode_task_fragment(fragment) {
