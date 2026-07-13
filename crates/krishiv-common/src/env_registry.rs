@@ -543,6 +543,13 @@ pub static FLAGS: &[FlagSpec] = &[
         "Job-completion poll interval for job-mode coordinator runs.",
     ),
     rt(
+        "KRISHIV_JOB_GC_GRACE_SECS",
+        FlagKind::UInt,
+        "30",
+        "Grace window a terminal job stays queryable before the GC tick may \
+         evict it, so a slow consumer still observes its outcome + result.",
+    ),
+    rt(
         "KRISHIV_JOB_ID",
         FlagKind::Text,
         "unset",

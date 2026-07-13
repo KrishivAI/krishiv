@@ -125,6 +125,13 @@ pub struct Coordinator {
     /// Jobs that have just reached a terminal state and need shuffle GC.
     /// Drained by the coordinator binary's tick loop.
     pub(crate) gc_ready_jobs: VecDeque<JobId>,
+    /// When each `gc_ready_jobs` entry became terminal. The GC tick only evicts
+    /// a job once it has been terminal for at least the GC grace window
+    /// (TTL-after-finished), so a slow consumer — e.g. a batch-SQL poll delayed
+    /// by write-lock contention — still observes the terminal outcome and takes
+    /// its result before the job is reaped (otherwise the poll sees `UnknownJob`
+    /// and the result is silently lost).
+    pub(crate) gc_ready_at: std::collections::HashMap<JobId, std::time::Instant>,
     /// Append-only log of adaptive decisions (hot-key split, repartition,
     /// throttle, slow-sink).  Keyed by job id.  R7.2 Group H.
     /// Uses VecDeque for O(1) front-pop when evicting oldest entries.
@@ -1268,6 +1275,7 @@ impl Coordinator {
             ckpt,
             queue_manager: Arc::new(InMemoryQueueManager),
             gc_ready_jobs: VecDeque::new(),
+            gc_ready_at: std::collections::HashMap::new(),
             adaptive_decision_log: HashMap::new(),
             adaptive_override: AdaptiveOverrideConfig::default(),
             pending_backlog_jobs: HashSet::new(),

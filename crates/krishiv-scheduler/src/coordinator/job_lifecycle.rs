@@ -331,10 +331,14 @@ impl Coordinator {
 
         if !self.gc_ready_jobs.contains(job_id) {
             const MAX_GC_JOBS: usize = 1000;
-            if self.gc_ready_jobs.len() >= MAX_GC_JOBS {
-                self.gc_ready_jobs.pop_front();
+            if self.gc_ready_jobs.len() >= MAX_GC_JOBS
+                && let Some(evicted) = self.gc_ready_jobs.pop_front()
+            {
+                self.gc_ready_at.remove(&evicted);
             }
             self.gc_ready_jobs.push_back(job_id.clone());
+            self.gc_ready_at
+                .insert(job_id.clone(), std::time::Instant::now());
         }
         self.ckpt.coordinators.remove(job_id);
         self.job_inline_results.remove(job_id);
@@ -872,10 +876,14 @@ impl Coordinator {
             return;
         }
         const MAX_GC_JOBS: usize = 1000;
-        if self.gc_ready_jobs.len() >= MAX_GC_JOBS {
-            self.gc_ready_jobs.pop_front();
+        if self.gc_ready_jobs.len() >= MAX_GC_JOBS
+            && let Some(evicted) = self.gc_ready_jobs.pop_front()
+        {
+            self.gc_ready_at.remove(&evicted);
         }
         self.gc_ready_jobs.push_back(job_id.clone());
+        self.gc_ready_at
+            .insert(job_id.clone(), std::time::Instant::now());
         self.ckpt.coordinators.remove(job_id);
 
         // Phase 59 (observability gap-a): observe whole-query wall-clock latency
@@ -965,13 +973,36 @@ impl Coordinator {
     /// growth. Eviction happens here (not in `apply_task_update`) so that the job
     /// snapshot remains queryable until the GC cycle runs.
     pub fn take_gc_ready_jobs(&mut self) -> Vec<JobId> {
-        let jobs: Vec<JobId> = std::mem::take(&mut self.gc_ready_jobs)
-            .into_iter()
-            .collect();
-        for job_id in &jobs {
+        // TTL-after-finished: only evict jobs that have been terminal for at
+        // least the grace window, so a consumer whose poll is delayed (e.g. a
+        // batch-SQL `poll_batch_sql_outcome` starved of the read lock) still
+        // observes the terminal outcome and takes its result before the job is
+        // reaped. Younger terminal jobs stay queued for a later GC cycle.
+        let grace = job_gc_grace();
+        let now = std::time::Instant::now();
+        let mut evict: Vec<JobId> = Vec::new();
+        let mut keep: std::collections::VecDeque<JobId> = std::collections::VecDeque::new();
+        for job_id in std::mem::take(&mut self.gc_ready_jobs) {
+            let aged = self
+                .gc_ready_at
+                .get(&job_id)
+                .map(|queued_at| now.duration_since(*queued_at) >= grace)
+                .unwrap_or(true);
+            if aged {
+                // Clean the timestamp here (not only in `evict_completed_job`,
+                // which early-returns for an already-removed job) so the
+                // `gc_ready_at` map can never leak an entry.
+                self.gc_ready_at.remove(&job_id);
+                evict.push(job_id);
+            } else {
+                keep.push_back(job_id);
+            }
+        }
+        self.gc_ready_jobs = keep;
+        for job_id in &evict {
             self.evict_completed_job(job_id);
         }
-        jobs
+        evict
     }
 
     /// Remove a single completed job from the in-memory registry.
@@ -1000,6 +1031,7 @@ impl Coordinator {
         self.batch_sql_job_tables.remove(job_id);
         self.ckpt.coordinators.remove(job_id);
         self.gc_ready_jobs.retain(|id| id != job_id);
+        self.gc_ready_at.remove(job_id);
         self.streaming_task_index
             .retain(|_, (jid, _)| jid != job_id);
         // S4: Evict adaptive decision log entries for the completed job to
@@ -1055,5 +1087,63 @@ impl Coordinator {
         let aqe = krishiv_plan::optimizer::default_aqe_optimizer_with_stats();
         let (optimized, _applied) = aqe.apply(plan.clone(), &[])?;
         self.submit_job(job_spec_from_physical_plan(job_id, &optimized)?)
+    }
+}
+
+/// Grace window a job stays queryable after reaching a terminal state before
+/// the GC tick may evict it (`KRISHIV_JOB_GC_GRACE_SECS`, default 30s). Bounds
+/// how long a slow consumer has to observe the terminal outcome + take its
+/// result; also bounds retained memory for jobs whose consumer never polls.
+fn job_gc_grace() -> std::time::Duration {
+    std::env::var("KRISHIV_JOB_GC_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(30))
+}
+
+#[cfg(test)]
+mod gc_grace_tests {
+    use super::*;
+
+    /// TTL-after-finished: `take_gc_ready_jobs` must retain a terminal job that
+    /// has been queued for less than the grace window (so a slow consumer still
+    /// observes its outcome), and evict only those past the window. Uses
+    /// backdated `gc_ready_at` timestamps for determinism (no env / sleeps).
+    #[test]
+    fn gc_grace_defers_eviction_of_young_terminal_jobs() {
+        let mut coord = Coordinator::new_active(None).unwrap();
+        let young = JobId::try_new("gc-young").unwrap();
+        let aged = JobId::try_new("gc-aged").unwrap();
+
+        coord.gc_ready_jobs.push_back(young.clone());
+        coord
+            .gc_ready_at
+            .insert(young.clone(), std::time::Instant::now());
+        coord.gc_ready_jobs.push_back(aged.clone());
+        coord.gc_ready_at.insert(
+            aged.clone(),
+            std::time::Instant::now() - std::time::Duration::from_secs(3600),
+        );
+
+        let evicted = coord.take_gc_ready_jobs();
+
+        assert_eq!(
+            evicted,
+            vec![aged.clone()],
+            "only the terminal job past the grace window should be evicted"
+        );
+        assert!(
+            coord.gc_ready_jobs.contains(&young),
+            "a young terminal job must stay queued within the grace window"
+        );
+        assert!(
+            coord.gc_ready_at.contains_key(&young),
+            "young job keeps its queued-at timestamp"
+        );
+        assert!(
+            !coord.gc_ready_at.contains_key(&aged),
+            "an evicted job's timestamp must not leak in gc_ready_at"
+        );
     }
 }

@@ -77,6 +77,7 @@ Regenerate with:
 | `KRISHIV_INLINE_RESULT_MAX_BYTES` | uint | `8388608` | Result size above which executor task output spools to disk instead of inlining. |
 | `KRISHIV_IVM_SHARDS` | uint | `1` | Shard count for coordinator-resident IVM flows. |
 | `KRISHIV_JCP_POLL_INTERVAL_SECS` | uint | `2` | Job-completion poll interval for job-mode coordinator runs. |
+| `KRISHIV_JOB_GC_GRACE_SECS` | uint | `30` | Grace window a terminal job stays queryable before the GC tick may evict it, so a slow consumer still observes its outcome + result. |
 | `KRISHIV_JOB_ID` | text | `unset` | Job ID for single-job (job-mode) coordinator/executor pods. |
 | `KRISHIV_JOB_SPEC_JSON` | text | `unset` | Inline JSON job spec submitted at startup in job-mode. |
 | `KRISHIV_LEADER_BACKEND` | single \| etcd | `single` | Coordinator leader-election backend. |
