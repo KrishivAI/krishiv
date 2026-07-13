@@ -395,6 +395,14 @@ pub static FLAGS: &[FlagSpec] = &[
         "Flight SQL service listen address.",
     ),
     rt(
+        "KRISHIV_FLIGHT_ALLOW_ALL_AUTHENTICATED",
+        FlagKind::Bool,
+        "false",
+        "Standalone Flight SQL: treat any authenticated subject as authorized \
+         (AllowAllPolicyHook) instead of SEC-2 default-deny. For deployments \
+         with no governance catalog; the API key is the authorization boundary.",
+    ),
+    rt(
         "KRISHIV_FLIGHT_API_KEY",
         FlagKind::Secret,
         "unset",

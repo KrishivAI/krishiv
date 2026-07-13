@@ -53,6 +53,7 @@ Regenerate with:
 | `KRISHIV_EXECUTOR_TASK_BEARER_TOKEN` | secret | `unset` | Bearer token the coordinator presents on executor task gRPC calls. |
 | `KRISHIV_FALLBACK_RUNTIME_THREADS` | uint | `2` | Worker threads for the shared fallback Tokio runtime used by sync-over-async bridges. |
 | `KRISHIV_FLIGHT_ADDR` | host:port | `127.0.0.1:50055` | Flight SQL service listen address. |
+| `KRISHIV_FLIGHT_ALLOW_ALL_AUTHENTICATED` | bool | `false` | Standalone Flight SQL: treat any authenticated subject as authorized (AllowAllPolicyHook) instead of SEC-2 default-deny. For deployments with no governance catalog; the API key is the authorization boundary. |
 | `KRISHIV_FLIGHT_API_KEY` | secret | `unset` | API key the Flight SQL client presents (takes precedence over KRISHIV_API_KEY). |
 | `KRISHIV_FLIGHT_MAX_CONCURRENT_QUERIES` | uint | `16` | Maximum concurrently executing Flight SQL queries. |
 | `KRISHIV_FLIGHT_MAX_RESULT_BYTES` | uint | `unset` | Per-query Flight SQL result-size cap; unset = unlimited. |

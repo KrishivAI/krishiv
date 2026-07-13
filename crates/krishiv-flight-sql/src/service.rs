@@ -28,7 +28,7 @@ use prost::Message as _;
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 
-use krishiv_plan::governance::{AuthProvider, PolicyHook, StaticApiKeyAuthProvider};
+use krishiv_plan::governance::{AllowAllPolicyHook, AuthProvider, PolicyHook, StaticApiKeyAuthProvider};
 
 use crate::actions::{
     KrishivActionError, build_param_schema, count_sql_params, encode_batches_ipc,
@@ -1283,7 +1283,23 @@ fn configure_flight_auth_from_env(
     service: KrishivFlightSqlService,
 ) -> Result<KrishivFlightSqlService, String> {
     match auth_provider_from_env() {
-        Ok(Some(auth)) => Ok(service.with_auth(auth)),
+        Ok(Some(auth)) => {
+            let service = service.with_auth(auth);
+            // SEC-2 default-deny: authentication without an authorization policy
+            // denies every request. A standalone daemon has no governance
+            // catalog to enforce table-level policy, so it can opt into
+            // "authenticated == authorized" (the API key is the authorization
+            // boundary) via KRISHIV_FLIGHT_ALLOW_ALL_AUTHENTICATED. Without the
+            // opt-in the default-deny stands, so an operator who configures auth
+            // but forgets a policy still gets a closed system — the flag makes
+            // the intent explicit. Required for the certified auth-on Flight
+            // path under durable profiles, which mandate API keys (SEC-7).
+            if krishiv_common::truthy_env("KRISHIV_FLIGHT_ALLOW_ALL_AUTHENTICATED") {
+                Ok(service.with_policy(Arc::new(AllowAllPolicyHook)))
+            } else {
+                Ok(service)
+            }
+        }
         Ok(None) => Ok(service),
         Err(message) => {
             if krishiv_common::profile_requires_authenticated_flight(

@@ -269,6 +269,32 @@ mod tests {
         assert_eq!(result3.err().unwrap().code(), tonic::Code::PermissionDenied);
     }
 
+    /// The counterpart to `auth_without_policy_is_denied`: attaching
+    /// `AllowAllPolicyHook` (what `KRISHIV_FLIGHT_ALLOW_ALL_AUTHENTICATED=true`
+    /// wires up) lifts the SEC-2 default-deny for an authenticated subject, so a
+    /// standalone auth-on Flight server can actually serve queries. Without this
+    /// path a durable-profile daemon — which mandates API keys — default-denies
+    /// every request (found live on the k3s cert cluster).
+    #[tokio::test]
+    async fn auth_with_allow_all_policy_permits_authenticated() {
+        let svc = make_auth_service().with_policy(Arc::new(AllowAllPolicyHook));
+        let cmd = CommandStatementQuery {
+            query: "SELECT 1".to_string(),
+            transaction_id: None,
+        };
+        let mut req = Request::new(FlightDescriptor::new_cmd(vec![]));
+        req.metadata_mut().insert(
+            "authorization",
+            MetadataValue::from_static("Bearer secret-key"),
+        );
+        let result = svc.get_flight_info_statement(cmd, req).await;
+        assert!(
+            result.is_ok(),
+            "auth + AllowAll must permit an authenticated request, got {:?}",
+            result.err().map(|e| e.code())
+        );
+    }
+
     // Auth enforcement tests use auth+policy (the complete, non-deny-default config).
     #[tokio::test]
     async fn auth_required_rejects_missing_token_on_get_flight_info() {
