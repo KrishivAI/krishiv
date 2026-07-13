@@ -233,20 +233,20 @@ impl FlightExecutionHost {
                     path_tables,
                 )
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+                .map_err(scheduler_error_to_status)?;
                 let mut batches = krishiv_scheduler::decode_inline_record_batches(
                     &outcome.inline_record_batch_ipc,
                 )
-                .map_err(|e| Status::internal(e.to_string()))?;
+                .map_err(|e| {
+                    krishiv_metrics::grpc::internal_status("decode inline result batches", &e)
+                })?;
                 // Phase 2.10: large task results arrive as disk spools instead
                 // of inline bytes; decode them straight from the spool files
                 // (files delete themselves when the outcome drops).
                 for spool in &outcome.result_spools {
-                    batches.extend(
-                        spool
-                            .decode_record_batches()
-                            .map_err(|e| Status::internal(e.to_string()))?,
-                    );
+                    batches.extend(spool.decode_record_batches().map_err(|e| {
+                        krishiv_metrics::grpc::internal_status("decode result spool", &e)
+                    })?);
                 }
                 Ok(batches)
             }
@@ -625,15 +625,62 @@ pub(crate) fn run_blocking<T: Send>(
 ) -> Result<T, Status> {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(f).map_err(|e| Status::internal(e.to_string()))
+            tokio::task::block_in_place(f).map_err(runtime_error_to_status)
         }
         _ => std::thread::scope(|scope| {
             scope
                 .spawn(f)
                 .join()
                 .map_err(|_| Status::internal("run_blocking thread panicked"))
-                .and_then(|r| r.map_err(|e| Status::internal(e.to_string())))
+                .and_then(|r| r.map_err(runtime_error_to_status))
         }),
+    }
+}
+
+/// Classify a [`krishiv_runtime::RuntimeError`] into a wire [`Status`]
+/// (Phase 63 / audit §11 error taxonomy).
+///
+/// Caller-facing query errors keep their message — they describe the submitted
+/// SQL (unknown table/column, type mismatch, unsupported query shape) and are
+/// safe and useful to return verbatim. Internal or infrastructure faults are
+/// logged server-side under a correlation reference by
+/// [`krishiv_metrics::grpc::internal_status`] and returned opaque, so no
+/// internal detail (paths, addresses, invariant text) ever leaks over the wire.
+pub(crate) fn runtime_error_to_status(err: krishiv_runtime::RuntimeError) -> Status {
+    use krishiv_runtime::RuntimeError as RE;
+    match err {
+        // The submitted plan/SQL was rejected during planning or execution.
+        RE::PlanRejected { reason } => Status::invalid_argument(reason),
+        RE::Unsupported { feature } => {
+            Status::unimplemented(format!("unsupported runtime feature: {feature}"))
+        }
+        RE::ServerUnimplemented { message } => Status::unimplemented(message),
+        // Transport / invalid-state / partial-result / stream-lifecycle faults
+        // are internal — never surface the raw detail.
+        other => krishiv_metrics::grpc::internal_status("batch SQL execution", &other),
+    }
+}
+
+/// Classify a [`krishiv_scheduler::SchedulerError`] into a wire [`Status`]
+/// (Phase 63 / audit §11 error taxonomy).
+///
+/// Submission-validation and job-execution failures carry a caller-facing cause
+/// (the query error); placement/transport/store faults are logged under a
+/// correlation reference and returned opaque.
+pub(crate) fn scheduler_error_to_status(err: krishiv_scheduler::SchedulerError) -> Status {
+    use krishiv_scheduler::SchedulerError as SE;
+    match err {
+        SE::InvalidJob { message } | SE::InvalidPlan { message } => {
+            Status::invalid_argument(message)
+        }
+        // A submitted job failed during execution; `reason` is the recorded
+        // query-execution cause and is safe to surface. Empty reason means no
+        // per-task cause was captured — treat as internal.
+        SE::JobFailed { reason, .. } if !reason.is_empty() => Status::invalid_argument(reason),
+        SE::NoExecutors | SE::ExecutorUnavailable { .. } => {
+            Status::unavailable("no executor is currently available to run the query; retry shortly")
+        }
+        other => krishiv_metrics::grpc::internal_status("coordinated batch SQL execution", &other),
     }
 }
 
@@ -671,6 +718,68 @@ mod tests {
         let sql = krishiv_runtime::flight_protocol::encode_explain_sql("SELECT 1");
         let batches = host.execute_sql(&sql).await.unwrap();
         assert!(!batches.is_empty());
+    }
+
+    /// Audit §11 error taxonomy: a caller's SQL error (unknown table) must
+    /// surface as `InvalidArgument` with the offending name preserved — not as
+    /// an opaque `Internal` (the pre-fix behaviour, which double-wrapped the
+    /// already-classified `Status` into `internal(err.to_string())`).
+    #[tokio::test]
+    async fn unknown_table_surfaces_as_invalid_argument() {
+        let host = FlightExecutionHost::embedded().unwrap();
+        let err = host
+            .execute_sql("SELECT * FROM definitely_missing_table")
+            .await
+            .expect_err("a query against a missing table must fail");
+        assert_eq!(
+            err.code(),
+            tonic::Code::InvalidArgument,
+            "caller SQL errors must classify as InvalidArgument, got {:?}: {}",
+            err.code(),
+            err.message()
+        );
+        assert!(
+            err.message().contains("definitely_missing_table"),
+            "the error must name the offending table: {}",
+            err.message()
+        );
+    }
+
+    /// Internal/infrastructure runtime faults must be logged under a correlation
+    /// ref and returned opaque — the raw detail (here an internal address) must
+    /// never appear on the wire.
+    #[test]
+    fn internal_runtime_errors_are_opaque() {
+        let status = runtime_error_to_status(krishiv_runtime::RuntimeError::transport(
+            "connect 10.0.0.5:2001 refused",
+        ));
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert!(
+            !status.message().contains("10.0.0.5"),
+            "internal transport detail leaked over the wire: {}",
+            status.message()
+        );
+        assert!(
+            status.message().contains("ref "),
+            "opaque internal status should carry a correlation ref: {}",
+            status.message()
+        );
+    }
+
+    /// The scheduler classifier surfaces submission-validation errors to the
+    /// caller but returns a retryable, detail-free status for placement
+    /// starvation.
+    #[test]
+    fn scheduler_errors_classify_by_kind() {
+        let status = scheduler_error_to_status(krishiv_scheduler::SchedulerError::InvalidJob {
+            message: "empty SQL statement".to_string(),
+        });
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("empty SQL statement"));
+
+        let status =
+            scheduler_error_to_status(krishiv_scheduler::SchedulerError::NoExecutors);
+        assert_eq!(status.code(), tonic::Code::Unavailable);
     }
 
     /// Regression (Wave 2 — Panic Propagation): `run_blocking` must convert a

@@ -363,13 +363,18 @@ impl InProcessStreamingRuntime {
                     }
                 }
             }
-            let df = engine
-                .sql(query)
-                .await
-                .map_err(|e| RuntimeError::transport(e.to_string()))?;
-            df.collect()
-                .await
-                .map_err(|e| RuntimeError::transport(e.to_string()))
+            // Planning and local execution failures on the inline path are
+            // query errors — there is no network hop here, so they are never
+            // "transport" faults. Classifying them as `PlanRejected` lets the
+            // interface layer surface "table not found" / type errors to the
+            // caller as `InvalidArgument` with the cause, instead of burying
+            // them as an opaque internal error (Phase 63 / audit §11).
+            let df = engine.sql(query).await.map_err(|e| RuntimeError::PlanRejected {
+                reason: e.to_string(),
+            })?;
+            df.collect().await.map_err(|e| RuntimeError::PlanRejected {
+                reason: e.to_string(),
+            })
         })
     }
 

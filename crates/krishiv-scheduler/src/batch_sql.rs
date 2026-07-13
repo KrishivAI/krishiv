@@ -18,9 +18,24 @@ fn batch_sql_timeout() -> Duration {
         .unwrap_or_else(|| Duration::from_secs(300))
 }
 
-use crate::{SchedulerError, SchedulerResult, SharedCoordinator};
+use crate::{JobDetailSnapshot, SchedulerError, SchedulerResult, SharedCoordinator};
 
 const BATCH_SQL_JOB_PREFIX: &str = "batch-sql-";
+
+/// Extract the terminal failure reason from a failed job's detail snapshot.
+///
+/// Scans stages in order and returns the first task-level `last_failure_reason`
+/// found — for a batch SQL job this is the query-execution error (unknown
+/// table/column, type mismatch, arithmetic overflow, …). Returns `None` when no
+/// task recorded a reason (e.g. an external cancellation), letting the caller
+/// fall back to a generic terminal-state message.
+fn first_task_failure_reason(detail: &JobDetailSnapshot) -> Option<String> {
+    detail
+        .stages()
+        .iter()
+        .flat_map(|stage| stage.tasks())
+        .find_map(|task| task.last_failure_reason().map(str::to_owned))
+}
 
 /// Legacy file-path table registration (single-node local cluster only).
 ///
@@ -132,9 +147,20 @@ async fn poll_batch_sql_outcome(
                 });
             }
             JobState::Failed | JobState::Cancelled => {
-                return Err(SchedulerError::Transport {
-                    message: format!("batch SQL job {job_id} finished in state {state:?}"),
-                });
+                // Surface the terminal failure reason the coordinator recorded
+                // (typically the query-execution error) instead of an opaque
+                // transport error, so the interface layer can classify it as a
+                // caller-facing query error rather than an internal fault
+                // (Phase 63 / audit §11 error taxonomy).
+                let reason = {
+                    let coord = coordinator.read().await;
+                    coord
+                        .job_detail_snapshot(&job_id)
+                        .ok()
+                        .and_then(|detail| first_task_failure_reason(&detail))
+                        .unwrap_or_else(|| format!("job finished in state {state:?}"))
+                };
+                return Err(SchedulerError::JobFailed { job_id, reason });
             }
             JobState::Queued
             | JobState::Accepted

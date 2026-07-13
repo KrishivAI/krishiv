@@ -537,10 +537,12 @@ impl FlightSqlService for KrishivFlightSqlService {
             } else {
                 None
             };
-            self.host
-                .execute_sql(query)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
+            // `execute_sql` already returns a classified `Status`
+            // (audit §11 error taxonomy: caller-facing query errors as
+            // `invalid_argument`, internal faults opaque under a ref) — do not
+            // re-wrap it as `internal`, which would clobber the code and leak
+            // the detail.
+            self.host.execute_sql(query).await?
             // _permit drops here
         };
 
@@ -795,11 +797,9 @@ impl FlightSqlService for KrishivFlightSqlService {
         };
 
         self.check_table_access(&sql)?;
-        let batches = self
-            .host
-            .execute_sql(&sql)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        // `execute_sql` returns an already-classified `Status`; propagate it
+        // as-is rather than re-wrapping (audit §11 error taxonomy).
+        let batches = self.host.execute_sql(&sql).await?;
         // DDL/DML through this engine returns either nothing or a summary
         // batch; a row count is not reliably reported, so `-1` (unknown) is
         // the honest answer unless the result is a single count row.

@@ -69,6 +69,15 @@ pub enum SchedulerError {
     /// Distributed DAG conversion failed.
     #[error("invalid plan: {message}")]
     InvalidPlan { message: String },
+    /// A submitted job reached a terminal `Failed`/`Cancelled` state during
+    /// execution. `reason` carries the terminal failure detail the coordinator
+    /// recorded (typically the query-execution error from the worst-affected
+    /// task); it is empty when no per-task reason was recorded. Distinct from
+    /// [`Self::InvalidJob`] (rejected at submission) so the interface layer can
+    /// surface an execution failure with its cause instead of an opaque
+    /// transport error (Phase 63 / audit §11 error taxonomy).
+    #[error("job {job_id} execution failed: {reason}")]
+    JobFailed { job_id: JobId, reason: String },
     /// Adaptive query optimization failed.
     #[error(transparent)]
     Optimizer(#[from] krishiv_plan::optimizer::OptimizerError),
