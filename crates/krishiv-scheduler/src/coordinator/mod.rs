@@ -1063,14 +1063,18 @@ impl SharedCoordinator {
                             "task launch delivery failed; marking unreachable executor lost for fast reassignment"
                         );
                         coord.clear_launch_in_flight_for_job(&job_id);
-                        if let Some(executor_id) = coord.executor_id_for_task_endpoint(&endpoint) {
-                            if let Err(e) = coord.mark_executor_lost(&executor_id) {
-                                tracing::debug!(
-                                    executor = %executor_id,
-                                    error = %e,
-                                    "mark_executor_lost after delivery failure was a no-op (already lost)"
-                                );
-                            }
+                        // `mark_executor_lost` runs as part of the condition, so
+                        // its reset/reassign side effects always fire when the
+                        // endpoint resolves; only the "already lost" log is
+                        // conditional on it returning Err.
+                        if let Some(executor_id) = coord.executor_id_for_task_endpoint(&endpoint)
+                            && let Err(e) = coord.mark_executor_lost(&executor_id)
+                        {
+                            tracing::debug!(
+                                executor = %executor_id,
+                                error = %e,
+                                "mark_executor_lost after delivery failure was a no-op (already lost)"
+                            );
                         }
                     }
                     Err(error) => {
