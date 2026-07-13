@@ -36,8 +36,8 @@ use crate::heartbeat::{ExecutorRecord, ExecutorRegistry};
 use crate::in_process::is_in_process_task_endpoint;
 use crate::job::{
     JobDetailSnapshot, JobRecord, JobSnapshot, NamespaceQuotaSnapshot, ResourceUsage,
-    SlotAwareScheduler, StabilityMetrics, SubmitOutcome, job_spec_from_logical_plan,
-    job_spec_from_physical_plan, validate_job,
+    ShuffleRegenOutcome, SlotAwareScheduler, StabilityMetrics, SubmitOutcome,
+    job_spec_from_logical_plan, job_spec_from_physical_plan, validate_job,
 };
 use crate::metrics::{
     CHECKPOINT_EPOCHS_TOTAL, JOBS_SUBMITTED_TOTAL, TASKS_ASSIGNED_TOTAL, record_checkpoint_epoch,

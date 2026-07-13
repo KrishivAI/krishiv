@@ -869,6 +869,8 @@ impl TryFrom<PersistedJobRecord> for JobRecord {
             // values via `set_retry_backoff` (defaults here are the same).
             retry_backoff_base_ms: 1_000,
             retry_backoff_cap_ms: 30_000,
+            // Phase 58: transient regeneration counter, reset on restore.
+            shuffle_regen_total: 0,
         })
     }
 }

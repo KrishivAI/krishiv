@@ -17,6 +17,15 @@ pub trait JobSubmitter: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CoordinatorConfig {
     max_stage_retries: u32,
+    /// Phase 58: maximum number of shuffle-partition regeneration cycles a
+    /// single job may trigger before it is failed as unrecoverable. Each cycle
+    /// is a consumer reporting missing upstream shuffle output, which re-runs
+    /// the producing map tasks. Without a bound a producer that persistently
+    /// loses its output (bad disk, repeated eviction) loops forever:
+    /// consumer-fails → producer-regenerates → consumer-fails → … This caps it
+    /// so the job fails with a terminal reason instead of spinning. Default 8;
+    /// override with `KRISHIV_MAX_SHUFFLE_REGEN`.
+    max_shuffle_regen_attempts: u32,
     heartbeat_timeout_ticks: u64,
     memory_threshold_bytes: Option<u64>,
     /// Number of ticks after coordinator restart during which streaming-job
@@ -155,6 +164,7 @@ impl CoordinatorConfig {
     pub fn new(max_stage_retries: u32, heartbeat_timeout_ticks: u64) -> Self {
         Self {
             max_stage_retries,
+            max_shuffle_regen_attempts: env_u64("KRISHIV_MAX_SHUFFLE_REGEN", 8) as u32,
             heartbeat_timeout_ticks: heartbeat_timeout_ticks.max(1),
             memory_threshold_bytes: None,
             streaming_reattach_grace_ticks: 5,
@@ -219,6 +229,13 @@ impl CoordinatorConfig {
     /// Maximum number of stage-level retries after an executor reports failure.
     pub fn max_stage_retries(&self) -> u32 {
         self.max_stage_retries
+    }
+
+    /// Phase 58: cap on shuffle-partition regeneration cycles per job before it
+    /// is failed as unrecoverable (prevents an infinite regenerate/refetch loop
+    /// when a producer's output is persistently lost).
+    pub fn max_shuffle_regen_attempts(&self) -> u32 {
+        self.max_shuffle_regen_attempts
     }
 
     /// Number of scheduler ticks an executor can miss before it is marked lost.

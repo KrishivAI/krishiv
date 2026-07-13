@@ -49,6 +49,27 @@ pub struct JobRecord {
     pub(crate) shuffle_output: HashMap<StageId, ShuffleMetadata>,
     /// Accumulated resource consumption from completed tasks.
     pub(crate) resource_usage: ResourceUsage,
+    /// Phase 58: how many shuffle-partition regeneration cycles this job has
+    /// triggered (a consumer reporting missing upstream output → re-running the
+    /// producing map tasks). Bounded by
+    /// `CoordinatorConfig::max_shuffle_regen_attempts` so a persistently-lost
+    /// producer fails the job instead of looping forever. Transient in-memory
+    /// counter — reset on coordinator restart, which itself re-plans from
+    /// durable metadata.
+    pub(crate) shuffle_regen_total: u32,
+}
+
+/// Phase 58: result of attempting shuffle-partition regeneration for a job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShuffleRegenOutcome {
+    /// No succeeded producer matched the reported missing partitions — nothing
+    /// to regenerate (e.g. a stale/duplicate report).
+    NoneAffected,
+    /// Producing map tasks were reset to Pending for re-execution.
+    Regenerated,
+    /// The job has regenerated shuffle output too many times; the caller must
+    /// fail it as unrecoverable rather than loop.
+    BudgetExhausted { attempts: u32, limit: u32 },
 }
 
 impl JobRecord {
@@ -79,6 +100,7 @@ impl JobRecord {
             stages,
             shuffle_output: HashMap::new(),
             resource_usage: ResourceUsage::default(),
+            shuffle_regen_total: 0,
         }
     }
 
@@ -678,10 +700,55 @@ impl JobRecord {
     pub(crate) fn invalidate_specific_shuffle_partitions(
         &mut self,
         missing: &[MissingShufflePartition],
-    ) -> bool {
+        max_regen: u32,
+    ) -> ShuffleRegenOutcome {
         if missing.is_empty() {
-            return false;
+            return ShuffleRegenOutcome::NoneAffected;
         }
+
+        // Detection pre-pass: does any *succeeded* producer actually own a
+        // reported-missing partition? A stale or duplicate consumer report can
+        // reference partitions that were already re-produced or never existed —
+        // that must not consume the regeneration budget or fail the job.
+        let mut any_match = false;
+        'detect: for stage in &self.stages {
+            let missing_ids: Vec<u32> = missing
+                .iter()
+                .filter(|m| m.stage_id() == stage.spec.stage_id())
+                .map(|m| m.partition_id())
+                .collect();
+            if missing_ids.is_empty() {
+                continue;
+            }
+            for task in &stage.tasks {
+                if task.state != TaskState::Succeeded {
+                    continue;
+                }
+                if let Some(meta) = &task.output_metadata
+                    && meta
+                        .shuffle_partitions()
+                        .iter()
+                        .any(|p| missing_ids.contains(&p.partition_id))
+                {
+                    any_match = true;
+                    break 'detect;
+                }
+            }
+        }
+        if !any_match {
+            return ShuffleRegenOutcome::NoneAffected;
+        }
+
+        // Phase 58: enforce the regeneration budget BEFORE mutating so a
+        // persistently-lost producer fails the job instead of looping forever.
+        if self.shuffle_regen_total >= max_regen {
+            return ShuffleRegenOutcome::BudgetExhausted {
+                attempts: self.shuffle_regen_total,
+                limit: max_regen,
+            };
+        }
+        self.shuffle_regen_total += 1;
+
         let job_id_str = self.spec.job_id().as_str().to_owned();
         let mut affected = false;
 
@@ -746,7 +813,7 @@ impl JobRecord {
             self.refresh_state();
         }
 
-        affected
+        ShuffleRegenOutcome::Regenerated
     }
 
     /// Phase 53: preferred placement node per stage, derived from where the
@@ -1315,5 +1382,91 @@ impl TaskRecord {
             last_watermark_ms: self.last_watermark_ms,
             last_source_offset: self.last_source_offset.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod shuffle_regen_tests {
+    use super::*;
+    use krishiv_proto::{
+        JobId, JobKind, JobSpec, MissingShufflePartition, ShufflePartitionOutput, StageId,
+        StageSpec, TaskId, TaskOutputMetadata, TaskSpec,
+    };
+
+    /// Mark the single producer task Succeeded with one shuffle partition (id 0)
+    /// so it is a valid regeneration target.
+    fn succeed_producer(job: &mut JobRecord) {
+        let meta = TaskOutputMetadata::new("shuffle", 10, 1, 1).with_shuffle_partitions(vec![
+            ShufflePartitionOutput::new(0, 1024, "http://producer-host:9000"),
+        ]);
+        let task = &mut job.stages[0].tasks[0];
+        task.state = TaskState::Succeeded;
+        task.output_metadata = Some(meta);
+        job.stages[0].refresh_state();
+        job.refresh_state();
+    }
+
+    fn producer_job() -> (JobRecord, StageId) {
+        let stage_id = StageId::try_new("stage-0").unwrap();
+        let spec = JobSpec::new(
+            JobId::try_new("regen-job").unwrap(),
+            "regen-test",
+            JobKind::Batch,
+        )
+        .with_stage(
+            StageSpec::new(stage_id.clone(), "write stage")
+                .with_task(TaskSpec::new(TaskId::try_new("task-0").unwrap(), "shuffle-write")),
+        );
+        let mut job = JobRecord::from_spec(spec, 4);
+        succeed_producer(&mut job);
+        (job, stage_id)
+    }
+
+    /// Phase 58: shuffle regeneration is bounded — the first `limit` cycles
+    /// re-run the producer, the next one reports `BudgetExhausted` so the caller
+    /// fails the job instead of looping forever. A report that matches no
+    /// succeeded producer consumes no budget.
+    #[test]
+    fn shuffle_regeneration_is_bounded_then_exhausts() {
+        let (mut job, stage_id) = producer_job();
+        let missing = vec![MissingShufflePartition::new(stage_id, 0)];
+
+        // A stale report referencing a stage that owns no matching partition
+        // must not consume the regeneration budget.
+        let bogus = vec![MissingShufflePartition::new(
+            StageId::try_new("stage-nonexistent").unwrap(),
+            0,
+        )];
+        assert_eq!(
+            job.invalidate_specific_shuffle_partitions(&bogus, 2),
+            ShuffleRegenOutcome::NoneAffected
+        );
+        assert_eq!(job.shuffle_regen_total, 0);
+
+        // Two real regenerations are within budget (limit = 2). Each resets the
+        // producer to Pending, so re-succeed it before the next consumer failure.
+        assert_eq!(
+            job.invalidate_specific_shuffle_partitions(&missing, 2),
+            ShuffleRegenOutcome::Regenerated
+        );
+        assert_eq!(job.stages[0].tasks[0].state, TaskState::Pending);
+        succeed_producer(&mut job);
+
+        assert_eq!(
+            job.invalidate_specific_shuffle_partitions(&missing, 2),
+            ShuffleRegenOutcome::Regenerated
+        );
+        succeed_producer(&mut job);
+
+        // The third real regeneration exceeds the budget → the caller must fail.
+        assert_eq!(
+            job.invalidate_specific_shuffle_partitions(&missing, 2),
+            ShuffleRegenOutcome::BudgetExhausted {
+                attempts: 2,
+                limit: 2,
+            }
+        );
+        // On exhaustion the producer is NOT reset — it stays as it was.
+        assert_eq!(job.stages[0].tasks[0].state, TaskState::Succeeded);
     }
 }

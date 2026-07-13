@@ -1,9 +1,9 @@
 use super::{
     Arc, AtomicOrdering, AttemptId, CheckpointCoordinator, Coordinator, EventLogEvent,
     JOBS_SUBMITTED_TOTAL, JobId, JobKind, JobRecord, JobSpec, JobState, LogicalPlan, PhysicalPlan,
-    ResourceUsage, SchedulerError, SchedulerResult, SlotAwareScheduler, StageState, SubmitOutcome,
-    TaskState, TaskStatusUpdate, TaskUpdateOutcome, job_spec_from_logical_plan,
-    job_spec_from_physical_plan, validate_job,
+    ResourceUsage, SchedulerError, SchedulerResult, ShuffleRegenOutcome, SlotAwareScheduler,
+    StageState, SubmitOutcome, TaskState, TaskStatusUpdate, TaskUpdateOutcome,
+    job_spec_from_logical_plan, job_spec_from_physical_plan, validate_job,
 };
 
 impl Coordinator {
@@ -502,13 +502,33 @@ impl Coordinator {
                 missing_count = missing_partitions.len(),
                 "consumer task reported missing upstream shuffle partitions; invalidating producers"
             );
-            let producers_affected = if let Ok(mut job) = self.find_job_mut(&job_id) {
-                job.invalidate_specific_shuffle_partitions(&missing_partitions)
+            let max_regen = self.config.max_shuffle_regen_attempts();
+            let regen = if let Ok(mut job) = self.find_job_mut(&job_id) {
+                job.invalidate_specific_shuffle_partitions(&missing_partitions, max_regen)
             } else {
-                false
+                ShuffleRegenOutcome::NoneAffected
             };
-            if producers_affected {
-                self.exec.notify.notify_waiters();
+            match regen {
+                ShuffleRegenOutcome::Regenerated => self.exec.notify.notify_waiters(),
+                ShuffleRegenOutcome::NoneAffected => {}
+                // Phase 58: the producing stage cannot durably retain its output.
+                // Stop the regenerate/refetch loop and fail the job with a
+                // terminal reason (mirrors the fatal spooled-result path below).
+                ShuffleRegenOutcome::BudgetExhausted { attempts, limit } => {
+                    let message = format!(
+                        "job {job_id} lost shuffle output and regenerated it {attempts} \
+                         times (limit {limit}); the producing stage cannot durably retain \
+                         its output — failing the job as unrecoverable"
+                    );
+                    tracing::error!(
+                        job_id = %job_id,
+                        attempts,
+                        limit,
+                        "shuffle regeneration budget exhausted; failing job"
+                    );
+                    let _ = self.cancel_job(&job_id);
+                    return Err(SchedulerError::Transport { message });
+                }
             }
         }
 
