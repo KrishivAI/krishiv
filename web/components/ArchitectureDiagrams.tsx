@@ -2,7 +2,6 @@ import type { JSX } from 'react';
 
 const gold = '#7aa7d9';
 const goldBright = '#7aa7d9';
-const goldSoft = 'rgba(122,167,217,.16)';
 const border = '#26262c';
 const text = '#efeff1';
 const muted = '#adadb8';
@@ -74,6 +73,7 @@ function Arrow({
   y2,
   label,
   curve = 0,
+  markerId,
 }: {
   x1: number;
   y1: number;
@@ -81,6 +81,7 @@ function Arrow({
   y2: number;
   label?: string;
   curve?: number;
+  markerId: string;
 }): JSX.Element {
   const mx = (x1 + x2) / 2;
   const my = (y1 + y2) / 2 + curve;
@@ -89,7 +90,7 @@ function Arrow({
   const midY = (y1 + y2) / 2;
   return (
     <g>
-      <path d={path} stroke={gold} strokeWidth={1.25} fill="none" markerEnd="url(#arrowhead)" />
+      <path d={path} stroke={gold} strokeWidth={1.25} fill="none" markerEnd={`url(#${markerId})`} />
       {label && (
         <text
           x={midX}
@@ -105,21 +106,19 @@ function Arrow({
   );
 }
 
-function Defs(): JSX.Element {
+function Defs({ markerId }: { markerId: string }): JSX.Element {
   return (
     <defs>
-      <marker id="arrowhead" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <marker id={markerId} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
         <path d="M 0 0 L 10 5 L 0 10 z" fill={gold} />
       </marker>
-      <linearGradient id="bandGrad" x1="0" x2="0" y1="0" y2="1">
-        <stop offset="0%" stopColor={goldSoft} />
-        <stop offset="100%" stopColor="rgba(122,167,217,0)" />
-      </linearGradient>
     </defs>
   );
 }
 
 export function TopologyDiagram(): JSX.Element {
+  const markerId = 'topology-arrowhead';
+
   return (
     <svg
       viewBox="0 0 900 360"
@@ -128,7 +127,7 @@ export function TopologyDiagram(): JSX.Element {
       aria-label="Three deployment topologies: embedded, single-node, and distributed"
       style={{ maxWidth: 900 }}
     >
-      <Defs />
+      <Defs markerId={markerId} />
 
       <text x={150} y={28} textAnchor="middle" fontSize={13} fontWeight={700} fill={goldBright}>
         Embedded
@@ -139,8 +138,8 @@ export function TopologyDiagram(): JSX.Element {
       <Box x={50} y={70} w={200} h={56} label="Your app" sub="Rust / Python" />
       <Box x={50} y={150} w={200} h={56} label="Krishiv" sub="in-process runtime" accent />
       <Box x={50} y={230} w={200} h={56} label="Local files" sub="CSV · Parquet" />
-      <Arrow x1={150} y1={126} x2={150} y2={150} />
-      <Arrow x1={150} y1={206} x2={150} y2={230} />
+      <Arrow markerId={markerId} x1={150} y1={126} x2={150} y2={150} />
+      <Arrow markerId={markerId} x1={150} y1={206} x2={150} y2={230} />
 
       <line x1={290} x2={290} y1={20} y2={340} stroke={border} strokeDasharray="2 4" />
 
@@ -153,8 +152,8 @@ export function TopologyDiagram(): JSX.Element {
       <Box x={350} y={70} w={200} h={56} label="Your app" sub="Rust / Python / SQL" />
       <Box x={350} y={150} w={200} h={84} label="Krishiv daemon" sub="coordinator + executor" accent />
       <Box x={350} y={258} w={200} h={56} label="Configured storage" sub="state + checkpoints" />
-      <Arrow x1={450} y1={126} x2={450} y2={150} />
-      <Arrow x1={450} y1={234} x2={450} y2={258} />
+      <Arrow markerId={markerId} x1={450} y1={126} x2={450} y2={150} />
+      <Arrow markerId={markerId} x1={450} y1={234} x2={450} y2={258} />
 
       <line x1={590} x2={590} y1={20} y2={340} stroke={border} strokeDasharray="2 4" />
 
@@ -168,16 +167,18 @@ export function TopologyDiagram(): JSX.Element {
       <Box x={650} y={150} w={200} h={56} label="Coordinator" sub="job & task lifecycle" accent />
       <Box x={650} y={220} w={94} h={56} label="Executor 1" sub="data plane" />
       <Box x={756} y={220} w={94} h={56} label="Executor N" sub="data plane" />
-      <Box x={650} y={290} w={200} h={40} label="Shared storage" sub="S3 / object store" />
-      <Arrow x1={750} y1={126} x2={750} y2={150} />
-      <Arrow x1={750} y1={206} x2={697} y2={220} />
-      <Arrow x1={750} y1={206} x2={803} y2={220} />
-      <Arrow x1={750} y1={276} x2={750} y2={290} />
+      <Box x={650} y={290} w={200} h={40} label="Shared storage" sub="configured backend" />
+      <Arrow markerId={markerId} x1={750} y1={126} x2={750} y2={150} />
+      <Arrow markerId={markerId} x1={750} y1={206} x2={697} y2={220} />
+      <Arrow markerId={markerId} x1={750} y1={206} x2={803} y2={220} />
+      <Arrow markerId={markerId} x1={750} y1={276} x2={750} y2={290} />
     </svg>
   );
 }
 
 export function RequestFlowDiagram(): JSX.Element {
+  const markerId = 'request-flow-arrowhead';
+
   return (
     <svg
       viewBox="0 0 900 220"
@@ -186,17 +187,17 @@ export function RequestFlowDiagram(): JSX.Element {
       aria-label="How a query flows through Krishiv: API to plan to execution to result"
       style={{ maxWidth: 900 }}
     >
-      <Defs />
+      <Defs markerId={markerId} />
       <Box x={10} y={80} w={130} h={60} label="SQL / Rust / Py" sub="your code" />
       <Box x={190} y={80} w={140} h={60} label="Session" sub="catalog + state" />
       <Box x={380} y={80} w={140} h={60} label="Plan" sub="logical + physical" accent />
       <Box x={570} y={80} w={140} h={60} label="Execute" sub="Arrow operators" />
       <Box x={760} y={80} w={130} h={60} label="Result" sub="RecordBatch" />
 
-      <Arrow x1={140} y1={110} x2={190} y2={110} />
-      <Arrow x1={330} y1={110} x2={380} y2={110} />
-      <Arrow x1={520} y1={110} x2={570} y2={110} />
-      <Arrow x1={710} y1={110} x2={760} y2={110} />
+      <Arrow markerId={markerId} x1={140} y1={110} x2={190} y2={110} />
+      <Arrow markerId={markerId} x1={330} y1={110} x2={380} y2={110} />
+      <Arrow markerId={markerId} x1={520} y1={110} x2={570} y2={110} />
+      <Arrow markerId={markerId} x1={710} y1={110} x2={760} y2={110} />
 
       <text x={260} y={70} textAnchor="middle" fontSize={10.5} fill={muted}>
         parse + bind
@@ -228,6 +229,8 @@ export function RequestFlowDiagram(): JSX.Element {
 }
 
 export function DataPlaneDiagram(): JSX.Element {
+  const markerId = 'data-plane-arrowhead';
+
   return (
     <svg
       viewBox="0 0 900 320"
@@ -236,7 +239,7 @@ export function DataPlaneDiagram(): JSX.Element {
       aria-label="Data plane components: coordinator routes work to executors, which read state and write checkpoints"
       style={{ maxWidth: 900 }}
     >
-      <Defs />
+      <Defs markerId={markerId} />
 
       <rect x={20} y={30} width={860} height={260} rx={14} fill={surface} stroke={border} />
       <text x={40} y={56} fontSize={12} fontWeight={700} fill={goldBright} letterSpacing=".04em">
@@ -247,7 +250,7 @@ export function DataPlaneDiagram(): JSX.Element {
       <text x={450} y={155} textAnchor="middle" fontSize={10.5} fill={muted}>
         task offers
       </text>
-      <Arrow x1={450} y1={140} x2={450} y2={185} />
+      <Arrow markerId={markerId} x1={450} y1={140} x2={450} y2={185} />
 
       <text x={40} y={190} fontSize={12} fontWeight={700} fill={goldBright} letterSpacing=".04em">
         DATA PLANE
@@ -271,6 +274,8 @@ export function DataPlaneDiagram(): JSX.Element {
 }
 
 export function LifecycleDiagram(): JSX.Element {
+  const markerId = 'lifecycle-arrowhead';
+
   return (
     <svg
       viewBox="0 0 900 200"
@@ -279,7 +284,7 @@ export function LifecycleDiagram(): JSX.Element {
       aria-label="Pipeline lifecycle from submission to running to recovery"
       style={{ maxWidth: 900 }}
     >
-      <Defs />
+      <Defs markerId={markerId} />
       <Box x={10} y={70} w={120} h={60} label="Submit" sub="pipeline / query" />
       <Box x={170} y={70} w={120} h={60} label="Validate" sub="schema + types" />
       <Box x={330} y={70} w={120} h={60} label="Plan" sub="fragment graph" accent />
@@ -287,11 +292,11 @@ export function LifecycleDiagram(): JSX.Element {
       <Box x={650} y={70} w={120} h={60} label="Run" sub="state + checkpoints" />
       <Box x={810} y={70} w={80} h={60} label="Result" sub="" />
 
-      <Arrow x1={130} y1={100} x2={170} y2={100} />
-      <Arrow x1={290} y1={100} x2={330} y2={100} />
-      <Arrow x1={450} y1={100} x2={490} y2={100} />
-      <Arrow x1={610} y1={100} x2={650} y2={100} />
-      <Arrow x1={770} y1={100} x2={810} y2={100} />
+      <Arrow markerId={markerId} x1={130} y1={100} x2={170} y2={100} />
+      <Arrow markerId={markerId} x1={290} y1={100} x2={330} y2={100} />
+      <Arrow markerId={markerId} x1={450} y1={100} x2={490} y2={100} />
+      <Arrow markerId={markerId} x1={610} y1={100} x2={650} y2={100} />
+      <Arrow markerId={markerId} x1={770} y1={100} x2={810} y2={100} />
 
       <text x={230} y={60} textAnchor="middle" fontSize={10.5} fill={muted}>
         catalog
@@ -312,7 +317,7 @@ export function LifecycleDiagram(): JSX.Element {
         strokeWidth={1.25}
         strokeDasharray="4 4"
         fill="none"
-        markerEnd="url(#arrowhead)"
+        markerEnd={`url(#${markerId})`}
       />
       <text x={550} y={172} textAnchor="middle" fontSize={10.5} fill={muted}>
         recovery depends on the end-to-end path

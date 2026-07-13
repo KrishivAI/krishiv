@@ -9,6 +9,8 @@ development, and daemon operations. Krishiv is pre-release, so the commands
 below run the binary from a source checkout rather than assuming a published
 package is available.
 
+## Quick start
+
 <Steps>
   <Step>
 
@@ -31,7 +33,32 @@ cargo run -p krishiv -- sql --query "SELECT 42 AS answer"
   </Step>
 </Steps>
 
-## Core commands
+## Quick index
+
+<Cards>
+  <Card
+    title="Command map"
+    description="Find the command family that owns a task."
+    href="#command-map"
+  />
+  <Card
+    title="Query and plan"
+    description="Review SQL flags, placement, and common query examples."
+    href="#query-and-plan"
+  />
+  <Card
+    title="Local development cluster"
+    description="Start, inspect, and stop a single-host development topology."
+    href="#local-development-cluster"
+  />
+  <Card
+    title="Configuration reference"
+    description="Resolve placement, durability, authentication, and tuning settings."
+    href="/docs/engine/reference/configuration"
+  />
+</Cards>
+
+## Command map
 
 | Command | Purpose |
 | --- | --- |
@@ -49,7 +76,9 @@ cargo run -p krishiv -- sql --query "SELECT 42 AS answer"
 Use `cargo run -p krishiv -- <command> --help` for the options compiled into
 your checkout.
 
-## SQL options
+## Query and plan
+
+### SQL options
 
 ```text
 krishiv sql --query <SQL> [OPTIONS]
@@ -68,6 +97,8 @@ canonical `KRISHIV_COORDINATOR_URL` setting. The `explain` dispatcher does not
 currently receive that top-level override; set `KRISHIV_COORDINATOR_URL` if you
 deliberately inspect a remote plan. A parsed `--timeout` does not currently
 cancel work, so do not use it as an operational safeguard.
+
+### Examples
 
 <Tabs items={["Parquet", "Multi-statement", "Remote"]}>
   <Tab value="Parquet">
@@ -106,16 +137,72 @@ The endpoint must already expose a compatible Engine service.
 
 ## Local development cluster
 
+<Steps>
+  <Step>
+
+### Start the cluster
+
 ```bash
 cargo run -p krishiv -- local start --data-dir /tmp/krishiv-local
+```
+
+  </Step>
+  <Step>
+
+### Inspect its status
+
+```bash
 cargo run -p krishiv -- local status --data-dir /tmp/krishiv-local
+```
+
+  </Step>
+  <Step>
+
+### Stop the cluster
+
+```bash
 cargo run -p krishiv -- local stop --data-dir /tmp/krishiv-local
 ```
+
+  </Step>
+</Steps>
 
 <Callout type="warn" title="CLI process lifetime">
   In-process job and catalog state does not survive a CLI invocation. Use a
   long-lived session or coordinator-backed lifecycle for persistent jobs.
 </Callout>
 
-The CLI and its configuration are preview APIs. Pin a commit when automating
-commands, and check command help again when upgrading.
+## Automation and compatibility
+
+<Callout type="info" title="Pin automated commands">
+  The CLI and its configuration are preview APIs. Pin an Engine commit when
+  automating commands, and check command help again when upgrading.
+</Callout>
+
+The CLI reports the options compiled into the current binary. Treat `--help`
+from the pinned build as the final command-line reference for that checkout.
+
+## Next steps
+
+<Cards>
+  <Card
+    title="Run batch SQL"
+    description="Register finite data, inspect a plan, and execute a query."
+    href="/docs/engine/guides/batch-sql"
+  />
+  <Card
+    title="Run a single node"
+    description="Use the local coordinator, executor, and Flight SQL endpoint."
+    href="/docs/engine/guides/single-node"
+  />
+  <Card
+    title="Configure the runtime"
+    description="Set placement, durability, state, and authentication values."
+    href="/docs/engine/reference/configuration"
+  />
+  <Card
+    title="Operate checkpoints"
+    description="Understand checkpoint, savepoint, and restore boundaries."
+    href="/docs/engine/operations/checkpointing"
+  />
+</Cards>

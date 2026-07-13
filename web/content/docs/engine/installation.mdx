@@ -7,6 +7,37 @@ status: available
 Krishiv is pre-release. These docs deliberately use source builds instead of
 assuming a stable package or container release exists.
 
+<Callout type="info" title="Source builds only">
+  Pin the Engine commit, Cargo lockfile, native toolchain, and enabled feature
+  set together. Pre-release APIs and protocol versions can change between
+  commits.
+</Callout>
+
+## Choose an installation target
+
+<Cards>
+  <Card
+    title="Command-line interface"
+    description="Build the krishiv binary and inspect the commands in your checkout."
+    href="#command-line-interface"
+  />
+  <Card
+    title="Rust library"
+    description="Depend on the public facade from the Engine workspace or a pinned revision."
+    href="#rust-library"
+  />
+  <Card
+    title="Python extension"
+    description="Build the PyO3 extension into an isolated Python environment."
+    href="#python-extension"
+  />
+  <Card
+    title="Verify the checkout"
+    description="Run workspace checks after the target you need builds successfully."
+    href="#verify-the-checkout"
+  />
+</Cards>
+
 ## Requirements
 
 - Git
@@ -14,53 +45,109 @@ assuming a stable package or container release exists.
 - A C/C++ build toolchain required by native dependencies
 - Python and Maturin only when building the Python extension
 
-## CLI
+## Command-line interface
+
+<Steps>
+  <Step>
+
+### Clone the repository
 
 ```bash
 git clone https://github.com/KrishivAI/krishiv.git
 cd krishiv
+```
+
+  </Step>
+  <Step>
+
+### Build a release binary
+
+```bash
 cargo build --release -p krishiv
+```
+
+  </Step>
+  <Step>
+
+### Verify the command surface
+
+```bash
 ./target/release/krishiv --help
 ```
+
+  </Step>
+</Steps>
 
 The default developer build includes local Engine capabilities. Cargo features
 select compiled integrations; execution mode is still selected at runtime.
 
 ## Rust library
 
-Inside the workspace, depend on the public facade or the smallest public crate
-that owns the API you need:
+<Steps>
+  <Step>
+
+### Select a public crate
+
+Inside the Engine workspace, depend on the public facade or the smallest public
+crate that owns the API you need:
 
 ```toml
 [dependencies]
 krishiv-api = { path = "crates/krishiv-api" }
 ```
 
+  </Step>
+  <Step>
+
+### Pin the source revision
+
 For another repository, pin a specific Git revision until stable crates are
 published. Do not depend on private crate internals or a moving branch in a
 production build.
 
+  </Step>
+</Steps>
+
 ## Python extension
 
-From the repository root:
+<Steps>
+  <Step>
+
+### Create an isolated environment
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install maturin
+```
+
+  </Step>
+  <Step>
+
+### Build the extension
+
+From the repository root:
+
+```bash
 maturin develop --manifest-path crates/krishiv-python/Cargo.toml
+```
+
+  </Step>
+  <Step>
+
+### Verify the import
+
+```bash
 python -c "import krishiv; print(krishiv.__doc__)"
 ```
+
+  </Step>
+</Steps>
 
 The current Python crate dependency always compiles Kafka, Schema Registry,
 lakehouse/Iceberg/Hudi, and the base vector-sink family. Python Cargo features
 add Kinesis, Pulsar, Cassandra, Elasticsearch, HBase, Qdrant, and pgvector.
 Those flags do not currently produce a minimal connector build.
-
-<Callout type="info" title="Reproducible builds">
-  Pin the Engine commit, Cargo lockfile, native toolchain, and enabled feature set
-  together. Pre-release APIs and protocol versions can change between commits.
-</Callout>
 
 ## Verify the checkout
 
@@ -71,3 +158,28 @@ cargo test --workspace --exclude krishiv-python
 
 The full workspace test suite is larger than the quickstart and may require
 optional services for integration tests.
+
+## Next steps
+
+<Cards>
+  <Card
+    title="Run a first query"
+    description="Use the source-built CLI in embedded mode."
+    href="/docs/engine/getting-started"
+  />
+  <Card
+    title="Use the Rust API"
+    description="Create sessions and query data through the public facade."
+    href="/docs/engine/reference/rust"
+  />
+  <Card
+    title="Use the Python API"
+    description="Work with sessions, DataFrames, and PyArrow data."
+    href="/docs/engine/reference/python"
+  />
+  <Card
+    title="Choose build features"
+    description="Review connector capabilities before composing a custom build."
+    href="/docs/engine/reference/connectors"
+  />
+</Cards>

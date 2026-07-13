@@ -1,5 +1,8 @@
 import type { Metadata } from 'next';
+import Link from 'next/link';
+import { ArrowIcon, InteriorHero, SectionIntro } from '@/components/InteriorPage';
 import { Badge, SiteShell } from '@/components/Shell';
+import { githubUrl } from '@/lib/site';
 
 export const metadata: Metadata = {
   title: 'Engine Feature Maturity',
@@ -74,40 +77,115 @@ const tiers: MaturityTier[] = [
   },
 ];
 
+const orderedTiers = [tiers[0], tiers[2], tiers[1], tiers[3]];
+
 export default function Maturity() {
   return (
     <SiteShell>
-      <main className="container">
-        <section className="page-hero">
-          <Badge tone="blue">Engine maturity</Badge>
-          <h1 className="gradient-text">Capability status, backed by codebase evidence.</h1>
-          <p className="lead">
-            Each status is derived from Engine sources, tests, examples, and public APIs. It describes repository maturity—not production readiness or a hosted-service SLA.
-          </p>
+      <main className="ip-page">
+        <InteriorHero
+          eyebrow="Engine maturity / Evidence map"
+          title="Capability status, backed by the source tree."
+          description={
+            <p>
+              Labels describe implementation maturity in the current Engine repository.
+              They are not production-readiness promises, support tiers, or hosted-service SLAs.
+            </p>
+          }
+          aside={
+            <div className="ip-panel">
+              <div className="ip-panel-top">
+                <span className="ip-panel-label">Current map</span>
+                <span className="ip-panel-badge"><i />Pre-release</span>
+              </div>
+              <h2 className="ip-panel-title">Four labels. One rule: verify the exact path.</h2>
+              <ul className="ip-panel-list">
+                {orderedTiers.map((tier) => (
+                  <li className="ip-panel-row" key={tier.label}>
+                    <span>{tier.label}</span><strong>{tier.items.length} capability groups</strong>
+                  </li>
+                ))}
+              </ul>
+              <p className="ip-panel-note">Counts organize this page; they are not a quality score.</p>
+            </div>
+          }
+        >
+          <div className="ip-actions">
+            <Link className="mk-button mk-button-primary" href="/docs/engine/maturity">Read the policy <ArrowIcon /></Link>
+            <a className="mk-button mk-button-secondary" href={githubUrl}>Inspect the source</a>
+          </div>
+        </InteriorHero>
+
+        <section className="ip-section">
+          <div className="mk-wrap">
+            <SectionIntro
+              eyebrow="Current Engine map"
+              title="Presence and stability are different things."
+              description={<p>A capability can be implemented while its compatibility, recovery behavior, or operating envelope remains unsettled.</p>}
+            />
+
+            {orderedTiers.map((tier, index) => (
+              <section className="ip-maturity-tier" key={tier.label}>
+                <div className="ip-tier-head">
+                  <div>
+                    <span className="ip-tag">0{index + 1} / Status</span>
+                    <h2><Badge tone={tier.tone}>{tier.label}</Badge></h2>
+                  </div>
+                  <p>{tier.description}</p>
+                </div>
+                <div className="maturity-grid">
+                  {tier.items.map((item) => (
+                    <article className="maturity-card" key={item.name}>
+                      <h3>{item.name}</h3>
+                      <p>{item.note}</p>
+                    </article>
+                  ))}
+                </div>
+              </section>
+            ))}
+          </div>
         </section>
 
-        {tiers.map((tier) => (
-          <section className="section" key={tier.label}>
-            <div className="maturity-section">
-              <h2>
-                <Badge tone={tier.tone}>{tier.label}</Badge>
-              </h2>
-              <p className="lead" style={{ fontSize: 16, marginBottom: 20 }}>{tier.description}</p>
-              <div className="maturity-grid">
-                {tier.items.map((item) => (
-                  <div className="maturity-card" key={item.name}>
-                    <h3>{item.name}</h3>
-                    <p>{item.note}</p>
-                  </div>
-                ))}
-              </div>
+        <section className="ip-section ip-section-contrast">
+          <div className="mk-wrap">
+            <SectionIntro
+              eyebrow="How to use this page"
+              title="Evaluate a combination, not a badge."
+              description={<p>Runtime mode, connector, checkpoint storage, sink semantics, and the pinned commit all influence the real boundary.</p>}
+            />
+            <div className="ip-card-grid">
+              <article className="ip-card">
+                <div className="ip-card-top"><span>01</span><span>Scope</span></div>
+                <h3>Read the exact surface.</h3>
+                <p>A label for Engine does not automatically promote every connector, deployment mode, or language binding.</p>
+              </article>
+              <article className="ip-card">
+                <div className="ip-card-top"><span>02</span><span>Evidence</span></div>
+                <h3>Reproduce the path.</h3>
+                <p>Prefer public APIs, CLI behavior, checked-in contracts, examples, and tests over dependency presence or roadmap copy.</p>
+              </article>
+              <article className="ip-card">
+                <div className="ip-card-top"><span>03</span><span>Change</span></div>
+                <h3>Pin the commit.</h3>
+                <p>Pre-release APIs and protocols can change. Record the revision and build features used by an evaluation.</p>
+              </article>
             </div>
-          </section>
-        ))}
+          </div>
+        </section>
 
-        <div className="maturity-note">
-          <strong>Maintainer note:</strong> Verify Preview, Experimental, and Planned claims against the current source tree before publishing them elsewhere. Krishiv Platform has its own coming-soon status and is not included in this Engine matrix.
-        </div>
+        <section className="ip-cta">
+          <div className="mk-wrap ip-cta-inner">
+            <div>
+              <p className="ip-kicker">Separate product status</p>
+              <h2>Platform is coming soon and is not part of this matrix.</h2>
+              <p>Its documentation remains an availability notice until a public preview creates real setup and API contracts.</p>
+            </div>
+            <div className="ip-actions">
+              <Link className="mk-button mk-button-primary" href="/platform">Platform direction <ArrowIcon /></Link>
+              <Link className="mk-button mk-button-secondary" href="/docs/platform">Platform docs</Link>
+            </div>
+          </div>
+        </section>
       </main>
     </SiteShell>
   );

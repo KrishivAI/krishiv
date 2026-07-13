@@ -41,7 +41,7 @@ export default function PlatformPage() {
               </div>
               <p className="pd-disclaimer">No download, public preview, or availability date is being announced yet.</p>
             </div>
-            <div className="pd-platform-map" aria-label="Planned relationship between Platform and Engine">
+            <div className="pd-platform-map" role="img" aria-label="Planned relationship between Platform and Engine">
               <div className="pd-map-header"><span>Krishiv Platform</span><b>Coming soon</b></div>
               <div className="pd-map-surface"><span>Console</span><span>API</span><span>CLI</span><span>MCP</span></div>
               <div className="pd-map-capabilities"><div>SQL workspace</div><div>Catalog</div><div>Pipelines</div><div>Jobs</div><div>Governance</div><div>Operations</div></div>

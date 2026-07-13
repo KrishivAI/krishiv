@@ -5,13 +5,16 @@ import { source } from '@/lib/source';
 
 export default function Layout({ children }: { children: ReactNode }) {
   return (
-    <DocsLayout
-      {...baseOptions()}
-      tree={source.getPageTree()}
-      tabMode="auto"
-      sidebar={{ defaultOpenLevel: 1, prefetch: false }}
-    >
-      {children}
-    </DocsLayout>
+    <>
+      <a className="skip-link" href="#main-content">Skip to main content</a>
+      <DocsLayout
+        {...baseOptions()}
+        tree={source.getPageTree()}
+        tabMode="auto"
+        sidebar={{ defaultOpenLevel: 1, prefetch: false }}
+      >
+        {children}
+      </DocsLayout>
+    </>
   );
 }

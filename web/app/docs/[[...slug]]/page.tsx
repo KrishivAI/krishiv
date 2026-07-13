@@ -26,15 +26,21 @@ export default async function Page({ params }: PageProps) {
   const MDX = data.body;
 
   return (
-    <DocsPage toc={data.toc}>
-      <div className="docs-page-kicker">
-        <DocsStatus status={data.status as DocsStatusName | undefined} />
-      </div>
-      <DocsTitle>{data.title}</DocsTitle>
-      <DocsDescription>{data.description}</DocsDescription>
-      <ViewOptionsPopover
-        githubUrl={`${githubUrl}/blob/main/web/content/docs/${page.path}`}
-      />
+    <DocsPage id="main-content" role="main" tabIndex={-1} toc={data.toc}>
+      <header className="docs-page-header">
+        <div className="docs-heading-copy">
+          <div className="docs-page-kicker">
+            <DocsStatus status={data.status as DocsStatusName | undefined} />
+          </div>
+          <DocsTitle>{data.title}</DocsTitle>
+          <DocsDescription>{data.description}</DocsDescription>
+        </div>
+        <div className="docs-page-options">
+          <ViewOptionsPopover
+            githubUrl={`${githubUrl}/blob/main/web/content/docs/${page.path}`}
+          />
+        </div>
+      </header>
       <DocsBody>
         <MDX
           components={getMDXComponents({
@@ -48,15 +54,7 @@ export default async function Page({ params }: PageProps) {
 
 export function generateStaticParams() {
   const params = source.generateParams();
-  const engineAliases = source
-    .getPages()
-    .filter((page) => page.slugs[0] === 'engine')
-    .flatMap((page) => {
-      const rest = page.slugs.slice(1);
-      return [{ slug: ['latest', ...rest] }, { slug: ['v0.1', ...rest] }];
-    });
-
-  return [{ slug: [] }, ...params, ...engineAliases];
+  return [{ slug: [] }, ...params];
 }
 
 export async function generateMetadata({ params }: PageProps): Promise<Metadata> {

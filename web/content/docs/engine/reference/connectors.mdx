@@ -10,25 +10,76 @@ standalone `Source` and `Sink` implementations only require capabilities.
 Capability flags describe what a connector can participate in; they do not
 independently prove an end-to-end guarantee.
 
-## Documentation maturity
+## Quick index
+
+<Cards>
+  <Card
+    title="File and object storage"
+    description="Review bounded file sources, sinks, and object-store boundaries."
+    href="#file-and-object-storage"
+  />
+  <Card
+    title="Streaming and change data"
+    description="Compare Kafka, schema decoding, streaming sources, and CDC readers."
+    href="#streaming-and-change-data"
+  />
+  <Card
+    title="Lakehouse and optional sinks"
+    description="Review table formats and optional database, search, and vector sinks."
+    href="#lakehouse-and-optional-sinks"
+  />
+  <Card
+    title="Delivery contract"
+    description="Describe end-to-end behavior from the weakest part of the path."
+    href="#delivery-is-compositional"
+  />
+  <Card
+    title="Build features"
+    description="Separate compile-time connector families from runtime placement."
+    href="#build-features"
+  />
+  <Card
+    title="Author contract"
+    description="Implement explicit source and sink capability boundaries."
+    href="#connector-author-contract"
+  />
+</Cards>
+
+## Read maturity labels
 
 These are conservative public documentation labels based on checked-in
 contracts and validation evidence. An internal registry descriptor alone does
 not raise a connector's public maturity.
 
-| Connector family | Role | Maturity | Important boundary |
+The **Public label** columns below describe the documentation contract. A
+“(docs)” suffix makes explicit that no standalone registry maturity descriptor
+exists or that the public label is deliberately more conservative.
+
+## File and object storage
+
+| Connector family | Role | Public label | Important boundary |
 | --- | --- | --- | --- |
 | Parquet | Source and sink | Preview | Bounded; local write helpers are not atomic distributed writes. |
 | S3/object-store paths | Source, sink, storage | Preview | The named registry driver currently opens a local object-store root; AWS construction requires the separate `cloud` feature. |
 | CSV/NDJSON | File source | Preview (docs) | Best effort when input files can change; NDJSON has no registry maturity descriptor. |
 | Avro | File source and sink | Preview | Optional feature with bounded file semantics. |
+| Local two-phase Parquet | Sink | Preview | Publication uses a same-filesystem rename; it is not an S3 two-phase implementation. |
+
+## Streaming and change data
+
+| Connector family | Role | Public label | Important boundary |
+| --- | --- | --- | --- |
 | Kafka | Source and sink | Preview | Checkpoint and transaction paths exist; external failure certification is pending. |
 | Schema Registry | Decoder integration | Preview (docs) | Supports a documented Avro/Protobuf compatibility subset; it has no standalone registry maturity descriptor. |
-| Iceberg | Lakehouse source and sink | Preview | Primary lakehouse target; a two-phase path exists. |
-| Local two-phase Parquet | Sink | Preview | Publication uses a same-filesystem rename; it is not an S3 two-phase implementation. |
-| Delta Lake, Hudi | Lakehouse compatibility | Experimental | Drivers compile through the top-level `lakehouse` dependency but remain experimental. |
 | Kinesis, Pulsar | Streaming sources | Experimental (docs) | Registry descriptors say Preview, while external recovery contracts remain incomplete. |
 | CDC readers | Streaming sources | Experimental (docs) | Reader-specific row kinds exist; no standalone registry maturity is published. |
+
+## Lakehouse and optional sinks
+
+| Connector family | Role | Public label | Important boundary |
+| --- | --- | --- | --- |
+| Iceberg | Lakehouse source and sink | Preview | Primary lakehouse target; a two-phase path exists. |
+| Delta Lake, Hudi | Lakehouse compatibility | Experimental | Drivers compile through the top-level `lakehouse` dependency but remain experimental. |
 | Search and database sinks | Optional sinks | Experimental (docs) | Several registry descriptors say Preview; public contract validation remains incomplete. |
 | Vector sinks | Optional sinks | Experimental (docs) | Registry maturity is mixed; external-system validation remains incomplete. |
 
@@ -57,7 +108,7 @@ source restorability
 | Rewindable source + idempotent keys | Effectively once when repeated writes converge. |
 | Checkpoint source + two-phase sink + durable checkpoint | Preview exactly-once candidate; certify the exact systems and versions. |
 
-## Features are compile-time capabilities
+## Build features
 
 Cargo features select optional dependency families. Runtime mode is chosen
 separately through `SessionBuilder`, `Session::from_env()`, or the CLI's
@@ -85,11 +136,48 @@ custom build.
 
 ## Connector author contract
 
-A source should declare boundedness, return Arrow `RecordBatch` values, honor
-backpressure, and capture an exact durable position before claiming restore.
-A sink should declare idempotent/transactional behavior, define what `flush`
-means, and implement prepare/commit/abort when it participates in two-phase
-checkpoint publication.
+### Source contract
+
+A source should:
+
+- declare whether its input is bounded;
+- return Arrow `RecordBatch` values;
+- honor backpressure;
+- capture an exact durable position before claiming restore.
+
+### Sink contract
+
+A sink should:
+
+- declare idempotent or transactional behavior;
+- define what `flush` means;
+- implement prepare, commit, and abort when it participates in two-phase
+  checkpoint publication.
 
 Keep credentials outside SQL strings and source control. Use the configuration
 mechanism expected by the selected driver and durability profile.
+
+## Next steps
+
+<Cards>
+  <Card
+    title="Configuration reference"
+    description="Configure durability, storage, authentication, and runtime behavior."
+    href="/docs/engine/reference/configuration"
+  />
+  <Card
+    title="Checkpoints and savepoints"
+    description="Understand source positions, state, and sink publication together."
+    href="/docs/engine/operations/checkpointing"
+  />
+  <Card
+    title="Security"
+    description="Keep connector and control-plane credentials out of source control."
+    href="/docs/engine/operations/security"
+  />
+  <Card
+    title="Feature maturity"
+    description="Interpret Available, Preview, Experimental, and In progress labels."
+    href="/docs/engine/maturity"
+  />
+</Cards>

@@ -1,4 +1,5 @@
 {
   "title": "Operations",
+  "defaultOpen": false,
   "pages": ["observability", "checkpointing", "security", "distributed"]
 }

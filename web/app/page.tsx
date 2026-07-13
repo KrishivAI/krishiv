@@ -38,7 +38,7 @@ function StatusPill({ children, muted = false }: { children: ReactNode; muted?: 
 
 function SystemMap() {
   return (
-    <div className="mk-system" aria-label="Krishiv product architecture">
+    <div className="mk-system" role="img" aria-label="Krishiv product architecture">
       <div className="mk-system-topline">
         <span>One data system</span>
         <span className="mk-live"><i /> Engine preview</span>

@@ -11,6 +11,47 @@ read every registry value, so use the explicit flags in the CLI reference. The
 canonical generated inventory is `docs/reference/env-flags.md` in the Engine
 repository.
 
+<Callout type="info" title="Choose the configuration surface first">
+  The tables on this page describe environment-aware APIs and services. CLI
+  subcommands have their own parsers, so use their explicit flags unless a
+  command documents an environment-variable override.
+</Callout>
+
+## Quick index
+
+<Cards>
+  <Card
+    title="Placement"
+    description="Select embedded, single-node, or distributed execution intent."
+    href="#placement"
+  />
+  <Card
+    title="Durability profiles"
+    description="Choose backing services that match the failure boundary you test."
+    href="#durability-profiles"
+  />
+  <Card
+    title="State and streaming"
+    description="Configure state backends, snapshots, batching, and watermarks."
+    href="#state-and-streaming"
+  />
+  <Card
+    title="Authentication and TLS"
+    description="Provide separate client and executor credentials."
+    href="#authentication-and-tls"
+  />
+  <Card
+    title="Query and executor tuning"
+    description="Adjust batching, memory, adaptive execution, and logging."
+    href="#query-and-executor-tuning"
+  />
+  <Card
+    title="Parsing and validation"
+    description="Use portable Boolean spellings and canonical variable names."
+    href="#value-parsing-and-validation"
+  />
+</Cards>
+
 ## Placement
 
 | Variable | Values | Default | Purpose |
@@ -27,6 +68,8 @@ that one protocol or port serves all three.
 
 The examples below are for environment-aware sessions. For the SQL CLI, always
 pass `--mode` explicitly.
+
+### Example environments
 
 <Tabs items={["Embedded", "Single node", "Distributed"]}>
   <Tab value="Embedded">
@@ -119,7 +162,34 @@ reject ephemeral memory storage.
 Change one tuning control at a time and record the query, data, hardware, and
 Engine commit. Defaults are not performance promises.
 
+## Value parsing and validation
+
 Across current readers, the portable Boolean spellings are `1/true/on` and
 `0/false/off`. Some flags accept additional words, but those are not consistent
 for AQE and runtime filters. Daemon startup validates registered values;
 deprecated aliases may warn, so prefer the canonical names on this page.
+
+## Next steps
+
+<Cards>
+  <Card
+    title="CLI reference"
+    description="Use the flags parsed by each command and inspect compiled help."
+    href="/docs/engine/reference/cli"
+  />
+  <Card
+    title="Execution modes"
+    description="Understand how placement and durability intent differ."
+    href="/docs/engine/concepts/execution-modes"
+  />
+  <Card
+    title="Security"
+    description="Protect coordinator and executor control paths."
+    href="/docs/engine/operations/security"
+  />
+  <Card
+    title="Observability"
+    description="Inspect health, readiness, metrics, logs, and traces."
+    href="/docs/engine/operations/observability"
+  />
+</Cards>

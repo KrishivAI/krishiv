@@ -8,14 +8,10 @@
     "getting-started",
     "installation",
     "maturity",
-    "---Core concepts---",
-    "...concepts",
-    "---Guides---",
-    "...guides",
-    "---Reference---",
-    "...reference",
-    "---Operations---",
-    "...operations",
+    "concepts",
+    "guides",
+    "reference",
+    "operations",
     "---Project---",
     "contributing"
   ]

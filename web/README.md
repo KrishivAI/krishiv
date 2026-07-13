@@ -60,6 +60,6 @@ Do not claim support solely because a dependency appears in `Cargo.toml`. The
 validated labels are `available`, `preview`, `experimental`, `in-progress`, and
 `coming-soon`. Avoid global exactly-once or production-readiness claims.
 
-The old duplicated `latest`/`v0.1` routes remain as generated compatibility
-aliases, but canonical docs live at `/docs/engine/...`. Add real versioned docs
-only when a frozen release manual exists.
+Canonical Engine docs live at `/docs/engine/...`; `/docs` resolves to that root.
+Add versioned docs only when a release has a frozen, maintained documentation set,
+instead of publishing aliases that imply historical content exists.

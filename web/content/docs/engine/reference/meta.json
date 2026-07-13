@@ -1,4 +1,5 @@
 {
   "title": "Reference",
+  "defaultOpen": false,
   "pages": ["cli", "sql", "rust", "python", "connectors", "configuration"]
 }
