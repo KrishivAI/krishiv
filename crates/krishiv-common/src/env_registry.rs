@@ -419,6 +419,16 @@ pub static FLAGS: &[FlagSpec] = &[
         "Maximum cached prepared statements per Flight SQL session.",
     ),
     rt(
+        "KRISHIV_FLIGHT_REQUEST_TIMEOUT_SECS",
+        FlagKind::UInt,
+        "0",
+        "Hard per-request deadline (seconds) on the client→coordinator Flight \
+         channel; 0 (default) disables it so long-running distributed queries \
+         are bounded by the coordinator's own statement timeout \
+         (KRISHIV_BATCH_SQL_TIMEOUT_SECS) rather than a premature transport cap. \
+         Dead peers are still detected via HTTP/2 keepalive.",
+    ),
+    rt(
         "KRISHIV_FULL_SNAPSHOT_EVERY",
         FlagKind::UInt,
         "8",
@@ -585,6 +595,13 @@ pub static FLAGS: &[FlagSpec] = &[
         FlagKind::UInt,
         "16",
         "Coordinator-side concurrency cap for task assignment RPC fan-out.",
+    ),
+    rt(
+        "KRISHIV_MAX_SHUFFLE_REGEN",
+        FlagKind::UInt,
+        "8",
+        "Maximum times a lost shuffle partition may be regenerated before the \
+         job fails terminally (consumer-driven FetchFailed recovery bound).",
     ),
     rt(
         "KRISHIV_MCP_ADDR",

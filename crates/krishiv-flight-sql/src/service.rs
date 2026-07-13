@@ -54,6 +54,40 @@ const DEFAULT_FLIGHT_MAX_RESULT_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// `do_action_end_transaction`), DataFusion-dialect SQL, `"` identifier
 /// quoting. Extend as capabilities land; never claim what the engine does
 /// not do.
+/// Split the wire tables of a `BatchSql` action into inline-IPC and
+/// path-registered tables.
+///
+/// The distributed client inlines a parquet table's Arrow IPC so executors need
+/// no shared filesystem, but when a table exceeds the inline-IPC cap it ships
+/// with an empty `ipc_b64` and a real `path`, expecting path-based resolution
+/// (the file is reachable from the coordinator and every executor over a shared
+/// filesystem). Such a table becomes a path table (`LocalParquet` / staged
+/// scan); one carrying IPC bytes stays inline. Dropping the path here would
+/// ship an empty inline partition the executor rejects, wedging the job forever.
+fn split_batch_sql_wire_tables(
+    tables: &[krishiv_runtime::in_process::BatchSqlTable],
+) -> (
+    Vec<krishiv_scheduler::BatchSqlInlineTable>,
+    Vec<krishiv_scheduler::BatchSqlTable>,
+) {
+    let mut inline_tables = Vec::new();
+    let mut path_tables = Vec::new();
+    for t in tables {
+        if t.ipc_b64.is_empty() && !t.path.as_os_str().is_empty() {
+            path_tables.push(krishiv_scheduler::BatchSqlTable {
+                table_name: t.table_name.clone(),
+                path: t.path.clone(),
+            });
+        } else {
+            inline_tables.push(krishiv_scheduler::BatchSqlInlineTable {
+                table_name: t.table_name.clone(),
+                ipc_b64: t.ipc_b64.clone(),
+            });
+        }
+    }
+    (inline_tables, path_tables)
+}
+
 fn server_sql_info() -> &'static SqlInfoData {
     use arrow_flight::sql::SqlSupportedTransaction;
     static INFO: std::sync::LazyLock<SqlInfoData> = std::sync::LazyLock::new(|| {
@@ -1407,24 +1441,18 @@ impl KrishivFlightSqlService {
                 Ok(Vec::new())
             }
             A::BatchSql(body) => {
-                // Convert BatchSqlTable entries to BatchSqlInlineTable.
-                // For InProcess backend the ipc_b64 can be empty (path-based tables
-                // are already registered in catalog). For Coordinator backend the
-                // client is expected to pass IPC bytes. We use encode_batch_sql to
-                // produce inline IPC via the existing protocol path for InProcess,
-                // and pass the body.tables directly for Coordinator.
-                use krishiv_scheduler::BatchSqlInlineTable;
-                let inline_tables: Vec<BatchSqlInlineTable> = body
-                    .tables
-                    .iter()
-                    .map(|t| BatchSqlInlineTable {
-                        table_name: t.table_name.clone(),
-                        // The distributed client inlines parquet data as IPC so
-                        // executors need no shared filesystem; empty falls back to
-                        // catalog/path resolution (single-node / InProcess backend).
-                        ipc_b64: t.ipc_b64.clone(),
-                    })
-                    .collect();
+                // Split the wire tables into inline-IPC tables and path tables.
+                //
+                // The distributed client inlines a parquet table's Arrow IPC so
+                // executors need no shared filesystem; but when a table exceeds
+                // the inline-IPC cap the client ships it with an empty `ipc_b64`
+                // and a real `path`, expecting path-based resolution (the file is
+                // reachable from the coordinator and every executor over a shared
+                // filesystem). A table with empty IPC and a real path therefore
+                // becomes a path table (`LocalParquet` / staged scan); one with
+                // IPC bytes stays inline. Dropping the path here would ship an
+                // empty inline partition the executor rejects, wedging the job.
+                let (inline_tables, path_tables) = split_batch_sql_wire_tables(&body.tables);
                 let batches = if body.is_streaming {
                     // Streaming queries go through execute_sql to classify properly.
                     let sql = format!(
@@ -1440,7 +1468,7 @@ impl KrishivFlightSqlService {
                         .map_err(KrishivActionError::Status)?
                 } else {
                     self.host
-                        .execute_batch_sql(&body.query, &inline_tables)
+                        .execute_batch_sql_with_paths(&body.query, &inline_tables, &path_tables)
                         .await
                         .map_err(KrishivActionError::Status)?
                 };
@@ -1504,6 +1532,53 @@ impl KrishivFlightSqlService {
                     .map_err(|e| KrishivActionError::Other(e.to_string()))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod batch_sql_wire_tests {
+    use super::*;
+    use krishiv_runtime::in_process::BatchSqlTable as WireTable;
+
+    /// A table the client could inline (non-empty IPC) stays inline; one it
+    /// could not inline (empty IPC + real path — the over-inline-cap degrade)
+    /// becomes a path table instead of an empty inline partition that would
+    /// wedge the job. Regression for the distributed over-cap parquet hang.
+    #[test]
+    fn over_cap_table_routes_to_path_not_empty_inline() {
+        let tables = vec![
+            WireTable {
+                table_name: "small".into(),
+                path: std::path::PathBuf::from("/data/small.parquet"),
+                ipc_b64: "QVJ...".into(),
+            },
+            WireTable {
+                table_name: "big".into(),
+                path: std::path::PathBuf::from("/shared/big.parquet"),
+                ipc_b64: String::new(),
+            },
+        ];
+        let (inline, path) = split_batch_sql_wire_tables(&tables);
+        assert_eq!(inline.len(), 1, "inline table stays inline");
+        assert_eq!(inline[0].table_name, "small");
+        assert!(!inline[0].ipc_b64.is_empty());
+        assert_eq!(path.len(), 1, "over-cap table becomes a path table");
+        assert_eq!(path[0].table_name, "big");
+        assert_eq!(path[0].path, std::path::PathBuf::from("/shared/big.parquet"));
+    }
+
+    /// An empty-IPC table with no path has nowhere to resolve from, so it stays
+    /// inline (and fails loudly downstream) rather than being silently dropped.
+    #[test]
+    fn empty_ipc_without_path_stays_inline() {
+        let tables = vec![WireTable {
+            table_name: "orphan".into(),
+            path: std::path::PathBuf::new(),
+            ipc_b64: String::new(),
+        }];
+        let (inline, path) = split_batch_sql_wire_tables(&tables);
+        assert_eq!(inline.len(), 1);
+        assert!(path.is_empty());
     }
 }
 

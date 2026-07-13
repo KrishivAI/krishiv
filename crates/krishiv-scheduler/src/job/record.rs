@@ -17,6 +17,15 @@ const MAX_KEY_GROUPS: u32 = 32_768;
 /// Conservative per-job UDF execution time cap (ms) — 1 hour.
 const UDF_EXECUTION_TIME_CAP_MS: u64 = 60 * 60 * 1_000;
 
+/// Generous retry budget for a consumer task that fails on a *missing upstream
+/// shuffle partition* (FetchFailed). Such failures are upstream data loss, not
+/// the task's fault, and a single executor loss can surface as several
+/// sequential fetch failures (one per lost producer). The productive recovery
+/// path is bounded by `max_shuffle_regen` (the job fails cleanly on durable
+/// loss); this only backstops a degenerate report loop so it never counts
+/// against the ordinary (default 1) task-attempt budget.
+const MISSING_SHUFFLE_MAX_ATTEMPTS: u32 = 30;
+
 pub(crate) fn key_group_range_for_task(task_index: usize, parallelism: usize) -> KeyGroupRange {
     let p = parallelism.max(1) as u32;
     let idx = task_index as u32;
@@ -294,14 +303,38 @@ impl JobRecord {
                         }
                     })?;
 
-                    let lease_generation = executor_leases
-                        .iter()
-                        .find_map(|(known_executor, lease_generation)| {
+                    let lease_generation = match executor_leases.iter().find_map(
+                        |(known_executor, lease_generation)| {
                             (known_executor == &executor_id).then_some(*lease_generation)
-                        })
-                        .ok_or_else(|| SchedulerError::UnknownExecutor {
-                            executor_id: executor_id.clone(),
-                        })?;
+                        },
+                    ) {
+                        Some(generation) => generation,
+                        None => {
+                            // The executor this task is assigned to is no longer
+                            // an eligible launch target — it was either
+                            // circuit-broken (over the failure threshold and
+                            // filtered from `executor_leases` before this call)
+                            // or is no longer registered (lost). Reset the task
+                            // to Pending so the next assignment round re-places
+                            // it on a healthy executor, rather than aborting the
+                            // whole job's launch with `UnknownExecutor` and
+                            // livelocking on the stale assignment. Observed on a
+                            // 3-node cluster: an early executor kill left one map
+                            // task pinned to a filtered executor and the launch
+                            // loop spun (`unknown executor: …`) until the job hit
+                            // its batch-SQL timeout.
+                            tracing::warn!(
+                                job_id = %self.spec.job_id(),
+                                task_id = %task.task_id(),
+                                executor_id = %executor_id,
+                                "assigned executor is no longer an eligible launch target; resetting task to Pending for re-assignment"
+                            );
+                            task.state = TaskState::Pending;
+                            task.assigned_executor = None;
+                            task.launch_in_flight = false;
+                            continue;
+                        }
+                    };
 
                     task.attempt = task.attempt.saturating_add(1);
                     task.launch_in_flight = true;
@@ -1017,7 +1050,26 @@ impl StageRecord {
             task.failure_count = task.failure_count.saturating_add(1);
             let task_failure_count = task.failure_count;
 
-            if task_failure_count < max_task_attempts {
+            // FetchFailed semantics (Spark parity): a consumer that failed
+            // because an upstream shuffle partition is unavailable is not at
+            // fault — its producer is re-queued by the caller's
+            // missing-partition branch and regenerated under the separate
+            // `max_shuffle_regen` budget. Give such failures a generous retry
+            // budget so a multi-producer executor loss (which surfaces as
+            // several *sequential* fetch failures, one lost producer at a
+            // time) still converges, instead of the default
+            // `max_task_attempts = 1` failing the whole job after the first
+            // lost producer. The productive path is bounded by
+            // `max_shuffle_regen` (the job fails cleanly on durable loss);
+            // this cap only backstops a pathological no-op report loop.
+            let missing_shuffle = !update.missing_shuffle_partitions().is_empty();
+            let effective_attempts = if missing_shuffle {
+                max_task_attempts.max(MISSING_SHUFFLE_MAX_ATTEMPTS)
+            } else {
+                max_task_attempts
+            };
+
+            if task_failure_count < effective_attempts {
                 let task =
                     self.tasks
                         .get_mut(task_idx)
@@ -1027,15 +1079,23 @@ impl StageRecord {
                 task.state = TaskState::Pending;
                 task.assigned_executor = None;
                 task.launch_in_flight = false;
-                // Phase 53: exponential backoff before re-assignment —
-                // base * 2^(failures-1), capped. Failure-driven retries only;
-                // executor-loss and speculation resets stay immediate.
-                let exp = task_failure_count.saturating_sub(1).min(16);
-                let delay_ms = retry_backoff_base_ms
-                    .saturating_mul(1u64 << exp)
-                    .min(retry_backoff_cap_ms);
-                let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
-                task.retry_backoff_until_ms = Some(now_ms.saturating_add(delay_ms));
+                if missing_shuffle {
+                    // The consumer's upstream-ready gate already holds it until
+                    // the regenerated producer re-succeeds, so an extra failure
+                    // backoff would only delay recovery.
+                    task.retry_backoff_until_ms = None;
+                } else {
+                    // Phase 53: exponential backoff before re-assignment —
+                    // base * 2^(failures-1), capped. Failure-driven retries only;
+                    // executor-loss and speculation resets stay immediate.
+                    let exp = task_failure_count.saturating_sub(1).min(16);
+                    let delay_ms = retry_backoff_base_ms
+                        .saturating_mul(1u64 << exp)
+                        .min(retry_backoff_cap_ms);
+                    let now_ms =
+                        u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+                    task.retry_backoff_until_ms = Some(now_ms.saturating_add(delay_ms));
+                }
                 self.refresh_state();
                 return Ok(TaskUpdateOutcome::Applied);
             }
@@ -1422,6 +1482,65 @@ mod shuffle_regen_tests {
         (job, stage_id)
     }
 
+    /// Phase 58/53: a task assigned to an executor that is no longer an eligible
+    /// launch target — circuit-broken (filtered from the leases) or lost
+    /// (unregistered) — must be reset to Pending for re-assignment, NOT abort
+    /// the whole job's launch with `UnknownExecutor`. The old behaviour
+    /// livelocked: the launch loop re-hit the stale assignment every cycle
+    /// (`unknown executor: …`) until the job timed out (observed on a 3-node
+    /// cluster when an executor was killed early, before it produced output).
+    #[test]
+    fn assigned_task_on_vanished_executor_resets_instead_of_erroring() {
+        use krishiv_proto::{ExecutorId, JobState, LeaseGeneration};
+
+        let stage_id = StageId::try_new("stage-0").unwrap();
+        let spec = JobSpec::new(
+            JobId::try_new("livelock-job").unwrap(),
+            "livelock-test",
+            JobKind::Batch,
+        )
+        .with_stage(
+            StageSpec::new(stage_id, "map stage")
+                .with_task(TaskSpec::new(TaskId::try_new("task-0").unwrap(), "map:body")),
+        );
+        let mut job = JobRecord::from_spec(spec, 0);
+        job.state = JobState::Running;
+
+        // Pin the task to an executor, as the assign phase would.
+        let gone = ExecutorId::try_new("exec-gone").unwrap();
+        {
+            let task = &mut job.stages[0].tasks[0];
+            task.state = TaskState::Assigned;
+            task.assigned_executor = Some(gone.clone());
+            task.launch_in_flight = false;
+        }
+
+        // Launch with a lease set that does NOT contain the assigned executor
+        // (it was circuit-broken / lost). Must return Ok (nothing launches),
+        // and the task must be reset to Pending with its executor cleared so
+        // the next assignment round re-places it on the healthy executor.
+        let healthy = ExecutorId::try_new("exec-healthy").unwrap();
+        let leases = vec![(healthy, LeaseGeneration::initial())];
+        let assignments = job
+            .launch_assigned_task_assignments(&leases, None, None, None, None)
+            .expect("a vanished assigned executor must not error the job's launch");
+        assert!(
+            assignments.is_empty(),
+            "the pinned task must not launch onto the vanished executor"
+        );
+        let task = &job.stages[0].tasks[0];
+        assert_eq!(
+            task.state,
+            TaskState::Pending,
+            "the orphaned task must be reset to Pending for re-assignment"
+        );
+        assert!(
+            task.assigned_executor.is_none(),
+            "the stale executor assignment must be cleared"
+        );
+        assert!(!task.launch_in_flight);
+    }
+
     /// Phase 58: shuffle regeneration is bounded — the first `limit` cycles
     /// re-run the producer, the next one reports `BudgetExhausted` so the caller
     /// fails the job instead of looping forever. A report that matches no
@@ -1468,5 +1587,67 @@ mod shuffle_regen_tests {
         );
         // On exhaustion the producer is NOT reset — it stays as it was.
         assert_eq!(job.stages[0].tasks[0].state, TaskState::Succeeded);
+    }
+
+    /// Phase 58 (FetchFailed semantics): a consumer that fails on a *missing
+    /// upstream shuffle partition* must be re-queued under a generous budget
+    /// rather than the default `max_task_attempts = 1`, so a multi-producer
+    /// executor loss (several sequential fetch failures) still converges. An
+    /// ordinary failure keeps the strict budget.
+    #[test]
+    fn missing_shuffle_failure_does_not_exhaust_default_task_budget() {
+        use krishiv_proto::{ExecutorId, TaskStatusUpdate};
+
+        let stage_id = StageId::try_new("dist-s1").unwrap();
+        let mut stage = StageRecord::from_spec(
+            StageSpec::new(stage_id.clone(), "reduce")
+                .with_task(TaskSpec::new(TaskId::try_new("r0").unwrap(), "dfplan:body")),
+        );
+        let exec = ExecutorId::try_new("exec-x").unwrap();
+        let job_id = JobId::try_new("fetchfail-job").unwrap();
+        let task_id = TaskId::try_new("r0").unwrap();
+        let missing = vec![MissingShufflePartition::new(
+            StageId::try_new("s0.m2").unwrap(),
+            3,
+        )];
+
+        // Six sequential missing-shuffle failures (as a multi-producer loss
+        // would surface) — every one must re-queue the consumer, not fail it.
+        for round in 1..=6u32 {
+            let t = &mut stage.tasks[0];
+            t.attempt = round;
+            t.state = TaskState::Assigned;
+            t.assigned_executor = Some(exec.clone());
+            let upd = TaskStatusUpdate::new(
+                job_id.clone(),
+                stage_id.clone(),
+                task_id.clone(),
+                exec.clone(),
+                TaskState::Failed,
+                round,
+            )
+            .with_missing_shuffle_partitions(missing.clone());
+            // max_stage_retries = 0: isolate the per-task budget.
+            stage.apply_task_update(upd, 0, 0, 0).unwrap();
+            assert_eq!(
+                stage.tasks[0].state,
+                TaskState::Pending,
+                "missing-shuffle failure #{round} must re-queue the consumer"
+            );
+        }
+
+        // Contrast: an ordinary failure under max_task_attempts = 1 (with no
+        // stage retries) must NOT retry — it stays Failed.
+        let t = &mut stage.tasks[0];
+        t.attempt = 7;
+        t.state = TaskState::Assigned;
+        t.assigned_executor = Some(exec.clone());
+        let upd = TaskStatusUpdate::new(job_id, stage_id, task_id, exec, TaskState::Failed, 7);
+        stage.apply_task_update(upd, 0, 0, 0).unwrap();
+        assert_eq!(
+            stage.tasks[0].state,
+            TaskState::Failed,
+            "an ordinary failure under max_task_attempts=1 must not retry"
+        );
     }
 }

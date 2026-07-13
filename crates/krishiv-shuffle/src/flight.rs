@@ -677,7 +677,38 @@ impl FlightShuffleClient {
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // We fall here in two ways:
+                    //  * a genuinely permanent error (`NotFound` / `InvalidInput`)
+                    //    — pass it through unchanged, and
+                    //  * a *transport* error (connection refused, unavailable,
+                    //    deadline) that survived every retry attempt.
+                    //
+                    // The second case means the producing executor's Flight
+                    // server is unreachable after `max_attempts` — operationally
+                    // the partition is gone (the executor was killed / evicted).
+                    // Surface it as `NotFound` so the task runner maps it to
+                    // `ShufflePartitionMissing`, the consumer reports the
+                    // partition missing, and the scheduler regenerates the
+                    // producer on a healthy executor. Without this the consumer
+                    // returns an opaque transport error that triggers NO shuffle
+                    // regeneration; it just burns the task's retry budget against
+                    // the dead endpoint and the whole job fails unrecoverably
+                    // (observed live on a 3-node cluster: batch job "Failed",
+                    // one reduce task never recovered after its producer's pod
+                    // was deleted mid-fetch).
+                    if is_retryable_fetch_error(&error) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!(
+                                "shuffle partition {job_id}/{stage_id}/{partition_id} \
+                                 unreachable after {max_attempts} attempts (producer \
+                                 executor gone): {error}"
+                            ),
+                        ));
+                    }
+                    return Err(error);
+                }
             }
         }
     }
@@ -1043,6 +1074,67 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_millis(200),
             "NotFound must fail fast without backoff sleeps; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_with_retry_maps_unreachable_producer_to_not_found() {
+        // Bind then immediately drop a listener to obtain a port that is
+        // guaranteed closed (connection refused) — simulating a producer
+        // executor whose Flight server was killed mid-fetch.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let policy = FetchRetryPolicy {
+            max_attempts: 3,
+            base_delay_ms: 0, // retry without sleeping
+        };
+        let result = FlightShuffleClient::fetch_with_retry(
+            dead_addr.to_string(),
+            "job",
+            "s0",
+            0,
+            policy,
+        )
+        .await;
+
+        // A dead producer's exhausted transport retries must surface as
+        // NotFound so the task runner maps it to ShufflePartitionMissing, the
+        // consumer reports the partition missing, and the scheduler
+        // regenerates the producer — instead of an opaque transport error that
+        // triggers no recovery and just fails the job.
+        assert!(
+            matches!(result, Err(ref e) if e.kind() == std::io::ErrorKind::NotFound),
+            "unreachable producer after retries must map to NotFound, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_with_retry_converts_unreachable_even_with_no_retries() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        // max_attempts = 1: the retry arm never fires, so the single failed
+        // attempt falls straight through to the terminal arm. It must STILL be
+        // converted to NotFound (producer gone) rather than leaking the raw
+        // ConnectionRefused, which would trigger no shuffle regeneration.
+        let policy = FetchRetryPolicy {
+            max_attempts: 1,
+            base_delay_ms: 0,
+        };
+        let result = FlightShuffleClient::fetch_with_retry(
+            dead_addr.to_string(),
+            "j",
+            "s0",
+            0,
+            policy,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ref e) if e.kind() == std::io::ErrorKind::NotFound),
+            "single-attempt unreachable must map to NotFound, got: {result:?}"
         );
     }
 }

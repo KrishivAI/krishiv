@@ -109,8 +109,36 @@ const RETRY_DELAYS_MS: &[u64] = &[100, 500, 2_000];
 
 /// Timeout for establishing a gRPC channel to the Flight coordinator.
 const FLIGHT_CONNECT_TIMEOUT_SECS: u64 = 10;
-/// Per-request timeout for in-flight gRPC calls.
-const FLIGHT_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// HTTP/2 keepalive ping interval on the client→coordinator channel. Detects a
+/// dead peer *during* a long-running request without imposing a hard deadline
+/// on legitimate long queries.
+const FLIGHT_KEEPALIVE_INTERVAL_SECS: u64 = 30;
+/// How long to wait for a keepalive ping ACK before declaring the connection
+/// dead (~`interval + timeout` ≈ 50s to notice a vanished coordinator).
+const FLIGHT_KEEPALIVE_TIMEOUT_SECS: u64 = 20;
+
+/// Optional hard per-request deadline (seconds) on the Flight channel, read from
+/// `KRISHIV_FLIGHT_REQUEST_TIMEOUT_SECS`. Returns `None` (the default) when the
+/// flag is unset, empty, `0`, or unparseable — in which case a long-running
+/// distributed query is bounded by the coordinator's own statement timeout
+/// (`KRISHIV_BATCH_SQL_TIMEOUT_SECS`, default 300s) rather than a premature
+/// transport cap. A tonic channel `.timeout()` applies to *every* request, so a
+/// fixed 30s value here silently aborted any query — or result stream — running
+/// longer than 30s (including a healthy multi-minute distributed scan).
+fn flight_request_timeout() -> Option<Duration> {
+    parse_flight_request_timeout(std::env::var("KRISHIV_FLIGHT_REQUEST_TIMEOUT_SECS").ok().as_deref())
+}
+
+/// Pure parse of the `KRISHIV_FLIGHT_REQUEST_TIMEOUT_SECS` value, split out so it
+/// is testable without mutating process env. `None` (no hard per-request cap)
+/// for unset/empty/`0`/unparseable input; `Some(secs)` for a positive integer.
+fn parse_flight_request_timeout(raw: Option<&str>) -> Option<Duration> {
+    match raw.map(str::trim).and_then(|s| s.parse::<u64>().ok()) {
+        Some(secs) if secs > 0 => Some(Duration::from_secs(secs)),
+        _ => None,
+    }
+}
 
 /// Health check interval for Flight endpoints.
 const FLIGHT_HEALTH_CHECK_INTERVAL_SECS: u64 = 30;
@@ -197,10 +225,22 @@ fn normalize_flight_endpoint(url: &str) -> RuntimeResult<String> {
 async fn connect_flight_channel(endpoint: &str) -> RuntimeResult<Channel> {
     let ep = endpoint.to_string();
     with_retry(|| async {
-        Endpoint::from_shared(ep.clone())
+        let mut endpoint = Endpoint::from_shared(ep.clone())
             .map_err(|e| RuntimeError::transport(format!("invalid coordinator URL: {e}")))?
-            .connect_timeout(std::time::Duration::from_secs(FLIGHT_CONNECT_TIMEOUT_SECS))
-            .timeout(std::time::Duration::from_secs(FLIGHT_REQUEST_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(FLIGHT_CONNECT_TIMEOUT_SECS))
+            // HTTP/2 keepalive so a vanished coordinator is noticed mid-request
+            // without capping legitimate long-running queries. This replaces the
+            // former fixed 30s per-request `.timeout()`, which aborted any query
+            // (or result stream) that ran longer than 30s.
+            .http2_keep_alive_interval(Duration::from_secs(FLIGHT_KEEPALIVE_INTERVAL_SECS))
+            .keep_alive_timeout(Duration::from_secs(FLIGHT_KEEPALIVE_TIMEOUT_SECS))
+            .keep_alive_while_idle(true);
+        // Optional operator-set hard deadline; unset by default (see
+        // `flight_request_timeout`).
+        if let Some(req_timeout) = flight_request_timeout() {
+            endpoint = endpoint.timeout(req_timeout);
+        }
+        endpoint
             .connect()
             .await
             .map_err(|e| RuntimeError::transport(format!("flight connect failed: {e}")))
@@ -805,6 +845,26 @@ mod tests {
     use futures::StreamExt;
 
     use super::*;
+
+    #[test]
+    fn flight_request_timeout_parse() {
+        // Unset / empty / zero / garbage → no hard per-request cap.
+        assert_eq!(parse_flight_request_timeout(None), None);
+        assert_eq!(parse_flight_request_timeout(Some("")), None);
+        assert_eq!(parse_flight_request_timeout(Some("  ")), None);
+        assert_eq!(parse_flight_request_timeout(Some("0")), None);
+        assert_eq!(parse_flight_request_timeout(Some("nonsense")), None);
+        assert_eq!(parse_flight_request_timeout(Some("-5")), None);
+        // Positive integer (with surrounding whitespace) → that many seconds.
+        assert_eq!(
+            parse_flight_request_timeout(Some("30")),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_flight_request_timeout(Some("  600 ")),
+            Some(Duration::from_secs(600))
+        );
+    }
 
     #[test]
     fn plan_to_sql_uses_select_verbatim() {

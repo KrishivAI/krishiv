@@ -72,8 +72,8 @@ pub use barrier_dispatch::{BarrierDispatchPlan, drive_barrier_dispatches};
 pub use barrier_tracker::CheckpointBarrierTracker;
 pub use batch_sql::{
     BatchSqlInlineTable, BatchSqlOutcome, BatchSqlTable, decode_inline_record_batches,
-    execute_batch_sql_coordinated, execute_batch_sql_sink_coordinated, submit_batch_sql_job,
-    submit_batch_sql_job_with_paths,
+    execute_batch_sql_coordinated, execute_batch_sql_coordinated_with_paths,
+    execute_batch_sql_sink_coordinated, submit_batch_sql_job, submit_batch_sql_job_with_paths,
 };
 pub use bounded_window::execute_bounded_window_coordinated;
 pub use checkpoint::{CheckpointCoordinator, CheckpointCoordinatorState};

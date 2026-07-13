@@ -557,6 +557,13 @@ async fn heartbeat_loop(
         Ok(false) => {}
         Err(error) => tracing::warn!(%error, "iceberg REST catalog registration from env failed"),
     }
+    // Whether a servable shuffle store (local dir or object/URI) was configured.
+    // When one is, its store is wired as BOTH the flight-served store and the
+    // `inmem_shuffle` store that typed dfplan shuffle writes target — they must
+    // be the same instance or a cross-node reduce fetch hits the served store
+    // and misses the write ("partition not found"). The unconditional in-memory
+    // fallback below is therefore gated on neither being set.
+    let has_configured_shuffle_store = shuffle_uri.is_some() || shuffle_dir.is_some();
     if let Some(uri) = shuffle_uri {
         // When both a local shuffle-dir and an s3:// URI are set, build a tiered
         // backend: local disk for fast P2P reads, object store for durability.
@@ -628,15 +635,28 @@ async fn heartbeat_loop(
         println!(
             "Krishiv executor shuffle flight listening on {local_addr} (advertised {endpoint})"
         );
-        runner_builder = runner_builder.with_shuffle(ShuffleContext {
-            store: Arc::new(krishiv_shuffle::ShuffleBackend::Local(disk)),
-            local_dir: dir.clone(),
-            flight_endpoint: endpoint,
-            ess_index: None,
-            push_store: None,
-        });
+        // The flight server above serves `disk`. Typed dfplan shuffle writes go
+        // to `inmem_shuffle`, so it must be the SAME disk-backed store — else a
+        // cross-node reduce fetches from the producer's flight server (serving
+        // `disk`) and misses partitions the write left in a separate store.
+        let backend = Arc::new(krishiv_shuffle::ShuffleBackend::Local(disk));
+        runner_builder = runner_builder
+            .with_shuffle(ShuffleContext {
+                store: Arc::clone(&backend),
+                local_dir: dir.clone(),
+                flight_endpoint: endpoint,
+                ess_index: None,
+                push_store: None,
+            })
+            .with_inmem_shuffle(backend);
     }
-    if krishiv_common::allows_unbounded_shuffle_store(durability_profile) {
+    // Fallback in-memory shuffle store — ONLY when no dir/URI store was
+    // configured. When one was, it is already wired as both the flight-served
+    // store and `inmem_shuffle`; a fresh store here would clobber that and
+    // strand typed dfplan shuffle writes in an unserved store.
+    if !has_configured_shuffle_store
+        && krishiv_common::allows_unbounded_shuffle_store(durability_profile)
+    {
         let inmem_shuffle = Arc::new(krishiv_shuffle::ShuffleBackend::InMemory(Arc::new(
             InMemoryShuffleStore::new(),
         )));

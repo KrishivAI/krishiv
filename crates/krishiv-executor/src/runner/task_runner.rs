@@ -183,7 +183,7 @@ impl TaskRunner {
         // chain; keeps rescale/savepoint materialization cheap) and whenever
         // the state is not RocksDB-backed.
         if incremental_checkpoints_enabled()
-            && req.epoch % full_snapshot_every() != 0
+            && !req.epoch.is_multiple_of(full_snapshot_every())
             && let Some(ack) = self.try_incremental_checkpoint(&req, state, storage)?
         {
             self.last_acked_epoch = req.epoch;

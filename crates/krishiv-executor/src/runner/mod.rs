@@ -30,7 +30,7 @@ pub use task_runner::{
 pub(crate) use partition::{
     CONNECTOR_PARQUET_PARTITION_PREFIX, LocalParquetPartition, OBJECT_PARQUET_PARTITION_PREFIX,
     OBJECT_PARQUET_SINK_PREFIX, REGISTRY_CONNECTOR_PARTITION_PREFIX, SHUFFLE_WRITE_PREFIX,
-    parse_local_parquet_partitions,
+    encode_missing_shuffle, parse_local_parquet_partitions,
 };
 #[cfg(feature = "kafka")]
 pub(crate) use partition::{

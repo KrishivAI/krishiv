@@ -1011,6 +1011,24 @@ impl SharedCoordinator {
                             coord.exec.notify.notify_waiters();
                         }
                     }
+                    Err(error @ SchedulerError::AssignmentRejected { .. }) => {
+                        // Permanent rejection: the task payload is malformed, so
+                        // re-delivery can never succeed. Fail the job terminally
+                        // instead of clearing in-flight and retrying forever.
+                        tracing::error!(
+                            job_id = %job_id,
+                            error = %error,
+                            "task launch permanently rejected by executor; failing job"
+                        );
+                        coord.clear_launch_in_flight_for_job(&job_id);
+                        if let Err(cancel_err) = coord.cancel_job(&job_id) {
+                            tracing::warn!(
+                                job_id = %job_id,
+                                error = %cancel_err,
+                                "failed to cancel job after permanent assignment rejection"
+                            );
+                        }
+                    }
                     Err(error) => {
                         tracing::warn!(
                             job_id = %job_id,

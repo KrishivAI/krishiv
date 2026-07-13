@@ -9,7 +9,10 @@ use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
 use krishiv_runtime::flight_protocol::{FlightDirective, apply_register_directives, parse_sql};
 use krishiv_runtime::in_process_cluster::{InProcessCluster, plan_spec_to_local};
-use krishiv_scheduler::{BatchSqlInlineTable, SharedCoordinator, execute_batch_sql_coordinated};
+use krishiv_scheduler::{
+    BatchSqlInlineTable, BatchSqlTable, SharedCoordinator,
+    execute_batch_sql_coordinated_with_paths,
+};
 use krishiv_sql::explain_sql;
 use tonic::Status;
 
@@ -180,8 +183,33 @@ impl FlightExecutionHost {
         query: &str,
         inline_tables: &[BatchSqlInlineTable],
     ) -> Result<Vec<RecordBatch>, Status> {
+        self.execute_batch_sql_with_paths(query, inline_tables, &[])
+            .await
+    }
+
+    /// Execute a batch SQL query with both inline-IPC and path-registered
+    /// tables.
+    ///
+    /// `path_tables` carry a shared-filesystem path instead of inline Arrow IPC
+    /// bytes — the client emits them when a parquet table is too large to inline
+    /// (over the inline-IPC cap) but is reachable from the coordinator and every
+    /// executor. On the Coordinator backend they become `LocalParquet` inputs
+    /// (and, for plain SELECTs, are eligible for partition-parallel staged
+    /// execution). On the InProcess backend they are registered into the
+    /// client-side catalog so the shared-context query resolves them.
+    pub async fn execute_batch_sql_with_paths(
+        &self,
+        query: &str,
+        inline_tables: &[BatchSqlInlineTable],
+        path_tables: &[BatchSqlTable],
+    ) -> Result<Vec<RecordBatch>, Status> {
         match self.backend.as_ref() {
             FlightHostBackend::InProcess(cluster) => {
+                // The in-process backend resolves tables through the client-side
+                // catalog, so register any path tables before running.
+                for t in path_tables {
+                    self.register_parquet(&t.table_name, t.path.clone());
+                }
                 let tables = self.catalog_tables();
                 let sql = query.to_string();
                 let cluster = Arc::clone(cluster);
@@ -198,9 +226,14 @@ impl FlightExecutionHost {
                 run_blocking(move || cluster.collect_batch_sql(&sql, &tables, is_streaming))
             }
             FlightHostBackend::Coordinator(coordinator) => {
-                let outcome = execute_batch_sql_coordinated(coordinator, query, inline_tables)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
+                let outcome = execute_batch_sql_coordinated_with_paths(
+                    coordinator,
+                    query,
+                    inline_tables,
+                    path_tables,
+                )
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
                 let mut batches = krishiv_scheduler::decode_inline_record_batches(
                     &outcome.inline_record_batch_ipc,
                 )

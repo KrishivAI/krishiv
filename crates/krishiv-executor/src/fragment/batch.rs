@@ -816,10 +816,24 @@ impl krishiv_sql::distributed_plan::ShufflePartitionReader for InmemDfplanShuffl
                 )
                 .await
                 .map_err(|e| {
-                    format!(
-                        "dfplan shuffle-flight fetch failed (endpoint={endpoint} \
-                         stage={stage_key} partition={partition}): {e}"
-                    )
+                    // A NotFound here means the producer executor is gone (see
+                    // FlightShuffleClient::fetch_with_retry, which maps an
+                    // exhausted transport retry to NotFound). The reader trait
+                    // is String-typed, so embed the structured missing-partition
+                    // marker the task runner recovers via
+                    // collect_missing_shuffle_partitions — the coordinator then
+                    // regenerates this producer instead of the job failing.
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        format!(
+                            "{}: {e}",
+                            crate::runner::encode_missing_shuffle(&stage_key, partition)
+                        )
+                    } else {
+                        format!(
+                            "dfplan shuffle-flight fetch failed (endpoint={endpoint} \
+                             stage={stage_key} partition={partition}): {e}"
+                        )
+                    }
                 })
             });
         }

@@ -340,6 +340,11 @@ pub(crate) fn batch_max_event_time(batch: &RecordBatch, column: &str) -> Option<
     }
 }
 
+/// Result of routing a batch by key group: `(owned_rows, per_peer_rows)` where
+/// `owned_rows` are the local subtask's rows and each `(subtask, batch)` pair in
+/// `per_peer_rows` is destined for a co-located peer subtask.
+type RoutedBatch = (Option<RecordBatch>, Vec<(usize, RecordBatch)>);
+
 /// Split one batch's rows by owning subtask (via the shared keyed hash →
 /// key-group mapping). Returns `(owned_rows, per_peer_rows)`; batches whose
 /// key column is absent are treated as fully owned (nothing to route on).
@@ -348,7 +353,7 @@ pub(crate) fn route_batch_by_key_group(
     key_column: &str,
     parallelism: usize,
     own_subtask: usize,
-) -> ExecutorResult<(Option<RecordBatch>, Vec<(usize, RecordBatch)>)> {
+) -> ExecutorResult<RoutedBatch> {
     use arrow::array::{Array, BooleanArray, Int64Array, StringArray};
 
     if parallelism <= 1 {

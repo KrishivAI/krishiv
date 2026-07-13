@@ -57,6 +57,7 @@ Regenerate with:
 | `KRISHIV_FLIGHT_MAX_CONCURRENT_QUERIES` | uint | `16` | Maximum concurrently executing Flight SQL queries. |
 | `KRISHIV_FLIGHT_MAX_RESULT_BYTES` | uint | `unset` | Per-query Flight SQL result-size cap; unset = unlimited. |
 | `KRISHIV_FLIGHT_PREPARED_STMT_CAPACITY` | uint | `128` | Maximum cached prepared statements per Flight SQL session. |
+| `KRISHIV_FLIGHT_REQUEST_TIMEOUT_SECS` | uint | `0` | Hard per-request deadline (seconds) on the client→coordinator Flight channel; 0 (default) disables it so long-running distributed queries are bounded by the coordinator's own statement timeout (KRISHIV_BATCH_SQL_TIMEOUT_SECS) rather than a premature transport cap. Dead peers are still detected via HTTP/2 keepalive. |
 | `KRISHIV_FULL_SNAPSHOT_EVERY` | uint | `8` | Every Nth checkpoint epoch takes a full portable snapshot in incremental mode (bounds the SST manifest chain). |
 | `KRISHIV_GLUE_CATALOG_ID` | text | `unset` | AWS Glue catalog ID (account) for the Glue catalog integration. |
 | `KRISHIV_GLUE_DATABASE` | text | `default` | AWS Glue database name for the Glue catalog integration. |
@@ -85,6 +86,7 @@ Regenerate with:
 | `KRISHIV_LOCAL_HTTP_ADDR` | host:port | `127.0.0.1:8080` | HTTP address for `krishiv local` status endpoints. |
 | `KRISHIV_MATCH_RECOGNIZE_STREAMING_LIMIT` | uint | `engine default` | Row cap for MATCH_RECOGNIZE evaluation over streaming inputs. |
 | `KRISHIV_MAX_CONCURRENT_ASSIGNMENT_RPCS` | uint | `16` | Coordinator-side concurrency cap for task assignment RPC fan-out. |
+| `KRISHIV_MAX_SHUFFLE_REGEN` | uint | `8` | Maximum times a lost shuffle partition may be regenerated before the job fails terminally (consumer-driven FetchFailed recovery bound). |
 | `KRISHIV_MCP_ADDR` | host:port | `127.0.0.1:8811` | MCP server listen address (http transport). |
 | `KRISHIV_MCP_ALLOW_WRITE_SQL` | bool | `false` | Allow the MCP run_sql tool to execute write statements. |
 | `KRISHIV_MCP_MAX_ROWS` | uint | `1000` | Row cap on MCP query results. |

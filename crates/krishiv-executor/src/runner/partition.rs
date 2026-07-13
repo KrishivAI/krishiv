@@ -55,29 +55,71 @@ pub(crate) fn format_failure_message(fragment: &str, error: &str) -> String {
     buf
 }
 
+/// Sentinel embedded in a dfplan shuffle-read error string when the upstream
+/// producer's partition is unfetchable (executor gone).
+///
+/// The dfplan `ShufflePartitionReader` trait is `Result<_, String>`-typed, so —
+/// unlike the legacy `shuffle-write:` path which returns a structured
+/// [`ExecutorError::ShufflePartitionMissing`] — a missing partition can only be
+/// signalled by embedding this marker in the error text. It survives the
+/// DataFusion → stream → `ExecutorError` wrapping (each layer does `"...: {e}"`)
+/// so [`collect_missing_shuffle_partitions`] can recover it downstream.
+// Deliberately does NOT start with the `KRISHIV_` prefix: the env-flag registry
+// test scans sources for `KRISHIV_*` literals and would otherwise mistake this
+// protocol marker for an undeclared environment flag.
+pub(crate) const MISSING_SHUFFLE_MARKER: &str = "KRV_SHUFFLE_MISSING";
+
+/// Encode the missing-partition marker for a dfplan shuffle-read failure.
+/// `stage_id` is the `shuffle_stage_key` (`sN.mM`) form, which contains no `,`
+/// or `)` so the payload parses unambiguously.
+pub(crate) fn encode_missing_shuffle(stage_id: &str, partition_id: u32) -> String {
+    format!("{MISSING_SHUFFLE_MARKER}(stage={stage_id},partition={partition_id})")
+}
+
+/// Recover `(stage_id, partition_id)` from a marker embedded anywhere in `text`.
+fn parse_missing_shuffle_marker(text: &str) -> Option<(String, u32)> {
+    let start = text.find(MISSING_SHUFFLE_MARKER)?;
+    let after = &text[start + MISSING_SHUFFLE_MARKER.len()..];
+    let inner = after.strip_prefix('(')?;
+    let end = inner.find(')')?;
+    let body = &inner[..end]; // "stage=sN.mM,partition=P"
+    let (stage_part, partition_part) = body.split_once(",partition=")?;
+    let stage_id = stage_part.strip_prefix("stage=")?;
+    let partition_id = partition_part.parse::<u32>().ok()?;
+    Some((stage_id.to_owned(), partition_id))
+}
+
 /// Extract missing shuffle partition references from a task execution error.
 ///
-/// When `read_shuffle_flight_partitions` encounters a `NotFound` gRPC status on an
-/// Arrow Flight call, it returns `ExecutorError::ShufflePartitionMissing`.  This
-/// helper converts that into the wire-level `MissingShufflePartition` list so the
-/// coordinator can re-schedule the producing task.
+/// Two shuffle-read paths report a lost producer:
+///  * the legacy `shuffle-write:` path returns a structured
+///    [`ExecutorError::ShufflePartitionMissing`], and
+///  * the dfplan (Phase 52 staged-batch) path, whose `Result<_, String>`
+///    reader can only embed the [`MISSING_SHUFFLE_MARKER`] in the error text.
+///
+/// Either way this converts it into the wire-level `MissingShufflePartition`
+/// list so the coordinator can re-schedule the producing task.
 pub(crate) fn collect_missing_shuffle_partitions(
     error: &ExecutorError,
 ) -> Vec<MissingShufflePartition> {
-    match error {
-        ExecutorError::ShufflePartitionMissing {
-            stage_id,
-            partition_id,
-            ..
-        } => {
-            if let Ok(sid) = StageId::try_new(stage_id.clone()) {
-                vec![MissingShufflePartition::new(sid, *partition_id)]
-            } else {
-                Vec::new()
-            }
+    if let ExecutorError::ShufflePartitionMissing {
+        stage_id,
+        partition_id,
+        ..
+    } = error
+    {
+        if let Ok(sid) = StageId::try_new(stage_id.clone()) {
+            return vec![MissingShufflePartition::new(sid, *partition_id)];
         }
-        _ => Vec::new(),
+        return Vec::new();
     }
+    // dfplan path: the marker rides inside the stringified error.
+    if let Some((stage_id, partition_id)) = parse_missing_shuffle_marker(&error.to_string())
+        && let Ok(sid) = StageId::try_new(stage_id)
+    {
+        return vec![MissingShufflePartition::new(sid, partition_id)];
+    }
+    Vec::new()
 }
 
 pub(crate) const LOCAL_PARQUET_PARTITION_PREFIX: &str = "local-parquet:";
@@ -176,4 +218,58 @@ pub(crate) fn parse_local_parquet_partitions(
         parsed.push(local_partition);
     }
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod missing_shuffle_tests {
+    use super::*;
+
+    #[test]
+    fn structured_shuffle_partition_missing_is_collected() {
+        let err = ExecutorError::ShufflePartitionMissing {
+            stage_id: "s0.m2".to_owned(),
+            partition_id: 3,
+            message: "gone".to_owned(),
+        };
+        let got = collect_missing_shuffle_partitions(&err);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].stage_id().as_str(), "s0.m2");
+        assert_eq!(got[0].partition_id(), 3);
+    }
+
+    #[test]
+    fn dfplan_marker_survives_wrapping_and_is_collected() {
+        // Mirror the real wrapping: read_partition embeds the marker, the
+        // ShuffleReadExec wraps it in a DataFusionError string, and the task
+        // runner surfaces it as a LocalExecution error. The marker must still
+        // be recoverable from the fully-wrapped `to_string()`.
+        let marker = encode_missing_shuffle("s1.m4", 7);
+        let wrapped = ExecutorError::LocalExecution {
+            message: format!(
+                "shuffle read (stage 1, map 4, partition 7): {marker}: \
+                 shuffle partition job/s1.m4/7 unreachable after 5 attempts \
+                 (producer executor gone): connection refused"
+            ),
+        };
+        let got = collect_missing_shuffle_partitions(&wrapped);
+        assert_eq!(got.len(), 1, "marker must be recovered from wrapped error");
+        assert_eq!(got[0].stage_id().as_str(), "s1.m4");
+        assert_eq!(got[0].partition_id(), 7);
+    }
+
+    #[test]
+    fn ordinary_error_yields_no_missing_partitions() {
+        let err = ExecutorError::LocalExecution {
+            message: "dfplan shuffle-flight fetch failed (endpoint=... ): decode error".to_owned(),
+        };
+        assert!(collect_missing_shuffle_partitions(&err).is_empty());
+    }
+
+    #[test]
+    fn encode_parse_round_trips() {
+        let s = encode_missing_shuffle("s10.m0", 42);
+        let (stage, part) = parse_missing_shuffle_marker(&s).expect("parses");
+        assert_eq!(stage, "s10.m0");
+        assert_eq!(part, 42);
+    }
 }

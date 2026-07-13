@@ -75,6 +75,12 @@ pub enum SchedulerError {
     /// Coordinator/executor transport failed.
     #[error("transport error: {message}")]
     Transport { message: String },
+    /// An executor permanently rejected a task assignment as invalid
+    /// (a non-retryable gRPC status such as `InvalidArgument`). The task
+    /// payload is malformed, so re-delivering it can never succeed — the
+    /// launch loop fails the job terminally instead of retrying forever.
+    #[error("executor {endpoint} rejected assignment: {message}")]
+    AssignmentRejected { endpoint: String, message: String },
     /// Executor endpoint is unavailable for task dispatch.
     #[error("executor endpoint {endpoint} unavailable: {reason}")]
     ExecutorUnavailable { endpoint: String, reason: String },

@@ -294,8 +294,8 @@ pub struct ExecutorTaskRunner {
     /// exchange deliveries to co-located peer subtasks.
     pub(crate) own_task_endpoint: Option<String>,
 
-    /// Phase 55: barrier-drive context for run-loop fragments (state fallback
-    /// + checkpoint storage + coordinator client). `None` outside the CLI
+    /// Phase 55: barrier-drive context for run-loop fragments (state fallback,
+    /// checkpoint storage, and coordinator client). `None` outside the CLI
     /// runtime — the slot loop in `cli.rs` then remains the only barrier
     /// drainer, as before.
     pub(crate) barrier_context: Option<RunLoopBarrierContext>,

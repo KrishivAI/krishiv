@@ -124,6 +124,19 @@ fn is_retryable_assignment_status(status: &tonic::Status) -> bool {
     )
 }
 
+/// A gRPC status that means the assignment request itself is malformed or
+/// unsupported by the executor: re-delivering the same payload can never
+/// succeed, so the launch loop must fail the job rather than retry it.
+fn is_permanent_assignment_status(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::InvalidArgument
+            | tonic::Code::FailedPrecondition
+            | tonic::Code::OutOfRange
+            | tonic::Code::Unimplemented
+    )
+}
+
 async fn assignment_retry_backoff(attempt_idx: usize) {
     let backoff_ms = 100u64.saturating_mul(1u64 << attempt_idx.min(4));
     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
@@ -839,6 +852,17 @@ impl Coordinator {
                     assignment_retry_backoff(attempt_idx).await;
                 }
                 Ok(Err(status)) => {
+                    // A non-retryable executor rejection (e.g. InvalidArgument
+                    // for a malformed task payload) will never succeed on
+                    // re-delivery. Surface it as a permanent AssignmentRejected
+                    // so the launch loop fails the job instead of retrying it
+                    // forever; genuinely transient codes stay Transport.
+                    if is_permanent_assignment_status(&status) {
+                        return Err(SchedulerError::AssignmentRejected {
+                            endpoint: endpoint.clone(),
+                            message: status.to_string(),
+                        });
+                    }
                     return Err(SchedulerError::Transport {
                         message: format!("assign_task to {endpoint}: {status}"),
                     });

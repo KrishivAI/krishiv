@@ -70,7 +70,33 @@ pub async fn execute_batch_sql_coordinated(
     tables: &[BatchSqlInlineTable],
 ) -> SchedulerResult<BatchSqlOutcome> {
     let job_id = submit_batch_sql_job(coordinator, query, tables, false).await?;
+    poll_batch_sql_outcome(coordinator, job_id).await
+}
 
+/// [`execute_batch_sql_coordinated`] with additional path-registered tables.
+///
+/// Used by the Flight SQL `BatchSql` action when the client could not inline a
+/// parquet table's Arrow IPC (e.g. it exceeds the inline-IPC cap) but the file
+/// is reachable from the coordinator and every executor over a shared
+/// filesystem. The path tables become `LocalParquet` inputs and — for plain
+/// SELECTs — are eligible for partition-parallel staged execution, exactly like
+/// the HTTP path-table submission surface.
+pub async fn execute_batch_sql_coordinated_with_paths(
+    coordinator: &SharedCoordinator,
+    query: &str,
+    tables: &[BatchSqlInlineTable],
+    path_tables: &[BatchSqlTable],
+) -> SchedulerResult<BatchSqlOutcome> {
+    let job_id =
+        submit_batch_sql_job_with_paths(coordinator, query, tables, path_tables, false).await?;
+    poll_batch_sql_outcome(coordinator, job_id).await
+}
+
+/// Poll a submitted batch SQL job to completion and collect its outcome.
+async fn poll_batch_sql_outcome(
+    coordinator: &SharedCoordinator,
+    job_id: JobId,
+) -> SchedulerResult<BatchSqlOutcome> {
     let notify = {
         let coord = coordinator.read().await;
         coord.notify().clone()

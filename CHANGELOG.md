@@ -38,6 +38,102 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Fixed
 
+- **Task launch no longer livelocks when its executor is circuit-broken or
+  lost** (Phase 58/53, 2026-07-13). If a task was assigned to an executor that
+  then dropped out of the launch leases — filtered by the circuit breaker after
+  crossing the failure threshold, or unregistered after a loss — the per-job
+  launch aborted with `UnknownExecutor` and never cleared the stale assignment,
+  so the coordinator's launch loop spun on it (`unknown executor: …`, every
+  ~3s) until the job hit its batch-SQL timeout. The launch path now resets such
+  an orphaned task to `Pending` (clearing the dead assignment) so the next
+  assignment round re-places it on a healthy executor. Observed on a 3-node
+  cluster: an executor killed *early* (before it produced any shuffle output)
+  left one map task pinned to a filtered executor and the job timed out instead
+  of recovering. (The mid-shuffle killed-*producer* case below already
+  recovered; this closes the early-kill gap.)
+
+- **Long-running distributed queries no longer abort at 30s**
+  (Phase 59, 2026-07-13). The client→coordinator Flight channel was built with
+  a fixed `.timeout(30s)`, which tonic applies to *every* request on the
+  channel — so any distributed query (or result stream) that ran longer than
+  30s was aborted with `do_action: Timeout expired`, regardless of the
+  statement-level `--timeout`. This capped healthy multi-minute scans and made
+  executor-loss recovery (which needs a regeneration cycle) unobservable from
+  the blocking client. The hard per-request timeout is removed by default;
+  query duration is now bounded by the coordinator's own statement timeout
+  (`KRISHIV_BATCH_SQL_TIMEOUT_SECS`, default 300s), and a vanished coordinator
+  is still detected mid-request via HTTP/2 keepalive (~50s). Operators who want
+  a hard client-side cap can set the new `KRISHIV_FLIGHT_REQUEST_TIMEOUT_SECS`.
+  (Surfaced while validating the killed-producer shuffle recovery below on a
+  live 3-node cluster.)
+
+- **Killed-producer shuffle now recovers instead of failing the job**
+  (Phase 58, 2026-07-13). When a producing executor's pod was deleted
+  mid-fetch, the downstream reduce's shuffle fetch got a *connection-refused*
+  transport error which was retried to exhaustion and then surfaced as an
+  opaque error that triggered no recovery — the reduce burned its whole
+  task-retry budget re-hitting the dead endpoint and the batch job failed
+  unrecoverably (observed live on a 3-node cluster — job `Failed`, one reduce
+  task never recovered). Two changes close this end to end: (1) a shuffle
+  fetch that exhausts its retries on a *transport* failure now surfaces as
+  `NotFound` (the producer is gone) rather than a raw transport error
+  (`FlightShuffleClient::fetch_with_retry`); and (2) the **dfplan staged-batch**
+  reader (Phase 52's distributed path) — whose `Result<_, String>` trait
+  boundary previously stringified that `NotFound` into an opaque message —
+  now emits a structured missing-partition marker that the task runner
+  recovers via `collect_missing_shuffle_partitions`; and (3) a consumer task
+  that fails on a *missing upstream shuffle partition* (FetchFailed) is now
+  retried under a generous budget (`MISSING_SHUFFLE_MAX_ATTEMPTS = 30`) rather
+  than the default `max_task_attempts = 1` — FetchFailed is upstream data loss,
+  not the task's fault (Spark parity), and a single multi-producer executor
+  loss surfaces as *several sequential* fetch failures (one per lost producer),
+  each of which would otherwise exhaust the strict one-attempt budget and fail
+  the job before recovery could converge; the productive path stays bounded by
+  `KRISHIV_MAX_SHUFFLE_REGEN` (a durable loss still fails cleanly) and this cap
+  only backstops a degenerate report loop. The consumer then reports
+  the partition missing and the coordinator regenerates exactly the lost
+  producer map task (`invalidate_specific_shuffle_partitions`, keyed on the
+  `sN.mM` sub-stage id, bounded by `KRISHIV_MAX_SHUFFLE_REGEN`); the reduce
+  waits for the upstream to re-succeed on a healthy executor and relaunches
+  against the fresh flight endpoint. The legacy `shuffle-write:` fragment path
+  already mapped `NotFound → ShufflePartitionMissing`; this brings the dfplan
+  path to parity. (An initial misdiagnosis — a redundant heartbeat-path
+  shuffle audit, and a fix confined to the legacy path — was corrected after
+  the on-cluster kill test still failed.) Reproduced and fixed on a 3-node
+  k3s cluster.
+
+- **Distributed dfplan shuffle no longer strands map output in an unserved
+  store** (Phase 58, 2026-07-13). On a dev-local/`--shuffle-dir` (or URI)
+  executor, typed dfplan shuffle writes (Phase 52 staged batch) target the
+  `inmem_shuffle` store, but the executor unconditionally overwrote that with a
+  *fresh* `InMemoryShuffleStore` whenever the durability profile allowed an
+  unbounded store — while the shuffle-flight server kept serving the
+  local-disk store. In-process tests read from the same in-memory store so they
+  passed, but on a real multi-node cluster the cross-node reduce fetched each
+  map partition over flight from the producer's flight server (serving disk)
+  and missed it (`partition s0.mN/p not found`), failing every multi-stage
+  batch job. The executor now wires the configured dir/URI store as **both**
+  the flight-served store and `inmem_shuffle` (one instance), and the
+  in-memory fallback only applies when no dir/URI store is configured.
+  Reproduced and fixed on a 3-node k3s cluster.
+
+- **Distributed batch SQL over an over-cap parquet no longer hangs**
+  (Phase 58, 2026-07-13). When the distributed client could not inline a
+  parquet table's Arrow IPC (it exceeded `KRISHIV_INLINE_IPC_MAX_BYTES`,
+  default 64 MiB) it degraded the table to an empty `ipc_b64` with a real
+  `path`, expecting path-based resolution — but the Flight SQL `BatchSql`
+  handler dropped the path and shipped an **empty inline partition** the
+  executor rejected (`inline ipc bytes cannot be empty`), and the launch
+  loop retried the malformed assignment **forever** with the job stuck
+  `Running`. The handler now splits wire tables into inline vs path tables
+  (empty IPC + real path → `LocalParquet`, eligible for partition-parallel
+  staged execution just like the HTTP path-table surface), so a large
+  shared-filesystem parquet runs as a real multi-stage shuffle job. And a
+  non-retryable executor rejection (`InvalidArgument` and peers) is now
+  surfaced as a permanent `AssignmentRejected` error that fails the job
+  terminally instead of retry-storming — a malformed task payload can no
+  longer wedge the coordinator. Verified on a 3-node k3s cluster.
+
 - **Assignment no longer demotes completed stages** (Phase 54). Applying
   task assignments used to stomp every stage's state to `Scheduling`,
   including `Succeeded` upstream stages — any post-success assignment
