@@ -54,13 +54,18 @@ fn make_date_format() -> ScalarUDF {
         Volatility::Immutable,
         Arc::new(|args: &[ColumnarValue]| {
             let arrays = ColumnarValue::values_to_arrays(args)?;
-            let ts = arrays[0]
+            let [ts_arr, fmt_arr] = arrays.as_slice() else {
+                return Err(DataFusionError::Internal(
+                    "date_format: expected 2 arguments".into(),
+                ));
+            };
+            let ts = ts_arr
                 .as_any()
                 .downcast_ref::<arrow::array::TimestampNanosecondArray>()
                 .ok_or_else(|| {
                     DataFusionError::Internal("date_format: arg 0 must be Timestamp(ns)".into())
                 })?;
-            let fmt = arrays[1]
+            let fmt = fmt_arr
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| {
@@ -91,22 +96,24 @@ fn spark_pattern_to_chrono(pattern: &str) -> Result<String, String> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut out = String::with_capacity(pattern.len() * 2);
     let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
+    while let Some(&c) = chars.get(i) {
         // Quoted literal segment.
         if c == '\'' {
             i += 1;
-            if i < chars.len() && chars[i] == '\'' {
+            if chars.get(i) == Some(&'\'') {
                 // '' → literal single quote
                 out.push('\'');
                 i += 1;
                 continue;
             }
-            while i < chars.len() && chars[i] != '\'' {
-                escape_literal(chars[i], &mut out);
+            while let Some(&c2) = chars.get(i) {
+                if c2 == '\'' {
+                    break;
+                }
+                escape_literal(c2, &mut out);
                 i += 1;
             }
-            if i >= chars.len() {
+            if chars.get(i).is_none() {
                 return Err(format!("unterminated quoted literal in pattern '{pattern}'"));
             }
             i += 1; // consume closing quote
@@ -115,14 +122,11 @@ fn spark_pattern_to_chrono(pattern: &str) -> Result<String, String> {
         // A run of the same pattern letter.
         if c.is_ascii_alphabetic() {
             let mut n = 1;
-            while i + n < chars.len() && chars[i + n] == c {
+            while chars.get(i + n) == Some(&c) {
                 n += 1;
             }
             out.push_str(&translate_letter(c, n).ok_or_else(|| {
-                format!(
-                    "unsupported Spark datetime pattern letter '{}' (x{}) in '{}'",
-                    c, n, pattern
-                )
+                format!("unsupported Spark datetime pattern letter '{c}' (x{n}) in '{pattern}'")
             })?);
             i += n;
             continue;
@@ -195,12 +199,13 @@ fn make_crc32() -> ScalarUDF {
         Volatility::Immutable,
         Arc::new(|args: &[ColumnarValue]| {
             let arrays = ColumnarValue::values_to_arrays(args)?;
-            let input = arrays[0]
+            let [input_arr] = arrays.as_slice() else {
+                return Err(DataFusionError::Internal("crc32: expected 1 argument".into()));
+            };
+            let input = input_arr
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("crc32: argument must be Utf8".into())
-                })?;
+                .ok_or_else(|| DataFusionError::Internal("crc32: argument must be Utf8".into()))?;
             let mut out = Int64Builder::new();
             for i in 0..input.len() {
                 if input.is_null(i) {

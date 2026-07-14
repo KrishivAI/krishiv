@@ -87,6 +87,8 @@ mod udf;
 mod json_functions;
 mod higher_order_functions;
 mod spark_functions;
+pub mod statement_completion;
+pub mod coverage;
 mod window_functions;
 
 pub use cep_sql::{
@@ -1969,6 +1971,21 @@ impl SqlEngine {
                     });
                 }
             }
+        }
+
+        // ── Intercept USE / SHOW DATABASES (Phase 60 statement completion) ───
+        // DataFusion does not plan `USE` (session catalog/schema navigation) or
+        // `SHOW DATABASES`/`SHOW SCHEMAS`; handle both before the fallthrough.
+        if let Some(result) = statement_completion::apply_use(&self.context, query) {
+            result.map_err(|message| SqlError::DataFusion { message })?;
+            let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
+            return Ok(self.attach_query_metadata(self.make_sql_df("use", empty), query));
+        }
+        if let Some(rewrite) = statement_completion::rewrite_show_databases(query) {
+            let dataframe = self.context.sql(&rewrite).await?;
+            return Ok(
+                self.attach_query_metadata(self.make_sql_df("show-databases", dataframe), query)
+            );
         }
 
         // ── Intercept CREATE FUNCTION … RETURNS TABLE ────────────────────────

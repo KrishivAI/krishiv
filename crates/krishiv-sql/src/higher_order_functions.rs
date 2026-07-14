@@ -240,10 +240,14 @@ impl HigherOrderUDFImpl for ArrayAllMatch {
         macro_rules! process_list {
             ($list_typed:expr) => {{
                 let offsets = adjust_offsets_for_slice($list_typed);
-                for i in 0..$list_typed.len() {
-                    let start = offsets[i].as_usize();
-                    let end = offsets[i + 1].as_usize();
-                    values.append_option(all_match_for_range(predicate_bool, start, end));
+                let offsets: &[_] = &offsets;
+                for pair in offsets.windows(2) {
+                    let [start, end] = pair else { continue };
+                    values.append_option(all_match_for_range(
+                        predicate_bool,
+                        start.as_usize(),
+                        end.as_usize(),
+                    ));
                 }
             }};
         }

@@ -628,8 +628,8 @@ static FEATURES: &[FeatureEntry] = &[
         "Atomic Iceberg MERGE with row-level deletes",
         S,
     ),
-    FeatureEntry::batch_only("dml.truncate", "DML", "TRUNCATE TABLE (Iceberg + memory)", S)
-        .with_note("Phase 60 statement completion"),
+    FeatureEntry::batch_only("dml.truncate", "DML", "TRUNCATE TABLE (Iceberg + memory)", PL)
+        .with_note("itemized shortfall: TRUNCATE is not yet wired for memory/Iceberg session tables"),
     // ── DDL ──────────────────────────────────────────────────────────────────
     FeatureEntry::batch_only(
         "ddl.create_external_table",
@@ -695,27 +695,35 @@ static FEATURES: &[FeatureEntry] = &[
          supported kinds come from connector descriptors, unsupported kinds fail loudly",
     ),
     // ── SESSION / CONFIG STATEMENTS (Phase 60) ───────────────────────────────
-    FeatureEntry::batch_only("stmt.set_reset", "SESSION", "SET / RESET / SET TIMEZONE session config", S),
-    FeatureEntry::batch_only("stmt.use", "SESSION", "USE [CATALOG|SCHEMA] current-namespace", S),
+    FeatureEntry::batch_only("stmt.set_reset", "SESSION", "SET / RESET / SET TIMEZONE session config", S)
+        .with_note("DataFusion-native session config"),
+    FeatureEntry::batch_only("stmt.use", "SESSION", "USE [CATALOG|SCHEMA] current-namespace", S)
+        .with_note("Phase 60: mutates the session default catalog/schema"),
     FeatureEntry::batch_only(
         "stmt.cache",
         "SESSION",
         "CACHE / UNCACHE / CLEAR CACHE TABLE (session materialization)",
-        S,
-    ),
+        PL,
+    )
+    .with_note("itemized shortfall: needs a session-scoped materialization + provider swap/restore"),
     // ── SHOW / DESCRIBE (Phase 60) ───────────────────────────────────────────
     FeatureEntry::batch_only(
         "show.tables_databases_functions",
         "SHOW",
-        "SHOW TABLES | DATABASES | FUNCTIONS | VIEWS | PARTITIONS | CREATE TABLE",
-        S,
+        "SHOW TABLES | DATABASES | SCHEMAS | FUNCTIONS | COLUMNS",
+        P,
+    )
+    .with_note(
+        "TABLES/FUNCTIONS/COLUMNS are DataFusion-native; DATABASES/SCHEMAS added in Phase 60 \
+         (information_schema.schemata). SHOW PARTITIONS (Iceberg) and SHOW VIEWS remain the gap.",
     ),
     FeatureEntry::batch_only(
         "describe.function_database_query",
         "DESCRIBE",
         "DESCRIBE FUNCTION | DATABASE | QUERY",
-        S,
-    ),
+        PL,
+    )
+    .with_note("DESCRIBE <table> is native; FUNCTION/DATABASE/QUERY are the itemized shortfall"),
     // ── TEMPORAL ─────────────────────────────────────────────────────────────
     FeatureEntry::batch_only("temporal.as_of", "TEMPORAL", "AS OF TIMESTAMP point-in-time queries", S),
     FeatureEntry::new(
