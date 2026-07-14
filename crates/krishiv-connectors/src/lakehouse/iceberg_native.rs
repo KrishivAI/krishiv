@@ -126,12 +126,19 @@ pub mod native {
                 ident,
                 root,
                 pending: Mutex::new(HashMap::new()),
-                // Seed snap_counter with (pid << 32) so staged filenames are
-                // unique across processes. Within one session the counter
-                // increments monotonically, guaranteeing no collision even if
-                // two sessions on the same host share the same root (e.g.
-                // crash recovery).
-                snap_counter: AtomicI64::new((std::process::id() as i64) << 32),
+                // Seed snap_counter with a per-instance nanosecond timestamp so
+                // staged filenames are unique across processes AND across
+                // instances of the same process — including after a restart
+                // that reuses the PID (the old `pid << 32` seed collided there,
+                // so a fresh sink could reuse an orphan's name and DUR-2
+                // re-staging could clobber the file it just committed). The
+                // counter still increments monotonically within an instance.
+                snap_counter: AtomicI64::new(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as i64)
+                        .unwrap_or_else(|_| (std::process::id() as i64) << 32),
+                ),
             })
         }
 
@@ -259,7 +266,8 @@ pub mod native {
             for task in tasks {
                 let path = task.data_file_path();
                 let local = path.strip_prefix("file://").unwrap_or(path);
-                let file = fs::File::open(local).map_err(|e| LakehouseError::Io(e.to_string()))?;
+                let file = fs::File::open(local)
+                    .map_err(|e| LakehouseError::Io(format!("open data file {local}: {e}")))?;
                 let reader =
                     parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
                         .map_err(|e| LakehouseError::Io(e.to_string()))?
@@ -268,6 +276,47 @@ pub mod native {
                 for batch in reader {
                     batches.push(batch.map_err(|e| LakehouseError::Io(e.to_string()))?);
                 }
+            }
+            Ok(batches)
+        }
+
+        /// The source offsets embedded in the current committed snapshot's
+        /// summary (empty for an uncommitted table). DUR-2 recovery gates an
+        /// idempotent re-commit on this: a prepared epoch whose offsets are
+        /// already covered here was committed and must not be appended again
+        /// (`fast_append` is not otherwise idempotent — a blind retry would
+        /// double-write the rows).
+        pub async fn committed_kafka_offsets(
+            &self,
+        ) -> Result<BTreeMap<String, i64>, LakehouseError> {
+            let table = self
+                .catalog
+                .load_table(&self.ident)
+                .await
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+            let Some(snapshot) = table.metadata().current_snapshot() else {
+                return Ok(BTreeMap::new());
+            };
+            Ok(snapshot
+                .summary()
+                .additional_properties
+                .get(KAFKA_OFFSETS_SUMMARY_KEY)
+                .map(|json| crate::lakehouse::two_phase::parse_kafka_offsets_json(json))
+                .unwrap_or_default())
+        }
+
+        /// Read a single staged Parquet file back into Arrow batches. DUR-2
+        /// upsert recovery replays the row-level merge from the staged rows.
+        pub fn read_staged_parquet(path: &Path) -> Result<Vec<RecordBatch>, LakehouseError> {
+            let file = fs::File::open(path).map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let reader =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                    .map_err(|e| LakehouseError::Io(e.to_string()))?
+                    .build()
+                    .map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let mut batches = Vec::new();
+            for batch in reader {
+                batches.push(batch.map_err(|e| LakehouseError::Io(e.to_string()))?);
             }
             Ok(batches)
         }
