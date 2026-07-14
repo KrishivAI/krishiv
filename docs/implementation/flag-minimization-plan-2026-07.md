@@ -92,11 +92,29 @@ few flags that remain *visible* and *validated*.
 ## Sequencing (low-risk first)
 
 1. Capability manifest + startup log (A4) — pure addition, immediate visibility.
-2. `prod` preset + build-script/CI switch (A3, A5) — fixes the shipped-gap.
-3. Delete dead features `s3`/`minimal`/`bare-metal` (A2) — mechanical.
-4. Registry completion + unknown-flag warn (B1, B2) — incremental per crate.
+   **DONE (engine a54fa65b):** `krishiv capabilities` + daemon boot banner; 3 tests.
+2. `prod` preset + build-script switch (A3) — fixes the shipped-gap.
+   **DONE (a54fa65b):** `prod` preset (adds the previously-unwireable `cloud` to
+   the top-level crate + `full`); `build-fast-engine.sh` builds `prod` and
+   asserts durable-CTAS+kafka+cloud markers. CI `--features prod` build (A5) is
+   the remaining follow-up.
+3. Delete dead features (A2) — mechanical. **DONE (a54fa65b):** removed `s3`
+   (0 cfg-sites; also dropped the stale krishiv-sql request) + `minimal` + the
+   unreferenced `cluster` alias. `bare-metal` kept (referenced by
+   run_bare_metal.sh + justfile).
+4. Registry completion + unknown-flag warn (B1, B2) — incremental per crate. *(open)*
 5. Capability propagation cleanup (A1) — the largest, do last with the manifest
-   as the regression guard.
+   as the regression guard. *(open; e.g. krishiv-sql unconditionally pulls
+   `krishiv-connectors/kafka` — a capability that should be `kafka`-gated.)*
+
+## Follow-ups (items 4–5, open)
+
+- CI: add a `cargo build -p krishiv --no-default-features --features prod` job so
+  the shipped combo is compiled + smoke-tested every PR (A5).
+- `/healthz` capability field (crate-locality: plumb the manifest string into the
+  scheduler HTTP handler) — the manifest currently surfaces via CLI + boot log.
+- Runtime: route every `KRISHIV_*` read through `env_registry` + warn on unknown
+  vars (B1/B2); collapse endpoint-name aliases (FLAG-3).
 
 ## Relation to the DUR-2 S3-native sink work
 
