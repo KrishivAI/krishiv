@@ -82,6 +82,12 @@ pub mod native {
         })
     }
 
+    // Sanctioned sync-over-async boundary (clippy.toml): the object-store branch
+    // of these methods must stay synchronous — they are called from the
+    // checkpoint-aligned two-phase sink staging/commit path, which runs in
+    // blocking contexts — while the `object_store` API is async. Bridging via
+    // `async_util::block_on` here is deliberate; async code elsewhere must await.
+    #[allow(clippy::disallowed_methods)]
     impl IcebergNativeTwoPhaseCommit {
         /// Open or create an Iceberg table at `root`.
         ///
