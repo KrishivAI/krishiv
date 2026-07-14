@@ -19,6 +19,7 @@ pub mod materialized_table;
 pub mod pipeline;
 pub mod prepared;
 pub mod process;
+pub mod pyspark_parity;
 pub mod query;
 pub mod session;
 pub mod sql_job;
