@@ -33,6 +33,12 @@ fn build_s3_store(bucket: &str) -> Result<object_store::aws::AmazonS3, object_st
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
         .unwrap_or_else(|_| "us-east-1".to_string());
     builder = builder.with_region(region);
+    // Evict pooled HTTP connections after 1s idle so spaced writers don't reuse
+    // a socket kube-proxy/MinIO silently closed (which hangs the 30s request
+    // timeout). See the note in krishiv-state's checkpoint storage_uri.
+    builder = builder.with_client_options(
+        object_store::ClientOptions::new().with_pool_idle_timeout(std::time::Duration::from_secs(1)),
+    );
     builder.build()
 }
 
