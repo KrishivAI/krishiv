@@ -49,8 +49,10 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
         return Ok(());
     }
     krishiv_common::log_env_issues();
-    config.validate_task_auth_startup(&ExecutorTaskAuthConfig::from_env())?;
+    let task_auth = ExecutorTaskAuthConfig::from_env();
+    config.validate_task_auth_startup(&task_auth)?;
     config.validate_durable_startup()?;
+    config.log_executor_security_posture(&task_auth);
 
     let mode = config.mode;
     let heartbeat_interval_secs = config.heartbeat_interval_secs;
@@ -1258,6 +1260,38 @@ impl ExecutorCliConfig {
             auth.validate_required()?;
         }
         Ok(())
+    }
+
+    /// Emit a loud boot-time security-posture warning (SEC-7).
+    ///
+    /// Durable and production profiles fail closed in
+    /// [`Self::validate_task_auth_startup`] when task-control gRPC is exposed
+    /// without a bearer token; this covers the dev-local path so an operator
+    /// serving unauthenticated task/barrier gRPC sees it announced rather than
+    /// relying on network-policy isolation alone.
+    fn log_executor_security_posture(&self, auth: &ExecutorTaskAuthConfig) {
+        let network_control = self.task_grpc_addr.is_some() || self.barrier_grpc_addr.is_some();
+        if !network_control {
+            return;
+        }
+        if auth.has_bearer_token() {
+            tracing::info!(
+                profile = %self.durability_profile,
+                "executor task-control gRPC authentication ENABLED (bearer token configured)"
+            );
+            return;
+        }
+        let bar = "=".repeat(72);
+        tracing::warn!(profile = %self.durability_profile, "{bar}");
+        tracing::warn!(
+            "SECURITY: executor task/barrier gRPC is UNAUTHENTICATED — anyone able to \
+             reach it can assign tasks and inject checkpoint barriers. Acceptable ONLY \
+             for local development on a trusted host; network-policy isolation alone is \
+             not a substitute for authentication. Set \
+             KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH=true and a non-empty \
+             KRISHIV_EXECUTOR_TASK_BEARER_TOKEN to authenticate it."
+        );
+        tracing::warn!("{bar}");
     }
 
     fn validate_durable_startup(&self) -> crate::ExecutorResult<()> {

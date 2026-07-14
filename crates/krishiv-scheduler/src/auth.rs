@@ -147,6 +147,23 @@ pub fn set_grpc_auth_provider(provider: Arc<dyn AuthProvider>) {
     grpc_auth_provider().set(provider);
 }
 
+/// Whether anonymous coordinator gRPC access is currently permitted.
+///
+/// Reflects the process-wide deny-by-default flag toggled by
+/// [`set_allow_anonymous`]. Used at boot to emit a loud security-posture
+/// banner (SEC-7): an operator running an unauthenticated control plane must
+/// see it, not discover it after the fact.
+pub fn anonymous_grpc_enabled() -> bool {
+    ALLOW_ANONYMOUS.load(Ordering::Acquire)
+}
+
+/// Whether a coordinator gRPC auth provider (static bearer tokens or JWT/JWKS)
+/// is currently installed. When false and anonymous is not enabled, gRPC is
+/// deny-all (no principal can authenticate).
+pub fn grpc_auth_provider_installed() -> bool {
+    grpc_auth_provider().current().is_some()
+}
+
 /// Build the static coordinator gRPC auth provider from a bearer token.
 pub fn static_grpc_auth_provider_from_bearer_token(
     token: impl AsRef<str>,

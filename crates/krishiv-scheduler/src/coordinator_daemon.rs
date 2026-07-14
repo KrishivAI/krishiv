@@ -1084,6 +1084,103 @@ async fn configure_coordinator_grpc_auth(config: &CoordinatorDaemonConfig) -> bo
     crate::auth::configure_grpc_auth_provider_from_env()
 }
 
+/// Coordinator authentication posture at boot, derived from the configured
+/// profile and the installed gRPC auth state (SEC-7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoordinatorSecurityPosture {
+    /// At least one control-plane surface accepts unauthenticated requests.
+    /// Only reachable on `dev-local` (durable profiles reject `--insecure`).
+    Anonymous { grpc: bool, http: bool },
+    /// A bearer/JWT auth provider is installed; requests are authenticated.
+    Authenticated,
+    /// No provider installed and anonymous denied: every RPC is rejected.
+    DenyAll,
+}
+
+/// Classify the coordinator's boot security posture. Pure so it can be tested
+/// without touching the process-wide auth state; `grpc_anonymous` is read from
+/// [`crate::auth::anonymous_grpc_enabled`] at the call site.
+fn classify_coordinator_security_posture(
+    config: &CoordinatorDaemonConfig,
+    grpc_auth_configured: bool,
+    grpc_anonymous: bool,
+) -> CoordinatorSecurityPosture {
+    let http_anonymous = config.http_addr.is_some() && !http_auth_required(config);
+    if grpc_anonymous || http_anonymous {
+        CoordinatorSecurityPosture::Anonymous {
+            grpc: grpc_anonymous,
+            http: http_anonymous,
+        }
+    } else if grpc_auth_configured {
+        CoordinatorSecurityPosture::Authenticated
+    } else {
+        CoordinatorSecurityPosture::DenyAll
+    }
+}
+
+/// Emit a loud boot-time security-posture banner (SEC-7).
+///
+/// Durable profiles already reject `--insecure` and require bearer tokens
+/// (`validate_runtime_security_config`), but the dev-local path can still serve
+/// unauthenticated control-plane RPCs. An operator running an engine without
+/// authentication must see it announced, not discover it after exposing the
+/// port. On the authenticated happy path we log a single confirming line so the
+/// posture is auditable either way.
+fn log_coordinator_security_posture(config: &CoordinatorDaemonConfig, grpc_auth_configured: bool) {
+    match classify_coordinator_security_posture(
+        config,
+        grpc_auth_configured,
+        crate::auth::anonymous_grpc_enabled(),
+    ) {
+        CoordinatorSecurityPosture::Anonymous { grpc, http } => {
+            let mut surfaces = Vec::new();
+            if grpc {
+                surfaces.push("gRPC control-plane");
+            }
+            if http {
+                surfaces.push("HTTP admin/federation");
+            }
+            let bar = "=".repeat(72);
+            tracing::warn!(
+                profile = %config.durability_profile,
+                insecure = config.insecure,
+                grpc_anonymous = grpc,
+                http_anonymous = http,
+                "{bar}"
+            );
+            tracing::warn!(
+                "SECURITY: coordinator is serving UNAUTHENTICATED {} — anyone able to \
+                 reach this port can control the engine. Acceptable ONLY for local \
+                 development on a trusted host. Do NOT expose this coordinator to an \
+                 untrusted network; network-policy isolation alone is not a substitute \
+                 for authentication. Configure {COORDINATOR_BEARER_TOKEN_ENV}/\
+                 {COORDINATOR_BEARER_TOKENS_ENV} (or an OIDC/JWKS provider) and drop \
+                 --insecure to authenticate it.",
+                surfaces.join(" + ")
+            );
+            tracing::warn!("{bar}");
+        }
+        CoordinatorSecurityPosture::Authenticated => {
+            tracing::info!(
+                profile = %config.durability_profile,
+                "coordinator gRPC authentication ENABLED (bearer/JWT provider installed)"
+            );
+        }
+        CoordinatorSecurityPosture::DenyAll => {
+            // No provider installed and anonymous denied: every control-plane RPC
+            // is rejected — surface the misconfiguration loudly instead of failing
+            // silently at the first request.
+            tracing::warn!(
+                profile = %config.durability_profile,
+                "coordinator gRPC has no auth provider and anonymous access is denied by \
+                 default: ALL control-plane RPCs will be rejected. Configure \
+                 {COORDINATOR_BEARER_TOKEN_ENV}/{COORDINATOR_BEARER_TOKENS_ENV} or an \
+                 OIDC/JWKS provider."
+            );
+        }
+    }
+}
+
 fn parse_etcd_endpoints_env() -> Vec<String> {
     env::var("KRISHIV_ETCD_ENDPOINTS")
         .ok()
@@ -1150,6 +1247,7 @@ pub async fn run_standalone_coordinator(
         executor_task_bearer_token_configured(),
         coordinator_bearer_token_configured(),
     )?;
+    log_coordinator_security_posture(&config, grpc_auth_configured);
     let _auth_reload_task = if grpc_auth_configured {
         crate::auth::spawn_grpc_auth_reload_task_from_env()
     } else {
@@ -1240,6 +1338,7 @@ pub async fn run_clusterd_daemon(
         executor_task_bearer_token_configured(),
         coordinator_bearer_token_configured(),
     )?;
+    log_coordinator_security_posture(&config, grpc_auth_configured);
     let _auth_reload_task = if grpc_auth_configured {
         crate::auth::spawn_grpc_auth_reload_task_from_env()
     } else {
@@ -1441,7 +1540,8 @@ pub async fn run_job_coordinator_daemon(
 #[cfg(test)]
 mod parse_tests {
     use super::{
-        CoordinatorDaemonConfig, build_shared_coordinator_sync, coordinator_daemon_help,
+        CoordinatorDaemonConfig, CoordinatorSecurityPosture, build_shared_coordinator_sync,
+        classify_coordinator_security_posture, coordinator_daemon_help,
         parse_coordinator_daemon_config, render_metrics_body, validate_runtime_security_config,
     };
     use crate::{Coordinator, SharedCoordinator};
@@ -1470,6 +1570,53 @@ mod parse_tests {
     fn parses_help_flag() {
         let config = parse_coordinator_daemon_config([String::from("--help")]).unwrap();
         assert!(config.help);
+    }
+
+    #[test]
+    fn security_posture_flags_anonymous_grpc() {
+        // dev-local + --insecure => gRPC anonymous is set at the call site.
+        let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DevLocal);
+        let posture = classify_coordinator_security_posture(&config, false, true);
+        assert_eq!(
+            posture,
+            CoordinatorSecurityPosture::Anonymous {
+                grpc: true,
+                http: true
+            }
+        );
+    }
+
+    #[test]
+    fn security_posture_authenticated_when_provider_installed() {
+        // A durable profile with a provider installed and no anonymous access.
+        // http_sidecar has http_addr set, but durable profiles require HTTP auth,
+        // so http_auth_required is true => http is not anonymous.
+        let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::SingleNodeDurable);
+        let posture = classify_coordinator_security_posture(&config, true, false);
+        assert_eq!(posture, CoordinatorSecurityPosture::Authenticated);
+    }
+
+    #[test]
+    fn security_posture_deny_all_without_provider_or_anonymous() {
+        // Durable profile, no provider, anonymous denied => every RPC rejected.
+        let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::SingleNodeDurable);
+        let posture = classify_coordinator_security_posture(&config, false, false);
+        assert_eq!(posture, CoordinatorSecurityPosture::DenyAll);
+    }
+
+    #[test]
+    fn security_posture_flags_http_even_when_grpc_authed() {
+        // dev-local HTTP is unauthenticated even if a gRPC provider is installed;
+        // the posture must still surface the anonymous HTTP surface.
+        let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DevLocal);
+        let posture = classify_coordinator_security_posture(&config, true, false);
+        assert_eq!(
+            posture,
+            CoordinatorSecurityPosture::Anonymous {
+                grpc: false,
+                http: true
+            }
+        );
     }
 
     #[test]
