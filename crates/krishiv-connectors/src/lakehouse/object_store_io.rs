@@ -102,12 +102,26 @@ pub(crate) fn build_s3_object_store(bucket: &str) -> Result<Arc<dyn ObjectStore>
     use object_store::aws::AmazonS3Builder;
 
     let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+    // Evict pooled HTTP connections after 1s idle. Behind k8s kube-proxy /
+    // MinIO, an idle keep-alive connection is silently dropped server-side
+    // within a few seconds; hyper's default 90s pool then reuses the dead
+    // socket and the request hangs the full 30s request timeout. Spaced
+    // writers (barrier checkpoints every few seconds) hit this every cycle —
+    // exceeding the coordinator's barrier deadline so checkpoints never
+    // commit. A sub-idle pool timeout forces a fresh connection per spaced
+    // request while still reusing within a burst. NOTE: allow_http must live on
+    // this ClientOptions — with_client_options REPLACES the builder's options,
+    // so a separate builder.with_allow_http(true) would be silently discarded.
+    let mut client_opts = object_store::ClientOptions::new()
+        .with_pool_idle_timeout(std::time::Duration::from_secs(1));
     if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL")
         && !endpoint.is_empty()
     {
         // MinIO / S3-compatible: path-style access over plain HTTP.
-        builder = builder.with_endpoint(endpoint).with_allow_http(true);
+        builder = builder.with_endpoint(endpoint);
+        client_opts = client_opts.with_allow_http(true);
     }
+    builder = builder.with_client_options(client_opts);
     if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
         builder = builder.with_access_key_id(key);
     }
@@ -118,18 +132,6 @@ pub(crate) fn build_s3_object_store(bucket: &str) -> Result<Arc<dyn ObjectStore>
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
         .unwrap_or_else(|_| "us-east-1".to_string());
     builder = builder.with_region(region);
-    // Evict pooled HTTP connections after 1s idle. Behind k8s kube-proxy /
-    // MinIO, an idle keep-alive connection is silently dropped server-side
-    // within a few seconds; hyper's default 90s pool then reuses the dead
-    // socket and the request hangs the full 30s request timeout. Spaced
-    // writers (barrier checkpoints every few seconds) hit this every cycle —
-    // exceeding the coordinator's barrier deadline so checkpoints never
-    // commit. A sub-idle pool timeout forces a fresh connection per spaced
-    // request while still reusing within a burst.
-    builder = builder.with_client_options(
-        object_store::ClientOptions::new()
-            .with_pool_idle_timeout(std::time::Duration::from_secs(1)),
-    );
     Ok(Arc::new(builder.build().map_err(os_err)?))
 }
 

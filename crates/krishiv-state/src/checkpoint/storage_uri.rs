@@ -59,11 +59,22 @@ pub fn open_checkpoint_storage_from_uri(uri: &str) -> CheckpointResult<Arc<dyn C
         // fail MinIO writes with "error sending request" where the identically
         // configured sink client succeeded from the same pod.)
         let mut builder = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
+        // Evict pooled HTTP connections after 1s idle. Behind kube-proxy/MinIO an
+        // idle keep-alive socket is silently dropped within seconds; hyper's
+        // default 90s pool reuses the dead socket and the write hangs the full
+        // 30s request timeout — which exceeds the barrier deadline so the
+        // checkpoint never commits. Barrier checkpoints are exactly such spaced
+        // writers, so force a fresh connection per cycle. allow_http must live on
+        // this ClientOptions — with_client_options REPLACES the builder's options.
+        let mut client_opts = object_store::ClientOptions::new()
+            .with_pool_idle_timeout(std::time::Duration::from_secs(1));
         if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL")
             && !endpoint.is_empty()
         {
-            builder = builder.with_endpoint(endpoint).with_allow_http(true);
+            builder = builder.with_endpoint(endpoint);
+            client_opts = client_opts.with_allow_http(true);
         }
+        builder = builder.with_client_options(client_opts);
         if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
             builder = builder.with_access_key_id(key);
         }
@@ -74,16 +85,6 @@ pub fn open_checkpoint_storage_from_uri(uri: &str) -> CheckpointResult<Arc<dyn C
             .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|_| "us-east-1".to_string());
         builder = builder.with_region(region);
-        // Evict pooled HTTP connections after 1s idle. Behind kube-proxy/MinIO an
-        // idle keep-alive socket is silently dropped within seconds; hyper's
-        // default 90s pool reuses the dead socket and the write hangs the full
-        // 30s request timeout — which exceeds the barrier deadline so the
-        // checkpoint never commits. Barrier checkpoints are exactly such spaced
-        // writers, so force a fresh connection per cycle.
-        builder = builder.with_client_options(
-            object_store::ClientOptions::new()
-                .with_pool_idle_timeout(std::time::Duration::from_secs(1)),
-        );
         let store = builder.build().map_err(|e| CheckpointError::Storage {
             message: format!("s3 checkpoint store {url}: {e}"),
         })?;

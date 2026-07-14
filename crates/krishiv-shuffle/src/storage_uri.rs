@@ -18,11 +18,19 @@ use crate::{
 /// where this builder succeeded from the same pod.
 fn build_s3_store(bucket: &str) -> Result<object_store::aws::AmazonS3, object_store::Error> {
     let mut builder = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
+    // Evict pooled HTTP connections after 1s idle so spaced writers don't reuse
+    // a socket kube-proxy/MinIO silently closed (which hangs the 30s request
+    // timeout). See the note in krishiv-state's checkpoint storage_uri. allow_http
+    // must live on this ClientOptions — with_client_options REPLACES the options.
+    let mut client_opts = object_store::ClientOptions::new()
+        .with_pool_idle_timeout(std::time::Duration::from_secs(1));
     if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL")
         && !endpoint.is_empty()
     {
-        builder = builder.with_endpoint(endpoint).with_allow_http(true);
+        builder = builder.with_endpoint(endpoint);
+        client_opts = client_opts.with_allow_http(true);
     }
+    builder = builder.with_client_options(client_opts);
     if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
         builder = builder.with_access_key_id(key);
     }
@@ -33,12 +41,6 @@ fn build_s3_store(bucket: &str) -> Result<object_store::aws::AmazonS3, object_st
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
         .unwrap_or_else(|_| "us-east-1".to_string());
     builder = builder.with_region(region);
-    // Evict pooled HTTP connections after 1s idle so spaced writers don't reuse
-    // a socket kube-proxy/MinIO silently closed (which hangs the 30s request
-    // timeout). See the note in krishiv-state's checkpoint storage_uri.
-    builder = builder.with_client_options(
-        object_store::ClientOptions::new().with_pool_idle_timeout(std::time::Duration::from_secs(1)),
-    );
     builder.build()
 }
 
