@@ -9,6 +9,33 @@ use crate::{
     tiered_store::TieredShuffleStore,
 };
 
+/// Build an S3 object store the same way the streaming sink does
+/// (`krishiv_connectors::lakehouse::object_store_io::build_s3_object_store`):
+/// `with_bucket_name` + explicit endpoint/creds/region, path-style over plain
+/// HTTP. `AmazonS3Builder::from_env` honours only `AWS_ENDPOINT`, not the
+/// AWS-SDK `AWS_ENDPOINT_URL` convention prod sets for MinIO; and `with_url`
+/// was observed to intermittently fail MinIO writes ("error sending request")
+/// where this builder succeeded from the same pod.
+fn build_s3_store(bucket: &str) -> Result<object_store::aws::AmazonS3, object_store::Error> {
+    let mut builder = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
+    if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL")
+        && !endpoint.is_empty()
+    {
+        builder = builder.with_endpoint(endpoint).with_allow_http(true);
+    }
+    if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
+        builder = builder.with_access_key_id(key);
+    }
+    if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+        builder = builder.with_secret_access_key(secret);
+    }
+    let region = std::env::var("AWS_REGION")
+        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|_| "us-east-1".to_string());
+    builder = builder.with_region(region);
+    builder.build()
+}
+
 /// Open a shuffle backend for the configured URI and durability profile.
 ///
 /// - `file://path` or bare path — local disk shuffle store
@@ -55,19 +82,13 @@ pub fn open_shuffle_backend_from_uri(
         } else {
             format!("s3://{bucket}/{prefix}")
         };
-        // AmazonS3Builder::from_env honours only AWS_ENDPOINT, not the AWS-SDK
-        // AWS_ENDPOINT_URL convention prod sets for MinIO/S3-compatible stores —
-        // without the override this silently targets real AWS and every request
-        // times out. Mirror the streaming sink / checkpoint store builders.
-        let mut builder = object_store::aws::AmazonS3Builder::from_env().with_url(&url);
-        if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL")
-            && !endpoint.is_empty()
-        {
-            builder = builder.with_endpoint(endpoint).with_allow_http(true);
-        }
-        let store = builder.build().map_err(|e| {
-            ShuffleError::Io(std::io::Error::other(format!("s3 shuffle store {url}: {e}")))
-        })?;
+        // Construct the S3 client like the proven streaming-sink builder:
+        // with_bucket_name + explicit endpoint/creds/region, path-style over HTTP.
+        // AmazonS3Builder::from_env honours only AWS_ENDPOINT, not AWS_ENDPOINT_URL;
+        // and `with_url` was observed to intermittently fail MinIO writes where the
+        // identically configured sink client (with_bucket_name) succeeded.
+        let store = build_s3_store(bucket)
+            .map_err(|e| ShuffleError::Io(std::io::Error::other(format!("s3 shuffle store {url}: {e}"))))?;
         let storage_prefix = if prefix.is_empty() {
             "shuffle".to_owned()
         } else {
@@ -113,15 +134,9 @@ pub fn open_tiered_shuffle_backend(
     } else {
         format!("s3://{bucket}/{prefix}")
     };
-    // See the note in `open_shuffle_backend`: honour AWS_ENDPOINT_URL so
-    // MinIO/S3-compatible endpoints work instead of timing out against real AWS.
-    let mut builder = object_store::aws::AmazonS3Builder::from_env().with_url(&url);
-    if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL")
-        && !endpoint.is_empty()
-    {
-        builder = builder.with_endpoint(endpoint).with_allow_http(true);
-    }
-    let store = builder.build().map_err(|e| {
+    // See the note in `open_shuffle_backend`: build the S3 client like the sink
+    // (with_bucket_name + endpoint/creds/region), path-style over HTTP.
+    let store = build_s3_store(bucket).map_err(|e| {
         ShuffleError::Io(std::io::Error::other(format!(
             "tiered shuffle s3 store {url}: {e}"
         )))

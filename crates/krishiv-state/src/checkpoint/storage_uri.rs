@@ -49,19 +49,31 @@ pub fn open_checkpoint_storage_from_uri(uri: &str) -> CheckpointResult<Arc<dyn C
         } else {
             format!("s3://{bucket}/{prefix}")
         };
-        // Mirror krishiv_connectors::lakehouse::object_store_io::build_s3_object_store:
+        // Construct the S3 client byte-for-byte like the proven streaming-sink
+        // builder (krishiv_connectors::lakehouse::object_store_io::build_s3_object_store):
+        // with_bucket_name + explicit endpoint/creds/region, path-style over HTTP.
         // AmazonS3Builder::from_env honours only AWS_ENDPOINT, not the AWS-SDK
-        // AWS_ENDPOINT_URL convention prod sets for MinIO/S3-compatible stores —
-        // without the override the checkpoint store silently targets real AWS and
-        // every write times out (the streaming sink writes fine because it uses
-        // the endpoint-aware builder). Read AWS_ENDPOINT_URL here and allow plain
-        // HTTP so barrier checkpoints reach the same MinIO the sink does.
-        let mut builder = object_store::aws::AmazonS3Builder::from_env().with_url(&url);
+        // AWS_ENDPOINT_URL convention prod sets for MinIO — without the override the
+        // store silently targets real AWS and every write times out. (Using
+        // `with_url` instead of `with_bucket_name` was observed to intermittently
+        // fail MinIO writes with "error sending request" where the identically
+        // configured sink client succeeded from the same pod.)
+        let mut builder = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
         if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL")
             && !endpoint.is_empty()
         {
             builder = builder.with_endpoint(endpoint).with_allow_http(true);
         }
+        if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
+            builder = builder.with_access_key_id(key);
+        }
+        if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+            builder = builder.with_secret_access_key(secret);
+        }
+        let region = std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|_| "us-east-1".to_string());
+        builder = builder.with_region(region);
         let store = builder.build().map_err(|e| CheckpointError::Storage {
             message: format!("s3 checkpoint store {url}: {e}"),
         })?;
