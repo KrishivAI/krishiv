@@ -16,7 +16,10 @@ pub mod native {
 
     use arrow::record_batch::RecordBatch;
     use async_trait::async_trait;
-    use iceberg::io::LocalFsStorageFactory;
+    use bytes::Bytes;
+    // `Storage as _` brings the async read/write/exists methods into scope so the
+    // object-store branch can drive `KrishivStorage` (staging, version-hint).
+    use iceberg::io::{LocalFsStorageFactory, Storage as _, StorageFactory};
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, Schema,
@@ -30,6 +33,7 @@ pub mod native {
     use tokio::sync::Mutex;
     use url::Url;
 
+    use crate::lakehouse::object_store_io::{KrishivStorage, KrishivStorageFactory};
     use crate::lakehouse::two_phase::{
         IcebergTwoPhaseCommit, KAFKA_OFFSETS_SUMMARY_KEY, StagedSnapshot, kafka_offsets_json,
     };
@@ -50,10 +54,32 @@ pub mod native {
     pub struct IcebergNativeTwoPhaseCommit {
         pub(crate) catalog: Arc<MemoryCatalog>,
         pub(crate) ident: TableIdent,
-        /// Absolute local root path (no URI prefix).
+        /// Local root path (canonicalized) for a `file://` table. For an
+        /// object-store table this holds the raw `s3://…` root as an opaque
+        /// carrier only — it is never `canonicalize`d or `join`ed for local FS.
         root: PathBuf,
+        /// `true` when the table root is an object-store URI (`s3://` / `s3a://`).
+        /// Selects the object-store branch in staging / version-hint / reads.
+        is_object_store: bool,
+        /// URI form of the table root: `s3://bucket/prefix` (object store) or the
+        /// `file://` URI of the local root. Staged files and the version-hint are
+        /// addressed beneath it on the object-store branch.
+        root_uri: String,
+        /// Scheme-dispatching object-store bridge, exercised only on the
+        /// object-store branch. `file://` I/O stays on `std::fs` to preserve the
+        /// certified fsync/rename crash-atomicity.
+        store: KrishivStorage,
         pub(crate) pending: Mutex<HashMap<i64, StagedEntry>>,
         snap_counter: AtomicI64,
+    }
+
+    /// `true` when `root` is an object-store URI the sink must address through
+    /// [`KrishivStorage`] rather than the local filesystem (`s3://`/`s3a://`, or
+    /// `memory://` for the deterministic in-process object store).
+    fn is_object_store_root(root: &Path) -> bool {
+        root.to_str().is_some_and(|s| {
+            s.starts_with("s3://") || s.starts_with("s3a://") || s.starts_with("memory://")
+        })
     }
 
     impl IcebergNativeTwoPhaseCommit {
@@ -67,19 +93,43 @@ pub mod native {
             table_name: &str,
             schema_version: &SchemaVersion,
         ) -> Result<Self, LakehouseError> {
-            // Ensure root is absolute.
-            fs::create_dir_all(root.join("data")).map_err(|e| LakehouseError::Io(e.to_string()))?;
-            fs::create_dir_all(root.join("metadata"))
-                .map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let is_object_store = is_object_store_root(root);
+            let store = KrishivStorage::default();
 
-            let root = root
-                .canonicalize()
-                .map_err(|e| LakehouseError::Io(e.to_string()))?;
+            // Path/URI setup differs by backend. Object stores are prefix-based:
+            // no directories to create, no local path to canonicalize — the raw
+            // `s3://…` string IS the warehouse URI (trailing slash trimmed so the
+            // `{root}/data/…` / `{root}/metadata/…` joins are well-formed).
+            let (root, table_uri): (PathBuf, String) = if is_object_store {
+                let uri = root
+                    .to_str()
+                    .ok_or_else(|| LakehouseError::Io("non-utf8 object-store root".to_string()))?
+                    .trim_end_matches('/')
+                    .to_string();
+                (root.to_path_buf(), uri)
+            } else {
+                fs::create_dir_all(root.join("data"))
+                    .map_err(|e| LakehouseError::Io(e.to_string()))?;
+                fs::create_dir_all(root.join("metadata"))
+                    .map_err(|e| LakehouseError::Io(e.to_string()))?;
+                let root = root
+                    .canonicalize()
+                    .map_err(|e| LakehouseError::Io(e.to_string()))?;
+                let uri = path_to_uri(&root)?;
+                (root, uri)
+            };
 
-            let table_uri = path_to_uri(&root)?;
-
+            // The MemoryCatalog's FileIO (manifests, manifest-lists,
+            // table-metadata.json) goes through `KrishivStorageFactory` for an
+            // object-store root (which serves `s3://`) and `LocalFsStorageFactory`
+            // for a local root (byte-identical to the certified path).
+            let storage_factory: Arc<dyn StorageFactory> = if is_object_store {
+                Arc::new(KrishivStorageFactory)
+            } else {
+                Arc::new(LocalFsStorageFactory)
+            };
             let catalog = MemoryCatalogBuilder::default()
-                .with_storage_factory(Arc::new(LocalFsStorageFactory))
+                .with_storage_factory(storage_factory)
                 .load(
                     "local",
                     HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), table_uri.clone())]),
@@ -94,11 +144,36 @@ pub mod native {
             // Create namespace (idempotent – ignore "already exists" errors).
             let _ = catalog.create_namespace(&namespace, HashMap::new()).await;
 
-            let version_hint = root.join("metadata").join(VERSION_HINT);
-            if version_hint.exists() {
-                let meta_loc = fs::read_to_string(&version_hint)
-                    .map_err(|e| LakehouseError::Io(e.to_string()))?;
-                let meta_loc = meta_loc.trim().to_string();
+            // Recovery: register the last committed metadata if a version-hint
+            // exists, else create the table and persist the initial hint. The
+            // hint lives at `{root}/metadata/version-hint.text` in both backends.
+            let existing_hint: Option<String> = if is_object_store {
+                let vh_uri = version_hint_uri(&table_uri);
+                if store
+                    .exists(&vh_uri)
+                    .await
+                    .map_err(|e| LakehouseError::Io(e.to_string()))?
+                {
+                    let bytes = store
+                        .read(&vh_uri)
+                        .await
+                        .map_err(|e| LakehouseError::Io(e.to_string()))?;
+                    Some(String::from_utf8_lossy(&bytes).trim().to_string())
+                } else {
+                    None
+                }
+            } else {
+                let version_hint = root.join("metadata").join(VERSION_HINT);
+                if version_hint.exists() {
+                    let meta_loc = fs::read_to_string(&version_hint)
+                        .map_err(|e| LakehouseError::Io(e.to_string()))?;
+                    Some(meta_loc.trim().to_string())
+                } else {
+                    None
+                }
+            };
+
+            if let Some(meta_loc) = existing_hint {
                 catalog
                     .register_table(&ident, meta_loc)
                     .await
@@ -108,7 +183,7 @@ pub mod native {
                 let creation = TableCreation::builder()
                     .name(table_name.to_string())
                     .schema(iceberg_schema)
-                    .location(table_uri)
+                    .location(table_uri.clone())
                     .build();
                 let table = catalog
                     .create_table(&namespace, creation)
@@ -117,7 +192,14 @@ pub mod native {
                 // Persist the initial metadata location so a crash after
                 // create_table but before any commit still recovers cleanly.
                 if let Some(loc) = table.metadata_location() {
-                    write_version_hint(&root, loc)?;
+                    if is_object_store {
+                        store
+                            .write(&version_hint_uri(&table_uri), Bytes::from(loc.to_string()))
+                            .await
+                            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+                    } else {
+                        write_version_hint(&root, loc)?;
+                    }
                 }
             }
 
@@ -125,6 +207,9 @@ pub mod native {
                 catalog,
                 ident,
                 root,
+                is_object_store,
+                root_uri: table_uri,
+                store,
                 pending: Mutex::new(HashMap::new()),
                 // Seed snap_counter with a per-instance nanosecond timestamp so
                 // staged filenames are unique across processes AND across
@@ -143,7 +228,17 @@ pub mod native {
         }
 
         fn update_version_hint(&self, metadata_location: &str) -> Result<(), LakehouseError> {
-            write_version_hint(&self.root, metadata_location)
+            if self.is_object_store {
+                // Object stores `put` atomically — no torn-write window, so the
+                // local temp+fsync+rename dance is unnecessary here.
+                krishiv_common::async_util::block_on(self.store.write(
+                    &version_hint_uri(&self.root_uri),
+                    Bytes::from(metadata_location.to_string()),
+                ))
+                .map_err(|e| LakehouseError::Io(e.to_string()))
+            } else {
+                write_version_hint(&self.root, metadata_location)
+            }
         }
 
         /// Durably stage `batches` as one Parquet file under `{root}/data/`
@@ -159,20 +254,35 @@ pub mod native {
         ) -> Result<(PathBuf, iceberg::spec::DataFile), LakehouseError> {
             let staged_id = self.snap_counter.fetch_add(1, Ordering::Relaxed);
             let file_name = format!("staged-{staged_id:016x}.parquet");
-            let parquet_path = self.root.join("data").join(&file_name);
-            let tmp_path = self.root.join("data").join(format!(".{file_name}.tmp"));
 
-            let (record_count, file_size) = write_parquet_and_measure(&tmp_path, batches)?;
+            let (staged_ref, file_uri, record_count, file_size) = if self.is_object_store {
+                // Object-store staging: buffer the Parquet in memory then `put`
+                // it as a single atomic object (no tmp+rename — object stores
+                // have neither directories nor rename). The staged ref carried
+                // through the pending map / DUR-2 sidecar is the `s3://…` URI.
+                let file_uri = format!("{}/data/{}", self.root_uri, file_name);
+                let (buf, record_count, file_size) = write_parquet_to_buf(batches)?;
+                krishiv_common::async_util::block_on(self.store.write(&file_uri, Bytes::from(buf)))
+                    .map_err(|e| LakehouseError::Io(e.to_string()))?;
+                (PathBuf::from(&file_uri), file_uri, record_count, file_size)
+            } else {
+                let parquet_path = self.root.join("data").join(&file_name);
+                let tmp_path = self.root.join("data").join(format!(".{file_name}.tmp"));
 
-            fs::rename(&tmp_path, &parquet_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
-            #[cfg(unix)]
-            {
-                if let Ok(dir) = fs::File::open(self.root.join("data")) {
-                    let _ = dir.sync_all();
+                let (record_count, file_size) = write_parquet_and_measure(&tmp_path, batches)?;
+
+                fs::rename(&tmp_path, &parquet_path)
+                    .map_err(|e| LakehouseError::Io(e.to_string()))?;
+                #[cfg(unix)]
+                {
+                    if let Ok(dir) = fs::File::open(self.root.join("data")) {
+                        let _ = dir.sync_all();
+                    }
                 }
-            }
+                let file_uri = path_to_uri(&parquet_path)?;
+                (parquet_path, file_uri, record_count, file_size)
+            };
 
-            let file_uri = path_to_uri(&parquet_path)?;
             let data_file = DataFileBuilder::default()
                 .content(DataContentType::Data)
                 .file_path(file_uri)
@@ -184,7 +294,7 @@ pub mod native {
                 .build()
                 .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
 
-            Ok((parquet_path, data_file))
+            Ok((staged_ref, data_file))
         }
 
         /// Atomically commit already-staged data files via
@@ -265,16 +375,27 @@ pub mod native {
             let mut batches = Vec::new();
             for task in tasks {
                 let path = task.data_file_path();
-                let local = path.strip_prefix("file://").unwrap_or(path);
-                let file = fs::File::open(local)
-                    .map_err(|e| LakehouseError::Io(format!("open data file {local}: {e}")))?;
-                let reader =
-                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                if self.is_object_store {
+                    let bytes = self
+                        .store
+                        .read(path)
+                        .await
+                        .map_err(|e| LakehouseError::Io(format!("read data file {path}: {e}")))?;
+                    batches.extend(read_parquet_bytes(bytes)?);
+                } else {
+                    let local = path.strip_prefix("file://").unwrap_or(path);
+                    let file = fs::File::open(local)
+                        .map_err(|e| LakehouseError::Io(format!("open data file {local}: {e}")))?;
+                    let reader =
+                        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                            file,
+                        )
                         .map_err(|e| LakehouseError::Io(e.to_string()))?
                         .build()
                         .map_err(|e| LakehouseError::Io(e.to_string()))?;
-                for batch in reader {
-                    batches.push(batch.map_err(|e| LakehouseError::Io(e.to_string()))?);
+                    for batch in reader {
+                        batches.push(batch.map_err(|e| LakehouseError::Io(e.to_string()))?);
+                    }
                 }
             }
             Ok(batches)
@@ -307,18 +428,84 @@ pub mod native {
 
         /// Read a single staged Parquet file back into Arrow batches. DUR-2
         /// upsert recovery replays the row-level merge from the staged rows.
-        pub fn read_staged_parquet(path: &Path) -> Result<Vec<RecordBatch>, LakehouseError> {
-            let file = fs::File::open(path).map_err(|e| LakehouseError::Io(e.to_string()))?;
-            let reader =
-                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-                    .map_err(|e| LakehouseError::Io(e.to_string()))?
-                    .build()
+        pub fn read_staged_parquet(&self, path: &str) -> Result<Vec<RecordBatch>, LakehouseError> {
+            if self.is_object_store {
+                let bytes = krishiv_common::async_util::block_on(self.store.read(path))
                     .map_err(|e| LakehouseError::Io(e.to_string()))?;
-            let mut batches = Vec::new();
-            for batch in reader {
-                batches.push(batch.map_err(|e| LakehouseError::Io(e.to_string()))?);
+                read_parquet_bytes(bytes)
+            } else {
+                let file = fs::File::open(path).map_err(|e| LakehouseError::Io(e.to_string()))?;
+                let reader =
+                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                        .map_err(|e| LakehouseError::Io(e.to_string()))?
+                        .build()
+                        .map_err(|e| LakehouseError::Io(e.to_string()))?;
+                let mut batches = Vec::new();
+                for batch in reader {
+                    batches.push(batch.map_err(|e| LakehouseError::Io(e.to_string()))?);
+                }
+                Ok(batches)
             }
-            Ok(batches)
+        }
+
+        /// Scheme-aware sidecar/cleanup helpers used by the streaming sink's
+        /// DUR-2 path so its `.dur2.json` writes/reads and staged-file cleanup
+        /// hit the same backend as the staged Parquet.
+        ///
+        /// Write `contents` to `path` (an `s3://…` URI on the object-store
+        /// branch, a local FS path otherwise).
+        pub fn write_file(&self, path: &str, contents: &str) -> Result<(), LakehouseError> {
+            if self.is_object_store {
+                krishiv_common::async_util::block_on(
+                    self.store.write(path, Bytes::from(contents.to_string())),
+                )
+                .map_err(|e| LakehouseError::Io(e.to_string()))
+            } else {
+                fs::write(path, contents).map_err(|e| LakehouseError::Io(e.to_string()))
+            }
+        }
+
+        /// Read `path` to a string, returning `None` if it does not exist
+        /// (the DUR-2 idempotency signal: a missing sidecar = already finalized).
+        pub fn read_file_opt(&self, path: &str) -> Result<Option<String>, LakehouseError> {
+            if self.is_object_store {
+                if !krishiv_common::async_util::block_on(self.store.exists(path))
+                    .map_err(|e| LakehouseError::Io(e.to_string()))?
+                {
+                    return Ok(None);
+                }
+                let bytes = krishiv_common::async_util::block_on(self.store.read(path))
+                    .map_err(|e| LakehouseError::Io(e.to_string()))?;
+                Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+            } else {
+                match fs::read_to_string(path) {
+                    Ok(s) => Ok(Some(s)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(LakehouseError::Io(e.to_string())),
+                }
+            }
+        }
+
+        /// Best-effort delete tolerant of an already-absent object (idempotent
+        /// cleanup); a genuine error is logged and the object left for VACUUM.
+        pub fn remove_file_best_effort(&self, path: &str) {
+            let result = if self.is_object_store {
+                krishiv_common::async_util::block_on(self.store.delete(path))
+                    .map_err(|e| LakehouseError::Io(e.to_string()))
+            } else {
+                match fs::remove_file(path) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(LakehouseError::Io(e.to_string())),
+                }
+            };
+            if let Err(e) = result {
+                tracing::warn!(
+                    path,
+                    error = %e,
+                    "iceberg streaming sink: cleanup remove failed (left as orphan for VACUUM)"
+                );
+            }
         }
 
         /// Atomically replace all table data with `batches`.
@@ -349,11 +536,20 @@ pub mod native {
             schema_version: &SchemaVersion,
         ) -> Result<i64, LakehouseError> {
             let namespace = self.ident.namespace().clone();
-            let table_uri = path_to_uri(&self.root)?;
+            let table_uri = if self.is_object_store {
+                self.root_uri.clone()
+            } else {
+                path_to_uri(&self.root)?
+            };
+            let storage_factory: Arc<dyn StorageFactory> = if self.is_object_store {
+                Arc::new(KrishivStorageFactory)
+            } else {
+                Arc::new(LocalFsStorageFactory)
+            };
 
             // 1. New generation under a throwaway catalog (same root/FileIO).
             let scratch = MemoryCatalogBuilder::default()
-                .with_storage_factory(Arc::new(LocalFsStorageFactory))
+                .with_storage_factory(storage_factory)
                 .load(
                     "local-overwrite",
                     HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), table_uri.clone())]),
@@ -637,6 +833,47 @@ pub mod native {
             .map_err(|()| {
                 LakehouseError::Io(format!("cannot convert path to URI: {}", path.display()))
             })
+    }
+
+    /// The version-hint object/file URI beneath a table root URI.
+    fn version_hint_uri(root_uri: &str) -> String {
+        format!("{root_uri}/metadata/{VERSION_HINT}")
+    }
+
+    /// Serialize `batches` to an in-memory Parquet buffer, returning
+    /// `(bytes, record_count, file_size)`. The object-store staging path uses
+    /// this so a single atomic `put` replaces the local temp+rename write.
+    fn write_parquet_to_buf(batches: &[RecordBatch]) -> Result<(Vec<u8>, u64, u64), LakehouseError> {
+        let schema = batches
+            .first()
+            .ok_or_else(|| LakehouseError::Io("empty batches".to_string()))?
+            .schema();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut buf, schema, None).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let mut record_count: u64 = 0;
+        for batch in batches {
+            record_count += batch.num_rows() as u64;
+            writer
+                .write(batch)
+                .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        }
+        writer.close().map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let file_size = buf.len() as u64;
+        Ok((buf, record_count, file_size))
+    }
+
+    /// Decode an in-memory Parquet buffer into Arrow batches (object-store reads).
+    fn read_parquet_bytes(bytes: Bytes) -> Result<Vec<RecordBatch>, LakehouseError> {
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .map_err(|e| LakehouseError::Io(e.to_string()))?
+            .build()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let mut batches = Vec::new();
+        for batch in reader {
+            batches.push(batch.map_err(|e| LakehouseError::Io(e.to_string()))?);
+        }
+        Ok(batches)
     }
 
     /// Write `batches` to `path` as Parquet, fsync, then return `(record_count, file_size_bytes)`.

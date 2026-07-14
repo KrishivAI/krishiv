@@ -16,6 +16,10 @@ mod hudi;
 mod iceberg_fs;
 #[cfg(feature = "iceberg")]
 pub(crate) mod iceberg_native;
+/// Object-store-backed Iceberg `Storage` bridge (S3/MinIO) — the single
+/// canonical `#[typetag::serde]` impl; `krishiv-sql` re-exports it.
+#[cfg(feature = "iceberg")]
+pub mod object_store_io;
 mod local_delta;
 #[cfg(feature = "iceberg")]
 pub mod maintenance;
@@ -50,6 +54,8 @@ pub use hudi::{
 pub use iceberg_fs::IcebergFsTable;
 #[cfg(feature = "iceberg")]
 pub use iceberg_native::IcebergNativeTwoPhaseCommit;
+#[cfg(feature = "iceberg")]
+pub use object_store_io::{KrishivStorage, KrishivStorageFactory};
 pub use local_delta::{
     DeltaStageHandle, LocalDeltaTwoPhaseCommitSink, list_table_data_files, read_table_at_timestamp,
     vacuum_table,

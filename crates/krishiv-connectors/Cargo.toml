@@ -40,7 +40,7 @@ state = ["dep:krishiv-state"]
 
 # Lakehouse table formats (implementation in `crate::lakehouse`)
 lakehouse = ["dep:async-trait", "dep:chrono", "dep:rocksdb", "dep:serde", "dep:tempfile", "dep:url"]
-iceberg = ["lakehouse", "dep:iceberg", "dep:iceberg-datafusion", "dep:uuid", "dep:datafusion"]
+iceberg = ["lakehouse", "dep:iceberg", "dep:iceberg-datafusion", "dep:uuid", "dep:datafusion", "dep:typetag"]
 delta = ["lakehouse"]
 hudi = ["lakehouse"]
 
@@ -115,6 +115,9 @@ tracing = { workspace = true }
 # schema-registry feature dependencies
 apache-avro = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
+# Iceberg's `Storage`/`StorageFactory` traits are `#[typetag::serde]`; the
+# object-store-backed bridge (object_store_io) implements them.
+typetag = { version = "0.2", optional = true }
 dashmap = { workspace = true, optional = true }
 reqwest = { workspace = true, features = ["json"], optional = true }
 serde = { workspace = true, optional = true }

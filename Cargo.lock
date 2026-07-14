@@ -5761,6 +5761,7 @@ dependencies = [
  "tokio",
  "tracing",
  "twox-hash",
+ "typetag",
  "url",
  "uuid",
  "vortex",

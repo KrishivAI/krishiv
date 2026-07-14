@@ -62,8 +62,11 @@ delta = ["krishiv-connectors/delta"]
 hudi = ["krishiv-connectors/hudi"]
 # J1-J4 unified catalog backends.
 local-catalog = ["dep:iceberg"]
-postgres-catalog = ["dep:sqlx", "dep:iceberg"]
-rest-catalog = ["dep:iceberg-catalog-rest", "dep:iceberg"]
+# These shared-warehouse backends resolve `s3://` through the object-store
+# Iceberg bridge, which now lives in krishiv-connectors — pull it (`iceberg`)
+# and its S3 leg (`cloud`).
+postgres-catalog = ["dep:sqlx", "dep:iceberg", "krishiv-connectors/iceberg", "krishiv-connectors/cloud"]
+rest-catalog = ["dep:iceberg-catalog-rest", "dep:iceberg", "krishiv-connectors/iceberg", "krishiv-connectors/cloud"]
 # The DataFusion catalog DML interception calls krishiv_connectors::lakehouse,
 # so this backend must pull the connector's iceberg implementation.
 iceberg-datafusion = [

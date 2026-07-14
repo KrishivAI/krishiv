@@ -28,15 +28,53 @@ files + committed snapshot visible to whichever executor restores. Preserve the
 per-instance nanosecond `snap_counter`, orphan cleanup) proven by the connectors
 iceberg suite (378/0).
 
-## Approach (chosen): uniform `object_store`, keep the sync surface via `block_on`
+## CORRECTION (2026-07-14, grounded in the code) — read before implementing
 
-Route **all** file I/O in `iceberg_native.rs` through an `Arc<dyn ObjectStore>`
-selected from the root URI (`file://` → `object_store::local::LocalFileSystem`,
-`s3://` → the `cloud`-gated `AmazonS3Builder` path already in
-`storage_factory.rs::build_s3`). Do **not** convert the `IcebergTwoPhaseCommit`
-trait to async — bridge at each object_store call with
-`krishiv_common::async_util::block_on` (the codebase's established sync-over-async
-pattern), so the sink's blocking checkpoint-aligned contract is unchanged.
+Two premises in the original draft were wrong or under-weighted; the corrected
+facts drive the approach:
+
+1. **iceberg 0.9.1 (pinned) has NO S3 storage backend.** Its `io/storage/`
+   ships only `local_fs.rs` + `memory.rs`; the crate has zero
+   `object_store`/`opendal` dependency (`default = []`). The original item 6
+   ("the iceberg crate supports S3 FileIO") is false. **However**, a custom
+   `object_store`→iceberg `Storage`/`StorageFactory` bridge ALREADY EXISTS in
+   this repo — `krishiv-sql/src/catalog/object_store_io.rs`
+   (`KrishivStorage` + `KrishivStorageFactory`), used by the REST-catalog and
+   Postgres-catalog S3 warehouse paths. It dispatches on scheme (`s3://` →
+   object store, else → `LocalFsStorage`), so swapping
+   `LocalFsStorageFactory` → `KrishivStorageFactory` makes the iceberg-crate
+   FileIO (manifests, manifest-lists, `metadata.json`) S3-capable while the
+   `file://` path stays **byte-identical** (delegates to `LocalFsStorage`) —
+   zero regression to the 378 certified tests on the local path.
+
+2. **The blast radius is larger than "33 fs sites in one file."** It is:
+   (a) relocate the bridge `krishiv-sql` → `krishiv-connectors` (the lowest
+   crate that has the iceberg traits, so `iceberg_native.rs` can use it) and
+   re-export it from `krishiv-sql` so the **verified** batch S3 path is
+   untouched — this needs `iceberg`/`cloud` feature propagation across
+   `rest-catalog`/`postgres-catalog`; (b) scheme-gated object-store branches in
+   `iceberg_native.rs` (staging, read, version-hint) — keep the local `std::fs`
+   branch byte-identical to preserve CONN-2/CONN-3 crash-atomicity; (c) the SAME
+   in `streaming_sink.rs` (the `.dur2.json` sidecar, `remove_if_exists`,
+   `read_staged_parquet`, the `PathBuf` staged paths); (d) root-URI plumbing so
+   an `s3://…` sink `root` survives (today `IcebergSinkTarget.root: PathBuf`
+   mangles `s3://` → `s3:/`).
+
+**Design to contain the risk:** object stores have no rename/fsync/dir-sync, but
+a `put` is atomic — so the object-store branch replaces the tmp+rename+fsync
+crash-atomicity dance with a single atomic `put` (no torn-write window). The
+local branch is unchanged. Reuse `KrishivStorage` for BOTH the iceberg-crate
+FileIO (factory swap) and my own staging/version-hint I/O (its async
+`read`/`write`/`exists`/`delete` wrapped in `block_on`).
+
+## Approach: uniform `object_store` via the existing bridge, sync surface via `block_on`
+
+Route the object-store branch of file I/O in `iceberg_native.rs` through the
+relocated `KrishivStorage` (scheme-dispatching) rather than a raw
+`Arc<dyn ObjectStore>`, so the iceberg-crate FileIO and our own I/O hit the same
+backend. Do **not** convert the `IcebergTwoPhaseCommit` trait to async — bridge
+at each object_store call with `krishiv_common::async_util::block_on`, so the
+sink's blocking checkpoint-aligned contract is unchanged.
 
 ### Concrete conversion (the 33 sites)
 
@@ -86,13 +124,42 @@ pattern), so the sink's blocking checkpoint-aligned contract is unchanged.
    `kubectl delete pod` the executor mid-run → restore on the sibling pod →
    assert Iceberg rowcount == N + offsets in the snapshot summary.
 
-## Sequencing
+## Sequencing (staged, each gated on the connectors iceberg suite)
 
-1. Introduce the `object_store` seam + `InMemory`/`file://` unit coverage (no S3
-   dep at test time) — the deterministic correctness gate.
-2. Wire the `cloud`/S3 backend selection.
-3. Build `prod`, deploy to krishiv-cert (coord+2 exec) with MinIO S3 env +
-   `AWS_ENDPOINT_URL`/creds (`minio-root-creds`), run the live cert.
+**Stage 1 — relocate the bridge (mechanical, compile-gated).** Move
+`KrishivStorage`/`KrishivStorageFactory` from `krishiv-sql/src/catalog/object_store_io.rs`
+into `krishiv-connectors/src/lakehouse/object_store_io.rs` (the lowest crate with
+the iceberg traits, so `iceberg_native.rs` can use it), with a self-contained
+`cloud`-gated `build_s3_object_store`. Re-export it from `krishiv-sql` so the
+verified batch/REST S3 path is untouched. Wire `krishiv-connectors/iceberg` +
+`krishiv-connectors/cloud` into krishiv-sql's `rest-catalog`/`postgres-catalog`
+features (their `s3://` warehouses use the bridge). Add `typetag` to connectors
+(the `Storage` trait is `#[typetag::serde]`). One canonical `#[typetag::serde]`
+registration — no duplicate-tag collision. *Gate: `cargo check -p krishiv-connectors
+--features iceberg,cloud` + `-p krishiv-sql --features rest-catalog`.*
+
+**Stage 2 — scheme-dispatch `iceberg_native.rs`.** Hold a `KrishivStorage` +
+`is_object_store` flag + `root_uri`. `open()` branches at the top: `s3://` skips
+`create_dir_all`/`canonicalize` and builds the `MemoryCatalog` with
+`KrishivStorageFactory` + the `s3://` warehouse URI; `file://` keeps today's code
+byte-identical. `stage_parquet`/`write_version_hint`/`read_staged_parquet`/
+`read_all`/`open`'s version-hint read each get an object-store branch (ArrowWriter
+over `Vec<u8>` → `block_on(store.write(uri,bytes))`; a `put` is atomic so no
+tmp+rename+fsync dance) and keep the local `std::fs` branch untouched.
+
+**Stage 3 — scheme-dispatch `streaming_sink.rs`.** Route the `.dur2.json` sidecar
+write/read, the staged-file cleanup (`remove_if_exists`/`remove_file`), and
+`read_staged_parquet` through new `&self` helpers on
+`IcebergNativeTwoPhaseCommit` that branch on scheme; the local branch calls the
+identical `std::fs` so the 378 certified tests are behaviorally unchanged.
+
+**Stage 4 — deterministic tests.** Parameterize the DUR-2 crash-recovery tests
+over `file://` AND an in-process `object_store::memory::InMemory` store so
+recover-commit (append+upsert+idempotent) is proven on the object-store path with
+no external deps. Keep the iceberg suite green.
+
+**Stage 5 — live cert.** Build `prod`, deploy to krishiv-cert (coord+2 exec) with
+MinIO S3 env + `AWS_ENDPOINT_URL`/creds (`minio-root-creds`), run the live cert.
 
 ## Out of scope
 

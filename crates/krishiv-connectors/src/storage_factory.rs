@@ -220,7 +220,9 @@ impl StorageFactory {
             builder = builder.with_bucket_name(bucket);
         }
         if let Some(endpoint) = &config.endpoint {
-            builder = builder.with_endpoint(endpoint);
+            // object_store 0.13 dropped `with_endpoint` on the GCS builder; a
+            // custom endpoint (e.g. the fake-gcs-server emulator) is the base URL.
+            builder = builder.with_base_url(endpoint);
         }
 
         let store = builder.build().map_err(|e| ConnectorError::Config {
@@ -244,7 +246,8 @@ impl StorageFactory {
             builder = builder.with_container_name(container);
         }
         if let Some(endpoint) = &config.endpoint {
-            builder = builder.with_endpoint(endpoint);
+            // object_store 0.13's `with_endpoint` takes an owned `String`.
+            builder = builder.with_endpoint(endpoint.clone());
         }
 
         let store = builder.build().map_err(|e| ConnectorError::Config {

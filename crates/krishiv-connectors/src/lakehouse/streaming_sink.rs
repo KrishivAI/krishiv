@@ -112,20 +112,6 @@ fn dur2_sidecar_path(data_file: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Best-effort removal that tolerates an already-absent file (idempotent
-/// cleanup); a genuine error is logged and the file left for VACUUM.
-fn remove_if_exists(path: &Path) {
-    if let Err(e) = std::fs::remove_file(path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(
-            path = %path.display(),
-            error = %e,
-            "iceberg streaming sink: cleanup remove failed (left as orphan for VACUUM)"
-        );
-    }
-}
-
 impl IcebergStreamingSink {
     /// Open (or create) the target table and return a ready participant.
     ///
@@ -357,14 +343,14 @@ impl TransactionalSinkParticipant for IcebergStreamingSink {
         // so a fresh sink after an executor crash can reconstruct and
         // idempotently finalize the prepared transaction from its durable path.
         let sidecar = dur2_sidecar_path(&path);
-        std::fs::write(&sidecar, kafka_offsets_json(&offsets)).map_err(|e| {
-            ConnectorError::Protocol {
+        self.table
+            .write_file(&sidecar.to_string_lossy(), &kafka_offsets_json(&offsets))
+            .map_err(|e| ConnectorError::Protocol {
                 message: format!(
                     "iceberg streaming sink: DUR-2 sidecar write {}: {e}",
                     sidecar.display()
                 ),
-            }
-        })?;
+            })?;
         self.prepared.insert(
             epoch,
             PreparedEpoch {
@@ -396,7 +382,8 @@ impl TransactionalSinkParticipant for IcebergStreamingSink {
             // DUR-2: the epoch is durably committed; its recovery sidecar is no
             // longer needed.
             for (path, _) in &entry.files {
-                remove_if_exists(&dur2_sidecar_path(path));
+                self.table
+                    .remove_file_best_effort(&dur2_sidecar_path(path).to_string_lossy());
             }
             committed += entry.files.len().max(1);
         }
@@ -408,21 +395,14 @@ impl TransactionalSinkParticipant for IcebergStreamingSink {
         self.pending_offsets.clear();
         let to_abort = self.prepared.split_off(&(epoch.saturating_add(1)));
         let mut aborted = 0usize;
-        for (txn_epoch, entry) in to_abort {
+        for (_txn_epoch, entry) in to_abort {
             for (path, _) in &entry.files {
                 // DUR-2: drop the recovery sidecar alongside the staged file.
-                remove_if_exists(&dur2_sidecar_path(path));
-                if let Err(e) = std::fs::remove_file(path)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    tracing::warn!(
-                        epoch = txn_epoch,
-                        path = %path.display(),
-                        error = %e,
-                        "iceberg streaming sink: failed to remove aborted staged file \
-                         (left as orphan for VACUUM)"
-                    );
-                }
+                // Both are scheme-aware (local FS or object store).
+                self.table
+                    .remove_file_best_effort(&dur2_sidecar_path(path).to_string_lossy());
+                self.table
+                    .remove_file_best_effort(&path.to_string_lossy());
             }
             aborted += entry.files.len().max(1);
         }
@@ -456,24 +436,18 @@ impl TransactionalSinkParticipant for IcebergStreamingSink {
     fn finalize_prepared(&mut self, prepare_path: &str, commit: bool) -> ConnectorResult<()> {
         let path = PathBuf::from(prepare_path);
         let sidecar = dur2_sidecar_path(&path);
+        let sidecar_uri = sidecar.to_string_lossy().into_owned();
 
-        // Read the durable offsets sidecar. A missing sidecar means the epoch
-        // was already finalized (sidecar removed on commit/abort) or was never
-        // durably prepared — either way there is nothing to commit, so drop any
-        // stray staging file and return. Idempotent.
-        let offsets = match std::fs::read_to_string(&sidecar) {
-            Ok(json) => parse_kafka_offsets_json(&json),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                remove_if_exists(&path);
+        // Read the durable offsets sidecar (scheme-aware: local FS or object
+        // store). A missing sidecar means the epoch was already finalized
+        // (sidecar removed on commit/abort) or was never durably prepared —
+        // either way there is nothing to commit, so drop any stray staging file
+        // and return. Idempotent.
+        let offsets = match self.table.read_file_opt(&sidecar_uri).map_err(lake_err)? {
+            Some(json) => parse_kafka_offsets_json(&json),
+            None => {
+                self.table.remove_file_best_effort(prepare_path);
                 return Ok(());
-            }
-            Err(e) => {
-                return Err(ConnectorError::Protocol {
-                    message: format!(
-                        "iceberg streaming sink: DUR-2 sidecar read {}: {e}",
-                        sidecar.display()
-                    ),
-                });
             }
         };
 
@@ -495,8 +469,8 @@ impl TransactionalSinkParticipant for IcebergStreamingSink {
             // file has already become the committed data file, so it is only an
             // orphan when we did not (re-)commit here — which is exactly these
             // branches.
-            remove_if_exists(&path);
-            remove_if_exists(&sidecar);
+            self.table.remove_file_best_effort(prepare_path);
+            self.table.remove_file_best_effort(&sidecar_uri);
             return Ok(());
         }
 
@@ -506,7 +480,7 @@ impl TransactionalSinkParticipant for IcebergStreamingSink {
         // instance's staged file directly makes iceberg's manifest reference a
         // file its FileIO cannot resolve on read; re-staging avoids that and
         // keeps the recovery path byte-identical to the certified commit path.
-        let batches = IcebergNativeTwoPhaseCommit::read_staged_parquet(&path).map_err(lake_err)?;
+        let batches = self.table.read_staged_parquet(prepare_path).map_err(lake_err)?;
         let (fresh_path, fresh_df) = self.table.stage_parquet(&batches).map_err(lake_err)?;
         let entry = PreparedEpoch {
             files: vec![(fresh_path.clone(), fresh_df)],
@@ -518,11 +492,12 @@ impl TransactionalSinkParticipant for IcebergStreamingSink {
         // The original staged file is now superseded by the committed fresh
         // copy. For upsert, commit_epoch rewrote the table into its own new
         // files, so the fresh staged copy is an orphan too.
-        remove_if_exists(&path);
+        self.table.remove_file_best_effort(prepare_path);
         if self.target.mode == IcebergSinkMode::Upsert {
-            remove_if_exists(&fresh_path);
+            self.table
+                .remove_file_best_effort(&fresh_path.to_string_lossy());
         }
-        remove_if_exists(&sidecar);
+        self.table.remove_file_best_effort(&sidecar_uri);
         Ok(())
     }
 }
@@ -656,11 +631,18 @@ mod tests {
     }
 
     fn open_sink(dir: &std::path::Path, mode: IcebergSinkMode) -> IcebergStreamingSink {
+        open_sink_root(dir.to_path_buf(), mode)
+    }
+
+    /// Open a sink at an arbitrary root — a local dir path or an object-store
+    /// URI (`memory://…`) — so the DUR-2 recovery invariants can be proven on
+    /// both backends from the same test bodies.
+    fn open_sink_root(root: std::path::PathBuf, mode: IcebergSinkMode) -> IcebergStreamingSink {
         let op_column = (mode == IcebergSinkMode::Upsert).then(|| "__op".to_owned());
         let sv = schema_version_from_arrow(&arrow_schema(false), None).unwrap();
         IcebergStreamingSink::open(
             IcebergSinkTarget {
-                root: dir.to_path_buf(),
+                root,
                 table: "t".into(),
                 mode,
                 key_columns: vec!["k".into()],
@@ -669,6 +651,16 @@ mod tests {
             sv,
         )
         .unwrap()
+    }
+
+    /// A fresh, unique `memory://` warehouse root. The backing in-process store
+    /// is process-global and shared across sink instances (like S3), so a
+    /// dropped-then-reopened sink recovers from what the prior instance wrote.
+    fn unique_memory_root() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        std::path::PathBuf::from(format!("memory://dur2-obj-{n}/warehouse"))
     }
 
     #[test]
@@ -944,5 +936,121 @@ mod tests {
             committed_rows(&recovered),
             vec![("a".into(), 10), ("c".into(), 3)]
         );
+    }
+
+    // ---- DUR-2 on an object-store backend (deterministic, in-process) ----
+    //
+    // These mirror the local-FS DUR-2 tests above but run the sink on a
+    // `memory://` warehouse, exercising the object-store code path in
+    // `iceberg_native` (staging, version-hint, reads via `KrishivStorage`) and
+    // the cross-instance recover-commit that a real S3/MinIO warehouse enables —
+    // with no external dependency.
+
+    #[test]
+    fn object_store_round_trip_stage_commit_read() {
+        let mut sink = open_sink_root(unique_memory_root(), IcebergSinkMode::Append);
+        sink.stage(&batch(&[("a", 1), ("b", 2)])).unwrap();
+        sink.pre_commit(1).unwrap();
+        assert!(committed_rows(&sink).is_empty(), "nothing visible pre-commit");
+        sink.commit_through(1).unwrap();
+        assert_eq!(
+            committed_rows(&sink),
+            vec![("a".into(), 1), ("b".into(), 2)],
+            "object-store append round-trips through the memory warehouse"
+        );
+    }
+
+    #[test]
+    fn dur2_recover_commit_append_across_crash_object_store() {
+        let root = unique_memory_root();
+
+        // Pre-crash: stage + pre_commit epoch 1, then drop (executor crash).
+        let prepare_path = {
+            let mut sink = open_sink_root(root.clone(), IcebergSinkMode::Append);
+            sink.stage(&batch(&[("a", 1)])).unwrap();
+            sink.stage_source_offsets(&BTreeMap::from([("p0".to_string(), 5)]))
+                .unwrap();
+            sink.pre_commit(1).unwrap();
+            let p = sink.prepared_refs()[0].prepare_path.clone();
+            assert!(
+                p.starts_with("memory://"),
+                "staged path is an object-store URI, got {p}"
+            );
+            p
+        };
+
+        // A DIFFERENT sink instance (the restarted executor) recovers from the
+        // shared object store — the staged parquet + sidecar the dead instance
+        // wrote are visible here, which is the whole point of shared storage.
+        let mut recovered = open_sink_root(root, IcebergSinkMode::Append);
+        assert!(recovered.prepared_epochs().is_empty());
+        recovered.finalize_prepared(&prepare_path, true).unwrap();
+        assert_eq!(committed_rows(&recovered), vec![("a".into(), 1)]);
+        let committed = recovered
+            .rt()
+            .block_on(recovered.table.committed_kafka_offsets())
+            .unwrap();
+        assert_eq!(committed.get("p0"), Some(&5), "epoch offsets landed");
+
+        // Idempotent: the offset gate prevents a double append.
+        recovered.finalize_prepared(&prepare_path, true).unwrap();
+        assert_eq!(committed_rows(&recovered), vec![("a".into(), 1)]);
+    }
+
+    #[test]
+    fn dur2_recover_commit_upsert_across_crash_object_store() {
+        let root = unique_memory_root();
+
+        // Seed committed epoch 1.
+        {
+            let mut sink = open_sink_root(root.clone(), IcebergSinkMode::Upsert);
+            sink.stage(&op_batch(&[("a", 1, "u"), ("b", 2, "u")])).unwrap();
+            sink.pre_commit(1).unwrap();
+            sink.commit_through(1).unwrap();
+        }
+
+        // Epoch 2 prepared (update a, delete b, insert c) then crash.
+        let prepare_path = {
+            let mut sink = open_sink_root(root.clone(), IcebergSinkMode::Upsert);
+            sink.stage(&op_batch(&[("a", 10, "u"), ("b", 0, "d"), ("c", 3, "u")]))
+                .unwrap();
+            sink.stage_source_offsets(&BTreeMap::from([("p0".to_string(), 9)]))
+                .unwrap();
+            sink.pre_commit(2).unwrap();
+            sink.prepared_refs()[0].prepare_path.clone()
+        };
+
+        let mut recovered = open_sink_root(root, IcebergSinkMode::Upsert);
+        recovered.finalize_prepared(&prepare_path, true).unwrap();
+        assert_eq!(
+            committed_rows(&recovered),
+            vec![("a".into(), 10), ("c".into(), 3)],
+            "row-level merge replayed from the object-store staged rows"
+        );
+
+        // Idempotent: the offset gate prevents a second overwrite.
+        recovered.finalize_prepared(&prepare_path, true).unwrap();
+        assert_eq!(
+            committed_rows(&recovered),
+            vec![("a".into(), 10), ("c".into(), 3)]
+        );
+    }
+
+    #[test]
+    fn dur2_recover_abort_discards_uncommitted_epoch_object_store() {
+        let root = unique_memory_root();
+        let prepare_path = {
+            let mut sink = open_sink_root(root.clone(), IcebergSinkMode::Append);
+            sink.stage(&batch(&[("z", 9)])).unwrap();
+            sink.pre_commit(1).unwrap();
+            sink.prepared_refs()[0].prepare_path.clone()
+        };
+
+        let mut recovered = open_sink_root(root, IcebergSinkMode::Append);
+        recovered.finalize_prepared(&prepare_path, false).unwrap();
+        assert!(committed_rows(&recovered).is_empty(), "aborted epoch not committed");
+        // Idempotent re-abort.
+        recovered.finalize_prepared(&prepare_path, false).unwrap();
+        assert!(committed_rows(&recovered).is_empty());
     }
 }
