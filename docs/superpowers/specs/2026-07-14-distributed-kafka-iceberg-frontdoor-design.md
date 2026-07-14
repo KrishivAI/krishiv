@@ -2,100 +2,106 @@
 
 **Date:** 2026-07-14
 **Author:** engine work (DUR-2 live-cert enablement / Phase 60 #183 + #197)
-**Status:** design approved (approach #1), pending implementation plan
+**Status:** SUPERSEDED — the front-door already exists; this doc is now a
+correction + a live-cert runbook.
 
-## Problem
+## CORRECTION (2026-07-14)
 
-DUR-2 (#188) recover-commit for the production `IcebergStreamingSink` is code-complete
-and **deterministically** unit-certified (append + upsert recover-commit + idempotent
-re-run; connectors iceberg suite 378/0), committed (`9ed0e7bb`, `30bcbe8f`), and
-deployed to the `krishiv-cert` cluster (`fast-30bcbe8f`, healthy, no regression).
+The original version of this design claimed there was **no engine-direct
+submission path** for a distributed Kafka→Iceberg `stream:rloop` job and
+proposed building a new coordinator HTTP `kafka-iceberg` handler. **That premise
+was wrong.** It came from an incomplete read of
+`crates/krishiv-scheduler/src/continuous_stream_http.rs`: I had only looked at
+the cycle-model path and the `unified_jobs_http` streaming shim (which forwards
+a bare `WindowExecutionSpec`), and missed the run-loop path.
 
-To run the **live distributed** streaming→sink→kill→restore exactly-once cert we need a
-running distributed Kafka→Iceberg `stream:rloop` job on the engine-only cert cluster.
-There is currently **no engine-direct submission path** for that: `krishiv stream`,
-`krishiv pipeline`, and `krishiv submit` are all in-process; the coordinator's
-`unified_jobs_http` streaming handler only accepts a windowed `WindowExecutionSpec`
-(push-fed); the coordinator Flight SQL rejects `CREATE TABLE ... WITH (connector=...)`.
-The distributed Kafka→Iceberg `JobSpec` is constructed only by platformd today (#171).
+The distributed front-door is already built and HTTP-reachable via **two**
+endpoints (both registered in `coordinator_daemon.rs` ~line 500):
 
-## Goal
+- `POST /api/v1/continuous-register` (`api_continuous_register`) — JSON body
+  `ContinuousRegisterRequest { job_id, spec, sink?, parallelism?, mode?,
+  sources[], checkpoint_interval_ms?, checkpoint_storage_path? }`.
+- `POST /api/v1/continuous-register-sql` (`api_continuous_register_sql`) — the
+  **SQL front door**: a windowed streaming SQL string is compiled by the
+  coordinator (`krishiv_sql::streaming_window_plan::compile_streaming_window_sql`)
+  into the `WindowExecutionSpec`, with the same run-loop/Kafka/Iceberg/checkpoint
+  options.
 
-A remote client can POST a small JSON to the coordinator to launch a distributed,
-checkpointing `stream:rloop` job that reads a Kafka topic and writes an Iceberg table,
-registering `IcebergStreamingSink` into the executor `transaction_log` so DUR-2
-recover-commit fires on restore. Enables the live cert and advances the "one SQL front
-door" (#183) + connector reachability (#197).
+Both map their body → `ContinuousRegistrationOptions` →
+`register_continuous_stream_with_options` → `build_continuous_job_spec`, which
+for `mode = "run-loop"` builds exactly the intended spec:
 
-## Approach (chosen: #1 — coordinator HTTP endpoint)
+- **Fragment:** `stream:rloop:<job_id>|<subtask>/<parallelism>|<encoded_spec>`
+  (`build_continuous_job_spec`, one `task-streaming-<i>` per subtask).
+- **Source:** registry connector sources (`sources: [{kind:"kafka", table,
+  config:{...}}]`) are carried as input partitions and opened by the run-loop
+  subtask via the connector registry (`launch_run_loop_job`).
+- **Sink:** `ContinuousSinkSpec` → `iceberg-sink:<root>|<table>|mode=...` contract
+  string on every task (`OutputContractDescriptor::parse_iceberg_sink`
+  round-trip-validated at registration).
+- **Barrier checkpoints:** when both `checkpoint_interval_ms` and
+  `checkpoint_storage_path` are set, `JobSpec::with_checkpoint(interval, path)`
+  wires the coordinator-driven barrier pipeline.
+- **Launch:** run-loop jobs are assigned + peer-wired + launched in
+  `launch_run_loop_job`; from there the coordinator is control-plane-only.
 
-Extend `krishiv-scheduler/src/unified_jobs_http.rs` (or a sibling module) with a
-`handle_kafka_iceberg` handler on the existing router (reuses auth + `state.coordinator`).
+The executor-side run-loop registers `IcebergStreamingSink` into the
+`transaction_log` (`fragment/streaming.rs` ~813), so the DUR-2 report + recover
+chain fires on this path. **No new submission surface is required.**
 
-Request:
-```json
-{ "job_id": "...", "topic": "dur2-cert", "brokers": "redpanda.krishiv-infra:9092",
-  "group_id": "dur2-cert", "table_root": "/warehouse/dur2", "table": "events",
-  "mode": "append", "schema": [ {"name":"id","type":"long"}, {"name":"payload","type":"string"} ],
-  "parallelism": 1 }
-```
+## What this means for DUR-2 (#188)
 
-Handler builds the distributed `JobSpec` and calls `coord.submit_job(spec)`:
+The DUR-2 recover-commit code (`30bcbe8f`) is already deployed to `krishiv-cert`
+(`fast-30bcbe8f`). The live distributed streaming→kill→restore exactly-once cert
+is therefore runnable **now** against the existing endpoint + image — it does not
+depend on any unbuilt feature. See the runbook below.
 
-- **Fragment**: `stream:rloop:<job_id>|0/<parallelism>|<window_fragment>`
-  (`run_loop::STREAM_RLOOP_PREFIX`). The `<window_fragment>` is a
-  `krishiv_plan::window::WindowExecutionSpec` encoded string — for the cert a
-  **pass-through** (no windowing) spec that forwards source rows to the sink.
-- **Source**: a registry Kafka partition spec parsed by
-  `fragment/common.rs::parse_registry_partition_specs` — a `ConnectorConfig{kind:"kafka",
-  topic, bootstrap.servers, group.id}` carried as the stage's `InputPartition`
-  descriptor (registry connector source; run_loop opens it via
-  `connector_registry.open_source`).
-- **Sink**: an `OutputContract` with `OutputContractDescriptor::IcebergSink{ root, table,
-  mode, key_columns, op_column }` (streaming.rs:791 decode site).
-- **Kind**: streaming; **durability**: the coordinator's active profile
-  (distributed-durable) drives barrier checkpoints.
+Phase 60 residual (#183/#197) is **not** "build the front-door" (done). It is the
+narrower "one SQL front door across the three engines" convergence + connector
+one-registry dispatch (#197) — a separate, smaller scope tracked under those
+tasks.
 
-### Implementation's first task (to finalize exactly)
+## Live DUR-2 cert runbook (krishiv-cert, engine-only)
 
-The precise construction of: (a) the pass-through `WindowExecutionSpec` encoding, (b) the
-registry Kafka `InputPartition` descriptor shape `parse_registry_partition_specs` expects,
-(c) the `IcebergSink` `OutputContract` string/descriptor, and (d) how `parallelism`/
-key-group ranges are set for a single-subtask job. These are read from
-`fragment/run_loop.rs`, `fragment/common.rs`, `fragment/streaming.rs`,
-`krishiv-plan/src/window.rs`, and `in_process.rs` (the existing JobSpec builder model at
-`in_process.rs:606-644`). A **unit test** in the scheduler asserting the built JobSpec
-round-trips + names the Kafka source and Iceberg sink is the correctness gate before deploy.
+Precondition: `krishiv-cert` healthy on `fast-30bcbe8f` (coordinator +
+≥2 executors), redpanda in `krishiv-infra`, a coordinator HTTP route reachable
+from a driver pod with a bearer token.
 
-## Cert flow (live, on krishiv-cert)
-
-1. `rpk topic create dur2-cert` (done); produce N=known rows.
-2. `curl` the endpoint from a driver pod → job launches distributed.
-3. Wait for ≥1 barrier checkpoint (coordinator logs / checkpoint list).
-4. `kubectl delete pod` an executor mid-run (between a `pre_commit` and its
-   `commit_through`, forced by producing across a barrier then killing).
-5. Coordinator reassigns + sends `RestoreFromCheckpointCommand`; executor drives
-   `recover_prepared_refs` → `IcebergStreamingSink::finalize_prepared`.
-6. **Assert exactly-once**: query the Iceberg table row count == N, no duplicate ids,
-   no lost ids. (Compare committed offsets in the snapshot summary vs produced.)
+1. `rpk topic create dur2-cert`; produce N=known rows (id, payload).
+2. From a driver pod, `POST /api/v1/continuous-register` with:
+   ```json
+   { "job_id": "dur2-cert", "spec": <pass-through window spec>,
+     "mode": "run-loop", "parallelism": 1,
+     "sources": [{ "kind": "kafka", "table": "events",
+       "config": { "bootstrap.servers": "redpanda.krishiv-infra:9092",
+                   "topic": "dur2-cert", "group.id": "dur2-cert" } }],
+     "sink": { "root": "/warehouse/dur2", "table": "events", "mode": "append" },
+     "checkpoint_interval_ms": 2000,
+     "checkpoint_storage_path": "file:///warehouse/dur2-ckpt" }
+   ```
+3. Wait for ≥1 barrier checkpoint (coordinator checkpoint list / logs).
+4. `kubectl delete pod` an executor running a subtask, mid-run (produce across a
+   barrier first so an epoch is prepared-but-not-committed).
+5. Coordinator reassigns + sends `RestoreFromCheckpointCommand`; the executor
+   drives `recover_prepared_refs` → `IcebergStreamingSink::finalize_prepared`
+   (offset-gated idempotent).
+6. **Assert exactly-once:** Iceberg row count == N, no duplicate ids, no lost
+   ids; committed offsets in the snapshot summary
+   (`krishiv.kafka.committed_offsets`) cover exactly the produced range.
 
 ## Testing
 
-- Scheduler unit test: JobSpec builder produces a well-formed `stream:rloop` spec with the
-  Kafka source + Iceberg sink (round-trip / field assertions).
-- Existing connectors DUR-2 crash-recovery unit tests remain the deterministic exactly-once
-  proof of the recovery logic; this front-door adds the live distributed wire validation.
-
-## Out of scope
-
-- SQL text front-door (`CREATE SINK ... INTO iceberg(...) FROM kafka(...)`) — the endpoint
-  takes structured JSON; SQL parsing into this spec is a later Phase-60 layer.
-- Multi-subtask key-group parallelism beyond `parallelism=1` (cert uses 1).
-- platformd kafka_bridge offset-consultation protocol (#171) — orthogonal.
+- Existing connectors DUR-2 crash-recovery unit tests remain the deterministic
+  exactly-once proof of the recovery logic (append + upsert recover-commit +
+  idempotent re-run; connectors iceberg suite 378/0).
+- This runbook adds the live distributed wire validation on real Kafka + real
+  executor kill.
 
 ## Risks
 
-- Getting the internal spec encodings wrong → job rejected or mis-runs. Mitigated by the
-  scheduler unit test + a dry-run submit before the kill step.
-- Touching the coordinator job-submission path near a certified streaming runtime. Mitigated
-  by additive endpoint (no change to existing handlers) + isolated cert cluster.
+- The pass-through (no-window) `WindowExecutionSpec` encoding for a plain
+  Kafka→Iceberg forward must be the one the run-loop accepts; the
+  `continuous-register-sql` path sidesteps this by compiling from SQL.
+- Timing the kill between `pre_commit` and `commit_through` requires producing
+  across a barrier; if the window is missed the cert is inconclusive (retry),
+  not a failure.
