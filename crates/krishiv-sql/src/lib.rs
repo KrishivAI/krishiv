@@ -85,6 +85,8 @@ pub mod streaming_tvf;
 pub mod streaming_window_plan;
 mod udf;
 mod json_functions;
+mod higher_order_functions;
+mod spark_functions;
 mod window_functions;
 
 pub use cep_sql::{
@@ -461,6 +463,14 @@ fn build_single_node_session_config(
             "datafusion.optimizer.enable_aggregate_dynamic_filter_pushdown",
             runtime_filters_enabled_from_env(),
         );
+    // Phase 60: use a lambda-capable parser dialect so Spark-style higher-order
+    // functions (`transform(arr, x -> …)`, `filter`, `forall`) parse — the
+    // default `Generic` dialect treats `->` as the JSON-arrow operator, so the
+    // lambda variable is mis-planned as a column reference. DuckDB is the most
+    // standards-compatible dialect that supports BOTH `x -> body` lambdas and
+    // `[...]` array literals; it changes only parse syntax, not semantics, and
+    // is validated against the full krishiv-sql suite.
+    config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::DuckDB;
     // Parquet scan options stay at DataFusion's defaults (`pushdown_filters`
     // off, `enable_page_index` on). Forcing `pushdown_filters = true` here
     // cost ~2.2× on scan-heavy queries (Phase 52 #194 attribution probe,
@@ -846,6 +856,19 @@ impl SqlEngine {
         // the batch SQL front door (get_json_object, json_array_length).
         json_functions::register_json_functions(&context).map_err(|e| SqlError::DataFusion {
             message: format!("failed to register JSON UDFs: {e}"),
+        })?;
+        // Phase 60: Spark-parity higher-order array functions
+        // (transform/filter/exists/forall) on the batch SQL front door.
+        higher_order_functions::register_higher_order_spark_functions(&context).map_err(|e| {
+            SqlError::DataFusion {
+                message: format!("failed to register higher-order UDFs: {e}"),
+            }
+        })?;
+        // Phase 60: Spark-parity scalar functions (Spark-pattern date_format, crc32).
+        spark_functions::register_spark_scalar_functions(&context).map_err(|e| {
+            SqlError::DataFusion {
+                message: format!("failed to register Spark scalar UDFs: {e}"),
+            }
         })?;
         Ok(Self {
             context,

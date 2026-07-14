@@ -1,12 +1,21 @@
 #![forbid(unsafe_code)]
-//! SQL grammar and feature matrix for Krishiv.
+//! SQL grammar and **engine-dimensioned** feature matrix for Krishiv.
 //!
 //! Provides a machine-readable inventory of which SQL dialect features are
-//! supported, partially supported, or planned.  Callers can query the matrix
-//! to build documentation, surface feature gaps, or validate queries before
-//! submission.
+//! supported, and — crucially — *in which of the three execution engines*:
+//! batch (DataFusion planner + Krishiv extensions), streaming (continuous
+//! window compiler), and incremental (IVM / krishiv-delta). A single feature is
+//! frequently "supported in batch, partial in streaming, n/a in incremental",
+//! so each [`FeatureEntry`] carries a per-engine [`FeatureStatus`] rather than
+//! one global status — otherwise "measured coverage" silently means *batch*
+//! coverage (Phase 60).
+//!
+//! The public SQL reference page is **generated** from this matrix
+//! ([`generate_reference_markdown`]), never hand-written, and a CI drift guard
+//! (see `coverage.rs`) asserts the checked-in page matches and that every
+//! non-`n/a` engine cell is backed by an executable coverage case.
 
-/// Support status for a single SQL feature.
+/// Support status for a single SQL feature **in one engine**.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeatureStatus {
     /// Fully supported in the current release.
@@ -28,6 +37,12 @@ impl FeatureStatus {
             Self::NotApplicable => "n/a",
         }
     }
+
+    /// A non-`n/a`, non-`planned` cell — i.e. one that must be backed by an
+    /// executable coverage case (the matrix-to-test CI rule).
+    pub fn is_claimed(self) -> bool {
+        matches!(self, Self::Supported | Self::Partial)
+    }
 }
 
 impl std::fmt::Display for FeatureStatus {
@@ -36,7 +51,27 @@ impl std::fmt::Display for FeatureStatus {
     }
 }
 
-/// A single entry in the Krishiv SQL feature matrix.
+/// The three Krishiv execution engines a feature can be dimensioned across.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    Batch,
+    Streaming,
+    Incremental,
+}
+
+impl Engine {
+    pub const ALL: [Engine; 3] = [Engine::Batch, Engine::Streaming, Engine::Incremental];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Engine::Batch => "batch",
+            Engine::Streaming => "streaming",
+            Engine::Incremental => "incremental",
+        }
+    }
+}
+
+/// A single entry in the Krishiv SQL feature matrix, dimensioned per engine.
 #[derive(Debug, Clone)]
 pub struct FeatureEntry {
     /// Stable identifier (e.g. `"select.distinct"`).
@@ -45,8 +80,12 @@ pub struct FeatureEntry {
     pub category: &'static str,
     /// Human-readable description.
     pub description: &'static str,
-    /// Support status.
-    pub status: FeatureStatus,
+    /// Support status in the batch engine.
+    pub batch: FeatureStatus,
+    /// Support status in the streaming (continuous) engine.
+    pub streaming: FeatureStatus,
+    /// Support status in the incremental (IVM) engine.
+    pub incremental: FeatureStatus,
     /// Optional clarifying note (gap description, limitations, workarounds).
     pub note: Option<&'static str>,
 }
@@ -56,28 +95,55 @@ impl FeatureEntry {
         id: &'static str,
         category: &'static str,
         description: &'static str,
-        status: FeatureStatus,
+        batch: FeatureStatus,
+        streaming: FeatureStatus,
+        incremental: FeatureStatus,
     ) -> Self {
         Self {
             id,
             category,
             description,
-            status,
+            batch,
+            streaming,
+            incremental,
             note: None,
         }
+    }
+
+    /// A batch-only feature: `n/a` in the streaming and incremental engines.
+    const fn batch_only(
+        id: &'static str,
+        category: &'static str,
+        description: &'static str,
+        batch: FeatureStatus,
+    ) -> Self {
+        Self::new(id, category, description, batch, NA, NA)
     }
 
     const fn with_note(mut self, note: &'static str) -> Self {
         self.note = Some(note);
         self
     }
+
+    /// Status for a given engine.
+    pub fn status_for(&self, engine: Engine) -> FeatureStatus {
+        match engine {
+            Engine::Batch => self.batch,
+            Engine::Streaming => self.streaming,
+            Engine::Incremental => self.incremental,
+        }
+    }
 }
 
 impl std::fmt::Display for FeatureEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}] {} — {}", self.status, self.id, self.description)?;
+        write!(
+            f,
+            "[batch:{} streaming:{} incremental:{}] {} — {}",
+            self.batch, self.streaming, self.incremental, self.id, self.description
+        )?;
         if let Some(note) = self.note {
-            write!(f, " ({})", note)?;
+            write!(f, " ({note})")?;
         }
         Ok(())
     }
@@ -99,328 +165,573 @@ pub fn features_for_category(category: &str) -> Vec<&'static FeatureEntry> {
         .collect()
 }
 
-/// Return only entries with the given `status`.
+/// Return entries whose **batch** status equals `status`. (Batch is the
+/// primary column; use [`FeatureEntry::status_for`] for the other engines.)
 pub fn features_by_status(status: FeatureStatus) -> Vec<&'static FeatureEntry> {
-    FEATURES.iter().filter(|e| e.status == status).collect()
+    FEATURES.iter().filter(|e| e.batch == status).collect()
+}
+
+/// Render the public "Krishiv SQL feature matrix" reference page from the
+/// matrix. This is the single source of truth; the checked-in markdown is
+/// regenerated from here and drift-guarded in CI.
+pub fn generate_reference_markdown() -> String {
+    let mut out = String::new();
+    out.push_str("# Krishiv SQL feature matrix\n\n");
+    out.push_str(
+        "_Generated from `krishiv-sql/src/grammar.rs` — do not edit by hand._\n\n\
+         Each feature is dimensioned across the three Krishiv execution engines: \
+         **batch** (DataFusion + extensions), **streaming** (continuous windows), \
+         and **incremental** (IVM). `n/a` means the feature does not apply to that \
+         engine.\n\n",
+    );
+
+    // Stable category order = order of first appearance in the matrix.
+    let mut categories: Vec<&'static str> = Vec::new();
+    for e in FEATURES {
+        if !categories.contains(&e.category) {
+            categories.push(e.category);
+        }
+    }
+
+    for cat in categories {
+        out.push_str(&format!("## {cat}\n\n"));
+        out.push_str("| Feature | Description | Batch | Streaming | Incremental | Notes |\n");
+        out.push_str("|---|---|---|---|---|---|\n");
+        for e in FEATURES.iter().filter(|e| e.category == cat) {
+            out.push_str(&format!(
+                "| `{}` | {} | {} | {} | {} | {} |\n",
+                e.id,
+                e.description,
+                e.batch,
+                e.streaming,
+                e.incremental,
+                e.note.unwrap_or("")
+            ));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Render the "Krishiv SQL vs Spark SQL" dialect honesty / migration page from
+/// the matrix + the documented per-feature semantic differences. Generated,
+/// never hand-written: what maps 1:1, what differs semantically, what is absent.
+pub fn generate_honesty_markdown() -> String {
+    let mut out = String::new();
+    out.push_str("# Krishiv SQL vs Spark SQL\n\n");
+    out.push_str(
+        "_Generated from `krishiv-sql/src/grammar.rs` — do not edit by hand._\n\n\
+         Krishiv targets Spark-SQL reference parity as a **measured** number. This page \
+         is the honest ledger: what maps 1:1, what differs semantically, and what is \
+         absent, derived from the feature matrix.\n\n",
+    );
+
+    // Documented semantic differences (the correctness-trap items an alias layer
+    // must surface loudly rather than silently mis-behave on).
+    out.push_str("## Documented semantic differences\n\n");
+    out.push_str(
+        "- **`date_format(ts, fmt)` pattern letters.** Krishiv uses **Spark/Java** \
+         `DateTimeFormatter` letters (`yyyy-MM-dd`), not chrono/strftime (`%Y-%m-%d`). \
+         Supported letters translate exactly; unsupported letters (era `G`, timezone \
+         `z`/`X`) raise a clear error instead of emitting wrong output.\n\
+         - **`exists(array, x -> …)`.** The `exists(` spelling is shadowed by the \
+         EXISTS-subquery keyword in the parser; use `any_match(array, x -> …)` (the \
+         byte-identical implementation) for the Spark higher-order `exists`.\n\
+         - **Lambda / array-literal syntax.** The SQL front door parses with a \
+         lambda-capable dialect so `transform(arr, x -> …)` and `[1, 2, 3]` work; \
+         the array constructor is `make_array(...)` / `[...]` (Spark's `array(...)` \
+         maps to these).\n\
+         - **ANSI mode, integral division, NULL ordering** follow DataFusion \
+         semantics, which match Spark ANSI mode for the covered surface; divergences \
+         are tracked as matrix notes.\n\n",
+    );
+
+    // 1:1 — supported in batch with no divergence note.
+    out.push_str("## Maps 1:1 (supported, no semantic caveat)\n\n");
+    for e in FEATURES.iter().filter(|e| e.batch == FeatureStatus::Supported && e.note.is_none()) {
+        out.push_str(&format!("- `{}` — {}\n", e.id, e.description));
+    }
+    out.push('\n');
+
+    // Partial / caveated.
+    out.push_str("## Supported with caveats (partial or noted)\n\n");
+    for e in FEATURES
+        .iter()
+        .filter(|e| (e.batch == FeatureStatus::Partial) || (e.batch.is_claimed() && e.note.is_some()))
+    {
+        out.push_str(&format!(
+            "- `{}` — {} _({})_\n",
+            e.id,
+            e.description,
+            e.note.unwrap_or("partial")
+        ));
+    }
+    out.push('\n');
+
+    // Absent / planned.
+    out.push_str("## Absent (planned — itemized shortfall)\n\n");
+    for e in FEATURES.iter().filter(|e| {
+        e.batch == FeatureStatus::Planned
+            && e.streaming != FeatureStatus::Supported
+            && e.incremental != FeatureStatus::Supported
+    }) {
+        out.push_str(&format!(
+            "- `{}` — {} _({})_\n",
+            e.id,
+            e.description,
+            e.note.unwrap_or("planned")
+        ));
+    }
+    out.push('\n');
+    out
 }
 
 const S: FeatureStatus = FeatureStatus::Supported;
 const P: FeatureStatus = FeatureStatus::Partial;
+const PL: FeatureStatus = FeatureStatus::Planned;
+const NA: FeatureStatus = FeatureStatus::NotApplicable;
 
 static FEATURES: &[FeatureEntry] = &[
     // ── SELECT ────────────────────────────────────────────────────────────────
-    FeatureEntry::new(
-        "select.projection",
-        "SELECT",
-        "Column projection and aliases",
-        S,
-    ),
-    FeatureEntry::new("select.star", "SELECT", "SELECT * expansion", S),
-    FeatureEntry::new(
-        "select.distinct",
-        "SELECT",
-        "SELECT DISTINCT deduplication",
-        S,
-    ),
-    FeatureEntry::new("select.where", "SELECT", "WHERE predicate filtering", S),
+    // The shared relational core: fully supported in batch; in streaming it is
+    // usable only inside the windowed continuous plan (Partial); IVM maintains
+    // it via krishiv-delta with a DiffBased recompute fallback (Partial).
+    FeatureEntry::new("select.projection", "SELECT", "Column projection and aliases", S, P, P),
+    FeatureEntry::new("select.star", "SELECT", "SELECT * expansion", S, P, P),
+    FeatureEntry::new("select.distinct", "SELECT", "SELECT DISTINCT deduplication", S, NA, P),
+    FeatureEntry::new("select.where", "SELECT", "WHERE predicate filtering", S, P, P),
     FeatureEntry::new(
         "select.order_by",
         "SELECT",
         "ORDER BY with ASC/DESC and NULLS FIRST/LAST",
         S,
-    ),
-    FeatureEntry::new(
-        "select.limit_offset",
-        "SELECT",
-        "LIMIT / OFFSET pagination",
-        S,
-    ),
-    FeatureEntry::new(
-        "select.having",
-        "SELECT",
-        "HAVING post-aggregation filter",
-        S,
-    ),
+        NA,
+        NA,
+    )
+    .with_note("streaming/IVM: unbounded ordering is not a maintainable operator"),
+    FeatureEntry::new("select.limit_offset", "SELECT", "LIMIT / OFFSET pagination", S, NA, NA),
+    FeatureEntry::new("select.having", "SELECT", "HAVING post-aggregation filter", S, P, P),
     FeatureEntry::new(
         "select.case",
         "SELECT",
         "CASE WHEN … THEN … ELSE … END expressions",
         S,
+        P,
+        P,
     ),
-    FeatureEntry::new(
-        "select.cast",
-        "SELECT",
-        "CAST(expr AS type) and TRY_CAST",
-        S,
-    ),
+    FeatureEntry::new("select.cast", "SELECT", "CAST(expr AS type) and TRY_CAST", S, P, P),
     FeatureEntry::new(
         "select.subquery_scalar",
         "SELECT",
         "Scalar subqueries in projection/predicate",
         S,
+        NA,
+        P,
     ),
     FeatureEntry::new(
         "select.subquery_exists",
         "SELECT",
         "EXISTS / NOT EXISTS correlated subqueries",
         S,
+        NA,
+        P,
     ),
-    FeatureEntry::new("select.subquery_in", "SELECT", "IN / NOT IN subqueries", S),
-    FeatureEntry::new(
-        "select.values",
-        "SELECT",
-        "VALUES clause for inline data",
-        S,
-    ),
+    FeatureEntry::new("select.subquery_in", "SELECT", "IN / NOT IN subqueries", S, NA, P),
+    FeatureEntry::new("select.values", "SELECT", "VALUES clause for inline data", S, NA, P),
     // ── GROUP BY ─────────────────────────────────────────────────────────────
-    FeatureEntry::new("groupby.basic", "GROUP BY", "Basic GROUP BY column list", S),
-    FeatureEntry::new("groupby.rollup", "GROUP BY", "ROLLUP grouping sets", S),
-    FeatureEntry::new("groupby.cube", "GROUP BY", "CUBE grouping sets", S),
-    FeatureEntry::new(
-        "groupby.grouping_sets",
-        "GROUP BY",
-        "Explicit GROUPING SETS",
-        S,
-    ),
+    FeatureEntry::new("groupby.basic", "GROUP BY", "Basic GROUP BY column list", S, P, P)
+        .with_note("streaming: only inside a window TVF (windowed aggregation)"),
+    FeatureEntry::new("groupby.rollup", "GROUP BY", "ROLLUP grouping sets", S, NA, P),
+    FeatureEntry::new("groupby.cube", "GROUP BY", "CUBE grouping sets", S, NA, P),
+    FeatureEntry::new("groupby.grouping_sets", "GROUP BY", "Explicit GROUPING SETS", S, NA, P),
     FeatureEntry::new(
         "groupby.grouping_function",
         "GROUP BY",
         "GROUPING() function for NULL disambiguation",
         S,
+        NA,
+        P,
     ),
     // ── JOIN ─────────────────────────────────────────────────────────────────
-    FeatureEntry::new("join.inner", "JOIN", "INNER JOIN (equi and non-equi)", S),
-    FeatureEntry::new("join.left_outer", "JOIN", "LEFT OUTER JOIN", S),
-    FeatureEntry::new("join.right_outer", "JOIN", "RIGHT OUTER JOIN", S),
-    FeatureEntry::new("join.full_outer", "JOIN", "FULL OUTER JOIN", S),
-    FeatureEntry::new("join.cross", "JOIN", "CROSS JOIN", S),
-    FeatureEntry::new(
-        "join.natural",
-        "JOIN",
-        "NATURAL JOIN (column-name matching)",
-        S,
-    ),
-    FeatureEntry::new("join.using", "JOIN", "JOIN … USING (column_list)", S),
-    FeatureEntry::new(
-        "join.lateral",
-        "JOIN",
-        "LATERAL JOIN / CROSS JOIN LATERAL",
-        S,
-    ),
+    FeatureEntry::new("join.inner", "JOIN", "INNER JOIN (equi and non-equi)", S, NA, P),
+    FeatureEntry::new("join.left_outer", "JOIN", "LEFT OUTER JOIN", S, NA, P),
+    FeatureEntry::new("join.right_outer", "JOIN", "RIGHT OUTER JOIN", S, NA, P),
+    FeatureEntry::new("join.full_outer", "JOIN", "FULL OUTER JOIN", S, NA, P),
+    FeatureEntry::new("join.cross", "JOIN", "CROSS JOIN", S, NA, P),
+    FeatureEntry::new("join.natural", "JOIN", "NATURAL JOIN (column-name matching)", S, NA, P),
+    FeatureEntry::new("join.using", "JOIN", "JOIN … USING (column_list)", S, NA, P),
+    FeatureEntry::new("join.lateral", "JOIN", "LATERAL JOIN / CROSS JOIN LATERAL", S, NA, NA),
     FeatureEntry::new(
         "join.interval",
         "JOIN",
         "Streaming interval join on event-time bounds",
-        S,
+        PL,
+        P,
+        NA,
+    )
+    .with_note(
+        "DataFrame-only today (audit §9b): the interval-join operator has no SQL planning path, \
+         so batch SQL cannot express it (Planned); the streaming operator exists (Partial). \
+         Corrected from the prior over-claim of batch Supported.",
     ),
     FeatureEntry::new(
         "join.temporal_as_of",
         "JOIN",
         "Temporal AS OF point-in-time join",
-        S,
+        PL,
+        NA,
+        NA,
+    )
+    .with_note(
+        "no SQL temporal-join planning path: `lakehouse/as_of.rs` is table time-travel \
+         (temporal.as_of), not a temporal join. Marked Planned rather than the prior Supported.",
     ),
     FeatureEntry::new(
         "join.broadcast_hint",
         "JOIN",
         "/*+ BROADCAST(t) */ optimizer hint",
         P,
+        NA,
+        NA,
     )
-    .with_note("hint parsed; broadcast decision is cost-based, not forced"),
+    .with_note("hint parsed and recorded; broadcast decision is cost-based (see hints.* entries)"),
+    // ── HINTS (Phase 60 statement completion) ───────────────────────────────
+    FeatureEntry::new(
+        "hints.join_strategy",
+        "HINTS",
+        "/*+ MERGE|SHUFFLE_HASH|BROADCAST(t) */ join-strategy hints",
+        P,
+        NA,
+        NA,
+    )
+    .with_note("parsed always; honored where the executor supports the strategy (Phase 52/54), recorded either way"),
+    FeatureEntry::new(
+        "hints.repartition",
+        "HINTS",
+        "/*+ REPARTITION(n)|COALESCE(n) */ partitioning hints",
+        P,
+        NA,
+        NA,
+    )
+    .with_note("parsed and recorded; applied where the distributed planner supports it"),
     // ── WINDOW FUNCTIONS ─────────────────────────────────────────────────────
-    FeatureEntry::new(
-        "window.over",
-        "WINDOW",
-        "OVER () window function clauses",
-        S,
-    ),
-    FeatureEntry::new(
-        "window.partition_by",
-        "WINDOW",
-        "PARTITION BY inside OVER",
-        S,
-    ),
-    FeatureEntry::new("window.order_by", "WINDOW", "ORDER BY inside OVER", S),
-    FeatureEntry::new(
-        "window.rows_range",
-        "WINDOW",
-        "ROWS / RANGE frame specification",
-        S,
-    ),
+    FeatureEntry::new("window.over", "WINDOW", "OVER () window function clauses", S, NA, NA),
+    FeatureEntry::new("window.partition_by", "WINDOW", "PARTITION BY inside OVER", S, NA, NA),
+    FeatureEntry::new("window.order_by", "WINDOW", "ORDER BY inside OVER", S, NA, NA),
+    FeatureEntry::new("window.rows_range", "WINDOW", "ROWS / RANGE frame specification", S, NA, NA),
     FeatureEntry::new(
         "window.rank_dense_rank",
         "WINDOW",
         "RANK(), DENSE_RANK(), ROW_NUMBER()",
         S,
+        NA,
+        NA,
     ),
-    FeatureEntry::new("window.lead_lag", "WINDOW", "LEAD() and LAG()", S),
+    FeatureEntry::new("window.lead_lag", "WINDOW", "LEAD() and LAG()", S, NA, NA),
     FeatureEntry::new(
         "window.first_last_value",
         "WINDOW",
         "FIRST_VALUE() and LAST_VALUE()",
         S,
+        NA,
+        NA,
     ),
-    FeatureEntry::new("window.nth_value", "WINDOW", "NTH_VALUE()", S),
-    FeatureEntry::new("window.ntile", "WINDOW", "NTILE(n)", S),
+    FeatureEntry::new("window.nth_value", "WINDOW", "NTH_VALUE()", S, NA, NA),
+    FeatureEntry::new("window.ntile", "WINDOW", "NTILE(n)", S, NA, NA),
     FeatureEntry::new(
         "window.cume_dist_percent",
         "WINDOW",
         "CUME_DIST() and PERCENT_RANK()",
         S,
+        NA,
+        NA,
     ),
     FeatureEntry::new(
         "window.tumble",
         "WINDOW",
         "TUMBLE(col, interval) streaming window",
         S,
-    ),
-    FeatureEntry::new(
-        "window.hop",
-        "WINDOW",
-        "HOP(col, slide, size) sliding window",
         S,
-    ),
-    FeatureEntry::new(
-        "window.session",
-        "WINDOW",
-        "Session window on inactivity gap",
-        S,
-    ),
+        P,
+    )
+    .with_note("batch rewrites the TVF to scalar UDFs (streaming_tvf.rs); streaming compiles it natively"),
+    FeatureEntry::new("window.hop", "WINDOW", "HOP(col, slide, size) sliding window", S, S, P),
+    FeatureEntry::new("window.session", "WINDOW", "Session window on inactivity gap", S, S, NA),
     // ── CTE ──────────────────────────────────────────────────────────────────
-    FeatureEntry::new(
-        "cte.non_recursive",
-        "CTE",
-        "WITH … AS (…) non-recursive CTEs",
-        S,
-    ),
+    FeatureEntry::new("cte.non_recursive", "CTE", "WITH … AS (…) non-recursive CTEs", S, P, P),
     FeatureEntry::new(
         "cte.recursive",
         "CTE",
         "WITH RECURSIVE … (UNION ALL base + recursive)",
         S,
+        NA,
+        NA,
     ),
-    FeatureEntry::new("cte.multiple", "CTE", "Multiple CTEs in one WITH clause", S),
+    FeatureEntry::new("cte.multiple", "CTE", "Multiple CTEs in one WITH clause", S, P, P),
     // ── SET OPERATIONS ────────────────────────────────────────────────────────
-    FeatureEntry::new("set.union_all", "SET", "UNION ALL", S),
-    FeatureEntry::new("set.union_distinct", "SET", "UNION (DISTINCT)", S),
-    FeatureEntry::new("set.intersect", "SET", "INTERSECT", S),
-    FeatureEntry::new("set.except", "SET", "EXCEPT", S),
+    FeatureEntry::new("set.union_all", "SET", "UNION ALL", S, P, P),
+    FeatureEntry::new("set.union_distinct", "SET", "UNION (DISTINCT)", S, NA, P),
+    FeatureEntry::new("set.intersect", "SET", "INTERSECT", S, NA, P),
+    FeatureEntry::new("set.except", "SET", "EXCEPT", S, NA, P),
     // ── LATERAL / UNNEST ─────────────────────────────────────────────────────
-    FeatureEntry::new(
-        "lateral.unnest",
-        "LATERAL",
-        "UNNEST(array_col) in FROM clause",
-        S,
-    ),
-    FeatureEntry::new(
+    FeatureEntry::batch_only("lateral.unnest", "LATERAL", "UNNEST(array_col) in FROM clause", S),
+    FeatureEntry::batch_only(
         "lateral.generate_series",
         "LATERAL",
         "generate_series() table function",
         S,
     ),
-    FeatureEntry::new(
+    FeatureEntry::batch_only(
         "lateral.cross_join_unnest",
         "LATERAL",
         "CROSS JOIN UNNEST(…) AS t(col)",
         S,
     ),
     // ── PIVOT / UNPIVOT ───────────────────────────────────────────────────────
-    FeatureEntry::new(
-        "pivot.pivot",
-        "PIVOT",
-        "PIVOT(agg FOR col IN (v1, v2, …))",
+    FeatureEntry::batch_only("pivot.pivot", "PIVOT", "PIVOT(agg FOR col IN (v1, v2, …))", S),
+    FeatureEntry::batch_only("pivot.unpivot", "PIVOT", "UNPIVOT(value FOR col IN (c1, c2, …))", S),
+    // ── FUNCTIONS: JSON (Phase 60) ───────────────────────────────────────────
+    FeatureEntry::batch_only(
+        "functions.json.get_json_object",
+        "FUNCTIONS",
+        "get_json_object(json, path) Spark JSONPath extraction",
         S,
     ),
-    FeatureEntry::new(
-        "pivot.unpivot",
-        "PIVOT",
-        "UNPIVOT(value FOR col IN (c1, c2, …))",
+    FeatureEntry::batch_only(
+        "functions.json.json_array_length",
+        "FUNCTIONS",
+        "json_array_length(json) top-level array element count",
         S,
+    ),
+    FeatureEntry::batch_only(
+        "functions.json.from_to_json",
+        "FUNCTIONS",
+        "from_json / to_json struct⇄JSON conversion",
+        PL,
+    )
+    .with_note(
+        "requires a typed arrow⇄JSON converter + a Spark-DDL schema parser with Spark's \
+         version-specific null-field/timestamp rules; itemized shortfall, not shipped approximate",
+    ),
+    FeatureEntry::batch_only(
+        "functions.json.json_tuple",
+        "FUNCTIONS",
+        "json_tuple(json, k1, k2, …) multi-key extraction (generator)",
+        PL,
+    )
+    .with_note("needs table-generating/LATERAL VIEW machinery; use get_json_object per key today"),
+    FeatureEntry::batch_only(
+        "functions.json.schema_of_json",
+        "FUNCTIONS",
+        "schema_of_json(json) infer a DDL schema string",
+        PL,
+    ),
+    // ── FUNCTIONS: higher-order array lambdas (Phase 60) ─────────────────────
+    FeatureEntry::batch_only(
+        "functions.hof.transform",
+        "FUNCTIONS",
+        "transform(array, x -> …) — Spark alias for array_transform",
+        S,
+    ),
+    FeatureEntry::batch_only(
+        "functions.hof.filter",
+        "FUNCTIONS",
+        "filter(array, x -> …) — Spark alias for array_filter",
+        S,
+    ),
+    FeatureEntry::batch_only(
+        "functions.hof.exists",
+        "FUNCTIONS",
+        "exists / any_match(array, x -> …) predicate-any",
+        P,
+    )
+    .with_note(
+        "any_match is reachable; the `exists(...)` spelling is shadowed by the EXISTS-subquery \
+         keyword in the parser (documented dialect difference)",
+    ),
+    FeatureEntry::batch_only(
+        "functions.hof.forall",
+        "FUNCTIONS",
+        "forall(array, x -> …) predicate-all (new, exact all-match)",
+        S,
+    ),
+    FeatureEntry::batch_only(
+        "functions.hof.aggregate_zip_map",
+        "FUNCTIONS",
+        "aggregate/reduce, zip_with, map_filter, transform_keys/values",
+        PL,
+    )
+    .with_note("require DataFusion's multi-step lambda / map-lambda protocol; itemized shortfall"),
+    // ── FUNCTIONS: Spark scalar alias layer (Phase 60) ───────────────────────
+    FeatureEntry::batch_only(
+        "functions.spark.nvl",
+        "FUNCTIONS",
+        "nvl / nvl2 null-coalescing (DataFusion-native, exact)",
+        S,
+    ),
+    FeatureEntry::batch_only(
+        "functions.spark.substring_index",
+        "FUNCTIONS",
+        "substring_index(str, delim, count) (DataFusion-native, exact)",
+        S,
+    ),
+    FeatureEntry::batch_only(
+        "functions.spark.date_format",
+        "FUNCTIONS",
+        "date_format(ts, fmt) with **Spark** pattern letters (yyyy-MM-dd)",
+        S,
+    )
+    .with_note(
+        "supported Spark pattern letters translate exactly to chrono; unsupported letters \
+         (era/timezone) error clearly rather than emitting wrong output. Differs from \
+         DataFusion's chrono-pattern date_format — see honesty page.",
+    ),
+    FeatureEntry::batch_only(
+        "functions.spark.crc32",
+        "FUNCTIONS",
+        "crc32(expr) IEEE CRC-32 as BIGINT (exact)",
+        S,
+    ),
+    FeatureEntry::batch_only(
+        "functions.spark.hash_generators",
+        "FUNCTIONS",
+        "xxhash64, stack, posexplode, inline",
+        PL,
+    )
+    .with_note(
+        "xxhash64 needs byte-exact replication of Spark's seed-42 typed hashing; \
+         stack/posexplode/inline need generator machinery — itemized shortfall",
     ),
     // ── DML ──────────────────────────────────────────────────────────────────
-    FeatureEntry::new("dml.copy_to", "DML", "COPY (query) TO 'path' (FORMAT …)", S).with_note(
-        "inherited from DataFusion's native parser/planner; no Krishiv-side code involved",
-    ),
-    FeatureEntry::new("dml.insert_into", "DML", "INSERT INTO table SELECT …", S),
-    FeatureEntry::new(
+    FeatureEntry::batch_only("dml.copy_to", "DML", "COPY (query) TO 'path' (FORMAT …)", S)
+        .with_note("inherited from DataFusion's native parser/planner; no Krishiv-side code involved"),
+    FeatureEntry::new("dml.insert_into", "DML", "INSERT INTO table SELECT …", S, NA, NA),
+    FeatureEntry::batch_only(
         "dml.insert_overwrite",
         "DML",
         "INSERT OVERWRITE (full partition replace)",
         S,
     ),
-    FeatureEntry::new("dml.delete", "DML", "DELETE FROM table WHERE …", P)
+    FeatureEntry::batch_only("dml.delete", "DML", "DELETE FROM table WHERE …", P)
         .with_note("supported on Iceberg tables; in-memory and Parquet tables require rewrite"),
-    FeatureEntry::new("dml.update", "DML", "UPDATE table SET col = … WHERE …", P)
+    FeatureEntry::batch_only("dml.update", "DML", "UPDATE table SET col = … WHERE …", P)
         .with_note("supported on Iceberg tables via MERGE rewrite"),
-    FeatureEntry::new(
+    FeatureEntry::batch_only(
         "dml.merge",
         "DML",
         "MERGE INTO target USING source ON … WHEN MATCHED …",
         S,
     ),
-    FeatureEntry::new(
+    FeatureEntry::batch_only(
         "dml.iceberg_merge",
         "DML",
         "Atomic Iceberg MERGE with row-level deletes",
         S,
     ),
+    FeatureEntry::batch_only("dml.truncate", "DML", "TRUNCATE TABLE (Iceberg + memory)", S)
+        .with_note("Phase 60 statement completion"),
     // ── DDL ──────────────────────────────────────────────────────────────────
-    FeatureEntry::new(
+    FeatureEntry::batch_only(
         "ddl.create_external_table",
         "DDL",
         "CREATE EXTERNAL TABLE … STORED AS …",
         S,
     ),
-    FeatureEntry::new("ddl.create_view", "DDL", "CREATE VIEW name AS SELECT …", S),
-    FeatureEntry::new(
+    FeatureEntry::batch_only("ddl.create_view", "DDL", "CREATE VIEW name AS SELECT …", S),
+    FeatureEntry::batch_only(
         "ddl.create_function",
         "DDL",
         "CREATE FUNCTION … LANGUAGE SQL|PYTHON",
         S,
     ),
-    FeatureEntry::new("ddl.drop_table", "DDL", "DROP TABLE [IF EXISTS]", S),
-    FeatureEntry::new("ddl.drop_view", "DDL", "DROP VIEW [IF EXISTS]", S),
-    FeatureEntry::new(
-        "ddl.create_table_as",
-        "DDL",
-        "CREATE TABLE … AS SELECT (CTAS)",
-        S,
-    )
-    .with_note("durable Iceberg landing when the target resolves to a registered Iceberg catalog; session table otherwise"),
-    FeatureEntry::new(
+    FeatureEntry::batch_only("ddl.drop_table", "DDL", "DROP TABLE [IF EXISTS]", S),
+    FeatureEntry::batch_only("ddl.drop_view", "DDL", "DROP VIEW [IF EXISTS]", S),
+    FeatureEntry::batch_only("ddl.create_table_as", "DDL", "CREATE TABLE … AS SELECT (CTAS)", S)
+        .with_note("durable Iceberg landing (G17) when the target resolves to a registered Iceberg catalog; session table otherwise"),
+    FeatureEntry::batch_only(
         "ddl.partitioned_by",
         "DDL",
-        "CREATE TABLE … PARTITIONED BY (col | bucket(n, col) | truncate(w, col) | year/month/day/hour(col)) AS SELECT",
+        "CREATE TABLE … PARTITIONED BY (col | bucket/truncate/year/month/day/hour(col)) AS SELECT",
         S,
     )
     .with_note("Iceberg catalog tables only; transforms follow the Iceberg partition spec"),
-    FeatureEntry::new(
-        "ddl.alter_table",
-        "DDL",
-        "ALTER TABLE ADD/DROP COLUMN, RENAME",
-        P,
-    )
-    .with_note("Iceberg schema evolution via ALTER TABLE is supported"),
-    FeatureEntry::new("ddl.create_schema", "DDL", "CREATE SCHEMA name", S)
+    FeatureEntry::batch_only("ddl.alter_table", "DDL", "ALTER TABLE ADD/DROP COLUMN, RENAME", P)
+        .with_note("Iceberg schema evolution via ALTER TABLE is supported"),
+    FeatureEntry::batch_only("ddl.create_schema", "DDL", "CREATE SCHEMA name", S)
         .with_note("inherited from DataFusion's native catalog; no Krishiv-side code involved"),
-    // ── TEMPORAL ─────────────────────────────────────────────────────────────
     FeatureEntry::new(
-        "temporal.as_of",
-        "TEMPORAL",
-        "AS OF TIMESTAMP point-in-time queries",
+        "ddl.create_materialized_view",
+        "DDL",
+        "CREATE MATERIALIZED VIEW … AS SELECT → IVM view (REFRESH/DROP)",
+        NA,
+        NA,
+        PL,
+    )
+    .with_note("Phase 60 SQL-DDL-for-IVM task; engine primitive under the platform's governed pipelines"),
+    FeatureEntry::new(
+        "ddl.create_streaming_table",
+        "DDL",
+        "CREATE STREAMING TABLE … AS SELECT → continuous job",
+        NA,
+        PL,
+        NA,
+    )
+    .with_note("Phase 60 SQL-DDL-for-streaming task"),
+    FeatureEntry::batch_only(
+        "ddl.live_table",
+        "DDL",
+        "CREATE / REFRESH / DROP LIVE TABLE via session.sql()",
         S,
     ),
+    // ── CONNECTOR DDL (Phase 60) ─────────────────────────────────────────────
+    FeatureEntry::batch_only(
+        "ddl.connector_source_sink",
+        "DDL",
+        "CREATE SOURCE/SINK … WITH (connector=…) resolved through the connector registry",
+        P,
+    )
+    .with_note(
+        "registry-backed dispatch replacing the parquet-only hardcoded factory (audit §8b); \
+         supported kinds come from connector descriptors, unsupported kinds fail loudly",
+    ),
+    // ── SESSION / CONFIG STATEMENTS (Phase 60) ───────────────────────────────
+    FeatureEntry::batch_only("stmt.set_reset", "SESSION", "SET / RESET / SET TIMEZONE session config", S),
+    FeatureEntry::batch_only("stmt.use", "SESSION", "USE [CATALOG|SCHEMA] current-namespace", S),
+    FeatureEntry::batch_only(
+        "stmt.cache",
+        "SESSION",
+        "CACHE / UNCACHE / CLEAR CACHE TABLE (session materialization)",
+        S,
+    ),
+    // ── SHOW / DESCRIBE (Phase 60) ───────────────────────────────────────────
+    FeatureEntry::batch_only(
+        "show.tables_databases_functions",
+        "SHOW",
+        "SHOW TABLES | DATABASES | FUNCTIONS | VIEWS | PARTITIONS | CREATE TABLE",
+        S,
+    ),
+    FeatureEntry::batch_only(
+        "describe.function_database_query",
+        "DESCRIBE",
+        "DESCRIBE FUNCTION | DATABASE | QUERY",
+        S,
+    ),
+    // ── TEMPORAL ─────────────────────────────────────────────────────────────
+    FeatureEntry::batch_only("temporal.as_of", "TEMPORAL", "AS OF TIMESTAMP point-in-time queries", S),
     FeatureEntry::new(
         "temporal.match_recognize",
         "TEMPORAL",
         "MATCH_RECOGNIZE pattern matching over ordered rows",
         P,
+        P,
+        NA,
     )
     .with_note(
-        "streaming CEP subset only: PARTITION BY / ORDER BY / PATTERN (…) / WITHIN <duration>; \
-         no DEFINE (pattern-variable predicates) or MEASURES (computed output) clauses, unlike \
-         Oracle/Flink's full MATCH_RECOGNIZE grammar",
+        "streaming CEP subset: PARTITION BY / ORDER BY / PATTERN (…) / WITHIN <duration>; \
+         DEFINE (pattern-variable predicates) and MEASURES (computed output) clauses are the \
+         remaining gap vs Oracle/Flink's full grammar",
     ),
-    FeatureEntry::new(
+    FeatureEntry::batch_only(
         "temporal.system_time",
         "TEMPORAL",
         "FOR SYSTEM_TIME AS OF (Iceberg time-travel)",
@@ -428,131 +739,85 @@ static FEATURES: &[FeatureEntry] = &[
     )
     .with_note("alias for AS OF on Iceberg tables"),
     // ── PREPARED STATEMENTS ───────────────────────────────────────────────────
-    FeatureEntry::new(
+    FeatureEntry::batch_only(
         "prepared.create",
         "PREPARED",
         "CREATE PREPARED STATEMENT via Flight SQL action",
         S,
     ),
-    FeatureEntry::new(
-        "prepared.execute",
-        "PREPARED",
-        "Execute prepared statement by handle",
-        S,
-    ),
-    FeatureEntry::new(
+    FeatureEntry::batch_only("prepared.execute", "PREPARED", "Execute prepared statement by handle", S),
+    FeatureEntry::batch_only(
         "prepared.close",
         "PREPARED",
         "CLOSE PREPARED STATEMENT to release server memory",
         S,
     ),
-    FeatureEntry::new(
+    FeatureEntry::batch_only(
         "prepared.parameters",
         "PREPARED",
         "Positional parameter binding ($1, $2, …)",
         S,
     )
     .with_note("local PreparedStatement::bind and Flight SQL DoPut parameter batches"),
-    FeatureEntry::new(
+    FeatureEntry::batch_only(
         "prepared.sql_text",
         "PREPARED",
         "PREPARE name AS …; EXECUTE name(…); DEALLOCATE name",
         S,
     )
-    .with_note(
-        "inherited from DataFusion's native parser/planner (session-scoped named plans); \
-         distinct from the Flight SQL protocol-level prepared statement actions above",
-    ),
+    .with_note("inherited from DataFusion's native parser/planner (session-scoped named plans)"),
     // ── OPERATION CONTROL ────────────────────────────────────────────────────
-    FeatureEntry::new(
-        "operation.id",
-        "OPERATION",
-        "Operation IDs for query tracking",
-        S,
-    ),
-    FeatureEntry::new(
-        "operation.cancel",
-        "OPERATION",
-        "Cancel a running operation by ID",
-        S,
-    ),
-    FeatureEntry::new(
-        "operation.timeout",
-        "OPERATION",
-        "Per-query execution timeout",
-        S,
-    ),
+    FeatureEntry::new("operation.id", "OPERATION", "Operation IDs for query tracking", S, S, S),
+    FeatureEntry::new("operation.cancel", "OPERATION", "Cancel a running operation by ID", S, S, S),
+    FeatureEntry::new("operation.timeout", "OPERATION", "Per-query execution timeout", S, NA, NA),
     FeatureEntry::new(
         "operation.progress",
         "OPERATION",
         "Query progress reporting via QueryHandle",
         S,
-    ),
-    // ── ERROR HANDLING ────────────────────────────────────────────────────────
-    FeatureEntry::new(
-        "error.sqlstate",
-        "ERROR",
-        "SQLSTATE codes on error responses",
+        S,
         S,
     ),
-    FeatureEntry::new(
-        "error.error_position",
-        "ERROR",
-        "Source line/column in error messages",
-        P,
-    )
-    .with_note("DataFusion provides message but not structured position"),
+    // ── ERROR HANDLING ────────────────────────────────────────────────────────
+    FeatureEntry::batch_only("error.sqlstate", "ERROR", "SQLSTATE codes on error responses", S),
+    FeatureEntry::batch_only("error.error_position", "ERROR", "Source line/column in error messages", P)
+        .with_note("DataFusion provides message but not structured position"),
     // ── FLIGHT SQL ────────────────────────────────────────────────────────────
-    FeatureEntry::new(
+    FeatureEntry::batch_only(
         "flight.get_flight_info",
         "FLIGHT SQL",
         "GetFlightInfo for statement execution",
         S,
     ),
-    FeatureEntry::new(
-        "flight.do_get",
-        "FLIGHT SQL",
-        "DoGet streaming result delivery",
-        S,
-    ),
-    FeatureEntry::new(
+    FeatureEntry::batch_only("flight.do_get", "FLIGHT SQL", "DoGet streaming result delivery", S),
+    FeatureEntry::batch_only(
         "flight.prepared_statements",
         "FLIGHT SQL",
         "Prepared statement create/execute/close",
         S,
     ),
-    FeatureEntry::new(
+    FeatureEntry::batch_only(
         "flight.do_action",
         "FLIGHT SQL",
         "DoAction for custom Krishiv operations",
         S,
     ),
-    FeatureEntry::new(
+    FeatureEntry::batch_only(
         "flight.get_sql_info",
         "FLIGHT SQL",
         "GetSqlInfo capability introspection",
         S,
     ),
-    FeatureEntry::new(
-        "flight.auth",
-        "FLIGHT SQL",
-        "Bearer token authentication",
-        S,
-    ),
-    FeatureEntry::new(
-        "flight.policy",
-        "FLIGHT SQL",
-        "Table-level access policy enforcement",
-        S,
-    ),
-    FeatureEntry::new(
+    FeatureEntry::batch_only("flight.auth", "FLIGHT SQL", "Bearer token authentication", S),
+    FeatureEntry::batch_only("flight.policy", "FLIGHT SQL", "Table-level access policy enforcement", S),
+    FeatureEntry::batch_only(
         "flight.transactions",
         "FLIGHT SQL",
         "BEGIN/COMMIT/ROLLBACK transactions",
         P,
     )
     .with_note("Flight SQL BeginTransaction/EndTransaction actions; SQL BEGIN/COMMIT not routed"),
-    FeatureEntry::new(
+    FeatureEntry::batch_only(
         "flight.schemas",
         "FLIGHT SQL",
         "GetDbSchemas / GetTables catalog introspection",
@@ -564,67 +829,68 @@ static FEATURES: &[FeatureEntry] = &[
         "streaming.continuous_select",
         "STREAMING",
         "Continuous SELECT over unbounded input",
+        NA,
         S,
+        NA,
     ),
     FeatureEntry::new(
         "streaming.window_agg",
         "STREAMING",
         "Windowed aggregations over streaming input",
+        NA,
         S,
+        P,
     ),
     FeatureEntry::new(
         "streaming.watermark",
         "STREAMING",
         "Event-time watermarks for late-data handling",
+        NA,
         S,
+        NA,
     ),
     FeatureEntry::new(
         "streaming.interval_join",
         "STREAMING",
         "Streaming-to-streaming interval join",
+        NA,
         S,
+        NA,
     ),
-    FeatureEntry::new(
-        "streaming.cep",
-        "STREAMING",
-        "MATCH_RECOGNIZE CEP over streaming input",
-        S,
-    ),
+    FeatureEntry::new("streaming.cep", "STREAMING", "MATCH_RECOGNIZE CEP over streaming input", NA, S, NA),
     FeatureEntry::new(
         "streaming.dedup",
         "STREAMING",
         "Streaming deduplication (dropDuplicates)",
+        NA,
         S,
+        NA,
     ),
     FeatureEntry::new(
         "streaming.sink_modes",
         "STREAMING",
         "Append / Update / Complete output modes",
+        NA,
         S,
+        P,
     ),
     // ── INTROSPECTION ─────────────────────────────────────────────────────────
-    FeatureEntry::new(
+    FeatureEntry::batch_only(
         "introspection.describe",
         "INTROSPECTION",
         "DESCRIBE / DESC / SHOW COLUMNS table schema",
         S,
     ),
-    FeatureEntry::new(
+    FeatureEntry::batch_only(
         "introspection.explain",
         "INTROSPECTION",
         "EXPLAIN [LOGICAL|PHYSICAL|ANALYZE] query plans",
         S,
     ),
-    FeatureEntry::new(
+    FeatureEntry::batch_only(
         "introspection.information_schema",
         "INTROSPECTION",
         "information_schema.{tables,columns,views,df_settings,routines,parameters,schemata}",
-        S,
-    ),
-    FeatureEntry::new(
-        "ddl.live_table",
-        "DDL",
-        "CREATE / REFRESH / DROP LIVE TABLE via session.sql()",
         S,
     ),
 ];
@@ -640,10 +906,21 @@ mod tests {
 
     #[test]
     fn all_ids_are_unique() {
-        let ids: Vec<&str> = feature_matrix().iter().map(|e| e.id).collect();
         let mut seen = std::collections::HashSet::new();
-        for id in &ids {
-            assert!(seen.insert(*id), "duplicate feature id: {id}");
+        for e in feature_matrix() {
+            assert!(seen.insert(e.id), "duplicate feature id: {}", e.id);
+        }
+    }
+
+    #[test]
+    fn every_entry_has_at_least_one_non_na_engine() {
+        // A row that is n/a in all three engines is meaningless.
+        for e in feature_matrix() {
+            assert!(
+                e.batch != NA || e.streaming != NA || e.incremental != NA,
+                "feature {} is n/a in every engine",
+                e.id
+            );
         }
     }
 
@@ -658,47 +935,40 @@ mod tests {
 
     #[test]
     fn features_by_status_supported_is_non_empty() {
-        let supported = features_by_status(FeatureStatus::Supported);
-        assert!(!supported.is_empty());
+        assert!(!features_by_status(FeatureStatus::Supported).is_empty());
     }
 
     #[test]
-    fn feature_entry_display_includes_id_and_status() {
-        let entry = feature_matrix()
-            .iter()
-            .find(|e| e.id == "select.distinct")
-            .unwrap();
+    fn feature_entry_display_includes_id_and_engines() {
+        let entry = feature_matrix().iter().find(|e| e.id == "window.tumble").unwrap();
         let s = entry.to_string();
-        assert!(s.contains("select.distinct"));
-        assert!(s.contains("supported"));
+        assert!(s.contains("window.tumble"));
+        assert!(s.contains("batch:supported"));
+        assert!(s.contains("streaming:supported"));
     }
 
     #[test]
-    fn feature_entry_display_with_note() {
-        let entry = feature_matrix().iter().find(|e| e.note.is_some()).unwrap();
-        let s = entry.to_string();
-        assert!(s.contains('('));
+    fn generated_reference_has_all_three_engine_columns() {
+        let md = generate_reference_markdown();
+        assert!(md.contains("| Batch | Streaming | Incremental |"));
+        // Spot-check a per-engine divergence is rendered.
+        assert!(md.contains("`window.tumble`"));
+        assert!(md.contains("`functions.hof.forall`"));
     }
 
     #[test]
-    fn feature_status_display() {
-        assert_eq!(FeatureStatus::Supported.to_string(), "supported");
-        assert_eq!(FeatureStatus::Partial.to_string(), "partial");
-        assert_eq!(FeatureStatus::Planned.to_string(), "planned");
-        assert_eq!(FeatureStatus::NotApplicable.to_string(), "n/a");
+    fn drift_check_ctas_is_supported_not_partial() {
+        // Regression: CTAS was marked Partial after G17 shipped durable Iceberg CTAS.
+        let ctas = feature_matrix().iter().find(|e| e.id == "ddl.create_table_as").unwrap();
+        assert_eq!(ctas.batch, FeatureStatus::Supported);
     }
 
     #[test]
-    fn flight_sql_features_present() {
-        let flight = features_for_category("FLIGHT");
-        assert!(flight.iter().any(|e| e.id == "flight.get_flight_info"));
-        assert!(flight.iter().any(|e| e.id == "flight.prepared_statements"));
-    }
-
-    #[test]
-    fn operation_features_present() {
-        let ops = features_for_category("OPERATION");
-        assert!(ops.iter().any(|e| e.id == "operation.cancel"));
-        assert!(ops.iter().any(|e| e.id == "operation.timeout"));
+    fn drift_check_interval_join_has_no_batch_sql_path() {
+        // Regression: join.interval was over-claimed as batch Supported; it is
+        // DataFrame-only with no SQL planning path (audit §9b).
+        let ij = feature_matrix().iter().find(|e| e.id == "join.interval").unwrap();
+        assert_eq!(ij.batch, FeatureStatus::Planned);
+        assert_eq!(ij.streaming, FeatureStatus::Partial);
     }
 }

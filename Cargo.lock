@@ -6163,6 +6163,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "datafusion 54.0.0",
+ "datafusion-functions-nested 54.0.0",
  "datafusion-proto",
  "futures",
  "iceberg",

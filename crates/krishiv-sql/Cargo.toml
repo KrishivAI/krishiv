@@ -22,6 +22,9 @@ datafusion = { workspace = true }
 # (ADR-0003): the coordinator serializes per-stage plan subtrees and the
 # executor deserializes them, replacing stringly `sql:` task bodies.
 datafusion-proto = { workspace = true }
+# Native higher-order array functions; the Spark-parity HOF aliases
+# (transform/filter/exists) delegate to these for byte-for-byte semantics.
+datafusion-functions-nested = { workspace = true }
 # Baseline connectors: parquet (default) + kafka + s3 + lakehouse. `lakehouse`
 # carries the Delta/Hudi table readers and the AS-OF time-travel types that this
 # crate's `lakehouse` module uses unconditionally (it is light — no Iceberg).

@@ -82,6 +82,10 @@ askama = "0.16.0"
 axum = "0.8.9"
 datafusion = "54.0.0"
 datafusion-proto = "54.0.0"
+# Higher-order array functions (array_transform/filter/any_match) that the
+# Spark-parity HOF layer (transform/filter/exists/forall) delegates to for
+# exact semantics. Pinned to the datafusion 54 train.
+datafusion-functions-nested = "54.0.0"
 futures = "0.3"
 k8s-openapi = { version = "0.27.1", features = ["v1_31"] }
 kube = { version = "3.1.0", features = ["runtime"] }
