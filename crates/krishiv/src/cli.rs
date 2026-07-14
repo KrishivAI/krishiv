@@ -119,6 +119,9 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
 
     match args {
         [] | ["--help"] | ["-h"] | ["help"] => CliResponse::ok(main_help()),
+        ["capabilities"] | ["capabilities", ..] | ["--capabilities"] => {
+            CliResponse::ok(crate::capabilities::report())
+        }
         ["sql"] | ["sql", "--help"] | ["sql", "-h"] => {
             CliResponse::ok(crate::query_cli::sql_help())
         }
@@ -217,6 +220,7 @@ pub fn main_help() -> String {
            ivm          Incremental view maintenance (delta-batch) jobs\n\
            table        Read parquet, delta, or hudi tables\n\
            doctor       Print the effective deployment configuration\n\
+           capabilities Show which optional features this binary was built with\n\
            submit       Submit a distributed job to the R2 local scheduler\n\
            jobs         List local jobs for this process\n\
            state        Inspect streaming operator state metadata (R5.2)\n\

@@ -18,9 +18,9 @@ path = "src/lib.rs"
 # lakehouse format; enable `iceberg` or the `full` engine preset when needed.
 default = ["parquet"]
 
-# Core batch/object-store connectors
+# Core batch/object-store connectors. Object-store backends (S3/GCS/Azure) are
+# gated by `cloud`; there is no separate `s3` feature (it gated no code).
 parquet = []
-s3 = []
 two-phase = ["parquet"]
 # E6.1: Avro file source and sink
 avro = ["dep:apache-avro"]
@@ -56,7 +56,7 @@ qdrant = ["vector-sinks", "dep:qdrant-client"]
 pgvector = ["vector-sinks", "dep:sqlx"]
 
 # Convenience presets
-local = ["parquet", "s3", "kafka", "two-phase"]
+local = ["parquet", "kafka", "two-phase"]
 # Standard full compute-engine build. AI/vector and secondary lakehouse formats
 # remain opt-in and are intentionally excluded.
 full = [

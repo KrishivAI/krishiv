@@ -21,6 +21,13 @@ pub fn try_run_daemon(args: &[String]) -> Option<i32> {
         | "shuffle-svc" | "mcp" | "health" => {}
         _ => return None,
     }
+    // Boot banner (flag-minimization plan): announce the compiled-in capability
+    // set before the daemon starts, so a missing `kafka`/`cloud`/etc. is visible
+    // in `kubectl logs` instead of surfacing as a first-job failure. Emitted via
+    // eprintln because per-daemon tracing is not yet initialised at this point.
+    if sub != "health" {
+        eprintln!("krishiv capabilities: {}", crate::capabilities::summary());
+    }
     let rest: Vec<String> = args.iter().skip(1).cloned().collect();
     let code = match sub {
         "coordinator" => run_coordinator(&rest),

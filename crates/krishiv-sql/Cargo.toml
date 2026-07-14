@@ -28,7 +28,7 @@ datafusion-proto = { workspace = true }
 # The heavyweight Iceberg tree (iceberg, iceberg-datafusion, datafusion-iceberg)
 # is NOT pulled here; it is enabled on demand by this crate's `iceberg` /
 # `iceberg-datafusion` / `*-catalog` features so lean builds (embedded) omit it.
-krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["kafka", "s3", "lakehouse"] }
+krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["kafka", "lakehouse"] }
 krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
 krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
 regex = { workspace = true }

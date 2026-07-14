@@ -36,16 +36,19 @@ path = "src/main.rs"
 default = ["local"]
 
 # Build presets
-minimal = []
 local   = ["embedded", "single-node", "jemalloc", "rest-catalog", "iceberg"]
-full    = ["single-node", "distributed", "k8s", "kafka", "iceberg", "jemalloc"]
+full    = ["single-node", "distributed", "k8s", "kafka", "iceberg", "cloud", "jemalloc"]
+# `prod`: the deployed-cluster preset. Everything a distributed cluster needs to
+# run real workloads — Kafka sources, Iceberg tables on object storage, the
+# distributed control plane. `build-fast-engine.sh` builds THIS, not bare
+# default, so shipped images never silently lack kafka/cloud.
+prod    = ["distributed", "rest-catalog", "kafka", "iceberg", "cloud", "jemalloc"]
 
 # Deployment capability surfaces (gate optional dep families)
 embedded    = []                                                 # baseline; no optional deps
 single-node = ["flight-sql", "shuffle"]                        # local daemon + RocksDB metadata
 distributed = ["flight-sql", "shuffle", "etcd"]                 # remote cluster + etcd metadata
-bare-metal  = ["distributed"]                                    # alias: process-managed cluster
-cluster     = ["distributed"]                                    # alias: distributed
+bare-metal  = ["distributed"]                                    # alias: process-managed cluster (run_bare_metal.sh, justfile)
 k8s         = ["distributed", "dep:krishiv-operator", "krishiv-operator/k8s"]
 
 # Optional dependency families
@@ -57,6 +60,11 @@ shuffle = ["dep:krishiv-shuffle"]
 etcd = ["krishiv-scheduler/etcd"]
 kafka = ["krishiv-connectors/kafka"]
 state = ["krishiv-connectors/state"]
+# cloud: object-store backends (S3/GCS/Azure, MinIO-compatible) for Iceberg and
+# other lakehouse I/O. Without this, `s3://`/object-store URIs fail at runtime —
+# the gap that motivated the capability manifest. Propagates to the connectors
+# object_store cloud features.
+cloud = ["krishiv-connectors/cloud"]
 # krishiv-sql no longer enables Iceberg by default, so the binary's iceberg
 # preset must re-enable it on the SQL layer to keep full/k8s builds unchanged.
 iceberg = ["krishiv-connectors/iceberg", "krishiv-sql/iceberg", "krishiv-executor/iceberg"]
