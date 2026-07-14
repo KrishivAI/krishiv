@@ -55,14 +55,19 @@ pub fn open_shuffle_backend_from_uri(
         } else {
             format!("s3://{bucket}/{prefix}")
         };
-        let store = object_store::aws::AmazonS3Builder::from_env()
-            .with_url(&url)
-            .build()
-            .map_err(|e| {
-                ShuffleError::Io(std::io::Error::other(format!(
-                    "s3 shuffle store {url}: {e}"
-                )))
-            })?;
+        // AmazonS3Builder::from_env honours only AWS_ENDPOINT, not the AWS-SDK
+        // AWS_ENDPOINT_URL convention prod sets for MinIO/S3-compatible stores —
+        // without the override this silently targets real AWS and every request
+        // times out. Mirror the streaming sink / checkpoint store builders.
+        let mut builder = object_store::aws::AmazonS3Builder::from_env().with_url(&url);
+        if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL")
+            && !endpoint.is_empty()
+        {
+            builder = builder.with_endpoint(endpoint).with_allow_http(true);
+        }
+        let store = builder.build().map_err(|e| {
+            ShuffleError::Io(std::io::Error::other(format!("s3 shuffle store {url}: {e}")))
+        })?;
         let storage_prefix = if prefix.is_empty() {
             "shuffle".to_owned()
         } else {
@@ -108,14 +113,19 @@ pub fn open_tiered_shuffle_backend(
     } else {
         format!("s3://{bucket}/{prefix}")
     };
-    let store = object_store::aws::AmazonS3Builder::from_env()
-        .with_url(&url)
-        .build()
-        .map_err(|e| {
-            ShuffleError::Io(std::io::Error::other(format!(
-                "tiered shuffle s3 store {url}: {e}"
-            )))
-        })?;
+    // See the note in `open_shuffle_backend`: honour AWS_ENDPOINT_URL so
+    // MinIO/S3-compatible endpoints work instead of timing out against real AWS.
+    let mut builder = object_store::aws::AmazonS3Builder::from_env().with_url(&url);
+    if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL")
+        && !endpoint.is_empty()
+    {
+        builder = builder.with_endpoint(endpoint).with_allow_http(true);
+    }
+    let store = builder.build().map_err(|e| {
+        ShuffleError::Io(std::io::Error::other(format!(
+            "tiered shuffle s3 store {url}: {e}"
+        )))
+    })?;
     let storage_prefix = if prefix.is_empty() {
         "shuffle".to_owned()
     } else {

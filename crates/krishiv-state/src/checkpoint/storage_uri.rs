@@ -49,12 +49,22 @@ pub fn open_checkpoint_storage_from_uri(uri: &str) -> CheckpointResult<Arc<dyn C
         } else {
             format!("s3://{bucket}/{prefix}")
         };
-        let store = object_store::aws::AmazonS3Builder::from_env()
-            .with_url(&url)
-            .build()
-            .map_err(|e| CheckpointError::Storage {
-                message: format!("s3 checkpoint store {url}: {e}"),
-            })?;
+        // Mirror krishiv_connectors::lakehouse::object_store_io::build_s3_object_store:
+        // AmazonS3Builder::from_env honours only AWS_ENDPOINT, not the AWS-SDK
+        // AWS_ENDPOINT_URL convention prod sets for MinIO/S3-compatible stores —
+        // without the override the checkpoint store silently targets real AWS and
+        // every write times out (the streaming sink writes fine because it uses
+        // the endpoint-aware builder). Read AWS_ENDPOINT_URL here and allow plain
+        // HTTP so barrier checkpoints reach the same MinIO the sink does.
+        let mut builder = object_store::aws::AmazonS3Builder::from_env().with_url(&url);
+        if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL")
+            && !endpoint.is_empty()
+        {
+            builder = builder.with_endpoint(endpoint).with_allow_http(true);
+        }
+        let store = builder.build().map_err(|e| CheckpointError::Storage {
+            message: format!("s3 checkpoint store {url}: {e}"),
+        })?;
         // Use the parsed URI path as the storage prefix, falling back to
         // "checkpoints" when no path component was provided.
         let storage_prefix = if prefix.is_empty() {
