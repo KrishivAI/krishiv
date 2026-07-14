@@ -180,6 +180,8 @@ mod phase3_recovery {
             job_id: JobId::try_new(job).unwrap(),
             epoch,
             fencing_token: FencingToken::initial(),
+            sink_commit: Vec::new(),
+            sink_abort: Vec::new(),
         }
     }
 

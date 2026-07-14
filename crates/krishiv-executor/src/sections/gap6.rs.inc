@@ -868,6 +868,7 @@ async fn checkpoint_ack_delivered() {
             crate::runner::CheckpointStateHandle::from_backend(backend),
             Arc::new(storage),
             coordinator.clone(),
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -990,6 +991,7 @@ async fn checkpoint_ack_delivery_retries_transient_failure() {
             crate::runner::CheckpointStateHandle::from_backend(backend),
             Arc::new(storage),
             coordinator.clone(),
+            Vec::new(),
         )
         .await
         .unwrap();

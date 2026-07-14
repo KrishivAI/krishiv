@@ -166,6 +166,79 @@ impl TwoPhaseSinkRegistry {
         Ok((committed, aborted))
     }
 
+    /// DUR-2 reporting: the prepared-but-unfinalized sink transactions for
+    /// `job_id`, to be recorded in the checkpoint ack so the coordinator can
+    /// persist them in the checkpoint metadata and drive recovery after a
+    /// crash. Empty when no participant is registered or none staged durable
+    /// output.
+    pub fn prepared_refs(
+        &self,
+        job_id: &str,
+    ) -> ConnectorResult<Vec<krishiv_connectors::PreparedSinkRef>> {
+        let Some(participants) = self.inner.get(job_id) else {
+            return Ok(Vec::new());
+        };
+        let mut refs = Vec::new();
+        for participant in participants.iter() {
+            let guard = participant
+                .lock()
+                .map_err(|_| krishiv_connectors::ConnectorError::Protocol {
+                    message: format!("transactional sink lock poisoned for job {job_id}"),
+                })?;
+            refs.extend(guard.prepared_refs());
+        }
+        Ok(refs)
+    }
+
+    /// DUR-2 durable recovery: finalize prepared-sink transactions listed in a
+    /// `RestoreFromCheckpointCommand` by reconstructing them from their durable
+    /// prepare paths, rather than from the in-memory prepared log.
+    ///
+    /// Runs alongside [`Self::restore_to`]: `restore_to` covers the case where
+    /// only the coordinator restarted (the executor's in-memory log is intact);
+    /// this covers the executor-crash case where that log was lost, so the
+    /// prepared transactions must be re-derived from the durable checkpoint
+    /// refs. `finalize_prepared` is idempotent, so running both is safe.
+    ///
+    /// A no-op (with a warning) when no participant is registered for the job
+    /// yet — the task-recreation path registers one and reconciles then.
+    /// Returns `(committed, aborted)` counts.
+    pub fn recover_prepared_refs(
+        &self,
+        job_id: &str,
+        commit_paths: &[String],
+        abort_paths: &[String],
+    ) -> ConnectorResult<(usize, usize)> {
+        if commit_paths.is_empty() && abort_paths.is_empty() {
+            return Ok((0, 0));
+        }
+        let Some(participants) = self.inner.get(job_id) else {
+            tracing::warn!(
+                job_id,
+                commit = commit_paths.len(),
+                abort = abort_paths.len(),
+                "DUR-2 recovery refs received but no sink participant is registered yet; \
+                 deferring to task re-creation"
+            );
+            return Ok((0, 0));
+        };
+        let Some(first) = participants.first() else {
+            return Ok((0, 0));
+        };
+        let mut guard = first
+            .lock()
+            .map_err(|_| krishiv_connectors::ConnectorError::Protocol {
+                message: format!("transactional sink lock poisoned for job {job_id}"),
+            })?;
+        for path in commit_paths {
+            guard.finalize_prepared(path, true)?;
+        }
+        for path in abort_paths {
+            guard.finalize_prepared(path, false)?;
+        }
+        Ok((commit_paths.len(), abort_paths.len()))
+    }
+
     /// Cycle-aligned commit for continuous `stream:loop` jobs: prepare and
     /// commit everything staged during the cycle that just completed as one
     /// epoch.  Returns the committed epoch, or `None` when the job has no
@@ -293,5 +366,108 @@ mod tests {
         registry.pre_commit("nope", 1).unwrap();
         assert_eq!(registry.commit_through("nope", 1).unwrap(), 0);
         assert_eq!(registry.restore_to("nope", 1).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn recover_prepared_refs_noop_on_empty_and_unknown() {
+        let registry = TwoPhaseSinkRegistry::new();
+        // Empty ref lists: nothing to do, no participant lookup needed.
+        assert_eq!(
+            registry.recover_prepared_refs("job-x", &[], &[]).unwrap(),
+            (0, 0)
+        );
+        // Non-empty refs but no participant registered yet: warn + defer, but
+        // must not error (task re-creation reconciles).
+        assert_eq!(
+            registry
+                .recover_prepared_refs("job-x", &[String::from("/tmp/a.parquet.tmp")], &[])
+                .unwrap(),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn recover_prepared_refs_drives_durable_finalize_after_crash() {
+        use krishiv_connectors::LocalParquetTwoPhaseCommitSink;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Pre-crash executor: stage two epochs through a durable parquet sink.
+        // pre_commit writes `.tmp` staging files that survive a crash.
+        let pre_crash = TwoPhaseSinkRegistry::new();
+        let participant = pre_crash
+            .get_or_register("job-recover", || {
+                Ok(EpochTransactionLog::new(LocalParquetTwoPhaseCommitSink::new(
+                    dir.path(),
+                )))
+            })
+            .unwrap();
+        participant.lock().unwrap().stage(&batch()).unwrap();
+        pre_crash.pre_commit("job-recover", 1).unwrap();
+        participant.lock().unwrap().stage(&batch()).unwrap();
+        pre_crash.pre_commit("job-recover", 2).unwrap();
+
+        // The durable prepare paths the coordinator would carry in the
+        // checkpoint refs: the two `.tmp` staging files now on disk.
+        let mut tmp_paths: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.unwrap().path();
+                (p.extension().and_then(|x| x.to_str()) == Some("tmp"))
+                    .then(|| p.to_string_lossy().into_owned())
+            })
+            .collect();
+        tmp_paths.sort();
+        assert_eq!(tmp_paths.len(), 2, "two staged .tmp files exist pre-crash");
+
+        // Crash: the in-memory prepared log is gone. A fresh executor registers
+        // a brand-new participant on the same durable directory — its in-memory
+        // log is empty, so `restore_to` alone would silently lose the staged
+        // output. The DUR-2 durable drive must finalize from the refs instead.
+        let post_crash = TwoPhaseSinkRegistry::new();
+        let _fresh = post_crash
+            .get_or_register("job-recover", || {
+                Ok(EpochTransactionLog::new(LocalParquetTwoPhaseCommitSink::new(
+                    dir.path(),
+                )))
+            })
+            .unwrap();
+        // restore_to on the fresh (empty) log is a genuine no-op here.
+        assert_eq!(post_crash.restore_to("job-recover", 1).unwrap(), (0, 0));
+
+        // Restored epoch = 1: commit epoch-1's transaction, abort epoch-2's.
+        let (committed, aborted) = post_crash
+            .recover_prepared_refs(
+                "job-recover",
+                std::slice::from_ref(&tmp_paths[0]),
+                std::slice::from_ref(&tmp_paths[1]),
+            )
+            .unwrap();
+        assert_eq!((committed, aborted), (1, 1));
+
+        // The committed epoch's `.tmp` became a final `.parquet`; the aborted
+        // one was removed. No `.tmp` files should remain.
+        let remaining: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            remaining.iter().any(|n| n.ends_with(".parquet")),
+            "committed transaction produced a final parquet file: {remaining:?}"
+        );
+        assert!(
+            !remaining.iter().any(|n| n.ends_with(".tmp")),
+            "no staging files remain after recovery: {remaining:?}"
+        );
+
+        // Idempotent: re-running recovery must not error or double-commit.
+        let (c2, a2) = post_crash
+            .recover_prepared_refs(
+                "job-recover",
+                std::slice::from_ref(&tmp_paths[0]),
+                std::slice::from_ref(&tmp_paths[1]),
+            )
+            .unwrap();
+        assert_eq!((c2, a2), (1, 1), "recovery is idempotent");
     }
 }

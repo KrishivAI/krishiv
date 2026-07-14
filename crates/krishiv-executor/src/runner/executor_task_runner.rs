@@ -1249,6 +1249,7 @@ impl ExecutorTaskRunner {
         state: CheckpointStateHandle,
         storage: Arc<dyn CheckpointStorage>,
         coordinator: S,
+        sink_transactions: Vec<krishiv_proto::SinkTransactionRef>,
     ) -> Result<CheckpointAckResponse, tonic::Status>
     where
         S: CoordinatorExecutorService + Clone + 'static,
@@ -1265,7 +1266,8 @@ impl ExecutorTaskRunner {
             .clone();
         // DashMap shard lock is now fully released; runner_arc keeps state alive.
 
-        let ack = tokio::task::spawn_blocking(move || {
+        let epoch = req.epoch;
+        let mut ack = tokio::task::spawn_blocking(move || {
             let mut runner = runner_arc
                 .lock()
                 .map_err(|_| ExecutorError::LocalExecution {
@@ -1276,6 +1278,17 @@ impl ExecutorTaskRunner {
         .await
         .map_err(|error| tonic::Status::internal(error.to_string()))?
         .map_err(|error| tonic::Status::internal(error.to_string()))?;
+
+        // DUR-2 reporting: attach the job's prepared-sink transactions so the
+        // coordinator persists them in the checkpoint metadata and can drive
+        // commit-or-abort on recovery. Only stamp on a real (non-stale) ack —
+        // a stale ack carries `last_acked_epoch` and must not claim to have
+        // prepared this epoch's sink output. The coordinator dedups by
+        // `prepare_path`, so stamping the same refs on every task attempt's ack
+        // is safe.
+        if ack.epoch == epoch {
+            ack.sink_transactions = sink_transactions;
+        }
 
         self.send_checkpoint_ack_with_retries(ack, coordinator)
             .await
@@ -1330,19 +1343,41 @@ impl ExecutorTaskRunner {
         // BEFORE any state snapshot or ack.  A committed checkpoint must have
         // its sink output prepared; failing here fails the whole barrier (no
         // ack is sent, the epoch aborts on timeout, and processing continues).
+        //
+        // DUR-2: after staging, read back the prepared-transaction refs (each
+        // with its durable prepare path) so every task attempt's ack can carry
+        // them to the coordinator. Without this the checkpoint metadata records
+        // no sink transactions and recovery cannot commit-or-abort them.
         let job_id_str = req.job_id.as_str().to_owned();
+        let mut sink_transactions: Vec<krishiv_proto::SinkTransactionRef> = Vec::new();
         if self.transaction_log.has_job(&job_id_str) {
             let log = self.transaction_log.clone();
             let epoch = req.epoch;
-            tokio::task::spawn_blocking(move || log.pre_commit(&job_id_str, epoch))
-                .await
-                .map_err(|error| tonic::Status::internal(error.to_string()))?
-                .map_err(|error| {
-                    tonic::Status::internal(format!(
-                        "transactional sink pre-commit failed for epoch {}: {error}",
-                        req.epoch
-                    ))
-                })?;
+            let job_for_blocking = job_id_str.clone();
+            let refs = tokio::task::spawn_blocking(move || {
+                log.pre_commit(&job_for_blocking, epoch)?;
+                log.prepared_refs(&job_for_blocking)
+            })
+            .await
+            .map_err(|error| tonic::Status::internal(error.to_string()))?
+            .map_err(|error| {
+                tonic::Status::internal(format!(
+                    "transactional sink pre-commit failed for epoch {}: {error}",
+                    req.epoch
+                ))
+            })?;
+            sink_transactions = refs
+                .into_iter()
+                .map(|r| krishiv_proto::SinkTransactionRef {
+                    // The durable path is the recovery identity; it is also the
+                    // coordinator's dedup key, so distinct staged files stay
+                    // distinct while duplicate reports collapse.
+                    sink_id: r.prepare_path.clone(),
+                    epoch: r.epoch,
+                    prepare_path: r.prepare_path,
+                    committed: false,
+                })
+                .collect();
         }
 
         // Continuous window jobs snapshot their stateful operator — the
@@ -1385,6 +1420,7 @@ impl ExecutorTaskRunner {
             let state = state_for_attempt(assignment.task_id());
             let storage = Arc::clone(&storage);
             let coordinator = coordinator.clone();
+            let sink_transactions = sink_transactions.clone();
             acks.push(async move {
                 let task_id = assignment.task_id().clone();
                 let result = self
@@ -1394,6 +1430,7 @@ impl ExecutorTaskRunner {
                         state,
                         storage,
                         coordinator,
+                        sink_transactions,
                     )
                     .await;
                 (task_id, result)
@@ -1504,6 +1541,37 @@ impl ExecutorTaskRunner {
                 committed,
                 aborted,
                 "reconciled transactional sink output during restore"
+            );
+        }
+
+        // DUR-2: `restore_to` above reconciles the in-memory prepared log,
+        // which covers a coordinator-only restart. On an executor crash that
+        // log was empty, so drive the coordinator's durable recovery plan —
+        // each ref reconstructs its prepared transaction from the durable
+        // prepare path and commits (covered by the restored epoch) or aborts
+        // (after it). `finalize_prepared` is idempotent, so running it after
+        // `restore_to` never double-commits.
+        let commit_paths: Vec<String> = cmd
+            .sink_commit
+            .iter()
+            .map(|s| s.prepare_path.clone())
+            .collect();
+        let abort_paths: Vec<String> = cmd
+            .sink_abort
+            .iter()
+            .map(|s| s.prepare_path.clone())
+            .collect();
+        let (rec_committed, rec_aborted) = self
+            .transaction_log
+            .recover_prepared_refs(job_id, &commit_paths, &abort_paths)
+            .map_err(|e| restore_err(format!("DUR-2 durable sink recovery for {job_id}: {e}")))?;
+        if rec_committed > 0 || rec_aborted > 0 {
+            tracing::info!(
+                job_id,
+                epoch = cmd.epoch,
+                rec_committed,
+                rec_aborted,
+                "recovered prepared-sink transactions from durable checkpoint refs (DUR-2)"
             );
         }
 

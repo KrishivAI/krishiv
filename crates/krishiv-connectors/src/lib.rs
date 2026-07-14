@@ -96,8 +96,8 @@ pub use source::{CheckpointSource, DynSource, Source};
 pub use storage_factory::{StorageBackend, StorageConfig, StorageFactory};
 pub use two_phase::{
     EpochTransactionLog, InMemoryCommitHandle, InMemoryTwoPhaseCommitSink,
-    LocalParquetTwoPhaseCommitSink, ParquetCommitHandle, TransactionalSinkParticipant,
-    TwoPhaseCommitSink,
+    LocalParquetTwoPhaseCommitSink, ParquetCommitHandle, PreparedSinkRef,
+    TransactionalSinkParticipant, TwoPhaseCommitSink,
 };
 
 #[cfg(all(feature = "vector-sinks", feature = "pgvector"))]

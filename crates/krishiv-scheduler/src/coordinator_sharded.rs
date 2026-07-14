@@ -599,6 +599,8 @@ mod checkpoint_inner_tests {
             RestoreDirective {
                 epoch: 7,
                 fencing_token: 3,
+                sink_commit: Vec::new(),
+                sink_abort: Vec::new(),
             },
         );
 
@@ -617,6 +619,8 @@ mod checkpoint_inner_tests {
             RestoreDirective {
                 epoch: 5,
                 fencing_token: 2,
+                sink_commit: Vec::new(),
+                sink_abort: Vec::new(),
             },
         );
 
@@ -640,6 +644,8 @@ mod checkpoint_inner_tests {
             RestoreDirective {
                 epoch: 5,
                 fencing_token: 0,
+                sink_commit: Vec::new(),
+                sink_abort: Vec::new(),
             },
         );
         let cmds = inner.pending_restore_commands_for_executor(&e, |_| true);
@@ -677,6 +683,8 @@ mod checkpoint_inner_tests {
             RestoreDirective {
                 epoch: 1,
                 fencing_token: 1,
+                sink_commit: Vec::new(),
+                sink_abort: Vec::new(),
             },
         );
         inner.pending_stop_after_savepoint.insert(j.clone(), 1);
@@ -726,6 +734,8 @@ mod checkpoint_inner_tests {
             RestoreDirective {
                 epoch: 3,
                 fencing_token: 1,
+                sink_commit: Vec::new(),
+                sink_abort: Vec::new(),
             },
         );
 

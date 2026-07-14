@@ -82,19 +82,26 @@ impl fmt::Debug for CheckpointCoordinator {
 }
 
 /// DUR-2: aggregate the prepared-sink transaction refs reported by a set of
-/// checkpoint acks into the durable checkpoint form, deduplicated by
-/// `(sink_id, epoch)` (a committed status wins over a not-yet-committed one).
+/// checkpoint acks into the durable checkpoint form, deduplicated by the
+/// globally-unique `prepare_path` (a committed status wins over a
+/// not-yet-committed one).
+///
+/// The key is `prepare_path`, not `(sink_id, epoch)`: a single sink can stage
+/// several durable files under one epoch (a multi-batch open buffer produces
+/// one handle, hence one path, per batch), and every one of them must survive
+/// into the recovery plan. Duplicate reports of the *same* file — the executor
+/// stamps the job's refs on every task attempt's ack — collapse because the
+/// path is identical.
 fn collect_sink_transactions<'a>(
     acks: impl Iterator<Item = &'a CheckpointAckRequest>,
 ) -> Vec<krishiv_state::checkpoint::SinkTransactionRef> {
     let mut by_key: std::collections::BTreeMap<
-        (String, u64),
+        String,
         krishiv_state::checkpoint::SinkTransactionRef,
     > = std::collections::BTreeMap::new();
     for ack in acks {
         for tx in &ack.sink_transactions {
-            let key = (tx.sink_id.clone(), tx.epoch);
-            let entry = by_key.entry(key).or_insert_with(|| {
+            let entry = by_key.entry(tx.prepare_path.clone()).or_insert_with(|| {
                 krishiv_state::checkpoint::SinkTransactionRef {
                     sink_id: tx.sink_id.clone(),
                     epoch: tx.epoch,

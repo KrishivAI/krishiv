@@ -66,6 +66,31 @@ pub trait TwoPhaseCommitSink: Send {
             ),
         })
     }
+
+    /// The durable path that identifies a prepared `handle` for recovery — the
+    /// value later passed to [`Self::finalize_prepared`]. Reported in the
+    /// checkpoint ack (DUR-2) so the coordinator can persist it and drive
+    /// commit-or-abort after a crash.
+    ///
+    /// Must be globally unique per prepared transaction (it is the recovery
+    /// dedup identity). The default returns `None`: a sink with no durable
+    /// staging cannot be recovered and reports nothing, so its transactions
+    /// never enter the durable recovery plan.
+    fn prepare_path_of(&self, handle: &Self::Handle) -> Option<String> {
+        let _ = handle;
+        None
+    }
+}
+
+/// A prepared-but-unfinalized sink transaction, reported by a participant at
+/// checkpoint time (DUR-2). `prepare_path` is the durable identity used to
+/// reconstruct the transaction during recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedSinkRef {
+    /// Checkpoint epoch under which the transaction was staged.
+    pub epoch: u64,
+    /// Durable staging path — recovery finalizes the transaction from this.
+    pub prepare_path: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +385,14 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
             self.abort(handle)
         }
     }
+
+    /// The durable `.tmp` staging path is the recovery identity — it is what
+    /// `finalize_prepared` reconstructs the transaction from. Globally unique
+    /// because `prepare` names each staging file `<epoch>-<handle_id>.parquet.tmp`
+    /// with a monotonic `handle_id`.
+    fn prepare_path_of(&self, handle: &Self::Handle) -> Option<String> {
+        Some(handle.staging_path.to_string_lossy().into_owned())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -420,6 +453,28 @@ pub trait TransactionalSinkParticipant: Send {
 
     /// Epochs with prepared-but-uncommitted transactions, ascending.
     fn prepared_epochs(&self) -> Vec<u64>;
+
+    /// DUR-2 reporting: the prepared-but-unfinalized transactions to record in
+    /// the checkpoint ack, each with the durable `prepare_path` recovery will
+    /// reconstruct it from. Default: none (a sink with no durable staging
+    /// reports nothing and so never enters the recovery plan).
+    fn prepared_refs(&self) -> Vec<PreparedSinkRef> {
+        Vec::new()
+    }
+
+    /// DUR-2 recovery: finalize a transaction reconstructed from its durable
+    /// `prepare_path` when the in-memory prepared handles were lost to an
+    /// executor crash. `commit` replays the two-phase second phase; `!commit`
+    /// rolls it back. Idempotent. Default: unsupported (the underlying sink
+    /// cannot reconstruct from durable state).
+    fn finalize_prepared(&mut self, prepare_path: &str, commit: bool) -> ConnectorResult<()> {
+        let _ = (prepare_path, commit);
+        Err(ConnectorError::Unsupported {
+            message: String::from(
+                "participant does not support prepared-transaction recovery from a durable ref",
+            ),
+        })
+    }
 }
 
 /// Checkpoint-aligned transaction log over any [`TwoPhaseCommitSink`].
@@ -529,6 +584,28 @@ impl<S: TwoPhaseCommitSink> TransactionalSinkParticipant for EpochTransactionLog
 
     fn prepared_epochs(&self) -> Vec<u64> {
         self.prepared.keys().copied().collect()
+    }
+
+    fn prepared_refs(&self) -> Vec<PreparedSinkRef> {
+        let mut refs = Vec::new();
+        for (&epoch, handles) in &self.prepared {
+            for handle in handles {
+                if let Some(prepare_path) = self.sink.prepare_path_of(handle) {
+                    refs.push(PreparedSinkRef {
+                        epoch,
+                        prepare_path,
+                    });
+                }
+            }
+        }
+        refs
+    }
+
+    fn finalize_prepared(&mut self, prepare_path: &str, commit: bool) -> ConnectorResult<()> {
+        // Delegate to the underlying sink, which reconstructs the prepared
+        // transaction from its durable path (DUR-2 recovery after an executor
+        // crash lost the in-memory `prepared` handles).
+        self.sink.finalize_prepared(prepare_path, commit)
     }
 }
 

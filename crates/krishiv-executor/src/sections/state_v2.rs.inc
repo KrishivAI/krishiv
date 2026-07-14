@@ -206,6 +206,8 @@ async fn restore_redistributes_run_loop_state_by_key_group() {
         job_id: JobId::try_new(job).unwrap(),
         epoch: 3,
         fencing_token: krishiv_proto::FencingToken::initial(),
+        sink_commit: Vec::new(),
+        sink_abort: Vec::new(),
     };
     let fallback = crate::runner::CheckpointStateHandle::from_backend(
         krishiv_state::InMemoryStateBackend::default(),
