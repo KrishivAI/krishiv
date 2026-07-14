@@ -65,8 +65,15 @@ local-catalog = ["dep:iceberg"]
 # These shared-warehouse backends resolve `s3://` through the object-store
 # Iceberg bridge, which now lives in krishiv-connectors — pull it (`iceberg`)
 # and its S3 leg (`cloud`).
-postgres-catalog = ["dep:sqlx", "dep:iceberg", "krishiv-connectors/iceberg", "krishiv-connectors/cloud"]
-rest-catalog = ["dep:iceberg-catalog-rest", "dep:iceberg", "krishiv-connectors/iceberg", "krishiv-connectors/cloud"]
+#
+# `rest-catalog`'s registration path (`register_iceberg_rest_catalog_from_env`)
+# calls `register_iceberg_catalog` + `KrishivCatalog::rest`, which are gated on
+# `iceberg-datafusion` (+ `local-catalog`, which it pulls). So `rest-catalog`
+# genuinely REQUIRES `iceberg-datafusion` — imply it here so the feature is
+# self-consistent standalone (higher crates already pair them via
+# krishiv-flight-sql; a no-op for the prod/full presets).
+postgres-catalog = ["dep:sqlx", "iceberg-datafusion", "krishiv-connectors/cloud"]
+rest-catalog = ["dep:iceberg-catalog-rest", "iceberg-datafusion", "krishiv-connectors/cloud"]
 # The DataFusion catalog DML interception calls krishiv_connectors::lakehouse,
 # so this backend must pull the connector's iceberg implementation.
 iceberg-datafusion = [
