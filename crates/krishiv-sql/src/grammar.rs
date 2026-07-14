@@ -662,21 +662,29 @@ static FEATURES: &[FeatureEntry] = &[
     FeatureEntry::new(
         "ddl.create_materialized_view",
         "DDL",
-        "CREATE MATERIALIZED VIEW … AS SELECT → IVM view (REFRESH/DROP)",
+        "CREATE [OR REPLACE] MATERIALIZED VIEW … AS SELECT → IVM view (REFRESH/DROP)",
         NA,
         NA,
-        PL,
+        S,
     )
-    .with_note("Phase 60 SQL-DDL-for-IVM task; engine primitive under the platform's governed pipelines"),
+    .with_note(
+        "Phase 60 SQL-DDL-for-IVM: ANSI/Spark synonym routed onto the same IVM engine as \
+         CREATE MATERIALIZED INCREMENTAL VIEW; REFRESH/DROP MATERIALIZED VIEW lifecycle; \
+         engine primitive under the platform's governed pipelines",
+    ),
     FeatureEntry::new(
         "ddl.create_streaming_table",
         "DDL",
-        "CREATE STREAMING TABLE … AS SELECT → continuous job",
+        "CREATE [OR REPLACE] STREAMING TABLE … AS SELECT → continuous job",
         NA,
         PL,
         NA,
     )
-    .with_note("Phase 60 SQL-DDL-for-streaming task"),
+    .with_note(
+        "Phase 60: SQL front door + planner validation land (the body lowers through the shared \
+         streaming compiler); continuous-job execution is coordinator-gated — a cluster-attached \
+         session submits the validated plan via the continuous-stream registration API",
+    ),
     FeatureEntry::batch_only(
         "ddl.live_table",
         "DDL",

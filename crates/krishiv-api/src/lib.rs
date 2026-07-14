@@ -34,6 +34,8 @@ mod conformance;
 #[cfg(test)]
 mod delivery_cert;
 #[cfg(test)]
+mod differential_corpus;
+#[cfg(test)]
 mod mode_conformance;
 #[cfg(test)]
 mod tests;

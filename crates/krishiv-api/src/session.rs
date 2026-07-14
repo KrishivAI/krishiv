@@ -2280,13 +2280,14 @@ impl Session {
                 ),
             });
         }
-        // Connector kinds must be constructible (kind supported).
+        // Connector kinds must be available in this build (dry run — no I/O,
+        // no connection opened; validation is delegated to the registry).
         if let Some(c) = &sink.connector {
-            crate::pipeline::build_sink(c)?;
+            crate::pipeline::validate_sink_spec(sink_name, c)?;
         }
-        for (_, src) in pipe_reg.sources().map_err(KrishivError::from)? {
+        for (src_name, src) in pipe_reg.sources().map_err(KrishivError::from)? {
             if let krishiv_sql::pipeline_ddl::SourceSpec::Connector(c) = src {
-                crate::pipeline::build_source(&c)?;
+                crate::pipeline::validate_source_spec(&src_name, &c)?;
             }
         }
         Ok(())
@@ -2334,7 +2335,7 @@ impl Session {
                     builder.source_memory(src_name, batches)
                 }
                 krishiv_sql::pipeline_ddl::SourceSpec::Connector(spec) => {
-                    let src = crate::pipeline::build_source(&spec)?;
+                    let src = crate::pipeline::build_source(&src_name, &spec).await?;
                     builder.source(src_name, crate::pipeline::Ingest::Connector(src))
                 }
             };
@@ -2366,7 +2367,7 @@ impl Session {
         let has_connector_sink = sink_spec.connector.is_some();
         builder = match sink_spec.connector {
             Some(spec) => {
-                let sink = crate::pipeline::build_sink(&spec)?;
+                let sink = crate::pipeline::build_sink(sink_name, &spec).await?;
                 builder.sink(
                     sink_spec.view.clone(),
                     crate::pipeline::Egress::Connector(sink),

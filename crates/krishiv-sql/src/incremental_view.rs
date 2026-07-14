@@ -159,6 +159,35 @@ pub fn parse_incremental_view_statement(sql: &str) -> SqlResult<Option<Increment
         }));
     }
 
+    // CREATE [OR REPLACE] MATERIALIZED VIEW <name> AS <body> [LATENESS …]
+    //
+    // The ANSI/Spark spelling of an incremental materialized view — a
+    // SQL-standard front door onto the same IVM engine as
+    // `CREATE MATERIALIZED INCREMENTAL VIEW`, so a plain Flight SQL / JDBC / BI
+    // client can create one without the Krishiv-specific `INCREMENTAL` keyword.
+    let mv_prefix = if upper.starts_with("CREATE OR REPLACE MATERIALIZED VIEW ") {
+        Some("CREATE OR REPLACE MATERIALIZED VIEW ")
+    } else if upper.starts_with("CREATE MATERIALIZED VIEW ") {
+        Some("CREATE MATERIALIZED VIEW ")
+    } else {
+        None
+    };
+    if let Some(prefix) = mv_prefix {
+        let rest = trimmed
+            .get(prefix.len()..)
+            .ok_or_else(|| SqlError::Unsupported {
+                feature: "CREATE MATERIALIZED VIEW".into(),
+            })?;
+        let (name, body_with_lateness) = split_name_and_body(rest)?;
+        let (body_sql, lateness) = split_body_and_lateness(&body_with_lateness)?;
+        return Ok(Some(IncrementalViewStatement::Create {
+            name,
+            body_sql,
+            is_materialized: true,
+            lateness,
+        }));
+    }
+
     // DECLARE RECURSIVE VIEW <name> AS <body>
     if upper.starts_with("DECLARE RECURSIVE VIEW ") {
         let rest = trimmed
@@ -195,6 +224,36 @@ pub fn parse_incremental_view_statement(sql: &str) -> SqlResult<Option<Increment
             .get("DROP INCREMENTAL VIEW ".len()..)
             .ok_or_else(|| SqlError::Unsupported {
                 feature: "DROP INCREMENTAL VIEW".into(),
+            })?
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            return Err(SqlError::EmptyTableName);
+        }
+        return Ok(Some(IncrementalViewStatement::Drop { name }));
+    }
+
+    // REFRESH MATERIALIZED VIEW <name>  (ANSI/Spark synonym)
+    if upper.starts_with("REFRESH MATERIALIZED VIEW ") {
+        let name = trimmed
+            .get("REFRESH MATERIALIZED VIEW ".len()..)
+            .ok_or_else(|| SqlError::Unsupported {
+                feature: "REFRESH MATERIALIZED VIEW".into(),
+            })?
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            return Err(SqlError::EmptyTableName);
+        }
+        return Ok(Some(IncrementalViewStatement::Refresh { name }));
+    }
+
+    // DROP MATERIALIZED VIEW <name>  (ANSI/Spark synonym)
+    if upper.starts_with("DROP MATERIALIZED VIEW ") {
+        let name = trimmed
+            .get("DROP MATERIALIZED VIEW ".len()..)
+            .ok_or_else(|| SqlError::Unsupported {
+                feature: "DROP MATERIALIZED VIEW".into(),
             })?
             .trim()
             .to_string();
@@ -465,6 +524,79 @@ mod tests {
                 is_materialized: true,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn parse_create_materialized_view_maps_to_ivm() {
+        // The ANSI/Spark `CREATE MATERIALIZED VIEW` maps onto the same IVM view
+        // as `CREATE MATERIALIZED INCREMENTAL VIEW`.
+        let sql = "CREATE MATERIALIZED VIEW revenue AS SELECT SUM(amount) AS t FROM orders";
+        let stmt = parse_incremental_view_statement(sql).unwrap().unwrap();
+        assert!(matches!(
+            stmt,
+            IncrementalViewStatement::Create { ref name, body_sql: ref body, is_materialized: true, .. }
+            if name == "revenue" && body.starts_with("SELECT SUM(amount)")
+        ));
+    }
+
+    #[test]
+    fn parse_create_or_replace_materialized_view() {
+        let sql = "CREATE OR REPLACE MATERIALIZED VIEW mv AS SELECT * FROM t";
+        let stmt = parse_incremental_view_statement(sql).unwrap().unwrap();
+        assert!(matches!(
+            stmt,
+            IncrementalViewStatement::Create { ref name, is_materialized: true, .. } if name == "mv"
+        ));
+    }
+
+    #[test]
+    fn parse_create_materialized_view_with_lateness() {
+        let sql = "CREATE MATERIALIZED VIEW ev AS SELECT * FROM s \
+                   LATENESS event_ts INTERVAL '5' MINUTE";
+        let stmt = parse_incremental_view_statement(sql).unwrap().unwrap();
+        match stmt {
+            IncrementalViewStatement::Create {
+                is_materialized,
+                lateness,
+                body_sql,
+                ..
+            } => {
+                assert!(is_materialized);
+                assert_eq!(lateness.len(), 1, "LATENESS annotation is parsed");
+                assert!(!body_sql.to_uppercase().contains("LATENESS"));
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_refresh_and_drop_materialized_view() {
+        let refresh = parse_incremental_view_statement("REFRESH MATERIALIZED VIEW revenue")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            refresh,
+            IncrementalViewStatement::Refresh { ref name } if name == "revenue"
+        ));
+        let drop = parse_incremental_view_statement("DROP MATERIALIZED VIEW revenue;")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            drop,
+            IncrementalViewStatement::Drop { ref name } if name == "revenue"
+        ));
+    }
+
+    #[test]
+    fn materialized_view_does_not_shadow_materialized_incremental_view() {
+        // The two-token `MATERIALIZED VIEW` matcher must not swallow the
+        // three-token `MATERIALIZED INCREMENTAL VIEW` form.
+        let sql = "CREATE MATERIALIZED INCREMENTAL VIEW snap AS SELECT * FROM t";
+        let stmt = parse_incremental_view_statement(sql).unwrap().unwrap();
+        assert!(matches!(
+            stmt,
+            IncrementalViewStatement::Create { ref name, is_materialized: true, .. } if name == "snap"
         ));
     }
 

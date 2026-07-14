@@ -33,7 +33,9 @@ mod sink;
 mod source;
 mod spine;
 
-pub(crate) use connector_factory::{build_sink, build_source};
+pub(crate) use connector_factory::{
+    build_sink, build_source, validate_sink_spec, validate_source_spec,
+};
 
 pub use driver::RunPolicy;
 pub use sink::Egress;

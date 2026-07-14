@@ -81,6 +81,7 @@ pub mod subquery;
 pub mod unnest_sql;
 
 pub mod streaming;
+pub mod streaming_table_ddl;
 pub mod streaming_tvf;
 pub mod streaming_window_plan;
 mod udf;
@@ -1918,6 +1919,25 @@ impl SqlEngine {
                 ));
             }
             None => {}
+        }
+
+        // ── Intercept CREATE STREAMING TABLE … AS <streaming SELECT> ─────────
+        // The body is validated through the shared streaming front door, so an
+        // unsupported query fails at the planner. Running the job needs the
+        // streaming coordinator, which the pure SQL engine does not have, so we
+        // surface a clear, actionable error rather than a cryptic parse failure;
+        // a cluster-attached session submits the validated plan via the
+        // continuous-stream registration API.
+        if let Some(ddl) = streaming_table_ddl::parse_create_streaming_table(query) {
+            let _plan = streaming_window_plan::compile_streaming_window_sql(&ddl.query)?;
+            return Err(SqlError::Unsupported {
+                feature: format!(
+                    "CREATE STREAMING TABLE '{}' compiled to a continuous plan, but this session \
+                     has no streaming coordinator to run it; submit it via the continuous-stream \
+                     registration API or a cluster-attached session",
+                    ddl.name
+                ),
+            });
         }
 
         // ── Intercept CREATE/DROP SOURCE / SINK (pipeline DDL) ───────────────

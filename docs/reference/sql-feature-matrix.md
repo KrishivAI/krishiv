@@ -151,8 +151,8 @@ Each feature is dimensioned across the three Krishiv execution engines: **batch*
 | `ddl.partitioned_by` | CREATE TABLE … PARTITIONED BY (col | bucket/truncate/year/month/day/hour(col)) AS SELECT | supported | n/a | n/a | Iceberg catalog tables only; transforms follow the Iceberg partition spec |
 | `ddl.alter_table` | ALTER TABLE ADD/DROP COLUMN, RENAME | partial | n/a | n/a | Iceberg schema evolution via ALTER TABLE is supported |
 | `ddl.create_schema` | CREATE SCHEMA name | supported | n/a | n/a | inherited from DataFusion's native catalog; no Krishiv-side code involved |
-| `ddl.create_materialized_view` | CREATE MATERIALIZED VIEW … AS SELECT → IVM view (REFRESH/DROP) | n/a | n/a | planned | Phase 60 SQL-DDL-for-IVM task; engine primitive under the platform's governed pipelines |
-| `ddl.create_streaming_table` | CREATE STREAMING TABLE … AS SELECT → continuous job | n/a | planned | n/a | Phase 60 SQL-DDL-for-streaming task |
+| `ddl.create_materialized_view` | CREATE [OR REPLACE] MATERIALIZED VIEW … AS SELECT → IVM view (REFRESH/DROP) | n/a | n/a | supported | Phase 60 SQL-DDL-for-IVM: ANSI/Spark synonym routed onto the same IVM engine as CREATE MATERIALIZED INCREMENTAL VIEW; REFRESH/DROP MATERIALIZED VIEW lifecycle; engine primitive under the platform's governed pipelines |
+| `ddl.create_streaming_table` | CREATE [OR REPLACE] STREAMING TABLE … AS SELECT → continuous job | n/a | planned | n/a | Phase 60: SQL front door + planner validation land (the body lowers through the shared streaming compiler); continuous-job execution is coordinator-gated — a cluster-attached session submits the validated plan via the continuous-stream registration API |
 | `ddl.live_table` | CREATE / REFRESH / DROP LIVE TABLE via session.sql() | supported | n/a | n/a |  |
 | `ddl.connector_source_sink` | CREATE SOURCE/SINK … WITH (connector=…) resolved through the connector registry | partial | n/a | n/a | registry-backed dispatch replacing the parquet-only hardcoded factory (audit §8b); supported kinds come from connector descriptors, unsupported kinds fail loudly |
 
