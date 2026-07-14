@@ -42,7 +42,7 @@ use krishiv_dataflow::ContinuousWindowExecutor;
 use krishiv_proto::{ExecutorTaskAssignment, KeyGroupRange};
 
 use crate::fragment::common::{
-    checkpoint_offset_from_dyn_source, parse_registry_partition_specs,
+    checkpoint_offset_from_dyn_source, coerce_batch_for_window, parse_registry_partition_specs,
     read_continuous_restore_hint,
 };
 use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner, TaskStateBinding};
@@ -727,6 +727,12 @@ pub(crate) async fn execute_run_loop_fragment(
                         ),
                     })?
             {
+                // Registry connector sources (notably Kafka JSON) decode every
+                // field as Utf8; the windowed operator requires an Int64/Timestamp
+                // event time and numeric aggregate inputs. Coerce to the spec's
+                // column types before watermark extraction and the drain — a
+                // no-op for already-typed sources.
+                let batch = coerce_batch_for_window(&batch, &window_spec)?;
                 if let Some(ts) = batch_max_event_time(&batch, &event_time_column) {
                     split_watermarks.observe(&spec.partition_id, ts);
                 }

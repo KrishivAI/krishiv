@@ -300,6 +300,127 @@ pub(crate) fn parse_registry_partition_specs(
     Ok(specs)
 }
 
+/// Map a [`WindowExecutionSpec::key_column_type`] string tag to its Arrow type.
+fn arrow_type_for_key_tag(tag: &str) -> Option<DataType> {
+    match tag.trim().to_ascii_lowercase().as_str() {
+        "int32" => Some(DataType::Int32),
+        "int64" => Some(DataType::Int64),
+        "float64" => Some(DataType::Float64),
+        "bool" | "boolean" => Some(DataType::Boolean),
+        "utf8" | "string" => Some(DataType::Utf8),
+        _ => None,
+    }
+}
+
+/// True for Arrow types the windowed aggregate operators accept directly as a
+/// numeric aggregate input (no coercion needed).
+fn is_numeric_agg_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+    )
+}
+
+/// Coerce a source-read batch to the column types the windowed operator
+/// requires. Kafka JSON sources (`registry-connector:kafka`) decode every field
+/// as `Utf8` (see `RdkafkaKafkaSource::payload_to_batch`), but the windowed
+/// executor requires an `Int64`/`Timestamp` event-time column, a
+/// `key_column_type`-typed key, and numeric aggregate-input columns — a raw
+/// all-`Utf8` batch fails the operator's type checks and its watermark never
+/// advances. This casts exactly those columns, and only when the current type is
+/// incompatible, so it is a cheap no-op for already-typed inputs (e.g. batches
+/// fed through the coordinator push path). Casts are strict (`safe = false`): a
+/// value that cannot be parsed to the required type fails loudly rather than
+/// silently nulling and dropping the row.
+pub(crate) fn coerce_batch_for_window(
+    batch: &arrow::record_batch::RecordBatch,
+    spec: &krishiv_plan::window::WindowExecutionSpec,
+) -> ExecutorResult<arrow::record_batch::RecordBatch> {
+    use arrow::array::ArrayRef;
+    use arrow::compute::{CastOptions, cast_with_options};
+    use arrow::datatypes::{Field, Schema};
+
+    let schema = batch.schema();
+    let key_target = arrow_type_for_key_tag(&spec.key_column_type);
+    let cast_opts = CastOptions {
+        safe: false,
+        ..Default::default()
+    };
+
+    let mut new_fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
+    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    let mut changed = false;
+
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let column = batch.column(idx);
+        let name = field.name();
+        let current = field.data_type();
+
+        let desired: Option<DataType> = if name == &spec.event_time_column {
+            match current {
+                DataType::Int64 | DataType::Timestamp(_, _) => None,
+                _ => Some(DataType::Int64),
+            }
+        } else if name == &spec.key_column {
+            key_target
+                .as_ref()
+                .filter(|target| *target != current)
+                .cloned()
+        } else if spec
+            .agg_exprs
+            .iter()
+            .any(|agg| !agg.input_column.is_empty() && &agg.input_column == name)
+        {
+            if is_numeric_agg_type(current) {
+                None
+            } else {
+                Some(DataType::Float64)
+            }
+        } else {
+            None
+        };
+
+        match desired {
+            Some(target) => {
+                let casted = cast_with_options(column, &target, &cast_opts).map_err(|error| {
+                    ExecutorError::LocalExecution {
+                        message: format!(
+                            "stream:rloop failed to coerce column '{name}' from {current:?} to \
+                             {target:?} for the window operator: {error}"
+                        ),
+                    }
+                })?;
+                new_fields.push(Field::new(name, target, field.is_nullable()));
+                new_columns.push(casted);
+                changed = true;
+            }
+            None => {
+                new_fields.push(field.as_ref().clone());
+                new_columns.push(Arc::clone(column));
+            }
+        }
+    }
+
+    if !changed {
+        return Ok(batch.clone());
+    }
+
+    arrow::record_batch::RecordBatch::try_new(Arc::new(Schema::new(new_fields)), new_columns)
+        .map_err(|error| ExecutorError::LocalExecution {
+            message: format!("stream:rloop rebuilt coerced batch is invalid: {error}"),
+        })
+}
+
 /// Read input partitions of the form `registry-connector:<kind>:<table_name>:<config_json>`
 /// using a pluggable [`ConnectorRegistry`], preserving any connector-encoded
 /// checkpoint offset observed after the read.
@@ -1279,6 +1400,79 @@ mod tests {
     use krishiv_proto::InputPartition;
 
     use crate::runner::RestoredSourceOffset;
+
+    #[test]
+    fn coerce_batch_for_window_casts_utf8_kafka_columns_to_window_types() {
+        use arrow::array::{Array, Float64Array, StringArray};
+        use krishiv_plan::window::{WindowAgg, WindowAggKind, WindowExecutionSpec};
+
+        // A Kafka JSON source decodes every field as Utf8 (sorted by name):
+        // key (string), ts (epoch-ms), val (numeric).
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, true),
+            Field::new("ts", DataType::Utf8, true),
+            Field::new("val", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])) as _,
+                Arc::new(StringArray::from(vec!["1720000000000", "1720000060000"])) as _,
+                Arc::new(StringArray::from(vec!["10", "32"])) as _,
+            ],
+        )
+        .unwrap();
+
+        let mut spec = WindowExecutionSpec::tumbling("key", "ts", 60_000);
+        spec.agg_exprs = vec![WindowAgg {
+            kind: WindowAggKind::Sum,
+            input_column: "val".into(),
+            output_column: "total".into(),
+            filter: None,
+        }];
+
+        let coerced = super::coerce_batch_for_window(&batch, &spec).unwrap();
+        let s = coerced.schema();
+        // Key stays Utf8 (the default key_column_type), event time becomes Int64,
+        // the aggregate input becomes Float64.
+        assert_eq!(s.field_with_name("key").unwrap().data_type(), &DataType::Utf8);
+        assert_eq!(s.field_with_name("ts").unwrap().data_type(), &DataType::Int64);
+        assert_eq!(
+            s.field_with_name("val").unwrap().data_type(),
+            &DataType::Float64
+        );
+        // Values round-trip through the strict cast.
+        let ts = coerced
+            .column(s.index_of("ts").unwrap())
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ts.value(0), 1_720_000_000_000);
+        let val = coerced
+            .column(s.index_of("val").unwrap())
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(val.value(1), 32.0);
+
+        // An already-typed batch (push path) is returned unchanged.
+        let typed_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, true),
+            Field::new("ts", DataType::Int64, true),
+            Field::new("val", DataType::Float64, true),
+        ]));
+        let typed = RecordBatch::try_new(
+            typed_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as _,
+                Arc::new(Int64Array::from(vec![1_720_000_000_000_i64])) as _,
+                Arc::new(Float64Array::from(vec![5.0])) as _,
+            ],
+        )
+        .unwrap();
+        let unchanged = super::coerce_batch_for_window(&typed, &spec).unwrap();
+        assert_eq!(unchanged.schema(), typed_schema);
+    }
 
     #[test]
     fn task_engine_memory_limit_uses_explicit_task_budget() {
