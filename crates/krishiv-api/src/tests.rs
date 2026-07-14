@@ -1701,6 +1701,33 @@ fn phase_c_set_null_sample_and_shape_operations_execute() {
 }
 
 #[test]
+fn union_by_name_aligns_columns_by_name() {
+    use crate::{col, lit};
+    let session = Session::builder().build().unwrap();
+    // Same column names, different order: unionByName must align by name.
+    let left = session.sql("SELECT 1 AS a, 2 AS b").unwrap();
+    let right = session.sql("SELECT 20 AS b, 10 AS a").unwrap();
+
+    let out = left.union_by_name(&right).unwrap().collect().unwrap();
+    assert_eq!(out.row_count(), 2);
+
+    // Right's row must land aligned by name (a=10). A positional union would
+    // have put 20 under `a`, so filtering a=10 proves name alignment.
+    let aligned = left
+        .union_by_name(&right)
+        .unwrap()
+        .filter_expr(col("a").eq(lit(10i64)))
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(aligned.row_count(), 1, "right's row aligned by name (a=10)");
+
+    // A differing column set is a clear error, never a silent misalignment.
+    let mismatched = session.sql("SELECT 1 AS a, 2 AS c").unwrap();
+    assert!(left.union_by_name(&mismatched).is_err());
+}
+
+#[test]
 fn phase_c_boundedness_metadata_exists_in_all_session_modes() {
     let sessions = [
         Session::builder().build().unwrap(),

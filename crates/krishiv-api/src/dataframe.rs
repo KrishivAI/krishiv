@@ -1105,6 +1105,38 @@ Execution statistics:
         }
     }
 
+    /// Union with `right`, aligning columns **by name** rather than by position
+    /// (PySpark `unionByName`). Both DataFrames must expose the same set of
+    /// column names; `right`'s columns are reordered to match `self`'s schema
+    /// before the positional [`union`](Self::union). Spark's
+    /// `allowMissingColumns=True` (null-filling absent columns) is not yet
+    /// supported — a differing column set is a clear error, never a silent
+    /// misalignment.
+    pub fn union_by_name(&self, right: &DataFrame) -> Result<DataFrame> {
+        let left_schema = self.schema()?;
+        let right_schema = right.schema()?;
+        let left_names: Vec<&str> = left_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        let right_names: std::collections::HashSet<&str> = right_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        if left_names.len() != right_names.len()
+            || !left_names.iter().all(|name| right_names.contains(name))
+        {
+            return Err(KrishivError::unsupported(
+                "union_by_name requires both DataFrames to have the same set of column names \
+                 (allowMissingColumns is not yet supported)",
+            ));
+        }
+        let right_reordered = right.select(&left_names)?;
+        self.union(&right_reordered)
+    }
+
     /// Return rows present in both DataFrames, preserving duplicate multiplicity.
     pub fn intersect(&self, right: &DataFrame) -> Result<DataFrame> {
         self.intersect_impl(right, false)

@@ -3,13 +3,13 @@
 > Generated from `crates/krishiv-api/src/pyspark_parity.rs` — do not edit by hand.
 > Regenerate with `KRISHIV_BLESS_PYSPARK_PARITY=1 cargo test -p krishiv-api pyspark_parity`.
 
-**Overall parity: 97/109 = 89%** of the enumerated PySpark surface (Supported or Partial). Each shortfall is itemized below.
+**Overall parity: 98/109 = 90%** of the enumerated PySpark surface (Supported or Partial). Each shortfall is itemized below.
 
 ## Coverage by namespace
 
 | Namespace | Covered | Total | % |
 |---|---|---|---|
-| DataFrame | 38 | 47 | 81% |
+| DataFrame | 39 | 47 | 83% |
 | Column | 13 | 16 | 81% |
 | functions | 22 | 22 | 100% |
 | GroupedData | 7 | 7 | 100% |
@@ -26,7 +26,7 @@
 | `filter` | supported | filter/filter_expr | alias `where` |
 | `where` | supported | filter |  |
 | `withColumn` | supported | with_column |  |
-| `withColumnRenamed` | partial | rename | rename exists; the exact (existing, new) rename signature is the Phase 61 gap |
+| `withColumnRenamed` | supported | rename | rename(existing, new); Spark's silent no-op on a missing column differs (rename validates) |
 | `drop` | supported | drop |  |
 | `groupBy` | supported | group_by |  |
 | `agg` | supported | agg |  |
@@ -39,7 +39,7 @@
 | `dropDuplicates` | planned | — | Phase 61 gap: dedup on a subset of columns (distinct() is all-columns) |
 | `union` | supported | union |  |
 | `unionAll` | supported | union | deprecated Spark alias of union |
-| `unionByName` | planned | — | Phase 61 gap: name-aligned union (union is positional) |
+| `unionByName` | supported | union_by_name | name-aligned union; allowMissingColumns (null-fill) is the residual |
 | `intersect` | supported | intersect/intersect_distinct |  |
 | `exceptAll` | supported | except | except/except_distinct |
 | `count` | supported | count |  |
