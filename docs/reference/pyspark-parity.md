@@ -3,7 +3,7 @@
 > Generated from `crates/krishiv-api/src/pyspark_parity.rs` — do not edit by hand.
 > Regenerate with `KRISHIV_BLESS_PYSPARK_PARITY=1 cargo test -p krishiv-api pyspark_parity`.
 
-**Overall parity: 98/109 = 90%** of the enumerated PySpark surface (Supported or Partial). Each shortfall is itemized below.
+**Overall parity: 105/116 = 91%** of the enumerated PySpark surface (Supported or Partial). Each shortfall is itemized below.
 
 ## Coverage by namespace
 
@@ -11,7 +11,7 @@
 |---|---|---|---|
 | DataFrame | 39 | 47 | 83% |
 | Column | 13 | 16 | 81% |
-| functions | 22 | 22 | 100% |
+| functions | 29 | 29 | 100% |
 | GroupedData | 7 | 7 | 100% |
 | Window | 6 | 6 | 100% |
 | DataFrameReader | 5 | 5 | 100% |
@@ -113,8 +113,15 @@
 | `last` | supported | last_value |  |
 | `nth_value` | supported | nth_value |  |
 | `when` | partial | function | reachable via the SQL registry / raw; no typed when() builder (Phase 61 gap) |
-| `coalesce` | partial | function | reachable via function("coalesce", …); typed F.coalesce is the gap |
-| `concat` | partial | function | any Phase 60 SQL scalar fn is reachable via function(name, args); typed F.* helpers are the gap |
+| `coalesce` | supported | coalesce | typed F.* helper over the SQL registry |
+| `nvl` | supported | nvl | typed helper; exact Spark alias |
+| `upper` | supported | upper | typed F.* helper |
+| `lower` | supported | lower | typed F.* helper |
+| `length` | supported | length | typed F.* helper (character length) |
+| `trim` | supported | trim | typed F.* helper |
+| `abs` | supported | abs | typed F.* helper |
+| `concat` | partial | function | reachable via function("concat", …); no typed helper — Spark returns NULL if any arg is NULL, DataFusion skips nulls, so an exact F.concat is deferred (exact-or-absent rule) |
+| `round` | partial | function | reachable via function("round", …); no typed helper — Spark rounds half-up, DataFusion half-even, so an exact F.round is deferred |
 | `<sql-registry>` | partial | function | the whole Phase 60 SQL function registry (JSON/HOF/date/hash/…) is reachable via function(name, args); Phase 61 ships typed F.* helpers over it (one registry, all surfaces) |
 
 ## GroupedData

@@ -162,6 +162,44 @@ pub fn function(name: impl Into<String>, arguments: Vec<Expr>) -> Expr {
     ))
 }
 
+// ── Scalar functions (F.*) ────────────────────────────────────────────────────
+//
+// Typed helpers over the shared SQL function registry (`function(name, args)` —
+// one registry, all surfaces; Phase 61). Only functions whose SQL semantics
+// match PySpark **exactly** are given typed helpers here (the Phase 60
+// exact-or-absent rule): e.g. `concat` (Spark returns NULL if any arg is NULL,
+// DataFusion skips nulls) and `round` (half-up vs half-even) are deliberately
+// left to the generic `function(...)` bridge rather than aliased inexactly.
+
+/// `COALESCE(a, b, …)` — the first non-null argument (PySpark `F.coalesce`).
+pub fn coalesce(arguments: Vec<Expr>) -> Expr {
+    function("coalesce", arguments)
+}
+/// `NVL(expr, default)` — `default` when `expr` is null (Spark alias, exact).
+pub fn nvl(expr: Expr, default: Expr) -> Expr {
+    function("nvl", vec![expr, default])
+}
+/// `UPPER(expr)` (PySpark `F.upper`).
+pub fn upper(expr: Expr) -> Expr {
+    function("upper", vec![expr])
+}
+/// `LOWER(expr)` (PySpark `F.lower`).
+pub fn lower(expr: Expr) -> Expr {
+    function("lower", vec![expr])
+}
+/// `LENGTH(expr)` — character length (PySpark `F.length`).
+pub fn length(expr: Expr) -> Expr {
+    function("length", vec![expr])
+}
+/// `TRIM(expr)` — strip leading and trailing spaces (PySpark `F.trim`).
+pub fn trim(expr: Expr) -> Expr {
+    function("trim", vec![expr])
+}
+/// `ABS(expr)` (PySpark `F.abs`).
+pub fn abs(expr: Expr) -> Expr {
+    function("abs", vec![expr])
+}
+
 // ── Window functions ──────────────────────────────────────────────────────────
 //
 // Typed sugar over `function(name, args)`, meant to be chained with `.over(...)`

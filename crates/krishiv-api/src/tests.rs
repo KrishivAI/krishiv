@@ -1728,6 +1728,45 @@ fn union_by_name_aligns_columns_by_name() {
 }
 
 #[test]
+fn f_star_scalar_helpers_have_exact_semantics() {
+    use crate::{abs, coalesce, col, lit, upper};
+    let session = Session::builder().build().unwrap();
+    let row = session
+        .sql("SELECT CAST(NULL AS BIGINT) AS a, 5 AS b, 'abc' AS s, -3 AS n")
+        .unwrap();
+
+    // coalesce(a, b) picks b=5 when a is NULL.
+    let filled = row
+        .select_exprs(&[coalesce(vec![col("a"), col("b")]).alias("c")])
+        .unwrap()
+        .filter_expr(col("c").eq(lit(5i64)))
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(filled.row_count(), 1, "coalesce picks the first non-null");
+
+    // upper('abc') = 'ABC'.
+    let up = row
+        .select_exprs(&[upper(col("s")).alias("u")])
+        .unwrap()
+        .filter_expr(col("u").eq(lit("ABC")))
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(up.row_count(), 1, "upper uppercases");
+
+    // abs(-3) = 3.
+    let a = row
+        .select_exprs(&[abs(col("n")).alias("m")])
+        .unwrap()
+        .filter_expr(col("m").eq(lit(3i64)))
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(a.row_count(), 1, "abs of -3 is 3");
+}
+
+#[test]
 fn phase_c_boundedness_metadata_exists_in_all_session_modes() {
     let sessions = [
         Session::builder().build().unwrap(),

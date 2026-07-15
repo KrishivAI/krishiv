@@ -232,19 +232,28 @@ pub const PARITY: &[ApiEntry] = &[
         "function",
         "reachable via the SQL registry / raw; no typed when() builder (Phase 61 gap)",
     ),
-    entry(
-        Functions,
-        "coalesce",
-        Partial,
-        "function",
-        "reachable via function(\"coalesce\", …); typed F.coalesce is the gap",
-    ),
+    entry(Functions, "coalesce", Supported, "coalesce", "typed F.* helper over the SQL registry"),
+    entry(Functions, "nvl", Supported, "nvl", "typed helper; exact Spark alias"),
+    entry(Functions, "upper", Supported, "upper", "typed F.* helper"),
+    entry(Functions, "lower", Supported, "lower", "typed F.* helper"),
+    entry(Functions, "length", Supported, "length", "typed F.* helper (character length)"),
+    entry(Functions, "trim", Supported, "trim", "typed F.* helper"),
+    entry(Functions, "abs", Supported, "abs", "typed F.* helper"),
     entry(
         Functions,
         "concat",
         Partial,
         "function",
-        "any Phase 60 SQL scalar fn is reachable via function(name, args); typed F.* helpers are the gap",
+        "reachable via function(\"concat\", …); no typed helper — Spark returns NULL if any arg is \
+         NULL, DataFusion skips nulls, so an exact F.concat is deferred (exact-or-absent rule)",
+    ),
+    entry(
+        Functions,
+        "round",
+        Partial,
+        "function",
+        "reachable via function(\"round\", …); no typed helper — Spark rounds half-up, DataFusion \
+         half-even, so an exact F.round is deferred",
     ),
     entry(
         Functions,
