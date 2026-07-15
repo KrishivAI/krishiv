@@ -5641,6 +5641,7 @@ dependencies = [
  "krishiv-dataflow",
  "krishiv-delta",
  "krishiv-engine-core",
+ "krishiv-engines",
  "krishiv-flight-sql",
  "krishiv-ivm",
  "krishiv-plan",
@@ -5822,6 +5823,24 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "krishiv-engines"
+version = "0.1.0"
+dependencies = [
+ "arrow 58.3.0",
+ "async-trait",
+ "datafusion 54.0.0",
+ "futures",
+ "krishiv-dataflow",
+ "krishiv-delta",
+ "krishiv-engine-core",
+ "krishiv-ivm",
+ "krishiv-sql",
+ "tempfile",
  "tokio",
  "tracing",
 ]

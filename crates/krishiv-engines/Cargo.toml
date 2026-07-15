@@ -1,0 +1,33 @@
+[package]
+name = "krishiv-engines"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+async-trait = { workspace = true }
+datafusion = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+krishiv-dataflow = { path = "../krishiv-dataflow", version = "0.1.0" }
+krishiv-delta = { path = "../krishiv-delta", version = "0.1.0" }
+krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.0" }
+krishiv-engine-core = { path = "../krishiv-engine-core", version = "0.1.0" }
+krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }

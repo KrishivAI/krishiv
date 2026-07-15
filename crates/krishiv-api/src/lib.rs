@@ -9,7 +9,12 @@ pub mod catalog;
 pub mod compute;
 pub mod connector_runtime;
 pub mod dataframe;
-pub mod engines;
+/// The three compute engines behind the `krishiv-engine-core` `ComputeEngine`
+/// contract now live in the dedicated `krishiv-engines` crate (Phase 61 #16 /
+/// STRUCT-1/2 — the engine layer implements the contract *outside* the
+/// krishiv-api god-crate). Re-exported here under the historical `engines`
+/// path so the frozen v1 surface is unchanged.
+pub use krishiv_engines as engines;
 pub mod error;
 pub mod expression;
 pub mod incremental_flow;

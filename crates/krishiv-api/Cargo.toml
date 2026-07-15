@@ -33,6 +33,7 @@ krishiv-scheduler = { path = "../krishiv-scheduler", version = "0.1.0" }
 krishiv-delta = { path = "../krishiv-delta", version = "0.1.0" }
 krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.0" }
 krishiv-engine-core = { path = "../krishiv-engine-core", version = "0.1.0" }
+krishiv-engines = { path = "../krishiv-engines", version = "0.1.0" }
 datafusion = { workspace = true }
 # iceberg feature deps — pulled in only when local-catalog or iceberg-datafusion are requested
 iceberg = { workspace = true, optional = true }

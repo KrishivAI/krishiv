@@ -140,7 +140,7 @@ async fn drain_changelog_source(
 /// incremental engine: each row's [`RowKind`] maps to a DBSP weight (`+1`
 /// insert/update-after, `-1` delete/update-before) appended as the `_weight`
 /// column. This is the bridge from CDC change semantics to Z-set deltas.
-pub(crate) fn delta_from_changelog(changelog: &ChangelogBatch) -> EngineResult<DeltaBatch> {
+pub fn delta_from_changelog(changelog: &ChangelogBatch) -> EngineResult<DeltaBatch> {
     let batch = changelog.batch();
     let weights: Vec<i64> = changelog.row_kinds().iter().map(|k| k.weight()).collect();
     let mut fields: Vec<Arc<arrow::datatypes::Field>> =
@@ -159,7 +159,7 @@ pub(crate) fn delta_from_changelog(changelog: &ChangelogBatch) -> EngineResult<D
 
 /// Probe the output schema of `query` by registering empty tables for each
 /// source schema and planning `... LIMIT 0`.
-pub(crate) async fn infer_output_schema(
+pub async fn infer_output_schema(
     sources: &[(String, SchemaRef)],
     query: &str,
 ) -> EngineResult<SchemaRef> {
