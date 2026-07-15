@@ -108,6 +108,21 @@ impl BlockingSession {
         self.inner.deregister_table(name)
     }
 
+    /// Read a Parquet file into a [`DataFrame`] synchronously.
+    pub fn read_parquet(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame> {
+        self.inner.read_parquet(path)
+    }
+
+    /// Read a CSV file into a [`DataFrame`] synchronously.
+    pub fn read_csv(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame> {
+        self.inner.read_csv(path)
+    }
+
+    /// Read a JSON file into a [`DataFrame`] synchronously.
+    pub fn read_json(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame> {
+        self.inner.read_json(path)
+    }
+
     /// Borrow the underlying async [`Session`].
     pub fn session(&self) -> &Session {
         &self.inner
@@ -155,6 +170,36 @@ mod tests {
         let df = session.session().sql("SELECT 1 AS x, 2 AS y").unwrap();
         let result = session.collect(df).unwrap();
         assert_eq!(result.row_count(), 1);
+    }
+
+    #[test]
+    fn blocking_session_covers_the_core_sync_facade() {
+        // The single complete sync facade (Phase 61): BlockingSession must expose
+        // a synchronous entry for every core data-plane operation. This list is
+        // the *enforced* contract — a new core capability must be mirrored here so
+        // the sync facade never silently lags the async Session. (The async-first
+        // core flip + `_async`-twin deprecation + Python mirror are the remaining
+        // structural residual of the one-sync/async-contract work.)
+        let source = include_str!("blocking.rs");
+        const CORE_FACADE: &[&str] = &[
+            "sql",
+            "collect",
+            "create_live_table",
+            "register_record_batches",
+            "deregister_table",
+            "read_parquet",
+            "read_csv",
+            "read_json",
+            "session",
+            "runtime",
+            "close",
+        ];
+        for method in CORE_FACADE {
+            assert!(
+                source.contains(&format!("pub fn {method}")),
+                "BlockingSession is missing a core sync-facade method: `{method}`"
+            );
+        }
     }
 
     #[test]
