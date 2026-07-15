@@ -1808,6 +1808,98 @@ fn create_live_table_selects_engine_by_refresh_mode() {
 }
 
 #[test]
+fn write_stream_to_table_materializes_via_the_dataframe() {
+    use crate::Refresh;
+    let session = Session::builder().build().unwrap();
+    let df = session.sql("SELECT 1 AS a UNION ALL SELECT 2 AS a").unwrap();
+
+    // Batch: df.write_stream().to_table materializes the DataFrame's result.
+    df.write_stream().to_table(&session, "wt").unwrap();
+    let rows = session
+        .sql("SELECT a FROM wt")
+        .unwrap()
+        .collect()
+        .unwrap()
+        .row_count();
+    assert_eq!(rows, 2, "write_stream batch snapshot holds both rows");
+
+    // Incremental via the DataFrame's defining query → IVM materialized view.
+    df.write_stream()
+        .refresh(Refresh::Incremental)
+        .to_table(&session, "wt_mv")
+        .unwrap();
+    assert!(
+        session
+            .incremental_view_registry()
+            .get("wt_mv")
+            .unwrap()
+            .is_some(),
+        "write_stream incremental registers an IVM view"
+    );
+
+    // Continuous is coordinator-gated.
+    assert!(
+        df.write_stream()
+            .refresh(Refresh::Continuous)
+            .to_table(&session, "wt_c")
+            .is_err()
+    );
+}
+
+#[test]
+fn more_f_star_string_helpers_execute() {
+    use crate::{col, lit, ltrim, substring};
+    let session = Session::builder().build().unwrap();
+    let row = session.sql("SELECT '  hi' AS s, 'hello' AS h").unwrap();
+
+    // ltrim('  hi') = 'hi'.
+    let l = row
+        .select_exprs(&[ltrim(col("s")).alias("t")])
+        .unwrap()
+        .filter_expr(col("t").eq(lit("hi")))
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(l.row_count(), 1, "ltrim strips leading spaces");
+
+    // substring('hello', 1, 3) = 'hel' (1-indexed).
+    let sub = row
+        .select_exprs(&[substring(col("h"), 1, 3).alias("x")])
+        .unwrap()
+        .filter_expr(col("x").eq(lit("hel")))
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(sub.row_count(), 1, "substring is 1-indexed");
+}
+
+#[test]
+fn with_columns_renamed_bulk_renames() {
+    let session = Session::builder().build().unwrap();
+    let df = session.sql("SELECT 1 AS a, 2 AS b").unwrap();
+    let renamed = df.with_columns_renamed(&[("a", "x"), ("b", "y")]).unwrap();
+    let schema = renamed.schema().unwrap();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(names, vec!["x", "y"], "both columns renamed in one call");
+}
+
+#[test]
+fn refresh_maps_to_engine_core_engine_kind() {
+    use crate::Refresh;
+    use krishiv_engine_core::EngineKind;
+    // The API-level engine selection speaks the engine-core contract's vocabulary.
+    assert!(matches!(Refresh::Batch.engine_kind(), EngineKind::Batch));
+    assert!(matches!(
+        Refresh::Incremental.engine_kind(),
+        EngineKind::Incremental
+    ));
+    assert!(matches!(
+        Refresh::Continuous.engine_kind(),
+        EngineKind::Streaming
+    ));
+}
+
+#[test]
 fn phase_c_boundedness_metadata_exists_in_all_session_modes() {
     let sessions = [
         Session::builder().build().unwrap(),

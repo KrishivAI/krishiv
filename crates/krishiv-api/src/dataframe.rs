@@ -148,6 +148,53 @@ impl PivotValue {
     }
 }
 
+/// Builder returned by [`DataFrame::write_stream`] — the DataFrame-side entry to
+/// the unified live-table write (Phase 61 keystone). Set the refresh mode, then
+/// materialize into a named table via [`to_table`](Self::to_table).
+pub struct WriteStreamBuilder<'a> {
+    df: &'a DataFrame,
+    refresh: crate::Refresh,
+}
+
+impl<'a> WriteStreamBuilder<'a> {
+    /// Select the compute engine by refresh mode (Batch / Incremental /
+    /// Continuous). Defaults to [`Refresh::Batch`](crate::Refresh::Batch).
+    #[must_use]
+    pub fn refresh(mut self, refresh: crate::Refresh) -> Self {
+        self.refresh = refresh;
+        self
+    }
+
+    /// Materialize into table `name` on `session`, choosing the engine from the
+    /// refresh mode. `Batch` materializes this DataFrame's result directly (so
+    /// transformations not expressible as a single query still work);
+    /// `Incremental` registers an IVM materialized view from the DataFrame's
+    /// defining query; `Continuous` targets the coordinator-gated streaming
+    /// engine. Mirrors [`Session::create_live_table`](crate::Session::create_live_table).
+    pub fn to_table(self, session: &crate::Session, name: &str) -> Result<()> {
+        match self.refresh {
+            crate::Refresh::Batch => {
+                let batches = self.df.collect()?.into_batches();
+                session.register_record_batches(name, batches)
+            }
+            crate::Refresh::Incremental => {
+                let query = self.df.sql_query.as_deref().ok_or_else(|| {
+                    KrishivError::unsupported(
+                        "write_stream().refresh(Incremental).to_table requires a SQL-defined \
+                         DataFrame (its defining query drives the materialized view)",
+                    )
+                })?;
+                session.create_live_table(name, query, crate::Refresh::Incremental)
+            }
+            crate::Refresh::Continuous => session.create_live_table(
+                name,
+                self.df.sql_query.as_deref().unwrap_or("<dataframe>"),
+                crate::Refresh::Continuous,
+            ),
+        }
+    }
+}
+
 /// DataFrame API backed by DataFusion for R1 local execution.
 #[derive(Clone)]
 pub struct DataFrame {
@@ -1011,6 +1058,18 @@ Execution statistics:
         }
     }
 
+    /// Rename several columns in one call (PySpark `withColumnsRenamed`) — each
+    /// pair is `(existing, new)`, applied left to right. Folds a run of
+    /// [`rename`](Self::rename) calls into one polymorphic entry (Phase 61
+    /// variant-collapse).
+    pub fn with_columns_renamed(&self, renames: &[(&str, &str)]) -> Result<DataFrame> {
+        let mut df = self.clone();
+        for (old, new) in renames {
+            df = df.rename(old, new)?;
+        }
+        Ok(df)
+    }
+
     /// Add or replace a column with a computed expression (SQL-based).
     pub fn with_column(&self, name: &str, expr: &str) -> Result<DataFrame> {
         match &self.sql_dataframe {
@@ -1135,6 +1194,17 @@ Execution statistics:
         }
         let right_reordered = right.select(&left_names)?;
         self.union(&right_reordered)
+    }
+
+    /// Begin a live-table / streaming write (PySpark `df.writeStream`), the
+    /// DataFrame-side entry to the Phase 61 keystone. The refresh mode chosen on
+    /// the returned builder selects the compute engine; `to_table` needs the
+    /// owning [`Session`](crate::Session) (a DataFrame carries no session ref).
+    pub fn write_stream(&self) -> WriteStreamBuilder<'_> {
+        WriteStreamBuilder {
+            df: self,
+            refresh: crate::Refresh::Batch,
+        }
     }
 
     /// Return rows present in both DataFrames, preserving duplicate multiplicity.

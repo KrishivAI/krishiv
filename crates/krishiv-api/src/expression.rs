@@ -199,6 +199,30 @@ pub fn trim(expr: Expr) -> Expr {
 pub fn abs(expr: Expr) -> Expr {
     function("abs", vec![expr])
 }
+/// `LTRIM(expr)` — strip leading spaces (PySpark `F.ltrim`).
+pub fn ltrim(expr: Expr) -> Expr {
+    function("ltrim", vec![expr])
+}
+/// `RTRIM(expr)` — strip trailing spaces (PySpark `F.rtrim`).
+pub fn rtrim(expr: Expr) -> Expr {
+    function("rtrim", vec![expr])
+}
+/// `CEIL(expr)` — round up to the nearest integer (PySpark `F.ceil`).
+pub fn ceil(expr: Expr) -> Expr {
+    function("ceil", vec![expr])
+}
+/// `FLOOR(expr)` — round down to the nearest integer (PySpark `F.floor`).
+pub fn floor(expr: Expr) -> Expr {
+    function("floor", vec![expr])
+}
+/// `SQRT(expr)` — square root (PySpark `F.sqrt`).
+pub fn sqrt(expr: Expr) -> Expr {
+    function("sqrt", vec![expr])
+}
+/// `SUBSTR(expr, pos, len)` — 1-indexed substring (PySpark `F.substring`).
+pub fn substring(expr: Expr, pos: i64, len: i64) -> Expr {
+    function("substr", vec![expr, lit(pos), lit(len)])
+}
 
 // ── Window functions ──────────────────────────────────────────────────────────
 //

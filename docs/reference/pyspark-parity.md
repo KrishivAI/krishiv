@@ -3,15 +3,15 @@
 > Generated from `crates/krishiv-api/src/pyspark_parity.rs` — do not edit by hand.
 > Regenerate with `KRISHIV_BLESS_PYSPARK_PARITY=1 cargo test -p krishiv-api pyspark_parity`.
 
-**Overall parity: 106/116 = 91%** of the enumerated PySpark surface (Supported or Partial). Each shortfall is itemized below.
+**Overall parity: 113/122 = 93%** of the enumerated PySpark surface (Supported or Partial). Each shortfall is itemized below.
 
 ## Coverage by namespace
 
 | Namespace | Covered | Total | % |
 |---|---|---|---|
-| DataFrame | 40 | 47 | 85% |
+| DataFrame | 41 | 47 | 87% |
 | Column | 13 | 16 | 81% |
-| functions | 29 | 29 | 100% |
+| functions | 35 | 35 | 100% |
 | GroupedData | 7 | 7 | 100% |
 | Window | 6 | 6 | 100% |
 | DataFrameReader | 5 | 5 | 100% |
@@ -63,10 +63,10 @@
 | `fillna` | supported | fill_null |  |
 | `dropna` | supported | drop_nulls |  |
 | `replace` | planned | — | Phase 61 gap: value replacement |
-| `withColumnsRenamed` | planned | — | bulk rename (variant-collapse target) |
+| `withColumnsRenamed` | supported | with_columns_renamed | bulk rename over (existing, new) pairs (Phase 61 variant-collapse) |
 | `toPandas` | planned | — | Phase 61 gap: zero-copy Arrow → pandas (Python surface) |
 | `write` | supported | write | DataFrameWriter |
-| `writeStream` | partial | session.create_live_table | Phase 61 keystone: session.create_live_table(name, query, Refresh::Batch|Incremental|Continuous) selects the engine by refresh mode; df.write_stream() sugar + Interval/cron are the residual |
+| `writeStream` | supported | write_stream | Phase 61 keystone: df.write_stream().refresh(Batch|Incremental|Continuous).to_table(session, name) selects the engine by refresh mode (also session.create_live_table); Continuous execution + Interval/cron are the coordinator/scheduler-gated residual |
 | `foreachBatch` | planned | — | Phase 61 gap: micro-batch sink callback |
 
 ## Column
@@ -119,7 +119,13 @@
 | `lower` | supported | lower | typed F.* helper |
 | `length` | supported | length | typed F.* helper (character length) |
 | `trim` | supported | trim | typed F.* helper |
+| `ltrim` | supported | ltrim | typed F.* helper |
+| `rtrim` | supported | rtrim | typed F.* helper |
 | `abs` | supported | abs | typed F.* helper |
+| `ceil` | supported | ceil | typed F.* helper |
+| `floor` | supported | floor | typed F.* helper |
+| `sqrt` | supported | sqrt | typed F.* helper |
+| `substring` | supported | substring | typed F.* helper (1-indexed substr) |
 | `concat` | partial | function | reachable via function("concat", …); no typed helper — Spark returns NULL if any arg is NULL, DataFusion skips nulls, so an exact F.concat is deferred (exact-or-absent rule) |
 | `round` | partial | function | reachable via function("round", …); no typed helper — Spark rounds half-up, DataFusion half-even, so an exact F.round is deferred |
 | `<sql-registry>` | partial | function | the whole Phase 60 SQL function registry (JSON/HOF/date/hash/…) is reachable via function(name, args); Phase 61 ships typed F.* helpers over it (one registry, all surfaces) |

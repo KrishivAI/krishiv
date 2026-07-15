@@ -184,17 +184,23 @@ pub const PARITY: &[ApiEntry] = &[
     entry(DataFrame, "fillna", Supported, "fill_null", ""),
     entry(DataFrame, "dropna", Supported, "drop_nulls", ""),
     entry(DataFrame, "replace", Planned, "", "Phase 61 gap: value replacement"),
-    entry(DataFrame, "withColumnsRenamed", Planned, "", "bulk rename (variant-collapse target)"),
+    entry(
+        DataFrame,
+        "withColumnsRenamed",
+        Supported,
+        "with_columns_renamed",
+        "bulk rename over (existing, new) pairs (Phase 61 variant-collapse)",
+    ),
     entry(DataFrame, "toPandas", Planned, "", "Phase 61 gap: zero-copy Arrow → pandas (Python surface)"),
     entry(DataFrame, "write", Supported, "write", "DataFrameWriter"),
     entry(
         DataFrame,
         "writeStream",
-        Partial,
-        "session.create_live_table",
-        "Phase 61 keystone: session.create_live_table(name, query, Refresh::Batch|Incremental|\
-         Continuous) selects the engine by refresh mode; df.write_stream() sugar + Interval/cron \
-         are the residual",
+        Supported,
+        "write_stream",
+        "Phase 61 keystone: df.write_stream().refresh(Batch|Incremental|Continuous).to_table(\
+         session, name) selects the engine by refresh mode (also session.create_live_table); \
+         Continuous execution + Interval/cron are the coordinator/scheduler-gated residual",
     ),
     entry(DataFrame, "foreachBatch", Planned, "", "Phase 61 gap: micro-batch sink callback"),
     // ── Column ───────────────────────────────────────────────────────────────
@@ -246,7 +252,13 @@ pub const PARITY: &[ApiEntry] = &[
     entry(Functions, "lower", Supported, "lower", "typed F.* helper"),
     entry(Functions, "length", Supported, "length", "typed F.* helper (character length)"),
     entry(Functions, "trim", Supported, "trim", "typed F.* helper"),
+    entry(Functions, "ltrim", Supported, "ltrim", "typed F.* helper"),
+    entry(Functions, "rtrim", Supported, "rtrim", "typed F.* helper"),
     entry(Functions, "abs", Supported, "abs", "typed F.* helper"),
+    entry(Functions, "ceil", Supported, "ceil", "typed F.* helper"),
+    entry(Functions, "floor", Supported, "floor", "typed F.* helper"),
+    entry(Functions, "sqrt", Supported, "sqrt", "typed F.* helper"),
+    entry(Functions, "substring", Supported, "substring", "typed F.* helper (1-indexed substr)"),
     entry(
         Functions,
         "concat",

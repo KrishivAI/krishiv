@@ -1077,6 +1077,23 @@ pub enum Refresh {
     Continuous,
 }
 
+impl Refresh {
+    /// The `engine-core` [`EngineKind`](krishiv_engine_core::EngineKind) this
+    /// refresh mode targets — the API-level expression of the engine-core
+    /// contract (STRUCT-1/2). The refresh mode a live table is created with *is*
+    /// the compute engine that maintains it: Batch → Batch, Incremental →
+    /// Incremental (IVM), Continuous → Streaming. As the engine crates come to
+    /// implement `ComputeEngine` directly, this is the single mapping the
+    /// unified API dispatches through.
+    pub fn engine_kind(&self) -> krishiv_engine_core::EngineKind {
+        match self {
+            Refresh::Batch => krishiv_engine_core::EngineKind::Batch,
+            Refresh::Incremental => krishiv_engine_core::EngineKind::Incremental,
+            Refresh::Continuous => krishiv_engine_core::EngineKind::Streaming,
+        }
+    }
+}
+
 impl Session {
     /// Start building a session.
     pub fn builder() -> SessionBuilder {

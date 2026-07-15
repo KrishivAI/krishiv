@@ -63,16 +63,16 @@ pub use engines::{
 // the SQL, Python, and Rust front-ends so engine selection never forks per API.
 pub use dataframe::{
     Boundedness, DataFrame, ExecutionResult, ExplainMode, GroupedDataFrame, GroupingSpec, JoinType,
-    PivotValue, QueryExecutionStats,
+    PivotValue, QueryExecutionStats, WriteStreamBuilder,
 };
 pub use error::{KrishivError, Result};
 pub use expression::{
     AggregateFunction as ExprAggregateFunction, BinaryOperator as ExprBinaryOperator,
     EXPRESSION_FORMAT_VERSION, Expr, ExprDataType, ExprField, IntervalUnit, Literal, NullOrdering,
     ScalarValue, SortDirection, TimeUnit, WindowFrame, WindowFrameBound, WindowFrameUnits, abs,
-    avg, coalesce, col, count, count_all, cume_dist, dense_rank, first_value, function, lag,
-    last_value, lead, length, lit, lower, max, min, nth_value, ntile, nvl, percent_rank, rank,
-    row_number, sum, trim, upper,
+    avg, ceil, coalesce, col, count, count_all, cume_dist, dense_rank, first_value, floor,
+    function, lag, last_value, lead, length, lit, lower, ltrim, max, min, nth_value, ntile, nvl,
+    percent_rank, rank, row_number, rtrim, sqrt, substring, sum, trim, upper,
 };
 pub use incremental_flow::{IncrementalFlow, StepSummary};
 pub use io::{

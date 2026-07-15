@@ -83,6 +83,31 @@ impl BlockingSession {
         self.rt.block_on(df.collect_async())
     }
 
+    /// Create a live table synchronously — the keystone surface through the
+    /// sync facade (delegates to [`Session::create_live_table`]).
+    pub fn create_live_table(
+        &self,
+        name: &str,
+        query: &str,
+        refresh: crate::Refresh,
+    ) -> Result<()> {
+        self.inner.create_live_table(name, query, refresh)
+    }
+
+    /// Register record batches as a named table synchronously.
+    pub fn register_record_batches(
+        &self,
+        name: &str,
+        batches: Vec<arrow::record_batch::RecordBatch>,
+    ) -> Result<()> {
+        self.inner.register_record_batches(name, batches)
+    }
+
+    /// Deregister (drop) a named table synchronously.
+    pub fn deregister_table(&self, name: &str) -> Result<()> {
+        self.inner.deregister_table(name)
+    }
+
     /// Borrow the underlying async [`Session`].
     pub fn session(&self) -> &Session {
         &self.inner
@@ -130,6 +155,21 @@ mod tests {
         let df = session.session().sql("SELECT 1 AS x, 2 AS y").unwrap();
         let result = session.collect(df).unwrap();
         assert_eq!(result.row_count(), 1);
+    }
+
+    #[test]
+    fn blocking_session_covers_live_table_facade() {
+        // The sync facade reaches the Phase 61 keystone without an async
+        // runtime: create a batch live table, query it, drop it — all blocking.
+        let bs = BlockingSession::embedded().unwrap();
+        bs.create_live_table(
+            "bt",
+            "SELECT 1 AS a UNION ALL SELECT 2 AS a",
+            crate::Refresh::Batch,
+        )
+        .unwrap();
+        assert_eq!(bs.sql("SELECT a FROM bt").unwrap().row_count(), 2);
+        bs.deregister_table("bt").unwrap();
     }
 
     #[test]
