@@ -37,12 +37,12 @@ default = ["local"]
 
 # Build presets
 local   = ["embedded", "single-node", "jemalloc", "rest-catalog", "iceberg"]
-full    = ["single-node", "distributed", "k8s", "kafka", "iceberg", "cloud", "jemalloc"]
+full    = ["single-node", "distributed", "k8s", "kafka", "iceberg", "cloud", "jemalloc", "jdbc"]
 # `prod`: the deployed-cluster preset. Everything a distributed cluster needs to
 # run real workloads — Kafka sources, Iceberg tables on object storage, the
 # distributed control plane. `build-fast-engine.sh` builds THIS, not bare
 # default, so shipped images never silently lack kafka/cloud.
-prod    = ["distributed", "rest-catalog", "kafka", "iceberg", "cloud", "jemalloc"]
+prod    = ["distributed", "rest-catalog", "kafka", "iceberg", "cloud", "jemalloc", "jdbc"]
 
 # Deployment capability surfaces (gate optional dep families)
 embedded    = []                                                 # baseline; no optional deps
@@ -59,6 +59,10 @@ rest-catalog = ["flight-sql", "krishiv-flight-sql/rest-catalog"]
 shuffle = ["dep:krishiv-shuffle"]
 etcd = ["krishiv-scheduler/etcd"]
 kafka = ["krishiv-connectors/kafka"]
+# jdbc: Postgres pull source/sink (sqlx) + the `STORED AS JDBC` SQL factory
+# with incremental keyset cursors — Phase 31 ingest breadth. In prod/full so
+# shipped images can serve governed JDBC pulls.
+jdbc = ["krishiv-connectors/jdbc", "krishiv-sql/jdbc"]
 state = ["krishiv-connectors/state"]
 # cloud: object-store backends (S3/GCS/Azure, MinIO-compatible) for Iceberg and
 # other lakehouse I/O. Without this, `s3://`/object-store URIs fail at runtime —

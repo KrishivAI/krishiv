@@ -63,6 +63,10 @@ default = []
 iceberg = ["krishiv-connectors/iceberg", "dep:iceberg"]
 delta = ["krishiv-connectors/delta"]
 hudi = ["krishiv-connectors/hudi"]
+# JDBC pull source: `CREATE EXTERNAL TABLE … STORED AS JDBC` over the
+# registry's JdbcSourceDriver (Postgres via sqlx), incl. incremental keyset
+# cursors (`cursor.column` / `cursor.after`). Phase 31 ingest breadth.
+jdbc = ["krishiv-connectors/jdbc"]
 # J1-J4 unified catalog backends.
 local-catalog = ["dep:iceberg"]
 # These shared-warehouse backends resolve `s3://` through the object-store

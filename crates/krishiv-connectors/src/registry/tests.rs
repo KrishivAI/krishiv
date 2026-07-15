@@ -63,3 +63,37 @@ fn custom_driver_registration() {
     assert!(registry.has_driver(ConnectorKind::Parquet, ConnectorRole::Source));
     assert!(registry.has_driver(ConnectorKind::Parquet, ConnectorRole::Sink));
 }
+
+/// Phase 31 ingest breadth: the JDBC driver's incremental-cursor options are
+/// validated fail-fast (no live database needed) — `cursor.after` needs
+/// `cursor.column` and must be an Int64.
+#[cfg(feature = "jdbc")]
+#[test]
+fn jdbc_source_validate_rejects_bad_cursor_options() {
+    let registry = default_registry();
+
+    let ok = ConnectorConfig::new("t", "jdbc")
+        .with_property("url", "postgres://u:p@127.0.0.1:1/db")
+        .with_property("table", "public.orders")
+        .with_property("cursor.column", "id")
+        .with_property("cursor.after", "42");
+    registry.validate_source(&ok).expect("valid cursor config");
+
+    let dangling = ConnectorConfig::new("t", "jdbc")
+        .with_property("url", "postgres://u:p@127.0.0.1:1/db")
+        .with_property("table", "public.orders")
+        .with_property("cursor.after", "42");
+    let err = registry.validate_source(&dangling).unwrap_err();
+    assert!(
+        err.to_string().contains("cursor.after requires cursor.column"),
+        "{err}"
+    );
+
+    let non_int = ConnectorConfig::new("t", "jdbc")
+        .with_property("url", "postgres://u:p@127.0.0.1:1/db")
+        .with_property("table", "public.orders")
+        .with_property("cursor.column", "id")
+        .with_property("cursor.after", "2026-07-15");
+    let err = registry.validate_source(&non_int).unwrap_err();
+    assert!(err.to_string().contains("64-bit integer"), "{err}");
+}

@@ -106,6 +106,16 @@ impl JdbcSource {
         self
     }
 
+    /// Start keyset pagination after `cursor` — the incremental-pull entry
+    /// point: a caller that persisted the last ingested key resumes with
+    /// `WHERE key > cursor`, reading only rows added since. Only meaningful
+    /// together with [`with_key_column`]; ignored by OFFSET pagination.
+    #[must_use]
+    pub fn with_cursor_after(mut self, cursor: i64) -> Self {
+        self.last_key = Some(cursor);
+        self
+    }
+
     /// Derive the Arrow schema from the first row by issuing `LIMIT 0`.
     async fn fetch_schema(&mut self) -> ConnectorResult<SchemaRef> {
         if let Some(s) = &self.schema {
@@ -142,7 +152,7 @@ impl Source for JdbcSource {
         // CONN-5: Use keyset pagination when a key column is configured
         // (stable under concurrent writes); fall back to OFFSET otherwise.
         let sql = if let Some(ref key_col) = self.key_column {
-            let quoted_key = quote_pg_ident(key_col);
+            let quoted_key = quote_identifier(key_col);
             match self.last_key {
                 Some(k) => format!(
                     "SELECT * FROM {} WHERE {} > {} ORDER BY {} LIMIT {}",
@@ -647,22 +657,24 @@ mod tests {
         // Embedded double-quotes are doubled per the Postgres spec (escape by doubling).
         assert_eq!(quote_identifier("table\"name"), "\"table\"\"name\"");
 
-        // An injection attempt (`users; DROP TABLE users; --`) is neutralised: the
-        // result is a single quoted identifier with the semicolons inside the quotes.
+        // An injection attempt (`users; DROP TABLE users; --`) is neutralised:
+        // wrap-quoting yields exactly ONE double-quoted identifier — the
+        // payload stays inert text inside the quotes (it contains no `"`, so
+        // nothing can terminate the identifier early).
         let injected = "users; DROP TABLE users; --";
-        let quoted = quote_identifier(injected);
-        assert!(quoted.starts_with('"'), "must be double-quoted");
-        assert!(quoted.ends_with('"'), "must be double-quoted");
-        assert!(
-            !quoted.contains("; DROP"),
-            "injection payload must be inside quotes"
-        );
+        assert_eq!(quote_identifier(injected), format!("\"{injected}\""));
 
-        // Schema-qualified names quote each component separately.
+        // A payload that DOES carry a quote cannot break out either — every
+        // interior `"` is doubled, so the identifier still ends only at the
+        // final wrapping quote.
+        let quote_escape = quote_identifier("x\"; DROP TABLE users; --");
+        assert_eq!(quote_escape, "\"x\"\"; DROP TABLE users; --\"");
+
+        // Schema-qualified names quote each `.`-separated component.
         assert_eq!(quote_qualified("public.users"), "\"public\".\"users\"");
         assert_eq!(
             quote_qualified("schema\".evil.table"),
-            "\"schema\"\".evil\".\"table\""
+            "\"schema\"\"\".\"evil\".\"table\""
         );
     }
 

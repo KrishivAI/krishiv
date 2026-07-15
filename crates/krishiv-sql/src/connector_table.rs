@@ -72,6 +72,14 @@ pub fn register_connector_table_factories(
         "KAFKA".to_string(),
         Arc::new(ConnectorTableFactory::streaming(streaming_sources)),
     );
+    #[cfg(feature = "jdbc")]
+    table_factories.insert(
+        "JDBC".to_string(),
+        Arc::new(ConnectorTableFactory::bounded(
+            "jdbc",
+            shared_connector_registry(),
+        )),
+    );
 }
 
 /// Build a [`ConnectorConfig`] from a `CREATE EXTERNAL TABLE` command.
@@ -117,6 +125,36 @@ pub fn connector_config_from_ddl(
             }
             if let Some(ms) = kafka_auto_commit_interval_ms() {
                 cfg = cfg.with_property("auto.commit.interval.ms", ms.to_string());
+            }
+            cfg
+        }
+        // JDBC pull source (Phase 31 ingest breadth): LOCATION is the bare
+        // Postgres connection URL (no warehouse-path validation — it is not a
+        // filesystem path). Options: `table` (required, validated by the
+        // registry driver), `cursor.column`/`cursor.after` for incremental
+        // keyset pull, `batch_size` for page sizing.
+        "jdbc" => {
+            let mut cfg = ConnectorConfig::new(name, kind)
+                .with_property("url", cmd.location.clone());
+            for (key, value) in &cmd.options {
+                // DataFusion namespaces un-dotted OPTIONS keys under
+                // `format.` — accept both spellings of the same option.
+                let key = key.strip_prefix("format.").unwrap_or(key);
+                match key {
+                    "table" | "cursor.column" | "cursor.after" | "batch_size" => {
+                        cfg = cfg.with_property(key, value.clone());
+                    }
+                    other => {
+                        return Err(DataFusionError::External(Box::new(
+                            ConnectorError::Unsupported {
+                                message: format!(
+                                    "unknown JDBC option '{other}' (expected table, \
+                                     cursor.column, cursor.after, batch_size)"
+                                ),
+                            },
+                        )));
+                    }
+                }
             }
             cfg
         }
@@ -357,6 +395,53 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
+
+    /// Phase 31 ingest breadth: `STORED AS JDBC` DDL creates the provider
+    /// without touching the database (connection is deferred to scan), and
+    /// the option surface is closed — unknown keys and cursor misuse fail at
+    /// DDL time, not at first pull.
+    #[cfg(feature = "jdbc")]
+    #[tokio::test]
+    async fn jdbc_ddl_validates_options_without_connecting() {
+        let engine = crate::SqlEngine::new();
+        engine
+            .sql(
+                "CREATE EXTERNAL TABLE pg_orders (id BIGINT, amount DOUBLE) \
+                 STORED AS JDBC LOCATION 'postgres://u:p@127.0.0.1:1/db' \
+                 OPTIONS ('table' 'public.orders', 'cursor.column' 'id', \
+                 'cursor.after' '42', 'batch_size' '500')",
+            )
+            .await
+            .expect("jdbc DDL must succeed without a live database");
+
+        let unknown = engine
+            .sql(
+                "CREATE EXTERNAL TABLE pg_bad (id BIGINT) STORED AS JDBC \
+                 LOCATION 'postgres://u:p@127.0.0.1:1/db' \
+                 OPTIONS ('table' 't', 'bogus' 'x')",
+            )
+            .await
+            .expect_err("unknown option must be rejected");
+        assert!(
+            unknown.to_string().contains("unknown JDBC option"),
+            "{unknown}"
+        );
+
+        let dangling_cursor = engine
+            .sql(
+                "CREATE EXTERNAL TABLE pg_bad2 (id BIGINT) STORED AS JDBC \
+                 LOCATION 'postgres://u:p@127.0.0.1:1/db' \
+                 OPTIONS ('table' 't', 'cursor.after' '7')",
+            )
+            .await
+            .expect_err("cursor.after without cursor.column must be rejected");
+        assert!(
+            dangling_cursor
+                .to_string()
+                .contains("cursor.after requires cursor.column"),
+            "{dangling_cursor}"
+        );
+    }
 
     #[test]
     fn bounded_connector_provider_statistics_returns_none_for_unknown_table() {

@@ -21,6 +21,25 @@ fn require_table(config: &ConnectorConfig) -> ConnectorResult<String> {
     Ok(config.required("table")?.to_owned())
 }
 
+/// Fail-fast validation of the incremental-cursor options, so a bad config
+/// is rejected at `validate` time instead of after a live connection opens.
+fn validate_cursor_options(config: &ConnectorConfig) -> ConnectorResult<()> {
+    match (config.get("cursor.column"), config.get("cursor.after")) {
+        (None, Some(_)) => Err(ConnectorError::Unsupported {
+            message: "cursor.after requires cursor.column".into(),
+        }),
+        (_, Some(after)) if after.parse::<i64>().is_err() => {
+            Err(ConnectorError::Unsupported {
+                message: format!(
+                    "cursor.after '{after}' must be a 64-bit integer \
+                     (jdbc incremental cursors are Int64 in v1)"
+                ),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 // ── Source driver ─────────────────────────────────────────────────────────────
 
 /// Driver for [`JdbcSource`].
@@ -29,8 +48,11 @@ fn require_table(config: &ConnectorConfig) -> ConnectorResult<String> {
 /// - `url` — bare Postgres connection URL (no `jdbc:` prefix)
 /// - `table` — target table name
 ///
-/// Optional config key:
+/// Optional config keys:
 /// - `batch_size` — rows per page (default 1 000)
+/// - `cursor.column` — keyset-pagination column for incremental pull
+/// - `cursor.after` — Int64 cursor to resume strictly after (needs
+///   `cursor.column`)
 pub struct JdbcSourceDriver;
 
 impl SourceDriver for JdbcSourceDriver {
@@ -47,6 +69,7 @@ impl SourceDriver for JdbcSourceDriver {
     fn validate(&self, config: &ConnectorConfig) -> ConnectorResult<()> {
         require_url(config)?;
         require_table(config)?;
+        validate_cursor_options(config)?;
         Ok(())
     }
 
@@ -61,10 +84,29 @@ impl SourceDriver for JdbcSourceDriver {
                 .get("batch_size")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1_000);
-            let source = JdbcSource::connect(&url, table)
+            let mut source = JdbcSource::connect(&url, table)
                 .await
                 .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?
                 .with_batch_size(batch_size);
+            // Incremental pull: `cursor.column` switches to keyset pagination
+            // (CONN-5) and `cursor.after` resumes strictly after a previously
+            // ingested key, so a scheduled re-pull reads only new rows.
+            if let Some(col) = config.get("cursor.column") {
+                source = source.with_key_column(col);
+                if let Some(after) = config.get("cursor.after") {
+                    let cursor: i64 = after.parse().map_err(|_| ConnectorError::Unsupported {
+                        message: format!(
+                            "cursor.after '{after}' must be a 64-bit integer \
+                             (jdbc incremental cursors are Int64 in v1)"
+                        ),
+                    })?;
+                    source = source.with_cursor_after(cursor);
+                }
+            } else if config.get("cursor.after").is_some() {
+                return Err(ConnectorError::Unsupported {
+                    message: "cursor.after requires cursor.column".into(),
+                });
+            }
             Ok(Box::new(source) as Box<dyn DynSource>)
         })
     }

@@ -52,6 +52,11 @@ pub fn all() -> Vec<Capability> {
             description: "Delta Lake table format",
         },
         Capability {
+            name: "jdbc",
+            enabled: cfg!(feature = "jdbc"),
+            description: "JDBC pull source/sink (Postgres) + STORED AS JDBC incremental cursors",
+        },
+        Capability {
             name: "state",
             enabled: cfg!(feature = "state"),
             description: "durable keyed state backend (RocksDB)",
