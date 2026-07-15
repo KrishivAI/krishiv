@@ -3,13 +3,13 @@
 > Generated from `crates/krishiv-api/src/pyspark_parity.rs` — do not edit by hand.
 > Regenerate with `KRISHIV_BLESS_PYSPARK_PARITY=1 cargo test -p krishiv-api pyspark_parity`.
 
-**Overall parity: 105/116 = 91%** of the enumerated PySpark surface (Supported or Partial). Each shortfall is itemized below.
+**Overall parity: 106/116 = 91%** of the enumerated PySpark surface (Supported or Partial). Each shortfall is itemized below.
 
 ## Coverage by namespace
 
 | Namespace | Covered | Total | % |
 |---|---|---|---|
-| DataFrame | 39 | 47 | 83% |
+| DataFrame | 40 | 47 | 85% |
 | Column | 13 | 16 | 81% |
 | functions | 29 | 29 | 100% |
 | GroupedData | 7 | 7 | 100% |
@@ -66,7 +66,7 @@
 | `withColumnsRenamed` | planned | — | bulk rename (variant-collapse target) |
 | `toPandas` | planned | — | Phase 61 gap: zero-copy Arrow → pandas (Python surface) |
 | `write` | supported | write | DataFrameWriter |
-| `writeStream` | planned | write | Phase 61 keystone: write_stream().to_table(refresh=…) |
+| `writeStream` | partial | session.create_live_table | Phase 61 keystone: session.create_live_table(name, query, Refresh::Batch|Incremental|Continuous) selects the engine by refresh mode; df.write_stream() sugar + Interval/cron are the residual |
 | `foreachBatch` | planned | — | Phase 61 gap: micro-batch sink callback |
 
 ## Column

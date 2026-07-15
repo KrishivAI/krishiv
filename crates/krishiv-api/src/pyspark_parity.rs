@@ -187,7 +187,15 @@ pub const PARITY: &[ApiEntry] = &[
     entry(DataFrame, "withColumnsRenamed", Planned, "", "bulk rename (variant-collapse target)"),
     entry(DataFrame, "toPandas", Planned, "", "Phase 61 gap: zero-copy Arrow → pandas (Python surface)"),
     entry(DataFrame, "write", Supported, "write", "DataFrameWriter"),
-    entry(DataFrame, "writeStream", Planned, "write", "Phase 61 keystone: write_stream().to_table(refresh=…)"),
+    entry(
+        DataFrame,
+        "writeStream",
+        Partial,
+        "session.create_live_table",
+        "Phase 61 keystone: session.create_live_table(name, query, Refresh::Batch|Incremental|\
+         Continuous) selects the engine by refresh mode; df.write_stream() sugar + Interval/cron \
+         are the residual",
+    ),
     entry(DataFrame, "foreachBatch", Planned, "", "Phase 61 gap: micro-batch sink callback"),
     // ── Column ───────────────────────────────────────────────────────────────
     entry(Column, "alias", Supported, "Expr::alias", ""),

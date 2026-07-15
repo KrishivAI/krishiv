@@ -1767,6 +1767,47 @@ fn f_star_scalar_helpers_have_exact_semantics() {
 }
 
 #[test]
+fn create_live_table_selects_engine_by_refresh_mode() {
+    use crate::Refresh;
+    let session = Session::builder().build().unwrap();
+
+    // Batch: materialize a snapshot, queryable as `snap`.
+    session
+        .create_live_table("snap", "SELECT 1 AS a UNION ALL SELECT 2 AS a", Refresh::Batch)
+        .unwrap();
+    let rows = session
+        .sql("SELECT a FROM snap")
+        .unwrap()
+        .collect()
+        .unwrap()
+        .row_count();
+    assert_eq!(rows, 2, "batch snapshot holds both rows");
+
+    // Incremental: register a materialized view on the IVM engine.
+    session
+        .create_live_table("mv", "SELECT SUM(a) AS s FROM snap", Refresh::Incremental)
+        .unwrap();
+    assert!(
+        session
+            .incremental_view_registry()
+            .get("mv")
+            .unwrap()
+            .is_some(),
+        "incremental refresh registers an IVM materialized view"
+    );
+
+    // Continuous: no coordinator in an embedded session — clear error, not a
+    // silent degrade.
+    let err = session
+        .create_live_table("c", "SELECT 1 AS a", Refresh::Continuous)
+        .expect_err("continuous refresh needs a coordinator");
+    assert!(
+        err.to_string().to_lowercase().contains("coordinator"),
+        "the error names the missing coordinator: {err}"
+    );
+}
+
+#[test]
 fn phase_c_boundedness_metadata_exists_in_all_session_modes() {
     let sessions = [
         Session::builder().build().unwrap(),

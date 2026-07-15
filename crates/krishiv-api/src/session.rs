@@ -1057,6 +1057,26 @@ impl fmt::Debug for Session {
     }
 }
 
+/// How a live table created by [`Session::create_live_table`] is kept current.
+///
+/// This is the API-level expression of the engine-core contract (Phase 61
+/// keystone): the *refresh* mode selects the compute engine behind **one**
+/// declarative surface — the same query, the same result, a different engine
+/// chosen by how the table is materialized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refresh {
+    /// One-shot batch snapshot of the query result (Batch engine). The table
+    /// holds the rows as of creation; re-run `create_live_table` to refresh.
+    Batch,
+    /// Continuously maintained by the incremental-view (IVM) engine — the table
+    /// is a materialized view kept up to date as its inputs change.
+    Incremental,
+    /// Continuously maintained by the streaming engine. Placing the operator on
+    /// the streaming coordinator/executors needs a running coordinator, so an
+    /// embedded session surfaces a clear error rather than silently degrading.
+    Continuous,
+}
+
 impl Session {
     /// Start building a session.
     pub fn builder() -> SessionBuilder {
@@ -3272,6 +3292,39 @@ impl Session {
     ) -> Result<()> {
         krishiv_common::async_util::block_on(self.sql_engine.register_record_batches(name, batches))
             .map_err(KrishivError::from)
+    }
+
+    /// Create a **live table** `name` defined by `query`, choosing the compute
+    /// engine from `refresh` — the unified declarative surface over the three
+    /// engines (Phase 61 keystone). One query, one result; the refresh mode is
+    /// the only thing that selects Batch / Incremental (IVM) / Streaming:
+    ///
+    /// - [`Refresh::Batch`] materializes a snapshot now (registered as `name`).
+    /// - [`Refresh::Incremental`] registers a materialized view maintained by
+    ///   the IVM engine (via the `CREATE MATERIALIZED VIEW` engine primitive).
+    /// - [`Refresh::Continuous`] targets the streaming engine; an embedded
+    ///   session has no coordinator to run it and says so, loudly.
+    ///
+    /// The platform's live-tables pipelines remain the *governed* wrapper — this
+    /// is the raw engine primitive underneath, not a competing catalog of record.
+    pub fn create_live_table(&self, name: &str, query: &str, refresh: Refresh) -> Result<()> {
+        match refresh {
+            Refresh::Batch => {
+                let batches = self.sql(query)?.collect()?.into_batches();
+                self.register_record_batches(name, batches)
+            }
+            Refresh::Incremental => {
+                // Route through the engine's CREATE MATERIALIZED VIEW primitive
+                // so the IVM engine owns the maintenance.
+                self.sql(format!("CREATE MATERIALIZED VIEW {name} AS {query}"))?;
+                Ok(())
+            }
+            Refresh::Continuous => Err(KrishivError::unsupported(format!(
+                "create_live_table('{name}', refresh=Continuous) needs a streaming coordinator to \
+                 run the continuous job; submit it via the continuous-stream registration API or a \
+                 cluster-attached session"
+            ))),
+        }
     }
 
     /// Deregister (drop) a named table from this session.

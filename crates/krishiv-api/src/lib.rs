@@ -98,7 +98,7 @@ pub use prepared::PreparedStatement;
 pub use process::{apply_async_io, apply_process_function};
 pub use query::{QueryCompletion, QueryHandle, QueryId, QueryProgress, QueryStatus};
 pub use session::{
-    CompiledContinuousStreamJob, ContinuousStreamCheckpoint, ContinuousStreamStatus,
+    CompiledContinuousStreamJob, ContinuousStreamCheckpoint, ContinuousStreamStatus, Refresh,
     RegisteredContinuousStreamJob, Session, SessionBuilder, SubmittedSqlJobState,
     SubmittedSqlJobStatus,
 };
