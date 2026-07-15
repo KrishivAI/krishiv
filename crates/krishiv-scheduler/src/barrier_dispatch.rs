@@ -12,6 +12,7 @@ use krishiv_proto::{
 
 use crate::barrier_client::inject_barrier;
 use crate::barrier_tracker::CheckpointBarrierTracker;
+use crate::coordinator::task_assignment::inject_executor_task_request_context;
 use crate::heartbeat::ExecutorRecord;
 use crate::job::JobRecord;
 use crate::{Coordinator, SchedulerResult};
@@ -357,10 +358,17 @@ pub async fn dispatch_barrier_plan(
             let channel = get_or_connect_barrier_channel(&endpoint).await.map_err(|e| {
                 format!("barrier connect failed for task {task_id_str}: {e}")
             })?;
+            // Inject the executor task bearer token (plus trace context) so the
+            // barrier RPC authenticates against the executor's BarrierService,
+            // whose `validate_auth` requires it whenever executor task auth is
+            // enabled (durable/production profiles). Using the trace-only
+            // interceptor here caused every barrier RPC to be rejected
+            // `Unauthenticated`, silently degrading all checkpoints to the
+            // heartbeat fallback and stalling data-bearing barrier epochs.
             let mut client =
                 krishiv_proto::wire::v1::barrier_service_client::BarrierServiceClient::with_interceptor(
                     channel,
-                    krishiv_metrics::grpc::inject_trace_context
+                    inject_executor_task_request_context
                         as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
                 );
             inject_barrier(&mut client, barrier, timeout).await.map_err(|e| {
