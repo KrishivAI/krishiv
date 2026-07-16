@@ -12,8 +12,13 @@ spec:
     matchLabels:
       {{- include "krishiv.coordinatorSelectorLabels" . | nindent 6 }}
   strategy:
-    # Only one active coordinator at a time (per-job leader election via Lease API).
-    type: Recreate
+    # Preserve quorum and a warm standby while a coordinator is replaced.
+    type: RollingUpdate
+    rollingUpdate:
+      # /leaderz makes warm standbys unavailable to the Service by design.
+      # A three-replica HA deployment still preserves one active endpoint.
+      maxUnavailable: 2
+      maxSurge: 0
   template:
     metadata:
       labels:
@@ -95,6 +100,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: KRISHIV_COORDINATOR_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
@@ -107,7 +116,9 @@ spec:
             {{- toYaml .Values.coordinator.resources | nindent 12 }}
           readinessProbe:
             httpGet:
-              path: /healthz
+              # Active-only routing. Unlike /readyz this does not require an
+              # executor, avoiding a coordinator/executor bootstrap deadlock.
+              path: /leaderz
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10

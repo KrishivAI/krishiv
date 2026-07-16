@@ -654,12 +654,29 @@ impl Coordinator {
 
         let mut executor_leases = self.exec.executors.assignment_leases();
         if !bad_executors.is_empty() {
+            let before = executor_leases.len();
             executor_leases.retain(|(eid, _)| !bad_executors.contains(eid));
-            tracing::warn!(
-                job_id = %job_id,
-                bad_executor_count = bad_executors.len(),
-                "circuit breaker: filtered bad executors from launch candidates"
-            );
+            if executor_leases.is_empty() && before > 0 {
+                // Starvation floor: the breaker exists to PREFER healthy
+                // executors, not to halt the cluster. With every live executor
+                // over the threshold, filtering leaves pending tasks with zero
+                // candidates forever (no cooldown resets the counters — only a
+                // success does, which can never come). Bypass the filter and
+                // let the retry/regen budgets decide the job's fate instead.
+                executor_leases = self.exec.executors.assignment_leases();
+                tracing::warn!(
+                    job_id = %job_id,
+                    bad_executor_count = bad_executors.len(),
+                    "circuit breaker: ALL launch candidates over the failure \
+                     threshold — bypassing the breaker to avoid starvation"
+                );
+            } else {
+                tracing::warn!(
+                    job_id = %job_id,
+                    bad_executor_count = bad_executors.len(),
+                    "circuit breaker: filtered bad executors from launch candidates"
+                );
+            }
         }
 
         let batch_tables = self.batch_sql_job_tables.get(job_id).cloned();

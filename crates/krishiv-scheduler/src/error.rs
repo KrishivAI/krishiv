@@ -7,6 +7,18 @@ use krishiv_proto::{
 /// Scheduler result alias.
 pub type SchedulerResult<T> = Result<T, SchedulerError>;
 
+/// Stable operator-facing classification for scheduler failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    /// The operation may succeed after retry or failover.
+    Retryable,
+    /// The engine reached a non-retryable terminal condition.
+    Terminal,
+    /// The submitted request, plan, or identifier is invalid.
+    UserError,
+}
+
 /// Result of applying a task status update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskUpdateOutcome {
@@ -96,4 +108,82 @@ pub enum SchedulerError {
     /// Storage/persistence backend failed.
     #[error("store error: {message}")]
     Store { message: String },
+}
+
+impl SchedulerError {
+    /// Classify every scheduler failure without parsing its display string.
+    pub const fn failure_class(&self) -> FailureClass {
+        match self {
+            Self::InactiveCoordinator { .. }
+            | Self::StaleExecutorLease { .. }
+            | Self::NoExecutors
+            | Self::StaleTaskAttempt { .. }
+            | Self::Transport { .. }
+            | Self::ExecutorUnavailable { .. }
+            | Self::Store { .. } => FailureClass::Retryable,
+            Self::DuplicateExecutor { .. }
+            | Self::UnknownExecutor { .. }
+            | Self::DuplicateJob { .. }
+            | Self::UnknownJob { .. }
+            | Self::UnknownStage { .. }
+            | Self::UnknownTask { .. }
+            | Self::InvalidJob { .. }
+            | Self::InvalidPlan { .. }
+            | Self::AssignmentRejected { .. } => FailureClass::UserError,
+            Self::JobFailed { .. } | Self::Optimizer(_) => FailureClass::Terminal,
+        }
+    }
+
+    /// Stable machine-readable reason code for metrics, logs, and APIs.
+    pub const fn failure_code(&self) -> &'static str {
+        match self {
+            Self::InactiveCoordinator { .. } => "inactive_coordinator",
+            Self::DuplicateExecutor { .. } => "duplicate_executor",
+            Self::UnknownExecutor { .. } => "unknown_executor",
+            Self::StaleExecutorLease { .. } => "stale_executor_lease",
+            Self::NoExecutors => "no_executors",
+            Self::DuplicateJob { .. } => "duplicate_job",
+            Self::UnknownJob { .. } => "unknown_job",
+            Self::UnknownStage { .. } => "unknown_stage",
+            Self::UnknownTask { .. } => "unknown_task",
+            Self::StaleTaskAttempt { .. } => "stale_task_attempt",
+            Self::InvalidJob { .. } => "invalid_job",
+            Self::InvalidPlan { .. } => "invalid_plan",
+            Self::JobFailed { .. } => "job_failed",
+            Self::Optimizer(_) => "optimizer",
+            Self::Transport { .. } => "transport",
+            Self::AssignmentRejected { .. } => "assignment_rejected",
+            Self::ExecutorUnavailable { .. } => "executor_unavailable",
+            Self::Store { .. } => "store",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_taxonomy_is_typed_and_stable() {
+        let retryable = SchedulerError::NoExecutors;
+        assert_eq!(retryable.failure_class(), FailureClass::Retryable);
+        assert_eq!(retryable.failure_code(), "no_executors");
+
+        let user = SchedulerError::InvalidJob {
+            message: "bad partition count".into(),
+        };
+        assert_eq!(user.failure_class(), FailureClass::UserError);
+        assert_eq!(user.failure_code(), "invalid_job");
+
+        let terminal = SchedulerError::JobFailed {
+            job_id: JobId::try_new("terminal-job").unwrap(),
+            reason: "retry budget exhausted".into(),
+        };
+        assert_eq!(terminal.failure_class(), FailureClass::Terminal);
+        assert_eq!(terminal.failure_code(), "job_failed");
+        assert_eq!(
+            serde_json::to_string(&FailureClass::UserError).unwrap(),
+            "\"user_error\""
+        );
+    }
 }

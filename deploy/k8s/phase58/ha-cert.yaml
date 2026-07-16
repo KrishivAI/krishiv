@@ -1,0 +1,339 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: krishiv-phase58
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: phase58-etcd
+  namespace: krishiv-phase58
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: phase58-etcd
+  ports:
+    - { name: client, port: 2379, targetPort: 2379 }
+    - { name: peer, port: 2380, targetPort: 2380 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: phase58-etcd
+  namespace: krishiv-phase58
+spec:
+  serviceName: phase58-etcd
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: { app: phase58-etcd }
+  template:
+    metadata:
+      labels: { app: phase58-etcd }
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: { app: phase58-etcd }
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: etcd
+          image: registry.k8s.io/etcd:3.5.21-0
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/etcd"]
+          args:
+            - --name=$(POD_NAME)
+            - --data-dir=/var/lib/etcd
+            - --listen-client-urls=http://0.0.0.0:2379
+            - --advertise-client-urls=http://$(POD_NAME).phase58-etcd.krishiv-phase58.svc:2379
+            - --listen-peer-urls=http://0.0.0.0:2380
+            - --initial-advertise-peer-urls=http://$(POD_NAME).phase58-etcd.krishiv-phase58.svc:2380
+            - --initial-cluster=phase58-etcd-0=http://phase58-etcd-0.phase58-etcd.krishiv-phase58.svc:2380,phase58-etcd-1=http://phase58-etcd-1.phase58-etcd.krishiv-phase58.svc:2380,phase58-etcd-2=http://phase58-etcd-2.phase58-etcd.krishiv-phase58.svc:2380
+            - --initial-cluster-state=new
+            - --initial-cluster-token=krishiv-phase58
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+          ports:
+            - { name: client, containerPort: 2379 }
+            - { name: peer, containerPort: 2380 }
+          readinessProbe:
+            exec:
+              command: ["/usr/local/bin/etcdctl", "endpoint", "health"]
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/etcd }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: { storage: 2Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: phase58-coordinator
+  namespace: krishiv-phase58
+spec:
+  selector: { app: phase58-coordinator }
+  ports:
+    - { name: grpc, port: 2001, targetPort: grpc }
+    - { name: http, port: 2002, targetPort: http }
+    - { name: flight, port: 2003, targetPort: flight }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: phase58-coordinator
+  namespace: krishiv-phase58
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    # /leaderz intentionally marks two standbys Unready for Service routing;
+    # allow those two unavailable replicas while always preserving one leader.
+    rollingUpdate: { maxUnavailable: 2, maxSurge: 0 }
+  selector:
+    matchLabels: { app: phase58-coordinator }
+  template:
+    metadata:
+      labels: { app: phase58-coordinator, component: coordinator }
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: { app: phase58-coordinator }
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: coordinator
+          image: localhost/krishiv:phase58-ha
+          imagePullPolicy: Never
+          command: ["krishiv"]
+          args:
+            - clusterd
+            - --grpc-addr
+            - 0.0.0.0:2001
+            - --http-addr
+            - 0.0.0.0:2002
+            - --flight-addr
+            - 0.0.0.0:2003
+            - --durability-profile
+            - distributed-durable
+            - --metadata-backend
+            - etcd
+            - --leader-backend
+            - etcd
+            - --etcd-endpoints
+            - http://phase58-etcd-0.phase58-etcd:2379,http://phase58-etcd-1.phase58-etcd:2379,http://phase58-etcd-2.phase58-etcd:2379
+            - --etcd-lease-key
+            - /krishiv/phase58/leader
+            - --leader-lease-secs
+            - "9"
+            - --shuffle-dir
+            - /data/shuffle
+          env:
+            - name: KRISHIV_COORDINATOR_ID
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: KRISHIV_COORDINATOR_BEARER_TOKEN
+              valueFrom: { secretKeyRef: { name: phase58-tokens, key: coordinator } }
+            - name: KRISHIV_EXECUTOR_TASK_BEARER_TOKEN
+              valueFrom: { secretKeyRef: { name: phase58-tokens, key: task } }
+            - name: KRISHIV_SHUFFLE_TOKEN
+              valueFrom: { secretKeyRef: { name: phase58-tokens, key: shuffle } }
+            - name: KRISHIV_API_KEYS
+              valueFrom: { secretKeyRef: { name: phase58-tokens, key: apikeys } }
+            - { name: KRISHIV_FLIGHT_ALLOW_ALL_AUTHENTICATED, value: "true" }
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: minio-s3-creds, key: AWS_ACCESS_KEY_ID } }
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: minio-s3-creds, key: AWS_SECRET_ACCESS_KEY } }
+            - { name: AWS_ENDPOINT_URL, value: "http://minio.krishiv-infra:9000" }
+            - { name: AWS_REGION, value: us-east-1 }
+            - { name: RUST_LOG, value: "info,krishiv_scheduler=debug" }
+          ports:
+            - { name: grpc, containerPort: 2001 }
+            - { name: http, containerPort: 2002 }
+            - { name: flight, containerPort: 2003 }
+          readinessProbe:
+            httpGet: { path: /leaderz, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            # The default 1s timeout / 3 failures liveness-killed a healthy
+            # standby during election + etcd churn on CPU-starved nodes
+            # (observed 2026-07-16: exit 137 while /healthz — a static
+            # handler — was merely slow, compounding the fault being tested).
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests: { cpu: 250m, memory: 384Mi }
+            limits: { cpu: "2", memory: 2Gi }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: phase58-data, mountPath: /phase58-data, readOnly: true }
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: phase58-data
+          hostPath: { path: /var/lib/krishiv-phase58, type: Directory }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: phase58-executor-s2
+  namespace: krishiv-phase58
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: phase58-executor-s2 }
+  template:
+    metadata:
+      labels: { app: phase58-executor-s2, component: executor }
+    spec:
+      nodeName: s2
+      containers:
+        - name: executor
+          image: localhost/krishiv:phase58-ha
+          imagePullPolicy: Never
+          command: ["krishiv"]
+          args: ["executor", "--connect", "--coordinator", "http://phase58-coordinator:2001", "--executor-id", "phase58-exec-s2", "--shuffle-dir", "/data/shuffle", "--state-dir", "/data/state"]
+          env:
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            - { name: KRISHIV_DURABILITY_PROFILE, value: distributed-durable }
+            - { name: KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH, value: "true" }
+            - name: KRISHIV_EXECUTOR_TASK_BEARER_TOKEN
+              valueFrom: { secretKeyRef: { name: phase58-tokens, key: task } }
+            - name: KRISHIV_COORDINATOR_BEARER_TOKEN
+              valueFrom: { secretKeyRef: { name: phase58-tokens, key: coordinator } }
+            - name: KRISHIV_SHUFFLE_TOKEN
+              valueFrom: { secretKeyRef: { name: phase58-tokens, key: shuffle } }
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: minio-s3-creds, key: AWS_ACCESS_KEY_ID } }
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: minio-s3-creds, key: AWS_SECRET_ACCESS_KEY } }
+            - { name: AWS_ENDPOINT_URL, value: "http://minio.krishiv-infra:9000" }
+            - { name: AWS_REGION, value: us-east-1 }
+            - { name: KRISHIV_CHECKPOINT_STORAGE, value: "s3://krishiv-cert-dur2/phase58" }
+          resources:
+            requests: { cpu: 300m, memory: 384Mi }
+            limits: { cpu: "2", memory: 2Gi }
+          volumeMounts:
+            - { name: phase58-data, mountPath: /phase58-data }
+            - { name: shuffle, mountPath: /data/shuffle }
+            - { name: state, mountPath: /data/state }
+      volumes:
+        - name: phase58-data
+          hostPath: { path: /var/lib/krishiv-phase58, type: DirectoryOrCreate }
+        - name: shuffle
+          emptyDir: {}
+        - name: state
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: phase58-executor-s3
+  namespace: krishiv-phase58
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: phase58-executor-s3 }
+  template:
+    metadata:
+      labels: { app: phase58-executor-s3, component: executor }
+    spec:
+      nodeName: s3
+      containers:
+        - name: executor
+          image: localhost/krishiv:phase58-ha
+          imagePullPolicy: Never
+          command: ["krishiv"]
+          args: ["executor", "--connect", "--coordinator", "http://phase58-coordinator:2001", "--executor-id", "phase58-exec-s3", "--shuffle-dir", "/data/shuffle", "--state-dir", "/data/state"]
+          env:
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            - { name: KRISHIV_DURABILITY_PROFILE, value: distributed-durable }
+            - { name: KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH, value: "true" }
+            - name: KRISHIV_EXECUTOR_TASK_BEARER_TOKEN
+              valueFrom: { secretKeyRef: { name: phase58-tokens, key: task } }
+            - name: KRISHIV_COORDINATOR_BEARER_TOKEN
+              valueFrom: { secretKeyRef: { name: phase58-tokens, key: coordinator } }
+            - name: KRISHIV_SHUFFLE_TOKEN
+              valueFrom: { secretKeyRef: { name: phase58-tokens, key: shuffle } }
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: minio-s3-creds, key: AWS_ACCESS_KEY_ID } }
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: minio-s3-creds, key: AWS_SECRET_ACCESS_KEY } }
+            - { name: AWS_ENDPOINT_URL, value: "http://minio.krishiv-infra:9000" }
+            - { name: AWS_REGION, value: us-east-1 }
+            - { name: KRISHIV_CHECKPOINT_STORAGE, value: "s3://krishiv-cert-dur2/phase58" }
+          resources:
+            requests: { cpu: 300m, memory: 384Mi }
+            limits: { cpu: "2", memory: 2Gi }
+          volumeMounts:
+            - { name: phase58-data, mountPath: /phase58-data }
+            - { name: shuffle, mountPath: /data/shuffle }
+            - { name: state, mountPath: /data/state }
+      volumes:
+        - name: phase58-data
+          hostPath: { path: /var/lib/krishiv-phase58, type: DirectoryOrCreate }
+        - name: shuffle
+          emptyDir: {}
+        - name: state
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: phase58-driver
+  namespace: krishiv-phase58
+  labels: { app: phase58-driver }
+spec:
+  nodeName: s1
+  containers:
+    - name: engine
+      image: localhost/krishiv:phase58-ha
+      imagePullPolicy: Never
+      command: ["sleep", "604800"]
+      env:
+        - name: KRISHIV_API_KEYS
+          valueFrom: { secretKeyRef: { name: phase58-tokens, key: apikeys } }
+        - name: KRISHIV_COORDINATOR_BEARER_TOKEN
+          valueFrom: { secretKeyRef: { name: phase58-tokens, key: coordinator } }
+      volumeMounts:
+        - { name: data, mountPath: /phase58-data }
+    - name: curl
+      image: curlimages/curl:8.12.1
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "604800"]
+      env:
+        - name: COORD_TOKEN
+          valueFrom: { secretKeyRef: { name: phase58-tokens, key: coordinator } }
+  volumes:
+    - name: data
+      hostPath: { path: /var/lib/krishiv-phase58, type: DirectoryOrCreate }
+---
+# Dormant until the chaos recipe labels one target pod. This partitions only
+# the isolated target pod; it never changes host networking on shared nodes.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: phase58-partition
+  namespace: krishiv-phase58
+spec:
+  podSelector:
+    matchLabels: { phase58-partition: "true" }
+  policyTypes: [Ingress, Egress]

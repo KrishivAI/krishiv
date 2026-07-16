@@ -388,6 +388,55 @@ async fn task_runner_reports_running_and_success_to_scheduler() {
 }
 
 #[tokio::test]
+async fn task_runner_retains_assignment_until_coordinator_is_active() {
+    allow_anonymous_for_tests();
+    let executor_id = ExecutorId::try_new("exec-runner-failover").unwrap();
+    let shared = SharedCoordinator::new(Coordinator::active(
+        CoordinatorId::try_new("coord-runner-failover").unwrap(),
+    ));
+    let service = CoordinatorExecutorTonicService::new(shared.clone());
+    let inbox = ExecutorAssignmentInbox::new();
+    let job_id = JobId::try_new("job-runner-failover").unwrap();
+
+    {
+        let mut coordinator = shared.write().await;
+        coordinator
+            .register_executor(krishiv_proto::ExecutorDescriptor::new(
+                executor_id,
+                "pod-runner-failover",
+                1,
+            ))
+            .unwrap();
+        coordinator
+            .submit_job(single_task_job(job_id.clone()))
+            .unwrap();
+        let mut assignments = coordinator
+            .launch_assigned_task_assignments(&job_id)
+            .unwrap();
+        inbox.push(assignments.remove(0)).unwrap();
+        coordinator.demote_to_standby();
+    }
+
+    let promote = shared.clone();
+    let promotion = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        promote.write().await.promote_to_active();
+    });
+
+    let report = ExecutorTaskRunner::new(inbox.clone())
+        .run_next_with(&service)
+        .await
+        .unwrap()
+        .unwrap();
+    promotion.await.unwrap();
+
+    assert_eq!(report.assignment().job_id(), &job_id);
+    assert_eq!(report.terminal_disposition(), TransportDisposition::Accepted);
+    assert!(inbox.is_empty().unwrap());
+    assert_eq!(shared.read().await.job_snapshot(&job_id).unwrap().state(), JobState::Succeeded);
+}
+
+#[tokio::test]
 async fn runtime_deregisters_through_service_boundary() {
     let runtime = ExecutorRuntime::new(
         ExecutorConfig::new("exec-1", "pod-a", 1, "http://coordinator").unwrap(),

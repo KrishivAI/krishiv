@@ -11,6 +11,7 @@
 //! | `/krishiv/jobs/<job_id>` | JSON-encoded `PersistedJobRecord` |
 //! | `/krishiv/executors/<executor_id>` | JSON-encoded `PersistedExecutorDescriptor` |
 //! | `/krishiv/continuous/<job_id>` | Binary `ContinuousSnapshot` payload |
+//! | `/krishiv/ivm/<job_id>` | Binary complete IVM job snapshot |
 //! | `/krishiv/history/<job_id>` | JSON-encoded terminal `JobHistoryRecord` |
 //!
 //! Events are not persisted — they are audit-only and kept in-memory.
@@ -37,6 +38,7 @@ use crate::{JobRecord, SchedulerError, SchedulerResult};
 const JOB_KEY_PREFIX: &str = "/krishiv/jobs/";
 const EXECUTOR_KEY_PREFIX: &str = "/krishiv/executors/";
 const CONTINUOUS_KEY_PREFIX: &str = "/krishiv/continuous/";
+const IVM_KEY_PREFIX: &str = "/krishiv/ivm/";
 const HISTORY_KEY_PREFIX: &str = "/krishiv/history/";
 
 /// Durable metadata store backed by per-record etcd keys.
@@ -47,15 +49,16 @@ const HISTORY_KEY_PREFIX: &str = "/krishiv/history/";
 ///
 /// # Cache contract
 ///
-/// `startup_jobs` and `startup_executors` are populated once at `connect()` time
-/// and are **never mutated** afterwards.  All writes (`save_job`, `save_executor`,
-/// `remove_executor`) go directly to etcd; the in-memory fields are not touched.
+/// `startup_jobs` and `startup_executors` are populated at `connect()` time and
+/// refreshed atomically immediately before a standby is promoted. All writes
+/// (`save_job`, `save_executor`, `remove_executor`) go directly to etcd; the
+/// in-memory fields are not touched between recovery refreshes.
 ///
 /// This eliminates split-brain between the in-memory view and etcd that would
 /// otherwise arise when a network timeout causes `put` to return an error even
 /// though the server committed the write.  `jobs()` and `executors()` are called
-/// only during coordinator startup (recovery), where the startup snapshot is
-/// authoritative.  For all other in-session state, the coordinator's own
+/// only during coordinator recovery, where the freshly loaded snapshot is
+/// authoritative. For all other in-session state, the coordinator's own
 /// `job_coordinators` map is the source of truth.
 pub struct EtcdMetadataStore {
     client: std::sync::Mutex<Client>,
@@ -65,6 +68,7 @@ pub struct EtcdMetadataStore {
     /// Startup-time snapshot loaded from etcd.  Read-only after construction.
     startup_executors: Vec<krishiv_proto::ExecutorDescriptor>,
     continuous_snapshots: std::collections::HashMap<String, ContinuousSnapshot>,
+    ivm_snapshots: std::collections::HashMap<String, Vec<u8>>,
     history: Vec<JobHistoryRecord>,
 }
 
@@ -100,6 +104,12 @@ impl EtcdMetadataStore {
             }
         })?;
 
+        let ivm_snapshots = load_binary_prefix(&mut client, IVM_KEY_PREFIX)
+            .await
+            .map_err(|e| SchedulerError::Transport {
+                message: format!("etcd IVM snapshots load failed: {e}"),
+            })?;
+
         let history = load_json_prefix::<JobHistoryRecord>(&mut client, HISTORY_KEY_PREFIX)
             .await
             .map_err(|e| SchedulerError::Transport {
@@ -112,6 +122,7 @@ impl EtcdMetadataStore {
             startup_jobs: jobs,
             startup_executors: executor_descriptors,
             continuous_snapshots,
+            ivm_snapshots,
             history: truncate_history(sort_history(history)),
         })
     }
@@ -148,6 +159,56 @@ impl EtcdMetadataStore {
 }
 
 impl MetadataStore for EtcdMetadataStore {
+    fn refresh(&mut self) -> SchedulerResult<()> {
+        let mut client = self
+            .client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let (jobs, executors, snapshots, ivm_snapshots, history) =
+            krishiv_common::async_util::block_on(async move {
+                let jobs =
+                    load_prefix::<PersistedJobRecord, JobRecord>(&mut client, JOB_KEY_PREFIX)
+                        .await
+                        .map_err(|e| SchedulerError::Transport {
+                            message: format!("etcd jobs refresh failed: {e}"),
+                        })?;
+                let executors = load_prefix::<
+                    PersistedExecutorDescriptor,
+                    krishiv_proto::ExecutorDescriptor,
+                >(&mut client, EXECUTOR_KEY_PREFIX)
+                .await
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!("etcd executors refresh failed: {e}"),
+                })?;
+                let snapshots = load_continuous_snapshots(&mut client).await.map_err(|e| {
+                    SchedulerError::Transport {
+                        message: format!("etcd continuous snapshots refresh failed: {e}"),
+                    }
+                })?;
+                let ivm_snapshots = load_binary_prefix(&mut client, IVM_KEY_PREFIX)
+                    .await
+                    .map_err(|e| SchedulerError::Transport {
+                        message: format!("etcd IVM snapshots refresh failed: {e}"),
+                    })?;
+                let history = load_json_prefix::<JobHistoryRecord>(&mut client, HISTORY_KEY_PREFIX)
+                    .await
+                    .map_err(|e| SchedulerError::Transport {
+                        message: format!("etcd job history refresh failed: {e}"),
+                    })?;
+                Ok::<_, SchedulerError>((jobs, executors, snapshots, ivm_snapshots, history))
+            })?;
+
+        // Replace the recovery cache only after every prefix loaded successfully;
+        // a partial etcd read must never become a promotable coordinator view.
+        self.startup_jobs = jobs;
+        self.startup_executors = executors;
+        self.continuous_snapshots = snapshots;
+        self.ivm_snapshots = ivm_snapshots;
+        self.history = truncate_history(sort_history(history));
+        Ok(())
+    }
+
     fn append_event(&mut self, event: EventLogEvent) -> SchedulerResult<()> {
         // Events are audit-only; not persisted to etcd (see module-level docs).
         self.events.push(event);
@@ -218,6 +279,29 @@ impl MetadataStore for EtcdMetadataStore {
         Ok(())
     }
 
+    fn save_ivm_snapshot(&mut self, job_id: &str, snapshot: Vec<u8>) -> SchedulerResult<()> {
+        self.put_key(ivm_key(job_id), snapshot.clone())?;
+        self.ivm_snapshots.insert(job_id.to_owned(), snapshot);
+        Ok(())
+    }
+
+    fn load_ivm_snapshot(&self, job_id: &str) -> Option<Vec<u8>> {
+        self.ivm_snapshots.get(job_id).cloned()
+    }
+
+    fn list_ivm_snapshots(&self) -> Vec<(String, Vec<u8>)> {
+        self.ivm_snapshots
+            .iter()
+            .map(|(job_id, snapshot)| (job_id.clone(), snapshot.clone()))
+            .collect()
+    }
+
+    fn remove_ivm_snapshot(&mut self, job_id: &str) -> SchedulerResult<()> {
+        self.delete_key(ivm_key(job_id))?;
+        self.ivm_snapshots.remove(job_id);
+        Ok(())
+    }
+
     fn save_job_history(&mut self, record: JobHistoryRecord) -> SchedulerResult<()> {
         let bytes = serde_json::to_vec(&record).map_err(|e| SchedulerError::Transport {
             message: format!("etcd job history encode failed for {}: {e}", record.job_id),
@@ -245,6 +329,10 @@ impl MetadataStore for EtcdMetadataStore {
 
 fn continuous_key(job_id: &str) -> String {
     format!("{CONTINUOUS_KEY_PREFIX}{job_id}")
+}
+
+fn ivm_key(job_id: &str) -> String {
+    format!("{IVM_KEY_PREFIX}{job_id}")
 }
 
 fn history_key(job_id: &str) -> String {
@@ -332,6 +420,25 @@ async fn load_continuous_snapshots(
         let snapshot = ContinuousSnapshot::decode(kv.value())
             .map_err(|e| format!("etcd continuous snapshot decode failed for {key}: {e}"))?;
         snapshots.insert(job_id.to_owned(), snapshot);
+    }
+    Ok(snapshots)
+}
+
+async fn load_binary_prefix(
+    client: &mut Client,
+    prefix: &str,
+) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
+    let resp = client
+        .get(prefix, Some(GetOptions::new().with_prefix()))
+        .await
+        .map_err(|e| format!("etcd get prefix {prefix} failed: {e}"))?;
+    let mut snapshots = std::collections::HashMap::with_capacity(resp.kvs().len());
+    for kv in resp.kvs() {
+        let key = kv.key_str().unwrap_or("?");
+        let job_id = key
+            .strip_prefix(prefix)
+            .ok_or_else(|| format!("etcd snapshot key has wrong prefix: {key}"))?;
+        snapshots.insert(job_id.to_owned(), kv.value().to_vec());
     }
     Ok(snapshots)
 }

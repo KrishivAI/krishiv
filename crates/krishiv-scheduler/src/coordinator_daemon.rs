@@ -450,6 +450,7 @@ pub fn coordinator_http_router(
 
     let public: Router<()> = Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
+        .route("/leaderz", get(leaderz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .with_state(coordinator.clone());
@@ -730,7 +731,7 @@ async fn api_executor_reset(
     )
 }
 
-async fn readyz(
+async fn leaderz(
     State(coordinator): State<SharedCoordinator>,
 ) -> Result<&'static str, (axum::http::StatusCode, String)> {
     let c = coordinator.read().await;
@@ -740,6 +741,14 @@ async fn readyz(
             "coordinator is not active\n".to_owned(),
         ));
     }
+    Ok("leader\n")
+}
+
+async fn readyz(
+    State(coordinator): State<SharedCoordinator>,
+) -> Result<&'static str, (axum::http::StatusCode, String)> {
+    leaderz(State(coordinator.clone())).await?;
+    let c = coordinator.read().await;
     let has_schedulable_executor = c
         .executor_snapshots()
         .into_iter()
@@ -1353,6 +1362,9 @@ pub async fn run_clusterd_daemon(
         shared.clone(),
         leader,
     ));
+    // No coordinator may serve as Active before it owns the leader lease.
+    // The election loop will refresh durable state and promote exactly one.
+    shared.write().await.demote_to_standby();
     let _sidecar_handles =
         spawn_coordinator_sidecars(&shared, &config, extra_http_factory, extra_sidecars).await?;
     let listener = TcpListener::bind(config.grpc_addr).await?;
@@ -2141,6 +2153,21 @@ mod parse_tests {
         ));
         let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DevLocal);
 
+        // /leaderz is the Kubernetes Service routing probe: it must publish the
+        // active leader before executors have registered, avoiding bootstrap
+        // deadlock while excluding standby coordinators.
+        let router = coordinator_http_router(coordinator.clone(), &config);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/leaderz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
         // No executors registered yet — coordinator is Active but cannot
         // accept work.
         let router = coordinator_http_router(coordinator.clone(), &config);
@@ -2184,5 +2211,18 @@ mod parse_tests {
             StatusCode::OK,
             "readyz must report ready once a healthy executor can accept work"
         );
+
+        coordinator.write().await.demote_to_standby();
+        let router = coordinator_http_router(coordinator, &config);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/leaderz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

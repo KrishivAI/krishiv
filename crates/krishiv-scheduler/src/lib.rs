@@ -91,7 +91,7 @@ pub use coordinator_daemon::{
     run_job_coordinator_daemon, run_standalone_coordinator, spawn_coordinator_sidecars,
 };
 pub use distributed_batch::plan_staged_batch_stages;
-pub use error::{SchedulerError, SchedulerResult, TaskUpdateOutcome};
+pub use error::{FailureClass, SchedulerError, SchedulerResult, TaskUpdateOutcome};
 #[cfg(feature = "etcd")]
 pub use etcd_lease::{DEFAULT_CCP_LEADER_KEY, EtcdLeaseElection};
 #[cfg(feature = "etcd")]

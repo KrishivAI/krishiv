@@ -27,10 +27,8 @@ spec:
       protocol: TCP
     {{- end }}
   type: ClusterIP
-  # Executors register through this Service, but the coordinator's /readyz is
-  # gated on having ≥1 registered executor — so the address must be published
-  # before the pod is Ready, otherwise the cluster deadlocks on bootstrap.
-  publishNotReadyAddresses: true
+  # Coordinator readiness uses /leaderz, so only the fenced active leader is
+  # published. /leaderz deliberately does not depend on executor registration.
 ---
 # Executor gRPC service — used by the coordinator to push task assignments.
 apiVersion: v1

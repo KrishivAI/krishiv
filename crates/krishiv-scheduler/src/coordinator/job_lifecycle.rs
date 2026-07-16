@@ -320,6 +320,12 @@ impl Coordinator {
             job.cancel();
         }
 
+        // Cancellation is a terminal state transition and must be durable
+        // before a future standby can promote. Without this write, failover
+        // reloads the last Running snapshot, resurrecting cancelled tasks and
+        // consuming executor slots indefinitely.
+        self.persist_job_record(job_id, true)?;
+
         if let Some(store) = &self.store {
             let mut guard = store.inner();
             if let Err(e) = guard.append_event(EventLogEvent::JobCancelled {
@@ -329,27 +335,10 @@ impl Coordinator {
             }
         }
 
-        if !self.gc_ready_jobs.contains(job_id) {
-            const MAX_GC_JOBS: usize = 1000;
-            if self.gc_ready_jobs.len() >= MAX_GC_JOBS
-                && let Some(evicted) = self.gc_ready_jobs.pop_front()
-            {
-                self.gc_ready_at.remove(&evicted);
-            }
-            self.gc_ready_jobs.push_back(job_id.clone());
-            self.gc_ready_at
-                .insert(job_id.clone(), std::time::Instant::now());
-        }
-        self.ckpt.coordinators.remove(job_id);
-        self.job_inline_results.remove(job_id);
-        self.job_result_spools.remove(job_id);
-        self.pending_task_result_spools
-            .retain(|key, _| key.job_id != *job_id);
-        self.job_input_partitions.remove(job_id);
-        self.job_task_input_partitions.remove(job_id);
-        self.continuous_input_cycles.remove(job_id);
-        self.pending_continuous_restores.remove(job_id);
-        self.batch_sql_job_tables.remove(job_id);
+        // Use the same terminal bookkeeping as succeeded/failed jobs so a
+        // cancellation is archived in durable history and releases resources
+        // exactly once.
+        self.on_job_terminal(job_id);
 
         Ok(())
     }
@@ -449,9 +438,19 @@ impl Coordinator {
         // IMM-2 (Circuit Breaker Strengthening):
         // Record failure and, if the executor is now bad, clear the assignment
         // so the task can be re-assigned to a healthy executor on the next launch cycle.
+        //
+        // FetchFailed exemption (Spark parity): a consumer that failed because
+        // an UPSTREAM shuffle partition is unavailable says nothing about the
+        // health of the executor it ran on — the data is gone, not the node.
+        // Counting those failures banned every executor in turn while the
+        // producer was regenerated (live wedge, Phase 58 chaos gate,
+        // 2026-07-16: two executors circuit-broken by one lost partition →
+        // zero launch candidates → job pinned Running forever). The failure
+        // metric still counts them; only the per-executor breaker skips them.
         if terminal_state == TaskState::Failed {
             krishiv_metrics::global_metrics().inc_tasks_failed();
-
+        }
+        if terminal_state == TaskState::Failed && missing_partitions.is_empty() {
             let threshold = self.config.circuit_breaker_failure_threshold();
             let exceeded = self
                 .exec

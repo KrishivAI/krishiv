@@ -153,6 +153,60 @@ fn lost_executor_can_reregister_with_next_lease_generation() {
 }
 
 #[test]
+fn fast_executor_reregister_reopens_unacknowledged_assignment_launch() {
+    let executor_id = ExecutorId::try_new("exec-fast-replacement").unwrap();
+    let mut coordinator =
+        Coordinator::active(CoordinatorId::try_new("coord-fast-replacement").unwrap());
+    coordinator
+        .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-old", 1))
+        .unwrap();
+
+    let job = demo_job();
+    let job_id = job.job_id().clone();
+    coordinator.submit_job(job).unwrap();
+    assert_eq!(coordinator.launch_assigned_tasks(&job_id).unwrap(), 1);
+    assert_eq!(
+        coordinator.launch_assigned_tasks(&job_id).unwrap(),
+        0,
+        "accepted launch stays guarded until an executor acknowledgement"
+    );
+
+    // The replacement keeps the stable executor id and arrives before the
+    // heartbeat timeout marks the old process lost.
+    coordinator
+        .register_executor(ExecutorDescriptor::new(executor_id, "pod-replacement", 1))
+        .unwrap();
+
+    assert_eq!(
+        coordinator.launch_assigned_tasks(&job_id).unwrap(),
+        1,
+        "registration must reopen the accepted-but-unacknowledged launch"
+    );
+}
+
+#[test]
+fn same_endpoint_reregister_reopens_launch_without_marking_executor_lost() {
+    let executor_id = ExecutorId::try_new("exec-same-endpoint").unwrap();
+    let descriptor = ExecutorDescriptor::new(executor_id.clone(), "pod-stable", 1)
+        .with_task_endpoint("http://pod-stable:2005");
+    let mut coordinator =
+        Coordinator::active(CoordinatorId::try_new("coord-same-endpoint").unwrap());
+    coordinator.register_executor(descriptor.clone()).unwrap();
+
+    let job = demo_job();
+    let job_id = job.job_id().clone();
+    coordinator.submit_job(job).unwrap();
+    assert_eq!(coordinator.launch_assigned_tasks(&job_id).unwrap(), 1);
+    assert_eq!(coordinator.launch_assigned_tasks(&job_id).unwrap(), 0);
+
+    // This models the same surviving process refreshing its lease after a
+    // coordinator failover. It needs idempotent redelivery, not task loss.
+    coordinator.register_executor(descriptor).unwrap();
+
+    assert_eq!(coordinator.launch_assigned_tasks(&job_id).unwrap(), 1);
+}
+
+#[test]
 fn executor_deregisters_with_valid_lease() {
     let executor_id = ExecutorId::try_new("exec-1").unwrap();
     let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-1").unwrap());
@@ -173,7 +227,8 @@ fn executor_deregisters_with_valid_lease() {
 fn cancel_job_marks_active_tasks_cancelled() {
     let executor_id = ExecutorId::try_new("exec-1").unwrap();
     let job_id = JobId::try_new("job-cancel").unwrap();
-    let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-1").unwrap());
+    let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-1").unwrap())
+        .with_store(crate::InMemoryMetadataStore::default());
     coordinator
         .register_executor(ExecutorDescriptor::new(executor_id, "pod-a", 1))
         .unwrap();
@@ -196,6 +251,19 @@ fn cancel_job_marks_active_tasks_cancelled() {
             .iter()
             .all(|task| task.state() == TaskState::Cancelled)
     );
+    let persisted = coordinator
+        .store
+        .as_ref()
+        .unwrap()
+        .inner()
+        .jobs()
+        .iter()
+        .find(|job| job.job_id() == &job_id)
+        .cloned()
+        .unwrap();
+    assert_eq!(persisted.state(), JobState::Cancelled);
+    let history = coordinator.get_job_history(job_id.as_str()).unwrap();
+    assert_eq!(history.final_state, "cancelled");
 }
 
 #[test]
@@ -243,7 +311,10 @@ fn submit_job_replaces_a_terminal_job_with_the_same_id() {
     let err = coordinator
         .submit_job(demo_job_with_id(job_id.clone()))
         .unwrap_err();
-    assert!(matches!(err, SchedulerError::DuplicateJob { .. }), "got {err:?}");
+    assert!(
+        matches!(err, SchedulerError::DuplicateJob { .. }),
+        "got {err:?}"
+    );
 }
 
 #[test]
@@ -304,8 +375,7 @@ fn task_output_metadata_is_visible_in_job_detail_snapshot() {
 #[test]
 fn apply_task_update_increments_succeeded_and_failed_metrics() {
     let executor_id = ExecutorId::try_new("exec-metric-task").unwrap();
-    let mut coordinator =
-        Coordinator::active(CoordinatorId::try_new("coord-metric-task").unwrap());
+    let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-metric-task").unwrap());
     let lease_generation = coordinator
         .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
         .unwrap();
@@ -510,6 +580,37 @@ async fn tonic_service_rejects_checkpoint_ack_when_standby() {
 
     let status = service
         .checkpoint_ack(tonic::Request::new(ack))
+        .await
+        .unwrap_err();
+
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("only the active coordinator"),
+        "unexpected status: {status}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tonic_service_rejects_task_status_when_standby() {
+    allow_anonymous_for_tests();
+    let shared = SharedCoordinator::new(Coordinator::standby(
+        CoordinatorId::try_new("coord-standby-status").unwrap(),
+    ));
+    let service = CoordinatorExecutorTonicService::new(shared);
+    let request = TaskStatusRequest::new(
+        TaskAttemptRef::new(
+            JobId::try_new("job-standby-status").unwrap(),
+            StageId::try_new("stage-standby-status").unwrap(),
+            TaskId::try_new("task-standby-status").unwrap(),
+            AttemptId::initial(),
+        ),
+        ExecutorId::try_new("exec-standby-status").unwrap(),
+        LeaseGeneration::initial(),
+        TaskState::Running,
+    );
+
+    let status = service
+        .task_status(tonic::Request::new(request))
         .await
         .unwrap_err();
 
@@ -1330,7 +1431,8 @@ fn duplicate_failed_task_status_does_not_replay_circuit_breaker_side_effects() {
 
     assert!(
         coordinator
-            .exec.executors
+            .exec
+            .executors
             .executors_over_failure_threshold(failure_threshold)
             .is_empty(),
         "duplicate failed task reports must not advance executor circuit-breaker counters"
@@ -1667,4 +1769,3 @@ fn task_failure_retries_entire_stage_before_terminal_failure() {
     assert_eq!(snapshot.state(), JobState::Succeeded);
     assert_eq!(snapshot.succeeded_task_count(), 2);
 }
-

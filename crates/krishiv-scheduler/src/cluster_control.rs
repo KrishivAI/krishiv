@@ -160,7 +160,16 @@ impl ClusterControlPlane {
     }
 
     pub async fn promote_to_active(&self) -> SchedulerResult<()> {
-        self.shared.write().await.promote_to_active();
+        // Drain writes queued by this process before taking an authoritative
+        // recovery snapshot. This is normally empty on a standby, but closes a
+        // race during rapid demote/reacquire cycles.
+        let store = { self.shared.read().await.store.clone() };
+        if let Some(store) = store {
+            store.flush().await;
+        }
+        let mut coordinator = self.shared.write().await;
+        coordinator.refresh_and_recover_from_attached_store()?;
+        coordinator.promote_to_active();
         Ok(())
     }
 
@@ -208,8 +217,11 @@ impl ClusterControlPlane {
             self.shared.sync_checkpoint_fencing_tokens(token).await;
             if let Err(e) = self.promote_to_active().await {
                 tracing::error!(error = %e, "failed to promote to active");
+                self.leader.release().await;
+                let _ = self.demote_to_standby().await;
+            } else {
+                orchestration_handles = Some(self.spawn_orchestration_loops());
             }
-            orchestration_handles = Some(self.spawn_orchestration_loops());
         } else if let Err(e) = self.demote_to_standby().await {
             tracing::error!(error = %e, "failed to demote to standby after failed acquisition");
         }
@@ -249,8 +261,9 @@ impl ClusterControlPlane {
                 last_fencing_token = token;
                 if let Err(e) = self.promote_to_active().await {
                     tracing::error!(error = %e, "failed to promote to active");
-                }
-                if orchestration_handles.is_none() {
+                    self.leader.release().await;
+                    let _ = self.demote_to_standby().await;
+                } else if orchestration_handles.is_none() {
                     orchestration_handles = Some(self.spawn_orchestration_loops());
                 }
             } else {
@@ -319,6 +332,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::{InMemoryMetadataStore, JobRecord, MetadataStore};
 
     #[derive(Debug)]
     struct NeverLeader;
@@ -387,6 +401,33 @@ mod tests {
         assert_eq!(
             shared.read().await.state(),
             krishiv_proto::CoordinatorState::Standby
+        );
+    }
+
+    #[tokio::test]
+    async fn promotion_recovers_authoritative_store_before_becoming_active() {
+        let id = CoordinatorId::try_new("ccp-recovering-standby").unwrap();
+        let job_id = JobId::try_new("persisted-before-promotion").unwrap();
+        let spec = JobSpec::new(job_id.clone(), "durable", JobKind::Batch).with_stage(
+            StageSpec::new(StageId::try_new("s1").unwrap(), "scan")
+                .with_task(TaskSpec::new(TaskId::try_new("t1").unwrap(), "scan")),
+        );
+        let record = JobRecord::from_spec(spec, 3);
+        let mut store = InMemoryMetadataStore::default();
+        store.save_job(&record).unwrap();
+
+        let coordinator = Coordinator::standby(id.clone()).with_store(store);
+        let shared = SharedCoordinator::new(coordinator);
+        let ccp = ClusterControlPlane::from_shared(id, shared.clone());
+
+        assert!(shared.read().await.job_snapshot(&job_id).is_err());
+        ccp.promote_to_active().await.unwrap();
+
+        let recovered = shared.read().await.job_snapshot(&job_id).unwrap();
+        assert_eq!(recovered.job_id(), &job_id);
+        assert_eq!(
+            shared.read().await.state(),
+            krishiv_proto::CoordinatorState::Active
         );
     }
 

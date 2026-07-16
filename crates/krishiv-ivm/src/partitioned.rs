@@ -243,6 +243,15 @@ impl PartitionedIncrementalFlow {
             .map(|o| o.flatten())
     }
 
+    /// Return every registered view spec (identical across all shards).
+    pub fn view_specs(&self) -> IvmResult<Vec<IncrementalViewSpec>> {
+        self.shards
+            .first()
+            .map(IncrementalFlow::view_specs)
+            .transpose()
+            .map(|specs| specs.unwrap_or_default())
+    }
+
     /// Read a source/view snapshot from the per-source map (the surface the
     /// coordinator's `/snap` endpoint reads), concatenating per-shard partials.
     pub fn source_snapshot(&self, name: &str) -> IvmResult<Option<RecordBatch>> {

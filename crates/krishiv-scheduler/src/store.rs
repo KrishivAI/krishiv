@@ -235,6 +235,15 @@ pub struct JobHistoryRecord {
 }
 
 pub trait MetadataStore: Send + Sync {
+    /// Refresh any read-through recovery snapshot from the authoritative backend.
+    ///
+    /// Stores whose reads are already live may keep the default no-op. Shared
+    /// stores such as etcd override this so a long-running standby reloads state
+    /// immediately before it is promoted to leader.
+    fn refresh(&mut self) -> SchedulerResult<()> {
+        Ok(())
+    }
+
     fn append_event(&mut self, event: EventLogEvent) -> SchedulerResult<()>;
     fn events(&self) -> &[EventLogEvent];
     fn save_job(&mut self, record: &JobRecord) -> SchedulerResult<()>;
@@ -277,6 +286,18 @@ pub trait MetadataStore: Send + Sync {
 
     /// Remove the persisted snapshot for a continuous job (called on deregistration).
     fn remove_continuous_snapshot(&mut self, job_id: &str) -> SchedulerResult<()>;
+
+    /// Persist a complete coordinator-side IVM job snapshot.
+    fn save_ivm_snapshot(&mut self, job_id: &str, snapshot: Vec<u8>) -> SchedulerResult<()>;
+
+    /// Load a complete coordinator-side IVM job snapshot.
+    fn load_ivm_snapshot(&self, job_id: &str) -> Option<Vec<u8>>;
+
+    /// List persisted IVM job snapshots for standby recovery and discovery.
+    fn list_ivm_snapshots(&self) -> Vec<(String, Vec<u8>)>;
+
+    /// Remove the persisted IVM job snapshot when the job is deleted.
+    fn remove_ivm_snapshot(&mut self, job_id: &str) -> SchedulerResult<()>;
 }
 
 // ── InMemoryMetadataStore ─────────────────────────────────────────────────────
@@ -301,6 +322,7 @@ pub struct InMemoryMetadataStore {
     jobs: Vec<JobRecord>,
     executors: Vec<ExecutorDescriptor>,
     continuous_snapshots: std::collections::HashMap<String, ContinuousSnapshot>,
+    ivm_snapshots: std::collections::HashMap<String, Vec<u8>>,
     /// Number of events evicted by the ring buffer since the store was created.
     /// Exposed via [`InMemoryMetadataStore::evicted_event_count`] for tests and
     /// metrics.
@@ -388,6 +410,27 @@ impl MetadataStore for InMemoryMetadataStore {
 
     fn remove_continuous_snapshot(&mut self, job_id: &str) -> SchedulerResult<()> {
         self.continuous_snapshots.remove(job_id);
+        Ok(())
+    }
+
+    fn save_ivm_snapshot(&mut self, job_id: &str, snapshot: Vec<u8>) -> SchedulerResult<()> {
+        self.ivm_snapshots.insert(job_id.to_owned(), snapshot);
+        Ok(())
+    }
+
+    fn load_ivm_snapshot(&self, job_id: &str) -> Option<Vec<u8>> {
+        self.ivm_snapshots.get(job_id).cloned()
+    }
+
+    fn list_ivm_snapshots(&self) -> Vec<(String, Vec<u8>)> {
+        self.ivm_snapshots
+            .iter()
+            .map(|(job_id, snapshot)| (job_id.clone(), snapshot.clone()))
+            .collect()
+    }
+
+    fn remove_ivm_snapshot(&mut self, job_id: &str) -> SchedulerResult<()> {
+        self.ivm_snapshots.remove(job_id);
         Ok(())
     }
 

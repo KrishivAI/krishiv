@@ -81,6 +81,35 @@ pub(crate) enum ShuffleRegenOutcome {
     BudgetExhausted { attempts: u32, limit: u32 },
 }
 
+/// Does a consumer's missing-partition report name this task's shuffle output?
+///
+/// Reports arrive in two addressing forms:
+///  * the **coordinator stage id** (`dist-sN` / native stages) from the legacy
+///    `shuffle-write:` path — the owning task is then found through its
+///    registered output metadata (which partition ids it produced);
+///  * the **`sN.mM` shuffle sub-stage key** the dfplan reader embeds
+///    (`collect_missing_shuffle_partitions` on the executor). That key IS
+///    the map task's own `ShuffleWriteConfig.stage_id`
+///    (`distributed_batch.rs::stage_specs_from_plan`), so it names exactly one
+///    task and every partition of the key is that task's output — no metadata
+///    lookup needed (or possible: the coordinator stage id never equals it).
+fn missing_report_addresses_task(
+    m: &MissingShufflePartition,
+    stage_id: &StageId,
+    task: &TaskRecord,
+) -> bool {
+    if m.stage_id() == stage_id {
+        return task.output_metadata.as_ref().is_some_and(|meta| {
+            meta.shuffle_partitions()
+                .iter()
+                .any(|p| p.partition_id == m.partition_id())
+        });
+    }
+    task.spec
+        .shuffle_write()
+        .is_some_and(|sw| &sw.stage_id == m.stage_id())
+}
+
 impl JobRecord {
     /// Conservative per-job execution time cap (ms) for sandboxed UDFs.
     pub fn udf_execution_time_cap_ms(&self) -> Option<u64> {
@@ -729,7 +758,11 @@ impl JobRecord {
     /// This method marks the named (stage_id, partition_id) paths as Failed and resets
     /// their owning tasks to Pending so they are re-scheduled.
     ///
-    /// Returns `true` if any tasks were affected.
+    /// Missing reports arrive in TWO addressing forms (see
+    /// [`missing_report_addresses_task`]); matching only the coordinator
+    /// stage-id form left every dfplan-path report unmatched — the consumer
+    /// refailed forever against a partition nobody would regenerate (live
+    /// wedge, Phase 58 chaos gate, 2026-07-16).
     pub(crate) fn invalidate_specific_shuffle_partitions(
         &mut self,
         missing: &[MissingShufflePartition],
@@ -745,23 +778,14 @@ impl JobRecord {
         // that must not consume the regeneration budget or fail the job.
         let mut any_match = false;
         'detect: for stage in &self.stages {
-            let missing_ids: Vec<u32> = missing
-                .iter()
-                .filter(|m| m.stage_id() == stage.spec.stage_id())
-                .map(|m| m.partition_id())
-                .collect();
-            if missing_ids.is_empty() {
-                continue;
-            }
+            let stage_id = stage.spec.stage_id();
             for task in &stage.tasks {
                 if task.state != TaskState::Succeeded {
                     continue;
                 }
-                if let Some(meta) = &task.output_metadata
-                    && meta
-                        .shuffle_partitions()
-                        .iter()
-                        .any(|p| missing_ids.contains(&p.partition_id))
+                if missing
+                    .iter()
+                    .any(|m| missing_report_addresses_task(m, stage_id, task))
                 {
                     any_match = true;
                     break 'detect;
@@ -787,16 +811,6 @@ impl JobRecord {
 
         for stage in &mut self.stages {
             let stage_id = stage.spec.stage_id().clone();
-            // Collect which partition_ids in this stage are reported missing.
-            let missing_ids: Vec<u32> = missing
-                .iter()
-                .filter(|m| m.stage_id() == &stage_id)
-                .map(|m| m.partition_id())
-                .collect();
-            if missing_ids.is_empty() {
-                continue;
-            }
-
             let mut stage_affected = false;
             let mut paths_to_invalidate: Vec<ShufflePath> = Vec::new();
 
@@ -804,25 +818,25 @@ impl JobRecord {
                 if task.state != TaskState::Succeeded {
                     continue;
                 }
-                let Some(meta) = &task.output_metadata else {
-                    continue;
-                };
-                let affected_partitions: Vec<ShufflePath> = meta
-                    .shuffle_partitions()
+                let addressed: Vec<&MissingShufflePartition> = missing
                     .iter()
-                    .filter(|p| missing_ids.contains(&p.partition_id))
-                    .map(|p| ShufflePath {
-                        job_id: job_id_str.clone(),
-                        stage_id: stage_id.as_str().to_owned(),
-                        partition_id: p.partition_id,
-                    })
+                    .filter(|m| missing_report_addresses_task(m, &stage_id, task))
                     .collect();
-
-                if affected_partitions.is_empty() {
+                if addressed.is_empty() {
                     continue;
                 }
 
-                paths_to_invalidate.extend(affected_partitions);
+                // Record failed paths under the addressing key the consumer
+                // used (coordinator stage id or sub-stage key), so the entry
+                // that served the fetch is the one marked. The re-run producer
+                // re-registers under the same key (replace-on-write) either way.
+                for m in &addressed {
+                    paths_to_invalidate.push(ShufflePath {
+                        job_id: job_id_str.clone(),
+                        stage_id: m.stage_id().as_str().to_owned(),
+                        partition_id: m.partition_id(),
+                    });
+                }
                 task.state = TaskState::Pending;
                 task.assigned_executor = None;
                 task.launch_in_flight = false;
@@ -1587,6 +1601,56 @@ mod shuffle_regen_tests {
         );
         // On exhaustion the producer is NOT reset — it stays as it was.
         assert_eq!(job.stages[0].tasks[0].state, TaskState::Succeeded);
+    }
+
+    /// Phase 58 (live chaos-gate wedge, 2026-07-16): a dfplan consumer reports
+    /// a missing partition by the `sN.mM` shuffle sub-stage key — the producing
+    /// map task's own `ShuffleWriteConfig.stage_id` — never by the coordinator
+    /// stage id (`dist-sN`). The report must still resolve to that task and
+    /// regenerate it; matching only the coordinator form made every dfplan
+    /// report a no-op, so the reduce refailed forever into the same missing
+    /// partition while its failures circuit-broke both executors.
+    #[test]
+    fn dfplan_substage_key_report_regenerates_producer() {
+        use krishiv_proto::ShuffleWriteConfig;
+
+        let stage_id = StageId::try_new("dist-s0").unwrap();
+        let spec = JobSpec::new(
+            JobId::try_new("dfplan-regen-job").unwrap(),
+            "dfplan-regen-test",
+            JobKind::Batch,
+        )
+        .with_stage(
+            StageSpec::new(stage_id, "map stage").with_task(
+                TaskSpec::new(TaskId::try_new("dist-s0-t2").unwrap(), "dfplan:v1:body")
+                    .with_shuffle_write(ShuffleWriteConfig {
+                        stage_id: StageId::try_new("s0.m2").unwrap(),
+                        num_partitions: 4,
+                        key_columns: Vec::new(),
+                        lease_token: 0,
+                    }),
+            ),
+        );
+        let mut job = JobRecord::from_spec(spec, 4);
+        succeed_producer(&mut job);
+
+        // The sub-stage key alone names the owning task: the reported
+        // partition (3) is deliberately absent from the producer's registered
+        // metadata (which only lists partition 0).
+        let missing = vec![MissingShufflePartition::new(
+            StageId::try_new("s0.m2").unwrap(),
+            3,
+        )];
+        assert_eq!(
+            job.invalidate_specific_shuffle_partitions(&missing, 2),
+            ShuffleRegenOutcome::Regenerated
+        );
+        assert_eq!(
+            job.stages[0].tasks[0].state,
+            TaskState::Pending,
+            "the sub-stage-keyed producer must be reset for re-execution"
+        );
+        assert!(job.stages[0].tasks[0].assigned_executor.is_none());
     }
 
     /// Phase 58 (FetchFailed semantics): a consumer that fails on a *missing

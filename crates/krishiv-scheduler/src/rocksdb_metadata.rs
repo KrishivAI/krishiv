@@ -13,6 +13,7 @@ const CF_JOBS: &str = "jobs";
 const CF_EXECUTORS: &str = "executors";
 const CF_METADATA: &str = "metadata";
 const CF_CONTINUOUS: &str = "continuous_snapshots";
+const CF_IVM: &str = "ivm_snapshots";
 const CF_HISTORY: &str = "job_history";
 
 fn all_cfs() -> Vec<ColumnFamilyDescriptor> {
@@ -22,6 +23,7 @@ fn all_cfs() -> Vec<ColumnFamilyDescriptor> {
         CF_EXECUTORS,
         CF_METADATA,
         CF_CONTINUOUS,
+        CF_IVM,
         CF_HISTORY,
     ]
     .iter()
@@ -31,8 +33,8 @@ fn all_cfs() -> Vec<ColumnFamilyDescriptor> {
 
 /// RocksDB-backed durable metadata store for the coordinator.
 ///
-/// Six column families — events, jobs, executors, metadata, continuous_snapshots,
-/// job_history — are created on first open and must exist on subsequent opens.
+/// Seven column families — events, jobs, executors, metadata, continuous snapshots,
+/// IVM snapshots, and job history — are created on first open.
 pub struct RocksDbMetadataStore {
     db: DB,
     events: Vec<EventLogEvent>,
@@ -335,6 +337,44 @@ impl MetadataStore for RocksDbMetadataStore {
         self.db.delete_cf(&cf, job_id).map_err(Self::store_err)?;
         self.continuous_snapshots.remove(job_id);
         Ok(())
+    }
+
+    fn save_ivm_snapshot(&mut self, job_id: &str, snapshot: Vec<u8>) -> SchedulerResult<()> {
+        let cf = self
+            .db
+            .cf_handle(CF_IVM)
+            .ok_or_else(|| Self::store_err("missing IVM snapshots CF"))?;
+        self.db
+            .put_cf_opt(&cf, job_id, snapshot, &self.write_opts())
+            .map_err(Self::store_err)
+    }
+
+    fn load_ivm_snapshot(&self, job_id: &str) -> Option<Vec<u8>> {
+        let cf = self.db.cf_handle(CF_IVM)?;
+        self.db.get_cf(&cf, job_id).ok().flatten()
+    }
+
+    fn list_ivm_snapshots(&self) -> Vec<(String, Vec<u8>)> {
+        let Some(cf) = self.db.cf_handle(CF_IVM) else {
+            return Vec::new();
+        };
+        self.db
+            .iterator_cf(&cf, rocksdb::IteratorMode::Start)
+            .filter_map(|item| {
+                let (key, value) = item.ok()?;
+                Some((String::from_utf8(key.to_vec()).ok()?, value.to_vec()))
+            })
+            .collect()
+    }
+
+    fn remove_ivm_snapshot(&mut self, job_id: &str) -> SchedulerResult<()> {
+        let cf = self
+            .db
+            .cf_handle(CF_IVM)
+            .ok_or_else(|| Self::store_err("missing IVM snapshots CF"))?;
+        self.db
+            .delete_cf_opt(&cf, job_id, &self.write_opts())
+            .map_err(Self::store_err)
     }
 
     fn save_job_history(&mut self, record: JobHistoryRecord) -> SchedulerResult<()> {

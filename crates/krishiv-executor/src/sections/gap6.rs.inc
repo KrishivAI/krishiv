@@ -400,6 +400,8 @@ async fn streaming_e2e_full_stack_job_stays_running() {
 async fn streaming_e2e_coordinator_reattach_preserves_watermark() {
     let executor_id = ExecutorId::try_new("exec-e2e-ra").unwrap();
     let job_id = JobId::try_new("job-e2e-ra-1").unwrap();
+    let executor_descriptor =
+        krishiv_proto::ExecutorDescriptor::new(executor_id.clone(), "pod-ra", 1);
     let shared = SharedCoordinator::new(Coordinator::active(
         CoordinatorId::try_new("coord-e2e-ra").unwrap(),
     ));
@@ -407,11 +409,7 @@ async fn streaming_e2e_coordinator_reattach_preserves_watermark() {
     {
         let mut coordinator = shared.write().await;
         coordinator
-            .register_executor(krishiv_proto::ExecutorDescriptor::new(
-                executor_id.clone(),
-                "pod-ra",
-                1,
-            ))
+            .register_executor(executor_descriptor.clone())
             .unwrap();
         let job = JobSpec::new(job_id.clone(), "ra streaming", JobKind::Streaming).with_stage(
             StageSpec::new(StageId::try_new("stage-1").unwrap(), "stream-stage").with_task(
@@ -437,6 +435,7 @@ async fn streaming_e2e_coordinator_reattach_preserves_watermark() {
         let mut coordinator = shared.write().await;
         let mut store = InMemoryMetadataStore::default();
         coordinator.persist_jobs_to_store(&mut store).unwrap();
+        krishiv_scheduler::MetadataStore::save_executor(&mut store, &executor_descriptor).unwrap();
         coordinator.recover_from_store(&mut store).unwrap();
     }
 

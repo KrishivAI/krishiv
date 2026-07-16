@@ -1108,36 +1108,54 @@ impl ExecutorTaskRunner {
         // keeps the assignment stamp when the shared handle was never attached
         // (it defaults to `initial()`); cross-process zombie fencing is
         // unaffected — a zombie's live lease is behind the registry either way.
-        let lease = assignment.lease_generation().max(self.live_lease.get());
-        let mut request =
-            TaskStatusRequest::new(ids, assignment.executor_id().clone(), lease, state)
-                .with_message(message);
-        if let Some(output_metadata) = output_metadata {
-            request = request.with_output_metadata(output_metadata);
-        }
-        if !missing_partitions.is_empty() {
-            request = request.with_missing_shuffle_partitions(missing_partitions);
-        }
-
-        const MAX_RETRIES: u8 = 3;
-        let mut attempt = 0;
+        // A task-status channel can remain pinned to a coordinator that has
+        // just demoted. The standby rejects mutations, while the heartbeat
+        // loop invalidates this channel and re-registers against the new
+        // leader. Keep the assignment in the runner until that convergence
+        // completes; dropping it here would leave the coordinator's Assigned
+        // task permanently wedged. Rebuild the request every time so a lease
+        // advanced by the heartbeat loop is picked up by the next attempt.
+        const MAX_RETRIES: u8 = 60;
+        let mut attempt = 0u8;
         loop {
+            let lease = assignment.lease_generation().max(self.live_lease.get());
+            let mut request =
+                TaskStatusRequest::new(ids.clone(), assignment.executor_id().clone(), lease, state)
+                    .with_message(message.clone());
+            if let Some(output_metadata) = &output_metadata {
+                request = request.with_output_metadata(output_metadata.clone());
+            }
+            if !missing_partitions.is_empty() {
+                request = request.with_missing_shuffle_partitions(missing_partitions.clone());
+            }
+
             let result = coordinator
-                .task_status(tonic::Request::new(request.clone()))
+                .task_status(tonic::Request::new(request))
                 .await
                 .map(tonic::Response::into_inner);
 
             match result {
+                Ok(response)
+                    if matches!(
+                        response.disposition(),
+                        krishiv_proto::TransportDisposition::StaleLease
+                            | krishiv_proto::TransportDisposition::UnknownExecutor
+                    ) && attempt < MAX_RETRIES - 1 =>
+                {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     let is_retryable = matches!(
                         e.code(),
-                        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+                        tonic::Code::Unavailable
+                            | tonic::Code::DeadlineExceeded
+                            | tonic::Code::FailedPrecondition
                     );
                     if is_retryable && attempt < MAX_RETRIES - 1 {
                         attempt += 1;
-                        let backoff_ms = 100u64 * (1u64 << attempt);
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         continue;
                     }
                     return Err(e);

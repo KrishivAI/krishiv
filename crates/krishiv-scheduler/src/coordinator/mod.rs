@@ -451,6 +451,42 @@ impl SharedCoordinator {
             .store(token, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Persist a complete IVM job snapshot through the configured metadata store.
+    pub async fn save_ivm_snapshot(&self, job_id: &str, snapshot: Vec<u8>) -> SchedulerResult<()> {
+        let store = { self.inner.read().await.store.clone() };
+        let Some(store) = store else {
+            return Ok(());
+        };
+        let mut guard = store.inner();
+        guard.save_ivm_snapshot(job_id, snapshot)
+    }
+
+    /// Load one persisted IVM job snapshot, if present.
+    pub async fn load_ivm_snapshot(&self, job_id: &str) -> Option<Vec<u8>> {
+        let store = { self.inner.read().await.store.clone() }?;
+        let snapshot = store.inner().load_ivm_snapshot(job_id);
+        snapshot
+    }
+
+    /// List all persisted IVM job snapshots visible to this coordinator.
+    pub async fn list_ivm_snapshots(&self) -> Vec<(String, Vec<u8>)> {
+        let Some(store) = ({ self.inner.read().await.store.clone() }) else {
+            return Vec::new();
+        };
+        let snapshots = store.inner().list_ivm_snapshots();
+        snapshots
+    }
+
+    /// Remove a persisted IVM job snapshot.
+    pub async fn remove_ivm_snapshot(&self, job_id: &str) -> SchedulerResult<()> {
+        let store = { self.inner.read().await.store.clone() };
+        let Some(store) = store else {
+            return Ok(());
+        };
+        let mut guard = store.inner();
+        guard.remove_ivm_snapshot(job_id)
+    }
+
     /// Override per-job checkpoint coordinator fencing tokens with the current
     /// leader token.
     ///

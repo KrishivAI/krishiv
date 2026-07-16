@@ -46,9 +46,13 @@ impl SharedLeaseGeneration {
     }
 
     pub fn set(&self, lease: LeaseGeneration) {
-        let new_val = lease.as_u64();
-        // Monotonic: never go backwards.  fetch_max returns the previous value.
-        self.inner.fetch_max(new_val, Ordering::Release);
+        // The generation is monotonic only within one coordinator registry.
+        // After leader failover the promoted coordinator rebuilds that registry
+        // from durable executor descriptors, so a successful re-registration
+        // can authoritatively return a lower generation (for example 3 -> 2).
+        // Retaining the larger value fences every task-status RPC forever even
+        // though heartbeats with the replacement generation are accepted.
+        self.inner.store(lease.as_u64(), Ordering::Release);
     }
 }
 
@@ -218,5 +222,14 @@ mod tests {
             .get("authorization")
             .and_then(|value| value.to_str().ok());
         assert_eq!(auth, Some("Bearer coord-secret"));
+    }
+
+    #[test]
+    fn shared_lease_accepts_authoritative_generation_reset_after_failover() {
+        let lease = SharedLeaseGeneration::new(LeaseGeneration::initial().next().next());
+
+        lease.set(LeaseGeneration::initial().next());
+
+        assert_eq!(lease.get(), LeaseGeneration::initial().next());
     }
 }

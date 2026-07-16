@@ -17,13 +17,43 @@
 //! parallel in-process).
 
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
+use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use krishiv_ivm::{
     DeltaBatch, IncrementalFlow, IncrementalViewSpec, IvmError, IvmResult,
     PartitionedIncrementalFlow, StepSummary, partition_key_from_sql,
 };
+use serde::{Deserialize, Serialize};
+
+const IVM_DURABLE_SNAPSHOT_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedIvmViewSpec {
+    name: String,
+    body_sql: String,
+    output_schema_ipc: Vec<u8>,
+    is_materialized: bool,
+    is_recursive: bool,
+    lateness: Vec<krishiv_ivm::LatenessSpec>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum PersistedIvmShape {
+    Single,
+    Partitioned { shards: usize, key_column: String },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedIvmJob {
+    version: u32,
+    shape: PersistedIvmShape,
+    views: Vec<PersistedIvmViewSpec>,
+    checkpoint_full: Vec<u8>,
+}
 
 /// A coordinator-hosted IVM job: a single flow, or one auto-partitioned by key.
 ///
@@ -114,6 +144,14 @@ impl IvmJob {
         match self {
             IvmJob::Single(f) => f.view_spec(view),
             IvmJob::Partitioned(p) => p.view_spec(view),
+        }
+    }
+
+    /// Return every registered view specification.
+    pub fn view_specs(&self) -> IvmResult<Vec<IncrementalViewSpec>> {
+        match self {
+            IvmJob::Single(f) => f.view_specs(),
+            IvmJob::Partitioned(p) => p.view_specs(),
         }
     }
 
@@ -452,6 +490,87 @@ impl IvmJobRegistry {
             .map(|j| j.keys().cloned().collect())
             .unwrap_or_default()
     }
+
+    /// Serialize a complete job definition and full state checkpoint.
+    pub fn durable_snapshot(&self, job_id: &str) -> IvmResult<Vec<u8>> {
+        let job = self
+            .get(job_id)
+            .ok_or_else(|| IvmError::execution(format!("IVM job not found: {job_id}")))?;
+        let shape = match &job {
+            IvmJob::Single(_) => PersistedIvmShape::Single,
+            IvmJob::Partitioned(flow) => PersistedIvmShape::Partitioned {
+                shards: flow.num_shards(),
+                key_column: flow.key_column().to_owned(),
+            },
+        };
+        let views = job
+            .view_specs()?
+            .into_iter()
+            .map(|spec| {
+                let mut output_schema_ipc = Vec::new();
+                {
+                    let mut writer =
+                        StreamWriter::try_new(&mut output_schema_ipc, &spec.output_schema)
+                            .map_err(|e| IvmError::execution(e.to_string()))?;
+                    writer
+                        .finish()
+                        .map_err(|e| IvmError::execution(e.to_string()))?;
+                }
+                Ok(PersistedIvmViewSpec {
+                    name: spec.name,
+                    body_sql: spec.body_sql,
+                    output_schema_ipc,
+                    is_materialized: spec.is_materialized,
+                    is_recursive: spec.is_recursive,
+                    lateness: spec.lateness,
+                })
+            })
+            .collect::<IvmResult<Vec<_>>>()?;
+        let persisted = PersistedIvmJob {
+            version: IVM_DURABLE_SNAPSHOT_VERSION,
+            shape,
+            views,
+            checkpoint_full: job.checkpoint_full()?,
+        };
+        serde_json::to_vec(&persisted).map_err(|e| IvmError::execution(e.to_string()))
+    }
+
+    /// Recreate a job from a durable definition and full-state checkpoint.
+    pub fn restore_durable_snapshot(&self, job_id: &str, bytes: &[u8]) -> IvmResult<()> {
+        let persisted: PersistedIvmJob =
+            serde_json::from_slice(bytes).map_err(|e| IvmError::execution(e.to_string()))?;
+        if persisted.version != IVM_DURABLE_SNAPSHOT_VERSION {
+            return Err(IvmError::execution(format!(
+                "unsupported IVM durable snapshot version {}",
+                persisted.version
+            )));
+        }
+        let job = match persisted.shape {
+            PersistedIvmShape::Single => IvmJob::Single(Arc::new(IncrementalFlow::new())),
+            PersistedIvmShape::Partitioned { shards, key_column } => IvmJob::Partitioned(Arc::new(
+                PartitionedIncrementalFlow::new(shards, key_column),
+            )),
+        };
+        for view in persisted.views {
+            let reader = StreamReader::try_new(Cursor::new(view.output_schema_ipc), None)
+                .map_err(|e| IvmError::execution(e.to_string()))?;
+            job.register_view(IncrementalViewSpec {
+                name: view.name,
+                body_sql: view.body_sql,
+                output_schema: reader.schema(),
+                is_materialized: view.is_materialized,
+                is_recursive: view.is_recursive,
+                lateness: view.lateness,
+            })?;
+        }
+        job.restore_full(&persisted.checkpoint_full)?;
+        self.jobs
+            .lock()
+            .map_err(|_| IvmError::execution("registry lock poisoned"))?
+            .insert(job_id.to_owned(), job);
+        self.update_dispatch(job_id, |dispatch| *dispatch = IvmDispatchState::default());
+        Ok(())
+    }
 }
 
 /// Shared, reference-counted handle to the IVM job registry.
@@ -612,6 +731,38 @@ mod tests {
         let after = job2.source_snapshot("orders").unwrap().unwrap();
 
         assert_eq!(before.num_rows(), after.num_rows());
+    }
+
+    #[tokio::test]
+    async fn durable_snapshot_restores_definition_shape_and_materialized_state() {
+        let reg = IvmJobRegistry::with_default_shards(3);
+        reg.create("durable".into()).unwrap();
+        reg.register_view("durable", revenue_spec()).unwrap();
+        let job = reg.get("durable").unwrap();
+        job.feed(
+            "orders",
+            DeltaBatch::from_inserts(orders(&["US", "EU", "US"], &[100, 50, 25])).unwrap(),
+        )
+        .unwrap();
+        job.step_datafusion().await.unwrap();
+        let snapshot = reg.durable_snapshot("durable").unwrap();
+
+        let restored = IvmJobRegistry::with_default_shards(1);
+        restored
+            .restore_durable_snapshot("durable", &snapshot)
+            .unwrap();
+        let restored_job = restored.get("durable").unwrap();
+        assert!(restored_job.is_partitioned());
+        assert_eq!(restored_job.view_specs().unwrap().len(), 1);
+        assert_eq!(restored_job.snapshot_revenue().await.num_rows(), 2);
+        assert_eq!(
+            restored_job
+                .source_snapshot("orders")
+                .unwrap()
+                .unwrap()
+                .num_rows(),
+            3
+        );
     }
 
     // ── shard-count policy (escape hatch) ─────────────────────────────────────

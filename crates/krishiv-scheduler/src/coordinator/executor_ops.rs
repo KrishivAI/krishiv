@@ -12,6 +12,38 @@ impl Coordinator {
         descriptor: ExecutorDescriptor,
     ) -> SchedulerResult<LeaseGeneration> {
         self.ensure_active()?;
+        let executor_id = descriptor.executor_id().clone();
+        let endpoint_changed = self
+            .exec
+            .executors
+            .find_executor(&executor_id)
+            .ok()
+            .filter(|record| {
+                record.state().can_accept_work()
+                    || matches!(record.state(), krishiv_proto::ExecutorState::Draining)
+            })
+            .is_some_and(|record| {
+                let previous = record.descriptor();
+                previous.host() != descriptor.host()
+                    || previous.task_endpoint() != descriptor.task_endpoint()
+                    || previous.barrier_endpoint() != descriptor.barrier_endpoint()
+            });
+        if endpoint_changed {
+            // A stable logical id with a different pod/endpoint is a new
+            // executor incarnation, not an ordinary lease refresh. Treat the
+            // old incarnation as lost before registration so Running work is
+            // replayed and shuffle locations pointing at the deleted pod are
+            // invalidated. Without this, a fast Kubernetes replacement can
+            // beat heartbeat timeout and leave a reduce task fetching forever
+            // from the old pod IP.
+            tracing::warn!(
+                executor_id = %executor_id,
+                new_host = %descriptor.host(),
+                new_task_endpoint = ?descriptor.task_endpoint(),
+                "executor endpoint changed; fencing prior incarnation"
+            );
+            self.mark_executor_lost(&executor_id)?;
+        }
         // Persist before admitting into the in-memory registry so a metadata
         // failure does not leave a worker accepted only until process restart.
         if let Some(ref store) = self.store {
@@ -19,6 +51,37 @@ impl Coordinator {
         }
         let res = self.exec.executors.register(descriptor.clone());
         if res.is_ok() {
+            // A Kubernetes replacement can come back under the same logical
+            // executor id before heartbeat-loss detection fires. Any task the
+            // old process accepted but had not yet acknowledged as Running is
+            // then stranded behind its in-memory launch guard forever. Reopen
+            // only Assigned launches on every accepted registration. Delivery
+            // is idempotent for a surviving process (its inbox returns
+            // Duplicate), while a replacement receives the lost assignment.
+            // Running tasks remain fenced by the new lease and are handled by
+            // the normal loss/status recovery paths.
+            let mut reopened = 0usize;
+            for job_coordinator in self.job_coordinators.values() {
+                let mut job = job_coordinator.write_record();
+                for stage in &mut job.stages {
+                    for task in &mut stage.tasks {
+                        if task.state == TaskState::Assigned
+                            && task.assigned_executor.as_ref() == Some(&executor_id)
+                            && task.launch_in_flight
+                        {
+                            task.clear_launch_in_flight();
+                            reopened = reopened.saturating_add(1);
+                        }
+                    }
+                }
+            }
+            if reopened > 0 {
+                tracing::info!(
+                    executor_id = %executor_id,
+                    reopened,
+                    "executor registration reopened unacknowledged task launches"
+                );
+            }
             self.assign_pending_tasks_for_schedulable_jobs();
             self.exec.notify.notify_waiters();
         }

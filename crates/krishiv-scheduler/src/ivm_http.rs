@@ -72,6 +72,39 @@ fn ivm_not_found(job_id: &str) -> StatusCode {
     StatusCode::NOT_FOUND
 }
 
+async fn ensure_ivm_job(
+    registry: &SharedIvmJobRegistry,
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+) -> Result<crate::ivm::IvmJob, StatusCode> {
+    if let Some(job) = registry.get(job_id) {
+        return Ok(job);
+    }
+    let snapshot = coordinator
+        .load_ivm_snapshot(job_id)
+        .await
+        .ok_or_else(|| ivm_not_found(job_id))?;
+    registry
+        .restore_durable_snapshot(job_id, &snapshot)
+        .map_err(ivm_err)?;
+    registry.get(job_id).ok_or_else(|| ivm_not_found(job_id))
+}
+
+async fn persist_ivm_job(
+    registry: &SharedIvmJobRegistry,
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+) -> Result<(), StatusCode> {
+    let snapshot = registry.durable_snapshot(job_id).map_err(ivm_err)?;
+    coordinator
+        .save_ivm_snapshot(job_id, snapshot)
+        .await
+        .map_err(|error| {
+            tracing::error!(job_id, %error, "persisting IVM snapshot failed");
+            StatusCode::SERVICE_UNAVAILABLE
+        })
+}
+
 // ── schema JSON ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -137,12 +170,22 @@ pub struct CreateJobResponse {
 
 pub async fn api_ivm_create_job(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Json(body): Json<CreateJobRequest>,
 ) -> Result<Json<CreateJobResponse>, StatusCode> {
     let job_id = body
         .job_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    registry.create(job_id.clone()).map_err(ivm_err)?;
+    if registry.get(&job_id).is_none() {
+        if let Some(snapshot) = coordinator.load_ivm_snapshot(&job_id).await {
+            registry
+                .restore_durable_snapshot(&job_id, &snapshot)
+                .map_err(ivm_err)?;
+        } else {
+            registry.create(job_id.clone()).map_err(ivm_err)?;
+        }
+    }
+    persist_ivm_job(&registry, &coordinator, &job_id).await?;
     Ok(Json(CreateJobResponse { job_id }))
 }
 
@@ -155,10 +198,19 @@ pub struct ListJobsResponse {
 
 pub async fn api_ivm_list_jobs(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
 ) -> Json<ListJobsResponse> {
-    Json(ListJobsResponse {
-        job_ids: registry.job_ids(),
-    })
+    let mut job_ids = registry.job_ids();
+    job_ids.extend(
+        coordinator
+            .list_ivm_snapshots()
+            .await
+            .into_iter()
+            .map(|(job_id, _)| job_id),
+    );
+    job_ids.sort();
+    job_ids.dedup();
+    Json(ListJobsResponse { job_ids })
 }
 
 // ── DELETE /api/v1/ivm/jobs/{job_id} ─────────────────────────────────────────
@@ -188,6 +240,9 @@ pub async fn api_ivm_delete_job(
             }
         });
     }
+    if let Err(error) = coordinator.remove_ivm_snapshot(&job_id).await {
+        tracing::error!(job_id, %error, "removing IVM snapshot failed");
+    }
     Json(DeleteJobResponse {
         deleted: registry.delete(&job_id),
     })
@@ -213,14 +268,13 @@ pub struct RegisterViewResponse {
 
 pub async fn api_ivm_register_view(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
     Json(body): Json<RegisterViewRequest>,
 ) -> Result<Json<RegisterViewResponse>, StatusCode> {
     // Existence is enforced by the registry (which also decides, on the first
     // view, whether to auto-partition the job by a single-column GROUP BY key).
-    if registry.get(&job_id).is_none() {
-        return Err(ivm_not_found(&job_id));
-    }
+    ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     let output_schema =
         parse_schema(&body.output_schema).ok_or_else(|| ivm_err("invalid output_schema"))?;
     let spec = IncrementalViewSpec {
@@ -232,6 +286,7 @@ pub async fn api_ivm_register_view(
         lateness: vec![],
     };
     registry.register_view(&job_id, spec).map_err(ivm_err)?;
+    persist_ivm_job(&registry, &coordinator, &job_id).await?;
     Ok(Json(RegisterViewResponse { success: true }))
 }
 
@@ -244,12 +299,12 @@ pub struct DropViewResponse {
 
 pub async fn api_ivm_drop_view(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Path((job_id, view_name)): Path<(String, String)>,
 ) -> Result<Json<DropViewResponse>, StatusCode> {
-    let flow = registry
-        .get(&job_id)
-        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     let dropped = flow.drop_view(&view_name).map_err(ivm_err)?;
+    persist_ivm_job(&registry, &coordinator, &job_id).await?;
     Ok(Json(DropViewResponse { dropped }))
 }
 
@@ -268,12 +323,11 @@ pub struct FeedSourceResponse {
 
 pub async fn api_ivm_feed_source(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Path((job_id, source_name)): Path<(String, String)>,
     Json(body): Json<FeedSourceRequest>,
 ) -> Result<Json<FeedSourceResponse>, StatusCode> {
-    let flow = registry
-        .get(&job_id)
-        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     let ipc_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         &body.delta_ipc_b64,
@@ -307,12 +361,11 @@ pub struct FeedStreamDeltaResponse {
 
 pub async fn api_ivm_feed_stream_delta(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Path((job_id, source_name)): Path<(String, String)>,
     Json(body): Json<FeedStreamDeltaRequest>,
 ) -> Result<Json<FeedStreamDeltaResponse>, StatusCode> {
-    let flow = registry
-        .get(&job_id)
-        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     let ipc_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         &body.delta_ipc_b64,
@@ -342,9 +395,7 @@ pub async fn api_ivm_step(
     State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
 ) -> Result<Json<StepResponse>, StatusCode> {
-    let flow = registry
-        .get(&job_id)
-        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
 
     // Serialize concurrent steps for this job so two simultaneous ticks cannot
     // drain each other's pending or double-advance the tick counter. Per-job,
@@ -420,6 +471,7 @@ pub async fn api_ivm_step(
     };
 
     let tick = flow.tick().unwrap_or(0);
+    persist_ivm_job(&registry, &coordinator, &job_id).await?;
     Ok(Json(StepResponse {
         active_views: summary.active_views,
         total_output_rows: summary.total_output_rows,
@@ -452,9 +504,15 @@ async fn run_ivm_fragment_job(
         krishiv_common::async_util::unix_now_ms()
     ))
     .map_err(|e| e.to_string())?;
-    let task = TaskSpec::new(TaskId::try_new("task-ivm").map_err(|e| e.to_string())?, fragment);
-    let stage = StageSpec::new(StageId::try_new("stage-ivm").map_err(|e| e.to_string())?, label)
-        .with_task(task);
+    let task = TaskSpec::new(
+        TaskId::try_new("task-ivm").map_err(|e| e.to_string())?,
+        fragment,
+    );
+    let stage = StageSpec::new(
+        StageId::try_new("stage-ivm").map_err(|e| e.to_string())?,
+        label,
+    )
+    .with_task(task);
     let spec = JobSpec::new(sched_job_id.clone(), label, JobKind::Batch).with_stage(stage);
 
     let notify = {
@@ -566,13 +624,9 @@ async fn submit_resident_ivm_step(
             .checkpoint_full()
             .map_err(|e| refeed(format!("checkpoint_full: {e}")))?;
         let specs = flow.view_specs().map_err(|e| refeed(e.to_string()))?;
-        let attach = krishiv_ivm::encode_ivm_attach_fragment(
-            ivm_job_id,
-            &specs,
-            &state_bytes,
-            disp.fence,
-        )
-        .map_err(|e| refeed(e.to_string()))?;
+        let attach =
+            krishiv_ivm::encode_ivm_attach_fragment(ivm_job_id, &specs, &state_bytes, disp.fence)
+                .map_err(|e| refeed(e.to_string()))?;
         run_ivm_fragment_job(coordinator, attach, "ivm-attach")
             .await
             .map_err(refeed)?;
@@ -598,8 +652,8 @@ async fn submit_resident_ivm_step(
         .await
         .map_err(refeed)?
         .ok_or_else(|| refeed("ivm-tick produced no inline result blob".to_owned()))?;
-    let view_deltas =
-        krishiv_ivm::decode_delta_map(&blob).map_err(|e| refeed(format!("decode delta map: {e}")))?;
+    let view_deltas = krishiv_ivm::decode_delta_map(&blob)
+        .map_err(|e| refeed(format!("decode delta map: {e}")))?;
 
     // 4. Mirror the tick on the coordinator's authoritative state.
     let summary = flow

@@ -51,6 +51,12 @@ impl ExecutorRegistry {
         }
     }
 
+    /// Clear runtime membership before restoring the authoritative durable view.
+    pub(crate) fn reset_for_recovery(&mut self) {
+        self.executors.clear();
+        self.current_tick = 0;
+    }
+
     /// Register an executor.
     ///
     /// GAP-CP-07: Idempotent re-registration with lease bump.

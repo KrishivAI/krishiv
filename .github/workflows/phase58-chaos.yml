@@ -1,0 +1,26 @@
+name: Phase 58 HA chaos
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: Iterations per consecutive run
+        default: "25"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  phase58-chaos:
+    runs-on: [self-hosted, linux, krishiv-chaos]
+    timeout-minutes: 120
+    env:
+      PHASE58_ITERATIONS: ${{ inputs.iterations || '25' }}
+      PHASE58_RUNS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the complete workload × fault matrix twice
+        run: ./scripts/phase58_chaos.sh

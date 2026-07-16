@@ -46,6 +46,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         let auth = extract_auth_context(request.metadata());
         validate_grpc_writer(&auth)?;
         tracing::debug!(subject = %auth.subject(), "register_executor");
+        ensure_shared_coordinator_active(&self.coordinator).await?;
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
 
@@ -91,6 +92,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         let auth = extract_auth_context(request.metadata());
         validate_grpc_writer(&auth)?;
         tracing::debug!(subject = %auth.subject(), "deregister_executor");
+        ensure_shared_coordinator_active(&self.coordinator).await?;
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
 
@@ -132,6 +134,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         let auth = extract_auth_context(request.metadata());
         validate_grpc_writer(&auth)?;
         tracing::debug!(subject = %auth.subject(), "executor_heartbeat");
+        ensure_shared_coordinator_active(&self.coordinator).await?;
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
 
@@ -193,6 +196,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         let auth = extract_auth_context(request.metadata());
         validate_grpc_writer(&auth)?;
         tracing::debug!(subject = %auth.subject(), "task_status");
+        ensure_shared_coordinator_active(&self.coordinator).await?;
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
 

@@ -6,6 +6,19 @@ use super::{
 use crate::job_coordinator::JobCoordinator;
 
 impl Coordinator {
+    /// Reload the attached shared store and rebuild coordinator state from it.
+    ///
+    /// This is used on every standby-to-active transition, not just process
+    /// startup, so a warm standby cannot schedule from a stale etcd snapshot.
+    pub(crate) fn refresh_and_recover_from_attached_store(&mut self) -> SchedulerResult<()> {
+        let Some(handle) = self.store.clone() else {
+            return Ok(());
+        };
+        let mut store = handle.inner();
+        store.refresh()?;
+        self.recover_from_store(&mut *store)
+    }
+
     /// Restore job state from a `MetadataStore` after coordinator restart.
     ///
     /// For streaming jobs with Running tasks, the `streaming_reattach_grace_ticks`
@@ -21,6 +34,7 @@ impl Coordinator {
         // Always prefer the persisted store as the authoritative source of truth.
         self.job_coordinators.clear();
         self.streaming_task_index.clear();
+        self.exec.executors.reset_for_recovery();
         for record in store.jobs() {
             let job_id = record.job_id().clone();
             self.job_coordinators.insert(

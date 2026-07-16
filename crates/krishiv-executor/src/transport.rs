@@ -234,6 +234,14 @@ impl ExecutorRuntime {
         &self.config
     }
 
+    /// Drop the runtime heartbeat/registration channel so the next RPC
+    /// resolves the coordinator Service again after an active-leader change.
+    pub async fn invalidate_coordinator_channel(&self) {
+        if let Some(pool) = self.pool.get() {
+            pool.invalidate().await;
+        }
+    }
+
     /// Mutable access to runtime configuration.
     pub fn config_mut(&mut self) -> &mut ExecutorConfig {
         &mut self.config
@@ -567,8 +575,9 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
             .await?
             .into_inner();
         Ok(tonic::Response::new(
-            wire::register_executor_response_from_wire(response)
-                .map_err(|e| krishiv_metrics::grpc::internal_status("decode register_executor response", &e))?,
+            wire::register_executor_response_from_wire(response).map_err(|e| {
+                krishiv_metrics::grpc::internal_status("decode register_executor response", &e)
+            })?,
         ))
     }
 
@@ -584,8 +593,9 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
             .await?
             .into_inner();
         Ok(tonic::Response::new(
-            wire::deregister_executor_response_from_wire(response)
-                .map_err(|e| krishiv_metrics::grpc::internal_status("decode deregister_executor response", &e))?,
+            wire::deregister_executor_response_from_wire(response).map_err(|e| {
+                krishiv_metrics::grpc::internal_status("decode deregister_executor response", &e)
+            })?,
         ))
     }
 
@@ -602,10 +612,17 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
             .executor_heartbeat(wire::executor_heartbeat_request_to_wire(hb))
             .await?
             .into_inner();
-        let decoded = wire::executor_heartbeat_response_from_wire(response)
-            .map_err(|e| krishiv_metrics::grpc::internal_status("decode executor_heartbeat response", &e))?;
-        // Coordinator's authoritative lease — propagate immediately.
-        self.pool.set_lease_generation(decoded.lease_generation());
+        let decoded = wire::executor_heartbeat_response_from_wire(response).map_err(|e| {
+            krishiv_metrics::grpc::internal_status("decode executor_heartbeat response", &e)
+        })?;
+        // Only an accepted heartbeat carries an authoritative lease. A stale
+        // response is the signal to re-register; adopting its generation here
+        // would race the caller's recovery path and could temporarily unfence
+        // an old process. The accepted registration response replaces the
+        // shared lease, including a legitimate generation reset after failover.
+        if decoded.disposition() == krishiv_proto::TransportDisposition::Accepted {
+            self.pool.set_lease_generation(decoded.lease_generation());
+        }
         Ok(tonic::Response::new(decoded))
     }
 
@@ -622,8 +639,9 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
             .await?
             .into_inner();
         Ok(tonic::Response::new(
-            wire::task_status_response_from_wire(response)
-                .map_err(|e| krishiv_metrics::grpc::internal_status("decode task_status response", &e))?,
+            wire::task_status_response_from_wire(response).map_err(|e| {
+                krishiv_metrics::grpc::internal_status("decode task_status response", &e)
+            })?,
         ))
     }
 
@@ -638,8 +656,9 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
             .await?
             .into_inner();
         Ok(tonic::Response::new(
-            wire::checkpoint_ack_response_from_wire(response)
-                .map_err(|e| krishiv_metrics::grpc::internal_status("decode checkpoint_ack response", &e))?,
+            wire::checkpoint_ack_response_from_wire(response).map_err(|e| {
+                krishiv_metrics::grpc::internal_status("decode checkpoint_ack response", &e)
+            })?,
         ))
     }
 
@@ -683,8 +702,9 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
         let _ = forwarder.await;
         let response = result?.into_inner();
         Ok(tonic::Response::new(
-            wire::push_task_result_response_from_wire(response)
-                .map_err(|e| krishiv_metrics::grpc::internal_status("decode push_task_result response", &e))?,
+            wire::push_task_result_response_from_wire(response).map_err(|e| {
+                krishiv_metrics::grpc::internal_status("decode push_task_result response", &e)
+            })?,
         ))
     }
 }

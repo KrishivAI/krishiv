@@ -289,6 +289,7 @@ async fn register_once(runtime: &mut ExecutorRuntime) -> crate::ExecutorResult<(
                 return Ok(());
             }
             Err(error) => {
+                runtime.invalidate_coordinator_channel().await;
                 if attempt >= max_attempts {
                     return Err(format!(
                         "registration failed after {max_attempts} attempts: {error}"
@@ -503,9 +504,7 @@ async fn heartbeat_loop(
     {
         "disaggregated" => {
             let dfs_root = std::env::var("KRISHIV_STATE_DFS_ROOT").map_err(|_| {
-                String::from(
-                    "KRISHIV_STATE_BACKEND=disaggregated requires KRISHIV_STATE_DFS_ROOT",
-                )
+                String::from("KRISHIV_STATE_BACKEND=disaggregated requires KRISHIV_STATE_DFS_ROOT")
             })?;
             let cache_dir = state_dir
                 .clone()
@@ -688,8 +687,9 @@ async fn heartbeat_loop(
     runner_builder = runner_builder.with_barrier_context(crate::runner::RunLoopBarrierContext {
         state: state_backend.clone(),
         storage: Arc::clone(&checkpoint_storage),
-        coordinator: crate::runner::SharedCoordinatorClient(coord_service.clone()
-            as Arc<dyn krishiv_proto::CoordinatorExecutorService>),
+        coordinator: crate::runner::SharedCoordinatorClient(
+            coord_service.clone() as Arc<dyn krishiv_proto::CoordinatorExecutorService>
+        ),
     });
 
     let runner = Arc::new(runner_builder);
@@ -886,6 +886,7 @@ async fn heartbeat_loop(
                                 }
                                 Err(error) => {
                                     readiness.mark_registered(false);
+                                    runtime.invalidate_coordinator_channel().await;
                                     tracing::error!(error = %error, "re-register failed");
                                 }
                             }
@@ -933,7 +934,10 @@ async fn heartbeat_loop(
                             backoff_secs = current_backoff.as_secs(),
                             "heartbeat rpc failed; will retry with backoff"
                         );
-                        // Drop the cached channel so the next iteration reconnects.
+                        // Heartbeats and task reports use separate pools. Drop
+                        // both so a channel pinned to a demoted coordinator
+                        // resolves the active-only Service endpoint again.
+                        runtime.invalidate_coordinator_channel().await;
                         coord_service.invalidate_channel().await;
                         tokio::time::sleep(current_backoff).await;
                         current_backoff = (current_backoff * 2).min(max_backoff);
@@ -1561,6 +1565,27 @@ mod tests {
 
         assert_eq!(runtime.config().lease_generation(), next_lease);
         assert_eq!(shared_lease.get(), next_lease);
+    }
+
+    #[test]
+    fn successful_reregister_replaces_higher_lease_after_leader_failover() {
+        let mut runtime = ExecutorRuntime::new(
+            ExecutorConfig::new("exec-lease", "pod-a", 1, "http://coordinator").unwrap(),
+        );
+        let old_leader_lease = LeaseGeneration::initial().next().next();
+        runtime.apply_lease_generation(old_leader_lease);
+        let shared_lease = SharedLeaseGeneration::new(old_leader_lease);
+        let new_leader_lease = LeaseGeneration::initial().next();
+        let response = RegisterExecutorResponse::new(
+            ExecutorId::try_new("exec-lease").unwrap(),
+            new_leader_lease,
+            TransportDisposition::Accepted,
+        );
+
+        apply_successful_reregister_lease(&mut runtime, &shared_lease, &response);
+
+        assert_eq!(runtime.config().lease_generation(), new_leader_lease);
+        assert_eq!(shared_lease.get(), new_leader_lease);
     }
 
     #[test]
