@@ -102,3 +102,65 @@ async fn sql_compat_union_all() {
     let total_rows: usize = r.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 2);
 }
+
+// ── Multi-statement scripts ──────────────────────────────────────────────
+// One SQL body may carry several `;`-separated statements; they execute
+// sequentially in the SAME engine context and the last statement's result
+// comes back. This is what lets a distributed batch fragment carry its own
+// setup DDL (fragments are re-planned on a fresh engine per assignment, so
+// session state from a previous call does not exist there).
+
+#[tokio::test]
+async fn multi_statement_script_shares_one_context() {
+    use arrow::array::Int64Array;
+    let r = run(
+        "CREATE TABLE ms_t (n INT); \
+         INSERT INTO ms_t VALUES (1),(2); \
+         SELECT COUNT(*) AS c FROM ms_t",
+    )
+    .await;
+    let col = r[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(col.value(0), 2);
+}
+
+#[tokio::test]
+async fn multi_statement_semicolon_inside_literal_is_not_a_split() {
+    use arrow::array::StringArray;
+    let r = run("SELECT 'a;b' AS s").await;
+    let col = r[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(col.value(0), "a;b");
+}
+
+#[tokio::test]
+async fn multi_statement_semicolon_inside_comment_is_not_a_split() {
+    use arrow::array::Int64Array;
+    let r = run("-- setup; still one comment\nSELECT 1 AS x; SELECT 2 AS y").await;
+    let col = r[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(col.value(0), 2); // last statement wins
+}
+
+#[tokio::test]
+async fn multi_statement_trailing_semicolon_stays_single_statement() {
+    let r = run("SELECT 1 AS one;").await;
+    assert_eq!(r[0].num_rows(), 1);
+}
+
+#[tokio::test]
+async fn multi_statement_failure_aborts_the_script() {
+    let err = SqlEngine::new()
+        .sql("SELECT * FROM ms_missing_table; SELECT 1 AS never_reached")
+        .await;
+    assert!(err.is_err(), "script must abort on the failing statement");
+}

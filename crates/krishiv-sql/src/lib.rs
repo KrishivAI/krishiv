@@ -1845,6 +1845,27 @@ impl SqlEngine {
             return Err(SqlError::EmptyQuery);
         }
 
+        // ── Multi-statement scripts ──────────────────────────────────────────
+        // Distributed batch fragments are re-planned on a fresh engine per
+        // assignment, so session state registered by an earlier Flight SQL
+        // call (e.g. a `STORED AS JDBC` pull table) does not exist there. A
+        // caller that needs setup DDL plus the statement that reads it must
+        // ship both in one body; statements run sequentially in this engine
+        // and the last statement's result is returned. A failing statement
+        // aborts the script (statements already executed are not rolled back).
+        let script = split_sql_statements(query);
+        if script.len() > 1
+            && let [setup @ .., last_stmt] = script.as_slice()
+        {
+            for stmt in setup {
+                // DDL executes eagerly inside `sql()`, but DML comes back as a
+                // lazy frame that only runs on collect — force each setup
+                // statement to completion before anything that depends on it.
+                Box::pin(self.sql(stmt.as_str())).await?.collect().await?;
+            }
+            return Box::pin(self.sql(last_stmt.as_str())).await;
+        }
+
         // Lazy UDF sync: only re-sync when the registry has changed since the
         // last sync. Avoids 3 RwLock reads per query when no UDFs are registered
         // or when the UDF set hasn't changed.
@@ -4811,6 +4832,75 @@ fn split_top_level_commas(s: &str) -> Vec<String> {
         i += 1;
     }
     if let Some(last) = s.get(start..).map(str::trim)
+        && !last.is_empty()
+    {
+        items.push(last.to_string());
+    }
+    items
+}
+
+/// Split a SQL body into its top-level statements.
+///
+/// Splits on `;` outside single-quoted literals (`''` escapes), double-quoted
+/// identifiers, `--` line comments, and `/* … */` block comments, preserving
+/// each statement's original text (no re-rendering, so literal contents are
+/// never altered). Empty pieces (trailing semicolons, blank statements) are
+/// dropped. A body with no top-level semicolon comes back as a single item.
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut start = 0usize;
+    let mut chars = sql.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\'' => {
+                // Single-quoted literal; '' is an escaped quote, not a close.
+                while let Some((_, c2)) = chars.next() {
+                    if c2 == '\'' {
+                        if chars.peek().is_some_and(|&(_, c3)| c3 == '\'') {
+                            chars.next();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            '"' => {
+                for (_, c2) in chars.by_ref() {
+                    if c2 == '"' {
+                        break;
+                    }
+                }
+            }
+            '-' if chars.peek().is_some_and(|&(_, c2)| c2 == '-') => {
+                for (_, c2) in chars.by_ref() {
+                    if c2 == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek().is_some_and(|&(_, c2)| c2 == '*') => {
+                chars.next();
+                let mut star = false;
+                for (_, c2) in chars.by_ref() {
+                    if star && c2 == '/' {
+                        break;
+                    }
+                    star = c2 == '*';
+                }
+            }
+            ';' => {
+                if let Some(piece) = sql.get(start..i).map(str::trim)
+                    && !piece.is_empty()
+                {
+                    items.push(piece.to_string());
+                }
+                // ';' is ASCII — one byte — so i + 1 is a char boundary.
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if let Some(last) = sql.get(start..).map(str::trim)
         && !last.is_empty()
     {
         items.push(last.to_string());
