@@ -1,6 +1,33 @@
 # Krishiv Implementation Status
 
-## 2026-07-17 — Phase 59 residual: ≤2 s cancel PROVEN live (clean path) + zombie-task bug found (#217)
+## 2026-07-17 (later) — #217 root cause found in code: HTTP cancel never pushes CancelTask; prior "clean-path PASS" claim corrected
+
+Code-read of the cancel path (while the leg2a rebuild ran) overturned the
+note below. The zombie is not primarily a dispatch race — three defects:
+
+1. **`api_job_cancel` never notifies executors.**
+   `coordinator_daemon.rs:659` calls the state-only `cancel_job`;
+   `push_cancel_job` (the RPC-pushing variant) is reached only by the
+   continuous-stream deregister route. `POST /api/v1/jobs/{id}/cancel`
+   therefore sends **zero** CancelTask RPCs for batch jobs. **Correction to
+   the entry below: the "clean path PASS, 6/6" measured coordinator-side
+   bookkeeping plus tasks that finished naturally — it is NOT evidence of
+   cancel propagation, and the ≤2 s cancel bound is NOT yet proven.** The
+   proof must be re-run after the fix.
+2. **`push_cancel_job` skips `Assigned` tasks for batch jobs**
+   (task_assignment.rs:989) — the dispatch-in-flight window. Safe to close:
+   the executor inbox tombstones cancelled task ids and the runner checks
+   `is_task_cancelled` after pop, so cancel-before-arrival is handled.
+3. **No mid-execution abort for batch fragments** — `is_task_cancelled` is
+   consulted only pre-execution and by run-loops; a fragment already inside
+   DataFusion runs to completion (or task timeout) regardless.
+
+Fix plan (edits, tests, live re-verification protocol on krishiv-cert) is
+staged in the session scratchpad (`fix217_plan.md`); implementation waits
+for the running leg2a build to land (source frozen). #181's cancel residual
+reverts to **open** until the re-proof.
+
+## 2026-07-17 — Phase 59 residual: ≤2 s cancel proven live (clean path — SEE CORRECTION ABOVE) + zombie-task bug found (#217)
 
 The infra-gated ≤2 s cancel proof ran on the live authed cert cluster
 (ns `krishiv-cert`, image `fast-7fd98941`, coordinator s1 + executors
