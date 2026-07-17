@@ -1,5 +1,42 @@
 # Krishiv Implementation Status
 
+## 2026-07-17 — Phase 59 residual: ≤2 s cancel PROVEN live (clean path) + zombie-task bug found (#217)
+
+The infra-gated ≤2 s cancel proof ran on the live authed cert cluster
+(ns `krishiv-cert`, image `fast-7fd98941`, coordinator s1 + executors
+s2/s3, bearer-authed HTTP API).
+
+- **Clean path PASS, 6/6**: submit a ~10^10-row cross-join COUNT via
+  `POST /api/v1/batch-sql/submit`, wait for `running_task_count > 0`,
+  `POST /api/v1/jobs/{id}/cancel` → terminal `Cancelled` in
+  **39–151 ms**, executor drained (running count 0) by **93–174 ms** —
+  two orders of magnitude under the 2 s bar. Post-cancel queries succeed
+  every time.
+- **REAL BUG (filed #217)**: cancelling 4 *concurrent* heavy jobs marks
+  all Cancelled in ~257 ms and evicts them, but one task escaped on
+  exec-s2 and kept executing at ~997 millicores for minutes with zero
+  non-terminal jobs; the executor log shows NO cancel receipt. G5-family
+  race: a task in Assigned/dispatch-in-flight never gets the CancelTask
+  RPC, starts after its job is terminal+evicted, runs to completion
+  (`unknown_job for succeeded status` WARN is the same race's other
+  end). Executor `running_task_count` also lags/diverges (a phantom 1
+  persisted minutes on exec-s3 at idle CPU before healing). Fix shape in
+  the task: cancel must cover non-terminal attempts (Phase 53 fencing
+  #199 adjacent); executors must reject task STARTS for unknown/terminal
+  jobs; heartbeat counter reconciliation must converge.
+- Housekeeping: exec-s3 found wedged since 07-15 09:22Z (silent
+  registry dropout after DUR-2 pre-commit failures — #188's known
+  territory; pod Running, process log dead); rollout-restarted, both
+  executors re-registered Healthy. exec-s2 restarted to reclaim the
+  zombie core. Cluster left healthy (2 executors, 0 running tasks,
+  sanity queries green).
+
+Validation: driven end-to-end over the authed API (port-forward
+`svc/cert-coordinator:2002`, coordinator bearer token). Evidence logs in
+the session scratchpad (`zombie_exec_s2.log`, `zombie_coordinator.log`).
+#181 stays in_progress: cancel-proof residual now has a PASS baseline +
+one open correctness bug (#217); connector one-registry (#197) unchanged.
+
 ## 2026-07-12 (leg 3) — Phase 54 COMPLETE: AQE + statistics (all legs in one cycle)
 
 Closes task #176. Commits ca866d9b (dfplan partition-spec grammar),
