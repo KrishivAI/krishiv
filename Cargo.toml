@@ -185,7 +185,15 @@ await_holding_refcell_ref = "deny"
 [profile.dev]
 opt-level = 0
 debug = 0
-incremental = true
+# Incremental is OFF deliberately: the global rustc-wrapper is sccache,
+# which cannot cache incremental compiles — with it on we paid wrapper
+# overhead AND the incremental dep-graph's memory (the multi-GB straw on
+# krishiv-executor's monomorphization-heavy compile) for zero caching.
+# Non-incremental, sccache caches at crate granularity: an unchanged
+# crate is a hit, a changed one recompiles whole — the right trade on a
+# workspace whose giants OOM 23GB boxes. (First build after this flip
+# recompiles everything once while populating the cache.)
+incremental = false
 split-debuginfo = "unpacked"
 
 # dev: non-optimized, fastest possible compile. opt-level 0 for every
