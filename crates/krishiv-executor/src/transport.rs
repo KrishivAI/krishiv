@@ -276,13 +276,10 @@ impl ExecutorRuntime {
     }
 
     /// Register this executor through a tonic-shaped coordinator service.
-    pub async fn register_with<S>(
+    pub async fn register_with(
         &self,
-        service: &S,
-    ) -> Result<RegisterExecutorResponse, tonic::Status>
-    where
-        S: CoordinatorExecutorService,
-    {
+        service: &dyn CoordinatorExecutorService,
+    ) -> Result<RegisterExecutorResponse, tonic::Status> {
         service
             .register_executor(tonic::Request::new(self.registration_request()))
             .await
@@ -299,13 +296,10 @@ impl ExecutorRuntime {
     }
 
     /// Deregister this executor through a tonic-shaped coordinator service.
-    pub async fn deregister_with<S>(
+    pub async fn deregister_with(
         &self,
-        service: &S,
-    ) -> Result<DeregisterExecutorResponse, tonic::Status>
-    where
-        S: CoordinatorExecutorService,
-    {
+        service: &dyn CoordinatorExecutorService,
+    ) -> Result<DeregisterExecutorResponse, tonic::Status> {
         service
             .deregister_executor(tonic::Request::new(self.deregistration_request()))
             .await
@@ -367,13 +361,10 @@ impl ExecutorRuntime {
     }
 
     /// Send a heartbeat through a tonic-shaped coordinator service.
-    pub async fn heartbeat_with<S>(
+    pub async fn heartbeat_with(
         &self,
-        service: &S,
-    ) -> Result<ExecutorHeartbeatResponse, tonic::Status>
-    where
-        S: CoordinatorExecutorService,
-    {
+        service: &dyn CoordinatorExecutorService,
+    ) -> Result<ExecutorHeartbeatResponse, tonic::Status> {
         service
             .executor_heartbeat(tonic::Request::new(self.heartbeat_request()))
             .await

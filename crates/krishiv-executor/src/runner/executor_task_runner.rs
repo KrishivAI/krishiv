@@ -37,6 +37,17 @@ use super::task_runner::{
 pub(crate) type SharedContinuousConnectorSources =
     Arc<DashMap<String, Arc<tokio::sync::Mutex<Box<dyn krishiv_connectors::DynSource>>>>>;
 
+/// Type-erase a fragment future so the runner's own async state machine holds
+/// one pointer instead of embedding the full execution-layout of the fragment
+/// (batch/streaming/IVM futures transitively embed DataFusion plan execution;
+/// inlining them made `run_assignment_with`'s generated future — and the
+/// compile time of this crate — explode).
+fn erased<'a, T>(
+    fut: impl std::future::Future<Output = T> + Send + 'a,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>> {
+    Box::pin(fut)
+}
+
 /// Shared per-job egress buffers for run-loop (`stream:rloop:`) jobs.
 ///
 /// The run-loop appends emitted windows here; `drain_continuous_output`
@@ -705,13 +716,10 @@ impl ExecutorTaskRunner {
     }
 
     /// Consume and run one queued assignment, if present.
-    pub async fn run_next_with<S>(
+    pub async fn run_next_with(
         &self,
-        coordinator: &S,
-    ) -> Result<Option<ExecutorTaskRunReport>, tonic::Status>
-    where
-        S: CoordinatorExecutorService,
-    {
+        coordinator: &dyn CoordinatorExecutorService,
+    ) -> Result<Option<ExecutorTaskRunReport>, tonic::Status> {
         let Some(assignment) = self
             .inbox
             .pop_next()
@@ -726,14 +734,11 @@ impl ExecutorTaskRunner {
     }
 
     /// Run a specific assignment through the skeleton lifecycle.
-    pub async fn run_assignment_with<S>(
+    pub async fn run_assignment_with(
         &self,
         assignment: ExecutorTaskAssignment,
-        coordinator: &S,
-    ) -> Result<ExecutorTaskRunReport, tonic::Status>
-    where
-        S: CoordinatorExecutorService,
-    {
+        coordinator: &dyn CoordinatorExecutorService,
+    ) -> Result<ExecutorTaskRunReport, tonic::Status> {
         let running = self
             .send_task_status(
                 &assignment,
@@ -821,7 +826,12 @@ impl ExecutorTaskRunner {
                     .unwrap_or(DEFAULT_BATCH_TASK_TIMEOUT_SECS);
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
-                    execute_batch_fragment(self, &assignment, udf_limits, memory_budget),
+                    erased(execute_batch_fragment(
+                        self,
+                        &assignment,
+                        udf_limits,
+                        memory_budget,
+                    )),
                 )
                 .await
                 {
@@ -835,8 +845,13 @@ impl ExecutorTaskRunner {
                 // Phase 55 run-loop: the task IS a long-lived loop that exits
                 // only on cancellation — a wall-clock timeout would kill a
                 // healthy streaming job, so none applies.
-                execute_streaming_fragment(self, &assignment, udf_limits.clone(), memory_budget)
-                    .await
+                erased(execute_streaming_fragment(
+                    self,
+                    &assignment,
+                    udf_limits.clone(),
+                    memory_budget,
+                ))
+                .await
             }
             crate::ExecutionModel::Streaming => {
                 // Streaming tasks run a bounded-window loop. A safety timeout
@@ -848,12 +863,12 @@ impl ExecutorTaskRunner {
                     .unwrap_or_else(default_streaming_task_timeout_secs);
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
-                    execute_streaming_fragment(
+                    erased(execute_streaming_fragment(
                         self,
                         &assignment,
                         udf_limits.clone(),
                         memory_budget,
-                    ),
+                    )),
                 )
                 .await
                 {
@@ -877,7 +892,7 @@ impl ExecutorTaskRunner {
                 let fragment_body = fragment_body.to_string();
                 let is_resident =
                     crate::fragment::ivm::is_resident_ivm_fragment(&fragment_body);
-                let ivm_future = async {
+                let ivm_future = erased(async {
                     if is_resident {
                         crate::fragment::ivm::execute_resident_ivm_fragment(
                             &self.ivm_flows,
@@ -887,7 +902,7 @@ impl ExecutorTaskRunner {
                     } else {
                         crate::fragment::ivm::execute_ivm_fragment(&fragment_body).await
                     }
-                };
+                });
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
                     ivm_future,
@@ -1081,18 +1096,15 @@ impl ExecutorTaskRunner {
         .await
     }
 
-    pub(crate) async fn send_task_status<S>(
+    pub(crate) async fn send_task_status(
         &self,
         assignment: &ExecutorTaskAssignment,
         state: TaskState,
         message: impl Into<String>,
-        coordinator: &S,
+        coordinator: &dyn CoordinatorExecutorService,
         output_metadata: Option<TaskOutputMetadata>,
         missing_partitions: Vec<MissingShufflePartition>,
-    ) -> Result<TaskStatusResponse, tonic::Status>
-    where
-        S: CoordinatorExecutorService,
-    {
+    ) -> Result<TaskStatusResponse, tonic::Status> {
         let ids = TaskAttemptRef::new(
             assignment.job_id().clone(),
             assignment.stage_id().clone(),
@@ -1164,14 +1176,11 @@ impl ExecutorTaskRunner {
         }
     }
 
-    async fn send_checkpoint_ack_with_retries<S>(
+    async fn send_checkpoint_ack_with_retries(
         &self,
         ack: CheckpointAckRequest,
-        coordinator: S,
-    ) -> Result<CheckpointAckResponse, tonic::Status>
-    where
-        S: CoordinatorExecutorService + Clone + 'static,
-    {
+        coordinator: SharedCoordinatorClient,
+    ) -> Result<CheckpointAckResponse, tonic::Status> {
         let mut attempt = 0;
         loop {
             let result = coordinator
@@ -1260,18 +1269,15 @@ impl ExecutorTaskRunner {
     }
 
     /// Handle a checkpoint initiation request and deliver the ack to the coordinator (P1-17).
-    pub async fn initiate_checkpoint_and_deliver_ack<S>(
+    pub async fn initiate_checkpoint_and_deliver_ack(
         &self,
         assignment: &ExecutorTaskAssignment,
         req: InitiateCheckpointRequest,
         state: CheckpointStateHandle,
         storage: Arc<dyn CheckpointStorage>,
-        coordinator: S,
+        coordinator: SharedCoordinatorClient,
         sink_transactions: Vec<krishiv_proto::SinkTransactionRef>,
-    ) -> Result<CheckpointAckResponse, tonic::Status>
-    where
-        S: CoordinatorExecutorService + Clone + 'static,
-    {
+    ) -> Result<CheckpointAckResponse, tonic::Status> {
         // Get-or-create the Arc<Mutex<TaskRunner>>; the entry stays in the DashMap
         // throughout the blocking I/O so concurrent barriers for the same task_id
         // find the existing Arc rather than creating a fresh TaskRunner with
@@ -1317,16 +1323,13 @@ impl ExecutorTaskRunner {
     /// Uses the real `running_attempts` map to source actual executor and
     /// stage identifiers — previously this code synthesized fake ids that
     /// the coordinator could not correlate (B10).
-    pub async fn initiate_checkpoint_for_job<S>(
+    pub async fn initiate_checkpoint_for_job(
         &self,
         req: &InitiateCheckpointRequest,
         fallback_state: CheckpointStateHandle,
         storage: Arc<dyn CheckpointStorage>,
-        coordinator: S,
-    ) -> Result<(), tonic::Status>
-    where
-        S: CoordinatorExecutorService + Clone + 'static,
-    {
+        coordinator: SharedCoordinatorClient,
+    ) -> Result<(), tonic::Status> {
         use krishiv_proto::{
             ExecutorTaskAssignment, OutputContract, OutputContractKind, PlanFragment,
             TaskAttemptRef,
@@ -1827,15 +1830,12 @@ impl ExecutorTaskRunner {
     /// checkpoints for each one.  Called from the runner loop in `cli.rs` and
     /// from run-loop iteration boundaries (Phase 55 Leg C). Returns the
     /// number of barriers processed.
-    pub async fn drain_pending_barriers<S>(
+    pub async fn drain_pending_barriers(
         &self,
         fallback_state: CheckpointStateHandle,
         storage: Arc<dyn CheckpointStorage>,
-        coordinator: S,
-    ) -> usize
-    where
-        S: CoordinatorExecutorService + Clone + 'static,
-    {
+        coordinator: SharedCoordinatorClient,
+    ) -> usize {
         let Some(ref injector) = self.barrier_injector else {
             return 0;
         };
