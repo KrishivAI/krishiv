@@ -1,0 +1,17 @@
+# rust-analyzer limits for this workspace's build box (23GB RAM).
+#
+# Unbounded flychecks (`cargo check --workspace --all-targets`) recompile
+# the monomorphization-heavy giants (krishiv-executor, krishiv-ui) in the
+# background; stacked on a real build they have twice OOM-killed the
+# host (2026-07-17). Scope checks to the crate being edited and skip
+# startup cache priming. Note this file takes precedence over editor
+# client settings — remove it (or edit here) if you're on a big machine
+# and want workspace-wide diagnostics back.
+
+[check]
+# Check only the crate of the saved file, not the whole workspace.
+workspace = false
+
+[cachePriming]
+# Don't compile the workspace on editor startup.
+enable = false
