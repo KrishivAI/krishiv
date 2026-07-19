@@ -656,7 +656,7 @@ async fn execute_loop_fragment(
         if !inline_batches.is_empty() {
             inline_batches
         } else {
-            read_continuous_registry_sources(runner, assignment, job_id).await?
+            crate::erased(read_continuous_registry_sources(runner, assignment, job_id)).await?
         }
     };
 
@@ -729,7 +729,14 @@ async fn execute_loop_fragment(
                 })
             })
             .unwrap_or_default();
-        stage_iceberg_sink_output(runner, job_id, descriptor, &output_batches, offsets).await?;
+        crate::erased(stage_iceberg_sink_output(
+            runner,
+            job_id,
+            descriptor,
+            &output_batches,
+            offsets,
+        ))
+        .await?;
     }
 
     let total_rows: usize = output_batches.iter().map(|b| b.num_rows()).sum();
@@ -992,8 +999,7 @@ pub(crate) async fn execute_streaming_fragment(
         ));
 
         // Continuous SQL queries must use execute_stream to avoid blocking and buffering forever.
-        let dataframe = engine
-            .sql(query)
+        let dataframe = crate::erased(engine.sql(query))
             .await
             .map_err(|error| ExecutorError::LocalExecution {
                 message: error.to_string(),
@@ -1039,10 +1045,10 @@ pub(crate) async fn execute_streaming_fragment(
             if is_staged_sink {
                 staged_buffer.push(batch.clone());
             } else if is_object_parquet_sink {
-                crate::fragment::common::write_object_parquet_sink(
+                crate::erased(crate::fragment::common::write_object_parquet_sink(
                     assignment.output_contract(),
                     std::slice::from_ref(&batch),
-                )
+                ))
                 .await?;
             }
 
@@ -1051,8 +1057,11 @@ pub(crate) async fn execute_streaming_fragment(
         }
 
         let sink_staged_files = if is_staged_sink {
-            crate::fragment::common::write_object_parquet_sink_for_task(assignment, &staged_buffer)
-                .await?
+            crate::erased(crate::fragment::common::write_object_parquet_sink_for_task(
+                assignment,
+                &staged_buffer,
+            ))
+            .await?
         } else {
             Vec::new()
         };
@@ -1075,14 +1084,16 @@ pub(crate) async fn execute_streaming_fragment(
     // Phase 55: stream:rloop: fragments run the promoted long-lived loop —
     // the task launches once, owns its splits, and exits only on cancel.
     if fragment.starts_with(crate::fragment::run_loop::STREAM_RLOOP_PREFIX) {
-        return crate::fragment::run_loop::execute_run_loop_fragment(runner, assignment, fragment)
-            .await;
+        return crate::erased(crate::fragment::run_loop::execute_run_loop_fragment(
+            runner, assignment, fragment,
+        ))
+        .await;
     }
 
     // GAP-6: stream:loop: fragments use a stateful ContinuousWindowExecutor
     // shared across drain cycles via runner.loop_executors.
     if fragment.starts_with(STREAM_LOOP_PREFIX) {
-        return execute_loop_fragment(runner, assignment, fragment).await;
+        return crate::erased(execute_loop_fragment(runner, assignment, fragment)).await;
     }
 
     // ST8: watermark-bounded stream-to-stream join. Phase 55 (G5/#88): the
@@ -1120,13 +1131,13 @@ pub(crate) async fn execute_streaming_fragment(
     let inmem_batches = read_inmem_stream_batches(assignment.input_partitions());
     let job_id = assignment.job_id().as_str();
     if !inmem_batches.is_empty() {
-        return execute_streaming_with_batches(
+        return crate::erased(execute_streaming_with_batches(
             runner,
             assignment.job_id(),
             assignment.stage_id(),
             inmem_batches,
             plan_spec,
-        )
+        ))
         .await;
     }
 

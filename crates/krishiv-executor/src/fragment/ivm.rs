@@ -274,9 +274,7 @@ pub async fn execute_resident_ivm_fragment(
                 .feed(pd.source.clone(), delta)
                 .map_err(|e| e.to_string())?;
         }
-        let summary = resident
-            .flow
-            .step_datafusion()
+        let summary = crate::erased(resident.flow.step_datafusion())
             .await
             .map_err(|e| e.to_string())?;
         resident.fence = fence;
@@ -409,7 +407,9 @@ pub async fn execute_ivm_fragment(
     }
 
     // Run one tick.
-    let summary = flow.step_datafusion().await.map_err(|e| e.to_string())?;
+    let summary = crate::erased(flow.step_datafusion())
+        .await
+        .map_err(|e| e.to_string())?;
 
     // Collect each view's full materialized output. Non-materialized or
     // never-stepped views yield an empty batch over their schema so the

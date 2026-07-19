@@ -641,7 +641,7 @@ pub(crate) async fn execute_run_loop_fragment(
 
         // Leg C: barriers align at iteration boundaries. Snapshots happen
         // ONLY here (barrier epochs) — never per iteration.
-        let barriers = runner.drain_barriers_via_context().await;
+        let barriers = crate::erased(runner.drain_barriers_via_context()).await;
         if barriers > 0 {
             // Refresh queryable state from the barrier-consistent snapshot
             // (Leg D: no per-cycle ephemeral RocksDB rebuild).
@@ -779,7 +779,8 @@ pub(crate) async fn execute_run_loop_fragment(
                 if !idle_outputs.is_empty() {
                     rows_emitted += idle_outputs.iter().map(|b| b.num_rows() as u64).sum::<u64>();
                     batches_emitted += idle_outputs.len() as u64;
-                    runner.stage_rloop_outputs(job_id, assignment, &idle_outputs).await?;
+                    crate::erased(runner.stage_rloop_outputs(job_id, assignment, &idle_outputs))
+                        .await?;
                 }
                 last_idle_tick = Instant::now();
             }
@@ -828,7 +829,7 @@ pub(crate) async fn execute_run_loop_fragment(
                     ),
                 });
             };
-            deliver_to_peer(runner, job_id, peer, batches).await?;
+            crate::erased(deliver_to_peer(runner, job_id, peer, batches)).await?;
         }
 
         if owned_batches.is_empty() {
@@ -859,7 +860,7 @@ pub(crate) async fn execute_run_loop_fragment(
             metrics.observe_stream_record_latency(job_id, read_started.elapsed().as_secs_f64());
             rows_emitted += outputs.iter().map(|b| b.num_rows() as u64).sum::<u64>();
             batches_emitted += outputs.len() as u64;
-            runner.stage_rloop_outputs(job_id, assignment, &outputs).await?;
+            crate::erased(runner.stage_rloop_outputs(job_id, assignment, &outputs)).await?;
         }
 
         // Report per-subtask progress; the coordinator min-combines subtask
@@ -930,7 +931,7 @@ impl ExecutorTaskRunner {
 
         let contract = assignment.output_contract();
         if let Some(descriptor) = crate::fragment::common::iceberg_sink_descriptor(contract)? {
-            self.stage_rloop_iceberg(job_id, descriptor, outputs).await?;
+            crate::erased(self.stage_rloop_iceberg(job_id, descriptor, outputs)).await?;
         } else if let Some(parsed) =
             krishiv_proto::OutputContractDescriptor::parse_kafka_sink(contract.description())
                 .or_else(|| {
@@ -946,7 +947,7 @@ impl ExecutorTaskRunner {
             let descriptor = parsed.map_err(|message| ExecutorError::InvalidAssignment {
                 message,
             })?;
-            self.stage_rloop_kafka(job_id, assignment, descriptor, outputs)
+            crate::erased(self.stage_rloop_kafka(job_id, assignment, descriptor, outputs))
                 .await?;
         }
         Ok(())

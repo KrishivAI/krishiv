@@ -1839,8 +1839,26 @@ impl SqlEngine {
     }
 
     /// Plan a SQL query with DataFusion.
-    pub async fn sql(&self, query: impl AsRef<str>) -> SqlResult<SqlDataFrame> {
-        let query = query.as_ref();
+    ///
+    /// Returns a boxed future ON PURPOSE (do not revert to `async fn`): this
+    /// body is one of the largest async state machines in the workspace, and
+    /// as an opaque `impl Future` its `Send` proof leaked into every CONSUMER
+    /// crate — rustc's old trait solver re-derived it per call site, which
+    /// drove krishiv-executor's front-end to 20+ hour compiles (95% of CPU in
+    /// `ObligationForest::process_obligations`, bisected 2026-07-19). Boxing
+    /// at the definition pays that proof once, here.
+    pub fn sql<'a>(
+        &'a self,
+        query: impl AsRef<str> + Send + 'a,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SqlResult<SqlDataFrame>> + Send + 'a>>
+    {
+        let query: String = query.as_ref().to_owned();
+        Box::pin(self.sql_boxed_body(query))
+    }
+
+    /// The real `sql` body — see the boxing note on [`Self::sql`].
+    async fn sql_boxed_body(&self, query: String) -> SqlResult<SqlDataFrame> {
+        let query = query.as_str();
         if query.trim().is_empty() {
             return Err(SqlError::EmptyQuery);
         }
@@ -3532,12 +3550,29 @@ impl SqlDataFrame {
     }
 
     /// Execute and collect this DataFrame.
-    pub async fn collect(&self) -> SqlResult<Vec<RecordBatch>> {
-        Ok(self.dataframe.clone().collect().await?)
+    ///
+    /// Boxed at the definition — see the compile-time note on
+    /// [`SqlEngine::sql`].
+    pub fn collect(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SqlResult<Vec<RecordBatch>>> + Send + '_>>
+    {
+        Box::pin(async move { Ok(self.dataframe.clone().collect().await?) })
     }
 
     /// Execute and return a record batch stream.
-    pub async fn execute_stream(&self) -> SqlResult<SqlStream> {
+    ///
+    /// Boxed at the definition (like [`SqlEngine::sql`]) so the DataFusion
+    /// planning future inside never leaks as an opaque type to consumer
+    /// crates — see the compile-time note on `sql`.
+    pub fn execute_stream(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SqlResult<SqlStream>> + Send + '_>>
+    {
+        Box::pin(self.execute_stream_boxed_body())
+    }
+
+    async fn execute_stream_boxed_body(&self) -> SqlResult<SqlStream> {
         let df_stream = self.dataframe.clone().execute_stream().await?;
         use futures::StreamExt;
         let mapped = df_stream.map(|res| {
@@ -3555,7 +3590,19 @@ impl SqlDataFrame {
     /// and `spill_count` are aggregated across every operator in the physical
     /// plan tree (sorts, hash joins, and aggregations report spills when the
     /// memory pool forces them to disk); other fields default to 0.
-    pub async fn collect_with_stats(&self) -> SqlResult<(Vec<RecordBatch>, SqlExecutionStats)> {
+    pub fn collect_with_stats(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = SqlResult<(Vec<RecordBatch>, SqlExecutionStats)>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self.collect_with_stats_boxed_body())
+    }
+
+    async fn collect_with_stats_boxed_body(&self) -> SqlResult<(Vec<RecordBatch>, SqlExecutionStats)> {
         use datafusion::physical_plan::collect as df_collect;
 
         let df = self.dataframe.clone();
@@ -3598,7 +3645,15 @@ impl SqlDataFrame {
     /// spooled to disk or written straight into a sink.
     ///
     /// [`collect_with_stats`]: Self::collect_with_stats
-    pub async fn execute_stream_with_stats(&self) -> SqlResult<(SqlStream, SqlStatsHandle)> {
+    pub fn execute_stream_with_stats(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = SqlResult<(SqlStream, SqlStatsHandle)>> + Send + '_>,
+    > {
+        Box::pin(self.execute_stream_with_stats_boxed_body())
+    }
+
+    async fn execute_stream_with_stats_boxed_body(&self) -> SqlResult<(SqlStream, SqlStatsHandle)> {
         use futures::StreamExt;
 
         let df = self.dataframe.clone();

@@ -37,16 +37,7 @@ use super::task_runner::{
 pub(crate) type SharedContinuousConnectorSources =
     Arc<DashMap<String, Arc<tokio::sync::Mutex<Box<dyn krishiv_connectors::DynSource>>>>>;
 
-/// Type-erase a fragment future so the runner's own async state machine holds
-/// one pointer instead of embedding the full execution-layout of the fragment
-/// (batch/streaming/IVM futures transitively embed DataFusion plan execution;
-/// inlining them made `run_assignment_with`'s generated future — and the
-/// compile time of this crate — explode).
-fn erased<'a, T>(
-    fut: impl std::future::Future<Output = T> + Send + 'a,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>> {
-    Box::pin(fut)
-}
+use crate::erased;
 
 /// Shared per-job egress buffers for run-loop (`stream:rloop:`) jobs.
 ///

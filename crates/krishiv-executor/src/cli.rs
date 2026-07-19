@@ -809,19 +809,16 @@ async fn heartbeat_loop(
 
                 // Drain any pending barriers from the gRPC injector before
                 // picking up the next task assignment.
-                let _ = runner_loop
-                    .drain_pending_barriers(
-                        backend.clone(),
-                        Arc::clone(&storage)
-                            as Arc<dyn krishiv_state::checkpoint::CheckpointStorage>,
-                        crate::runner::SharedCoordinatorClient(
-                            coord.clone()
-                                as Arc<dyn krishiv_proto::CoordinatorExecutorService>,
-                        ),
-                    )
-                    .await;
+                let _ = crate::erased(runner_loop.drain_pending_barriers(
+                    backend.clone(),
+                    Arc::clone(&storage) as Arc<dyn krishiv_state::checkpoint::CheckpointStorage>,
+                    crate::runner::SharedCoordinatorClient(
+                        coord.clone() as Arc<dyn krishiv_proto::CoordinatorExecutorService>,
+                    ),
+                ))
+                .await;
 
-                match runner_loop.run_next_with(coord.as_ref()).await {
+                match crate::erased(runner_loop.run_next_with(coord.as_ref())).await {
                     Ok(Some(_report)) => {}
                     Ok(None) => {
                         // Wait for a push notification or a 1-second fallback so

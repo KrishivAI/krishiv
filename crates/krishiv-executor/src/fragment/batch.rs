@@ -41,7 +41,7 @@ async fn load_input_tables(
             })?;
     }
     for (table_name, batches) in
-        read_connector_parquet_partitions(assignment.input_partitions()).await?
+        crate::erased(read_connector_parquet_partitions(assignment.input_partitions())).await?
     {
         engine
             .register_record_batches(&table_name, batches)
@@ -51,7 +51,7 @@ async fn load_input_tables(
             })?;
     }
     for (table_name, batches) in
-        read_object_parquet_partitions(assignment.input_partitions()).await?
+        crate::erased(read_object_parquet_partitions(assignment.input_partitions())).await?
     {
         engine
             .register_record_batches(&table_name, batches)
@@ -61,7 +61,7 @@ async fn load_input_tables(
             })?;
     }
     for (table_name, batches) in
-        read_shuffle_flight_partitions(assignment.input_partitions()).await?
+        crate::erased(read_shuffle_flight_partitions(assignment.input_partitions())).await?
     {
         engine
             .register_record_batches(&table_name, batches)
@@ -72,8 +72,12 @@ async fn load_input_tables(
     }
     if let Some(reg) = registry {
         for (table_name, batches) in
-            read_registry_partitions(reg, assignment.input_partitions(), restored_source_offsets)
-                .await?
+            crate::erased(read_registry_partitions(
+                reg,
+                assignment.input_partitions(),
+                restored_source_offsets,
+            ))
+            .await?
         {
             engine
                 .register_record_batches(&table_name, batches)
@@ -127,7 +131,7 @@ pub(crate) async fn execute_batch_fragment(
     // R4a typed shuffle read: read from the in-memory store and return batches directly.
     if let Some(read_cfg) = assignment.shuffle_read() {
         if let Some(store) = &runner.inmem_shuffle {
-            return execute_inmem_shuffle_read(assignment, read_cfg, store).await;
+            return crate::erased(execute_inmem_shuffle_read(assignment, read_cfg, store)).await;
         } else {
             return Err(ExecutorError::InvalidAssignment {
                 message: String::from(
@@ -142,24 +146,24 @@ pub(crate) async fn execute_batch_fragment(
     // dfplan map tasks carry a ShuffleWriteConfig too, but their body is a
     // plan partition, not a `sql:` query.
     if krishiv_sql::distributed_plan::is_dfplan_body(fragment) {
-        return execute_dfplan_fragment(
+        return crate::erased(execute_dfplan_fragment(
             runner,
             assignment,
             fragment,
             udf_limits.clone(),
             engine_memory_limit,
-        )
+        ))
         .await;
     }
 
     #[cfg(feature = "kafka")]
     if fragment == KAFKA_TO_PARQUET_FRAGMENT {
-        return execute_source_to_sink_pipeline(runner, assignment).await;
+        return crate::erased(execute_source_to_sink_pipeline(runner, assignment)).await;
     }
 
     if let Some(shuffle_spec) = fragment.strip_prefix(SHUFFLE_WRITE_PREFIX) {
         if let Some(ctx) = &runner.shuffle {
-            return execute_shuffle_write_fragment(
+            return crate::erased(execute_shuffle_write_fragment(
                 assignment,
                 shuffle_spec,
                 ctx,
@@ -167,7 +171,7 @@ pub(crate) async fn execute_batch_fragment(
                 engine_memory_limit,
                 Some(runner.connector_registry.as_ref()),
                 restored_source_offsets,
-            )
+            ))
             .await;
         } else {
             return Err(ExecutorError::InvalidAssignment {
@@ -181,7 +185,7 @@ pub(crate) async fn execute_batch_fragment(
     // R4a typed shuffle write: hash-partition SQL output and write to the in-memory store.
     if let Some(write_cfg) = assignment.shuffle_write() {
         if let Some(store) = &runner.inmem_shuffle {
-            return execute_inmem_shuffle_write(
+            return crate::erased(execute_inmem_shuffle_write(
                 assignment,
                 write_cfg,
                 store,
@@ -189,7 +193,7 @@ pub(crate) async fn execute_batch_fragment(
                 engine_memory_limit,
                 Some(runner.connector_registry.as_ref()),
                 restored_source_offsets,
-            )
+            ))
             .await;
         } else {
             return Err(ExecutorError::InvalidAssignment {
@@ -224,7 +228,7 @@ pub(crate) async fn execute_batch_fragment(
                 })?;
         }
         for (table_name, batches) in
-            read_connector_parquet_partitions(assignment.input_partitions()).await?
+            crate::erased(read_connector_parquet_partitions(assignment.input_partitions())).await?
         {
             engine
                 .register_record_batches(&table_name, batches)
@@ -234,7 +238,7 @@ pub(crate) async fn execute_batch_fragment(
                 })?;
         }
         for (table_name, batches) in
-            read_object_parquet_partitions(assignment.input_partitions()).await?
+            crate::erased(read_object_parquet_partitions(assignment.input_partitions())).await?
         {
             engine
                 .register_record_batches(&table_name, batches)
@@ -244,7 +248,7 @@ pub(crate) async fn execute_batch_fragment(
                 })?;
         }
         for (table_name, batches) in
-            read_shuffle_flight_partitions(assignment.input_partitions()).await?
+            crate::erased(read_shuffle_flight_partitions(assignment.input_partitions())).await?
         {
             engine
                 .register_record_batches(&table_name, batches)
@@ -382,7 +386,7 @@ pub(crate) async fn execute_batch_fragment(
     }
 
     if let Some(rest) = fragment.strip_prefix(WINDOW_PREFIX) {
-        return execute_window_fragment(rest, assignment).await;
+        return crate::erased(execute_window_fragment(rest, assignment)).await;
     }
 
     Err(ExecutorError::InvalidAssignment {
@@ -542,16 +546,15 @@ async fn execute_shuffle_write_fragment(
     {
         tracing::warn!(%error, "iceberg REST catalog registration from env failed");
     }
-    load_input_tables(
+    crate::erased(load_input_tables(
         &limited_engine,
         assignment,
         registry,
         restored_source_offsets,
-    )
+    ))
     .await?;
 
-    let dataframe = limited_engine
-        .sql(query)
+    let dataframe = crate::erased(limited_engine.sql(query))
         .await
         .map_err(|e| ExecutorError::LocalExecution {
             message: e.to_string(),
@@ -1072,16 +1075,15 @@ async fn execute_inmem_shuffle_write(
     let mut hot_key_acc = HotKeyAccumulator::new();
 
     if let Some(query) = sql_query_from_fragment(&fragment_body) {
-        load_input_tables(
+        crate::erased(load_input_tables(
             &limited_engine,
             assignment,
             registry,
             restored_source_offsets,
-        )
+        ))
         .await?;
         let dataframe =
-            limited_engine
-                .sql(query)
+            crate::erased(limited_engine.sql(query))
                 .await
                 .map_err(|e| ExecutorError::LocalExecution {
                     message: e.to_string(),
@@ -1230,9 +1232,9 @@ async fn execute_source_to_sink_pipeline(
 ) -> ExecutorResult<ExecutorTaskOutput> {
     let profile = krishiv_common::resolve_durability_profile();
     if krishiv_common::forbids_simulation_connectors(profile) {
-        return execute_broker_kafka_to_parquet(runner, assignment, profile).await;
+        return crate::erased(execute_broker_kafka_to_parquet(runner, assignment, profile)).await;
     }
-    execute_memory_kafka_to_parquet(runner, assignment).await
+    crate::erased(execute_memory_kafka_to_parquet(runner, assignment)).await
 }
 
 #[cfg(feature = "kafka")]
@@ -1394,10 +1396,24 @@ async fn execute_broker_kafka_to_parquet(
     }
 
     if manual_commit {
-        execute_broker_kafka_two_phase(runner, assignment, source, &sink_path, &source_id, &topic)
-            .await
+        crate::erased(execute_broker_kafka_two_phase(
+            runner,
+            assignment,
+            source,
+            &sink_path,
+            &source_id,
+            &topic,
+        ))
+        .await
     } else {
-        execute_broker_kafka_at_least_once(runner, assignment, source, &sink_path, &source_id).await
+        crate::erased(execute_broker_kafka_at_least_once(
+            runner,
+            assignment,
+            source,
+            &sink_path,
+            &source_id,
+        ))
+        .await
     }
 }
 

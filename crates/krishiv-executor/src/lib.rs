@@ -27,6 +27,20 @@ pub mod transport;
 #[cfg(test)]
 mod tests;
 
+/// Type-erase a future behind `Pin<Box<dyn Future + Send>>`.
+///
+/// Compile-time load-bearing, not a style choice: the executor's deep async
+/// call graph (runner → fragment → staging/exchange helpers) otherwise inlines
+/// every callee's generator into the caller's, and rustc's trait solver then
+/// proves `Send` over one enormous nested type per spawn/boxing point —
+/// measured at 95% of a 20h+ compile (`ObligationForest::process_obligations`).
+/// Boxing at cross-function await seams makes each proof local and small.
+pub(crate) fn erased<'a, T>(
+    fut: impl std::future::Future<Output = T> + Send + 'a,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>> {
+    Box::pin(fut)
+}
+
 // Re-export the public API at the crate root for source compatibility.
 pub use assignment_inbox::{AssignmentPushOutcome, ExecutorAssignmentInbox};
 pub use error::{ExecutorError, ExecutorResult, ExecutorTransportResult};
