@@ -168,7 +168,11 @@ async fn corpus_results_are_non_trivial() {
     // Guard against a false green where both engines return nothing: the grouped
     // query must produce the expected three category groups (a, b, c).
     let ivm = canonicalize(
-        &run_view("SELECT cat, SUM(amount) AS s FROM t GROUP BY cat", PipelineMode::Ivm).await,
+        &run_view(
+            "SELECT cat, SUM(amount) AS s FROM t GROUP BY cat",
+            PipelineMode::Ivm,
+        )
+        .await,
     );
     assert_eq!(ivm.1.len(), 3, "expected 3 category groups: {ivm:?}");
 }

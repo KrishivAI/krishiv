@@ -274,10 +274,12 @@ mod tests {
 
         // Read the output back through a freshly built registry source: the full
         // three rows must survive the SQL-factory round trip.
-        let mut verify: Box<dyn DynSource> =
-            build_source("verify", &spec("parquet", &[("path", out_path.to_str().unwrap())]))
-                .await
-                .unwrap();
+        let mut verify: Box<dyn DynSource> = build_source(
+            "verify",
+            &spec("parquet", &[("path", out_path.to_str().unwrap())]),
+        )
+        .await
+        .unwrap();
         let mut rows = 0;
         while let Some(batch) = verify.read_batch_dyn().await.unwrap() {
             rows += batch.num_rows();

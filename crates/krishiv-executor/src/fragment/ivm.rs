@@ -156,7 +156,10 @@ pub struct ResidentIvmFlow {
 pub type ResidentIvmFlows =
     std::sync::Arc<dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<ResidentIvmFlow>>>>;
 
-fn register_specs_on_flow(flow: &IncrementalFlow, view_specs: &[ViewSpecJson]) -> Result<(), String> {
+fn register_specs_on_flow(
+    flow: &IncrementalFlow,
+    view_specs: &[ViewSpecJson],
+) -> Result<(), String> {
     for vs in view_specs {
         if let Some(schema) = parse_schema_fields(&vs.output_schema_fields) {
             let spec = IncrementalViewSpec {
@@ -300,10 +303,7 @@ pub async fn execute_resident_ivm_fragment(
             .map(|e| e.value().clone())
             .ok_or_else(|| format!("no resident IVM flow for job '{job}' (needs attach)"))?;
         let resident = entry.lock().await;
-        let bytes = resident
-            .flow
-            .checkpoint_full()
-            .map_err(|e| e.to_string())?;
+        let bytes = resident.flow.checkpoint_full().map_err(|e| e.to_string())?;
         return Ok((krishiv_ivm::StepSummary::default(), Some(bytes)));
     }
 
@@ -518,9 +518,10 @@ mod tests {
         };
 
         // Tick 1: 100+200 → total 300 (all-insert first output).
-        let (_s1, blob1) = super::execute_resident_ivm_fragment(&flows, &tick(vec![100.0, 200.0], 1))
-            .await
-            .unwrap();
+        let (_s1, blob1) =
+            super::execute_resident_ivm_fragment(&flows, &tick(vec![100.0, 200.0], 1))
+                .await
+                .unwrap();
         let d1 = decode_delta_map(blob1.as_ref().unwrap()).unwrap();
         let out1 = d1.get("total_sales").expect("view emitted a delta");
         assert!(
@@ -565,12 +566,10 @@ mod tests {
         assert!(gap.is_err(), "fence gap must be rejected");
 
         // Checkpoint returns restorable full-state bytes.
-        let (_sc, ckpt) = super::execute_resident_ivm_fragment(
-            &flows,
-            &encode_ivm_ckpt_fragment("job-r"),
-        )
-        .await
-        .unwrap();
+        let (_sc, ckpt) =
+            super::execute_resident_ivm_fragment(&flows, &encode_ivm_ckpt_fragment("job-r"))
+                .await
+                .unwrap();
         let restored = IncrementalFlow::new();
         restored.register_view(sum_view_spec()).unwrap();
         restored.restore_full(ckpt.as_ref().unwrap()).unwrap();
@@ -582,7 +581,10 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .unwrap()
             .value(0);
-        assert!((total - 350.0).abs() < 1e-9, "ckpt restores 350, got {total}");
+        assert!(
+            (total - 350.0).abs() < 1e-9,
+            "ckpt restores 350, got {total}"
+        );
 
         // Detach drops the flow; the next tick errors (needs re-attach).
         super::execute_resident_ivm_fragment(&flows, &encode_ivm_detach_fragment("job-r"))

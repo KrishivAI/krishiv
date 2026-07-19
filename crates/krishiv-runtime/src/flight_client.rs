@@ -127,7 +127,11 @@ const FLIGHT_KEEPALIVE_TIMEOUT_SECS: u64 = 20;
 /// fixed 30s value here silently aborted any query — or result stream — running
 /// longer than 30s (including a healthy multi-minute distributed scan).
 fn flight_request_timeout() -> Option<Duration> {
-    parse_flight_request_timeout(std::env::var("KRISHIV_FLIGHT_REQUEST_TIMEOUT_SECS").ok().as_deref())
+    parse_flight_request_timeout(
+        std::env::var("KRISHIV_FLIGHT_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Pure parse of the `KRISHIV_FLIGHT_REQUEST_TIMEOUT_SECS` value, split out so it

@@ -795,8 +795,7 @@ impl ExecutorTaskRunner {
         )
         .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         let is_continuous_cycle = fragment_body.starts_with("stream:loop:");
-        let is_run_loop =
-            fragment_body.starts_with(crate::fragment::run_loop::STREAM_RLOOP_PREFIX);
+        let is_run_loop = fragment_body.starts_with(crate::fragment::run_loop::STREAM_RLOOP_PREFIX);
 
         // Build resource limits from assignment (propagated from job spec).
         let udf_limits = krishiv_plan::udf::ResourceLimits {
@@ -881,8 +880,7 @@ impl ExecutorTaskRunner {
                     .task_timeout_secs()
                     .unwrap_or(DEFAULT_BATCH_TASK_TIMEOUT_SECS);
                 let fragment_body = fragment_body.to_string();
-                let is_resident =
-                    crate::fragment::ivm::is_resident_ivm_fragment(&fragment_body);
+                let is_resident = crate::fragment::ivm::is_resident_ivm_fragment(&fragment_body);
                 let ivm_future = erased(async {
                     if is_resident {
                         crate::fragment::ivm::execute_resident_ivm_fragment(
@@ -894,11 +892,8 @@ impl ExecutorTaskRunner {
                         crate::fragment::ivm::execute_ivm_fragment(&fragment_body).await
                     }
                 });
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(timeout_secs),
-                    ivm_future,
-                )
-                .await
+                match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), ivm_future)
+                    .await
                 {
                     Ok(Ok((summary, blob))) => {
                         tracing::debug!(
@@ -961,8 +956,8 @@ impl ExecutorTaskRunner {
         // collect this cycle's output while keeping the logical job active for
         // the next push. Other reattachable streaming operators remain Running
         // continuously.
-        let run_loop_cancelled = is_run_loop
-            && output.kind() == crate::runner::ExecutorTaskOutputKind::Cancelled;
+        let run_loop_cancelled =
+            is_run_loop && output.kind() == crate::runner::ExecutorTaskOutputKind::Cancelled;
         let terminal_state = if run_loop_cancelled {
             // A run-loop returns only when cancelled: report Cancelled so the
             // coordinator's teardown observes the stop instead of a phantom
@@ -1677,9 +1672,7 @@ impl ExecutorTaskRunner {
                 parallelism as u32,
                 krishiv_state::EntryRouting::WindowGroupKey,
             )
-            .map_err(|e| {
-                restore_err(format!("key-group redistribution for {job_id}: {e}"))
-            })?;
+            .map_err(|e| restore_err(format!("key-group redistribution for {job_id}: {e}")))?;
             let mut applied = 0usize;
             for entry in self.loop_executors.iter() {
                 let Some(subtask) = entry

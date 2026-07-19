@@ -477,9 +477,9 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
             match checkpoint_inner.coordinators.get(&req.job_id) {
                 None => (vec![], None),
                 Some(coord) => {
-                    let epochs = coord
-                        .list_epochs()
-                        .map_err(|e| krishiv_metrics::grpc::internal_status("list checkpoint epochs", &e))?;
+                    let epochs = coord.list_epochs().map_err(|e| {
+                        krishiv_metrics::grpc::internal_status("list checkpoint epochs", &e)
+                    })?;
                     (epochs, Some(Arc::clone(&coord.storage)))
                 }
             }
@@ -544,7 +544,12 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
             req.job_id.as_str(),
         )
         .await
-        .map_err(|e| krishiv_metrics::grpc::internal_status("list checkpoint epochs for state inspection", &e))?;
+        .map_err(|e| {
+            krishiv_metrics::grpc::internal_status(
+                "list checkpoint epochs for state inspection",
+                &e,
+            )
+        })?;
 
         let mut snapshots = Vec::new();
         for epoch in epochs.into_iter().rev().take(20) {
@@ -554,7 +559,9 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
                 epoch,
             )
             .await
-            .map_err(|e| krishiv_metrics::grpc::internal_status("read checkpoint epoch metadata", &e))?
+            .map_err(|e| {
+                krishiv_metrics::grpc::internal_status("read checkpoint epoch metadata", &e)
+            })?
             else {
                 continue;
             };

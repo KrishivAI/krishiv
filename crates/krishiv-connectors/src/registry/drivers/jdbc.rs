@@ -28,14 +28,12 @@ fn validate_cursor_options(config: &ConnectorConfig) -> ConnectorResult<()> {
         (None, Some(_)) => Err(ConnectorError::Unsupported {
             message: "cursor.after requires cursor.column".into(),
         }),
-        (_, Some(after)) if after.parse::<i64>().is_err() => {
-            Err(ConnectorError::Unsupported {
-                message: format!(
-                    "cursor.after '{after}' must be a 64-bit integer \
+        (_, Some(after)) if after.parse::<i64>().is_err() => Err(ConnectorError::Unsupported {
+            message: format!(
+                "cursor.after '{after}' must be a 64-bit integer \
                      (jdbc incremental cursors are Int64 in v1)"
-                ),
-            })
-        }
+            ),
+        }),
         _ => Ok(()),
     }
 }

@@ -372,7 +372,9 @@ pub(crate) fn route_batch_by_key_group(
             } else {
                 arr.value(i).as_bytes()
             };
-            row_groups.push(u32::from(krishiv_state::key_group::key_group_for_key(bytes)));
+            row_groups.push(u32::from(krishiv_state::key_group::key_group_for_key(
+                bytes,
+            )));
         }
     } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
         for i in 0..arr.len() {
@@ -556,8 +558,7 @@ pub(crate) async fn execute_run_loop_fragment(
             })?;
         Arc::clone(entry.value())
     };
-    if let Some((snapshot_bytes, _)) = read_continuous_restore_hint(assignment.input_partitions())
-    {
+    if let Some((snapshot_bytes, _)) = read_continuous_restore_hint(assignment.input_partitions()) {
         executor_arc
             .lock()
             .map_err(|_| ExecutorError::LocalExecution {
@@ -580,7 +581,10 @@ pub(crate) async fn execute_run_loop_fragment(
         .rloop_parallelism
         .insert(job_id.to_owned(), parsed.parallelism);
     // Egress buffer + input notifies must exist before the first push races us.
-    runner.continuous_outputs.entry(job_id.to_owned()).or_default();
+    runner
+        .continuous_outputs
+        .entry(job_id.to_owned())
+        .or_default();
     let own_notify = runner.notify_handle(&input_key);
     let shared_notify = runner.notify_handle(job_id);
 
@@ -777,7 +781,10 @@ pub(crate) async fn execute_run_loop_fragment(
                         })?
                 };
                 if !idle_outputs.is_empty() {
-                    rows_emitted += idle_outputs.iter().map(|b| b.num_rows() as u64).sum::<u64>();
+                    rows_emitted += idle_outputs
+                        .iter()
+                        .map(|b| b.num_rows() as u64)
+                        .sum::<u64>();
                     batches_emitted += idle_outputs.len() as u64;
                     crate::erased(runner.stage_rloop_outputs(job_id, assignment, &idle_outputs))
                         .await?;
@@ -915,7 +922,10 @@ impl ExecutorTaskRunner {
             return Ok(());
         }
         {
-            let mut egress = self.continuous_outputs.entry(job_id.to_owned()).or_default();
+            let mut egress = self
+                .continuous_outputs
+                .entry(job_id.to_owned())
+                .or_default();
             egress.extend(outputs.iter().cloned());
             if egress.len() > RLOOP_EGRESS_CAP {
                 let overflow = egress.len() - RLOOP_EGRESS_CAP;
@@ -939,16 +949,16 @@ impl ExecutorTaskRunner {
                         contract.descriptor(),
                         Some(krishiv_proto::OutputContractDescriptor::KafkaSink { .. })
                     )
-                    .then(|| Ok(contract.descriptor().cloned().unwrap_or(
-                        krishiv_proto::OutputContractDescriptor::InlineRecordBatches,
-                    )))
+                    .then(|| {
+                        Ok(contract.descriptor().cloned().unwrap_or(
+                            krishiv_proto::OutputContractDescriptor::InlineRecordBatches,
+                        ))
+                    })
                 })
         {
-            let descriptor = parsed.map_err(|message| ExecutorError::InvalidAssignment {
-                message,
-            })?;
-            crate::erased(self.stage_rloop_kafka(job_id, assignment, descriptor, outputs))
-                .await?;
+            let descriptor =
+                parsed.map_err(|message| ExecutorError::InvalidAssignment { message })?;
+            crate::erased(self.stage_rloop_kafka(job_id, assignment, descriptor, outputs)).await?;
         }
         Ok(())
     }
@@ -1120,9 +1130,10 @@ mod tests {
 
     #[test]
     fn rloop_fragment_round_trips_identity() {
-        let parsed =
-            parse_rloop_fragment("stream:rloop:job-a|1/3|stream:tw:key=k:time=ts:win=1000:lag=0:agg=count")
-                .unwrap();
+        let parsed = parse_rloop_fragment(
+            "stream:rloop:job-a|1/3|stream:tw:key=k:time=ts:win=1000:lag=0:agg=count",
+        )
+        .unwrap();
         assert_eq!(parsed.job_id, "job-a");
         assert_eq!(parsed.subtask, 1);
         assert_eq!(parsed.parallelism, 3);

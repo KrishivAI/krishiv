@@ -1143,7 +1143,10 @@ pub(crate) fn reserve_task_engine_memory(
         let granted = usize::try_from(want).unwrap_or(usize::MAX);
         return (
             Some(granted),
-            Some(ProcessMemoryReservation { bytes: want, unified: false }),
+            Some(ProcessMemoryReservation {
+                bytes: want,
+                unified: false,
+            }),
         );
     }
 
@@ -1158,7 +1161,10 @@ pub(crate) fn reserve_task_engine_memory(
         let granted = usize::try_from(remaining).unwrap_or(usize::MAX);
         return (
             Some(granted),
-            Some(ProcessMemoryReservation { bytes: remaining, unified: false }),
+            Some(ProcessMemoryReservation {
+                bytes: remaining,
+                unified: false,
+            }),
         );
     }
 
@@ -1435,8 +1441,14 @@ mod tests {
         let s = coerced.schema();
         // Key stays Utf8 (the default key_column_type), event time becomes Int64,
         // the aggregate input becomes Float64.
-        assert_eq!(s.field_with_name("key").unwrap().data_type(), &DataType::Utf8);
-        assert_eq!(s.field_with_name("ts").unwrap().data_type(), &DataType::Int64);
+        assert_eq!(
+            s.field_with_name("key").unwrap().data_type(),
+            &DataType::Utf8
+        );
+        assert_eq!(
+            s.field_with_name("ts").unwrap().data_type(),
+            &DataType::Int64
+        );
         assert_eq!(
             s.field_with_name("val").unwrap().data_type(),
             &DataType::Float64
@@ -1548,7 +1560,10 @@ mod tests {
         // The Drop impl on ProcessMemoryReservation calls release on the
         // global EXECUTOR_PROCESS_BUDGET, which is unlimited in tests; verify
         // dropping a guard with zero bytes is a no-op and does not panic.
-        drop(super::ProcessMemoryReservation { bytes: 0, unified: false });
+        drop(super::ProcessMemoryReservation {
+            bytes: 0,
+            unified: false,
+        });
     }
 
     #[derive(Clone)]

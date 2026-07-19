@@ -446,8 +446,16 @@ pub fn executor_heartbeat_response_from_wire(
                     job_id,
                     epoch: cmd.epoch,
                     fencing_token,
-                    sink_commit: cmd.sink_commit.into_iter().map(sink_txn_ref_from_wire).collect(),
-                    sink_abort: cmd.sink_abort.into_iter().map(sink_txn_ref_from_wire).collect(),
+                    sink_commit: cmd
+                        .sink_commit
+                        .into_iter()
+                        .map(sink_txn_ref_from_wire)
+                        .collect(),
+                    sink_abort: cmd
+                        .sink_abort
+                        .into_iter()
+                        .map(sink_txn_ref_from_wire)
+                        .collect(),
                 })
             })
             .collect::<WireResult<Vec<_>>>()?;
@@ -1542,7 +1550,10 @@ fn output_contract_descriptor_from_wire(
             })
         }
         v1::OutputContractDescriptorKind::KafkaSink => {
-            require_non_empty(&value.kafka_bootstrap_servers, "kafka sink bootstrap servers")?;
+            require_non_empty(
+                &value.kafka_bootstrap_servers,
+                "kafka sink bootstrap servers",
+            )?;
             require_non_empty(&value.kafka_topic, "kafka sink topic")?;
             require_non_empty(
                 &value.kafka_transactional_id_prefix,

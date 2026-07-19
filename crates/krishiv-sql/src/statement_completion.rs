@@ -141,36 +141,58 @@ mod tests {
     fn parse_use_forms() {
         assert_eq!(
             parse_use("USE analytics"),
-            Some(UseTarget { catalog: None, schema: Some("analytics".into()) })
+            Some(UseTarget {
+                catalog: None,
+                schema: Some("analytics".into())
+            })
         );
         assert_eq!(
             parse_use("USE SCHEMA sales"),
-            Some(UseTarget { catalog: None, schema: Some("sales".into()) })
+            Some(UseTarget {
+                catalog: None,
+                schema: Some("sales".into())
+            })
         );
         assert_eq!(
             parse_use("USE DATABASE sales;"),
-            Some(UseTarget { catalog: None, schema: Some("sales".into()) })
+            Some(UseTarget {
+                catalog: None,
+                schema: Some("sales".into())
+            })
         );
         assert_eq!(
             parse_use("USE CATALOG lakehouse"),
-            Some(UseTarget { catalog: Some("lakehouse".into()), schema: None })
+            Some(UseTarget {
+                catalog: Some("lakehouse".into()),
+                schema: None
+            })
         );
         assert_eq!(
             parse_use("USE lake.sales"),
-            Some(UseTarget { catalog: Some("lake".into()), schema: Some("sales".into()) })
+            Some(UseTarget {
+                catalog: Some("lake".into()),
+                schema: Some("sales".into())
+            })
         );
-        assert_eq!(parse_use("USE `my schema`").unwrap().schema.as_deref(), Some("my schema"));
+        assert_eq!(
+            parse_use("USE `my schema`").unwrap().schema.as_deref(),
+            Some("my schema")
+        );
         assert_eq!(parse_use("SELECT 1"), None);
     }
 
     #[test]
     fn show_databases_rewrite() {
-        assert!(rewrite_show_databases("SHOW DATABASES")
-            .unwrap()
-            .contains("information_schema.schemata"));
-        assert!(rewrite_show_databases("SHOW SCHEMAS")
-            .unwrap()
-            .contains("AS namespace"));
+        assert!(
+            rewrite_show_databases("SHOW DATABASES")
+                .unwrap()
+                .contains("information_schema.schemata")
+        );
+        assert!(
+            rewrite_show_databases("SHOW SCHEMAS")
+                .unwrap()
+                .contains("AS namespace")
+        );
         let with_like = rewrite_show_databases("SHOW DATABASES LIKE 'sal%'").unwrap();
         assert!(with_like.contains("LIKE 'sal%'"));
         assert_eq!(rewrite_show_databases("SHOW TABLES"), None);
@@ -181,7 +203,10 @@ mod tests {
         let engine = crate::SqlEngine::new();
         // USE mutates the session default schema, so a subsequent *unqualified*
         // reference to an information_schema relation now resolves.
-        engine.sql("USE information_schema").await.expect("USE runs");
+        engine
+            .sql("USE information_schema")
+            .await
+            .expect("USE runs");
         let batches = engine
             .sql("SELECT count(*) AS c FROM tables")
             .await

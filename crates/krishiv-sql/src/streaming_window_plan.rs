@@ -171,9 +171,9 @@ fn extract_window(select: &Select) -> SqlResult<(WindowParams, String)> {
 fn find_tvf_window_subquery(select: &Select) -> Option<&Query> {
     fn from_relation(relation: &TableFactor) -> Option<&Query> {
         match relation {
-            TableFactor::Derived { subquery, alias, .. }
-                if alias.as_ref().map(|a| a.name.value.as_str()) == Some("_tvf_window") =>
-            {
+            TableFactor::Derived {
+                subquery, alias, ..
+            } if alias.as_ref().map(|a| a.name.value.as_str()) == Some("_tvf_window") => {
                 Some(subquery.as_ref())
             }
             _ => None,
@@ -212,7 +212,9 @@ fn window_params_from_udf(func: &Function) -> SqlResult<WindowParams> {
     let ms = |slot: Option<&&Expr>, what: &str| -> SqlResult<u64> {
         let expr = slot.ok_or_else(|| unsupported(format!("window function needs a {what}")))?;
         let literal = number_literal(expr).ok_or_else(|| {
-            unsupported(format!("window {what} must be an integer millisecond literal"))
+            unsupported(format!(
+                "window {what} must be an integer millisecond literal"
+            ))
         })?;
         parse_ms(&literal)
     };

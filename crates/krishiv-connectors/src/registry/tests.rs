@@ -85,7 +85,8 @@ fn jdbc_source_validate_rejects_bad_cursor_options() {
         .with_property("cursor.after", "42");
     let err = registry.validate_source(&dangling).unwrap_err();
     assert!(
-        err.to_string().contains("cursor.after requires cursor.column"),
+        err.to_string()
+            .contains("cursor.after requires cursor.column"),
         "{err}"
     );
 

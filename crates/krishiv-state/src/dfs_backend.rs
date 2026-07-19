@@ -442,11 +442,7 @@ impl StateBackend for DisaggregatedStateBackend {
     fn clear_namespace(&mut self, namespace: &Namespace) -> StateResult<()> {
         // Remove all DFS files for this namespace (operator AND state name —
         // an operator-only prefix would clear sibling states too)
-        let ns_prefix = format!(
-            "{}__{}__",
-            namespace.operator_id(),
-            namespace.state_name()
-        );
+        let ns_prefix = format!("{}__{}__", namespace.operator_id(), namespace.state_name());
         if let Ok(entries) = std::fs::read_dir(&self.config.dfs_root) {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str()
@@ -518,11 +514,7 @@ impl StateBackend for DisaggregatedStateBackend {
         // DFS is primary: enumerate its records (which embed the real key) so
         // a fresh instance with a cold cache sees the full keyspace.
         let mut keys = Vec::new();
-        let ns_prefix = format!(
-            "{}__{}__",
-            namespace.operator_id(),
-            namespace.state_name()
-        );
+        let ns_prefix = format!("{}__{}__", namespace.operator_id(), namespace.state_name());
         if let Ok(entries) = std::fs::read_dir(&self.config.dfs_root) {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str()
@@ -879,7 +871,11 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(recovered.cache_size_bytes(), 0, "no state download at start");
+        assert_eq!(
+            recovered.cache_size_bytes(),
+            0,
+            "no state download at start"
+        );
         assert_eq!(recovered.get(&ns, &[7]).unwrap(), Some(vec![7, 7]));
         assert!(
             recovered.cache_size_bytes() > 0,

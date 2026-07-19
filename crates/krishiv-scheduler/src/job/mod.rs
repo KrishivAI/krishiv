@@ -4,8 +4,8 @@ mod record;
 mod scheduler;
 mod snapshot;
 
-pub use record::{JobRecord, StageRecord, TaskRecord};
 pub(crate) use record::ShuffleRegenOutcome;
+pub use record::{JobRecord, StageRecord, TaskRecord};
 pub(crate) use scheduler::{ExecutorPlacement, validate_job};
 pub use scheduler::{
     FairScheduler, LocalityOutcome, LocalityPreference, LocalityScheduler, LocalityTierCounts,

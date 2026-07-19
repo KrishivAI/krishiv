@@ -598,11 +598,11 @@ impl CheckpointStateHandle {
                             message: format!("window join restore: {e}"),
                             source: None,
                         })?;
-                let mut guard =
-                    op.lock()
-                        .map_err(|e| krishiv_state::StateError::LockPoisoned {
-                            message: e.to_string(),
-                        })?;
+                let mut guard = op
+                    .lock()
+                    .map_err(|e| krishiv_state::StateError::LockPoisoned {
+                        message: e.to_string(),
+                    })?;
                 *guard = restored;
                 Ok(())
             }

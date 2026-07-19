@@ -127,7 +127,10 @@ mod tests {
         let caps = all();
         assert!(caps.iter().any(|c| c.name == "kafka"));
         assert!(caps.iter().any(|c| c.name == "cloud"));
-        assert!(caps.iter().all(|c| !c.name.is_empty() && !c.description.is_empty()));
+        assert!(
+            caps.iter()
+                .all(|c| !c.name.is_empty() && !c.description.is_empty())
+        );
     }
 
     #[test]

@@ -211,9 +211,8 @@ impl PerKeyIntervalJoin {
                         .ok_or("join restore: missing ipc")?,
                 )
                 .map_err(|e| format!("join restore base64: {e}"))?;
-            let reader =
-                arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc), None)
-                    .map_err(|e| format!("join restore IPC: {e}"))?;
+            let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc), None)
+                .map_err(|e| format!("join restore IPC: {e}"))?;
             for batch in reader {
                 let batch = batch.map_err(|e| format!("join restore batch: {e}"))?;
                 let buffers = self

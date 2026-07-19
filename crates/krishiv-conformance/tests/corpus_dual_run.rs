@@ -44,10 +44,7 @@ fn corpus_files(tier: &str) -> Vec<PathBuf> {
 async fn corpus_embedded_runtime_filters_off() {
     // Own-process flag flip (the main corpus binary runs with defaults).
     krishiv_sql::set_runtime_filters_for_tests(false);
-    for file in ["scalar", "stateful"]
-        .iter()
-        .flat_map(|t| corpus_files(t))
-    {
+    for file in ["scalar", "stateful"].iter().flat_map(|t| corpus_files(t)) {
         let mut runner = sqllogictest::Runner::new(|| async { Ok(EmbeddedDriver::new()) });
         runner
             .run_file_async(&file)

@@ -2161,7 +2161,10 @@ fn committed_v1_savepoint_fixture_restores() {
     let restored = restore_savepoint(&s, "fixture-job", 1, 5)
         .expect("v1 savepoint fixture must restore under the compatibility window");
     assert!(restored.is_savepoint);
-    assert_eq!(restored.savepoint_label.as_deref(), Some("v1-compat-fixture"));
+    assert_eq!(
+        restored.savepoint_label.as_deref(),
+        Some("v1-compat-fixture")
+    );
     restored.validate().expect("restored metadata validates");
     assert!(
         validate_epoch(&s, "fixture-job", 1).unwrap(),
@@ -2189,4 +2192,3 @@ fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) {
         }
     }
 }
-

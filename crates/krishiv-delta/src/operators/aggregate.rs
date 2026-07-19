@@ -351,9 +351,7 @@ impl ValueReader {
                 let arr = arr
                     .as_any()
                     .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| {
-                        DeltaError::Operator("float64 cast produced wrong type".into())
-                    })?
+                    .ok_or_else(|| DeltaError::Operator("float64 cast produced wrong type".into()))?
                     .clone();
                 Ok(ValueReader::Float(arr))
             }

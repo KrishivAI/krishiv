@@ -113,11 +113,9 @@ async fn sql_compat_union_all() {
 #[tokio::test]
 async fn multi_statement_script_shares_one_context() {
     use arrow::array::Int64Array;
-    let r = run(
-        "CREATE TABLE ms_t (n INT); \
+    let r = run("CREATE TABLE ms_t (n INT); \
          INSERT INTO ms_t VALUES (1),(2); \
-         SELECT COUNT(*) AS c FROM ms_t",
-    )
+         SELECT COUNT(*) AS c FROM ms_t")
     .await;
     let col = r[0]
         .column(0)

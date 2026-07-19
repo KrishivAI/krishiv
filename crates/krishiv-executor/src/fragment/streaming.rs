@@ -392,11 +392,11 @@ fn execute_window_join_fragment(
                 {
                     op = krishiv_dataflow::WatermarkWindowJoinOperator::restore_from_bytes(bytes)
                         .map_err(|e| ExecutorError::LocalExecution {
-                            message: format!(
-                                "window-join restore from checkpoint epoch {} failed: {e}",
-                                restored.epoch
-                            ),
-                        })?;
+                        message: format!(
+                            "window-join restore from checkpoint epoch {} failed: {e}",
+                            restored.epoch
+                        ),
+                    })?;
                 }
                 Ok::<_, ExecutorError>(Arc::new(Mutex::new(op)))
             })?;
@@ -408,9 +408,7 @@ fn execute_window_join_fragment(
         assignment.task_id().as_str().to_owned(),
         crate::runner::TaskStateBinding::Join(job_id.to_owned()),
     );
-    if let Some((snapshot_bytes, _)) =
-        read_continuous_restore_hint(assignment.input_partitions())
-    {
+    if let Some((snapshot_bytes, _)) = read_continuous_restore_hint(assignment.input_partitions()) {
         let restored =
             krishiv_dataflow::WatermarkWindowJoinOperator::restore_from_bytes(&snapshot_bytes)
                 .map_err(|e| ExecutorError::LocalExecution {
@@ -456,19 +454,17 @@ fn execute_window_join_fragment(
             })?;
         let mut out: Vec<arrow::record_batch::RecordBatch> = Vec::new();
         for batch in &left {
-            if let Some(ts) = crate::fragment::run_loop::batch_max_event_time(
-                batch,
-                &spec.time_column,
-            ) {
+            if let Some(ts) =
+                crate::fragment::run_loop::batch_max_event_time(batch, &spec.time_column)
+            {
                 max_event_time = max_event_time.max(ts);
             }
             out.extend(op.process_left(batch));
         }
         for batch in &right {
-            if let Some(ts) = crate::fragment::run_loop::batch_max_event_time(
-                batch,
-                &spec.time_column,
-            ) {
+            if let Some(ts) =
+                crate::fragment::run_loop::batch_max_event_time(batch, &spec.time_column)
+            {
                 max_event_time = max_event_time.max(ts);
             }
             out.extend(op.process_right(batch));
@@ -480,22 +476,15 @@ fn execute_window_join_fragment(
         } else {
             None
         };
-        let state_snapshot = op
-            .snapshot_bytes()
-            .ok()
-            .filter(|bytes| !bytes.is_empty());
+        let state_snapshot = op.snapshot_bytes().ok().filter(|bytes| !bytes.is_empty());
         (out, state_snapshot, watermark_ms)
     };
 
     let total_rows: usize = out.iter().map(|b| b.num_rows()).sum();
     let total_batches = out.len();
     let column_count = out.first().map(|b| b.num_columns()).unwrap_or(0);
-    let mut output = ExecutorTaskOutput::streaming_window(
-        total_rows,
-        total_batches,
-        column_count,
-        out,
-    );
+    let mut output =
+        ExecutorTaskOutput::streaming_window(total_rows, total_batches, column_count, out);
     if let Some(wm) = watermark_ms {
         output = output.with_watermark_ms(wm);
     }
@@ -999,11 +988,11 @@ pub(crate) async fn execute_streaming_fragment(
         ));
 
         // Continuous SQL queries must use execute_stream to avoid blocking and buffering forever.
-        let dataframe = crate::erased(engine.sql(query))
-            .await
-            .map_err(|error| ExecutorError::LocalExecution {
+        let dataframe = crate::erased(engine.sql(query)).await.map_err(|error| {
+            ExecutorError::LocalExecution {
                 message: error.to_string(),
-            })?;
+            }
+        })?;
 
         let mut stream =
             dataframe

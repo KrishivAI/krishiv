@@ -369,9 +369,12 @@ impl InProcessStreamingRuntime {
             // interface layer surface "table not found" / type errors to the
             // caller as `InvalidArgument` with the cause, instead of burying
             // them as an opaque internal error (Phase 63 / audit §11).
-            let df = engine.sql(query).await.map_err(|e| RuntimeError::PlanRejected {
-                reason: e.to_string(),
-            })?;
+            let df = engine
+                .sql(query)
+                .await
+                .map_err(|e| RuntimeError::PlanRejected {
+                    reason: e.to_string(),
+                })?;
             df.collect().await.map_err(|e| RuntimeError::PlanRejected {
                 reason: e.to_string(),
             })

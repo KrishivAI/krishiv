@@ -409,10 +409,12 @@ mod tests {
             .await
             .unwrap();
         let batches = df.collect().await.unwrap();
-        let row = batches.iter().find(|b| b.num_rows() > 0).expect("summary row");
-        let cell = |col: usize| {
-            arrow::util::display::array_value_to_string(row.column(col), 0).unwrap()
-        };
+        let row = batches
+            .iter()
+            .find(|b| b.num_rows() > 0)
+            .expect("summary row");
+        let cell =
+            |col: usize| arrow::util::display::array_value_to_string(row.column(col), 0).unwrap();
         assert_eq!(cell(0), "aqe_stats_probe_t");
         assert_eq!(cell(1), "4", "row_count");
         assert_eq!(cell(3), "2", "columns_analyzed");
@@ -539,7 +541,10 @@ mod tests {
                 // Mirror the engine's KRISHIV_RUNTIME_FILTERS wiring: the
                 // master switch alone does not disable the per-operator
                 // options, so all four move together.
-                config.options_mut().optimizer.enable_dynamic_filter_pushdown = enable;
+                config
+                    .options_mut()
+                    .optimizer
+                    .enable_dynamic_filter_pushdown = enable;
                 config
                     .options_mut()
                     .optimizer
@@ -575,10 +580,9 @@ mod tests {
                     .create_physical_plan()
                     .await
                     .unwrap();
-                let batches =
-                    datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
-                        .await
-                        .unwrap();
+                let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+                    .await
+                    .unwrap();
                 let rows: Vec<String> = batches
                     .iter()
                     .flat_map(|b| {
@@ -604,7 +608,10 @@ mod tests {
             "runtime filters must be result-neutral (AQE corpus rule)"
         );
         assert_eq!(rows_on.len(), 3, "three dim keys match");
-        assert_eq!(scan_off, 10_000, "without runtime filters the scan reads everything");
+        assert_eq!(
+            scan_off, 10_000,
+            "without runtime filters the scan reads everything"
+        );
         assert!(
             scan_on < scan_off,
             "dynamic join filter must prune the probe scan: on={scan_on} off={scan_off}"
@@ -1591,7 +1598,6 @@ mod iceberg_catalog_tests {
             .value(0);
         assert_eq!(updated, 0, "empty table: no rows to update");
     }
-
 }
 
 /// Sum the `output_rows` metric across parquet `DataSourceExec` nodes of an
@@ -1622,6 +1628,9 @@ fn parquet_scan_output_rows(
     let mut total = 0;
     let mut found = false;
     walk(plan, &mut total, &mut found);
-    assert!(found, "no parquet DataSourceExec with metrics found in plan");
+    assert!(
+        found,
+        "no parquet DataSourceExec with metrics found in plan"
+    );
     total
 }

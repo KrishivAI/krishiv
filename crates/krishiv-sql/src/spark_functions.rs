@@ -77,8 +77,8 @@ fn make_date_format() -> ScalarUDF {
                     out.append_null();
                     continue;
                 }
-                let chrono_fmt = spark_pattern_to_chrono(fmt.value(i))
-                    .map_err(DataFusionError::Execution)?;
+                let chrono_fmt =
+                    spark_pattern_to_chrono(fmt.value(i)).map_err(DataFusionError::Execution)?;
                 let dt = DateTime::from_timestamp_nanos(ts.value(i)).naive_utc();
                 out.append_value(dt.format(&chrono_fmt).to_string());
             }
@@ -114,7 +114,9 @@ fn spark_pattern_to_chrono(pattern: &str) -> Result<String, String> {
                 i += 1;
             }
             if chars.get(i).is_none() {
-                return Err(format!("unterminated quoted literal in pattern '{pattern}'"));
+                return Err(format!(
+                    "unterminated quoted literal in pattern '{pattern}'"
+                ));
             }
             i += 1; // consume closing quote
             continue;
@@ -200,7 +202,9 @@ fn make_crc32() -> ScalarUDF {
         Arc::new(|args: &[ColumnarValue]| {
             let arrays = ColumnarValue::values_to_arrays(args)?;
             let [input_arr] = arrays.as_slice() else {
-                return Err(DataFusionError::Internal("crc32: expected 1 argument".into()));
+                return Err(DataFusionError::Internal(
+                    "crc32: expected 1 argument".into(),
+                ));
             };
             let input = input_arr
                 .as_any()
@@ -263,10 +267,7 @@ mod tests {
     #[test]
     fn spark_pattern_literals_and_percent() {
         // Quoted literal and a stray percent sign must be escaped for chrono.
-        assert_eq!(
-            spark_pattern_to_chrono("yyyy 'at' HH").unwrap(),
-            "%Y at %H"
-        );
+        assert_eq!(spark_pattern_to_chrono("yyyy 'at' HH").unwrap(), "%Y at %H");
         assert_eq!(spark_pattern_to_chrono("HH'%'").unwrap(), "%H%%");
         // Non-letter separators pass through literally.
         assert_eq!(spark_pattern_to_chrono("yyyy/MM").unwrap(), "%Y/%m");

@@ -138,7 +138,11 @@ static ERROR_REF_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// ```
 pub fn internal_status(context: &str, error: &dyn std::fmt::Display) -> tonic::Status {
     let n = ERROR_REF_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let error_ref = format!("{:08x}-{:06x}", error_ref_seed() & 0xFFFF_FFFF, n & 0xFF_FFFF);
+    let error_ref = format!(
+        "{:08x}-{:06x}",
+        error_ref_seed() & 0xFFFF_FFFF,
+        n & 0xFF_FFFF
+    );
     // Full detail stays server-side, keyed by the ref the client receives.
     tracing::error!(error_ref = %error_ref, context, error = %error, "internal error");
     tonic::Status::internal(format!(

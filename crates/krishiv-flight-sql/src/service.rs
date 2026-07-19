@@ -28,7 +28,9 @@ use prost::Message as _;
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 
-use krishiv_plan::governance::{AllowAllPolicyHook, AuthProvider, PolicyHook, StaticApiKeyAuthProvider};
+use krishiv_plan::governance::{
+    AllowAllPolicyHook, AuthProvider, PolicyHook, StaticApiKeyAuthProvider,
+};
 
 use crate::actions::{
     KrishivActionError, build_param_schema, count_sql_params, encode_batches_ipc,
@@ -1602,7 +1604,10 @@ mod batch_sql_wire_tests {
         assert!(!inline[0].ipc_b64.is_empty());
         assert_eq!(path.len(), 1, "over-cap table becomes a path table");
         assert_eq!(path[0].table_name, "big");
-        assert_eq!(path[0].path, std::path::PathBuf::from("/shared/big.parquet"));
+        assert_eq!(
+            path[0].path,
+            std::path::PathBuf::from("/shared/big.parquet")
+        );
     }
 
     /// An empty-IPC table with no path has nowhere to resolve from, so it stays

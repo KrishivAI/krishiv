@@ -149,9 +149,7 @@ impl ViewPlan {
             ViewPlan::Aggregate { .. } => {
                 "incremental aggregate — retract/insert only the changed groups per delta"
             }
-            ViewPlan::Distinct { .. } => {
-                "incremental DISTINCT — multiset add/remove per delta"
-            }
+            ViewPlan::Distinct { .. } => "incremental DISTINCT — multiset add/remove per delta",
             ViewPlan::Join { .. } => {
                 "incremental equi-join — symmetric hash trace; probes only the delta rows"
             }

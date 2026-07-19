@@ -191,7 +191,11 @@ impl HigherOrderUDFImpl for ArrayAllMatch {
                 self.name()
             )));
         };
-        Ok(Arc::new(Field::new("", DataType::Boolean, list.is_nullable())))
+        Ok(Arc::new(Field::new(
+            "",
+            DataType::Boolean,
+            list.is_nullable(),
+        )))
     }
 
     fn invoke_with_args(&self, args: HigherOrderFunctionArgs) -> DFResult<ColumnarValue> {
@@ -225,16 +229,15 @@ impl HigherOrderUDFImpl for ArrayAllMatch {
             })?
             .into_array(list_values.len())?;
 
-        let predicate_bool =
-            predicate_results
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "{} predicate must return a boolean array",
-                        self.name()
-                    ))
-                })?;
+        let predicate_bool = predicate_results
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "{} predicate must return a boolean array",
+                    self.name()
+                ))
+            })?;
 
         let mut values = BooleanBuilder::with_capacity(list_array.len());
         macro_rules! process_list {
@@ -290,7 +293,10 @@ mod tests {
     #[tokio::test]
     async fn spark_transform_alias_doubles_elements() {
         let b = run("SELECT transform([1, 2, 3], x -> x * 2) AS r").await;
-        let list = b[0].column(0).as_any().downcast_ref::<arrow::array::ListArray>();
+        let list = b[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>();
         let list = list.expect("list");
         let vals = list.value(0);
         let vals = vals.as_any().downcast_ref::<Int64Array>().expect("i64");
@@ -317,12 +323,10 @@ mod tests {
         // same (aliased) impl is `any_match`. `forall` has no keyword clash.
         // The empty array is built by filtering everything out (an untyped `[]`
         // literal has no element type to check the predicate against).
-        let b = run(
-            "SELECT any_match([1, 2, 3], x -> x > 2) AS any_gt2, \
+        let b = run("SELECT any_match([1, 2, 3], x -> x > 2) AS any_gt2, \
                     forall([2, 4, 6], x -> x % 2 = 0) AS all_even, \
                     forall([2, 3, 6], x -> x % 2 = 0) AS not_all_even, \
-                    forall(filter([1], x -> x > 100), x -> x > 0) AS empty_all",
-        )
+                    forall(filter([1], x -> x > 100), x -> x > 0) AS empty_all")
         .await;
         let row = &b[0];
         let col = |i: usize| {
@@ -348,10 +352,21 @@ mod tests {
         )
         .await;
         let row = &b[0];
-        let poisoned = row.column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
-        let false_wins = row.column(1).as_any().downcast_ref::<BooleanArray>().unwrap();
+        let poisoned = row
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let false_wins = row
+            .column(1)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
         assert!(poisoned.is_null(0), "NULL result with no false ⇒ NULL");
-        assert!(!false_wins.is_null(0) && !false_wins.value(0), "false dominates NULL");
+        assert!(
+            !false_wins.is_null(0) && !false_wins.value(0),
+            "false dominates NULL"
+        );
     }
 
     #[tokio::test]

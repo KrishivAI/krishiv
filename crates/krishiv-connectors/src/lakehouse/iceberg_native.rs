@@ -382,11 +382,10 @@ pub mod native {
             for task in tasks {
                 let path = task.data_file_path();
                 if self.is_object_store {
-                    let bytes = self
-                        .store
-                        .read(path)
-                        .await
-                        .map_err(|e| LakehouseError::Io(format!("read data file {path}: {e}")))?;
+                    let bytes =
+                        self.store.read(path).await.map_err(|e| {
+                            LakehouseError::Io(format!("read data file {path}: {e}"))
+                        })?;
                     batches.extend(read_parquet_bytes(bytes)?);
                 } else {
                     let local = path.strip_prefix("file://").unwrap_or(path);
@@ -849,14 +848,16 @@ pub mod native {
     /// Serialize `batches` to an in-memory Parquet buffer, returning
     /// `(bytes, record_count, file_size)`. The object-store staging path uses
     /// this so a single atomic `put` replaces the local temp+rename write.
-    fn write_parquet_to_buf(batches: &[RecordBatch]) -> Result<(Vec<u8>, u64, u64), LakehouseError> {
+    fn write_parquet_to_buf(
+        batches: &[RecordBatch],
+    ) -> Result<(Vec<u8>, u64, u64), LakehouseError> {
         let schema = batches
             .first()
             .ok_or_else(|| LakehouseError::Io("empty batches".to_string()))?
             .schema();
         let mut buf: Vec<u8> = Vec::new();
-        let mut writer =
-            ArrowWriter::try_new(&mut buf, schema, None).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, None)
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
         let mut record_count: u64 = 0;
         for batch in batches {
             record_count += batch.num_rows() as u64;
@@ -864,7 +865,9 @@ pub mod native {
                 .write(batch)
                 .map_err(|e| LakehouseError::Io(e.to_string()))?;
         }
-        writer.close().map_err(|e| LakehouseError::Io(e.to_string()))?;
+        writer
+            .close()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
         let file_size = buf.len() as u64;
         Ok((buf, record_count, file_size))
     }

@@ -120,7 +120,13 @@ pub const PARITY: &[ApiEntry] = &[
     // ── DataFrame ────────────────────────────────────────────────────────────
     entry(DataFrame, "select", Supported, "select/select_exprs", ""),
     entry(DataFrame, "selectExpr", Supported, "select_exprs", ""),
-    entry(DataFrame, "filter", Supported, "filter/filter_expr", "alias `where`"),
+    entry(
+        DataFrame,
+        "filter",
+        Supported,
+        "filter/filter_expr",
+        "alias `where`",
+    ),
     entry(DataFrame, "where", Supported, "filter", ""),
     entry(DataFrame, "withColumn", Supported, "with_column", ""),
     entry(
@@ -134,7 +140,13 @@ pub const PARITY: &[ApiEntry] = &[
     entry(DataFrame, "groupBy", Supported, "group_by", ""),
     entry(DataFrame, "agg", Supported, "agg", ""),
     entry(DataFrame, "join", Supported, "join/join_on", ""),
-    entry(DataFrame, "crossJoin", Planned, "", "no dedicated cross-join method"),
+    entry(
+        DataFrame,
+        "crossJoin",
+        Planned,
+        "",
+        "no dedicated cross-join method",
+    ),
     entry(DataFrame, "orderBy", Supported, "order_by", "alias `sort`"),
     entry(DataFrame, "sort", Supported, "sort", ""),
     entry(DataFrame, "limit", Supported, "limit", ""),
@@ -147,7 +159,13 @@ pub const PARITY: &[ApiEntry] = &[
         "Phase 61 gap: dedup on a subset of columns (distinct() is all-columns)",
     ),
     entry(DataFrame, "union", Supported, "union", ""),
-    entry(DataFrame, "unionAll", Supported, "union", "deprecated Spark alias of union"),
+    entry(
+        DataFrame,
+        "unionAll",
+        Supported,
+        "union",
+        "deprecated Spark alias of union",
+    ),
     entry(
         DataFrame,
         "unionByName",
@@ -155,23 +173,65 @@ pub const PARITY: &[ApiEntry] = &[
         "union_by_name",
         "name-aligned union; allowMissingColumns (null-fill) is the residual",
     ),
-    entry(DataFrame, "intersect", Supported, "intersect/intersect_distinct", ""),
-    entry(DataFrame, "exceptAll", Supported, "except", "except/except_distinct"),
+    entry(
+        DataFrame,
+        "intersect",
+        Supported,
+        "intersect/intersect_distinct",
+        "",
+    ),
+    entry(
+        DataFrame,
+        "exceptAll",
+        Supported,
+        "except",
+        "except/except_distinct",
+    ),
     entry(DataFrame, "count", Supported, "count", ""),
     entry(DataFrame, "collect", Supported, "collect", ""),
     entry(DataFrame, "show", Supported, "show", ""),
     entry(DataFrame, "describe", Supported, "describe", ""),
-    entry(DataFrame, "explain", Supported, "explain/explain_logical", ""),
+    entry(
+        DataFrame,
+        "explain",
+        Supported,
+        "explain/explain_logical",
+        "",
+    ),
     entry(DataFrame, "schema", Supported, "schema", ""),
-    entry(DataFrame, "columns", Partial, "schema", "column names via schema(); no `columns` shortcut"),
-    entry(DataFrame, "printSchema", Partial, "schema", "schema() is programmatic; no pretty-print helper"),
+    entry(
+        DataFrame,
+        "columns",
+        Partial,
+        "schema",
+        "column names via schema(); no `columns` shortcut",
+    ),
+    entry(
+        DataFrame,
+        "printSchema",
+        Partial,
+        "schema",
+        "schema() is programmatic; no pretty-print helper",
+    ),
     entry(DataFrame, "sample", Supported, "sample", ""),
     entry(DataFrame, "repartition", Supported, "repartition", ""),
-    entry(DataFrame, "coalesce", Planned, "repartition", "repartition exists; no shrink-only coalesce"),
+    entry(
+        DataFrame,
+        "coalesce",
+        Planned,
+        "repartition",
+        "repartition exists; no shrink-only coalesce",
+    ),
     entry(DataFrame, "cache", Supported, "cache/persist", ""),
     entry(DataFrame, "persist", Supported, "persist", ""),
     entry(DataFrame, "unpersist", Supported, "unpersist", ""),
-    entry(DataFrame, "createOrReplaceTempView", Supported, "create_or_replace_temp_view", ""),
+    entry(
+        DataFrame,
+        "createOrReplaceTempView",
+        Supported,
+        "create_or_replace_temp_view",
+        "",
+    ),
     entry(DataFrame, "unpivot", Supported, "unpivot", "alias `melt`"),
     entry(DataFrame, "melt", Supported, "unpivot", ""),
     entry(
@@ -183,7 +243,13 @@ pub const PARITY: &[ApiEntry] = &[
     ),
     entry(DataFrame, "fillna", Supported, "fill_null", ""),
     entry(DataFrame, "dropna", Supported, "drop_nulls", ""),
-    entry(DataFrame, "replace", Planned, "", "Phase 61 gap: value replacement"),
+    entry(
+        DataFrame,
+        "replace",
+        Planned,
+        "",
+        "Phase 61 gap: value replacement",
+    ),
     entry(
         DataFrame,
         "withColumnsRenamed",
@@ -191,7 +257,13 @@ pub const PARITY: &[ApiEntry] = &[
         "with_columns_renamed",
         "bulk rename over (existing, new) pairs (Phase 61 variant-collapse)",
     ),
-    entry(DataFrame, "toPandas", Planned, "", "Phase 61 gap: zero-copy Arrow → pandas (Python surface)"),
+    entry(
+        DataFrame,
+        "toPandas",
+        Planned,
+        "",
+        "Phase 61 gap: zero-copy Arrow → pandas (Python surface)",
+    ),
     entry(DataFrame, "write", Supported, "write", "DataFrameWriter"),
     entry(
         DataFrame,
@@ -202,7 +274,13 @@ pub const PARITY: &[ApiEntry] = &[
          session, name) selects the engine by refresh mode (also session.create_live_table); \
          Continuous execution + Interval/cron are the coordinator/scheduler-gated residual",
     ),
-    entry(DataFrame, "foreachBatch", Planned, "", "Phase 61 gap: micro-batch sink callback"),
+    entry(
+        DataFrame,
+        "foreachBatch",
+        Planned,
+        "",
+        "Phase 61 gap: micro-batch sink callback",
+    ),
     // ── Column ───────────────────────────────────────────────────────────────
     entry(Column, "alias", Supported, "Expr::alias", ""),
     entry(Column, "cast", Supported, "Expr::cast", ""),
@@ -211,15 +289,51 @@ pub const PARITY: &[ApiEntry] = &[
     entry(Column, "desc", Supported, "Expr::desc", ""),
     entry(Column, "and", Supported, "Expr::and", "`&`"),
     entry(Column, "or", Supported, "Expr::or", "`|`"),
-    entry(Column, "eqNullSafe", Planned, "", "null-safe equality (<=>) not exposed"),
+    entry(
+        Column,
+        "eqNullSafe",
+        Planned,
+        "",
+        "null-safe equality (<=>) not exposed",
+    ),
     entry(Column, "isNull", Supported, "Expr::is_null", ""),
     entry(Column, "isNotNull", Supported, "Expr::is_not_null", ""),
     entry(Column, "over", Supported, "Expr::over", "window spec"),
-    entry(Column, "between", Planned, "", "reachable as (c>=lo)&(c<=hi); no between() sugar"),
-    entry(Column, "isin", Planned, "", "Phase 61 gap: IN-list column predicate"),
-    entry(Column, "like", Partial, "raw", "reachable via raw SQL; no typed like()"),
-    entry(Column, "substr", Partial, "function", "reachable via function(\"substr\", …)"),
-    entry(Column, "when_otherwise", Partial, "raw", "CASE via raw/SQL; no Column.when chain"),
+    entry(
+        Column,
+        "between",
+        Planned,
+        "",
+        "reachable as (c>=lo)&(c<=hi); no between() sugar",
+    ),
+    entry(
+        Column,
+        "isin",
+        Planned,
+        "",
+        "Phase 61 gap: IN-list column predicate",
+    ),
+    entry(
+        Column,
+        "like",
+        Partial,
+        "raw",
+        "reachable via raw SQL; no typed like()",
+    ),
+    entry(
+        Column,
+        "substr",
+        Partial,
+        "function",
+        "reachable via function(\"substr\", …)",
+    ),
+    entry(
+        Column,
+        "when_otherwise",
+        Partial,
+        "raw",
+        "CASE via raw/SQL; no Column.when chain",
+    ),
     // ── functions (F.*) ──────────────────────────────────────────────────────
     entry(Functions, "col", Supported, "col", ""),
     entry(Functions, "lit", Supported, "lit", ""),
@@ -246,11 +360,29 @@ pub const PARITY: &[ApiEntry] = &[
         "function",
         "reachable via the SQL registry / raw; no typed when() builder (Phase 61 gap)",
     ),
-    entry(Functions, "coalesce", Supported, "coalesce", "typed F.* helper over the SQL registry"),
-    entry(Functions, "nvl", Supported, "nvl", "typed helper; exact Spark alias"),
+    entry(
+        Functions,
+        "coalesce",
+        Supported,
+        "coalesce",
+        "typed F.* helper over the SQL registry",
+    ),
+    entry(
+        Functions,
+        "nvl",
+        Supported,
+        "nvl",
+        "typed helper; exact Spark alias",
+    ),
     entry(Functions, "upper", Supported, "upper", "typed F.* helper"),
     entry(Functions, "lower", Supported, "lower", "typed F.* helper"),
-    entry(Functions, "length", Supported, "length", "typed F.* helper (character length)"),
+    entry(
+        Functions,
+        "length",
+        Supported,
+        "length",
+        "typed F.* helper (character length)",
+    ),
     entry(Functions, "trim", Supported, "trim", "typed F.* helper"),
     entry(Functions, "ltrim", Supported, "ltrim", "typed F.* helper"),
     entry(Functions, "rtrim", Supported, "rtrim", "typed F.* helper"),
@@ -258,7 +390,13 @@ pub const PARITY: &[ApiEntry] = &[
     entry(Functions, "ceil", Supported, "ceil", "typed F.* helper"),
     entry(Functions, "floor", Supported, "floor", "typed F.* helper"),
     entry(Functions, "sqrt", Supported, "sqrt", "typed F.* helper"),
-    entry(Functions, "substring", Supported, "substring", "typed F.* helper (1-indexed substr)"),
+    entry(
+        Functions,
+        "substring",
+        Supported,
+        "substring",
+        "typed F.* helper (1-indexed substr)",
+    ),
     entry(
         Functions,
         "concat",
@@ -285,9 +423,21 @@ pub const PARITY: &[ApiEntry] = &[
     ),
     // ── GroupedData ──────────────────────────────────────────────────────────
     entry(GroupedData, "agg", Supported, "group_by(...).agg", ""),
-    entry(GroupedData, "count", Supported, "group_by(...).agg(count)", ""),
+    entry(
+        GroupedData,
+        "count",
+        Supported,
+        "group_by(...).agg(count)",
+        "",
+    ),
     entry(GroupedData, "sum", Supported, "group_by(...).agg(sum)", ""),
-    entry(GroupedData, "avg/mean", Supported, "group_by(...).agg(avg)", ""),
+    entry(
+        GroupedData,
+        "avg/mean",
+        Supported,
+        "group_by(...).agg(avg)",
+        "",
+    ),
     entry(GroupedData, "min", Supported, "group_by(...).agg(min)", ""),
     entry(GroupedData, "max", Supported, "group_by(...).agg(max)", ""),
     entry(
@@ -298,25 +448,67 @@ pub const PARITY: &[ApiEntry] = &[
         "pivot exists on DataFrame; PySpark places it on GroupedData (groupBy().pivot())",
     ),
     // ── Window ───────────────────────────────────────────────────────────────
-    entry(Window, "partitionBy", Supported, "Expr::over(partition_by=…)", ""),
+    entry(
+        Window,
+        "partitionBy",
+        Supported,
+        "Expr::over(partition_by=…)",
+        "",
+    ),
     entry(Window, "orderBy", Supported, "Expr::frame/over order", ""),
     entry(Window, "rowsBetween", Supported, "Expr::frame (rows)", ""),
     entry(Window, "rangeBetween", Supported, "Expr::frame (range)", ""),
-    entry(Window, "unboundedPreceding/Following", Supported, "frame bounds", ""),
+    entry(
+        Window,
+        "unboundedPreceding/Following",
+        Supported,
+        "frame bounds",
+        "",
+    ),
     entry(Window, "currentRow", Supported, "frame bounds", ""),
     // ── DataFrameReader ──────────────────────────────────────────────────────
     entry(Reader, "parquet", Supported, "session.read_parquet", ""),
     entry(Reader, "csv", Supported, "session.read_csv", ""),
-    entry(Reader, "json", Partial, "session.read_json", "reachable; option coverage narrower than Spark"),
+    entry(
+        Reader,
+        "json",
+        Partial,
+        "session.read_json",
+        "reachable; option coverage narrower than Spark",
+    ),
     entry(Reader, "table", Supported, "session.sql/table", ""),
-    entry(Reader, "format/load", Partial, "read_* methods", "typed per-format readers; no generic format(...).load()"),
+    entry(
+        Reader,
+        "format/load",
+        Partial,
+        "read_* methods",
+        "typed per-format readers; no generic format(...).load()",
+    ),
     // ── DataFrameWriter ──────────────────────────────────────────────────────
     entry(Writer, "parquet", Supported, "write_parquet", ""),
     entry(Writer, "csv", Supported, "write_csv", ""),
     entry(Writer, "json", Supported, "write_json", ""),
-    entry(Writer, "saveAsTable", Partial, "write / CTAS", "reachable via SQL CTAS; no writer.saveAsTable"),
-    entry(Writer, "mode", Partial, "write_parquet_overwrite_partition", "overwrite modes exist per-format; no unified .mode()"),
-    entry(Writer, "partitionBy", Partial, "write_parquet_with_options", "partitioned writes via options / SQL PARTITIONED BY"),
+    entry(
+        Writer,
+        "saveAsTable",
+        Partial,
+        "write / CTAS",
+        "reachable via SQL CTAS; no writer.saveAsTable",
+    ),
+    entry(
+        Writer,
+        "mode",
+        Partial,
+        "write_parquet_overwrite_partition",
+        "overwrite modes exist per-format; no unified .mode()",
+    ),
+    entry(
+        Writer,
+        "partitionBy",
+        Partial,
+        "write_parquet_with_options",
+        "partitioned writes via options / SQL PARTITIONED BY",
+    ),
 ];
 
 /// Per-namespace and overall parity numbers.
@@ -386,7 +578,14 @@ pub fn generate_parity_markdown() -> String {
         } else {
             (*covered as f64) * 100.0 / (*total as f64)
         };
-        let _ = writeln!(out, "| {} | {} | {} | {:.0}% |", ns.as_str(), covered, total, pct);
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {:.0}% |",
+            ns.as_str(),
+            covered,
+            total,
+            pct
+        );
     }
     out.push('\n');
 
@@ -403,7 +602,11 @@ pub fn generate_parity_markdown() -> String {
                 "| `{}` | {} | {} | {} |",
                 e.pyspark,
                 e.status.as_str(),
-                if e.krishiv.is_empty() { "—" } else { e.krishiv },
+                if e.krishiv.is_empty() {
+                    "—"
+                } else {
+                    e.krishiv
+                },
                 e.note
             );
         }

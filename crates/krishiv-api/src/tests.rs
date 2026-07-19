@@ -1773,7 +1773,11 @@ fn create_live_table_selects_engine_by_refresh_mode() {
 
     // Batch: materialize a snapshot, queryable as `snap`.
     session
-        .create_live_table("snap", "SELECT 1 AS a UNION ALL SELECT 2 AS a", Refresh::Batch)
+        .create_live_table(
+            "snap",
+            "SELECT 1 AS a UNION ALL SELECT 2 AS a",
+            Refresh::Batch,
+        )
         .unwrap();
     let rows = session
         .sql("SELECT a FROM snap")
@@ -1811,7 +1815,9 @@ fn create_live_table_selects_engine_by_refresh_mode() {
 fn write_stream_to_table_materializes_via_the_dataframe() {
     use crate::Refresh;
     let session = Session::builder().build().unwrap();
-    let df = session.sql("SELECT 1 AS a UNION ALL SELECT 2 AS a").unwrap();
+    let df = session
+        .sql("SELECT 1 AS a UNION ALL SELECT 2 AS a")
+        .unwrap();
 
     // Batch: df.write_stream().to_table materializes the DataFrame's result.
     df.write_stream().to_table(&session, "wt").unwrap();

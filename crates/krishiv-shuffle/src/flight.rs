@@ -1091,14 +1091,9 @@ mod tests {
             max_attempts: 3,
             base_delay_ms: 0, // retry without sleeping
         };
-        let result = FlightShuffleClient::fetch_with_retry(
-            dead_addr.to_string(),
-            "job",
-            "s0",
-            0,
-            policy,
-        )
-        .await;
+        let result =
+            FlightShuffleClient::fetch_with_retry(dead_addr.to_string(), "job", "s0", 0, policy)
+                .await;
 
         // A dead producer's exhausted transport retries must surface as
         // NotFound so the task runner maps it to ShufflePartitionMissing, the
@@ -1125,14 +1120,9 @@ mod tests {
             max_attempts: 1,
             base_delay_ms: 0,
         };
-        let result = FlightShuffleClient::fetch_with_retry(
-            dead_addr.to_string(),
-            "j",
-            "s0",
-            0,
-            policy,
-        )
-        .await;
+        let result =
+            FlightShuffleClient::fetch_with_retry(dead_addr.to_string(), "j", "s0", 0, policy)
+                .await;
         assert!(
             matches!(result, Err(ref e) if e.kind() == std::io::ErrorKind::NotFound),
             "single-attempt unreachable must map to NotFound, got: {result:?}"

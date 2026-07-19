@@ -1487,10 +1487,9 @@ mod shuffle_regen_tests {
             "regen-test",
             JobKind::Batch,
         )
-        .with_stage(
-            StageSpec::new(stage_id.clone(), "write stage")
-                .with_task(TaskSpec::new(TaskId::try_new("task-0").unwrap(), "shuffle-write")),
-        );
+        .with_stage(StageSpec::new(stage_id.clone(), "write stage").with_task(
+            TaskSpec::new(TaskId::try_new("task-0").unwrap(), "shuffle-write"),
+        ));
         let mut job = JobRecord::from_spec(spec, 4);
         succeed_producer(&mut job);
         (job, stage_id)
@@ -1508,15 +1507,15 @@ mod shuffle_regen_tests {
         use krishiv_proto::{ExecutorId, JobState, LeaseGeneration};
 
         let stage_id = StageId::try_new("stage-0").unwrap();
-        let spec = JobSpec::new(
-            JobId::try_new("livelock-job").unwrap(),
-            "livelock-test",
-            JobKind::Batch,
-        )
-        .with_stage(
-            StageSpec::new(stage_id, "map stage")
-                .with_task(TaskSpec::new(TaskId::try_new("task-0").unwrap(), "map:body")),
-        );
+        let spec =
+            JobSpec::new(
+                JobId::try_new("livelock-job").unwrap(),
+                "livelock-test",
+                JobKind::Batch,
+            )
+            .with_stage(StageSpec::new(stage_id, "map stage").with_task(
+                TaskSpec::new(TaskId::try_new("task-0").unwrap(), "map:body"),
+            ));
         let mut job = JobRecord::from_spec(spec, 0);
         job.state = JobState::Running;
 

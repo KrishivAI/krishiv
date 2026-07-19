@@ -136,7 +136,11 @@ fn max_epoch_ms(arr: &dyn arrow::array::Array) -> Option<i64> {
 /// rows carry event times that were necessarily observed on their earlier
 /// insertion, so taking the column max over all rows never moves the watermark
 /// backward — the tracker itself is monotonic (`observe` only raises it).
-fn observe_source_watermark(inner: &mut IncrementalFlowInner, source_name: &str, batch: &DeltaBatch) {
+fn observe_source_watermark(
+    inner: &mut IncrementalFlowInner,
+    source_name: &str,
+    batch: &DeltaBatch,
+) {
     let Some(column) = inner
         .watermark_trackers
         .get(source_name)
@@ -2820,7 +2824,10 @@ mod integration_tests {
         assert!(flow.view_plan_classification("nope").unwrap().is_none());
 
         // Before any tick the plan is lazy → not-yet-planned, not incremental.
-        let (incr, reason) = flow.view_plan_classification("total_sales").unwrap().unwrap();
+        let (incr, reason) = flow
+            .view_plan_classification("total_sales")
+            .unwrap()
+            .unwrap();
         assert!(!incr, "pre-tick view must not claim incremental");
         assert!(
             reason.contains("not yet planned"),
@@ -2842,7 +2849,10 @@ mod integration_tests {
             .unwrap();
         flow.step_datafusion().await.unwrap();
 
-        let (incr, reason) = flow.view_plan_classification("total_sales").unwrap().unwrap();
+        let (incr, reason) = flow
+            .view_plan_classification("total_sales")
+            .unwrap()
+            .unwrap();
         assert!(incr, "aggregate view must report incremental after tick");
         assert!(
             reason.contains("incremental aggregate"),
@@ -3317,7 +3327,9 @@ mod integration_tests {
         for spec in auth.view_specs().unwrap() {
             resident.register_view(spec).unwrap();
         }
-        resident.restore_full(&auth.checkpoint_full().unwrap()).unwrap();
+        resident
+            .restore_full(&auth.checkpoint_full().unwrap())
+            .unwrap();
         auth.invalidate_view_plans().unwrap();
 
         // Tick 2 via the resident protocol: deltas out, output deltas back.

@@ -757,10 +757,8 @@ async fn heartbeat_loop(
                             state_backend.clone(),
                             Arc::clone(&checkpoint_storage)
                                 as Arc<dyn krishiv_state::checkpoint::CheckpointStorage>,
-                            crate::runner::SharedCoordinatorClient(
-                                coord_service.clone()
-                                    as Arc<dyn krishiv_proto::CoordinatorExecutorService>,
-                            ),
+                            crate::runner::SharedCoordinatorClient(coord_service.clone()
+                                as Arc<dyn krishiv_proto::CoordinatorExecutorService>),
                         )
                         .await
                     {
@@ -813,7 +811,7 @@ async fn heartbeat_loop(
                     backend.clone(),
                     Arc::clone(&storage) as Arc<dyn krishiv_state::checkpoint::CheckpointStorage>,
                     crate::runner::SharedCoordinatorClient(
-                        coord.clone() as Arc<dyn krishiv_proto::CoordinatorExecutorService>,
+                        coord.clone() as Arc<dyn krishiv_proto::CoordinatorExecutorService>
                     ),
                 ))
                 .await;

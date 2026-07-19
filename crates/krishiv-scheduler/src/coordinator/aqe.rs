@@ -251,8 +251,7 @@ fn plan_stage_rewrite(
             }
             if let Some(meta) = task.output_metadata() {
                 for p in meta.shuffle_partitions() {
-                    *partition_bytes.entry(p.partition_id as usize).or_insert(0) +=
-                        p.size_bytes;
+                    *partition_bytes.entry(p.partition_id as usize).or_insert(0) += p.size_bytes;
                 }
             }
         }
@@ -286,9 +285,7 @@ fn plan_stage_rewrite(
         // encoded plan — evaluate once, lazily.
         let mut split_safe: Option<bool> = None;
         for (p, &size) in sizes.iter().enumerate() {
-            if size < thresholds.skew_min_bytes
-                || (size as f64) < thresholds.skew_factor * median
-            {
+            if size < thresholds.skew_min_bytes || (size as f64) < thresholds.skew_factor * median {
                 continue;
             }
             // Attribute the skew to the upstream contributing the most bytes.
@@ -352,8 +349,7 @@ fn plan_stage_rewrite(
         );
     }
 
-    let new_task_count: usize =
-        groups.len() + skew_ranges.values().map(Vec::len).sum::<usize>();
+    let new_task_count: usize = groups.len() + skew_ranges.values().map(Vec::len).sum::<usize>();
     if new_task_count == partition_count {
         return None;
     }

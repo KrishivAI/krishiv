@@ -142,10 +142,9 @@ impl StreamExchange {
                 .await?
                 .clone();
             let max = krishiv_proto::max_grpc_message_bytes();
-            let mut client =
-                wire::v1::executor_task_client::ExecutorTaskClient::new(channel)
-                    .max_decoding_message_size(max)
-                    .max_encoding_message_size(max);
+            let mut client = wire::v1::executor_task_client::ExecutorTaskClient::new(channel)
+                .max_decoding_message_size(max)
+                .max_encoding_message_size(max);
             // Same cluster bearer token the coordinator stamps on assignment
             // pushes — peer executors enforcing task-API auth accept us.
             let mut request = tonic::Request::new(wire_request.clone());
@@ -213,9 +212,11 @@ fn encode_ipc(batches: &[RecordBatch]) -> ExecutorResult<Vec<u8>> {
             message: format!("stream exchange IPC writer: {e}"),
         })?;
     for batch in batches {
-        writer.write(batch).map_err(|e| ExecutorError::LocalExecution {
-            message: format!("stream exchange IPC write: {e}"),
-        })?;
+        writer
+            .write(batch)
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!("stream exchange IPC write: {e}"),
+            })?;
     }
     writer.finish().map_err(|e| ExecutorError::LocalExecution {
         message: format!("stream exchange IPC finish: {e}"),

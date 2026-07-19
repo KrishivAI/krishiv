@@ -401,8 +401,7 @@ impl TransactionalSinkParticipant for IcebergStreamingSink {
                 // Both are scheme-aware (local FS or object store).
                 self.table
                     .remove_file_best_effort(&dur2_sidecar_path(path).to_string_lossy());
-                self.table
-                    .remove_file_best_effort(&path.to_string_lossy());
+                self.table.remove_file_best_effort(&path.to_string_lossy());
             }
             aborted += entry.files.len().max(1);
         }
@@ -480,7 +479,10 @@ impl TransactionalSinkParticipant for IcebergStreamingSink {
         // instance's staged file directly makes iceberg's manifest reference a
         // file its FileIO cannot resolve on read; re-staging avoids that and
         // keeps the recovery path byte-identical to the certified commit path.
-        let batches = self.table.read_staged_parquet(prepare_path).map_err(lake_err)?;
+        let batches = self
+            .table
+            .read_staged_parquet(prepare_path)
+            .map_err(lake_err)?;
         let (fresh_path, fresh_df) = self.table.stage_parquet(&batches).map_err(lake_err)?;
         let entry = PreparedEpoch {
             files: vec![(fresh_path.clone(), fresh_df)],
@@ -906,7 +908,8 @@ mod tests {
         // Seed committed epoch 1.
         {
             let mut sink = open_sink(dir.path(), IcebergSinkMode::Upsert);
-            sink.stage(&op_batch(&[("a", 1, "u"), ("b", 2, "u")])).unwrap();
+            sink.stage(&op_batch(&[("a", 1, "u"), ("b", 2, "u")]))
+                .unwrap();
             sink.pre_commit(1).unwrap();
             sink.commit_through(1).unwrap();
         }
@@ -951,7 +954,10 @@ mod tests {
         let mut sink = open_sink_root(unique_memory_root(), IcebergSinkMode::Append);
         sink.stage(&batch(&[("a", 1), ("b", 2)])).unwrap();
         sink.pre_commit(1).unwrap();
-        assert!(committed_rows(&sink).is_empty(), "nothing visible pre-commit");
+        assert!(
+            committed_rows(&sink).is_empty(),
+            "nothing visible pre-commit"
+        );
         sink.commit_through(1).unwrap();
         assert_eq!(
             committed_rows(&sink),
@@ -1004,7 +1010,8 @@ mod tests {
         // Seed committed epoch 1.
         {
             let mut sink = open_sink_root(root.clone(), IcebergSinkMode::Upsert);
-            sink.stage(&op_batch(&[("a", 1, "u"), ("b", 2, "u")])).unwrap();
+            sink.stage(&op_batch(&[("a", 1, "u"), ("b", 2, "u")]))
+                .unwrap();
             sink.pre_commit(1).unwrap();
             sink.commit_through(1).unwrap();
         }
@@ -1048,7 +1055,10 @@ mod tests {
 
         let mut recovered = open_sink_root(root, IcebergSinkMode::Append);
         recovered.finalize_prepared(&prepare_path, false).unwrap();
-        assert!(committed_rows(&recovered).is_empty(), "aborted epoch not committed");
+        assert!(
+            committed_rows(&recovered).is_empty(),
+            "aborted epoch not committed"
+        );
         // Idempotent re-abort.
         recovered.finalize_prepared(&prepare_path, false).unwrap();
         assert!(committed_rows(&recovered).is_empty());

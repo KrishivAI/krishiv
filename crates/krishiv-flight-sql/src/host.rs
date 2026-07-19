@@ -10,8 +10,7 @@ use dashmap::DashMap;
 use krishiv_runtime::flight_protocol::{FlightDirective, apply_register_directives, parse_sql};
 use krishiv_runtime::in_process_cluster::{InProcessCluster, plan_spec_to_local};
 use krishiv_scheduler::{
-    BatchSqlInlineTable, BatchSqlTable, SharedCoordinator,
-    execute_batch_sql_coordinated_with_paths,
+    BatchSqlInlineTable, BatchSqlTable, SharedCoordinator, execute_batch_sql_coordinated_with_paths,
 };
 use krishiv_sql::explain_sql;
 use tonic::Status;
@@ -677,9 +676,9 @@ pub(crate) fn scheduler_error_to_status(err: krishiv_scheduler::SchedulerError) 
         // query-execution cause and is safe to surface. Empty reason means no
         // per-task cause was captured — treat as internal.
         SE::JobFailed { reason, .. } if !reason.is_empty() => Status::invalid_argument(reason),
-        SE::NoExecutors | SE::ExecutorUnavailable { .. } => {
-            Status::unavailable("no executor is currently available to run the query; retry shortly")
-        }
+        SE::NoExecutors | SE::ExecutorUnavailable { .. } => Status::unavailable(
+            "no executor is currently available to run the query; retry shortly",
+        ),
         other => krishiv_metrics::grpc::internal_status("coordinated batch SQL execution", &other),
     }
 }
@@ -777,8 +776,7 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert!(status.message().contains("empty SQL statement"));
 
-        let status =
-            scheduler_error_to_status(krishiv_scheduler::SchedulerError::NoExecutors);
+        let status = scheduler_error_to_status(krishiv_scheduler::SchedulerError::NoExecutors);
         assert_eq!(status.code(), tonic::Code::Unavailable);
     }
 

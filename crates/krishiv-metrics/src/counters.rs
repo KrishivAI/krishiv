@@ -16,8 +16,8 @@ const LATENCY_BUCKETS: &[f64] = &[
 /// continuous loop's sub-millisecond target — so this family carries its own
 /// per-metric bucket set: 50 µs → 1 s.
 const STREAM_RECORD_LATENCY_BUCKETS: &[f64] = &[
-    0.000_05, 0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
-    0.5, 1.0,
+    0.000_05, 0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+    1.0,
 ];
 
 /// µs-resolution bucket bounds (in seconds) for the per-RPC gRPC call-duration
@@ -26,8 +26,8 @@ const STREAM_RECORD_LATENCY_BUCKETS: &[f64] = &[
 /// dispatch, barrier acks, shuffle metadata) into the first bucket and makes
 /// tail-latency SLOs unreadable. This set resolves from 100 µs to 10 s.
 const GRPC_LATENCY_BUCKETS: &[f64] = &[
-    0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
-    2.5, 5.0, 10.0,
+    0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+    5.0, 10.0,
 ];
 
 /// Wide bucket bounds (in seconds) for whole-query wall-clock latency
@@ -36,8 +36,7 @@ const GRPC_LATENCY_BUCKETS: &[f64] = &[
 /// family needs a much wider dynamic range than the RPC or record-latency
 /// sets: 1 ms → 600 s.
 const QUERY_LATENCY_BUCKETS: &[f64] = &[
-    0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
-    600.0,
+    0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
 ];
 
 /// Escape a Prometheus label value per the text exposition format: `\`, `"`,

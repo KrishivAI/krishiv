@@ -189,7 +189,10 @@ mod tests {
         assert_eq!(get_json_object_impl(doc, "$.c[1]").as_deref(), Some("y"));
         assert_eq!(get_json_object_impl(doc, "$.t").as_deref(), Some("true"));
         // Object leaf → compact JSON text.
-        assert_eq!(get_json_object_impl(doc, "$.a").as_deref(), Some(r#"{"b":42}"#));
+        assert_eq!(
+            get_json_object_impl(doc, "$.a").as_deref(),
+            Some(r#"{"b":42}"#)
+        );
     }
 
     #[test]
@@ -204,7 +207,10 @@ mod tests {
 
     #[test]
     fn json_navigate_root_and_array_root() {
-        assert_eq!(get_json_object_impl(r#"[10,20,30]"#, "$[2]").as_deref(), Some("30"));
+        assert_eq!(
+            get_json_object_impl(r#"[10,20,30]"#, "$[2]").as_deref(),
+            Some("30")
+        );
         assert_eq!(get_json_object_impl(r#"[10,20,30]"#, "$[9]"), None);
     }
 

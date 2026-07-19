@@ -139,7 +139,11 @@ pub struct CoordinatorConfig {
 
 fn env_flag_enabled(name: &str) -> bool {
     !matches!(
-        std::env::var(name).unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+        std::env::var(name)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
         "off" | "0" | "false" | "disabled"
     )
 }

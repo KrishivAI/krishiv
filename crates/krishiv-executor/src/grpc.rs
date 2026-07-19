@@ -248,17 +248,21 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
             }
             self.input_notify
                 .retain(|k, _| k != job_id.as_str() && !k.starts_with(&rloop_prefix));
-            let purged = self
-                .inbox
-                .forget_job(job_id)
-                .map_err(|error| krishiv_metrics::grpc::internal_status("forget cancelled job", &error))?;
+            let purged = self.inbox.forget_job(job_id).map_err(|error| {
+                krishiv_metrics::grpc::internal_status("forget cancelled job", &error)
+            })?;
             // Run-loop tasks poll `is_task_cancelled` to exit — their
             // tombstone is cleared by the loop itself after it stops, so only
             // cycle-model tombstones are cleared eagerly here.
             if had_cycle_executor && !had_rloop {
                 self.inbox
                     .clear_cancelled_task(request.task_id())
-                    .map_err(|error| krishiv_metrics::grpc::internal_status("clear cancelled task tombstone", &error))?;
+                    .map_err(|error| {
+                        krishiv_metrics::grpc::internal_status(
+                            "clear cancelled task tombstone",
+                            &error,
+                        )
+                    })?;
             }
             tracing::debug!(
                 job_id = %job_id,
@@ -300,7 +304,10 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         // Enforce per-buffer capacity to prevent unbounded memory growth (M1).
         const MAX_PENDING_BATCHES: usize = 64;
         {
-            let mut entry = self.continuous_inputs.entry(buffer_key.clone()).or_default();
+            let mut entry = self
+                .continuous_inputs
+                .entry(buffer_key.clone())
+                .or_default();
             if entry.len() + batches.len() > MAX_PENDING_BATCHES {
                 return Err(tonic::Status::resource_exhausted(format!(
                     "continuous input buffer for job {} exceeded capacity ({MAX_PENDING_BATCHES}); \
@@ -340,8 +347,9 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         if let Some(mut egress) = self.continuous_outputs.get_mut(job_id) {
             let batches: Vec<RecordBatch> = egress.drain(..).collect();
             drop(egress);
-            let ipc_bytes = encode_ipc_batches(&batches)
-                .map_err(|e| krishiv_metrics::grpc::internal_status("encode continuous output", &e))?;
+            let ipc_bytes = encode_ipc_batches(&batches).map_err(|e| {
+                krishiv_metrics::grpc::internal_status("encode continuous output", &e)
+            })?;
             return Ok(tonic::Response::new(
                 krishiv_proto::task::DrainContinuousOutputResponse {
                     version: krishiv_proto::TransportVersion::CURRENT,
@@ -378,8 +386,9 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
             let mut exec = executor_arc
                 .lock()
                 .map_err(|_| tonic::Status::internal("loop executor lock poisoned"))?;
-            exec.drain(input_batches)
-                .map_err(|e| krishiv_metrics::grpc::internal_status("drain continuous executor", &e))?
+            exec.drain(input_batches).map_err(|e| {
+                krishiv_metrics::grpc::internal_status("drain continuous executor", &e)
+            })?
         };
 
         let ipc_bytes = encode_ipc_batches(&output_batches)

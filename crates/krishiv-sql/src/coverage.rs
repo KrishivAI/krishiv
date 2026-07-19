@@ -56,8 +56,7 @@ pub const FIXTURE_T: &str = "CREATE TABLE t AS SELECT * FROM (VALUES \
     (1, 'a', TIMESTAMP '2024-01-01 00:00:00'), \
     (2, 'b', TIMESTAMP '2024-01-01 00:01:30'), \
     (3, 'a', TIMESTAMP '2024-01-01 00:03:00')) v(id, name, ts)";
-pub const FIXTURE_U: &str =
-    "CREATE TABLE u AS SELECT * FROM (VALUES (1, 10), (2, 20)) v(id, val)";
+pub const FIXTURE_U: &str = "CREATE TABLE u AS SELECT * FROM (VALUES (1, 10), (2, 20)) v(id, val)";
 
 /// The Spark-reference checklist: one case per batch-claimed matrix feature.
 pub static CHECKLIST: &[ChecklistCase] = &[
@@ -66,144 +65,381 @@ pub static CHECKLIST: &[ChecklistCase] = &[
     sql("select.star", "SELECT * FROM t"),
     sql("select.distinct", "SELECT DISTINCT name FROM t"),
     sql("select.where", "SELECT id FROM t WHERE id > 1"),
-    sql("select.order_by", "SELECT id FROM t ORDER BY id DESC NULLS LAST"),
-    sql("select.limit_offset", "SELECT id FROM t ORDER BY id LIMIT 1 OFFSET 1"),
-    sql("select.having", "SELECT name, count(*) c FROM t GROUP BY name HAVING count(*) >= 1"),
-    sql("select.case", "SELECT CASE WHEN id > 1 THEN 'p' ELSE 'n' END AS c FROM t"),
-    sql("select.cast", "SELECT CAST(id AS VARCHAR) a, TRY_CAST(name AS INT) b FROM t"),
-    sql("select.subquery_scalar", "SELECT id, (SELECT max(id) FROM t) m FROM t"),
-    sql("select.subquery_exists", "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)"),
-    sql("select.subquery_in", "SELECT id FROM t WHERE id IN (SELECT id FROM u)"),
+    sql(
+        "select.order_by",
+        "SELECT id FROM t ORDER BY id DESC NULLS LAST",
+    ),
+    sql(
+        "select.limit_offset",
+        "SELECT id FROM t ORDER BY id LIMIT 1 OFFSET 1",
+    ),
+    sql(
+        "select.having",
+        "SELECT name, count(*) c FROM t GROUP BY name HAVING count(*) >= 1",
+    ),
+    sql(
+        "select.case",
+        "SELECT CASE WHEN id > 1 THEN 'p' ELSE 'n' END AS c FROM t",
+    ),
+    sql(
+        "select.cast",
+        "SELECT CAST(id AS VARCHAR) a, TRY_CAST(name AS INT) b FROM t",
+    ),
+    sql(
+        "select.subquery_scalar",
+        "SELECT id, (SELECT max(id) FROM t) m FROM t",
+    ),
+    sql(
+        "select.subquery_exists",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
+    ),
+    sql(
+        "select.subquery_in",
+        "SELECT id FROM t WHERE id IN (SELECT id FROM u)",
+    ),
     sql("select.values", "SELECT * FROM (VALUES (1), (2)) v(x)"),
     // ── GROUP BY ──────────────────────────────────────────────────────────────
-    sql("groupby.basic", "SELECT name, count(*) c FROM t GROUP BY name"),
-    sql("groupby.rollup", "SELECT name, count(*) c FROM t GROUP BY ROLLUP(name)"),
-    sql("groupby.cube", "SELECT name, count(*) c FROM t GROUP BY CUBE(name)"),
-    sql("groupby.grouping_sets", "SELECT name, count(*) c FROM t GROUP BY GROUPING SETS ((name), ())"),
-    sql("groupby.grouping_function", "SELECT name, GROUPING(name) g FROM t GROUP BY ROLLUP(name)"),
+    sql(
+        "groupby.basic",
+        "SELECT name, count(*) c FROM t GROUP BY name",
+    ),
+    sql(
+        "groupby.rollup",
+        "SELECT name, count(*) c FROM t GROUP BY ROLLUP(name)",
+    ),
+    sql(
+        "groupby.cube",
+        "SELECT name, count(*) c FROM t GROUP BY CUBE(name)",
+    ),
+    sql(
+        "groupby.grouping_sets",
+        "SELECT name, count(*) c FROM t GROUP BY GROUPING SETS ((name), ())",
+    ),
+    sql(
+        "groupby.grouping_function",
+        "SELECT name, GROUPING(name) g FROM t GROUP BY ROLLUP(name)",
+    ),
     // ── JOIN ──────────────────────────────────────────────────────────────────
     sql("join.inner", "SELECT * FROM t JOIN u ON t.id = u.id"),
-    sql("join.left_outer", "SELECT * FROM t LEFT JOIN u ON t.id = u.id"),
-    sql("join.right_outer", "SELECT * FROM t RIGHT JOIN u ON t.id = u.id"),
-    sql("join.full_outer", "SELECT * FROM t FULL JOIN u ON t.id = u.id"),
+    sql(
+        "join.left_outer",
+        "SELECT * FROM t LEFT JOIN u ON t.id = u.id",
+    ),
+    sql(
+        "join.right_outer",
+        "SELECT * FROM t RIGHT JOIN u ON t.id = u.id",
+    ),
+    sql(
+        "join.full_outer",
+        "SELECT * FROM t FULL JOIN u ON t.id = u.id",
+    ),
     sql("join.cross", "SELECT t.id, u.val FROM t CROSS JOIN u"),
     sql("join.natural", "SELECT * FROM t NATURAL JOIN u"),
     sql("join.using", "SELECT * FROM t JOIN u USING (id)"),
-    elsewhere("join.lateral", "sql_tests.rs lateral-join coverage; correlation shape varies"),
-    sql("join.broadcast_hint", "SELECT /*+ BROADCAST(u) */ t.id FROM t JOIN u ON t.id = u.id"),
+    elsewhere(
+        "join.lateral",
+        "sql_tests.rs lateral-join coverage; correlation shape varies",
+    ),
+    sql(
+        "join.broadcast_hint",
+        "SELECT /*+ BROADCAST(u) */ t.id FROM t JOIN u ON t.id = u.id",
+    ),
     // ── HINTS ─────────────────────────────────────────────────────────────────
-    sql("hints.join_strategy", "SELECT /*+ MERGE(u) */ t.id FROM t JOIN u ON t.id = u.id"),
-    sql("hints.repartition", "SELECT /*+ REPARTITION(4) */ id FROM t"),
+    sql(
+        "hints.join_strategy",
+        "SELECT /*+ MERGE(u) */ t.id FROM t JOIN u ON t.id = u.id",
+    ),
+    sql(
+        "hints.repartition",
+        "SELECT /*+ REPARTITION(4) */ id FROM t",
+    ),
     // ── WINDOW FUNCTIONS ──────────────────────────────────────────────────────
     sql("window.over", "SELECT id, sum(id) OVER () s FROM t"),
-    sql("window.partition_by", "SELECT id, sum(id) OVER (PARTITION BY name) s FROM t"),
-    sql("window.order_by", "SELECT id, row_number() OVER (ORDER BY id) r FROM t"),
-    sql("window.rows_range", "SELECT id, sum(id) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) s FROM t"),
-    sql("window.rank_dense_rank", "SELECT rank() OVER (ORDER BY id) a, dense_rank() OVER (ORDER BY id) b, row_number() OVER (ORDER BY id) c FROM t"),
-    sql("window.lead_lag", "SELECT lead(id) OVER (ORDER BY id) a, lag(id) OVER (ORDER BY id) b FROM t"),
-    sql("window.first_last_value", "SELECT first_value(id) OVER (ORDER BY id) a, last_value(id) OVER (ORDER BY id) b FROM t"),
-    sql("window.nth_value", "SELECT nth_value(id, 1) OVER (ORDER BY id) a FROM t"),
-    sql("window.ntile", "SELECT ntile(2) OVER (ORDER BY id) a FROM t"),
-    sql("window.cume_dist_percent", "SELECT cume_dist() OVER (ORDER BY id) a, percent_rank() OVER (ORDER BY id) b FROM t"),
-    elsewhere("window.tumble", "streaming_tvf.rs batch TUMBLE (needs an Int64 epoch-ms descriptor column)"),
-    elsewhere("window.hop", "streaming_tvf.rs + streaming_window_plan.rs HOP coverage"),
-    elsewhere("window.session", "streaming_window_plan.rs SESSION coverage"),
+    sql(
+        "window.partition_by",
+        "SELECT id, sum(id) OVER (PARTITION BY name) s FROM t",
+    ),
+    sql(
+        "window.order_by",
+        "SELECT id, row_number() OVER (ORDER BY id) r FROM t",
+    ),
+    sql(
+        "window.rows_range",
+        "SELECT id, sum(id) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) s FROM t",
+    ),
+    sql(
+        "window.rank_dense_rank",
+        "SELECT rank() OVER (ORDER BY id) a, dense_rank() OVER (ORDER BY id) b, row_number() OVER (ORDER BY id) c FROM t",
+    ),
+    sql(
+        "window.lead_lag",
+        "SELECT lead(id) OVER (ORDER BY id) a, lag(id) OVER (ORDER BY id) b FROM t",
+    ),
+    sql(
+        "window.first_last_value",
+        "SELECT first_value(id) OVER (ORDER BY id) a, last_value(id) OVER (ORDER BY id) b FROM t",
+    ),
+    sql(
+        "window.nth_value",
+        "SELECT nth_value(id, 1) OVER (ORDER BY id) a FROM t",
+    ),
+    sql(
+        "window.ntile",
+        "SELECT ntile(2) OVER (ORDER BY id) a FROM t",
+    ),
+    sql(
+        "window.cume_dist_percent",
+        "SELECT cume_dist() OVER (ORDER BY id) a, percent_rank() OVER (ORDER BY id) b FROM t",
+    ),
+    elsewhere(
+        "window.tumble",
+        "streaming_tvf.rs batch TUMBLE (needs an Int64 epoch-ms descriptor column)",
+    ),
+    elsewhere(
+        "window.hop",
+        "streaming_tvf.rs + streaming_window_plan.rs HOP coverage",
+    ),
+    elsewhere(
+        "window.session",
+        "streaming_window_plan.rs SESSION coverage",
+    ),
     // ── CTE ───────────────────────────────────────────────────────────────────
-    sql("cte.non_recursive", "WITH c AS (SELECT id FROM t) SELECT * FROM c"),
-    sql("cte.recursive", "WITH RECURSIVE c(n) AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT * FROM c"),
-    sql("cte.multiple", "WITH a AS (SELECT 1 x), b AS (SELECT 2 y) SELECT * FROM a, b"),
+    sql(
+        "cte.non_recursive",
+        "WITH c AS (SELECT id FROM t) SELECT * FROM c",
+    ),
+    sql(
+        "cte.recursive",
+        "WITH RECURSIVE c(n) AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT * FROM c",
+    ),
+    sql(
+        "cte.multiple",
+        "WITH a AS (SELECT 1 x), b AS (SELECT 2 y) SELECT * FROM a, b",
+    ),
     // ── SET OPS ───────────────────────────────────────────────────────────────
-    sql("set.union_all", "SELECT id FROM t UNION ALL SELECT id FROM u"),
-    sql("set.union_distinct", "SELECT id FROM t UNION SELECT id FROM u"),
-    sql("set.intersect", "SELECT id FROM t INTERSECT SELECT id FROM u"),
+    sql(
+        "set.union_all",
+        "SELECT id FROM t UNION ALL SELECT id FROM u",
+    ),
+    sql(
+        "set.union_distinct",
+        "SELECT id FROM t UNION SELECT id FROM u",
+    ),
+    sql(
+        "set.intersect",
+        "SELECT id FROM t INTERSECT SELECT id FROM u",
+    ),
     sql("set.except", "SELECT id FROM t EXCEPT SELECT id FROM u"),
     // ── LATERAL / UNNEST ──────────────────────────────────────────────────────
     sql("lateral.unnest", "SELECT unnest([1, 2, 3]) AS e"),
-    sql("lateral.generate_series", "SELECT * FROM generate_series(1, 3)"),
-    elsewhere("lateral.cross_join_unnest", "unnest_sql.rs CROSS JOIN UNNEST coverage"),
+    sql(
+        "lateral.generate_series",
+        "SELECT * FROM generate_series(1, 3)",
+    ),
+    elsewhere(
+        "lateral.cross_join_unnest",
+        "unnest_sql.rs CROSS JOIN UNNEST coverage",
+    ),
     // ── PIVOT ─────────────────────────────────────────────────────────────────
     elsewhere("pivot.pivot", "pivot_sql.rs PIVOT rewrite coverage"),
     elsewhere("pivot.unpivot", "pivot_sql.rs UNPIVOT rewrite coverage"),
     // ── FUNCTIONS: JSON ───────────────────────────────────────────────────────
-    sql("functions.json.get_json_object", "SELECT get_json_object('{\"a\":{\"b\":7}}', '$.a.b') AS v"),
-    sql("functions.json.json_array_length", "SELECT json_array_length('[1,2,3,4]') AS n"),
+    sql(
+        "functions.json.get_json_object",
+        "SELECT get_json_object('{\"a\":{\"b\":7}}', '$.a.b') AS v",
+    ),
+    sql(
+        "functions.json.json_array_length",
+        "SELECT json_array_length('[1,2,3,4]') AS n",
+    ),
     // ── FUNCTIONS: higher-order ───────────────────────────────────────────────
-    sql("functions.hof.transform", "SELECT transform([1, 2, 3], x -> x * 2) AS r"),
-    sql("functions.hof.filter", "SELECT filter([1, 2, 3, 4], x -> x % 2 = 0) AS r"),
-    sql("functions.hof.exists", "SELECT any_match([1, 2, 3], x -> x > 2) AS r"),
-    sql("functions.hof.forall", "SELECT forall([2, 4, 6], x -> x % 2 = 0) AS r"),
+    sql(
+        "functions.hof.transform",
+        "SELECT transform([1, 2, 3], x -> x * 2) AS r",
+    ),
+    sql(
+        "functions.hof.filter",
+        "SELECT filter([1, 2, 3, 4], x -> x % 2 = 0) AS r",
+    ),
+    sql(
+        "functions.hof.exists",
+        "SELECT any_match([1, 2, 3], x -> x > 2) AS r",
+    ),
+    sql(
+        "functions.hof.forall",
+        "SELECT forall([2, 4, 6], x -> x % 2 = 0) AS r",
+    ),
     // ── FUNCTIONS: Spark scalar aliases ───────────────────────────────────────
-    sql("functions.spark.nvl", "SELECT nvl(NULL, 1) a, nvl2(1, 2, 3) b"),
-    sql("functions.spark.substring_index", "SELECT substring_index('a.b.c', '.', 2) AS s"),
-    sql("functions.spark.date_format", "SELECT date_format(TIMESTAMP '2024-03-07 09:05:00', 'yyyy-MM-dd') AS d"),
+    sql(
+        "functions.spark.nvl",
+        "SELECT nvl(NULL, 1) a, nvl2(1, 2, 3) b",
+    ),
+    sql(
+        "functions.spark.substring_index",
+        "SELECT substring_index('a.b.c', '.', 2) AS s",
+    ),
+    sql(
+        "functions.spark.date_format",
+        "SELECT date_format(TIMESTAMP '2024-03-07 09:05:00', 'yyyy-MM-dd') AS d",
+    ),
     sql("functions.spark.crc32", "SELECT crc32('Spark') AS c"),
     // ── DML ───────────────────────────────────────────────────────────────────
     elsewhere("dml.copy_to", "DataFusion-native COPY TO (writes a file)"),
     sql("dml.insert_into", "INSERT INTO u SELECT 9, 90"),
-    elsewhere("dml.insert_overwrite", "lakehouse Iceberg INSERT OVERWRITE coverage"),
-    elsewhere("dml.delete", "lakehouse Iceberg DELETE coverage (Iceberg-gated)"),
-    elsewhere("dml.update", "lakehouse Iceberg UPDATE coverage (Iceberg-gated)"),
+    elsewhere(
+        "dml.insert_overwrite",
+        "lakehouse Iceberg INSERT OVERWRITE coverage",
+    ),
+    elsewhere(
+        "dml.delete",
+        "lakehouse Iceberg DELETE coverage (Iceberg-gated)",
+    ),
+    elsewhere(
+        "dml.update",
+        "lakehouse Iceberg UPDATE coverage (Iceberg-gated)",
+    ),
     elsewhere("dml.merge", "lakehouse MERGE coverage (Iceberg-gated)"),
-    elsewhere("dml.iceberg_merge", "lakehouse atomic Iceberg MERGE coverage"),
+    elsewhere(
+        "dml.iceberg_merge",
+        "lakehouse atomic Iceberg MERGE coverage",
+    ),
     // ── DDL ───────────────────────────────────────────────────────────────────
-    elsewhere("ddl.create_external_table", "sql_tests.rs CREATE EXTERNAL TABLE (needs a file)"),
+    elsewhere(
+        "ddl.create_external_table",
+        "sql_tests.rs CREATE EXTERNAL TABLE (needs a file)",
+    ),
     sql("ddl.create_view", "CREATE VIEW cov_v AS SELECT 1 AS x"),
-    elsewhere("ddl.create_function", "create_function_ddl.rs CREATE FUNCTION coverage"),
+    elsewhere(
+        "ddl.create_function",
+        "create_function_ddl.rs CREATE FUNCTION coverage",
+    ),
     sql("ddl.drop_table", "DROP TABLE IF EXISTS cov_absent_table"),
     sql("ddl.drop_view", "DROP VIEW IF EXISTS cov_absent_view"),
-    sql("ddl.create_table_as", "CREATE TABLE cov_ctas AS SELECT 1 AS x"),
-    elsewhere("ddl.partitioned_by", "lakehouse PARTITIONED BY writer coverage (Iceberg-gated)"),
-    elsewhere("ddl.alter_table", "lakehouse ALTER TABLE schema-evolution coverage"),
-    sql("ddl.create_schema", "CREATE SCHEMA IF NOT EXISTS cov_schema"),
+    sql(
+        "ddl.create_table_as",
+        "CREATE TABLE cov_ctas AS SELECT 1 AS x",
+    ),
+    elsewhere(
+        "ddl.partitioned_by",
+        "lakehouse PARTITIONED BY writer coverage (Iceberg-gated)",
+    ),
+    elsewhere(
+        "ddl.alter_table",
+        "lakehouse ALTER TABLE schema-evolution coverage",
+    ),
+    sql(
+        "ddl.create_schema",
+        "CREATE SCHEMA IF NOT EXISTS cov_schema",
+    ),
     elsewhere("ddl.live_table", "live_table.rs LIVE TABLE DDL coverage"),
-    elsewhere("ddl.connector_source_sink", "krishiv-api connector-registry DDL coverage"),
+    elsewhere(
+        "ddl.connector_source_sink",
+        "krishiv-api connector-registry DDL coverage",
+    ),
     // ── SESSION ───────────────────────────────────────────────────────────────
-    sql("stmt.set_reset", "SET datafusion.execution.batch_size = 4096"),
+    sql(
+        "stmt.set_reset",
+        "SET datafusion.execution.batch_size = 4096",
+    ),
     // `USE public` keeps the default schema where the fixtures live, so it does
     // not pollute later cases (its own unit test proves the schema switch).
     sql("stmt.use", "USE public"),
     // ── SHOW ──────────────────────────────────────────────────────────────────
     sql("show.tables_databases_functions", "SHOW DATABASES"),
     // ── TEMPORAL ──────────────────────────────────────────────────────────────
-    elsewhere("temporal.as_of", "lakehouse/as_of.rs time-travel coverage (Iceberg-gated)"),
-    elsewhere("temporal.match_recognize", "cep_sql.rs MATCH_RECOGNIZE coverage"),
-    elsewhere("temporal.system_time", "lakehouse FOR SYSTEM_TIME AS OF coverage"),
+    elsewhere(
+        "temporal.as_of",
+        "lakehouse/as_of.rs time-travel coverage (Iceberg-gated)",
+    ),
+    elsewhere(
+        "temporal.match_recognize",
+        "cep_sql.rs MATCH_RECOGNIZE coverage",
+    ),
+    elsewhere(
+        "temporal.system_time",
+        "lakehouse FOR SYSTEM_TIME AS OF coverage",
+    ),
     // ── PREPARED ──────────────────────────────────────────────────────────────
-    elsewhere("prepared.create", "krishiv-flight-sql prepared-statement protocol coverage"),
-    elsewhere("prepared.execute", "krishiv-flight-sql prepared-statement protocol coverage"),
-    elsewhere("prepared.close", "krishiv-flight-sql prepared-statement protocol coverage"),
-    elsewhere("prepared.parameters", "krishiv-flight-sql parameter-binding coverage"),
+    elsewhere(
+        "prepared.create",
+        "krishiv-flight-sql prepared-statement protocol coverage",
+    ),
+    elsewhere(
+        "prepared.execute",
+        "krishiv-flight-sql prepared-statement protocol coverage",
+    ),
+    elsewhere(
+        "prepared.close",
+        "krishiv-flight-sql prepared-statement protocol coverage",
+    ),
+    elsewhere(
+        "prepared.parameters",
+        "krishiv-flight-sql parameter-binding coverage",
+    ),
     sql("prepared.sql_text", "PREPARE cov_p AS SELECT 1"),
     // ── OPERATION ─────────────────────────────────────────────────────────────
-    elsewhere("operation.id", "krishiv-runtime operation-tracking coverage"),
+    elsewhere(
+        "operation.id",
+        "krishiv-runtime operation-tracking coverage",
+    ),
     elsewhere("operation.cancel", "krishiv-runtime cancel coverage"),
-    elsewhere("operation.timeout", "krishiv-runtime per-query timeout coverage"),
+    elsewhere(
+        "operation.timeout",
+        "krishiv-runtime per-query timeout coverage",
+    ),
     elsewhere("operation.progress", "krishiv-runtime progress coverage"),
     // ── ERROR ─────────────────────────────────────────────────────────────────
     elsewhere("error.sqlstate", "sqlstate.rs SQLSTATE coverage"),
-    elsewhere("error.error_position", "DataFusion message-only error position"),
+    elsewhere(
+        "error.error_position",
+        "DataFusion message-only error position",
+    ),
     // ── FLIGHT SQL ────────────────────────────────────────────────────────────
-    elsewhere("flight.get_flight_info", "krishiv-flight-sql service coverage"),
+    elsewhere(
+        "flight.get_flight_info",
+        "krishiv-flight-sql service coverage",
+    ),
     elsewhere("flight.do_get", "krishiv-flight-sql service coverage"),
-    elsewhere("flight.prepared_statements", "krishiv-flight-sql service coverage"),
+    elsewhere(
+        "flight.prepared_statements",
+        "krishiv-flight-sql service coverage",
+    ),
     elsewhere("flight.do_action", "krishiv-flight-sql service coverage"),
     elsewhere("flight.get_sql_info", "krishiv-flight-sql service coverage"),
     elsewhere("flight.auth", "krishiv-flight-sql auth coverage"),
     elsewhere("flight.policy", "krishiv-flight-sql policy coverage"),
-    elsewhere("flight.transactions", "krishiv-flight-sql transaction coverage"),
-    elsewhere("flight.schemas", "krishiv-flight-sql catalog-introspection coverage"),
+    elsewhere(
+        "flight.transactions",
+        "krishiv-flight-sql transaction coverage",
+    ),
+    elsewhere(
+        "flight.schemas",
+        "krishiv-flight-sql catalog-introspection coverage",
+    ),
     // ── STREAMING ─────────────────────────────────────────────────────────────
-    elsewhere("streaming.continuous_select", "streaming.rs continuous-select coverage"),
-    elsewhere("streaming.window_agg", "streaming_window_plan.rs windowed-agg coverage"),
+    elsewhere(
+        "streaming.continuous_select",
+        "streaming.rs continuous-select coverage",
+    ),
+    elsewhere(
+        "streaming.window_agg",
+        "streaming_window_plan.rs windowed-agg coverage",
+    ),
     elsewhere("streaming.watermark", "streaming engine watermark coverage"),
-    elsewhere("streaming.interval_join", "streaming interval-join coverage"),
+    elsewhere(
+        "streaming.interval_join",
+        "streaming interval-join coverage",
+    ),
     elsewhere("streaming.cep", "cep_sql.rs streaming CEP coverage"),
     elsewhere("streaming.dedup", "streaming dedup coverage"),
     elsewhere("streaming.sink_modes", "streaming sink-mode coverage"),
     // ── INTROSPECTION ─────────────────────────────────────────────────────────
     sql("introspection.describe", "DESCRIBE t"),
     sql("introspection.explain", "EXPLAIN SELECT 1"),
-    sql("introspection.information_schema", "SELECT count(*) c FROM information_schema.tables"),
+    sql(
+        "introspection.information_schema",
+        "SELECT count(*) c FROM information_schema.tables",
+    ),
 ];
 
 /// A published coverage summary (the phase KPI).
@@ -311,8 +547,16 @@ mod tests {
         // the rule above); assert the KPI is computed and the executable subset
         // is substantial.
         assert_eq!(r.batch_covered, r.batch_claimed);
-        assert!(r.executable_cases >= 45, "executable cases: {}", r.executable_cases);
-        assert!(r.functions_supported >= 8, "functions supported: {}", r.functions_supported);
+        assert!(
+            r.executable_cases >= 45,
+            "executable cases: {}",
+            r.executable_cases
+        );
+        assert!(
+            r.functions_supported >= 8,
+            "functions supported: {}",
+            r.functions_supported
+        );
     }
 
     fn workspace_doc(rel: &str) -> std::path::PathBuf {
@@ -364,8 +608,20 @@ mod tests {
     #[tokio::test]
     async fn spark_checklist_sql_cases_execute() {
         let engine = crate::SqlEngine::new();
-        engine.sql(FIXTURE_T).await.expect("fixture t").collect().await.expect("t rows");
-        engine.sql(FIXTURE_U).await.expect("fixture u").collect().await.expect("u rows");
+        engine
+            .sql(FIXTURE_T)
+            .await
+            .expect("fixture t")
+            .collect()
+            .await
+            .expect("t rows");
+        engine
+            .sql(FIXTURE_U)
+            .await
+            .expect("fixture u")
+            .collect()
+            .await
+            .expect("u rows");
 
         let mut failures: Vec<String> = Vec::new();
         for c in CHECKLIST {
@@ -380,6 +636,10 @@ mod tests {
                 }
             }
         }
-        assert!(failures.is_empty(), "checklist failures:\n{}", failures.join("\n"));
+        assert!(
+            failures.is_empty(),
+            "checklist failures:\n{}",
+            failures.join("\n")
+        );
     }
 }

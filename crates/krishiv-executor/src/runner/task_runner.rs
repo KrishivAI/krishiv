@@ -33,8 +33,7 @@ pub struct TaskRunner {
     /// Phase 56: incremental SST checkpointer for RocksDB-backed window
     /// state, created lazily on the first incremental epoch. `None` until
     /// then and for tasks whose state is not RocksDB-backed.
-    pub(crate) incremental_checkpointer:
-        Option<krishiv_state::RocksDbIncrementalCheckpointer>,
+    pub(crate) incremental_checkpointer: Option<krishiv_state::RocksDbIncrementalCheckpointer>,
     /// Phase 56 (SH7): bytes currently reserved in the unified arbiter's
     /// State region for this task's operator state (updated per checkpoint
     /// from observed snapshot/SST size; best-effort accounting).
@@ -344,11 +343,11 @@ impl TaskRunner {
                     .join(req.job_id.as_str())
                     .join(self.task_id.as_str());
                 self.incremental_checkpointer = Some(
-                    krishiv_state::RocksDbIncrementalCheckpointer::new(work_dir).map_err(
-                        |e| ExecutorError::LocalExecution {
+                    krishiv_state::RocksDbIncrementalCheckpointer::new(work_dir).map_err(|e| {
+                        ExecutorError::LocalExecution {
                             message: format!("incremental checkpointer init: {e}"),
-                        },
-                    )?,
+                        }
+                    })?,
                 );
             }
             let Some(checkpointer) = self.incremental_checkpointer.as_mut() else {
@@ -553,9 +552,7 @@ pub(crate) fn materialize_portable_snapshots(
         ));
         let _ = std::fs::remove_dir_all(&scratch);
         krishiv_state::RocksDbIncrementalCheckpointer::restore_checkpoint(
-            &manifest,
-            storage,
-            &scratch,
+            &manifest, storage, &scratch,
         )
         .map_err(|e| ExecutorError::LocalExecution {
             message: format!("incremental restore: rebuild RocksDB dir: {e}"),

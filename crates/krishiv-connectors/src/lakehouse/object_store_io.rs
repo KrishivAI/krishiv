@@ -180,7 +180,10 @@ impl KrishivStorage {
     fn resolve(&self, path: &str) -> Result<(Arc<dyn ObjectStore>, ObjectPath)> {
         if let Some(rest) = path.strip_prefix("memory://") {
             let (bucket, key) = rest.split_once('/').ok_or_else(|| {
-                Error::new(ErrorKind::DataInvalid, format!("memory uri has no key: {path}"))
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("memory uri has no key: {path}"),
+                )
             })?;
             Ok((memory_store_for_bucket(bucket), ObjectPath::from(key)))
         } else {

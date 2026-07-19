@@ -80,16 +80,16 @@ pub mod sqlstate;
 pub mod subquery;
 pub mod unnest_sql;
 
+pub mod coverage;
+mod higher_order_functions;
+mod json_functions;
+mod spark_functions;
+pub mod statement_completion;
 pub mod streaming;
 pub mod streaming_table_ddl;
 pub mod streaming_tvf;
 pub mod streaming_window_plan;
 mod udf;
-mod json_functions;
-mod higher_order_functions;
-mod spark_functions;
-pub mod statement_completion;
-pub mod coverage;
 mod window_functions;
 
 pub use cep_sql::{
@@ -2682,12 +2682,13 @@ impl SqlEngine {
         }
         let scan_sql = format!("SELECT {} FROM {table_ref}", projections.join(", "));
         let batches = self.context.sql(&scan_sql).await?.collect().await?;
-        let row = batches
-            .iter()
-            .find(|b| b.num_rows() > 0)
-            .ok_or_else(|| SqlError::DataFusion {
-                message: format!("ANALYZE TABLE {table_ref}: aggregation returned no rows"),
-            })?;
+        let row =
+            batches
+                .iter()
+                .find(|b| b.num_rows() > 0)
+                .ok_or_else(|| SqlError::DataFusion {
+                    message: format!("ANALYZE TABLE {table_ref}: aggregation returned no rows"),
+                })?;
         let cell_string = |col: usize| -> Option<String> {
             let column = row.columns().get(col)?;
             if column.is_null(0) {
@@ -2723,8 +2724,8 @@ impl SqlEngine {
             Err(_) => None,
         };
 
-        let mut stats = krishiv_plan::optimizer::TableCboStats::new(table_ref)
-            .with_row_count(row_count);
+        let mut stats =
+            krishiv_plan::optimizer::TableCboStats::new(table_ref).with_row_count(row_count);
         if let Some(bytes) = avg_row_bytes {
             stats = stats.with_avg_row_bytes(bytes);
         }
@@ -3618,7 +3619,9 @@ impl SqlDataFrame {
         Box::pin(self.collect_with_stats_boxed_body())
     }
 
-    async fn collect_with_stats_boxed_body(&self) -> SqlResult<(Vec<RecordBatch>, SqlExecutionStats)> {
+    async fn collect_with_stats_boxed_body(
+        &self,
+    ) -> SqlResult<(Vec<RecordBatch>, SqlExecutionStats)> {
         use datafusion::physical_plan::collect as df_collect;
 
         let df = self.dataframe.clone();

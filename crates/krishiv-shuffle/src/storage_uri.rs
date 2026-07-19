@@ -95,8 +95,11 @@ pub fn open_shuffle_backend_from_uri(
         // AmazonS3Builder::from_env honours only AWS_ENDPOINT, not AWS_ENDPOINT_URL;
         // and `with_url` was observed to intermittently fail MinIO writes where the
         // identically configured sink client (with_bucket_name) succeeded.
-        let store = build_s3_store(bucket)
-            .map_err(|e| ShuffleError::Io(std::io::Error::other(format!("s3 shuffle store {url}: {e}"))))?;
+        let store = build_s3_store(bucket).map_err(|e| {
+            ShuffleError::Io(std::io::Error::other(format!(
+                "s3 shuffle store {url}: {e}"
+            )))
+        })?;
         let storage_prefix = if prefix.is_empty() {
             "shuffle".to_owned()
         } else {

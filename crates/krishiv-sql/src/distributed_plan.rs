@@ -237,10 +237,7 @@ fn parse_partition_segment(segment: &str) -> SqlResult<DfplanTaskSpec> {
             };
             if range.start >= range.end {
                 return Err(SqlError::DataFusion {
-                    message: format!(
-                        "dfplan map range is empty: m{}-{}",
-                        range.start, range.end
-                    ),
+                    message: format!("dfplan map range is empty: m{}-{}", range.start, range.end),
                 });
             }
             (list, Some(range))
@@ -1483,8 +1480,7 @@ mod tests {
             )
             .await
             .expect("register parquet");
-        let query =
-            "SELECT category, COUNT(*) AS n, SUM(amount) AS total FROM t GROUP BY category";
+        let query = "SELECT category, COUNT(*) AS n, SUM(amount) AS total FROM t GROUP BY category";
         let df = plan_ctx.sql(query).await.expect("sql");
         let plan = df.create_physical_plan().await.expect("physical plan");
         let staged = build_distributed_stages(plan)

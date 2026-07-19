@@ -813,8 +813,7 @@ async fn drain_run_loop_output(
         let request = krishiv_proto::task::DrainContinuousOutputRequest {
             version: TransportVersion::CURRENT,
             job_id: job_id.clone(),
-            task_id: TaskId::try_new(&task_id)
-                .map_err(|e| invalid_registration(e.to_string()))?,
+            task_id: TaskId::try_new(&task_id).map_err(|e| invalid_registration(e.to_string()))?,
         };
         let response = client
             .drain_continuous_output(wire::drain_continuous_output_request_to_wire(request))
@@ -1137,10 +1136,10 @@ fn build_continuous_job_spec(
     use krishiv_plan::window::encode_window_execution_spec;
     use krishiv_proto::{JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
 
-    let stage_id = StageId::try_new("stage-streaming")
-        .map_err(|e| invalid_registration(e.to_string()))?;
-    let encoded_spec = encode_window_execution_spec(spec)
-        .map_err(|e| invalid_registration(e.to_string()))?;
+    let stage_id =
+        StageId::try_new("stage-streaming").map_err(|e| invalid_registration(e.to_string()))?;
+    let encoded_spec =
+        encode_window_execution_spec(spec).map_err(|e| invalid_registration(e.to_string()))?;
     let sink_contract = match &options.sink {
         Some(sink) => Some(
             sink.contract_string()
@@ -1184,8 +1183,8 @@ fn build_continuous_job_spec(
         }
     }
 
-    let mut job_spec = JobSpec::new(job_id.clone(), "continuous-streaming", JobKind::Streaming)
-        .with_stage(stage);
+    let mut job_spec =
+        JobSpec::new(job_id.clone(), "continuous-streaming", JobKind::Streaming).with_stage(stage);
     if let (Some(interval), Some(path)) = (
         options.checkpoint_interval_ms,
         options.checkpoint_storage_path.as_deref(),
@@ -1216,8 +1215,7 @@ pub async fn register_continuous_stream_with_options(
             "run-loop checkpointing requires BOTH checkpoint_interval_ms and              checkpoint_storage_path (or neither)",
         ));
     }
-    let job_id_typed =
-        JobId::try_new(job_id).map_err(|e| invalid_registration(e.to_string()))?;
+    let job_id_typed = JobId::try_new(job_id).map_err(|e| invalid_registration(e.to_string()))?;
     let job_spec = build_continuous_job_spec(&job_id_typed, spec, mode, parallelism, options)?;
 
     let freshly_submitted = {
@@ -1851,7 +1849,7 @@ mod tests {
             let coord = coordinator.read().await;
             let job_id = krishiv_proto::JobId::try_new("rloop-upsert-job").unwrap();
             let jc = coord.job_coordinator(&job_id).unwrap();
-        let record = jc.read_record();
+            let record = jc.read_record();
             assert_eq!(record.spec.task_count(), 2);
         }
         // Parallelism change → retire + fresh submit at the new parallelism.

@@ -40,8 +40,10 @@ async fn load_input_tables(
                 message: e.to_string(),
             })?;
     }
-    for (table_name, batches) in
-        crate::erased(read_connector_parquet_partitions(assignment.input_partitions())).await?
+    for (table_name, batches) in crate::erased(read_connector_parquet_partitions(
+        assignment.input_partitions(),
+    ))
+    .await?
     {
         engine
             .register_record_batches(&table_name, batches)
@@ -50,8 +52,10 @@ async fn load_input_tables(
                 message: e.to_string(),
             })?;
     }
-    for (table_name, batches) in
-        crate::erased(read_object_parquet_partitions(assignment.input_partitions())).await?
+    for (table_name, batches) in crate::erased(read_object_parquet_partitions(
+        assignment.input_partitions(),
+    ))
+    .await?
     {
         engine
             .register_record_batches(&table_name, batches)
@@ -60,8 +64,10 @@ async fn load_input_tables(
                 message: e.to_string(),
             })?;
     }
-    for (table_name, batches) in
-        crate::erased(read_shuffle_flight_partitions(assignment.input_partitions())).await?
+    for (table_name, batches) in crate::erased(read_shuffle_flight_partitions(
+        assignment.input_partitions(),
+    ))
+    .await?
     {
         engine
             .register_record_batches(&table_name, batches)
@@ -71,13 +77,12 @@ async fn load_input_tables(
             })?;
     }
     if let Some(reg) = registry {
-        for (table_name, batches) in
-            crate::erased(read_registry_partitions(
-                reg,
-                assignment.input_partitions(),
-                restored_source_offsets,
-            ))
-            .await?
+        for (table_name, batches) in crate::erased(read_registry_partitions(
+            reg,
+            assignment.input_partitions(),
+            restored_source_offsets,
+        ))
+        .await?
         {
             engine
                 .register_record_batches(&table_name, batches)
@@ -227,8 +232,10 @@ pub(crate) async fn execute_batch_fragment(
                     message: error.to_string(),
                 })?;
         }
-        for (table_name, batches) in
-            crate::erased(read_connector_parquet_partitions(assignment.input_partitions())).await?
+        for (table_name, batches) in crate::erased(read_connector_parquet_partitions(
+            assignment.input_partitions(),
+        ))
+        .await?
         {
             engine
                 .register_record_batches(&table_name, batches)
@@ -237,8 +244,10 @@ pub(crate) async fn execute_batch_fragment(
                     message: error.to_string(),
                 })?;
         }
-        for (table_name, batches) in
-            crate::erased(read_object_parquet_partitions(assignment.input_partitions())).await?
+        for (table_name, batches) in crate::erased(read_object_parquet_partitions(
+            assignment.input_partitions(),
+        ))
+        .await?
         {
             engine
                 .register_record_batches(&table_name, batches)
@@ -247,8 +256,10 @@ pub(crate) async fn execute_batch_fragment(
                     message: error.to_string(),
                 })?;
         }
-        for (table_name, batches) in
-            crate::erased(read_shuffle_flight_partitions(assignment.input_partitions())).await?
+        for (table_name, batches) in crate::erased(read_shuffle_flight_partitions(
+            assignment.input_partitions(),
+        ))
+        .await?
         {
             engine
                 .register_record_batches(&table_name, batches)
@@ -1082,12 +1093,11 @@ async fn execute_inmem_shuffle_write(
             restored_source_offsets,
         ))
         .await?;
-        let dataframe =
-            crate::erased(limited_engine.sql(query))
-                .await
-                .map_err(|e| ExecutorError::LocalExecution {
-                    message: e.to_string(),
-                })?;
+        let dataframe = crate::erased(limited_engine.sql(query))
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: e.to_string(),
+            })?;
         let mut sql_stream =
             dataframe
                 .execute_stream()
@@ -1397,21 +1407,12 @@ async fn execute_broker_kafka_to_parquet(
 
     if manual_commit {
         crate::erased(execute_broker_kafka_two_phase(
-            runner,
-            assignment,
-            source,
-            &sink_path,
-            &source_id,
-            &topic,
+            runner, assignment, source, &sink_path, &source_id, &topic,
         ))
         .await
     } else {
         crate::erased(execute_broker_kafka_at_least_once(
-            runner,
-            assignment,
-            source,
-            &sink_path,
-            &source_id,
+            runner, assignment, source, &sink_path, &source_id,
         ))
         .await
     }

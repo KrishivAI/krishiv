@@ -134,8 +134,8 @@ pub fn connector_config_from_ddl(
         // registry driver), `cursor.column`/`cursor.after` for incremental
         // keyset pull, `batch_size` for page sizing.
         "jdbc" => {
-            let mut cfg = ConnectorConfig::new(name, kind)
-                .with_property("url", cmd.location.clone());
+            let mut cfg =
+                ConnectorConfig::new(name, kind).with_property("url", cmd.location.clone());
             for (key, value) in &cmd.options {
                 // DataFusion namespaces un-dotted OPTIONS keys under
                 // `format.` — accept both spellings of the same option.

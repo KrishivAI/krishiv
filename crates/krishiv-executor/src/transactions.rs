@@ -180,11 +180,12 @@ impl TwoPhaseSinkRegistry {
         };
         let mut refs = Vec::new();
         for participant in participants.iter() {
-            let guard = participant
-                .lock()
-                .map_err(|_| krishiv_connectors::ConnectorError::Protocol {
-                    message: format!("transactional sink lock poisoned for job {job_id}"),
-                })?;
+            let guard =
+                participant
+                    .lock()
+                    .map_err(|_| krishiv_connectors::ConnectorError::Protocol {
+                        message: format!("transactional sink lock poisoned for job {job_id}"),
+                    })?;
             refs.extend(guard.prepared_refs());
         }
         Ok(refs)
@@ -397,9 +398,9 @@ mod tests {
         let pre_crash = TwoPhaseSinkRegistry::new();
         let participant = pre_crash
             .get_or_register("job-recover", || {
-                Ok(EpochTransactionLog::new(LocalParquetTwoPhaseCommitSink::new(
-                    dir.path(),
-                )))
+                Ok(EpochTransactionLog::new(
+                    LocalParquetTwoPhaseCommitSink::new(dir.path()),
+                ))
             })
             .unwrap();
         participant.lock().unwrap().stage(&batch()).unwrap();
@@ -427,9 +428,9 @@ mod tests {
         let post_crash = TwoPhaseSinkRegistry::new();
         let _fresh = post_crash
             .get_or_register("job-recover", || {
-                Ok(EpochTransactionLog::new(LocalParquetTwoPhaseCommitSink::new(
-                    dir.path(),
-                )))
+                Ok(EpochTransactionLog::new(
+                    LocalParquetTwoPhaseCommitSink::new(dir.path()),
+                ))
             })
             .unwrap();
         // restore_to on the fresh (empty) log is a genuine no-op here.
