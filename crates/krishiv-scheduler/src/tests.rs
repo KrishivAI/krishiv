@@ -49,6 +49,7 @@ mod scheduler_tests {
     #[derive(Debug, Clone, Default)]
     struct RecordingExecutorTaskService {
         task_ids: Arc<Mutex<Vec<String>>>,
+        cancelled_task_ids: Arc<Mutex<Vec<String>>>,
     }
 
     #[tonic::async_trait]
@@ -70,8 +71,14 @@ mod scheduler_tests {
 
         async fn cancel_task(
             &self,
-            _request: tonic::Request<wire::v1::TaskCancellationRequest>,
+            request: tonic::Request<wire::v1::TaskCancellationRequest>,
         ) -> Result<tonic::Response<wire::v1::TaskStatusResponse>, tonic::Status> {
+            let req = wire::task_cancellation_request_from_wire(request.into_inner())
+                .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+            self.cancelled_task_ids
+                .lock()
+                .unwrap()
+                .push(req.task_id().as_str().to_owned());
             Ok(tonic::Response::new(wire::task_status_response_to_wire(
                 TaskStatusResponse::new(TransportDisposition::Accepted),
             )))

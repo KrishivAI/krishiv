@@ -656,7 +656,11 @@ async fn api_job_cancel(
             );
         }
     };
-    match coordinator.write().await.cancel_job(&job_id) {
+    // push_cancel_job (not plain cancel_job): the assigned executors must
+    // hear about the cancel or a batch task runs to completion and burns
+    // its core for nothing — the state-only variant was the #217 zombie
+    // (write lock held across the await matches the deregister route).
+    match coordinator.write().await.push_cancel_job(&job_id).await {
         Ok(()) => (
             axum::http::StatusCode::OK,
             Json(serde_json::json!({"cancelled": true, "job_id": job_id_str})),

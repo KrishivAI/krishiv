@@ -814,7 +814,31 @@ impl ExecutorTaskRunner {
                 let timeout_secs = assignment
                     .task_timeout_secs()
                     .unwrap_or(DEFAULT_BATCH_TASK_TIMEOUT_SECS);
-                match tokio::time::timeout(
+                // Mid-execution abort (#217): watch the inbox tombstone while
+                // the fragment runs. Without this, a batch fragment already
+                // inside the engine runs to its end (or the timeout) no
+                // matter when the CancelTask RPC arrives — the pre-execution
+                // check above only covers cancels that beat the dequeue.
+                // Dropping the fragment future stops the work at its next
+                // await point. Caveat (inherent to async Rust, not this
+                // structure): a plan whose poll never yields — a pure
+                // in-memory aggregate draining an always-ready input inside
+                // one poll — cannot be preempted here; that class needs
+                // cooperative yield injection in the operators themselves.
+                // Fragments that touch storage or shuffle yield per batch.
+                let cancel_watch = async {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        if self
+                            .inbox
+                            .is_task_cancelled(assignment.task_id())
+                            .unwrap_or(false)
+                        {
+                            return;
+                        }
+                    }
+                };
+                let fragment = tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
                     erased(execute_batch_fragment(
                         self,
@@ -822,13 +846,34 @@ impl ExecutorTaskRunner {
                         udf_limits,
                         memory_budget,
                     )),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_elapsed) => Err(ExecutorError::InvalidAssignment {
-                        message: format!("task timed out after {} seconds", timeout_secs),
-                    }),
+                );
+                tokio::select! {
+                    result = fragment => match result {
+                        Ok(result) => result,
+                        Err(_elapsed) => Err(ExecutorError::InvalidAssignment {
+                            message: format!("task timed out after {} seconds", timeout_secs),
+                        }),
+                    },
+                    () = cancel_watch => {
+                        self.clear_running_attempt(&assignment);
+                        let _ = self.inbox.clear_cancelled_task(assignment.task_id());
+                        let cancelled = self
+                            .send_task_status(
+                                &assignment,
+                                TaskState::Cancelled,
+                                "task cancelled by coordinator request",
+                                coordinator,
+                                None,
+                                Vec::new(),
+                            )
+                            .await?;
+                        return Ok(ExecutorTaskRunReport::new(
+                            assignment,
+                            ExecutorTaskOutput::cancelled(),
+                            running.disposition(),
+                            cancelled.disposition(),
+                        ));
+                    }
                 }
             }
             crate::ExecutionModel::Streaming if is_run_loop => {

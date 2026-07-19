@@ -413,6 +413,67 @@ async fn cancel_job_pushes_cancel_rpc_to_executor() {
     let _ = server.await;
 }
 
+/// #217: an Assigned (launched, dispatch-in-flight, not yet Running) batch
+/// task must also receive the CancelTask RPC — otherwise the executor never
+/// hears the cancel and runs the task to completion. The inbox tombstone
+/// makes delivery-before-arrival safe on the executor side.
+#[tokio::test]
+async fn cancel_job_pushes_cancel_rpc_for_assigned_batch_task() {
+    let service = RecordingExecutorTaskService::default();
+    let cancelled = service.cancelled_task_ids.clone();
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping assigned-cancel push test because loopback sockets are denied");
+            return;
+        }
+        Err(error) => panic!("failed to bind executor task gRPC listener: {error}"),
+    };
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(wire::v1::executor_task_server::ExecutorTaskServer::new(
+                service,
+            ))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let executor_id = ExecutorId::try_new("exec-cancel-assigned").unwrap();
+    let job_id = JobId::try_new("job-cancel-assigned").unwrap();
+    let mut coordinator =
+        Coordinator::active(CoordinatorId::try_new("coord-cancel-assigned").unwrap());
+    coordinator
+        .register_executor(
+            ExecutorDescriptor::new(executor_id.clone(), "pod-a", 1)
+                .with_task_endpoint(format!("http://{addr}")),
+        )
+        .unwrap();
+    coordinator
+        .submit_job(single_task_job(job_id.clone()))
+        .unwrap();
+    // Launch assigns attempt 1 but the task stays Assigned — no Running
+    // status update ever arrives (the dispatch is "in flight").
+    let assignments = coordinator
+        .launch_assigned_task_assignments(&job_id)
+        .unwrap();
+    let expected_task = assignments[0].task_id().as_str().to_owned();
+
+    coordinator.push_cancel_job(&job_id).await.unwrap();
+
+    let snap = coordinator.job_snapshot(&job_id).unwrap();
+    assert_eq!(snap.state(), JobState::Cancelled);
+    assert_eq!(
+        cancelled.lock().unwrap().as_slice(),
+        std::slice::from_ref(&expected_task),
+        "the Assigned task must be told about the cancel"
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
 // --- Slice 6: Extended heartbeat + memory-aware placement ---
 
 #[test]

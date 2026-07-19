@@ -986,7 +986,14 @@ impl Coordinator {
             let job = self.find_job(job_id)?;
             for stage in job.stages() {
                 for task in stage.tasks() {
-                    if (task.state() == TaskState::Running || job_is_streaming)
+                    // Assigned counts too: a dispatch-in-flight batch task
+                    // would otherwise never hear the cancel and run to
+                    // completion (#217). Safe — the executor inbox
+                    // tombstones cancelled ids, and the runner checks the
+                    // tombstone after pop, so cancel-before-arrival reports
+                    // Cancelled instead of executing.
+                    if (matches!(task.state(), TaskState::Running | TaskState::Assigned)
+                        || job_is_streaming)
                         && let Some(executor_id) = task.assigned_executor()
                         && let Ok(record) = self.exec.executors.find_executor(executor_id)
                         && let Some(endpoint) = record.descriptor().task_endpoint()
