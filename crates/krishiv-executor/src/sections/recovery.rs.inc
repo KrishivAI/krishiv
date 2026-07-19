@@ -265,7 +265,7 @@ mod phase3_recovery {
                 },
                 fallback,
                 Arc::clone(&storage),
-                coordinator.clone(),
+                crate::runner::SharedCoordinatorClient(Arc::new(coordinator.clone())),
             )
             .await
             .unwrap();
@@ -352,7 +352,7 @@ mod phase3_recovery {
                     krishiv_state::RocksDbStateBackend::ephemeral().unwrap(),
                 ),
                 Arc::clone(&storage),
-                coordinator.clone(),
+                crate::runner::SharedCoordinatorClient(Arc::new(coordinator.clone())),
             )
             .await
             .unwrap();
@@ -555,7 +555,7 @@ mod phase3_recovery {
                     krishiv_state::RocksDbStateBackend::ephemeral().unwrap(),
                 ),
                 Arc::clone(&storage),
-                coordinator.clone(),
+                crate::runner::SharedCoordinatorClient(Arc::new(coordinator.clone())),
             )
             .await
             .unwrap();
@@ -758,7 +758,7 @@ mod phase3_recovery {
                         krishiv_state::RocksDbStateBackend::ephemeral().unwrap(),
                     ),
                     Arc::clone(&storage),
-                    coordinator.clone(),
+                    crate::runner::SharedCoordinatorClient(Arc::new(coordinator.clone())),
                 )
                 .await
                 .unwrap_or_else(|e| panic!("checkpoint at iteration {i} failed: {e}"));

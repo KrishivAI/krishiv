@@ -866,7 +866,7 @@ async fn checkpoint_ack_delivered() {
             req,
             crate::runner::CheckpointStateHandle::from_backend(backend),
             Arc::new(storage),
-            coordinator.clone(),
+            crate::runner::SharedCoordinatorClient(Arc::new(coordinator.clone())),
             Vec::new(),
         )
         .await
@@ -989,7 +989,7 @@ async fn checkpoint_ack_delivery_retries_transient_failure() {
             req,
             crate::runner::CheckpointStateHandle::from_backend(backend),
             Arc::new(storage),
-            coordinator.clone(),
+            crate::runner::SharedCoordinatorClient(Arc::new(coordinator.clone())),
             Vec::new(),
         )
         .await
@@ -1108,7 +1108,7 @@ async fn checkpoint_fanout_uses_running_attempts_without_preexisting_task_runner
             &req,
             crate::runner::CheckpointStateHandle::from_backend(backend),
             Arc::new(storage) as Arc<dyn CheckpointStorage>,
-            coordinator.clone(),
+            crate::runner::SharedCoordinatorClient(Arc::new(coordinator.clone())),
         )
         .await
         .unwrap();
