@@ -143,10 +143,23 @@ enum WindowFnRegistration {
 /// (`DashMap` + `Mutex<VecDeque>`) which had a TOCTOU race: two threads could
 /// both see `len() < MAX` and both insert, growing the cache past the limit.
 struct PlanCache {
-    map: HashMap<String, datafusion::logical_expr::LogicalPlan>,
+    map: HashMap<String, (datafusion::logical_expr::LogicalPlan, std::time::Instant)>,
     order: VecDeque<String>,
     max: usize,
 }
+
+/// How long a cached logical plan stays valid.
+///
+/// A cached plan pins the table providers resolved at planning time —
+/// including the exact data-file listing of Iceberg catalog tables. Local
+/// writes clear the cache, but a table replaced by ANOTHER engine (a
+/// coordinator-mode executor landing a pipeline pull, a second daemon) is
+/// invisible here, and without a TTL a repeated query text served stale
+/// results forever (found live 2026-07-19: the jdbc-pull e2e's COUNT read
+/// 3 rows from a snapshot the executor had already replaced with 5).
+/// 30s matches CATALOG_CACHE_TTL — the staleness bound the catalog layer
+/// already accepts.
+const PLAN_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl PlanCache {
     fn new(max: usize) -> Self {
@@ -158,7 +171,10 @@ impl PlanCache {
     }
 
     fn get(&self, key: &str) -> Option<&datafusion::logical_expr::LogicalPlan> {
-        self.map.get(key)
+        self.map
+            .get(key)
+            .filter(|(_, at)| at.elapsed() < PLAN_CACHE_TTL)
+            .map(|(plan, _)| plan)
     }
 
     fn insert(&mut self, key: String, plan: datafusion::logical_expr::LogicalPlan) {
@@ -172,7 +188,7 @@ impl PlanCache {
             self.map.remove(&oldest);
         }
         self.order.push_back(key.clone());
-        self.map.insert(key, plan);
+        self.map.insert(key, (plan, std::time::Instant::now()));
     }
 
     fn clear(&mut self) {
