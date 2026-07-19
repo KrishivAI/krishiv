@@ -62,6 +62,7 @@ pub mod catalog;
 pub mod cep_sql;
 
 pub mod connector_table;
+pub mod coop_amplifiers;
 pub mod create_function_ddl;
 pub mod distributed_plan;
 pub mod grammar;
@@ -827,6 +828,9 @@ impl SqlEngine {
 
         let mut state_builder = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
+            .with_physical_optimizer_rule(std::sync::Arc::new(
+                crate::coop_amplifiers::CooperativeAmplifiers::new(),
+            ))
             .with_config(build_single_node_session_config(
                 target_partitions,
                 memory_limit_bytes,
@@ -921,6 +925,9 @@ impl SqlEngine {
             Arc::new(RwLock::new(std::collections::HashSet::new()));
         let mut state = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
+            .with_physical_optimizer_rule(std::sync::Arc::new(
+                crate::coop_amplifiers::CooperativeAmplifiers::new(),
+            ))
             .with_config(build_single_node_session_config(target_partitions, None))
             .build();
         crate::connector_table::register_connector_table_factories(

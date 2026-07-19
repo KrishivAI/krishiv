@@ -2,6 +2,54 @@ use crate::*;
 
 #[cfg(test)]
 mod tests {
+    /// #217 probe: a long pure-compute aggregate must yield cooperatively
+    /// (DataFusion EnsureCooperative), or no timeout/cancel watcher can
+    /// ever preempt it. The timeout firing IS the assertion — on a
+    /// current-thread runtime it can only fire if execution yields.
+    #[tokio::test]
+    async fn heavy_aggregate_yields_cooperatively_for_timeouts() {
+        let engine = SqlEngine::new();
+        let values: String = (0..100)
+            .map(|i| format!("({i})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Ladder step 1: 4-way (10^8 rows) — must complete; times the
+        // execution rate so the 5-way bound below stays meaningful.
+        let sql4 = format!(
+            "SELECT sum(a.x * b.x + c.x * d.x) \
+             FROM (VALUES {values}) a(x), (VALUES {values}) b(x), \
+             (VALUES {values}) c(x), (VALUES {values}) d(x)"
+        );
+        let t = std::time::Instant::now();
+        let df = engine.sql(&sql4).await.unwrap();
+        df.collect().await.unwrap();
+        let four_way = t.elapsed();
+        eprintln!("4-way (1e8 rows) took {four_way:?}");
+
+        // Ladder step 2: 5-way (10^10 rows, ~100x step 1) under a short
+        // timeout — the timeout firing proves execution yields.
+        let sql5 = format!(
+            "SELECT sum(a.x * b.x + c.x * d.x + e.x) \
+             FROM (VALUES {values}) a(x), (VALUES {values}) b(x), \
+             (VALUES {values}) c(x), (VALUES {values}) d(x), (VALUES {values}) e(x)"
+        );
+        let df = engine.sql(&sql5).await.unwrap();
+        let t = std::time::Instant::now();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(2), df.collect()).await;
+        eprintln!("5-way probe returned after {:?}: timed_out={}", t.elapsed(), out.is_err());
+        assert!(
+            out.is_err(),
+            "10^10-row aggregate finished within 2s?! (it should time out — \
+             and the timeout firing proves execution yields cooperatively)"
+        );
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(10),
+            "timeout armed at 2s only fired after {:?} — execution is not \
+             yielding cooperatively",
+            t.elapsed()
+        );
+    }
+
     #[tokio::test]
     async fn typed_expression_ast_matches_raw_sql_execution() {
         use krishiv_plan::expression::{BinaryOperator, Expr, ScalarValue};

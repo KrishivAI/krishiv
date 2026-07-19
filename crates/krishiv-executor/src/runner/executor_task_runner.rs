@@ -820,12 +820,12 @@ impl ExecutorTaskRunner {
                 // matter when the CancelTask RPC arrives — the pre-execution
                 // check above only covers cancels that beat the dequeue.
                 // Dropping the fragment future stops the work at its next
-                // await point. Caveat (inherent to async Rust, not this
-                // structure): a plan whose poll never yields — a pure
-                // in-memory aggregate draining an always-ready input inside
-                // one poll — cannot be preempted here; that class needs
-                // cooperative yield injection in the operators themselves.
-                // Fragments that touch storage or shuffle yield per batch.
+                // await point. Plans yield cooperatively per batch: leaves
+                // via DataFusion's EnsureCooperative, and input-amplifying
+                // operators (cross/nested-loop joins) via krishiv-sql's
+                // CooperativeAmplifiers rule — without the latter, a pure
+                // in-memory aggregate over a cross join ran budget-free
+                // inside one poll and nothing could preempt it.
                 let cancel_watch = async {
                     loop {
                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;

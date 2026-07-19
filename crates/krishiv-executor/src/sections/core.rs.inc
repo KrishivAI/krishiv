@@ -126,6 +126,67 @@ async fn deregister_via_grpc_endpoint_transitions_executor_to_removed() {
     let _ = server.await;
 }
 
+/// #217: a cancel that arrives while the batch fragment is already
+/// executing must abort it promptly. The fragment is a cross-join sum
+/// sized for minutes of work; the select! watcher can only win because
+/// the CooperativeAmplifiers rule makes the join yield per output batch
+/// (without it, this exact plan ran budget-free inside one poll and
+/// nothing — not even the 30 s guard — could preempt it).
+#[tokio::test]
+async fn task_runner_aborts_batch_fragment_mid_execution_on_cancel() {
+    let inbox = ExecutorAssignmentInbox::new();
+    let runner = ExecutorTaskRunner::new(inbox.clone());
+
+    // 100^6 tuples with a per-row expression — count(*) alone constant-
+    // folds to the cardinality product, so sum() forces real evaluation.
+    let values: String = (0..100)
+        .map(|i| format!("({i})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "sql: SELECT sum(a.x * b.x + c.x * d.x + e.x * f.x) \
+         FROM (VALUES {values}) a(x), (VALUES {values}) b(x), \
+         (VALUES {values}) c(x), (VALUES {values}) d(x), (VALUES {values}) e(x), \
+         (VALUES {values}) f(x)"
+    );
+    let assignment = ExecutorTaskAssignment::new(
+        TaskAttemptRef::new(
+            JobId::try_new("job-cancel-mid").unwrap(),
+            StageId::try_new("stage-1").unwrap(),
+            TaskId::try_new("task-cancel-mid-1").unwrap(),
+            AttemptId::initial(),
+        ),
+        ExecutorId::try_new("exec-1").unwrap(),
+        LeaseGeneration::initial(),
+        PlanFragment::new(sql),
+        OutputContract::new(OutputContractKind::InlineRecordBatches, "inline"),
+    );
+
+    let task_id = assignment.task_id().clone();
+    let cancel_inbox = inbox.clone();
+    let canceller = tokio::spawn(async move {
+        // Let execution actually start before cancelling.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        cancel_inbox.cancel_task(&task_id).unwrap();
+    });
+
+    let service = AcceptingCoordinatorService;
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        runner.run_assignment_with(assignment, &service),
+    )
+    .await
+    .expect("cancel watcher must abort the fragment well before the 30s guard")
+    .unwrap();
+    canceller.await.unwrap();
+
+    assert_eq!(report.output().kind(), ExecutorTaskOutputKind::Cancelled);
+    assert_eq!(
+        report.terminal_disposition(),
+        TransportDisposition::Accepted
+    );
+}
+
 #[tokio::test]
 async fn task_runner_reports_cancelled_when_inbox_cancel_received() {
     let inbox = ExecutorAssignmentInbox::new();
