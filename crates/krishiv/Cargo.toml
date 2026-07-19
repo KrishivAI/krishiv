@@ -36,13 +36,13 @@ path = "src/main.rs"
 default = ["local"]
 
 # Build presets
-local   = ["embedded", "single-node", "jemalloc", "rest-catalog", "iceberg"]
-full    = ["single-node", "distributed", "k8s", "kafka", "iceberg", "cloud", "jemalloc", "jdbc"]
+local   = ["embedded", "single-node", "jemalloc", "rest-catalog", "iceberg", "ui"]
+full    = ["single-node", "distributed", "k8s", "kafka", "iceberg", "cloud", "jemalloc", "jdbc", "ui"]
 # `prod`: the deployed-cluster preset. Everything a distributed cluster needs to
 # run real workloads — Kafka sources, Iceberg tables on object storage, the
 # distributed control plane. `build-fast-engine.sh` builds THIS, not bare
 # default, so shipped images never silently lack kafka/cloud.
-prod    = ["distributed", "rest-catalog", "kafka", "iceberg", "cloud", "jemalloc", "jdbc"]
+prod    = ["distributed", "rest-catalog", "kafka", "iceberg", "cloud", "jemalloc", "jdbc", "ui"]
 
 # Deployment capability surfaces (gate optional dep families)
 embedded    = []                                                 # baseline; no optional deps
@@ -52,6 +52,10 @@ bare-metal  = ["distributed"]                                    # alias: proces
 k8s         = ["distributed", "dep:krishiv-operator", "krishiv-operator/k8s"]
 
 # Optional dependency families
+# ui: the embedded single-binary web UI (#216). Off the preset = the giant
+# krishiv-ui crate never compiles, which is what makes narrow leg builds
+# (single-node,rest-catalog,iceberg,jdbc) fast. All shipping presets keep it.
+ui = ["dep:krishiv-ui"]
 flight-sql = ["dep:krishiv-flight-sql"]
 # Platform catalog bridge: the local daemon can attach an Iceberg REST
 # catalog (KRISHIV_ICEBERG_REST_* env) so SQL resolves governed tables.
@@ -87,7 +91,7 @@ krishiv-state = { path = "../krishiv-state", version = "0.1.0" }
 krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["lakehouse"] }
 krishiv-metrics = { path = "../krishiv-metrics", version = "0.1.0" }
 krishiv-operator = { path = "../krishiv-operator", version = "0.1.0", optional = true, default-features = false }
-krishiv-ui = { path = "../krishiv-ui", version = "0.1.0" }
+krishiv-ui = { path = "../krishiv-ui", version = "0.1.0", optional = true }
 krishiv-mcp = { path = "../krishiv-mcp", version = "0.1.0" }
 krishiv-proto = { path = "../krishiv-proto", version = "0.1.0" }
 krishiv-scheduler = { path = "../krishiv-scheduler", version = "0.1.0" }

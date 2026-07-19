@@ -127,13 +127,27 @@ fn run_clusterd(args: &[String]) -> i32 {
     }
 }
 
+#[cfg(feature = "ui")]
 fn build_ui_http_factory() -> Option<Box<dyn FnOnce(SharedCoordinator) -> axum::Router<()> + Send>>
 {
+    // Runtime off-switch (approved surface ruling): KRISHIV_UI=off boots
+    // the daemon without the embedded UI even in a ui-featured build.
+    if std::env::var("KRISHIV_UI").is_ok_and(|v| v.eq_ignore_ascii_case("off")) {
+        tracing::info!("embedded UI disabled by KRISHIV_UI=off");
+        return None;
+    }
     Some(Box::new(|shared: SharedCoordinator| {
         let engine = krishiv_sql::SqlEngine::new();
         let ui_state = krishiv_ui::UiState::from_shared_coordinator(shared).with_sql_engine(engine);
         krishiv_ui::embedded_router(ui_state)
     }))
+}
+
+/// Built without the `ui` feature (#216): the daemon serves no embedded UI.
+#[cfg(not(feature = "ui"))]
+fn build_ui_http_factory() -> Option<Box<dyn FnOnce(SharedCoordinator) -> axum::Router<()> + Send>>
+{
+    None
 }
 
 /// Build a Flight SQL sidecar factory when `config.flight_addr` is set.

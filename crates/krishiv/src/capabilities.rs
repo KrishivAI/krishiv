@@ -86,6 +86,11 @@ pub fn all() -> Vec<Capability> {
             enabled: cfg!(feature = "jemalloc"),
             description: "jemalloc global allocator",
         },
+        Capability {
+            name: "ui",
+            enabled: cfg!(feature = "ui"),
+            description: "embedded web UI (runtime off-switch: KRISHIV_UI=off)",
+        },
     ]
 }
 

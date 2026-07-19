@@ -22,7 +22,7 @@ use std::sync::Arc;
 use datafusion::common::Result;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::physical_plan::{DisplayAs, ExecutionPlan};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::joins::{CrossJoinExec, NestedLoopJoinExec};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
