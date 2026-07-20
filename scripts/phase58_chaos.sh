@@ -32,23 +32,35 @@ retry_engine() {
   done
 }
 
+# Every retry_* / while-loop above these helpers assumes a failed attempt
+# returns promptly so the loop's own deadline can be re-checked. A fault that
+# kills or partitions a pod mid-request can leave curl's TCP connection
+# half-dead with no RST, and plain curl blocks on that indefinitely — which
+# silently defeats every enclosing bound (a real 2026-07-20 gate hang: the
+# streaming-workload teardown's `while ! http_delete ...` loop never got past
+# its first attempt because that attempt never returned, even though the
+# coordinator itself was healthy and served a fresh identical request in
+# under 200ms). Bound each attempt here, once, so every call site inherits it.
+CURL_CONNECT_TIMEOUT_S=5
+CURL_MAX_TIME_S=20
+
 http() {
   local path="$1"
   kubectl -n "$NS" exec "$DRIVER" -c curl -- sh -ec \
-    'curl -fsS -H "Authorization: Bearer ${COORD_TOKEN}" "http://phase58-coordinator:2002'"$path"'"'
+    'curl -fsS --connect-timeout '"$CURL_CONNECT_TIMEOUT_S"' -m '"$CURL_MAX_TIME_S"' -H "Authorization: Bearer ${COORD_TOKEN}" "http://phase58-coordinator:2002'"$path"'"'
 }
 
 http_post() {
   local path="$1" payload="$2"
   kubectl -n "$NS" exec "$DRIVER" -c curl -- sh -ec \
-    'curl -fsS -H "Authorization: Bearer ${COORD_TOKEN}" -H "Content-Type: application/json" -d "$1" "http://phase58-coordinator:2002'"$path"'"' \
+    'curl -fsS --connect-timeout '"$CURL_CONNECT_TIMEOUT_S"' -m '"$CURL_MAX_TIME_S"' -H "Authorization: Bearer ${COORD_TOKEN}" -H "Content-Type: application/json" -d "$1" "http://phase58-coordinator:2002'"$path"'"' \
     phase58 "$payload"
 }
 
 http_delete() {
   local path="$1"
   kubectl -n "$NS" exec "$DRIVER" -c curl -- sh -ec \
-    'curl -fsS -X DELETE -H "Authorization: Bearer ${COORD_TOKEN}" "http://phase58-coordinator:2002'"$path"'"'
+    'curl -fsS --connect-timeout '"$CURL_CONNECT_TIMEOUT_S"' -m '"$CURL_MAX_TIME_S"' -X DELETE -H "Authorization: Bearer ${COORD_TOKEN}" "http://phase58-coordinator:2002'"$path"'"'
 }
 
 # HTTP counterparts of retry_engine: the failover SLO allows up to 30s with no

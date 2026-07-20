@@ -30,6 +30,14 @@ impl Coordinator {
             if existing.read_record().state().is_terminal() {
                 let job_id = spec.job_id().clone();
                 self.evict_completed_job(&job_id);
+                // Clear the durable store's terminal-job latch (see
+                // `NonBlockingStoreHandle::terminal_jobs`): this id is being
+                // deliberately reused, so the fresh, non-terminal record this
+                // call is about to persist must not be mistaken for the stale
+                // write the latch exists to reject.
+                if let Some(store) = &self.store {
+                    store.forget_terminal_job(job_id.as_str());
+                }
             } else {
                 return Err(SchedulerError::DuplicateJob {
                     job_id: spec.job_id().clone(),
@@ -293,8 +301,7 @@ impl Coordinator {
                 job_id: job_id.clone(),
             })?;
         if sync {
-            let mut guard = store.inner();
-            guard.save_job(&record)?;
+            store.save_job_checked(&record)?;
         } else {
             store.save_job(&record);
         }
@@ -767,8 +774,10 @@ impl Coordinator {
                 || krishiv_common::profile_requires_fail_closed_metadata(self.durability_profile)
             {
                 // Durable profiles require synchronous metadata commits for all task updates.
-                let mut guard = store.inner();
-                guard.save_job(&record)?;
+                // Latch-checked: this is the other path (besides cancel_job) through
+                // which a job's record can reach a durably terminal state, and it
+                // must be protected from the same stale-write resurrection race.
+                store.save_job_checked(&record)?;
             } else {
                 store.save_job(&record);
             }

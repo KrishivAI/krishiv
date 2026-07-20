@@ -1286,6 +1286,49 @@ pub struct NonBlockingStoreHandle {
     /// Handle to the background store drain task.  When all clones are dropped the
     /// handle is dropped (the task auto-terminates on channel close).
     _bg_task: std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Job ids already durably persisted in a terminal state (Cancelled /
+    /// Succeeded / Failed), guarding against a resurrection race: a `SaveJob`
+    /// enqueued *before* a cancellation (e.g. a routine task-update persist)
+    /// can still be sitting in the channel when the cancellation's own
+    /// synchronous, must-be-durable write (see `cancel_job`) completes and
+    /// returns 200 to the caller. If the background worker then dequeues that
+    /// older command, it silently overwrites the just-committed terminal
+    /// record with stale non-terminal data — a coordinator restart afterward
+    /// reloads that stale record and resurrects an already-cancelled job,
+    /// which then cycles forever in the stuck-Assigned reclaim loop (observed
+    /// live on the Phase 58 HA chaos gate, 2026-07-20: `r1-i1-streaming`
+    /// stayed Running and kept consuming an executor slot 38+ minutes after
+    /// its own deregister call had already returned `{"cancelled":true}`).
+    /// Every write that would regress a latched id back to non-terminal is
+    /// skipped; [`Self::forget_terminal_job`] clears the latch for the
+    /// documented, legitimate job-id-reuse path (a fresh `submit_job` after a
+    /// full deregister).
+    terminal_jobs: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+/// Returns `true` if `record` should be written, `false` if this write must be
+/// skipped as a stale attempt to regress an already-terminal job back to a
+/// non-terminal state. See the `terminal_jobs` field doc for why this exists.
+fn admit_job_write(
+    terminal_jobs: &std::sync::Mutex<std::collections::HashSet<String>>,
+    record: &JobRecord,
+) -> bool {
+    let job_id = record.job_id().as_str();
+    let mut terminal = terminal_jobs.lock().unwrap_or_else(|p| p.into_inner());
+    if record.state().is_terminal() {
+        terminal.insert(job_id.to_owned());
+        true
+    } else if terminal.contains(job_id) {
+        tracing::warn!(
+            job_id = %job_id,
+            "NonBlockingStoreHandle: refusing to persist a non-terminal record over an \
+             already-terminal job (stale/delayed write — this is what a resurrection race \
+             looks like; see the `terminal_jobs` field doc)"
+        );
+        false
+    } else {
+        true
+    }
 }
 
 impl std::fmt::Debug for NonBlockingStoreHandle {
@@ -1307,6 +1350,19 @@ impl NonBlockingStoreHandle {
     /// writes become non-blocking.  Otherwise writes happen synchronously in
     /// the calling thread (safe for unit tests and startup code).
     pub fn new(store: impl MetadataStore + 'static) -> Self {
+        // Seed the terminal-job latch from whatever the store already has on
+        // disk (e.g. a warm reconnect) before `store` is moved into the Mutex
+        // below, so a write racing in immediately after construction is
+        // protected too, not just ones persisted during this process's life.
+        let terminal_jobs: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> = {
+            let initial: std::collections::HashSet<String> = store
+                .jobs()
+                .iter()
+                .filter(|record| record.state().is_terminal())
+                .map(|record| record.job_id().as_str().to_owned())
+                .collect();
+            std::sync::Arc::new(std::sync::Mutex::new(initial))
+        };
         let inner: std::sync::Arc<std::sync::Mutex<dyn MetadataStore + 'static>> =
             std::sync::Arc::new(std::sync::Mutex::new(store));
 
@@ -1316,6 +1372,7 @@ impl NonBlockingStoreHandle {
         let tx = if tokio::runtime::Handle::try_current().is_ok() {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<StoreCommand>(STORE_CHANNEL_CAPACITY);
             let bg_store = std::sync::Arc::clone(&inner);
+            let bg_terminal_jobs = std::sync::Arc::clone(&terminal_jobs);
             let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let notify = std::sync::Arc::new(tokio::sync::Notify::new());
             let handle = tokio::spawn(async move {
@@ -1341,6 +1398,13 @@ impl NonBlockingStoreHandle {
                             .ok();
                         }
                         StoreCommand::SaveJob(record) => {
+                            // This command may have been enqueued well before it is
+                            // dequeued here; if a synchronous terminal-state write
+                            // (cancel_job et al.) has since latched this job_id, this
+                            // is exactly the stale write the latch exists to catch.
+                            if !admit_job_write(&bg_terminal_jobs, &record) {
+                                continue;
+                            }
                             in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             let bg = std::sync::Arc::clone(&bg_store);
                             let in_flight_done = std::sync::Arc::clone(&in_flight);
@@ -1405,6 +1469,7 @@ impl NonBlockingStoreHandle {
             tx,
             fail_closed_writes: false,
             _bg_task: bg_task,
+            terminal_jobs,
         }
     }
 
@@ -1423,10 +1488,47 @@ impl NonBlockingStoreHandle {
     }
 
     fn save_job_sync(&self, record: &JobRecord) {
+        if !admit_job_write(&self.terminal_jobs, record) {
+            return;
+        }
         let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Err(e) = guard.save_job(record) {
             tracing::error!(error = %e, "NonBlockingStoreHandle: save_job failed (sync fallback)");
         }
+    }
+
+    /// Clear the terminal-job latch for `job_id`, allowing a fresh, legitimate
+    /// resubmission under the same id to persist normally. Callers must only
+    /// invoke this at the point a reused id is deliberately being replaced
+    /// (see `Coordinator::submit_job`'s terminal-id-reuse branch) — clearing
+    /// it any earlier would reopen the resurrection race this latch closes.
+    pub fn forget_terminal_job(&self, job_id: &str) {
+        let mut terminal = self
+            .terminal_jobs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        terminal.remove(job_id);
+    }
+
+    /// Synchronous, latch-checked, error-propagating job save.
+    ///
+    /// This is the method every "must be durable before returning" caller
+    /// (`cancel_job` et al., via `Coordinator::persist_job_record(_, true)`)
+    /// should use instead of reaching into [`Self::inner`] directly. Calling
+    /// `.inner().save_job(...)` bypasses this handle's own methods entirely —
+    /// which is exactly the gap that shipped in this latch's first version:
+    /// `persist_job_record`'s sync branch used `.inner()` directly, so
+    /// `cancel_job`'s durable write never passed through [`admit_job_write`]
+    /// and never actually latched the job_id, making the whole terminal-jobs
+    /// mechanism a no-op for the one call site it exists to protect (found
+    /// live: a job cancelled through this exact path still resurrected after
+    /// a later coordinator restart, on the very first post-fix gate rerun).
+    pub(crate) fn save_job_checked(&self, record: &JobRecord) -> SchedulerResult<()> {
+        if !admit_job_write(&self.terminal_jobs, record) {
+            return Ok(());
+        }
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        guard.save_job(record)
     }
 
     /// Access the underlying store for reads (blocks on mutex).
@@ -1769,5 +1871,108 @@ mod job_completed_event_tests {
             }
             _ => panic!("expected JobCompleted, got {round:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod terminal_job_latch_tests {
+    use super::*;
+    use crate::job_spec_from_logical_plan;
+    use krishiv_plan::{ExecutionKind, LogicalPlan};
+
+    fn job_record(id: &str) -> JobRecord {
+        let job_id = JobId::try_new(id).unwrap();
+        let spec =
+            job_spec_from_logical_plan(job_id, &LogicalPlan::new("test", ExecutionKind::Batch))
+                .unwrap();
+        JobRecord::from_spec(spec, 1)
+    }
+
+    /// Direct unit test of the admission rule `admit_job_write` enforces:
+    /// once a job_id is latched terminal, a write attempting to regress it
+    /// back to non-terminal is rejected; clearing the latch (what
+    /// `submit_job`'s terminal-id-reuse branch does via
+    /// `forget_terminal_job`) is what re-opens it for a legitimate
+    /// resubmission.
+    #[test]
+    fn admit_job_write_rejects_a_stale_regression_but_allows_legitimate_reuse() {
+        let latch: std::sync::Mutex<std::collections::HashSet<String>> =
+            std::sync::Mutex::new(std::collections::HashSet::new());
+
+        // Ordinary non-terminal write before any cancellation: admitted,
+        // latch untouched.
+        let running = job_record("job-a");
+        assert!(admit_job_write(&latch, &running));
+        assert!(latch.lock().unwrap().is_empty());
+
+        // The job is cancelled and durably persisted (this is `cancel_job`'s
+        // synchronous, must-be-durable write): admitted, and now latched.
+        let mut cancelled = job_record("job-a");
+        cancelled.state = JobState::Cancelled;
+        assert!(admit_job_write(&latch, &cancelled));
+        assert!(latch.lock().unwrap().contains("job-a"));
+
+        // A stale write from before the cancellation — e.g. a background
+        // command enqueued while the job was still Running that only gets
+        // dequeued after the sync cancel write already landed — must never
+        // resurrect it. This is the exact 2026-07-20 Phase 58 gate finding:
+        // `r1-i1-streaming` stayed Running and kept cycling in the
+        // stuck-Assigned reclaim loop for 38+ minutes after its own
+        // deregister call had already returned `{"cancelled":true}`.
+        let mut stale = job_record("job-a");
+        stale.state = JobState::Running;
+        assert!(
+            !admit_job_write(&latch, &stale),
+            "a stale non-terminal write must be rejected once the job is latched terminal"
+        );
+
+        // Legitimate id reuse (a fresh `continuous-register-sql`/`submit_job`
+        // after a full deregister) clears the latch first, so the new
+        // registration's write is admitted normally.
+        latch.lock().unwrap().remove("job-a");
+        let mut fresh = job_record("job-a");
+        fresh.state = JobState::Queued;
+        assert!(
+            admit_job_write(&latch, &fresh),
+            "after the latch is cleared for legitimate reuse, a fresh registration must be admitted"
+        );
+    }
+
+    /// End-to-end version through the real async plumbing (channel +
+    /// background worker, not just the pure decision function): a `SaveJob`
+    /// that reaches the store after the job is already durably cancelled must
+    /// not resurrect it, and `forget_terminal_job` must still let a
+    /// legitimate resubmission through afterward.
+    #[tokio::test]
+    async fn non_blocking_store_handle_rejects_a_stale_queued_write_after_cancellation() {
+        let handle = NonBlockingStoreHandle::new(InMemoryMetadataStore::default());
+
+        let mut cancelled = job_record("job-a");
+        cancelled.state = JobState::Cancelled;
+        handle.save_job(&cancelled);
+        handle.flush().await;
+        assert_eq!(handle.inner().jobs()[0].state(), JobState::Cancelled);
+
+        // A stale write for the same id landing after the cancellation is
+        // already durable — exactly what a delayed background command looks
+        // like from the store's point of view.
+        let mut stale = job_record("job-a");
+        stale.state = JobState::Running;
+        handle.save_job(&stale);
+        handle.flush().await;
+        assert_eq!(
+            handle.inner().jobs()[0].state(),
+            JobState::Cancelled,
+            "a stale write must never resurrect an already-cancelled job"
+        );
+
+        // Legitimate reuse: forget the latch, then a fresh registration
+        // persists normally.
+        handle.forget_terminal_job("job-a");
+        let mut fresh = job_record("job-a");
+        fresh.state = JobState::Queued;
+        handle.save_job(&fresh);
+        handle.flush().await;
+        assert_eq!(handle.inner().jobs()[0].state(), JobState::Queued);
     }
 }
