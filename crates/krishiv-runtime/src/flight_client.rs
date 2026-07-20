@@ -157,9 +157,13 @@ fn is_transient_status(e: &RuntimeError) -> bool {
         _ => return false,
     };
     // tonic encodes the gRPC status code name into the error string.
+    // "Cancelled" is deliberately NOT here: a server-side job cancel
+    // surfaces through this path, and retrying it silently resubmits the
+    // statement as a fresh job — the #217 live repro watched a cancelled
+    // query rise from the dead on the other executor and burn a core.
+    // Cancellation is an outcome, never a blip.
     msg.contains("Unavailable")
         || msg.contains("DeadlineExceeded")
-        || msg.contains("Cancelled")
         || msg.contains("connection refused")
         || msg.contains("connect failed")
 }
@@ -1253,6 +1257,26 @@ mod tests {
         }
         server.abort();
         Ok(())
+    }
+
+    /// #217: a server-side job cancel must surface as a permanent error —
+    /// classifying it transient made with_retry resubmit the statement as
+    /// a fresh job (the cancelled query rose from the dead live).
+    #[test]
+    fn cancelled_is_never_a_transient_error() {
+        let cancelled = RuntimeError::transport(
+            "batch SQL job batch-sql-1 failed: job finished in state Cancelled",
+        );
+        assert!(!is_transient_status(&cancelled));
+        let grpc_cancelled = RuntimeError::transport("status: Cancelled, message: ...");
+        assert!(!is_transient_status(&grpc_cancelled));
+        // The genuinely transient shapes stay retryable.
+        assert!(is_transient_status(&RuntimeError::transport(
+            "status: Unavailable"
+        )));
+        assert!(is_transient_status(&RuntimeError::transport(
+            "connection refused"
+        )));
     }
 
     #[tokio::test]

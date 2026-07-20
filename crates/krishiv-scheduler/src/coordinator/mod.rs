@@ -599,6 +599,14 @@ impl SharedCoordinator {
                 .collect()
         };
         for (job_id, jc) in jc_snapshots {
+            // Terminal jobs (Cancelled/Failed/Succeeded awaiting eviction)
+            // have no heartbeat work: consulting their JCP every tick is
+            // wasted lock traffic, and a cancelled job answering
+            // "eligible_for_launch=true" forever is a resurrection footgun
+            // waiting for a caller (#217 post-mortem).
+            if jc.read_record().state().is_terminal() {
+                continue;
+            }
             for lost in &lost {
                 let ts = krishiv_common::async_util::unix_now_ms() as u64;
                 let stale = jc.record_heartbeat_and_detect_stale(lost, ts);
