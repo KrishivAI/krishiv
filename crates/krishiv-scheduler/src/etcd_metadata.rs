@@ -27,7 +27,7 @@
 //! to the async etcd client, using `block_in_place` on multi-thread runtimes
 //! and a fallback runtime on current-thread or no-runtime callers.
 
-use etcd_client::{Client, GetOptions};
+use etcd_client::{Client, GetOptions, KeyValue, SortOrder, SortTarget};
 
 use crate::store::{
     ContinuousSnapshot, EventLogEvent, JobHistoryRecord, MAX_JOB_HISTORY, MetadataStore,
@@ -351,19 +351,78 @@ fn truncate_history(mut history: Vec<JobHistoryRecord>) -> Vec<JobHistoryRecord>
 
 /// Load all values under `prefix` from etcd, deserializing each as `P` then
 /// converting to `T` via `TryFrom`.
+/// Key-values fetched per etcd range page. etcd/tonic caps a single gRPC
+/// response at 4 MiB by default, and a `get(prefix, with_prefix)` returns
+/// the WHOLE range in one message — so an accumulated prefix (e.g. many
+/// IVM snapshots under `/krishiv/ivm/`) crashes the coordinator on startup
+/// once it crosses 4 MiB (observed 2026-07-20 on the Phase 58 HA cluster:
+/// a ~5 MB IVM prefix → "decoded message length too large: found 5027816
+/// bytes, the limit is 4194304"; a fresh/failover coordinator could then
+/// never load state — a hard availability cliff). Paginating the range
+/// keeps every response bounded no matter how large the prefix grows. A
+/// small page bounds a page even when individual snapshots are large.
+const ETCD_PAGE_LIMIT: i64 = 16;
+
+/// Lexicographic end of a prefix range: the smallest key strictly greater
+/// than every key under `prefix` (increment the last byte below 0xff,
+/// dropping trailing 0xff bytes). An all-0xff (or empty) prefix has no
+/// finite end → empty vec, which etcd range semantics read as "to the end
+/// of the keyspace".
+fn prefix_range_end(prefix: &str) -> Vec<u8> {
+    let mut end = prefix.as_bytes().to_vec();
+    while let Some(&last) = end.last() {
+        if last < 0xff {
+            *end.last_mut().unwrap() = last + 1;
+            return end;
+        }
+        end.pop();
+    }
+    Vec::new()
+}
+
+/// Read every key-value under `prefix` in bounded, key-ascending pages so
+/// no single etcd range response can exceed the gRPC decode limit. Each
+/// page resumes strictly past the previous page's last key.
+async fn get_prefix_paged(client: &mut Client, prefix: &str) -> Result<Vec<KeyValue>, String> {
+    let range_end = prefix_range_end(prefix);
+    let mut start = prefix.as_bytes().to_vec();
+    let mut out: Vec<KeyValue> = Vec::new();
+    loop {
+        let opts = GetOptions::new()
+            .with_range(range_end.clone())
+            .with_limit(ETCD_PAGE_LIMIT)
+            .with_sort(SortTarget::Key, SortOrder::Ascend);
+        let resp = client
+            .get(start.clone(), Some(opts))
+            .await
+            .map_err(|e| format!("etcd get prefix {prefix} failed: {e}"))?;
+        let kvs = resp.kvs();
+        if kvs.is_empty() {
+            break;
+        }
+        let page_len = kvs.len();
+        let last_key = kvs[page_len - 1].key().to_vec();
+        out.extend(kvs.iter().cloned());
+        if (page_len as i64) < ETCD_PAGE_LIMIT {
+            break;
+        }
+        // Resume strictly after the last key returned (append a 0 byte).
+        start = last_key;
+        start.push(0);
+    }
+    Ok(out)
+}
+
 async fn load_prefix<P, T>(client: &mut Client, prefix: &str) -> Result<Vec<T>, String>
 where
     P: serde::de::DeserializeOwned,
     T: TryFrom<P>,
     <T as TryFrom<P>>::Error: std::fmt::Display,
 {
-    let resp = client
-        .get(prefix, Some(GetOptions::new().with_prefix()))
-        .await
-        .map_err(|e| format!("etcd get prefix {prefix} failed: {e}"))?;
+    let kvs = get_prefix_paged(client, prefix).await?;
 
-    let mut results = Vec::with_capacity(resp.kvs().len());
-    for kv in resp.kvs() {
+    let mut results = Vec::with_capacity(kvs.len());
+    for kv in &kvs {
         let persisted: P = serde_json::from_slice(kv.value()).map_err(|e| {
             format!(
                 "etcd decode failed for key {}: {e}",
@@ -385,13 +444,10 @@ async fn load_json_prefix<T>(client: &mut Client, prefix: &str) -> Result<Vec<T>
 where
     T: serde::de::DeserializeOwned,
 {
-    let resp = client
-        .get(prefix, Some(GetOptions::new().with_prefix()))
-        .await
-        .map_err(|e| format!("etcd get prefix {prefix} failed: {e}"))?;
+    let kvs = get_prefix_paged(client, prefix).await?;
 
-    let mut results = Vec::with_capacity(resp.kvs().len());
-    for kv in resp.kvs() {
+    let mut results = Vec::with_capacity(kvs.len());
+    for kv in &kvs {
         let record: T = serde_json::from_slice(kv.value()).map_err(|e| {
             format!(
                 "etcd decode failed for key {}: {e}",
@@ -406,13 +462,10 @@ where
 async fn load_continuous_snapshots(
     client: &mut Client,
 ) -> Result<std::collections::HashMap<String, ContinuousSnapshot>, String> {
-    let resp = client
-        .get(CONTINUOUS_KEY_PREFIX, Some(GetOptions::new().with_prefix()))
-        .await
-        .map_err(|e| format!("etcd get prefix {CONTINUOUS_KEY_PREFIX} failed: {e}"))?;
+    let kvs = get_prefix_paged(client, CONTINUOUS_KEY_PREFIX).await?;
 
-    let mut snapshots = std::collections::HashMap::with_capacity(resp.kvs().len());
-    for kv in resp.kvs() {
+    let mut snapshots = std::collections::HashMap::with_capacity(kvs.len());
+    for kv in &kvs {
         let key = kv.key_str().unwrap_or("?");
         let job_id = key
             .strip_prefix(CONTINUOUS_KEY_PREFIX)
@@ -428,12 +481,9 @@ async fn load_binary_prefix(
     client: &mut Client,
     prefix: &str,
 ) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
-    let resp = client
-        .get(prefix, Some(GetOptions::new().with_prefix()))
-        .await
-        .map_err(|e| format!("etcd get prefix {prefix} failed: {e}"))?;
-    let mut snapshots = std::collections::HashMap::with_capacity(resp.kvs().len());
-    for kv in resp.kvs() {
+    let kvs = get_prefix_paged(client, prefix).await?;
+    let mut snapshots = std::collections::HashMap::with_capacity(kvs.len());
+    for kv in &kvs {
         let key = kv.key_str().unwrap_or("?");
         let job_id = key
             .strip_prefix(prefix)
@@ -471,6 +521,28 @@ mod tests {
             "/krishiv/continuous/job-stream-1"
         );
         assert_eq!(history_key("job-batch-1"), "/krishiv/history/job-batch-1");
+    }
+
+    #[test]
+    fn prefix_range_end_covers_every_key_under_the_prefix() {
+        // The end must be strictly greater than every "<prefix><suffix>" key
+        // and strictly less than the next unrelated prefix, so a paged range
+        // scan reads exactly the prefix's keys and stops.
+        let end = prefix_range_end(IVM_KEY_PREFIX);
+        assert_eq!(end, b"/krishiv/ivm0"); // '/' (0x2f) -> '0' (0x30)
+        let under = b"/krishiv/ivm/some-job-id".to_vec();
+        assert!(under.as_slice() < end.as_slice(), "a prefixed key sorts before the range end");
+        assert!(IVM_KEY_PREFIX.as_bytes() < end.as_slice(), "the prefix itself sorts before its end");
+    }
+
+    #[test]
+    fn prefix_range_end_increments_the_last_byte() {
+        // The last byte is incremented (0xff never appears in a &str prefix,
+        // so the carry/pop branch is defensive-only). Every real prefix here
+        // ends in '/', which increments to '0'.
+        assert_eq!(prefix_range_end("ab"), b"ac");
+        assert_eq!(prefix_range_end(JOB_KEY_PREFIX), b"/krishiv/jobs0");
+        assert_eq!(prefix_range_end(HISTORY_KEY_PREFIX), b"/krishiv/history0");
     }
 
     #[test]
