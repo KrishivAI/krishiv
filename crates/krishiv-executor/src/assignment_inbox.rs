@@ -86,7 +86,20 @@ impl SeenSet {
 #[derive(Debug, Clone)]
 pub struct ExecutorAssignmentInbox {
     assignments: Arc<RwLock<VecDeque<ExecutorTaskAssignment>>>,
-    cancelled_tasks: Arc<RwLock<BTreeSet<krishiv_proto::TaskId>>>,
+    /// Keyed by `(JobId, TaskId)`, not bare `TaskId`: continuous/streaming
+    /// jobs deliberately reuse deterministic task ids (`task-streaming`)
+    /// across different job incarnations (see `forget_job`'s doc comment), so
+    /// a bare-`TaskId` set lets a cancel tombstone from one job's teardown
+    /// leak forward and insta-cancel an unrelated later job's task the
+    /// moment it lands on the same executor — live-repro'd in the Phase 58
+    /// chaos gate as a streaming job whose task went Running then Cancelled
+    /// 41ms later with no execution in between, because an earlier streaming
+    /// job's teardown cancel had planted the bare "task-streaming" tombstone
+    /// here without `cancel_task`'s `had_cycle_executor` eager-clear firing
+    /// (that guard can legitimately be false — e.g. the cancel races ahead of
+    /// this job's own cycle-executor registration — even when this executor
+    /// is the correct, intended cancel target).
+    cancelled_tasks: Arc<RwLock<BTreeSet<(krishiv_proto::JobId, krishiv_proto::TaskId)>>>,
     seen: Arc<RwLock<SeenSet>>,
     /// None = unbounded (legacy / test default). Some(n) = hard limit.
     max_capacity: Option<usize>,
@@ -215,10 +228,15 @@ impl ExecutorAssignmentInbox {
             .pop_front())
     }
 
-    /// Cancel and remove queued assignments for a task id.
+    /// Cancel and remove queued assignments for `(job_id, task_id)`.
     ///
-    /// Also marks the task id as cancelled so the runner can skip execution even
+    /// Also marks the pair as cancelled so the runner can skip execution even
     /// if the task has already been popped from the queue.
+    ///
+    /// Scoped by job id, not bare task id: continuous/streaming jobs reuse
+    /// deterministic task ids across incarnations (see [`Self::forget_job`]),
+    /// so matching on task id alone would let one job's cancel remove or
+    /// tombstone a same-named task belonging to a different, unrelated job.
     ///
     /// Lock order: `seen` → `assignments` → `cancelled_tasks`. This matches the
     /// order used by [`push_with_outcome`] (`seen` → `assignments`), so a
@@ -226,7 +244,11 @@ impl ExecutorAssignmentInbox {
     /// `seen`'s write-lock across the queue mutation so that no `push` can
     /// observe a key already removed from `assignments` while still seeing it
     /// in `seen` (which would block a legitimate re-push).
-    pub fn cancel_task(&self, task_id: &krishiv_proto::TaskId) -> ExecutorResult<bool> {
+    pub fn cancel_task(
+        &self,
+        job_id: &krishiv_proto::JobId,
+        task_id: &krishiv_proto::TaskId,
+    ) -> ExecutorResult<bool> {
         let mut seen = self
             .seen
             .write()
@@ -238,7 +260,7 @@ impl ExecutorAssignmentInbox {
         let before = assignments.len();
         let mut removed_keys = Vec::new();
         assignments.retain(|assignment| {
-            let remove = assignment.task_id() == task_id;
+            let remove = assignment.job_id() == job_id && assignment.task_id() == task_id;
             if remove {
                 removed_keys.push((
                     assignment.job_id().clone(),
@@ -257,16 +279,18 @@ impl ExecutorAssignmentInbox {
         self.cancelled_tasks
             .write()
             .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?
-            .insert(task_id.clone());
+            .insert((job_id.clone(), task_id.clone()));
         Ok(removed)
     }
 
-    /// Retire a job's identity from this inbox: drop its queued assignments
-    /// and every `(job, task, attempt)` dedupe entry. Called when a job is
-    /// torn down (continuous deregister/cancel) so a *recreated* job reusing
-    /// the same deterministic ids (`stage-streaming`/`task-streaming`,
-    /// attempts from 1) is a new incarnation, not an at-least-once duplicate
-    /// to be silently swallowed. Returns how many dedupe entries were purged.
+    /// Retire a job's identity from this inbox: drop its queued assignments,
+    /// every `(job, task, attempt)` dedupe entry, and any cancel tombstone
+    /// still held for it. Called when a job is torn down (continuous
+    /// deregister/cancel) so a *recreated* job reusing the same deterministic
+    /// ids (`stage-streaming`/`task-streaming`, attempts from 1) is a new
+    /// incarnation, not an at-least-once duplicate to be silently swallowed —
+    /// and, symmetrically, not one insta-cancelled by a tombstone this same
+    /// retired job left behind. Returns how many dedupe entries were purged.
     ///
     /// Lock order matches [`push_with_outcome`]: `seen` → `assignments`.
     pub fn forget_job(&self, job_id: &krishiv_proto::JobId) -> ExecutorResult<usize> {
@@ -280,24 +304,39 @@ impl ExecutorAssignmentInbox {
             .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
         assignments.retain(|assignment| assignment.job_id() != job_id);
         let purged = seen.remove_job(job_id);
+        drop(assignments);
+        drop(seen);
+        self.cancelled_tasks
+            .write()
+            .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?
+            .retain(|(job, _)| job != job_id);
         Ok(purged)
     }
 
-    /// Whether a task id has been cancelled.
-    pub fn is_task_cancelled(&self, task_id: &krishiv_proto::TaskId) -> ExecutorResult<bool> {
+    /// Whether `(job_id, task_id)` has been cancelled.
+    pub fn is_task_cancelled(
+        &self,
+        job_id: &krishiv_proto::JobId,
+        task_id: &krishiv_proto::TaskId,
+    ) -> ExecutorResult<bool> {
         Ok(self
             .cancelled_tasks
             .read()
             .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?
-            .contains(task_id))
+            .contains(&(job_id.clone(), task_id.clone())))
     }
 
-    /// Remove a task id from the cancelled set after the runner has handled it.
-    pub fn clear_cancelled_task(&self, task_id: &krishiv_proto::TaskId) -> ExecutorResult<()> {
+    /// Remove `(job_id, task_id)` from the cancelled set after the runner has
+    /// handled it.
+    pub fn clear_cancelled_task(
+        &self,
+        job_id: &krishiv_proto::JobId,
+        task_id: &krishiv_proto::TaskId,
+    ) -> ExecutorResult<()> {
         self.cancelled_tasks
             .write()
             .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?
-            .remove(task_id);
+            .remove(&(job_id.clone(), task_id.clone()));
         Ok(())
     }
 
@@ -459,8 +498,9 @@ mod tests {
         let inbox = ExecutorAssignmentInbox::new();
         inbox.push(make_assignment("task-1")).unwrap();
         inbox.push(make_assignment("task-2")).unwrap();
+        let job_id = JobId::try_new("job-1").unwrap();
         let task_id = TaskId::try_new("task-1").unwrap();
-        let removed = inbox.cancel_task(&task_id).unwrap();
+        let removed = inbox.cancel_task(&job_id, &task_id).unwrap();
         assert!(removed);
         assert_eq!(inbox.len().unwrap(), 1);
         assert_eq!(
@@ -472,28 +512,71 @@ mod tests {
     #[test]
     fn cancel_task_marks_as_cancelled() {
         let inbox = ExecutorAssignmentInbox::new();
+        let job_id = JobId::try_new("job-1").unwrap();
         let task_id = TaskId::try_new("task-1").unwrap();
-        inbox.cancel_task(&task_id).unwrap();
-        assert!(inbox.is_task_cancelled(&task_id).unwrap());
+        inbox.cancel_task(&job_id, &task_id).unwrap();
+        assert!(inbox.is_task_cancelled(&job_id, &task_id).unwrap());
     }
 
     #[test]
     fn cancel_task_not_in_queue_marks_cancelled() {
         let inbox = ExecutorAssignmentInbox::new();
+        let job_id = JobId::try_new("job-1").unwrap();
         let task_id = TaskId::try_new("task-1").unwrap();
-        let removed = inbox.cancel_task(&task_id).unwrap();
+        let removed = inbox.cancel_task(&job_id, &task_id).unwrap();
         assert!(!removed);
-        assert!(inbox.is_task_cancelled(&task_id).unwrap());
+        assert!(inbox.is_task_cancelled(&job_id, &task_id).unwrap());
     }
 
     #[test]
     fn clear_cancelled_task_removes_from_cancelled_set() {
         let inbox = ExecutorAssignmentInbox::new();
+        let job_id = JobId::try_new("job-1").unwrap();
         let task_id = TaskId::try_new("task-1").unwrap();
-        inbox.cancel_task(&task_id).unwrap();
-        assert!(inbox.is_task_cancelled(&task_id).unwrap());
-        inbox.clear_cancelled_task(&task_id).unwrap();
-        assert!(!inbox.is_task_cancelled(&task_id).unwrap());
+        inbox.cancel_task(&job_id, &task_id).unwrap();
+        assert!(inbox.is_task_cancelled(&job_id, &task_id).unwrap());
+        inbox.clear_cancelled_task(&job_id, &task_id).unwrap();
+        assert!(!inbox.is_task_cancelled(&job_id, &task_id).unwrap());
+    }
+
+    /// The bug this scoping closes: two different jobs whose task happens to
+    /// share the same literal task id (continuous/streaming jobs deliberately
+    /// reuse deterministic ids like `task-streaming` across incarnations —
+    /// see `forget_job`) must not be able to cancel each other. Live-repro'd
+    /// in the Phase 58 chaos gate as a brand-new streaming job insta-cancelled
+    /// by a stale tombstone an unrelated, already-torn-down streaming job
+    /// left behind on the same executor.
+    #[test]
+    fn cancel_task_does_not_affect_a_different_job_with_the_same_task_id() {
+        let inbox = ExecutorAssignmentInbox::new();
+        let job_a = JobId::try_new("job-a").unwrap();
+        let job_b = JobId::try_new("job-b").unwrap();
+        let task_id = TaskId::try_new("task-streaming").unwrap();
+
+        inbox.cancel_task(&job_a, &task_id).unwrap();
+
+        assert!(inbox.is_task_cancelled(&job_a, &task_id).unwrap());
+        assert!(
+            !inbox.is_task_cancelled(&job_b, &task_id).unwrap(),
+            "cancelling job A's task must never mark job B's same-named task cancelled"
+        );
+    }
+
+    /// `forget_job` must also purge any cancel tombstone left for the
+    /// retired job, so a long-lived executor process does not accumulate an
+    /// unbounded `cancelled_tasks` set across many short-lived jobs that
+    /// reuse the same deterministic ids.
+    #[test]
+    fn forget_job_purges_its_own_cancel_tombstone() {
+        let inbox = ExecutorAssignmentInbox::new();
+        let job_id = JobId::try_new("job-a").unwrap();
+        let task_id = TaskId::try_new("task-streaming").unwrap();
+
+        inbox.cancel_task(&job_id, &task_id).unwrap();
+        assert!(inbox.is_task_cancelled(&job_id, &task_id).unwrap());
+
+        inbox.forget_job(&job_id).unwrap();
+        assert!(!inbox.is_task_cancelled(&job_id, &task_id).unwrap());
     }
 
     #[test]
@@ -541,10 +624,11 @@ mod tests {
     fn cancel_queued_task_allows_same_attempt_to_be_requeued() {
         let inbox = ExecutorAssignmentInbox::new();
         let assignment = make_assignment("task-cancel-retry");
+        let job_id = assignment.job_id().clone();
         let task_id = assignment.task_id().clone();
         inbox.push(assignment.clone()).unwrap();
 
-        assert!(inbox.cancel_task(&task_id).unwrap());
+        assert!(inbox.cancel_task(&job_id, &task_id).unwrap());
         assert_eq!(
             inbox.push_with_outcome(assignment).unwrap(),
             AssignmentPushOutcome::Enqueued
@@ -599,10 +683,11 @@ mod tests {
         inbox.push(make_assignment("task-1")).unwrap();
         inbox.push(make_assignment("task-2")).unwrap();
         inbox.push(make_assignment("task-3")).unwrap();
+        let job_id = JobId::try_new("job-1").unwrap();
         let t1 = TaskId::try_new("task-1").unwrap();
         let t3 = TaskId::try_new("task-3").unwrap();
-        inbox.cancel_task(&t1).unwrap();
-        inbox.cancel_task(&t3).unwrap();
+        inbox.cancel_task(&job_id, &t1).unwrap();
+        inbox.cancel_task(&job_id, &t3).unwrap();
         assert_eq!(inbox.len().unwrap(), 1);
         assert_eq!(
             inbox.pop_next().unwrap().unwrap().task_id().as_str(),

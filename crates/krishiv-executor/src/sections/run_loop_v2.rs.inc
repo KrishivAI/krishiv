@@ -106,7 +106,10 @@ async fn run_rloop_job_to_completion(
     // Stop every subtask; the loop observes the tombstone and exits.
     for subtask in 0..parallelism {
         let task_id = TaskId::try_new(format!("task-streaming-{subtask}")).unwrap();
-        runner.inbox().cancel_task(&task_id).unwrap();
+        runner
+            .inbox()
+            .cancel_task(&JobId::try_new(job_id).unwrap(), &task_id)
+            .unwrap();
         runner.notify_continuous_input(&format!("{job_id}#task-streaming-{subtask}"));
     }
     runner.notify_continuous_input(job_id);
@@ -267,7 +270,10 @@ async fn run_loop_idle_tick_closes_session_windows_distributed() {
     }
 
     let task_id = TaskId::try_new("task-streaming-0").unwrap();
-    runner.inbox().cancel_task(&task_id).unwrap();
+    runner
+        .inbox()
+        .cancel_task(&JobId::try_new(job_id).unwrap(), &task_id)
+        .unwrap();
     runner.notify_continuous_input(&format!("{job_id}#task-streaming-0"));
     let output = handle.await.unwrap().unwrap();
     assert_eq!(output.kind(), ExecutorTaskOutputKind::Cancelled);

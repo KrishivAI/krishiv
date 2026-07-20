@@ -765,11 +765,13 @@ impl ExecutorTaskRunner {
         // instead of starting execution.
         if self
             .inbox
-            .is_task_cancelled(assignment.task_id())
+            .is_task_cancelled(assignment.job_id(), assignment.task_id())
             .map_err(|error| tonic::Status::internal(error.to_string()))?
         {
             self.clear_running_attempt(&assignment);
-            let _ = self.inbox.clear_cancelled_task(assignment.task_id());
+            let _ = self
+                .inbox
+                .clear_cancelled_task(assignment.job_id(), assignment.task_id());
             let cancelled = self
                 .send_task_status(
                     &assignment,
@@ -831,7 +833,7 @@ impl ExecutorTaskRunner {
                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         if self
                             .inbox
-                            .is_task_cancelled(assignment.task_id())
+                            .is_task_cancelled(assignment.job_id(), assignment.task_id())
                             .unwrap_or(false)
                         {
                             return;
@@ -856,7 +858,9 @@ impl ExecutorTaskRunner {
                     },
                     () = cancel_watch => {
                         self.clear_running_attempt(&assignment);
-                        let _ = self.inbox.clear_cancelled_task(assignment.task_id());
+                        let _ = self
+                            .inbox
+                            .clear_cancelled_task(assignment.job_id(), assignment.task_id());
                         let cancelled = self
                             .send_task_status(
                                 &assignment,

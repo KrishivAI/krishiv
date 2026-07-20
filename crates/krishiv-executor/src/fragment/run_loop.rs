@@ -637,7 +637,7 @@ pub(crate) async fn execute_run_loop_fragment(
         // Cancellation is the run-loop's only exit; check every iteration.
         if runner
             .inbox
-            .is_task_cancelled(assignment.task_id())
+            .is_task_cancelled(assignment.job_id(), assignment.task_id())
             .unwrap_or(false)
         {
             break;
@@ -892,7 +892,9 @@ pub(crate) async fn execute_run_loop_fragment(
     }
 
     runner.task_state_bindings.remove(&task_id);
-    let _ = runner.inbox.clear_cancelled_task(assignment.task_id());
+    let _ = runner
+        .inbox
+        .clear_cancelled_task(assignment.job_id(), assignment.task_id());
     tracing::info!(
         job_id,
         subtask = parsed.subtask,

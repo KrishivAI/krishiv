@@ -207,7 +207,7 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         }
         let removed = self
             .inbox
-            .cancel_task(request.task_id())
+            .cancel_task(request.job_id(), request.task_id())
             .map_err(|error| krishiv_metrics::grpc::internal_status("cancel task", &error))?;
         // A cancel for a job with a registered `stream:loop` executor is a
         // continuous-job teardown (the only producer of continuous cancels is
@@ -256,7 +256,7 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
             // cycle-model tombstones are cleared eagerly here.
             if had_cycle_executor && !had_rloop {
                 self.inbox
-                    .clear_cancelled_task(request.task_id())
+                    .clear_cancelled_task(job_id, request.task_id())
                     .map_err(|error| {
                         krishiv_metrics::grpc::internal_status(
                             "clear cancelled task tombstone",
