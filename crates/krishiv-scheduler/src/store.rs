@@ -1523,12 +1523,41 @@ impl NonBlockingStoreHandle {
     /// mechanism a no-op for the one call site it exists to protect (found
     /// live: a job cancelled through this exact path still resurrected after
     /// a later coordinator restart, on the very first post-fix gate rerun).
-    pub(crate) fn save_job_checked(&self, record: &JobRecord) -> SchedulerResult<()> {
+    ///
+    /// Returns `Ok(true)` if the write was admitted and performed, `Ok(false)`
+    /// if it was rejected as a stale write over an already-latched terminal
+    /// job (see [`admit_job_write`]). `Coordinator::submit_job` uses the
+    /// `false` case to refuse a resubmission outright rather than silently
+    /// proceeding to insert a job into the live in-memory registry whose
+    /// persist attempt was just dropped — the second gap this latch shipped
+    /// with: `submit_job` itself wrote through `.inner()` directly (never
+    /// gated at all), so a resubmission whose id was still latched from an
+    /// earlier, already-concluded lifecycle got a fresh in-memory
+    /// `JobCoordinator` that could never become durable again — it was
+    /// actively rescheduled (and, for a stuck-Assigned task, reaped) forever,
+    /// with every persist attempt silently rejected, live-repro'd in the
+    /// Phase 58 chaos gate as two streaming jobs that churned for over an
+    /// hour past their own cancellation.
+    pub(crate) fn save_job_checked(&self, record: &JobRecord) -> SchedulerResult<bool> {
         if !admit_job_write(&self.terminal_jobs, record) {
-            return Ok(());
+            return Ok(false);
         }
         let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        guard.save_job(record)
+        guard.save_job(record)?;
+        Ok(true)
+    }
+
+    /// Returns `true` if `job_id` is currently latched as terminal in this
+    /// handle's view (see the `terminal_jobs` field doc). Used by the
+    /// scheduler to detect — and self-heal — a job that is still non-terminal
+    /// in the live `job_coordinators` map despite the durable store already
+    /// considering its lifecycle concluded (see
+    /// `Coordinator::reconcile_store_latched_terminal_jobs`).
+    pub(crate) fn is_terminal_latched(&self, job_id: &str) -> bool {
+        self.terminal_jobs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(job_id)
     }
 
     /// Access the underlying store for reads (blocks on mutex).
@@ -1974,5 +2003,63 @@ mod terminal_job_latch_tests {
         handle.save_job(&fresh);
         handle.flush().await;
         assert_eq!(handle.inner().jobs()[0].state(), JobState::Queued);
+    }
+
+    /// `save_job_checked`'s return value is what `Coordinator::submit_job`
+    /// uses to decide whether a resubmission actually became durable, or was
+    /// silently dropped by the latch — the second Phase 58 #180 gap, where
+    /// `submit_job` used to write through `.inner()` directly (never gated at
+    /// all) and so never noticed a rejection. `Ok(true)` must mean "the store
+    /// now reflects this record"; `Ok(false)` must mean "nothing was written".
+    #[test]
+    fn save_job_checked_reports_whether_the_write_was_admitted() {
+        let handle = NonBlockingStoreHandle::new(InMemoryMetadataStore::default());
+
+        let mut cancelled = job_record("job-a");
+        cancelled.state = JobState::Cancelled;
+        assert!(
+            handle.save_job_checked(&cancelled).unwrap(),
+            "the first, terminal write for a fresh id must always be admitted"
+        );
+
+        let mut stale = job_record("job-a");
+        stale.state = JobState::Running;
+        assert!(
+            !handle.save_job_checked(&stale).unwrap(),
+            "a non-terminal write over an already-latched id must be reported \
+             as rejected, not silently treated as success"
+        );
+        assert_eq!(
+            handle.inner().jobs()[0].state(),
+            JobState::Cancelled,
+            "a rejected write must not have touched the store"
+        );
+
+        handle.forget_terminal_job("job-a");
+        let mut fresh = job_record("job-a");
+        fresh.state = JobState::Queued;
+        assert!(
+            handle.save_job_checked(&fresh).unwrap(),
+            "after the latch is cleared, the write must be admitted and reported as such"
+        );
+        assert_eq!(handle.inner().jobs()[0].state(), JobState::Queued);
+    }
+
+    /// `is_terminal_latched` is the read side `Coordinator::submit_job` and
+    /// `reconcile_store_latched_terminal_jobs` both depend on: it must track
+    /// exactly what `admit_job_write` has latched, independent of whatever a
+    /// job's in-memory record currently says.
+    #[test]
+    fn is_terminal_latched_reflects_the_current_latch_state() {
+        let handle = NonBlockingStoreHandle::new(InMemoryMetadataStore::default());
+        assert!(!handle.is_terminal_latched("job-a"));
+
+        let mut cancelled = job_record("job-a");
+        cancelled.state = JobState::Cancelled;
+        handle.save_job_checked(&cancelled).unwrap();
+        assert!(handle.is_terminal_latched("job-a"));
+
+        handle.forget_terminal_job("job-a");
+        assert!(!handle.is_terminal_latched("job-a"));
     }
 }

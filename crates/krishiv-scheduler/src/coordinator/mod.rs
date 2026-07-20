@@ -1845,6 +1845,54 @@ impl Coordinator {
         }
     }
 
+    /// Self-heal a job that is still non-terminal in the live
+    /// `job_coordinators` map despite the durable store already latching its
+    /// id as terminal (see `NonBlockingStoreHandle::terminal_jobs`).
+    ///
+    /// This divergence should be unreachable after the `submit_job` fix that
+    /// closed its one known cause: a resubmission for an id whose prior
+    /// lifecycle had already concluded bypassed the latch on write (via
+    /// `store.inner().save_job(...)` instead of `save_job_checked`), so the
+    /// fresh in-memory job it created could never become durable again — the
+    /// coordinator kept rescheduling it (and, for a stuck-Assigned task,
+    /// reaping it via `reset_stuck_assigned_tasks` above) forever, every
+    /// persist attempt silently rejected, live-repro'd in the Phase 58 chaos
+    /// gate as two streaming jobs that churned for over an hour past their
+    /// own recorded cancellation. This sweep is defense in depth: if the same
+    /// class of divergence is ever reintroduced by a different call site, the
+    /// coordinator reconciles to the store's already-latched answer — the one
+    /// proven correct by direct etcd inspection during that incident —
+    /// instead of scheduling and persisting-forever-in-vain a job that can
+    /// never durably record another state change.
+    pub(crate) fn reconcile_store_latched_terminal_jobs(&mut self) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let job_ids: Vec<JobId> = self.job_coordinators.keys().cloned().collect();
+        for job_id in job_ids {
+            let Some(jc) = self.job_coordinators.get(&job_id) else {
+                continue;
+            };
+            {
+                let record = jc.read_record();
+                if record.state().is_terminal() {
+                    continue;
+                }
+            }
+            if !store.is_terminal_latched(job_id.as_str()) {
+                continue;
+            }
+            tracing::error!(
+                job_id = %job_id,
+                "job is latched as terminal in the durable store but still \
+                 live in memory — every persist for it would be silently \
+                 rejected; self-healing by cancelling it in memory to match \
+                 the store"
+            );
+            jc.write_record().cancel();
+        }
+    }
+
     /// Collect straggler tasks eligible for speculative preemption.
     ///
     /// Returns `Vec<SpeculativeWork>` for each Running task in a Running

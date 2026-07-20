@@ -794,6 +794,12 @@ impl Coordinator {
         // round is immediately visible as Pending work in the same pass
         // instead of waiting for a later heartbeat.
         self.reset_stuck_assigned_tasks();
+        // Phase 58 #180: self-heal any job that is live in memory but already
+        // latched terminal in the durable store — see
+        // `reconcile_store_latched_terminal_jobs` for why this can happen and
+        // why it must run before demand is computed below (a job caught here
+        // would otherwise keep consuming a slot in every following round).
+        self.reconcile_store_latched_terminal_jobs();
         // Phase 53 fair pools: one assignment round distributes the free-slot
         // budget across pools by min-share + weight, then jobs draw from
         // their pool's quota in priority order. With no pool config every

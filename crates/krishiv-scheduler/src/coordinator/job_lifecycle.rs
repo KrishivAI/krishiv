@@ -28,21 +28,29 @@ impl Coordinator {
             // deregistered (cancel marks the job GC-ready but keeps it in the
             // registry). A live job is still a genuine duplicate.
             if existing.read_record().state().is_terminal() {
-                let job_id = spec.job_id().clone();
-                self.evict_completed_job(&job_id);
-                // Clear the durable store's terminal-job latch (see
-                // `NonBlockingStoreHandle::terminal_jobs`): this id is being
-                // deliberately reused, so the fresh, non-terminal record this
-                // call is about to persist must not be mistaken for the stale
-                // write the latch exists to reject.
-                if let Some(store) = &self.store {
-                    store.forget_terminal_job(job_id.as_str());
-                }
+                self.evict_completed_job(&spec.job_id().clone());
             } else {
                 return Err(SchedulerError::DuplicateJob {
                     job_id: spec.job_id().clone(),
                 });
             }
+        }
+        // Reaching here means there is no live (non-terminal) job under this
+        // id right now — either there never was one in memory, or it was just
+        // evicted above for being terminal. Either way this id is being
+        // freshly (re)used, so clear the durable store's terminal-job latch
+        // before the persist below: see `NonBlockingStoreHandle::terminal_jobs`.
+        // This must run even when `existing` above was `None` — a job whose
+        // in-memory `JobCoordinator` was already GC'd (or never rebuilt after
+        // a coordinator restart) is still latched in the store, and skipping
+        // this for that case is exactly the gap that let a live-repro'd
+        // chaos-gate resubmission churn forever in memory while every persist
+        // for it was silently rejected (Phase 58 #180: two streaming jobs
+        // found stuck Assigned/reaped in a loop for over an hour past their
+        // own recorded cancellation, because `forget_terminal_job` was only
+        // ever reached from the `existing.is_terminal()` arm above).
+        if let Some(store) = &self.store {
+            store.forget_terminal_job(spec.job_id().as_str());
         }
 
         // Admission control: queued jobs are persisted as visible job records
@@ -103,10 +111,24 @@ impl Coordinator {
         // in-memory state.  A synchronous write ensures durability: if the
         // store write fails, the caller receives an error and no in-memory
         // state is leaked (B7 / ADR-12.9).
+        //
+        // This goes through `save_job_checked` (not `store.inner().save_job`
+        // directly) so a fresh, non-terminal submission is also subject to
+        // the terminal-job latch: `forget_terminal_job` was just called for
+        // this exact id above, so admission should always succeed, but if a
+        // concurrent write raced in and relatched it first, `inner().save_job`
+        // would silently write a record the latch immediately makes
+        // unpersistable to every caller thereafter — precisely the bypass
+        // that let a resubmission become live in memory while never able to
+        // durably save again (Phase 58 #180). Treat rejection as a genuine
+        // conflict rather than proceeding to insert an unpersisted job.
         if let Some(store) = &self.store {
-            let mut guard = store.inner();
-            guard.save_job(&record)?;
-            guard.append_event(EventLogEvent::JobSubmitted {
+            if !store.save_job_checked(&record)? {
+                return Err(SchedulerError::DuplicateJob {
+                    job_id: job_id.clone(),
+                });
+            }
+            store.inner().append_event(EventLogEvent::JobSubmitted {
                 job_id: job_id.clone(),
             })?;
         }
@@ -1152,6 +1174,138 @@ mod gc_grace_tests {
         assert!(
             !coord.gc_ready_at.contains_key(&aged),
             "an evicted job's timestamp must not leak in gc_ready_at"
+        );
+    }
+}
+
+/// Phase 58 #180 (second gap, found on the very next gate rerun after the
+/// resurrection-latch fix landed): `submit_job` persisted through
+/// `store.inner().save_job(...)` directly instead of the latch-checked
+/// `save_job_checked`, and only called `forget_terminal_job` when an
+/// in-memory `JobCoordinator` for the id already existed and was terminal —
+/// never when the id was latched terminal in the store but absent from
+/// memory entirely (evicted by GC, or a coordinator restart that didn't
+/// reload it). A resubmission hitting either gap became live in memory while
+/// every subsequent persist for it was silently rejected, forever — live
+/// found as two chaos-gate streaming jobs cycling Assigned -> Pending ->
+/// Assigned for over an hour past their own recorded cancellation, confirmed
+/// via direct etcd inspection to still show `state: cancelled` the entire
+/// time.
+#[cfg(test)]
+mod terminal_id_reuse_tests {
+    use super::*;
+    use crate::store::InMemoryMetadataStore;
+    use krishiv_proto::{StageId, StageSpec, TaskId, TaskSpec};
+
+    fn single_task_job(job_id: &JobId, task_id: &str) -> JobSpec {
+        JobSpec::new(job_id.clone(), "terminal-reuse-test", JobKind::Batch).with_stage(
+            StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(
+                TaskSpec::new(TaskId::try_new(task_id).unwrap(), "sql: select 1"),
+            ),
+        )
+    }
+
+    /// Resubmitting under an id whose in-memory `JobCoordinator` was evicted
+    /// (not merely cancelled-in-place) while the store still latches it
+    /// terminal must succeed, and must actually persist — not silently create
+    /// a job that can never become durable again.
+    #[test]
+    fn submit_job_after_id_evicted_from_memory_but_still_latched_terminal_succeeds_and_persists() {
+        let mut coordinator = Coordinator::new_active(None)
+            .unwrap()
+            .with_store(InMemoryMetadataStore::default());
+
+        let job_id = JobId::try_new("job-reused").unwrap();
+        coordinator
+            .submit_job(single_task_job(&job_id, "t0"))
+            .unwrap();
+        coordinator.cancel_job(&job_id).unwrap();
+
+        // Simulate eviction from the live registry (GC tick, or a coordinator
+        // restart that only partially reloads history) while the store still
+        // remembers the id as terminal.
+        coordinator.job_coordinators.remove(&job_id);
+        assert!(
+            coordinator
+                .store
+                .as_ref()
+                .unwrap()
+                .is_terminal_latched(job_id.as_str()),
+            "the store must still latch the id as terminal after eviction"
+        );
+
+        coordinator
+            .submit_job(single_task_job(&job_id, "t0-again"))
+            .expect(
+                "resubmission after eviction must not be treated as a stale, \
+                 unpersistable duplicate",
+            );
+
+        let persisted = coordinator
+            .store
+            .as_ref()
+            .unwrap()
+            .inner()
+            .jobs()
+            .iter()
+            .find(|r| r.job_id() == &job_id)
+            .cloned()
+            .expect("the fresh submission must have been persisted, not silently dropped");
+        assert!(
+            !persisted.state().is_terminal(),
+            "the persisted record must reflect the fresh, non-terminal \
+             submission, not the stale cancelled one"
+        );
+    }
+
+    /// Defense in depth: even if some other path ever reintroduces the same
+    /// divergence directly (job live in memory, store already latched
+    /// terminal), the scheduler must self-heal instead of scheduling a job
+    /// that can never become durable again.
+    #[test]
+    fn reconcile_store_latched_terminal_jobs_cancels_a_job_the_store_already_considers_done() {
+        let mut coordinator = Coordinator::new_active(None)
+            .unwrap()
+            .with_store(InMemoryMetadataStore::default());
+
+        let job_id = JobId::try_new("job-divergent").unwrap();
+        coordinator
+            .submit_job(single_task_job(&job_id, "t0"))
+            .unwrap();
+        coordinator.cancel_job(&job_id).unwrap();
+
+        // Reproduce the divergence directly, bypassing whatever real path
+        // might cause it, so this test exercises the self-heal in isolation.
+        {
+            let jc = coordinator.job_coordinators.get(&job_id).unwrap();
+            let mut record = jc.write_record();
+            record.state = JobState::Running;
+            for stage in record.stages_mut() {
+                stage.state = StageState::Running;
+            }
+        }
+        assert!(
+            !coordinator
+                .job_coordinators
+                .get(&job_id)
+                .unwrap()
+                .read_record()
+                .state()
+                .is_terminal(),
+            "the divergence must be in place before the reconcile runs"
+        );
+
+        coordinator.reconcile_store_latched_terminal_jobs();
+
+        assert!(
+            coordinator
+                .job_coordinators
+                .get(&job_id)
+                .unwrap()
+                .read_record()
+                .state()
+                .is_terminal(),
+            "a job latched terminal in the store must be cancelled in memory to match"
         );
     }
 }
