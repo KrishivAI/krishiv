@@ -773,6 +773,33 @@ impl SharedCoordinator {
         coord.apply_stall_resets(&work);
     }
 
+    /// Cancel a job and notify its executors without holding the
+    /// coordinator-wide write lock across the network dispatch.
+    ///
+    /// Mirrors the 3-phase pattern in `detect_and_cancel_stalled_tasks`:
+    /// mutate scheduler state and collect RPC targets under the write lock,
+    /// drop it, then dispatch best-effort `CancelTask` RPCs. Prefer this over
+    /// calling `Coordinator::push_cancel_job` directly through a held guard
+    /// (`coordinator.write().await.push_cancel_job(..).await`) — that pattern
+    /// held the lock across unbounded executor RPCs and, under Phase 58
+    /// chaos (executor-kill / network-partition), let a single cancel to a
+    /// dead/partitioned executor wedge the whole coordinator: every other
+    /// task needing `inner` queued behind it faster than the (tens-of-
+    /// seconds) RPC could time out, presenting as a full stall with every
+    /// scheduler worker parked and the etcd runtime idle. `push_cancel_job`
+    /// itself now also bounds each RPC via `CANCEL_RPC_TIMEOUT` for callers
+    /// that cannot restructure their lock scope (Phase 58 #180).
+    pub async fn cancel_job_and_notify(&self, job_id: &JobId) -> SchedulerResult<()> {
+        let (targets, channels) = {
+            let mut coord = self.inner.write().await;
+            let targets = coord.prepare_cancel_dispatch(job_id)?;
+            let channels = coord.executor_channels.clone();
+            (targets, channels)
+        };
+        Coordinator::dispatch_cancel_targets(channels, targets).await;
+        Ok(())
+    }
+
     /// Run one speculative-execution tick.
     ///
     /// Phase 53 (audit §3b) — the correct straggler protocol on the stall

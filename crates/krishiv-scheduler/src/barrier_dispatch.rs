@@ -30,9 +30,24 @@ async fn get_or_connect_barrier_channel(
         return Ok(channel.clone());
     }
 
+    // Phase 58 #180: this channel previously had no `connect_timeout` (unlike
+    // `get_or_connect_channel_on_map` in task_assignment.rs). Under a
+    // network-partition fault the peer silently drops packets rather than
+    // resetting the connection, so a bare `.connect()` relies on the OS TCP
+    // SYN-retry timeout (~127s on Linux) instead of an application-level
+    // bound — far outside the `timeout` budget `dispatch_barrier_plan`
+    // callers pass in, stalling that job's checkpoint round well past its
+    // intended deadline. `tcp_keepalive`/`http2_keep_alive` additionally
+    // bound the case where the connection dies *after* a successful connect
+    // (mid-life partition), matching `get_or_connect_channel_on_map`.
     let parsed = tonic::transport::Channel::from_shared(endpoint.to_owned())
         .map_err(|e| format!("invalid barrier endpoint {endpoint}: {e}"))?;
     let channel = parsed
+        .connect_timeout(Duration::from_secs(10))
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .http2_keep_alive_interval(Duration::from_secs(15))
+        .keep_alive_timeout(Duration::from_secs(20))
+        .keep_alive_while_idle(true)
         .connect()
         .await
         .map_err(|e| format!("barrier connect {endpoint}: {e}"))?;

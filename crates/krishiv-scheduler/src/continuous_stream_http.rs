@@ -18,6 +18,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Coordinator, SchedulerError, SharedCoordinator};
 
+/// Bound for the run-loop data-plane push/drain RPCs (Phase 58 #180).
+///
+/// Neither `push_run_loop_input` nor `drain_run_loop_output` holds any
+/// coordinator lock during the RPC (both clone `executor_channels` and drop
+/// the read guard immediately), so a stuck call here does not wedge the
+/// coordinator the way the unbounded `push_cancel_job` dispatch did. But
+/// without an explicit deadline these single-attempt, latency-sensitive
+/// calls fall back to the channel's implicit ~35s keepalive detection
+/// (`get_or_connect_channel_on_map`'s `keep_alive_timeout` +
+/// `http2_keep_alive_interval`) to notice a dead/partitioned executor —
+/// a much slower and less precise failure signal than an explicit bound.
+const RUN_LOOP_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn scheduler_status(error: &SchedulerError) -> StatusCode {
     match error {
         SchedulerError::DuplicateJob { .. } => StatusCode::CONFLICT,
@@ -770,14 +783,22 @@ async fn push_run_loop_input(
         task_id: TaskId::try_new(&task_id).map_err(|e| invalid_registration(e.to_string()))?,
         ipc_bytes,
     };
-    client
-        .push_continuous_input(wire::push_continuous_input_request_to_wire(request))
-        .await
-        .map_err(|status| {
-            ContinuousStreamError::Unavailable(format!(
-                "run-loop push to {endpoint} failed: {status}"
-            ))
-        })?;
+    tokio::time::timeout(
+        RUN_LOOP_RPC_TIMEOUT,
+        client.push_continuous_input(wire::push_continuous_input_request_to_wire(request)),
+    )
+    .await
+    .map_err(|_| {
+        ContinuousStreamError::Unavailable(format!(
+            "run-loop push to {endpoint} timed out after {}s",
+            RUN_LOOP_RPC_TIMEOUT.as_secs()
+        ))
+    })?
+    .map_err(|status| {
+        ContinuousStreamError::Unavailable(format!(
+            "run-loop push to {endpoint} failed: {status}"
+        ))
+    })?;
     Ok(())
 }
 
@@ -815,15 +836,23 @@ async fn drain_run_loop_output(
             job_id: job_id.clone(),
             task_id: TaskId::try_new(&task_id).map_err(|e| invalid_registration(e.to_string()))?,
         };
-        let response = client
-            .drain_continuous_output(wire::drain_continuous_output_request_to_wire(request))
-            .await
-            .map_err(|status| {
-                ContinuousStreamError::Unavailable(format!(
-                    "run-loop drain from {endpoint} failed: {status}"
-                ))
-            })?
-            .into_inner();
+        let response = tokio::time::timeout(
+            RUN_LOOP_RPC_TIMEOUT,
+            client.drain_continuous_output(wire::drain_continuous_output_request_to_wire(request)),
+        )
+        .await
+        .map_err(|_| {
+            ContinuousStreamError::Unavailable(format!(
+                "run-loop drain from {endpoint} timed out after {}s",
+                RUN_LOOP_RPC_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|status| {
+            ContinuousStreamError::Unavailable(format!(
+                "run-loop drain from {endpoint} failed: {status}"
+            ))
+        })?
+        .into_inner();
         let decoded = wire::drain_continuous_output_response_from_wire(response)
             .map_err(|e| invalid_registration(e.to_string()))?;
         if !decoded.ipc_bytes.is_empty() {

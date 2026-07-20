@@ -44,6 +44,15 @@ impl std::fmt::Debug for StreamExchange {
 const EXCHANGE_CREDIT_BYTES: u64 = 8 * 1024 * 1024;
 /// Send retry budget for receiver-full / transient transport errors.
 const EXCHANGE_MAX_RETRIES: u32 = 5;
+/// Bound on a single `push_continuous_input` RPC to a peer executor (Phase 58
+/// #180 sweep). The channel previously configured `tcp_keepalive` without
+/// `http2_keep_alive_interval`/`keep_alive_timeout`, so a peer that goes dark
+/// *after* connecting (network partition, executor kill) was not detected at
+/// the HTTP/2 level at all — the call relied on OS TCP retransmission timeouts
+/// (which can extend to minutes on an established connection) to ever return,
+/// during which this retry loop cannot retry because it is still awaiting the
+/// first attempt.
+const EXCHANGE_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl StreamExchange {
     fn peer(&self, endpoint: &str) -> Arc<PeerChannel> {
@@ -132,6 +141,8 @@ impl StreamExchange {
                         })?
                         .connect_timeout(std::time::Duration::from_secs(5))
                         .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+                        .http2_keep_alive_interval(std::time::Duration::from_secs(15))
+                        .keep_alive_timeout(std::time::Duration::from_secs(20))
                         .keep_alive_while_idle(true)
                         .connect()
                         .await
@@ -157,8 +168,13 @@ impl StreamExchange {
                     request.metadata_mut().insert("authorization", value);
                 }
             }
-            match client.push_continuous_input(request).await {
-                Ok(response) => {
+            match tokio::time::timeout(
+                EXCHANGE_RPC_TIMEOUT,
+                client.push_continuous_input(request),
+            )
+            .await
+            {
+                Ok(Ok(response)) => {
                     let decoded = wire::task_status_response_from_wire(response.into_inner())
                         .map_err(|e| ExecutorError::LocalExecution {
                             message: format!("stream exchange decode from '{endpoint}': {e}"),
@@ -172,7 +188,7 @@ impl StreamExchange {
                         }),
                     };
                 }
-                Err(status)
+                Ok(Err(status))
                     if matches!(
                         status.code(),
                         tonic::Code::ResourceExhausted
@@ -185,9 +201,30 @@ impl StreamExchange {
                     let backoff_ms = 10u64.saturating_mul(1 << attempt.min(6));
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 }
-                Err(status) => {
+                Ok(Err(status)) => {
                     return Err(ExecutorError::LocalExecution {
                         message: format!("stream exchange push to '{endpoint}': {status}"),
+                    });
+                }
+                Err(_elapsed) if attempt + 1 < EXCHANGE_MAX_RETRIES => {
+                    // Phase 58 #180: a dead/partitioned peer with no explicit
+                    // bound could hang this call for the OS TCP retransmission
+                    // timeout (minutes) instead of retrying within budget.
+                    tracing::warn!(
+                        endpoint = %endpoint,
+                        attempt,
+                        timeout_secs = EXCHANGE_RPC_TIMEOUT.as_secs(),
+                        "stream exchange push timed out; retrying"
+                    );
+                    let backoff_ms = 10u64.saturating_mul(1 << attempt.min(6));
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                }
+                Err(_elapsed) => {
+                    return Err(ExecutorError::LocalExecution {
+                        message: format!(
+                            "stream exchange push to '{endpoint}' timed out after {}s (all attempts)",
+                            EXCHANGE_RPC_TIMEOUT.as_secs()
+                        ),
                     });
                 }
             }

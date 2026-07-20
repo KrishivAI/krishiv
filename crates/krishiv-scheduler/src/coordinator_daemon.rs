@@ -711,11 +711,14 @@ async fn api_job_cancel(
             );
         }
     };
-    // push_cancel_job (not plain cancel_job): the assigned executors must
-    // hear about the cancel or a batch task runs to completion and burns
-    // its core for nothing — the state-only variant was the #217 zombie
-    // (write lock held across the await matches the deregister route).
-    match coordinator.write().await.push_cancel_job(&job_id).await {
+    // cancel_job_and_notify (not plain cancel_job): the assigned executors
+    // must hear about the cancel or a batch task runs to completion and
+    // burns its core for nothing — that was the #217 zombie. Unlike the
+    // earlier `coordinator.write().await.push_cancel_job(&job_id).await`
+    // form, this drops the write lock before the network dispatch (Phase 58
+    // #180): holding it across an unbounded cancel RPC let a dead/
+    // partitioned executor wedge the whole coordinator under chaos.
+    match coordinator.cancel_job_and_notify(&job_id).await {
         Ok(()) => (
             axum::http::StatusCode::OK,
             Json(serde_json::json!({"cancelled": true, "job_id": job_id_str})),

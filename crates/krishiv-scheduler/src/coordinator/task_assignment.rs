@@ -34,6 +34,19 @@ pub(crate) const DEFAULT_MAX_CONCURRENT_ASSIGNMENT_RPCS: usize = 128;
 
 const MAX_ASSIGNMENT_DELIVERY_ATTEMPTS: usize = 3;
 const ASSIGNMENT_DELIVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Bound on each best-effort CancelTask RPC (connect + call). Cancel is
+/// fire-and-forget (Phase 58 #180): unlike assignment delivery, losing a
+/// cancel notification is not fatal (the scheduler-side state is already
+/// terminal by the time this fires) and it is never retried, so this stays
+/// short. Without a bound, a target that is dead/network-partitioned relies
+/// on HTTP/2 keepalive (~35s) or raw TCP timeouts to notice, and every caller
+/// of `push_cancel_job` holds the coordinator-wide write lock for the whole
+/// await (see the #217 comment at its call sites) — under chaos-induced
+/// executor churn, back-to-back cancels each stalling tens of seconds queue
+/// faster than they drain and wedge the coordinator indefinitely (found live
+/// in the Phase 58 chaos gate: all scheduler workers parked waiting on this
+/// lock, etcd runtime idle).
+const CANCEL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const EXECUTOR_TASK_BEARER_TOKEN_ENV: &str = "KRISHIV_EXECUTOR_TASK_BEARER_TOKEN";
 
 fn configured_executor_task_bearer_token() -> Option<String> {
@@ -968,18 +981,23 @@ impl Coordinator {
             .collect())
     }
 
-    /// Cancel a job and push `CancelTask` RPCs to all executors owning running tasks.
+    /// Collect (endpoint, `TaskCancellationRequest`) targets for a job's
+    /// in-flight tasks and apply the scheduler-side cancel. Split out of
+    /// `push_cancel_job` (Phase 58 #180) so callers holding the
+    /// coordinator-wide write lock can drop it — via `SharedCoordinator::
+    /// cancel_job_and_notify` — before the network dispatch phase, instead of
+    /// holding it for the RPC round-trips.
     ///
-    /// Partial RPC failures are logged but are not fatal for R3.1 — the
-    /// scheduler-side cancel is always applied.
-    pub async fn push_cancel_job(&mut self, job_id: &JobId) -> SchedulerResult<()> {
-        // Collect (endpoint, TaskCancellationRequest) for each running task.
-        // Streaming jobs also cancel *assigned* tasks regardless of state: a
-        // continuous `stream:loop` task is only `Running` inside a cycle, but
-        // its executor retains the window state and the inbox dedupe identity
-        // between cycles — the teardown must reach it (the executor retires
-        // the job identity on cancel) or a recreated job with the same
-        // deterministic ids is silently swallowed as a duplicate.
+    /// Streaming jobs also cancel *assigned* tasks regardless of state: a
+    /// continuous `stream:loop` task is only `Running` inside a cycle, but
+    /// its executor retains the window state and the inbox dedupe identity
+    /// between cycles — the teardown must reach it (the executor retires
+    /// the job identity on cancel) or a recreated job with the same
+    /// deterministic ids is silently swallowed as a duplicate.
+    pub(crate) fn prepare_cancel_dispatch(
+        &mut self,
+        job_id: &JobId,
+    ) -> SchedulerResult<Vec<(String, TaskCancellationRequest)>> {
         let job_is_streaming = self.find_job(job_id)?.spec.kind() == JobKind::Streaming;
         let mut targets: Vec<(String, TaskCancellationRequest)> = Vec::new();
         {
@@ -1022,11 +1040,23 @@ impl Coordinator {
 
         // Cancel the job in scheduler state first.
         self.cancel_job(job_id)?;
+        Ok(targets)
+    }
 
-        // Push cancel RPCs — partial failures are non-fatal.  Re-use the
-        // executor channel cache so we do not pay a TCP+TLS handshake per
-        // cancel target (F2).  Drive them concurrently.
-        let channels = self.executor_channels.clone();
+    /// Push best-effort `CancelTask` RPCs to the collected targets, concurrently.
+    ///
+    /// Partial RPC failures are logged but are not fatal for R3.1 — the
+    /// scheduler-side cancel (`prepare_cancel_dispatch`) is always applied
+    /// before this runs. Each attempt is bounded by `CANCEL_RPC_TIMEOUT`: a
+    /// dead or network-partitioned target must never be allowed to stall this
+    /// call indefinitely, because every current caller (`push_cancel_job`,
+    /// and the direct `coordinator_daemon.rs` / `continuous_stream_http.rs`
+    /// call sites predating the split) runs this while holding the
+    /// coordinator-wide write lock for the whole await.
+    pub(crate) async fn dispatch_cancel_targets(
+        channels: ExecutorChannelMap,
+        targets: Vec<(String, TaskCancellationRequest)>,
+    ) {
         let mut futures = futures::stream::FuturesUnordered::new();
         for (endpoint, req) in targets {
             if is_in_process_task_endpoint(&endpoint) {
@@ -1035,31 +1065,63 @@ impl Coordinator {
             }
             let channels = channels.clone();
             futures.push(async move {
-                let channel = match Self::get_or_connect_channel_on_map(&channels, &endpoint).await {
-                    Ok(c) => c,
-                    Err(err) => {
-                        tracing::warn!(endpoint = %endpoint, error = %err, "push_cancel_job: connect failed");
-                        return;
+                let attempt = async {
+                    let channel =
+                        match Self::get_or_connect_channel_on_map(&channels, &endpoint).await {
+                            Ok(c) => c,
+                            Err(err) => {
+                                tracing::warn!(endpoint = %endpoint, error = %err, "push_cancel_job: connect failed");
+                                return;
+                            }
+                        };
+                    let max = krishiv_proto::max_grpc_message_bytes();
+                    let mut client =
+                        wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
+                            channel,
+                            inject_executor_task_request_context
+                                as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+                        )
+                        .max_decoding_message_size(max)
+                        .max_encoding_message_size(max);
+                    if let Err(err) = client
+                        .cancel_task(wire::task_cancellation_request_to_wire(req))
+                        .await
+                    {
+                        tracing::warn!(endpoint = %endpoint, error = %err, "push_cancel_job: cancel_task rpc failed");
                     }
                 };
-                let max = krishiv_proto::max_grpc_message_bytes();
-                let mut client = wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
-                    channel,
-                    inject_executor_task_request_context
-                        as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
-                )
-                .max_decoding_message_size(max)
-                .max_encoding_message_size(max);
-                if let Err(err) = client
-                    .cancel_task(wire::task_cancellation_request_to_wire(req))
+                if tokio::time::timeout(CANCEL_RPC_TIMEOUT, attempt)
                     .await
+                    .is_err()
                 {
-                    tracing::warn!(endpoint = %endpoint, error = %err, "push_cancel_job: cancel_task rpc failed");
+                    tracing::warn!(
+                        endpoint = %endpoint,
+                        timeout_secs = CANCEL_RPC_TIMEOUT.as_secs(),
+                        "push_cancel_job: cancel_task rpc timed out; abandoning (best-effort)"
+                    );
                 }
             });
         }
         use futures::stream::StreamExt;
         while futures.next().await.is_some() {}
+    }
+
+    /// Cancel a job and push `CancelTask` RPCs to all executors owning running tasks.
+    ///
+    /// # Lock safety
+    ///
+    /// This takes `&mut self` and awaits the network dispatch internally, so a
+    /// caller holding a `SharedCoordinator` write guard across this call holds
+    /// it for the whole (now `CANCEL_RPC_TIMEOUT`-bounded) dispatch too. Prefer
+    /// `SharedCoordinator::cancel_job_and_notify`, which drops the guard before
+    /// dispatching; this method remains for tests/CLI tools and call sites that
+    /// cannot restructure their lock scope, where the bounded timeout in
+    /// `dispatch_cancel_targets` is what keeps a partitioned executor from
+    /// wedging the caller.
+    pub async fn push_cancel_job(&mut self, job_id: &JobId) -> SchedulerResult<()> {
+        let targets = self.prepare_cancel_dispatch(job_id)?;
+        let channels = self.executor_channels.clone();
+        Self::dispatch_cancel_targets(channels, targets).await;
         Ok(())
     }
 
@@ -1319,6 +1381,59 @@ mod tests {
                 "http://exec-c",
                 "http://exec-a",
             ]
+        );
+    }
+
+    /// Phase 58 #180 regression: a peer that accepts the TCP connection but
+    /// never speaks HTTP/2 back (simulating an executor that is up at the
+    /// transport level but wedged, or a network partition that drops
+    /// application-layer traffic after the handshake) must not hang
+    /// `dispatch_cancel_targets` past `CANCEL_RPC_TIMEOUT`. Before this fix,
+    /// every caller of `push_cancel_job` — all of which currently hold the
+    /// coordinator-wide write lock across the dispatch — relied solely on
+    /// implicit HTTP/2 keepalive (tens of seconds) or OS TCP timeouts to ever
+    /// return, which is precisely what let a single dead-executor cancel wedge
+    /// the whole coordinator under Phase 58 chaos.
+    #[tokio::test]
+    async fn dispatch_cancel_targets_bounds_a_hung_peer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                // Accept and hold the connection open without ever reading or
+                // writing — the peer looks alive at the TCP layer but never
+                // completes the HTTP/2 handshake.
+                std::mem::forget(socket);
+            }
+        });
+
+        let channels: ExecutorChannelMap = Arc::new(DashMap::new());
+        let target = TaskCancellationRequest::new(TaskAttemptRef::new(
+            JobId::try_new("job-hang").unwrap(),
+            StageId::try_new("stage-hang").unwrap(),
+            TaskId::try_new("task-hang").unwrap(),
+            AttemptId::initial(),
+        ))
+        .with_reason("test: simulated hung peer");
+
+        let start = tokio::time::Instant::now();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            Coordinator::dispatch_cancel_targets(channels, vec![(format!("http://{addr}"), target)]),
+        )
+        .await
+        .expect(
+            "dispatch_cancel_targets must return within CANCEL_RPC_TIMEOUT even when a \
+             target never responds — it must never hang indefinitely",
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(8),
+            "cancel dispatch to a hung peer took {:?}; expected it bounded near \
+             CANCEL_RPC_TIMEOUT ({}s)",
+            start.elapsed(),
+            CANCEL_RPC_TIMEOUT.as_secs()
         );
     }
 }
