@@ -426,6 +426,61 @@ pub async fn spawn_coordinator_sidecars(
             };
             let _ = axum::serve(http_listener, router).await;
         }));
+
+        // Dedicated liveness listener on its own OS thread + single-thread
+        // runtime. Liveness must reflect "the process is alive", not "the main
+        // scheduling runtime is momentarily saturated". Under chaos (network
+        // partitions, executor churn) the main multi-thread runtime's workers
+        // can all be parked on `block_in_place` etcd bridges, starving even the
+        // trivial `/healthz` handler past its probe deadline — the coordinator
+        // is then SIGKILLed and restarts mid-recovery, amplifying the very
+        // fault it was recovering from (observed 2026-07-20 on the Phase 58 HA
+        // chaos gate: exitCode-137 liveness kills with `nr_throttled == 0`).
+        // Leadership failover is already driven by the etcd lease (~9s),
+        // independent of this process's liveness, so a never-starved liveness
+        // endpoint is the correct signal. Bound at http_port + 2 (2004 for the
+        // standard 2002); skipped for an ephemeral (port 0) HTTP address, which
+        // only appears in embedded/test configs that have no liveness probe.
+        if let Some(liveness_port) =
+            http_addr.port().checked_add(2).filter(|_| http_addr.port() != 0)
+        {
+            let liveness_addr = SocketAddr::new(http_addr.ip(), liveness_port);
+            if let Err(e) = std::thread::Builder::new()
+                .name("krishiv-liveness".into())
+                .spawn(move || {
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            tracing::error!(error = %e, "liveness runtime build failed");
+                            return;
+                        }
+                    };
+                    rt.block_on(async move {
+                        let app =
+                            Router::new().route("/healthz", get(|| async { "ok\n" }));
+                        match TcpListener::bind(liveness_addr).await {
+                            Ok(listener) => {
+                                tracing::info!(
+                                    addr = %liveness_addr,
+                                    "Krishiv coordinator liveness listening"
+                                );
+                                let _ = axum::serve(listener, app).await;
+                            }
+                            Err(e) => tracing::error!(
+                                error = %e,
+                                addr = %liveness_addr,
+                                "liveness listener bind failed"
+                            ),
+                        }
+                    });
+                })
+            {
+                tracing::error!(error = %e, "failed to spawn liveness thread");
+            }
+        }
     }
 
     // Spawn any additional co-located services (e.g., Flight SQL server).

@@ -162,19 +162,31 @@ spec:
             - { name: grpc, containerPort: 2001 }
             - { name: http, containerPort: 2002 }
             - { name: flight, containerPort: 2003 }
+            # Dedicated liveness listener (http port + 2), served on its own OS
+            # thread + runtime so it never starves when the main scheduling
+            # runtime is saturated under chaos load.
+            - { name: liveness, containerPort: 2004 }
           readinessProbe:
+            # /leaderz stays on the main HTTP port: readiness *should* reflect
+            # the main runtime's ability to serve, shedding a saturated pod from
+            # Service routing without killing it.
             httpGet: { path: /leaderz, port: http }
             initialDelaySeconds: 2
             periodSeconds: 2
             failureThreshold: 2
           livenessProbe:
-            httpGet: { path: /healthz, port: http }
+            # Liveness targets the dedicated listener, NOT the main HTTP port.
+            # /healthz on the main port is a static handler but still shares the
+            # main multi-thread runtime, whose workers can all be parked on
+            # block_in_place etcd bridges during executor churn / network
+            # partitions — starving it past the probe deadline and SIGKILLing a
+            # busy-but-alive coordinator (observed 2026-07-16 exit 137, and
+            # again 2026-07-20 on the HA chaos gate). Leadership failover is
+            # driven by the etcd lease (~9s) independent of this probe, so
+            # liveness only needs to answer "is the process alive".
+            httpGet: { path: /healthz, port: liveness }
             initialDelaySeconds: 10
             periodSeconds: 10
-            # The default 1s timeout / 3 failures liveness-killed a healthy
-            # standby during election + etcd churn on CPU-starved nodes
-            # (observed 2026-07-16: exit 137 while /healthz — a static
-            # handler — was merely slow, compounding the fault being tested).
             timeoutSeconds: 5
             failureThreshold: 6
           resources:
