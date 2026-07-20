@@ -33,6 +33,10 @@ krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
 krishiv-proto = { path = "../krishiv-proto", version = "0.1.0" }
 krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
 krishiv-shuffle = { path = "../krishiv-shuffle", version = "0.1.0" }
+# Compresses (and, above etcd's per-key limit, chunks) durable IVM snapshots
+# before they are written to etcd — a single snapshot value can exceed etcd's
+# 1.5 MiB --max-request-bytes ceiling and would otherwise be rejected on PUT.
+zstd = { workspace = true }
 constant_time_eq = { workspace = true }
 rocksdb = { workspace = true }
 tempfile = { workspace = true }

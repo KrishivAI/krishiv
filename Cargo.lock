@@ -6138,6 +6138,7 @@ dependencies = [
  "tracing",
  "urlencoding",
  "uuid",
+ "zstd",
 ]
 
 [[package]]

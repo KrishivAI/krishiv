@@ -269,6 +269,11 @@ pub struct FlightClientPool {
     health_state: Arc<tokio::sync::RwLock<Vec<EndpointHealth>>>,
     /// Background health check task handle.
     health_check_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Lazy-start guard: flipped true the first time the pool is used from an
+    /// async context so the background health loop always starts, even when
+    /// the runtime was built from a sync (no ambient Tokio runtime) call site
+    /// where the eager `spawn_health_checks()` would otherwise silently skip.
+    health_started: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -295,7 +300,29 @@ impl FlightClientPool {
             channel: Arc::new(tokio::sync::RwLock::new(None)),
             health_state: Arc::new(tokio::sync::RwLock::new(vec![health])),
             health_check_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            health_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// Start the background health loop the first time the pool is exercised
+    /// from an async context. Cheap after the first call: a relaxed atomic
+    /// load short-circuits before touching the handle mutex. This is the
+    /// backstop for pools whose runtime was constructed without an ambient
+    /// Tokio runtime, so the eager `spawn_health_checks()` never ran.
+    async fn ensure_health_checks(&self) {
+        use std::sync::atomic::Ordering;
+        if self.health_started.load(Ordering::Relaxed) {
+            return;
+        }
+        // Only the first caller to win the swap actually starts the loop;
+        // `start_health_checks` is itself idempotent, so a lost race is safe.
+        if self
+            .health_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.start_health_checks().await;
+        }
     }
 
     pub fn with_alternate(mut self, url: impl Into<String>) -> Self {
@@ -335,6 +362,10 @@ impl FlightClientPool {
         if handle_guard.is_some() {
             return; // Already running
         }
+        // Mark started so the lazy backstop in `ensure_health_checks` skips its
+        // work once the loop is up, regardless of which path started it.
+        self.health_started
+            .store(true, std::sync::atomic::Ordering::Release);
 
         let pool = self.clone();
         let handle = tokio::spawn(async move {
@@ -443,6 +474,11 @@ impl FlightClientPool {
     }
 
     pub async fn get_channel(&self) -> RuntimeResult<Channel> {
+        // First async touch of the pool guarantees a running Tokio runtime,
+        // so start the background health loop here as a backstop for sync
+        // (no ambient runtime) construction paths. No-op after the first call.
+        self.ensure_health_checks().await;
+
         // Fast path: channel already connected.
         {
             let guard = self.channel.read().await;
@@ -1292,5 +1328,38 @@ mod tests {
             .await
             .expect("finite stream must drain without timing out");
         assert_eq!(batches.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn ensure_health_checks_starts_the_loop_lazily_and_is_idempotent() {
+        use std::sync::atomic::Ordering;
+        // A pool built from a sync (no ambient runtime) path never had its
+        // eager `spawn_health_checks` run: the loop must not be up yet.
+        let pool = FlightClientPool::new("http://127.0.0.1:1").expect("pool");
+        assert!(
+            !pool.health_started.load(Ordering::Relaxed),
+            "freshly built pool must not have started health checks"
+        );
+        assert!(
+            pool.health_check_handle.lock().await.is_none(),
+            "no background handle before first use"
+        );
+
+        // First async touch (what `get_channel` does) starts the loop.
+        pool.ensure_health_checks().await;
+        assert!(
+            pool.health_started.load(Ordering::Relaxed),
+            "first async use must start the background health loop"
+        );
+        assert!(
+            pool.health_check_handle.lock().await.is_some(),
+            "background handle must be installed after ensure_health_checks"
+        );
+
+        // Idempotent: a repeat call neither restarts nor replaces the handle.
+        pool.ensure_health_checks().await;
+        assert!(pool.health_check_handle.lock().await.is_some());
+
+        pool.stop_health_checks().await;
     }
 }

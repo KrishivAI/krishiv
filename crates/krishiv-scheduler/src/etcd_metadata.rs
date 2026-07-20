@@ -11,10 +11,23 @@
 //! | `/krishiv/jobs/<job_id>` | JSON-encoded `PersistedJobRecord` |
 //! | `/krishiv/executors/<executor_id>` | JSON-encoded `PersistedExecutorDescriptor` |
 //! | `/krishiv/continuous/<job_id>` | Binary `ContinuousSnapshot` payload |
-//! | `/krishiv/ivm/<job_id>` | Binary complete IVM job snapshot |
+//! | `/krishiv/ivm/<job_id>` | IVM snapshot manifest (magic header; compressed data inline when small) |
+//! | `/krishiv/ivm/<job_id>#<index>` | IVM snapshot chunk (only when the compressed snapshot exceeds one etcd value) |
 //! | `/krishiv/history/<job_id>` | JSON-encoded terminal `JobHistoryRecord` |
 //!
 //! Events are not persisted — they are audit-only and kept in-memory.
+//!
+//! # IVM snapshot size
+//!
+//! Per-record keys keep every *other* record small, but a single IVM job
+//! snapshot is one record that can itself exceed etcd's 1.5 MiB
+//! `--max-request-bytes` write ceiling (observed 2026-07-20: a ~1.57 MiB
+//! snapshot rejected with "etcdserver: request is too large", failing the
+//! IVM write path with HTTP 503 under the Phase 58 HA chaos gate). IVM
+//! snapshots are therefore zstd-compressed and, if the compressed value
+//! still exceeds one etcd value, split across `#<index>` chunk keys —
+//! bounding every PUT well under the ceiling with no fixed size cliff. See
+//! [`save_ivm_snapshot`] / [`reassemble_ivm_snapshot`].
 
 // Deliberate sync-over-async boundary module (Phase 51 async contract):
 // block_on here bridges the sync MetadataStore trait to the async etcd client.
@@ -27,7 +40,7 @@
 //! to the async etcd client, using `block_in_place` on multi-thread runtimes
 //! and a fallback runtime on current-thread or no-runtime callers.
 
-use etcd_client::{Client, GetOptions, KeyValue, KvClient, SortOrder, SortTarget};
+use etcd_client::{Client, DeleteOptions, GetOptions, KeyValue, KvClient, SortOrder, SortTarget};
 
 use crate::store::{
     ContinuousSnapshot, EventLogEvent, JobHistoryRecord, MAX_JOB_HISTORY, MetadataStore,
@@ -108,7 +121,7 @@ impl EtcdMetadataStore {
             }
         })?;
 
-        let ivm_snapshots = load_binary_prefix(&mut kv, IVM_KEY_PREFIX)
+        let ivm_snapshots = load_ivm_snapshots(&mut kv)
             .await
             .map_err(|e| SchedulerError::Transport {
                 message: format!("etcd IVM snapshots load failed: {e}"),
@@ -160,6 +173,24 @@ impl EtcdMetadataStore {
         })?;
         Ok(())
     }
+
+    /// Delete every key in the half-open range `[start, end)` from etcd. Used
+    /// to sweep IVM snapshot chunk keys (`/krishiv/ivm/<job>#…`) — both when a
+    /// snapshot shrinks (surplus higher-index chunks) and when it is removed.
+    fn delete_range(&self, start: Vec<u8>, end: Vec<u8>) -> SchedulerResult<()> {
+        let mut client = self
+            .client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let opts = DeleteOptions::new().with_range(end);
+        krishiv_common::async_util::block_on(client.delete(start, Some(opts))).map_err(|e| {
+            SchedulerError::Transport {
+                message: format!("etcd delete range failed: {e}"),
+            }
+        })?;
+        Ok(())
+    }
 }
 
 impl MetadataStore for EtcdMetadataStore {
@@ -191,7 +222,7 @@ impl MetadataStore for EtcdMetadataStore {
                         message: format!("etcd continuous snapshots refresh failed: {e}"),
                     }
                 })?;
-                let ivm_snapshots = load_binary_prefix(&mut kv, IVM_KEY_PREFIX)
+                let ivm_snapshots = load_ivm_snapshots(&mut kv)
                     .await
                     .map_err(|e| SchedulerError::Transport {
                         message: format!("etcd IVM snapshots refresh failed: {e}"),
@@ -285,7 +316,41 @@ impl MetadataStore for EtcdMetadataStore {
     }
 
     fn save_ivm_snapshot(&mut self, job_id: &str, snapshot: Vec<u8>) -> SchedulerResult<()> {
-        self.put_key(ivm_key(job_id), snapshot.clone())?;
+        // A single IVM snapshot can exceed etcd's 1.5 MiB per-value write limit
+        // (see module docs). Compress, then store the compressed payload inline
+        // in the manifest when it fits one etcd value, else split it across
+        // bounded `#<index>` chunk keys. Chunks are written before the manifest
+        // so the manifest (the commit point) only becomes visible once its data
+        // is durable; a crash mid-write leaves the manifest pointing at a
+        // consistent prior/partial set that recovery detects and skips rather
+        // than silently corrupting.
+        let raw_len = snapshot.len() as u64;
+        let (codec, payload) = compress_ivm_payload(&snapshot);
+        let chunk_prefix = ivm_chunk_prefix(job_id);
+        let chunk_prefix_end = prefix_range_end(&chunk_prefix);
+
+        if payload.len() <= IVM_INLINE_MAX {
+            // Inline: manifest carries the whole (compressed) payload.
+            let mut value = ivm_manifest_header(codec, 0, raw_len);
+            value.extend_from_slice(&payload);
+            self.put_key(ivm_key(job_id), value)?;
+            // Sweep any chunk keys left by a previous, larger snapshot.
+            self.delete_range(chunk_prefix.into_bytes(), chunk_prefix_end)?;
+        } else {
+            let chunks: Vec<&[u8]> = payload.chunks(IVM_CHUNK_BYTES).collect();
+            let chunk_count = chunks.len() as u32;
+            for (i, chunk) in chunks.iter().enumerate() {
+                self.put_key(ivm_chunk_key(job_id, i as u32), chunk.to_vec())?;
+            }
+            // Commit: publish the manifest only after every chunk is durable.
+            self.put_key(ivm_key(job_id), ivm_manifest_header(codec, chunk_count, raw_len))?;
+            // Sweep surplus chunks (index >= chunk_count) from a larger prior
+            // snapshot; the just-written chunks 0..chunk_count are untouched.
+            self.delete_range(
+                ivm_chunk_key(job_id, chunk_count).into_bytes(),
+                chunk_prefix_end,
+            )?;
+        }
         self.ivm_snapshots.insert(job_id.to_owned(), snapshot);
         Ok(())
     }
@@ -303,6 +368,10 @@ impl MetadataStore for EtcdMetadataStore {
 
     fn remove_ivm_snapshot(&mut self, job_id: &str) -> SchedulerResult<()> {
         self.delete_key(ivm_key(job_id))?;
+        // Also drop any chunk keys the snapshot spilled into.
+        let chunk_prefix = ivm_chunk_prefix(job_id);
+        let chunk_prefix_end = prefix_range_end(&chunk_prefix);
+        self.delete_range(chunk_prefix.into_bytes(), chunk_prefix_end)?;
         self.ivm_snapshots.remove(job_id);
         Ok(())
     }
@@ -338,6 +407,23 @@ fn continuous_key(job_id: &str) -> String {
 
 fn ivm_key(job_id: &str) -> String {
     format!("{IVM_KEY_PREFIX}{job_id}")
+}
+
+/// Separator between an IVM job id and a chunk index in a chunk key. `#`
+/// (0x23) sorts below every character a job id can contain (`[A-Za-z0-9_-]`,
+/// all ≥ 0x2d), so a job's chunk keys always sort immediately after its
+/// manifest key and never interleave with another job's keys.
+const IVM_CHUNK_SEP: char = '#';
+
+/// Prefix under which one IVM job's snapshot chunks live: `/krishiv/ivm/<job>#`.
+fn ivm_chunk_prefix(job_id: &str) -> String {
+    format!("{IVM_KEY_PREFIX}{job_id}{IVM_CHUNK_SEP}")
+}
+
+/// Chunk key `/krishiv/ivm/<job>#<index:08x>` — zero-padded hex so keys sort
+/// in ascending chunk-index order under an etcd range scan.
+fn ivm_chunk_key(job_id: &str, index: u32) -> String {
+    format!("{IVM_KEY_PREFIX}{job_id}{IVM_CHUNK_SEP}{index:08x}")
 }
 
 fn history_key(job_id: &str) -> String {
@@ -501,18 +587,183 @@ async fn load_continuous_snapshots(
     Ok(snapshots)
 }
 
-async fn load_binary_prefix(
+// ── IVM snapshot codec (compression + chunking) ──────────────────────────
+//
+// A single IVM snapshot can exceed etcd's 1.5 MiB per-value write ceiling.
+// Snapshots are zstd-compressed and, when still too large, split across
+// bounded chunk keys. The manifest at `/krishiv/ivm/<job>` is self-describing
+// (magic-prefixed) so a legacy uncompressed value (no magic) is still read
+// verbatim, keeping recovery working across a rolling upgrade.
+
+/// Magic prefix identifying a chunked/compressed IVM manifest value. Legacy
+/// raw snapshots (written before this format) will not start with it.
+const IVM_MANIFEST_MAGIC: &[u8] = b"KIVMSNP";
+const IVM_MANIFEST_VERSION: u8 = 1;
+const IVM_CODEC_NONE: u8 = 0;
+const IVM_CODEC_ZSTD: u8 = 1;
+/// magic(7) + version(1) + codec(1) + flags(1) + chunk_count(u32) + raw_len(u64).
+const IVM_HEADER_LEN: usize = IVM_MANIFEST_MAGIC.len() + 1 + 1 + 1 + 4 + 8;
+/// Max bytes per etcd value we write — well under etcd's 1.5 MiB
+/// `--max-request-bytes` ceiling to leave room for key + gRPC framing.
+const IVM_CHUNK_BYTES: usize = 1024 * 1024;
+/// Largest compressed payload we inline into the manifest value (header + this
+/// must stay one etcd value).
+const IVM_INLINE_MAX: usize = IVM_CHUNK_BYTES - IVM_HEADER_LEN;
+/// zstd level: fast, since this is on the coordinator write path.
+const IVM_ZSTD_LEVEL: i32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IvmManifestHeader {
+    codec: u8,
+    chunk_count: u32,
+    raw_len: u64,
+}
+
+/// Compress a raw snapshot, falling back to storing it uncompressed if zstd
+/// fails or would expand it (incompressible payloads).
+fn compress_ivm_payload(raw: &[u8]) -> (u8, Vec<u8>) {
+    match zstd::encode_all(raw, IVM_ZSTD_LEVEL) {
+        Ok(compressed) if compressed.len() < raw.len() => (IVM_CODEC_ZSTD, compressed),
+        _ => (IVM_CODEC_NONE, raw.to_vec()),
+    }
+}
+
+/// Build the fixed-size manifest header. `chunk_count == 0` means the payload
+/// is inlined after this header in the same value; otherwise it lives in
+/// `chunk_count` chunk keys.
+fn ivm_manifest_header(codec: u8, chunk_count: u32, raw_len: u64) -> Vec<u8> {
+    let mut header = Vec::with_capacity(IVM_HEADER_LEN);
+    header.extend_from_slice(IVM_MANIFEST_MAGIC);
+    header.push(IVM_MANIFEST_VERSION);
+    header.push(codec);
+    header.push(0); // flags (reserved)
+    header.extend_from_slice(&chunk_count.to_le_bytes());
+    header.extend_from_slice(&raw_len.to_le_bytes());
+    header
+}
+
+/// Parse a manifest header. Returns `None` when the value is not our format
+/// (no magic, truncated, or an unknown version) so the caller can decide
+/// between "legacy raw value" and "corrupt".
+fn parse_ivm_manifest_header(value: &[u8]) -> Option<IvmManifestHeader> {
+    if value.len() < IVM_HEADER_LEN || !value.starts_with(IVM_MANIFEST_MAGIC) {
+        return None;
+    }
+    let mut p = IVM_MANIFEST_MAGIC.len();
+    if value[p] != IVM_MANIFEST_VERSION {
+        return None;
+    }
+    p += 1;
+    let codec = value[p];
+    p += 2; // skip codec + flags
+    let chunk_count = u32::from_le_bytes(value[p..p + 4].try_into().ok()?);
+    p += 4;
+    let raw_len = u64::from_le_bytes(value[p..p + 8].try_into().ok()?);
+    Some(IvmManifestHeader {
+        codec,
+        chunk_count,
+        raw_len,
+    })
+}
+
+/// Reconstruct a raw IVM snapshot from its manifest value and (if chunked) its
+/// chunk keys. A value without our magic is a legacy uncompressed snapshot and
+/// is returned verbatim. Any inconsistency (missing chunk, bad codec, length
+/// mismatch, decode failure) returns `Err` so recovery skips the snapshot
+/// rather than surfacing a corrupt one.
+fn reassemble_ivm_snapshot(
+    manifest_value: &[u8],
+    chunks: Option<&std::collections::BTreeMap<u32, Vec<u8>>>,
+) -> Result<Vec<u8>, String> {
+    if !manifest_value.starts_with(IVM_MANIFEST_MAGIC) {
+        // Legacy pre-format snapshot: the value IS the raw snapshot.
+        return Ok(manifest_value.to_vec());
+    }
+    let header = parse_ivm_manifest_header(manifest_value)
+        .ok_or_else(|| "corrupt or unsupported IVM manifest header".to_string())?;
+
+    let payload = if header.chunk_count == 0 {
+        manifest_value[IVM_HEADER_LEN..].to_vec()
+    } else {
+        let chunks = chunks.ok_or_else(|| {
+            format!(
+                "IVM manifest declares {} chunk(s) but none are present",
+                header.chunk_count
+            )
+        })?;
+        let mut buf = Vec::new();
+        for i in 0..header.chunk_count {
+            let chunk = chunks
+                .get(&i)
+                .ok_or_else(|| format!("missing IVM chunk {i} of {}", header.chunk_count))?;
+            buf.extend_from_slice(chunk);
+        }
+        buf
+    };
+
+    let raw = match header.codec {
+        IVM_CODEC_NONE => payload,
+        IVM_CODEC_ZSTD => zstd::decode_all(&payload[..])
+            .map_err(|e| format!("IVM snapshot zstd decode failed: {e}"))?,
+        other => return Err(format!("unknown IVM snapshot codec {other}")),
+    };
+    if raw.len() as u64 != header.raw_len {
+        return Err(format!(
+            "IVM snapshot length mismatch: reassembled {} bytes, manifest declared {}",
+            raw.len(),
+            header.raw_len
+        ));
+    }
+    Ok(raw)
+}
+
+/// Load every IVM snapshot under `/krishiv/ivm/`, reassembling chunked and
+/// decompressing compressed values. Manifest keys (`<job>`) and chunk keys
+/// (`<job>#<index>`) share the prefix; they are partitioned by the `#`
+/// separator. An unrecoverable snapshot is logged and skipped so one bad
+/// record never blocks the coordinator from loading the rest.
+async fn load_ivm_snapshots(
     client: &mut KvClient,
-    prefix: &str,
 ) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
-    let kvs = get_prefix_paged(client, prefix).await?;
-    let mut snapshots = std::collections::HashMap::with_capacity(kvs.len());
+    use std::collections::{BTreeMap, HashMap};
+    let kvs = get_prefix_paged(client, IVM_KEY_PREFIX).await?;
+
+    let mut manifests: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut chunks: HashMap<String, BTreeMap<u32, Vec<u8>>> = HashMap::new();
     for kv in &kvs {
         let key = kv.key_str().unwrap_or("?");
-        let job_id = key
-            .strip_prefix(prefix)
-            .ok_or_else(|| format!("etcd snapshot key has wrong prefix: {key}"))?;
-        snapshots.insert(job_id.to_owned(), kv.value().to_vec());
+        let remainder = key
+            .strip_prefix(IVM_KEY_PREFIX)
+            .ok_or_else(|| format!("etcd IVM key has wrong prefix: {key}"))?;
+        match remainder.split_once(IVM_CHUNK_SEP) {
+            Some((job_id, index_hex)) => {
+                let index = u32::from_str_radix(index_hex, 16)
+                    .map_err(|e| format!("etcd IVM chunk key {key} has a bad index: {e}"))?;
+                chunks
+                    .entry(job_id.to_owned())
+                    .or_default()
+                    .insert(index, kv.value().to_vec());
+            }
+            None => {
+                manifests.insert(remainder.to_owned(), kv.value().to_vec());
+            }
+        }
+    }
+
+    let mut snapshots = HashMap::with_capacity(manifests.len());
+    for (job_id, manifest_value) in manifests {
+        match reassemble_ivm_snapshot(&manifest_value, chunks.get(&job_id)) {
+            Ok(raw) => {
+                snapshots.insert(job_id, raw);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    job_id = %job_id,
+                    %error,
+                    "skipping unrecoverable IVM snapshot during etcd load"
+                );
+            }
+        }
     }
     Ok(snapshots)
 }
@@ -623,5 +874,125 @@ mod tests {
         let restored = ExecutorDescriptor::try_from(decoded).unwrap();
         assert_eq!(restored.executor_id(), exec.executor_id());
         assert_eq!(restored.task_endpoint(), exec.task_endpoint());
+    }
+
+    // ── IVM snapshot codec (compression + chunking) ──────────────────────
+
+    /// Deterministic, effectively-incompressible bytes (xorshift) so a large
+    /// payload actually spills across chunk keys instead of compressing to
+    /// inline size.
+    fn pseudo_random(len: usize) -> Vec<u8> {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x & 0xff) as u8
+            })
+            .collect()
+    }
+
+    /// Emulate exactly what `save_ivm_snapshot` writes to etcd: a manifest
+    /// value plus (when chunked) the chunk-index → bytes map.
+    fn encode_ivm_for_test(raw: &[u8]) -> (Vec<u8>, std::collections::BTreeMap<u32, Vec<u8>>) {
+        let (codec, payload) = compress_ivm_payload(raw);
+        let mut chunks = std::collections::BTreeMap::new();
+        let manifest = if payload.len() <= IVM_INLINE_MAX {
+            let mut value = ivm_manifest_header(codec, 0, raw.len() as u64);
+            value.extend_from_slice(&payload);
+            value
+        } else {
+            let parts: Vec<&[u8]> = payload.chunks(IVM_CHUNK_BYTES).collect();
+            for (i, part) in parts.iter().enumerate() {
+                chunks.insert(i as u32, part.to_vec());
+            }
+            ivm_manifest_header(codec, parts.len() as u32, raw.len() as u64)
+        };
+        (manifest, chunks)
+    }
+
+    #[test]
+    fn ivm_snapshot_inline_round_trips() {
+        let raw = b"a small IVM snapshot that compresses well".repeat(4);
+        let (manifest, chunks) = encode_ivm_for_test(&raw);
+        // Small + compressible => inline (no chunk keys), magic-prefixed.
+        assert!(chunks.is_empty(), "small snapshot must inline");
+        assert!(manifest.starts_with(IVM_MANIFEST_MAGIC));
+        let restored = reassemble_ivm_snapshot(&manifest, Some(&chunks)).unwrap();
+        assert_eq!(restored, raw);
+    }
+
+    #[test]
+    fn ivm_snapshot_multi_chunk_round_trips() {
+        // ~3 MiB incompressible => exceeds one etcd value => multiple chunks,
+        // each bounded well under etcd's 1.5 MiB write ceiling.
+        let raw = pseudo_random(3 * 1024 * 1024);
+        let (manifest, chunks) = encode_ivm_for_test(&raw);
+        assert!(chunks.len() >= 3, "large snapshot must span chunks: {}", chunks.len());
+        for (idx, chunk) in &chunks {
+            assert!(
+                chunk.len() <= IVM_CHUNK_BYTES,
+                "chunk {idx} is {} bytes, over the per-value bound",
+                chunk.len()
+            );
+        }
+        let restored = reassemble_ivm_snapshot(&manifest, Some(&chunks)).unwrap();
+        assert_eq!(restored, raw);
+    }
+
+    #[test]
+    fn ivm_snapshot_legacy_raw_value_is_read_verbatim() {
+        // A pre-format value (no magic) must still load, unchanged.
+        let legacy = vec![0u8, 1, 2, 3, 200, 201, 202];
+        assert!(!legacy.starts_with(IVM_MANIFEST_MAGIC));
+        let restored = reassemble_ivm_snapshot(&legacy, None).unwrap();
+        assert_eq!(restored, legacy);
+    }
+
+    #[test]
+    fn ivm_snapshot_missing_chunk_is_an_error_not_corruption() {
+        let raw = pseudo_random(3 * 1024 * 1024);
+        let (manifest, mut chunks) = encode_ivm_for_test(&raw);
+        chunks.remove(&1); // simulate a chunk lost to a mid-write crash
+        let err = reassemble_ivm_snapshot(&manifest, Some(&chunks)).unwrap_err();
+        assert!(err.contains("missing IVM chunk"), "got: {err}");
+    }
+
+    #[test]
+    fn ivm_snapshot_length_mismatch_is_rejected() {
+        let raw = b"snapshot bytes".repeat(3);
+        let (mut manifest, chunks) = encode_ivm_for_test(&raw);
+        // Corrupt the declared raw_len in the header (last 8 bytes of header).
+        let len_off = IVM_HEADER_LEN - 8;
+        manifest[len_off] = manifest[len_off].wrapping_add(1);
+        let err = reassemble_ivm_snapshot(&manifest, Some(&chunks)).unwrap_err();
+        assert!(err.contains("length mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn ivm_chunk_keys_sort_after_manifest_and_before_sibling_jobs() {
+        // Contiguous grouping under an ascending key scan is what lets the
+        // loader partition manifests from chunks reliably.
+        let manifest = ivm_key("job");
+        let c0 = ivm_chunk_key("job", 0);
+        let c1 = ivm_chunk_key("job", 1);
+        let sibling = ivm_key("job-2"); // '-' (0x2d) > '#' (0x23)
+        assert!(manifest.as_str() < c0.as_str(), "manifest sorts before its chunks");
+        assert!(c0.as_str() < c1.as_str(), "chunks sort by ascending index");
+        assert!(c1.as_str() < sibling.as_str(), "a job's chunks sort before a sibling job");
+        assert_eq!(ivm_chunk_key("job", 255), "/krishiv/ivm/job#000000ff");
+        assert!(ivm_chunk_prefix("job").starts_with(&ivm_key("job")));
+    }
+
+    #[test]
+    fn compress_ivm_payload_falls_back_to_none_for_incompressible_data() {
+        let compressible = vec![7u8; 4096];
+        let (codec, _) = compress_ivm_payload(&compressible);
+        assert_eq!(codec, IVM_CODEC_ZSTD);
+        let incompressible = pseudo_random(4096);
+        let (codec, payload) = compress_ivm_payload(&incompressible);
+        assert_eq!(codec, IVM_CODEC_NONE);
+        assert_eq!(payload, incompressible, "NONE codec stores raw bytes");
     }
 }

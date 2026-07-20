@@ -489,10 +489,12 @@ impl RemoteExecutionRuntime {
         self.pool.start_health_checks().await;
     }
 
-    /// Spawn health checks as a background Tokio task.  Safe to call from a
-    /// sync context as long as a Tokio runtime is already running (e.g. from
-    /// within a `#[tokio::main]` or any async call-chain).  Logs a warning and
-    /// skips if no runtime is available.
+    /// Eagerly spawn health checks as a background Tokio task when a runtime is
+    /// already available (e.g. from within a `#[tokio::main]` or any async
+    /// call-chain). When called from a sync context with no ambient runtime
+    /// this is a no-op: the pool lazily starts the same background loop on its
+    /// first async use (`FlightClientPool::ensure_health_checks`), so the
+    /// checks are never silently dropped — this method only front-loads them.
     pub fn spawn_health_checks(&self) {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
@@ -500,8 +502,8 @@ impl RemoteExecutionRuntime {
                 handle.spawn(async move { pool.start_health_checks().await });
             }
             Err(_) => {
-                tracing::warn!(
-                    "Flight client health checks not started: \
+                tracing::debug!(
+                    "Flight client health checks deferred to first use: \
                      spawn_health_checks called outside a Tokio runtime context"
                 );
             }
