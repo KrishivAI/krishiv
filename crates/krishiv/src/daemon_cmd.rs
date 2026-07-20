@@ -60,6 +60,43 @@ fn run_mcp(args: &[String]) -> i32 {
     }
 }
 
+/// Env override for the coordinator daemon's Tokio worker-thread count.
+const DAEMON_RUNTIME_THREADS_ENV: &str = "KRISHIV_DAEMON_RUNTIME_THREADS";
+
+/// Build a Tokio runtime for a long-running coordinator daemon.
+///
+/// The shared embedded fallback runtime caps worker threads at `min(cpu, 4)`
+/// so it does not monopolise an embedded/test host — but that is far too tight
+/// for a coordinator, which concurrently runs an HTTP server, a gRPC server, a
+/// Flight sidecar, the task-launch and heartbeat loops, leader election, AND
+/// bridges every synchronous metadata write to the async etcd client via
+/// `block_in_place`. Each in-flight blocking bridge parks a worker thread, so
+/// on a 2-core pod (`worker_threads == 2`) a burst of concurrent metadata
+/// writes during executor churn can park every worker and starve even the
+/// trivial `/healthz` liveness handler past its probe deadline — the process
+/// is then SIGKILLed and restarts, amplifying the very churn that caused it
+/// (observed 2026-07-20 on the Phase 58 HA chaos gate: coordinators taking
+/// exitCode-137 liveness kills while `nr_throttled == 0`, i.e. runtime worker
+/// starvation, not CPU throttling). Worker threads parked on I/O consume no
+/// CPU, so a floor decoupled from the core count is safe under the pod's CPU
+/// limit; it only guarantees the async servers always have a runnable worker.
+fn build_daemon_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    let workers = std::env::var(DAEMON_RUNTIME_THREADS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().max(8))
+                .unwrap_or(8)
+        });
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(workers)
+        .thread_name("krishiv-coordinator")
+        .build()
+}
+
 fn run_coordinator(args: &[String]) -> i32 {
     match parse_coordinator_daemon_config(args.iter().cloned()) {
         Ok(config) if config.help => {
@@ -72,12 +109,18 @@ fn run_coordinator(args: &[String]) -> i32 {
             if let Some(sidecar) = build_flight_sidecar(&config) {
                 sidecars.push(sidecar);
             }
+            let rt = match build_daemon_runtime() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("failed to build coordinator runtime: {e}");
+                    return 2;
+                }
+            };
             // Stringify the error inside the awaited future: `Box<dyn Error>`
-            // (krishiv-scheduler's return type) is not `Send`, but `block_on`
-            // requires its future's output to be `Send`. Only the `Display`
-            // text is used here, so converting before crossing that boundary
-            // avoids changing krishiv-scheduler's error type.
-            match block_on(async {
+            // (krishiv-scheduler's return type) is not `Send`. Only the
+            // `Display` text is used here, so converting before returning keeps
+            // krishiv-scheduler's error type unchanged.
+            match rt.block_on(async {
                 run_standalone_coordinator(config, factory, sidecars)
                     .await
                     .map_err(|e| e.to_string())
@@ -108,7 +151,14 @@ fn run_clusterd(args: &[String]) -> i32 {
             if let Some(sidecar) = build_flight_sidecar(&config) {
                 sidecars.push(sidecar);
             }
-            match block_on(async {
+            let rt = match build_daemon_runtime() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("failed to build coordinator runtime: {e}");
+                    return 2;
+                }
+            };
+            match rt.block_on(async {
                 run_clusterd_daemon(config, factory, sidecars)
                     .await
                     .map_err(|e| e.to_string())
