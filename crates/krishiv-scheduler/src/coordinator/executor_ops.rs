@@ -998,7 +998,9 @@ mod endpoint_lookup_tests {
 #[cfg(test)]
 mod stuck_assigned_reclaim_tests {
     use super::*;
-    use krishiv_proto::{ExecutorDescriptor, ExecutorId, JobSpec, StageSpec, TaskSpec};
+    use krishiv_proto::{
+        ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, JobSpec, StageSpec, TaskSpec,
+    };
 
     fn single_task_job(job_id: &JobId, task_id: &str) -> JobSpec {
         JobSpec::new(job_id.clone(), "stuck-assigned-test", JobKind::Batch).with_stage(
@@ -1120,6 +1122,52 @@ mod stuck_assigned_reclaim_tests {
             task.state(),
             TaskState::Assigned,
             "a task assigned moments ago must not be reclaimed yet"
+        );
+    }
+
+    /// Integration check for the fix's other half: `apply_assignments` (the
+    /// real assignment path, not hand-set test state) must itself stamp
+    /// `assigned_at_ms` the moment a task becomes `Assigned` — previously
+    /// this field stayed `None` until the task reached `Running`, so
+    /// `reset_stuck_assigned_tasks`'s `let Some(assigned_ms) = ... else {
+    /// continue }` would have silently skipped every real stuck-Assigned
+    /// task forever, the exact case it exists to catch.
+    #[test]
+    fn a_real_assignment_stamps_assigned_at_ms_immediately() {
+        let mut coordinator =
+            Coordinator::active(CoordinatorId::try_new("real-assign-stamp").unwrap());
+        let exec_id = ExecutorId::try_new("exec-real").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-real", 1))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-real-assign").unwrap();
+        coordinator
+            .submit_job(single_task_job(&job_id, "real-t0"))
+            .unwrap();
+        // submit_job itself leaves new tasks Pending; a heartbeat is the real
+        // production trigger for assign_pending_tasks_for_schedulable_jobs.
+        coordinator
+            .executor_heartbeat(ExecutorHeartbeat::new(
+                exec_id.clone(),
+                krishiv_proto::ExecutorState::Healthy,
+            ))
+            .unwrap();
+
+        let jc = coordinator.job_coordinators.get(&job_id).unwrap();
+        let record = jc.read_record();
+        let task = &record.stages()[0].tasks()[0];
+        assert_eq!(
+            task.state(),
+            TaskState::Assigned,
+            "the heartbeat-triggered assignment pass should have placed the \
+             only task on the only (free) executor"
+        );
+        assert!(
+            task.assigned_at_ms.is_some(),
+            "a task must have assigned_at_ms populated the moment it becomes \
+             Assigned, not only once it later reaches Running — otherwise \
+             reset_stuck_assigned_tasks can never see it"
         );
     }
 }

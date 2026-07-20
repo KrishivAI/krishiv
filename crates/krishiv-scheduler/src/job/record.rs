@@ -198,6 +198,14 @@ impl JobRecord {
         }
         self.state = JobState::Running;
         let _job_id_str = self.job_id().to_string();
+        // Phase 58 #180: stamp assignment time so a task stuck in `Assigned`
+        // (dispatch never lands, or launch is never even attempted) can be
+        // detected the same way `reset_stuck_assigned_tasks` detects it —
+        // `apply_task_update` already overwrites this with a fresh value the
+        // moment the task actually reaches `Running`, so Running-stall
+        // detection (which anchors on this same field) is unaffected; this
+        // only fills in the previously-`None` gap during the Assigned phase.
+        let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
         for stage in &mut self.stages {
             let _stage_id_str = stage.stage_id().to_string();
             let mut stage_received_assignment = false;
@@ -210,6 +218,7 @@ impl JobRecord {
                     task.state = TaskState::Assigned;
                     task.pending_since_ms = None;
                     task.retry_backoff_until_ms = None;
+                    task.assigned_at_ms = Some(now_ms);
                     stage_received_assignment = true;
                 }
             }
