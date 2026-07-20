@@ -88,16 +88,74 @@ fn etcd_runtime() -> &'static tokio::runtime::Runtime {
 /// the worker is parked rather than silently losing it. A current-thread caller
 /// blocks directly — safe here because the result is produced by a *different*
 /// runtime, so there is no self-deadlock.
-fn etcd_block_on<F>(fut: F) -> F::Output
+/// Per-key RPC bound (put/delete/delete_range) — the hot path, called while
+/// `NonBlockingStoreHandle`'s coordinator-wide `std::sync::Mutex` is held
+/// (see [`etcd_block_on`]'s doc comment for why that makes this bound
+/// load-bearing for the whole coordinator, not just the caller).
+const ETCD_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Bound for [`EtcdMetadataStore::refresh`]'s combined five-prefix load.
+/// Runs only at startup / standby-promotion, not the per-write hot path, and
+/// can legitimately take longer than one key's [`ETCD_RPC_TIMEOUT`] against a
+/// cluster with a large accumulated job/IVM-snapshot history.
+const ETCD_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Drive an etcd future to completion on [`etcd_runtime`], blocking the
+/// caller for the result, bounded by [`ETCD_RPC_TIMEOUT`].
+///
+/// `NonBlockingStoreHandle` serializes ALL metadata writes (job records,
+/// executor descriptors, IVM/continuous snapshots) through one
+/// coordinator-wide `std::sync::Mutex`, held for the full duration of each
+/// write. An etcd RPC that hangs with no bound therefore freezes every other
+/// metadata write in the whole coordinator indefinitely, which cascades into
+/// every subsystem that persists anything — task launches, heartbeats, IVM
+/// dispatch, cancellation. Found live (Phase 58, 2026-07-20): an
+/// executor-kill fault landing during concurrent IVM dispatch calls left a
+/// coordinator replica's etcd `put` hung with no timeout, silently wedging
+/// every HTTP endpoint (including `/leaderz`) for 10+ minutes with zero
+/// self-recovery — confirmed via `/proc/net/tcp` showing accumulated
+/// `CLOSE_WAIT` connections (request handlers stuck forever, never reaching
+/// the point of closing their own socket) and complete silence from the
+/// coordinator's own periodic heartbeat/launch-loop tracing, which normally
+/// fires every ~500ms. This is the same "unbounded external I/O held under
+/// a lock" bug class already fixed this session for cancel-RPC dispatch,
+/// assignment delivery, and barrier/run-loop channels — etcd was the one
+/// remaining unbounded call.
+///
+/// The future runs on the dedicated runtime (its reactor is never starved by
+/// the scheduling runtime); the caller waits on a std channel, wrapped in
+/// `block_in_place` on a multi-thread worker so that runtime is told the
+/// worker is parked rather than silently losing it. A current-thread caller
+/// blocks directly — safe here because the result is produced by a
+/// *different* runtime, so there is no self-deadlock.
+fn etcd_block_on<F>(fut: F) -> Result<F::Output, SchedulerError>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    etcd_block_on_bounded(fut, ETCD_RPC_TIMEOUT)
+}
+
+/// Like [`etcd_block_on`] but with an explicit bound, for callers (namely
+/// [`EtcdMetadataStore::refresh`]) whose legitimate cost differs from the
+/// single-key hot path's [`ETCD_RPC_TIMEOUT`].
+fn etcd_block_on_bounded<F>(fut: F, timeout: std::time::Duration) -> Result<F::Output, SchedulerError>
 where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     etcd_runtime().spawn(async move {
-        let _ = tx.send(fut.await);
+        let outcome = tokio::time::timeout(timeout, fut).await;
+        let _ = tx.send(outcome);
     });
-    let recv = move || rx.recv().expect("etcd runtime dropped the task before sending a result");
+    let recv = move || -> Result<F::Output, SchedulerError> {
+        rx.recv()
+            .expect("etcd runtime dropped the task before sending a result")
+            .map_err(|_elapsed| SchedulerError::Transport {
+                message: format!("etcd operation did not complete within {}s", timeout.as_secs()),
+            })
+    };
     match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(recv),
         _ => recv(),
@@ -144,7 +202,24 @@ pub struct EtcdMetadataStore {
 impl EtcdMetadataStore {
     /// Connect to etcd and load all job and executor records from their
     /// individual keys.
+    ///
+    /// The whole connect-plus-initial-load sequence is bounded by
+    /// [`ETCD_REFRESH_TIMEOUT`] (this is genuinely `async`, not bridged
+    /// through [`etcd_block_on`], so it needed its own explicit bound rather
+    /// than inheriting one) — an unreachable etcd at startup must fail the
+    /// pod's readiness probe promptly, not hang the process forever.
     pub async fn connect(endpoints: Vec<String>) -> SchedulerResult<Self> {
+        tokio::time::timeout(ETCD_REFRESH_TIMEOUT, Self::connect_inner(endpoints))
+            .await
+            .map_err(|_elapsed| SchedulerError::Transport {
+                message: format!(
+                    "etcd connect did not complete within {}s",
+                    ETCD_REFRESH_TIMEOUT.as_secs()
+                ),
+            })?
+    }
+
+    async fn connect_inner(endpoints: Vec<String>) -> SchedulerResult<Self> {
         let client =
             Client::connect(endpoints, None)
                 .await
@@ -207,7 +282,7 @@ impl EtcdMetadataStore {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        etcd_block_on(async move { client.put(key, value, None).await }).map_err(|e| {
+        etcd_block_on(async move { client.put(key, value, None).await })?.map_err(|e| {
             SchedulerError::Transport {
                 message: format!("etcd put failed: {e}"),
             }
@@ -222,7 +297,7 @@ impl EtcdMetadataStore {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        etcd_block_on(async move { client.delete(key, None).await }).map_err(|e| {
+        etcd_block_on(async move { client.delete(key, None).await })?.map_err(|e| {
             SchedulerError::Transport {
                 message: format!("etcd delete failed: {e}"),
             }
@@ -240,7 +315,7 @@ impl EtcdMetadataStore {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         let opts = DeleteOptions::new().with_range(end);
-        etcd_block_on(async move { client.delete(start, Some(opts)).await }).map_err(|e| {
+        etcd_block_on(async move { client.delete(start, Some(opts)).await })?.map_err(|e| {
             SchedulerError::Transport {
                 message: format!("etcd delete range failed: {e}"),
             }
@@ -256,8 +331,8 @@ impl MetadataStore for EtcdMetadataStore {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        let (jobs, executors, snapshots, ivm_snapshots, history) =
-            etcd_block_on(async move {
+        let (jobs, executors, snapshots, ivm_snapshots, history) = etcd_block_on_bounded(
+            async move {
                 let mut kv = wide_kv(&client);
                 let jobs =
                     load_prefix::<PersistedJobRecord, JobRecord>(&mut kv, JOB_KEY_PREFIX)
@@ -289,7 +364,9 @@ impl MetadataStore for EtcdMetadataStore {
                         message: format!("etcd job history refresh failed: {e}"),
                     })?;
                 Ok::<_, SchedulerError>((jobs, executors, snapshots, ivm_snapshots, history))
-            })?;
+            },
+            ETCD_REFRESH_TIMEOUT,
+        )??;
 
         // Replace the recovery cache only after every prefix loaded successfully;
         // a partial etcd read must never become a promotable coordinator view.
@@ -867,6 +944,37 @@ mod tests {
     }
 
     #[test]
+    fn etcd_block_on_bounded_times_out_a_hung_future_instead_of_blocking_forever() {
+        // No real etcd server needed: `etcd_block_on_bounded` is generic over
+        // any future, so a deliberately-never-resolving one stands in for a
+        // stuck etcd RPC. Before this fix, `etcd_block_on` had no bound at
+        // all — a hung `client.put(...)` held `NonBlockingStoreHandle`'s
+        // single coordinator-wide store lock forever, freezing every other
+        // metadata write in the coordinator (jobs, executors, heartbeats,
+        // IVM dispatch) and cascading into a total, unrecoverable wedge
+        // (live repro, Phase 58, 2026-07-20: an executor-kill fault landing
+        // during concurrent IVM dispatch left `/leaderz` itself unresponsive
+        // for 10+ minutes with zero self-recovery).
+        let result = etcd_block_on_bounded(
+            async {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                42u32
+            },
+            std::time::Duration::from_millis(200),
+        );
+        assert!(
+            result.is_err(),
+            "a future that never resolves within the bound must return an error, not hang forever"
+        );
+    }
+
+    #[test]
+    fn etcd_block_on_bounded_returns_the_value_for_a_future_that_finishes_in_time() {
+        let result = etcd_block_on_bounded(async { 7u32 }, std::time::Duration::from_secs(5));
+        assert_eq!(result.unwrap(), 7);
+    }
+
+    #[test]
     fn prefix_range_end_increments_the_last_byte() {
         // The last byte is incremented (0xff never appears in a &str prefix,
         // so the carry/pop branch is defensive-only). Every real prefix here
@@ -1058,9 +1166,12 @@ mod tests {
     fn etcd_block_on_drives_future_on_the_dedicated_runtime() {
         // From a plain (no ambient runtime) thread: exercises ETCD_RUNTIME
         // creation, spawn, and the blocking channel receive.
-        assert_eq!(etcd_block_on(async { 21u32 * 2 }), 42);
+        assert_eq!(etcd_block_on(async { 21u32 * 2 }).unwrap(), 42);
         // A second call reuses the same runtime and still returns.
-        assert_eq!(etcd_block_on(async { format!("{}-{}", 4, 2) }), "4-2");
+        assert_eq!(
+            etcd_block_on(async { format!("{}-{}", 4, 2) }).unwrap(),
+            "4-2"
+        );
     }
 
     #[test]
@@ -1073,7 +1184,8 @@ mod tests {
                 .name()
                 .unwrap_or_default()
                 .to_string()
-        });
+        })
+        .unwrap();
         assert!(
             name.starts_with("krishiv-etcd"),
             "etcd future must run on the dedicated runtime, ran on {name:?}"
