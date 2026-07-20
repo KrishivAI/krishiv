@@ -27,7 +27,7 @@
 //! to the async etcd client, using `block_in_place` on multi-thread runtimes
 //! and a fallback runtime on current-thread or no-runtime callers.
 
-use etcd_client::{Client, GetOptions, KeyValue, SortOrder, SortTarget};
+use etcd_client::{Client, GetOptions, KeyValue, KvClient, SortOrder, SortTarget};
 
 use crate::store::{
     ContinuousSnapshot, EventLogEvent, JobHistoryRecord, MAX_JOB_HISTORY, MetadataStore,
@@ -76,14 +76,18 @@ impl EtcdMetadataStore {
     /// Connect to etcd and load all job and executor records from their
     /// individual keys.
     pub async fn connect(endpoints: Vec<String>) -> SchedulerResult<Self> {
-        let mut client =
+        let client =
             Client::connect(endpoints, None)
                 .await
                 .map_err(|e| SchedulerError::Transport {
                     message: format!("etcd metadata connect failed: {e}"),
                 })?;
+        // Metadata reads go through a kv client with a raised decode cap
+        // (see wide_kv / ETCD_MAX_DECODE_BYTES); the plain `client` below is
+        // kept only for the O(1) per-key put/delete writes.
+        let mut kv = wide_kv(&client);
 
-        let jobs = load_prefix::<PersistedJobRecord, JobRecord>(&mut client, JOB_KEY_PREFIX)
+        let jobs = load_prefix::<PersistedJobRecord, JobRecord>(&mut kv, JOB_KEY_PREFIX)
             .await
             .map_err(|e| SchedulerError::Transport {
                 message: format!("etcd jobs load failed: {e}"),
@@ -92,25 +96,25 @@ impl EtcdMetadataStore {
         let executor_descriptors = load_prefix::<
             PersistedExecutorDescriptor,
             krishiv_proto::ExecutorDescriptor,
-        >(&mut client, EXECUTOR_KEY_PREFIX)
+        >(&mut kv, EXECUTOR_KEY_PREFIX)
         .await
         .map_err(|e| SchedulerError::Transport {
             message: format!("etcd executors load failed: {e}"),
         })?;
 
-        let continuous_snapshots = load_continuous_snapshots(&mut client).await.map_err(|e| {
+        let continuous_snapshots = load_continuous_snapshots(&mut kv).await.map_err(|e| {
             SchedulerError::Transport {
                 message: format!("etcd continuous snapshots load failed: {e}"),
             }
         })?;
 
-        let ivm_snapshots = load_binary_prefix(&mut client, IVM_KEY_PREFIX)
+        let ivm_snapshots = load_binary_prefix(&mut kv, IVM_KEY_PREFIX)
             .await
             .map_err(|e| SchedulerError::Transport {
                 message: format!("etcd IVM snapshots load failed: {e}"),
             })?;
 
-        let history = load_json_prefix::<JobHistoryRecord>(&mut client, HISTORY_KEY_PREFIX)
+        let history = load_json_prefix::<JobHistoryRecord>(&mut kv, HISTORY_KEY_PREFIX)
             .await
             .map_err(|e| SchedulerError::Transport {
                 message: format!("etcd job history load failed: {e}"),
@@ -160,15 +164,16 @@ impl EtcdMetadataStore {
 
 impl MetadataStore for EtcdMetadataStore {
     fn refresh(&mut self) -> SchedulerResult<()> {
-        let mut client = self
+        let client = self
             .client
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         let (jobs, executors, snapshots, ivm_snapshots, history) =
             krishiv_common::async_util::block_on(async move {
+                let mut kv = wide_kv(&client);
                 let jobs =
-                    load_prefix::<PersistedJobRecord, JobRecord>(&mut client, JOB_KEY_PREFIX)
+                    load_prefix::<PersistedJobRecord, JobRecord>(&mut kv, JOB_KEY_PREFIX)
                         .await
                         .map_err(|e| SchedulerError::Transport {
                             message: format!("etcd jobs refresh failed: {e}"),
@@ -176,22 +181,22 @@ impl MetadataStore for EtcdMetadataStore {
                 let executors = load_prefix::<
                     PersistedExecutorDescriptor,
                     krishiv_proto::ExecutorDescriptor,
-                >(&mut client, EXECUTOR_KEY_PREFIX)
+                >(&mut kv, EXECUTOR_KEY_PREFIX)
                 .await
                 .map_err(|e| SchedulerError::Transport {
                     message: format!("etcd executors refresh failed: {e}"),
                 })?;
-                let snapshots = load_continuous_snapshots(&mut client).await.map_err(|e| {
+                let snapshots = load_continuous_snapshots(&mut kv).await.map_err(|e| {
                     SchedulerError::Transport {
                         message: format!("etcd continuous snapshots refresh failed: {e}"),
                     }
                 })?;
-                let ivm_snapshots = load_binary_prefix(&mut client, IVM_KEY_PREFIX)
+                let ivm_snapshots = load_binary_prefix(&mut kv, IVM_KEY_PREFIX)
                     .await
                     .map_err(|e| SchedulerError::Transport {
                         message: format!("etcd IVM snapshots refresh failed: {e}"),
                     })?;
-                let history = load_json_prefix::<JobHistoryRecord>(&mut client, HISTORY_KEY_PREFIX)
+                let history = load_json_prefix::<JobHistoryRecord>(&mut kv, HISTORY_KEY_PREFIX)
                     .await
                     .map_err(|e| SchedulerError::Transport {
                         message: format!("etcd job history refresh failed: {e}"),
@@ -351,17 +356,36 @@ fn truncate_history(mut history: Vec<JobHistoryRecord>) -> Vec<JobHistoryRecord>
 
 /// Load all values under `prefix` from etcd, deserializing each as `P` then
 /// converting to `T` via `TryFrom`.
-/// Key-values fetched per etcd range page. etcd/tonic caps a single gRPC
-/// response at 4 MiB by default, and a `get(prefix, with_prefix)` returns
-/// the WHOLE range in one message — so an accumulated prefix (e.g. many
-/// IVM snapshots under `/krishiv/ivm/`) crashes the coordinator on startup
-/// once it crosses 4 MiB (observed 2026-07-20 on the Phase 58 HA cluster:
-/// a ~5 MB IVM prefix → "decoded message length too large: found 5027816
-/// bytes, the limit is 4194304"; a fresh/failover coordinator could then
-/// never load state — a hard availability cliff). Paginating the range
-/// keeps every response bounded no matter how large the prefix grows. A
-/// small page bounds a page even when individual snapshots are large.
-const ETCD_PAGE_LIMIT: i64 = 16;
+/// Raised gRPC decode cap for the etcd metadata reads (default is 4 MiB).
+/// A single IVM snapshot value is already ~1.5 MiB, and even one paged
+/// response can carry several — plus a lone snapshot can itself exceed
+/// 4 MiB — so the coordinator must accept large decoded messages or it
+/// crash-loops on startup the moment durable state grows (observed
+/// 2026-07-20 on the Phase 58 HA cluster: five IVM snapshots totalling
+/// ~5 MB under `/krishiv/ivm/` → "decoded message length too large: found
+/// 5027816 bytes, the limit is 4194304"; a fresh or failover coordinator
+/// could then never load state — a hard availability cliff). 256 MiB is a
+/// cap, not a preallocation (only the actual response is allocated), and
+/// stays well under the coordinator's 2 GiB memory limit for a realistic
+/// prefix. Pagination below caps per-message size in the healthy case;
+/// the raised decode limit is what makes an oversized single response —
+/// or a single oversized value — decodable at all.
+const ETCD_MAX_DECODE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Key-values fetched per etcd range page — pagination bounds per-message
+/// memory in the common case (a large decode cap alone would let one
+/// response balloon). Kept small because individual snapshots are ~MiB.
+const ETCD_PAGE_LIMIT: i64 = 8;
+
+/// A [`KvClient`] with the raised decode cap applied. `Client::get` uses a
+/// private 4 MiB-capped kv client, but `kv_client()` hands back a clone on
+/// the same channel that we can reconfigure — so every metadata load goes
+/// through this, both at `connect` and on `refresh`.
+fn wide_kv(client: &Client) -> KvClient {
+    client
+        .kv_client()
+        .max_decoding_message_size(ETCD_MAX_DECODE_BYTES)
+}
 
 /// Lexicographic end of a prefix range: the smallest key strictly greater
 /// than every key under `prefix` (increment the last byte below 0xff,
@@ -383,7 +407,7 @@ fn prefix_range_end(prefix: &str) -> Vec<u8> {
 /// Read every key-value under `prefix` in bounded, key-ascending pages so
 /// no single etcd range response can exceed the gRPC decode limit. Each
 /// page resumes strictly past the previous page's last key.
-async fn get_prefix_paged(client: &mut Client, prefix: &str) -> Result<Vec<KeyValue>, String> {
+async fn get_prefix_paged(client: &mut KvClient, prefix: &str) -> Result<Vec<KeyValue>, String> {
     let range_end = prefix_range_end(prefix);
     let mut start = prefix.as_bytes().to_vec();
     let mut out: Vec<KeyValue> = Vec::new();
@@ -413,7 +437,7 @@ async fn get_prefix_paged(client: &mut Client, prefix: &str) -> Result<Vec<KeyVa
     Ok(out)
 }
 
-async fn load_prefix<P, T>(client: &mut Client, prefix: &str) -> Result<Vec<T>, String>
+async fn load_prefix<P, T>(client: &mut KvClient, prefix: &str) -> Result<Vec<T>, String>
 where
     P: serde::de::DeserializeOwned,
     T: TryFrom<P>,
@@ -440,7 +464,7 @@ where
     Ok(results)
 }
 
-async fn load_json_prefix<T>(client: &mut Client, prefix: &str) -> Result<Vec<T>, String>
+async fn load_json_prefix<T>(client: &mut KvClient, prefix: &str) -> Result<Vec<T>, String>
 where
     T: serde::de::DeserializeOwned,
 {
@@ -460,7 +484,7 @@ where
 }
 
 async fn load_continuous_snapshots(
-    client: &mut Client,
+    client: &mut KvClient,
 ) -> Result<std::collections::HashMap<String, ContinuousSnapshot>, String> {
     let kvs = get_prefix_paged(client, CONTINUOUS_KEY_PREFIX).await?;
 
@@ -478,7 +502,7 @@ async fn load_continuous_snapshots(
 }
 
 async fn load_binary_prefix(
-    client: &mut Client,
+    client: &mut KvClient,
     prefix: &str,
 ) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
     let kvs = get_prefix_paged(client, prefix).await?;
