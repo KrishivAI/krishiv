@@ -130,3 +130,153 @@ impl Coordinator {
         set
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use krishiv_proto::{
+        CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorState, JobSpec, StageId,
+        StageSpec, TaskId, TaskSpec,
+    };
+
+    fn two_task_streaming_job(job_id: &JobId) -> JobSpec {
+        JobSpec::new(job_id.clone(), "streaming-job", JobKind::Streaming).with_stage(
+            StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage")
+                .with_task(TaskSpec::new(
+                    TaskId::try_new("t0").unwrap(),
+                    "stream:tw",
+                ))
+                .with_task(TaskSpec::new(
+                    TaskId::try_new("t1").unwrap(),
+                    "stream:tw",
+                )),
+        )
+    }
+
+    #[test]
+    fn index_streaming_tasks_then_remove_clears_both_indexes() {
+        let mut coord = Coordinator::active(CoordinatorId::try_new("stream-idx").unwrap());
+        let job_id = JobId::try_new("job-idx").unwrap();
+        coord.submit_job(two_task_streaming_job(&job_id)).unwrap();
+
+        coord.index_streaming_tasks(&job_id);
+        assert_eq!(
+            coord.streaming_task_index.len(),
+            2,
+            "both tasks must be indexed for O(1) lookup"
+        );
+        assert!(
+            coord
+                .streaming_task_index
+                .contains_key(&TaskId::try_new("t0").unwrap())
+        );
+        assert_eq!(
+            coord.streaming_job_task_index.get(&job_id).map(Vec::len),
+            Some(2)
+        );
+
+        coord.remove_streaming_task_index(&job_id);
+        assert!(
+            coord.streaming_task_index.is_empty(),
+            "removing the job must clear every indexed task, not just the reverse entry"
+        );
+        assert!(!coord.streaming_job_task_index.contains_key(&job_id));
+    }
+
+    #[test]
+    fn apply_streaming_task_state_updates_the_indexed_task() {
+        let mut coord = Coordinator::active(CoordinatorId::try_new("stream-apply").unwrap());
+        let job_id = JobId::try_new("job-apply").unwrap();
+        coord.submit_job(two_task_streaming_job(&job_id)).unwrap();
+        coord.index_streaming_tasks(&job_id);
+
+        let task_id = TaskId::try_new("t0").unwrap();
+        coord.apply_streaming_task_state(&StreamingTaskState::new(
+            task_id.clone(),
+            42_000,
+            b"offset-7".to_vec(),
+        ));
+
+        let record = coord.job_coordinators.get(&job_id).unwrap().read_record();
+        let task = record
+            .stages()
+            .iter()
+            .flat_map(|s| s.tasks())
+            .find(|t| t.task_id() == &task_id)
+            .unwrap();
+        assert_eq!(task.last_watermark_ms(), Some(42_000));
+        assert_eq!(task.last_source_offset(), Some(b"offset-7".as_slice()));
+    }
+
+    #[test]
+    fn apply_streaming_task_state_is_a_noop_for_an_unindexed_task() {
+        // `submit_job` always indexes its own tasks (job_lifecycle.rs calls
+        // `index_streaming_tasks` unconditionally), so the only way to
+        // observe a genuinely unindexed task is one that was never
+        // submitted at all — a stale/unknown report arriving after the
+        // index believes nothing about this id.
+        let mut coord = Coordinator::active(CoordinatorId::try_new("stream-noop").unwrap());
+        let job_id = JobId::try_new("job-noop").unwrap();
+        coord.submit_job(two_task_streaming_job(&job_id)).unwrap();
+
+        // Must not panic even though "no-such-task" is not in any job.
+        coord.apply_streaming_task_state(&StreamingTaskState::new(
+            TaskId::try_new("no-such-task").unwrap(),
+            1,
+            Vec::new(),
+        ));
+
+        // And the real, indexed tasks must be completely unaffected.
+        let record = coord.job_coordinators.get(&job_id).unwrap().read_record();
+        for task in record.stages().iter().flat_map(|s| s.tasks()) {
+            assert_eq!(task.last_watermark_ms(), None);
+        }
+    }
+
+    #[test]
+    fn executors_with_streaming_running_tasks_excludes_batch_jobs_and_unassigned_tasks() {
+        let mut coord = Coordinator::active(CoordinatorId::try_new("stream-running").unwrap());
+        let exec_id = krishiv_proto::ExecutorId::try_new("exec-running").unwrap();
+        coord
+            .register_executor(ExecutorDescriptor::new(exec_id.clone(), "host", 2))
+            .unwrap();
+        coord
+            .executor_heartbeat(ExecutorHeartbeat::new(exec_id.clone(), ExecutorState::Healthy))
+            .unwrap();
+
+        let streaming_job = JobId::try_new("job-streaming").unwrap();
+        coord
+            .submit_job(two_task_streaming_job(&streaming_job))
+            .unwrap();
+        {
+            let mut record = coord.find_job_mut(&streaming_job).unwrap();
+            record.stages[0].tasks[0].state = TaskState::Running;
+            record.stages[0].tasks[0].assigned_executor = Some(exec_id.clone());
+            // t1 stays unassigned/Pending — must not contribute to the set.
+        }
+
+        let batch_job = JobId::try_new("job-batch").unwrap();
+        coord
+            .submit_job(
+                JobSpec::new(batch_job.clone(), "batch-job", JobKind::Batch).with_stage(
+                    StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(
+                        TaskSpec::new(TaskId::try_new("bt0").unwrap(), "sql: select 1"),
+                    ),
+                ),
+            )
+            .unwrap();
+        {
+            let mut record = coord.find_job_mut(&batch_job).unwrap();
+            record.stages[0].tasks[0].state = TaskState::Running;
+            record.stages[0].tasks[0].assigned_executor = Some(exec_id.clone());
+        }
+
+        let running = coord.executors_with_streaming_running_tasks();
+        assert_eq!(
+            running,
+            std::collections::HashSet::from([exec_id]),
+            "only the executor running the streaming job's Running task counts, \
+             not the batch job's Running task nor the streaming job's unassigned task"
+        );
+    }
+}

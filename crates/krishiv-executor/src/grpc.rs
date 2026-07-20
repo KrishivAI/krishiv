@@ -652,3 +652,125 @@ pub fn executor_task_grpc_server_with_run_loop(
         .max_decoding_message_size(max)
         .max_encoding_message_size(max)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service_with_auth(auth: ExecutorTaskAuthConfig) -> ExecutorTaskGrpcService {
+        ExecutorTaskGrpcService::with_auth_config(ExecutorAssignmentInbox::new_unbounded(), auth)
+    }
+
+    fn metadata_with_bearer(token: &str) -> tonic::metadata::MetadataMap {
+        let mut request = tonic::Request::new(());
+        request.metadata_mut().insert(
+            "authorization",
+            tonic::metadata::MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
+        );
+        request.metadata().clone()
+    }
+
+    #[test]
+    fn validate_auth_allows_any_request_when_no_token_is_required() {
+        let service = service_with_auth(ExecutorTaskAuthConfig::new(false, None));
+        assert!(
+            service
+                .validate_auth(&tonic::metadata::MetadataMap::new())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_auth_rejects_a_request_with_no_token_when_required() {
+        let service =
+            service_with_auth(ExecutorTaskAuthConfig::new(true, Some("secret".to_owned())));
+        let err = service
+            .validate_auth(&tonic::metadata::MetadataMap::new())
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert!(err.message().contains("missing"));
+    }
+
+    #[test]
+    fn validate_auth_rejects_the_wrong_token() {
+        let service =
+            service_with_auth(ExecutorTaskAuthConfig::new(true, Some("secret".to_owned())));
+        let err = service
+            .validate_auth(&metadata_with_bearer("wrong"))
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert!(err.message().contains("invalid"));
+    }
+
+    #[test]
+    fn validate_auth_accepts_the_correct_token() {
+        let service =
+            service_with_auth(ExecutorTaskAuthConfig::new(true, Some("secret".to_owned())));
+        assert!(
+            service
+                .validate_auth(&metadata_with_bearer("secret"))
+                .is_ok()
+        );
+    }
+
+    /// Security-critical: a deployment that sets `KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH=true`
+    /// but forgets to configure a bearer token must fail closed on every
+    /// request — never silently fall back to "no auth required". A request
+    /// with a token attached must be rejected exactly like one without, since
+    /// there is no configured token to validate against.
+    #[test]
+    fn validate_auth_fails_closed_when_auth_is_required_but_no_token_is_configured() {
+        let service = service_with_auth(ExecutorTaskAuthConfig::new(true, None));
+        assert!(
+            service
+                .validate_auth(&tonic::metadata::MetadataMap::new())
+                .is_err(),
+            "misconfigured auth must reject bare requests"
+        );
+        assert!(
+            service
+                .validate_auth(&metadata_with_bearer("anything"))
+                .is_err(),
+            "misconfigured auth must reject requests even if they carry a token"
+        );
+    }
+
+    #[tokio::test]
+    async fn assign_task_rpc_enforces_auth_before_touching_the_inbox() {
+        use krishiv_proto::{
+            AttemptId, ExecutorId, JobId, LeaseGeneration, OutputContract, OutputContractKind,
+            PlanFragment, StageId, TaskAttemptRef, TaskId,
+        };
+
+        let service =
+            service_with_auth(ExecutorTaskAuthConfig::new(true, Some("secret".to_owned())));
+        let assignment = ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                JobId::try_new("job-auth").unwrap(),
+                StageId::try_new("stage-auth").unwrap(),
+                TaskId::try_new("task-auth").unwrap(),
+                AttemptId::initial(),
+            ),
+            ExecutorId::try_new("exec-auth").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new("sql: select 1"),
+            OutputContract::new(OutputContractKind::InlineRecordBatches, "inline"),
+        );
+        let request =
+            tonic::Request::new(wire::executor_task_assignment_to_wire(assignment).unwrap());
+
+        // No authorization header attached — must be rejected before the
+        // request ever reaches inbox decoding/insertion.
+        let status =
+            <ExecutorTaskGrpcService as wire::v1::executor_task_server::ExecutorTask>::assign_task(
+                &service, request,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        assert!(
+            service.inbox().pop_next().unwrap().is_none(),
+            "the rejected assignment must never reach the inbox"
+        );
+    }
+}

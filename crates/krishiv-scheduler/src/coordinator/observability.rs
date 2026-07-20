@@ -114,3 +114,66 @@ pub fn build_observability_report(
         connector_metrics: None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use krishiv_proto::{
+        CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorState, JobKind, JobSpec,
+        StageId, StageSpec, TaskId, TaskSpec,
+    };
+
+    #[test]
+    fn build_observability_report_errs_for_an_unknown_job() {
+        let coordinator = Coordinator::active(CoordinatorId::try_new("obs-unknown").unwrap());
+        let err =
+            build_observability_report(&coordinator, &JobId::try_new("no-such-job").unwrap())
+                .unwrap_err();
+        assert!(matches!(err, crate::SchedulerError::UnknownJob { .. }));
+    }
+
+    #[test]
+    fn build_observability_report_reflects_live_coordinator_state() {
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("obs-live").unwrap());
+        let exec_id = krishiv_proto::ExecutorId::try_new("exec-obs").unwrap();
+        coordinator
+            .register_executor(
+                ExecutorDescriptor::new(exec_id.clone(), "10.0.0.5", 4)
+                    .with_task_endpoint("http://10.0.0.5:2001"),
+            )
+            .unwrap();
+        coordinator
+            .executor_heartbeat(ExecutorHeartbeat::new(exec_id.clone(), ExecutorState::Healthy))
+            .unwrap();
+
+        let job_id = JobId::try_new("obs-job").unwrap();
+        let spec = JobSpec::new(job_id.clone(), "obs-job-name", JobKind::Batch).with_stage(
+            StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(
+                TaskSpec::new(TaskId::try_new("t0").unwrap(), "sql: select 1"),
+            ),
+        );
+        coordinator.submit_job(spec).unwrap();
+
+        let report = build_observability_report(&coordinator, &job_id).unwrap();
+
+        assert_eq!(report.job.job_id, "obs-job");
+        assert_eq!(report.job.job_name, "obs-job-name");
+        assert_eq!(report.coordinator_id, "obs-live");
+        assert_eq!(report.stages.len(), 1);
+        assert_eq!(report.stages[0].task_details.len(), 1);
+        assert_eq!(report.stages[0].task_details[0].task_id, "t0");
+        assert_eq!(
+            report.stages[0].task_counts.values().sum::<usize>(),
+            1,
+            "every task must be bucketed into exactly one state count"
+        );
+        assert_eq!(report.executors.len(), 1);
+        assert_eq!(report.executors[0].executor_id, "exec-obs");
+        assert_eq!(report.executors[0].host, "10.0.0.5");
+        assert_eq!(report.executors[0].slots, 4);
+        assert!(
+            report.checkpoint.is_none(),
+            "a job without checkpoint config must report no checkpoint block"
+        );
+    }
+}

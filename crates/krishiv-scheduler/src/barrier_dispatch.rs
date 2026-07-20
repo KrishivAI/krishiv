@@ -632,7 +632,10 @@ pub async fn drive_barrier_dispatches(
 mod tests {
     use super::*;
     use krishiv_proto::wire::v1::BarrierAck;
-    use krishiv_proto::{CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorState};
+    use krishiv_proto::{
+        CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorState, JobKind, JobSpec,
+        StageId, StageSpec, TaskSpec,
+    };
 
     /// Regression (Wave 2 — Scheduler Hardening): `apply_barrier_acks` must
     /// drive every ack through `handle_checkpoint_ack` and handle every
@@ -681,5 +684,134 @@ mod tests {
             .executor_heartbeat(ExecutorHeartbeat::new(exec_id, ExecutorState::Healthy))
             .unwrap();
         assert!(coord.pending_barrier_dispatch_plans().is_empty());
+    }
+
+    fn record_for(descriptor: ExecutorDescriptor) -> ExecutorRecord {
+        let mut coord = Coordinator::active(CoordinatorId::try_new("endpoint-fallback").unwrap());
+        let exec_id = descriptor.executor_id().clone();
+        coord.register_executor(descriptor).unwrap();
+        coord.exec.executors.find_executor(&exec_id).unwrap().clone()
+    }
+
+    #[test]
+    fn barrier_endpoint_prefers_the_dedicated_barrier_endpoint() {
+        let exec_id = krishiv_proto::ExecutorId::try_new("exec-both").unwrap();
+        let record = record_for(
+            ExecutorDescriptor::new(exec_id, "host", 2)
+                .with_task_endpoint("http://host:2001")
+                .with_barrier_endpoint("http://host:2006"),
+        );
+        assert_eq!(
+            barrier_endpoint_for_record(&record).as_deref(),
+            Some("http://host:2006")
+        );
+    }
+
+    #[test]
+    fn barrier_endpoint_falls_back_to_task_endpoint_when_unset() {
+        let exec_id = krishiv_proto::ExecutorId::try_new("exec-task-only").unwrap();
+        let record = record_for(
+            ExecutorDescriptor::new(exec_id, "host", 2).with_task_endpoint("http://host:2001"),
+        );
+        assert_eq!(
+            barrier_endpoint_for_record(&record).as_deref(),
+            Some("http://host:2001")
+        );
+    }
+
+    #[test]
+    fn barrier_endpoint_is_none_when_neither_endpoint_is_set() {
+        let exec_id = krishiv_proto::ExecutorId::try_new("exec-none").unwrap();
+        let record = record_for(ExecutorDescriptor::new(exec_id, "host", 2));
+        assert_eq!(barrier_endpoint_for_record(&record), None);
+    }
+
+    #[test]
+    fn barrier_endpoint_treats_empty_barrier_endpoint_as_unset() {
+        // `with_barrier_endpoint("")` must fall back to the task endpoint,
+        // not surface an empty string as if it were a real address.
+        let exec_id = krishiv_proto::ExecutorId::try_new("exec-empty-barrier").unwrap();
+        let record = record_for(
+            ExecutorDescriptor::new(exec_id, "host", 2)
+                .with_task_endpoint("http://host:2001")
+                .with_barrier_endpoint(""),
+        );
+        assert_eq!(
+            barrier_endpoint_for_record(&record).as_deref(),
+            Some("http://host:2001")
+        );
+    }
+
+    fn job_with_task_description(task_id: &str, description: &str) -> JobRecord {
+        let spec = JobSpec::new(
+            JobId::try_new("op-id-job").unwrap(),
+            "op-id-test",
+            JobKind::Batch,
+        )
+        .with_stage(
+            StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(
+                TaskSpec::new(TaskId::try_new(task_id).unwrap(), description),
+            ),
+        );
+        JobRecord::from_spec(spec, 1)
+    }
+
+    #[test]
+    fn stable_operator_id_errs_without_a_job_record() {
+        let err =
+            stable_operator_id_for_task_id(None, &TaskId::try_new("t0").unwrap()).unwrap_err();
+        assert!(err.contains("no job record"));
+    }
+
+    #[test]
+    fn stable_operator_id_errs_when_task_is_not_in_the_job() {
+        let record = job_with_task_description("t0", "krishiv-fragment:body");
+        let err = stable_operator_id_for_task_id(Some(record), &TaskId::try_new("t1").unwrap())
+            .unwrap_err();
+        assert!(err.contains("not found in job stages"));
+    }
+
+    #[test]
+    fn stable_operator_id_errs_on_empty_description() {
+        let record = job_with_task_description("t0", "");
+        let err = stable_operator_id_for_task_id(Some(record), &TaskId::try_new("t0").unwrap())
+            .unwrap_err();
+        assert!(err.contains("description is empty"));
+    }
+
+    #[test]
+    fn stable_operator_id_is_deterministic_and_strips_the_fragment_prefix() {
+        let record_a = job_with_task_description("t0", "krishiv-fragment:sql: select 1");
+        let record_b = job_with_task_description("t0", "krishiv-fragment:sql: select 1");
+        let task_id = TaskId::try_new("t0").unwrap();
+
+        let id_a = stable_operator_id_for_task_id(Some(record_a), &task_id).unwrap();
+        let id_b = stable_operator_id_for_task_id(Some(record_b), &task_id).unwrap();
+
+        assert_eq!(id_a, id_b, "identical fragment bodies must hash identically");
+        assert!(id_a.as_str().starts_with("op-h"));
+    }
+
+    #[test]
+    fn stable_operator_id_differs_for_different_fragment_bodies() {
+        let record_a = job_with_task_description("t0", "krishiv-fragment:sql: select 1");
+        let record_b = job_with_task_description("t0", "krishiv-fragment:sql: select 2");
+        let task_id = TaskId::try_new("t0").unwrap();
+
+        let id_a = stable_operator_id_for_task_id(Some(record_a), &task_id).unwrap();
+        let id_b = stable_operator_id_for_task_id(Some(record_b), &task_id).unwrap();
+
+        assert_ne!(id_a, id_b);
+    }
+
+    #[test]
+    fn stable_operator_id_hashes_the_whole_description_for_legacy_fragments() {
+        // No `krishiv-fragment:` prefix: the legacy fallback hashes the raw
+        // description rather than erroring, so old-style tasks still get a
+        // deterministic (if not retry-stable) operator id.
+        let record = job_with_task_description("t0", "sql: select 1");
+        let id =
+            stable_operator_id_for_task_id(Some(record), &TaskId::try_new("t0").unwrap()).unwrap();
+        assert!(id.as_str().starts_with("op-h"));
     }
 }
