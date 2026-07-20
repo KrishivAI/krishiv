@@ -2622,6 +2622,104 @@ mod tests {
         );
     }
 
+    /// Sibling of the #9 fix in `apply_assignments` (Phase 58 #180): recycling
+    /// a continuous job's task for its *next* push cycle must stamp a fresh
+    /// `assigned_at_ms`, not clear it to `None`. `reset_stuck_assigned_tasks`
+    /// silently skips any `Assigned` task with `assigned_at_ms: None` forever
+    /// — if the recycled task's next launch never lands (its executor dies in
+    /// the same fault window that triggered the push, or the launch RPC is
+    /// simply lost), it becomes permanently invisible to the reaper. Live
+    /// found in the Phase 58 chaos gate: a streaming job's task sat `Assigned`
+    /// with `assigned_at_ms: None` for 20+ minutes after a successful cycle
+    /// recycled it, surviving two full clean 50-cell gate runs undetected.
+    #[tokio::test]
+    async fn recycled_cycle_task_gets_a_fresh_assigned_at_ms_not_none() {
+        use base64::Engine as _;
+        use krishiv_proto::{TaskOutputMetadata, TaskState, TaskStatusUpdate};
+
+        let coordinator = make_coordinator_with_executor("recycle-stamp").await;
+        let _ = api_continuous_register(
+            State(coordinator.clone()),
+            Json(ContinuousRegisterRequest {
+                job_id: "cs-recycle-stamp-job".into(),
+                spec: tumbling_spec(),
+                sink: None,
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let job_id = krishiv_proto::JobId::try_new("cs-recycle-stamp-job").unwrap();
+
+        // First cycle: drive it to Succeeded, exactly like a real push.
+        let first = prepare_cycle(&coordinator, "cs-recycle-stamp-job").await;
+        let running = TaskStatusUpdate::new(
+            job_id.clone(),
+            first.stage_id().clone(),
+            first.task_id().clone(),
+            first.executor_id().clone(),
+            TaskState::Running,
+            first.attempt_id().as_u32(),
+        )
+        .with_lease_generation(first.lease_generation());
+        coordinator
+            .write()
+            .await
+            .apply_task_update(running)
+            .unwrap();
+        let output_ipc = base64::engine::general_purpose::STANDARD
+            .decode(encoded_input())
+            .unwrap();
+        let succeeded = TaskStatusUpdate::new(
+            job_id.clone(),
+            first.stage_id().clone(),
+            first.task_id().clone(),
+            first.executor_id().clone(),
+            TaskState::Succeeded,
+            first.attempt_id().as_u32(),
+        )
+        .with_lease_generation(first.lease_generation())
+        .with_output_metadata(
+            TaskOutputMetadata::new("streaming_window", 1, 1, 2)
+                .with_inline_record_batch_ipc(vec![output_ipc]),
+        );
+        coordinator
+            .write()
+            .await
+            .apply_task_update(succeeded)
+            .unwrap();
+        // Drain so the second cycle's undrained-output guard doesn't fire.
+        coordinator
+            .write()
+            .await
+            .take_job_inline_results(&job_id);
+
+        // Second cycle: this is the recycle path — the task transitions
+        // Succeeded -> Assigned again to prepare for the next push.
+        let mut coord = coordinator.write().await;
+        coord
+            .prepare_continuous_input_cycle(&job_id, vec![input_partition()])
+            .unwrap();
+        let jc = coord.job_coordinator(&job_id).unwrap();
+        let record = jc.read_record();
+        let task = &record.stages()[0].tasks()[0];
+        assert_eq!(
+            task.state(),
+            TaskState::Assigned,
+            "recycle must move the task back to Assigned"
+        );
+        assert!(
+            task.assigned_at_ms.is_some(),
+            "a recycled Assigned task must carry a fresh assigned_at_ms or it \
+             becomes permanently invisible to reset_stuck_assigned_tasks if \
+             its next launch never lands"
+        );
+    }
+
     /// G5 follow-up (found live via the Phase-20 executor fault loop): if the
     /// executor holding a continuous job's task is lost *mid-cycle* — the
     /// task never reports a terminal status, so `apply_task_update`'s

@@ -474,6 +474,17 @@ impl Coordinator {
         }
 
         let profile = self.durability_profile;
+        // Sibling of the #9 fix in `apply_assignments`: any task entering
+        // `Assigned` must carry a fresh `assigned_at_ms`, or
+        // `reset_stuck_assigned_tasks`'s `let Some(assigned_ms) = ... else {
+        // continue }` silently skips it forever if the next launch never
+        // lands (e.g. the assigned executor dies in the same fault window
+        // that triggered this push). Found live: a continuous job's task
+        // stayed `Assigned` with `assigned_at_ms: None` for 20+ minutes,
+        // invisible to the reaper, after `push_continuous_input` recycled it
+        // for the next cycle and cleared the timestamp instead of
+        // refreshing it.
+        let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
         {
             let mut job = self.find_job_mut(job_id)?;
             if job.spec.kind() != JobKind::Streaming {
@@ -515,7 +526,7 @@ impl Coordinator {
                         }
                     }
                     task.output_metadata = None;
-                    task.assigned_at_ms = None;
+                    task.assigned_at_ms = Some(now_ms);
                     task.last_progress_ms = None;
                 }
                 stage.refresh_state();
