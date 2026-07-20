@@ -36,9 +36,11 @@
 //! # Persist mechanism
 //!
 //! `MetadataStore` is a sync trait called from within the coordinator's async
-//! write-lock.  `krishiv_common::async_util::block_on` bridges the sync trait
-//! to the async etcd client, using `block_in_place` on multi-thread runtimes
-//! and a fallback runtime on current-thread or no-runtime callers.
+//! write-lock. [`etcd_block_on`] bridges the sync trait to the async etcd
+//! client by running every etcd future on a **dedicated etcd runtime** and
+//! blocking the caller on a channel — never driving etcd I/O on the caller's
+//! scheduling runtime, which would deadlock the coordinator under load (see
+//! [`ETCD_RUNTIME`]).
 
 use etcd_client::{Client, DeleteOptions, GetOptions, KeyValue, KvClient, SortOrder, SortTarget};
 
@@ -47,6 +49,60 @@ use crate::store::{
     PersistedExecutorDescriptor, PersistedJobRecord,
 };
 use crate::{JobRecord, SchedulerError, SchedulerResult};
+
+/// Dedicated Tokio runtime for **all** etcd I/O.
+///
+/// The `MetadataStore` trait is synchronous but the etcd client is async, so
+/// every call bridges sync→async by blocking. If that bridge drove the etcd
+/// future on the *caller's* runtime (via `block_in_place(handle.block_on(..))`),
+/// it deadlocks the coordinator under load: enough concurrent metadata writes
+/// (executor churn during a chaos fault) park every worker thread in
+/// `block_in_place`, leaving no thread to drive the etcd I/O reactor those
+/// same threads are blocked waiting on — the whole coordinator wedges, so
+/// `/leaderz` stops answering and the pod is dropped from Service routing with
+/// no leader endpoint (observed 2026-07-20 on the Phase 58 HA chaos gate: all
+/// coordinators frozen for minutes while `/healthz` on the dedicated liveness
+/// thread stayed up). Running every etcd future on this separate runtime keeps
+/// the etcd reactor always live, independent of how saturated the scheduling
+/// runtime is; the caller only ever blocks on a plain channel receive.
+static ETCD_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+fn etcd_runtime() -> &'static tokio::runtime::Runtime {
+    ETCD_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("krishiv-etcd")
+            .build()
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "failed to build the dedicated etcd runtime; aborting");
+                std::process::abort()
+            })
+    })
+}
+
+/// Drive an etcd future to completion on [`etcd_runtime`], blocking the caller
+/// for the result. The future runs on the dedicated runtime (its reactor is
+/// never starved by the scheduling runtime); the caller waits on a std channel,
+/// wrapped in `block_in_place` on a multi-thread worker so that runtime is told
+/// the worker is parked rather than silently losing it. A current-thread caller
+/// blocks directly — safe here because the result is produced by a *different*
+/// runtime, so there is no self-deadlock.
+fn etcd_block_on<F>(fut: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    etcd_runtime().spawn(async move {
+        let _ = tx.send(fut.await);
+    });
+    let recv = move || rx.recv().expect("etcd runtime dropped the task before sending a result");
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(recv),
+        _ => recv(),
+    }
+}
 
 const JOB_KEY_PREFIX: &str = "/krishiv/jobs/";
 const EXECUTOR_KEY_PREFIX: &str = "/krishiv/executors/";
@@ -151,7 +207,7 @@ impl EtcdMetadataStore {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        krishiv_common::async_util::block_on(client.put(key, value, None)).map_err(|e| {
+        etcd_block_on(async move { client.put(key, value, None).await }).map_err(|e| {
             SchedulerError::Transport {
                 message: format!("etcd put failed: {e}"),
             }
@@ -166,7 +222,7 @@ impl EtcdMetadataStore {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        krishiv_common::async_util::block_on(client.delete(key, None)).map_err(|e| {
+        etcd_block_on(async move { client.delete(key, None).await }).map_err(|e| {
             SchedulerError::Transport {
                 message: format!("etcd delete failed: {e}"),
             }
@@ -184,7 +240,7 @@ impl EtcdMetadataStore {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         let opts = DeleteOptions::new().with_range(end);
-        krishiv_common::async_util::block_on(client.delete(start, Some(opts))).map_err(|e| {
+        etcd_block_on(async move { client.delete(start, Some(opts)).await }).map_err(|e| {
             SchedulerError::Transport {
                 message: format!("etcd delete range failed: {e}"),
             }
@@ -201,7 +257,7 @@ impl MetadataStore for EtcdMetadataStore {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         let (jobs, executors, snapshots, ivm_snapshots, history) =
-            krishiv_common::async_util::block_on(async move {
+            etcd_block_on(async move {
                 let mut kv = wide_kv(&client);
                 let jobs =
                     load_prefix::<PersistedJobRecord, JobRecord>(&mut kv, JOB_KEY_PREFIX)
@@ -994,5 +1050,33 @@ mod tests {
         let (codec, payload) = compress_ivm_payload(&incompressible);
         assert_eq!(codec, IVM_CODEC_NONE);
         assert_eq!(payload, incompressible, "NONE codec stores raw bytes");
+    }
+
+    // ── dedicated etcd runtime bridge ────────────────────────────────────
+
+    #[test]
+    fn etcd_block_on_drives_future_on_the_dedicated_runtime() {
+        // From a plain (no ambient runtime) thread: exercises ETCD_RUNTIME
+        // creation, spawn, and the blocking channel receive.
+        assert_eq!(etcd_block_on(async { 21u32 * 2 }), 42);
+        // A second call reuses the same runtime and still returns.
+        assert_eq!(etcd_block_on(async { format!("{}-{}", 4, 2) }), "4-2");
+    }
+
+    #[test]
+    fn etcd_block_on_result_comes_from_a_separate_runtime_thread() {
+        // The future must run on the etcd runtime, never the caller thread, so
+        // the caller's runtime can never starve the etcd reactor. Assert the
+        // future executes on a `krishiv-etcd`-named thread.
+        let name = etcd_block_on(async {
+            std::thread::current()
+                .name()
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert!(
+            name.starts_with("krishiv-etcd"),
+            "etcd future must run on the dedicated runtime, ran on {name:?}"
+        );
     }
 }
