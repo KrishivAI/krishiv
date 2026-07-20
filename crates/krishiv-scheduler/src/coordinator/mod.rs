@@ -1846,24 +1846,38 @@ impl Coordinator {
     }
 
     /// Self-heal a job that is still non-terminal in the live
-    /// `job_coordinators` map despite the durable store already latching its
-    /// id as terminal (see `NonBlockingStoreHandle::terminal_jobs`).
+    /// `job_coordinators` map despite this coordinator's own latch believing
+    /// the durable store already has it terminal (see
+    /// `NonBlockingStoreHandle::terminal_jobs`).
     ///
-    /// This divergence should be unreachable after the `submit_job` fix that
-    /// closed its one known cause: a resubmission for an id whose prior
-    /// lifecycle had already concluded bypassed the latch on write (via
-    /// `store.inner().save_job(...)` instead of `save_job_checked`), so the
-    /// fresh in-memory job it created could never become durable again — the
-    /// coordinator kept rescheduling it (and, for a stuck-Assigned task,
-    /// reaping it via `reset_stuck_assigned_tasks` above) forever, every
-    /// persist attempt silently rejected, live-repro'd in the Phase 58 chaos
-    /// gate as two streaming jobs that churned for over an hour past their
-    /// own recorded cancellation. This sweep is defense in depth: if the same
-    /// class of divergence is ever reintroduced by a different call site, the
-    /// coordinator reconciles to the store's already-latched answer — the one
-    /// proven correct by direct etcd inspection during that incident —
-    /// instead of scheduling and persisting-forever-in-vain a job that can
-    /// never durably record another state change.
+    /// One known trigger (closed): a resubmission for an id whose prior
+    /// lifecycle had already concluded used to bypass the latch on write
+    /// (`store.inner().save_job(...)` instead of `save_job_checked`), so the
+    /// fresh in-memory job it created could never become durable again —
+    /// live-repro'd as two streaming jobs that churned for over an hour past
+    /// their own recorded cancellation.
+    ///
+    /// The in-memory-only cancel this function originally applied assumed
+    /// the store was already correct and needed no re-write. A second,
+    /// separate live incident (Phase 58 chaos gate, sustained
+    /// `coordinator-kill` churn — 6+ leader kills across one gate run,
+    /// several coordinator pods replaced within minutes of each other)
+    /// proved that assumption wrong: this function fired for a job whose
+    /// *durable* etcd record was independently confirmed non-terminal
+    /// (`version: 10`, actively cycling Assigned/Pending) at the exact same
+    /// moment — i.e. this coordinator's local latch said "terminal" while
+    /// etcd itself said otherwise, most likely because a retried
+    /// submit/cancel from the gate's own retry-on-uncertain-delivery client
+    /// landed on a different coordinator generation across a leader
+    /// failover. An in-memory-only fix in that situation self-un-heals on
+    /// the very next heartbeat once the record is (re)loaded from the store.
+    /// This function now also re-persists the cancellation through
+    /// `save_job_checked` — a terminal write is always admitted by the latch
+    /// regardless of which side was actually stale, so this converges the
+    /// store back to the correct answer instead of only patching the local
+    /// view. It runs every assignment round, so even if the same class of
+    /// divergence recurs under further chaos, it gets corrected again within
+    /// one heartbeat rather than compounding.
     pub(crate) fn reconcile_store_latched_terminal_jobs(&mut self) {
         let Some(store) = self.store.clone() else {
             return;
@@ -1886,10 +1900,22 @@ impl Coordinator {
                 job_id = %job_id,
                 "job is latched as terminal in the durable store but still \
                  live in memory — every persist for it would be silently \
-                 rejected; self-healing by cancelling it in memory to match \
-                 the store"
+                 rejected; self-healing by cancelling it in memory and \
+                 re-persisting to converge the store back to that answer"
             );
-            jc.write_record().cancel();
+            let record = {
+                let mut guard = jc.write_record();
+                guard.cancel();
+                guard.clone()
+            };
+            if let Err(error) = store.save_job_checked(&record) {
+                tracing::error!(
+                    job_id = %job_id,
+                    error = %error,
+                    "self-heal cancel could not be durably persisted this round; \
+                     will retry on the next assignment round"
+                );
+            }
         }
     }
 

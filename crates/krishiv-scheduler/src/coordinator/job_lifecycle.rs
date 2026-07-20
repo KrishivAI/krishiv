@@ -1307,5 +1307,108 @@ mod terminal_id_reuse_tests {
                 .is_terminal(),
             "a job latched terminal in the store must be cancelled in memory to match"
         );
+        let persisted = coordinator
+            .store
+            .as_ref()
+            .unwrap()
+            .inner()
+            .jobs()
+            .iter()
+            .find(|r| r.job_id() == &job_id)
+            .cloned()
+            .expect("job must still exist in the store");
+        assert!(
+            persisted.state().is_terminal(),
+            "the self-heal must also durably persist the correction, not just \
+             patch the in-memory copy"
+        );
+    }
+
+    /// Live-repro'd on 2026-07-20 under sustained `coordinator-kill` chaos:
+    /// the self-heal fired because this coordinator's *local* latch believed
+    /// the job was terminal, but the durable store itself was independently
+    /// non-terminal at that exact moment (confirmed by direct etcd
+    /// inspection) — most likely a retried submit/cancel landing on a
+    /// different coordinator generation across a leader failover. An
+    /// in-memory-only fix there would self-undo on the very next reload from
+    /// the store. This test reproduces that: the store is left genuinely
+    /// non-terminal (not just "latched but actually fine") when the
+    /// reconcile runs, and asserts the self-heal converges the store itself,
+    /// not only the in-memory view.
+    #[test]
+    fn reconcile_store_latched_terminal_jobs_persists_the_fix_even_when_the_store_itself_is_stale()
+     {
+        let mut coordinator = Coordinator::new_active(None)
+            .unwrap()
+            .with_store(InMemoryMetadataStore::default());
+
+        let job_id = JobId::try_new("job-store-also-stale").unwrap();
+        coordinator
+            .submit_job(single_task_job(&job_id, "t0"))
+            .unwrap();
+        coordinator.cancel_job(&job_id).unwrap();
+
+        // Simulate a stale write reaching the store directly (bypassing the
+        // latch, as a delayed duplicate from a different coordinator
+        // generation would) so the durable record is ALSO non-terminal, not
+        // merely the in-memory copy.
+        {
+            let jc = coordinator.job_coordinators.get(&job_id).unwrap();
+            let mut record = jc.write_record();
+            record.state = JobState::Running;
+            for stage in record.stages_mut() {
+                stage.state = StageState::Running;
+            }
+            let stale = record.clone();
+            drop(record);
+            coordinator
+                .store
+                .as_ref()
+                .unwrap()
+                .inner()
+                .save_job(&stale)
+                .unwrap();
+        }
+        assert!(
+            !coordinator
+                .store
+                .as_ref()
+                .unwrap()
+                .inner()
+                .jobs()
+                .iter()
+                .find(|r| r.job_id() == &job_id)
+                .unwrap()
+                .state()
+                .is_terminal(),
+            "the store must be genuinely non-terminal before the reconcile runs"
+        );
+
+        coordinator.reconcile_store_latched_terminal_jobs();
+
+        assert!(
+            coordinator
+                .job_coordinators
+                .get(&job_id)
+                .unwrap()
+                .read_record()
+                .state()
+                .is_terminal(),
+            "in-memory must be corrected"
+        );
+        assert!(
+            coordinator
+                .store
+                .as_ref()
+                .unwrap()
+                .inner()
+                .jobs()
+                .iter()
+                .find(|r| r.job_id() == &job_id)
+                .unwrap()
+                .state()
+                .is_terminal(),
+            "the store must be converged back to terminal too, not left stale"
+        );
     }
 }
