@@ -1772,6 +1772,79 @@ impl Coordinator {
         self.apply_stall_resets(&work);
     }
 
+    /// Reclaim tasks stuck in `Assigned` state (has an executor, never
+    /// reached `Running`) for longer than `stuck_assigned_reset_ms` — resets
+    /// them to `Pending` and clears the assignment so they compete for
+    /// capacity again instead of permanently masquerading as in-flight work.
+    ///
+    /// A task normally crosses `Assigned` → `Running` within one heartbeat
+    /// cycle. A launch that never lands (a dropped dispatch RPC during a
+    /// network partition, or a continuous/streaming job whose caller
+    /// vanished before ever driving it) leaves it `Assigned` forever, and
+    /// nothing else reclaims that: `inflight_tasks_by_executor` counts
+    /// `Assigned` the same as `Running` when computing free slots, so a
+    /// single indefinitely-stuck assignment permanently and silently
+    /// consumes real capacity from every other job — with both executors
+    /// correctly reporting zero actually-running tasks the whole time. Found
+    /// live in the Phase 58 chaos gate: accumulated orphaned continuous jobs
+    /// from earlier iterations starved a later batch job's AQE-coalesced
+    /// reduce task of all executor slots, forever.
+    ///
+    /// Unlike the Running-task stall path (`collect_stall_cancel_work`), no
+    /// cancel RPC is sent: a task that never made it to `Running` was never
+    /// confirmed to be executing anywhere, so there is nothing live to
+    /// cancel — a late/duplicate report from the reset attempt is already
+    /// fenced by the existing stale-attempt check once a new attempt
+    /// supersedes it.
+    pub(crate) fn reset_stuck_assigned_tasks(&mut self) {
+        let timeout_ms = self.config.stuck_assigned_reset_ms();
+        let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+        let job_ids: Vec<JobId> = self.job_coordinators.keys().cloned().collect();
+        for job_id in job_ids {
+            let Some(jc) = self.job_coordinators.get(&job_id) else {
+                continue;
+            };
+            let mut record = jc.write_record();
+            if record.state().is_terminal() {
+                continue;
+            }
+            let mut any_reset = false;
+            for stage in record.stages_mut() {
+                let mut stage_affected = false;
+                for task in stage.tasks_mut() {
+                    if task.state() != krishiv_proto::TaskState::Assigned {
+                        continue;
+                    }
+                    let Some(assigned_ms) = task.assigned_at_ms else {
+                        continue;
+                    };
+                    if now_ms.saturating_sub(assigned_ms) <= timeout_ms {
+                        continue;
+                    }
+                    tracing::warn!(
+                        job_id = %job_id,
+                        task_id = %task.task_id(),
+                        stuck_secs = now_ms.saturating_sub(assigned_ms) / 1000,
+                        executor_id = ?task.assigned_executor(),
+                        "resetting task stuck in Assigned (never reached Running) back to Pending"
+                    );
+                    task.state = krishiv_proto::TaskState::Pending;
+                    task.assigned_executor = None;
+                    task.clear_launch_in_flight();
+                    task.assigned_at_ms = None;
+                    stage_affected = true;
+                    any_reset = true;
+                }
+                if stage_affected {
+                    stage.refresh_state();
+                }
+            }
+            if any_reset {
+                record.refresh_state();
+            }
+        }
+    }
+
     /// Collect straggler tasks eligible for speculative preemption.
     ///
     /// Returns `Vec<SpeculativeWork>` for each Running task in a Running

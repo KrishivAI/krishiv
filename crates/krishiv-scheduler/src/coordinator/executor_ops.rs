@@ -789,6 +789,11 @@ impl Coordinator {
         if let Err(error) = self.admit_queued_jobs() {
             tracing::warn!(error = %error, "failed to admit queued jobs");
         }
+        // Phase 58 #180: reclaim any task stuck in `Assigned` (never reached
+        // `Running`) before computing demand below, so a task freed this
+        // round is immediately visible as Pending work in the same pass
+        // instead of waiting for a later heartbeat.
+        self.reset_stuck_assigned_tasks();
         // Phase 53 fair pools: one assignment round distributes the free-slot
         // budget across pools by min-share + weight, then jobs draw from
         // their pool's quota in priority order. With no pool config every
@@ -978,6 +983,143 @@ mod endpoint_lookup_tests {
             coord.executor_id_for_task_endpoint("http://10.0.0.7:9999"),
             None,
             "an unknown endpoint must not resolve to any executor"
+        );
+    }
+}
+
+/// Phase 58 #180 regression: a task stuck in `Assigned` (never reached
+/// `Running`) must be reclaimed after `stuck_assigned_reset_ms`, not left to
+/// permanently inflate `inflight_tasks_by_executor` and starve every other
+/// job of capacity. Live root cause: an orphaned/abandoned job (e.g. a
+/// continuous job whose teardown never landed) whose one task never got
+/// launched — `inflight_tasks_by_executor` counts `Assigned` the same as
+/// `Running`, so the executor's free-slot computation saw it as permanently
+/// busy even though it was never actually running anything.
+#[cfg(test)]
+mod stuck_assigned_reclaim_tests {
+    use super::*;
+    use krishiv_proto::{ExecutorDescriptor, ExecutorId, JobSpec, StageSpec, TaskSpec};
+
+    fn single_task_job(job_id: &JobId, task_id: &str) -> JobSpec {
+        JobSpec::new(job_id.clone(), "stuck-assigned-test", JobKind::Batch).with_stage(
+            StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(
+                TaskSpec::new(TaskId::try_new(task_id).unwrap(), "sql: select 1"),
+            ),
+        )
+    }
+
+    #[test]
+    fn stuck_assigned_task_past_timeout_is_reclaimed_and_stops_inflating_capacity() {
+        let mut coordinator =
+            Coordinator::active(CoordinatorId::try_new("stuck-assigned").unwrap());
+        coordinator.config = coordinator.config.with_stuck_assigned_reset_ms(60_000);
+
+        let exec_id = ExecutorId::try_new("exec-stuck").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-stuck", 1))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-orphan").unwrap();
+        coordinator
+            .submit_job(single_task_job(&job_id, "orphan-t0"))
+            .unwrap();
+        {
+            let jc = coordinator.job_coordinators.get(&job_id).unwrap();
+            let mut record = jc.write_record();
+            for stage in record.stages_mut() {
+                for task in stage.tasks_mut() {
+                    task.assigned_executor = Some(exec_id.clone());
+                    task.state = TaskState::Assigned;
+                    task.launch_in_flight = false;
+                    let two_min_ago =
+                        u64::try_from(krishiv_common::async_util::unix_now_ms())
+                            .unwrap_or(0)
+                            .saturating_sub(120_000);
+                    task.assigned_at_ms = Some(two_min_ago);
+                }
+            }
+        }
+
+        // Before the fix runs: the stuck Assigned task inflates in-flight
+        // accounting exactly like a real Running task would.
+        assert_eq!(
+            coordinator
+                .inflight_tasks_by_executor()
+                .get(&exec_id)
+                .copied(),
+            Some(1),
+            "a stuck Assigned task must count toward in-flight load before reclaim"
+        );
+
+        coordinator.reset_stuck_assigned_tasks();
+
+        {
+            let jc = coordinator.job_coordinators.get(&job_id).unwrap();
+            let record = jc.read_record();
+            let task = &record.stages()[0].tasks()[0];
+            assert_eq!(
+                task.state(),
+                TaskState::Pending,
+                "a task stuck in Assigned past the timeout must be reset to Pending"
+            );
+            assert_eq!(
+                task.assigned_executor(),
+                None,
+                "the stale assignment must be cleared so the task can be placed elsewhere"
+            );
+            assert!(task.assigned_at_ms.is_none());
+        }
+
+        assert_eq!(
+            coordinator
+                .inflight_tasks_by_executor()
+                .get(&exec_id)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "after reclaim the executor must no longer show phantom in-flight load"
+        );
+    }
+
+    #[test]
+    fn stuck_assigned_task_within_timeout_is_left_alone() {
+        let mut coordinator =
+            Coordinator::active(CoordinatorId::try_new("stuck-not-yet").unwrap());
+        coordinator.config = coordinator.config.with_stuck_assigned_reset_ms(60_000);
+
+        let exec_id = ExecutorId::try_new("exec-fresh").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-fresh", 1))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-fresh").unwrap();
+        coordinator
+            .submit_job(single_task_job(&job_id, "fresh-t0"))
+            .unwrap();
+        {
+            let jc = coordinator.job_coordinators.get(&job_id).unwrap();
+            let mut record = jc.write_record();
+            for stage in record.stages_mut() {
+                for task in stage.tasks_mut() {
+                    task.assigned_executor = Some(exec_id.clone());
+                    task.state = TaskState::Assigned;
+                    task.launch_in_flight = false;
+                    task.assigned_at_ms = Some(
+                        u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0),
+                    );
+                }
+            }
+        }
+
+        coordinator.reset_stuck_assigned_tasks();
+
+        let jc = coordinator.job_coordinators.get(&job_id).unwrap();
+        let record = jc.read_record();
+        let task = &record.stages()[0].tasks()[0];
+        assert_eq!(
+            task.state(),
+            TaskState::Assigned,
+            "a task assigned moments ago must not be reclaimed yet"
         );
     }
 }

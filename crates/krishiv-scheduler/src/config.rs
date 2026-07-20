@@ -62,6 +62,28 @@ pub struct CoordinatorConfig {
     /// can lower it.
     task_stall_timeout_ms: u64,
 
+    /// Wall-clock milliseconds a task may stay in `Assigned` state (has an
+    /// executor, not yet launched/`Running`) before the coordinator resets it
+    /// back to `Pending` and frees its assumed capacity (Phase 58 #180).
+    ///
+    /// A task normally crosses `Assigned` → `Running` within one heartbeat
+    /// cycle (a few seconds). A launch that never lands — a dropped
+    /// dispatch RPC during a network partition, or (for streaming jobs) a
+    /// job whose owning continuous-push caller vanished — leaves it
+    /// `Assigned` forever. Nothing else reclaims that: `inflight_tasks_by_executor`
+    /// counts `Assigned` the same as `Running` when computing free slots, so an
+    /// indefinitely-stuck assignment permanently and silently consumes real
+    /// capacity from every other job, with no error surfaced anywhere (found
+    /// live in the Phase 58 chaos gate: accumulated orphaned continuous jobs
+    /// from earlier iterations starved a later batch job's AQE-coalesced
+    /// reduce task of all 4 executor slots, forever, despite both executors
+    /// reporting zero actually-running tasks).
+    ///
+    /// Default: 2 minutes — generous versus the sub-second normal case,
+    /// far tighter than `task_stall_timeout_ms`'s 30 minutes (which guards a
+    /// task that IS making it to the executor, not one stuck before dispatch).
+    stuck_assigned_reset_ms: u64,
+
     /// Enable speculative re-execution of straggler tasks.
     ///
     /// When `true`, the coordinator periodically checks for Running tasks that
@@ -182,6 +204,7 @@ impl CoordinatorConfig {
             circuit_breaker_failure_threshold: 5,
             inline_partition_limit_bytes: 3 * 1024 * 1024,
             task_stall_timeout_ms: 30 * 60 * 1_000,
+            stuck_assigned_reset_ms: 2 * 60 * 1_000,
             speculative_execution_enabled: false,
             speculative_slowdown_factor: 1.5,
             speculative_min_completed_tasks: 3,
@@ -292,6 +315,18 @@ impl CoordinatorConfig {
     #[must_use]
     pub fn with_task_stall_timeout_ms(mut self, ms: u64) -> Self {
         self.task_stall_timeout_ms = ms.max(1);
+        self
+    }
+
+    /// Stuck-`Assigned`-task reclaim threshold in milliseconds (Phase 58 #180).
+    pub fn stuck_assigned_reset_ms(&self) -> u64 {
+        self.stuck_assigned_reset_ms
+    }
+
+    /// Override the stuck-`Assigned`-task reclaim timeout.
+    #[must_use]
+    pub fn with_stuck_assigned_reset_ms(mut self, ms: u64) -> Self {
+        self.stuck_assigned_reset_ms = ms.max(1);
         self
     }
 
