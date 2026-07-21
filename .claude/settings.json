@@ -40,7 +40,9 @@
       "Bash(./target/debug/krishiv local status*)",
       "Bash(cat /tmp/claude-0/*)",
       "Bash(wc -c *)",
-      "Bash(wc -l *)"
+      "Bash(wc -l *)",
+      "Bash(scp *)",
+      "Bash(ssh *)"
     ]
   }
 }

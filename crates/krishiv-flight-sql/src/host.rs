@@ -674,39 +674,65 @@ impl FlightExecutionHost {
         .map_err(|e| krishiv_metrics::grpc::internal_status("decode inline result batches", &e))?;
         let mut spools = outcome.result_spools.into_iter();
 
-        // The encoder needs a schema up front. Rather than peek the lazy
-        // spool stream (which would decode the same spool anyway, since
-        // spools decode a whole file at a time, not batch-by-batch), take
-        // it from `inline` if present, else eagerly decode just the first
-        // spool — the same O(one spool) bound the lazy path below keeps
-        // for everything after it.
-        let (schema, prefix): (Arc<Schema>, Vec<RecordBatch>) = if let Some(first) = inline.first()
-        {
-            (first.schema(), inline)
-        } else if let Some(first_spool) = spools.next() {
-            let decoded = first_spool.decode_record_batches().map_err(|e| {
-                krishiv_metrics::grpc::internal_status("decode result spool", &e)
-            })?;
-            let schema = decoded
-                .first()
-                .map(|b| b.schema())
-                .unwrap_or_else(|| Arc::new(Schema::empty()));
-            (schema, decoded)
-        } else {
-            (Arc::new(Schema::empty()), Vec::new())
-        };
-
-        let prefix_stream = stream::iter(prefix.into_iter().map(Ok));
-        let rest_stream = stream::iter(spools).flat_map(|spool| {
-            let items: Vec<Result<RecordBatch, Status>> = match spool.decode_record_batches() {
-                Ok(batches) => batches.into_iter().map(Ok).collect(),
-                Err(e) => vec![Err(krishiv_metrics::grpc::internal_status(
+        /// One spool's batches as a boxed `Result<RecordBatch, Status>`
+        /// iterator — the common type both the `Ok` (genuinely lazy,
+        /// `StreamReader` itself) and `Err` (one-item) cases below collapse
+        /// to, so `flat_map` (and the prefix-spool case) can return either
+        /// without an intermediate `Vec` forcing the whole spool to decode
+        /// up front.
+        type SpoolBatchIter = Box<dyn Iterator<Item = Result<RecordBatch, Status>> + Send>;
+        fn spool_iter(spool: krishiv_scheduler::TaskResultSpool) -> SpoolBatchIter {
+            match spool.decode_record_batches_streaming() {
+                Ok(reader) => Box::new(reader.map(|r| {
+                    r.map_err(|e| krishiv_metrics::grpc::internal_status("decode result spool", &e))
+                })),
+                Err(e) => Box::new(std::iter::once(Err(krishiv_metrics::grpc::internal_status(
                     "decode result spool",
                     &e,
-                ))],
-            };
-            stream::iter(items)
-        });
+                )))),
+            }
+        }
+
+        // #211 residual: the schema used to come from eagerly decoding the
+        // whole first spool (`decode_record_batches` collects every batch
+        // into a `Vec`) just to read `.schema()` off the first `RecordBatch`
+        // — for a query that ran as a single task, that spool. IS. the
+        // entire result, so "peek the schema" meant "materialize the whole
+        // multi-GiB result" before a single byte reached the client, the
+        // exact OOM shape #211 was filed against. `StreamReader::schema()`
+        // is free: the IPC stream's header carries the schema separately
+        // from its batch messages, parsed once in `try_new` — no batch
+        // decode needed at all.
+        let (schema, prefix): (Arc<Schema>, SpoolBatchIter) = if let Some(first) = inline.first() {
+            (
+                first.schema(),
+                Box::new(inline.into_iter().map(Ok)) as SpoolBatchIter,
+            )
+        } else if let Some(first_spool) = spools.next() {
+            match first_spool.decode_record_batches_streaming() {
+                Ok(reader) => {
+                    let schema = reader.schema();
+                    let iter: SpoolBatchIter = Box::new(reader.map(|r| {
+                        r.map_err(|e| {
+                            krishiv_metrics::grpc::internal_status("decode result spool", &e)
+                        })
+                    }));
+                    (schema, iter)
+                }
+                Err(e) => {
+                    let status = krishiv_metrics::grpc::internal_status("decode result spool", &e);
+                    (
+                        Arc::new(Schema::empty()),
+                        Box::new(std::iter::once(Err(status))) as SpoolBatchIter,
+                    )
+                }
+            }
+        } else {
+            (Arc::new(Schema::empty()), Box::new(std::iter::empty()))
+        };
+
+        let prefix_stream = stream::iter(prefix);
+        let rest_stream = stream::iter(spools).flat_map(|spool| stream::iter(spool_iter(spool)));
         // FlightDataEncoderBuilder::build wants Result<_, FlightError>, not
         // our tonic Status — convert at this one seam (arrow_flight already
         // provides From<tonic::Status> for FlightError) rather than

@@ -61,16 +61,43 @@ impl TaskResultSpool {
 
     /// Decode the spooled Arrow IPC stream into record batches.
     ///
-    /// Reads incrementally from disk; peak memory is the decoded batches
-    /// themselves (no intermediate whole-file byte buffer).
+    /// Collects every batch into one `Vec` before returning — peak memory is
+    /// the whole decoded spool, not just one chunk. Fine for spools known to
+    /// be small (or for a caller that needs random access to the batches);
+    /// for a large spool that will only be streamed back out one batch at a
+    /// time (the Flight SQL `do_get` path), use
+    /// [`Self::decode_record_batches_streaming`] instead, which never holds
+    /// more than one decoded batch at once.
     pub fn decode_record_batches(
         &self,
     ) -> Result<Vec<arrow::record_batch::RecordBatch>, arrow::error::ArrowError> {
+        self.decode_record_batches_streaming()?.collect()
+    }
+
+    /// Decode the spooled Arrow IPC stream lazily: each `next()` call reads
+    /// and decodes exactly one more batch from disk, so a caller that drains
+    /// the iterator one batch at a time (rather than collecting it) never
+    /// holds more than one decoded batch in memory.
+    ///
+    /// `#211` residual: [`Self::decode_record_batches`]'s `O(largest spool)`
+    /// bound is only as tight as "largest spool" is small — a query that
+    /// runs as a single unpartitioned task produces exactly one spool sized
+    /// to the *entire* result, at which point `O(largest spool)` and
+    /// `O(total result)` are the same bound, and the coordinator OOMs on
+    /// exactly the un-LIMITed-SELECT shape #211 was filed against in the
+    /// first place. This method is what actually gets a `do_get` consumer to
+    /// `O(one batch)` regardless of how many tasks a query happened to run
+    /// as; see `krishiv-flight-sql::host::execute_sql_stream`, which uses it
+    /// for both the schema-extraction peek and the per-spool batch stream.
+    pub fn decode_record_batches_streaming(
+        &self,
+    ) -> Result<
+        arrow::ipc::reader::StreamReader<std::io::BufReader<std::fs::File>>,
+        arrow::error::ArrowError,
+    > {
         let file = std::fs::File::open(&self.path)
             .map_err(|e| arrow::error::ArrowError::IoError(format!("open result spool: {e}"), e))?;
-        let reader =
-            arrow::ipc::reader::StreamReader::try_new(std::io::BufReader::new(file), None)?;
-        reader.collect()
+        arrow::ipc::reader::StreamReader::try_new(std::io::BufReader::new(file), None)
     }
 }
 
@@ -290,5 +317,89 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    fn int_batch(values: &[i64]) -> arrow::record_batch::RecordBatch {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![std::sync::Arc::new(Int64Array::from(values.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    /// A spool file on disk containing a real multi-batch Arrow IPC stream —
+    /// `TaskResultSpool`'s fields are private but visible to this same-file
+    /// test module, so we can construct one directly around a hand-encoded
+    /// file instead of going through the chunk-receiving path above (which
+    /// only exercises raw bytes, not Arrow IPC content).
+    fn ipc_spool(batches: &[arrow::record_batch::RecordBatch]) -> (TaskResultSpool, tempfile::TempDir) {
+        use arrow::ipc::writer::StreamWriter;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.arrows");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = StreamWriter::try_new(file, &batches[0].schema()).unwrap();
+        for batch in batches {
+            writer.write(batch).unwrap();
+        }
+        writer.finish().unwrap();
+        let total_bytes = std::fs::metadata(&path).unwrap().len();
+        (
+            TaskResultSpool {
+                path,
+                total_bytes,
+            },
+            dir,
+        )
+    }
+
+    #[test]
+    fn decode_record_batches_streaming_yields_every_batch_in_order() {
+        let batches = vec![int_batch(&[1, 2, 3]), int_batch(&[4, 5]), int_batch(&[6])];
+        let (spool, _dir) = ipc_spool(&batches);
+
+        let decoded: Vec<arrow::record_batch::RecordBatch> = spool
+            .decode_record_batches_streaming()
+            .expect("open spool for streaming decode")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("every batch decodes");
+
+        assert_eq!(decoded.len(), 3);
+        for (expected, actual) in batches.iter().zip(decoded.iter()) {
+            assert_eq!(expected, actual);
+        }
+    }
+
+    #[test]
+    fn decode_record_batches_streaming_and_eager_agree() {
+        let batches = vec![int_batch(&[10, 20]), int_batch(&[30])];
+        let (spool, _dir) = ipc_spool(&batches);
+
+        let eager = spool
+            .decode_record_batches()
+            .expect("eager decode succeeds");
+        let streamed: Vec<_> = spool
+            .decode_record_batches_streaming()
+            .expect("open spool for streaming decode")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("every batch decodes");
+
+        assert_eq!(eager, streamed);
+    }
+
+    #[test]
+    fn decode_record_batches_streaming_schema_is_available_before_any_batch_is_read() {
+        let batches = vec![int_batch(&[1])];
+        let (spool, _dir) = ipc_spool(&batches);
+
+        let reader = spool
+            .decode_record_batches_streaming()
+            .expect("open spool for streaming decode");
+        // The whole point of using `.schema()` over peeking a batch: it must
+        // be readable before `next()` is ever called, so a caller extracting
+        // just the schema doesn't have to decode (and hold) a batch to get it.
+        assert_eq!(reader.schema(), batches[0].schema());
     }
 }
