@@ -231,9 +231,9 @@ Each feature is dimensioned across the three Krishiv execution engines: **batch*
 | `streaming.continuous_select` | Continuous SELECT over unbounded input | n/a | supported | n/a |  |
 | `streaming.window_agg` | Windowed aggregations over streaming input | n/a | supported | partial |  |
 | `streaming.watermark` | Event-time watermarks for late-data handling | n/a | supported | n/a |  |
-| `streaming.interval_join` | Streaming-to-streaming interval join | n/a | supported | n/a |  |
+| `streaming.interval_join` | Streaming-to-streaming interval join | n/a | supported | n/a | **placement: embedded API + distributed runtime only.** no SQL planning path; embedded PerKeyIntervalJoin, and distributed only as the watermark window-join WindowExecutionSpec shape |
 | `streaming.cep` | MATCH_RECOGNIZE CEP over streaming input | n/a | supported | n/a |  |
-| `streaming.dedup` | Streaming deduplication (dropDuplicates) | n/a | supported | n/a |  |
+| `streaming.dedup` | Streaming deduplication (dropDuplicates) | n/a | supported | n/a | **placement: embedded API only.** embedded API only — not compiled from SQL and not a distributed stream:loop shape (audit §9b) |
 | `streaming.sink_modes` | Append / Update / Complete output modes | n/a | supported | partial |  |
 
 ## INTROSPECTION
@@ -243,4 +243,14 @@ Each feature is dimensioned across the three Krishiv execution engines: **batch*
 | `introspection.describe` | DESCRIBE / DESC / SHOW COLUMNS table schema | supported | n/a | n/a |  |
 | `introspection.explain` | EXPLAIN [LOGICAL|PHYSICAL|ANALYZE] query plans | supported | n/a | n/a |  |
 | `introspection.information_schema` | information_schema.{tables,columns,views,df_settings,routines,parameters,schemata} | supported | n/a | n/a |  |
+
+## Embedded-API-only streaming operators
+
+These operators are real and tested but reachable **only** from the embedded Rust `StreamingDataFrame`/process API and its Python mirror — they are not compiled from SQL, and the distributed `stream:loop` runtime executes only `WindowExecutionSpec` shapes (windows, window-join, CEP). A job built on them cannot run distributed today.
+
+- **temporal join** — event-time temporal (versioned lookup) join between two streams
+- **side outputs** — route late/rejected/tagged rows to a secondary stream
+- **broadcast state** — low-volume control stream broadcast to all tasks of a keyed stream
+- **connected streams** — two-input operators sharing state across both inputs
+- **ProcessFunction + timers** — per-key user logic with registered event/processing-time timers
 

@@ -71,6 +71,32 @@ impl Engine {
     }
 }
 
+/// An execution surface a feature can be reached from. A `supported` engine
+/// cell alone cannot say *where* the feature runs (audit §9b): several real,
+/// tested streaming operators are reachable only from the embedded
+/// `StreamingDataFrame`/process API, while the distributed `stream:loop`
+/// runtime executes only `WindowExecutionSpec` shapes (windows, window-join,
+/// CEP) and the SQL front door compiles a further subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// The embedded Rust `StreamingDataFrame` / process API and its Python mirror.
+    EmbeddedApi,
+    /// The SQL front door (text SQL parse → plan → execute).
+    Sql,
+    /// The distributed runtime (`stream:loop` / partitioned batch fragments).
+    Distributed,
+}
+
+impl Placement {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EmbeddedApi => "embedded API",
+            Self::Sql => "SQL front door",
+            Self::Distributed => "distributed runtime",
+        }
+    }
+}
+
 /// A single entry in the Krishiv SQL feature matrix, dimensioned per engine.
 #[derive(Debug, Clone)]
 pub struct FeatureEntry {
@@ -88,6 +114,11 @@ pub struct FeatureEntry {
     pub incremental: FeatureStatus,
     /// Optional clarifying note (gap description, limitations, workarounds).
     pub note: Option<&'static str>,
+    /// Where the feature actually executes. `None` means the feature is
+    /// reachable from every surface its engine cells imply (the common case).
+    /// `Some(..)` restricts the claim — e.g. embedded-API-only operators —
+    /// and is rendered into the generated reference page.
+    pub placement: Option<&'static [Placement]>,
 }
 
 impl FeatureEntry {
@@ -107,6 +138,7 @@ impl FeatureEntry {
             streaming,
             incremental,
             note: None,
+            placement: None,
         }
     }
 
@@ -123,6 +155,19 @@ impl FeatureEntry {
     const fn with_note(mut self, note: &'static str) -> Self {
         self.note = Some(note);
         self
+    }
+
+    /// Restrict where this feature executes (placement honesty, audit §9b).
+    const fn placed(mut self, placement: &'static [Placement]) -> Self {
+        self.placement = Some(placement);
+        self
+    }
+
+    /// True when the entry's execution surface is restricted below what its
+    /// engine cells imply (i.e. it carries an explicit placement set that
+    /// excludes at least one surface).
+    pub fn placement_restricted(&self) -> bool {
+        matches!(self.placement, Some(p) if p.len() < 3)
     }
 
     /// Status for a given engine.
@@ -198,6 +243,12 @@ pub fn generate_reference_markdown() -> String {
         out.push_str("| Feature | Description | Batch | Streaming | Incremental | Notes |\n");
         out.push_str("|---|---|---|---|---|---|\n");
         for e in FEATURES.iter().filter(|e| e.category == cat) {
+            let mut notes = String::new();
+            if let Some(placement) = e.placement {
+                let surfaces: Vec<&str> = placement.iter().map(|p| p.as_str()).collect();
+                notes.push_str(&format!("**placement: {} only.** ", surfaces.join(" + ")));
+            }
+            notes.push_str(e.note.unwrap_or(""));
             out.push_str(&format!(
                 "| `{}` | {} | {} | {} | {} | {} |\n",
                 e.id,
@@ -205,13 +256,58 @@ pub fn generate_reference_markdown() -> String {
                 e.batch,
                 e.streaming,
                 e.incremental,
-                e.note.unwrap_or("")
+                notes.trim_end()
             ));
         }
         out.push('\n');
     }
+
+    // Placement honesty (audit §9b): the embedded-only operator tier has no SQL
+    // spellings, so it has no rows above — but a user who builds on these
+    // operators embedded cannot run that job distributed, and this page must
+    // say so rather than stay silent. (Operators that DO have a SQL matrix row,
+    // like streaming.dedup, carry the placement marker on their row instead.)
+    out.push_str("## Embedded-API-only streaming operators\n\n");
+    out.push_str(
+        "These operators are real and tested but reachable **only** from the embedded \
+         Rust `StreamingDataFrame`/process API and its Python mirror — they are not \
+         compiled from SQL, and the distributed `stream:loop` runtime executes only \
+         `WindowExecutionSpec` shapes (windows, window-join, CEP). A job built on them \
+         cannot run distributed today.\n\n",
+    );
+    for (name, desc) in EMBEDDED_ONLY_OPERATORS {
+        out.push_str(&format!("- **{name}** — {desc}\n"));
+    }
+    out.push('\n');
     out
 }
+
+/// The embedded-API-only streaming operator tier (audit §9b). These have no
+/// SQL spelling, so they carry no [`FeatureEntry`] row; they are published on
+/// the generated reference page so the placement restriction is stated
+/// somewhere a user will read it.
+pub const EMBEDDED_ONLY_OPERATORS: &[(&str, &str)] = &[
+    (
+        "temporal join",
+        "event-time temporal (versioned lookup) join between two streams",
+    ),
+    (
+        "side outputs",
+        "route late/rejected/tagged rows to a secondary stream",
+    ),
+    (
+        "broadcast state",
+        "low-volume control stream broadcast to all tasks of a keyed stream",
+    ),
+    (
+        "connected streams",
+        "two-input operators sharing state across both inputs",
+    ),
+    (
+        "ProcessFunction + timers",
+        "per-key user logic with registered event/processing-time timers",
+    ),
+];
 
 /// Render the "Krishiv SQL vs Spark SQL" dialect honesty / migration page from
 /// the matrix + the documented per-feature semantic differences. Generated,
@@ -248,17 +344,19 @@ pub fn generate_honesty_markdown() -> String {
 
     // 1:1 — supported in batch with no divergence note.
     out.push_str("## Maps 1:1 (supported, no semantic caveat)\n\n");
-    for e in FEATURES.iter().filter(|e| e.batch == FeatureStatus::Supported && e.note.is_none()) {
+    for e in FEATURES
+        .iter()
+        .filter(|e| e.batch == FeatureStatus::Supported && e.note.is_none())
+    {
         out.push_str(&format!("- `{}` — {}\n", e.id, e.description));
     }
     out.push('\n');
 
     // Partial / caveated.
     out.push_str("## Supported with caveats (partial or noted)\n\n");
-    for e in FEATURES
-        .iter()
-        .filter(|e| (e.batch == FeatureStatus::Partial) || (e.batch.is_claimed() && e.note.is_some()))
-    {
+    for e in FEATURES.iter().filter(|e| {
+        (e.batch == FeatureStatus::Partial) || (e.batch.is_claimed() && e.note.is_some())
+    }) {
         out.push_str(&format!(
             "- `{}` — {} _({})_\n",
             e.id,
@@ -872,6 +970,11 @@ static FEATURES: &[FeatureEntry] = &[
         NA,
         S,
         NA,
+    )
+    .placed(&[Placement::EmbeddedApi, Placement::Distributed])
+    .with_note(
+        "no SQL planning path; embedded PerKeyIntervalJoin, and distributed only as the \
+         watermark window-join WindowExecutionSpec shape",
     ),
     FeatureEntry::new("streaming.cep", "STREAMING", "MATCH_RECOGNIZE CEP over streaming input", NA, S, NA),
     FeatureEntry::new(
@@ -881,6 +984,11 @@ static FEATURES: &[FeatureEntry] = &[
         NA,
         S,
         NA,
+    )
+    .placed(&[Placement::EmbeddedApi])
+    .with_note(
+        "embedded API only — not compiled from SQL and not a distributed \
+         stream:loop shape (audit §9b)",
     ),
     FeatureEntry::new(
         "streaming.sink_modes",
@@ -956,7 +1064,10 @@ mod tests {
 
     #[test]
     fn feature_entry_display_includes_id_and_engines() {
-        let entry = feature_matrix().iter().find(|e| e.id == "window.tumble").unwrap();
+        let entry = feature_matrix()
+            .iter()
+            .find(|e| e.id == "window.tumble")
+            .unwrap();
         let s = entry.to_string();
         assert!(s.contains("window.tumble"));
         assert!(s.contains("batch:supported"));
@@ -975,7 +1086,10 @@ mod tests {
     #[test]
     fn drift_check_ctas_is_supported_not_partial() {
         // Regression: CTAS was marked Partial after G17 shipped durable Iceberg CTAS.
-        let ctas = feature_matrix().iter().find(|e| e.id == "ddl.create_table_as").unwrap();
+        let ctas = feature_matrix()
+            .iter()
+            .find(|e| e.id == "ddl.create_table_as")
+            .unwrap();
         assert_eq!(ctas.batch, FeatureStatus::Supported);
     }
 
@@ -983,8 +1097,62 @@ mod tests {
     fn drift_check_interval_join_has_no_batch_sql_path() {
         // Regression: join.interval was over-claimed as batch Supported; it is
         // DataFrame-only with no SQL planning path (audit §9b).
-        let ij = feature_matrix().iter().find(|e| e.id == "join.interval").unwrap();
+        let ij = feature_matrix()
+            .iter()
+            .find(|e| e.id == "join.interval")
+            .unwrap();
         assert_eq!(ij.batch, FeatureStatus::Planned);
         assert_eq!(ij.streaming, FeatureStatus::Partial);
+    }
+
+    #[test]
+    fn embedded_only_operators_carry_the_placement_marker() {
+        // Regression (audit §9b): "supported" must say WHERE. dedup is
+        // embedded-API-only; interval join has no SQL planning path and is
+        // distributed only as the watermark window-join shape.
+        let dedup = feature_matrix()
+            .iter()
+            .find(|e| e.id == "streaming.dedup")
+            .unwrap();
+        assert_eq!(dedup.placement, Some(&[Placement::EmbeddedApi][..]));
+        assert!(dedup.placement_restricted());
+
+        let ij = feature_matrix()
+            .iter()
+            .find(|e| e.id == "streaming.interval_join")
+            .unwrap();
+        let p = ij
+            .placement
+            .expect("streaming.interval_join must carry a placement set");
+        assert!(p.contains(&Placement::EmbeddedApi) && p.contains(&Placement::Distributed));
+        assert!(
+            !p.contains(&Placement::Sql),
+            "no SQL planning path exists for interval join"
+        );
+    }
+
+    #[test]
+    fn placement_restricted_entries_always_explain_themselves() {
+        // A restricted placement without a note is a claim without a reason.
+        for e in feature_matrix() {
+            if e.placement_restricted() {
+                assert!(
+                    e.note.is_some(),
+                    "feature {} restricts placement but has no note",
+                    e.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generated_reference_renders_placement_and_embedded_only_ledger() {
+        let md = generate_reference_markdown();
+        assert!(md.contains("**placement: embedded API only.**"));
+        assert!(md.contains("**placement: embedded API + distributed runtime only.**"));
+        assert!(md.contains("## Embedded-API-only streaming operators"));
+        for (name, _) in EMBEDDED_ONLY_OPERATORS {
+            assert!(md.contains(name), "embedded-only ledger is missing {name}");
+        }
     }
 }
