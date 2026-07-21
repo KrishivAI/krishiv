@@ -464,8 +464,7 @@ impl SharedCoordinator {
     /// Load one persisted IVM job snapshot, if present.
     pub async fn load_ivm_snapshot(&self, job_id: &str) -> Option<Vec<u8>> {
         let store = { self.inner.read().await.store.clone() }?;
-        let snapshot = store.inner().load_ivm_snapshot(job_id);
-        snapshot
+        store.inner().load_ivm_snapshot(job_id)
     }
 
     /// List all persisted IVM job snapshots visible to this coordinator.
@@ -473,8 +472,7 @@ impl SharedCoordinator {
         let Some(store) = ({ self.inner.read().await.store.clone() }) else {
             return Vec::new();
         };
-        let snapshots = store.inner().list_ivm_snapshots();
-        snapshots
+        store.inner().list_ivm_snapshots()
     }
 
     /// Remove a persisted IVM job snapshot.
