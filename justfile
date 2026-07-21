@@ -255,6 +255,15 @@ lint:
         --exclude krishiv-python \
         --exclude krishiv-chaos \
         -- -D warnings
+    # krishiv-sql's `default = []` means a plain --workspace pass above never
+    # enables iceberg-datafusion/local-catalog, so execute_iceberg_ctas and
+    # its callees (the code path the `prod` preset actually ships) are
+    # invisible to the check above — a lint blindspot, not a clean bill of
+    # health. Lint that combination explicitly too.
+    {{ cargo }} clippy \
+        -p krishiv-sql \
+        --features iceberg-datafusion,local-catalog \
+        -- -D warnings
 
 # Verify each optional feature compiles on its own — catches forwarding-flag
 # rot and "doesn't build with --no-default-features" breakage in the crates

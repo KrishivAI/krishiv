@@ -3671,13 +3671,7 @@ impl SqlDataFrame {
     /// memory pool forces them to disk); other fields default to 0.
     pub fn collect_with_stats(
         &self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = SqlResult<(Vec<RecordBatch>, SqlExecutionStats)>>
-                + Send
-                + '_,
-        >,
-    > {
+    ) -> futures::future::BoxFuture<'_, SqlResult<(Vec<RecordBatch>, SqlExecutionStats)>> {
         Box::pin(self.collect_with_stats_boxed_body())
     }
 
@@ -3728,9 +3722,7 @@ impl SqlDataFrame {
     /// [`collect_with_stats`]: Self::collect_with_stats
     pub fn execute_stream_with_stats(
         &self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = SqlResult<(SqlStream, SqlStatsHandle)>> + Send + '_>,
-    > {
+    ) -> futures::future::BoxFuture<'_, SqlResult<(SqlStream, SqlStatsHandle)>> {
         Box::pin(self.execute_stream_with_stats_boxed_body())
     }
 
