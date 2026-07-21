@@ -26,8 +26,6 @@
 //! The JDBC wrapper in [`crate::sql::SqlConnector`] strips the prefix before
 //! calling these constructors.
 
-#![cfg(feature = "jdbc")]
-
 use std::any::Any;
 use std::sync::Arc;
 
@@ -116,25 +114,6 @@ impl JdbcSource {
         self
     }
 
-    /// Derive the Arrow schema from the first row by issuing `LIMIT 0`.
-    async fn fetch_schema(&mut self) -> ConnectorResult<SchemaRef> {
-        if let Some(s) = &self.schema {
-            return Ok(Arc::clone(s));
-        }
-        let sql = format!("SELECT * FROM {} LIMIT 0", quote_qualified(&self.table));
-        let rows = sqlx::query(&sql)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
-        // When the table is empty, infer schema from column metadata.
-        let cols = rows
-            .first()
-            .map_or_else(|| vec![], |row| row.columns().iter().collect::<Vec<_>>());
-        let schema = pg_columns_to_schema(cols);
-        let schema = Arc::new(schema);
-        self.schema = Some(Arc::clone(&schema));
-        Ok(schema)
-    }
 }
 
 impl Source for JdbcSource {
@@ -186,18 +165,20 @@ impl Source for JdbcSource {
             return Ok(None);
         }
         // CONN-5: Track the last key for keyset pagination.
-        if let Some(ref key_col) = self.key_column {
-            if let Some(last_row) = rows.last() {
-                if let Ok(val) = last_row.try_get::<i64, _>(key_col.as_str()) {
-                    self.last_key = Some(val);
-                }
-            }
+        if let Some(ref key_col) = self.key_column
+            && let Some(last_row) = rows.last()
+            && let Ok(val) = last_row.try_get::<i64, _>(key_col.as_str())
+        {
+            self.last_key = Some(val);
         }
         self.offset = self.offset.saturating_add(rows.len() as u64);
         let schema = match &self.schema {
             Some(s) => Arc::clone(s),
             None => {
-                let s = Arc::new(pg_columns_to_schema(rows[0].columns().iter().collect()));
+                let first_row = rows.first().ok_or_else(|| ConnectorError::Io(
+                    std::io::Error::other("jdbc read_batch: rows became empty after the is_empty guard"),
+                ))?;
+                let s = Arc::new(pg_columns_to_schema(first_row.columns().iter().collect()));
                 self.schema = Some(Arc::clone(&s));
                 s
             }
@@ -261,57 +242,50 @@ impl crate::offset::Offset for JdbcOffset {
     where
         Self: Sized,
     {
-        if bytes.is_empty() {
-            return Err(ConnectorError::Config {
-                message: "empty JDBC offset bytes".into(),
-            });
+        fn truncated(what: &str) -> ConnectorError {
+            ConnectorError::Config {
+                message: format!("truncated JDBC offset ({what})"),
+            }
         }
-        match bytes[0] {
+
+        let tag = *bytes.first().ok_or_else(|| ConnectorError::Config {
+            message: "empty JDBC offset bytes".into(),
+        })?;
+        match tag {
             0 => {
-                if bytes.len() < 9 {
-                    return Err(ConnectorError::Config {
-                        message: "truncated JDBC offset (Offset)".into(),
-                    });
-                }
-                let v = u64::from_le_bytes(bytes[1..9].try_into().map_err(|_| {
-                    ConnectorError::Config {
-                        message: "offset decode failed".into(),
-                    }
+                let field = bytes.get(1..9).ok_or_else(|| truncated("Offset"))?;
+                let v = u64::from_le_bytes(field.try_into().map_err(|_| ConnectorError::Config {
+                    message: "offset decode failed".into(),
                 })?);
                 Ok(JdbcOffset::Offset(v))
             }
             1 => {
-                if bytes.len() < 5 {
-                    return Err(ConnectorError::Config {
-                        message: "truncated JDBC offset (Keyset)".into(),
-                    });
-                }
-                let col_len = u32::from_le_bytes(bytes[1..5].try_into().map_err(|_| {
+                let len_field = bytes.get(1..5).ok_or_else(|| truncated("Keyset"))?;
+                let col_len = u32::from_le_bytes(len_field.try_into().map_err(|_| {
                     ConnectorError::Config {
                         message: "keyset col_len decode failed".into(),
                     }
                 })?) as usize;
                 let key_start = 5 + col_len;
-                if bytes.len() < key_start + 8 {
-                    return Err(ConnectorError::Config {
-                        message: "truncated JDBC offset (Keyset key)".into(),
-                    });
-                }
-                let column = String::from_utf8(bytes[5..5 + col_len].to_vec()).map_err(|e| {
+                let column_field = bytes
+                    .get(5..key_start)
+                    .ok_or_else(|| truncated("Keyset column"))?;
+                let column = String::from_utf8(column_field.to_vec()).map_err(|e| {
                     ConnectorError::Config {
                         message: format!("keyset column not valid utf-8: {e}"),
                     }
                 })?;
+                let key_field = bytes
+                    .get(key_start..key_start + 8)
+                    .ok_or_else(|| truncated("Keyset key"))?;
                 let last_key =
-                    i64::from_le_bytes(bytes[key_start..key_start + 8].try_into().map_err(
-                        |_| ConnectorError::Config {
-                            message: "keyset key decode failed".into(),
-                        },
-                    )?);
+                    i64::from_le_bytes(key_field.try_into().map_err(|_| ConnectorError::Config {
+                        message: "keyset key decode failed".into(),
+                    })?);
                 Ok(JdbcOffset::Keyset { column, last_key })
             }
-            tag => Err(ConnectorError::Config {
-                message: format!("unknown JDBC offset tag: {tag}"),
+            other => Err(ConnectorError::Config {
+                message: format!("unknown JDBC offset tag: {other}"),
             }),
         }
     }
@@ -423,10 +397,6 @@ impl Sink for JdbcSink {
     }
 }
 
-// ── Identifier quoting ───────────────────────────────────────────────────────
-
-/// Double-quote a Postgres identifier and escape any embedded double-quote
-/// characters by doubling them (`"` → `""`).
 // ── Arrow ↔ Postgres helpers ──────────────────────────────────────────────────
 
 fn pg_columns_to_schema(cols: Vec<&sqlx::postgres::PgColumn>) -> Schema {
@@ -532,69 +502,60 @@ fn pg_rows_to_batch(schema: SchemaRef, rows: &[PgRow]) -> arrow::error::Result<R
     RecordBatch::try_new(schema, arrays)
 }
 
+/// Downcast `col` to the concrete array type `data_type()` reported.
+///
+/// Arrow's own contract guarantees `col.data_type()` and `col`'s actual
+/// concrete Rust type always correspond — a mismatch here would mean the
+/// `Array` itself was built inconsistently, not a normal runtime condition
+/// this connector can hit. Still returns a real error rather than
+/// `.unwrap()`-panicking on it: this crate treats "should be provably
+/// unreachable" as a case to report, not a license to crash.
+fn downcast_or_err<'a, T: 'static>(col: &'a dyn Array, want: &str) -> ConnectorResult<&'a T> {
+    col.as_any().downcast_ref::<T>().ok_or_else(|| {
+        ConnectorError::Io(std::io::Error::other(format!(
+            "jdbc bind: column reported {want} but its Array value did not downcast to it"
+        )))
+    })
+}
+
 fn bind_column_value<'q>(
     q: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
     col: &dyn Array,
     row_idx: usize,
 ) -> ConnectorResult<sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>> {
-    use arrow::array::*;
+    use arrow::array::{
+        BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, StringArray,
+    };
     if col.is_null(row_idx) {
         return Ok(q.bind(Option::<i64>::None));
     }
     let bound = match col.data_type() {
         DataType::Int16 => {
-            let v = col
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .unwrap()
-                .value(row_idx);
+            let v = downcast_or_err::<Int16Array>(col, "Int16")?.value(row_idx);
             q.bind(v)
         }
         DataType::Int32 => {
-            let v = col
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap()
-                .value(row_idx);
+            let v = downcast_or_err::<Int32Array>(col, "Int32")?.value(row_idx);
             q.bind(v)
         }
         DataType::Int64 => {
-            let v = col
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(row_idx);
+            let v = downcast_or_err::<Int64Array>(col, "Int64")?.value(row_idx);
             q.bind(v)
         }
         DataType::Float32 => {
-            let v = col
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .unwrap()
-                .value(row_idx);
+            let v = downcast_or_err::<Float32Array>(col, "Float32")?.value(row_idx);
             q.bind(v)
         }
         DataType::Float64 => {
-            let v = col
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap()
-                .value(row_idx);
+            let v = downcast_or_err::<Float64Array>(col, "Float64")?.value(row_idx);
             q.bind(v)
         }
         DataType::Boolean => {
-            let v = col
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .unwrap()
-                .value(row_idx);
+            let v = downcast_or_err::<BooleanArray>(col, "Boolean")?.value(row_idx);
             q.bind(v)
         }
         DataType::Utf8 => {
-            let v = col
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
+            let v = downcast_or_err::<StringArray>(col, "Utf8")?
                 .value(row_idx)
                 .to_owned();
             q.bind(v)
@@ -615,6 +576,7 @@ mod tests {
     use super::*;
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use crate::offset::Offset as _;
 
     /// Verify that `pg_rows_to_batch` round-trips a manually-constructed list
     /// of typed builders — no live database required.
@@ -692,5 +654,73 @@ mod tests {
         let sink_caps = ConnectorCapabilities::new().with_bounded();
         assert!(sink_caps.is_bounded());
         assert!(!sink_caps.is_rewindable());
+    }
+
+    /// CONN-10: `JdbcOffset::encode`/`decode` round-trip both pagination
+    /// modes. Guards the `.get(range)`-based decode rewrite (was raw `[]`
+    /// indexing) against accidentally changing the wire format, not just
+    /// against panicking.
+    #[test]
+    fn offset_round_trips_both_modes() {
+        let offset = JdbcOffset::Offset(42);
+        assert_eq!(JdbcOffset::decode(&offset.encode()).unwrap(), offset);
+
+        let keyset = JdbcOffset::Keyset {
+            column: "id".to_owned(),
+            last_key: -7,
+        };
+        assert_eq!(JdbcOffset::decode(&keyset.encode()).unwrap(), keyset);
+
+        // A non-ASCII column name exercises the UTF-8 boundary in the
+        // `bytes.get(5..key_start)` slice explicitly.
+        let unicode_keyset = JdbcOffset::Keyset {
+            column: "ключ".to_owned(),
+            last_key: 0,
+        };
+        assert_eq!(
+            JdbcOffset::decode(&unicode_keyset.encode()).unwrap(),
+            unicode_keyset
+        );
+    }
+
+    /// Every truncation point in `decode` must return a `Config` error, not
+    /// panic — each case below is `encode()`'s real output for that variant,
+    /// cut off one byte before the field decode would need.
+    #[test]
+    fn offset_decode_rejects_truncated_bytes_at_every_boundary() {
+        assert!(JdbcOffset::decode(&[]).is_err(), "empty bytes");
+
+        let full_offset = JdbcOffset::Offset(1).encode();
+        assert!(
+            JdbcOffset::decode(&full_offset[..full_offset.len() - 1]).is_err(),
+            "Offset payload one byte short"
+        );
+
+        let full_keyset = JdbcOffset::Keyset {
+            column: "id".to_owned(),
+            last_key: 1,
+        }
+        .encode();
+        // Cut before the col_len u32 is complete.
+        assert!(
+            JdbcOffset::decode(&full_keyset[..4]).is_err(),
+            "Keyset col_len truncated"
+        );
+        // Cut inside the column name bytes.
+        assert!(
+            JdbcOffset::decode(&full_keyset[..6]).is_err(),
+            "Keyset column name truncated"
+        );
+        // Cut inside the trailing i64 key.
+        assert!(
+            JdbcOffset::decode(&full_keyset[..full_keyset.len() - 1]).is_err(),
+            "Keyset key truncated"
+        );
+    }
+
+    #[test]
+    fn offset_decode_rejects_unknown_tag() {
+        let err = JdbcOffset::decode(&[99]).unwrap_err();
+        assert!(matches!(err, ConnectorError::Config { .. }));
     }
 }
