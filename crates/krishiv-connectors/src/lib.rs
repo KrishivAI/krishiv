@@ -54,6 +54,7 @@ pub mod error;
 pub mod io_contract;
 pub mod offset;
 pub mod quality;
+pub mod reachability;
 pub mod registry;
 pub mod sink;
 pub mod source;
