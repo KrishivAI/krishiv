@@ -2626,6 +2626,7 @@ impl SqlEngine {
     /// in both the engine row-count registry and the process-global stats
     /// registry. Called from write paths (Iceberg CTAS) so planner
     /// statistics stay warm without an explicit `ANALYZE TABLE` run.
+    #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
     fn record_table_row_count_stat(&self, table_ref: &str, row_count: u64) {
         let registry = krishiv_plan::optimizer::global_table_stats();
         let mut names = vec![table_ref];
