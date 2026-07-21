@@ -627,7 +627,10 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
                 }
                 Err(e) if is_result_too_large(&e) => {
                     let sql = encode_bounded_window(topic, spec, &input_batches)?;
-                    let batches = self.pool.execute_sql(&sql).await?;
+                    let batches = self
+                        .pool
+                        .execute_sql_capped(&sql, crate::flight_client::client_max_result_bytes())
+                        .await?;
                     Ok((batches, None))
                 }
                 Err(e) if is_server_unimplemented(&e) => {
@@ -687,7 +690,9 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
                     if is_streaming {
                         sql = format!("-- krishiv:streaming=true\n{sql}");
                     }
-                    self.pool.execute_sql(&sql).await
+                    self.pool
+                        .execute_sql_capped(&sql, crate::flight_client::client_max_result_bytes())
+                        .await
                 }
                 Err(e) if is_server_unimplemented(&e) => {
                     if !allow_remote_sql_comment_fallback() {
@@ -800,7 +805,9 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
                 Ok(body) => decode_ipc_response(&body),
                 Err(e) if is_result_too_large(&e) => {
                     let sql = encode_continuous_drain(job_id);
-                    self.pool.execute_sql(&sql).await
+                    self.pool
+                        .execute_sql_capped(&sql, crate::flight_client::client_max_result_bytes())
+                        .await
                 }
                 Err(e) if is_server_unimplemented(&e) => {
                     if !allow_remote_sql_comment_fallback() {

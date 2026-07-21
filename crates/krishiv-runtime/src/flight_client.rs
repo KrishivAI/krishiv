@@ -28,15 +28,23 @@ const FLIGHT_PER_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
 /// can be exercised directly with a mock stream and a short duration —
 /// waiting out the real (60s) production timeout in a test would be
 /// impractically slow.
+/// Drain a Flight SQL record-batch stream, applying `per_batch_timeout` to
+/// each poll and rejecting the result once the accumulated batches' in-memory
+/// size exceeds `max_bytes` (`0` = unbounded) instead of buffering an
+/// arbitrarily large stream to completion. The cap check happens per batch,
+/// as data arrives, not after the fact — an oversized result stops accumulating
+/// as soon as the running total crosses the line.
 async fn collect_flight_batches<S>(
     mut stream: S,
     per_batch_timeout: Duration,
+    max_bytes: usize,
 ) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>>
 where
     S: futures::Stream<Item = arrow_flight::error::Result<arrow::record_batch::RecordBatch>>
         + Unpin,
 {
     let mut batches = Vec::new();
+    let mut total_bytes: usize = 0;
     while let Some(batch) = tokio::time::timeout(per_batch_timeout, stream.try_next())
         .await
         .map_err(|_| {
@@ -46,9 +54,34 @@ where
         })?
         .map_err(|e| RuntimeError::transport(format!("flight decode failed: {e}")))?
     {
+        if max_bytes > 0 {
+            total_bytes = total_bytes.saturating_add(batch.get_array_memory_size());
+            if total_bytes > max_bytes {
+                return Err(RuntimeError::result_too_large(format!(
+                    "streamed result ({total_bytes} bytes) exceeds maximum ({max_bytes} \
+                     bytes); add a LIMIT clause or raise {CLIENT_MAX_RESULT_BYTES_ENV}"
+                )));
+            }
+        }
         batches.push(batch);
     }
     Ok(batches)
+}
+
+/// Client-side counterpart of the server's `KRISHIV_FLIGHT_MAX_RESULT_BYTES`
+/// (same env var, independent processes): how large a streamed result this
+/// client is willing to buffer into a `Vec<RecordBatch>` before giving up.
+/// Exists so the do_action too-large fallback (which routes through the
+/// uncapped streaming transport) doesn't trade the coordinator's OOM risk for
+/// the caller's — see `FlightClientPool::execute_sql_capped`.
+pub(crate) const CLIENT_MAX_RESULT_BYTES_ENV: &str = "KRISHIV_FLIGHT_MAX_RESULT_BYTES";
+const DEFAULT_CLIENT_MAX_RESULT_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+pub(crate) fn client_max_result_bytes() -> usize {
+    std::env::var(CLIENT_MAX_RESULT_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_CLIENT_MAX_RESULT_BYTES)
 }
 
 /// Bearer token for outbound Flight SQL / Flight action requests.
@@ -617,6 +650,24 @@ impl FlightClientPool {
         &self,
         sql: &str,
     ) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
+        self.execute_sql_capped(sql, 0).await
+    }
+
+    /// Like [`Self::execute_sql`], but rejects the result once the
+    /// accumulated batches' in-memory size exceeds `max_bytes` (`0` =
+    /// unbounded).
+    ///
+    /// `execute_sql` alone routes real streaming data through a real
+    /// streaming transport (`execute()`+`do_get`, no per-message cap like
+    /// `do_action`), but still buffers the whole thing client-side into one
+    /// `Vec` — with no cap at all, that just moves the OOM risk from the
+    /// coordinator to whatever process is running this client. Used by the
+    /// `do_action` too-large fallback so that move doesn't happen silently.
+    pub async fn execute_sql_capped(
+        &self,
+        sql: &str,
+        max_bytes: usize,
+    ) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
         let sql = sql.to_string();
         with_retry(|| async {
             let channel = self.get_channel().await?;
@@ -640,7 +691,7 @@ impl FlightClientPool {
                 .await
                 .map_err(|e| RuntimeError::transport(format!("flight do_get failed: {e}")))?;
 
-            collect_flight_batches(stream, FLIGHT_PER_BATCH_TIMEOUT).await
+            collect_flight_batches(stream, FLIGHT_PER_BATCH_TIMEOUT, max_bytes).await
         })
         .await
     }
@@ -1154,7 +1205,7 @@ mod tests {
         // exercising the same logic with a short duration proves the timeout
         // path fires and surfaces a transport error rather than hanging.
         let stream = stalling_batch_stream(0);
-        let result = collect_flight_batches(stream, Duration::from_millis(20)).await;
+        let result = collect_flight_batches(stream, Duration::from_millis(20), 0).await;
         match result {
             Err(RuntimeError::Transport { message }) => {
                 assert!(
@@ -1171,7 +1222,7 @@ mod tests {
         // Batches that arrive within the per-batch timeout must be collected
         // even if the stream subsequently stalls and the overall read fails.
         let stream = stalling_batch_stream(2);
-        let result = collect_flight_batches(stream, Duration::from_millis(20)).await;
+        let result = collect_flight_batches(stream, Duration::from_millis(20), 0).await;
         assert!(
             matches!(result, Err(RuntimeError::Transport { .. })),
             "stalled stream must still surface a timeout error: {result:?}"
@@ -1374,10 +1425,79 @@ mod tests {
             as std::pin::Pin<
                 Box<dyn futures::Stream<Item = arrow_flight::error::Result<RecordBatch>>>,
             >;
-        let batches = collect_flight_batches(stream, Duration::from_secs(5))
+        let batches = collect_flight_batches(stream, Duration::from_secs(5), 0)
             .await
             .expect("finite stream must drain without timing out");
         assert_eq!(batches.len(), 3);
+    }
+
+    // ── collect_flight_batches size cap ───────────────────────────────────
+
+    /// A batch with one non-empty Int64 column, so `get_array_memory_size()`
+    /// is a real, non-zero, easy-to-reason-about number of bytes.
+    fn sized_batch(rows: usize) -> RecordBatch {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "n",
+            DataType::Int64,
+            false,
+        )]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from_iter_values(
+                0..rows as i64,
+            ))],
+        )
+        .expect("valid batch")
+    }
+
+    #[tokio::test]
+    async fn collect_flight_batches_zero_cap_is_unbounded() {
+        let stream = Box::pin(futures::stream::iter((0..3).map(|_| Ok(sized_batch(1_000)))))
+            as std::pin::Pin<
+                Box<dyn futures::Stream<Item = arrow_flight::error::Result<RecordBatch>>>,
+            >;
+        let batches = collect_flight_batches(stream, Duration::from_secs(5), 0)
+            .await
+            .expect("zero cap must not reject any size");
+        assert_eq!(batches.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn collect_flight_batches_under_cap_is_accepted() {
+        let one_batch_bytes = sized_batch(1_000).get_array_memory_size();
+        let stream = Box::pin(futures::stream::iter((0..3).map(|_| Ok(sized_batch(1_000)))))
+            as std::pin::Pin<
+                Box<dyn futures::Stream<Item = arrow_flight::error::Result<RecordBatch>>>,
+            >;
+        let batches = collect_flight_batches(stream, Duration::from_secs(5), one_batch_bytes * 10)
+            .await
+            .expect("well under cap must be accepted");
+        assert_eq!(batches.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn collect_flight_batches_over_cap_is_rejected() {
+        let one_batch_bytes = sized_batch(1_000).get_array_memory_size();
+        let stream = Box::pin(futures::stream::iter((0..3).map(|_| Ok(sized_batch(1_000)))))
+            as std::pin::Pin<
+                Box<dyn futures::Stream<Item = arrow_flight::error::Result<RecordBatch>>>,
+            >;
+        // Cap sits strictly between one batch and the full three-batch total,
+        // so the accumulation must be rejected partway through, not at the end.
+        let result = collect_flight_batches(
+            stream,
+            Duration::from_secs(5),
+            (one_batch_bytes as f64 * 1.5) as usize,
+        )
+        .await;
+        match result {
+            Err(RuntimeError::ResultTooLarge { message }) => {
+                assert!(message.contains("exceeds maximum"));
+            }
+            other => panic!("expected ResultTooLarge, got {other:?}"),
+        }
     }
 
     #[tokio::test]
