@@ -251,6 +251,23 @@ pub async fn receive_task_result_spool(
                     cleanup(&path);
                     tonic::Status::internal(format!("result spool write failed: {e}"))
                 })?;
+            // #222: a large transfer that stalls (network contention, or a
+            // genuine hang) used to be a total black box until the caller's
+            // own timeout fired minutes later, with no trace of how far it
+            // got. Log at the same cadence as the fdatasync above (unsynced
+            // resets to exactly 0 only when a sync just ran) so a future
+            // occurrence has periodic breadcrumbs instead of silence.
+            if unsynced == 0
+                && let Some(k) = &key
+            {
+                tracing::debug!(
+                    job_id = %k.job_id,
+                    task_id = %k.task_id,
+                    attempt_id = k.attempt_id,
+                    received,
+                    "result spool receive progress"
+                );
+            }
         }
     }
 
