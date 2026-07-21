@@ -211,3 +211,167 @@ async fn handle_streaming(
         }),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use krishiv_proto::CoordinatorId;
+
+    use super::*;
+    use crate::ivm::IvmJobRegistry;
+    use crate::{Coordinator, SharedCoordinator};
+
+    /// A cheap, real (not mocked) `IvmRouterState`: an in-memory registry and
+    /// an active coordinator with no registered executors. Sufficient for
+    /// every request-validation path (which errors before touching `state`
+    /// at all) and for `handle_ivm`'s success path (pure in-memory registry
+    /// write, no scheduling required).
+    fn test_state() -> IvmRouterState {
+        IvmRouterState {
+            registry: Arc::new(IvmJobRegistry::new()),
+            coordinator: SharedCoordinator::new(Coordinator::active(
+                CoordinatorId::try_new("test-coord").unwrap(),
+            )),
+        }
+    }
+
+    fn request(kind: &str) -> UnifiedJobRequest {
+        UnifiedJobRequest {
+            kind: kind.to_owned(),
+            query: None,
+            tables: Vec::new(),
+            job_id: None,
+            spec: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_kind_is_rejected_with_bad_request() {
+        let state = test_state();
+        let err = api_unified_submit(State(state), Json(request("nonsense")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("nonsense"), "got: {}", err.1);
+    }
+
+    #[tokio::test]
+    async fn batch_sql_without_query_is_rejected() {
+        let state = test_state();
+        let err = api_unified_submit(State(state), Json(request("batch_sql")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("query"), "got: {}", err.1);
+    }
+
+    #[tokio::test]
+    async fn streaming_without_job_id_is_rejected() {
+        let state = test_state();
+        let mut body = request("streaming");
+        body.spec = Some(serde_json::json!({}));
+        let err = api_unified_submit(State(state), Json(body))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("job_id"), "got: {}", err.1);
+    }
+
+    #[tokio::test]
+    async fn streaming_without_spec_is_rejected() {
+        let state = test_state();
+        let mut body = request("streaming");
+        body.job_id = Some("job-1".to_owned());
+        let err = api_unified_submit(State(state), Json(body))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("spec"), "got: {}", err.1);
+    }
+
+    #[tokio::test]
+    async fn streaming_with_malformed_spec_is_rejected_as_bad_request_not_500() {
+        let state = test_state();
+        let mut body = request("streaming");
+        body.job_id = Some("job-1".to_owned());
+        // Missing every required WindowExecutionSpec field.
+        body.spec = Some(serde_json::json!({"not_a_real_field": true}));
+        let err = api_unified_submit(State(state), Json(body))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("invalid spec"), "got: {}", err.1);
+    }
+
+    #[tokio::test]
+    async fn ivm_without_job_id_generates_one() {
+        let state = test_state();
+        let (status, Json(resp)) = api_unified_submit(State(state), Json(request("ivm")))
+            .await
+            .expect("ivm submission with no explicit job_id must succeed");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.kind, "ivm");
+        assert!(!resp.job_id.is_empty());
+        assert!(resp.state.is_none());
+        assert!(resp.poll_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn ivm_with_explicit_job_id_echoes_it_back() {
+        let state = test_state();
+        let mut body = request("ivm");
+        body.job_id = Some("revenue".to_owned());
+        let (status, Json(resp)) = api_unified_submit(State(state), Json(body))
+            .await
+            .expect("ivm submission must succeed");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.job_id, "revenue");
+    }
+
+    #[tokio::test]
+    async fn ivm_create_is_idempotent_for_a_repeated_job_id() {
+        // IvmJobRegistry::create uses entry().or_insert_with — calling twice
+        // with the same id must not error the second time.
+        let state = test_state();
+        for _ in 0..2 {
+            let mut body = request("ivm");
+            body.job_id = Some("revenue".to_owned());
+            let (status, _) = api_unified_submit(State(state.clone()), Json(body))
+                .await
+                .expect("both submissions must succeed");
+            assert_eq!(status, StatusCode::CREATED);
+        }
+    }
+
+    #[test]
+    fn unified_job_request_deserializes_minimal_batch_sql_body() {
+        let body: UnifiedJobRequest =
+            serde_json::from_str(r#"{"kind": "batch_sql", "query": "SELECT 1"}"#).unwrap();
+        assert_eq!(body.kind, "batch_sql");
+        assert_eq!(body.query.as_deref(), Some("SELECT 1"));
+        assert!(body.tables.is_empty(), "tables must default to empty");
+        assert!(body.job_id.is_none());
+        assert!(body.spec.is_none());
+    }
+
+    #[test]
+    fn unified_job_response_omits_null_optional_fields_when_serialized() {
+        let resp = UnifiedJobResponse {
+            job_id: "job-1".to_owned(),
+            kind: "ivm".to_owned(),
+            state: None,
+            poll_url: None,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(
+            !obj.contains_key("state"),
+            "None state must be omitted, not serialized as null: {json}"
+        );
+        assert!(
+            !obj.contains_key("poll_url"),
+            "None poll_url must be omitted, not serialized as null: {json}"
+        );
+    }
+}

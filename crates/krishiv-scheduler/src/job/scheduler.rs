@@ -8,28 +8,6 @@ use krishiv_proto::{
 
 use crate::{SchedulerError, SchedulerResult};
 
-#[cfg(test)]
-use krishiv_proto::KeyGroupRange;
-
-#[cfg(test)]
-const MAX_KEY_GROUPS: u32 = 32_768;
-
-/// Conservative per-job UDF execution time cap (ms) — 1 hour.
-#[cfg(test)]
-const UDF_EXECUTION_TIME_CAP_MS: u64 = 60 * 60 * 1_000;
-
-#[cfg(test)]
-pub(crate) fn key_group_range_for_task(task_index: usize, parallelism: usize) -> KeyGroupRange {
-    let p = parallelism.max(1) as u32;
-    let idx = task_index as u32;
-    let base = MAX_KEY_GROUPS / p;
-    let rem = MAX_KEY_GROUPS % p;
-    let extra_before = idx.min(rem);
-    let start = idx.saturating_mul(base) + extra_before;
-    let count = base + u32::from(idx < rem);
-    let end = start + count - 1;
-    KeyGroupRange::new(start, end)
-}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitOutcome {
     /// Job was admitted and is now scheduled.
