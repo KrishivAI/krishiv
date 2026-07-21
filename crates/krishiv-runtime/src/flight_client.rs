@@ -104,6 +104,26 @@ fn flight_sql_client(channel: Channel) -> FlightSqlServiceClient<AuthenticatedFl
     ))
 }
 
+/// Classify a `do_action` gRPC failure into a [`RuntimeError`].
+///
+/// A free function (not inlined in `do_action`) so the classification is
+/// directly unit-testable without a live server, matching how
+/// `is_server_unimplemented` is a dedicated variant rather than a string
+/// match: `Unimplemented` means "retry via the legacy SQL-comment protocol,
+/// server doesn't know this action"; `ResourceExhausted` means "retry via the
+/// streaming do_get transport, the result was too large for one response."
+fn map_do_action_status(s: tonic::Status) -> RuntimeError {
+    if s.code() == tonic::Code::Unimplemented {
+        RuntimeError::ServerUnimplemented {
+            message: s.message().to_string(),
+        }
+    } else if s.code() == tonic::Code::ResourceExhausted {
+        RuntimeError::result_too_large(s.message().to_string())
+    } else {
+        RuntimeError::transport(format!("do_action: {s}"))
+    }
+}
+
 /// Retry delays (ms) for transient Flight connection failures.
 const RETRY_DELAYS_MS: &[u64] = &[100, 500, 2_000];
 
@@ -573,15 +593,7 @@ impl FlightClientPool {
             let mut stream = client
                 .do_action(apply_flight_auth(tonic::Request::new(req)))
                 .await
-                .map_err(|s| {
-                    if s.code() == tonic::Code::Unimplemented {
-                        RuntimeError::ServerUnimplemented {
-                            message: s.message().to_string(),
-                        }
-                    } else {
-                        RuntimeError::transport(format!("do_action: {s}"))
-                    }
-                })?
+                .map_err(map_do_action_status)?
                 .into_inner();
             let mut buf = Vec::new();
             let max_response_bytes: usize = 64 * 1024 * 1024; // 64 MiB cap
@@ -590,7 +602,7 @@ impl FlightClientPool {
                     item.map_err(|e| RuntimeError::transport(format!("do_action stream: {e}")))?;
                 buf.extend_from_slice(&part.body);
                 if buf.len() > max_response_bytes {
-                    return Err(RuntimeError::transport(format!(
+                    return Err(RuntimeError::result_too_large(format!(
                         "do_action response exceeded {} MiB limit",
                         max_response_bytes / (1024 * 1024),
                     )));
@@ -908,6 +920,44 @@ mod tests {
             parse_flight_request_timeout(Some("  600 ")),
             Some(Duration::from_secs(600))
         );
+    }
+
+    // ── map_do_action_status ──────────────────────────────────────────────────
+
+    #[test]
+    fn map_do_action_status_unimplemented_becomes_server_unimplemented() {
+        let s = tonic::Status::unimplemented("action not yet supported");
+        assert!(matches!(
+            map_do_action_status(s),
+            RuntimeError::ServerUnimplemented { .. }
+        ));
+    }
+
+    #[test]
+    fn map_do_action_status_resource_exhausted_becomes_result_too_large() {
+        let s = tonic::Status::resource_exhausted("Flight action result (999) exceeds maximum");
+        match map_do_action_status(s) {
+            RuntimeError::ResultTooLarge { message } => {
+                assert!(message.contains("exceeds maximum"));
+            }
+            other => panic!("expected ResultTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_do_action_status_other_codes_become_transport() {
+        for code in [
+            tonic::Code::Internal,
+            tonic::Code::Unauthenticated,
+            tonic::Code::InvalidArgument,
+            tonic::Code::DeadlineExceeded,
+        ] {
+            let s = tonic::Status::new(code, "boom");
+            assert!(
+                matches!(map_do_action_status(s), RuntimeError::Transport { .. }),
+                "code {code:?} should map to a generic Transport error"
+            );
+        }
     }
 
     #[test]

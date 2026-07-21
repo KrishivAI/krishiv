@@ -516,6 +516,17 @@ fn is_server_unimplemented(e: &RuntimeError) -> bool {
     matches!(e, RuntimeError::ServerUnimplemented { .. })
 }
 
+/// Return true when `do_action`'s response was rejected for being too large
+/// (server `resource_exhausted`, or the client's own response buffer
+/// overflowing) — the caller should retry through the streaming
+/// `execute()`/`do_get` transport, which has no equivalent single-message cap.
+/// Unlike the `is_server_unimplemented` fallback, this is not a version- or
+/// capability-compatibility downgrade, so callers apply it unconditionally
+/// rather than gating it behind `allow_remote_sql_comment_fallback`.
+fn is_result_too_large(e: &RuntimeError) -> bool {
+    matches!(e, RuntimeError::ResultTooLarge { .. })
+}
+
 fn allow_remote_sql_comment_fallback() -> bool {
     krishiv_common::allows_remote_sql_comment_fallback()
 }
@@ -614,6 +625,11 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
                     let batches = decode_ipc_response(&body)?;
                     Ok((batches, watermark))
                 }
+                Err(e) if is_result_too_large(&e) => {
+                    let sql = encode_bounded_window(topic, spec, &input_batches)?;
+                    let batches = self.pool.execute_sql(&sql).await?;
+                    Ok((batches, None))
+                }
                 Err(e) if is_server_unimplemented(&e) => {
                     if !allow_remote_sql_comment_fallback() {
                         return Err(e);
@@ -661,6 +677,18 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
             });
             match self.pool.do_action(&action).await {
                 Ok(body) => decode_ipc_response(&body),
+                Err(e) if is_result_too_large(&e) => {
+                    // Not a compatibility downgrade (unlike the Unimplemented
+                    // arm below) — do_action's single-message transport is
+                    // structurally the wrong tool for this result regardless
+                    // of server version, so retry unconditionally through the
+                    // streaming do_get transport instead.
+                    let mut sql = encode_batch_sql(query, &batch_tables);
+                    if is_streaming {
+                        sql = format!("-- krishiv:streaming=true\n{sql}");
+                    }
+                    self.pool.execute_sql(&sql).await
+                }
                 Err(e) if is_server_unimplemented(&e) => {
                     if !allow_remote_sql_comment_fallback() {
                         return Err(e);
@@ -770,6 +798,10 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         block_on(async {
             match self.pool.do_action(&action).await {
                 Ok(body) => decode_ipc_response(&body),
+                Err(e) if is_result_too_large(&e) => {
+                    let sql = encode_continuous_drain(job_id);
+                    self.pool.execute_sql(&sql).await
+                }
                 Err(e) if is_server_unimplemented(&e) => {
                     if !allow_remote_sql_comment_fallback() {
                         return Err(e);
@@ -1492,6 +1524,49 @@ mod tests {
             !is_server_unimplemented(&err),
             "Transport error with Unimplemented text must not trigger fallback; use ServerUnimplemented"
         );
+    }
+
+    // ── is_result_too_large guard ─────────────────────────────────────────────
+
+    use super::is_result_too_large;
+
+    #[test]
+    fn stream_fallback_triggered_on_result_too_large() {
+        // Emitted by do_action for both the server's resource_exhausted status
+        // and the client's own response-buffer overflow — either one should
+        // route the query through the streaming do_get transport instead.
+        let err = crate::RuntimeError::ResultTooLarge {
+            message: "Flight action result (999) exceeds maximum (100)".into(),
+        };
+        assert!(
+            is_result_too_large(&err),
+            "ResultTooLarge variant must trigger the streaming fallback"
+        );
+    }
+
+    #[test]
+    fn stream_fallback_not_triggered_on_word_large_in_message() {
+        // A schema or user-facing error mentioning "large" in prose must not
+        // trigger the fallback — only the dedicated variant does.
+        let err = crate::RuntimeError::Transport {
+            message: "column 'large_value' has an unsupported type".into(),
+        };
+        assert!(
+            !is_result_too_large(&err),
+            "non-dedicated error containing 'large' must not trigger the streaming fallback"
+        );
+    }
+
+    #[test]
+    fn stream_fallback_and_unimplemented_fallback_are_independent() {
+        let unimplemented = crate::RuntimeError::ServerUnimplemented {
+            message: "action not yet supported".into(),
+        };
+        assert!(!is_result_too_large(&unimplemented));
+        let too_large = crate::RuntimeError::ResultTooLarge {
+            message: "too big".into(),
+        };
+        assert!(!is_server_unimplemented(&too_large));
     }
 
     #[test]

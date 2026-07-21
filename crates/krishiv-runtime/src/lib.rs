@@ -101,6 +101,14 @@ pub enum RuntimeError {
     /// so callers use a proper enum match instead of fragile string comparison.
     #[error("server unimplemented: {message}")]
     ServerUnimplemented { message: String },
+    /// The result was rejected for exceeding a size cap: either the server's
+    /// own `resource_exhausted` check, or the client's `do_action` response
+    /// buffer overflowing before that check could apply.  Kept as a distinct
+    /// variant (mirroring `ServerUnimplemented`) so callers can route the same
+    /// query through the genuinely-streaming `execute()`/`do_get` transport
+    /// instead of treating this as an ordinary transport failure.
+    #[error("result too large: {message}")]
+    ResultTooLarge { message: String },
 }
 
 impl RuntimeError {
@@ -128,6 +136,13 @@ impl RuntimeError {
     /// Create a partial-result error.
     pub fn partial_result(succeeded: usize, failed: usize) -> Self {
         Self::PartialResult { succeeded, failed }
+    }
+
+    /// Create a result-too-large error.
+    pub fn result_too_large(message: impl Into<String>) -> Self {
+        Self::ResultTooLarge {
+            message: message.into(),
+        }
     }
 }
 
