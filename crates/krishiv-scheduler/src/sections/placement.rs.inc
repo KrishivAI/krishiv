@@ -161,6 +161,77 @@ fn executor_loss_invalidates_remote_shuffle_partitions() {
     );
 }
 
+/// DUR-2 residual (found live 2026-07-15, cert session): the recovery
+/// pipeline (checkpoint rollback + task reset for reassignment) must fire
+/// on EVERY path an executor stops being available, not just
+/// timeout/`mark_executor_lost`. `kubectl delete pod` sends SIGTERM; the
+/// executor's shutdown handler calls `deregister_executor` unconditionally,
+/// even while a task is still `Running` on it — and `deregister_executor`
+/// removed the executor from the registry without ever resetting that
+/// task, orphaning it (`assigned_executor` kept pointing at the now-Removed
+/// executor forever, and `assign_pending_tasks` only looks at Pending
+/// tasks, so nothing ever revived it).
+#[test]
+fn executor_deregister_while_task_running_resets_it_for_reassignment() {
+    allow_anonymous_for_tests();
+
+    let exec_id = ExecutorId::try_new("exec-dereg-running").unwrap();
+    let coord_id = CoordinatorId::try_new("coord-dereg-running").unwrap();
+    let job_id = JobId::try_new("job-dereg-running").unwrap();
+
+    let mut coordinator = Coordinator::active(coord_id);
+    let lease_gen = coordinator
+        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-dereg", 1))
+        .unwrap();
+
+    coordinator
+        .submit_job(single_task_job(job_id.clone()))
+        .unwrap();
+    let assignments = coordinator
+        .launch_assigned_task_assignments(&job_id)
+        .unwrap();
+    let assign = assignments.first().unwrap();
+
+    // Drive the task to Running — still in flight when the executor leaves.
+    coordinator
+        .apply_task_update(
+            TaskStatusUpdate::new(
+                assign.job_id().clone(),
+                assign.stage_id().clone(),
+                assign.task_id().clone(),
+                exec_id.clone(),
+                TaskState::Running,
+                assign.attempt_id().as_u32(),
+            )
+            .with_lease_generation(lease_gen),
+        )
+        .unwrap();
+    {
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        assert_eq!(
+            detail.stages()[0].tasks()[0].state(),
+            TaskState::Running,
+            "precondition: task must be Running before the executor leaves"
+        );
+    }
+
+    // Graceful departure (the SIGTERM path) — deliberately NOT
+    // mark_executor_lost/heartbeat-timeout, which already handle this.
+    coordinator
+        .deregister_executor(&exec_id, lease_gen)
+        .unwrap();
+
+    let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+    let task = &detail.stages()[0].tasks()[0];
+    assert_eq!(
+        task.state(),
+        TaskState::Pending,
+        "a task Running on a gracefully-deregistered executor must be reset \
+         to Pending for reassignment, not left orphaned pointing at a \
+         Removed executor"
+    );
+}
+
 /// Phase 2.9: After a shuffle stage completes with serialized_bytes reported,
 /// the AQE coalesce hint is stored on the coordinator.
 #[test]

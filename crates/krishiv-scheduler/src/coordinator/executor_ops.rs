@@ -100,6 +100,24 @@ impl Coordinator {
             .executors
             .deregister(executor_id, lease_generation);
         if res.is_ok() {
+            // DUR-2 residual (found live 2026-07-15): a graceful departure
+            // (SIGTERM -> executor calls this RPC) is not the same as "this
+            // executor had already finished its work" — the executor's own
+            // shutdown handler calls it unconditionally, including while a
+            // streaming task is still Running. Run the SAME recovery
+            // pipeline mark_executor_lost/heartbeat-timeout use, in the
+            // SAME order (checkpoint handling reads task->executor
+            // assignments, so it must run before
+            // reset_running_tasks_for_lost_executor clears them), so
+            // in-flight work is never silently orphaned regardless of
+            // which path an executor stops being available through. Gated
+            // on `res.is_ok()`, like the cleanup below it, so a rejected
+            // deregister (e.g. stale lease) — where the executor is still
+            // actually current — never touches its running tasks.
+            self.handle_executor_loss_for_checkpoints(executor_id);
+            self.reset_running_tasks_for_lost_executor(executor_id);
+            self.executor_job_watermarks.remove(executor_id);
+            self.pending_source_throttles.remove(executor_id);
             // Evict the executor's gRPC channel so stale TCP connections
             // do not leak (Phase 1.3).
             if let Ok(record) = self.exec.executors.find_executor(executor_id)
