@@ -45,8 +45,8 @@ jobs:
         include:
         - language: actions
           build-mode: none
-        - language: c-cpp
-          build-mode: none
+        # c-cpp removed: the repo has no first-party C/C++ (build-mode:none
+        # analysis found nothing to extract and failed the whole run).
         - language: javascript-typescript
           build-mode: none
         - language: python

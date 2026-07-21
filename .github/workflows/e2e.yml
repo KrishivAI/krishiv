@@ -46,12 +46,19 @@ jobs:
           curl -sSLo ./kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
           chmod +x ./kubectl && sudo mv ./kubectl /usr/local/bin/kubectl
       - run: kind create cluster --name krishiv-e2e --wait 60s
-      - run: cargo build -p krishiv-operator -p krishiv-scheduler --release
+      # No default features: the operator's `cluster` default drags in the
+      # embedded UI crate, whose release compile OOMs the 7 GB hosted runner
+      # (exit 143). The failover e2e needs k8s only.
+      - run: cargo build -p krishiv-operator --no-default-features --features k8s -p krishiv-scheduler --release
       - name: Run failover integration test
         env:
           KRISHIV_E2E_KIND_CLUSTER: "true"
           KUBECONFIG: ${{ env.HOME }}/.kube/config
-        run: cargo test -p krishiv-operator failover_stale_coordinator --release -- --nocapture
+        # Same --no-default-features --features k8s as the prewarm build above:
+        # `cargo test` resolves features independently, so without this it
+        # rebuilds against the default `cluster` (k8s+ui) set and hits the
+        # same OOM the prewarm line exists to avoid — just one step later.
+        run: cargo test -p krishiv-operator --no-default-features --features k8s --release failover_stale_coordinator -- --nocapture
       - name: Collect kind logs on failure
         if: failure()
         run: |

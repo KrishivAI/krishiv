@@ -132,59 +132,122 @@ async fn deregister_via_grpc_endpoint_transitions_executor_to_removed() {
 /// the CooperativeAmplifiers rule makes the join yield per output batch
 /// (without it, this exact plan ran budget-free inside one poll and
 /// nothing — not even the 30 s guard — could preempt it).
-#[tokio::test]
-async fn task_runner_aborts_batch_fragment_mid_execution_on_cancel() {
-    let inbox = ExecutorAssignmentInbox::new();
-    let runner = ExecutorTaskRunner::new(inbox.clone());
+///
+/// Deliberately not `#[tokio::test]`: `cargo test` runs hundreds of tests
+/// concurrently in one process, and `/proc/self/stat` (whole process)
+/// picks up every sibling test's CPU too. The crate forbids `unsafe`, so a
+/// raw `gettid()` syscall isn't an option; running the whole test on a
+/// uniquely-named OS thread and reading `/proc/self/task/*/comm` scopes
+/// the CPU measurement to only the thread this test's fragment could
+/// actually run on.
+#[test]
+fn task_runner_aborts_batch_fragment_mid_execution_on_cancel() {
+    const WORKER_NAME: &str = "execburn-worker";
 
-    // 100^6 tuples with a per-row expression — count(*) alone constant-
-    // folds to the cardinality product, so sum() forces real evaluation.
-    let values: String = (0..100)
-        .map(|i| format!("({i})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "sql: SELECT sum(a.x * b.x + c.x * d.x + e.x * f.x) \
-         FROM (VALUES {values}) a(x), (VALUES {values}) b(x), \
-         (VALUES {values}) c(x), (VALUES {values}) d(x), (VALUES {values}) e(x), \
-         (VALUES {values}) f(x)"
-    );
-    let assignment = ExecutorTaskAssignment::new(
-        TaskAttemptRef::new(
-            JobId::try_new("job-cancel-mid").unwrap(),
-            StageId::try_new("stage-1").unwrap(),
-            TaskId::try_new("task-cancel-mid-1").unwrap(),
-            AttemptId::initial(),
-        ),
-        ExecutorId::try_new("exec-1").unwrap(),
-        LeaseGeneration::initial(),
-        PlanFragment::new(sql),
-        OutputContract::new(OutputContractKind::InlineRecordBatches, "inline"),
-    );
+    fn worker_jiffies() -> u64 {
+        let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter(|entry| {
+                std::fs::read_to_string(entry.path().join("comm"))
+                    .is_ok_and(|comm| comm.trim() == WORKER_NAME)
+            })
+            .filter_map(|entry| std::fs::read_to_string(entry.path().join("stat")).ok())
+            .map(|stat| {
+                let fields: Vec<&str> = stat.split_whitespace().collect();
+                if fields.len() < 15 {
+                    return 0;
+                }
+                fields[13].parse::<u64>().unwrap_or(0) + fields[14].parse::<u64>().unwrap_or(0)
+            })
+            .sum()
+    }
 
-    let task_id = assignment.task_id().clone();
-    let cancel_inbox = inbox.clone();
-    let canceller = tokio::spawn(async move {
-        // Let execution actually start before cancelling.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        cancel_inbox.cancel_task(&task_id).unwrap();
-    });
+    std::thread::Builder::new()
+        .name(WORKER_NAME.to_string())
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let inbox = ExecutorAssignmentInbox::new();
+                let runner = ExecutorTaskRunner::new(inbox.clone());
 
-    let service = AcceptingCoordinatorService;
-    let report = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        runner.run_assignment_with(assignment, &service),
-    )
-    .await
-    .expect("cancel watcher must abort the fragment well before the 30s guard")
-    .unwrap();
-    canceller.await.unwrap();
+                // 100^6 tuples with a per-row expression — count(*) alone
+                // constant-folds to the cardinality product, so sum()
+                // forces real evaluation.
+                let values: String = (0..100)
+                    .map(|i| format!("({i})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "sql: SELECT sum(a.x * b.x + c.x * d.x + e.x * f.x) \
+                     FROM (VALUES {values}) a(x), (VALUES {values}) b(x), \
+                     (VALUES {values}) c(x), (VALUES {values}) d(x), (VALUES {values}) e(x), \
+                     (VALUES {values}) f(x)"
+                );
+                let assignment = ExecutorTaskAssignment::new(
+                    TaskAttemptRef::new(
+                        JobId::try_new("job-cancel-mid").unwrap(),
+                        StageId::try_new("stage-1").unwrap(),
+                        TaskId::try_new("task-cancel-mid-1").unwrap(),
+                        AttemptId::initial(),
+                    ),
+                    ExecutorId::try_new("exec-1").unwrap(),
+                    LeaseGeneration::initial(),
+                    PlanFragment::new(sql),
+                    OutputContract::new(OutputContractKind::InlineRecordBatches, "inline"),
+                );
 
-    assert_eq!(report.output().kind(), ExecutorTaskOutputKind::Cancelled);
-    assert_eq!(
-        report.terminal_disposition(),
-        TransportDisposition::Accepted
-    );
+                let job_id = assignment.job_id().clone();
+                let task_id = assignment.task_id().clone();
+                let cancel_inbox = inbox.clone();
+                let canceller = tokio::spawn(async move {
+                    // Let execution actually start before cancelling.
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    cancel_inbox.cancel_task(&job_id, &task_id).unwrap();
+                });
+
+                let service = AcceptingCoordinatorService;
+                let report = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    runner.run_assignment_with(assignment, &service),
+                )
+                .await
+                .expect("cancel watcher must abort the fragment well before the 30s guard")
+                .unwrap();
+                canceller.await.unwrap();
+
+                assert_eq!(report.output().kind(), ExecutorTaskOutputKind::Cancelled);
+                assert_eq!(
+                    report.terminal_disposition(),
+                    TransportDisposition::Accepted
+                );
+
+                // Give aborts a moment to land before measuring.
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            });
+
+            // The report alone is not the proof (#217 live repro: the
+            // executor reported Cancelled in 250ms and then burned a full
+            // core for five minutes). The dropped fragment's compute must
+            // actually stop — measured here, still on this named thread,
+            // right after block_on has returned.
+            let before = worker_jiffies();
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let burned = worker_jiffies().saturating_sub(before);
+            assert!(
+                burned < 60,
+                "fragment kept burning {burned} jiffies over 3s after the cancel \
+                 report — its execution tasks were not stopped"
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -205,8 +268,14 @@ async fn task_runner_reports_cancelled_when_inbox_cancel_received() {
         OutputContract::new(OutputContractKind::InlineRecordBatches, "inline"),
     );
 
-    inbox.cancel_task(assignment.task_id()).unwrap();
-    assert!(inbox.is_task_cancelled(assignment.task_id()).unwrap());
+    inbox
+        .cancel_task(assignment.job_id(), assignment.task_id())
+        .unwrap();
+    assert!(
+        inbox
+            .is_task_cancelled(assignment.job_id(), assignment.task_id())
+            .unwrap()
+    );
 
     let service = AcceptingCoordinatorService;
     let report = runner

@@ -50,6 +50,85 @@ mod tests {
         );
     }
 
+    /// #217 part 2: after a timeout/cancel DROPS the result stream, the
+    /// spawned per-partition execution tasks must actually stop — the
+    /// live cert repro showed a full core burning to natural completion
+    /// after the future was dropped. Asserts CPU goes quiet within 3s of
+    /// the drop.
+    ///
+    /// Deliberately not `#[tokio::test]`: `cargo test` runs hundreds of
+    /// tests concurrently in one process, and `/proc/self/stat` (whole
+    /// process) picks up every sibling test's CPU too — this flaked under
+    /// the full-suite default parallel run even though the underlying fix
+    /// is correct, because an unrelated heavy test happened to overlap the
+    /// 3s window. The crate forbids `unsafe`, so a raw `gettid()` syscall
+    /// isn't an option either; naming this runtime's own worker threads
+    /// and reading `/proc/self/task/*/comm` scopes the measurement to only
+    /// the threads this test's query could actually run on.
+    #[test]
+    fn dropped_query_stops_burning_cpu() {
+        const WORKER_NAME: &str = "sqlburn-worker";
+
+        fn worker_jiffies() -> u64 {
+            let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
+                return 0;
+            };
+            entries
+                .flatten()
+                .filter(|entry| {
+                    std::fs::read_to_string(entry.path().join("comm"))
+                        .is_ok_and(|comm| comm.trim() == WORKER_NAME)
+                })
+                .filter_map(|entry| std::fs::read_to_string(entry.path().join("stat")).ok())
+                .map(|stat| {
+                    let fields: Vec<&str> = stat.split_whitespace().collect();
+                    if fields.len() < 15 {
+                        return 0;
+                    }
+                    fields[13].parse::<u64>().unwrap_or(0) + fields[14].parse::<u64>().unwrap_or(0)
+                })
+                .sum()
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .thread_name(WORKER_NAME)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let engine = SqlEngine::new();
+            let values: String = (0..100)
+                .map(|i| format!("({i})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT sum(a.x * b.x + c.x * d.x + e.x) \
+                 FROM (VALUES {values}) a(x), (VALUES {values}) b(x), \
+                 (VALUES {values}) c(x), (VALUES {values}) d(x), (VALUES {values}) e(x)"
+            );
+            let df = engine.sql(&sql).await.unwrap();
+            let out = tokio::time::timeout(std::time::Duration::from_secs(2), df.collect()).await;
+            assert!(out.is_err(), "the 10^10-row aggregate should not finish in 2s");
+            drop(out);
+            // Give aborts a moment to land, then measure.
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        });
+
+        let before = worker_jiffies();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let burned = worker_jiffies().saturating_sub(before);
+        // 3s fully idle ≈ 0; one core burning ≈ 300 jiffies. Allow slack
+        // for scheduling noise — scoped to only this runtime's own named
+        // worker threads, so unrelated sibling tests can't trip it.
+        assert!(
+            burned < 60,
+            "this runtime's worker threads burned {burned} jiffies over 3s \
+             after the stream was dropped — spawned partition tasks are not aborted"
+        );
+    }
+
     #[tokio::test]
     async fn typed_expression_ast_matches_raw_sql_execution() {
         use krishiv_plan::expression::{BinaryOperator, Expr, ScalarValue};
