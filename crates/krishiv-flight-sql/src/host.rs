@@ -1,12 +1,15 @@
 //! Shared server-side execution host for the Krishiv Flight SQL service.
 
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use arrow_flight::error::FlightError;
 use dashmap::DashMap;
+use futures::{Stream, StreamExt as _, stream};
 use krishiv_runtime::flight_protocol::{FlightDirective, apply_register_directives, parse_sql};
 use krishiv_runtime::in_process_cluster::{InProcessCluster, plan_spec_to_local};
 use krishiv_scheduler::{
@@ -602,6 +605,134 @@ impl FlightExecutionHost {
         // Plain SQL execution.
         self.execute_batch_sql(&sql, &ipc_tables).await
     }
+
+    /// Like [`Self::execute_sql`], but avoids collecting the whole result
+    /// into memory before the client sees a single row, when possible.
+    ///
+    /// #211: `execute_sql` always returned `Vec<RecordBatch>` — the Flight
+    /// host materialized the entire result before `do_get` streamed a
+    /// single byte to the client, which is what actually produced the
+    /// reported `resource_exhausted "Flight SQL result (8149911680 bytes)
+    /// exceeds maximum"` on an un-LIMITed SELECT. Directives (explain,
+    /// continuous register/push/drain, bounded window) and the
+    /// `InProcess` backend still execute through the existing fully
+    /// buffered path — their results are inherently small (control
+    /// messages, explain text) or would need touching DataFusion's own
+    /// execution model to stream (residual, not attempted this pass) —
+    /// and come back as [`SqlResultDelivery::Buffered`]. Plain SQL against
+    /// the `Coordinator` backend (the `prod`/`distributed` preset, and the
+    /// actual trigger for the reported OOM) decodes its on-disk
+    /// task-result spools one at a time as the client drains `do_get`,
+    /// instead of eagerly flattening every spool into one `Vec` first —
+    /// peak host memory drops from O(total result size) to O(largest
+    /// single spool).
+    pub async fn execute_sql_stream(&self, raw_sql: &str) -> Result<SqlResultDelivery, Status> {
+        let (directives, sql) = parse_sql(raw_sql);
+        let has_special_directive = directives.iter().any(|d| {
+            matches!(
+                d,
+                FlightDirective::Explain
+                    | FlightDirective::ContinuousRegister { .. }
+                    | FlightDirective::ContinuousPush { .. }
+                    | FlightDirective::ContinuousDrain { .. }
+                    | FlightDirective::BoundedWindow { .. }
+            )
+        });
+        if has_special_directive || matches!(self.backend.as_ref(), FlightHostBackend::InProcess(_))
+        {
+            return self
+                .execute_sql(raw_sql)
+                .await
+                .map(SqlResultDelivery::Buffered);
+        }
+
+        self.apply_catalog_directives(&directives)?;
+        let ipc_tables: Vec<BatchSqlInlineTable> = directives
+            .iter()
+            .filter_map(|d| {
+                if let FlightDirective::RegisterParquetIpc { table, ipc_b64 } = d {
+                    Some(BatchSqlInlineTable {
+                        table_name: table.clone(),
+                        ipc_b64: ipc_b64.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let FlightHostBackend::Coordinator(coordinator) = self.backend.as_ref() else {
+            unreachable!("InProcess already returned above");
+        };
+        let outcome =
+            execute_batch_sql_coordinated_with_paths(coordinator, &sql, &ipc_tables, &[])
+                .await
+                .map_err(scheduler_error_to_status)?;
+        let inline = krishiv_scheduler::decode_inline_record_batches(
+            &outcome.inline_record_batch_ipc,
+        )
+        .map_err(|e| krishiv_metrics::grpc::internal_status("decode inline result batches", &e))?;
+        let mut spools = outcome.result_spools.into_iter();
+
+        // The encoder needs a schema up front. Rather than peek the lazy
+        // spool stream (which would decode the same spool anyway, since
+        // spools decode a whole file at a time, not batch-by-batch), take
+        // it from `inline` if present, else eagerly decode just the first
+        // spool — the same O(one spool) bound the lazy path below keeps
+        // for everything after it.
+        let (schema, prefix): (Arc<Schema>, Vec<RecordBatch>) = if let Some(first) = inline.first()
+        {
+            (first.schema(), inline)
+        } else if let Some(first_spool) = spools.next() {
+            let decoded = first_spool.decode_record_batches().map_err(|e| {
+                krishiv_metrics::grpc::internal_status("decode result spool", &e)
+            })?;
+            let schema = decoded
+                .first()
+                .map(|b| b.schema())
+                .unwrap_or_else(|| Arc::new(Schema::empty()));
+            (schema, decoded)
+        } else {
+            (Arc::new(Schema::empty()), Vec::new())
+        };
+
+        let prefix_stream = stream::iter(prefix.into_iter().map(Ok));
+        let rest_stream = stream::iter(spools).flat_map(|spool| {
+            let items: Vec<Result<RecordBatch, Status>> = match spool.decode_record_batches() {
+                Ok(batches) => batches.into_iter().map(Ok).collect(),
+                Err(e) => vec![Err(krishiv_metrics::grpc::internal_status(
+                    "decode result spool",
+                    &e,
+                ))],
+            };
+            stream::iter(items)
+        });
+        // FlightDataEncoderBuilder::build wants Result<_, FlightError>, not
+        // our tonic Status — convert at this one seam (arrow_flight already
+        // provides From<tonic::Status> for FlightError) rather than
+        // threading FlightError through every internal error site above.
+        let combined = prefix_stream
+            .chain(rest_stream)
+            .map(|item: Result<RecordBatch, Status>| item.map_err(FlightError::from));
+
+        Ok(SqlResultDelivery::Streamed {
+            schema,
+            batches: Box::pin(combined),
+        })
+    }
+}
+
+/// Result of [`FlightExecutionHost::execute_sql_stream`].
+pub enum SqlResultDelivery {
+    /// The full result, already collected — the size cap in `do_get_statement`
+    /// still applies to this variant.
+    Buffered(Vec<RecordBatch>),
+    /// Batches arriving incrementally; `schema` is known up front (needed by
+    /// the Flight encoder) without buffering the batches themselves.
+    Streamed {
+        schema: Arc<Schema>,
+        batches: Pin<Box<dyn Stream<Item = Result<RecordBatch, FlightError>> + Send>>,
+    },
 }
 
 // Async bridge for blocking cluster calls.
@@ -717,6 +848,43 @@ mod tests {
         let sql = krishiv_runtime::flight_protocol::encode_explain_sql("SELECT 1");
         let batches = host.execute_sql(&sql).await.unwrap();
         assert!(!batches.is_empty());
+    }
+
+    /// #211: the InProcess backend still returns `Buffered` from
+    /// `execute_sql_stream` (true streaming is only implemented for the
+    /// Coordinator backend so far) — but it must go through the SAME public
+    /// method `do_get_statement` now calls, with the SAME row content
+    /// `execute_sql` would have produced directly.
+    #[tokio::test]
+    async fn execute_sql_stream_returns_buffered_for_inprocess_backend() {
+        let host = FlightExecutionHost::embedded().unwrap();
+        let delivery = host.execute_sql_stream("SELECT 42 AS n").await.unwrap();
+        match delivery {
+            SqlResultDelivery::Buffered(batches) => {
+                assert!(!batches.is_empty());
+                assert_eq!(batches[0].num_rows(), 1);
+            }
+            SqlResultDelivery::Streamed { .. } => {
+                panic!("InProcess backend must not take the Streamed path")
+            }
+        }
+    }
+
+    /// #211: a directive (explain) must still route through the buffered
+    /// path and produce the same result `execute_sql` would, regardless of
+    /// backend — directives are control messages/small results, not the
+    /// large-SELECT case #211 is about.
+    #[tokio::test]
+    async fn execute_sql_stream_returns_buffered_for_explain_directive() {
+        let host = FlightExecutionHost::embedded().unwrap();
+        let sql = krishiv_runtime::flight_protocol::encode_explain_sql("SELECT 1");
+        let delivery = host.execute_sql_stream(&sql).await.unwrap();
+        match delivery {
+            SqlResultDelivery::Buffered(batches) => assert!(!batches.is_empty()),
+            SqlResultDelivery::Streamed { .. } => {
+                panic!("a directive must not take the Streamed path")
+            }
+        }
     }
 
     /// Audit §11 error taxonomy: a caller's SQL error (unknown table) must

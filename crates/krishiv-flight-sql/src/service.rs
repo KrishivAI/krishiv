@@ -7,6 +7,7 @@ use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::error::FlightError;
 use arrow_flight::sql::metadata::{SqlInfoData, SqlInfoDataBuilder};
 use arrow_flight::sql::server::{FlightSqlService, PeekableFlightDataStream};
 use arrow_flight::sql::{
@@ -524,8 +525,11 @@ impl FlightSqlService for KrishivFlightSqlService {
 
         // Acquire a concurrent-query slot. Returns immediately if no cap is set;
         // returns resource_exhausted when the semaphore is saturated.
-        // The permit is held only for the duration of execute_sql, then dropped.
-        let batches = {
+        // The permit is held only for the duration of execute_sql_stream, then
+        // dropped — note this only covers the up-front planning/dispatch for
+        // the #211 streamed case, not the full drain (the client controls
+        // how long that takes via backpressure).
+        let delivery = {
             let _permit = if let Some(sem) = &self.inflight_queries {
                 match sem.try_acquire() {
                     Ok(p) => Some(p),
@@ -539,39 +543,54 @@ impl FlightSqlService for KrishivFlightSqlService {
             } else {
                 None
             };
-            // `execute_sql` already returns a classified `Status`
+            // `execute_sql_stream` already returns a classified `Status`
             // (audit §11 error taxonomy: caller-facing query errors as
             // `invalid_argument`, internal faults opaque under a ref) — do not
             // re-wrap it as `internal`, which would clobber the code and leak
             // the detail.
-            self.host.execute_sql(query).await?
+            self.host.execute_sql_stream(query).await?
             // _permit drops here
         };
 
-        // API-1: Enforce a result-size cap to prevent server OOM from
-        // unbounded `SELECT *` queries. Bypasses the 2 GiB batch-engine cap.
-        if self.max_result_bytes > 0 {
-            let total: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
-            if total > self.max_result_bytes {
-                return Err(Status::resource_exhausted(format!(
-                    "Flight SQL result ({} bytes) exceeds maximum ({} bytes); \
-                     add a LIMIT clause or raise {}",
-                    total, self.max_result_bytes, FLIGHT_MAX_RESULT_BYTES_ENV
-                )));
+        let (schema, batch_stream): (
+            Arc<Schema>,
+            Pin<Box<dyn Stream<Item = Result<RecordBatch, FlightError>> + Send>>,
+        ) = match delivery {
+            crate::host::SqlResultDelivery::Buffered(batches) => {
+                // API-1: Enforce a result-size cap to prevent server OOM from
+                // unbounded `SELECT *` queries — only reachable here for
+                // results that had to be fully buffered anyway (the
+                // InProcess backend, or a directive whose result isn't a
+                // plain streamed SELECT). Bypasses the 2 GiB batch-engine cap.
+                if self.max_result_bytes > 0 {
+                    let total: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+                    if total > self.max_result_bytes {
+                        return Err(Status::resource_exhausted(format!(
+                            "Flight SQL result ({} bytes) exceeds maximum ({} bytes); \
+                             add a LIMIT clause or raise {}",
+                            total, self.max_result_bytes, FLIGHT_MAX_RESULT_BYTES_ENV
+                        )));
+                    }
+                }
+                let schema = batches
+                    .first()
+                    .map(|b| b.schema())
+                    .unwrap_or_else(|| Arc::new(Schema::empty()));
+                (schema, Box::pin(stream::iter(batches.into_iter().map(Ok))))
             }
-        }
-
-        let schema: Arc<Schema> = batches
-            .first()
-            .map(|b| b.schema())
-            .unwrap_or_else(|| Arc::new(Schema::empty()));
+            // #211: batches arrive incrementally from on-disk task-result
+            // spools as the client drains do_get; there is no single
+            // up-front allocation to cap here, so the size cap does not
+            // apply — client backpressure on DoGet is the flow control.
+            crate::host::SqlResultDelivery::Streamed { schema, batches } => (schema, batches),
+        };
 
         // Encode incrementally: FlightDataEncoder emits one message per batch
         // as the client drains do_get, instead of materializing the whole
         // encoded result up front (a second full copy for large results).
         let encoded = FlightDataEncoderBuilder::new()
             .with_schema(schema)
-            .build(stream::iter(batches.into_iter().map(Ok)))
+            .build(batch_stream)
             .map_err(Status::from);
 
         let stream: Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send>> =
