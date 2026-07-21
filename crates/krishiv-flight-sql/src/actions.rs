@@ -12,6 +12,7 @@ use arrow::record_batch::RecordBatch;
 use tonic::Status;
 
 /// Error type for Krishiv DoAction handlers.
+#[derive(Debug)]
 pub(crate) enum KrishivActionError {
     Status(Status),
     Other(String),

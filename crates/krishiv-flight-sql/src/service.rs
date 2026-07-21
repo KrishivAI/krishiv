@@ -1414,6 +1414,115 @@ pub async fn run_flight_server(
     Ok(())
 }
 
+/// API-1, extended: the same result-size cap `do_get_statement`'s
+/// `Buffered` branch already applies to `execute_sql_stream`'s buffered
+/// results, for `do_action` handlers that *also* fully materialize their
+/// result into one in-memory `Vec<RecordBatch>` before returning it
+/// (`do_action` has no streaming variant — the client further caps the
+/// whole response at 64 MiB, see `FlightClientPool::do_action`).
+///
+/// This runs *after* the caller has already built `batches`, so it does not
+/// prevent the materialization itself — a result large enough to exhaust
+/// memory while being *built* would still do so before this check runs.
+/// What it does stop is what was actually observed: growing an in-memory
+/// result past the cap (default 2 GiB) and then re-encoding all of it into
+/// IPC bytes for a client whose own transport cap (64 MiB) was always going
+/// to reject it anyway — failing with a clear `resource_exhausted` the
+/// moment the cap is crossed is strictly better than continuing to grow
+/// past it. A free function (not a `KrishivFlightSqlService` method) since
+/// it only needs `max_result_bytes`, not any other service state — keeps it
+/// directly unit-testable without a full service instance.
+fn check_batch_result_size(
+    batches: &[RecordBatch],
+    max_result_bytes: usize,
+) -> Result<(), KrishivActionError> {
+    if max_result_bytes == 0 {
+        return Ok(());
+    }
+    let total: usize = batches
+        .iter()
+        .map(RecordBatch::get_array_memory_size)
+        .sum();
+    if total > max_result_bytes {
+        return Err(KrishivActionError::Status(Status::resource_exhausted(
+            format!(
+                "Flight action result ({total} bytes) exceeds maximum \
+                 ({max_result_bytes} bytes); add a LIMIT clause or raise {FLIGHT_MAX_RESULT_BYTES_ENV}"
+            ),
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod result_size_cap_tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field};
+    use std::sync::Arc;
+
+    fn batch_of(rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let values: Vec<i64> = (0..rows as i64).collect();
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap()
+    }
+
+    #[test]
+    fn zero_cap_means_unbounded() {
+        // max_result_bytes == 0 is the documented "no cap configured" state
+        // (read_max_result_bytes's env-parsing only ever sets a positive
+        // value or the positive default — 0 only happens if a caller wires
+        // it in directly, which this test guards stays a deliberate no-op).
+        let huge = vec![batch_of(1_000_000)];
+        assert!(check_batch_result_size(&huge, 0).is_ok());
+    }
+
+    #[test]
+    fn result_within_cap_is_accepted() {
+        let small = vec![batch_of(10)];
+        let total: usize = small.iter().map(RecordBatch::get_array_memory_size).sum();
+        assert!(check_batch_result_size(&small, total + 1).is_ok());
+        assert!(
+            check_batch_result_size(&small, total).is_ok(),
+            "exactly at the cap must not be rejected, only strictly over it"
+        );
+    }
+
+    #[test]
+    fn result_over_cap_is_rejected_with_resource_exhausted() {
+        let batches = vec![batch_of(1000)];
+        let total: usize = batches
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .sum();
+        let err = check_batch_result_size(&batches, total - 1).unwrap_err();
+        match err {
+            KrishivActionError::Status(status) => {
+                assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+            }
+            other => panic!("expected KrishivActionError::Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cap_sums_across_multiple_batches_not_just_the_first() {
+        // A single batch under the cap must still be rejected if there are
+        // several of them and the *total* crosses it -- guards against a
+        // regression that only checks batches[0].
+        let batches = vec![batch_of(100), batch_of(100), batch_of(100)];
+        let one_batch_size = batch_of(100).get_array_memory_size();
+        assert!(
+            check_batch_result_size(&batches, one_batch_size).is_err(),
+            "three batches' combined size must exceed a one-batch cap"
+        );
+    }
+
+    #[test]
+    fn empty_result_is_always_accepted() {
+        assert!(check_batch_result_size(&[], 1).is_ok());
+    }
+}
+
 impl KrishivFlightSqlService {
     /// Dispatch a typed Krishiv DoAction into the execution host (B3, D2).
     ///
@@ -1453,6 +1562,7 @@ impl KrishivFlightSqlService {
                     .drain_continuous_stream(&body.job_id)
                     .await
                     .map_err(KrishivActionError::Status)?;
+                check_batch_result_size(&batches, self.max_result_bytes)?;
                 encode_batches_ipc(&batches)
             }
             A::BoundedWindow(body) => {
@@ -1463,6 +1573,7 @@ impl KrishivFlightSqlService {
                     .execute_bounded_window(&body.topic, &body.spec, input_batches)
                     .await
                     .map_err(KrishivActionError::Status)?;
+                check_batch_result_size(&result, self.max_result_bytes)?;
                 encode_batches_ipc(&result)
             }
             A::Explain(body) => {
@@ -1531,6 +1642,7 @@ impl KrishivFlightSqlService {
                         .await
                         .map_err(KrishivActionError::Status)?
                 };
+                check_batch_result_size(&batches, self.max_result_bytes)?;
                 encode_batches_ipc(&batches)
             }
             A::BatchSqlSink(body) => {
