@@ -28,6 +28,28 @@ pub const RESULT_SPOOL_MAX_BYTES_ENV: &str = "KRISHIV_RESULT_SPOOL_MAX_BYTES";
 
 const DEFAULT_RESULT_SPOOL_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+/// Environment variable overriding how much unsynced data
+/// `receive_task_result_spool` writes before forcing an `fdatasync`
+/// (default 64 MiB). Large results otherwise arrive as a burst of writes
+/// that the kernel buffers as dirty page cache with nothing forcing
+/// writeback — under a memory-cgroup limit (Kubernetes `memory.max` counts
+/// page cache alongside process RSS), a several-GiB spool can accumulate as
+/// dirty cache faster than background writeback reclaims it and get the pod
+/// OOMKilled even though the receiving process's own RSS never grows.
+/// Syncing periodically bounds how much of any one spool can be dirty at
+/// once, independent of the spool's total size.
+pub const RESULT_SPOOL_SYNC_INTERVAL_BYTES_ENV: &str = "KRISHIV_RESULT_SPOOL_SYNC_INTERVAL_BYTES";
+
+const DEFAULT_RESULT_SPOOL_SYNC_INTERVAL_BYTES: u64 = 64 * 1024 * 1024;
+
+fn result_spool_sync_interval_bytes() -> u64 {
+    std::env::var(RESULT_SPOOL_SYNC_INTERVAL_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_RESULT_SPOOL_SYNC_INTERVAL_BYTES)
+}
+
 /// Monotonic suffix so concurrent spools for retried attempts never collide.
 static SPOOL_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -147,6 +169,8 @@ pub async fn receive_task_result_spool(
     let mut received: u64 = 0;
     let mut saw_last = false;
     let mut declared_total: u64 = 0;
+    let mut unsynced: u64 = 0;
+    let sync_interval = result_spool_sync_interval_bytes();
 
     // Remove the partial file on any early-return error.
     let cleanup = |path: &Option<PathBuf>| {
@@ -221,10 +245,12 @@ pub async fn receive_task_result_spool(
         if let Some(f) = file.as_mut()
             && !data.is_empty()
         {
-            f.write_all(&data).await.map_err(|e| {
-                cleanup(&path);
-                tonic::Status::internal(format!("result spool write failed: {e}"))
-            })?;
+            write_and_maybe_sync(f, &data, &mut unsynced, sync_interval)
+                .await
+                .map_err(|e| {
+                    cleanup(&path);
+                    tonic::Status::internal(format!("result spool write failed: {e}"))
+                })?;
         }
     }
 
@@ -249,6 +275,14 @@ pub async fn receive_task_result_spool(
         cleanup(&Some(path_buf.clone()));
         tonic::Status::internal(format!("result spool flush failed: {e}"))
     })?;
+    // Sync the tail too — a spool smaller than the sync interval (or the
+    // last partial interval of a larger one) would otherwise never get an
+    // fdatasync at all, sitting as dirty page cache until the kernel's own
+    // background writeback gets to it.
+    writer.get_ref().sync_data().await.map_err(|e| {
+        cleanup(&Some(path_buf.clone()));
+        tonic::Status::internal(format!("result spool final sync failed: {e}"))
+    })?;
 
     Ok((
         key,
@@ -257,6 +291,30 @@ pub async fn receive_task_result_spool(
             total_bytes: received,
         },
     ))
+}
+
+/// Write `data` to `writer`, forcing an `fdatasync` (and resetting
+/// `*unsynced`) once `*unsynced` reaches `sync_interval`. Factored out of
+/// [`receive_task_result_spool`] so the periodic-sync behavior itself is
+/// unit-testable without needing an env-var override (which would be
+/// process-global and race with other tests) or a giant multi-GiB test
+/// fixture — a caller can pass an arbitrarily small `sync_interval`
+/// directly.
+async fn write_and_maybe_sync(
+    writer: &mut tokio::io::BufWriter<tokio::fs::File>,
+    data: &[u8],
+    unsynced: &mut u64,
+    sync_interval: u64,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    writer.write_all(data).await?;
+    *unsynced = unsynced.saturating_add(data.len() as u64);
+    if *unsynced >= sync_interval {
+        writer.flush().await?;
+        writer.get_ref().sync_data().await?;
+        *unsynced = 0;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -401,5 +459,52 @@ mod tests {
         // be readable before `next()` is ever called, so a caller extracting
         // just the schema doesn't have to decode (and hold) a batch to get it.
         assert_eq!(reader.schema(), batches[0].schema());
+    }
+
+    #[tokio::test]
+    async fn write_and_maybe_sync_preserves_data_across_many_sync_points() {
+        use tokio::io::AsyncWriteExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.bin");
+        let file = tokio::fs::File::create(&path).await.unwrap();
+        let mut writer = tokio::io::BufWriter::new(file);
+
+        // A 3-byte interval against 10 writes of 1 byte each forces a sync
+        // roughly every third write, well-exercised, not just once at the
+        // very end.
+        let mut unsynced = 0u64;
+        let mut expected = Vec::new();
+        for byte in 0u8..10 {
+            write_and_maybe_sync(&mut writer, &[byte], &mut unsynced, 3)
+                .await
+                .unwrap();
+            expected.push(byte);
+        }
+        writer.flush().await.unwrap();
+
+        let on_disk = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(on_disk, expected, "every byte must survive periodic syncing, in order");
+    }
+
+    #[tokio::test]
+    async fn write_and_maybe_sync_resets_the_counter_only_when_it_actually_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.bin");
+        let file = tokio::fs::File::create(&path).await.unwrap();
+        let mut writer = tokio::io::BufWriter::new(file);
+
+        let mut unsynced = 0u64;
+        write_and_maybe_sync(&mut writer, &[1, 2], &mut unsynced, 100)
+            .await
+            .unwrap();
+        assert_eq!(unsynced, 2, "under the interval: counter just accumulates");
+
+        write_and_maybe_sync(&mut writer, &[3, 4, 5], &mut unsynced, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            unsynced, 0,
+            "crossing the interval must sync and reset the counter"
+        );
     }
 }
