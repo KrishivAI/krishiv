@@ -206,7 +206,7 @@ test-external:
         {{ sccache_env }} {{ cargo }} test -p krishiv-sql --features postgres-catalog --lib -- --ignored s3_round_trip
     OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://127.0.0.1:4319}" \
         {{ sccache_env }} {{ cargo }} test -p krishiv-metrics --lib -- --ignored otlp_integration
-    {{ sccache_env }} {{ cargo }} test -p krishiv-runtime --lib -- --ignored do_action_rejects_response_exceeding_size_cap
+    {{ sccache_env }} {{ cargo }} test -p krishiv-runtime --lib -- --ignored do_action_
 
 # Tests that must pass with only embedded features enabled
 test-embedded:

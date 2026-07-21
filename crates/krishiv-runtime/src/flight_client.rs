@@ -20,6 +20,21 @@ use crate::{RuntimeError, RuntimeResult};
 /// before treating the server as stalled.
 const FLIGHT_PER_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Application-level cap on a single `do_action` response. The whole response
+/// arrives as one gRPC message (`do_action_fallback` wraps it in a one-item
+/// stream server-side), so this is checked against the accumulated buffer as
+/// chunks of that one message arrive.
+const DO_ACTION_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// gRPC's own per-message decode limit for the `do_action` channel,
+/// comfortably above `DO_ACTION_MAX_RESPONSE_BYTES` so that cap — not tonic's
+/// much smaller 4 MiB default — is what actually classifies and rejects an
+/// oversized response. Without raising this, any do_action response over
+/// 4 MiB fails as a raw, unclassified tonic decode error before
+/// DO_ACTION_MAX_RESPONSE_BYTES (and the ResultTooLarge/streaming-fallback
+/// classification built on it) is ever reached.
+const DO_ACTION_MAX_DECODE_BYTES: usize = 96 * 1024 * 1024;
+
 /// Drain a Flight SQL record-batch stream, applying `per_batch_timeout` to
 /// each individual `next()` poll so a stalled server cannot hang the caller
 /// indefinitely.
@@ -618,7 +633,8 @@ impl FlightClientPool {
         let action_type = action.action_type();
         with_retry(|| async {
             let channel = self.get_channel().await?;
-            let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
+            let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel)
+                .max_decoding_message_size(DO_ACTION_MAX_DECODE_BYTES);
             let req = arrow_flight::Action {
                 r#type: action_type.clone(),
                 body: body.clone().into(),
@@ -629,15 +645,14 @@ impl FlightClientPool {
                 .map_err(map_do_action_status)?
                 .into_inner();
             let mut buf = Vec::new();
-            let max_response_bytes: usize = 64 * 1024 * 1024; // 64 MiB cap
             while let Some(item) = stream.next().await {
                 let part =
                     item.map_err(|e| RuntimeError::transport(format!("do_action stream: {e}")))?;
                 buf.extend_from_slice(&part.body);
-                if buf.len() > max_response_bytes {
+                if buf.len() > DO_ACTION_MAX_RESPONSE_BYTES {
                     return Err(RuntimeError::result_too_large(format!(
                         "do_action response exceeded {} MiB limit",
-                        max_response_bytes / (1024 * 1024),
+                        DO_ACTION_MAX_RESPONSE_BYTES / (1024 * 1024),
                     )));
                 }
             }
@@ -1343,10 +1358,15 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requires binding a local TCP listener; run with --ignored outside restricted sandboxes"]
-    async fn do_action_rejects_response_exceeding_size_cap()
-    -> Result<(), Box<dyn std::error::Error>> {
+    /// Spin up a real gRPC server backed by `OversizedActionService`
+    /// (`chunk_size` bytes per `ActionResult` item, `chunk_count` items),
+    /// connect a real `FlightClientPool`, and return `do_action`'s result.
+    /// Shared by the size-cap tests below so each one only states its chunk
+    /// shape and expected outcome, not the server/client plumbing.
+    async fn do_action_against_oversized_mock(
+        chunk_size: usize,
+        chunk_count: usize,
+    ) -> Result<RuntimeResult<Vec<u8>>, Box<dyn std::error::Error>> {
         use arrow_flight::flight_service_server::FlightServiceServer;
         use tonic::transport::Server;
 
@@ -1360,11 +1380,9 @@ mod tests {
             .map_err(|e| Box::<dyn std::error::Error>::from(format!("local_addr: {e}")))?;
         let incoming = tonic::transport::server::TcpIncoming::from(listener);
 
-        // 40 chunks * 2 MiB = 80 MiB, over the 64 MiB cap while each chunk
-        // stays comfortably under tonic's default 4 MiB decode-length limit.
         let service = OversizedActionService {
-            chunk_size: 2 * 1024 * 1024,
-            chunk_count: 40,
+            chunk_size,
+            chunk_count,
         };
         let server = tokio::spawn(async move {
             Server::builder()
@@ -1383,16 +1401,65 @@ mod tests {
             });
 
         let result = pool.do_action(&action).await;
+        server.abort();
+        Ok(result)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires binding a local TCP listener; run with --ignored outside restricted sandboxes"]
+    async fn do_action_rejects_response_exceeding_size_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // 40 chunks * 2 MiB = 80 MiB, over the 64 MiB cap while each chunk
+        // stays comfortably under tonic's default 4 MiB decode-length limit —
+        // isolates the app-level accumulation cap from the gRPC message-size
+        // limit exercised by the two tests below.
+        let result = do_action_against_oversized_mock(2 * 1024 * 1024, 40).await?;
         match result {
-            Err(RuntimeError::Transport { message }) => {
+            Err(RuntimeError::ResultTooLarge { message }) => {
                 assert!(
                     message.contains("MiB limit"),
                     "expected a response-size-cap error, got: {message}"
                 );
             }
-            other => panic!("expected Transport size-limit error, got {other:?}"),
+            other => panic!("expected ResultTooLarge size-limit error, got {other:?}"),
         }
-        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires binding a local TCP listener; run with --ignored outside restricted sandboxes"]
+    async fn do_action_single_chunk_between_grpc_default_and_app_cap_succeeds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The real server (do_action_fallback) always sends the whole
+        // response as ONE ActionResult, unlike the multi-chunk test above.
+        // 40 MiB in one chunk exceeds tonic's 4 MiB decode-length default but
+        // stays under the 64 MiB app-level cap — before
+        // DO_ACTION_MAX_DECODE_BYTES raised the client's decode limit, this
+        // failed with a raw, unclassified tonic decode error before the
+        // app-level cap (or ResultTooLarge classification) ever ran.
+        let result = do_action_against_oversized_mock(40 * 1024 * 1024, 1).await?;
+        let body = result.expect("40 MiB single-chunk response must succeed, not hit gRPC's decode-length default");
+        assert_eq!(body.len(), 40 * 1024 * 1024);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires binding a local TCP listener; run with --ignored outside restricted sandboxes"]
+    async fn do_action_single_chunk_over_app_cap_is_rejected_cleanly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Same one-shot shape as the real server, sized past the 64 MiB app
+        // cap but still under DO_ACTION_MAX_DECODE_BYTES (96 MiB) so the app
+        // check — not gRPC's own decode limit — is what actually fires.
+        let result = do_action_against_oversized_mock(80 * 1024 * 1024, 1).await?;
+        match result {
+            Err(RuntimeError::ResultTooLarge { message }) => {
+                assert!(
+                    message.contains("MiB limit"),
+                    "expected a response-size-cap error, got: {message}"
+                );
+            }
+            other => panic!("expected ResultTooLarge size-limit error, got {other:?}"),
+        }
         Ok(())
     }
 
