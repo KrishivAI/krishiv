@@ -916,7 +916,7 @@ pub static FLAGS: &[FlagSpec] = &[
         "KRISHIV_STREAM_EARLY_FIRE_MS",
         FlagKind::UInt,
         "unset",
-        "Speculative early-fire interval for open windows (embedded loop; the state-backed operator accessor is a known gap).",
+        "Speculative early-fire interval for open windows (embedded loop only — the distributed stream:rloop: run-loop does not read this flag).",
     ),
     rt(
         "KRISHIV_STREAM_LINGER_MS",

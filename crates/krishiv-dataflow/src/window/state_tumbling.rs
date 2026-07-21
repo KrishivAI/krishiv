@@ -172,6 +172,17 @@ state_backed_window_op! {
     }
 }
 
+impl StateBackedTumblingWindowOperator {
+    /// H-14: speculative early-fire (`KRISHIV_STREAM_EARLY_FIRE_MS`) — the
+    /// accessor `continuous.rs::emit_open_windows_speculative` needed. Reads
+    /// the in-memory operator's currently-open windows without touching
+    /// state (see [`TumblingWindowOperator::emit_open_windows`]); state-backed
+    /// callers get the same non-mutating snapshot as the embedded path.
+    pub fn emit_open_windows(&self) -> ExecResult<Vec<RecordBatch>> {
+        self.inner.emit_open_windows()
+    }
+}
+
 state_backed_window_op! {
     pub struct StateBackedSlidingWindowOperator {
         inner: SlidingWindowOperator,

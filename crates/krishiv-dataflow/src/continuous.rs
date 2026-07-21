@@ -604,22 +604,24 @@ impl ContinuousWindowExecutor {
     /// call this on a configurable cadence
     /// (`KRISHIV_STREAM_EARLY_FIRE_MS`) and route the snapshot to a
     /// downstream upsert sink keyed on `(key, window_start)`.
-    ///
-    /// Note: this implementation is intentionally minimal — it returns
-    /// `None` for the production state-backed window operators, leaving
-    /// the primitive available for tests. Wiring it into the
-    /// state-backed path requires accessing the underlying non-state
-    /// operator through a new accessor on `StateBackedTumblingWindowOperator`,
-    /// tracked as a follow-up.
     pub fn emit_open_windows_speculative(&self) -> Option<Vec<RecordBatch>> {
-        // The state-backed operator's emit_open_windows is not yet
-        // exposed through the production API surface. Returning `None`
-        // here is a safe no-op: callers see no early-fire outputs and
-        // continue with the normal close-time flush. Documented as a
-        // known gap; the wiring is one accessor on the state-backed
-        // operator away.
-        let _ = &self.operator;
-        None
+        let Some(WindowOperatorState::Tumbling(op)) = &self.operator else {
+            return None;
+        };
+        match op.emit_open_windows() {
+            Ok(batches) if batches.is_empty() => None,
+            Ok(batches) => Some(batches),
+            Err(err) => {
+                // Best-effort: a speculative snapshot failing never blocks
+                // the normal close-time flush, which still holds the durable
+                // state. Log and skip this round's early fire.
+                tracing::warn!(
+                    error = %err,
+                    "speculative early-fire snapshot failed; skipping this round"
+                );
+                None
+            }
+        }
     }
 
     pub fn uses_multi_source_watermark(&self) -> bool {
@@ -830,6 +832,46 @@ mod tests {
         assert!(
             output.is_empty(),
             "the failed cycle's first batch must not remain in window state"
+        );
+    }
+
+    #[test]
+    fn emit_open_windows_speculative_returns_none_before_any_drain() {
+        let spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+        let exec = ContinuousWindowExecutor::new(spec).expect("create");
+        assert!(
+            exec.emit_open_windows_speculative().is_none(),
+            "no operator has been created yet (no drain call), so there is nothing to peek at"
+        );
+    }
+
+    #[test]
+    fn emit_open_windows_speculative_snapshots_an_open_tumbling_window_without_consuming_it() {
+        let mut spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+        spec.watermark_lag_ms = 0;
+        let mut exec = ContinuousWindowExecutor::new(spec).expect("create");
+
+        // Window [0, 10000) is still open: watermark (1_000) has not passed
+        // its end.
+        let closed = exec.drain(vec![events_batch(1_000)]).expect("drain1");
+        assert!(closed.is_empty(), "window must not have closed yet");
+
+        let speculative = exec
+            .emit_open_windows_speculative()
+            .expect("H-14: an open tumbling window must produce a speculative snapshot");
+        assert_eq!(speculative.len(), 1);
+        assert_eq!(
+            speculative[0].num_rows(),
+            1,
+            "one key (\"a\") has one open window"
+        );
+
+        // The peek must not have mutated state: the real close still sees
+        // the same row when the watermark actually passes the boundary.
+        let final_output = exec.drain(vec![events_batch(12_000)]).expect("drain2");
+        assert!(
+            !final_output.is_empty(),
+            "the window must still close normally after being speculatively peeked"
         );
     }
 

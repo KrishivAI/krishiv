@@ -50,12 +50,12 @@ record() { # path value_ms
 
 echo "==> streaming_latency"
 cargo bench -p krishiv-bench --bench streaming_latency
-if v=$(criterion_median_ms "streaming_latency_embedded/embedded_10k_rows_10k_window"); then
+if v=$(criterion_median_ms "streaming_latency_embedded/embedded_1k_row_batch_steady_state"); then
   record streaming_latency_embedded_p50 "$v"
 else
   echo "SKIP streaming_latency_embedded_p50 (no criterion output)"
 fi
-if v=$(criterion_median_ms "streaming_latency_single_node/single_node_10k_rows_10k_window"); then
+if v=$(criterion_median_ms "streaming_latency_single_node/single_node_1k_row_batch_steady_state"); then
   record streaming_latency_single_node_p50 "$v"
 else
   echo "SKIP streaming_latency_single_node_p50 (no criterion output)"
