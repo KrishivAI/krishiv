@@ -2295,6 +2295,61 @@ impl SqlEngine {
             return Ok(self.attach_query_metadata(self.make_sql_df("update", dataframe), query));
         }
 
+        // ── Intercept INSERT INTO <iceberg-table> [SELECT|VALUES ...] ────────
+        // #219: DataFusion's own ListingTable::insert_into rejects every
+        // catalog table deterministically — each data file parses to an
+        // exact object path, never a URL ending in `/`, so its "backed by a
+        // single file" collection check always fails, table-exists-or-not.
+        // Route the common form (no explicit column list, i.e. all columns
+        // in table order) to a durable append landing instead. An explicit
+        // column list falls through to DataFusion's existing (rejecting)
+        // path — narrower form, not yet supported here (residual).
+        #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+        if trimmed.to_ascii_uppercase().starts_with("INSERT ")
+            && let Some(parsed) = parse_dml_insert(trimmed)
+            && parsed.columns.is_empty()
+            && let Some((iceberg_catalog, table_ident)) =
+                self.resolve_iceberg_table(&parsed.table_ref)
+        {
+            use arrow::array::{ArrayRef, Int64Array};
+            use arrow::datatypes::{DataType, Field, Schema};
+            let source_df = self.context.sql(&parsed.inner_query).await?;
+            let stream = source_df
+                .execute_stream()
+                .await
+                .map_err(|e| SqlError::DataFusion {
+                    message: e.to_string(),
+                })?;
+            let report = krishiv_connectors::lakehouse::dml::iceberg_append_into(
+                iceberg_catalog,
+                &table_ident,
+                stream,
+            )
+            .await
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
+            // Phase 54 auto-stats: keep any known row count in step.
+            self.adjust_table_row_count_stat(&parsed.table_ref, report.rows as i64);
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "inserted_rows",
+                DataType::Int64,
+                false,
+            )]));
+            let array: ArrayRef = Arc::new(Int64Array::from(vec![report.rows as i64]));
+            let batch =
+                RecordBatch::try_new(schema, vec![array]).map_err(|e| SqlError::DataFusion {
+                    message: e.to_string(),
+                })?;
+            let res_table = next_ephemeral_name("insert_result");
+            lakehouse::register_scan_batches(&self.context, &res_table, vec![batch]).await?;
+            let dataframe = self
+                .context
+                .sql(&format!("SELECT * FROM {res_table}"))
+                .await?;
+            return Ok(self.attach_query_metadata(self.make_sql_df("insert", dataframe), query));
+        }
+
         // ── Intercept MATCH_RECOGNIZE ─────────────────────────────────────────
         // DataFusion does not parse MATCH_RECOGNIZE. Route it through the CEP
         // path: parse → run PatternMatcher on the source table → return results.
@@ -4757,6 +4812,51 @@ fn parse_dml_delete(stmt: &str) -> Option<(String, String)> {
         .map(|e| e.to_string())
         .unwrap_or_else(|| "TRUE".to_string());
     Some((table_name, predicate))
+}
+
+/// Parsed `INSERT INTO <table> [(<columns>)] <source>` statement.
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+struct ParsedInsert {
+    /// Dotted target reference exactly as written (`cat.ns.tbl` or `ns.tbl`).
+    table_ref: String,
+    /// Explicit column list, if given (`INSERT INTO t (a, b) ...`). Empty
+    /// means "all columns, in table order" — the only form this engine's
+    /// Iceberg append landing currently accepts (#219 residual: an explicit
+    /// list would need positional remapping + NULL-fill for omitted
+    /// columns, not implemented yet).
+    columns: Vec<String>,
+    /// The source query text (`SELECT ...` or `VALUES (...)`), rendered
+    /// back from the AST so it can be executed on its own.
+    inner_query: String,
+}
+
+/// Parse `INSERT INTO <table> [(<columns>)] <source-query>` using the
+/// sqlparser AST. Returns `None` for non-INSERT statements, multi-statement
+/// input, or an INSERT with no source query (bare `DEFAULT VALUES` / MySQL
+/// `SET`-assignment forms) — this engine only supports the `SELECT`/`VALUES`
+/// source forms, both of which parse into `Insert::source`.
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+fn parse_dml_insert(stmt: &str) -> Option<ParsedInsert> {
+    use datafusion::sql::sqlparser::ast::{Statement, TableObject};
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
+    use datafusion::sql::sqlparser::parser::Parser;
+
+    let mut stmts = Parser::parse_sql(&GenericDialect {}, stmt).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let Statement::Insert(insert) = stmts.remove(0) else {
+        return None;
+    };
+    let TableObject::TableName(name) = insert.table else {
+        return None;
+    };
+    let inner_query = insert.source?.to_string();
+    Some(ParsedInsert {
+        table_ref: name.to_string(),
+        columns: insert.columns.iter().map(|c| c.to_string()).collect(),
+        inner_query,
+    })
 }
 
 /// Parsed `CREATE [OR REPLACE] TABLE … AS <query>` statement.

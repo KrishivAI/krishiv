@@ -1078,6 +1078,203 @@ pub async fn land_ctas_with_target(
     })
 }
 
+// ── INSERT INTO landing (durable append, no rewrite) ──────────────────────────
+
+/// Outcome of a durable `INSERT INTO` append.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertLandingReport {
+    /// Rows written into the new snapshot.
+    pub rows: u64,
+    /// Total bytes of the Parquet data files written.
+    pub bytes: u64,
+    /// Number of data files added by this insert.
+    pub data_files: usize,
+    /// The snapshot id after this insert (unchanged from before if the
+    /// stream produced zero rows).
+    pub snapshot_id: i64,
+}
+
+/// Durably append a result stream into an **existing** Iceberg table as one
+/// new snapshot, writing only new data files — no drop, no rewrite, no
+/// touching existing snapshots.
+///
+/// This is the real `INSERT INTO` this engine has been missing (#219):
+/// catalog tables were only reachable via `CREATE [OR REPLACE] TABLE AS`
+/// (full rewrite, [`land_ctas`]) or the copy-on-write DELETE/UPDATE path
+/// ([`iceberg_delete_where`]/[`iceberg_update_where`]), forcing every
+/// platform-side caller that needed to add rows into a full-table
+/// self-union CTAS instead. `catalog.load_table` + DataFusion's own
+/// `ListingTable::insert_into` rejects appends to an existing table outright
+/// (`"Inserting into a ListingTable backed by a single file is not
+/// supported"` — the table's data files each parse to an exact object path,
+/// never a URL ending in `/`, so DataFusion's own collection check always
+/// fails); this function is the intended replacement for that path.
+///
+/// The incoming stream's schema must exactly match the target table's
+/// current schema (same column names, same order) — this engine does not
+/// attempt schema evolution on `INSERT`. Partitioning is read back from the
+/// table's own default spec via [`transforms_from_metadata`], so rows land
+/// correctly partitioned without the caller repeating the table's
+/// `PARTITIONED BY` clause.
+///
+/// Peak memory is bounded the same way [`land_ctas_with_target`] bounds it:
+/// rolling per-partition part files at `target_bytes` of buffered Arrow
+/// data, each uploaded through the table's `FileIO` before the next part
+/// buffers.
+pub async fn iceberg_append_into(
+    catalog: Arc<dyn Catalog + Send + Sync>,
+    ident: &TableIdent,
+    stream: datafusion::execution::SendableRecordBatchStream,
+) -> Result<InsertLandingReport, LakehouseError> {
+    iceberg_append_into_with_target(catalog, ident, stream, ctas_target_file_bytes()).await
+}
+
+/// [`iceberg_append_into`] with an explicit per-part roll threshold, for
+/// callers/tests that need to control file sizing directly instead of via
+/// `KRISHIV_CTAS_TARGET_FILE_BYTES`.
+pub async fn iceberg_append_into_with_target(
+    catalog: Arc<dyn Catalog + Send + Sync>,
+    ident: &TableIdent,
+    mut stream: datafusion::execution::SendableRecordBatchStream,
+    target_bytes: usize,
+) -> Result<InsertLandingReport, LakehouseError> {
+    use futures::StreamExt as _;
+
+    let table = catalog
+        .load_table(ident)
+        .await
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+
+    // INSERT INTO does not evolve the target schema — a genuine column-list
+    // mismatch must fail fast, before any part is written, not commit data
+    // a reader can no longer reconcile with the table's own schema.
+    let incoming_schema = arrow_schema_to_iceberg_schema(stream.schema().as_ref())?;
+    let incoming_names: Vec<&str> = incoming_schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    let target_names: Vec<&str> = table
+        .metadata()
+        .current_schema()
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    if incoming_names != target_names {
+        return Err(LakehouseError::Iceberg(format!(
+            "INSERT INTO {ident}: column list {incoming_names:?} does not match \
+             table schema {target_names:?}; this engine does not evolve schema on INSERT"
+        )));
+    }
+
+    let partition_by = transforms_from_metadata(table.metadata())?;
+    let fanout = PartitionFanout::try_new(stream.schema().as_ref(), &partition_by)?;
+    let table_location = table.metadata().location().to_string();
+    let file_io = table.file_io().clone();
+
+    let mut buffers: BTreeMap<String, PartBuffer> = BTreeMap::new();
+    let mut buffered_bytes = 0usize;
+    let mut pending: Vec<PendingPart> = Vec::new();
+    let mut total_rows = 0u64;
+    let mut total_bytes = 0u64;
+    while let Some(next) = stream.next().await {
+        let batch = next.map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        total_rows += batch.num_rows() as u64;
+        buffered_bytes += fanout_into_buffers(&fanout, &batch, &mut buffers)?;
+        while buffered_bytes >= target_bytes {
+            let largest = buffers
+                .iter()
+                .max_by_key(|(_, b)| b.bytes)
+                .map(|(k, _)| k.clone());
+            let Some(key) = largest else { break };
+            let Some(buf) = buffers.remove(&key) else {
+                break;
+            };
+            buffered_bytes = buffered_bytes.saturating_sub(buf.bytes);
+            let part = write_ctas_part(
+                &file_io,
+                &table_location,
+                &buf.path,
+                buf.partition,
+                buf.batches,
+            )
+            .await?;
+            total_bytes += part.file_size;
+            pending.push(part);
+        }
+    }
+    for (_, buf) in buffers {
+        let part = write_ctas_part(
+            &file_io,
+            &table_location,
+            &buf.path,
+            buf.partition,
+            buf.batches,
+        )
+        .await?;
+        total_bytes += part.file_size;
+        pending.push(part);
+    }
+
+    let data_files = pending.len();
+    let snapshot_id = if pending.is_empty() {
+        // No rows: leave the table exactly as it was.
+        table
+            .metadata()
+            .current_snapshot()
+            .map(|s| s.snapshot_id())
+            .unwrap_or(-1)
+    } else {
+        let spec_id = table.metadata().default_partition_spec_id();
+        let data_files_built = pending
+            .into_iter()
+            .map(|p| p.into_data_file(spec_id))
+            .collect::<Result<Vec<_>, LakehouseError>>()?;
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(data_files_built);
+        let tx = action
+            .apply(tx)
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+        let committed = tx
+            .commit(&*catalog)
+            .await
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+        // Local-FS native tables track the current metadata via a version
+        // hint; object-store tables (REST catalog) do not use one.
+        if table_location.starts_with("file://")
+            && let Some(loc) = committed.metadata_location()
+        {
+            let table_root = std::path::Path::new(table_location.trim_start_matches("file://"));
+            if let Err(e) = super::iceberg_native::native::write_version_hint(table_root, loc) {
+                tracing::warn!(
+                    table = %ident,
+                    location = loc,
+                    error = %e,
+                    "version hint update failed after INSERT INTO commit; hint may be stale"
+                );
+            }
+        }
+        committed
+            .metadata()
+            .current_snapshot()
+            .map(|s| s.snapshot_id())
+            .unwrap_or(-1)
+    };
+
+    Ok(InsertLandingReport {
+        rows: total_rows,
+        bytes: total_bytes,
+        data_files,
+        snapshot_id,
+    })
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn extract_count(batches: &[RecordBatch]) -> i64 {
@@ -1506,5 +1703,100 @@ mod tests {
         )]);
         let err = arrow_schema_to_iceberg_schema(&nested).unwrap_err();
         assert!(err.to_string().contains("cannot map"), "got: {err}");
+    }
+
+    // ── iceberg_append_into (#219) ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn insert_into_appends_without_touching_existing_rows() {
+        let (catalog, _dir) = make_empty_catalog().await;
+        let ctx = SessionContext::new();
+        let ident = TableIdent::new(NamespaceIdent::new("pipe".into()), "growing".into());
+
+        // Land the table with 2 rows via CTAS (existing, proven path).
+        let first = stream_of(&ctx, "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name)")
+            .await;
+        let ctas_report = land_ctas(Arc::clone(&catalog), &ident, false, &[], first)
+            .await
+            .unwrap();
+        assert_eq!(ctas_report.rows, 2);
+
+        // A plain INSERT INTO must not need OR REPLACE and must not fail
+        // the way ListingTable::insert_into does on a real catalog table.
+        let second =
+            stream_of(&ctx, "SELECT * FROM (VALUES (3, 'c'), (4, 'd')) AS t(id, name)").await;
+        let insert_report = iceberg_append_into(Arc::clone(&catalog), &ident, second)
+            .await
+            .unwrap();
+        assert_eq!(insert_report.rows, 2, "insert reports only the new rows");
+        assert_eq!(insert_report.data_files, 1);
+        // Iceberg snapshot ids are random (Uuid-derived, see
+        // generate_unique_snapshot_id in iceberg-rust) -- they carry no
+        // ordering guarantee, so ">" is not a valid check. What actually
+        // matters is that the insert produced a genuinely NEW snapshot
+        // whose parent is the CTAS snapshot, proving it appended onto the
+        // existing history rather than replacing it.
+        assert_ne!(
+            insert_report.snapshot_id, ctas_report.snapshot_id,
+            "insert must create a new snapshot, not reuse the CTAS one"
+        );
+        let table = catalog.load_table(&ident).await.unwrap();
+        let insert_snapshot = table
+            .metadata()
+            .snapshot_by_id(insert_report.snapshot_id)
+            .expect("insert's snapshot id must be findable in the committed table metadata");
+        assert_eq!(
+            insert_snapshot.parent_snapshot_id(),
+            Some(ctas_report.snapshot_id),
+            "the insert's snapshot must chain onto the CTAS snapshot as its parent"
+        );
+
+        // Both the original CTAS rows and the inserted rows must be
+        // readable — an append, not a rewrite.
+        let rows: Vec<RecordBatch> = table_rows(&catalog, &ident, &ctx).await;
+        let total: usize = rows.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, 4, "original + inserted rows must both be present");
+
+        // The append must not have replaced the CTAS snapshot's data file —
+        // a real append adds a file, it never rewrites/removes one.
+        let scan = table.scan().build().unwrap();
+        let tasks: Vec<iceberg::scan::FileScanTask> =
+            scan.plan_files().await.unwrap().try_collect().await.unwrap();
+        assert_eq!(
+            tasks.len(),
+            2,
+            "one data file from CTAS + one from the insert, both still referenced"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_into_rejects_schema_mismatch() {
+        let (catalog, ident, _dir) = make_catalog_with_table().await;
+        let ctx = SessionContext::new();
+        // make_catalog_with_table's schema is (id: Long, name: String) —
+        // this stream has a different column list entirely.
+        let stream = stream_of(&ctx, "SELECT * FROM (VALUES (1.5, true)) AS t(price, active)")
+            .await;
+        let err = iceberg_append_into(catalog, &ident, stream).await.unwrap_err();
+        assert!(
+            err.to_string().contains("does not match"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_into_unknown_table_fails_instead_of_creating_one() {
+        let (catalog, _dir) = make_empty_catalog().await;
+        let ctx = SessionContext::new();
+        let ns = NamespaceIdent::new("pipe".into());
+        catalog
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .unwrap();
+        let ident = TableIdent::new(ns, "never_created".into());
+        let stream = stream_of(&ctx, "SELECT * FROM (VALUES (1)) AS t(id)").await;
+        // INSERT INTO must target an EXISTING table — CREATE [OR REPLACE]
+        // TABLE AS is the (separate, already-supported) create path.
+        assert!(iceberg_append_into(catalog, &ident, stream).await.is_err());
     }
 }

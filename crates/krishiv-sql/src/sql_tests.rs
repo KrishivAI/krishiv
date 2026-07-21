@@ -1660,6 +1660,41 @@ mod iceberg_catalog_tests {
         assert!(crate::parse_dml_update("DELETE FROM t").is_none());
     }
 
+    // ── INSERT INTO helper (#219) ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_dml_insert_select_no_column_list() {
+        let parsed = crate::parse_dml_insert("INSERT INTO myns.orders SELECT id, name FROM src")
+            .expect("must parse");
+        assert_eq!(parsed.table_ref, "myns.orders");
+        assert!(parsed.columns.is_empty());
+        assert!(parsed.inner_query.to_ascii_uppercase().contains("SELECT"));
+    }
+
+    #[test]
+    fn parse_dml_insert_values() {
+        let parsed = crate::parse_dml_insert("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+            .expect("must parse");
+        assert_eq!(parsed.table_ref, "t");
+        assert!(parsed.columns.is_empty());
+        assert!(parsed.inner_query.to_ascii_uppercase().contains("VALUES"));
+    }
+
+    #[test]
+    fn parse_dml_insert_with_explicit_column_list() {
+        let parsed = crate::parse_dml_insert("INSERT INTO t (a, b) SELECT x, y FROM src")
+            .expect("must parse");
+        assert_eq!(parsed.table_ref, "t");
+        assert_eq!(parsed.columns, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn parse_dml_insert_rejects_non_insert() {
+        assert!(crate::parse_dml_insert("SELECT 1").is_none());
+        assert!(crate::parse_dml_insert("DELETE FROM t").is_none());
+        assert!(crate::parse_dml_insert("UPDATE t SET x = 1").is_none());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delete_from_iceberg_table_removes_rows() {
         use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
@@ -1724,6 +1759,77 @@ mod iceberg_catalog_tests {
             .unwrap()
             .value(0);
         assert_eq!(updated, 0, "empty table: no rows to update");
+    }
+
+    /// #219: `INSERT INTO <catalog-table> SELECT ...` must actually append
+    /// rows instead of hitting DataFusion's `ListingTable::insert_into`
+    /// rejection ("Inserting into a ListingTable backed by a single file is
+    /// not supported") that every catalog table used to hit deterministically.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn insert_into_iceberg_table_appends_rows() {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog = Arc::new(KrishivCatalog::local(dir.path()).await.unwrap());
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+        catalog
+            .create_table("myns", "growing", schema, "")
+            .await
+            .unwrap();
+        let engine = SqlEngine::new().with_iceberg_catalog(Arc::clone(&catalog), "mycat");
+
+        // First insert lands into the empty table.
+        let df = engine
+            .sql("INSERT INTO myns.growing SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name)")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        assert_eq!(batches[0].schema().field(0).name(), "inserted_rows");
+        let inserted = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(inserted, 2);
+
+        // A second insert must ADD to the first, not replace it — this is
+        // the whole point of #219 (no more full-table self-union CTAS).
+        let df = engine
+            .sql("INSERT INTO myns.growing SELECT * FROM (VALUES (3, 'c')) AS t(id, name)")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let inserted = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(inserted, 1, "second insert reports only its own new row");
+
+        // A bare 2-part name only resolves for the DML-interception paths
+        // above (resolve_iceberg_table's explicit "single registered
+        // catalog" fallback); a plain SELECT goes straight to DataFusion's
+        // own planner, which requires the full catalog.schema.table path.
+        let df = engine
+            .sql("SELECT id FROM mycat.myns.growing")
+            .await
+            .unwrap();
+        let rows: usize = df
+            .collect()
+            .await
+            .unwrap()
+            .iter()
+            .map(arrow::record_batch::RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 3, "both inserts' rows must be present");
     }
 }
 
