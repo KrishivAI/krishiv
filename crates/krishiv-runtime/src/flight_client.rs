@@ -167,6 +167,15 @@ fn map_do_action_status(s: tonic::Status) -> RuntimeError {
         }
     } else if s.code() == tonic::Code::ResourceExhausted {
         RuntimeError::result_too_large(s.message().to_string())
+    } else if s.code() == tonic::Code::OutOfRange {
+        // do_action's entire response arrives as one unchunked gRPC message
+        // (do_action_fallback sends a one-item stream), so a response bigger
+        // than the channel's max_decoding_message_size fails the *transport's*
+        // decode before DO_ACTION_MAX_RESPONSE_BYTES's own accumulation check
+        // ever sees a byte — no amount of raising that decode limit closes
+        // this for an arbitrarily large result, so it must be classified here
+        // too, not just treated as a generic transport failure.
+        RuntimeError::result_too_large(format!("do_action: {s}"))
     } else {
         RuntimeError::transport(format!("do_action: {s}"))
     }
@@ -646,8 +655,7 @@ impl FlightClientPool {
                 .into_inner();
             let mut buf = Vec::new();
             while let Some(item) = stream.next().await {
-                let part =
-                    item.map_err(|e| RuntimeError::transport(format!("do_action stream: {e}")))?;
+                let part = item.map_err(map_do_action_status)?;
                 buf.extend_from_slice(&part.body);
                 if buf.len() > DO_ACTION_MAX_RESPONSE_BYTES {
                     return Err(RuntimeError::result_too_large(format!(
@@ -1005,6 +1013,21 @@ mod tests {
         match map_do_action_status(s) {
             RuntimeError::ResultTooLarge { message } => {
                 assert!(message.contains("exceeds maximum"));
+            }
+            other => panic!("expected ResultTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_do_action_status_out_of_range_becomes_result_too_large() {
+        // tonic's own code for "decoded message length too large" — do_action's
+        // whole response is one gRPC message, so this is the transport-level
+        // signal that a response was too big to even receive, not just too
+        // big by the application's own accounting.
+        let s = tonic::Status::out_of_range("decoded message length too large: found 999, limit 100");
+        match map_do_action_status(s) {
+            RuntimeError::ResultTooLarge { message } => {
+                assert!(message.contains("too large"));
             }
             other => panic!("expected ResultTooLarge, got {other:?}"),
         }
@@ -1460,6 +1483,28 @@ mod tests {
             }
             other => panic!("expected ResultTooLarge size-limit error, got {other:?}"),
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires binding a local TCP listener; run with --ignored outside restricted sandboxes"]
+    async fn do_action_single_chunk_exceeding_grpc_decode_limit_is_classified_as_too_large()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Live testing caught this: a response bigger than
+        // DO_ACTION_MAX_DECODE_BYTES itself (not just DO_ACTION_MAX_RESPONSE_BYTES)
+        // fails the *transport's* decode with a raw tonic::Code::OutOfRange —
+        // the accumulation loop in do_action never even sees a byte, so
+        // DO_ACTION_MAX_RESPONSE_BYTES's own check can't be what classifies
+        // it. No amount of raising the decode limit fixes this in general
+        // (a large enough result always exceeds whatever it's set to), so
+        // OutOfRange must be classified as ResultTooLarge directly in
+        // map_do_action_status, exercised here via a chunk bigger than
+        // DO_ACTION_MAX_DECODE_BYTES (96 MiB).
+        let result = do_action_against_oversized_mock(150 * 1024 * 1024, 1).await?;
+        assert!(
+            matches!(result, Err(RuntimeError::ResultTooLarge { .. })),
+            "expected ResultTooLarge for a response exceeding the gRPC decode limit, got {result:?}"
+        );
         Ok(())
     }
 
