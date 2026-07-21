@@ -299,3 +299,86 @@ Findings:
 This measurement (the 10 M point) now also feeds
 `benchmarks/results.jsonl` via the nightly regression gate
 (`ivm_tick_p50_at_10m_rows`) — see "Regression budgets (Phase 66)" above.
+
+### 2026-07-21 — streaming_latency methodology fix (task #195 residual)
+
+- **Revision**: engine `034187a3` (the `streaming_latency.rs` rewrite,
+  `scripts/bench-tier.sh` fix, and the H-14 `emit_open_windows_speculative`
+  wiring); `benchmarks/budgets.json`'s note update and the fresh
+  `results.jsonl` rows below committed with this entry. Same hardware/method
+  as the entries above (AMD EPYC KVM guest, 8 cores, rustc 1.92.0).
+- **Why this entry exists**: the Phase 51 yardstick (above) found
+  single-node streaming latency missing its 5 ms P99 target at 11.7 ms/batch
+  (2.3× over), tracked as task #195/Phase 55. #195's actual functional work
+  (early-fire wiring, resident IVM state, etc.) shipped across Phases 55–58
+  without ever touching this specific benchmark number, so the finding sat
+  undisturbed as a residual. Asked directly to fix it — not just document it
+  — this is the root-cause investigation and fix.
+- **Root cause was two bugs, not one**:
+  1. The original benchmark dispatched through `run_job`, which per-job
+     constructs a checkpoint service and (for single-node) opens the RocksDB
+     state backend — both one-time costs for a job that then runs
+     continuously for its whole lifetime. Measuring them inside a "per
+     batch" timed closure charges an entire job's startup cost to a single
+     batch.
+  2. Fixing (1) by driving `ContinuousWindowExecutor::drain` directly still
+     left a second, self-inflicted bug: that first rewrite timed an
+     11-batch sequence as one criterion sample and compared the result
+     against a per-batch target — and that sequence's timestamps jumped
+     100,000 ms per batch against a 10,000 ms tumbling window, so (per
+     `tumbling.rs`'s `window_end ≤ new_watermark_ms` close predicate, with
+     this spec's default `watermark_lag_ms: 0`) nearly every batch closed
+     the *previous* batch's window instead of quietly accumulating into
+     one, contradicting the benchmark's own stated design. Caught before
+     committing by re-deriving the window-close math from source rather
+     than trusting the first rewrite's result.
+- **Fix**: `streaming_latency_embedded`/`streaming_latency_single_node` each
+  now warm up 9 batches (untimed, in criterion's setup closure) that tile
+  `[0, 9_000)` of a single `[0, 10_000)` tumbling window without crossing
+  its boundary, then time exactly one more same-window batch — the
+  representative steady-state cost of updating already-known per-key state,
+  genuinely comparable to the documented P99 targets.
+
+**Streaming latency**, criterion median (Phase 51's differently-shaped
+"10k-row batch via `run_job`" alongside for continuity — not a strict
+apples-to-apples comparison, given the methodology changed; the real
+comparison is against the budget, not the old number):
+
+| Cell | Phase 51 (2026-07-11) | Now (2026-07-21) | Target |
+|------|---:|---:|---:|
+| embedded (1 batch)     | 148 µs  | 140 µs | < 1 ms (met both times)  |
+| single-node (1 batch)  | 11.7 ms | 142 µs | < 5 ms (missed → met)    |
+| shuffle IPC round-trip | 79 µs   | 90 µs  | (no budget declared)     |
+
+Findings:
+
+1. **The single-node P99 gap is closed, and it was never a real engine
+   regression.** Both root causes were benchmark-methodology bugs
+   (job-setup cost, then ladder-vs-single-batch conflation), not slow
+   production code. Single-node now measures 142 µs against the 5 ms
+   budget, a ~35× margin.
+2. **Single-node is barely above embedded (142 µs vs 140 µs), not "a few
+   milliseconds higher" as an earlier draft of this benchmark's own doc
+   comment predicted.** This is empirical confirmation of
+   `operator_runtime.rs`'s `open_state_backend` using `durable_fsync =
+   false`: the state backend batches its WAL and only calls `sync()` once
+   per checkpoint epoch, so an ordinary drain pays RocksDB's in-process API
+   overhead but no synchronous disk flush. Checkpoint-time cost is a
+   separate, still-unmeasured cost.
+3. **Window-close/emit cost is a distinct, still-unmeasured cost.** Both
+   benchmarks now deliberately avoid crossing a window boundary during the
+   timed call (that's the steady-state/common case). The cost of the batch
+   that actually closes a window — aggregation finalization, output
+   `RecordBatch` construction — could legitimately be higher and is not
+   covered by this entry. Flagged as a residual, not assumed negligible.
+4. **shuffle IPC round-trip's ~90 µs reading is unchanged code, not a
+   regression.** This function was not touched this session; its median
+   moved 79 µs (Phase 51) → 80.5 µs → 90.1 µs across two more back-to-back
+   runs today, from this shared VM's run-to-run scheduling noise (this box
+   has separately been observed to swing much larger, up to ~1.7×, on
+   heavier benchmarks — see the IVM entry above). Not investigated further;
+   no budget is declared for this cell.
+
+`benchmarks/budgets.json`'s `streaming_latency_single_node_p50` note is
+updated to reflect the fix; `benchmarks/results.jsonl` gets fresh rows for
+both `streaming_latency_*_p50`, tagged to this entry's commit.

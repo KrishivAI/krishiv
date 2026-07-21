@@ -5,3 +5,5 @@
 {"path": "nexmark_q2_auction_filter_100k_p50", "value_ms": 4.8320671, "commit": "301a3f9e072a0710260295e8d8b52fd369e911fd", "date": "2026-07-21", "env": "dev-box"}
 {"path": "nexmark_q5_auction_category_100k_p50", "value_ms": 5.1174455666666665, "commit": "301a3f9e072a0710260295e8d8b52fd369e911fd", "date": "2026-07-21", "env": "dev-box"}
 {"path": "nexmark_q8_person_region_100k_p50", "value_ms": 3.0559841590909094, "commit": "301a3f9e072a0710260295e8d8b52fd369e911fd", "date": "2026-07-21", "env": "dev-box"}
+{"path": "streaming_latency_embedded_p50", "value_ms": 0.14012947222222222, "commit": "034187a3cff8572f39b602c6df8fcbd5be768e3b", "date": "2026-07-21", "env": "dev-box"}
+{"path": "streaming_latency_single_node_p50", "value_ms": 0.14238066666666666, "commit": "034187a3cff8572f39b602c6df8fcbd5be768e3b", "date": "2026-07-21", "env": "dev-box"}

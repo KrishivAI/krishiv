@@ -4,14 +4,14 @@
     {
       "path": "streaming_latency_embedded_p50",
       "budget_ms": 1,
-      "benchmark": "cargo bench -p krishiv-bench --bench streaming_latency (streaming_latency_embedded/embedded_10k_rows_10k_window)",
-      "note": "documented target < 1ms; met at 148us in the Phase 51 yardstick"
+      "benchmark": "cargo bench -p krishiv-bench --bench streaming_latency (streaming_latency_embedded/embedded_1k_row_batch_steady_state)",
+      "note": "documented target < 1ms; met at ~140us measuring one steady-state batch directly against ContinuousWindowExecutor (see BENCHMARKING.md's streaming_latency methodology-fix entry)"
     },
     {
       "path": "streaming_latency_single_node_p50",
       "budget_ms": 5,
-      "benchmark": "cargo bench -p krishiv-bench --bench streaming_latency (streaming_latency_single_node/single_node_10k_rows_10k_window)",
-      "note": "documented target < 5ms; MISSED at 11.7ms (2.3x over) in the Phase 51 yardstick, tracked for Phase 55/#195 (not yet started as of Phase 66) — expect this budget to stay red until that lands"
+      "benchmark": "cargo bench -p krishiv-bench --bench streaming_latency (streaming_latency_single_node/single_node_1k_row_batch_steady_state)",
+      "note": "documented target < 5ms; met at ~142us after the streaming_latency rewrite (was MISSED at 11.7ms, a benchmark-methodology artifact of measuring one-time RocksDB-open cost as if it were per-batch cost, not a real engine regression — see BENCHMARKING.md)"
     },
     {
       "path": "ivm_tick_p50_at_10m_rows",
