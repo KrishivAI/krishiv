@@ -25,8 +25,13 @@ use krishiv_state::{
 ///   the tempdir-on-disk roundtrip those paths were paying.
 ///
 /// - `state_dir = Some(path)` (single-node-durable / distributed-durable) ⇒
-///   [`RocksDbStateBackend`] at the given path, with `durable_fsync = true`
-///   so a process crash never loses committed state.
+///   [`RocksDbStateBackend`] at the given path, opened with
+///   `durable_fsync = false`: window state is written on every batch but
+///   only synced to disk once per checkpoint epoch (via
+///   `StateBackend::sync()` inside `checkpoint()`), so the crash-durability
+///   boundary is "state as of the last checkpoint" rather than "state as of
+///   the last write." See the inline comment at the call site below for why
+///   this is the intended, batched-WAL behavior rather than a gap.
 pub(crate) fn open_state_backend(
     state_dir: Option<&std::path::Path>,
     tag: &str,
