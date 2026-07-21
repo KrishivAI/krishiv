@@ -450,9 +450,6 @@ impl MetadataStore for InMemoryMetadataStore {
     }
 }
 
-#[cfg(feature = "etcd")]
-const JSON_METADATA_SCHEMA_VERSION: u32 = 1;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PersistedExecutorDescriptor {
     executor_id: String,
@@ -492,44 +489,6 @@ impl TryFrom<PersistedExecutorDescriptor> for ExecutorDescriptor {
         }
         Ok(d)
     }
-}
-
-#[cfg(feature = "etcd")]
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct PersistedMetadata {
-    #[serde(default = "default_json_metadata_schema_version")]
-    schema_version: u32,
-    #[serde(default = "default_json_metadata_store_kind")]
-    store_kind: String,
-    pub(crate) events: Vec<PersistedEvent>,
-    pub(crate) jobs: Vec<PersistedJobRecord>,
-    #[serde(default)]
-    pub(crate) executor_descriptors: Vec<PersistedExecutorDescriptor>,
-}
-
-#[cfg(feature = "etcd")]
-impl PersistedMetadata {
-    pub(crate) fn validate_schema_version(&self) -> SchedulerResult<()> {
-        if self.schema_version > JSON_METADATA_SCHEMA_VERSION {
-            return Err(SchedulerError::InvalidJob {
-                message: format!(
-                    "metadata store schema version {} is newer than supported version {}",
-                    self.schema_version, JSON_METADATA_SCHEMA_VERSION
-                ),
-            });
-        }
-        Ok(())
-    }
-}
-
-#[cfg(feature = "etcd")]
-fn default_json_metadata_schema_version() -> u32 {
-    JSON_METADATA_SCHEMA_VERSION
-}
-
-#[cfg(feature = "etcd")]
-fn default_json_metadata_store_kind() -> String {
-    String::from("krishiv.scheduler.metadata")
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1223,36 +1182,6 @@ pub(crate) fn parse_task_state(value: &str) -> SchedulerResult<TaskState> {
     }
 }
 
-/// Serialize coordinator metadata for etcd or other blob stores.
-#[cfg(all(feature = "etcd", test))]
-pub(crate) fn encode_metadata_snapshot(
-    events: &[EventLogEvent],
-    jobs: &[JobRecord],
-) -> SchedulerResult<Vec<u8>> {
-    encode_metadata_snapshot_with_executors(events, jobs, &[])
-}
-
-/// Like [`encode_metadata_snapshot`] but also includes executor descriptors.
-#[cfg(feature = "etcd")]
-pub(crate) fn encode_metadata_snapshot_with_executors(
-    events: &[EventLogEvent],
-    jobs: &[JobRecord],
-    executors: &[krishiv_proto::ExecutorDescriptor],
-) -> SchedulerResult<Vec<u8>> {
-    let persisted = PersistedMetadata {
-        schema_version: JSON_METADATA_SCHEMA_VERSION,
-        store_kind: String::from("krishiv.scheduler.metadata"),
-        events: events.iter().map(PersistedEvent::from).collect(),
-        jobs: jobs.iter().map(PersistedJobRecord::from).collect(),
-        executor_descriptors: executors
-            .iter()
-            .map(PersistedExecutorDescriptor::from)
-            .collect(),
-    };
-    serde_json::to_vec_pretty(&persisted).map_err(|error| SchedulerError::Transport {
-        message: format!("failed to encode metadata snapshot: {error}"),
-    })
-}
 
 /// Commands sent from the coordinator to the background store writer.
 #[derive(Debug)]
@@ -1760,50 +1689,6 @@ impl NonBlockingStoreHandle {
             let _ = rx.await;
         }
     }
-}
-
-/// Restore coordinator metadata from a serialized snapshot blob.
-#[cfg(all(feature = "etcd", test))]
-pub(crate) fn decode_metadata_snapshot(
-    bytes: &[u8],
-) -> SchedulerResult<(Vec<EventLogEvent>, Vec<JobRecord>)> {
-    let (events, jobs, _executors) = decode_metadata_snapshot_with_executors(bytes)?;
-    Ok((events, jobs))
-}
-
-/// Like [`decode_metadata_snapshot`] but also restores executor descriptors.
-#[cfg(feature = "etcd")]
-pub(crate) fn decode_metadata_snapshot_with_executors(
-    bytes: &[u8],
-) -> SchedulerResult<(
-    Vec<EventLogEvent>,
-    Vec<JobRecord>,
-    Vec<krishiv_proto::ExecutorDescriptor>,
-)> {
-    if bytes.is_empty() {
-        return Ok((Vec::new(), Vec::new(), Vec::new()));
-    }
-    let persisted: PersistedMetadata =
-        serde_json::from_slice(bytes).map_err(|error| SchedulerError::InvalidJob {
-            message: format!("failed to decode metadata snapshot: {error}"),
-        })?;
-    persisted.validate_schema_version()?;
-    let events = persisted
-        .events
-        .into_iter()
-        .map(EventLogEvent::try_from)
-        .collect::<SchedulerResult<Vec<_>>>()?;
-    let jobs = persisted
-        .jobs
-        .into_iter()
-        .map(JobRecord::try_from)
-        .collect::<SchedulerResult<Vec<_>>>()?;
-    let executors = persisted
-        .executor_descriptors
-        .into_iter()
-        .filter_map(|p| krishiv_proto::ExecutorDescriptor::try_from(p).ok())
-        .collect();
-    Ok((events, jobs, executors))
 }
 
 #[cfg(test)]
