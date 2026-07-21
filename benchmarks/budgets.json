@@ -1,0 +1,47 @@
+{
+  "_doc": "Latency budgets for the engine's own nightly-measurable benchmarks (Phase 66). Each budget names its owner criterion group/id under crates/krishiv-bench/benches/ so scripts/bench-tier.sh knows where to read target/criterion/<path>/new/estimates.json. The gate (scripts/bench_gate.py, ported from the platform repo's Phase 29) flags results exceeding budget by >20% on two consecutive nightly runs. Units: milliseconds unless noted. Deliberately excludes TPC-H/TPC-DS budgets: those benches need KRISHIV_TPCH_DATA_DIR_*/KRISHIV_TPCDS_DATA_DIR pointing at multi-GB generated data that CI does not provision, so they self-skip today (see BENCHMARKING.md's 'What this gate does not cover yet') rather than being declared here and permanently failing --require-fresh for an infrastructure reason, not a performance one.",
+  "budgets": [
+    {
+      "path": "streaming_latency_embedded_p50",
+      "budget_ms": 1,
+      "benchmark": "cargo bench -p krishiv-bench --bench streaming_latency (streaming_latency_embedded/embedded_10k_rows_10k_window)",
+      "note": "documented target < 1ms; met at 148us in the Phase 51 yardstick"
+    },
+    {
+      "path": "streaming_latency_single_node_p50",
+      "budget_ms": 5,
+      "benchmark": "cargo bench -p krishiv-bench --bench streaming_latency (streaming_latency_single_node/single_node_10k_rows_10k_window)",
+      "note": "documented target < 5ms; MISSED at 11.7ms (2.3x over) in the Phase 51 yardstick, tracked for Phase 55/#195 (not yet started as of Phase 66) — expect this budget to stay red until that lands"
+    },
+    {
+      "path": "ivm_tick_p50_at_10m_rows",
+      "budget_ms": 2000,
+      "benchmark": "cargo bench -p krishiv-bench --bench ivm_vs_full_recompute (ivm_incremental_feed/10000000)",
+      "note": "budget borrowed from the platform repo's benchmarks/budgets.json pipeline_tick_p50 (post-G14 target) — the only recorded tick-latency SLO in either repo; feeds the Phase 64 entry-gate demand trigger (a view whose tick latency exceeds one-executor budget). Phase 51 measured 140.4ms at this point, well under budget — current data does not show the Phase 64 trigger firing"
+    },
+    {
+      "path": "nexmark_q1_currency_conversion_100k_p50",
+      "budget_ms": 3,
+      "benchmark": "cargo bench -p krishiv-bench --bench nexmark (nexmark_sql/q1_currency_conversion_100k)",
+      "note": "Phase 51 yardstick measured 1.61ms; budget gives ~2x headroom on shared/noisy hardware"
+    },
+    {
+      "path": "nexmark_q2_auction_filter_100k_p50",
+      "budget_ms": 10,
+      "benchmark": "cargo bench -p krishiv-bench --bench nexmark (nexmark_sql/q2_auction_filter_100k)",
+      "note": "Phase 51 yardstick measured 4.86ms; budget gives ~2x headroom on shared/noisy hardware"
+    },
+    {
+      "path": "nexmark_q5_auction_category_100k_p50",
+      "budget_ms": 8,
+      "benchmark": "cargo bench -p krishiv-bench --bench nexmark (nexmark_sql/q5_auction_category_100k)",
+      "note": "Phase 51 yardstick measured 3.80ms; budget gives ~2x headroom on shared/noisy hardware"
+    },
+    {
+      "path": "nexmark_q8_person_region_100k_p50",
+      "budget_ms": 3,
+      "benchmark": "cargo bench -p krishiv-bench --bench nexmark (nexmark_sql/q8_person_region_100k)",
+      "note": "Phase 51 yardstick measured 1.66ms; budget gives ~2x headroom on shared/noisy hardware"
+    }
+  ]
+}

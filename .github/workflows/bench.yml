@@ -1,15 +1,14 @@
 name: Benchmarks
 
 # Only run on main branch pushes and manual dispatch — not on every PR —
-# to avoid burning runner minutes on benchmark noise.
+# to avoid burning runner minutes on benchmark noise. The regression-gate
+# job additionally runs nightly on schedule (Phase 66).
 on:
   push:
     branches: [main]
   workflow_dispatch:
-
-concurrency:
-  group: benchmarks-${{ github.ref }}
-  cancel-in-progress: true
+  schedule:
+    - cron: "17 3 * * *"
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,7 +18,14 @@ env:
 jobs:
   bench:
     name: TPC-H / Nexmark
+    # Push/dispatch only — NOT schedule, so the nightly cron (added for
+    # regression-gate below) doesn't also re-trigger this unrelated,
+    # expensive, mostly-data-less (no TPC-H fixtures in CI) job every night.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    concurrency:
+      group: bench-${{ github.ref }}
+      cancel-in-progress: true
     # Bench profile compiles at opt-level 3 across the full workspace; the
     # ubuntu-latest runner (7 GB RAM) can hit peak memory during codegen.
     # continue-on-error prevents runner OOM from blocking CI — results are
@@ -71,3 +77,68 @@ jobs:
         with:
           path: target/criterion
           key: bench-baseline-main-${{ github.sha }}
+
+  # Phase 66: nightly regression gate against committed budgets
+  # (benchmarks/budgets.json), reusing the platform repo's Phase 29 gate
+  # semantics (scripts/bench_gate.py — ported, same 20%-over/2-consecutive
+  # -nights-sustained rule). Distinct purpose from the `bench` job above:
+  # that job is an informational criterion-vs-itself diff for humans
+  # reviewing a push; this job is a small, fast, unattended-safe subset
+  # (streaming_latency, ivm_vs_full_recompute, nexmark — the krishiv-bench
+  # targets that need no external dataset) that can actually FAIL the
+  # check and open a tracked issue. TPC-H/TPC-DS budgets are intentionally
+  # not included yet — see benchmarks/budgets.json and BENCHMARKING.md.
+  regression-gate:
+    name: Nightly regression gate
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: bench-regression-gate-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      issues: write
+      contents: write
+    env:
+      CARGO_BUILD_JOBS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: bench-regression-gate
+
+      - name: Gate self-test
+        run: python3 scripts/bench_gate.py --self-test
+
+      - name: Nightly tier
+        run: BENCH_ENV=ci-shared scripts/bench-tier.sh
+
+      # The platform repo's Phase 29 gate never commits its results.jsonl
+      # back to the branch, so its "2 consecutive nights" rule can never
+      # actually accumulate real CI-sourced history — every run compares
+      # against the same stale committed baseline. Fixed here: always
+      # persist this run's measurements (even on a breach — that row is
+      # exactly what the next night needs to confirm "sustained").
+      - name: Commit benchmark history
+        if: always()
+        run: |
+          if git diff --quiet -- benchmarks/results.jsonl; then
+            echo "no new measurements to commit"
+            exit 0
+          fi
+          TOKEN="${{ secrets.GH_WORKFLOW_PAT || secrets.GITHUB_TOKEN }}"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git"
+          git add benchmarks/results.jsonl
+          git commit -m "bench: nightly regression-gate measurements ($(date -u +%F))"
+          git push origin HEAD:main
+
+      - name: Open tracked issue on sustained breach
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "Nightly benchmark gate: sustained budget breach ($(date -u +%F))" \
+            --body "scripts/bench_gate.py failed on a sustained (2-night) breach or a stale budget. History: benchmarks/results.jsonl @ ${{ github.sha }}. See docs/BENCHMARKING.md for budgets." \
+            --label performance || true

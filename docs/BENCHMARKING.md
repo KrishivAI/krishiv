@@ -37,15 +37,57 @@ checkpoint interval to the result notes.
   explanation or a follow-up issue before merge.
 - Do not compare unlike hardware, dependency versions, datasets, or execution
   modes as if they were equivalent.
-- Benchmark artifacts are retained by CI for inspection; CI does not yet provide
-  a permanent historical performance database.
+- Benchmark artifacts are retained by CI for inspection. The nightly
+  regression gate (below) is a permanent historical performance database
+  for the budgets it tracks; everything else still relies on artifact
+  retention only.
+
+## Regression budgets (Phase 66)
+
+`benchmarks/budgets.json` declares a latency budget per tracked benchmark
+path; `benchmarks/results.jsonl` is the append-only measurement history
+(one JSON object per run: `path`, `value_ms`, `commit`, `date`, `env`).
+`scripts/bench_gate.py` (ported from the platform repo's Phase 29 gate —
+same semantics, reused rather than reinvented) flags a path whose latest
+result exceeds its budget by more than 20%, and fails only on a **sustained**
+breach (two consecutive measured runs both over budget) — a single spike on
+shared CI hardware warns, it does not fail the build.
+
+`scripts/bench-tier.sh` runs the krishiv-bench targets that need no external
+dataset (`streaming_latency`, `ivm_vs_full_recompute`, `nexmark`), reads each
+tracked result straight out of criterion's own
+`target/criterion/<group>/<id>/new/estimates.json`, and appends it to
+`benchmarks/results.jsonl`. `.github/workflows/bench.yml`'s
+`regression-gate` job runs this nightly (`workflow_dispatch` also works for
+an on-demand run), commits the updated history back to `main` so the
+sustained-breach check has real consecutive data to compare (a gap the
+platform repo's own equivalent job has today — its history file is never
+committed back, so every nightly run there compares against the same stale
+baseline instead of the previous night), and opens a tracked `performance`-
+labeled issue on a sustained breach.
+
+**What this gate does not cover yet**: `tpch_sf10`, `tpch_distributed`,
+`tpch_overhead`, and `tpcds_smoke` all need `KRISHIV_TPCH_DATA_DIR_*` /
+`KRISHIV_TPCDS_DATA_DIR` pointing at pre-generated multi-GB data that CI
+does not provision — they self-skip (stderr notice) rather than fail when
+unset, which is correct behavior for the bench itself but means declaring a
+budget for them today would either go permanently "NO DATA YET" or, worse,
+permanently fail `--require-fresh` for an infrastructure reason having
+nothing to do with performance. Those stay manual (`just bench-tpch`,
+`scripts/bench-tpcds-gate.sh`) until a runner with the datasets is wired in
+— tracked, not silently dropped.
 
 ## Publishing comparisons
 
 When comparing Krishiv with Spark, Flink, or another engine, publish all engine
 versions, equivalent semantics, configuration files, queries, raw output, and
 reproduction commands. Clearly separate batch latency, streaming throughput,
-checkpoint cost, recovery time, and resource consumption.
+checkpoint cost, recovery time, and resource consumption. No such comparison
+exists yet — `crates/krishiv-bench/src/comparison.rs` models cross-engine
+runs but nothing populates it with real Spark/DuckDB/Sail numbers measured
+on identical hardware and data; every existing "vs Spark" reference in this
+repo's docs cites the other project's own published numbers, not something
+Krishiv ran. Recorded as a Phase 66 residual, not attempted this pass.
 
 ## Recorded baselines
 
@@ -176,3 +218,84 @@ Findings tracked from this entry:
    lifecycle, result collection — that Phase 51 could not see under the
    4.5–8.9× session tax). Tracked as input to the Phase 53 scheduler-v2
    work (task #175/#199).
+
+### 2026-07-21 — Phase 66 #208: post-Phase-57 IVM re-benchmark
+
+- **Revision**: engine `301a3f9e` plus the `benchmarks/`/`scripts/bench-tier.sh`
+  regression-gate addition committed with this entry. Same hardware class
+  and method as the Phase 51 yardstick (AMD EPYC, 8 cores, KVM guest,
+  rustc 1.92.0). `ivm_vs_full_recompute` run twice back-to-back this pass
+  (once standalone, once as part of `scripts/bench-tier.sh`'s real run);
+  the table below is the **second** run only, kept internally consistent
+  rather than mixed — see the variance note.
+- **Why this entry exists**: Phase 57 (#179, closed 2026-07-13) shipped
+  delta-batch tick mechanics fixes (task #196) whose own exit gate required
+  "IVM beats full recompute at the recorded crossover ≤1M rows... result
+  published in BENCHMARKING history" — but nobody ever re-ran this bench
+  after #196 landed, so that exit-gate claim was never actually checked
+  against fresh data. This is the first post-#196 measurement. `just
+  bench-tpch`/`tpch_overhead` (TPC-H) were not re-run this pass — only the
+  IVM ladder plus what `bench-tier.sh` covers (streaming_latency, nexmark),
+  since the IVM ladder is what #196 and Phase 64's entry gate depend on.
+- **Run-to-run variance on this shared VM is real and worth stating
+  plainly**: the 10 M IVM-tick point read 38.5 ms, then 58.8 ms (mean-CI
+  midpoint of the same run), then 64.6 ms on a second full run minutes
+  later — all three well under the 2000 ms budget this path is gated on,
+  but a ~1.7× spread on an identically-configured back-to-back rerun. Do
+  not read single-sample precision into any number here; the qualitative
+  findings below (10 M point improved substantially; crossover regressed
+  past 1 M) hold across both runs even though the exact figures don't
+  repeat.
+
+**IVM tick vs full recompute**, 5 000-row delta feed vs from-scratch
+recompute of `SELECT region, SUM(amount) … GROUP BY region`, ms per tick
+(criterion median, second run — this is also what's seeded in
+`benchmarks/results.jsonl`; Phase 51's 2026-07-11 numbers alongside):
+
+| Accumulated rows | IVM tick (now) | IVM tick (2026-07-11) | full recompute (now) | full recompute (2026-07-11) |
+|------------------|---------:|---------:|---------------:|---------------:|
+| 50 k             | 11.68    | 11.0     | 6.21           | 3.6            |
+| 200 k            | 11.67    | 12.8     | 6.73           | 7.1            |
+| 500 k            | 14.41    | 15.1     | 9.54           | 12.5           |
+| 1 M              | 13.91    | 15.7     | 11.92          | 28.4           |
+| 10 M             | 64.62    | 140.4    | 93.66          | 297.9          |
+
+Findings:
+
+1. **The 10 M point improved substantially** (140.4 ms → 64.6 ms this run,
+   or → 38.5 ms on the first run — 2.2×–3.6× depending on which sample)
+   — task #196's delta-batch tick mechanics fix genuinely closed (or at
+   least significantly narrowed) the state-size-dependent scaling problem
+   the Phase 51 entry flagged ("the step still has a state-size-dependent
+   component"). This is a real, previously unpublished win, even accounting
+   for the run-to-run noise.
+2. **The crossover point regressed and is not ≤1M rows today — Phase 57's
+   own exit-gate number is not currently met.** At 1 M rows full recompute
+   is still faster in both runs (11.92 ms vs 13.91 ms here, 13.07 ms vs
+   14.74 ms on the first run — full recompute wins either way); at 10 M
+   rows IVM is faster in both runs. The crossover is somewhere in
+   (1 M, 10 M] rows, not ≈0.7 M as the Phase 51 entry reported — this
+   qualitative conclusion is robust to the run-to-run noise even though the
+   exact crossover row count isn't pinned. Root cause is likely **not** an
+   IVM regression — `full_recompute` itself got faster at every scale below
+   10 M too (plausibly Phase 52's batch-hot-path work, #194, which targeted
+   exactly this raw-DataFusion path) — so the IVM side held roughly
+   steady-to-improved in absolute terms while the competing baseline it's
+   measured against also improved, moving the crossover the wrong way. Not
+   root-caused further this pass; needs intermediate samples between 1 M
+   and 10 M to pin the actual crossover row count, and a check of whether
+   #194's fix touched the `full_recompute` code path directly. Recorded as
+   a residual on #179 (Phase 57), not silently corrected in the task's
+   "completed" status.
+3. **This is also Phase 64's (#193) demand-trigger input.** Current data
+   does not show a one-executor tick-latency budget breach at any sampled
+   value (64.6 ms at 10 M rows vs the 2000 ms budget in
+   `benchmarks/budgets.json`'s `ivm_tick_p50_at_10m_rows`, borrowed from
+   the platform repo's `pipeline_tick_p50`) — the trigger does not fire on
+   this data, and the ~1.7× run-to-run noise observed is nowhere near
+   large enough to change that conclusion. This is the first time that
+   question has been answerable at all (see task #193's entry gate).
+
+This measurement (the 10 M point) now also feeds
+`benchmarks/results.jsonl` via the nightly regression gate
+(`ivm_tick_p50_at_10m_rows`) — see "Regression budgets (Phase 66)" above.
