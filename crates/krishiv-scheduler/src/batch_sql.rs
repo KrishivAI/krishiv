@@ -121,8 +121,22 @@ async fn poll_batch_sql_outcome(
     loop {
         if tokio::time::Instant::now() >= deadline {
             let _ = coordinator.write().await.cancel_job(&job_id);
-            return Err(SchedulerError::Transport {
-                message: format!("batch SQL job {job_id} timed out after 300s"),
+            // #222: this used to be a generic Transport error, which the
+            // interface layer classifies Retryable/opaque (the "internal
+            // error; contact the operator" wrapping) — indistinguishable
+            // from an actual network fault. A job that ran out its own
+            // execution budget is a terminal, caller-actionable outcome
+            // (same "surface an execution failure with its cause" reasoning
+            // as JobFailed's other callers below), not a transport blip.
+            return Err(SchedulerError::JobFailed {
+                job_id,
+                reason: format!(
+                    "did not complete within {}s; the query may be too large \
+                     or the cluster may be under load — consider adding a \
+                     LIMIT clause, reducing result size, or raising \
+                     KRISHIV_BATCH_SQL_TIMEOUT_SECS",
+                    batch_sql_timeout().as_secs()
+                ),
             });
         }
 
@@ -218,8 +232,18 @@ pub async fn execute_batch_sql_sink_coordinated(
     loop {
         if tokio::time::Instant::now() >= deadline {
             let _ = coordinator.write().await.cancel_job(&job_id);
-            return Err(SchedulerError::Transport {
-                message: format!("batch SQL sink job {job_id} timed out after 300s"),
+            // #222: see the matching fix in poll_batch_sql_outcome above —
+            // a terminal, caller-actionable outcome, not an opaque Transport
+            // failure.
+            return Err(SchedulerError::JobFailed {
+                job_id,
+                reason: format!(
+                    "did not complete within {}s; the query may be too large \
+                     or the cluster may be under load — consider adding a \
+                     LIMIT clause, reducing result size, or raising \
+                     KRISHIV_BATCH_SQL_TIMEOUT_SECS",
+                    batch_sql_timeout().as_secs()
+                ),
             });
         }
 
