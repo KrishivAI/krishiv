@@ -118,12 +118,43 @@ pub(crate) struct DrainedShape {
     pub column_count: usize,
 }
 
+type SpoolWriter = arrow::ipc::writer::StreamWriter<std::io::BufWriter<std::fs::File>>;
+
+fn io_err(context: &str, e: &dyn std::fmt::Display) -> ExecutorError {
+    ExecutorError::LocalExecution {
+        message: format!("{context}: {e}"),
+    }
+}
+
+/// Join a `spawn_blocking` handle, flattening the join error into the same
+/// `ExecutorError` the blocking closure itself would have returned.
+async fn join_blocking<T: Send + 'static>(
+    context: &str,
+    task: tokio::task::JoinHandle<Result<T, ExecutorError>>,
+) -> ExecutorResult<T> {
+    task.await.map_err(|e| io_err(context, &e))?
+}
+
 /// Drain `stream`, keeping at most `threshold` in-memory bytes before
 /// overflowing every batch (buffered and future) to a spool file.
 ///
 /// `threshold = None` disables spooling (collect everything, pre-2.10
 /// behavior). Peak memory in the spooled case is the buffered prefix plus
 /// one in-flight batch.
+///
+/// #223: every disk write below runs inside `spawn_blocking`, never inline
+/// on this async fn. `StreamWriter::write`/`flush`/`into_inner` are plain
+/// synchronous `std::fs` calls with no `.await` point of their own — run
+/// directly here, they'd give the executor's `tokio::select!`-based task
+/// cancellation (`executor_task_runner.rs`'s `cancel_watch`, which only
+/// works by dropping the execution future at its next await point) nothing
+/// to interrupt for however long the write takes. A large single batch was
+/// live-measured taking the cancel path over 2s past its bound this way.
+/// `spawn_blocking` gives the awaiting future a real yield point: dropping
+/// it (on cancel) detaches from the write immediately rather than waiting
+/// for it, at the cost of an orphaned spool file on that specific abandoned
+/// write — acceptable since spooled files already only live as long as the
+/// (ephemeral, regularly-recycled) executor pod's temp dir.
 pub(crate) async fn drain_stream_with_spool(
     mut stream: krishiv_sql::SqlStream,
     threshold: Option<usize>,
@@ -131,13 +162,8 @@ pub(crate) async fn drain_stream_with_spool(
     let mut shape = DrainedShape::default();
     let mut buffered: Vec<RecordBatch> = Vec::new();
     let mut buffered_bytes: usize = 0;
-    let mut writer: Option<arrow::ipc::writer::StreamWriter<std::io::BufWriter<std::fs::File>>> =
-        None;
+    let mut writer: Option<SpoolWriter> = None;
     let mut spool_path: Option<PathBuf> = None;
-
-    let io_err = |context: &str, e: &dyn std::fmt::Display| ExecutorError::LocalExecution {
-        message: format!("{context}: {e}"),
-    };
 
     while let Some(batch) = stream.next().await {
         let batch = batch.map_err(|e| ExecutorError::LocalExecution {
@@ -149,9 +175,13 @@ pub(crate) async fn drain_stream_with_spool(
             shape.column_count = batch.num_columns();
         }
 
-        if let Some(w) = writer.as_mut() {
-            w.write(&batch)
-                .map_err(|e| io_err("result spool write", &e))?;
+        if let Some(mut w) = writer.take() {
+            let task = tokio::task::spawn_blocking(move || {
+                w.write(&batch)
+                    .map_err(|e| io_err("result spool write", &e))?;
+                Ok(w)
+            });
+            writer = Some(join_blocking("result spool write join", task).await?);
             continue;
         }
 
@@ -162,23 +192,31 @@ pub(crate) async fn drain_stream_with_spool(
             && buffered_bytes > limit
         {
             // Overflow: open the spool and move every buffered batch into it.
-            let dir = spool_dir();
-            std::fs::create_dir_all(&dir).map_err(|e| io_err("create result spool dir", &e))?;
+            let to_spool = std::mem::take(&mut buffered);
             let seq = SPOOL_SEQ.fetch_add(1, Ordering::Relaxed);
-            let path = dir.join(format!("executor-{}-{}.arrow-ipc", std::process::id(), seq));
-            let file =
-                std::fs::File::create(&path).map_err(|e| io_err("create result spool", &e))?;
-            let Some(schema) = buffered.first().map(|b| b.schema()) else {
-                return Err(ExecutorError::LocalExecution {
-                    message: "result spool overflow with no buffered batch".to_string(),
-                });
-            };
-            let mut w =
-                arrow::ipc::writer::StreamWriter::try_new(std::io::BufWriter::new(file), &schema)
-                    .map_err(|e| io_err("open result spool writer", &e))?;
-            for b in buffered.drain(..) {
-                w.write(&b).map_err(|e| io_err("result spool write", &e))?;
-            }
+            let task = tokio::task::spawn_blocking(move || {
+                let dir = spool_dir();
+                std::fs::create_dir_all(&dir)
+                    .map_err(|e| io_err("create result spool dir", &e))?;
+                let path = dir.join(format!("executor-{}-{}.arrow-ipc", std::process::id(), seq));
+                let file =
+                    std::fs::File::create(&path).map_err(|e| io_err("create result spool", &e))?;
+                let Some(schema) = to_spool.first().map(|b| b.schema()) else {
+                    return Err(ExecutorError::LocalExecution {
+                        message: "result spool overflow with no buffered batch".to_string(),
+                    });
+                };
+                let mut w = arrow::ipc::writer::StreamWriter::try_new(
+                    std::io::BufWriter::new(file),
+                    &schema,
+                )
+                .map_err(|e| io_err("open result spool writer", &e))?;
+                for b in &to_spool {
+                    w.write(b).map_err(|e| io_err("result spool write", &e))?;
+                }
+                Ok((w, path))
+            });
+            let (w, path) = join_blocking("result spool overflow join", task).await?;
             buffered_bytes = 0;
             spool_path = Some(path);
             writer = Some(w);
@@ -187,17 +225,18 @@ pub(crate) async fn drain_stream_with_spool(
 
     match (writer, spool_path) {
         (Some(w), Some(path)) => {
-            let mut inner = w
-                .into_inner()
-                .map_err(|e| io_err("finish result spool", &e))?;
-            use std::io::Write as _;
-            inner
-                .flush()
-                .map_err(|e| io_err("flush result spool", &e))?;
-            drop(inner);
-            let total_bytes = std::fs::metadata(&path)
-                .map_err(|e| io_err("stat result spool", &e))?
-                .len();
+            let task = tokio::task::spawn_blocking(move || {
+                let mut inner = w.into_inner().map_err(|e| io_err("finish result spool", &e))?;
+                use std::io::Write as _;
+                inner
+                    .flush()
+                    .map_err(|e| io_err("flush result spool", &e))?;
+                drop(inner);
+                std::fs::metadata(&path)
+                    .map_err(|e| io_err("stat result spool", &e))
+                    .map(|m| (path, m.len()))
+            });
+            let (path, total_bytes) = join_blocking("result spool finish join", task).await?;
             Ok((
                 DrainedResult::Spooled(SpooledTaskResult { path, total_bytes }),
                 shape,
@@ -315,6 +354,28 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(result, DrainedResult::Inline(_)));
+    }
+
+    /// #223 regression guard: every spool write runs inside `spawn_blocking`,
+    /// so a task draining the stream must be abortable without the join
+    /// hanging on an in-flight write. Pre-fix, each `StreamWriter::write` ran
+    /// synchronously inline on this task with no yield point of its own —
+    /// aborting still resolved fast in this local/tiny-file unit-test
+    /// environment (the multi-second stall only showed up against a real
+    /// multi-GiB write on live infra), so this guards against a hang/panic
+    /// regression in the spawn_blocking plumbing itself, not the timing bug
+    /// directly — the timing fix is verified live (task #223 notes).
+    #[tokio::test]
+    async fn draining_task_is_promptly_abortable_after_spool_starts() {
+        let batches: Vec<RecordBatch> = (0..50).map(|_| batch(5_000)).collect();
+        let task = tokio::spawn(drain_stream_with_spool(stream_of(batches), Some(1024)));
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        task.abort();
+        let joined = tokio::time::timeout(std::time::Duration::from_millis(500), task).await;
+        assert!(
+            joined.is_ok(),
+            "aborting mid-drain must resolve promptly, not hang on an in-flight write"
+        );
     }
 
     #[tokio::test]
