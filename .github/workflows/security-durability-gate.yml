@@ -1,0 +1,95 @@
+name: Security & Durability Gate
+
+# Phase 63 (P0 GATE 0): a standing, explicitly-named, required check for the
+# application-level auth/authz/durability-boundary protections found by the
+# 2026-07-10 external engine review (SEC-1/2/3/5/6/7, DUR-1/2). These tests
+# already run as part of the routine `just test` suite in ci.yml — a
+# regression would already fail CI — but that buries them among hundreds of
+# unrelated unit tests. This job runs exactly the named regression test for
+# each finding as its own visible, auditable, required gate, so a reviewer
+# can see coverage at a glance and a future change can't silently disable
+# one (e.g. by `#[ignore]`-ing a whole module) without this check going red
+# for a reason that names the finding, not just "Tests failed".
+#
+# Adding a new SEC-N/DUR-N finding: name its regression test `secN_...` /
+# `durN_...` (matching the existing convention) and add it to the relevant
+# step below.
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+
+jobs:
+  security-durability-gate:
+    name: Security & Durability Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: security-durability-gate
+
+      # SEC-1: HTTP auth bypass — IVM + queryable-state routes merged
+      # outside the bearer middleware.
+      - name: SEC-1 — IVM/queryable-state routes require auth
+        run: cargo test -p krishiv-scheduler --lib -- --exact coordinator_daemon::parse_tests::sec1_ivm_and_queryable_state_routes_require_auth
+
+      # SEC-2: Flight SQL authz asymmetry — prepared-update/action paths
+      # skipped default-deny.
+      - name: SEC-2 — Flight SQL default-deny covers actions and prepared paths
+        run: cargo test -p krishiv-flight-sql --lib -- --exact service::metadata_rpc_tests::sec2_auth_without_policy_default_denies_actions_and_prepared_paths
+
+      # SEC-3: listening-surface auth sweep — shuffle/Flight data-plane RPCs.
+      - name: SEC-3 — shuffle Flight data plane enforces bearer auth
+        run: cargo test -p krishiv-shuffle --lib -- --exact flight::tests::sec3_flight_shuffle_enforces_bearer_token
+
+      # SEC-5: bearer tokens must never appear in logs/subjects.
+      - name: SEC-5 — subject never exposes the raw bearer token
+        run: cargo test -p krishiv-scheduler --lib -- --exact auth::tests::sec5_subject_never_exposes_raw_bearer_token
+
+      # SEC-6: JWKS-derived keys must pin an asymmetric algorithm, never HS256.
+      - name: SEC-6 — JWKS pins asymmetric algorithms, not HS256
+        run: cargo test -p krishiv-scheduler --lib -- --exact auth::tests::sec6_jwks_pins_asymmetric_algorithms_not_hs256
+
+      # SEC-7: the engine must refuse to run --insecure in a distributed
+      # durable profile; netpol-only isolation is not a substitute.
+      - name: SEC-7 — distributed durable runtime rejects insecure gRPC
+        run: cargo test -p krishiv-scheduler --lib -- --exact coordinator_daemon::parse_tests::sec7_distributed_durable_runtime_rejects_insecure_grpc
+
+      # DUR-2: prepared sink transactions must survive a durable checkpoint —
+      # dedup-on-(sink_id,epoch) and commit-wins-over-duplicate-report.
+      - name: DUR-2 — checkpoint sink-transaction collection dedups and commit wins
+        run: cargo test -p krishiv-scheduler --lib -- --exact checkpoint::tests::dur2_collect_sink_transactions_dedups_and_commit_wins
+
+      # DUR-2: IcebergStreamingSink recover-commit across an executor crash
+      # (append + upsert, both idempotent on re-run) and abort-discards-path.
+      - name: DUR-2 — Iceberg sink recover-commit survives an executor crash
+        run: >
+          cargo test -p krishiv-connectors --features iceberg --lib --
+          dur2_prepared_refs_report_staged_epochs
+          dur2_recover_commit_append_across_executor_crash
+          dur2_recover_abort_discards_uncommitted_epoch
+          dur2_recover_commit_upsert_across_executor_crash
+          dur2_recover_commit_append_across_crash_object_store
+          dur2_recover_commit_upsert_across_crash_object_store
+          dur2_recover_abort_discards_uncommitted_epoch_object_store
+
+      # DUR-2: deregister_executor (graceful departure) must recover
+      # in-flight tasks the same way mark_executor_lost does (fixed
+      # 2026-07-21, engine c6cd9c2d — this is the regression test).
+      - name: DUR-2 — graceful executor departure recovers in-flight tasks
+        run: cargo test -p krishiv-scheduler --lib -- --exact tests::scheduler_tests::executor_deregister_while_task_running_resets_it_for_reassignment
+
+      # DUR-1: a Succeeded job with staged sink output must not persist
+      # Succeeded until the publish durably completes.
+      #
+      # RESIDUAL (found 2026-07-21, not fixed this pass): no dedicated
+      # regression test exists yet for finalize_staged_sink_outputs /
+      # mark_sink_publish_committed / mark_sink_publish_failed /
+      # redrive_committing_jobs (the Committing-state demote-and-recover
+      # mechanism, coordinator/mod.rs:2141-2322) despite the fix being real
+      # and correctly wired. Needs a fixture that stages real sink output
+      # via SinkWriteSpec/publish_staged_outputs and asserts a coordinator
+      # restart while Committing re-drives to a terminal state instead of
+      # trusting a false Succeeded. Tracked, not blocking this gate's other
+      # 8 findings.

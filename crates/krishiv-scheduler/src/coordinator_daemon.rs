@@ -1891,7 +1891,7 @@ mod parse_tests {
     }
 
     #[test]
-    fn distributed_durable_runtime_rejects_insecure_grpc() {
+    fn sec7_distributed_durable_runtime_rejects_insecure_grpc() {
         let config = parse_coordinator_daemon_config([
             String::from("--durability-profile"),
             String::from("distributed-durable"),
