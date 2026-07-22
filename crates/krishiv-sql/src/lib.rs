@@ -2438,6 +2438,19 @@ impl SqlEngine {
             }
         }
 
+        // Register the backing S3 object store before executing a
+        // `CREATE EXTERNAL TABLE … LOCATION 's3://…'` DDL. DataFusion infers the
+        // schema by listing the location during DDL execution, which needs the
+        // object store registered on the runtime env first. The `register_parquet`
+        // path already does this; DDL-created external tables did not
+        // (engine-s3-ddl-gap), so an `s3://` external table previously failed at
+        // plan time with "no suitable object store found for s3://…". No-op for
+        // file/connector locations, so it is safe for every external-table DDL.
+        if let Some(location) = extract_create_external_table_location(&rewritten) {
+            self.register_s3_object_store_for_warehouse(&location)
+                .map_err(|message| SqlError::DataFusion { message })?;
+        }
+
         let dataframe = self.context.sql(&rewritten).await?;
 
         // After CREATE EXTERNAL TABLE DDL, try to extract row-count statistics
@@ -3072,6 +3085,22 @@ pub(crate) fn extract_create_external_table_name(query: &str) -> Option<String> 
     let mut stmts = DFParser::parse_sql(query).ok()?;
     match stmts.pop_front()? {
         DFStatement::CreateExternalTable(create) => Some(create.name.to_string()),
+        _ => None,
+    }
+}
+
+/// Extract the `LOCATION` URI of a `CREATE EXTERNAL TABLE … LOCATION '<uri>'`
+/// statement, or `None` for any other SQL.
+///
+/// Used to register the backing S3 object store before the DDL executes, so an
+/// `s3://`/`s3a://` location can be schema-inferred and scanned. Mirrors
+/// [`extract_create_external_table_name`] (same single-parse, first-statement
+/// contract).
+pub(crate) fn extract_create_external_table_location(query: &str) -> Option<String> {
+    use datafusion::sql::parser::{DFParser, Statement as DFStatement};
+    let mut stmts = DFParser::parse_sql(query).ok()?;
+    match stmts.pop_front()? {
+        DFStatement::CreateExternalTable(create) => Some(create.location),
         _ => None,
     }
 }

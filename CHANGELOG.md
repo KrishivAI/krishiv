@@ -38,6 +38,15 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Fixed
 
+- **`CREATE EXTERNAL TABLE … LOCATION 's3://…'` now registers its object
+  store** (2026-07-22). The SQL DDL path executed the statement without first
+  registering the backing S3/MinIO object store on the DataFusion runtime, so
+  schema inference during DDL failed with "no suitable object store found for
+  s3://…" — even though the programmatic `register_parquet` path already
+  handled this. The engine now registers the store (idempotent; a no-op for
+  file and connector locations, so it is safe for every external-table DDL)
+  immediately before executing the statement.
+
 - **Incremental-view (IVM) job safety hardening** (2026-07-22). Two real bugs
   found while certifying cancel latency (#224), plus a design clarification.
   (1) A **central-computed** IVM tick — the fallback taken when no executor

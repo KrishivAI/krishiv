@@ -2,6 +2,24 @@ use crate::*;
 
 #[cfg(test)]
 mod tests {
+    /// engine-s3-ddl-gap: `CREATE EXTERNAL TABLE … LOCATION 's3://…'` must
+    /// expose its location so the engine can register the backing object store
+    /// before DataFusion plans/scans it. Non-DDL returns `None`; file locations
+    /// pass through unchanged (and the registration step no-ops on them).
+    #[test]
+    fn extract_create_external_table_location_reads_the_uri() {
+        use crate::extract_create_external_table_location as loc;
+        assert_eq!(
+            loc("CREATE EXTERNAL TABLE t STORED AS PARQUET LOCATION 's3://bkt/p/'").as_deref(),
+            Some("s3://bkt/p/")
+        );
+        assert_eq!(loc("SELECT 1"), None);
+        assert_eq!(
+            loc("CREATE EXTERNAL TABLE f STORED AS PARQUET LOCATION '/tmp/d.parquet'").as_deref(),
+            Some("/tmp/d.parquet")
+        );
+    }
+
     /// #217 probe: a long pure-compute aggregate must yield cooperatively
     /// (DataFusion EnsureCooperative), or no timeout/cancel watcher can
     /// ever preempt it. The timeout firing IS the assertion — on a
