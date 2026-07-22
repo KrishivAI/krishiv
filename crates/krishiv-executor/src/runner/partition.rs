@@ -126,6 +126,14 @@ pub(crate) const LOCAL_PARQUET_PARTITION_PREFIX: &str = "local-parquet:";
 pub(crate) const CONNECTOR_PARQUET_PARTITION_PREFIX: &str = "connector-parquet:";
 pub(crate) const OBJECT_PARQUET_PARTITION_PREFIX: &str = "object-parquet:";
 pub(crate) const OBJECT_PARQUET_SINK_PREFIX: &str = "object-parquet-sink:";
+/// Batch-export sink contract dispatched through the connector registry
+/// (#197 / Phase 67 export leg). Format:
+/// `registry-sink:<kind>|<base64(config-json)>` where config-json is
+/// `{"name": "...", "properties": {"k": "v", …}}`. The executor opens the
+/// registered sink driver for `<kind>` and streams the task's result batches
+/// into it — one generic path for every registry sink (s3-files, jdbc-sink,
+/// elasticsearch, …), availability decided by which drivers are registered.
+pub(crate) const REGISTRY_SINK_PREFIX: &str = "registry-sink:";
 #[cfg(feature = "kafka")]
 pub(crate) const MEMORY_KAFKA_PARTITION_PREFIX: &str = "memory-kafka:";
 #[cfg(feature = "kafka")]

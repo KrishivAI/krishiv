@@ -300,6 +300,18 @@ pub(crate) async fn execute_batch_fragment(
                 message: error.to_string(),
             })?;
 
+        // #197 / Phase 67 export leg: a `registry-sink:` contract streams the
+        // task's result batches into any registered connector sink (s3-files,
+        // jdbc-sink, elasticsearch, …) through the one connector registry —
+        // the batch-export counterpart to the streaming Iceberg/Kafka sinks.
+        let output_description = assignment.output_contract().description().trim().to_owned();
+        let is_registry_sink = assignment.output_contract().kind()
+            == krishiv_proto::OutputContractKind::Sink
+            && output_description.starts_with(crate::runner::REGISTRY_SINK_PREFIX);
+        if is_registry_sink {
+            return execute_registry_sink(runner, &dataframe, &output_description).await;
+        }
+
         let is_object_sink = assignment.output_contract().kind()
             == krishiv_proto::OutputContractKind::Sink
             && assignment
@@ -1802,12 +1814,321 @@ fn shuffle_seed_from_job_id(job_id: &str) -> u64 {
     hasher.finish()
 }
 
+/// Parse a `registry-sink:<kind>|<base64(config-json)>` output contract into a
+/// [`ConnectorConfig`] the connector registry can open (#197 / Phase 67).
+///
+/// The config JSON is `{"name": "...", "properties": {"k": "v", …}}`. It is
+/// base64-encoded on the wire so arbitrary property values (paths, URLs,
+/// containing `|`/`:`) cannot corrupt the contract framing. Property values are
+/// coerced to strings; a non-string JSON value is serialized back to its JSON
+/// text so nothing is silently dropped.
+fn parse_registry_sink_contract(
+    description: &str,
+) -> Result<krishiv_connectors::config::ConnectorConfig, String> {
+    use base64::Engine as _;
+    use krishiv_connectors::config::ConnectorConfig;
+
+    let payload = description
+        .trim()
+        .strip_prefix(crate::runner::REGISTRY_SINK_PREFIX)
+        .ok_or("registry-sink contract missing prefix")?;
+    let (kind, encoded) = payload
+        .split_once('|')
+        .ok_or("registry-sink contract must be <kind>|<base64-json>")?;
+    let kind = kind.trim();
+    if kind.is_empty() {
+        return Err("registry-sink contract missing connector kind".into());
+    }
+    let json_bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|e| format!("registry-sink config base64: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&json_bytes).map_err(|e| format!("registry-sink config json: {e}"))?;
+    let name = value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("registry-sink-export");
+    let mut config = ConnectorConfig::new(name, kind);
+    if let Some(props) = value.get("properties").and_then(|v| v.as_object()) {
+        for (key, val) in props {
+            let val_str = match val.as_str() {
+                Some(s) => s.to_owned(),
+                None => val.to_string(),
+            };
+            config = config.with_property(key, val_str);
+        }
+    }
+    Ok(config)
+}
+
+/// Stream a batch SQL result into a registry-dispatched connector sink and
+/// report the row count (#197 / Phase 67 batch export). The sink is opened
+/// through the executor's connector registry, so availability is decided by
+/// which drivers are registered — an unregistered kind fails the task cleanly
+/// rather than silently discarding output.
+async fn execute_registry_sink(
+    runner: &ExecutorTaskRunner,
+    dataframe: &krishiv_sql::SqlDataFrame,
+    output_description: &str,
+) -> ExecutorResult<ExecutorTaskOutput> {
+    let config = parse_registry_sink_contract(output_description)
+        .map_err(|message| ExecutorError::InvalidAssignment { message })?;
+
+    let mut sink = runner
+        .connector_registry
+        .open_sink(&config)
+        .await
+        .map_err(|error| ExecutorError::LocalExecution {
+            message: format!("registry-sink open ({}): {error}", config.kind),
+        })?;
+
+    let (mut stream, stats_handle) =
+        dataframe
+            .execute_stream_with_stats()
+            .await
+            .map_err(|error| ExecutorError::LocalExecution {
+                message: error.to_string(),
+            })?;
+
+    let mut row_count = 0usize;
+    let mut batch_count = 0usize;
+    let mut column_count = 0usize;
+    while let Some(batch) = stream.next().await {
+        let batch = batch.map_err(|error| ExecutorError::LocalExecution {
+            message: error.to_string(),
+        })?;
+        row_count += batch.num_rows();
+        batch_count += 1;
+        column_count = batch.num_columns();
+        sink.write_batch_dyn(batch)
+            .await
+            .map_err(|error| ExecutorError::LocalExecution {
+                message: format!("registry-sink write ({}): {error}", config.kind),
+            })?;
+    }
+    // Flush is mandatory before the task reports success: it is what makes the
+    // output durable, so a write/flush failure fails the task (post-write
+    // offset-commit contract) rather than acknowledging unwritten output.
+    sink.flush_dyn()
+        .await
+        .map_err(|error| ExecutorError::LocalExecution {
+            message: format!("registry-sink flush ({}): {error}", config.kind),
+        })?;
+
+    let sql_stats = stats_handle.stats();
+    if sql_stats.spill_bytes > 0 {
+        krishiv_metrics::global_metrics().record_spill(sql_stats.spill_bytes, sql_stats.spill_count);
+    }
+    let runtime_stats = TaskRuntimeStats {
+        input_rows: 0,
+        output_rows: sql_stats.output_rows,
+        cpu_nanos: sql_stats.cpu_nanos,
+        memory_bytes: 0,
+        spill_bytes: sql_stats.spill_bytes,
+        serialized_bytes: 0,
+    };
+    Ok(ExecutorTaskOutput::sql(row_count, batch_count, column_count)
+        .with_runtime_stats(runtime_stats))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+
+    // ── #197 / Phase 67: registry-sink batch export ──────────────────────────
+
+    /// Build a `registry-sink:<kind>|<base64-json>` contract string the same way
+    /// a coordinator/platform would emit one.
+    fn registry_sink_contract(kind: &str, name: &str, props: &[(&str, &str)]) -> String {
+        use base64::Engine as _;
+        let properties: serde_json::Map<String, serde_json::Value> = props
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), serde_json::Value::String((*v).to_owned())))
+            .collect();
+        let json = serde_json::json!({ "name": name, "properties": properties });
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&json).unwrap());
+        format!("{}{kind}|{encoded}", crate::runner::REGISTRY_SINK_PREFIX)
+    }
+
+    #[test]
+    fn parse_registry_sink_contract_round_trips_kind_and_properties() {
+        let contract =
+            registry_sink_contract("s3", "orders-export", &[("path", "s3://bucket/x|y"), ("format", "parquet")]);
+        let config = parse_registry_sink_contract(&contract).expect("parse");
+        assert_eq!(config.kind, "s3");
+        assert_eq!(config.name, "orders-export");
+        // A value containing the framing char survives because the JSON is b64'd.
+        assert_eq!(config.get("path"), Some("s3://bucket/x|y"));
+        assert_eq!(config.get("format"), Some("parquet"));
+    }
+
+    #[test]
+    fn parse_registry_sink_contract_rejects_malformed() {
+        assert!(parse_registry_sink_contract("not-a-registry-sink").is_err());
+        assert!(parse_registry_sink_contract("registry-sink:s3").is_err()); // no |payload
+        assert!(parse_registry_sink_contract("registry-sink:|abcd").is_err()); // empty kind
+        assert!(parse_registry_sink_contract("registry-sink:s3|not-base64!!").is_err());
+    }
+
+    /// A collecting sink + driver so the export path can be exercised without an
+    /// external system: every written batch is captured for assertion.
+    #[derive(Clone, Default)]
+    struct CollectingSink {
+        batches: std::sync::Arc<std::sync::Mutex<Vec<RecordBatch>>>,
+        flushed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl krishiv_connectors::sink::Sink for CollectingSink {
+        fn capabilities(&self) -> krishiv_connectors::ConnectorCapabilities {
+            krishiv_connectors::ConnectorCapabilities::new().with_idempotent()
+        }
+        fn write_batch(
+            &mut self,
+            batch: RecordBatch,
+        ) -> impl std::future::Future<Output = krishiv_connectors::error::ConnectorResult<()>> + Send
+        {
+            let batches = self.batches.clone();
+            async move {
+                batches.lock().unwrap().push(batch);
+                Ok(())
+            }
+        }
+        fn flush(
+            &mut self,
+        ) -> impl std::future::Future<Output = krishiv_connectors::error::ConnectorResult<()>> + Send
+        {
+            let flushed = self.flushed.clone();
+            async move {
+                flushed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+    }
+
+    struct CollectingSinkDriver {
+        sink: CollectingSink,
+    }
+
+    impl krishiv_connectors::registry::SinkDriver for CollectingSinkDriver {
+        fn descriptor(&self) -> krishiv_connectors::registry::ConnectorDescriptor {
+            krishiv_connectors::registry::ConnectorDescriptor::new(
+                krishiv_connectors::registry::ConnectorKind::S3,
+                krishiv_connectors::registry::ConnectorRole::Sink,
+                krishiv_connectors::ConnectorCapabilities::new().with_idempotent(),
+            )
+        }
+        fn validate(
+            &self,
+            _config: &krishiv_connectors::config::ConnectorConfig,
+        ) -> krishiv_connectors::error::ConnectorResult<()> {
+            Ok(())
+        }
+        fn open<'a>(
+            &'a self,
+            _config: &'a krishiv_connectors::config::ConnectorConfig,
+        ) -> krishiv_connectors::registry::OpenSinkFuture<'a> {
+            let sink = self.sink.clone();
+            Box::pin(async move {
+                Ok(Box::new(sink) as Box<dyn krishiv_connectors::sink::DynSink>)
+            })
+        }
+    }
+
+    /// End-to-end: a batch SQL fragment with a `registry-sink:` output contract
+    /// opens the registered sink and streams its result rows into it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registry_sink_batch_export_writes_result_rows_to_the_sink() {
+        use krishiv_proto::{
+            AttemptId, ExecutorId, JobId, LeaseGeneration, OutputContract, OutputContractKind,
+            PlanFragment, StageId, TaskAttemptRef, TaskId,
+        };
+
+        let sink = CollectingSink::default();
+        let mut registry = krishiv_connectors::ConnectorRegistry::new();
+        registry.register_sink(std::sync::Arc::new(CollectingSinkDriver { sink: sink.clone() }));
+        let runner = crate::runner::ExecutorTaskRunner::new(
+            crate::ExecutorAssignmentInbox::new(),
+        )
+        .with_connector_registry(registry);
+
+        let fragment = krishiv_plan::TypedTaskFragment::new(
+            krishiv_plan::ExecutionKind::Batch,
+            "sql: SELECT 1 AS a UNION ALL SELECT 2 AS a UNION ALL SELECT 3 AS a",
+        )
+        .encode()
+        .unwrap();
+        let contract = registry_sink_contract("s3", "export", &[("path", "s3://b/out")]);
+        let assignment = ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                JobId::try_new("job-registry-sink").unwrap(),
+                StageId::try_new("stage-1").unwrap(),
+                TaskId::try_new("task-1").unwrap(),
+                AttemptId::initial(),
+            ),
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new(fragment),
+            OutputContract::new(OutputContractKind::Sink, contract),
+        );
+
+        let output = runner.execute_batch_fragment(&assignment).await.unwrap();
+        assert_eq!(output.row_count(), 3, "all result rows reported");
+
+        let written: usize = sink
+            .batches
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(written, 3, "all result rows streamed into the sink");
+        assert!(
+            sink.flushed.load(std::sync::atomic::Ordering::SeqCst),
+            "sink must be flushed before the task reports success"
+        );
+    }
+
+    /// An unregistered sink kind fails the task cleanly instead of silently
+    /// discarding output.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registry_sink_unregistered_kind_fails_the_task() {
+        use krishiv_proto::{
+            AttemptId, ExecutorId, JobId, LeaseGeneration, OutputContract, OutputContractKind,
+            PlanFragment, StageId, TaskAttemptRef, TaskId,
+        };
+        // Empty registry: no driver registered for "s3".
+        let runner = crate::runner::ExecutorTaskRunner::new(
+            crate::ExecutorAssignmentInbox::new(),
+        )
+        .with_connector_registry(krishiv_connectors::ConnectorRegistry::new());
+        let fragment = krishiv_plan::TypedTaskFragment::new(
+            krishiv_plan::ExecutionKind::Batch,
+            "sql: SELECT 1 AS a",
+        )
+        .encode()
+        .unwrap();
+        let assignment = ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                JobId::try_new("job-registry-sink-missing").unwrap(),
+                StageId::try_new("stage-1").unwrap(),
+                TaskId::try_new("task-1").unwrap(),
+                AttemptId::initial(),
+            ),
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new(fragment),
+            OutputContract::new(
+                OutputContractKind::Sink,
+                registry_sink_contract("s3", "export", &[]),
+            ),
+        );
+        let result = runner.execute_batch_fragment(&assignment).await;
+        assert!(result.is_err(), "unregistered sink kind must fail the task");
+    }
     use krishiv_shuffle::{
         InMemoryShuffleStore, LocalDiskShuffleStore, PartitionId, ShuffleBackend, ShufflePartition,
         ShuffleStore as _,
