@@ -34,6 +34,7 @@ from ..krishiv import (
     rank as _rank,
     row_number as _row_number,
     sum as _sum,
+    when as _when,
 )
 
 ColumnOrName = Union[Column, str]
@@ -285,59 +286,676 @@ def nth_value(column: ColumnLike, n: int) -> Column:
     return _nth_value(_to_column(column), n)
 
 
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+
+def _flatten(cols: tuple) -> list:
+    """Accept both ``f(a, b, c)`` and ``f([a, b, c])`` call styles (PySpark
+    functions accept either a single iterable or varargs)."""
+    if len(cols) == 1 and isinstance(cols[0], (list, tuple)):
+        return list(cols[0])
+    return list(cols)
+
+
+def _sql(value: ColumnLike) -> str:
+    return _to_column(value).sql()
+
+
+# ── Conditional / null handling ─────────────────────────────────────────────
+#
+# `when(...).when(...).otherwise(...)` builds a SQL CASE expression. The
+# returned value is a real Column, so `F.when(c, v)` on its own is already a
+# valid `CASE WHEN c THEN v END` (implicit `ELSE NULL`), exactly like PySpark.
+
+
+def when(condition: Column, value: Any) -> Column:
+    """`CASE WHEN condition THEN value END` — chainable with
+    `.when(...)`/`.otherwise(...)` (PySpark `F.when`).
+
+    Like PySpark, a non-``Column`` ``value`` is a **literal** (not a column
+    reference), so ``when(cond, "yes")`` yields the string ``'yes'``."""
+    if not isinstance(condition, Column):
+        raise TypeError("when() condition must be a Column boolean expression")
+    return _when(condition, value)
+
+
+def nvl(column: ColumnLike, replacement: ColumnLike) -> Column:
+    return coalesce(column, replacement)
+
+
+def nvl2(column: ColumnLike, value_if_not_null: ColumnLike, value_if_null: ColumnLike) -> Column:
+    return _expr(
+        f"CASE WHEN ({_sql(column)}) IS NOT NULL "
+        f"THEN ({_sql(value_if_not_null)}) ELSE ({_sql(value_if_null)}) END"
+    )
+
+
+def greatest(*columns: ColumnLike) -> Column:
+    cols = _flatten(columns)
+    if not cols:
+        raise ValueError("greatest requires at least one argument")
+    return call_function("greatest", *cols)
+
+
+def least(*columns: ColumnLike) -> Column:
+    cols = _flatten(columns)
+    if not cols:
+        raise ValueError("least requires at least one argument")
+    return call_function("least", *cols)
+
+
+def nanvl(col1: ColumnLike, col2: ColumnLike) -> Column:
+    return call_function("nanvl", col1, col2)
+
+
+# ── String functions ────────────────────────────────────────────────────────
+
+
+def ascii(column: ColumnLike) -> Column:  # noqa: A001
+    return call_function("ascii", column)
+
+
+def chr(column: ColumnLike) -> Column:  # noqa: A001
+    return call_function("chr", column)
+
+
+def initcap(column: ColumnLike) -> Column:
+    return call_function("initcap", column)
+
+
+def btrim(column: ColumnLike) -> Column:
+    return call_function("btrim", column)
+
+
+def reverse(column: ColumnLike) -> Column:
+    return call_function("reverse", column)
+
+
+def repeat(column: ColumnLike, n: int) -> Column:
+    return call_function("repeat", column, lit(n))
+
+
+def instr(column: ColumnLike, substr: str) -> Column:
+    """1-based position of the first occurrence of ``substr`` (PySpark
+    `F.instr`); 0 when absent."""
+    return call_function("strpos", column, lit(substr))
+
+
+def locate(substr: str, column: ColumnLike, pos: int = 1) -> Column:
+    """1-based position of ``substr`` in ``column`` (PySpark `F.locate`)."""
+    if pos != 1:
+        return call_function("strpos", call_function("substr", column, lit(pos)), lit(substr))
+    return call_function("strpos", column, lit(substr))
+
+
+def lpad(column: ColumnLike, length: int, pad: str = " ") -> Column:
+    return call_function("lpad", column, lit(length), lit(pad))
+
+
+def rpad(column: ColumnLike, length: int, pad: str = " ") -> Column:
+    return call_function("rpad", column, lit(length), lit(pad))
+
+
+def split_part(column: ColumnLike, delimiter: str, part: int) -> Column:
+    return call_function("split_part", column, lit(delimiter), lit(part))
+
+
+def translate(column: ColumnLike, matching: str, replacing: str) -> Column:
+    return call_function("translate", column, lit(matching), lit(replacing))
+
+
+def left(column: ColumnLike, n: int) -> Column:
+    return call_function("left", column, lit(n))
+
+
+def right(column: ColumnLike, n: int) -> Column:
+    return call_function("right", column, lit(n))
+
+
+def substring(column: ColumnLike, pos: int, length: int) -> Column:
+    """1-based substring (PySpark `F.substring`)."""
+    return call_function("substr", column, lit(pos), lit(length))
+
+
+def substr(column: ColumnLike, pos: ColumnLike, length: Optional[ColumnLike] = None) -> Column:
+    if length is None:
+        return call_function("substr", column, pos)
+    return call_function("substr", column, pos, length)
+
+
+def concat_ws(sep: str, *columns: ColumnLike) -> Column:
+    cols = _flatten(columns)
+    return call_function("concat_ws", lit(sep), *cols)
+
+
+def _search_arg(value: ColumnLike) -> Column:
+    """A search term (prefix/suffix/substring): a bare ``str`` is a **literal**,
+    not a column reference (matches PySpark `Column.startswith` etc.)."""
+    return value if isinstance(value, Column) else lit(value)
+
+
+def starts_with(column: ColumnLike, prefix: ColumnLike) -> Column:
+    return call_function("starts_with", column, _search_arg(prefix))
+
+
+def ends_with(column: ColumnLike, suffix: ColumnLike) -> Column:
+    return call_function("ends_with", column, _search_arg(suffix))
+
+
+def contains(column: ColumnLike, substr: ColumnLike) -> Column:
+    return call_function("strpos", column, _search_arg(substr)) > lit(0)
+
+
+def char_length(column: ColumnLike) -> Column:
+    return call_function("character_length", column)
+
+
+def octet_length(column: ColumnLike) -> Column:
+    return call_function("octet_length", column)
+
+
+def bit_length(column: ColumnLike) -> Column:
+    return call_function("bit_length", column)
+
+
+def regexp_replace(column: ColumnLike, pattern: str, replacement: str) -> Column:
+    """Regex replace. NOTE: the engine uses the Rust ``regex`` dialect, which
+    differs from Java/Spark regex for some advanced constructs."""
+    return call_function("regexp_replace", column, lit(pattern), lit(replacement))
+
+
+def regexp_like(column: ColumnLike, pattern: str) -> Column:
+    """Regex match test (Rust ``regex`` dialect; see `regexp_replace`)."""
+    return call_function("regexp_like", column, lit(pattern))
+
+
+# ── Math functions ──────────────────────────────────────────────────────────
+
+
+def acos(column: ColumnLike) -> Column:
+    return call_function("acos", column)
+
+
+def asin(column: ColumnLike) -> Column:
+    return call_function("asin", column)
+
+
+def atan(column: ColumnLike) -> Column:
+    return call_function("atan", column)
+
+
+def atan2(y: ColumnLike, x: ColumnLike) -> Column:
+    return call_function("atan2", y, x)
+
+
+def cosh(column: ColumnLike) -> Column:
+    return call_function("cosh", column)
+
+
+def sinh(column: ColumnLike) -> Column:
+    return call_function("sinh", column)
+
+
+def tanh(column: ColumnLike) -> Column:
+    return call_function("tanh", column)
+
+
+def cot(column: ColumnLike) -> Column:
+    return call_function("cot", column)
+
+
+def degrees(column: ColumnLike) -> Column:
+    return call_function("degrees", column)
+
+
+def radians(column: ColumnLike) -> Column:
+    return call_function("radians", column)
+
+
+def ln(column: ColumnLike) -> Column:
+    return call_function("ln", column)
+
+
+def log2(column: ColumnLike) -> Column:
+    return call_function("log2", column)
+
+
+def log10(column: ColumnLike) -> Column:
+    return call_function("log10", column)
+
+
+def power(base: ColumnLike, exponent: ColumnLike) -> Column:
+    return call_function("power", base, exponent)
+
+
+def pow(base: ColumnLike, exponent: ColumnLike) -> Column:  # noqa: A001
+    return power(base, exponent)
+
+
+def cbrt(column: ColumnLike) -> Column:
+    return call_function("cbrt", column)
+
+
+def signum(column: ColumnLike) -> Column:
+    return call_function("signum", column)
+
+
+def sign(column: ColumnLike) -> Column:
+    return signum(column)
+
+
+def factorial(column: ColumnLike) -> Column:
+    return call_function("factorial", column)
+
+
+def gcd(col1: ColumnLike, col2: ColumnLike) -> Column:
+    return call_function("gcd", col1, col2)
+
+
+def lcm(col1: ColumnLike, col2: ColumnLike) -> Column:
+    return call_function("lcm", col1, col2)
+
+
+def pi() -> Column:
+    return call_function("pi")
+
+
+def rand() -> Column:
+    """Uniform random double in [0, 1) (PySpark `F.rand`, unseeded)."""
+    return call_function("random")
+
+
+def uuid() -> Column:
+    return call_function("uuid")
+
+
+# ── Aggregate functions ─────────────────────────────────────────────────────
+
+
+def stddev(column: ColumnOrName) -> Column:
+    return call_function("stddev", column)
+
+
+def stddev_samp(column: ColumnOrName) -> Column:
+    return call_function("stddev_samp", column)
+
+
+def stddev_pop(column: ColumnOrName) -> Column:
+    return call_function("stddev_pop", column)
+
+
+def variance(column: ColumnOrName) -> Column:
+    return call_function("var_samp", column)
+
+
+def var_samp(column: ColumnOrName) -> Column:
+    return call_function("var_samp", column)
+
+
+def var_pop(column: ColumnOrName) -> Column:
+    return call_function("var_pop", column)
+
+
+def corr(col1: ColumnOrName, col2: ColumnOrName) -> Column:
+    return call_function("corr", col1, col2)
+
+
+def covar_samp(col1: ColumnOrName, col2: ColumnOrName) -> Column:
+    return call_function("covar_samp", col1, col2)
+
+
+def covar_pop(col1: ColumnOrName, col2: ColumnOrName) -> Column:
+    return call_function("covar_pop", col1, col2)
+
+
+def approx_count_distinct(column: ColumnOrName) -> Column:
+    return call_function("approx_distinct", column)
+
+
+def array_agg(column: ColumnOrName) -> Column:
+    return call_function("array_agg", column)
+
+
+def collect_list(column: ColumnOrName) -> Column:
+    """Aggregate values into an array (PySpark `F.collect_list`)."""
+    return call_function("array_agg", column)
+
+
+def bit_and(column: ColumnOrName) -> Column:
+    return call_function("bit_and", column)
+
+
+def bit_or(column: ColumnOrName) -> Column:
+    return call_function("bit_or", column)
+
+
+def bit_xor(column: ColumnOrName) -> Column:
+    return call_function("bit_xor", column)
+
+
+def bool_and(column: ColumnOrName) -> Column:
+    return call_function("bool_and", column)
+
+
+def bool_or(column: ColumnOrName) -> Column:
+    return call_function("bool_or", column)
+
+
+def first(column: ColumnOrName) -> Column:
+    return _first_value(_to_column(column))
+
+
+def last(column: ColumnOrName) -> Column:
+    return _last_value(_to_column(column))
+
+
+def median(column: ColumnOrName) -> Column:
+    return call_function("median", column)
+
+
+def count_distinct(*columns: ColumnLike) -> Column:
+    cols = _flatten(columns)
+    if not cols:
+        raise ValueError("count_distinct requires at least one argument")
+    inside = ", ".join(_sql(c) for c in cols)
+    return _expr(f"COUNT(DISTINCT {inside})")
+
+
+def sum_distinct(column: ColumnOrName) -> Column:
+    return _expr(f"SUM(DISTINCT {_sql(column)})")
+
+
+# ── Date / time functions ───────────────────────────────────────────────────
+#
+# Only extractions whose value matches Spark exactly are exposed. Pattern-based
+# formatting (`date_format`, `to_date(fmt)`) is deliberately left to `expr(...)`
+# because Spark's Java pattern grammar differs from the engine's chrono grammar.
+
+
+def now() -> Column:
+    return call_function("now")
+
+
+def to_date(column: ColumnLike) -> Column:
+    return call_function("to_date", column)
+
+
+def to_timestamp(column: ColumnLike) -> Column:
+    return call_function("to_timestamp", column)
+
+
+def _date_part(part: str, column: ColumnLike) -> Column:
+    return call_function("date_part", lit(part), column)
+
+
+def year(column: ColumnLike) -> Column:
+    return _date_part("year", column)
+
+
+def month(column: ColumnLike) -> Column:
+    return _date_part("month", column)
+
+
+def day(column: ColumnLike) -> Column:
+    return _date_part("day", column)
+
+
+def dayofmonth(column: ColumnLike) -> Column:
+    return _date_part("day", column)
+
+
+def hour(column: ColumnLike) -> Column:
+    return _date_part("hour", column)
+
+
+def minute(column: ColumnLike) -> Column:
+    return _date_part("minute", column)
+
+
+def second(column: ColumnLike) -> Column:
+    return _date_part("second", column)
+
+
+def quarter(column: ColumnLike) -> Column:
+    return _date_part("quarter", column)
+
+
+# ── Array / collection functions ────────────────────────────────────────────
+
+
+def array(*columns: ColumnLike) -> Column:
+    return call_function("make_array", *_flatten(columns))
+
+
+def array_contains(column: ColumnLike, value: ColumnLike) -> Column:
+    return call_function("array_contains", column, value)
+
+
+def array_distinct(column: ColumnLike) -> Column:
+    return call_function("array_distinct", column)
+
+
+def array_position(column: ColumnLike, value: ColumnLike) -> Column:
+    return call_function("array_position", column, value)
+
+
+def array_remove(column: ColumnLike, value: ColumnLike) -> Column:
+    return call_function("array_remove", column, value)
+
+
+def array_append(column: ColumnLike, value: ColumnLike) -> Column:
+    return call_function("array_append", column, value)
+
+
+def array_prepend(value: ColumnLike, column: ColumnLike) -> Column:
+    return call_function("array_prepend", value, column)
+
+
+def array_union(col1: ColumnLike, col2: ColumnLike) -> Column:
+    return call_function("array_union", col1, col2)
+
+
+def array_intersect(col1: ColumnLike, col2: ColumnLike) -> Column:
+    return call_function("array_intersect", col1, col2)
+
+
+def array_except(col1: ColumnLike, col2: ColumnLike) -> Column:
+    return call_function("array_except", col1, col2)
+
+
+def array_length(column: ColumnLike) -> Column:
+    return call_function("array_length", column)
+
+
+def cardinality(column: ColumnLike) -> Column:
+    return call_function("cardinality", column)
+
+
+def flatten(column: ColumnLike) -> Column:
+    return call_function("flatten", column)
+
+
+# ── Hash functions ──────────────────────────────────────────────────────────
+
+
+def md5(column: ColumnLike) -> Column:
+    return call_function("md5", column)
+
+
+def sha256(column: ColumnLike) -> Column:
+    return call_function("sha256", column)
+
+
+def sha512(column: ColumnLike) -> Column:
+    return call_function("sha512", column)
+
+
 __all__ = [
-    "abs",
-    "asc",
-    "avg",
-    "call_function",
-    "cast",
-    "ceil",
-    "coalesce",
+    # core / literals
     "col",
     "column",
-    "concat",
-    "cos",
+    "lit",
+    "expr",
+    "call_function",
+    "function",
+    "asc",
+    "desc",
+    "cast",
+    "try_cast",
+    # conditional / null
+    "when",
+    "coalesce",
+    "ifnull",
+    "nullif",
+    "nvl",
+    "nvl2",
+    "nanvl",
+    "greatest",
+    "least",
+    "isnull",
+    "isnotnull",
+    "isnan",
+    # aggregates
+    "avg",
+    "mean",
     "count",
     "count_all",
-    "cume_dist",
+    "count_distinct",
+    "sum",
+    "sum_distinct",
+    "min",
+    "max",
+    "first",
+    "last",
+    "median",
+    "stddev",
+    "stddev_samp",
+    "stddev_pop",
+    "variance",
+    "var_samp",
+    "var_pop",
+    "corr",
+    "covar_samp",
+    "covar_pop",
+    "approx_count_distinct",
+    "array_agg",
+    "collect_list",
+    "bit_and",
+    "bit_or",
+    "bit_xor",
+    "bool_and",
+    "bool_or",
+    # strings
+    "upper",
+    "lower",
+    "length",
+    "char_length",
+    "octet_length",
+    "bit_length",
+    "trim",
+    "ltrim",
+    "rtrim",
+    "btrim",
+    "concat",
+    "concat_ws",
+    "ascii",
+    "chr",
+    "initcap",
+    "reverse",
+    "repeat",
+    "instr",
+    "locate",
+    "lpad",
+    "rpad",
+    "left",
+    "right",
+    "substr",
+    "substring",
+    "split_part",
+    "translate",
+    "starts_with",
+    "ends_with",
+    "contains",
+    "regexp_replace",
+    "regexp_like",
+    # math
+    "abs",
+    "round",
+    "ceil",
+    "floor",
+    "sqrt",
+    "cbrt",
+    "exp",
+    "log",
+    "ln",
+    "log2",
+    "log10",
+    "power",
+    "pow",
+    "signum",
+    "sign",
+    "factorial",
+    "gcd",
+    "lcm",
+    "pi",
+    "rand",
+    "uuid",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "atan2",
+    "sinh",
+    "cosh",
+    "tanh",
+    "cot",
+    "degrees",
+    "radians",
+    # date / time
     "current_date",
     "current_timestamp",
+    "now",
+    "to_date",
+    "to_timestamp",
     "date_trunc",
-    "dense_rank",
-    "desc",
-    "exp",
-    "expr",
-    "first_value",
-    "floor",
-    "function",
-    "ifnull",
-    "isnan",
-    "isnotnull",
-    "isnull",
-    "lag",
-    "last_value",
-    "lead",
-    "length",
-    "lit",
-    "log",
-    "lower",
-    "ltrim",
-    "max",
-    "mean",
-    "min",
-    "nth_value",
-    "ntile",
-    "nullif",
-    "percent_rank",
-    "rank",
-    "round",
+    "year",
+    "month",
+    "day",
+    "dayofmonth",
+    "hour",
+    "minute",
+    "second",
+    "quarter",
+    # arrays / collections
+    "array",
+    "array_contains",
+    "array_distinct",
+    "array_position",
+    "array_remove",
+    "array_append",
+    "array_prepend",
+    "array_union",
+    "array_intersect",
+    "array_except",
+    "array_length",
+    "cardinality",
+    "flatten",
+    # hashing
+    "md5",
+    "sha256",
+    "sha512",
+    # window
     "row_number",
-    "rtrim",
-    "sin",
-    "sqrt",
-    "sum",
-    "tan",
-    "trim",
-    "try_cast",
-    "upper",
+    "rank",
+    "dense_rank",
+    "percent_rank",
+    "cume_dist",
+    "ntile",
+    "lag",
+    "lead",
+    "first_value",
+    "last_value",
+    "nth_value",
 ]

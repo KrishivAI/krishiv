@@ -66,6 +66,7 @@ from .krishiv import (  # noqa: F401
     min,
     avg,
     sum,
+    when,
     udf,
 )
 
@@ -74,6 +75,15 @@ from .krishiv import sinks
 from .krishiv import agg
 from .krishiv import windows
 from . import functions
+from . import types
+from ._pyspark import Row, _apply as _apply_pyspark_compat
+
+# Graft the PySpark-compatible convenience surface onto the native classes.
+_apply_pyspark_compat()
+
+# PySpark entry-point alias. `SparkSession.builder.getOrCreate()` yields an
+# embedded Krishiv session; `SparkSession(...)` is the native `Session`.
+SparkSession = Session
 
 import asyncio as _asyncio
 import inspect as _inspect
@@ -270,11 +280,15 @@ __all__ = [
     "min",
     "avg",
     "sum",
+    "when",
     "connect_async",
     "agg",
     "functions",
+    "types",
     "windows",
     "udf",
+    "Row",
+    "SparkSession",
     "QueryResult",
     "JobStatus",
     "sinks",

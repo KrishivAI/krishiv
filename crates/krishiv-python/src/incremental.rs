@@ -28,11 +28,24 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 
+use crate::arrow_compat::PyArrowBatch;
 use crate::batch::PyBatch;
 use crate::schema::PySchema;
+use arrow::record_batch::RecordBatch;
 
 fn rt_err(e: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
+}
+
+/// Accept either a Krishiv [`PyBatch`] or a raw PyArrow ``RecordBatch`` so the
+/// `DeltaBatch` constructors work directly on the Arrow objects users already
+/// hold, without an explicit `krishiv.Batch(...)` wrap.
+fn record_batch_from_py(obj: &Bound<'_, PyAny>) -> PyResult<RecordBatch> {
+    if let Ok(batch) = obj.extract::<PyRef<'_, PyBatch>>() {
+        return Ok(batch.record_batch().clone());
+    }
+    let py_batch: PyArrowBatch = obj.extract()?;
+    Ok(py_batch.into_inner())
 }
 
 fn map_delta_error(e: krishiv_delta::DeltaError) -> PyErr {
@@ -53,20 +66,20 @@ pub struct PyDeltaBatch {
 
 #[pymethods]
 impl PyDeltaBatch {
-    /// Construct a `DeltaBatch` from a :class:`Batch`, treating all rows as
-    /// insertions (weight = +1).
+    /// Construct a `DeltaBatch` from a :class:`Batch` or a PyArrow
+    /// ``RecordBatch``, treating all rows as insertions (weight = +1).
     #[staticmethod]
-    pub fn from_inserts(batch: PyRef<'_, PyBatch>) -> PyResult<Self> {
-        let rb = batch.record_batch().clone();
+    pub fn from_inserts(batch: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let rb = record_batch_from_py(batch)?;
         let inner = DeltaBatch::from_inserts(rb).map_err(rt_err)?;
         Ok(Self { inner })
     }
 
-    /// Construct a `DeltaBatch` from a :class:`Batch`, treating all rows as
-    /// deletions / retractions (weight = -1).
+    /// Construct a `DeltaBatch` from a :class:`Batch` or a PyArrow
+    /// ``RecordBatch``, treating all rows as deletions / retractions (weight = -1).
     #[staticmethod]
-    pub fn from_deletes(batch: PyRef<'_, PyBatch>) -> PyResult<Self> {
-        let rb = batch.record_batch().clone();
+    pub fn from_deletes(batch: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let rb = record_batch_from_py(batch)?;
         let inner = DeltaBatch::from_deletes(rb).map_err(rt_err)?;
         Ok(Self { inner })
     }
@@ -80,11 +93,11 @@ impl PyDeltaBatch {
     #[staticmethod]
     #[pyo3(signature = (before=None, after=None))]
     pub fn from_cdc(
-        before: Option<PyRef<'_, PyBatch>>,
-        after: Option<PyRef<'_, PyBatch>>,
+        before: Option<Bound<'_, PyAny>>,
+        after: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Option<Self>> {
-        let before = before.map(|b| b.record_batch().clone());
-        let after = after.map(|b| b.record_batch().clone());
+        let before = before.map(|b| record_batch_from_py(&b)).transpose()?;
+        let after = after.map(|b| record_batch_from_py(&b)).transpose()?;
         let opt = DeltaBatch::from_cdc(before, after).map_err(rt_err)?;
         Ok(opt.map(|inner| Self { inner }))
     }
@@ -156,18 +169,18 @@ impl PyDeltaBatch {
     /// Build a ``DeltaBatch`` encoding an update: ``before`` rows get weight
     /// ``-1``, ``after`` rows get weight ``+1``. Schemas must match.
     #[staticmethod]
-    pub fn from_update(before: &PyBatch, after: &PyBatch) -> PyResult<Self> {
-        let db = DeltaBatch::from_update(before.record_batch(), after.record_batch())
-            .map_err(map_delta_error)?;
+    pub fn from_update(before: &Bound<'_, PyAny>, after: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let before = record_batch_from_py(before)?;
+        let after = record_batch_from_py(after)?;
+        let db = DeltaBatch::from_update(&before, &after).map_err(map_delta_error)?;
         Ok(Self { inner: db })
     }
 
-    /// Build a ``DeltaBatch`` from an already-weighted ``RecordBatch`` (last
-    /// column must be ``_weight: Int64``).
+    /// Build a ``DeltaBatch`` from an already-weighted :class:`Batch` or PyArrow
+    /// ``RecordBatch`` (last column must be ``_weight: Int64``).
     #[staticmethod]
-    pub fn from_weighted(batch: &PyBatch) -> PyResult<Self> {
-        let db =
-            DeltaBatch::from_weighted(batch.record_batch().clone()).map_err(map_delta_error)?;
+    pub fn from_weighted(batch: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let db = DeltaBatch::from_weighted(record_batch_from_py(batch)?).map_err(map_delta_error)?;
         Ok(Self { inner: db })
     }
 

@@ -77,7 +77,7 @@ pub use expression::{
     ScalarValue, SortDirection, TimeUnit, WindowFrame, WindowFrameBound, WindowFrameUnits, abs,
     avg, ceil, coalesce, col, count, count_all, cume_dist, dense_rank, first_value, floor,
     function, lag, last_value, lead, length, lit, lower, ltrim, max, min, nth_value, ntile, nvl,
-    percent_rank, rank, row_number, rtrim, sqrt, substring, sum, trim, upper,
+    percent_rank, rank, row_number, rtrim, sqrt, substring, sum, trim, upper, when,
 };
 pub use incremental_flow::{IncrementalFlow, StepSummary};
 pub use io::{

@@ -86,6 +86,186 @@ impl PyColumn {
         Self::new(self.inner.clone().desc())
     }
 
+    // ── PySpark `Column` predicates, accessors & operators ───────────────────
+    //
+    // Native wrappers over the engine-neutral combinators added to
+    // `krishiv_api::Expr`. Method names match PySpark (`isNull`, `isin`,
+    // `startswith`, `eqNullSafe`, …) so migrated PySpark code runs unchanged.
+
+    /// PySpark `Column.isNull` (camelCase alias of [`Self::is_null`]).
+    #[pyo3(name = "isNull")]
+    pub fn is_null_camel(&self) -> Self {
+        self.is_null()
+    }
+
+    /// PySpark `Column.isNotNull` (camelCase alias of [`Self::is_not_null`]).
+    #[pyo3(name = "isNotNull")]
+    pub fn is_not_null_camel(&self) -> Self {
+        self.is_not_null()
+    }
+
+    /// PySpark `Column.name` / `Column.alias` — name this expression.
+    pub fn name(&self, name: String) -> Self {
+        self.alias(name)
+    }
+
+    /// PySpark `Column.astype` — alias for [`Self::cast`].
+    pub fn astype(&self, data_type: &str) -> PyResult<Self> {
+        self.cast(data_type)
+    }
+
+    /// PySpark `Column.between(lower, upper)` — inclusive range test.
+    pub fn between(
+        &self,
+        lower: &Bound<'_, PyAny>,
+        upper: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        Ok(Self::new(self.inner.clone().between(
+            expression_from_python(lower)?,
+            expression_from_python(upper)?,
+        )))
+    }
+
+    /// PySpark `Column.isin(*values)` — accepts varargs or a single iterable.
+    #[pyo3(signature = (*values))]
+    pub fn isin(&self, values: Vec<Bound<'_, PyAny>>) -> PyResult<Self> {
+        Ok(Self::new(
+            self.inner.clone().is_in(collect_value_exprs(values)?, false),
+        ))
+    }
+
+    /// PySpark `Column.like(pattern)` — SQL `LIKE`.
+    pub fn like(&self, pattern: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self::new(
+            self.inner.clone().like(expression_from_python(pattern)?),
+        ))
+    }
+
+    /// PySpark `Column.ilike(pattern)` — case-insensitive `LIKE`.
+    pub fn ilike(&self, pattern: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self::new(
+            self.inner.clone().ilike(expression_from_python(pattern)?),
+        ))
+    }
+
+    /// PySpark `Column.rlike(pattern)` — regex match. Uses the engine's Rust
+    /// `regex` dialect (differs from Java/Spark regex for advanced constructs).
+    pub fn rlike(&self, pattern: String) -> Self {
+        Self::new(krishiv_api::function(
+            "regexp_like",
+            vec![self.inner.clone(), krishiv_api::lit(pattern)],
+        ))
+    }
+
+    /// PySpark `Column.contains(other)` — substring containment.
+    pub fn contains(&self, other: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self::new(
+            self.inner.clone().contains(expression_from_python(other)?),
+        ))
+    }
+
+    /// PySpark `Column.startswith(other)`.
+    pub fn startswith(&self, other: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self::new(
+            self.inner.clone().starts_with(expression_from_python(other)?),
+        ))
+    }
+
+    /// PySpark `Column.endswith(other)`.
+    pub fn endswith(&self, other: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self::new(
+            self.inner.clone().ends_with(expression_from_python(other)?),
+        ))
+    }
+
+    /// PySpark `Column.substr(startPos, length)` — 1-based.
+    pub fn substr(&self, start_pos: i64, length: i64) -> Self {
+        Self::new(
+            self.inner
+                .clone()
+                .substr(krishiv_api::lit(start_pos), krishiv_api::lit(length)),
+        )
+    }
+
+    /// PySpark `Column.eqNullSafe(other)` — null-safe equality (`<=>`).
+    #[pyo3(name = "eqNullSafe")]
+    pub fn eq_null_safe(&self, other: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self::new(
+            self.inner.clone().eq_null_safe(expression_from_python(other)?),
+        ))
+    }
+
+    /// PySpark `Column.when(condition, value)` — append a branch to a `CASE`
+    /// started by [`when`].
+    pub fn when(&self, condition: PyColumn, value: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self::new(
+            self.inner
+                .clone()
+                .when(condition.inner, expression_from_python(value)?),
+        ))
+    }
+
+    /// PySpark `Column.otherwise(value)` — the `ELSE` default of a `CASE`.
+    pub fn otherwise(&self, value: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self::new(
+            self.inner.clone().otherwise(expression_from_python(value)?),
+        ))
+    }
+
+    fn __mod__(&self, other: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self::new(
+            self.inner.clone().modulo(expression_from_python(other)?),
+        ))
+    }
+
+    fn __rmod__(&self, other: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self::new(
+            expression_from_python(other)?.modulo(self.inner.clone()),
+        ))
+    }
+
+    fn __neg__(&self) -> Self {
+        Self::new(self.inner.clone().negate())
+    }
+
+    fn __invert__(&self) -> Self {
+        Self::new(self.inner.clone().logical_not())
+    }
+
+    fn __pow__(
+        &self,
+        other: &Bound<'_, PyAny>,
+        _modulo: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        Ok(Self::new(
+            self.inner.clone().power(expression_from_python(other)?),
+        ))
+    }
+
+    fn __radd__(&self, other: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self::new(
+            expression_from_python(other)?.plus(self.inner.clone()),
+        ))
+    }
+
+    fn __rsub__(&self, other: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self::new(
+            expression_from_python(other)?.minus(self.inner.clone()),
+        ))
+    }
+
+    fn __rmul__(&self, other: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self::new(
+            expression_from_python(other)?.multiply(self.inner.clone()),
+        ))
+    }
+
+    fn __rtruediv__(&self, other: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self::new(
+            expression_from_python(other)?.divide(self.inner.clone()),
+        ))
+    }
+
     pub fn normalized_ast(&self) -> PyResult<String> {
         self.inner
             .normalize_json()
@@ -229,6 +409,32 @@ pub fn call_function(name: String, arguments: Vec<PyColumn>) -> PyColumn {
         name,
         arguments.into_iter().map(|column| column.inner).collect(),
     ))
+}
+
+/// PySpark `F.when(condition, value)` — `CASE WHEN condition THEN value END`.
+/// Chain with `Column.when(...)` / `Column.otherwise(...)`.
+#[pyfunction]
+pub fn when(condition: PyColumn, value: &Bound<'_, PyAny>) -> PyResult<PyColumn> {
+    Ok(PyColumn::new(krishiv_api::when(
+        condition.inner,
+        expression_from_python(value)?,
+    )))
+}
+
+/// Convert PySpark `isin(*values)` arguments — either varargs or a single
+/// list/tuple — into a vector of literal/column expressions.
+fn collect_value_exprs(values: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<krishiv_api::Expr>> {
+    if let [single] = values.as_slice()
+        && (single.is_instance_of::<pyo3::types::PyList>()
+            || single.is_instance_of::<pyo3::types::PyTuple>())
+    {
+        let mut items = Vec::new();
+        for value in single.try_iter()? {
+            items.push(expression_from_python(&value?)?);
+        }
+        return Ok(items);
+    }
+    values.iter().map(expression_from_python).collect()
 }
 
 // ── Window functions ──────────────────────────────────────────────────────────

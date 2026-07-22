@@ -127,6 +127,129 @@ impl Expr {
     fn binary(self, op: BinaryOperator, right: Expr) -> Self {
         Self::from_node(self.node.binary(op, right.node))
     }
+
+    // ── Predicate & operator combinators ─────────────────────────────────────
+    //
+    // The plan AST has no dedicated modulo/NOT/LIKE/IN/BETWEEN/CASE nodes, so
+    // these are composed as rendered-SQL fragments over the already-escaped
+    // child rendering (`as_sql()` quotes identifiers and literals). They plan
+    // through the same SQL path as [`Expr::raw`]. Structural constructs only —
+    // no PySpark-vs-DataFusion semantic divergence (the exact-or-absent rule).
+
+    /// `(self % right)` — SQL modulo (PySpark `%`).
+    pub fn modulo(self, right: Expr) -> Self {
+        Self::raw(format!("({} % {})", self.as_sql(), right.as_sql()))
+    }
+    /// `(- self)` — arithmetic negation (PySpark unary `-`).
+    pub fn negate(self) -> Self {
+        Self::raw(format!("(- {})", self.as_sql()))
+    }
+    /// `(NOT self)` — logical negation (PySpark unary `~`).
+    pub fn logical_not(self) -> Self {
+        Self::raw(format!("(NOT {})", self.as_sql()))
+    }
+    /// `POWER(self, exponent)` (PySpark `**` / `F.pow`).
+    pub fn power(self, exponent: Expr) -> Self {
+        function("power", vec![self, exponent])
+    }
+    /// `(self LIKE pattern)` (PySpark `Column.like`).
+    pub fn like(self, pattern: Expr) -> Self {
+        Self::raw(format!("({} LIKE {})", self.as_sql(), pattern.as_sql()))
+    }
+    /// `(self NOT LIKE pattern)`.
+    pub fn not_like(self, pattern: Expr) -> Self {
+        Self::raw(format!("({} NOT LIKE {})", self.as_sql(), pattern.as_sql()))
+    }
+    /// `(self ILIKE pattern)` — case-insensitive LIKE (PySpark `Column.ilike`).
+    pub fn ilike(self, pattern: Expr) -> Self {
+        Self::raw(format!("({} ILIKE {})", self.as_sql(), pattern.as_sql()))
+    }
+    /// `(self [NOT] IN (a, b, …))` (PySpark `Column.isin`).
+    pub fn is_in(self, list: Vec<Expr>, negated: bool) -> Self {
+        let items = list
+            .iter()
+            .map(Expr::as_sql)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Self::raw(format!(
+            "({} {}IN ({}))",
+            self.as_sql(),
+            if negated { "NOT " } else { "" },
+            items
+        ))
+    }
+    /// `(self BETWEEN low AND high)` — inclusive (PySpark `Column.between`).
+    pub fn between(self, low: Expr, high: Expr) -> Self {
+        Self::raw(format!(
+            "({} BETWEEN {} AND {})",
+            self.as_sql(),
+            low.as_sql(),
+            high.as_sql()
+        ))
+    }
+    /// `(self IS NOT DISTINCT FROM right)` — null-safe equality (PySpark `eqNullSafe`).
+    pub fn eq_null_safe(self, right: Expr) -> Self {
+        Self::raw(format!(
+            "({} IS NOT DISTINCT FROM {})",
+            self.as_sql(),
+            right.as_sql()
+        ))
+    }
+    /// `STARTS_WITH(self, prefix)` (PySpark `Column.startswith`).
+    pub fn starts_with(self, prefix: Expr) -> Self {
+        function("starts_with", vec![self, prefix])
+    }
+    /// `ENDS_WITH(self, suffix)` (PySpark `Column.endswith`).
+    pub fn ends_with(self, suffix: Expr) -> Self {
+        function("ends_with", vec![self, suffix])
+    }
+    /// `(STRPOS(self, substring) > 0)` — substring containment (PySpark `Column.contains`).
+    pub fn contains(self, substring: Expr) -> Self {
+        function("strpos", vec![self, substring]).gt(lit(0_i64))
+    }
+    /// `SUBSTR(self, pos, len)` — 1-based substring (PySpark `Column.substr`).
+    pub fn substr(self, pos: Expr, len: Expr) -> Self {
+        function("substr", vec![self, pos, len])
+    }
+    /// Append a `WHEN condition THEN value` branch to a `CASE` built by
+    /// [`when`]. Only meaningful on a CASE expression (one rendered ending in
+    /// `END`); otherwise the resulting SQL fails to plan (loud, not silent).
+    pub fn when(self, condition: Expr, value: Expr) -> Self {
+        let body = case_body(self.as_sql());
+        Self::raw(format!(
+            "{body} WHEN ({}) THEN ({}) END",
+            condition.as_sql(),
+            value.as_sql()
+        ))
+    }
+    /// Attach the `ELSE value` default to a `CASE` built by [`when`].
+    pub fn otherwise(self, value: Expr) -> Self {
+        let body = case_body(self.as_sql());
+        Self::raw(format!("{body} ELSE ({}) END", value.as_sql()))
+    }
+}
+
+/// `CASE WHEN condition THEN value END` (PySpark `F.when`). Chain further
+/// branches with [`Expr::when`] and a default with [`Expr::otherwise`]; on its
+/// own it is a valid expression with an implicit `ELSE NULL`.
+pub fn when(condition: Expr, value: Expr) -> Expr {
+    Expr::raw(format!(
+        "CASE WHEN ({}) THEN ({}) END",
+        condition.as_sql(),
+        value.as_sql()
+    ))
+}
+
+/// Strip the trailing `END` from a rendered `CASE` so another branch or the
+/// `ELSE` default can be appended. If the input is not a CASE (no `END`), it
+/// is returned unchanged so the caller produces a clearly-invalid expression
+/// rather than silently succeeding.
+fn case_body(sql: &str) -> String {
+    let trimmed = sql.trim_end();
+    match trimmed.strip_suffix("END") {
+        Some(body) => body.trim_end().to_string(),
+        None => trimmed.to_string(),
+    }
 }
 
 pub fn col(name: &str) -> Expr {

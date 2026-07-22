@@ -3,14 +3,14 @@
 > Generated from `crates/krishiv-api/src/pyspark_parity.rs` — do not edit by hand.
 > Regenerate with `KRISHIV_BLESS_PYSPARK_PARITY=1 cargo test -p krishiv-api pyspark_parity`.
 
-**Overall parity: 113/122 = 93%** of the enumerated PySpark surface (Supported or Partial). Each shortfall is itemized below.
+**Overall parity: 121/128 = 95%** of the enumerated PySpark surface (Supported or Partial). Each shortfall is itemized below.
 
 ## Coverage by namespace
 
 | Namespace | Covered | Total | % |
 |---|---|---|---|
 | DataFrame | 41 | 47 | 87% |
-| Column | 13 | 16 | 81% |
+| Column | 21 | 22 | 95% |
 | functions | 35 | 35 | 100% |
 | GroupedData | 7 | 7 | 100% |
 | Window | 6 | 6 | 100% |
@@ -84,11 +84,17 @@
 | `isNull` | supported | Expr::is_null |  |
 | `isNotNull` | supported | Expr::is_not_null |  |
 | `over` | supported | Expr::over | window spec |
-| `between` | planned | — | reachable as (c>=lo)&(c<=hi); no between() sugar |
-| `isin` | planned | — | Phase 61 gap: IN-list column predicate |
-| `like` | partial | raw | reachable via raw SQL; no typed like() |
-| `substr` | partial | function | reachable via function("substr", …) |
-| `when_otherwise` | partial | raw | CASE via raw/SQL; no Column.when chain |
+| `between` | supported | Expr::between |  |
+| `isin` | supported | Expr::is_in | varargs or a list |
+| `like` | supported | Expr::like |  |
+| `rlike` | supported | regexp_like | Rust regex dialect |
+| `ilike` | supported | Expr::ilike |  |
+| `contains` | supported | Expr::contains |  |
+| `startswith` | supported | Expr::starts_with |  |
+| `endswith` | supported | Expr::ends_with |  |
+| `substr` | supported | Expr::substr | 1-based |
+| `eqNullSafe` | supported | Expr::eq_null_safe | IS NOT DISTINCT FROM |
+| `when_otherwise` | supported | Expr::when | Column.when(...).otherwise(...) chain |
 
 ## functions
 
@@ -112,7 +118,7 @@
 | `first` | supported | first_value |  |
 | `last` | supported | last_value |  |
 | `nth_value` | supported | nth_value |  |
-| `when` | partial | function | reachable via the SQL registry / raw; no typed when() builder (Phase 61 gap) |
+| `when` | supported | when | F.when(...).otherwise(...) |
 | `coalesce` | supported | coalesce | typed F.* helper over the SQL registry |
 | `nvl` | supported | nvl | typed helper; exact Spark alias |
 | `upper` | supported | upper | typed F.* helper |
