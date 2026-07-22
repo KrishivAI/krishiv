@@ -127,7 +127,12 @@ prost = { workspace = true, optional = true }
 qdrant-client = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 twox-hash = { workspace = true, optional = true }
-aws-sdk-kinesis = { version = "1.109.0", optional = true }
+# Drop the SDK's legacy `rustls` feature: it maps to aws-smithy-runtime/tls-rustls,
+# a hyper-0.14-era connector pinned to rustls 0.21 -> rustls-webpki 0.101.7
+# (GHSA-82j2-j2ch-gfr8, high). `default-https-client` already gives the modern
+# rustls-aws-lc (0.23 -> webpki 0.103) path, so selecting it minus `rustls`
+# yields modern-TLS-only and removes the vulnerable 0.101.7 from the graph.
+aws-sdk-kinesis = { version = "1.109.0", optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-config = { version = "1.8.18", optional = true }
 pulsar = { version = "6.8.0", optional = true }
 elasticsearch = { version = "9.1.0-alpha.1", optional = true }
