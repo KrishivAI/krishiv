@@ -36,6 +36,26 @@ impl BlockingSession {
         })
     }
 
+    /// Drive an async operation to completion on this session's **owned**
+    /// runtime — the single blocking primitive every method below goes through,
+    /// so there is no hidden global runtime.
+    ///
+    /// Rejects unsafe runtime nesting instead of panicking: `Runtime::block_on`
+    /// from a thread already driving a Tokio runtime panics with "Cannot start a
+    /// runtime from within a runtime". Callers already inside async code should
+    /// use the async [`Session`] API directly instead of `BlockingSession`.
+    fn block<T>(&self, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(KrishivError::Runtime {
+                message: "BlockingSession cannot be used from within an active Tokio runtime; \
+                          call the async Session API (e.g. DataFrame::collect_async().await) \
+                          instead of BlockingSession when already in async code"
+                    .to_string(),
+            });
+        }
+        self.rt.block_on(fut)
+    }
+
     /// Create an embedded (in-process) blocking session.
     pub fn embedded() -> Result<Self> {
         Self::build(SessionBuilder::new().build()?)
@@ -60,27 +80,20 @@ impl BlockingSession {
 
     /// Execute a SQL query and collect results synchronously.
     pub fn sql(&self, query: &str) -> Result<QueryResult> {
-        let df = self.inner.sql(query)?;
+        let df = self.block(self.inner.sql_async(query))?;
+        self.collect(df)
+    }
+
+    /// Policy-enforced `sql_as` (requires `SessionBuilder::with_auth`), collected
+    /// synchronously.
+    pub fn sql_as(&self, api_key: &str, query: &str) -> Result<QueryResult> {
+        let df = self.block(self.inner.sql_as_async(api_key, query))?;
         self.collect(df)
     }
 
     /// Collect a [`DataFrame`] synchronously using the owned runtime.
-    ///
-    /// Rejects unsafe runtime nesting instead of panicking: calling
-    /// `Runtime::block_on` while the current thread is already driving a
-    /// Tokio runtime panics with "Cannot start a runtime from within a
-    /// runtime". Callers already inside async code should use
-    /// [`DataFrame::collect_async`] directly instead of `BlockingSession`.
     pub fn collect(&self, df: DataFrame) -> Result<QueryResult> {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(KrishivError::Runtime {
-                message: "BlockingSession cannot be used from within an active Tokio runtime; \
-                          call DataFrame::collect_async().await instead of BlockingSession::collect \
-                          when already in async code"
-                    .to_string(),
-            });
-        }
-        self.rt.block_on(df.collect_async())
+        self.block(df.collect_async())
     }
 
     /// Create a live table synchronously — the keystone surface through the
@@ -100,7 +113,16 @@ impl BlockingSession {
         name: &str,
         batches: Vec<arrow::record_batch::RecordBatch>,
     ) -> Result<()> {
-        self.inner.register_record_batches(name, batches)
+        self.block(self.inner.register_record_batches_async(name, batches))
+    }
+
+    /// Register a Parquet file as a named table synchronously.
+    pub fn register_parquet(
+        &self,
+        table_name: impl AsRef<str>,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<()> {
+        self.block(self.inner.register_parquet_async(table_name, path))
     }
 
     /// Deregister (drop) a named table synchronously.
@@ -110,17 +132,76 @@ impl BlockingSession {
 
     /// Read a Parquet file into a [`DataFrame`] synchronously.
     pub fn read_parquet(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame> {
-        self.inner.read_parquet(path)
+        self.block(self.inner.read_parquet_async(path))
+    }
+
+    /// Read a Parquet file with explicit reader options, synchronously.
+    pub fn read_parquet_with_options(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        opts: krishiv_sql::ParquetReaderOptions,
+    ) -> Result<DataFrame> {
+        self.block(self.inner.read_parquet_with_options_async(path, opts))
     }
 
     /// Read a CSV file into a [`DataFrame`] synchronously.
     pub fn read_csv(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame> {
-        self.inner.read_csv(path)
+        self.block(self.inner.read_csv_async(path))
+    }
+
+    /// Read a CSV file with explicit header/delimiter options, synchronously.
+    pub fn read_csv_with_options(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        has_header: bool,
+        delimiter: u8,
+    ) -> Result<DataFrame> {
+        self.block(
+            self.inner
+                .read_csv_with_options_async(path, has_header, delimiter),
+        )
     }
 
     /// Read a JSON file into a [`DataFrame`] synchronously.
     pub fn read_json(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame> {
-        self.inner.read_json(path)
+        self.block(self.inner.read_json_async(path))
+    }
+
+    /// Read a Delta Lake table (optionally at a version) synchronously.
+    pub fn read_delta(&self, path: impl AsRef<str>, version: Option<i64>) -> Result<DataFrame> {
+        self.block(self.inner.read_delta_async(path, version))
+    }
+
+    /// Read a Hudi table synchronously.
+    pub fn read_hudi(
+        &self,
+        path: impl AsRef<str>,
+        query_type: krishiv_connectors::lakehouse::HudiQueryType,
+        begin_instant: Option<&str>,
+    ) -> Result<DataFrame> {
+        self.block(self.inner.read_hudi_async(path, query_type, begin_instant))
+    }
+
+    /// Append a [`DataFrame`] to a Hudi table synchronously.
+    pub fn write_hudi_append(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        dataframe: &DataFrame,
+    ) -> Result<krishiv_connectors::lakehouse::HudiWriteResult> {
+        self.block(self.inner.write_hudi_append_async(path, dataframe))
+    }
+
+    /// Upsert a [`DataFrame`] into a Hudi table synchronously.
+    pub fn write_hudi_upsert(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        key_column: &str,
+        dataframe: &DataFrame,
+    ) -> Result<krishiv_connectors::lakehouse::HudiWriteResult> {
+        self.block(
+            self.inner
+                .write_hudi_upsert_async(path, key_column, dataframe),
+        )
     }
 
     /// Borrow the underlying async [`Session`].
@@ -183,13 +264,21 @@ mod tests {
         let source = include_str!("blocking.rs");
         const CORE_FACADE: &[&str] = &[
             "sql",
+            "sql_as",
             "collect",
             "create_live_table",
             "register_record_batches",
+            "register_parquet",
             "deregister_table",
             "read_parquet",
+            "read_parquet_with_options",
             "read_csv",
+            "read_csv_with_options",
             "read_json",
+            "read_delta",
+            "read_hudi",
+            "write_hudi_append",
+            "write_hudi_upsert",
             "session",
             "runtime",
             "close",
