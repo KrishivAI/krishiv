@@ -262,46 +262,23 @@ impl SortShuffleWriter {
         let data_path = self.output_dir.join(format!("{base}.data"));
         let index_path = self.output_dir.join(format!("{base}.index"));
 
+        // Phase 65: the per-bucket gather → concat → sort → IPC-encode is
+        // independent CPU-bound work. Run it in parallel on the process-global
+        // compute pool, then concatenate the encoded blocks IN ORDER — the data
+        // file layout and the (n+1) index offsets stay byte-identical to the
+        // serial path (empty buckets encode to a zero-length block, so their
+        // offset still points to valid, zero-length data).
+        let bucket_refs: Vec<(usize, &Vec<RecordBatch>)> =
+            self.buckets.iter().enumerate().collect();
+        let encoded_blocks = krishiv_common::compute_pool::par_map(bucket_refs, |(idx, bucket)| {
+            encode_bucket(bucket, self.spill_files.get(idx), &self.sort_key)
+        });
+
         let mut data_buf: Vec<u8> = Vec::new();
         let mut offsets: Vec<u64> = Vec::with_capacity(n as usize + 1);
-
-        for (idx, bucket) in self.buckets.iter().enumerate() {
+        for block in encoded_blocks {
             offsets.push(data_buf.len() as u64);
-            let has_spills = self.spill_files.get(idx).is_some_and(|f| !f.is_empty());
-            if bucket.is_empty() && !has_spills {
-                // Empty partition: write an empty IPC stream so the index
-                // still points to valid (zero-length) data.
-                continue;
-            }
-
-            // Collect all batches: spilled files first, then in-memory.
-            let mut all_batches: Vec<RecordBatch> = Vec::new();
-            if let Some(spills) = self.spill_files.get(idx) {
-                for spill_path in spills {
-                    let mut spilled = read_ipc_file(spill_path)?;
-                    all_batches.append(&mut spilled);
-                    // Clean up the temp spill file.
-                    let _ = std::fs::remove_file(spill_path);
-                }
-            }
-            for b in bucket {
-                all_batches.push(b.clone());
-            }
-
-            if all_batches.is_empty() {
-                continue;
-            }
-
-            // Concatenate and sort.
-            let schema = all_batches
-                .first()
-                .ok_or_else(|| io_err("empty batch list".to_string()))?
-                .schema();
-            let combined = arrow::compute::concat_batches(&schema, all_batches.iter())
-                .map_err(|e| io_err(format!("concat failed: {e}")))?;
-            let sorted = sort_by_key(&combined, &self.sort_key)?;
-            let encoded = encode_ipc(&sorted)?;
-            data_buf.extend_from_slice(&encoded);
+            data_buf.extend_from_slice(&block?);
         }
         offsets.push(data_buf.len() as u64);
 
@@ -366,6 +343,51 @@ impl SortShuffleWriter {
 /// Estimate the in-memory byte size of a batch.
 fn estimated_batch_bytes(batch: &RecordBatch) -> usize {
     batch.get_array_memory_size()
+}
+
+/// Gather one shuffle bucket's batches (spilled files first, then in-memory),
+/// concatenate, sort by the shuffle key, and IPC-encode into a byte block.
+///
+/// Returns an empty block when the bucket has no rows (its index offset then
+/// points to valid, zero-length data). Independent per bucket, so this is the
+/// unit of parallelism in [`SortShuffleWriter::flush`] (Phase 65). Reading and
+/// removing the temp spill files happens here too — they are per-bucket
+/// independent, and `flush` is a synchronous call (no Tokio reactor to protect).
+fn encode_bucket(
+    bucket: &[RecordBatch],
+    spills: Option<&Vec<PathBuf>>,
+    sort_key: &str,
+) -> ShuffleResult<Vec<u8>> {
+    let has_spills = spills.is_some_and(|f| !f.is_empty());
+    if bucket.is_empty() && !has_spills {
+        return Ok(Vec::new());
+    }
+
+    // Collect all batches: spilled files first, then in-memory.
+    let mut all_batches: Vec<RecordBatch> = Vec::new();
+    if let Some(spill_files) = spills {
+        for spill_path in spill_files {
+            let mut spilled = read_ipc_file(spill_path)?;
+            all_batches.append(&mut spilled);
+            // Clean up the temp spill file.
+            let _ = std::fs::remove_file(spill_path);
+        }
+    }
+    for b in bucket {
+        all_batches.push(b.clone());
+    }
+    if all_batches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let schema = all_batches
+        .first()
+        .ok_or_else(|| io_err("empty batch list".to_string()))?
+        .schema();
+    let combined = arrow::compute::concat_batches(&schema, all_batches.iter())
+        .map_err(|e| io_err(format!("concat failed: {e}")))?;
+    let sorted = sort_by_key(&combined, sort_key)?;
+    encode_ipc(&sorted)
 }
 
 /// Read a previously-spilled IPC file back as `Vec<RecordBatch>`.

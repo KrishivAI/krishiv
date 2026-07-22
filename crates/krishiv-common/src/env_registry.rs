@@ -251,6 +251,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "HTTP address for `krishiv cluster` status endpoints.",
     ),
     rt(
+        "KRISHIV_COMPUTE_THREADS",
+        FlagKind::UInt,
+        "auto (max(1, cores - 1))",
+        "Thread count for the global Rayon compute-kernel pool (shuffle/checkpoint/decode kernels); 0 or unset auto-sizes to cores minus one reserved for the async reactor.",
+    ),
+    rt(
         "KRISHIV_COORDINATOR",
         FlagKind::Url,
         "unset",
@@ -1454,6 +1460,7 @@ mod tests {
         "KRISHIV_BLESS_CONNECTOR_DOCS",
         "KRISHIV_BLESS_PYSPARK_PARITY",
         "KRISHIV_BLESS_SQL_DOCS",
+        "KRISHIV_BLESS_CERT_MATRIX",
     ];
 
     #[test]

@@ -29,6 +29,7 @@ Regenerate with:
 | `KRISHIV_CHECKPOINT_STORAGE` | url | `unset` | Checkpoint storage URI (memory://, file://…, s3://…). Durable profiles reject memory://. |
 | `KRISHIV_CLUSTER_DATA_DIR` | path | `~/.krishiv/cluster` | Data directory for `krishiv cluster` bare-metal deployments. |
 | `KRISHIV_CLUSTER_HTTP_ADDR` | host:port | `127.0.0.1:8080` | HTTP address for `krishiv cluster` status endpoints. |
+| `KRISHIV_COMPUTE_THREADS` | uint | `auto (max(1, cores - 1))` | Thread count for the global Rayon compute-kernel pool (shuffle/checkpoint/decode kernels); 0 or unset auto-sizes to cores minus one reserved for the async reactor. |
 | `KRISHIV_COORDINATOR` | url | `unset` | Deprecated alias of KRISHIV_COORDINATOR_URL (CLI/query paths). |
 | `KRISHIV_COORDINATOR_AUTH_RELOAD_INTERVAL_SECS` | uint | `30` | Interval for re-reading coordinator bearer-token files. |
 | `KRISHIV_COORDINATOR_AUTH_SECRET_KEY` | text | `token` | K8s Secret key holding the coordinator bearer token (operator-injected pods). |
