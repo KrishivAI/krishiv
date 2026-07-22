@@ -2977,7 +2977,7 @@ impl Session {
     ///
     /// **Local-only (R18)**: Reads from a local `_delta_log/*.json` directory.
     /// S3 paths and `delta-rs` integration are not yet implemented in this release.
-    pub async fn read_delta_async(
+    pub async fn read_delta(
         &self,
         path: impl AsRef<str>,
         version: Option<i64>,
@@ -2990,7 +2990,7 @@ impl Session {
     ///
     /// **Local-only (R18)**: Reads local Copy-on-Write Parquet files.
     /// Remote Hudi catalogs and S3 paths are not yet supported.
-    pub async fn read_hudi_async(
+    pub async fn read_hudi(
         &self,
         path: impl AsRef<str>,
         query_type: krishiv_connectors::lakehouse::HudiQueryType,
@@ -3008,7 +3008,7 @@ impl Session {
     /// **Local-only (R18)**: Writes to a local CoW Parquet directory.
     /// S3, object-store URIs, and remote Iceberg catalogs are not supported.
     /// The `path` argument must be a local filesystem path.
-    pub async fn write_hudi_append_async(
+    pub async fn write_hudi_append(
         &self,
         path: impl AsRef<std::path::Path>,
         dataframe: &DataFrame,
@@ -3045,7 +3045,7 @@ impl Session {
     /// **Local-only (R18)**: Writes to a local CoW Parquet directory by key column.
     /// S3, object-store URIs, and remote Iceberg catalogs are not supported.
     /// The `path` argument must be a local filesystem path.
-    pub async fn write_hudi_upsert_async(
+    pub async fn write_hudi_upsert(
         &self,
         path: impl AsRef<std::path::Path>,
         key_column: &str,
