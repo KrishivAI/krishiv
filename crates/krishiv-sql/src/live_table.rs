@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn registry_register_and_drop() {
         let reg = LiveTableRegistry::new();
-        reg.register("v", "SELECT 1");
+        reg.register("v", "SELECT 1").unwrap();
         assert!(reg.contains("v").unwrap());
         reg.remove_table("v").unwrap();
         assert!(!reg.contains("v").unwrap());

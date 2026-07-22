@@ -1044,7 +1044,6 @@ mod tests {
             window_timezone: None,
         };
         let frag = encode_stream_fragment(&spec).unwrap();
-        let parsed = parse_stream_fragment(&frag).expect("parse escaped fragment");
         let parsed = parse_stream_fragment(&frag).expect("parse escaped backslash");
         assert_eq!(parsed.key_col, "path\\to");
     }
