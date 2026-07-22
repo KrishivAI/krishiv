@@ -49,6 +49,7 @@ pub mod two_phase_parquet_s3;
 
 // Module facades
 pub mod capabilities;
+pub mod cert_matrix;
 pub mod config;
 pub mod error;
 pub mod io_contract;
