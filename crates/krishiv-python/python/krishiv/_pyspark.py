@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+import inspect
+
 from .krishiv import (
     Batch,
     Column,
@@ -25,9 +27,11 @@ from .krishiv import (
     GroupedDataFrame,
     QueryResult,
     Session,
+    call_function,
     col,
     expr,
     lit,
+    udf as _native_udf,
 )
 
 
@@ -488,6 +492,78 @@ def _session_range(self, start, end=None, step=1, numPartitions=None):  # noqa: 
     return self.table(name)
 
 
+_UDF_TYPE_ALIASES = {
+    "int": "int64",
+    "integer": "int64",
+    "long": "int64",
+    "bigint": "int64",
+    "short": "int64",
+    "byte": "int64",
+    "float": "double",
+    "real": "double",
+    "str": "string",
+    "bool": "boolean",
+}
+
+
+def _udf_type(dtype) -> str:
+    """Normalise a UDF type: a `krishiv.types.DataType`, a PySpark type name, or
+    an engine type string, to the engine's UDF type grammar."""
+    if hasattr(dtype, "cast_string"):
+        dtype = dtype.cast_string()
+    name = str(dtype).strip().lower()
+    return _UDF_TYPE_ALIASES.get(name, name)
+
+
+class UDFRegistration:
+    """``session.udf`` — register Python scalar UDFs (PySpark ``spark.udf``).
+
+    ``register(name, f, returnType)`` wraps a plain Python scalar function
+    (called once per row) over the engine's columnar UDF interface and returns
+    a callable usable in DataFrame expressions::
+
+        square = spark.udf.register("square", lambda x: x * x, "int")
+        df.select(square(col("n")))
+
+    ``returnType`` accepts a ``krishiv.types`` object, a PySpark type name
+    (``"int"``, ``"string"``…), or an engine type string. Argument types
+    default to ``returnType``; pass ``argTypes=[...]`` for heterogeneous inputs
+    (the engine is typed, so an int column bound to a declared string arg is
+    fine, but not the reverse)."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def register(self, name: str, f, returnType="string", argTypes=None):  # noqa: N803
+        try:
+            arity = sum(
+                1
+                for p in inspect.signature(f).parameters.values()
+                if p.kind in (p.POSITIONAL_OR_KEYWORD, p.POSITIONAL_ONLY)
+            )
+        except (TypeError, ValueError):
+            arity = len(argTypes) if argTypes else 1
+        out_type = _udf_type(returnType)
+        arg_types = [_udf_type(t) for t in argTypes] if argTypes else [out_type] * arity
+        params = [f"a{i}" for i in range(len(arg_types))]
+        input_types = dict(zip(params, arg_types))
+
+        def _batch(cols):
+            columns = [cols[p] for p in params]
+            return [f(*row) for row in zip(*columns)]
+
+        wrapped = _native_udf(
+            _batch, name=name, input_types=input_types, output_type=out_type
+        )
+        self._session.register_udf(wrapped)
+
+        def _invoke(*cols):
+            return call_function(name, [_as_column(c) for c in cols])
+
+        _invoke.__name__ = name
+        return _invoke
+
+
 class Catalog:
     """``session.catalog`` — a subset of PySpark's ``Catalog``."""
 
@@ -701,6 +777,7 @@ def _apply() -> None:
     Session.createDataFrame = _session_createDataFrame
     Session.range = _session_range
     Session.catalog = property(Catalog)
+    Session.udf = property(UDFRegistration)
     Session.read = property(DataFrameReader)
     Session.stop = Session.close
     Session.builder = _SessionBuilder()

@@ -265,6 +265,22 @@ def test_spark_session_builder():
     assert spark.sql("SELECT 1 AS n").collect_rows()[0]["n"] == 1
 
 
+def test_udf_register(session):
+    square = session.udf.register("square", lambda x: x * x, "int")
+    combine = session.udf.register(
+        "combine", lambda a, b: f"{a}={b}", "string", argTypes=["int", "string"]
+    )
+    tolen = session.udf.register("tolen", len, T.IntegerType(), argTypes=[T.StringType()])
+    df = session.sql("SELECT 3 AS n, 'xy' AS s")
+    row = df.select_columns(
+        [square(col("n")).alias("sq"), combine(col("n"), col("s")).alias("c"),
+         tolen(col("s")).alias("l")]
+    ).collect_rows()[0]
+    assert row["sq"] == 9
+    assert row["c"] == "3=xy"
+    assert row["l"] == 2
+
+
 # ── types module ─────────────────────────────────────────────────────────────
 
 
