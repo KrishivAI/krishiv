@@ -130,3 +130,124 @@ impl QueueManager for NamespaceQuotaQueueManager {
         SubmitOutcome::Accepted
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use krishiv_proto::{JobId, JobKind};
+
+    fn job(cpu_nanos: Option<u64>, memory_bytes: Option<u64>) -> JobSpec {
+        let mut spec = JobSpec::new(JobId::try_new("job-adm").unwrap(), "adm", JobKind::Batch);
+        if let Some(c) = cpu_nanos {
+            spec = spec.with_cpu_limit_nanos(c);
+        }
+        if let Some(m) = memory_bytes {
+            spec = spec.with_memory_limit_bytes(m);
+        }
+        spec
+    }
+
+    fn snapshot(active: usize, cpu: u64, mem: u64) -> NamespaceQuotaSnapshot {
+        NamespaceQuotaSnapshot {
+            active_job_count: active,
+            cpu_nanos_reserved: cpu,
+            memory_bytes_reserved: mem,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn in_memory_manager_always_accepts_regardless_of_quota() {
+        let qm = InMemoryQueueManager;
+        // Even an absurdly loaded namespace snapshot is admitted.
+        let outcome = qm.admit(&job(Some(u64::MAX), Some(u64::MAX)), &snapshot(9999, u64::MAX, u64::MAX));
+        assert_eq!(outcome, SubmitOutcome::Accepted);
+    }
+
+    #[test]
+    fn unconstrained_quota_manager_admits_everything() {
+        let qm = NamespaceQuotaQueueManager::new(None, None, None);
+        assert_eq!(
+            qm.admit(&job(Some(1_000), Some(1_000)), &snapshot(1_000, 1_000_000, 1_000_000)),
+            SubmitOutcome::Accepted
+        );
+    }
+
+    #[test]
+    fn active_job_limit_queues_at_capacity_and_admits_below() {
+        let qm = NamespaceQuotaQueueManager::new(Some(2), None, None);
+        // Below limit → accepted.
+        assert_eq!(qm.admit(&job(None, None), &snapshot(1, 0, 0)), SubmitOutcome::Accepted);
+        // At limit → queued (>= is the boundary).
+        assert_eq!(
+            qm.admit(&job(None, None), &snapshot(2, 0, 0)),
+            SubmitOutcome::Queued { position: 0 }
+        );
+        // Above limit → queued.
+        assert_eq!(
+            qm.admit(&job(None, None), &snapshot(3, 0, 0)),
+            SubmitOutcome::Queued { position: 0 }
+        );
+    }
+
+    #[test]
+    fn cpu_limit_uses_would_be_reservation() {
+        let qm = NamespaceQuotaQueueManager::new(None, Some(100), None);
+        // reserved 60 + this job's 40 == 100, not > 100 → accepted.
+        assert_eq!(qm.admit(&job(Some(40), None), &snapshot(0, 60, 0)), SubmitOutcome::Accepted);
+        // reserved 60 + 41 == 101 > 100 → queued.
+        assert_eq!(
+            qm.admit(&job(Some(41), None), &snapshot(0, 60, 0)),
+            SubmitOutcome::Queued { position: 0 }
+        );
+        // A job with no declared cpu limit contributes 0.
+        assert_eq!(qm.admit(&job(None, None), &snapshot(0, 100, 0)), SubmitOutcome::Accepted);
+    }
+
+    #[test]
+    fn memory_limit_uses_would_be_reservation() {
+        let qm = NamespaceQuotaQueueManager::new(None, None, Some(1_000));
+        assert_eq!(qm.admit(&job(None, Some(500)), &snapshot(0, 0, 500)), SubmitOutcome::Accepted);
+        assert_eq!(
+            qm.admit(&job(None, Some(501)), &snapshot(0, 0, 500)),
+            SubmitOutcome::Queued { position: 0 }
+        );
+    }
+
+    #[test]
+    fn saturating_add_never_overflows() {
+        let qm = NamespaceQuotaQueueManager::new(None, Some(u64::MAX), Some(u64::MAX));
+        // reserved MAX + job MAX would overflow; saturating_add caps at MAX which
+        // is NOT > MAX, so this is admitted rather than panicking.
+        let outcome = qm.admit(&job(Some(u64::MAX), Some(u64::MAX)), &snapshot(0, u64::MAX, u64::MAX));
+        assert_eq!(outcome, SubmitOutcome::Accepted);
+    }
+
+    #[test]
+    fn first_tripped_limit_queues_even_if_others_pass() {
+        // Only the active-job limit is exceeded; cpu/mem are fine.
+        let qm = NamespaceQuotaQueueManager::new(Some(1), Some(u64::MAX), Some(u64::MAX));
+        assert_eq!(
+            qm.admit(&job(Some(1), Some(1)), &snapshot(5, 0, 0)),
+            SubmitOutcome::Queued { position: 0 }
+        );
+    }
+
+    #[test]
+    fn from_env_without_vars_is_unconstrained() {
+        // The three quota env vars are not set in the test process → all limits
+        // None → behaves like the always-admit path.
+        let qm = NamespaceQuotaQueueManager::from_env();
+        assert_eq!(
+            qm.admit(&job(Some(1_000), Some(1_000)), &snapshot(1_000, u64::MAX / 2, u64::MAX / 2)),
+            SubmitOutcome::Accepted
+        );
+    }
+
+    #[test]
+    fn on_job_complete_default_is_a_noop() {
+        // The default trait method must not panic and returns nothing.
+        let qm = NamespaceQuotaQueueManager::new(Some(1), None, None);
+        qm.on_job_complete(&JobId::try_new("done").unwrap(), &crate::ResourceUsage::default());
+    }
+}
