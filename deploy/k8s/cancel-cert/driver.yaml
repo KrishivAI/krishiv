@@ -1,0 +1,40 @@
+# Driver pod for scripts/phase59_cancel_cert.sh (Phase 59 cancel-latency
+# cert). Same engine+curl sidecar pattern as deploy/k8s/phase58/ha-cert.yaml's
+# phase58-driver: "engine" runs the actual krishiv client (krishiv sql
+# --remote), "curl" drives the coordinator's HTTP admin API (job list/cancel)
+# since the krishiv image itself ships no curl/wget.
+#
+# Point this at any already-running coordinator via
+# PHASE59_COORDINATOR_SVC (default: cert-v2-coordinator) — the driver's own
+# image only needs to be a reasonably current krishiv build capable of
+# `sql --remote`, it does not need to match the target coordinator's exact
+# version. Update the `image:` tags below to a currently-imported build
+# before applying.
+#
+# Requires a `<namespace>-tokens` Secret with a `coordinator` key (the same
+# bearer token the target coordinator's own KRISHIV_COORDINATOR_BEARER_TOKEN
+# uses) already present in the namespace.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cancel-cert-driver
+  namespace: krishiv-cert
+  labels: { app: cancel-cert-driver }
+spec:
+  containers:
+    - name: engine
+      image: localhost/krishiv:fast-e04e0a8c
+      imagePullPolicy: Never
+      command: ["sleep", "604800"]
+      env:
+        - name: KRISHIV_API_KEYS
+          value: "certkey-9f3a=certuser"
+        - name: KRISHIV_COORDINATOR_BEARER_TOKEN
+          valueFrom: { secretKeyRef: { name: krishiv-cert-tokens, key: coordinator } }
+    - name: curl
+      image: curlimages/curl:8.12.1
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "604800"]
+      env:
+        - name: COORD_TOKEN
+          valueFrom: { secretKeyRef: { name: krishiv-cert-tokens, key: coordinator } }
