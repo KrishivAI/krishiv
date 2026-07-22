@@ -169,7 +169,7 @@ impl BlockingSession {
 
     /// Read a Delta Lake table (optionally at a version) synchronously.
     pub fn read_delta(&self, path: impl AsRef<str>, version: Option<i64>) -> Result<DataFrame> {
-        self.block(self.inner.read_delta(path, version))
+        self.block(self.inner.read_delta_async(path, version))
     }
 
     /// Read a Hudi table synchronously.
@@ -179,7 +179,7 @@ impl BlockingSession {
         query_type: krishiv_connectors::lakehouse::HudiQueryType,
         begin_instant: Option<&str>,
     ) -> Result<DataFrame> {
-        self.block(self.inner.read_hudi(path, query_type, begin_instant))
+        self.block(self.inner.read_hudi_async(path, query_type, begin_instant))
     }
 
     /// Append a [`DataFrame`] to a Hudi table synchronously.
@@ -188,7 +188,7 @@ impl BlockingSession {
         path: impl AsRef<std::path::Path>,
         dataframe: &DataFrame,
     ) -> Result<krishiv_connectors::lakehouse::HudiWriteResult> {
-        self.block(self.inner.write_hudi_append(path, dataframe))
+        self.block(self.inner.write_hudi_append_async(path, dataframe))
     }
 
     /// Upsert a [`DataFrame`] into a Hudi table synchronously.
@@ -200,7 +200,7 @@ impl BlockingSession {
     ) -> Result<krishiv_connectors::lakehouse::HudiWriteResult> {
         self.block(
             self.inner
-                .write_hudi_upsert(path, key_column, dataframe),
+                .write_hudi_upsert_async(path, key_column, dataframe),
         )
     }
 

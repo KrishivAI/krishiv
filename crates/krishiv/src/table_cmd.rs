@@ -179,12 +179,12 @@ async fn read_and_pretty(
         TableFormat::Parquet => session.read_parquet_async(&cmd.path).await?,
         TableFormat::Delta => {
             session
-                .read_delta(cmd.path.to_string_lossy().as_ref(), cmd.delta_version)
+                .read_delta_async(cmd.path.to_string_lossy().as_ref(), cmd.delta_version)
                 .await?
         }
         TableFormat::Hudi => {
             session
-                .read_hudi(
+                .read_hudi_async(
                     cmd.path.to_string_lossy().as_ref(),
                     cmd.hudi_query,
                     cmd.hudi_begin.as_deref(),

@@ -29,7 +29,7 @@ pub fn read_delta(
 ) -> PyResult<PyDataFrame> {
     reject_distributed_lakehouse(session, "read_delta")?;
     let inner = session.inner.clone();
-    py.detach(move || RUNTIME.block_on(inner.read_delta(path, version)))
+    py.detach(move || RUNTIME.block_on(inner.read_delta_async(path, version)))
         .map(|df| PyDataFrame { inner: df })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
@@ -84,7 +84,7 @@ pub fn read_hudi(
         _ => krishiv_connectors::lakehouse::HudiQueryType::Snapshot,
     };
     let inner = session.inner.clone();
-    py.detach(move || RUNTIME.block_on(inner.read_hudi(path, qt, begin_instant.as_deref())))
+    py.detach(move || RUNTIME.block_on(inner.read_hudi_async(path, qt, begin_instant.as_deref())))
         .map(|df| PyDataFrame { inner: df })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
@@ -127,7 +127,7 @@ pub fn write_hudi_append(
     reject_distributed_lakehouse(session, "write_hudi_append")?;
     let inner = session.inner.clone();
     let df = dataframe.inner.clone();
-    py.detach(move || RUNTIME.block_on(inner.write_hudi_append(path, &df)))
+    py.detach(move || RUNTIME.block_on(inner.write_hudi_append_async(path, &df)))
         .map(|inner| PyHudiWriteResult { inner })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
@@ -143,7 +143,7 @@ pub fn write_hudi_upsert(
     reject_distributed_lakehouse(session, "write_hudi_upsert")?;
     let inner = session.inner.clone();
     let df = dataframe.inner.clone();
-    py.detach(move || RUNTIME.block_on(inner.write_hudi_upsert(path, &key_column, &df)))
+    py.detach(move || RUNTIME.block_on(inner.write_hudi_upsert_async(path, &key_column, &df)))
         .map(|inner| PyHudiWriteResult { inner })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
