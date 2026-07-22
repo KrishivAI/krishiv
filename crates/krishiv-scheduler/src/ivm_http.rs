@@ -1197,6 +1197,9 @@ pub fn ivm_router(state: IvmRouterState) -> Router<()> {
 mod tests {
     use super::*;
     use crate::Coordinator;
+    use arrow::array::{Float64Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use krishiv_proto::CoordinatorId;
 
     fn test_deps() -> (SharedIvmJobRegistry, SharedCoordinator) {
@@ -1206,6 +1209,902 @@ mod tests {
                 CoordinatorId::try_new("test-coord").unwrap(),
             )),
         )
+    }
+
+    /// Deterministic deps: the partition decision depends on the shard count
+    /// (`IvmJobRegistry::new()` derives it from the environment), so handler
+    /// tests pin it explicitly — 1 = always Single, >1 = GROUP BY views
+    /// auto-partition.
+    fn test_deps_with_shards(shards: usize) -> (SharedIvmJobRegistry, SharedCoordinator) {
+        (
+            std::sync::Arc::new(crate::ivm::IvmJobRegistry::with_default_shards(shards)),
+            SharedCoordinator::new(Coordinator::active(
+                CoordinatorId::try_new("test-coord").unwrap(),
+            )),
+        )
+    }
+
+    fn orders(regions: &[&str], amounts: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, false),
+                Field::new("amount", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(regions.to_vec())),
+                Arc::new(Int64Array::from(amounts.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn delta_b64(rb: RecordBatch) -> String {
+        let delta = DeltaBatch::from_inserts(rb).unwrap();
+        let ipc = serialize_delta_batch(&delta).unwrap();
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ipc)
+    }
+
+    fn ipc_stream_b64(rb: &RecordBatch) -> String {
+        let mut buf = Vec::new();
+        {
+            let mut w = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &rb.schema()).unwrap();
+            w.write(rb).unwrap();
+            w.finish().unwrap();
+        }
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, buf)
+    }
+
+    fn revenue_view_request() -> RegisterViewRequest {
+        RegisterViewRequest {
+            name: "revenue".into(),
+            body_sql: "SELECT region, SUM(amount) AS total FROM orders GROUP BY region".into(),
+            output_schema: SchemaJson {
+                fields: vec![
+                    SchemaFieldJson {
+                        name: "region".into(),
+                        data_type: "Utf8".into(),
+                        nullable: true,
+                    },
+                    SchemaFieldJson {
+                        name: "total".into(),
+                        data_type: "Float64".into(),
+                        nullable: true,
+                    },
+                ],
+            },
+            is_materialized: true,
+            is_recursive: false,
+        }
+    }
+
+    /// Create a job + revenue view through the HTTP handlers themselves.
+    async fn create_revenue_job(
+        registry: &SharedIvmJobRegistry,
+        coordinator: &SharedCoordinator,
+        job_id: &str,
+    ) {
+        let _ = api_ivm_create_job(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Json(CreateJobRequest {
+                job_id: Some(job_id.to_owned()),
+            }),
+        )
+        .await
+        .expect("create job");
+        let _ = api_ivm_register_view(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(job_id.to_owned()),
+            Json(revenue_view_request()),
+        )
+        .await
+        .expect("register view");
+    }
+
+    /// Decode a snapshot/output payload back into (region → value) pairs.
+    fn decode_delta_rows(b64: &str) -> Vec<(String, f64)> {
+        let ipc =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
+        let delta = deserialize_delta_batch(&ipc).unwrap();
+        let data = delta.data_batch();
+        let regions = data
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let totals = data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let mut rows: Vec<(String, f64)> = (0..data.num_rows())
+            .map(|i| (regions.value(i).to_owned(), totals.value(i)))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    // ── job lifecycle ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn create_job_generates_an_id_and_lists_it() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        let resp = api_ivm_create_job(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Json(CreateJobRequest { job_id: None }),
+        )
+        .await
+        .expect("create");
+        assert!(!resp.job_id.is_empty(), "generated id must be non-empty");
+
+        let listed = api_ivm_list_jobs(State(registry), State(coordinator)).await;
+        assert!(listed.job_ids.contains(&resp.job_id));
+    }
+
+    #[tokio::test]
+    async fn create_job_with_explicit_id_is_idempotent() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        for _ in 0..2 {
+            let resp = api_ivm_create_job(
+                State(registry.clone()),
+                State(coordinator.clone()),
+                Json(CreateJobRequest {
+                    job_id: Some("job-a".into()),
+                }),
+            )
+            .await
+            .expect("create");
+            assert_eq!(resp.job_id, "job-a");
+        }
+        let listed = api_ivm_list_jobs(State(registry), State(coordinator)).await;
+        assert_eq!(
+            listed.job_ids.iter().filter(|j| *j == "job-a").count(),
+            1,
+            "duplicate create must not duplicate the listing"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_reports_deleted_then_false_for_missing() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        registry.create("gone".into()).unwrap();
+
+        let first = api_ivm_delete_job(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("gone".into()),
+        )
+        .await;
+        assert!(first.deleted);
+
+        let second =
+            api_ivm_delete_job(State(registry.clone()), State(coordinator), Path("gone".into()))
+                .await;
+        assert!(!second.deleted, "second delete of the same job is a no-op");
+        assert!(registry.get("gone").is_none());
+    }
+
+    // ── view registration ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn register_view_404s_on_missing_job() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        let err = api_ivm_register_view(
+            State(registry),
+            State(coordinator),
+            Path("nope".into()),
+            Json(revenue_view_request()),
+        )
+        .await
+        .expect_err("must fail");
+        assert_eq!(err, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn register_view_rejects_an_unknown_schema_type() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        registry.create("j".into()).unwrap();
+        let mut req = revenue_view_request();
+        req.output_schema.fields[1].data_type = "Decimal999".into();
+        let err = api_ivm_register_view(
+            State(registry),
+            State(coordinator),
+            Path("j".into()),
+            Json(req),
+        )
+        .await
+        .expect_err("must fail");
+        assert_eq!(err, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn drop_view_reports_dropped_then_false() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+
+        let dropped = api_ivm_drop_view(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("drop");
+        assert!(dropped.dropped);
+
+        let again = api_ivm_drop_view(
+            State(registry),
+            State(coordinator),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("second drop still 200s");
+        assert!(!again.dropped);
+    }
+
+    // ── feed / step / read-back ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn feed_rejects_bad_base64_and_garbage_ipc() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+
+        let err = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: "not/base64!!".into(),
+            }),
+        )
+        .await
+        .expect_err("bad base64");
+        assert_eq!(err, StatusCode::BAD_REQUEST);
+
+        let err = api_ivm_feed_source(
+            State(registry),
+            State(coordinator),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    b"not arrow ipc",
+                ),
+            }),
+        )
+        .await
+        .expect_err("garbage ipc");
+        assert_eq!(err, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn feed_step_and_snapshot_end_to_end() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+
+        let _ = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(
+                    &["US", "EU", "US", "APAC", "EU", "US"],
+                    &[100, 50, 25, 10, 75, 5],
+                )),
+            }),
+        )
+        .await
+        .expect("feed");
+
+        let step = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("step");
+        assert_eq!(step.active_views, 1);
+        assert_eq!(step.tick, 1);
+        assert!(step.total_output_rows > 0);
+
+        let snap = api_ivm_snapshot(State(registry), Path(("j".into(), "revenue".into())))
+            .await
+            .expect("snapshot");
+        assert_eq!(snap.num_rows, 3, "one aggregate row per region");
+        let rows = decode_delta_rows(snap.snapshot_ipc_b64.as_deref().unwrap());
+        assert_eq!(
+            rows,
+            vec![
+                ("APAC".to_owned(), 10.0),
+                ("EU".to_owned(), 125.0),
+                ("US".to_owned(), 130.0),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_delta_endpoint_feeds_a_precomputed_delta() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+
+        let _ = api_ivm_feed_stream_delta(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedStreamDeltaRequest {
+                delta_ipc_b64: delta_b64(orders(&["US"], &[42])),
+            }),
+        )
+        .await
+        .expect("stream-delta feed");
+
+        let _ = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator),
+            Path("j".into()),
+        )
+        .await
+        .expect("step");
+        let snap = api_ivm_snapshot(State(registry), Path(("j".into(), "revenue".into())))
+            .await
+            .expect("snapshot");
+        assert_eq!(
+            decode_delta_rows(snap.snapshot_ipc_b64.as_deref().unwrap()),
+            vec![("US".to_owned(), 42.0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_bridge_accepts_a_full_ipc_snapshot() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+
+        let batch = orders(&["US", "EU"], &[7, 3]);
+        let _ = api_ivm_stream_bridge(
+            State(registry.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(StreamBridgeRequest {
+                snapshot_ipc_b64: ipc_stream_b64(&batch),
+            }),
+        )
+        .await
+        .expect("stream-bridge");
+
+        let _ = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator),
+            Path("j".into()),
+        )
+        .await
+        .expect("step");
+        let snap = api_ivm_snapshot(State(registry), Path(("j".into(), "revenue".into())))
+            .await
+            .expect("snapshot");
+        assert_eq!(
+            decode_delta_rows(snap.snapshot_ipc_b64.as_deref().unwrap()),
+            vec![("EU".to_owned(), 3.0), ("US".to_owned(), 7.0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_bridge_rejects_garbage_ipc() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        let err = api_ivm_stream_bridge(
+            State(registry),
+            Path(("j".into(), "orders".into())),
+            Json(StreamBridgeRequest {
+                snapshot_ipc_b64: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    b"junk",
+                ),
+            }),
+        )
+        .await
+        .expect_err("garbage ipc");
+        assert_eq!(err, StatusCode::BAD_REQUEST);
+    }
+
+    // ── dispatch decision visibility ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn step_records_the_central_dispatch_decision() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        let _ = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator),
+            Path("j".into()),
+        )
+        .await
+        .expect("step");
+
+        let disp = api_ivm_dispatch_state(State(registry), Path("j".into()))
+            .await
+            .expect("dispatch state")
+            .0;
+        assert!(!disp.attached);
+        let last = disp.last.expect("a dispatch record must be recorded");
+        assert_eq!(last.mode, "central-no-executors");
+    }
+
+    #[tokio::test]
+    async fn partitioned_job_steps_centrally_and_records_it() {
+        let (registry, coordinator) = test_deps_with_shards(3);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        assert!(
+            registry.get("j").unwrap().is_partitioned(),
+            "GROUP BY view must auto-partition at 3 shards"
+        );
+
+        let _ = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(&["US", "EU", "APAC"], &[1, 2, 3])),
+            }),
+        )
+        .await
+        .expect("feed");
+        let _ = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator),
+            Path("j".into()),
+        )
+        .await
+        .expect("step");
+
+        let disp = api_ivm_dispatch_state(State(registry), Path("j".into()))
+            .await
+            .expect("dispatch state")
+            .0;
+        assert_eq!(disp.last.unwrap().mode, "central-partitioned");
+    }
+
+    #[tokio::test]
+    async fn dispatch_state_404s_on_missing_job() {
+        let (registry, _) = test_deps_with_shards(1);
+        let err = api_ivm_dispatch_state(State(registry), Path("nope".into()))
+            .await
+            .expect_err("must 404");
+        assert_eq!(err, StatusCode::NOT_FOUND);
+    }
+
+    // ── read-only view endpoints ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn snapshot_and_output_are_empty_before_any_step() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+
+        let snap = api_ivm_snapshot(
+            State(registry.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("snapshot");
+        assert_eq!(snap.num_rows, 0);
+        assert!(snap.snapshot_ipc_b64.is_none());
+
+        let out = api_ivm_view_output(State(registry), Path(("j".into(), "revenue".into())))
+            .await
+            .expect("output");
+        assert_eq!(out.num_rows, 0);
+        assert!(out.delta_ipc_b64.is_none());
+    }
+
+    #[tokio::test]
+    async fn view_output_returns_the_last_tick_delta() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        let _ = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(&["US"], &[9])),
+            }),
+        )
+        .await
+        .expect("feed");
+        let _ = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator),
+            Path("j".into()),
+        )
+        .await
+        .expect("step");
+
+        let out = api_ivm_view_output(State(registry), Path(("j".into(), "revenue".into())))
+            .await
+            .expect("output");
+        assert!(out.delta_ipc_b64.is_some());
+        assert!(out.num_rows > 0);
+    }
+
+    #[tokio::test]
+    async fn view_stats_404_for_unregistered_view_and_count_inserts() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+
+        let err = api_ivm_view_stats(
+            State(registry.clone()),
+            Path(("j".into(), "no-such-view".into())),
+        )
+        .await
+        .expect_err("unregistered view must 404");
+        assert_eq!(err, StatusCode::NOT_FOUND);
+
+        let _ = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(&["US", "EU"], &[1, 2])),
+            }),
+        )
+        .await
+        .expect("feed");
+        let _ = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator),
+            Path("j".into()),
+        )
+        .await
+        .expect("step");
+
+        let stats = api_ivm_view_stats(State(registry), Path(("j".into(), "revenue".into())))
+            .await
+            .expect("stats");
+        assert_eq!(stats.num_rows, 2);
+        assert!(stats.rows_inserted_total >= 2);
+        assert!(stats.last_tick_inserts >= 2);
+        assert_eq!(stats.rows_retracted_total, 0);
+    }
+
+    #[tokio::test]
+    async fn view_debug_info_reports_materialization_and_plan_choice() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        let _ = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(&["US"], &[1])),
+            }),
+        )
+        .await
+        .expect("feed");
+        let _ = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator),
+            Path("j".into()),
+        )
+        .await
+        .expect("step");
+
+        let info = api_ivm_view_debug_info(
+            State(registry.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("debug info");
+        assert!(info.is_materialized);
+        assert!(info.has_snapshot);
+        assert_eq!(info.snapshot_num_rows, 1);
+        assert!(info.has_last_output);
+        assert!(
+            !info.plan_reason.is_empty(),
+            "plan choice must always carry a reason (AUD-9 loud degradation)"
+        );
+
+        let err = api_ivm_view_debug_info(State(registry), Path(("j".into(), "ghost".into())))
+            .await
+            .expect_err("unknown view");
+        assert_eq!(err, StatusCode::BAD_REQUEST);
+    }
+
+    // ── checkpoint / restore ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn full_checkpoint_restores_earlier_view_state() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        let _ = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(&["US"], &[100])),
+            }),
+        )
+        .await
+        .expect("feed 1");
+        let _ = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("step 1");
+
+        let ckpt = api_ivm_checkpoint(State(registry.clone()), Path("j".into()))
+            .await
+            .expect("checkpoint")
+            .0;
+        assert!(!ckpt.checkpoint_b64.is_empty());
+
+        // Advance the state past the checkpoint…
+        let _ = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(&["US"], &[900])),
+            }),
+        )
+        .await
+        .expect("feed 2");
+        let _ = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("step 2");
+        let advanced = api_ivm_snapshot(
+            State(registry.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("snapshot");
+        assert_eq!(
+            decode_delta_rows(advanced.snapshot_ipc_b64.as_deref().unwrap()),
+            vec![("US".to_owned(), 1000.0)]
+        );
+
+        // …then restore back to the checkpointed state.
+        let _ = api_ivm_restore(
+            State(registry.clone()),
+            Path("j".into()),
+            Json(RestoreRequest {
+                checkpoint_b64: ckpt.checkpoint_b64,
+            }),
+        )
+        .await
+        .expect("restore");
+        let restored = api_ivm_snapshot(State(registry), Path(("j".into(), "revenue".into())))
+            .await
+            .expect("snapshot");
+        assert_eq!(
+            decode_delta_rows(restored.snapshot_ipc_b64.as_deref().unwrap()),
+            vec![("US".to_owned(), 100.0)],
+            "restore must rewind the materialized view to the checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn delta_checkpoint_round_trips() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        let _ = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(&["US"], &[5])),
+            }),
+        )
+        .await
+        .expect("feed");
+        let _ = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator),
+            Path("j".into()),
+        )
+        .await
+        .expect("step");
+
+        let delta_ckpt = api_ivm_checkpoint_delta(State(registry.clone()), Path("j".into()))
+            .await
+            .expect("checkpoint-delta")
+            .0;
+        let _ = api_ivm_restore_delta(
+            State(registry),
+            Path("j".into()),
+            Json(RestoreDeltaRequest {
+                checkpoint_delta_b64: delta_ckpt.checkpoint_delta_b64,
+            }),
+        )
+        .await
+        .expect("restore-delta");
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_bad_base64_and_garbage_bytes() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+
+        let err = api_ivm_restore(
+            State(registry.clone()),
+            Path("j".into()),
+            Json(RestoreRequest {
+                checkpoint_b64: "!!!".into(),
+            }),
+        )
+        .await
+        .expect_err("bad base64");
+        assert_eq!(err, StatusCode::BAD_REQUEST);
+
+        let err = api_ivm_restore(
+            State(registry),
+            Path("j".into()),
+            Json(RestoreRequest {
+                checkpoint_b64: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    b"not a checkpoint",
+                ),
+            }),
+        )
+        .await
+        .expect_err("garbage bytes");
+        assert_eq!(err, StatusCode::BAD_REQUEST);
+    }
+
+    // ── durable snapshot round trip through a store-backed coordinator ────────
+
+    #[tokio::test]
+    async fn evicted_job_is_restored_from_the_durable_snapshot() {
+        let (registry, _) = test_deps_with_shards(1);
+        let coordinator = SharedCoordinator::new(
+            Coordinator::active(CoordinatorId::try_new("test-coord").unwrap())
+                .with_store(crate::store::InMemoryMetadataStore::default()),
+        );
+        create_revenue_job(&registry, &coordinator, "j").await;
+        let _ = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(&["US"], &[100])),
+            }),
+        )
+        .await
+        .expect("feed");
+        let _ = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("step persists the snapshot");
+
+        // Simulate an in-memory eviction (process restart): the registry loses
+        // the job but the coordinator's store still holds the durable snapshot.
+        assert!(registry.delete("j"));
+        assert!(registry.get("j").is_none());
+
+        // list still surfaces the durably-persisted job…
+        let listed =
+            api_ivm_list_jobs(State(registry.clone()), State(coordinator.clone())).await;
+        assert!(listed.job_ids.contains(&"j".to_owned()));
+
+        // …and a state-reading handler that goes through ensure_ivm_job
+        // transparently restores it.
+        let _ = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(&["EU"], &[50])),
+            }),
+        )
+        .await
+        .expect("feed after restore");
+        let _ = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator),
+            Path("j".into()),
+        )
+        .await
+        .expect("step after restore");
+        let snap = api_ivm_snapshot(State(registry), Path(("j".into(), "revenue".into())))
+            .await
+            .expect("snapshot");
+        assert_eq!(
+            decode_delta_rows(snap.snapshot_ipc_b64.as_deref().unwrap()),
+            vec![("EU".to_owned(), 50.0), ("US".to_owned(), 100.0)],
+            "restored job must keep its pre-eviction materialized state"
+        );
+    }
+
+    // ── vector views ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn vector_view_rejects_unsupported_sink_and_missing_job() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+
+        let err = api_ivm_register_vector_view(
+            State(registry.clone()),
+            Path("nope".into()),
+            Json(RegisterVectorViewRequest {
+                view_name: "v".into(),
+                id_column: "id".into(),
+                vector_column: "vec".into(),
+                sink_type: "in_memory".into(),
+            }),
+        )
+        .await
+        .expect_err("missing job");
+        assert_eq!(err, StatusCode::NOT_FOUND);
+
+        create_revenue_job(&registry, &coordinator, "j").await;
+        let err = api_ivm_register_vector_view(
+            State(registry),
+            Path("j".into()),
+            Json(RegisterVectorViewRequest {
+                view_name: "v".into(),
+                id_column: "id".into(),
+                vector_column: "vec".into(),
+                sink_type: "qdrant".into(),
+            }),
+        )
+        .await
+        .expect_err("unsupported sink");
+        assert_eq!(err, StatusCode::BAD_REQUEST);
+    }
+
+    // ── schema JSON parsing ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_schema_supports_every_documented_type_and_rejects_unknown() {
+        let all = [
+            "Int8",
+            "Int16",
+            "Int32",
+            "Int64",
+            "UInt8",
+            "UInt16",
+            "UInt32",
+            "UInt64",
+            "Float32",
+            "Float64",
+            "Utf8",
+            "LargeUtf8",
+            "Boolean",
+            "Binary",
+            "TimestampMs",
+            "TimestampUs",
+            "Date32",
+            "Date64",
+        ];
+        let schema = parse_schema(&SchemaJson {
+            fields: all
+                .iter()
+                .map(|t| SchemaFieldJson {
+                    name: format!("f_{t}"),
+                    data_type: (*t).to_owned(),
+                    nullable: true,
+                })
+                .collect(),
+        })
+        .expect("all documented types must parse");
+        assert_eq!(schema.fields().len(), all.len());
+
+        assert!(
+            parse_schema(&SchemaJson {
+                fields: vec![SchemaFieldJson {
+                    name: "x".into(),
+                    data_type: "Struct".into(),
+                    nullable: false,
+                }],
+            })
+            .is_none(),
+            "unknown type must reject the whole schema"
+        );
     }
 
     /// #224 (C): job deletion must serialize against an in-flight `/step` via

@@ -444,3 +444,72 @@ async fn drain_barriers_without_context_is_noop() {
     let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
     assert_eq!(runner.drain_barriers_via_context().await, 0);
 }
+
+/// Phase 59 cancel-latency cert, streaming surface. The batch surface was
+/// live-proven at 0.03–0.23s (scripts/phase59_cancel_cert.sh); the run-loop
+/// checks its cancel tombstone at the top of every iteration but that
+/// transition had never been *timed*. This measures cancel→exit latency on a
+/// loop that is actively draining input (not idle-waking) and holds it to the
+/// certified ≤2s bound with heavy margin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_loop_cancel_latency_stays_inside_the_two_second_bound() {
+    let job_id = "rloop-cancel-latency";
+    let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new())
+        .with_own_task_endpoint(RLOOP_LOCAL_ENDPOINT);
+    let peers = rloop_peers_partition(1);
+    let assignment = make_rloop_assignment(job_id, 0, 1, Some(&peers));
+    let task_runner = runner.clone();
+    let handle =
+        tokio::spawn(async move { task_runner.execute_streaming_fragment(&assignment).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Keep the loop busy: push fresh batches every 5 ms until the task exits,
+    // so the measurement covers a working loop, not an idle notify wake-up.
+    let feeder_runner = runner.clone();
+    let feeder_job = job_id.to_owned();
+    let feeder = tokio::spawn(async move {
+        let mut ts = 0i64;
+        loop {
+            let batch = krishiv_common::test_fixtures::make_test_key_ts_batch(
+                vec!["k1", "k2"],
+                vec![ts, ts + 1],
+            )
+            .unwrap();
+            feeder_runner
+                .continuous_inputs
+                .entry(feeder_job.clone())
+                .or_default()
+                .push(batch);
+            feeder_runner.notify_continuous_input(&feeder_job);
+            ts += 10;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    });
+
+    // Let it chew on real input before cancelling.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let started = std::time::Instant::now();
+    let task_id = TaskId::try_new("task-streaming-0").unwrap();
+    runner
+        .inbox()
+        .cancel_task(&JobId::try_new(job_id).unwrap(), &task_id)
+        .unwrap();
+    runner.notify_continuous_input(&format!("{job_id}#task-streaming-0"));
+    runner.notify_continuous_input(job_id);
+
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        .await
+        .expect("run-loop must exit after cancel, not hang")
+        .expect("run-loop task must not panic")
+        .expect("run-loop task must exit cleanly on cancel");
+    let latency = started.elapsed();
+    feeder.abort();
+
+    assert_eq!(output.kind(), ExecutorTaskOutputKind::Cancelled);
+    assert!(
+        latency < std::time::Duration::from_secs(2),
+        "streaming cancel latency exceeded the certified 2s bound: {latency:?}"
+    );
+    eprintln!("phase59 streaming cancel->exit latency: {latency:?}");
+}

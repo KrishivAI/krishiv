@@ -1509,4 +1509,45 @@ mod tests {
             assert!(lookup(alias).is_some(), "alias {alias} must be declared");
         }
     }
+
+    /// FLAG-2 (audit §12): the security-relevant boolean flags
+    /// (`KRISHIV_ALLOW_ANONYMOUS`, `KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH`,
+    /// `KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS`) must resolve to the *same* boolean
+    /// at every read site regardless of capitalization/spelling. The original
+    /// finding was that one site parsed case-insensitively while another matched
+    /// exact `"true"`/`"1"`, so a flag could silently take effect on one path
+    /// and not another. Every site now routes through [`is_truthy`] /
+    /// [`truthy_env`] (grpc.rs's `parse_bool_env` is a one-line wrapper over
+    /// `truthy_env`, and `production.rs` uses `truthy_env` directly). This test
+    /// locks the shared parser's behavior across the capitalization variants a
+    /// deployment might realistically use, so a future divergent parser would
+    /// have to break this assertion, not just a distant integration test.
+    #[test]
+    fn flag2_security_flags_parse_uniformly_across_capitalizations() {
+        // Every documented truthy spelling, in the casings an operator might
+        // plausibly write in Helm values / env, must be accepted.
+        for truthy in [
+            "1", "true", "TRUE", "True", "yes", "YES", "on", "ON", " on ", "  TrUe  ",
+        ] {
+            assert!(
+                is_truthy(truthy),
+                "{truthy:?} must be recognized as enabling a security flag"
+            );
+            assert!(
+                !is_falsy(truthy),
+                "{truthy:?} must not also be recognized as falsy"
+            );
+        }
+        // Falsy / absent spellings must never enable a fail-closed flag.
+        for falsy in ["0", "false", "FALSE", "no", "NO", "off", "OFF", "", "   "] {
+            assert!(
+                !is_truthy(falsy),
+                "{falsy:?} must NOT enable a security flag"
+            );
+        }
+        // A typo'd value ("enabled") is neither truthy nor falsy — it is
+        // reported as suspicious by validate_env rather than silently enabling.
+        assert!(!is_truthy("enabled"));
+        assert!(!is_falsy("enabled"));
+    }
 }
