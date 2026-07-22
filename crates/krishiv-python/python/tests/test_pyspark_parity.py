@@ -141,6 +141,31 @@ def test_hash_functions_return_hex(session):
     assert row["s512"] == hashlib.sha512(b"abc").hexdigest()
 
 
+def test_explode(session):
+    df = session.sql(
+        "SELECT 1 AS id, make_array(10, 20, 30) AS a "
+        "UNION ALL SELECT 2 AS id, make_array(40, 50) AS a"
+    )
+    rows = df.select(col("id"), F.explode(col("a")).alias("e")).collect_rows()
+    assert sorted((r["id"], r["e"]) for r in rows) == [
+        (1, 10), (1, 20), (1, 30), (2, 40), (2, 50)
+    ]
+    # withColumn form keeps existing columns
+    wc = df.withColumn("e", F.explode(col("a"))).collect_rows()
+    assert len(wc) == 5 and {"id", "a", "e"} <= set(wc[0].keys())
+
+
+def test_posexplode(session):
+    df = session.sql("SELECT make_array(10, 20, 30) AS a")
+    rows = df.select(F.posexplode(col("a"))).collect_rows()
+    assert sorted((r["pos"], r["col"]) for r in rows) == [(0, 10), (1, 20), (2, 30)]
+
+
+def test_dataframe_unnest_primitive(session):
+    df = session.sql("SELECT 1 AS id, make_array(7, 8) AS a")
+    assert df.unnest(["a"]).count() == 2
+
+
 def test_array_functions(session):
     adf = session.createDataFrame([(1,)], ["z"]).select(
         F.array(lit(3), lit(1), lit(2)).alias("a")

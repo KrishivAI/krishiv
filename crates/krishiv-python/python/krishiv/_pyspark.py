@@ -78,6 +78,50 @@ def _rows(result: QueryResult) -> list:
     return [Row(**record) for record in table.to_pylist()]
 
 
+class _Explode:
+    """Marker produced by ``F.explode`` / ``F.posexplode``. It is not a Column;
+    the DataFrame ``select``/``withColumn`` adapters recognise it and route
+    through the engine's ``unnest`` so the row count expands (a plain Column
+    cannot, since explode changes cardinality)."""
+
+    def __init__(self, column, pos: bool = False) -> None:
+        self.column = _as_column(column)
+        self.pos = pos
+        self.col_name = "col"
+        self.pos_name = "pos"
+
+    def alias(self, *names: str) -> "_Explode":
+        if self.pos and len(names) == 2:
+            self.pos_name, self.col_name = names
+        elif names:
+            self.col_name = names[-1]
+        return self
+
+
+def explode(column) -> _Explode:
+    """Explode an array column into one row per element (PySpark `F.explode`)."""
+    return _Explode(column, pos=False)
+
+
+def posexplode(column) -> _Explode:
+    """Explode an array into ``(pos, col)`` rows, 0-based (PySpark `F.posexplode`)."""
+    return _Explode(column, pos=True)
+
+
+def _apply_explode(df: DataFrame, normal_cols: list, ex: _Explode) -> DataFrame:
+    prefix = [_as_column(c) for c in normal_cols]
+    if ex.pos:
+        # 0-based positions: generate_series(0, cardinality(arr) - 1) is a
+        # list column the same length as the exploded array, so unnesting both
+        # together zips element/position row-wise.
+        cardinality = call_function("cardinality", [ex.column]).cast("int64")
+        positions = call_function("generate_series", [lit(0), cardinality - lit(1)])
+        proj = prefix + [positions.alias(ex.pos_name), ex.column.alias(ex.col_name)]
+        return df.select_columns(proj).unnest([ex.pos_name, ex.col_name])
+    proj = prefix + [ex.column.alias(ex.col_name)]
+    return df.select_columns(proj).unnest([ex.col_name])
+
+
 # Native methods we override but must still be able to call in their original
 # form (the native list/string calling convention stays supported).
 _native = {
@@ -162,6 +206,12 @@ def _df_groupBy(self, *cols):
 
 def _df_select(self, *cols):
     cols = _flatten(cols)
+    explodes = [c for c in cols if isinstance(c, _Explode)]
+    if explodes:
+        if len(explodes) > 1:
+            raise ValueError("only one explode/posexplode is allowed per select()")
+        normal = [c for c in cols if not isinstance(c, _Explode)]
+        return _apply_explode(self, normal, explodes[0])
     if any(isinstance(c, Column) for c in cols):
         return self.select_columns([_as_column(c) for c in cols])
     # all plain names — preserve native name-based projection (validates cols)
@@ -179,6 +229,9 @@ def _df_filter(self, condition):
 
 
 def _df_withColumn(self, name: str, column):
+    if isinstance(column, _Explode):
+        column.col_name = name
+        return _apply_explode(self, [col(c) for c in self.columns()], column)
     return self.with_column(name, column.sql() if isinstance(column, Column) else str(column))
 
 

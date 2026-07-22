@@ -3149,6 +3149,14 @@ pub trait KrishivDataFrameOps: Send + Sync {
         expressions: &[&krishiv_plan::expression::Expr],
     ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 
+    /// Unnest (explode) one or more array/list columns, producing one output
+    /// row per element. Multiple equal-length columns are zipped element-wise
+    /// (DataFusion `DataFrame::unnest_columns`).
+    async fn unnest_columns(
+        &self,
+        columns: &[&str],
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
     /// Group by expressions and compute aggregate expressions.
     async fn aggregate(
         &self,
@@ -4266,6 +4274,14 @@ impl KrishivDataFrameOps for SqlDataFrame {
             .collect::<Result<Vec<_>, _>>()?;
         let df = self.dataframe.clone().select(expressions)?;
         Ok(Box::new(self.with_new_dataframe(df, "select_exprs")))
+    }
+
+    async fn unnest_columns(
+        &self,
+        columns: &[&str],
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let df = self.dataframe.clone().unnest_columns(columns)?;
+        Ok(Box::new(self.with_new_dataframe(df, "unnest")))
     }
 
     async fn aggregate(

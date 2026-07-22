@@ -286,6 +286,14 @@ def nth_value(column: ColumnLike, n: int) -> Column:
     return _nth_value(_to_column(column), n)
 
 
+# ── Generators (row-expanding) ──────────────────────────────────────────────
+#
+# `explode`/`posexplode` are not Columns — they change row cardinality — so they
+# return a marker the DataFrame `select`/`withColumn` adapters route through the
+# engine's `unnest`. Defined in the compat layer; re-exported here.
+from .._pyspark import explode, posexplode  # noqa: E402,F401
+
+
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 
@@ -944,6 +952,8 @@ __all__ = [
     "array_length",
     "cardinality",
     "flatten",
+    "explode",
+    "posexplode",
     # hashing
     "md5",
     "sha256",

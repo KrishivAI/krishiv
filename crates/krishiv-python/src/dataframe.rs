@@ -130,6 +130,16 @@ impl PyDataFrame {
             .map_err(map_krishiv_error)
     }
 
+    /// Unnest (explode) one or more array columns — one output row per element.
+    /// Multiple equal-length columns zip element-wise (PySpark `explode`/`posexplode`).
+    pub fn unnest(&self, columns: Vec<String>) -> PyResult<Self> {
+        let refs = columns.iter().map(String::as_str).collect::<Vec<_>>();
+        self.inner
+            .unnest(&refs)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
     pub fn filter_column(&self, predicate: PyColumn) -> PyResult<Self> {
         self.inner
             .filter_expr(predicate.inner)

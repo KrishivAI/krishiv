@@ -854,6 +854,21 @@ Execution statistics:
         }
     }
 
+    /// Unnest (explode) one or more array columns — one output row per element.
+    /// Multiple equal-length columns are zipped element-wise. Requires an
+    /// SQL-backed DataFrame.
+    pub fn unnest(&self, columns: &[&str]) -> Result<DataFrame> {
+        match &self.sql_dataframe {
+            Some(df) => {
+                let new_ops = krishiv_common::async_util::block_on(df.unnest_columns(columns))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None => Err(KrishivError::unsupported(
+                "unnest requires an SQL-backed DataFrame",
+            )),
+        }
+    }
+
     /// Filter rows using a typed expression.
     pub fn filter_expr(&self, predicate: Expr) -> Result<DataFrame> {
         match &self.sql_dataframe {
