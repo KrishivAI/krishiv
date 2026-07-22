@@ -57,6 +57,15 @@ check-k8s:
 check-full:
     {{ cargo }} check -p krishiv -p krishiv-operator \
         --no-default-features --features full
+    # Phase 63 exit gate (feature propagation): the certified profile must
+    # compile the executor's Iceberg *sink* path, which is gated behind
+    # `krishiv-executor/iceberg` (stage_iceberg_sink_output ->
+    # IcebergStreamingSink in fragment/streaming.rs + run_loop.rs). The
+    # `--features full` check above pulls it in transitively via
+    # krishiv -> full -> iceberg, but assert it by name so a future feature
+    # reshuffle that stops propagating iceberg to the executor fails loudly
+    # here instead of silently shipping a coordinator that can't commit sinks.
+    {{ cargo }} check -p krishiv-executor --features iceberg
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 
