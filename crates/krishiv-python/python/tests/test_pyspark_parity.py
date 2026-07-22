@@ -236,6 +236,20 @@ def test_reader_fluent(session, tmp_path):
     assert loaded.count() == 2
 
 
+def test_reader_csv_with_options(session, tmp_path):
+    src = session.sql("SELECT 1 AS id, 'a' AS name UNION ALL SELECT 2 AS id, 'b' AS name")
+    path = str(tmp_path / "out.csv")
+    src.write.mode("overwrite").option("header", True).csv(path)
+    loaded = session.read.format("csv").option("header", True).load(path)
+    assert loaded.count() == 2
+
+
+def test_persist_unpersist_return_self(df):
+    # PySpark cache/persist/unpersist all return the DataFrame for chaining.
+    assert df.persist().count() == 4
+    assert df.cache().unpersist().count() == 4
+
+
 def test_write_created_dataframe(session, tmp_path):
     # A createDataFrame result is MemTable-backed; the parquet write path must
     # fall back to client-side collect-then-write (the distributed sink cannot

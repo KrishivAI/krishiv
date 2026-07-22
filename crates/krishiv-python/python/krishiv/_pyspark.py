@@ -81,7 +81,14 @@ _native = {
     "filter": DataFrame.filter,
     "sort": DataFrame.sort,
     "grouped_agg": GroupedDataFrame.agg,
+    "unpersist": DataFrame.unpersist,
 }
+
+
+def _df_unpersist(self, blocking: bool = False):  # noqa: ARG001
+    # PySpark returns the DataFrame for chaining; the native call returns None.
+    _native["unpersist"](self)
+    return self
 
 
 def _agg_columns(*exprs, **named):
@@ -538,8 +545,10 @@ class DataFrameReader:
             header = self._options.get("header", True)
             header = header in (True, "true", "True")
             delimiter = self._options.get("sep", self._options.get("delimiter", ","))
+            if not isinstance(delimiter, str):
+                delimiter = chr(delimiter)
             return self._session.read_csv_with_options(
-                path, has_header=header, delimiter=ord(delimiter[0]) if isinstance(delimiter, str) else delimiter
+                path, has_header=header, delimiter=delimiter
             )
         if fmt in ("json", "ndjson"):
             return self._session.read_json(path)
@@ -666,6 +675,7 @@ def _apply() -> None:
     DataFrame.agg = _df_agg
     DataFrame.rollup = _df_rollup
     DataFrame.cube = _df_cube
+    DataFrame.unpersist = _df_unpersist
     GroupedDataFrame.agg = _grouped_agg
     DataFrame.unionByName = _df_unionByName
     DataFrame.unionAll = _df_unionAll
