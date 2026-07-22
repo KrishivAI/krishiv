@@ -714,6 +714,27 @@ impl FlightSqlService for KrishivFlightSqlService {
                 .ok_or_else(|| Status::not_found(format!("unknown prepared statement: {handle}")))?
         };
 
+        // Apply bound parameters (G16/G12) — CRITICAL for the JDBC driver.
+        // Its prepared-query flow reaches execution through *this*
+        // getFlightInfo → DoGet(ticket) path, which routes to the plain
+        // statement path, NOT `do_get_prepared_statement` (where substitution
+        // also happens). So the ticket built below must already carry the
+        // param-substituted SQL, and the schema must be inferred from it —
+        // otherwise `$1 … $N` reach the planner unbound and execution fails
+        // with "Placeholder '$N' was not provided a value". Mirrors the
+        // substitution in `do_get_prepared_statement`.
+        let sql = {
+            let mut params = self.bound_params.lock().await;
+            match params
+                .get_mut(&subject_key)
+                .and_then(|cache| cache.get(&handle))
+                .and_then(|b| b.first())
+            {
+                Some(batch) => substitute_sql_params(&sql, batch),
+                None => sql,
+            }
+        };
+
         // Build the same raw-SQL ticket the statement path produces
         // (`[4-byte txn_len = 0][sql]`), but attach the result schema when
         // the host can plan the statement: the JDBC driver's prepared-query
@@ -2143,6 +2164,81 @@ mod prepared_statement_schema_tests {
         assert!(
             result.dataset_schema.is_empty(),
             "DDL must not fabricate a dataset schema (and must not execute at prepare time)"
+        );
+    }
+
+    /// G12/G16 regression (found live via the Arrow JDBC driver 2026-07-22):
+    /// the JDBC prepared-query flow reaches execution through
+    /// `get_flight_info_prepared_statement` → `DoGet(ticket)`, which routes to
+    /// the plain statement path — NOT `do_get_prepared_statement`, where param
+    /// substitution also happens. So bound parameters must be substituted into
+    /// the ticket SQL *here*, or `$N` placeholders reach the planner unbound
+    /// ("Placeholder '$1' was not provided a value for execution"). This asserts
+    /// the substitution (and that the schema is inferred from the substituted,
+    /// plannable SQL — not the unbound `$1`).
+    #[tokio::test]
+    async fn prepared_query_flight_info_substitutes_bound_params() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow_flight::sql::{Any, TicketStatementQuery};
+        use prost::Message;
+
+        let svc = service();
+        // `?` exercises the ?→$1 rewrite as well.
+        let created = svc
+            .do_action_create_prepared_statement(
+                ActionCreatePreparedStatementRequest {
+                    query: "SELECT ? AS v".to_string(),
+                    transaction_id: None,
+                },
+                action_request(),
+            )
+            .await
+            .expect("create prepared statement");
+        let handle = String::from_utf8(created.prepared_statement_handle.to_vec()).unwrap();
+
+        // Bind a Utf8 param value (the JDBC setString path, matching the Utf8
+        // parameter schema). Inserted directly — the DoPut storage path is
+        // separate and simpler; this isolates the getFlightInfo substitution.
+        let param_schema = Arc::new(Schema::new(vec![Field::new("p1", DataType::Utf8, false)]));
+        let param_batch =
+            RecordBatch::try_new(param_schema, vec![Arc::new(StringArray::from(vec!["world"]))])
+                .unwrap();
+        {
+            let mut map = svc.bound_params.lock().await;
+            map.entry("__anon__".to_string())
+                .or_insert_with(|| lru::LruCache::new(read_prepared_stmt_capacity()))
+                .put(handle.clone(), vec![param_batch]);
+        }
+
+        let info = svc
+            .get_flight_info_prepared_statement(
+                CommandPreparedStatementQuery {
+                    prepared_statement_handle: handle.into_bytes().into(),
+                },
+                Request::new(arrow_flight::FlightDescriptor::default()),
+            )
+            .await
+            .expect("prepared getFlightInfo")
+            .into_inner();
+
+        // Decode the endpoint ticket → TicketStatementQuery → [4-byte len=0][sql].
+        let ticket = info.endpoint[0]
+            .ticket
+            .as_ref()
+            .expect("endpoint ticket")
+            .ticket
+            .clone();
+        let any = Any::decode(ticket).expect("decode Any");
+        let tsq: TicketStatementQuery = any.unpack().expect("unpack").expect("TicketStatementQuery");
+        let sql = std::str::from_utf8(&tsq.statement_handle[4..]).expect("sql utf8");
+        assert_eq!(
+            sql, "SELECT 'world' AS v",
+            "bound param must be substituted into the ticket SQL for the JDBC flow"
+        );
+        assert!(
+            !info.schema.is_empty(),
+            "schema must be inferred from the substituted (plannable) SQL, not unbound $1"
         );
     }
 }

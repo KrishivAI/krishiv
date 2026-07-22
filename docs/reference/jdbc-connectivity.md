@@ -50,10 +50,22 @@ launcher config. See https://arrow.apache.org/docs/java/install.html.
 | Typed multi-column result (`ResultSetMetaData`) | column count + SQL types (e.g. `BIGINT`) |
 | Large aggregation (`GROUP BY` over 300k rows) | correct grouped results streamed |
 
-## Known limitation
+## Prepared statements with parameters
 
-Server-side prepared-statement parameter binding uses `$N` placeholders, not the
-JDBC `?` placeholder, so `PreparedStatement.setX(...)` with `?` is not yet mapped
-(tracked as G12). Inline the values, or use `$1`-style parameters, until the `?`→
-`$N` mapping lands. Non-parameterized prepared statements and all metadata paths
-work.
+`PreparedStatement` with `?` placeholders works: the server rewrites JDBC `?`
+positional placeholders to its `$1 … $N` machinery (string-literal- and
+quoted-identifier-aware), and the bound values are substituted into the query
+before execution — through **both** the DoGet-prepared path and the
+`GetFlightInfo → DoGet(ticket)` path the Arrow JDBC driver actually uses.
+
+- **String parameters** (`PreparedStatement.setString`) are fully supported.
+- **Non-string typed parameters** (`setInt`, `setLong`, `setDouble`, …) are
+  currently **rejected by the JDBC driver client-side**: the server advertises a
+  parameter schema of `Utf8` (it cannot infer per-parameter types from a bare
+  `?`/`$N` without planning the statement), and the driver enforces that schema
+  before sending the value. Until per-parameter type inference lands, bind typed
+  params as strings (`setString`) — the server renders each bound Arrow value as
+  the correct SQL literal regardless — or inline the literal. (Residual: G12
+  parameter-type inference.)
+
+Non-parameterized prepared statements and all metadata paths work fully.
