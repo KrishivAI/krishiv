@@ -108,6 +108,37 @@ def _df_agg(self, *exprs, **named):
     return _grouped_agg(self.group_by_columns([]), *exprs, **named)
 
 
+class _GroupingSet:
+    """PySpark ``df.rollup(...)`` / ``df.cube(...)`` — a grouping-set builder
+    finalized with ``.agg(...)`` or ``.count()``."""
+
+    def __init__(self, df: DataFrame, cols: list, kind: str) -> None:
+        self._df = df
+        self._groups = [c if isinstance(c, Column) else col(c) for c in cols]
+        self._kind = kind
+
+    def agg(self, *exprs, **named):
+        columns, strings = _agg_columns(*exprs, **named)
+        columns.extend(expr(s) for s in strings)
+        grouped = self._df.group_by_columns([])
+        if self._kind == "rollup":
+            return grouped.rollup(self._groups, columns)
+        return grouped.cube(self._groups, columns)
+
+    def count(self):
+        from .sql.functions import count_all  # noqa: PLC0415
+
+        return self.agg(count_all().alias("count"))
+
+
+def _df_rollup(self, *cols):
+    return _GroupingSet(self, _flatten(cols), "rollup")
+
+
+def _df_cube(self, *cols):
+    return _GroupingSet(self, _flatten(cols), "cube")
+
+
 # ── DataFrame: transforms (PySpark camelCase + varargs + Column) ─────────────
 
 
@@ -633,6 +664,8 @@ def _apply() -> None:
     DataFrame.dropDuplicates = _df_dropDuplicates
     DataFrame.drop_duplicates = _df_dropDuplicates
     DataFrame.agg = _df_agg
+    DataFrame.rollup = _df_rollup
+    DataFrame.cube = _df_cube
     GroupedDataFrame.agg = _grouped_agg
     DataFrame.unionByName = _df_unionByName
     DataFrame.unionAll = _df_unionAll

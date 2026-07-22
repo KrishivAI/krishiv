@@ -783,11 +783,13 @@ def md5(column: ColumnLike) -> Column:
 
 
 def sha256(column: ColumnLike) -> Column:
-    return call_function("sha256", column)
+    """SHA-256 as a lowercase hex string (PySpark `F.sha2(col, 256)`)."""
+    return call_function("encode", call_function("sha256", column), lit("hex"))
 
 
 def sha512(column: ColumnLike) -> Column:
-    return call_function("sha512", column)
+    """SHA-512 as a lowercase hex string (PySpark `F.sha2(col, 512)`)."""
+    return call_function("encode", call_function("sha512", column), lit("hex"))
 
 
 __all__ = [

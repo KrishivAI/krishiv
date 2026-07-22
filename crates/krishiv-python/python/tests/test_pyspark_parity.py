@@ -117,6 +117,30 @@ def test_grouped_agg(df):
     assert result == {1: 50.0, 2: 20.0, 3: 30.0}
 
 
+def test_rollup_and_cube(df):
+    # rollup over id adds the grand-total (id = None) super-aggregate row.
+    rolled = {
+        r["id"]: r["s"]
+        for r in df.rollup("id").agg(F.sum("amount").alias("s")).collect_rows()
+    }
+    assert rolled[1] == 50.0 and rolled[2] == 20.0 and rolled[3] == 30.0
+    assert rolled[None] == 100.0  # grand total
+    assert df.cube("id").count().count() == 4  # 3 groups + grand total
+
+
+def test_hash_functions_return_hex(session):
+    import hashlib  # noqa: PLC0415
+
+    row = session.createDataFrame([(1,)], ["z"]).select(
+        F.md5(lit("abc")).alias("m"),
+        F.sha256(lit("abc")).alias("s256"),
+        F.sha512(lit("abc")).alias("s512"),
+    ).collect_rows()[0]
+    assert row["m"] == hashlib.md5(b"abc").hexdigest()
+    assert row["s256"] == hashlib.sha256(b"abc").hexdigest()
+    assert row["s512"] == hashlib.sha512(b"abc").hexdigest()
+
+
 def test_array_functions(session):
     adf = session.createDataFrame([(1,)], ["z"]).select(
         F.array(lit(3), lit(1), lit(2)).alias("a")
