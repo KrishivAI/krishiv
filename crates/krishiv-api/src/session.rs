@@ -3307,7 +3307,23 @@ impl Session {
         name: &str,
         batches: Vec<arrow::record_batch::RecordBatch>,
     ) -> Result<()> {
-        krishiv_common::async_util::block_on(self.sql_engine.register_record_batches(name, batches))
+        block_on(self.register_record_batches_async(name, batches))
+    }
+
+    /// Asynchronously register in-memory Arrow batches as a queryable table.
+    ///
+    /// Phase 61 (#15 async completeness): the async twin of
+    /// [`register_record_batches`](Self::register_record_batches). Prefer this
+    /// from async code — the sync form blocks the current thread on it, which
+    /// from inside a Tokio runtime forces a thread hop.
+    pub async fn register_record_batches_async(
+        &self,
+        name: &str,
+        batches: Vec<arrow::record_batch::RecordBatch>,
+    ) -> Result<()> {
+        self.sql_engine
+            .register_record_batches(name, batches)
+            .await
             .map_err(KrishivError::from)
     }
 
