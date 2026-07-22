@@ -329,6 +329,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "Target data-file size for durable CTAS writes.",
     ),
     rt(
+        "KRISHIV_DAEMON_RUNTIME_THREADS",
+        FlagKind::UInt,
+        "auto (min(cpu, 4) embedded; cpu for a full daemon)",
+        "Tokio worker-thread count for a long-running coordinator/executor daemon runtime; 0 or unset auto-sizes from CPU count.",
+    ),
+    rt(
         "KRISHIV_DEPLOYMENT_TARGET",
         FlagKind::Text,
         "unknown",
@@ -763,6 +769,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "Cap on total spooled result bytes per node.",
     ),
     rt(
+        "KRISHIV_RESULT_SPOOL_SYNC_INTERVAL_BYTES",
+        FlagKind::UInt,
+        "67108864",
+        "Bytes written between fsyncs of the disk-spooled result file; 0 or unset uses the 64 MiB default.",
+    ),
+    rt(
         "KRISHIV_ROCKSDB_MAX_OPEN_FILES",
         FlagKind::Int,
         "rocksdb default",
@@ -965,6 +977,12 @@ pub static FLAGS: &[FlagSpec] = &[
         FlagKind::Path,
         "unset",
         "TLS private-key path for coordinator/executor gRPC servers.",
+    ),
+    rt(
+        "KRISHIV_UI",
+        FlagKind::Bool,
+        "on",
+        "Embedded web-UI off-switch: KRISHIV_UI=off boots the daemon without the always-on embedded UI factory (certified platform profile sets off).",
     ),
     rt(
         "KRISHIV_UI_TOKEN",
@@ -1424,10 +1442,19 @@ mod tests {
             .to_path_buf()
     }
 
-    /// Meta-flags of test harnesses, not engine configuration: the registry
-    /// bless flag (read only below) and the conformance-corpus bless flag
-    /// (read only in `krishiv-conformance/tests/corpus.rs`).
-    const SCAN_ALLOWLIST: &[&str] = &["KRISHIV_BLESS_ENV_REFERENCE", "KRISHIV_BLESS_CORPUS"];
+    /// Meta-flags of test harnesses, not engine configuration: doc/reference
+    /// "bless" switches read only inside a test to regenerate a committed
+    /// golden file (env reference, conformance corpus, connector-reachability
+    /// doc, PySpark-parity doc, SQL-grammar doc). These are developer doc-gen
+    /// toggles, never product configuration, so they are exempt from the
+    /// declared-flag scan rather than surfaced in the env reference.
+    const SCAN_ALLOWLIST: &[&str] = &[
+        "KRISHIV_BLESS_ENV_REFERENCE",
+        "KRISHIV_BLESS_CORPUS",
+        "KRISHIV_BLESS_CONNECTOR_DOCS",
+        "KRISHIV_BLESS_PYSPARK_PARITY",
+        "KRISHIV_BLESS_SQL_DOCS",
+    ];
 
     #[test]
     fn every_flag_read_in_source_is_declared() {

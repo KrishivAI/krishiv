@@ -42,6 +42,7 @@ Regenerate with:
 | `KRISHIV_COORDINATOR_ID` | text | `coordinator-1` | Stable identity of this coordinator instance (leader election, fencing). |
 | `KRISHIV_COORDINATOR_URL` | url | `unset` | Canonical coordinator gRPC URL clients and executors connect to. |
 | `KRISHIV_CTAS_TARGET_FILE_BYTES` | uint | `134217728` | Target data-file size for durable CTAS writes. |
+| `KRISHIV_DAEMON_RUNTIME_THREADS` | uint | `auto (min(cpu, 4) embedded; cpu for a full daemon)` | Tokio worker-thread count for a long-running coordinator/executor daemon runtime; 0 or unset auto-sizes from CPU count. |
 | `KRISHIV_DEPLOYMENT_TARGET` | text | `unknown` | Deployment label attached to telemetry (dev, staging, prod…). |
 | `KRISHIV_DURABILITY_PROFILE` | dev-local \| single-node-durable \| distributed-durable | `dev-local` | Durability/safety profile; gates auth, state persistence, and connector requirements. |
 | `KRISHIV_ETCD_ENDPOINTS` | list | `unset` | Comma-separated etcd endpoints for HA leader election (clusterd etcd feature). |
@@ -112,6 +113,7 @@ Regenerate with:
 | `KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH` | bool | `profile-dependent` | Require bearer auth on executor task gRPC even in dev profiles. |
 | `KRISHIV_RESULT_SPOOL_DIR` | path | `temp dir` | Directory for disk-spooled large query results. |
 | `KRISHIV_RESULT_SPOOL_MAX_BYTES` | uint | `1073741824` | Cap on total spooled result bytes per node. |
+| `KRISHIV_RESULT_SPOOL_SYNC_INTERVAL_BYTES` | uint | `67108864` | Bytes written between fsyncs of the disk-spooled result file; 0 or unset uses the 64 MiB default. |
 | `KRISHIV_ROCKSDB_MAX_OPEN_FILES` | int | `rocksdb default` | RocksDB max_open_files for state/metadata stores (-1 = unlimited). |
 | `KRISHIV_ROCKSDB_WRITE_BUFFER_MB` | uint | `rocksdb default` | RocksDB write-buffer (memtable) size in MiB. |
 | `KRISHIV_RUNTIME_FILTERS` | bool | `on` | DataFusion dynamic (runtime) filters: TopK / join / aggregate predicates pushed into probe-side file scans at execution time (Phase 54). `off` disables all three via the DataFusion master switch. |
@@ -136,7 +138,7 @@ Regenerate with:
 | `KRISHIV_STATE_DFS_ROOT` | path | `unset` | DFS/object-store root for the disaggregated state backend. |
 | `KRISHIV_STATE_DIR` | path | `unset` | Executor state-backend directory (RocksDB window/operator state). |
 | `KRISHIV_STREAMING_TASK_TIMEOUT_SECS` | uint | `unset` | Watchdog timeout for streaming task cycles; unset = disabled. |
-| `KRISHIV_STREAM_EARLY_FIRE_MS` | uint | `unset` | Speculative early-fire interval for open windows (embedded loop; the state-backed operator accessor is a known gap). |
+| `KRISHIV_STREAM_EARLY_FIRE_MS` | uint | `unset` | Speculative early-fire interval for open windows (embedded loop only — the distributed stream:rloop: run-loop does not read this flag). |
 | `KRISHIV_STREAM_LINGER_MS` | uint | `profile` | Run-loop batch/linger before each drain in ms; overrides the KRISHIV_STREAM_PROFILE default (0 low-latency, 5 throughput). |
 | `KRISHIV_STREAM_PROFILE` | low-latency \| throughput | `low-latency` | Streaming loop profile: embedded checkpoint cadence and the distributed run-loop batch/linger dial (Phase 55). |
 | `KRISHIV_TARGET_PARALLELISM` | uint | `cores` | DataFusion target partition count for local execution. |
@@ -145,6 +147,7 @@ Regenerate with:
 | `KRISHIV_TASK_TARGET_PARALLELISM` | uint | `cores/slots` | DataFusion parallelism per executor task engine; unset = per-slot share of cores. |
 | `KRISHIV_TLS_CERT` | path | `unset` | TLS certificate path for coordinator/executor gRPC servers. |
 | `KRISHIV_TLS_KEY` | path | `unset` | TLS private-key path for coordinator/executor gRPC servers. |
+| `KRISHIV_UI` | bool | `on` | Embedded web-UI off-switch: KRISHIV_UI=off boots the daemon without the always-on embedded UI factory (certified platform profile sets off). |
 | `KRISHIV_UI_TOKEN` | secret | `unset` | Bearer token protecting the embedded web UI. |
 | `KRISHIV_UI_TOKEN_FILE` | path | `unset` | File containing the UI bearer token. |
 | `KRISHIV_UNITY_CATALOG_NAME` | text | `main` | Catalog name to register the Unity Catalog integration under. |
