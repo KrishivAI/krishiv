@@ -346,36 +346,37 @@ fn validate_manifest_entries(
     if !manifest.contains("metadata.json") {
         return Ok(false);
     }
-    for (path, expected_hex) in manifest.entries() {
-        validate_manifest_relative_path(path, epoch)?;
-        let full = format!("{base_prefix}/{path}");
-        match storage.read_bytes(&full)? {
-            None => return Ok(false),
-            Some(data) => {
-                // Stream-hash via BufReader to avoid loading large files into
-                // memory twice (once for read, once for digest).
-                use std::io::Read as _;
-                let mut reader = std::io::BufReader::new(data.as_slice());
-                let mut hasher = Sha256::new();
-                let mut buf = [0u8; 8192];
-                loop {
-                    let n = reader
-                        .read(&mut buf)
-                        .map_err(|e| CheckpointError::Storage {
-                            message: format!("reading {full} for hash: {e}"),
-                        })?;
-                    if n == 0 {
-                        break;
-                    }
-                    if let Some(chunk) = buf.get(..n) {
-                        hasher.update(chunk);
-                    }
-                }
-                let hash = format!("{:x}", hasher.finalize());
-                if hash != *expected_hex {
-                    return Ok(false);
+    // Phase 65: read + SHA-256 each manifest entry in parallel on the compute
+    // pool. Every entry's read (I/O) + digest (CPU) is independent, and this
+    // sits on the DUR-2 barrier critical path, so parallelizing it directly
+    // shrinks the barrier window on wide state. Peak memory stays bounded by the
+    // pool thread count (one file's bytes per worker), preserving the streaming
+    // intent. `CheckpointStorage: Send + Sync`. Any missing/mismatched entry
+    // invalidates the whole manifest regardless of order, so computing every
+    // result before checking is equivalent to the serial early-return (the
+    // common valid case hashes all entries anyway; only the rare invalid case
+    // does marginally more work, off the latency path).
+    let entries: Vec<(&str, &str)> = manifest.entries().collect();
+    let results: Vec<CheckpointResult<bool>> =
+        krishiv_common::compute_pool::par_map(entries, |(path, expected_hex)| {
+            validate_manifest_relative_path(path, epoch)?;
+            let full = format!("{base_prefix}/{path}");
+            match storage.read_bytes(&full)? {
+                None => Ok(false),
+                Some(data) => {
+                    // `data` is already fully in memory (read_bytes returns a
+                    // Vec), so a single digest pass is equivalent to the former
+                    // BufReader streaming, without the extra copy loop.
+                    let mut hasher = Sha256::new();
+                    hasher.update(&data);
+                    let hash = format!("{:x}", hasher.finalize());
+                    Ok(hash == expected_hex)
                 }
             }
+        });
+    for result in results {
+        if !result? {
+            return Ok(false);
         }
     }
     Ok(true)
