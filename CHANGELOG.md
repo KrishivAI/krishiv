@@ -38,6 +38,26 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Fixed
 
+- **Incremental-view (IVM) job safety hardening** (2026-07-22). Two real bugs
+  found while certifying cancel latency (#224), plus a design clarification.
+  (1) A **central-computed** IVM tick — the fallback taken when no executor
+  can accept work or a resident dispatch failed — ran unbounded, so a
+  pathologically large delta could block the coordinator's HTTP handler *and*
+  hold the per-job step lock indefinitely, wedging every subsequent tick and
+  deletion for that job. It is now bounded by the same timeout as the
+  resident-dispatch path (`503 Service Unavailable` on expiry, retryable).
+  (2) Deleting an IVM job **raced** a concurrent `/step`: the step's trailing
+  snapshot persist could land *after* deletion removed the snapshot,
+  resurrecting a deleted job on disk. `DELETE` now holds the per-job step
+  lock, so it either wins outright (the next tick 404s) or waits for the
+  in-flight tick, whose persist then no-ops because the registry entry is
+  gone; a regression test proves the handler serializes on the lock.
+  Separately clarified (with a code comment) that an IVM tick is deliberately
+  *not* drop-cancellable mid-flight — it applies already-accepted deltas that
+  must be reflected for correctness, so the wall-clock timeout is the safety
+  bound and any failure recovers by re-attaching from the coordinator's
+  authoritative state mirror.
+
 - **Task launch no longer livelocks when its executor is circuit-broken or
   lost** (Phase 58/53, 2026-07-13). If a task was assigned to an executor that
   then dropped out of the launch leases — filtered by the circuit breaker after

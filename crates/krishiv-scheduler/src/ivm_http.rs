@@ -225,6 +225,17 @@ pub async fn api_ivm_delete_job(
     State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
 ) -> Json<DeleteJobResponse> {
+    // Serialize against any in-flight `/step` for this job by holding the same
+    // per-job step lock a tick holds (#224 C). Without this, deletion races a
+    // concurrent tick: the tick reads its snapshot, we remove it here, then the
+    // tick's trailing `persist_ivm_job` writes the snapshot back — resurrecting
+    // a deleted job on disk. Taking the lock makes deletion either win outright
+    // (the next tick's `ensure_ivm_job` 404s) or wait for the in-flight tick to
+    // finish first (whose `persist` then no-ops because the registry entry is
+    // gone). The wait is bounded by one tick's timeout now that both the
+    // resident and central step paths are time-bounded (#224 B).
+    let _step_guard = registry.step_lock(&job_id).lock_owned().await;
+
     // Best-effort detach of the resident executor flow (Phase 57): fire the
     // detach fragment in the background so job deletion never blocks on an
     // executor round trip. If it fails, the orphaned flow is bounded by the
@@ -443,10 +454,7 @@ pub async fn api_ivm_step(
                         at_unix_ms: krishiv_common::async_util::unix_now_ms(),
                     });
                 });
-                flow.step_datafusion().await.map_err(|e| {
-                    tracing::error!("IVM central fallback error for job {job_id}: {e}");
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?
+                central_step_with_timeout(&flow, &job_id).await?
             }
         }
     } else {
@@ -464,10 +472,7 @@ pub async fn api_ivm_step(
                 at_unix_ms: krishiv_common::async_util::unix_now_ms(),
             });
         });
-        flow.step_datafusion().await.map_err(|e| {
-            tracing::error!("IVM step error for job {job_id}: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
+        central_step_with_timeout(&flow, &job_id).await?
     };
 
     let tick = flow.tick().unwrap_or(0);
@@ -481,6 +486,42 @@ pub async fn api_ivm_step(
 
 /// Timeout for a dispatched IVM fragment before falling back to central compute.
 const IVM_DISPATCH_TIMEOUT_SECS: u64 = 300;
+
+/// Run one **central** (in-coordinator) IVM tick under the same safety timeout
+/// the resident-dispatch path already enforces (#224 B).
+///
+/// The central path is the fallback taken when no executor can accept work or a
+/// resident dispatch failed. Before this it ran unbounded, so a pathologically
+/// large delta could block the HTTP handler — and, worse, hold the per-job step
+/// lock — indefinitely, wedging every subsequent tick and deletion for that job.
+/// The bound matches [`IVM_DISPATCH_TIMEOUT_SECS`] so both step paths behave
+/// identically. A timeout surfaces as `503 Service Unavailable` (retryable),
+/// never a silent hang.
+async fn central_step_with_timeout(
+    flow: &crate::ivm::IvmJob,
+    job_id: &str,
+) -> Result<krishiv_ivm::StepSummary, StatusCode> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(IVM_DISPATCH_TIMEOUT_SECS),
+        flow.step_datafusion(),
+    )
+    .await
+    {
+        Ok(Ok(summary)) => Ok(summary),
+        Ok(Err(e)) => {
+            tracing::error!(job_id, error = %e, "IVM central step failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Err(_elapsed) => {
+            tracing::error!(
+                job_id,
+                timeout_secs = IVM_DISPATCH_TIMEOUT_SECS,
+                "IVM central step timed out"
+            );
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
+    }
+}
 
 /// Submit one IVM fragment as a scheduler batch job, await its terminal state,
 /// and return the inline result blob (if any).
@@ -1150,4 +1191,59 @@ pub fn ivm_router(state: IvmRouterState) -> Router<()> {
             post(api_ivm_register_vector_view),
         )
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Coordinator;
+    use krishiv_proto::CoordinatorId;
+
+    fn test_deps() -> (SharedIvmJobRegistry, SharedCoordinator) {
+        (
+            std::sync::Arc::new(crate::ivm::IvmJobRegistry::new()),
+            SharedCoordinator::new(Coordinator::active(
+                CoordinatorId::try_new("test-coord").unwrap(),
+            )),
+        )
+    }
+
+    /// #224 (C): job deletion must serialize against an in-flight `/step` via
+    /// the per-job step lock, so a concurrent tick cannot re-persist (resurrect)
+    /// the snapshot after deletion removed it. This proves the handler *waits*
+    /// on a held step lock rather than racing past it. Without the fix in
+    /// `api_ivm_delete_job`, the handler never touches the lock and finishes
+    /// immediately even while a tick holds it.
+    #[tokio::test]
+    async fn delete_waits_for_the_per_job_step_lock() {
+        let (registry, coordinator) = test_deps();
+        let job_id = "resurrect-me".to_owned();
+        registry.create(job_id.clone()).unwrap();
+
+        // Simulate an in-flight /step by holding the same per-job step lock.
+        let held = registry.step_lock(&job_id).lock_owned().await;
+
+        let delete = tokio::spawn({
+            let (registry, coordinator, job_id) =
+                (registry.clone(), coordinator.clone(), job_id.clone());
+            async move {
+                api_ivm_delete_job(State(registry), State(coordinator), Path(job_id)).await
+            }
+        });
+
+        // While the lock is held, deletion must not complete.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !delete.is_finished(),
+            "delete completed without waiting on the step lock (resurrection race open)"
+        );
+
+        // Releasing the lock lets deletion proceed to completion.
+        drop(held);
+        let resp = tokio::time::timeout(Duration::from_secs(2), delete)
+            .await
+            .expect("delete did not finish within 2s of lock release")
+            .expect("delete task panicked");
+        assert!(resp.deleted, "job should have been reported deleted");
+    }
 }

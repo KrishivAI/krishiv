@@ -925,6 +925,19 @@ impl ExecutorTaskRunner {
                 // executor's persistent per-job flow (attach/tick/ckpt/detach).
                 // The legacy `delta:step:` stateless tick is kept for
                 // rolling-upgrade compatibility with older coordinators.
+                //
+                // Unlike the Batch branch above, a tick is deliberately NOT
+                // raced against a cancel-watch (#224). A tick applies deltas
+                // that have *already been accepted* into the system; dropping
+                // it mid-flight would not cancel logical work, it would lose
+                // committed data. In-place `feed()` + `step_datafusion()` is
+                // also not drop-atomic. The safety model is instead: bound the
+                // tick with a wall-clock timeout, and on any failure the
+                // coordinator marks the job `attached=false` so the next step
+                // re-attaches from its authoritative mirror (replacing the
+                // partially-advanced resident flow). There is likewise no
+                // user-facing surface that cancels an individual tick — job
+                // deletion stops *future* ticks (see api_ivm_delete_job).
                 let timeout_secs = assignment
                     .task_timeout_secs()
                     .unwrap_or(DEFAULT_BATCH_TASK_TIMEOUT_SECS);
