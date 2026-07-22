@@ -1602,7 +1602,8 @@ impl IncrementalFlow {
     pub fn restore(&self, bytes: &[u8]) -> IvmResult<()> {
         let mut pos = 0usize;
         let n = read_u32(bytes, &mut pos)? as usize;
-        let mut source_snapshots: HashMap<String, RecordBatch> = HashMap::with_capacity(n);
+        let mut source_snapshots: HashMap<String, RecordBatch> =
+            HashMap::with_capacity(bounded_capacity(n, bytes.len()));
         for _ in 0..n {
             let name_len = read_u32(bytes, &mut pos)? as usize;
             let name = std::str::from_utf8(bytes.get(pos..pos + name_len).ok_or_else(slice_err)?)
@@ -1835,7 +1836,8 @@ impl IncrementalFlow {
     pub fn restore_full(&self, bytes: &[u8]) -> IvmResult<()> {
         let mut pos = 0usize;
         let n_sources = read_u32(bytes, &mut pos)? as usize;
-        let mut source_snapshots: HashMap<String, RecordBatch> = HashMap::with_capacity(n_sources);
+        let mut source_snapshots: HashMap<String, RecordBatch> =
+            HashMap::with_capacity(bounded_capacity(n_sources, bytes.len()));
         for _ in 0..n_sources {
             let (name, batch) = decode_named_batch(bytes, &mut pos)?;
             source_snapshots.insert(name, batch);
@@ -1843,7 +1845,7 @@ impl IncrementalFlow {
         let n_views = read_u32(bytes, &mut pos)? as usize;
         // Pairs of (snapshot, full_output) per view name.
         let mut view_state: HashMap<String, (Option<RecordBatch>, Option<RecordBatch>)> =
-            HashMap::with_capacity(n_views);
+            HashMap::with_capacity(bounded_capacity(n_views, bytes.len()));
         for _ in 0..n_views {
             let (name, snap) = decode_named_batch_opt(bytes, &mut pos)?;
             let (_name2, full) = decode_named_batch_opt(bytes, &mut pos)?;
@@ -2210,6 +2212,18 @@ fn read_u32(bytes: &[u8], pos: &mut usize) -> IvmResult<u32> {
     Ok(u32::from_le_bytes(arr))
 }
 
+/// Capacity hint for a collection whose element count `n` was just read from an
+/// untrusted checkpoint blob. Every element consumes at least a 4-byte length
+/// prefix, so a blob of `len` bytes can encode at most `len / 4` elements —
+/// preallocating beyond that is impossible-to-fill and, on a corrupt/garbage
+/// blob, a huge `n` (up to `u32::MAX`) turns `with_capacity(n)` into a
+/// multi-gigabyte allocation that aborts the process. Clamp the hint; the
+/// per-element reads below still fail cleanly with `slice_err` once the bytes
+/// run out.
+fn bounded_capacity(n: usize, total_bytes: usize) -> usize {
+    n.min(total_bytes / 4)
+}
+
 fn slice_err() -> IvmError {
     IvmError::execution("checkpoint bytes truncated")
 }
@@ -2344,7 +2358,7 @@ pub fn encode_batch_map(map: &HashMap<String, RecordBatch>) -> IvmResult<Vec<u8>
 pub fn decode_batch_map(bytes: &[u8]) -> IvmResult<HashMap<String, RecordBatch>> {
     let mut pos = 0usize;
     let n = read_u32(bytes, &mut pos)? as usize;
-    let mut map = HashMap::with_capacity(n);
+    let mut map = HashMap::with_capacity(bounded_capacity(n, bytes.len()));
     for _ in 0..n {
         let (name, batch) = decode_named_batch(bytes, &mut pos)?;
         map.insert(name, batch);
@@ -2384,7 +2398,7 @@ pub fn decode_delta_map(bytes: &[u8]) -> IvmResult<HashMap<String, DeltaBatch>> 
         .ok_or_else(|| IvmError::execution("blob is not an IVM delta map (missing magic)"))?;
     let mut pos = 0usize;
     let n = read_u32(rest, &mut pos)? as usize;
-    let mut map = HashMap::with_capacity(n);
+    let mut map = HashMap::with_capacity(bounded_capacity(n, rest.len()));
     for _ in 0..n {
         let name = decode_name(rest, &mut pos)?;
         let len = read_u32(rest, &mut pos)? as usize;
@@ -2586,6 +2600,38 @@ mod integration_tests {
     fn make_batch(ids: &[i32]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids.to_vec()))]).unwrap()
+    }
+
+    // ── Robustness: corrupt/garbage checkpoint bytes must error, not OOM ───────
+
+    /// A garbage blob whose leading u32 count is enormous must NOT be trusted as
+    /// a `with_capacity` hint — before the `bounded_capacity` clamp, four bytes
+    /// of `0xFF` made `restore_full`/`restore`/`restore_delta` try to allocate
+    /// ~69 GB and abort the process (SIGABRT). Now every corrupt blob returns a
+    /// clean `Err` (truncated bytes) once the per-element reads run past the end.
+    #[test]
+    fn corrupt_checkpoint_bytes_error_instead_of_aborting() {
+        let flow = IncrementalFlow::new();
+        // u32::MAX count, then nothing — the classic length-prefix attack.
+        let huge_count = [0xFFu8, 0xFF, 0xFF, 0xFF];
+        assert!(flow.restore_full(&huge_count).is_err());
+        assert!(flow.restore(&huge_count).is_err());
+        assert!(flow.restore_delta(&huge_count).is_err());
+        // Fully random short blob.
+        assert!(flow.restore_full(b"not a checkpoint").is_err());
+        // Empty blob (can't even read the first u32).
+        assert!(flow.restore_full(&[]).is_err());
+    }
+
+    #[test]
+    fn corrupt_delta_map_bytes_error_instead_of_aborting() {
+        // decode_delta_map is the resident-executor → coordinator wire decoder;
+        // a corrupt tick result must not OOM the coordinator.
+        let mut blob = b"IVMD1".to_vec();
+        blob.extend_from_slice(&[0xFFu8, 0xFF, 0xFF, 0xFF]); // u32::MAX views
+        assert!(super::decode_delta_map(&blob).is_err());
+        // decode_batch_map (attach state) shares the bug class.
+        assert!(super::decode_batch_map(&[0xFFu8, 0xFF, 0xFF, 0xFF]).is_err());
     }
 
     // ── G2: restore_delta idempotency ─────────────────────────────────────────
