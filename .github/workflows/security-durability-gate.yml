@@ -81,15 +81,13 @@ jobs:
         run: cargo test -p krishiv-scheduler --lib -- --exact tests::scheduler_tests::executor_deregister_while_task_running_resets_it_for_reassignment
 
       # DUR-1: a Succeeded job with staged sink output must not persist
-      # Succeeded until the publish durably completes.
-      #
-      # RESIDUAL (found 2026-07-21, not fixed this pass): no dedicated
-      # regression test exists yet for finalize_staged_sink_outputs /
-      # mark_sink_publish_committed / mark_sink_publish_failed /
-      # redrive_committing_jobs (the Committing-state demote-and-recover
-      # mechanism, coordinator/mod.rs:2141-2322) despite the fix being real
-      # and correctly wired. Needs a fixture that stages real sink output
-      # via SinkWriteSpec/publish_staged_outputs and asserts a coordinator
-      # restart while Committing re-drives to a terminal state instead of
-      # trusting a false Succeeded. Tracked, not blocking this gate's other
-      # 8 findings.
+      # Succeeded until the publish durably completes — the Committing-state
+      # demote/commit/fail/redrive mechanism (coordinator/mod.rs). The three
+      # tests live in sections/dur1.rs.inc (landed with the fix, c59eb8f8);
+      # each path verified individually ("1 passed") before being added here.
+      - name: DUR-1 — staged sink publish never persists a false Succeeded
+        run: >
+          cargo test -p krishiv-scheduler --lib -- --exact
+          tests::scheduler_tests::dur1_finalize_demotes_to_committing_then_commit_succeeds
+          tests::scheduler_tests::dur1_publish_failure_marks_failed_durably
+          tests::scheduler_tests::dur1_recovery_redrives_committing_job
