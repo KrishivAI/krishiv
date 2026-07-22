@@ -172,19 +172,7 @@ impl LocalDiskShuffleStore {
         })
     }
 
-    #[cfg(test)]
-    fn resolve_lease_token(&self, id: &PartitionId, incoming: u64) -> ShuffleResult<u64> {
-        let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
-        let memory = shuffle_write_lock(&self.lease_tokens)?.get(&key).copied();
-        let persisted = self.load_persisted_lease(id)?;
-        let current = memory.or(persisted);
-        let next = crate::lease_persistence::enforce_monotonic_lease(current, incoming)?;
-        shuffle_write_lock(&self.lease_tokens)?.insert(key, next);
-        self.persist_lease(id, next)?;
-        Ok(next)
-    }
-
-    /// Async variant of `resolve_lease_token` that offloads blocking filesystem
+    /// Offloads blocking filesystem
     /// operations (`std::fs::read`, `create_dir_all`, `write`) to
     /// `spawn_blocking` so the async executor thread is not stalled.
     ///

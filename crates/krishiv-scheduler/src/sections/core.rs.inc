@@ -1,3 +1,4 @@
+#[test]
 fn standby_coordinator_rejects_mutation() {
     let mut coordinator = Coordinator::standby(CoordinatorId::try_new("coord-1").unwrap());
     let executor = ExecutorDescriptor::new(ExecutorId::try_new("exec-1").unwrap(), "pod-a", 1);

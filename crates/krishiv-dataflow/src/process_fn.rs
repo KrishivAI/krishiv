@@ -618,29 +618,6 @@ mod tests {
 
     // ── G: snapshot/restore test ──────────────────────────────────────────────
 
-    struct StatefulFn;
-
-    impl ProcessFunction for StatefulFn {
-        fn on_event(
-            &mut self,
-            _key: &str,
-            _batch: &RecordBatch,
-            _row: usize,
-            _ctx: &mut ProcessContext<'_>,
-        ) -> ExecResult<()> {
-            Ok(())
-        }
-
-        fn on_timer(
-            &mut self,
-            _key: &str,
-            _fire_time_ms: i64,
-            _ctx: &mut ProcessContext<'_>,
-        ) -> ExecResult<()> {
-            Ok(())
-        }
-    }
-
     #[test]
     fn snapshot_restore_preserves_state_and_timers() {
         let func = CountAndTimerFn::new();

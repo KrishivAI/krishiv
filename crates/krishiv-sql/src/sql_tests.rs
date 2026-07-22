@@ -1,5 +1,3 @@
-use crate::*;
-
 #[cfg(test)]
 mod tests {
     /// engine-s3-ddl-gap: `CREATE EXTERNAL TABLE … LOCATION 's3://…'` must
@@ -244,7 +242,7 @@ mod tests {
 
     use crate::{
         SqlEngine, SqlError, explain_sql, explain_sql_optimized, explain_sql_with_cost, plan_sql,
-        query_memory_limit_from_env, referenced_table_names, resolve_query_memory_limit_bytes,
+        referenced_table_names, resolve_query_memory_limit_bytes,
     };
 
     #[tokio::test]
@@ -479,7 +477,7 @@ mod tests {
 
         let bounded = SqlEngine::new_with_memory_limit(Some(1_000_000));
         let pool = Arc::clone(&bounded.context.runtime_env().memory_pool);
-        let mut reservation = MemoryConsumer::new("phase2-test").register(&pool);
+        let reservation = MemoryConsumer::new("phase2-test").register(&pool);
         assert!(
             reservation.try_grow(2_000_000).is_err(),
             "reservation above the configured limit must be rejected"
@@ -489,7 +487,7 @@ mod tests {
         let unbounded = SqlEngine::new_with_memory_limit(None);
         assert_eq!(unbounded.memory_limit_bytes(), None);
         let pool = Arc::clone(&unbounded.context.runtime_env().memory_pool);
-        let mut reservation = MemoryConsumer::new("phase2-test-unbounded").register(&pool);
+        let reservation = MemoryConsumer::new("phase2-test-unbounded").register(&pool);
         assert!(
             reservation.try_grow(2_000_000).is_ok(),
             "default engine keeps DataFusion's unbounded pool"
@@ -670,7 +668,7 @@ mod tests {
         .unwrap();
         let file = std::fs::File::create(&fact_path).unwrap();
         let props = datafusion::parquet::file::properties::WriterProperties::builder()
-            .set_max_row_group_size(100)
+            .set_max_row_group_row_count(Some(100))
             .build();
         let mut writer =
             datafusion::parquet::arrow::ArrowWriter::try_new(file, schema.clone(), Some(props))

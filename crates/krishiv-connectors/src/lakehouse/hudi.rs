@@ -1564,8 +1564,6 @@ mod tests {
 
     // ── HudiTwoPhaseCommitSink tests ───────────────────────────────────────────────
 
-    use crate::two_phase::TwoPhaseCommitSink as _;
-
     #[test]
     fn hudi_two_phase_prepare_commit_roundtrip() {
         let dir = tempdir().unwrap();

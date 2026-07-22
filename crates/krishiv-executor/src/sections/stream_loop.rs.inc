@@ -705,7 +705,6 @@ fn source_throttle_table_shared_across_runner_clones() {
 async fn stream_loop_iceberg_sink_commits_each_cycle_and_restore_keeps_history() {
     use std::sync::Arc;
 
-    use krishiv_connectors::TransactionalSinkParticipant as _;
     use krishiv_connectors::lakehouse::{
         IcebergSinkMode, IcebergSinkTarget, IcebergStreamingSink, schema_version_from_arrow,
     };

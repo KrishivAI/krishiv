@@ -851,6 +851,11 @@ pub(crate) fn build_python_table_udf(
 /// - `right: list[pyarrow.RecordBatch]`
 ///
 /// It must return a `list[pyarrow.RecordBatch]` (may be empty).
+///
+/// Engine-side impl is complete but not yet wired: no PySession method exposes
+/// cogroup UDFs to Python (staged Spark/pandas-parity feature), so the struct
+/// and its builder are intentionally unused for now.
+#[allow(dead_code)]
 pub(crate) struct PythonCoGroupMapUdf {
     callable: Py<PyAny>,
     name: String,
@@ -944,6 +949,7 @@ impl krishiv_plan::udf::CoGroupUdf for PythonCoGroupMapUdf {
 }
 
 /// Build a Python co-group map UDF.
+#[allow(dead_code)] // pending Python cogroup registration surface (see PythonCoGroupMapUdf)
 pub(crate) fn build_python_co_group_udf(
     py: Python<'_>,
     name: String,
@@ -973,6 +979,11 @@ pub(crate) fn build_python_co_group_udf(
 /// The Python callable receives a `list[pyarrow.RecordBatch]` and must return
 /// a `list[pyarrow.RecordBatch]`.  On the Python side, callers may convert
 /// each batch to pandas with `.to_pandas()` if they prefer.
+///
+/// Engine-side impl is complete but not yet wired: no PySession method exposes
+/// map_pandas_iter UDFs to Python (staged Spark/pandas-parity feature), so the
+/// struct and its builder are intentionally unused for now.
+#[allow(dead_code)]
 pub(crate) struct PythonMapPandasIterUdf {
     callable: Py<PyAny>,
     name: String,
@@ -1046,6 +1057,7 @@ impl krishiv_plan::udf::MapPandasIterUdf for PythonMapPandasIterUdf {
 }
 
 /// Build a Python map-pandas-iter UDF.
+#[allow(dead_code)] // pending Python map_pandas_iter registration surface (see PythonMapPandasIterUdf)
 pub(crate) fn build_python_map_pandas_iter_udf(
     py: Python<'_>,
     name: String,

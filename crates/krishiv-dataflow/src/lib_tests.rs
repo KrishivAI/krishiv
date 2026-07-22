@@ -4,7 +4,6 @@ use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::aggregate::AggState;
 use crate::{
     AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig, AggExpr, AggFunction,
     ExecError, HeavyHittersTracker, MultiSourceWatermarkState, OperatorMessage, RateLimiter,
@@ -200,7 +199,6 @@ fn local_agg_single_group_produces_one_row() {
 fn local_agg_empty_group_min_max_avg_semantics() {
     // Verify that AggState finalized values for empty groups use sentinel semantics.
     use crate::aggregate::AggState;
-    use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode, lower_to_physical};
     let exprs = vec![
         AggExpr {
             filter: None,

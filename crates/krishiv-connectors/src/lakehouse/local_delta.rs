@@ -643,8 +643,6 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values.to_vec()))]).unwrap()
     }
 
-    use crate::two_phase::TwoPhaseCommitSink as _;
-
     #[test]
     fn delta_two_phase_prepare_commit_roundtrip() {
         let dir = tempfile::tempdir().unwrap();

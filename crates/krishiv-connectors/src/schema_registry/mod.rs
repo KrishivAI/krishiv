@@ -135,8 +135,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::avro::{
-        avro_records_to_batches, avro_schema_to_arrow_schema, avro_values_to_column,
-        decode_avro_datum_payload,
+        avro_schema_to_arrow_schema, avro_values_to_column, decode_avro_datum_payload,
     };
     use super::client::{
         MAX_CACHED_SCHEMA_BYTES, MAX_CACHED_SCHEMAS, MAX_REGISTRY_RESPONSE_BYTES,

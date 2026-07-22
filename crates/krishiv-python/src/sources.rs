@@ -234,7 +234,7 @@ fn read_iceberg_impl(
 #[pyfunction]
 #[pyo3(signature = (session, stream_name, region, *, shard_id="shardId-000000000000", start_position="trim_horizon", max_batches=10, batch_size=100))]
 pub fn read_kinesis(
-    py: Python<'_>,
+    _py: Python<'_>,
     session: &PySession,
     stream_name: String,
     region: String,
@@ -333,7 +333,7 @@ pub fn read_kinesis(
 #[pyfunction]
 #[pyo3(signature = (session, broker_url, topic, *, subscription="krishiv-default", max_batches=10, batch_size=100))]
 pub fn read_pulsar(
-    py: Python<'_>,
+    _py: Python<'_>,
     session: &PySession,
     broker_url: String,
     topic: String,

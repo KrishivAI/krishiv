@@ -839,7 +839,6 @@ mod aggregation_proptests {
             // First batch: on-time events, advances prev_watermark_ms to 500.
             let first: Vec<(i64, i64)> = on_time.iter().map(|&t| (t, 0)).collect();
             let ts_first: Vec<i64> = first.iter().map(|(t, _)| *t).collect();
-            let max_first = *ts_first.iter().max().unwrap();
             let b1 = RecordBatch::try_new(schema.clone(), vec![
                 Arc::new(StringArray::from(vec!["k"; first.len()])),
                 Arc::new(Int64Array::from(ts_first.clone())),

@@ -6,8 +6,8 @@
 #[cfg(test)]
 mod conformance_tests {
     use arrow::array::{
-        Array, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray,
-        StringViewArray, TimestampMicrosecondArray,
+        Array, BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray,
+        StringViewArray,
     };
     use arrow::datatypes::{DataType, TimeUnit};
     use krishiv_sql::SqlEngine;

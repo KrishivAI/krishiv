@@ -45,7 +45,7 @@ fn map_delta_error(e: krishiv_delta::DeltaError) -> PyErr {
 ///
 /// A weight of ``+1`` represents an insertion; ``-1`` represents a retraction.
 /// The weight column is stored as the last column, named ``_weight``.
-#[pyclass(name = "DeltaBatch")]
+#[pyclass(name = "DeltaBatch", from_py_object)]
 #[derive(Clone)]
 pub struct PyDeltaBatch {
     pub(crate) inner: DeltaBatch,
@@ -230,7 +230,7 @@ impl From<StepReport> for PyStepSummary {
 }
 
 /// One view's failure during a step, surfaced via `StepSummary.errored_views`.
-#[pyclass(name = "ViewError")]
+#[pyclass(name = "ViewError", from_py_object)]
 #[derive(Clone)]
 pub struct PyViewError {
     #[pyo3(get)]
@@ -277,7 +277,7 @@ impl From<krishiv_api::compute::job::ViewError> for PyViewError {
 ///
 /// All methods are synchronous wrappers that drive the shared Krishiv Tokio
 /// runtime; in distributed mode they issue coordinator HTTP calls.
-#[pyclass(name = "IvmJob")]
+#[pyclass(name = "IvmJob", from_py_object)]
 #[derive(Clone)]
 pub struct PyIvmJob {
     pub(crate) inner: IvmJob,

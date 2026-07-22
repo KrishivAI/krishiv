@@ -347,31 +347,6 @@ mod connector_tests {
     // TwoPhaseCommitSink
     // -----------------------------------------------------------------------
 
-    struct DishonestTwoPhaseSink;
-
-    impl TwoPhaseCommitSink for DishonestTwoPhaseSink {
-        type Handle = ();
-
-        fn capabilities(&self) -> ConnectorCapabilities {
-            ConnectorCapabilities::new().with_checkpoint()
-        }
-
-        fn prepare(
-            &mut self,
-            _epoch: u64,
-            _batch: &arrow::record_batch::RecordBatch,
-        ) -> ConnectorResult<Self::Handle> {
-            Ok(())
-        }
-
-        fn commit(&mut self, _handle: Self::Handle) -> ConnectorResult<()> {
-            Ok(())
-        }
-
-        fn abort(&mut self, _handle: Self::Handle) -> ConnectorResult<()> {
-            Ok(())
-        }
-    }
 
     #[test]
     fn two_phase_commit_sink_prepare_commit_roundtrip() {

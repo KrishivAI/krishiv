@@ -56,7 +56,7 @@ struct PyExpectation {
 }
 
 /// A handle to an in-memory pipeline sink; read collected batches after `run`.
-#[pyclass(name = "MemorySink")]
+#[pyclass(name = "MemorySink", from_py_object)]
 #[derive(Clone)]
 pub struct PyMemorySink {
     inner: Arc<Mutex<Vec<RecordBatch>>>,

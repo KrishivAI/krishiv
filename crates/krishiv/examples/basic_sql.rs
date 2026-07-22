@@ -10,7 +10,7 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use krishiv_api::session::{Session, SessionBuilder};
+use krishiv_api::session::Session;
 use krishiv_api::types::{ExecutionMode, QueryResult};
 
 #[tokio::main]

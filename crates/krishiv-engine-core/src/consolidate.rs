@@ -151,43 +151,6 @@ struct ConsolidatingSinkWriter {
     row_converter_schema: Option<SchemaRef>,
 }
 
-/// Encode every column of `batch` into one stable, comparable byte string per row.
-///
-/// **Deprecated**: superseded by the in-struct `RowConverter` cache on
-/// [`ConsolidatingSinkWriter`] (P-4 audit). Retained only for tests that
-/// still call it directly. New code should rely on the writer's own
-/// converter cache.
-#[cfg(test)]
-fn encode_full_rows(
-    batch: &RecordBatch,
-    pk_columns: Option<&[String]>,
-) -> EngineResult<Vec<Vec<u8>>> {
-    let columns: Vec<ArrayRef> = match pk_columns {
-        Some(cols) => {
-            let mut arrays = Vec::with_capacity(cols.len());
-            for c in cols {
-                let idx = batch.schema().index_of(c).map_err(|e| {
-                    EngineError::Sink(format!("primary key column '{c}' not in batch schema: {e}"))
-                })?;
-                arrays.push(Arc::clone(batch.column(idx)));
-            }
-            arrays
-        }
-        None => batch.columns().to_vec(),
-    };
-    let fields: Vec<SortField> = columns
-        .iter()
-        .map(|c| SortField::new(c.data_type().clone()))
-        .collect();
-    let converter = RowConverter::new(fields).map_err(|e| EngineError::Sink(e.to_string()))?;
-    let encoded = converter
-        .convert_columns(&columns)
-        .map_err(|e| EngineError::Sink(e.to_string()))?;
-    Ok((0..batch.num_rows())
-        .map(|i| encoded.row(i).as_ref().to_vec())
-        .collect())
-}
-
 #[async_trait]
 impl SinkWriter for ConsolidatingSinkWriter {
     async fn write(&mut self, changes: ChangelogBatch) -> EngineResult<()> {

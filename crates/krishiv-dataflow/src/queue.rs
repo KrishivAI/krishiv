@@ -445,7 +445,7 @@ mod tests {
 
     #[test]
     fn aligned_mode_delivers_in_order() {
-        let (mut tx, mut rx) = operator_queue(8);
+        let (tx, mut rx) = operator_queue(8);
         let r = futures::executor::block_on(async {
             tx.send_data(int_batch(&[1, 2])).await.unwrap();
             tx.send_barrier(1).await.unwrap();
@@ -469,7 +469,7 @@ mod tests {
 
     #[test]
     fn unaligned_mode_buffers_in_flight_records() {
-        let (mut tx, mut rx) =
+        let (tx, mut rx) =
             operator_queue_with_alignment_and_cap(8, CheckpointAlignment::Unaligned, 8);
         let r = futures::executor::block_on(async {
             tx.send_data(int_batch(&[1])).await.unwrap();
@@ -525,7 +525,7 @@ mod tests {
 
     #[test]
     fn drain_unaligned_buffer_returns_records() {
-        let (mut tx, mut rx) =
+        let (tx, mut rx) =
             operator_queue_with_alignment_and_cap(8, CheckpointAlignment::Unaligned, 4);
         // Send barrier, then 2 records, drop sender, drain everything.
         // After draining, the receiver's drain_unaligned_buffer should
@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn unaligned_metrics_include_buffered_count() {
-        let (mut tx, mut rx) =
+        let (tx, mut rx) =
             operator_queue_with_alignment_and_cap(8, CheckpointAlignment::Unaligned, 4);
         let m0 = rx.metrics();
         assert!(m0.unaligned);

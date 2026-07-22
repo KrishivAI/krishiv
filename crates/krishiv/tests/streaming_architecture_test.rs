@@ -80,21 +80,6 @@ fn sum_last_int64_column(batches: &[StreamBatch]) -> i64 {
     total
 }
 
-fn concat_stream_batches(batches: &[StreamBatch]) -> RecordBatch {
-    let rbs: Vec<RecordBatch> = batches.iter().map(|b| b.batch().clone()).collect();
-    arrow::compute::concat_batches(&rbs[0].schema(), &rbs).expect("concat")
-}
-
-fn collect_int64_col(result: &[StreamBatch], col_idx: usize) -> Vec<i64> {
-    let tbl = concat_stream_batches(result);
-    tbl.column(col_idx)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap()
-        .values()
-        .to_vec()
-}
-
 fn sql_result_int64_col(result: &krishiv::QueryResult, col_idx: usize) -> Vec<i64> {
     let batches = result.batches();
     let tbl = arrow::compute::concat_batches(&batches[0].schema(), batches).expect("concat");

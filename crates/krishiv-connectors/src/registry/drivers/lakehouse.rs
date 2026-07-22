@@ -518,8 +518,6 @@ mod tests {
 
     use crate::config::ConnectorConfig;
     use crate::registry::driver::{SinkDriver, SourceDriver};
-    use crate::sink::DynSink;
-    use crate::source::DynSource;
 
     use super::{IcebergSinkDriver, IcebergSourceDriver};
 
