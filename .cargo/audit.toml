@@ -2,11 +2,11 @@
 # Mirrors the [advisories].ignore list in deny.toml for the rustsec/audit-check CI step.
 [advisories]
 ignore = [
-    # Marvin Attack on `rsa` — no patch available; pulled in by optional kinesis feature.
+    # Marvin Attack on `rsa` — no patch available; pulled in transitively
+    # (openidconnect -> pulsar, optional connector features only).
     "RUSTSEC-2023-0071",
-    # rustls-webpki 0.101.7 advisories — from aws-smithy-http-client (optional kinesis feature).
-    # aws-sdk-kinesis 1.x pins rustls 0.21; upgrade tracked in deps backlog.
-    "RUSTSEC-2026-0104",
-    "RUSTSEC-2026-0099",
-    "RUSTSEC-2026-0098",
+    # NOTE: rustls-webpki 0.101.7 (RUSTSEC-2026-0104/0099/0098) is no longer
+    # ignored — the vulnerable version was removed by dropping aws-sdk-kinesis's
+    # legacy `rustls` feature; only modern rustls-aws-lc 0.23 (webpki 0.103)
+    # remains. See crates/krishiv-connectors/Cargo.toml.
 ]

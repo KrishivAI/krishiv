@@ -77,12 +77,11 @@ ignore = [
     # RUSTSEC-2026-0190: anyhow::Error::downcast_mut unsoundness.
     # Fixed in anyhow >= 1.0.103; upgrade once deps support it.
     { id = "RUSTSEC-2026-0190" },
-    # RUSTSEC-2026-0104/0099/0098: rustls-webpki 0.101.7 advisories.
-    # Brought in by aws-smithy-http-client via the optional `kinesis` feature.
-    # aws-sdk-kinesis 1.x pins rustls 0.21; upgrade tracked in deps backlog.
-    { id = "RUSTSEC-2026-0104" },
-    { id = "RUSTSEC-2026-0099" },
-    { id = "RUSTSEC-2026-0098" },
+    # NOTE: the rustls-webpki 0.101.7 advisories (RUSTSEC-2026-0104/0099/0098)
+    # are no longer ignored — the vulnerable version was removed from the graph
+    # by dropping aws-sdk-kinesis's legacy `rustls` (tls-rustls) feature in
+    # crates/krishiv-connectors/Cargo.toml. Modern rustls-aws-lc 0.23 (webpki
+    # 0.103) is now the sole TLS path.
     # RUSTSEC-2026-0194/0195: quick-xml 0.39.4 DoS (quadratic duplicate-attribute
     # scan / unbounded namespace-declaration allocation on malicious XML). Fixed
     # in quick-xml >= 0.41, but the only consumer is `object_store 0.13.2` (S3
