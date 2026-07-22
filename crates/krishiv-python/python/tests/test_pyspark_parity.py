@@ -205,14 +205,21 @@ def test_catalog(session):
 
 
 def test_reader_fluent(session, tmp_path):
-    # Source from SQL so the writer plan is executable without an in-memory
-    # table scan (createDataFrame registers a MemTable, which the write path's
-    # staged fragment execution cannot see).
     src = session.sql("SELECT 1 AS id, 'a' AS name UNION ALL SELECT 2 AS id, 'b' AS name")
     path = str(tmp_path / "out.parquet")
     src.write.mode("overwrite").format("parquet").save(path)
     loaded = session.read.format("parquet").load(path)
     assert loaded.count() == 2
+
+
+def test_write_created_dataframe(session, tmp_path):
+    # A createDataFrame result is MemTable-backed; the parquet write path must
+    # fall back to client-side collect-then-write (the distributed sink cannot
+    # ship an in-memory table to a fresh fragment engine).
+    df = session.createDataFrame([(1, "a"), (2, "b"), (3, "c")], ["id", "name"])
+    path = str(tmp_path / "created.parquet")
+    df.write.mode("overwrite").parquet(path)
+    assert session.read.parquet(path).count() == 3
 
 
 def test_spark_session_builder():

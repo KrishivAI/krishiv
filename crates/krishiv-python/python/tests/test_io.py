@@ -108,19 +108,23 @@ def test_multiple_formats_same_session(session, sample_df, tmp_dir):
     assert parquet_result.row_count == 1
 
 
-def test_read_nonexistent_csv_does_not_crash(session):
-    result = session.read_csv("/nonexistent/path/data.csv")
-    assert result is not None
+# Reading a path with no files fails fast with a clean, catchable error
+# (schema-on-read cannot infer a schema from an empty location) — the same
+# eager behaviour as Spark's `spark.read.*`. "Does not crash" means it raises
+# a normal exception rather than panicking / aborting the process.
+def test_read_nonexistent_csv_raises_cleanly(session):
+    with pytest.raises(Exception):
+        session.read_csv("/nonexistent/path/data.csv")
 
 
-def test_read_nonexistent_json_does_not_crash(session):
-    result = session.read_json("/nonexistent/path/data.json")
-    assert result is not None
+def test_read_nonexistent_json_raises_cleanly(session):
+    with pytest.raises(Exception):
+        session.read_json("/nonexistent/path/data.json")
 
 
-def test_read_nonexistent_parquet_does_not_crash(session):
-    result = session.read_parquet("/nonexistent/path/data.parquet")
-    assert result is not None
+def test_read_nonexistent_parquet_raises_cleanly(session):
+    with pytest.raises(Exception):
+        session.read_parquet("/nonexistent/path/data.parquet")
 
 
 def test_write_csv_with_options(session, sample_df, tmp_dir):

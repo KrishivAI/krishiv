@@ -60,14 +60,16 @@ def test_delta_batch_serialize_deserialize():
 
 
 def test_delta_batch_from_update():
-    """from_update produces retract+insert pairs."""
+    """from_update retracts every `before` row (-1) and inserts every `after`
+    row (+1); it does not consolidate unchanged rows (the downstream IVM sums
+    weights, so retraction+insertion of an unchanged row nets to zero)."""
     import pyarrow as pa
 
     before = pa.RecordBatch.from_pydict({"x": [1, 2], "y": ["a", "b"]})
     after = pa.RecordBatch.from_pydict({"x": [1, 3], "y": ["a", "c"]})
     db = krishiv.DeltaBatch.from_update(before, after)
-    # One retraction (-1) + one insertion (+1) = 2 rows total
-    assert db.num_rows == 2
+    # 2 retractions + 2 insertions = 4 weighted rows.
+    assert db.num_rows == 4
 
 
 def test_ivm_basic_flow():

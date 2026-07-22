@@ -1370,6 +1370,21 @@ Execution statistics:
         if !(self.is_locally_evaluated() && self.sql_query.is_some()) {
             return Ok(None);
         }
+        // The distributed parquet sink re-plans on a fresh fragment engine that
+        // only sees file-backed (shippable) tables. If the query references any
+        // table that is not a registered file source — e.g. an in-memory table
+        // from `register_record_batches` / `createDataFrame` — the fragment
+        // cannot resolve it. Skip the sink so the caller falls back to the
+        // client-side collect-then-write path, which always works. A false
+        // negative here only forgoes the distributed fast path, never correctness.
+        if let Some(query) = self.sql_query.as_deref()
+            && let Ok(tables) = krishiv_sql::referenced_table_names(query)
+            && !tables
+                .iter()
+                .all(|table| self.registered_parquet.contains_key(table))
+        {
+            return Ok(None);
+        }
         match self.run_sink_write(path, mode, partition_by)? {
             Ok(()) => Ok(Some(())),
             Err(krishiv_runtime::RuntimeError::Unsupported { feature }) => {
