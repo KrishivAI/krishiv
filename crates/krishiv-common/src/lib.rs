@@ -21,6 +21,7 @@ pub mod auth_util;
 pub mod backpressure;
 #[cfg(feature = "chaos")]
 pub mod chaos;
+pub mod compute_pool;
 pub mod durability;
 pub mod env_registry;
 pub mod hash;

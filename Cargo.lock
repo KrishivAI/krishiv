@@ -5639,6 +5639,7 @@ name = "krishiv-common"
 version = "0.1.0"
 dependencies = [
  "arrow 58.3.0",
+ "rayon",
  "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
