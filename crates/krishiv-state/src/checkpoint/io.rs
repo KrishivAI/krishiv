@@ -391,34 +391,34 @@ async fn validate_manifest_entries_async(
     if !manifest.contains("metadata.json") {
         return Ok(false);
     }
+    // Phase 65: pipeline async reads with parallel hashing. Each entry's bytes
+    // are read via async I/O (staying on Tokio), then its SHA-256 is dispatched
+    // to the compute pool — so hashing a just-read entry overlaps reading the
+    // next, and independent digests run across cores. This is on the DUR-2
+    // barrier critical path; parallelizing the CPU half shrinks the window.
+    let mut hash_checks = Vec::new();
     for (path, expected_hex) in manifest.entries() {
         validate_manifest_relative_path(path, epoch)?;
         let full = format!("{base_prefix}/{path}");
         match storage.read_bytes_async(&full).await? {
             None => return Ok(false),
             Some(data) => {
-                use std::io::Read as _;
-                let mut reader = std::io::BufReader::new(data.as_slice());
-                let mut hasher = Sha256::new();
-                let mut buf = [0u8; 8192];
-                loop {
-                    let n = reader
-                        .read(&mut buf)
-                        .map_err(|e| CheckpointError::Storage {
-                            message: format!("reading {full} for hash: {e}"),
-                        })?;
-                    if n == 0 {
-                        break;
-                    }
-                    if let Some(chunk) = buf.get(..n) {
-                        hasher.update(chunk);
-                    }
-                }
-                let hash = format!("{:x}", hasher.finalize());
-                if hash != *expected_hex {
-                    return Ok(false);
-                }
+                let expected = expected_hex.to_owned();
+                hash_checks.push(krishiv_common::compute_pool::run_on_compute_pool(
+                    move || {
+                        // `data` is fully in memory; one digest pass equals the
+                        // former BufReader streaming without the copy loop.
+                        let mut hasher = Sha256::new();
+                        hasher.update(&data);
+                        format!("{:x}", hasher.finalize()) == expected
+                    },
+                ));
             }
+        }
+    }
+    for check in hash_checks {
+        if !check.await {
+            return Ok(false);
         }
     }
     Ok(true)
