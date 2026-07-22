@@ -728,8 +728,7 @@ impl PySession {
     pub fn execute_local(&self, py: Python<'_>, query: String) -> PyResult<PyDataFrame> {
         let inner = self.inner.clone();
         py.detach(move || {
-            inner
-                .execute_local(&query)
+            block_on_async(inner.execute_local(&query))
                 .map(|df| PyDataFrame { inner: df })
                 .map_err(map_krishiv_error)
         })
@@ -742,8 +741,7 @@ impl PySession {
     pub fn execute_remote(&self, py: Python<'_>, query: String) -> PyResult<PyDataFrame> {
         let inner = self.inner.clone();
         py.detach(move || {
-            inner
-                .execute_remote(&query)
+            block_on_async(inner.execute_remote(&query))
                 .map(|df| PyDataFrame { inner: df })
                 .map_err(map_krishiv_error)
         })
@@ -769,7 +767,7 @@ impl PySession {
     ) -> PyResult<PyDataFrame> {
         let inner = self.inner.clone();
         py.detach(move || {
-            block_on_async(inner.sql_with_timeout_async(&query, timeout_ms))
+            block_on_async(inner.sql_with_timeout(&query, timeout_ms))
                 .map(|df| PyDataFrame { inner: df })
                 .map_err(map_krishiv_error)
         })

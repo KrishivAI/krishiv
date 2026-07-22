@@ -2845,7 +2845,7 @@ impl Session {
     ///
     /// Returns `KrishivError::Runtime` if the query does not produce a result
     /// within `timeout_ms` milliseconds.
-    pub async fn sql_with_timeout_async(
+    pub async fn sql_with_timeout(
         &self,
         query: impl AsRef<str> + Send,
         timeout_ms: u64,
@@ -2858,29 +2858,16 @@ impl Session {
             })?
     }
 
-    /// Synchronous variant of [`sql_with_timeout_async`].
-    pub fn sql_with_timeout(
-        &self,
-        query: impl AsRef<str> + Send,
-        timeout_ms: u64,
-    ) -> Result<DataFrame> {
-        let query = query.as_ref().to_owned();
-        block_on(self.sql_with_timeout_async(query, timeout_ms))
-    }
-
     /// Execute SQL on the local `SqlEngine` only (embedded / single-node path).
     ///
     /// Never routes to a remote Flight endpoint, even in distributed mode.
-    pub fn execute_local(&self, query: impl AsRef<str> + Send) -> Result<DataFrame> {
-        block_on(self.execute_local_async(query))
-    }
 
     /// Async variant of [`Self::execute_local`].
     ///
     /// Always executes via the local `SqlEngine` (DataFusion) regardless of
     /// session mode. Returns a DataFrame with pre-collected results so that
     /// `.collect()` returns immediately without remote routing.
-    pub async fn execute_local_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
+    pub async fn execute_local(&self, query: impl AsRef<str>) -> Result<DataFrame> {
         let query = query.as_ref();
         // Enforce table-access policy.
         if let Some(policy) = &self.policy
@@ -2915,12 +2902,9 @@ impl Session {
     }
 
     /// Execute SQL through the session [`ExecutionRuntime`] (remote when configured).
-    pub fn execute_remote(&self, query: impl AsRef<str> + Send) -> Result<DataFrame> {
-        block_on(self.execute_remote_async(query))
-    }
 
     /// Async variant of [`Self::execute_remote`].
-    pub async fn execute_remote_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
+    pub async fn execute_remote(&self, query: impl AsRef<str>) -> Result<DataFrame> {
         if self.coordinator_url.is_none() {
             return Err(KrishivError::unsupported(
                 "execute_remote requires SessionBuilder::with_coordinator(flight_url)",
