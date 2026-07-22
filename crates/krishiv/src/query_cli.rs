@@ -282,8 +282,8 @@ async fn query_dataframe(
     }
     match command.execution {
         QueryExecution::Default => session.sql_async(&command.query).await,
-        QueryExecution::Local => session.execute_local(&command.query).await,
-        QueryExecution::Remote => session.execute_remote(&command.query).await,
+        QueryExecution::Local => session.execute_local_async(&command.query).await,
+        QueryExecution::Remote => session.execute_remote_async(&command.query).await,
     }
 }
 

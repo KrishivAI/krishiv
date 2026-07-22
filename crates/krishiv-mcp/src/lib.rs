@@ -985,7 +985,7 @@ impl KrishivMcpServer {
         let execution_query = limited_query_for_sql(query, limit);
         let result = self
             .session
-            .sql_with_timeout(execution_query, timeout_ms)
+            .sql_with_timeout_async(execution_query, timeout_ms)
             .await?
             .collect_async()
             .await?;
