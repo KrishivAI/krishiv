@@ -9,7 +9,9 @@ wrapped explicitly.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Union
+import itertools
+
+from typing import Any, Callable, Optional, Union
 
 from ..krishiv import (
     Column,
@@ -783,6 +785,44 @@ def flatten(column: ColumnLike) -> Column:
     return call_function("flatten", column)
 
 
+# ── Higher-order (lambda) array functions ───────────────────────────────────
+#
+# The lambda receives a `Column` bound to the element and returns a `Column`
+# expression, rendered into the engine's SQL lambda syntax (`x -> expr`). A
+# unique variable name per call keeps nested higher-order calls correct.
+# Only single-argument lambdas are supported (the engine rejects the indexed
+# `(x, i) -> …` form); `aggregate`/`zip_with` have no engine equivalent yet.
+
+_hof_var_counter = itertools.count()
+
+
+def _hof(sql_name: str, column: ColumnLike, f: Callable[[Column], Any]) -> Column:
+    var = f"__k{next(_hof_var_counter)}"
+    body = f(_col(var))
+    body = body if isinstance(body, Column) else _to_column(body)
+    return _expr(f"{sql_name}({_sql(column)}, {var} -> {body.sql()})")
+
+
+def transform(column: ColumnLike, f: Callable[[Column], Any]) -> Column:
+    """Apply ``f`` to each element of an array (PySpark `F.transform`)."""
+    return _hof("transform", column, f)
+
+
+def filter(column: ColumnLike, f: Callable[[Column], Any]) -> Column:  # noqa: A001
+    """Keep array elements where ``f`` is true (PySpark `F.filter`)."""
+    return _hof("filter", column, f)
+
+
+def exists(column: ColumnLike, f: Callable[[Column], Any]) -> Column:
+    """True if any element satisfies ``f`` (PySpark `F.exists`)."""
+    return _hof("any_match", column, f)
+
+
+def forall(column: ColumnLike, f: Callable[[Column], Any]) -> Column:
+    """True if every element satisfies ``f`` (PySpark `F.forall`)."""
+    return _hof("array_forall", column, f)
+
+
 # ── Hash functions ──────────────────────────────────────────────────────────
 
 
@@ -954,6 +994,10 @@ __all__ = [
     "flatten",
     "explode",
     "posexplode",
+    "transform",
+    "filter",
+    "exists",
+    "forall",
     # hashing
     "md5",
     "sha256",

@@ -166,6 +166,28 @@ def test_dataframe_unnest_primitive(session):
     assert df.unnest(["a"]).count() == 2
 
 
+def test_higher_order_functions(session):
+    df = session.sql("SELECT make_array(1, 2, 3, 4) AS a")
+    row = df.select(
+        F.transform(col("a"), lambda x: x * lit(10)).alias("t"),
+        F.filter(col("a"), lambda x: x > lit(2)).alias("f"),
+        F.exists(col("a"), lambda x: x > lit(3)).alias("e"),
+        F.forall(col("a"), lambda x: x > lit(0)).alias("g"),
+    ).collect_rows()[0]
+    assert row["t"] == [10, 20, 30, 40]
+    assert row["f"] == [3, 4]
+    assert row["e"] is True
+    assert row["g"] is True
+
+
+def test_nested_higher_order(session):
+    df = session.sql("SELECT make_array(make_array(1, 2), make_array(3)) AS a")
+    out = df.select(
+        F.transform(col("a"), lambda inner: F.transform(inner, lambda y: y + lit(100))).alias("n")
+    ).collect_rows()[0]
+    assert out["n"] == [[101, 102], [103]]
+
+
 def test_array_functions(session):
     adf = session.createDataFrame([(1,)], ["z"]).select(
         F.array(lit(3), lit(1), lit(2)).alias("a")
