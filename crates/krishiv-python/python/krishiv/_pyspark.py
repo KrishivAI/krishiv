@@ -713,6 +713,25 @@ class UDFRegistration:
         wrapped = _native_udf(_arrow_batch, name=name, input_types=input_types, output_type=out_type)
         self._session.register_udf(wrapped)
 
+        # Also ship the vectorized callable (cloudpickled) so the SAME UDF runs
+        # DISTRIBUTED, applied whole-batch (arrow-native) in the executor's python
+        # worker. The worker's arrow-native path expects f(batch) -> pa.Array, so
+        # ship a wrapper that returns the array (unwrapping a RecordBatch result).
+        def _arrow_ship(rb):
+            result = f(rb)
+            if isinstance(result, pa.RecordBatch):
+                return result.column(0)
+            return result if isinstance(result, (pa.Array, pa.ChunkedArray)) else pa.array(result)
+
+        _arrow_ship._krishiv_arrow_udf = True
+        try:
+            import cloudpickle as _cloudpickle  # noqa: PLC0415
+            self._session.register_python_udf_bytes(
+                name, _cloudpickle.dumps(_arrow_ship), list(arg_types), out_type
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
         def _invoke(*cols):
             return call_function(name, [_as_column(c) for c in cols])
 
