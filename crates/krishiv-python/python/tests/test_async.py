@@ -39,6 +39,34 @@ async def test_session_sql_async_returns_lazy_dataframe():
     assert "7" in result.pretty()
 
 
+@pytest.mark.asyncio
+async def test_dataframe_execute_stream_async():
+    """DataFrame.execute_stream_async runs on a thread pool and its
+    DataFrameStream.__anext__ is offloaded per-batch (init __init__ wrappers)."""
+    session = ks.Session.local()
+    df = await session.sql_async("SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3")
+    stream = await df.execute_stream_async()
+    rows = 0
+    async for batch in stream:
+        rows += batch.num_rows
+    assert rows == 3
+
+
+@pytest.mark.asyncio
+async def test_streaming_dataframe_execute_stream_async_awaited():
+    """Awaiting StreamingDataFrame.execute_stream_async offloads to a thread
+    pool (covers the __init__ streaming wrapper, not just awaitable creation)."""
+    session = ks.Session.local()
+    df = session.sql("SELECT 1 AS n, 100 AS val, 1000 AS ts UNION ALL SELECT 1, 200, 2000")
+    sdf = df.to_streaming().with_event_time("ts").key_by("n").tumbling_window(1000)
+    stream = await sdf.execute_stream_async()
+    seen = 0
+    async for batch in stream:
+        seen += 1
+        break
+    assert seen >= 1
+
+
 async def _assert_yields_to_event_loop(awaitable_factory, label):
     """Assert that awaiting `awaitable_factory()` suspends at least once.
 

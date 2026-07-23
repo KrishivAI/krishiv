@@ -421,6 +421,19 @@ def _df_dtypes(self):
 # ── DataFrame: na / stat accessors ──────────────────────────────────────────
 
 
+def _na_type_matches(value, type_str: str) -> bool:
+    """Whether a ``na.fill`` scalar may fill a column of this engine type
+    (PySpark only fills type-compatible columns)."""
+    t = type_str.lower()
+    if isinstance(value, bool):
+        return "bool" in t
+    if isinstance(value, (int, float)):
+        return any(k in t for k in ("int", "float", "double", "decimal"))
+    if isinstance(value, str):
+        return "utf8" in t or "string" in t
+    return True
+
+
 class DataFrameNaFunctions:
     """``df.na`` — null handling (PySpark ``DataFrameNaFunctions``)."""
 
@@ -440,13 +453,21 @@ class DataFrameNaFunctions:
 
     def fill(self, value, subset=None):
         df = self._df
+        # ``fill_null`` interpolates the value as raw SQL (COALESCE(col, value)),
+        # so a Python value must become a proper SQL literal — ``lit(...).sql()``
+        # quotes strings (escaping embedded quotes) and renders numbers/bools.
         if isinstance(value, dict):
             for column, val in value.items():
-                df = df.fill_null(column, str(val))
+                df = df.fill_null(column, lit(val).sql())
             return df
-        columns = list(subset) if subset else [name for name, _ in df.schema()]
-        for column in columns:
-            df = df.fill_null(column, str(value))
+        # PySpark fills only columns whose type matches the scalar's type
+        # (a numeric value never touches a string column, and vice versa).
+        schema = dict(df.schema())
+        candidates = list(subset) if subset else list(schema)
+        literal = lit(value).sql()
+        for column in candidates:
+            if _na_type_matches(value, schema.get(column, "")):
+                df = df.fill_null(column, literal)
         return df
 
 
