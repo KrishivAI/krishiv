@@ -706,6 +706,40 @@ impl PySession {
             .map_err(map_krishiv_error)
     }
 
+    /// Register a scalar SQL-expression function whose calls are inlined into
+    /// native SQL before planning. Unlike a Python-callable UDF (embedded only),
+    /// this runs EVERYWHERE the engine runs — including distributed execution on
+    /// the Rust executors, with no Python. ``body`` is a SQL expression over the
+    /// named ``params`` (e.g. name=``"tax"``, params=``["x"]``, body=``"x * 1.1"``).
+    #[pyo3(signature = (name, params, body))]
+    pub fn register_scalar_sql_function(
+        &self,
+        name: String,
+        params: Vec<String>,
+        body: String,
+    ) -> PyResult<()> {
+        self.inner
+            .register_scalar_sql_function(&name, &params, &body)
+            .map_err(map_krishiv_error)
+    }
+
+    /// Ship a cloudpickled Python UDF for distributed execution (runs on the
+    /// executors via a python worker). `input_types`/`output_type` are Arrow
+    /// type names. Embedded execution uses the in-process UDF registered via
+    /// `register_udf`; this is additive for the distributed path.
+    #[pyo3(signature = (name, pickle, input_types, output_type))]
+    pub fn register_python_udf_bytes(
+        &self,
+        name: String,
+        pickle: Vec<u8>,
+        input_types: Vec<String>,
+        output_type: String,
+    ) -> PyResult<()> {
+        self.inner
+            .register_python_udf_bytes(&name, &pickle, &input_types, &output_type);
+        Ok(())
+    }
+
     pub fn register_parquet_stream(&self, name: String, path: String) -> PyResult<()> {
         self.inner
             .register_parquet_stream(&name, path.as_ref())

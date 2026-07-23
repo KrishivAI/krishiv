@@ -577,7 +577,14 @@ async fn execute_shuffle_write_fragment(
     ))
     .await?;
 
-    let dataframe = crate::erased(limited_engine.sql(query))
+    // Register any Python UDFs shipped in the fragment before planning.
+    let query = limited_engine
+        .register_python_udfs_from_sql(query)
+        .await
+        .map_err(|e| ExecutorError::LocalExecution {
+            message: e.to_string(),
+        })?;
+    let dataframe = crate::erased(limited_engine.sql(&query))
         .await
         .map_err(|e| ExecutorError::LocalExecution {
             message: e.to_string(),
@@ -1105,7 +1112,12 @@ async fn execute_inmem_shuffle_write(
             restored_source_offsets,
         ))
         .await?;
-        let dataframe = crate::erased(limited_engine.sql(query))
+        let query =
+            limited_engine
+            .register_python_udfs_from_sql(query)
+            .await
+            .map_err(|e| ExecutorError::LocalExecution { message: e.to_string() })?;
+        let dataframe = crate::erased(limited_engine.sql(&query))
             .await
             .map_err(|e| ExecutorError::LocalExecution {
                 message: e.to_string(),

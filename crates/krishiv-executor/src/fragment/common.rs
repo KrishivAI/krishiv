@@ -990,6 +990,11 @@ pub(crate) fn task_sql_engine(
     krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
         .with_target_parallelism(task_engine_parallelism())
         .with_udf_limits(udf_limits)
+        // Give the task engine a UDF registry so Python UDFs shipped in the
+        // fragment (register_python_udf) have somewhere to land.
+        .with_udf_registry(std::sync::Arc::new(std::sync::RwLock::new(
+            krishiv_plan::udf::UdfRegistry::new(),
+        )))
 }
 
 /// Environment variable: whole-process memory budget for this executor,

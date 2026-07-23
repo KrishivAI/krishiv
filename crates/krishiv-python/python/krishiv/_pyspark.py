@@ -666,6 +666,19 @@ class UDFRegistration:
         )
         self._session.register_udf(wrapped)
 
+        # Additionally ship the callable (cloudpickled) so the SAME UDF also runs
+        # in DISTRIBUTED mode, on the executors, via a python worker subprocess.
+        # Embedded execution uses the in-process UDF registered above; distributed
+        # execution uses the shipped pickle. If cloudpickle is unavailable the UDF
+        # simply stays embedded-only.
+        try:
+            import cloudpickle as _cloudpickle  # noqa: PLC0415
+            self._session.register_python_udf_bytes(
+                name, _cloudpickle.dumps(f), list(arg_types), out_type
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
         def _invoke(*cols):
             return call_function(name, [_as_column(c) for c in cols])
 

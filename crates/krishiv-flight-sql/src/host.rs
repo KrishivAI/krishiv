@@ -598,9 +598,37 @@ impl FlightExecutionHost {
                 }
                 FlightDirective::Explain
                 | FlightDirective::RegisterParquet { .. }
-                | FlightDirective::RegisterParquetIpc { .. } => {}
+                | FlightDirective::RegisterParquetIpc { .. }
+                | FlightDirective::RegisterPythonUdf { .. } => {}
             }
         }
+
+        // Re-attach any Python-UDF directives to the query so they travel with
+        // the fragment SQL to the executors, which register them on their
+        // per-task engine before planning (the executor has the python worker;
+        // the coordinator only forwards the fragment).
+        let udf_comments: Vec<String> = directives
+            .iter()
+            .filter_map(|d| match d {
+                FlightDirective::RegisterPythonUdf {
+                    name,
+                    input_types,
+                    output_type,
+                    pickle_b64,
+                } => Some(krishiv_runtime::flight_protocol::encode_python_udf(
+                    name,
+                    input_types,
+                    output_type,
+                    pickle_b64,
+                )),
+                _ => None,
+            })
+            .collect();
+        let sql = if udf_comments.is_empty() {
+            sql
+        } else {
+            format!("{}\n{}", udf_comments.join("\n"), sql)
+        };
 
         // Plain SQL execution.
         self.execute_batch_sql(&sql, &ipc_tables).await
@@ -660,6 +688,31 @@ impl FlightExecutionHost {
                 }
             })
             .collect();
+
+        // Carry Python-UDF directives into the fragment SQL so executors register
+        // them (the coordinator only forwards the fragment).
+        let udf_comments: Vec<String> = directives
+            .iter()
+            .filter_map(|d| match d {
+                FlightDirective::RegisterPythonUdf {
+                    name,
+                    input_types,
+                    output_type,
+                    pickle_b64,
+                } => Some(krishiv_runtime::flight_protocol::encode_python_udf(
+                    name,
+                    input_types,
+                    output_type,
+                    pickle_b64,
+                )),
+                _ => None,
+            })
+            .collect();
+        let sql = if udf_comments.is_empty() {
+            sql
+        } else {
+            format!("{}\n{}", udf_comments.join("\n"), sql)
+        };
 
         let FlightHostBackend::Coordinator(coordinator) = self.backend.as_ref() else {
             unreachable!("InProcess already returned above");

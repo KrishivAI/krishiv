@@ -34,6 +34,21 @@ use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 /// Reading `AWS_ENDPOINT_URL` here — the AWS-SDK convention prod sets — is what
 /// makes MinIO reachable; `AmazonS3Builder::from_env` alone honours only
 /// `AWS_ENDPOINT` and would silently target real AWS.
+/// Map an Arrow type name (as shipped in a Python-UDF directive) to a DataType.
+/// Unknown names fall back to Utf8 (the safest catch-all for a scalar result).
+fn python_udf_arrow_type(name: &str) -> arrow::datatypes::DataType {
+    use arrow::datatypes::DataType;
+    match name.trim().to_ascii_lowercase().as_str() {
+        "double" | "float64" | "float" => DataType::Float64,
+        "float32" | "real" => DataType::Float32,
+        "int" | "int64" | "bigint" | "long" => DataType::Int64,
+        "int32" | "integer" => DataType::Int32,
+        "bool" | "boolean" => DataType::Boolean,
+        "utf8" | "string" | "varchar" | "text" => DataType::Utf8,
+        _ => DataType::Utf8,
+    }
+}
+
 pub(crate) fn build_s3_object_store(
     bucket: &str,
 ) -> object_store::Result<std::sync::Arc<dyn object_store::ObjectStore>> {
@@ -1573,6 +1588,107 @@ impl SqlEngine {
 
     /// Register all scalar UDFs from the attached registry with DataFusion.
     /// Uses unlimited defaults (backward compat).
+    /// Extract `/* krishiv-register-python-udf:name:in,…:out:pickle_b64 */`
+    /// directive comments from `sql`, register each Python UDF on this engine
+    /// (via [`Self::register_python_udf`]), and return `sql` with the directives
+    /// removed. This is how a Python UDF shipped inside a fragment's SQL reaches
+    /// the executor's fresh per-task engine. No-op for SQL that carries none.
+    pub async fn register_python_udfs_from_sql(&self, sql: &str) -> SqlResult<String> {
+        use base64::Engine as _;
+        const PREFIX: &str = "/* krishiv-register-python-udf:";
+        if !sql.contains(PREFIX) {
+            return Ok(sql.to_string());
+        }
+        let mut out = String::with_capacity(sql.len());
+        let mut rest = sql;
+        while let Some(start) = rest.find(PREFIX) {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + PREFIX.len()..];
+            let Some(end) = after.find(" */") else {
+                // Unterminated — leave the remainder verbatim and stop.
+                out.push_str(&rest[start..]);
+                return Ok(out);
+            };
+            let body = &after[..end];
+            // name:in1,in2:out:pickle_b64
+            let mut parts = body.splitn(4, ':');
+            let (name, in_types, out_type, pickle_b64) = match (
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+            ) {
+                (Some(n), Some(i), Some(o), Some(p)) => (n, i, o, p),
+                _ => {
+                    return Err(SqlError::DataFusion {
+                        message: "malformed python-udf directive".into(),
+                    });
+                }
+            };
+            let input_types: Vec<String> = if in_types.is_empty() {
+                Vec::new()
+            } else {
+                in_types.split(',').map(str::to_string).collect()
+            };
+            let pickle = base64::engine::general_purpose::STANDARD
+                .decode(pickle_b64)
+                .map_err(|e| SqlError::DataFusion {
+                    message: format!("invalid python-udf pickle base64: {e}"),
+                })?;
+            self.register_python_udf(name, &pickle, &input_types, out_type)
+                .await?;
+            rest = &after[end + " */".len()..];
+        }
+        out.push_str(rest);
+        Ok(out)
+    }
+
+    /// Register a distributed Python UDF from cloudpickled bytes. The callable
+    /// runs in a shared `python3` worker subprocess ([`crate::python_udf`]) — so
+    /// it works on the Rust executors with no embedded interpreter. `input_types`
+    /// / `output_type` are Arrow type names. Requires a UDF registry on this
+    /// engine (executors' task engines set one).
+    pub async fn register_python_udf(
+        &self,
+        name: &str,
+        pickle: &[u8],
+        input_types: &[String],
+        output_type: &str,
+    ) -> SqlResult<()> {
+        use arrow::datatypes::{Field, Schema};
+        let Some(registry) = &self.udf_registry else {
+            return Err(SqlError::DataFusion {
+                message: "cannot register a python UDF: engine has no UDF registry".into(),
+            });
+        };
+        let input_fields: Vec<Field> = input_types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| Field::new(format!("a{i}"), python_udf_arrow_type(t), true))
+            .collect();
+        let input_schema = Schema::new(input_fields);
+        let output_field = Field::new("out", python_udf_arrow_type(output_type), true);
+        let pool = crate::python_udf::global_pool().map_err(|e| SqlError::DataFusion {
+            message: format!("python UDF worker unavailable: {e:?}"),
+        })?;
+        let udf = std::sync::Arc::new(crate::python_udf::PythonWorkerUdf::new(
+            name,
+            pickle.to_vec(),
+            input_schema,
+            output_field,
+            pool,
+        ));
+        registry
+            .write()
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?
+            .register_scalar(udf);
+        self.udf_registry_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.sync_scalar_udfs().await
+    }
+
     pub async fn sync_scalar_udfs(&self) -> SqlResult<()> {
         let Some(registry) = &self.udf_registry else {
             return Ok(());

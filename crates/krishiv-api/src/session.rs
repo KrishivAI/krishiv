@@ -1004,6 +1004,8 @@ impl SessionBuilder {
             local_cluster,
             runtime,
             registered_parquet: Arc::new(DashMap::new()),
+            scalar_sql_functions: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            python_udfs: Arc::new(DashMap::new()),
             registered_sources: Arc::new(DashMap::new()),
             registered_sinks: Arc::new(DashMap::new()),
             submitted_sql_jobs: Arc::new(DashMap::new()),
@@ -1035,6 +1037,15 @@ pub struct Session {
     local_cluster: Arc<InProcessCluster>,
     runtime: Arc<dyn ExecutionRuntime>,
     registered_parquet: Arc<DashMap<String, PathBuf>>,
+    /// Scalar SQL-expression user functions, inlined into native SQL before
+    /// planning so they run anywhere the engine runs — including distributed
+    /// execution on the Rust executors (no Python worker required).
+    scalar_sql_functions:
+        Arc<RwLock<std::collections::HashMap<String, krishiv_sql::scalar_udf::ScalarSqlFunction>>>,
+    /// Cloudpickled Python UDFs to ship with distributed queries (name →
+    /// (pickle base64, input Arrow type names, output type name)). Shipped as a
+    /// comment directive so executors run them via a python worker subprocess.
+    python_udfs: Arc<DashMap<String, (String, Vec<String>, String)>>,
     registered_sources: Arc<DashMap<String, ConnectorConfig>>,
     registered_sinks: Arc<DashMap<String, ConnectorConfig>>,
     submitted_sql_jobs: Arc<DashMap<String, SubmittedSqlJobStatus>>,
@@ -1781,6 +1792,85 @@ impl Session {
         Arc::clone(&self.udf_registry)
     }
 
+    /// Register a scalar SQL-expression function (e.g. name `tax`, params
+    /// `["x"]`, body `"x * 1.1"`). Calls to it in subsequent queries are inlined
+    /// into native SQL before planning, so the function works EVERYWHERE the
+    /// engine runs — including distributed execution on the Rust executors, with
+    /// no Python worker. This is the portable counterpart to Python-callable
+    /// scalar UDFs (which run only in the embedded engine). Re-registering a name
+    /// replaces the prior definition.
+    pub fn register_scalar_sql_function(
+        &self,
+        name: &str,
+        params: &[String],
+        body: &str,
+    ) -> Result<()> {
+        let func = krishiv_sql::scalar_udf::ScalarSqlFunction::new(name, params, body)
+            .map_err(|message| KrishivError::InvalidConfig { message })?;
+        let mut map = self
+            .scalar_sql_functions
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        map.insert(name.trim().to_lowercase(), func);
+        Ok(())
+    }
+
+    /// Register a cloudpickled Python UDF to ship with distributed queries so it
+    /// runs on the executors via a python worker subprocess. `input_types` /
+    /// `output_type` are Arrow type names. Embedded execution uses the in-process
+    /// UDF instead (registered separately).
+    pub fn register_python_udf_bytes(
+        &self,
+        name: &str,
+        pickle: &[u8],
+        input_types: &[String],
+        output_type: &str,
+    ) {
+        use base64::Engine as _;
+        let pickle_b64 = base64::engine::general_purpose::STANDARD.encode(pickle);
+        self.python_udfs.insert(
+            name.trim().to_lowercase(),
+            (pickle_b64, input_types.to_vec(), output_type.to_string()),
+        );
+    }
+
+    /// Prepend `register-python-udf` comment directives for every registered
+    /// Python UDF, so they travel with a distributed query to the executors.
+    fn prepend_python_udfs(&self, query: &str) -> String {
+        if self.python_udfs.is_empty() {
+            return query.to_string();
+        }
+        let mut comments: Vec<String> = self
+            .python_udfs
+            .iter()
+            .map(|entry| {
+                let (pickle_b64, input_types, output_type) = entry.value();
+                krishiv_runtime::flight_protocol::encode_python_udf(
+                    entry.key(),
+                    input_types,
+                    output_type,
+                    pickle_b64,
+                )
+            })
+            .collect();
+        comments.push(query.to_string());
+        comments.join("\n")
+    }
+
+    /// Inline any registered scalar SQL functions in `query`, returning native
+    /// SQL. Cheap no-op when nothing is registered.
+    fn expand_scalar_sql(&self, query: &str) -> Result<String> {
+        let map = self
+            .scalar_sql_functions
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        if map.is_empty() {
+            return Ok(query.to_string());
+        }
+        krishiv_sql::scalar_udf::expand_scalar_sql_functions(query, &map)
+            .map_err(|message| KrishivError::InvalidConfig { message })
+    }
+
     /// Register a vectorized scalar UDF for this session.
     ///
     /// Registration fails closed when native UDFs are forbidden by the active
@@ -2238,7 +2328,9 @@ impl Session {
 
     /// Asynchronously create a DataFrame from a SQL query.
     pub async fn sql_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
-        let query = query.as_ref().to_owned();
+        // Inline any registered scalar SQL functions to native SQL first, so
+        // they work identically in embedded and distributed execution.
+        let query = self.expand_scalar_sql(query.as_ref())?;
 
         // Intercept START / REFRESH PIPELINE first so the policy check
         // can include the resolved source/sink tables of the pipeline.
@@ -2967,7 +3059,11 @@ impl Session {
                 "distributed remote execution requires SessionBuilder::with_remote_execution(true)",
             ));
         }
-        let query = query.as_ref();
+        // Inline scalar SQL functions, then prepend any Python UDF directives so
+        // they ship to the executors (which run them via a python worker).
+        let expanded = self.expand_scalar_sql(query.as_ref())?;
+        let expanded = self.prepend_python_udfs(&expanded);
+        let query = expanded.as_str();
         if let Some(policy) = &self.policy
             && let Ok(tables) = krishiv_sql::referenced_table_names(query)
         {
