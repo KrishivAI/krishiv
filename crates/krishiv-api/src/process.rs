@@ -69,29 +69,30 @@ pub fn apply_process_function(
 
 // ── apply_async_io ────────────────────────────────────────────────────────────
 
-/// Apply an async I/O function to each batch in the stream.
+/// Apply an async I/O enrichment function to each batch in the stream, with up
+/// to `concurrency` lookups in flight at once (Flink's *ordered* AsyncFunction).
 ///
-/// The async lookup is applied to each `RecordBatch` independently. The
-/// `batch_size` parameter is currently informational (reserved for future
-/// windowed concurrency); the function is applied batch-by-batch.
-pub fn apply_async_io<F, Fut>(input: KrishivStream, _batch_size: usize, lookup: F) -> KrishivStream
+/// `concurrency` in-flight futures are buffered and their results emitted **in
+/// input order**, so a slow external lookup (DB / HTTP / model call) overlaps
+/// with its neighbours instead of stalling the stream one batch at a time — the
+/// whole point of async I/O. `concurrency` is clamped to at least 1.
+pub fn apply_async_io<F, Fut>(input: KrishivStream, concurrency: usize, lookup: F) -> KrishivStream
 where
     F: Fn(RecordBatch) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = crate::error::Result<RecordBatch>> + Send + 'static,
 {
-    let output = input.then(move |result| {
-        let maybe_batch = result;
-        let fut: std::pin::Pin<
-            Box<dyn std::future::Future<Output = std::result::Result<RecordBatch, String>> + Send>,
-        > = match maybe_batch {
-            Err(e) => Box::pin(futures::future::ready(Err(e))),
-            Ok(batch) => {
-                let inner = lookup(batch);
-                Box::pin(async move { inner.await.map_err(|e| e.to_string()) })
+    let lookup = std::sync::Arc::new(lookup);
+    let output = input
+        .map(move |result| {
+            let lookup = std::sync::Arc::clone(&lookup);
+            async move {
+                match result {
+                    Err(e) => Err(e),
+                    Ok(batch) => lookup(batch).await.map_err(|e| e.to_string()),
+                }
             }
-        };
-        fut
-    });
+        })
+        .buffered(concurrency.max(1));
 
     Box::pin(output)
 }

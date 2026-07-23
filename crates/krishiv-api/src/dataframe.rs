@@ -564,6 +564,14 @@ Execution statistics:
         krishiv_common::async_util::block_on(self.collect_async())
     }
 
+    /// The execution runtime backing this DataFrame (embedded in-process, or the
+    /// remote/coordinator runtime for a distributed session). Exposed so the
+    /// streaming builder can route windowed collection through the same
+    /// distributed primitive (`collect_bounded_window`) the DataStream path uses.
+    pub(crate) fn runtime(&self) -> Arc<dyn ExecutionRuntime> {
+        Arc::clone(&self.runtime)
+    }
+
     /// Collect results and convert to a ``DeltaBatch`` (all rows as insertions,
     /// weight +1). Convenience bridge from the SQL/DataFrame API to the IVM
     /// engine: use this to feed SQL query output into an incremental view.

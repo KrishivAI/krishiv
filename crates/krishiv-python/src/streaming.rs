@@ -199,6 +199,72 @@ impl PyStreamingQuery {
 /// writer.query_name("etl-job")
 /// query = writer.start()
 /// ```
+// ── StreamingQueryManager + listener (Spark parity) ──────────────────────────
+
+/// Rust adapter that forwards streaming-query lifecycle events to a Python
+/// callback. Listener callbacks must not break the query, so callback errors are
+/// swallowed.
+struct PyQueryListener {
+    callback: Py<PyAny>,
+}
+
+impl krishiv_api::streaming_builder::StreamingQueryListener for PyQueryListener {
+    fn on_query_terminated(
+        &self,
+        event: &krishiv_api::streaming_builder::QueryTerminatedEvent,
+    ) {
+        Python::attach(|py| {
+            let d = pyo3::types::PyDict::new(py);
+            let _ = d.set_item("event", "query_terminated");
+            let _ = d.set_item("query_id", &event.query_id);
+            let _ = d.set_item("query_name", event.query_name.clone());
+            let _ = d.set_item("exception", event.exception.clone());
+            if let Some(p) = &event.last_progress {
+                let _ = d.set_item("input_rows", p.input_rows);
+                let _ = d.set_item("output_rows", p.output_rows);
+            }
+            let _ = self.callback.call1(py, (d,));
+        });
+    }
+}
+
+/// Registry of streaming queries + listeners — Krishiv's analogue of Spark's
+/// ``StreamingQueryManager``. Add listeners, then attach the manager to a writer
+/// via :meth:`DataStreamWriter.with_stream_manager` to receive lifecycle events.
+///
+/// ```python
+/// mgr = StreamingQueryManager()
+/// mgr.add_listener(lambda ev: print("terminated:", ev["query_id"]))
+/// df.writeStream.with_stream_manager(mgr).trigger("once").foreach_batch(f).start()
+/// ```
+#[pyclass(name = "StreamingQueryManager")]
+pub struct PyStreamingQueryManager {
+    pub(crate) inner: krishiv_api::streaming_builder::StreamingQueryManager,
+}
+
+#[pymethods]
+impl PyStreamingQueryManager {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: krishiv_api::streaming_builder::StreamingQueryManager::default(),
+        }
+    }
+
+    /// Register a listener ``callback(event: dict)`` called on query lifecycle
+    /// events. On termination the dict carries ``event="query_terminated"``,
+    /// ``query_id``, ``query_name``, ``exception`` (and progress counts if any).
+    fn add_listener(&self, callback: Py<PyAny>) {
+        self.inner
+            .add_listener(std::sync::Arc::new(PyQueryListener { callback }));
+    }
+
+    /// Number of currently-active queries known to this manager.
+    fn active_count(&self) -> usize {
+        self.inner.active_count()
+    }
+}
+
 #[pyclass(name = "DataStreamWriter")]
 pub struct PyDataStreamWriter {
     df: Option<DataFrame>,
@@ -208,6 +274,7 @@ pub struct PyDataStreamWriter {
     query_name: Option<String>,
     options: HashMap<String, String>,
     foreach_batch_fn: Option<Py<PyAny>>,
+    stream_manager: Option<krishiv_api::streaming_builder::StreamingQueryManager>,
 }
 
 impl PyDataStreamWriter {
@@ -220,6 +287,7 @@ impl PyDataStreamWriter {
             query_name: None,
             options: HashMap::new(),
             foreach_batch_fn: None,
+            stream_manager: None,
         }
     }
 }
@@ -282,6 +350,14 @@ impl PyDataStreamWriter {
         self.foreach_batch_fn = Some(func);
     }
 
+    /// Attach a :class:`StreamingQueryManager` so its listeners receive this
+    /// query's lifecycle events (e.g. termination). Pass ``session.streams`` to
+    /// wire session-scoped listeners (Spark's ``spark.streams.addListener``).
+    #[pyo3(signature = (manager))]
+    fn with_stream_manager(&mut self, manager: &PyStreamingQueryManager) {
+        self.stream_manager = Some(manager.inner.clone());
+    }
+
     /// Execute the streaming query and return a :class:`StreamingQuery` handle.
     ///
     /// This method is synchronous — it starts the background query task and returns
@@ -308,6 +384,7 @@ impl PyDataStreamWriter {
         let query_name = self.query_name.clone();
         let options = self.options.clone();
         let foreach_fn_opt = self.foreach_batch_fn.take();
+        let stream_manager = self.stream_manager.take();
 
         let query = py.detach(move || {
             // Build the writer.
@@ -315,6 +392,9 @@ impl PyDataStreamWriter {
                 .output_mode(output_mode)
                 .trigger(trigger);
 
+            if let Some(manager) = stream_manager {
+                writer = writer.with_stream_manager(manager);
+            }
             if let Some(name) = query_name {
                 writer = writer.query_name(name);
             }

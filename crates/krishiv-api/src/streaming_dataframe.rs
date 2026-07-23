@@ -211,6 +211,31 @@ impl StreamingDataFrame {
         ))
     }
 
+    /// Collect this windowed streaming DataFrame as a BOUNDED result, executed
+    /// through the session's runtime.
+    ///
+    /// This is what makes the Structured-Streaming DataFrame **distributed**: on
+    /// a distributed session the windowed aggregation runs on the CLUSTER via the
+    /// coordinator's bounded-window operator — the exact same
+    /// `collect_bounded_window` primitive the low-level DataStream path uses (a
+    /// `BoundedWindow` Flight action) — while an embedded session runs it
+    /// in-process. Requires `with_event_time` + `key_by` + a window.
+    pub async fn collect_bounded(&self) -> Result<Vec<RecordBatch>> {
+        let spec = self.window_spec()?.ok_or_else(|| KrishivError::InvalidConfig {
+            message: "collect() on a streaming DataFrame requires a window + key \
+                      (use .with_event_time(..).key_by(..).tumbling_window(..).agg(..))"
+                .into(),
+        })?;
+        // Resolve the source to input batches (runs distributed if the df is
+        // remote), then hand them to the runtime's bounded-window operator.
+        let input = self.df.collect_async().await?.into_batches();
+        let topic = format!("sdf-window-{}", krishiv_common::async_util::unix_now_ms());
+        self.df
+            .runtime()
+            .collect_bounded_window(&topic, input, &spec)
+            .map_err(KrishivError::from)
+    }
+
     /// Set watermark lag.
     pub fn with_watermark_lag(mut self, lag_ms: u64) -> Self {
         self.watermark_lag_ms = lag_ms;
@@ -1651,6 +1676,28 @@ mod tests {
         let mut vals: Vec<i64> = (0..bumped.len()).map(|i| bumped.value(i)).collect();
         vals.sort_unstable();
         assert_eq!(vals, vec![103, 104]);
+    }
+
+    /// collect_bounded routes the windowed aggregation through the session
+    /// runtime's `collect_bounded_window` — the same distributed primitive the
+    /// DataStream path uses (ships to the coordinator on a distributed session).
+    /// Here (embedded) it runs in-process; the routing is what matters.
+    #[tokio::test]
+    async fn collect_bounded_windows_via_runtime_primitive() {
+        // window0 (0-60s): a@0,a@1000 -> 2 ; b@2000 -> 1
+        // window1 (60-120s): a@65000 -> 1 ; b@70000 -> 1   => 4 (key,window) groups
+        let df = dataframe_from_batches(vec![stream_batch(
+            &["a", "a", "b", "a", "b"],
+            &[0, 1000, 2000, 65000, 70000],
+        )]);
+        let sdf = df
+            .stream()
+            .with_event_time("stream_ts")
+            .key_by("user_id")
+            .tumbling_window(60_000);
+        let out = sdf.collect_bounded().await.expect("collect_bounded");
+        let total_rows: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 4, "4 (key, window) groups expected");
     }
 
     // Test: streaming query restart -- start two sequential queries from the same data

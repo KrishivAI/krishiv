@@ -206,6 +206,7 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<streaming_dataframe::PyDataStreamReader>()?;
     m.add_class::<streaming::PyStreamingQueryProgress>()?;
     m.add_class::<streaming::PyStreamingQuery>()?;
+    m.add_class::<streaming::PyStreamingQueryManager>()?;
     m.add_class::<streaming::PyDataStreamWriter>()?;
     m.add_class::<streaming::PyRemoteStreamingJob>()?;
     m.add_function(wrap_pyfunction!(connect_streaming, m)?)?;
@@ -217,6 +218,7 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<process_api::PyMapState>()?;
     m.add_class::<process_api::PyAggregatingState>()?;
     m.add_function(wrap_pyfunction!(process_api::apply_process_function, m)?)?;
+    m.add_function(wrap_pyfunction!(process_api::apply_async_io, m)?)?;
 
     // SQL gateway (Phase H parity)
     m.add_class::<session::PyOperationRegistry>()?;

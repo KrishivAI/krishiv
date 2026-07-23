@@ -259,6 +259,67 @@ pub fn apply_process_function(
     Ok(crate::dataframe::PyDataFrameStream::from_stream(out_stream))
 }
 
+// ── apply_async_io (Flink AsyncFunction) ──────────────────────────────────────
+
+/// Attach an async I/O enrichment function to a :class:`DataFrame` streaming
+/// pipeline — Krishiv's analogue of Flink's ``AsyncFunction``.
+///
+/// ``func(batch) -> batch`` is applied to each RecordBatch (e.g. to enrich rows
+/// with an external DB / HTTP / model lookup). Up to ``concurrency`` lookups run
+/// in flight at once and results are emitted in input order, so a slow lookup
+/// overlaps its neighbours instead of stalling the stream. (Overlap is real when
+/// the callback releases the GIL — e.g. blocking network I/O — since the Python
+/// call itself holds the GIL.) Returns a :class:`DataFrameStream`.
+#[pyfunction]
+#[pyo3(signature = (df, func, concurrency=8))]
+pub fn apply_async_io(
+    py: Python<'_>,
+    df: &crate::dataframe::PyDataFrame,
+    func: Py<PyAny>,
+    concurrency: usize,
+) -> PyResult<crate::dataframe::PyDataFrameStream> {
+    let inner_df = df.inner.clone();
+    let func = std::sync::Arc::new(func);
+
+    let out_stream = py
+        .detach(move || {
+            crate::session::block_on_async(async move {
+                let input = inner_df.execute_stream_async().await.map_err(|e| {
+                    krishiv_api::KrishivError::Runtime {
+                        message: e.to_string(),
+                    }
+                })?;
+                let lookup = move |batch: RecordBatch| {
+                    let func = std::sync::Arc::clone(&func);
+                    async move {
+                        Python::attach(|py| {
+                            let py_batch = PyBatch::from_record_batch(batch);
+                            let result = func.call1(py, (py_batch,)).map_err(|e| {
+                                krishiv_api::KrishivError::Runtime {
+                                    message: e.to_string(),
+                                }
+                            })?;
+                            let out = result.bind(py).cast::<PyBatch>().map_err(|e| {
+                                krishiv_api::KrishivError::Runtime {
+                                    message: format!("async_io func must return a Batch: {e}"),
+                                }
+                            })?;
+                            Ok(out.borrow().record_batch().clone())
+                        })
+                    }
+                };
+                Ok::<_, krishiv_api::KrishivError>(krishiv_api::apply_async_io(
+                    input,
+                    concurrency,
+                    lookup,
+                ))
+            })
+        })
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+    Ok(crate::dataframe::PyDataFrameStream::from_stream(out_stream))
+}
+
 // ── State descriptors ─────────────────────────────────────────────────────────
 
 /// A JSON-backed value-state descriptor for use inside process functions.

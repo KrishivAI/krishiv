@@ -135,6 +135,22 @@ impl PyStreamingDataFrame {
         Ok(PyDataFrameStream::from_stream(out_stream))
     }
 
+    /// Collect this windowed streaming DataFrame as a bounded result. On a
+    /// distributed session the windowed aggregation runs DISTRIBUTED on the
+    /// cluster (via the coordinator); embedded sessions run it in-process.
+    pub fn collect(&self, py: Python<'_>) -> PyResult<Vec<crate::batch::PyBatch>> {
+        let inner = self.inner.clone();
+        let batches = py
+            .detach(move || {
+                crate::session::block_on_async(async move { inner.collect_bounded().await })
+            })
+            .map_err(map_krishiv_error)?;
+        Ok(batches
+            .into_iter()
+            .map(crate::batch::PyBatch::from_record_batch)
+            .collect())
+    }
+
     pub fn execute_stream_async(&self, py: Python<'_>) -> PyResult<PyDataFrameStream> {
         let inner = self.inner.clone();
         let stream = py
