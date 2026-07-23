@@ -43,3 +43,36 @@ impl<'a, B: StateBackend> StateInspector<'a, B> {
         true
     }
 }
+
+/// The read half of the State Processor API: reads a keyed-state backend's full
+/// contents — keys **and** values — as `(key, value)` pairs, for offline
+/// inspection / debugging / migration of checkpointed state (Spark's State Data
+/// Source / Flink's State Processor API). Unlike [`StateInspector`] (which
+/// deliberately surfaces only metadata), this exposes value bytes, so use it on
+/// a restored checkpoint/savepoint backend to materialise "state as a table".
+pub struct StateReader<'a, B: StateBackend> {
+    backend: &'a B,
+}
+
+impl<'a, B: StateBackend> StateReader<'a, B> {
+    pub fn new(backend: &'a B) -> Self {
+        Self { backend }
+    }
+
+    /// All `(key, value)` entries in `namespace`, in backend key order.
+    pub fn entries(&self, namespace: &Namespace) -> StateResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        let keys = self.backend.list_keys(namespace)?;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(value) = self.backend.get(namespace, &key)? {
+                out.push((key, value));
+            }
+        }
+        Ok(out)
+    }
+
+    /// List all namespaces present in the backend.
+    pub fn list_namespaces(&self) -> StateResult<Vec<Namespace>> {
+        self.backend.list_namespaces()
+    }
+}

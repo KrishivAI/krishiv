@@ -529,6 +529,28 @@ impl PySession {
         })
     }
 
+    /// State Processor API: read checkpointed keyed state as a DataFrame.
+    ///
+    /// `path` is a RocksDB state directory (checkpoint / savepoint); returns
+    /// columns `key`/`value` (bytes) + `key_utf8`/`value_utf8` for offline
+    /// inspection, debugging, or migration of state.
+    #[pyo3(signature = (path, operator_id, state_name))]
+    pub fn read_state(
+        &self,
+        py: Python<'_>,
+        path: String,
+        operator_id: String,
+        state_name: String,
+    ) -> PyResult<PyDataFrame> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            inner
+                .read_state(&path, &operator_id, &state_name)
+                .map(|df| PyDataFrame { inner: df })
+                .map_err(map_krishiv_error)
+        })
+    }
+
     pub fn read_csv(&self, py: Python<'_>, path: String) -> PyResult<PyDataFrame> {
         let inner = self.inner.clone();
         py.detach(move || {

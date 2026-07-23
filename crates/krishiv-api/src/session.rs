@@ -3127,6 +3127,33 @@ impl Session {
         ))
     }
 
+    /// Read checkpointed keyed state as a table — the **State Processor API**
+    /// (Spark's State Data Source / Flink's State Processor API).
+    ///
+    /// Opens the RocksDB state backend directory at `path` (a checkpoint /
+    /// savepoint state dir), scans the `(operator_id, state_name)` namespace, and
+    /// returns a DataFrame with columns `key` / `value` (raw bytes) plus
+    /// `key_utf8` / `value_utf8` (UTF-8 decode where the bytes are valid text) —
+    /// so state can be inspected, debugged, or migrated offline.
+    pub fn read_state(
+        &self,
+        path: impl AsRef<Path>,
+        operator_id: &str,
+        state_name: &str,
+    ) -> Result<DataFrame> {
+        use krishiv_state::{Namespace, RocksDbStateBackend, StateReader};
+        let backend =
+            RocksDbStateBackend::open(path.as_ref()).map_err(|e| KrishivError::Runtime {
+                message: format!("open state backend at {}: {e}", path.as_ref().display()),
+            })?;
+        let entries = StateReader::new(&backend)
+            .entries(&Namespace::new(operator_id, state_name))
+            .map_err(|e| KrishivError::Runtime {
+                message: format!("read state ({operator_id}/{state_name}): {e}"),
+            })?;
+        Ok(self.dataframe_from_batches(vec![state_entries_to_batch(&entries)?]))
+    }
+
     /// Create a DataFrame by reading a local Parquet path directly.
     pub fn read_parquet(&self, path: impl AsRef<Path>) -> Result<DataFrame> {
         let path = path.as_ref().to_path_buf();
@@ -3570,6 +3597,48 @@ fn parquet_scan_table_name(path: &Path) -> String {
     format!("_krishiv_parquet_{sanitized}_{path_hash:x}")
 }
 
+/// Build the state-as-a-table RecordBatch for [`Session::read_state`]: raw
+/// `key`/`value` bytes plus best-effort `key_utf8`/`value_utf8` decodes.
+fn state_entries_to_batch(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RecordBatch> {
+    use arrow::array::{BinaryBuilder, StringBuilder};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let mut key_b = BinaryBuilder::new();
+    let mut val_b = BinaryBuilder::new();
+    let mut key_s = StringBuilder::new();
+    let mut val_s = StringBuilder::new();
+    for (k, v) in entries {
+        key_b.append_value(k);
+        val_b.append_value(v);
+        match std::str::from_utf8(k) {
+            Ok(s) => key_s.append_value(s),
+            Err(_) => key_s.append_null(),
+        }
+        match std::str::from_utf8(v) {
+            Ok(s) => val_s.append_value(s),
+            Err(_) => val_s.append_null(),
+        }
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Binary, false),
+        Field::new("value", DataType::Binary, false),
+        Field::new("key_utf8", DataType::Utf8, true),
+        Field::new("value_utf8", DataType::Utf8, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(key_b.finish()),
+            Arc::new(val_b.finish()),
+            Arc::new(key_s.finish()),
+            Arc::new(val_s.finish()),
+        ],
+    )
+    .map_err(|e| KrishivError::Runtime {
+        message: format!("build state table: {e}"),
+    })
+}
+
 pub(crate) async fn runtime_collect_batch_sql(
     runtime: Arc<dyn ExecutionRuntime>,
     query: &str,
@@ -3650,6 +3719,69 @@ mod coordinator_url_tests {
             .expect("session builds");
         assert_eq!(s.ivm_http_url(), Some("http://coord:2003"));
         assert_eq!(s.coordinator_http_url(), Some("http://coord:2003"));
+    }
+}
+
+#[cfg(test)]
+mod state_reader_tests {
+    use super::*;
+
+    /// State Processor API: write keyed state to a RocksDB backend, then read it
+    /// back offline as a table via `Session::read_state`.
+    #[test]
+    fn read_state_returns_checkpointed_state_as_a_table() {
+        use krishiv_state::{Namespace, RocksDbStateBackend, StateBackend};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("state");
+        let ns = Namespace::new("op1", "count");
+        // Write state, then drop the backend so RocksDB flushes and releases the
+        // directory lock before read_state re-opens it.
+        {
+            let mut backend = RocksDbStateBackend::open(&dir).expect("open");
+            backend
+                .put(&ns, b"alice".to_vec(), b"3".to_vec())
+                .expect("put alice");
+            backend
+                .put(&ns, b"bob".to_vec(), b"7".to_vec())
+                .expect("put bob");
+        }
+
+        let session = SessionBuilder::new().build().expect("session");
+        let df = session.read_state(&dir, "op1", "count").expect("read_state");
+        let batches = df.collect().expect("collect").into_batches();
+
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2, "two state entries");
+        let batch = batches.first().expect("one batch");
+        assert_eq!(batch.num_columns(), 4, "key,value,key_utf8,value_utf8");
+        let schema = batch.schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["key", "value", "key_utf8", "value_utf8"]);
+
+        // Read out the utf8-decoded keys/values and check the mapping.
+        use arrow::array::StringArray;
+        let keys = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8 keys");
+        let vals = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8 vals");
+        let mut got: Vec<(String, String)> = (0..batch.num_rows())
+            .map(|i| (keys.value(i).to_string(), vals.value(i).to_string()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("alice".to_string(), "3".to_string()),
+                ("bob".to_string(), "7".to_string())
+            ]
+        );
     }
 }
 

@@ -61,7 +61,7 @@ pub use error::{StateError, StateResult};
 pub use incremental_checkpoint::{
     EpochMetaFile, RocksDbIncrementalCheckpointer, SstEpochManifest, SstFileRef,
 };
-pub use inspector::StateInspector;
+pub use inspector::{StateInspector, StateReader};
 pub use krishiv_common::durability::{DurabilityProfile, StateDurability};
 pub use migration::{
     CURRENT_STATE_SCHEMA_VERSION, SharedStateMigrationRegistry, StateMigrationError,
