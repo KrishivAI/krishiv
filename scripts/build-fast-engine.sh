@@ -53,9 +53,13 @@ trap 'rm -rf "$CTX"' EXIT
 cp "$BIN" "$CTX/krishiv"
 cat > "$CTX/Dockerfile" <<'EOF'
 FROM ubuntu:26.04
+# python3 + pyarrow/numpy/cloudpickle power the distributed Python-UDF worker
+# (krishiv_sql::python_udf spawns `python3` to run cloudpickled UDFs on executors).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
+        ca-certificates python3 python3-pip \
+    && pip3 install --no-cache-dir --break-system-packages pyarrow numpy cloudpickle \
+    && apt-get purge -y python3-pip && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/* /root/.cache \
     && groupadd -r krishiv \
     && useradd -r -g krishiv -d /var/lib/krishiv -s /sbin/nologin krishiv
 COPY krishiv /usr/local/bin/krishiv

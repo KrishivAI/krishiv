@@ -5572,6 +5572,7 @@ version = "0.1.0"
 dependencies = [
  "arrow 58.3.0",
  "async-trait",
+ "base64 0.22.1",
  "dashmap",
  "datafusion 54.0.0",
  "futures",

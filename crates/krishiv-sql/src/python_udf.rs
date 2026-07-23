@@ -25,6 +25,23 @@ use krishiv_plan::udf::{ScalarUdf, UdfError};
 /// The worker program, embedded in the binary and launched via `python3 -c`.
 const WORKER_SRC: &str = include_str!("udf_worker.py");
 
+/// Process-global worker pool. One `python3` worker per process (executor or
+/// embedded engine) is spawned lazily on first Python-UDF use and shared by all
+/// engines/tasks; UDFs are distinguished by name, and access is serialized. This
+/// avoids one process-spawn per UDF and keeps hot imports (numpy, a model) loaded.
+pub fn global_pool() -> Result<Arc<PythonWorkerPool>, UdfError> {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<Mutex<Option<Arc<PythonWorkerPool>>>> = OnceLock::new();
+    let cell = POOL.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pool) = guard.as_ref() {
+        return Ok(Arc::clone(pool));
+    }
+    let pool = PythonWorkerPool::spawn()?;
+    *guard = Some(Arc::clone(&pool));
+    Ok(pool)
+}
+
 fn exec_err(msg: impl Into<String>) -> UdfError {
     UdfError::Execution {
         message: msg.into(),

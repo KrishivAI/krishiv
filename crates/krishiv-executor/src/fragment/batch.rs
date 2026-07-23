@@ -293,8 +293,15 @@ pub(crate) async fn execute_batch_fragment(
                 })?;
         }
 
+        // Register any Python UDFs shipped in the fragment SQL before planning.
+        let query = engine
+            .register_python_udfs_from_sql(query)
+            .await
+            .map_err(|error| ExecutorError::LocalExecution {
+                message: error.to_string(),
+            })?;
         let dataframe = engine
-            .sql(query)
+            .sql(&query)
             .await
             .map_err(|error| ExecutorError::LocalExecution {
                 message: error.to_string(),
