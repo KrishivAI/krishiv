@@ -92,7 +92,9 @@ pub mod lakehouse;
 pub mod live_table;
 pub mod pipeline_ddl;
 pub mod pivot_sql;
+pub mod python_udf;
 pub mod recursive_cte;
+pub mod scalar_udf;
 /// Spark SQL extensions: LATERAL VIEW, TABLESAMPLE, TRANSFORM, DESCRIBE EXTENDED, etc.
 pub mod spark_sql_ext;
 pub mod sqlstate;
