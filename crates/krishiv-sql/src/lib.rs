@@ -38,17 +38,35 @@ pub(crate) fn build_s3_object_store(
     bucket: &str,
 ) -> object_store::Result<std::sync::Arc<dyn object_store::ObjectStore>> {
     let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+    let mut has_endpoint = false;
     if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL")
         && !endpoint.is_empty()
     {
         // MinIO / S3-compatible: path-style access over plain HTTP.
         builder = builder.with_endpoint(endpoint).with_allow_http(true);
+        has_endpoint = true;
     }
-    if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
+    let has_key = std::env::var("AWS_ACCESS_KEY_ID")
+        .map(|k| !k.is_empty())
+        .unwrap_or(false);
+    if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID")
+        && !key.is_empty()
+    {
         builder = builder.with_access_key_id(key);
     }
-    if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+    if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY")
+        && !secret.is_empty()
+    {
         builder = builder.with_secret_access_key(secret);
+    }
+    // A custom endpoint with no credentials means MinIO / an S3-compatible store
+    // reached anonymously — NOT EC2. Skip request signing so the client reads
+    // public objects directly instead of blocking for ~180s trying to fetch
+    // instance credentials from the IMDS endpoint (169.254.169.254), which is
+    // unreachable off-EC2. Real-AWS deployments (no endpoint) keep the default
+    // credential chain, so EC2 instance-role auth is unaffected.
+    if has_endpoint && !has_key {
+        builder = builder.with_skip_signature(true);
     }
     let region = std::env::var("AWS_REGION")
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))

@@ -189,14 +189,29 @@ impl StorageFactory {
         }
 
         // Honor common S3 env vars if from_env() didn't pick them up
-        if let Ok(v) = std::env::var("AWS_ACCESS_KEY_ID") {
+        let mut has_key = false;
+        if let Ok(v) = std::env::var("AWS_ACCESS_KEY_ID")
+            && !v.is_empty()
+        {
             builder = builder.with_access_key_id(&v);
+            has_key = true;
         }
-        if let Ok(v) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+        if let Ok(v) = std::env::var("AWS_SECRET_ACCESS_KEY")
+            && !v.is_empty()
+        {
             builder = builder.with_secret_access_key(&v);
         }
-        if let Ok(v) = std::env::var("AWS_SESSION_TOKEN") {
+        if let Ok(v) = std::env::var("AWS_SESSION_TOKEN")
+            && !v.is_empty()
+        {
             builder = builder.with_token(&v);
+        }
+
+        // Custom endpoint + no credentials => anonymous S3-compatible access
+        // (MinIO), not EC2. Skip signing so reads don't stall ~180s on the IMDS
+        // credential endpoint, which is unreachable off-EC2.
+        if config.endpoint.is_some() && !has_key {
+            builder = builder.with_skip_signature(true);
         }
 
         let store = builder.build().map_err(|e| ConnectorError::Config {

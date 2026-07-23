@@ -17,6 +17,17 @@ use krishiv_connectors::{ConnectorConfig, ConnectorError, ConnectorRegistry, def
 
 use crate::kafka_table::{KafkaPartitionStream, kafka_auto_commit_interval_ms, project_batch};
 
+/// Whether a `CREATE EXTERNAL TABLE` LOCATION is an object-store URL (S3/GCS/
+/// Azure) rather than a local filesystem path. Object-store URLs must not be
+/// run through local-filesystem canonicalization, and `STORED AS PARQUET`
+/// against one is a native DataFusion ListingTable read, not a connector source.
+fn is_object_store_url(location: &str) -> bool {
+    let l = location.trim_start();
+    ["s3://", "s3a://", "gs://", "gcs://", "az://", "azure://", "abfs://", "abfss://"]
+        .iter()
+        .any(|scheme| l.starts_with(scheme))
+}
+
 /// Reject paths that escape the warehouse root via traversal or absolutes.
 fn validate_path_under_warehouse(location: &str) -> DataFusionResult<()> {
     let warehouse = std::env::var("KRISHIV_WAREHOUSE_ROOT").unwrap_or_else(|_| ".".to_string());
@@ -203,9 +214,26 @@ impl ConnectorTableFactory {
 impl TableProviderFactory for ConnectorTableFactory {
     async fn create(
         &self,
-        _state: &dyn datafusion::catalog::Session,
+        state: &dyn datafusion::catalog::Session,
         cmd: &CreateExternalTable,
     ) -> DataFusionResult<Arc<dyn TableProvider>> {
+        // `STORED AS PARQUET LOCATION 's3://…'` is a native DataFusion
+        // ListingTable read of object storage, not a connector source. The
+        // SqlEngine has already registered the backing S3 object store on the
+        // runtime env (register_s3_object_store_for_warehouse, invoked before
+        // this DDL executes), so delegate to DataFusion's own
+        // ListingTableFactory: it looks up the Parquet FileFormat, lists the
+        // location to infer the schema, and builds the ListingTable. This
+        // bypasses the connector path's local-filesystem `canonicalize`, which
+        // cannot resolve an s3:// URL and previously failed the DDL with
+        // "path 's3://…' not accessible: No such file or directory"
+        // (engine-s3-ddl-gap).
+        if self.connector_kind == "parquet" && is_object_store_url(&cmd.location) {
+            return datafusion::datasource::listing_table_factory::ListingTableFactory::new()
+                .create(state, cmd)
+                .await;
+        }
+
         // `connector_config_from_ddl` calls `validate_path_under_warehouse`,
         // which does blocking `Path::canonicalize` syscalls. Run it on the
         // blocking pool so this async `create` never stalls the DataFusion/

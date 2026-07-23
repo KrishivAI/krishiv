@@ -114,19 +114,35 @@ pub(crate) fn build_s3_object_store(bucket: &str) -> Result<Arc<dyn ObjectStore>
     // so a separate builder.with_allow_http(true) would be silently discarded.
     let mut client_opts = object_store::ClientOptions::new()
         .with_pool_idle_timeout(std::time::Duration::from_secs(1));
+    let mut has_endpoint = false;
     if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL")
         && !endpoint.is_empty()
     {
         // MinIO / S3-compatible: path-style access over plain HTTP.
         builder = builder.with_endpoint(endpoint);
         client_opts = client_opts.with_allow_http(true);
+        has_endpoint = true;
     }
     builder = builder.with_client_options(client_opts);
-    if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
+    let has_key = std::env::var("AWS_ACCESS_KEY_ID")
+        .map(|k| !k.is_empty())
+        .unwrap_or(false);
+    if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID")
+        && !key.is_empty()
+    {
         builder = builder.with_access_key_id(key);
     }
-    if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+    if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY")
+        && !secret.is_empty()
+    {
         builder = builder.with_secret_access_key(secret);
+    }
+    // Custom endpoint + no credentials => anonymous MinIO/S3-compatible access,
+    // not EC2. Skip signing so reads don't block ~180s on the IMDS credential
+    // endpoint (unreachable off-EC2). Real AWS (no endpoint) keeps the default
+    // credential chain intact.
+    if has_endpoint && !has_key {
+        builder = builder.with_skip_signature(true);
     }
     let region = std::env::var("AWS_REGION")
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
