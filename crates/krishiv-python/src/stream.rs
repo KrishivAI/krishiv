@@ -436,10 +436,30 @@ impl PyWindowedStream {
 // ── G10: ConnectedStreams / CoProcessFunction ─────────────────────────────────
 
 /// Bridge: Python object with `on_stream1`, `on_stream2`, `on_timer` → Rust `CoProcessFunction`.
-struct PyCoProcessBridge {
+pub(crate) struct PyCoProcessBridge {
     on_stream1: pyo3::Py<pyo3::PyAny>,
     on_stream2: pyo3::Py<pyo3::PyAny>,
     on_timer: pyo3::Py<pyo3::PyAny>,
+}
+
+/// Build a co-process bridge from a Python handler (`on_stream1`/`on_stream2`/
+/// `on_timer`). Shared by the DataStream `connect` and `SDF.co_process`.
+pub(crate) fn co_bridge_from_func(
+    py: pyo3::Python<'_>,
+    func: &pyo3::Py<pyo3::PyAny>,
+) -> PyResult<PyCoProcessBridge> {
+    let getattr = |name: &str| {
+        func.getattr(py, name).map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "co-process function must have an '{name}' method"
+            ))
+        })
+    };
+    Ok(PyCoProcessBridge {
+        on_stream1: getattr("on_stream1")?,
+        on_stream2: getattr("on_stream2")?,
+        on_timer: getattr("on_timer")?,
+    })
 }
 
 impl krishiv_api::CoProcessFunction for PyCoProcessBridge {
@@ -508,7 +528,7 @@ impl krishiv_api::CoProcessFunction for PyCoProcessBridge {
     }
 }
 
-fn dispatch_co_event(
+pub(crate) fn dispatch_co_event(
     callable: &pyo3::Py<pyo3::PyAny>,
     key: &str,
     batch: &arrow::record_batch::RecordBatch,
@@ -732,9 +752,29 @@ impl PyBroadcastContext {
     }
 }
 
-struct PyBroadcastBridge {
+pub(crate) struct PyBroadcastBridge {
     on_keyed: pyo3::Py<pyo3::PyAny>,
     on_broadcast: pyo3::Py<pyo3::PyAny>,
+}
+
+/// Build a broadcast bridge from a Python handler (`on_keyed_event`/
+/// `on_broadcast_event`). Shared by the DataStream broadcast and
+/// `SDF.broadcast_process`.
+pub(crate) fn broadcast_bridge_from_func(
+    py: pyo3::Python<'_>,
+    func: &pyo3::Py<pyo3::PyAny>,
+) -> PyResult<PyBroadcastBridge> {
+    let getattr = |name: &str| {
+        func.getattr(py, name).map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "broadcast function must have an '{name}' method"
+            ))
+        })
+    };
+    Ok(PyBroadcastBridge {
+        on_keyed: getattr("on_keyed_event")?,
+        on_broadcast: getattr("on_broadcast_event")?,
+    })
 }
 
 impl krishiv_api::BroadcastProcessFunction for PyBroadcastBridge {

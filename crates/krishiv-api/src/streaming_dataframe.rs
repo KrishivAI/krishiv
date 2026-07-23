@@ -182,6 +182,12 @@ impl StreamingDataFrame {
         self
     }
 
+    /// The underlying source DataFrame — used by the co-process / broadcast
+    /// bindings to collect this stream's batches.
+    pub fn source_df(&self) -> DataFrame {
+        self.df.clone()
+    }
+
     // ── Stateless transforms (applied to the source stream before windowing) ──
     // These delegate to the underlying batch/stream `DataFrame`, so a streaming
     // pipeline gets the same fluent select/filter/withColumn/drop as a batch one

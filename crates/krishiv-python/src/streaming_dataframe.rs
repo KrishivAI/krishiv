@@ -174,6 +174,84 @@ impl PyStreamingDataFrame {
             .collect())
     }
 
+    /// Connect this streaming DataFrame with `other` for dual-stream
+    /// `CoProcessFunction` processing (Flink connected streams). `func` is a
+    /// handler with `on_stream1`/`on_stream2`/`on_timer`; both streams are keyed
+    /// by `key_column`. Returns a stream of the batches the handler emits.
+    pub fn co_process(
+        &self,
+        py: Python<'_>,
+        other: &PyStreamingDataFrame,
+        key_column: String,
+        func: Py<PyAny>,
+    ) -> PyResult<PyDataFrameStream> {
+        let bridge = crate::stream::co_bridge_from_func(py, &func)?;
+        let left_df = self.inner.source_df();
+        let right_df = other.inner.source_df();
+        let out = py.detach(move || -> PyResult<Vec<arrow::record_batch::RecordBatch>> {
+            let left = crate::session::block_on_async(async move { left_df.collect_async().await })
+                .map_err(map_krishiv_error)?
+                .into_batches();
+            let right =
+                crate::session::block_on_async(async move { right_df.collect_async().await })
+                    .map_err(map_krishiv_error)?
+                    .into_batches();
+            let mut ex = krishiv_api::CoProcessExecutor::new(&key_column, Box::new(bridge));
+            let err = |e: krishiv_dataflow::ExecError| PyRuntimeError::new_err(e.to_string());
+            let mut emitted = Vec::new();
+            for b in &left {
+                emitted.extend(ex.process_stream1(b, 0).map_err(err)?);
+            }
+            for b in &right {
+                emitted.extend(ex.process_stream2(b, 0).map_err(err)?);
+            }
+            emitted.extend(ex.fire_timers(i64::MAX).map_err(err)?);
+            Ok(emitted)
+        })?;
+        Ok(PyDataFrameStream::from_stream(Box::pin(
+            futures::stream::iter(out.into_iter().map(Ok::<_, String>)),
+        )))
+    }
+
+    /// Process this (keyed) streaming DataFrame against a `broadcast` streaming
+    /// DataFrame with a `BroadcastProcessFunction` (Flink broadcast state).
+    /// `func` has `on_keyed_event`/`on_broadcast_event`; `key_column` shards the
+    /// keyed state. Returns a stream of the emitted batches.
+    pub fn broadcast_process(
+        &self,
+        py: Python<'_>,
+        broadcast: &PyStreamingDataFrame,
+        key_column: String,
+        func: Py<PyAny>,
+    ) -> PyResult<PyDataFrameStream> {
+        let bridge = crate::stream::broadcast_bridge_from_func(py, &func)?;
+        let keyed_df = self.inner.source_df();
+        let broadcast_df = broadcast.inner.source_df();
+        let out = py.detach(move || -> PyResult<Vec<arrow::record_batch::RecordBatch>> {
+            let bcast =
+                crate::session::block_on_async(async move { broadcast_df.collect_async().await })
+                    .map_err(map_krishiv_error)?
+                    .into_batches();
+            let keyed =
+                crate::session::block_on_async(async move { keyed_df.collect_async().await })
+                    .map_err(map_krishiv_error)?
+                    .into_batches();
+            let mut ex = krishiv_api::BroadcastProcessExecutor::new(&key_column, Box::new(bridge));
+            let err = |e: krishiv_dataflow::ExecError| PyRuntimeError::new_err(e.to_string());
+            let mut emitted = Vec::new();
+            for b in &bcast {
+                emitted.extend(ex.process_broadcast_batch(b, 0).map_err(err)?);
+            }
+            for b in &keyed {
+                emitted.extend(ex.process_keyed_batch(b, 0).map_err(err)?);
+            }
+            Ok(emitted)
+        })?;
+        Ok(PyDataFrameStream::from_stream(Box::pin(
+            futures::stream::iter(out.into_iter().map(Ok::<_, String>)),
+        )))
+    }
+
     pub fn execute_stream_async(&self, py: Python<'_>) -> PyResult<PyDataFrameStream> {
         let inner = self.inner.clone();
         let stream = py
