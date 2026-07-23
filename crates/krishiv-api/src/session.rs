@@ -2109,6 +2109,37 @@ impl Session {
         Ok(())
     }
 
+    /// Register a Parquet path (local or `s3://`) for REMOTE execution WITHOUT
+    /// reading it on the client.
+    ///
+    /// Unlike [`register_parquet`](Self::register_parquet), this builds no local
+    /// table provider — it does no client-side schema inference or object-store
+    /// access. It exists for the distributed case where only the coordinator and
+    /// executors can reach the data: an `s3://` dataset whose credentials live on
+    /// the cluster (mounted secret), not on the client. The path is shipped as a
+    /// `BatchTableRegistration` with every `execute_remote` / distributed collect;
+    /// the coordinator resolves the schema and the executors read the data with
+    /// their own credentials.
+    ///
+    /// Query such a table through [`execute_remote`](Self::execute_remote) — local
+    /// `sql()` planning cannot see it (there is no local provider), by design.
+    /// Requires a distributed session with remote execution enabled.
+    pub fn register_remote_parquet(
+        &self,
+        table_name: impl AsRef<str>,
+        path: impl AsRef<Path>,
+    ) -> Result<()> {
+        if !self.runtime.uses_remote_execution() {
+            return Err(KrishivError::unsupported(
+                "register_remote_parquet requires a distributed session with remote execution; \
+                 use register_parquet for local reads",
+            ));
+        }
+        self.registered_parquet
+            .insert(table_name.as_ref().to_owned(), path.as_ref().to_path_buf());
+        Ok(())
+    }
+
     /// Validate and register a connector source configuration in this session.
     ///
     /// The registration is session metadata used by SQL job compilation and

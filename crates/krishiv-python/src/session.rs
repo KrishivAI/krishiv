@@ -695,6 +695,17 @@ impl PySession {
             .map_err(map_krishiv_error)
     }
 
+    /// Register a Parquet path (local or ``s3://``) for REMOTE execution without
+    /// reading it on the client — no client-side schema inference or object-store
+    /// access. Use in distributed mode when only the coordinator/executors can
+    /// reach the data (e.g. an S3 dataset whose credentials live on the cluster).
+    /// Query it via :py:meth:`execute_remote`; local ``sql()`` cannot see it.
+    pub fn register_remote_parquet(&self, name: String, path: String) -> PyResult<()> {
+        self.inner
+            .register_remote_parquet(&name, &path)
+            .map_err(map_krishiv_error)
+    }
+
     pub fn register_parquet_stream(&self, name: String, path: String) -> PyResult<()> {
         self.inner
             .register_parquet_stream(&name, path.as_ref())

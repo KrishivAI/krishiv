@@ -244,7 +244,10 @@ pub struct GroupedDataFrame {
 impl GroupedDataFrame {
     /// Compute aggregate expressions for each group.
     pub fn agg(&self, aggregate_exprs: &[Expr]) -> Result<DataFrame> {
-        let Some(ops) = &self.dataframe.sql_dataframe else {
+        // Materialize a pre-collected base (execute_remote/collect result) into
+        // an SQL-backed DataFrame so groupBy(...).agg(...) works on remote results.
+        let base = self.dataframe.as_sql_backed()?;
+        let Some(ops) = &base.sql_dataframe else {
             return Err(KrishivError::unsupported(
                 "grouped aggregation requires an SQL-backed DataFrame",
             ));
@@ -252,7 +255,7 @@ impl GroupedDataFrame {
         let groups = self.group_exprs.iter().map(Expr::node).collect::<Vec<_>>();
         let aggregates = aggregate_exprs.iter().map(Expr::node).collect::<Vec<_>>();
         let new_ops = krishiv_common::async_util::block_on(ops.aggregate(&groups, &aggregates))?;
-        Ok(self.dataframe.with_new_ops(new_ops))
+        Ok(base.with_new_ops(new_ops))
     }
 
     /// Aggregate using SQL-compatible GROUPING SETS, CUBE, or ROLLUP semantics.
@@ -780,6 +783,42 @@ Execution statistics:
         }
     }
 
+    /// Materialize a pre-collected DataFrame into an SQL-backed one by
+    /// registering its in-memory batches in an ephemeral `SqlEngine`. This lets
+    /// the lazy transform methods (select / filter / sort / groupBy / withColumn
+    /// / distinct / drop / …) run on results read back from the coordinator
+    /// (`execute_remote` / `collect` / `sql_as`) instead of failing with
+    /// "requires an SQL-backed DataFrame". No-op when already SQL-backed. The
+    /// resulting `SqlDataFrame` owns its DataFusion session state (Arc-backed),
+    /// so the ephemeral engine can drop without invalidating it.
+    fn as_sql_backed(&self) -> Result<DataFrame> {
+        if self.sql_dataframe.is_some() {
+            return Ok(self.clone());
+        }
+        let batches = self.pre_collected.clone().ok_or_else(|| {
+            KrishivError::unsupported("DataFrame has neither SQL ops nor collected data")
+        })?;
+        if batches.iter().all(|b| b.num_rows() == 0) && batches.first().is_none() {
+            return Err(KrishivError::unsupported(
+                "cannot transform an empty pre-collected DataFrame with no schema",
+            ));
+        }
+        let engine = krishiv_sql::SqlEngine::new();
+        krishiv_common::async_util::block_on(
+            engine.register_record_batches("__krishiv_df", batches),
+        )?;
+        let sql_df =
+            krishiv_common::async_util::block_on(engine.sql("SELECT * FROM __krishiv_df"))?;
+        let mut df = self.with_new_ops(Box::new(sql_df));
+        // The batches are already local (fetched from the coordinator), and the
+        // ephemeral engine's in-memory table cannot be shipped for remote
+        // execution. Force local collection so transforms on this materialized
+        // DataFrame run against the in-memory data instead of failing with
+        // "remote execution requires a SQL query".
+        df.force_local = true;
+        Ok(df)
+    }
+
     /// Create a new `DataFrame` from a new inner ops object, preserving
     /// runtime state from `self`.
     fn with_new_ops(&self, new_ops: Box<dyn KrishivDataFrameOps>) -> Self {
@@ -844,14 +883,10 @@ Execution statistics:
                 let new_ops = krishiv_common::async_util::block_on(df.select(columns))?;
                 Ok(self.with_new_ops(new_ops))
             }
-            None => {
-                let msg = if self.pre_collected.is_some() {
-                    "select on pre-collected DataFrame is not yet supported; collect() first"
-                } else {
-                    "select requires an SQL-backed DataFrame"
-                };
-                Err(KrishivError::unsupported(msg))
-            }
+            None if self.pre_collected.is_some() => self.as_sql_backed()?.select(columns),
+            None => Err(KrishivError::unsupported(
+                "select requires an SQL-backed DataFrame",
+            )),
         }
     }
 
@@ -863,6 +898,7 @@ Execution statistics:
                 let new_ops = krishiv_common::async_util::block_on(df.select_exprs(&expressions))?;
                 Ok(self.with_new_ops(new_ops))
             }
+            None if self.pre_collected.is_some() => self.as_sql_backed()?.select_exprs(expressions),
             None => Err(KrishivError::unsupported(
                 "select_exprs requires an SQL-backed DataFrame",
             )),
@@ -878,6 +914,7 @@ Execution statistics:
                 let new_ops = krishiv_common::async_util::block_on(df.unnest_columns(columns))?;
                 Ok(self.with_new_ops(new_ops))
             }
+            None if self.pre_collected.is_some() => self.as_sql_backed()?.unnest(columns),
             None => Err(KrishivError::unsupported(
                 "unnest requires an SQL-backed DataFrame",
             )),
@@ -892,6 +929,7 @@ Execution statistics:
                     krishiv_common::async_util::block_on(df.filter_expr(predicate.node()))?;
                 Ok(self.with_new_ops(new_ops))
             }
+            None if self.pre_collected.is_some() => self.as_sql_backed()?.filter_expr(predicate),
             None => Err(KrishivError::unsupported(
                 "filter_expr requires an SQL-backed DataFrame",
             )),
@@ -957,6 +995,7 @@ Execution statistics:
                 let new_ops = krishiv_common::async_util::block_on(df.filter(predicate))?;
                 Ok(self.with_new_ops(new_ops))
             }
+            None if self.pre_collected.is_some() => self.as_sql_backed()?.filter(predicate),
             None => Err(KrishivError::unsupported(
                 "filter requires an SQL-backed DataFrame",
             )),
@@ -975,9 +1014,34 @@ Execution statistics:
                 let new_ops = krishiv_common::async_util::block_on(df.limit(n))?;
                 Ok(self.with_new_ops(new_ops))
             }
-            None => Err(KrishivError::unsupported(
-                "limit requires an SQL-backed DataFrame",
-            )),
+            // A pre-collected DataFrame (produced by execute_remote / collect /
+            // sql_as) has no SQL ops handle — slice its in-memory batches to the
+            // first `n` rows instead of erroring. This makes limit()/head()/take()
+            // work on results read back from the coordinator, matching the
+            // SQL-backed behaviour (previously "limit requires an SQL-backed
+            // DataFrame", which broke df.head() on any remote result).
+            None => match &self.pre_collected {
+                Some(batches) => {
+                    let mut sliced = Vec::new();
+                    let mut remaining = n;
+                    for batch in batches {
+                        if remaining == 0 {
+                            break;
+                        }
+                        let take = remaining.min(batch.num_rows());
+                        if take > 0 {
+                            sliced.push(batch.slice(0, take));
+                            remaining -= take;
+                        }
+                    }
+                    let mut df = self.clone_no_ops();
+                    df.pre_collected = Some(sliced);
+                    Ok(df)
+                }
+                None => Err(KrishivError::unsupported(
+                    "limit requires an SQL-backed or pre-collected DataFrame",
+                )),
+            },
         }
     }
 
@@ -988,6 +1052,7 @@ Execution statistics:
                 let new_ops = krishiv_common::async_util::block_on(df.distinct())?;
                 Ok(self.with_new_ops(new_ops))
             }
+            None if self.pre_collected.is_some() => self.as_sql_backed()?.distinct(),
             None => Err(KrishivError::unsupported(
                 "distinct requires an SQL-backed DataFrame",
             )),
@@ -1001,6 +1066,7 @@ Execution statistics:
                 let new_ops = krishiv_common::async_util::block_on(df.drop_nulls(columns))?;
                 Ok(self.with_new_ops(new_ops))
             }
+            None if self.pre_collected.is_some() => self.as_sql_backed()?.drop_nulls(columns),
             None => Err(KrishivError::unsupported(
                 "drop_nulls requires an SQL-backed DataFrame",
             )),
@@ -1043,6 +1109,7 @@ Execution statistics:
                 let new_ops = krishiv_common::async_util::block_on(df.sort(columns, descending))?;
                 Ok(self.with_new_ops(new_ops))
             }
+            None if self.pre_collected.is_some() => self.as_sql_backed()?.sort(columns, descending),
             None => Err(KrishivError::unsupported(
                 "sort requires an SQL-backed DataFrame",
             )),
@@ -1069,6 +1136,7 @@ Execution statistics:
                 let new_ops = krishiv_common::async_util::block_on(df.drop_columns(columns))?;
                 Ok(self.with_new_ops(new_ops))
             }
+            None if self.pre_collected.is_some() => self.as_sql_backed()?.drop(columns),
             None => Err(KrishivError::unsupported(
                 "drop requires an SQL-backed DataFrame",
             )),
@@ -1082,6 +1150,7 @@ Execution statistics:
                 let new_ops = krishiv_common::async_util::block_on(df.rename_column(old, new))?;
                 Ok(self.with_new_ops(new_ops))
             }
+            None if self.pre_collected.is_some() => self.as_sql_backed()?.rename(old, new),
             None => Err(KrishivError::unsupported(
                 "rename requires an SQL-backed DataFrame",
             )),
@@ -1107,6 +1176,7 @@ Execution statistics:
                 let new_ops = krishiv_common::async_util::block_on(df.with_column(name, expr))?;
                 Ok(self.with_new_ops(new_ops))
             }
+            None if self.pre_collected.is_some() => self.as_sql_backed()?.with_column(name, expr),
             None => Err(KrishivError::unsupported(
                 "with_column requires an SQL-backed DataFrame",
             )),
@@ -1120,6 +1190,7 @@ Execution statistics:
                 let new_ops = krishiv_common::async_util::block_on(df.fill_null(column, value))?;
                 Ok(self.with_new_ops(new_ops))
             }
+            None if self.pre_collected.is_some() => self.as_sql_backed()?.fill_null(column, value),
             None => Err(KrishivError::unsupported(
                 "fill_null requires an SQL-backed DataFrame",
             )),
