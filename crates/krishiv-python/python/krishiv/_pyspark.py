@@ -630,6 +630,37 @@ class UDFRegistration:
         _invoke.__name__ = name
         return _invoke
 
+    def register_arrow(self, name: str, f, returnType="double", argTypes=None):  # noqa: N803
+        """Register a VECTORIZED (Arrow-native) scalar UDF — Krishiv's analogue of
+        PySpark's ``pandas_udf``. ``f`` receives the input columns as a
+        ``pyarrow.RecordBatch`` and returns a ``pyarrow.Array`` (or RecordBatch)
+        of results — one call per batch, not per row, so it runs at native Arrow
+        speed. Embedded-engine only (executes Python). Contrast register_sql
+        (distributed, SQL-only) and register (scalar, row-at-a-time)."""
+        import pyarrow as pa  # noqa: PLC0415
+
+        out_type = _udf_type(returnType)
+        arg_types = [_udf_type(t) for t in argTypes] if argTypes else []
+        params = [f"a{i}" for i in range(len(arg_types))]
+        input_types = dict(zip(params, arg_types))
+
+        def _arrow_batch(rb):
+            result = f(rb)
+            if isinstance(result, pa.RecordBatch):
+                return result
+            arr = result if isinstance(result, (pa.Array, pa.ChunkedArray)) else pa.array(result)
+            return pa.RecordBatch.from_arrays([arr], names=["out"])
+
+        _arrow_batch._krishiv_arrow_udf = True
+        wrapped = _native_udf(_arrow_batch, name=name, input_types=input_types, output_type=out_type)
+        self._session.register_udf(wrapped)
+
+        def _invoke(*cols):
+            return call_function(name, [_as_column(c) for c in cols])
+
+        _invoke.__name__ = name
+        return _invoke
+
     def register_sql(self, name: str, body: str, arg_names):
         """Register a scalar SQL-expression function that works in DISTRIBUTED
         mode (unlike Python-callable UDFs, which are embedded-only). ``body`` is a
