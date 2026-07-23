@@ -838,6 +838,9 @@ def _apply() -> None:
     DataFrame.printSchema = _df_printSchema
     DataFrame.dtypes = property(_df_dtypes)
     DataFrame.na = property(DataFrameNaFunctions)
+    # PySpark direct aliases for the na functions (df.fillna / df.dropna).
+    DataFrame.fillna = lambda self, value, subset=None: DataFrameNaFunctions(self).fill(value, subset=subset)
+    DataFrame.dropna = lambda self, how="any", thresh=None, subset=None: DataFrameNaFunctions(self).drop(how=how, thresh=thresh, subset=subset)
     DataFrame.stat = property(DataFrameStatFunctions)
     DataFrame.write = property(DataFrameWriter)
     # Session parity

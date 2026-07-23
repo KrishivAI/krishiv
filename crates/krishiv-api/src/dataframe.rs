@@ -1034,6 +1034,15 @@ Execution statistics:
                             remaining -= take;
                         }
                     }
+                    // limit(0) (or an all-empty source) must still carry the
+                    // schema — keep a zero-row slice of the first batch so
+                    // downstream collect()/toPandas() has a schema to render
+                    // instead of failing with "Must pass schema".
+                    if sliced.is_empty()
+                        && let Some(first) = batches.first()
+                    {
+                        sliced.push(first.slice(0, 0));
+                    }
                     let mut df = self.clone_no_ops();
                     df.pre_collected = Some(sliced);
                     Ok(df)
