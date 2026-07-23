@@ -582,6 +582,30 @@ def _udf_type(dtype) -> str:
     return _UDF_TYPE_ALIASES.get(name, name)
 
 
+import re as _re
+
+_SQL_UDF_KEYWORDS = frozenset({
+    "and", "or", "not", "case", "when", "then", "else", "end", "as", "null",
+    "true", "false", "is", "in", "between", "like", "distinct", "cast", "over",
+    "interval", "date", "timestamp",
+})
+
+
+def _extract_sql_params(expr: str):
+    """Best-effort parameter names for a SQL-expression UDF: identifiers in the
+    body that are not SQL keywords and not function calls (not followed by ``(``),
+    in first-appearance order. Pass ``params=[...]`` explicitly to override."""
+    params = []
+    for m in _re.finditer(r"[A-Za-z_]\w*", expr):
+        tok = m.group(0)
+        after = expr[m.end():m.end() + 1]
+        if after == "(" or tok.lower() in _SQL_UDF_KEYWORDS:
+            continue
+        if tok not in params:
+            params.append(tok)
+    return params
+
+
 class UDFRegistration:
     """``session.udf`` — register Python scalar UDFs (PySpark ``spark.udf``).
 
@@ -601,7 +625,25 @@ class UDFRegistration:
     def __init__(self, session: Session) -> None:
         self._session = session
 
-    def register(self, name: str, f, returnType="string", argTypes=None):  # noqa: N803
+    def register(self, name: str, f, returnType="string", argTypes=None, *, params=None, vectorized=False):  # noqa: N803
+        """Register a UDF. One entry point, three kinds — chosen by what you pass:
+
+        - ``register("tax", "x * 1.1")`` — ``f`` is a SQL expression string. This
+          is the PORTABLE kind: it is inlined to native SQL and behaves
+          identically in embedded AND distributed mode (runs on the cluster).
+          Parameter names are read from the expression, or pass ``params=[...]``.
+        - ``register("inc", lambda x: x + 1, "int", ["int"])`` — ``f`` is a Python
+          callable: a scalar (row-at-a-time) UDF. Embedded-engine only.
+        - ``register("v", batch_fn, "double", ["double"], vectorized=True)`` — a
+          whole-batch Arrow UDF (like pandas_udf). Embedded-engine only.
+
+        Python callables can't run distributed because the executors are pure
+        Rust (no Python). For a UDF that runs on the cluster, give a SQL
+        expression string."""
+        if isinstance(f, str):
+            return self.register_sql(name, f, params if params is not None else _extract_sql_params(f))
+        if vectorized:
+            return self.register_arrow(name, f, returnType, argTypes)
         try:
             arity = sum(
                 1
