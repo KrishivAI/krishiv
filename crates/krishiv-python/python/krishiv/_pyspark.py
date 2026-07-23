@@ -1083,6 +1083,33 @@ def _apply() -> None:
     _SDF.sessionWindow = lambda self, gap: self.session_window(_parse_duration_ms(gap))
     _SDF.writeStream = property(lambda self: self.write_stream())
 
+    # Phase 2: fluent STATELESS verbs on the streaming DataFrame — Spark's "same
+    # DataFrame API for batch and streaming" (they push into the source stream
+    # before windowing). `_col_sql` renders a Column arg to a SQL string.
+    def _col_sql(x):
+        return x if isinstance(x, str) else x.sql()
+
+    _native_sdf_select = _SDF.select
+
+    def _sdf_select(self, *cols):
+        if len(cols) == 1 and isinstance(cols[0], (list, tuple)):
+            cols = tuple(cols[0])
+        return _native_sdf_select(self, [_col_sql(c) for c in cols])
+
+    _SDF.select = _sdf_select
+
+    _native_sdf_filter = _SDF.filter
+    _SDF.filter = lambda self, condition: _native_sdf_filter(self, _col_sql(condition))
+    _SDF.where = _SDF.filter
+    _SDF.withColumn = lambda self, name, expr: self.with_column(name, _col_sql(expr))
+
+    def _sdf_drop(self, *columns):
+        if len(columns) == 1 and isinstance(columns[0], (list, tuple)):
+            columns = tuple(columns[0])
+        return self.drop_columns([str(c) for c in columns])
+
+    _SDF.drop = _sdf_drop
+
     # -- DataStream surface: unit-consistent camelCase windows + one watermark --
     _Stream.withWatermark = lambda self, column, delayThreshold: self.with_watermark(
         column, _parse_duration_ms(delayThreshold)

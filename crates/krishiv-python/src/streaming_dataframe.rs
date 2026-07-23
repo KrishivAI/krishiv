@@ -71,6 +71,46 @@ impl PyStreamingDataFrame {
         }
     }
 
+    // ── Stateless transforms (before windowing) — Spark's "same DataFrame API
+    // for batch and streaming". Delegate to the underlying DataFrame. ──
+    pub fn select(&self, columns: Vec<String>) -> PyResult<Self> {
+        let cols: Vec<&str> = columns.iter().map(String::as_str).collect();
+        Ok(Self {
+            inner: self.inner.clone().select(&cols).map_err(map_krishiv_error)?,
+        })
+    }
+
+    pub fn filter(&self, predicate: String) -> PyResult<Self> {
+        Ok(Self {
+            inner: self
+                .inner
+                .clone()
+                .filter(&predicate)
+                .map_err(map_krishiv_error)?,
+        })
+    }
+
+    pub fn with_column(&self, name: String, expr: String) -> PyResult<Self> {
+        Ok(Self {
+            inner: self
+                .inner
+                .clone()
+                .with_column(&name, &expr)
+                .map_err(map_krishiv_error)?,
+        })
+    }
+
+    pub fn drop_columns(&self, columns: Vec<String>) -> PyResult<Self> {
+        let cols: Vec<&str> = columns.iter().map(String::as_str).collect();
+        Ok(Self {
+            inner: self
+                .inner
+                .clone()
+                .drop_columns(&cols)
+                .map_err(map_krishiv_error)?,
+        })
+    }
+
     pub fn execute_stream_async(&self, py: Python<'_>) -> PyResult<PyDataFrameStream> {
         let inner = self.inner.clone();
         let stream = py

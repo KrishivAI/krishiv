@@ -151,6 +151,37 @@ impl StreamingDataFrame {
         self
     }
 
+    // ── Stateless transforms (applied to the source stream before windowing) ──
+    // These delegate to the underlying batch/stream `DataFrame`, so a streaming
+    // pipeline gets the same fluent select/filter/withColumn/drop as a batch one
+    // (Spark's "same DataFrame API for batch and streaming"). Because the SDF
+    // executes `self.df.execute_stream_async()`, the projection/filter is pushed
+    // into the source stream ahead of any windowing/dedup.
+
+    /// Stateless projection: keep only `columns`.
+    pub fn select(mut self, columns: &[&str]) -> Result<Self> {
+        self.df = self.df.select(columns)?;
+        Ok(self)
+    }
+
+    /// Stateless filter on a SQL predicate string (e.g. `"amount > 0"`).
+    pub fn filter(mut self, predicate: &str) -> Result<Self> {
+        self.df = self.df.filter(predicate)?;
+        Ok(self)
+    }
+
+    /// Stateless computed column: `name = <SQL expr>`.
+    pub fn with_column(mut self, name: &str, expr: &str) -> Result<Self> {
+        self.df = self.df.with_column(name, expr)?;
+        Ok(self)
+    }
+
+    /// Stateless column drop.
+    pub fn drop_columns(mut self, columns: &[&str]) -> Result<Self> {
+        self.df = self.df.drop(columns)?;
+        Ok(self)
+    }
+
     /// Set watermark lag.
     pub fn with_watermark_lag(mut self, lag_ms: u64) -> Self {
         self.watermark_lag_ms = lag_ms;
@@ -1563,6 +1594,39 @@ mod tests {
             convenience.len(),
             "both approaches must produce the same number of matches"
         );
+    }
+
+    // Phase 2: stateless verbs (filter/select/with_column/drop) push into the
+    // source stream before windowing.
+    #[tokio::test]
+    async fn stateless_verbs_filter_project_before_windowing() {
+        let df = dataframe_from_batches(vec![stream_batch(&["a", "b", "c", "d"], &[1, 2, 3, 4])]);
+        let sdf = df
+            .stream()
+            .filter("stream_ts > 2")
+            .expect("filter")
+            .with_column("bumped", "stream_ts + 100")
+            .expect("with_column")
+            .select(&["user_id", "bumped"])
+            .expect("select");
+        let out = collect_stream(sdf.execute_stream_async().await.expect("stream"))
+            .await
+            .expect("collect");
+        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2, "filter stream_ts > 2 keeps rows 3 and 4");
+        let batch = out.first().expect("one batch");
+        assert_eq!(batch.num_columns(), 2, "projected to user_id + bumped");
+        assert_eq!(batch.schema().field(0).name(), "user_id");
+        assert_eq!(batch.schema().field(1).name(), "bumped");
+        // bumped = stream_ts + 100 -> {103, 104}
+        let bumped = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64");
+        let mut vals: Vec<i64> = (0..bumped.len()).map(|i| bumped.value(i)).collect();
+        vals.sort_unstable();
+        assert_eq!(vals, vec![103, 104]);
     }
 
     // Test: streaming query restart -- start two sequential queries from the same data
