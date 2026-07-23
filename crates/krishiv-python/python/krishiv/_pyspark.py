@@ -954,6 +954,44 @@ class _SessionBuilder:
         return Session.embedded()
 
 
+_DURATION_UNITS = {
+    "ms": 1, "milli": 1, "millis": 1, "millisecond": 1, "milliseconds": 1,
+    "s": 1000, "sec": 1000, "secs": 1000, "second": 1000, "seconds": 1000,
+    "m": 60_000, "min": 60_000, "mins": 60_000, "minute": 60_000, "minutes": 60_000,
+    "h": 3_600_000, "hr": 3_600_000, "hrs": 3_600_000, "hour": 3_600_000, "hours": 3_600_000,
+    "d": 86_400_000, "day": 86_400_000, "days": 86_400_000,
+}
+
+
+def _parse_duration_ms(value) -> int:
+    """Spark-style duration -> milliseconds.
+
+    Accepts an int/float already in milliseconds, or a string like ``"10 minutes"``,
+    ``"30 seconds"``, ``"1 hour"``, ``"500 ms"``. This is the single, unit-unambiguous
+    spelling the unified streaming windows/watermarks use — the native
+    ``tumbling_window`` takes seconds on ``Stream`` but milliseconds on
+    ``StreamingDataFrame``, which this avoids."""
+    import re  # noqa: PLC0415
+
+    if isinstance(value, bool):  # guard: bool is an int subclass
+        raise TypeError("duration must be an int of ms or a string like '10 minutes'")
+    if isinstance(value, (int, float)):
+        return int(value)
+    if not isinstance(value, str):
+        raise TypeError(
+            f"duration must be an int of ms or a string like '10 minutes', got {value!r}"
+        )
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([A-Za-z]+)\s*", value)
+    if not m:
+        raise ValueError(
+            f"cannot parse duration {value!r}; use e.g. '10 minutes' or an int of milliseconds"
+        )
+    factor = _DURATION_UNITS.get(m.group(2).lower())
+    if factor is None:
+        raise ValueError(f"unknown duration unit {m.group(2)!r} in {value!r}")
+    return int(float(m.group(1)) * factor)
+
+
 def _apply() -> None:
     """Graft every PySpark-shaped name onto the native classes."""
     # DataFrame transforms
@@ -1012,3 +1050,68 @@ def _apply() -> None:
     # which is exposed here under the PySpark spellings).
     Session.readStream = property(lambda self: self.read_stream())
     DataFrame.writeStream = property(lambda self: self.write_stream())
+
+    # ── Streaming API unification (Phase 1) ──────────────────────────────────
+    # One canonical, Spark-consistent naming across BOTH the DataStream
+    # (Stream / KeyedStream) and Structured-Streaming (StreamingDataFrame)
+    # surfaces. All window / watermark durations accept a Spark string
+    # ("10 minutes") or an int of milliseconds via _parse_duration_ms — which
+    # also removes the native seconds-vs-milliseconds mismatch (`tumbling_window`
+    # is seconds on Stream but milliseconds on StreamingDataFrame).
+    from .krishiv import (  # noqa: PLC0415
+        Stream as _Stream,
+        KeyedStream as _KeyedStream,
+        StreamingDataFrame as _SDF,
+    )
+
+    # -- Structured Streaming surface (the primary, "easier" one) --
+    _SDF.withWatermark = lambda self, eventTimeColumn, delayThreshold: (
+        self.with_event_time(eventTimeColumn).with_watermark_lag(
+            _parse_duration_ms(delayThreshold)
+        )
+    )
+    _SDF.dropDuplicates = lambda self, subset=None: self.drop_duplicates(
+        list(subset) if subset else []
+    )
+    _SDF.keyBy = lambda self, column: self.key_by(column)
+    _SDF.tumblingWindow = lambda self, duration: self.tumbling_window(
+        _parse_duration_ms(duration)
+    )
+    _SDF.slidingWindow = lambda self, size, slide: self.sliding_window(
+        _parse_duration_ms(size), _parse_duration_ms(slide)
+    )
+    _SDF.sessionWindow = lambda self, gap: self.session_window(_parse_duration_ms(gap))
+    _SDF.writeStream = property(lambda self: self.write_stream())
+
+    # -- DataStream surface: unit-consistent camelCase windows + one watermark --
+    _Stream.withWatermark = lambda self, column, delayThreshold: self.with_watermark(
+        column, _parse_duration_ms(delayThreshold)
+    )
+    for _cls in (_Stream, _KeyedStream):
+        _cls.tumblingWindow = lambda self, duration: self.tumbling_window_ms(
+            _parse_duration_ms(duration)
+        )
+        _cls.slidingWindow = lambda self, size, slide: self.sliding_window_ms(
+            _parse_duration_ms(size), _parse_duration_ms(slide)
+        )
+        _cls.sessionWindow = lambda self, gap: self.session_window_ms(
+            _parse_duration_ms(gap)
+        )
+    _Stream.keyBy = lambda self, *columns: self.key_by(*columns)
+
+    # Deprecate the pure-redundant Stream.watermark alias (identical to
+    # with_watermark) in favour of the canonical withWatermark.
+    _orig_stream_watermark = _Stream.watermark
+
+    def _stream_watermark_deprecated(self, column, max_lateness_ms):
+        import warnings  # noqa: PLC0415
+
+        warnings.warn(
+            "Stream.watermark() is deprecated; use withWatermark(col, delay) "
+            "(delay may be an int of ms or a string like '5 minutes').",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return _orig_stream_watermark(self, column, max_lateness_ms)
+
+    _Stream.watermark = _stream_watermark_deprecated
