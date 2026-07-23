@@ -470,11 +470,13 @@ impl krishiv_api::CoProcessFunction for PyCoProcessBridge {
         ctx: &mut krishiv_api::ProcessContext<'_>,
     ) -> krishiv_dataflow::ExecResult<()> {
         let key_owned = key.to_owned();
-        let (emitted, event_timers, processing_timers) =
+        let seed_state = ctx.state.clone();
+        let (emitted, event_timers, processing_timers, new_state) =
             pyo3::Python::attach(|py| -> krishiv_dataflow::ExecResult<_> {
                 let bridge_ctx = pyo3::Py::new(
                     py,
                     crate::process_api::PyProcessContext {
+                        state: seed_state.clone(),
                         emitted: Vec::new(),
                         event_timers: Vec::new(),
                         processing_timers: Vec::new(),
@@ -489,6 +491,7 @@ impl krishiv_api::CoProcessFunction for PyCoProcessBridge {
                     inner.emitted.clone(),
                     inner.event_timers.clone(),
                     inner.processing_timers.clone(),
+                    inner.state.clone(),
                 ))
             })?;
         for b in emitted {
@@ -500,6 +503,7 @@ impl krishiv_api::CoProcessFunction for PyCoProcessBridge {
         for (k, t) in processing_timers {
             ctx.register_processing_time_timer(&k, t);
         }
+        *ctx.state = new_state;
         Ok(())
     }
 }
@@ -513,11 +517,13 @@ fn dispatch_co_event(
 ) -> krishiv_dataflow::ExecResult<()> {
     let key_owned = key.to_owned();
     let batch_clone = batch.clone();
-    let (emitted, event_timers, processing_timers) =
+    let seed_state = ctx.state.clone();
+    let (emitted, event_timers, processing_timers, new_state) =
         pyo3::Python::attach(|py| -> krishiv_dataflow::ExecResult<_> {
             let bridge_ctx = pyo3::Py::new(
                 py,
                 crate::process_api::PyProcessContext {
+                    state: seed_state.clone(),
                     emitted: Vec::new(),
                     event_timers: Vec::new(),
                     processing_timers: Vec::new(),
@@ -533,6 +539,7 @@ fn dispatch_co_event(
                 inner.emitted.clone(),
                 inner.event_timers.clone(),
                 inner.processing_timers.clone(),
+                inner.state.clone(),
             ))
         })?;
     for b in emitted {
@@ -544,6 +551,7 @@ fn dispatch_co_event(
     for (k, t) in processing_timers {
         ctx.register_processing_time_timer(&k, t);
     }
+    *ctx.state = new_state;
     Ok(())
 }
 

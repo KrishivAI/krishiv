@@ -111,6 +111,30 @@ impl PyStreamingDataFrame {
         })
     }
 
+    /// Flink-style `transformWithState` — the single low-level escape hatch.
+    ///
+    /// `func` is a handler object with `on_event(key, batch, row, ctx)` and
+    /// `on_timer(key, fire_time_ms, ctx)`; inside them it may use ValueState /
+    /// ListState / MapState / ReducingState / AggregatingState and register
+    /// event/processing-time timers via `ctx`. Requires `key_by(...)`. Returns
+    /// the stream of emitted rows (bypasses window()+agg()).
+    pub fn transform_with_state(
+        &self,
+        py: Python<'_>,
+        func: Py<PyAny>,
+    ) -> PyResult<PyDataFrameStream> {
+        let bridge = crate::process_api::bridge_from_func(py, &func)?;
+        let inner = self.inner.clone();
+        let out_stream = py
+            .detach(move || {
+                crate::session::block_on_async(async move {
+                    inner.transform_with_state(Box::new(bridge)).await
+                })
+            })
+            .map_err(map_krishiv_error)?;
+        Ok(PyDataFrameStream::from_stream(out_stream))
+    }
+
     pub fn execute_stream_async(&self, py: Python<'_>) -> PyResult<PyDataFrameStream> {
         let inner = self.inner.clone();
         let stream = py

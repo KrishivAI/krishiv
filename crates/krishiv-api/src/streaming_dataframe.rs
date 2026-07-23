@@ -182,6 +182,35 @@ impl StreamingDataFrame {
         Ok(self)
     }
 
+    /// Flink-style `transformWithState` — the single low-level escape hatch.
+    ///
+    /// Apply a keyed [`ProcessFunction`](crate::ProcessFunction) (arbitrary keyed
+    /// state — Value/List/Map/Reducing/Aggregating — plus event- and
+    /// processing-time timers and side outputs) over the source stream, keyed by
+    /// the `key_by(...)` column. This replaces `window()` + `agg()` with custom
+    /// stateful logic, so the whole Flink DataStream power is reachable from the
+    /// Structured-Streaming surface without a second builder hierarchy. Returns
+    /// the stream of rows the process function emits.
+    pub async fn transform_with_state(
+        self,
+        func: Box<dyn crate::ProcessFunction>,
+    ) -> Result<KrishivStream> {
+        let key = self
+            .key_column
+            .clone()
+            .ok_or_else(|| KrishivError::InvalidConfig {
+                message: "transform_with_state requires key_by(<column>) to set the state key"
+                    .into(),
+            })?;
+        let input = self.df.execute_stream_async().await?;
+        Ok(crate::apply_process_function(
+            input,
+            key,
+            func,
+            crate::OperatorConfig::new("transform-with-state"),
+        ))
+    }
+
     /// Set watermark lag.
     pub fn with_watermark_lag(mut self, lag_ms: u64) -> Self {
         self.watermark_lag_ms = lag_ms;

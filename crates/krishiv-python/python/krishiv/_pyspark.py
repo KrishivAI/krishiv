@@ -1110,6 +1110,11 @@ def _apply() -> None:
 
     _SDF.drop = _sdf_drop
 
+    # Phase 3: the single low-level escape hatch (Flink transformWithState) on the
+    # Structured-Streaming surface — arbitrary keyed state + timers via a handler,
+    # instead of a separate Stream/KeyedStream hierarchy. Requires keyBy(...).
+    _SDF.transformWithState = lambda self, handler: self.transform_with_state(handler)
+
     # -- DataStream surface: unit-consistent camelCase windows + one watermark --
     _Stream.withWatermark = lambda self, column, delayThreshold: self.with_watermark(
         column, _parse_duration_ms(delayThreshold)

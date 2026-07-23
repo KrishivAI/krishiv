@@ -35,6 +35,10 @@ use crate::batch::PyBatch;
 /// registrations are flushed to the Rust execution context.
 #[pyclass(name = "ProcessContext")]
 pub struct PyProcessContext {
+    /// The current key's raw state bytes (seeded from the operator's per-key
+    /// state before the callback, written back after). Handlers read/replace it
+    /// via `get_state()` / `set_state()` and decode it with a state descriptor.
+    pub(crate) state: Vec<u8>,
     pub(crate) emitted: Vec<RecordBatch>,
     pub(crate) event_timers: Vec<(String, i64)>,
     pub(crate) processing_timers: Vec<(String, i64)>,
@@ -42,6 +46,19 @@ pub struct PyProcessContext {
 
 #[pymethods]
 impl PyProcessContext {
+    /// The current key's raw state bytes (empty if unset). Decode with a state
+    /// descriptor — ValueState / ListState / MapState / AggregatingState — then
+    /// persist the new bytes with `set_state()`.
+    fn get_state<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyBytes> {
+        pyo3::types::PyBytes::new(py, &self.state)
+    }
+
+    /// Replace the current key's raw state bytes. The new bytes are persisted to
+    /// the operator's keyed state after the callback returns.
+    fn set_state(&mut self, raw: Vec<u8>) {
+        self.state = raw;
+    }
+
     /// Emit an output :class:`Batch` to the downstream pipeline.
     fn emit(&mut self, batch: PyBatch) {
         self.emitted.push(batch.record_batch().clone());
@@ -60,7 +77,7 @@ impl PyProcessContext {
 
 // ── Bridge: Python object → Rust ProcessFunction ─────────────────────────────
 
-struct PyProcessFunctionBridge {
+pub(crate) struct PyProcessFunctionBridge {
     on_event_callable: Py<PyAny>,
     on_timer_callable: Py<PyAny>,
 }
@@ -74,6 +91,23 @@ impl PyProcessFunctionBridge {
     }
 }
 
+/// Build a [`PyProcessFunctionBridge`] from a Python handler object (an object
+/// with `on_event(key, batch, row, ctx)` and `on_timer(key, fire_time_ms, ctx)`
+/// methods). Shared by [`apply_process_function`] and
+/// `StreamingDataFrame.transform_with_state`.
+pub(crate) fn bridge_from_func(
+    py: Python<'_>,
+    func: &Py<PyAny>,
+) -> PyResult<PyProcessFunctionBridge> {
+    let on_event = func.getattr(py, "on_event").map_err(|_| {
+        pyo3::exceptions::PyRuntimeError::new_err("process function must have an 'on_event' method")
+    })?;
+    let on_timer = func.getattr(py, "on_timer").map_err(|_| {
+        pyo3::exceptions::PyRuntimeError::new_err("process function must have an 'on_timer' method")
+    })?;
+    Ok(PyProcessFunctionBridge::new(on_event, on_timer))
+}
+
 impl ProcessFunction for PyProcessFunctionBridge {
     fn on_event(
         &mut self,
@@ -84,34 +118,38 @@ impl ProcessFunction for PyProcessFunctionBridge {
     ) -> ExecResult<()> {
         let key_owned = key.to_owned();
         let batch_clone = batch.clone();
+        let seed_state = ctx.state.clone();
 
-        let (emitted, event_timers, processing_timers) = Python::attach(|py| -> ExecResult<_> {
-            let on_event = self.on_event_callable.clone_ref(py);
-            let bridge_ctx = Py::new(
-                py,
-                PyProcessContext {
-                    emitted: Vec::new(),
-                    event_timers: Vec::new(),
-                    processing_timers: Vec::new(),
-                },
-            )
-            .map_err(|e| ExecError::InvalidInput(e.to_string()))?;
-
-            let py_batch = PyBatch::from_record_batch(batch_clone);
-            on_event
-                .call1(
+        let (emitted, event_timers, processing_timers, new_state) =
+            Python::attach(|py| -> ExecResult<_> {
+                let on_event = self.on_event_callable.clone_ref(py);
+                let bridge_ctx = Py::new(
                     py,
-                    (key_owned.as_str(), py_batch, row, bridge_ctx.clone_ref(py)),
+                    PyProcessContext {
+                        state: seed_state.clone(),
+                        emitted: Vec::new(),
+                        event_timers: Vec::new(),
+                        processing_timers: Vec::new(),
+                    },
                 )
                 .map_err(|e| ExecError::InvalidInput(e.to_string()))?;
 
-            let inner = bridge_ctx.borrow(py);
-            Ok((
-                inner.emitted.clone(),
-                inner.event_timers.clone(),
-                inner.processing_timers.clone(),
-            ))
-        })?;
+                let py_batch = PyBatch::from_record_batch(batch_clone);
+                on_event
+                    .call1(
+                        py,
+                        (key_owned.as_str(), py_batch, row, bridge_ctx.clone_ref(py)),
+                    )
+                    .map_err(|e| ExecError::InvalidInput(e.to_string()))?;
+
+                let inner = bridge_ctx.borrow(py);
+                Ok((
+                    inner.emitted.clone(),
+                    inner.event_timers.clone(),
+                    inner.processing_timers.clone(),
+                    inner.state.clone(),
+                ))
+            })?;
 
         for b in emitted {
             ctx.emit(b);
@@ -122,6 +160,7 @@ impl ProcessFunction for PyProcessFunctionBridge {
         for (k, t) in processing_timers {
             ctx.register_processing_time_timer(&k, t);
         }
+        *ctx.state = new_state;
         Ok(())
     }
 
@@ -132,33 +171,37 @@ impl ProcessFunction for PyProcessFunctionBridge {
         ctx: &mut ProcessContext<'_>,
     ) -> ExecResult<()> {
         let key_owned = key.to_owned();
+        let seed_state = ctx.state.clone();
 
-        let (emitted, event_timers, processing_timers) = Python::attach(|py| -> ExecResult<_> {
-            let on_timer = self.on_timer_callable.clone_ref(py);
-            let bridge_ctx = Py::new(
-                py,
-                PyProcessContext {
-                    emitted: Vec::new(),
-                    event_timers: Vec::new(),
-                    processing_timers: Vec::new(),
-                },
-            )
-            .map_err(|e| ExecError::InvalidInput(e.to_string()))?;
-
-            on_timer
-                .call1(
+        let (emitted, event_timers, processing_timers, new_state) =
+            Python::attach(|py| -> ExecResult<_> {
+                let on_timer = self.on_timer_callable.clone_ref(py);
+                let bridge_ctx = Py::new(
                     py,
-                    (key_owned.as_str(), fire_time_ms, bridge_ctx.clone_ref(py)),
+                    PyProcessContext {
+                        state: seed_state.clone(),
+                        emitted: Vec::new(),
+                        event_timers: Vec::new(),
+                        processing_timers: Vec::new(),
+                    },
                 )
                 .map_err(|e| ExecError::InvalidInput(e.to_string()))?;
 
-            let inner = bridge_ctx.borrow(py);
-            Ok((
-                inner.emitted.clone(),
-                inner.event_timers.clone(),
-                inner.processing_timers.clone(),
-            ))
-        })?;
+                on_timer
+                    .call1(
+                        py,
+                        (key_owned.as_str(), fire_time_ms, bridge_ctx.clone_ref(py)),
+                    )
+                    .map_err(|e| ExecError::InvalidInput(e.to_string()))?;
+
+                let inner = bridge_ctx.borrow(py);
+                Ok((
+                    inner.emitted.clone(),
+                    inner.event_timers.clone(),
+                    inner.processing_timers.clone(),
+                    inner.state.clone(),
+                ))
+            })?;
 
         for b in emitted {
             ctx.emit(b);
@@ -169,6 +212,7 @@ impl ProcessFunction for PyProcessFunctionBridge {
         for (k, t) in processing_timers {
             ctx.register_processing_time_timer(&k, t);
         }
+        *ctx.state = new_state;
         Ok(())
     }
 }
@@ -191,15 +235,8 @@ pub fn apply_process_function(
     key_column: String,
     func: Py<PyAny>,
 ) -> PyResult<crate::dataframe::PyDataFrameStream> {
-    let on_event: Py<PyAny> = func.getattr(py, "on_event").map_err(|_| {
-        pyo3::exceptions::PyRuntimeError::new_err("process function must have an 'on_event' method")
-    })?;
-    let on_timer: Py<PyAny> = func.getattr(py, "on_timer").map_err(|_| {
-        pyo3::exceptions::PyRuntimeError::new_err("process function must have an 'on_timer' method")
-    })?;
-
+    let bridge = bridge_from_func(py, &func)?;
     let inner_df = df.inner.clone();
-    let bridge = PyProcessFunctionBridge::new(on_event, on_timer);
 
     let out_stream = py
         .detach(move || {
