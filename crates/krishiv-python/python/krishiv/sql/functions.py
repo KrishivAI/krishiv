@@ -871,6 +871,37 @@ def zip_with(left: ColumnLike, right: ColumnLike, f: Callable) -> Column:
     return _expr(f"transform({zipped.sql()}, {var} -> {body.sql()})")
 
 
+def aggregate(
+    column: ColumnLike,
+    initialValue: ColumnLike,  # noqa: N803
+    merge: Callable,
+    finish: Optional[Callable] = None,
+) -> Column:
+    """Left-fold an array into a single accumulator (PySpark `F.aggregate`).
+
+    ``merge`` is ``(acc, element) -> acc`` and must return the accumulator's
+    type (that of ``initialValue``). The optional ``finish`` is ``(acc) ->
+    result``, applied to the folded accumulator."""
+    acc_var = _fresh_var()
+    elem_var = _fresh_var()
+    body = _to_column(merge(_col(acc_var), _col(elem_var)))
+    folded = _expr(
+        f"aggregate({_sql(column)}, {_sql(initialValue)}, "
+        f"({acc_var}, {elem_var}) -> {body.sql()})"
+    )
+    return _to_column(finish(folded)) if finish is not None else folded
+
+
+def reduce(  # noqa: A001
+    column: ColumnLike,
+    initialValue: ColumnLike,  # noqa: N803
+    merge: Callable,
+    finish: Optional[Callable] = None,
+) -> Column:
+    """Alias of :func:`aggregate` (PySpark `F.reduce`)."""
+    return aggregate(column, initialValue, merge, finish)
+
+
 # ── Hash functions ──────────────────────────────────────────────────────────
 
 
@@ -1047,6 +1078,8 @@ __all__ = [
     "exists",
     "forall",
     "zip_with",
+    "aggregate",
+    "reduce",
     # hashing
     "md5",
     "sha256",

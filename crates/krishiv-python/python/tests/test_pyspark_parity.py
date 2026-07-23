@@ -205,6 +205,33 @@ def test_nested_higher_order(session):
     assert out["n"] == [[101, 102], [103]]
 
 
+def test_aggregate(session):
+    df = session.sql(
+        "SELECT make_array(1, 2, 3, 4) AS a "
+        "UNION ALL SELECT make_array(10, 20) AS a "
+        "UNION ALL SELECT CAST(make_array() AS BIGINT[]) AS a"
+    )
+    rows = df.select(
+        F.aggregate(col("a"), lit(0), lambda acc, x: acc + x).alias("sum"),
+        F.aggregate(col("a"), lit(1), lambda acc, x: acc * x).alias("prod"),
+        F.aggregate(
+            col("a"), lit(0), lambda acc, x: acc + x, lambda acc: acc * lit(10)
+        ).alias("sum_x10"),
+    ).collect_rows()
+    sums = sorted(r["sum"] for r in rows)
+    assert sums == [0, 10, 30]          # [], [10,20], [1,2,3,4]
+    prods = sorted(r["prod"] for r in rows)
+    assert prods == [1, 24, 200]        # empty→1 (identity)
+    finished = sorted(r["sum_x10"] for r in rows)
+    assert finished == [0, 100, 300]    # finish: acc*10
+
+
+def test_reduce_alias(session):
+    df = session.sql("SELECT make_array(2, 3, 4) AS a")
+    val = df.select(F.reduce(col("a"), lit(0), lambda acc, x: acc + x).alias("r")).collect_rows()[0]["r"]
+    assert val == 9
+
+
 def test_array_functions(session):
     adf = session.createDataFrame([(1,)], ["z"]).select(
         F.array(lit(3), lit(1), lit(2)).alias("a")

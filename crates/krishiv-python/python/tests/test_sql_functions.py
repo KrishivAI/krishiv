@@ -11,6 +11,7 @@ from krishiv.sql import functions as F
 FUNCTION_NAMES = {
     "abs",
     "acos",
+    "aggregate",
     "approx_count_distinct",
     "array",
     "array_agg",
@@ -132,6 +133,7 @@ FUNCTION_NAMES = {
     "radians",
     "rand",
     "rank",
+    "reduce",
     "regexp_like",
     "regexp_replace",
     "repeat",

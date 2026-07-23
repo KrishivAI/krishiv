@@ -30,8 +30,11 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, AsArray, BooleanArray, BooleanBuilder, new_null_array};
+use arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, Int64Builder, new_null_array,
+};
 use arrow::buffer::NullBuffer;
+use arrow::compute::take;
 use arrow::compute::take_arrays;
 use arrow::datatypes::{ArrowNativeType, DataType, Field, FieldRef};
 use datafusion::common::utils::{
@@ -73,7 +76,216 @@ pub fn register_higher_order_spark_functions(ctx: &SessionContext) -> DFResult<(
     ctx.register_higher_order_function(Arc::new(HigherOrderUDF::new_from_impl(
         ArrayAllMatch::new(),
     )));
+    ctx.register_higher_order_function(Arc::new(HigherOrderUDF::new_from_impl(
+        ArrayReduce::new(),
+    )));
     Ok(())
+}
+
+/// Spark `aggregate(array, start, (acc, x) -> merge)` — left-fold an array into
+/// a single accumulator (registered as `aggregate` / `reduce`). The four-arg
+/// `finish` form is composed in the Python layer by applying the finish lambda
+/// to this result. The accumulator's type is fixed to the `start` type (Spark's
+/// buffer type), so the merge lambda must return that same type.
+///
+/// The fold is evaluated column-wise, one array position at a time: at step `k`
+/// the merge lambda is invoked over the whole accumulator column and the
+/// `k`-th element of every row; rows whose array is shorter than `k+1` keep
+/// their accumulator unchanged. A `NULL` input array yields a `NULL` result.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct ArrayReduce {
+    signature: HigherOrderSignature,
+    aliases: Vec<String>,
+}
+
+impl Default for ArrayReduce {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ArrayReduce {
+    pub fn new() -> Self {
+        Self {
+            signature: HigherOrderSignature::exact(
+                vec![
+                    ValueOrLambda::Value(()),
+                    ValueOrLambda::Value(()),
+                    ValueOrLambda::Lambda(()),
+                ],
+                Volatility::Immutable,
+            ),
+            aliases: vec![
+                String::from("aggregate"),
+                String::from("reduce"),
+                String::from("array_aggregate"),
+            ],
+        }
+    }
+}
+
+impl HigherOrderUDFImpl for ArrayReduce {
+    fn name(&self) -> &str {
+        "array_reduce"
+    }
+
+    fn aliases(&self) -> &[String] {
+        &self.aliases
+    }
+
+    fn signature(&self) -> &HigherOrderSignature {
+        &self.signature
+    }
+
+    fn coerce_value_types(&self, arg_types: &[DataType]) -> DFResult<Vec<DataType>> {
+        let [list, init] = take_function_args(self.name(), arg_types)?;
+        let coerced_list = match list {
+            DataType::List(_) | DataType::LargeList(_) => list.clone(),
+            DataType::ListView(field) | DataType::FixedSizeList(field, _) => {
+                DataType::List(Arc::clone(field))
+            }
+            DataType::LargeListView(field) => DataType::LargeList(Arc::clone(field)),
+            other => {
+                return Err(DataFusionError::Plan(format!(
+                    "{} expected a list as first argument, got {other}",
+                    self.name()
+                )));
+            }
+        };
+        Ok(vec![coerced_list, init.clone()])
+    }
+
+    fn lambda_parameters(
+        &self,
+        _step: usize,
+        fields: &[ValueOrLambda<FieldRef, Option<FieldRef>>],
+    ) -> DFResult<LambdaParametersProgress> {
+        let [list, init, _merge] = take_function_args(self.name(), fields)?;
+        let (ValueOrLambda::Value(list), ValueOrLambda::Value(init)) = (list, init) else {
+            return Err(DataFusionError::Plan(format!(
+                "{} expects two value arguments before the lambda",
+                self.name()
+            )));
+        };
+        let element = match list.data_type() {
+            DataType::List(field) | DataType::LargeList(field) => Arc::clone(field),
+            other => {
+                return Err(DataFusionError::Plan(format!("expected list, got {other}")));
+            }
+        };
+        // The merge lambda `(acc, x)` takes the accumulator (the `start` field)
+        // and the array element.
+        Ok(LambdaParametersProgress::Complete(vec![vec![
+            Arc::clone(init),
+            element,
+        ]]))
+    }
+
+    fn return_field_from_args(&self, args: HigherOrderReturnFieldArgs) -> DFResult<Arc<Field>> {
+        let [_list, init, merge] = take_function_args(self.name(), args.arg_fields)?;
+        // The result is the accumulator — the merge lambda's output field (which
+        // must match the `start` type); fall back to `start` when unresolved.
+        let data_type = match merge {
+            ValueOrLambda::Lambda(field) => field.data_type().clone(),
+            ValueOrLambda::Value(_) => match init {
+                ValueOrLambda::Value(field) => field.data_type().clone(),
+                ValueOrLambda::Lambda(_) => {
+                    return Err(DataFusionError::Plan(format!(
+                        "{} expects a start value as the second argument",
+                        self.name()
+                    )));
+                }
+            },
+        };
+        Ok(Arc::new(Field::new("", data_type, true)))
+    }
+
+    fn invoke_with_args(&self, args: HigherOrderFunctionArgs) -> DFResult<ColumnarValue> {
+        let num_rows = args.number_rows;
+        let [list, init, merge] = take_function_args(self.name(), &args.args)?;
+        let (
+            ValueOrLambda::Value(list),
+            ValueOrLambda::Value(init),
+            ValueOrLambda::Lambda(merge),
+        ) = (list, init, merge)
+        else {
+            return Err(DataFusionError::Execution(format!(
+                "{} expects (array, start, lambda)",
+                self.name()
+            )));
+        };
+
+        let list_array = list.to_array(num_rows)?;
+        let mut acc = init.to_array(num_rows)?;
+
+        // Normalise offsets to i64 and grab the flat element values.
+        let (offsets, values): (Vec<i64>, ArrayRef) = match list_array.data_type() {
+            DataType::List(_) => {
+                let list = list_array.as_list::<i32>();
+                (
+                    list.offsets().iter().map(|offset| i64::from(*offset)).collect(),
+                    Arc::clone(list.values()),
+                )
+            }
+            DataType::LargeList(_) => {
+                let list = list_array.as_list::<i64>();
+                (list.offsets().iter().copied().collect(), Arc::clone(list.values()))
+            }
+            other => {
+                return Err(DataFusionError::Execution(format!(
+                    "expected list, got {other}"
+                )));
+            }
+        };
+        let lengths: Vec<i64> = offsets
+            .windows(2)
+            .map(|window| match window {
+                [start, end] => *end - *start,
+                _ => 0,
+            })
+            .collect();
+        let max_len = lengths.iter().copied().max().unwrap_or(0);
+
+        for k in 0..max_len {
+            let mut index_builder = Int64Builder::with_capacity(num_rows);
+            let mut has_kth = BooleanBuilder::with_capacity(num_rows);
+            for (offset, len) in offsets.iter().zip(lengths.iter()) {
+                if k < *len {
+                    index_builder.append_value(*offset + k);
+                    has_kth.append_value(true);
+                } else {
+                    index_builder.append_null();
+                    has_kth.append_value(false);
+                }
+            }
+            let indices = index_builder.finish();
+            let has_kth = has_kth.finish();
+            let element = take(values.as_ref(), &indices, None)?;
+
+            let accumulator = Arc::clone(&acc);
+            let acc_fn: &dyn Fn() -> DFResult<ArrayRef> = &|| Ok(Arc::clone(&accumulator));
+            let element_fn: &dyn Fn() -> DFResult<ArrayRef> = &|| Ok(Arc::clone(&element));
+            let merged = merge
+                .evaluate(&[acc_fn, element_fn], |arrays| Ok(arrays.to_vec()))?
+                .into_array(num_rows)?;
+
+            // Rows that ran out of elements keep the previous accumulator.
+            let merged_ref: &dyn Array = merged.as_ref();
+            let acc_ref: &dyn Array = acc.as_ref();
+            acc = arrow::compute::kernels::zip::zip(&has_kth, &merged_ref, &acc_ref)?;
+        }
+
+        // A NULL input array produces a NULL result (Spark semantics).
+        if let Some(nulls) = list_array.nulls() {
+            let valid = BooleanArray::new(nulls.inner().clone(), None);
+            let null_array = new_null_array(acc.data_type(), num_rows);
+            let acc_ref: &dyn Array = acc.as_ref();
+            let null_ref: &dyn Array = null_array.as_ref();
+            acc = arrow::compute::kernels::zip::zip(&valid, &acc_ref, &null_ref)?;
+        }
+
+        Ok(ColumnarValue::Array(acc))
+    }
 }
 
 /// Spark `forall(array, predicate)` — returns whether *every* element of the
