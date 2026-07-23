@@ -630,6 +630,21 @@ class UDFRegistration:
         _invoke.__name__ = name
         return _invoke
 
+    def register_sql(self, name: str, body: str, arg_names):
+        """Register a scalar SQL-expression function that works in DISTRIBUTED
+        mode (unlike Python-callable UDFs, which are embedded-only). ``body`` is a
+        SQL expression over ``arg_names`` — e.g. register_sql("tax", "x * 1.1",
+        ["x"]). Calls are inlined to native SQL before planning, so they run on
+        the Rust executors with no Python. Returns a callable usable as
+        ``fn(col)`` in Column expressions."""
+        self._session.register_scalar_sql_function(name, list(arg_names), body)
+
+        def _invoke(*cols):
+            return call_function(name, [_as_column(c) for c in cols])
+
+        _invoke.__name__ = name
+        return _invoke
+
 
 class Catalog:
     """``session.catalog`` — a subset of PySpark's ``Catalog``."""
