@@ -1190,6 +1190,13 @@ pub fn ivm_router(state: IvmRouterState) -> Router<()> {
             "/api/v1/ivm/jobs/{job_id}/vector-views",
             post(api_ivm_register_vector_view),
         )
+        // IVM feed / checkpoint / restore / snapshot carry Arrow IPC batches of
+        // real user data (base64), which routinely exceed axum's 2 MiB default
+        // request-body cap — a modest 500k-row delta already trips it with
+        // "413 Payload Too Large". Raise the cap to 512 MiB so realistic
+        // incremental workloads and state checkpoints go through; this is a
+        // data-plane router, not a control endpoint.
+        .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024))
         .with_state(state)
 }
 
