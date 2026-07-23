@@ -67,6 +67,71 @@ impl LocalWindowExecutionSpec {
         }]
     }
 
+    /// Canonical constructor for a windowed streaming spec — the single place
+    /// window defaults and field assembly live, shared by every fluent facade
+    /// (the DataStream `Stream`/`KeyedStream` builder and the Structured-Streaming
+    /// `StreamingDataFrame`). Start here, then chain the optional setters; this
+    /// keeps the two facades from drifting on defaults (key type, default
+    /// COUNT(*), timezone, …) as they did before.
+    pub fn windowed(
+        key_column: impl Into<String>,
+        event_time_column: impl Into<String>,
+        window_kind: LocalWindowKind,
+        window_size_ms: u64,
+    ) -> Self {
+        Self {
+            key_column: key_column.into(),
+            key_column_type: String::from("utf8"),
+            event_time_column: event_time_column.into(),
+            watermark_lag_ms: 0,
+            window_kind,
+            window_size_ms,
+            agg_exprs: Self::default_count_agg(),
+            state_ttl_ms: None,
+            allowed_lateness_ms: None,
+            source_watermark_lags: std::collections::HashMap::new(),
+            source_id_column: None,
+            window_timezone: None,
+        }
+    }
+
+    /// Set the watermark lag (max out-of-orderness), in milliseconds.
+    pub fn with_watermark_lag_ms(mut self, lag_ms: u64) -> Self {
+        self.watermark_lag_ms = lag_ms;
+        self
+    }
+
+    /// Set the aggregations. An empty vec keeps the default `COUNT(*)`.
+    pub fn with_aggs(mut self, aggs: Vec<AggExpr>) -> Self {
+        if !aggs.is_empty() {
+            self.agg_exprs = aggs;
+        }
+        self
+    }
+
+    /// Set the per-key state TTL, in milliseconds (`None` = no expiry).
+    pub fn with_state_ttl_ms(mut self, ttl_ms: Option<u64>) -> Self {
+        self.state_ttl_ms = ttl_ms;
+        self
+    }
+
+    /// Set the allowed lateness window, in milliseconds (`None` = none).
+    pub fn with_allowed_lateness_ms(mut self, lateness_ms: Option<u64>) -> Self {
+        self.allowed_lateness_ms = lateness_ms;
+        self
+    }
+
+    /// Set per-source watermark lags and the source-id column they key off.
+    pub fn with_source_watermarks(
+        mut self,
+        lags: std::collections::HashMap<String, u64>,
+        source_id_column: Option<String>,
+    ) -> Self {
+        self.source_watermark_lags = lags;
+        self.source_id_column = source_id_column;
+        self
+    }
+
     /// Create a standard tumbling window spec with count aggregation for tests.
     pub fn new_test_tumbling(key_col: &str, ts_col: &str, window_size_ms: u64) -> Self {
         Self {
@@ -299,5 +364,59 @@ mod tests {
         };
         let out = execute_windowed_stream(vec![batch], &spec).unwrap();
         assert!(!out.is_empty());
+    }
+
+    /// The shared `windowed()` builder both streaming facades now use: correct
+    /// defaults, and the setters thread the optional fields. `with_aggs([])`
+    /// keeps the default COUNT(*).
+    #[test]
+    fn windowed_builder_defaults_and_setters() {
+        // Defaults + empty aggs keep COUNT(*).
+        let base = LocalWindowExecutionSpec::windowed(
+            "user_id",
+            "ts",
+            LocalWindowKind::Session { gap_ms: 5_000 },
+            0,
+        )
+        .with_aggs(Vec::new());
+        assert_eq!(base.key_column, "user_id");
+        assert_eq!(base.key_column_type, "utf8");
+        assert_eq!(base.event_time_column, "ts");
+        assert_eq!(base.window_kind, LocalWindowKind::Session { gap_ms: 5_000 });
+        assert_eq!(base.watermark_lag_ms, 0);
+        assert!(base.state_ttl_ms.is_none());
+        assert!(base.source_watermark_lags.is_empty());
+        // with_aggs([]) keeps the default COUNT(*) (AggExpr has no PartialEq, so
+        // check its shape).
+        let a = base.agg_exprs.first().expect("one default agg");
+        assert_eq!(base.agg_exprs.len(), 1);
+        assert!(matches!(a.function, AggFunction::Count));
+        assert_eq!(a.output_column, "count");
+
+        // Setters thread the optional fields; a non-empty aggs replaces the default.
+        let mut lags = std::collections::HashMap::new();
+        lags.insert("s1".to_string(), 100);
+        let custom_aggs = vec![AggExpr {
+            filter: None,
+            function: AggFunction::Sum,
+            input_column: "amount".into(),
+            output_column: "total".into(),
+        }];
+        let full = LocalWindowExecutionSpec::windowed("k", "ts", LocalWindowKind::Tumbling, 10_000)
+            .with_watermark_lag_ms(2_000)
+            .with_aggs(custom_aggs)
+            .with_state_ttl_ms(Some(30_000))
+            .with_allowed_lateness_ms(Some(1_000))
+            .with_source_watermarks(lags.clone(), Some("source_id".into()));
+        assert_eq!(full.watermark_lag_ms, 2_000);
+        let fa = full.agg_exprs.first().expect("one custom agg");
+        assert_eq!(full.agg_exprs.len(), 1);
+        assert!(matches!(fa.function, AggFunction::Sum));
+        assert_eq!(fa.input_column, "amount");
+        assert_eq!(fa.output_column, "total");
+        assert_eq!(full.state_ttl_ms, Some(30_000));
+        assert_eq!(full.allowed_lateness_ms, Some(1_000));
+        assert_eq!(full.source_watermark_lags, lags);
+        assert_eq!(full.source_id_column.as_deref(), Some("source_id"));
     }
 }

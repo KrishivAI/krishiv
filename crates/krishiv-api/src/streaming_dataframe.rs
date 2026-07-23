@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -388,26 +388,21 @@ impl StreamingDataFrame {
             .clone()
             .unwrap_or(LocalWindowKind::Tumbling);
         let window_size_ms = self.window_size_ms.unwrap_or(0);
-        let agg_exprs = if self.agg_exprs.is_empty() {
-            LocalWindowExecutionSpec::default_count_agg()
-        } else {
-            self.agg_exprs.clone()
-        };
 
-        Ok(Some(LocalWindowExecutionSpec {
-            key_column,
-            key_column_type: String::from("utf8"),
-            event_time_column,
-            watermark_lag_ms: self.watermark_lag_ms,
-            window_kind,
-            window_size_ms,
-            agg_exprs,
-            state_ttl_ms: None,
-            allowed_lateness_ms: None,
-            source_watermark_lags: HashMap::new(),
-            source_id_column: None,
-            window_timezone: None,
-        }))
+        // Shared builder (krishiv-runtime): the single source of truth for window
+        // spec defaults, so this Structured-Streaming path can't drift from the
+        // DataStream path's `spec_from_pipeline`. `with_aggs` keeps the default
+        // COUNT(*) when none are configured.
+        Ok(Some(
+            LocalWindowExecutionSpec::windowed(
+                key_column,
+                event_time_column,
+                window_kind,
+                window_size_ms,
+            )
+            .with_watermark_lag_ms(self.watermark_lag_ms)
+            .with_aggs(self.agg_exprs.clone()),
+        ))
     }
 }
 

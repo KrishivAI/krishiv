@@ -91,15 +91,13 @@ pub(crate) fn spec_from_pipeline(pipeline: &StreamPipeline) -> PyResult<LocalWin
             "streaming execution requires a watermark or event-time column",
         ));
     }
-    let agg_exprs = if pipeline.aggregations.is_empty() {
-        LocalWindowExecutionSpec::default_count_agg()
-    } else {
-        pipeline
-            .aggregations
-            .iter()
-            .map(agg_descriptor_to_expr)
-            .collect()
-    };
+    // Empty stays empty here; the shared builder's `with_aggs` keeps the default
+    // COUNT(*) when no aggregations are supplied.
+    let aggs: Vec<AggExpr> = pipeline
+        .aggregations
+        .iter()
+        .map(agg_descriptor_to_expr)
+        .collect();
     // B1: reject multi-column key_by — the runtime key_column field is a single string.
     if pipeline.key_columns.len() > 1 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -146,20 +144,13 @@ pub(crate) fn spec_from_pipeline(pipeline: &StreamPipeline) -> PyResult<LocalWin
             .clone()
             .or_else(|| Some("source_id".to_string()))
     };
-    Ok(LocalWindowExecutionSpec {
-        key_column_type: String::from("utf8"),
-        key_column,
-        event_time_column: event_time,
-        watermark_lag_ms: pipeline.max_lateness_ms,
-        window_kind,
-        window_size_ms: window.size_ms,
-        agg_exprs,
-        state_ttl_ms,
-        allowed_lateness_ms: None,
-        source_watermark_lags,
-        source_id_column,
-        window_timezone: None,
-    })
+    Ok(
+        LocalWindowExecutionSpec::windowed(key_column, event_time, window_kind, window.size_ms)
+            .with_watermark_lag_ms(pipeline.max_lateness_ms)
+            .with_aggs(aggs)
+            .with_state_ttl_ms(state_ttl_ms)
+            .with_source_watermarks(source_watermark_lags, source_id_column),
+    )
 }
 
 pub(crate) fn execute_pipeline(pipeline: &StreamPipeline) -> PyResult<Vec<PyBatch>> {
