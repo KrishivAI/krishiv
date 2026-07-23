@@ -266,6 +266,37 @@ impl PyDataFrame {
             .map_err(map_krishiv_error)
     }
 
+    /// Union by column name (not position), aligning `right` to this schema.
+    pub fn union_by_name(&self, right: &PyDataFrame) -> PyResult<Self> {
+        self.inner
+            .union_by_name(&right.inner)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    /// Rename multiple columns at once from `(old, new)` pairs.
+    pub fn with_columns_renamed(&self, renames: Vec<(String, String)>) -> PyResult<Self> {
+        let refs: Vec<(&str, &str)> = renames
+            .iter()
+            .map(|(old, new)| (old.as_str(), new.as_str()))
+            .collect();
+        self.inner
+            .with_columns_renamed(&refs)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    /// Collect this DataFrame directly as a `DeltaBatch` (all rows as
+    /// insertions), for feeding SQL/DataFrame output into the IVM engine.
+    pub fn collect_as_delta_batch(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<crate::incremental::PyDeltaBatch> {
+        let inner = self.inner.clone();
+        let delta = py.detach(move || inner.collect_as_delta_batch().map_err(map_krishiv_error))?;
+        Ok(crate::incremental::PyDeltaBatch { inner: delta })
+    }
+
     pub fn intersect(&self, right: &PyDataFrame) -> PyResult<Self> {
         self.inner
             .intersect(&right.inner)
@@ -504,12 +535,7 @@ impl PyDataFrame {
 
     pub fn num_rows(&self, py: Python<'_>) -> PyResult<usize> {
         let inner = self.inner.clone();
-        py.detach(move || {
-            inner
-                .collect()
-                .map(|r| r.row_count())
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-        })
+        py.detach(move || inner.num_rows().map_err(map_krishiv_error))
     }
 
     /// Create a :class:`DataStreamWriter` for writing this DataFrame as a streaming sink.
@@ -553,10 +579,7 @@ impl PyDataFrame {
 
     /// Return column names.
     pub fn columns(&self) -> PyResult<Vec<String>> {
-        self.inner
-            .schema()
-            .map(|s| s.fields().iter().map(|f| f.name().clone()).collect())
-            .map_err(map_krishiv_error)
+        self.inner.columns().map_err(map_krishiv_error)
     }
 
     /// Compute summary statistics (count, mean, stddev, min, max per column).

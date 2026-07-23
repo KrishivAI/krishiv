@@ -389,3 +389,32 @@ def test_row_helper():
     assert r.id == 1
     assert r["name"] == "a"
     assert r.asDict() == {"id": 1, "name": "a"}
+
+
+# ── native API surface parity (Rust methods now exposed on the bindings) ─────
+
+
+def test_native_union_by_name(session):
+    a = session.sql("SELECT 1 AS id, 'x' AS name")
+    b = session.sql("SELECT 'y' AS name, 2 AS id")  # reordered
+    # native union_by_name aligns by column name, not position
+    assert sorted(r["id"] for r in a.union_by_name(b).collect_rows()) == [1, 2]
+
+
+def test_native_with_columns_renamed(session):
+    df = session.sql("SELECT 1 AS a, 2 AS b, 3 AS c")
+    out = df.with_columns_renamed([("a", "x"), ("c", "z")])
+    assert out.columns() == ["x", "b", "z"]
+
+
+def test_native_column_not_like(session):
+    df = session.sql("SELECT 'alice' AS n UNION ALL SELECT 'bob'")
+    assert df.filter(col("n").not_like("a%")).collect_rows()[0]["n"] == "bob"
+
+
+def test_native_collect_as_delta_batch(session):
+    import krishiv  # noqa: PLC0415
+
+    db = session.sql("SELECT 1 AS x UNION ALL SELECT 2").collect_as_delta_batch()
+    assert isinstance(db, krishiv.DeltaBatch)
+    assert db.num_rows == 2

@@ -822,6 +822,21 @@ Execution statistics:
         }
     }
 
+    /// Column names, in schema order.
+    pub fn columns(&self) -> Result<Vec<String>> {
+        Ok(self
+            .schema()?
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect())
+    }
+
+    /// Number of rows (collects the DataFrame).
+    pub fn num_rows(&self) -> Result<usize> {
+        Ok(self.collect()?.row_count())
+    }
+
     /// Select columns by name.
     pub fn select(&self, columns: &[&str]) -> Result<DataFrame> {
         match &self.sql_dataframe {

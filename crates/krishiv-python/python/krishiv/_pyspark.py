@@ -247,10 +247,7 @@ def _df_withColumnRenamed(self, existing: str, new: str):
 
 
 def _df_withColumnsRenamed(self, mapping: dict):
-    result = self
-    for existing, new in mapping.items():
-        result = result.rename(existing, new)
-    return result
+    return self.with_columns_renamed(list(mapping.items()))
 
 
 def _df_drop(self, *cols):
@@ -326,16 +323,12 @@ def _df_dropDuplicates(self, subset=None):
 
 
 def _df_unionByName(self, other, allowMissingColumns: bool = False):
+    if not allowMissingColumns:
+        # Native union-by-name aligns `other` to this schema by name (and
+        # errors on a column mismatch, matching PySpark).
+        return self.union_by_name(other)
     left_cols = self.columns()
     right_cols = other.columns()
-    if not allowMissingColumns:
-        if set(left_cols) != set(right_cols):
-            raise ValueError(
-                "unionByName requires the same column names unless "
-                "allowMissingColumns=True; "
-                f"left={left_cols} right={right_cols}"
-            )
-        return self.union(other.select_columns([col(c) for c in left_cols]))
     ordered = list(left_cols) + [c for c in right_cols if c not in left_cols]
     left = self.select_columns(
         [col(c) if c in left_cols else lit(None).alias(c) for c in ordered]

@@ -148,6 +148,13 @@ impl PyColumn {
         ))
     }
 
+    /// `NOT LIKE pattern` (the negation of [`Self::like`]).
+    pub fn not_like(&self, pattern: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self::new(
+            self.inner.clone().not_like(expression_from_python(pattern)?),
+        ))
+    }
+
     /// PySpark `Column.rlike(pattern)` — regex match. Uses the engine's Rust
     /// `regex` dialect (differs from Java/Spark regex for advanced constructs).
     pub fn rlike(&self, pattern: String) -> Self {
