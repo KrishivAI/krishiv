@@ -1006,6 +1006,7 @@ impl SessionBuilder {
             registered_parquet: Arc::new(DashMap::new()),
             scalar_sql_functions: Arc::new(RwLock::new(std::collections::HashMap::new())),
             python_udfs: Arc::new(DashMap::new()),
+            python_udafs: Arc::new(DashMap::new()),
             registered_sources: Arc::new(DashMap::new()),
             registered_sinks: Arc::new(DashMap::new()),
             submitted_sql_jobs: Arc::new(DashMap::new()),
@@ -1046,6 +1047,9 @@ pub struct Session {
     /// (pickle base64, input Arrow type names, output type name)). Shipped as a
     /// comment directive so executors run them via a python worker subprocess.
     python_udfs: Arc<DashMap<String, (String, Vec<String>, String)>>,
+    /// Cloudpickled Python aggregate UDFs (GROUPED_AGG), same value shape as
+    /// [`Self::python_udfs`]; shipped as a `register-python-udaf` directive.
+    python_udafs: Arc<DashMap<String, (String, Vec<String>, String)>>,
     registered_sources: Arc<DashMap<String, ConnectorConfig>>,
     registered_sinks: Arc<DashMap<String, ConnectorConfig>>,
     submitted_sql_jobs: Arc<DashMap<String, SubmittedSqlJobStatus>>,
@@ -1834,10 +1838,30 @@ impl Session {
         );
     }
 
-    /// Prepend `register-python-udf` comment directives for every registered
-    /// Python UDF, so they travel with a distributed query to the executors.
+    /// Register a cloudpickled Python **aggregate** UDF (GROUPED_AGG) to ship
+    /// with distributed queries; it runs on the executors via the python worker
+    /// (buffer-all then finalize, mergeable across partitions). `input_types` /
+    /// `output_type` are Arrow type names.
+    pub fn register_python_udaf_bytes(
+        &self,
+        name: &str,
+        pickle: &[u8],
+        input_types: &[String],
+        output_type: &str,
+    ) {
+        use base64::Engine as _;
+        let pickle_b64 = base64::engine::general_purpose::STANDARD.encode(pickle);
+        self.python_udafs.insert(
+            name.trim().to_lowercase(),
+            (pickle_b64, input_types.to_vec(), output_type.to_string()),
+        );
+    }
+
+    /// Prepend `register-python-udf`/`register-python-udaf` comment directives
+    /// for every registered Python scalar/aggregate UDF, so they travel with a
+    /// distributed query to the executors.
     fn prepend_python_udfs(&self, query: &str) -> String {
-        if self.python_udfs.is_empty() {
+        if self.python_udfs.is_empty() && self.python_udafs.is_empty() {
             return query.to_string();
         }
         let mut comments: Vec<String> = self
@@ -1853,6 +1877,15 @@ impl Session {
                 )
             })
             .collect();
+        comments.extend(self.python_udafs.iter().map(|entry| {
+            let (pickle_b64, input_types, output_type) = entry.value();
+            krishiv_runtime::flight_protocol::encode_python_udaf(
+                entry.key(),
+                input_types,
+                output_type,
+                pickle_b64,
+            )
+        }));
         comments.push(query.to_string());
         comments.join("\n")
     }

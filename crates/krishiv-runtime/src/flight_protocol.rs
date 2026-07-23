@@ -25,6 +25,7 @@ use crate::{RuntimeError, RuntimeResult};
 const REGISTER_PARQUET: &str = "krishiv-register-parquet";
 const REGISTER_PARQUET_IPC: &str = "krishiv-register-parquet-ipc";
 const REGISTER_PYTHON_UDF: &str = "krishiv-register-python-udf";
+const REGISTER_PYTHON_UDAF: &str = "krishiv-register-python-udaf";
 const CONTINUOUS_REGISTER: &str = "krishiv-continuous-register";
 const CONTINUOUS_PUSH: &str = "krishiv-continuous-push";
 const CONTINUOUS_DRAIN: &str = "krishiv-continuous-drain";
@@ -47,6 +48,15 @@ pub enum FlightDirective {
     /// executor via a python worker subprocess. `input_types`/`output_type` are
     /// Arrow type names; `pickle_b64` is base64 of the cloudpickled callable.
     RegisterPythonUdf {
+        name: String,
+        input_types: Vec<String>,
+        output_type: String,
+        pickle_b64: String,
+    },
+    /// A cloudpickled Python aggregate UDF (GROUPED_AGG). Same wire shape as
+    /// [`FlightDirective::RegisterPythonUdf`]; the callable is applied to each
+    /// group's whole column(s) at finalize on the executor.
+    RegisterPythonUdaf {
         name: String,
         input_types: Vec<String>,
         output_type: String,
@@ -114,6 +124,21 @@ pub fn encode_python_udf(
 ) -> String {
     format!(
         "/* {REGISTER_PYTHON_UDF}:{name}:{}:{output_type}:{pickle_b64} */",
+        input_types.join(",")
+    )
+}
+
+/// Encode a Python aggregate UDF (GROUPED_AGG) as a comment directive. Same
+/// field layout as [`encode_python_udf`]; a distinct prefix routes it to
+/// aggregate registration on the executor.
+pub fn encode_python_udaf(
+    name: &str,
+    input_types: &[String],
+    output_type: &str,
+    pickle_b64: &str,
+) -> String {
+    format!(
+        "/* {REGISTER_PYTHON_UDAF}:{name}:{}:{output_type}:{pickle_b64} */",
         input_types.join(",")
     )
 }
@@ -341,6 +366,30 @@ fn parse_comment(comment: &str) -> Option<FlightDirective> {
             return None;
         }
         return Some(FlightDirective::RegisterPythonUdf {
+            name: name.to_string(),
+            input_types,
+            output_type: out_type.to_string(),
+            pickle_b64: pickle_b64.to_string(),
+        });
+    }
+    if let Some(rest) = comment.strip_prefix(REGISTER_PYTHON_UDAF) {
+        // name:in1,in2,…:out:pickle_b64  (empty in-types allowed)
+        let rest = rest.strip_prefix(':')?;
+        let (name, rest) = rest.split_once(':')?;
+        let (in_types, rest) = rest.split_once(':')?;
+        let (out_type, pickle_b64) = rest.split_once(':')?;
+        let input_types: Vec<String> = if in_types.is_empty() {
+            Vec::new()
+        } else {
+            in_types.split(',').map(str::to_string).collect()
+        };
+        let types_ok = is_safe_identifier(name)
+            && is_safe_identifier(out_type)
+            && input_types.iter().all(|t| is_safe_identifier(t));
+        if !types_ok || !is_safe_base64(pickle_b64) {
+            return None;
+        }
+        return Some(FlightDirective::RegisterPythonUdaf {
             name: name.to_string(),
             input_types,
             output_type: out_type.to_string(),

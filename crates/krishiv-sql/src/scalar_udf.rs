@@ -73,8 +73,10 @@ fn substitute(body: &mut Expr, params: &[String], args: &[Expr]) {
     let _: ControlFlow<()> = visit_expressions_mut(body, |expr| {
         if let Expr::Identifier(ident) = expr {
             let name = ident.value.to_lowercase();
-            if let Some(pos) = params.iter().position(|p| *p == name) {
-                *expr = args[pos].clone();
+            if let Some(pos) = params.iter().position(|p| *p == name)
+                && let Some(arg) = args.get(pos)
+            {
+                *expr = arg.clone();
             }
         }
         ControlFlow::Continue(())

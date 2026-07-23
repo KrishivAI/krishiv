@@ -1285,6 +1285,112 @@ mod tests {
         );
     }
 
+    /// Cloudpickle a Python expression and base64-encode it the way the client
+    /// ships UDFs, so the test drives the real pickle → worker path. Returns
+    /// `None` (test skips) when python3/cloudpickle is unavailable.
+    fn cloudpickle_b64(expr: &str) -> Option<String> {
+        let out = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(format!(
+                "import sys,base64,cloudpickle; \
+                 sys.stdout.write(base64.b64encode(cloudpickle.dumps({expr})).decode())"
+            ))
+            .output()
+            .ok()?;
+        (out.status.success() && !out.stdout.is_empty())
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    /// Follow-up #1 end-to-end: a Python SCALAR UDF inside a GROUP BY runs
+    /// through the coordinator as a **staged** (partition-parallel) job — each
+    /// executor task reconstructs the worker-backed UDF from the directive that
+    /// rides on its dfplan fragment — and produces exactly what the native
+    /// equivalent expression produces. Integer arithmetic keeps the SUM exact
+    /// regardless of partition/row order.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn staged_python_scalar_udf_group_by_matches_native() {
+        let Some(pickle_b64) = cloudpickle_b64("lambda x: x + 1000") else {
+            eprintln!("skipping: python3/cloudpickle unavailable");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = write_staged_test_parquet(tmp.path());
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let tables = vec![BatchSqlTable {
+            table_name: "t".into(),
+            path: table_dir,
+            ipc_b64: String::new(),
+        }];
+
+        let directive = format!("/* krishiv-register-python-udf:addk:int64:int64:{pickle_b64} */");
+        let udf_query = format!(
+            "{directive}\nSELECT category, SUM(addk(amount)) AS s FROM t GROUP BY category"
+        );
+        let udf_rows = runtime
+            .execute_batch_sql_via_coordinator(&udf_query, &tables)
+            .expect("staged python-UDF execution");
+        // Prove it actually ran multi-stage (not the single-task fallback): the
+        // directive must survive the SELECT gate and the plan must cut at the
+        // GROUP BY hash exchange.
+        assert!(
+            runtime.last_batch_job_stage_count() > 1,
+            "python-UDF GROUP BY must run staged, got {} stage(s)",
+            runtime.last_batch_job_stage_count()
+        );
+
+        let native = runtime
+            .execute_batch_sql_via_coordinator(
+                "SELECT category, SUM(amount + 1000) AS s FROM t GROUP BY category",
+                &tables,
+            )
+            .expect("native execution");
+        assert_eq!(
+            render_sorted_rows(&udf_rows),
+            render_sorted_rows(&native),
+            "staged python UDF must match the native `amount + 1000` expression"
+        );
+    }
+
+    /// Follow-up #2 end-to-end: a Python AGGREGATE UDF (GROUPED_AGG) runs
+    /// distributed on the executor and merges partial states correctly, matching
+    /// the native aggregate. Uses an integer sum so the comparison is exact.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn distributed_python_aggregate_udf_matches_native() {
+        let Some(pickle_b64) = cloudpickle_b64("lambda a: int(a.sum())") else {
+            eprintln!("skipping: python3/cloudpickle unavailable");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = write_staged_test_parquet(tmp.path());
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let tables = vec![BatchSqlTable {
+            table_name: "t".into(),
+            path: table_dir,
+            ipc_b64: String::new(),
+        }];
+
+        let directive = format!("/* krishiv-register-python-udaf:isum:int64:int64:{pickle_b64} */");
+        let udaf_query =
+            format!("{directive}\nSELECT category, isum(amount) AS s FROM t GROUP BY category");
+        let udaf_rows = runtime
+            .execute_batch_sql_via_coordinator(&udaf_query, &tables)
+            .expect("python-UDAF execution");
+
+        let native = runtime
+            .execute_batch_sql_via_coordinator(
+                "SELECT category, SUM(amount) AS s FROM t GROUP BY category",
+                &tables,
+            )
+            .expect("native aggregate execution");
+        assert_eq!(
+            render_sorted_rows(&udaf_rows),
+            render_sorted_rows(&native),
+            "python aggregate UDF must match native SUM(amount)"
+        );
+    }
+
     /// Phase 52 scale gate: staged execution must return byte-identical
     /// results to the inline single-engine path on a real TPC-H dataset.
     ///

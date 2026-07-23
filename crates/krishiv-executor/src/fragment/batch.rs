@@ -103,6 +103,29 @@ use crate::{ExecutorError, ExecutorResult};
 const WINDOW_PREFIX: &str = "window:";
 
 /// Execute a batch (terminal) stage fragment.
+/// Split leading `/* krishiv-register-python-udf(a)f:… */` directive comment(s)
+/// off the front of a fragment body. Returns the joined directives and the
+/// remaining body. Staged Python-UDF fragments prepend these ahead of their
+/// `dfplan:` body so the executor can register the worker-backed UDF before
+/// decoding the plan; every other fragment has no leading comment and comes back
+/// unchanged (the single-task `sql:` body keeps its directive after `sql:`).
+fn split_leading_python_udf_directives(body: &str) -> (String, String) {
+    const CLOSE: &str = " */";
+    let mut directives: Vec<&str> = Vec::new();
+    let mut rest = body.trim_start();
+    loop {
+        let is_directive = rest.starts_with("/* krishiv-register-python-udf:")
+            || rest.starts_with("/* krishiv-register-python-udaf:");
+        if !is_directive {
+            break;
+        }
+        let Some(end) = rest.find(CLOSE) else { break };
+        directives.push(&rest[..end + CLOSE.len()]);
+        rest = rest[end + CLOSE.len()..].trim_start();
+    }
+    (directives.join("\n"), rest.to_string())
+}
+
 pub(crate) async fn execute_batch_fragment(
     runner: &ExecutorTaskRunner,
     assignment: &ExecutorTaskAssignment,
@@ -113,7 +136,14 @@ pub(crate) async fn execute_batch_fragment(
     // duration of the fragment; the guard releases the share on return.
     let (engine_memory_limit, _process_memory_reservation) =
         crate::fragment::common::reserve_task_engine_memory(&memory_budget);
-    let fragment_body = task_fragment_body(assignment.plan_fragment().description())?;
+    let raw_fragment_body = task_fragment_body(assignment.plan_fragment().description())?;
+    // A staged Python-UDF fragment carries the `/* krishiv-register-python-udf */`
+    // directive(s) ahead of its `dfplan:` body so this executor can reconstruct
+    // the worker-backed UDF before decoding the plan. Split them off here; the
+    // single-task `sql:` path keeps its directive inside the SQL body (handled by
+    // register_python_udfs_from_sql) and is unaffected (no leading comment).
+    let (python_udf_directives, fragment_body) =
+        split_leading_python_udf_directives(&raw_fragment_body);
     let fragment = fragment_body.as_str();
     let restored_source_offsets = runner
         .source_restore_offsets
@@ -155,6 +185,7 @@ pub(crate) async fn execute_batch_fragment(
             runner,
             assignment,
             fragment,
+            &python_udf_directives,
             udf_limits.clone(),
             engine_memory_limit,
         ))
@@ -906,6 +937,7 @@ async fn execute_dfplan_fragment(
     runner: &ExecutorTaskRunner,
     assignment: &ExecutorTaskAssignment,
     fragment: &str,
+    python_udf_directives: &str,
     udf_limits: ResourceLimits,
     engine_memory_limit: Option<usize>,
 ) -> ExecutorResult<ExecutorTaskOutput> {
@@ -925,6 +957,17 @@ async fn execute_dfplan_fragment(
         engine_memory_limit,
         udf_limits,
     ));
+    // Register any Python scalar UDF the staged fragment carries BEFORE decoding
+    // the plan: the serialized dfplan references the UDF by name, so it must
+    // exist in this engine's function registry for decode to resolve it.
+    if !python_udf_directives.is_empty() {
+        engine
+            .register_python_udfs_from_sql(python_udf_directives)
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!("register staged python UDF: {e}"),
+            })?;
+    }
     let job_id = assignment.job_id().as_str();
     // This executor's advertised shuffle endpoint: partitions recorded under
     // it (or under no endpoint) are local; everything else is fetched.

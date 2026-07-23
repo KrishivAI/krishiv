@@ -1588,36 +1588,64 @@ impl SqlEngine {
 
     /// Register all scalar UDFs from the attached registry with DataFusion.
     /// Uses unlimited defaults (backward compat).
-    /// Extract `/* krishiv-register-python-udf:name:in,…:out:pickle_b64 */`
-    /// directive comments from `sql`, register each Python UDF on this engine
-    /// (via [`Self::register_python_udf`]), and return `sql` with the directives
-    /// removed. This is how a Python UDF shipped inside a fragment's SQL reaches
-    /// the executor's fresh per-task engine. No-op for SQL that carries none.
+    /// Extract Python UDF/UDAF directive comments from `sql`, register each on
+    /// this engine, and return `sql` with the directives removed. Handles both
+    /// `/* krishiv-register-python-udf:name:in,…:out:pickle_b64 */` (scalar, via
+    /// [`Self::register_python_udf`]) and
+    /// `/* krishiv-register-python-udaf:… */` (aggregate, via
+    /// [`Self::register_python_udaf`]). This is how a Python UDF shipped inside a
+    /// fragment's SQL reaches the executor's fresh per-task engine. No-op for SQL
+    /// that carries none.
     pub async fn register_python_udfs_from_sql(&self, sql: &str) -> SqlResult<String> {
-        use base64::Engine as _;
-        const PREFIX: &str = "/* krishiv-register-python-udf:";
-        if !sql.contains(PREFIX) {
+        const SCALAR_PREFIX: &str = "/* krishiv-register-python-udf:";
+        const AGG_PREFIX: &str = "/* krishiv-register-python-udaf:";
+        if !sql.contains(SCALAR_PREFIX) && !sql.contains(AGG_PREFIX) {
             return Ok(sql.to_string());
         }
         let mut out = String::with_capacity(sql.len());
         let mut rest = sql;
-        while let Some(start) = rest.find(PREFIX) {
+        loop {
+            // Find whichever directive appears first (aggregate and scalar
+            // prefixes are disjoint: "udaf:" never contains "udf:").
+            let agg = rest.find(AGG_PREFIX).map(|i| (i, true, AGG_PREFIX.len()));
+            let scalar = rest
+                .find(SCALAR_PREFIX)
+                .map(|i| (i, false, SCALAR_PREFIX.len()));
+            let next = match (agg, scalar) {
+                (Some(a), Some(s)) => Some(if a.0 <= s.0 { a } else { s }),
+                (Some(a), None) => Some(a),
+                (None, Some(s)) => Some(s),
+                (None, None) => None,
+            };
+            let Some((start, is_aggregate, prefix_len)) = next else {
+                break;
+            };
             out.push_str(&rest[..start]);
-            let after = &rest[start + PREFIX.len()..];
+            let after = &rest[start + prefix_len..];
             let Some(end) = after.find(" */") else {
                 // Unterminated — leave the remainder verbatim and stop.
                 out.push_str(&rest[start..]);
                 return Ok(out);
             };
-            let body = &after[..end];
-            // name:in1,in2:out:pickle_b64
-            let mut parts = body.splitn(4, ':');
-            let (name, in_types, out_type, pickle_b64) = match (
-                parts.next(),
-                parts.next(),
-                parts.next(),
-                parts.next(),
-            ) {
+            self.register_python_udf_directive(&after[..end], is_aggregate)
+                .await?;
+            rest = &after[end + " */".len()..];
+        }
+        out.push_str(rest);
+        Ok(out)
+    }
+
+    /// Parse and register one `name:in1,in2:out:pickle_b64` directive body as a
+    /// scalar or aggregate Python UDF.
+    async fn register_python_udf_directive(
+        &self,
+        body: &str,
+        is_aggregate: bool,
+    ) -> SqlResult<()> {
+        use base64::Engine as _;
+        let mut parts = body.splitn(4, ':');
+        let (name, in_types, out_type, pickle_b64) =
+            match (parts.next(), parts.next(), parts.next(), parts.next()) {
                 (Some(n), Some(i), Some(o), Some(p)) => (n, i, o, p),
                 _ => {
                     return Err(SqlError::DataFusion {
@@ -1625,22 +1653,23 @@ impl SqlEngine {
                     });
                 }
             };
-            let input_types: Vec<String> = if in_types.is_empty() {
-                Vec::new()
-            } else {
-                in_types.split(',').map(str::to_string).collect()
-            };
-            let pickle = base64::engine::general_purpose::STANDARD
-                .decode(pickle_b64)
-                .map_err(|e| SqlError::DataFusion {
-                    message: format!("invalid python-udf pickle base64: {e}"),
-                })?;
+        let input_types: Vec<String> = if in_types.is_empty() {
+            Vec::new()
+        } else {
+            in_types.split(',').map(str::to_string).collect()
+        };
+        let pickle = base64::engine::general_purpose::STANDARD
+            .decode(pickle_b64)
+            .map_err(|e| SqlError::DataFusion {
+                message: format!("invalid python-udf pickle base64: {e}"),
+            })?;
+        if is_aggregate {
+            self.register_python_udaf(name, &pickle, &input_types, out_type)
+                .await
+        } else {
             self.register_python_udf(name, &pickle, &input_types, out_type)
-                .await?;
-            rest = &after[end + " */".len()..];
+                .await
         }
-        out.push_str(rest);
-        Ok(out)
     }
 
     /// Register a distributed Python UDF from cloudpickled bytes. The callable
@@ -1687,6 +1716,53 @@ impl SqlEngine {
         self.udf_registry_version
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         self.sync_scalar_udfs().await
+    }
+
+    /// Register a distributed Python **aggregate** UDF (GROUPED_AGG) from
+    /// cloudpickled bytes. The callable buffers a group's rows and runs once at
+    /// finalize inside the shared `python3` worker, so it works on the Rust
+    /// executors and merges correctly across partitions/executors (two-phase
+    /// aggregation). `input_types`/`output_type` are Arrow type names. Requires
+    /// a UDF registry on this engine (executors' task engines set one).
+    pub async fn register_python_udaf(
+        &self,
+        name: &str,
+        pickle: &[u8],
+        input_types: &[String],
+        output_type: &str,
+    ) -> SqlResult<()> {
+        use arrow::datatypes::{Field, Schema};
+        let Some(registry) = &self.udf_registry else {
+            return Err(SqlError::DataFusion {
+                message: "cannot register a python UDAF: engine has no UDF registry".into(),
+            });
+        };
+        let input_fields: Vec<Field> = input_types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| Field::new(format!("a{i}"), python_udf_arrow_type(t), true))
+            .collect();
+        let input_schema = Schema::new(input_fields);
+        let output_field = Field::new("out", python_udf_arrow_type(output_type), true);
+        let pool = crate::python_udf::global_pool().map_err(|e| SqlError::DataFusion {
+            message: format!("python UDF worker unavailable: {e:?}"),
+        })?;
+        let udf = std::sync::Arc::new(crate::python_udf::PythonWorkerAggregateUdf::new(
+            name,
+            pickle.to_vec(),
+            input_schema,
+            output_field,
+            pool,
+        ));
+        registry
+            .write()
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?
+            .register_aggregate(udf);
+        self.udf_registry_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.sync_aggregate_udfs().await
     }
 
     pub async fn sync_scalar_udfs(&self) -> SqlResult<()> {

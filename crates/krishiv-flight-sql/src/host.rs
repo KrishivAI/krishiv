@@ -599,31 +599,16 @@ impl FlightExecutionHost {
                 FlightDirective::Explain
                 | FlightDirective::RegisterParquet { .. }
                 | FlightDirective::RegisterParquetIpc { .. }
-                | FlightDirective::RegisterPythonUdf { .. } => {}
+                | FlightDirective::RegisterPythonUdf { .. }
+                | FlightDirective::RegisterPythonUdaf { .. } => {}
             }
         }
 
-        // Re-attach any Python-UDF directives to the query so they travel with
-        // the fragment SQL to the executors, which register them on their
+        // Re-attach any Python-UDF/UDAF directives to the query so they travel
+        // with the fragment SQL to the executors, which register them on their
         // per-task engine before planning (the executor has the python worker;
         // the coordinator only forwards the fragment).
-        let udf_comments: Vec<String> = directives
-            .iter()
-            .filter_map(|d| match d {
-                FlightDirective::RegisterPythonUdf {
-                    name,
-                    input_types,
-                    output_type,
-                    pickle_b64,
-                } => Some(krishiv_runtime::flight_protocol::encode_python_udf(
-                    name,
-                    input_types,
-                    output_type,
-                    pickle_b64,
-                )),
-                _ => None,
-            })
-            .collect();
+        let udf_comments = reattach_python_udf_comments(&directives);
         let sql = if udf_comments.is_empty() {
             sql
         } else {
@@ -689,25 +674,9 @@ impl FlightExecutionHost {
             })
             .collect();
 
-        // Carry Python-UDF directives into the fragment SQL so executors register
-        // them (the coordinator only forwards the fragment).
-        let udf_comments: Vec<String> = directives
-            .iter()
-            .filter_map(|d| match d {
-                FlightDirective::RegisterPythonUdf {
-                    name,
-                    input_types,
-                    output_type,
-                    pickle_b64,
-                } => Some(krishiv_runtime::flight_protocol::encode_python_udf(
-                    name,
-                    input_types,
-                    output_type,
-                    pickle_b64,
-                )),
-                _ => None,
-            })
-            .collect();
+        // Carry Python-UDF/UDAF directives into the fragment SQL so executors
+        // register them (the coordinator only forwards the fragment).
+        let udf_comments = reattach_python_udf_comments(&directives);
         let sql = if udf_comments.is_empty() {
             sql
         } else {
@@ -829,6 +798,33 @@ pub enum SqlResultDelivery {
 /// into the spawned thread. A panic inside the closure is caught and surfaced
 /// as `Status::internal("run_blocking thread panicked")` rather than being
 /// allowed to unwind across the thread boundary.
+/// Re-encode Python scalar/aggregate UDF directives so they can be prepended to
+/// the fragment SQL forwarded to executors. The coordinator itself does not run
+/// them (it only forwards the fragment); each executor's per-task engine parses
+/// these back out via `SqlEngine::register_python_udfs_from_sql` and registers
+/// the worker-backed UDF before planning its fragment.
+fn reattach_python_udf_comments(directives: &[FlightDirective]) -> Vec<String> {
+    use krishiv_runtime::flight_protocol::{encode_python_udaf, encode_python_udf};
+    directives
+        .iter()
+        .filter_map(|d| match d {
+            FlightDirective::RegisterPythonUdf {
+                name,
+                input_types,
+                output_type,
+                pickle_b64,
+            } => Some(encode_python_udf(name, input_types, output_type, pickle_b64)),
+            FlightDirective::RegisterPythonUdaf {
+                name,
+                input_types,
+                output_type,
+                pickle_b64,
+            } => Some(encode_python_udaf(name, input_types, output_type, pickle_b64)),
+            _ => None,
+        })
+        .collect()
+}
+
 pub(crate) fn run_blocking<T: Send>(
     f: impl FnOnce() -> Result<T, krishiv_runtime::RuntimeError> + Send,
 ) -> Result<T, Status> {

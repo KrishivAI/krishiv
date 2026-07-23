@@ -625,23 +625,26 @@ class UDFRegistration:
     def __init__(self, session: Session) -> None:
         self._session = session
 
-    def register(self, name: str, f, returnType="string", argTypes=None, *, params=None, vectorized=False):  # noqa: N803
-        """Register a UDF. One entry point, three kinds — chosen by what you pass:
+    def register(self, name: str, f, returnType="string", argTypes=None, *, params=None, vectorized=False, agg=False):  # noqa: N803
+        """Register a UDF. One entry point, four kinds — chosen by what you pass:
 
         - ``register("tax", "x * 1.1")`` — ``f`` is a SQL expression string. This
           is the PORTABLE kind: it is inlined to native SQL and behaves
           identically in embedded AND distributed mode (runs on the cluster).
           Parameter names are read from the expression, or pass ``params=[...]``.
         - ``register("inc", lambda x: x + 1, "int", ["int"])`` — ``f`` is a Python
-          callable: a scalar (row-at-a-time) UDF. Embedded-engine only.
+          callable: a scalar (row-at-a-time) UDF. Runs embedded AND distributed
+          (shipped to the executors and run via a python worker subprocess).
         - ``register("v", batch_fn, "double", ["double"], vectorized=True)`` — a
           whole-batch Arrow UDF (like pandas_udf). Embedded-engine only.
-
-        Python callables can't run distributed because the executors are pure
-        Rust (no Python). For a UDF that runs on the cluster, give a SQL
-        expression string."""
+        - ``register("gmean", fn, "double", ["double"], agg=True)`` — a Python
+          AGGREGATE UDF (GROUPED_AGG): ``f`` receives the group's column(s) as
+          numpy array(s) and returns one scalar. Runs DISTRIBUTED on the
+          executors and merges across partitions."""
         if isinstance(f, str):
             return self.register_sql(name, f, params if params is not None else _extract_sql_params(f))
+        if agg:
+            return self.register_aggregate(name, f, returnType, argTypes)
         if vectorized:
             return self.register_arrow(name, f, returnType, argTypes)
         try:
@@ -709,6 +712,40 @@ class UDFRegistration:
         _arrow_batch._krishiv_arrow_udf = True
         wrapped = _native_udf(_arrow_batch, name=name, input_types=input_types, output_type=out_type)
         self._session.register_udf(wrapped)
+
+        def _invoke(*cols):
+            return call_function(name, [_as_column(c) for c in cols])
+
+        _invoke.__name__ = name
+        return _invoke
+
+    def register_aggregate(self, name: str, f, returnType="double", argTypes=None):  # noqa: N803
+        """Register a Python AGGREGATE UDF (GROUPED_AGG) that runs DISTRIBUTED on
+        the executors via a python worker — Krishiv's analogue of PySpark's
+        ``pandas_udf(..., PandasUDFType.GROUPED_AGG)``.
+
+        ``f`` receives the whole group's input column(s) as numpy array(s) (one
+        positional argument per input column) and returns a single Python scalar::
+
+            import numpy as np
+            gmean = spark.udf.register_aggregate(
+                "gmean", lambda a: float(np.exp(np.log(a).mean())), "double", ["double"])
+            df.group_by("k").agg(gmean(col("x")).alias("g"))
+
+        The group's rows are buffered and the callable runs once at finalize, so
+        the aggregate is trivially mergeable across partitions and executors
+        (correct two-phase distributed aggregation). Requires ``cloudpickle``."""
+        out_type = _udf_type(returnType)
+        arg_types = [_udf_type(t) for t in argTypes] if argTypes else [out_type]
+        try:
+            import cloudpickle as _cloudpickle  # noqa: PLC0415
+        except ImportError as exc:  # pragma: no cover - environment dependent
+            raise RuntimeError(
+                "register_aggregate requires cloudpickle to ship the callable to the executors"
+            ) from exc
+        self._session.register_python_udaf_bytes(
+            name, _cloudpickle.dumps(f), list(arg_types), out_type
+        )
 
         def _invoke(*cols):
             return call_function(name, [_as_column(c) for c in cols])

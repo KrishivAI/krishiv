@@ -740,6 +740,22 @@ impl PySession {
         Ok(())
     }
 
+    /// Ship a cloudpickled Python aggregate UDF (GROUPED_AGG) for distributed
+    /// execution on the executors via the python worker. `input_types` /
+    /// `output_type` are Arrow type names.
+    #[pyo3(signature = (name, pickle, input_types, output_type))]
+    pub fn register_python_udaf_bytes(
+        &self,
+        name: String,
+        pickle: Vec<u8>,
+        input_types: Vec<String>,
+        output_type: String,
+    ) -> PyResult<()> {
+        self.inner
+            .register_python_udaf_bytes(&name, &pickle, &input_types, &output_type);
+        Ok(())
+    }
+
     pub fn register_parquet_stream(&self, name: String, path: String) -> PyResult<()> {
         self.inner
             .register_parquet_stream(&name, path.as_ref())

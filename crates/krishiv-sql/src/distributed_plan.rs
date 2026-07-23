@@ -195,9 +195,27 @@ pub fn dfplan_body_with_spec(body: &str, spec: &DfplanTaskSpec) -> SqlResult<Str
     Ok(format!("{DFPLAN_BODY_PREFIX}{}:{b64}", spec.render()))
 }
 
+/// Strip the leading `/* krishiv-register-python-udf(a)f:… */` directive
+/// comment(s) a staged Python-UDF fragment carries ahead of its `dfplan:` body,
+/// returning the remaining body. A cheap no-op for any body without a leading
+/// directive. Keeps every dfplan-body parser — and the coordinator's
+/// `is_dfplan_body` shuffle-input wiring / AQE split analysis — working on a
+/// fragment that still carries its executor-side UDF registration directive.
+pub(crate) fn strip_leading_python_udf_directives(body: &str) -> &str {
+    const CLOSE: &str = " */";
+    let mut rest = body.trim_start();
+    while rest.starts_with("/* krishiv-register-python-udf:")
+        || rest.starts_with("/* krishiv-register-python-udaf:")
+    {
+        let Some(end) = rest.find(CLOSE) else { break };
+        rest = rest[end + CLOSE.len()..].trim_start();
+    }
+    rest
+}
+
 /// Split a body into its raw (partition segment, b64 payload) halves.
 fn split_dfplan_body(body: &str) -> SqlResult<(&str, &str)> {
-    let rest = body
+    let rest = strip_leading_python_udf_directives(body)
         .strip_prefix(DFPLAN_BODY_PREFIX)
         .ok_or_else(|| SqlError::DataFusion {
             message: format!(
@@ -341,8 +359,12 @@ fn pin_file_scans_to_partitions(plan: Arc<dyn ExecutionPlan>) -> SqlResult<Arc<d
 }
 
 /// True when a task-fragment body carries a proto-encoded physical plan.
+///
+/// Tolerates a leading Python-UDF registration directive (a staged Python-UDF
+/// fragment prepends one ahead of its `dfplan:` body), so the coordinator's
+/// shuffle-input wiring and AQE analysis classify it correctly.
 pub fn is_dfplan_body(body: &str) -> bool {
-    body.starts_with(DFPLAN_BODY_PREFIX)
+    strip_leading_python_udf_directives(body).starts_with(DFPLAN_BODY_PREFIX)
 }
 
 /// Decode a dfplan body and execute its assigned partition (executor seam).
@@ -493,7 +515,14 @@ pub async fn build_stages_for_parquet_query(
             message: format!("staged planning: register '{name}': {e}"),
         })?;
     }
-    let df = ctx.sql(query).await.map_err(|e| SqlError::DataFusion {
+    // A Python scalar UDF shipped inline (`/* krishiv-register-python-udf */`)
+    // must be known by name/signature for planning to resolve it, then stripped
+    // so the parser sees clean SQL. The stage bodies carry the same directive so
+    // the executor reconstructs the worker-backed UDF before decoding the plan;
+    // here the coordinator only needs the signature (the closure is never
+    // invoked during planning — Volatile keeps it out of const-folding).
+    let query = register_python_udf_signatures_and_strip(&ctx, query)?;
+    let df = ctx.sql(&query).await.map_err(|e| SqlError::DataFusion {
         message: format!("staged planning: {e}"),
     })?;
     let plan = df
@@ -503,6 +532,72 @@ pub async fn build_stages_for_parquet_query(
             message: format!("staged physical planning: {e}"),
         })?;
     build_distributed_stages(plan)
+}
+
+/// Register a signature-only DataFusion scalar UDF for every inline
+/// `/* krishiv-register-python-udf:name:in,…:out:pickle */` directive in
+/// `query`, so the coordinator can plan a staged query that references it, and
+/// return `query` with the directives stripped (clean SQL for the parser).
+///
+/// The registered UDF's implementation errors if invoked — it exists only to
+/// carry the name, argument types, and return type through planning and physical
+/// serialization (the plan references the UDF by name; the executor supplies the
+/// real worker-backed implementation on decode). Marked `Volatile` so the
+/// optimizer never tries to const-fold it at plan time. Aggregate directives
+/// (`python-udaf`) are intentionally left in place: staged aggregation is not
+/// planned here, so those queries fall back to the single-task path.
+pub fn register_python_udf_signatures_and_strip(
+    ctx: &SessionContext,
+    query: &str,
+) -> SqlResult<String> {
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    const PREFIX: &str = "/* krishiv-register-python-udf:";
+    if !query.contains(PREFIX) {
+        return Ok(query.to_string());
+    }
+    let mut out = String::with_capacity(query.len());
+    let mut rest = query;
+    while let Some(start) = rest.find(PREFIX) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + PREFIX.len()..];
+        let Some(end) = after.find(" */") else {
+            out.push_str(&rest[start..]);
+            return Ok(out);
+        };
+        let body = &after[..end];
+        rest = &after[end + " */".len()..];
+        // name:in1,in2:out:pickle_b64  (pickle unused for planning)
+        let mut parts = body.splitn(4, ':');
+        let (name, in_types, out_type) = match (parts.next(), parts.next(), parts.next()) {
+            (Some(n), Some(i), Some(o)) => (n, i, o),
+            _ => continue,
+        };
+        let input_types: Vec<arrow::datatypes::DataType> = if in_types.is_empty() {
+            Vec::new()
+        } else {
+            in_types
+                .split(',')
+                .map(crate::python_udf_arrow_type)
+                .collect()
+        };
+        let return_type = crate::python_udf_arrow_type(out_type);
+        let name_owned = name.to_string();
+        let udf = create_udf(
+            name,
+            input_types,
+            return_type,
+            Volatility::Volatile,
+            Arc::new(move |_: &[ColumnarValue]| {
+                Err(DataFusionError::NotImplemented(format!(
+                    "python UDF '{name_owned}' executes on the executor, not during \
+                     coordinator planning"
+                )))
+            }),
+        );
+        ctx.register_udf(udf);
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 // ── Shuffle partition reader (executor-injected) ───────────────────────────

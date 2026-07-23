@@ -32,10 +32,18 @@ pub async fn plan_staged_batch_stages(
     if !stage_split_enabled() {
         return None;
     }
+    // A Python scalar UDF query carries leading `/* krishiv-register-python-udf */`
+    // directive(s). Split them off: they ride along on every stage fragment (so
+    // each executor reconstructs the worker-backed UDF before decoding its
+    // dfplan), and the SELECT/WITH gate must look at the SQL past them. The
+    // coordinator's planner (build_stages) re-registers the UDF by signature and
+    // strips the directive itself.
+    let (udf_directives, gate_query) = split_leading_python_udf_directives(query);
+
     // Only plain SELECT/WITH queries are stage-split. DDL/DML and engine
     // extensions keep the coordinator lifecycle semantics of the
     // single-task path (and would not plan on a raw context anyway).
-    let trimmed = query.trim_start();
+    let trimmed = gate_query.trim_start();
     let is_select = ["SELECT", "WITH"].iter().any(|prefix| {
         trimmed.len() >= prefix.len() && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix)
     });
@@ -55,7 +63,24 @@ pub async fn plan_staged_batch_stages(
             return None;
         }
     };
-    stage_specs_from_plan(&staged)
+    stage_specs_from_plan(&staged, &udf_directives)
+}
+
+/// Split leading `/* krishiv-register-python-udf:… */` scalar-UDF directive
+/// comment(s) off the front of `query`, returning them joined by newlines and
+/// the remaining SQL. Aggregate directives are left in place — staged planning
+/// declines aggregate queries, so they never reach a staged fragment.
+fn split_leading_python_udf_directives(query: &str) -> (String, &str) {
+    const OPEN: &str = "/* krishiv-register-python-udf:";
+    const CLOSE: &str = " */";
+    let mut directives: Vec<&str> = Vec::new();
+    let mut rest = query.trim_start();
+    while rest.starts_with(OPEN) {
+        let Some(end) = rest.find(CLOSE) else { break };
+        directives.push(&rest[..end + CLOSE.len()]);
+        rest = rest[end + CLOSE.len()..].trim_start();
+    }
+    (directives.join("\n"), rest)
 }
 
 /// Convert a builder [`DistributedStagePlan`] into scheduler stage specs.
@@ -64,7 +89,10 @@ pub async fn plan_staged_batch_stages(
 /// output under the sub-stage key [`shuffle_stage_key`]`(i, t)` — the
 /// executor's dfplan shuffle reader derives the same key from the
 /// `ShuffleReadExec` leaves in downstream plans.
-fn stage_specs_from_plan(staged: &DistributedStagePlan) -> Option<Vec<StageSpec>> {
+fn stage_specs_from_plan(
+    staged: &DistributedStagePlan,
+    udf_directives: &str,
+) -> Option<Vec<StageSpec>> {
     let stage_id = |index: usize| StageId::try_new(format!("dist-s{index}")).ok();
     let mut specs = Vec::with_capacity(staged.stages.len());
     for (stage_index, stage) in staged.stages.iter().enumerate() {
@@ -85,10 +113,20 @@ fn stage_specs_from_plan(staged: &DistributedStagePlan) -> Option<Vec<StageSpec>
         }
         for (task_index, body) in stage.task_bodies.iter().enumerate() {
             let task_id = TaskId::try_new(format!("dist-s{stage_index}-t{task_index}")).ok()?;
-            let fragment =
-                krishiv_plan::TypedTaskFragment::new(krishiv_plan::ExecutionKind::Batch, body)
-                    .encode()
-                    .ok()?;
+            // Prepend the Python-UDF directive(s) so the executor registers the
+            // worker-backed UDF before decoding the dfplan; the body is otherwise
+            // unchanged. `parse_dfplan_task_body` on the executor strips them.
+            let framed_body = if udf_directives.is_empty() {
+                body.clone()
+            } else {
+                format!("{udf_directives}\n{body}")
+            };
+            let fragment = krishiv_plan::TypedTaskFragment::new(
+                krishiv_plan::ExecutionKind::Batch,
+                &framed_body,
+            )
+            .encode()
+            .ok()?;
             let mut task = TaskSpec::new(task_id, fragment);
             if let Some(shuffle) = &stage.shuffle {
                 task = task.with_shuffle_write(ShuffleWriteConfig {

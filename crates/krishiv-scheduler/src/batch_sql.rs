@@ -360,18 +360,18 @@ async fn submit_batch_sql_job_inner(
     // input partitions. Inline IPC tables cannot be stage-split; any query
     // or plan shape the builder declines falls back to the single-task
     // `sql:` path exactly as before (capability honesty).
-    // A query carrying a Python UDF must run single-task: the staged path emits
-    // `dfplan:` (serialized physical plan) bodies that reference the UDF by name
-    // but cannot carry its cloudpickled definition, so executors fail to resolve
-    // it. The single-task `sql:` path keeps the register-python-udf directive
-    // comment in the fragment, so the executor registers the worker UDF before
-    // planning. (Partition-parallelism for Python-UDF queries is a follow-up.)
-    let has_python_udf = query.contains("krishiv-register-python-udf");
+    //
+    // A Python SCALAR UDF query stages too: the coordinator resolves the UDF by
+    // signature for planning and the directive rides along on each stage
+    // fragment so executors reconstruct the worker-backed UDF before decoding
+    // the dfplan (see distributed_batch/distributed_plan). Shapes the builder
+    // declines — including Python AGGREGATE UDFs and object-store paths the
+    // coordinator cannot read to plan — fall back to the single-task `sql:`
+    // path, which carries the directive inside the fragment SQL.
     let staged_stages = if !is_streaming
         && sink_contract.is_none()
         && tables.is_empty()
         && !path_tables.is_empty()
-        && !has_python_udf
     {
             let table_refs: Vec<(String, std::path::PathBuf)> = path_tables
                 .iter()
