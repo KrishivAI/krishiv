@@ -55,6 +55,29 @@ impl PyStreamingDataFrame {
         }
     }
 
+    /// Per-key state TTL in milliseconds (expired keys are evicted).
+    pub fn with_state_ttl(&self, ttl_ms: u64) -> Self {
+        Self {
+            inner: self.inner.clone().with_state_ttl(Some(ttl_ms)),
+        }
+    }
+
+    /// Add a per-source watermark lag (source_id -> lag_ms) for multi-source
+    /// watermark reconciliation (effective watermark = min across sources).
+    pub fn with_source_watermark(&self, source_id: String, lag_ms: u64) -> Self {
+        Self {
+            inner: self.inner.clone().with_source_watermark(source_id, lag_ms),
+        }
+    }
+
+    /// Column identifying which source each row came from (required with
+    /// per-source watermark lags).
+    pub fn with_source_id_column(&self, column: String) -> Self {
+        Self {
+            inner: self.inner.clone().with_source_id_column(column),
+        }
+    }
+
     pub fn with_side_output(&self, name: String, lateness_threshold_ms: u64) -> Self {
         Self {
             inner: self

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -94,6 +94,12 @@ pub struct StreamingDataFrame {
     dedup_columns: Option<Vec<String>>,
     /// Which deduplication implementation to wire into the pipeline.
     dedup_state: DedupStateMode,
+    /// Per-key state TTL in milliseconds (`None` = no expiry).
+    state_ttl_ms: Option<u64>,
+    /// Per-source watermark lags for multi-source reconciliation (source_id → lag_ms).
+    source_watermark_lags: HashMap<String, u64>,
+    /// Column identifying the source when `source_watermark_lags` is set.
+    source_id_column: Option<String>,
 }
 
 impl StreamingDataFrame {
@@ -109,6 +115,9 @@ impl StreamingDataFrame {
             side_output: None,
             dedup_columns: None,
             dedup_state: DedupStateMode::default(),
+            state_ttl_ms: None,
+            source_watermark_lags: HashMap::new(),
+            source_id_column: None,
         }
     }
 
@@ -148,6 +157,28 @@ impl StreamingDataFrame {
     /// Add aggregation expressions.
     pub fn agg(mut self, exprs: Vec<AggExpr>) -> Self {
         self.agg_exprs = exprs;
+        self
+    }
+
+    /// Set the per-key state TTL in milliseconds (`None` clears it). Expired keys
+    /// are evicted from the windowed operator's state.
+    pub fn with_state_ttl(mut self, ttl_ms: Option<u64>) -> Self {
+        self.state_ttl_ms = ttl_ms;
+        self
+    }
+
+    /// Add a per-source watermark lag (source_id → lag_ms) for multi-source
+    /// watermark reconciliation. The effective watermark is the minimum across
+    /// sources; pair with [`with_source_id_column`](Self::with_source_id_column).
+    pub fn with_source_watermark(mut self, source_id: impl Into<String>, lag_ms: u64) -> Self {
+        self.source_watermark_lags.insert(source_id.into(), lag_ms);
+        self
+    }
+
+    /// Set the column identifying which source each row came from (required when
+    /// per-source watermark lags are configured).
+    pub fn with_source_id_column(mut self, column: impl Into<String>) -> Self {
+        self.source_id_column = Some(column.into());
         self
     }
 
@@ -426,7 +457,12 @@ impl StreamingDataFrame {
                 window_size_ms,
             )
             .with_watermark_lag_ms(self.watermark_lag_ms)
-            .with_aggs(self.agg_exprs.clone()),
+            .with_aggs(self.agg_exprs.clone())
+            .with_state_ttl_ms(self.state_ttl_ms)
+            .with_source_watermarks(
+                self.source_watermark_lags.clone(),
+                self.source_id_column.clone(),
+            ),
         ))
     }
 }
