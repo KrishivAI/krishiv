@@ -582,6 +582,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spark_aggregate_left_folds_sum() {
+        // `aggregate(array, start, (acc, x) -> merge)` — sum with a zero start,
+        // and the `reduce` alias with a non-zero start (proves both the fold and
+        // that `start` seeds the accumulator).
+        let b = run(
+            "SELECT aggregate([1, 2, 3, 4], 0, (acc, x) -> acc + x) AS s, \
+                    reduce([1, 2, 3], 10, (acc, x) -> acc + x) AS s10",
+        )
+        .await;
+        let row = &b[0];
+        let col = |i: usize| {
+            row.column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("i64")
+                .value(0)
+        };
+        assert_eq!(col(0), 10, "0 + 1 + 2 + 3 + 4");
+        assert_eq!(col(1), 16, "10 + 1 + 2 + 3");
+    }
+
+    #[tokio::test]
+    async fn aggregate_multi_row_varying_lengths_and_null() {
+        // Column-wise fold across rows with different array lengths, plus a NULL
+        // input array. Shorter rows must keep their accumulator once exhausted;
+        // a NULL array must yield a NULL result (Spark semantics).
+        let b = run(
+            "SELECT aggregate(arr, 0, (acc, x) -> acc + x) AS s FROM (VALUES \
+                (1, [1, 2, 3]), \
+                (2, [10]), \
+                (3, CAST(NULL AS INT[])), \
+                (4, [5, 5, 5, 5]) \
+             ) AS t(id, arr) ORDER BY id",
+        )
+        .await;
+        let s = b[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("i64");
+        assert_eq!(s.value(0), 6, "1+2+3");
+        assert_eq!(s.value(1), 10, "single element");
+        assert!(s.is_null(2), "NULL array ⇒ NULL result");
+        assert_eq!(s.value(3), 20, "5*4");
+    }
+
+    #[tokio::test]
     async fn all_match_range_helper_direct() {
         use super::all_match_for_range;
         let p = BooleanArray::from(vec![Some(true), Some(true), Some(false), None]);

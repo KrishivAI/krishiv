@@ -492,6 +492,84 @@ mod tests {
         assert!(expr.normalize_json().unwrap().contains("aggregate"));
     }
     #[test]
+    fn arithmetic_and_logical_combinators() {
+        assert_eq!(col("a").modulo(lit(3)).as_sql(), "(\"a\" % 3)");
+        assert_eq!(col("a").negate().as_sql(), "(- \"a\")");
+        assert_eq!(col("a").logical_not().as_sql(), "(NOT \"a\")");
+    }
+
+    #[test]
+    fn pattern_and_membership_combinators() {
+        assert_eq!(col("a").like(lit("x%")).as_sql(), "(\"a\" LIKE 'x%')");
+        assert_eq!(col("a").not_like(lit("x%")).as_sql(), "(\"a\" NOT LIKE 'x%')");
+        assert_eq!(col("a").ilike(lit("x%")).as_sql(), "(\"a\" ILIKE 'x%')");
+        assert_eq!(
+            col("a").is_in(vec![lit(1), lit(2)], false).as_sql(),
+            "(\"a\" IN (1, 2))"
+        );
+        assert_eq!(
+            col("a").is_in(vec![lit(1), lit(2)], true).as_sql(),
+            "(\"a\" NOT IN (1, 2))"
+        );
+        assert_eq!(
+            col("a").between(lit(1), lit(9)).as_sql(),
+            "(\"a\" BETWEEN 1 AND 9)"
+        );
+        assert_eq!(
+            col("a").eq_null_safe(col("b")).as_sql(),
+            "(\"a\" IS NOT DISTINCT FROM \"b\")"
+        );
+    }
+
+    #[test]
+    fn function_backed_string_combinators() {
+        // Function-backed combinators render as `name(args)` via the plan node.
+        assert_eq!(col("a").power(lit(2)).as_sql(), "power(\"a\", 2)");
+        assert_eq!(
+            col("a").starts_with(lit("pre")).as_sql(),
+            "starts_with(\"a\", 'pre')"
+        );
+        assert_eq!(
+            col("a").ends_with(lit("suf")).as_sql(),
+            "ends_with(\"a\", 'suf')"
+        );
+        assert_eq!(
+            col("a").contains(lit("x")).as_sql(),
+            "(strpos(\"a\", 'x') > 0)"
+        );
+        assert_eq!(
+            col("a").substr(lit(1), lit(3)).as_sql(),
+            "substr(\"a\", 1, 3)"
+        );
+    }
+
+    #[test]
+    fn case_when_chain_and_otherwise() {
+        let expr = when(col("x").gt(lit(0)), lit("pos"))
+            .when(col("x").lt(lit(0)), lit("neg"))
+            .otherwise(lit("zero"));
+        assert_eq!(
+            expr.as_sql(),
+            "CASE WHEN ((\"x\" > 0)) THEN ('pos') \
+             WHEN ((\"x\" < 0)) THEN ('neg') ELSE ('zero') END"
+        );
+        // A bare when() is a valid CASE with an implicit ELSE NULL.
+        assert_eq!(
+            when(col("x").gt(lit(0)), lit(1)).as_sql(),
+            "CASE WHEN ((\"x\" > 0)) THEN (1) END"
+        );
+    }
+
+    #[test]
+    fn case_body_leaves_non_case_input_untouched() {
+        // Chaining .otherwise onto a non-CASE expression must not silently
+        // succeed: case_body returns the input unchanged so the result is a
+        // clearly-invalid expression rather than a plausible-but-wrong one.
+        let bogus = col("a").otherwise(lit(0));
+        assert_eq!(bogus.as_sql(), "\"a\" ELSE (0) END");
+    }
+
+    #[test]
     fn nested_types_are_structured() {
         let ty = ExprDataType::List(Box::new(ExprDataType::Struct(vec![ExprField {
             name: "value".into(),

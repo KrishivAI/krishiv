@@ -893,6 +893,38 @@ async fn show_async_matches_show() {
 }
 
 #[tokio::test]
+async fn dataframe_columns_reports_schema_order() {
+    let session = Session::builder().build().unwrap();
+    let df = session.sql("SELECT 1 AS id, 'x' AS name, 2.0 AS amount").unwrap();
+    // columns() is schema-ordered, not sorted.
+    assert_eq!(
+        df.columns().unwrap(),
+        vec!["id".to_string(), "name".to_string(), "amount".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn dataframe_num_rows_counts_rows() {
+    let session = Session::builder().build().unwrap();
+    let df = session
+        .sql("SELECT * FROM (VALUES (1), (2), (3), (4)) AS t(x)")
+        .unwrap();
+    assert_eq!(df.num_rows().unwrap(), 4);
+}
+
+#[tokio::test]
+async fn dataframe_unnest_expands_array_column() {
+    let session = Session::builder().build().unwrap();
+    let df = session.sql("SELECT 7 AS id, [10, 20, 30] AS arr").unwrap();
+    let exploded = df.unnest(&["arr"]).unwrap();
+    // One row per array element, with the scalar `id` repeated.
+    assert_eq!(exploded.num_rows().unwrap(), 3);
+    assert!(exploded.columns().unwrap().contains(&"arr".to_string()));
+    let rows = exploded.collect().unwrap();
+    assert_eq!(rows.row_count(), 3);
+}
+
+#[tokio::test]
 async fn read_parquet_with_options_async_collects_rows() {
     let temp = tempdir().unwrap();
     let parquet_path = temp.path().join("people.parquet");
