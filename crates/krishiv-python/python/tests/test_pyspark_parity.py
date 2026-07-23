@@ -180,6 +180,23 @@ def test_higher_order_functions(session):
     assert row["g"] is True
 
 
+def test_zip_with_and_indexed_lambdas(session):
+    df = session.sql("SELECT make_array(10, 20, 30) AS a, make_array(1, 2, 3) AS b")
+    row = df.select(
+        F.zip_with(col("a"), col("b"), lambda x, y: x + y).alias("z"),
+        F.transform(col("a"), lambda x, i: x + i).alias("ti"),
+        F.filter(col("a"), lambda x, i: i > lit(0)).alias("fi"),
+    ).collect_rows()[0]
+    assert row["z"] == [11, 22, 33]
+    assert row["ti"] == [10, 21, 32]   # element + 0-based index
+    assert row["fi"] == [20, 30]       # keep index > 0
+    # unequal lengths pad the shorter with NULL (Spark semantics)
+    pad = session.sql("SELECT make_array(1, 2, 3) AS a, make_array(10) AS b").select(
+        F.zip_with(col("a"), col("b"), lambda x, y: F.coalesce(y, lit(0)) + x).alias("z")
+    ).collect_rows()[0]
+    assert pad["z"] == [11, 2, 3]
+
+
 def test_nested_higher_order(session):
     df = session.sql("SELECT make_array(make_array(1, 2), make_array(3)) AS a")
     out = df.select(

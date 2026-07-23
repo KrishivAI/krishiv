@@ -9,6 +9,7 @@ wrapped explicitly.
 
 from __future__ import annotations
 
+import inspect
 import itertools
 
 from typing import Any, Callable, Optional, Union
@@ -787,40 +788,87 @@ def flatten(column: ColumnLike) -> Column:
 
 # ── Higher-order (lambda) array functions ───────────────────────────────────
 #
-# The lambda receives a `Column` bound to the element and returns a `Column`
-# expression, rendered into the engine's SQL lambda syntax (`x -> expr`). A
-# unique variable name per call keeps nested higher-order calls correct.
-# Only single-argument lambdas are supported (the engine rejects the indexed
-# `(x, i) -> …` form); `aggregate`/`zip_with` have no engine equivalent yet.
+# The lambda receives a `Column` bound to the element (and optionally its index)
+# and returns a `Column`, rendered into the engine's SQL lambda syntax
+# (`x -> expr`). A unique variable per call keeps nested calls correct. The
+# indexed `(x, i) -> …` form and `zip_with` are built by zipping with
+# `arrays_zip` (elements paired with positions / a second array; shorter arrays
+# pad with NULL, matching Spark) and applying a single-arg transform over the
+# resulting structs.
 
 _hof_var_counter = itertools.count()
 
 
-def _hof(sql_name: str, column: ColumnLike, f: Callable[[Column], Any]) -> Column:
-    var = f"__k{next(_hof_var_counter)}"
-    body = f(_col(var))
-    body = body if isinstance(body, Column) else _to_column(body)
+def _fresh_var() -> str:
+    return f"__k{next(_hof_var_counter)}"
+
+
+def _hof_arity(f: Callable) -> int:
+    try:
+        params = inspect.signature(f).parameters.values()
+    except (TypeError, ValueError):
+        return 1
+    kinds = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.POSITIONAL_ONLY)
+    # NOTE: `sum`/`min`/`max`/`filter` are shadowed by this module's functions,
+    # so count with a comprehension rather than the (shadowed) builtin `sum`.
+    return len([p for p in params if p.kind in kinds])
+
+
+def _field(struct_col: Column, i: int) -> Column:
+    return call_function("get_field", struct_col, lit(str(i)))
+
+
+def _index_array(column: ColumnLike) -> Column:
+    c = _to_column(column)
+    return _expr(f"generate_series(0, cardinality({c.sql()})::bigint - 1)")
+
+
+def _one_arg(sql_name: str, column: ColumnLike, f: Callable) -> Column:
+    var = _fresh_var()
+    body = _to_column(f(_col(var)))
     return _expr(f"{sql_name}({_sql(column)}, {var} -> {body.sql()})")
 
 
-def transform(column: ColumnLike, f: Callable[[Column], Any]) -> Column:
-    """Apply ``f`` to each element of an array (PySpark `F.transform`)."""
-    return _hof("transform", column, f)
+def transform(column: ColumnLike, f: Callable) -> Column:
+    """Apply ``f`` to each element of an array (PySpark `F.transform`). ``f`` may
+    take one arg (element) or two (element, 0-based index)."""
+    if _hof_arity(f) >= 2:
+        return zip_with(column, _index_array(column), f)
+    return _one_arg("transform", column, f)
 
 
-def filter(column: ColumnLike, f: Callable[[Column], Any]) -> Column:  # noqa: A001
-    """Keep array elements where ``f`` is true (PySpark `F.filter`)."""
-    return _hof("filter", column, f)
+def filter(column: ColumnLike, f: Callable) -> Column:  # noqa: A001
+    """Keep array elements where ``f`` is true (PySpark `F.filter`). ``f`` may
+    take one arg (element) or two (element, 0-based index)."""
+    if _hof_arity(f) >= 2:
+        var = _fresh_var()
+        pair = _col(var)
+        pred = _to_column(f(_field(pair, 1), _field(pair, 2)))
+        zipped = call_function("arrays_zip", _to_column(column), _index_array(column))
+        filtered = _expr(f"filter({zipped.sql()}, {var} -> {pred.sql()})")
+        out = _fresh_var()
+        return _expr(f"transform({filtered.sql()}, {out} -> {_field(_col(out), 1).sql()})")
+    return _one_arg("filter", column, f)
 
 
-def exists(column: ColumnLike, f: Callable[[Column], Any]) -> Column:
+def exists(column: ColumnLike, f: Callable) -> Column:
     """True if any element satisfies ``f`` (PySpark `F.exists`)."""
-    return _hof("any_match", column, f)
+    return _one_arg("any_match", column, f)
 
 
-def forall(column: ColumnLike, f: Callable[[Column], Any]) -> Column:
+def forall(column: ColumnLike, f: Callable) -> Column:
     """True if every element satisfies ``f`` (PySpark `F.forall`)."""
-    return _hof("array_forall", column, f)
+    return _one_arg("array_forall", column, f)
+
+
+def zip_with(left: ColumnLike, right: ColumnLike, f: Callable) -> Column:
+    """Merge two arrays element-wise with a binary lambda (PySpark `F.zip_with`).
+    Unequal lengths pad the shorter with NULL, matching Spark."""
+    var = _fresh_var()
+    pair = _col(var)
+    body = _to_column(f(_field(pair, 1), _field(pair, 2)))
+    zipped = call_function("arrays_zip", _to_column(left), _to_column(right))
+    return _expr(f"transform({zipped.sql()}, {var} -> {body.sql()})")
 
 
 # ── Hash functions ──────────────────────────────────────────────────────────
@@ -998,6 +1046,7 @@ __all__ = [
     "filter",
     "exists",
     "forall",
+    "zip_with",
     # hashing
     "md5",
     "sha256",

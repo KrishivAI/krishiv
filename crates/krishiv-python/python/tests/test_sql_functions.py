@@ -173,6 +173,7 @@ FUNCTION_NAMES = {
     "variance",
     "when",
     "year",
+    "zip_with",
 }
 
 
