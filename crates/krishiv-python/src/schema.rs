@@ -33,7 +33,8 @@ impl PySchema {
                     })?;
                     fields.push((name, dt));
                 }
-                fields.sort_by(|a, b| a.0.cmp(&b.0));
+                // Preserve declaration order (see __init_subclass__): the stored
+                // `_krishiv_fields` dict is already in declaration order.
                 return Ok(fields);
             }
         }
@@ -96,7 +97,12 @@ impl PySchema {
             let dt = python_annotation_to_arrow(py, ann)?;
             fields.push((name, dt));
         }
-        fields.sort_by(|a, b| a.0.cmp(&b.0));
+        // Preserve declaration order: a materialized IVM view binds this schema
+        // to the view query's output columns positionally, so the fields must
+        // stay in the order the user declared them (which they write to match
+        // the SELECT list). Sorting alphabetically here silently mismatched the
+        // columns — e.g. `SELECT SUM(x) AS total, COUNT(*) AS cnt` bound SUM to
+        // `cnt` and COUNT to `total`, truncating the sum to the int `cnt` type.
         Self::store_fields_on_class(cls, &fields)?;
         Ok(())
     }

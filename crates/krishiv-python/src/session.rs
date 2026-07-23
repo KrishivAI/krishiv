@@ -303,14 +303,20 @@ impl PySession {
     /// :py:meth:`embedded` or :py:meth:`local` for local execution.
     ///
     /// ``grpc_url`` — optional separate gRPC control-plane address.
+    /// ``http_url`` — optional coordinator HTTP address for incremental-view
+    /// (IVM) management, which lives on the coordinator's HTTP port — distinct
+    /// from the Arrow Flight data port. Set this when the two ports differ (the
+    /// normal distributed deployment); otherwise IVM management falls back to the
+    /// Flight URL, which is wrong whenever HTTP and Flight are separate ports.
     /// ``target_parallelism`` / ``shuffle_partitions`` — performance tuning.
     /// ``state_ttl_ms`` — state eviction TTL in milliseconds (0 = no eviction).
     #[classmethod]
-    #[pyo3(signature = (url, *, grpc_url = None, target_parallelism = None, shuffle_partitions = None, state_ttl_ms = None))]
+    #[pyo3(signature = (url, *, grpc_url = None, http_url = None, target_parallelism = None, shuffle_partitions = None, state_ttl_ms = None))]
     pub fn connect(
         _cls: &Bound<'_, PyType>,
         url: String,
         grpc_url: Option<String>,
+        http_url: Option<String>,
         target_parallelism: Option<usize>,
         shuffle_partitions: Option<u32>,
         state_ttl_ms: Option<u64>,
@@ -320,6 +326,9 @@ impl PySession {
             .with_remote_execution(true);
         if let Some(g) = grpc_url {
             builder = builder.with_coordinator_grpc(g);
+        }
+        if let Some(h) = http_url {
+            builder = builder.with_coordinator_http(h);
         }
         build_session_with_opts(
             builder,
