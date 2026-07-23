@@ -295,6 +295,84 @@ impl<T: StateValue> ReducingState<T> {
     }
 }
 
+// ── AggregatingState ──────────────────────────────────────────────────────────
+
+type AggAddFn<In, Acc> = Arc<dyn Fn(&Acc, &In) -> Acc + Send + Sync>;
+type AggResultFn<Acc, Out> = Arc<dyn Fn(&Acc) -> Out + Send + Sync>;
+
+/// Aggregating state descriptor.
+///
+/// The generalisation of [`ReducingState`]: values of an input type `In` are
+/// folded into an accumulator of a *distinct* type `Acc`, and reads project the
+/// accumulator to an output type `Out`. Equivalent to Flink's `AggregatingState`
+/// backed by an `AggregateFunction<In, Acc, Out>` — e.g. accumulate `(sum, count)`
+/// while reading out a running `average`, which a same-typed `ReducingState`
+/// cannot express. Only the accumulator is persisted (the initial accumulator is
+/// `Acc::default()`).
+pub struct AggregatingState<In: StateValue, Acc: StateValue, Out> {
+    key: String,
+    add_fn: AggAddFn<In, Acc>,
+    result_fn: AggResultFn<Acc, Out>,
+}
+
+impl<In: StateValue, Acc: StateValue, Out> AggregatingState<In, Acc, Out> {
+    /// Create a new `AggregatingState`.
+    ///
+    /// `add` folds an input value into the accumulator (`|acc, value| -> acc`);
+    /// `get_result` projects the accumulator to the output (`|acc| -> out`).
+    pub fn new(
+        key: impl Into<String>,
+        add: impl Fn(&Acc, &In) -> Acc + Send + Sync + 'static,
+        get_result: impl Fn(&Acc) -> Out + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            add_fn: Arc::new(add),
+            result_fn: Arc::new(get_result),
+        }
+    }
+
+    /// Read the current accumulator, or `None` if nothing has been added.
+    pub fn accumulator(&self, raw: &[u8]) -> Result<Option<Acc>, StateError> {
+        let map = decode_map(raw)?;
+        match map.get(&self.key) {
+            Some(v) => serde_json::from_value(v.clone())
+                .map(Some)
+                .map_err(|e| StateError::Deserialization(e.to_string())),
+            None => Ok(None),
+        }
+    }
+
+    /// Read the projected output, or `None` if nothing has been added.
+    pub fn get(&self, raw: &[u8]) -> Result<Option<Out>, StateError> {
+        Ok(self.accumulator(raw)?.as_ref().map(|acc| (self.result_fn)(acc)))
+    }
+
+    /// Fold a new input value into the accumulator (starting from
+    /// `Acc::default()` on first add).
+    pub fn add(&self, raw: &mut Vec<u8>, value: In) -> Result<(), StateError> {
+        let mut map = decode_map(raw)?;
+        let acc = match map.get(&self.key) {
+            Some(existing) => serde_json::from_value(existing.clone())
+                .map_err(|e| StateError::Deserialization(e.to_string()))?,
+            None => Acc::default(),
+        };
+        let new_acc = (self.add_fn)(&acc, &value);
+        let json_val =
+            serde_json::to_value(&new_acc).map_err(|e| StateError::Serialization(e.to_string()))?;
+        map.insert(self.key.clone(), json_val);
+        encode_map(raw, map)
+    }
+
+    /// Remove the accumulator from the state buffer.
+    pub fn clear(&self, raw: &mut Vec<u8>) {
+        if let Ok(mut map) = decode_map(raw) {
+            map.remove(&self.key);
+            let _ = encode_map(raw, map);
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -379,6 +457,38 @@ mod tests {
 
         desc.add(&mut raw, 3).unwrap();
         assert_eq!(desc.get(&raw).unwrap(), Some(18));
+
+        desc.clear(&mut raw);
+        assert!(desc.get(&raw).unwrap().is_none());
+    }
+
+    #[test]
+    fn aggregating_state_accumulates_and_projects_distinct_types() {
+        // Running average: accumulate (sum, count) but read out the mean — a
+        // shape a same-typed ReducingState cannot express.
+        let desc: AggregatingState<i64, (i64, i64), f64> = AggregatingState::new(
+            "avg",
+            |acc: &(i64, i64), v: &i64| (acc.0 + v, acc.1 + 1),
+            |acc: &(i64, i64)| {
+                if acc.1 == 0 {
+                    0.0
+                } else {
+                    acc.0 as f64 / acc.1 as f64
+                }
+            },
+        );
+        let mut raw: Vec<u8> = Vec::new();
+
+        assert!(desc.get(&raw).unwrap().is_none());
+
+        desc.add(&mut raw, 10).unwrap();
+        desc.add(&mut raw, 20).unwrap();
+        desc.add(&mut raw, 30).unwrap();
+        assert_eq!(desc.accumulator(&raw).unwrap(), Some((60, 3)));
+        assert_eq!(desc.get(&raw).unwrap(), Some(20.0));
+
+        desc.add(&mut raw, 0).unwrap();
+        assert_eq!(desc.get(&raw).unwrap(), Some(15.0)); // 60/4
 
         desc.clear(&mut raw);
         assert!(desc.get(&raw).unwrap().is_none());

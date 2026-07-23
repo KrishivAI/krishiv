@@ -111,7 +111,7 @@ pub use queue::{
 };
 pub use schema_normalize::{ColumnRenameMap, SchemaNormalizeOperator};
 pub use state_descriptor::{
-    ListState, MapState, ReducingState, StateError, StateValue, ValueState,
+    AggregatingState, ListState, MapState, ReducingState, StateError, StateValue, ValueState,
 };
 pub use watermark_join::{WatermarkWindowJoinOperator, WatermarkWindowJoinSpec};
 pub use window::{

@@ -126,11 +126,11 @@ pub use window::{
 pub use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 pub use arrow::record_batch::RecordBatch;
 pub use krishiv_dataflow::{
-    AggExpr, AggFunction, BroadcastContext, BroadcastProcessExecutor, BroadcastProcessFunction,
-    BroadcastStateDescriptor, CoProcessExecutor, CoProcessFunction, ConnectedStreams, ListState,
-    MapState, OperatorConfig, OperatorUid, ProcessContext, ProcessFunction,
-    ProcessFunctionExecutor, ReducingState, StateError, StateValue, TimerEntry, TimerKind,
-    ValueState,
+    AggExpr, AggFunction, AggregatingState, BroadcastContext, BroadcastProcessExecutor,
+    BroadcastProcessFunction, BroadcastStateDescriptor, CoProcessExecutor, CoProcessFunction,
+    ConnectedStreams, ListState, MapState, OperatorConfig, OperatorUid, ProcessContext,
+    ProcessFunction, ProcessFunctionExecutor, ReducingState, StateError, StateValue, TimerEntry,
+    TimerKind, ValueState,
 };
 pub use krishiv_plan::udf::{ScalarUdf, UdfError, UdfRegistry};
 pub use krishiv_plan::{LogicalPlan as KrishivLogicalPlan, PhysicalPlan as KrishivPhysicalPlan};

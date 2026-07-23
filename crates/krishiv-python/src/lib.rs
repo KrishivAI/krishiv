@@ -57,7 +57,9 @@ pub use job_status::PyJobStatus;
 pub use live_table::{PyChangeFeedIter, PyLiveTable};
 pub use pipeline_api::{PyMemorySink, PyPipeline};
 pub use prepared::PyPreparedStatement;
-pub use process_api::{PyListState, PyMapState, PyProcessContext, PyValueState};
+pub use process_api::{
+    PyAggregatingState, PyListState, PyMapState, PyProcessContext, PyValueState,
+};
 pub use query_handle::PyQueryHandle;
 pub use query_result::PyQueryResult;
 pub use relation::PyRelation;
@@ -213,6 +215,7 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<process_api::PyValueState>()?;
     m.add_class::<process_api::PyListState>()?;
     m.add_class::<process_api::PyMapState>()?;
+    m.add_class::<process_api::PyAggregatingState>()?;
     m.add_function(wrap_pyfunction!(process_api::apply_process_function, m)?)?;
 
     // SQL gateway (Phase H parity)

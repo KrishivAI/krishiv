@@ -391,3 +391,96 @@ impl PyMapState {
         Vec::new()
     }
 }
+
+/// A JSON-backed aggregating-state descriptor for use inside process functions —
+/// Flink's ``AggregatingState``. Folds inputs into an accumulator of a distinct
+/// type via ``add(acc, value)`` and projects the accumulator to an output via
+/// ``get_result(acc)`` — the generalisation of ``ReducingState`` (e.g. accumulate
+/// ``[sum, count]`` while reading out a running ``average``).
+///
+/// ```python
+/// # running average, keyed
+/// avg = AggregatingState("avg",
+///     add=lambda acc, v: [acc[0] + v, acc[1] + 1],
+///     get_result=lambda acc: acc[0] / acc[1] if acc[1] else 0.0,
+///     initial=[0, 0])
+/// raw = avg.add_json(raw, event_value)
+/// mean = avg.get_result_json(raw)
+/// ```
+///
+/// The accumulator is JSON-serialised, so use JSON-native shapes (lists / dicts /
+/// numbers), exactly like ``ListState`` / ``MapState``.
+#[pyclass(name = "AggregatingState")]
+pub struct PyAggregatingState {
+    key: String,
+    add: Py<PyAny>,
+    get_result: Py<PyAny>,
+    initial: Py<PyAny>,
+}
+
+#[pymethods]
+impl PyAggregatingState {
+    #[new]
+    #[pyo3(signature = (key, add, get_result, initial=None))]
+    pub fn new(
+        py: Python<'_>,
+        key: String,
+        add: Py<PyAny>,
+        get_result: Py<PyAny>,
+        initial: Option<Py<PyAny>>,
+    ) -> Self {
+        Self {
+            key,
+            add,
+            get_result,
+            initial: initial.unwrap_or_else(|| py.None()),
+        }
+    }
+
+    #[getter]
+    fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// The current accumulator, or ``initial`` if nothing has been added.
+    fn accumulator_json<'py>(&self, py: Python<'py>, raw: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+        if raw.is_empty() {
+            return Ok(self.initial.bind(py).clone());
+        }
+        let s = std::str::from_utf8(raw).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("state contains invalid UTF-8: {e}"))
+        })?;
+        Ok(py.import("json")?.getattr("loads")?.call1((s,))?)
+    }
+
+    /// Fold ``value`` into the accumulator (via ``add``) and return new raw bytes.
+    fn add_json(&self, py: Python<'_>, raw: Vec<u8>, value: Py<PyAny>) -> PyResult<Vec<u8>> {
+        let acc = self.accumulator_json(py, &raw)?;
+        let new_acc = self.add.bind(py).call1((acc, value))?;
+        let s: String = py
+            .import("json")?
+            .getattr("dumps")?
+            .call1((&new_acc,))?
+            .extract()?;
+        Ok(s.into_bytes())
+    }
+
+    /// Project the accumulator to the output (via ``get_result``), or ``None`` if
+    /// nothing has been added.
+    fn get_result_json<'py>(
+        &self,
+        py: Python<'py>,
+        raw: &[u8],
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let acc = self.accumulator_json(py, raw)?;
+        Ok(Some(self.get_result.bind(py).call1((acc,))?))
+    }
+
+    /// Return empty bytes (clear the accumulator).
+    fn clear(&self) -> Vec<u8> {
+        Vec::new()
+    }
+}

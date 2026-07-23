@@ -15,7 +15,7 @@ pub use krishiv_dataflow::connected_streams::{
 pub use krishiv_dataflow::operator_config::OperatorConfig;
 pub use krishiv_dataflow::process_fn::{ProcessContext, ProcessFunction, ProcessFunctionExecutor};
 pub use krishiv_dataflow::state_descriptor::{
-    ListState, MapState, ReducingState, StateError, StateValue, ValueState,
+    AggregatingState, ListState, MapState, ReducingState, StateError, StateValue, ValueState,
 };
 
 use arrow::record_batch::RecordBatch;
