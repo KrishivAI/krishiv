@@ -1,6 +1,9 @@
 use std::fmt;
 
-use arrow::array::{BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{
+    BooleanArray, Float64Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+    StringViewArray,
+};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 
@@ -103,6 +106,21 @@ pub fn extract_agg_key(batch: &RecordBatch, col_idx: usize, row: usize) -> ExecR
             })?;
             Ok(AggKey::Utf8(arr.value(row).to_string()))
         }
+        // DataFusion 54 emits `Utf8View` as the default representation for
+        // string columns (e.g. `CAST(x AS VARCHAR)`), and can also produce
+        // `LargeUtf8`; both are the same logical string key.
+        DataType::Utf8View => {
+            let arr = col.as_any().downcast_ref::<StringViewArray>().ok_or_else(|| {
+                ExecError::UnsupportedType("declared Utf8View key failed downcast".into())
+            })?;
+            Ok(AggKey::Utf8(arr.value(row).to_string()))
+        }
+        DataType::LargeUtf8 => {
+            let arr = col.as_any().downcast_ref::<LargeStringArray>().ok_or_else(|| {
+                ExecError::UnsupportedType("declared LargeUtf8 key failed downcast".into())
+            })?;
+            Ok(AggKey::Utf8(arr.value(row).to_string()))
+        }
         DataType::Boolean => {
             let arr = col.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
                 ExecError::UnsupportedType("declared Bool key failed downcast".into())
@@ -154,5 +172,36 @@ mod tests {
         let row_err = extract_agg_key(&batch, 0, 1).unwrap_err();
         assert!(matches!(row_err, ExecError::InvalidInput(_)));
         assert!(row_err.to_string().contains("row index 1"));
+    }
+
+    #[test]
+    fn extract_agg_key_supports_all_string_representations() {
+        use arrow::array::{LargeStringArray, StringArray, StringViewArray};
+        use arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+
+        // Utf8, Utf8View (DataFusion 54's default for CAST(.. AS VARCHAR)), and
+        // LargeUtf8 all yield the same logical AggKey::Utf8 — the bounded-window
+        // group-by must accept every string representation the planner emits.
+        for (dt, arr) in [
+            (
+                DataType::Utf8,
+                Arc::new(StringArray::from(vec!["grp-3"])) as arrow::array::ArrayRef,
+            ),
+            (
+                DataType::Utf8View,
+                Arc::new(StringViewArray::from(vec!["grp-3"])) as arrow::array::ArrayRef,
+            ),
+            (
+                DataType::LargeUtf8,
+                Arc::new(LargeStringArray::from(vec!["grp-3"])) as arrow::array::ArrayRef,
+            ),
+        ] {
+            let schema = Arc::new(Schema::new(vec![Field::new("grp", dt.clone(), false)]));
+            let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+            let key = extract_agg_key(&batch, 0, 0)
+                .unwrap_or_else(|e| panic!("{dt} key must extract: {e}"));
+            assert_eq!(key, AggKey::Utf8("grp-3".to_string()), "for {dt}");
+        }
     }
 }
