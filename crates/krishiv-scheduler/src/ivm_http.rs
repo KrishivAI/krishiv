@@ -140,6 +140,11 @@ fn parse_schema(s: &SchemaJson) -> Option<arrow::datatypes::SchemaRef> {
                 "Float32" => Some(DataType::Float32),
                 "Float64" => Some(DataType::Float64),
                 "Utf8" => Some(DataType::Utf8),
+                // DataFusion 54 emits Utf8View as the default string representation
+                // (e.g. CAST(x AS VARCHAR), string GROUP BY keys), so an
+                // IncrementalDataFrame's inferred output schema serializes string
+                // columns as "Utf8View". Accept it (and LargeUtf8) as a string type.
+                "Utf8View" => Some(DataType::Utf8View),
                 "LargeUtf8" => Some(DataType::LargeUtf8),
                 "Boolean" => Some(DataType::Boolean),
                 "Binary" => Some(DataType::Binary),
@@ -1424,6 +1429,27 @@ mod tests {
         .await
         .expect_err("must fail");
         assert_eq!(err, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn register_view_accepts_utf8view_schema() {
+        // DataFusion 54 emits Utf8View for string columns, so an
+        // IncrementalDataFrame's inferred output schema serializes them as
+        // "Utf8View". The coordinator must accept it (regression for the
+        // distributed df.to_incremental() "invalid output_schema" 400).
+        let (registry, coordinator) = test_deps_with_shards(1);
+        registry.create("j".into()).unwrap();
+        let mut req = revenue_view_request();
+        req.output_schema.fields[0].data_type = "Utf8View".into();
+        let resp = api_ivm_register_view(
+            State(registry),
+            State(coordinator),
+            Path("j".into()),
+            Json(req),
+        )
+        .await
+        .expect("Utf8View output schema must be accepted");
+        assert!(resp.0.success);
     }
 
     #[tokio::test]
