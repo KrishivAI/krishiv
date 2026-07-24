@@ -72,31 +72,73 @@ pub struct SchemaFieldJson {
     pub nullable: bool,
 }
 
+/// Parse one Arrow `DataType` from the wire string. The coordinator encodes
+/// each field with `format!("{:?}", data_type)` (see `encode_specs_b64`), so
+/// this must round-trip the Arrow **Debug** representation — including the
+/// `Utf8View`/`BinaryView` types DataFusion 54 emits by default for string and
+/// binary columns, and the `Timestamp(<unit>, <tz>)` Debug form. A gap here
+/// silently drops the view (its output schema won't parse), which surfaces as
+/// an empty coordinator snapshot; keep it faithful to the encoder.
+fn parse_data_type(s: &str) -> Option<DataType> {
+    Some(match s {
+        "Int8" => DataType::Int8,
+        "Int16" => DataType::Int16,
+        "Int32" => DataType::Int32,
+        "Int64" => DataType::Int64,
+        "UInt8" => DataType::UInt8,
+        "UInt16" => DataType::UInt16,
+        "UInt32" => DataType::UInt32,
+        "UInt64" => DataType::UInt64,
+        "Float16" => DataType::Float16,
+        "Float32" => DataType::Float32,
+        "Float64" => DataType::Float64,
+        "Utf8" => DataType::Utf8,
+        "LargeUtf8" => DataType::LargeUtf8,
+        // DataFusion 54 default string/binary representations.
+        "Utf8View" => DataType::Utf8View,
+        "BinaryView" => DataType::BinaryView,
+        "Boolean" => DataType::Boolean,
+        "Binary" => DataType::Binary,
+        "LargeBinary" => DataType::LargeBinary,
+        // Legacy short aliases (kept for backward-compatible fragments).
+        "TimestampMs" => DataType::Timestamp(TimeUnit::Millisecond, None),
+        "TimestampUs" => DataType::Timestamp(TimeUnit::Microsecond, None),
+        "Date32" => DataType::Date32,
+        "Date64" => DataType::Date64,
+        // Arrow Debug form: `Timestamp(<Unit>, None)` / `Timestamp(<Unit>, Some("<tz>"))`.
+        other if other.starts_with("Timestamp(") => return parse_timestamp_debug(other),
+        _ => return None,
+    })
+}
+
+/// Parse the Arrow Debug form of a `Timestamp` data type, e.g.
+/// `Timestamp(Millisecond, None)` or `Timestamp(Microsecond, Some("UTC"))`.
+fn parse_timestamp_debug(s: &str) -> Option<DataType> {
+    let inner = s.strip_prefix("Timestamp(")?.strip_suffix(')')?;
+    let (unit_s, tz_s) = inner.split_once(',')?;
+    let unit = match unit_s.trim() {
+        "Second" => TimeUnit::Second,
+        "Millisecond" => TimeUnit::Millisecond,
+        "Microsecond" => TimeUnit::Microsecond,
+        "Nanosecond" => TimeUnit::Nanosecond,
+        _ => return None,
+    };
+    let tz_s = tz_s.trim();
+    let tz = if tz_s == "None" {
+        None
+    } else {
+        // `Some("UTC")` → UTC
+        let q = tz_s.strip_prefix("Some(")?.strip_suffix(')')?;
+        Some(q.trim_matches('"').to_string().into())
+    };
+    Some(DataType::Timestamp(unit, tz))
+}
+
 fn parse_schema_fields(fields: &[SchemaFieldJson]) -> Option<SchemaRef> {
     let arrow_fields: Option<Vec<Field>> = fields
         .iter()
         .map(|f| {
-            let dt = match f.data_type.as_str() {
-                "Int8" => Some(DataType::Int8),
-                "Int16" => Some(DataType::Int16),
-                "Int32" => Some(DataType::Int32),
-                "Int64" => Some(DataType::Int64),
-                "UInt8" => Some(DataType::UInt8),
-                "UInt16" => Some(DataType::UInt16),
-                "UInt32" => Some(DataType::UInt32),
-                "UInt64" => Some(DataType::UInt64),
-                "Float32" => Some(DataType::Float32),
-                "Float64" => Some(DataType::Float64),
-                "Utf8" => Some(DataType::Utf8),
-                "LargeUtf8" => Some(DataType::LargeUtf8),
-                "Boolean" => Some(DataType::Boolean),
-                "Binary" => Some(DataType::Binary),
-                "TimestampMs" => Some(DataType::Timestamp(TimeUnit::Millisecond, None)),
-                "TimestampUs" => Some(DataType::Timestamp(TimeUnit::Microsecond, None)),
-                "Date32" => Some(DataType::Date32),
-                "Date64" => Some(DataType::Date64),
-                _ => None,
-            }?;
+            let dt = parse_data_type(&f.data_type)?;
             Some(Field::new(f.name.clone(), dt, f.nullable))
         })
         .collect();
@@ -161,17 +203,25 @@ fn register_specs_on_flow(
     view_specs: &[ViewSpecJson],
 ) -> Result<(), String> {
     for vs in view_specs {
-        if let Some(schema) = parse_schema_fields(&vs.output_schema_fields) {
-            let spec = IncrementalViewSpec {
-                name: vs.name.clone(),
-                body_sql: vs.body_sql.clone(),
-                output_schema: schema,
-                is_materialized: vs.is_materialized,
-                is_recursive: vs.is_recursive,
-                lateness: vs.lateness.clone(),
-            };
-            flow.register_view(spec).map_err(|e| e.to_string())?;
-        }
+        // Fail loud on an unparseable output schema: a silently skipped view
+        // produces no output delta, which the coordinator mirror reads as an
+        // empty snapshot — a ghost failure. Surface it as a tick error instead.
+        let schema = parse_schema_fields(&vs.output_schema_fields).ok_or_else(|| {
+            format!(
+                "view '{}' has an unparseable output schema in the wire fragment: {:?} \
+                 (executor parse_data_type is missing an arm for the encoder's Debug form)",
+                vs.name, vs.output_schema_fields
+            )
+        })?;
+        let spec = IncrementalViewSpec {
+            name: vs.name.clone(),
+            body_sql: vs.body_sql.clone(),
+            output_schema: schema,
+            is_materialized: vs.is_materialized,
+            is_recursive: vs.is_recursive,
+            lateness: vs.lateness.clone(),
+        };
+        flow.register_view(spec).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -371,21 +421,7 @@ pub async fn execute_ivm_fragment(
     // restored baselines land on real views (restore_full walks registered
     // view names and seeds each view's snapshot + full_output).
     let flow = IncrementalFlow::new();
-    for vs in &view_specs {
-        if let Some(schema) = parse_schema_fields(&vs.output_schema_fields) {
-            let spec = IncrementalViewSpec {
-                name: vs.name.clone(),
-                body_sql: vs.body_sql.clone(),
-                output_schema: schema,
-                is_materialized: vs.is_materialized,
-                is_recursive: vs.is_recursive,
-                // AUD-4: preserve lateness so an offloaded tick applies the same
-                // retention/GC semantics as a central tick (was hardcoded empty).
-                lateness: vs.lateness.clone(),
-            };
-            flow.register_view(spec).map_err(|e| e.to_string())?;
-        }
-    }
+    register_specs_on_flow(&flow, &view_specs)?;
     flow.restore_full(&state_bytes)
         .map_err(|e| format!("restore_full: {e}"))?;
     // Operator accumulator state is included in checkpoint_full (plan-state
@@ -452,6 +488,113 @@ mod tests {
             DataType::Float64,
             false,
         )]))
+    }
+
+    /// The wire encoder ships each field type as `format!("{:?}", data_type)`;
+    /// `parse_data_type` must round-trip that Debug form for every type an IVM
+    /// view output can carry — notably the DataFusion 54 `Utf8View` default and
+    /// the `Timestamp(<unit>, <tz>)` form (windowed views).
+    #[test]
+    fn parse_data_type_round_trips_debug_form() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        let cases = [
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Utf8,
+            DataType::Utf8View,
+            DataType::BinaryView,
+            DataType::Boolean,
+            DataType::Date32,
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        ];
+        for dt in cases {
+            let encoded = format!("{dt:?}");
+            assert_eq!(
+                super::parse_data_type(&encoded),
+                Some(dt.clone()),
+                "parse_data_type must round-trip the encoder's Debug form {encoded:?}"
+            );
+        }
+        assert_eq!(super::parse_data_type("NoSuchType"), None);
+    }
+
+    /// Repro of the live distributed regression: a resident flow attached with
+    /// EMPTY state, then ticked with a **GROUP BY** aggregate delta, must return
+    /// a non-empty per-view output delta (the mirror skips empty deltas, so an
+    /// empty return leaves the coordinator snapshot empty → `snapshot()` None).
+    #[tokio::test]
+    async fn resident_group_by_aggregate_first_tick_emits_delta() {
+        use arrow::array::StringArray;
+        use krishiv_ivm::{
+            decode_delta_map, encode_ivm_attach_fragment, encode_ivm_tick_fragment,
+        };
+
+        fn orders_schema() -> Arc<Schema> {
+            Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, false),
+                Field::new("amount", DataType::Float64, false),
+            ]))
+        }
+        fn orders_batch(regions: &[&str], amounts: &[f64]) -> RecordBatch {
+            RecordBatch::try_new(
+                orders_schema(),
+                vec![
+                    Arc::new(StringArray::from(regions.to_vec())),
+                    Arc::new(Float64Array::from(amounts.to_vec())),
+                ],
+            )
+            .unwrap()
+        }
+        // The output schema uses Utf8View for `region` — exactly what DataFusion
+        // 54 emits and the coordinator ships (`format!("{:?}")` → "Utf8View").
+        // Before the parse_data_type fix this view was silently dropped on the
+        // executor (unparseable schema), yielding an empty coordinator snapshot.
+        let group_spec = IncrementalViewSpec {
+            name: "rev".into(),
+            body_sql: "SELECT region, SUM(amount) AS total FROM orders GROUP BY region".into(),
+            output_schema: Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8View, true),
+                Field::new("total", DataType::Float64, true),
+            ])),
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        };
+
+        let flows: super::ResidentIvmFlows = Arc::new(dashmap::DashMap::new());
+        let specs = vec![group_spec];
+        let attach = encode_ivm_attach_fragment("job-g", &specs, &[], 0).unwrap();
+        super::execute_resident_ivm_fragment(&flows, &attach)
+            .await
+            .unwrap();
+
+        let mut pending = std::collections::HashMap::new();
+        pending.insert(
+            "orders".to_string(),
+            DeltaBatch::from_inserts(orders_batch(
+                &["us", "eu", "us", "ap"],
+                &[100.0, 50.0, 25.0, 75.0],
+            ))
+            .unwrap(),
+        );
+        let tick = encode_ivm_tick_fragment("job-g", &pending, 1).unwrap();
+        let (summary, blob) = super::execute_resident_ivm_fragment(&flows, &tick)
+            .await
+            .unwrap();
+        let d = decode_delta_map(blob.as_ref().unwrap()).unwrap();
+        assert!(
+            summary.total_output_rows > 0,
+            "GROUP BY first tick must report output rows, got summary {summary:?}"
+        );
+        let out = d
+            .get("rev")
+            .expect("GROUP BY view must emit an output delta on first tick");
+        assert!(
+            out.weights().iter().flatten().any(|w| w > 0),
+            "first tick GROUP BY output must contain insertions; got {out:?}"
+        );
     }
 
     fn sales_batch(amounts: &[f64]) -> RecordBatch {
