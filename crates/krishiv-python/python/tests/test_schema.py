@@ -14,7 +14,10 @@ class EventSchema(ks.Schema):
 
 
 def test_schema_column_names():
-    assert EventSchema.column_names() == ["active", "name", "payload", "ts", "value"]
+    # Declaration order is preserved (not sorted) — an IVM view binds this schema
+    # to its SELECT list positionally, so alphabetical sorting silently mismatched
+    # columns. Order here must match the annotation order above.
+    assert EventSchema.column_names() == ["name", "value", "active", "ts", "payload"]
 
 
 def test_schema_repr_html_contains_columns():
