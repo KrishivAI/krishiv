@@ -67,6 +67,14 @@ impl PartitionStream for KafkaPartitionStream {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch, DataFusionError>>(64);
 
         let task = tokio::spawn(async move {
+            // Coalesce the source's per-message (typically single-row) batches
+            // into larger record batches for downstream throughput, while still
+            // flushing promptly on a poll gap so streaming latency stays low.
+            // Every projected batch shares the declared table schema, so
+            // concatenation is always valid.
+            const COALESCE_MAX_ROWS: usize = 1024;
+            let mut pending: Vec<RecordBatch> = Vec::new();
+            let mut pending_rows: usize = 0;
             loop {
                 // Check cancellation before doing any I/O: if the DataFusion
                 // executor dropped the stream, stop immediately rather than
@@ -83,31 +91,48 @@ impl PartitionStream for KafkaPartitionStream {
                         // Empty batch (tombstone / non-UTF-8 skip) — keep polling.
                     }
                     Ok(Some(batch)) => {
-                        let send_result = match project_batch(&batch, &schema) {
-                            Ok(projected) => tx.send(Ok(projected)).await,
-                            Err(e) => {
-                                tx.send(Err(DataFusionError::ArrowError(Box::new(e), None)))
-                                    .await
+                        match project_batch(&batch, &schema) {
+                            Ok(projected) => {
+                                pending_rows += projected.num_rows();
+                                pending.push(projected);
                             }
-                        };
-                        if send_result.is_err() {
-                            break; // receiver dropped — query cancelled
+                            Err(e) => {
+                                let _ = flush_pending(&tx, &schema, &mut pending).await;
+                                let _ = tx
+                                    .send(Err(DataFusionError::ArrowError(Box::new(e), None)))
+                                    .await;
+                                break;
+                            }
                         }
                         if manual_commit {
                             let guard = source.lock().await;
                             guard.commit_current_offset();
                         }
+                        if pending_rows >= COALESCE_MAX_ROWS {
+                            pending_rows = 0;
+                            if flush_pending(&tx, &schema, &mut pending).await.is_err() {
+                                break; // receiver dropped — query cancelled
+                            }
+                        }
                     }
                     Ok(None) => {
-                        // Poll timeout — no message ready; yield and retry.
+                        // Poll gap — flush what we have so consumers see low
+                        // latency, then yield and retry.
+                        pending_rows = 0;
+                        if flush_pending(&tx, &schema, &mut pending).await.is_err() {
+                            break;
+                        }
                         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
                     }
                     Err(e) => {
+                        let _ = flush_pending(&tx, &schema, &mut pending).await;
                         let _ = tx.send(Err(DataFusionError::External(Box::new(e)))).await;
                         break;
                     }
                 }
             }
+            // Best-effort final flush before the task exits.
+            let _ = flush_pending(&tx, &schema, &mut pending).await;
         });
         *self.consumer_task.lock().unwrap_or_else(|p| p.into_inner()) = Some(task);
 
@@ -117,6 +142,39 @@ impl PartitionStream for KafkaPartitionStream {
             recv_stream,
         ))
     }
+}
+
+/// Concatenate the buffered per-message batches into one and send it downstream.
+///
+/// All buffered batches share the declared table schema (they come from
+/// `project_batch`), so concatenation always succeeds. Returns `Err(())` if the
+/// receiver has been dropped (query cancelled) so the caller can stop polling.
+async fn flush_pending(
+    tx: &tokio::sync::mpsc::Sender<Result<RecordBatch, DataFusionError>>,
+    schema: &SchemaRef,
+    pending: &mut Vec<RecordBatch>,
+) -> Result<(), ()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let coalesced = if pending.len() == 1 {
+        pending.remove(0)
+    } else {
+        match arrow::compute::concat_batches(schema, pending.iter()) {
+            Ok(batch) => {
+                pending.clear();
+                batch
+            }
+            Err(e) => {
+                pending.clear();
+                return tx
+                    .send(Err(DataFusionError::ArrowError(Box::new(e), None)))
+                    .await
+                    .map_err(|_| ());
+            }
+        }
+    };
+    tx.send(Ok(coalesced)).await.map_err(|_| ())
 }
 
 /// Project and cast a raw connector batch to the declared table schema.

@@ -13,7 +13,7 @@ use crate::errors::map_krishiv_error;
 use crate::pipeline::{StreamPipeline, WindowKind};
 use crate::session::block_on_async;
 
-fn agg_descriptor_to_expr(desc: &AggDescriptor) -> AggExpr {
+pub(crate) fn agg_descriptor_to_expr(desc: &AggDescriptor) -> AggExpr {
     let function = match desc.function {
         AggKind::Count => AggFunction::Count,
         AggKind::Sum => AggFunction::Sum,

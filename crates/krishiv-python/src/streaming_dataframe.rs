@@ -49,6 +49,27 @@ impl PyStreamingDataFrame {
         }
     }
 
+    /// Set the windowed aggregations, e.g. ``agg(total=ks.agg.sum("amount"),
+    /// n=ks.agg.count())``. Without this, a windowed ``collect()`` defaults to
+    /// ``COUNT(*)`` as the single ``count`` column.
+    #[pyo3(signature = (**kwargs))]
+    pub fn agg(&self, kwargs: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<Self> {
+        let descriptors = crate::agg::descriptors_from_kwargs(kwargs)?;
+        if descriptors.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "agg() requires at least one named aggregation, \
+                 e.g. agg(total=ks.agg.sum('amount'))",
+            ));
+        }
+        let exprs: Vec<krishiv_dataflow::AggExpr> = descriptors
+            .iter()
+            .map(crate::stream_exec::agg_descriptor_to_expr)
+            .collect();
+        Ok(Self {
+            inner: self.inner.clone().agg(exprs),
+        })
+    }
+
     pub fn with_watermark_lag(&self, lag_ms: u64) -> Self {
         Self {
             inner: self.inner.clone().with_watermark_lag(lag_ms),

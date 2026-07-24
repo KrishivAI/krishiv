@@ -3,6 +3,11 @@
 //! Provides [`DataStreamReader`], [`DataStreamWriter`], [`StreamingQuery`],
 //! [`StreamingOutputMode`], and [`StreamingTrigger`] for structured streaming pipelines.
 
+// The Kafka and Parquet sink dispatchers are synchronous closures invoked from
+// the async micro-batch drain loop, so they legitimately drive the connector's
+// async write/flush via `krishiv_common::async_util::block_on`.
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1331,7 +1336,11 @@ fn build_sink_dispatcher(
                     })?;
                     *guard = Some(sink);
                 }
-                let sink = guard.as_mut().expect("kafka sink initialised above");
+                let Some(sink) = guard.as_mut() else {
+                    return Err(KrishivError::Runtime {
+                        message: "kafka sink not initialised".to_string(),
+                    });
+                };
                 block_on(async {
                     for batch in batches {
                         sink.write_batch(batch).await?;
@@ -1353,16 +1362,50 @@ fn build_sink_dispatcher(
                 })
             }
         }
-        Some(StreamSinkFormat::Parquet) => Err(KrishivError::Unsupported {
-            feature: "format(\"parquet\") sink dispatch is not yet implemented; use \
-                      foreach_batch() and write to a ParquetSink from your callback. \
-                      See T4 in the Spark parity plan."
-                .to_string(),
-        }),
+        Some(StreamSinkFormat::Parquet) => {
+            use krishiv_common::async_util::block_on;
+            use krishiv_connectors::parquet::ParquetSink;
+            use krishiv_connectors::sink::Sink as _;
+
+            if batches.iter().all(|b| b.num_rows() == 0) {
+                return Ok(());
+            }
+            let base = options
+                .get("path")
+                .or_else(|| options.get("parquet.path"))
+                .cloned()
+                .ok_or_else(|| KrishivError::InvalidConfig {
+                    message: "parquet sink requires option 'path'".to_string(),
+                })?;
+            // A `*.parquet` path is treated as a single file (overwritten each
+            // epoch); anything else is a directory that receives one
+            // `part-<epoch>.parquet` file per micro-batch (FileStreamSink style).
+            let target = if base.ends_with(".parquet") {
+                base
+            } else {
+                std::fs::create_dir_all(&base).map_err(|e| KrishivError::Runtime {
+                    message: format!("parquet sink: create dir '{base}': {e}"),
+                })?;
+                format!("{base}/part-{epoch:05}.parquet")
+            };
+            let mut sink = ParquetSink::create(&target).map_err(|e| KrishivError::Runtime {
+                message: format!("parquet sink init: {e}"),
+            })?;
+            block_on(async {
+                for batch in batches {
+                    sink.write_batch(batch).await?;
+                }
+                sink.flush().await
+            })
+            .map_err(|e| KrishivError::Runtime {
+                message: format!("parquet sink write: {e}"),
+            })?;
+            Ok(())
+        }
         Some(StreamSinkFormat::Iceberg) => Err(KrishivError::Unsupported {
-            feature: "format(\"iceberg\") sink dispatch is not yet implemented; use \
-                      foreach_batch() and write to IcebergSink from your callback. \
-                      See T4 in the Spark parity plan."
+            feature: "format(\"iceberg\") sink dispatch requires the checkpoint-barrier \
+                      protocol (IcebergStreamingSink is transactional / checkpoint-aligned). \
+                      Use foreach_batch() with an Iceberg writer, or the Kafka/Parquet sink."
                 .to_string(),
         }),
     }
