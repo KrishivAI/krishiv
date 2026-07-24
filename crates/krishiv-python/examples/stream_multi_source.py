@@ -38,7 +38,7 @@ def main():
 
     # 5. Collect and print
     results = windowed.collect()
-    pa_batches = [pa.record_batch(b.to_arrow()) for b in results.batches()]
+    pa_batches = [pa.record_batch(b.to_arrow()) for b in results]
     table = pa.Table.from_batches(pa_batches)
     print(table)
 

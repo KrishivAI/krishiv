@@ -34,7 +34,7 @@ def main():
     windowed = (
         stream
         .key_by("user_id")
-        .tumbling_window(2)  # 2 seconds
+        .tumbling_window(2000)  # 2 seconds
     )
 
     # 5. Collect and print

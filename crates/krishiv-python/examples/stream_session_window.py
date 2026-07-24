@@ -30,7 +30,7 @@ def main():
     session_windowed = (
         stream
         .key_by("user_id")
-        .window(ks.windows.session(10000))
+        .session_window(10000)
     )
 
     # 4. Collect and print results

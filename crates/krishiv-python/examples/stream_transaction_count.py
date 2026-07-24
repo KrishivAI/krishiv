@@ -30,7 +30,7 @@ def main():
     windowed = (
         stream
         .key_by("user_id")
-        .tumbling_window(60) # 60 seconds tumbling window size (1 minute)
+        .tumbling_window(60000) # 60 seconds tumbling window size (1 minute)
     )
 
     # 5. Execute in-process and collect output stream batches

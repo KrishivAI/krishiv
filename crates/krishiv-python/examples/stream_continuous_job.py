@@ -8,28 +8,34 @@ def main():
     # 1. Build session
     session = ks.Session.from_env()
 
-    # 2. Build stream and window pipeline representing the continuous job query
-    # We use a placeholder query selects from the registered stream name "alerts_stream"
-    stream = session.stream(
-        "SELECT timestamp, user_id FROM alerts_stream",
-        watermark_column="timestamp",
-        max_lateness_ms=1000
-    )
-    windowed = (
-        stream
-        .key_by("user_id")
-        .tumbling_window(10) # 10 seconds tumbling window
-    )
-
-    # 3. Submit the continuous job
-    job_id = session.submit_stream_job("alerts_stream", windowed)
-    print(f"Submitted continuous stream job ID: {job_id}")
-
-    # 4. Prepare and dynamically push a real-time record batch
+    # 2. Register the source stream table up front so the job query can be
+    # planned; live rows are fed later via push_stream_job_input. (The unified
+    # StreamingDataFrame plans its SQL eagerly, so the source must exist first.)
     schema = pa.schema([
         ("timestamp", pa.int64()),
         ("user_id", pa.string()),
     ])
+    # A one-row placeholder just gives the source its schema so the query plans;
+    # submit_stream_job reads only the window spec, not these rows.
+    seed = pa.RecordBatch.from_pydict({"timestamp": [0], "user_id": ["_seed"]}, schema=schema)
+    session.register_record_batches("alerts_stream", [ks.Batch(seed)])
+
+    # 3. Build the windowed pipeline over the source stream.
+    windowed = (
+        session.stream(
+            "SELECT timestamp, user_id FROM alerts_stream",
+            watermark_column="timestamp",
+            max_lateness_ms=1000,
+        )
+        .key_by("user_id")
+        .tumbling_window(10000)  # 10 seconds tumbling window
+    )
+
+    # 4. Submit the continuous job.
+    job_id = session.submit_stream_job("alerts_stream", windowed)
+    print(f"Submitted continuous stream job ID: {job_id}")
+
+    # 5. Prepare and dynamically push a real-time record batch
     batch = pa.RecordBatch.from_pydict({
         "timestamp": [1000, 2000],
         "user_id": ["Alice", "Bob"],
