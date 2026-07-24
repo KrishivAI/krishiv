@@ -106,9 +106,28 @@ iv.name                                 # view identity
 - **Output modes:** both `snapshot()` (full state) and `changes()` (output deltas)
   are always available — Spark's complete and update modes, exposed as two reads.
 - **Async parity:** `changes()` is an async iterator (matches `StreamingDataFrame`);
-  `snapshot()` is sync. The output-delta change-feed is what makes views composable
-  (one view's `changes()` can feed another view's `apply()` — a live view DAG, a
-  natural follow-up capability but not required in v1).
+  `snapshot()` is sync.
+
+### 4.2.1 Composition — the live view DAG (in v1)
+
+A downstream `DataFrame` may be built on top of an existing `IncrementalDataFrame`
+and converted; the two views are registered into the **same** underlying `IvmJob`, so
+a feed to the base **cascades** automatically to the derived view. This reuses the
+engine's existing multi-view delta-cascade (Phase 57 §5c), so it is wiring + surface,
+not new execution:
+
+```python
+iv1 = df1.to_incremental()                      # base view v1 in job J
+df2 = s.view(iv1).group_by("region").agg(n=F.count())   # read v1 as a source
+iv2 = df2.to_incremental()                      # v2 references v1, same job J
+iv1.insert(batch)                               # cascades: v1 updates → v2 updates
+iv2.snapshot()                                  # reflects the cascade
+```
+
+`s.view(iv)` (alias `iv.as_source()`) exposes an `IncrementalDataFrame`'s output as a
+named source a new `DataFrame` can read. `to_incremental()` detects a plan leaf that
+is another view in an existing job and co-registers into that job rather than creating
+a new one.
 
 ### 4.3 Engine plumbing (the one real addition)
 
@@ -182,14 +201,20 @@ route to the coordinator in distributed mode.
 1. Engine plumbing: `register_view_from_plan` in krishiv-api (+ unit test).
 2. pyo3 `IncrementalDataFrame` + `DataFrame.to_incremental()` (feed/read/step, async
    `changes()`), exported top-level + `.pyi`.
-3. Retire Python `LiveTable`; migrate examples/tests per the mapping table.
-4. Oracle + cross-mode + migration tests green (embedded).
-5. Distributed validation on k8s; docs + examples updated to the unified triad.
+3. Composition: `s.view(iv)` / `iv.as_source()` + co-registration into the base job
+   (view-DAG cascade).
+4. Retire Python `LiveTable`; migrate examples/tests per the mapping table.
+5. Oracle + change-feed + transaction + view-DAG + cross-mode + migration tests green
+   (embedded).
+6. Distributed validation on k8s with real datasets; docs + examples updated to the
+   unified triad.
 
-## 8. Open questions (for review)
+## 8. Resolved decisions
 
-- Should v1 include the composable **view-DAG** (one view's `changes()` auto-wired to
-  another's `apply()`), or defer it as a follow-up? (Recommendation: defer; keep v1 to
-  the single-view surface + cleanup.)
-- `transaction()` as a context manager (shown) vs an explicit `begin/commit` pair?
-  (Recommendation: context manager — safer, Pythonic.)
+- **View-DAG composition is IN v1** (§4.2.1) — reuses the existing multi-view
+  delta-cascade; `s.view(iv)` / `iv.as_source()` co-registers derived views into the
+  base view's job.
+- **`transaction()` is a context manager** (`with iv.transaction(): …`) — one atomic
+  tick on exit; no explicit begin/commit pair.
+- Any bug observed in the IVM engine / bindings while implementing is fixed in-scope
+  (not deferred).
