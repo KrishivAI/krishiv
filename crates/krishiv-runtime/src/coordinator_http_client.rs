@@ -878,7 +878,7 @@ pub async fn execute_coordinator_physical_plan(
         ExecutionKind::DeltaBatch => {
             // Create the IVM job idempotently on the coordinator.
             // Plan name is the job ID so subsequent feed/step calls reference it.
-            execute_coordinator_ivm_create_job(coordinator_http, Some(plan.name())).await?;
+            execute_coordinator_ivm_create_job(coordinator_http, Some(plan.name()), None).await?;
             Ok(())
         }
     }
@@ -889,6 +889,10 @@ pub async fn execute_coordinator_physical_plan(
 #[derive(serde::Serialize)]
 struct IvmCreateJobBody {
     job_id: Option<String>,
+    /// `Some(false)` pins the job to a single (non-partitioned) flow so it can
+    /// host a view-DAG. `None` keeps the coordinator's default auto-partitioning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    partitioned: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -897,14 +901,19 @@ struct IvmCreateJobResponse {
 }
 
 /// Create a new IVM job on the coordinator. Returns the assigned job ID.
+///
+/// `partitioned = Some(false)` pins the job to a single (non-partitioned) flow so
+/// it can host a view-DAG; `None` keeps the coordinator's default.
 pub async fn execute_coordinator_ivm_create_job(
     coordinator_http: &str,
     job_id: Option<&str>,
+    partitioned: Option<bool>,
 ) -> RuntimeResult<String> {
     let base = normalize_http_base(coordinator_http)?;
     let client = coordinator_http_client()?;
     let body = IvmCreateJobBody {
         job_id: job_id.map(|s| s.to_string()),
+        partitioned,
     };
     let resp = apply_coordinator_bearer(client.post(format!("{base}/api/v1/ivm/jobs")))
         .json(&body)

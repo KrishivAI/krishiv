@@ -35,6 +35,15 @@ impl IvmJob {
         ))
     }
 
+    /// Like [`remote`](Self::remote), but pins the coordinator job to a single
+    /// (non-partitioned) flow so it can host a view-DAG (a derived view reading
+    /// the base view's full output). Used by distributed `to_incremental`.
+    pub async fn remote_unpartitioned(coordinator_http: &str, name: &str) -> Result<Self> {
+        Ok(Self::Remote(
+            RemoteIvmJob::create_unpartitioned(coordinator_http, Some(name)).await?,
+        ))
+    }
+
     /// Register or update an incremental view on this job.
     pub async fn register_view(&self, spec: IncrementalViewSpec) -> Result<()> {
         match self {

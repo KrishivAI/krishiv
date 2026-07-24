@@ -335,6 +335,12 @@ pub struct IvmJobRegistry {
     jobs: Mutex<HashMap<String, IvmJob>>,
     /// Shard count used when a job's first view is auto-partitioned.
     default_shards: usize,
+    /// Jobs pinned to a single (non-partitioned) flow. Auto-partitioning is
+    /// skipped for these. Set at create time by composition-capable callers
+    /// (`Session::view` view-DAGs / `to_incremental`): a partitioned job shards
+    /// its output by key and cannot cascade to a derived view that reads the
+    /// full base output, so composition requires a single job.
+    pinned_single: Mutex<std::collections::HashSet<String>>,
     /// Per-job async step locks. Serialize concurrent `step` calls so two
     /// simultaneous ticks cannot drain each other's pending or double-advance
     /// the tick counter. Each job gets its own lock (created lazily, removed on
@@ -358,6 +364,7 @@ impl Default for IvmJobRegistry {
         Self {
             jobs: Mutex::new(HashMap::new()),
             default_shards: default_ivm_shards(),
+            pinned_single: Mutex::new(std::collections::HashSet::new()),
             step_locks: Mutex::new(HashMap::new()),
             dispatch: Mutex::new(HashMap::new()),
         }
@@ -374,9 +381,20 @@ impl IvmJobRegistry {
         Self {
             jobs: Mutex::new(HashMap::new()),
             default_shards: default_shards.max(1),
+            pinned_single: Mutex::new(std::collections::HashSet::new()),
             step_locks: Mutex::new(HashMap::new()),
             dispatch: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Create a job pinned to a single (non-partitioned) flow — auto-partitioning
+    /// is skipped for it. Used by composition-capable callers (`to_incremental` /
+    /// `Session::view` view-DAGs) so a base view can cascade to derived views.
+    pub fn create_unpartitioned(&self, job_id: String) -> Result<(), IvmError> {
+        if let Ok(mut pinned) = self.pinned_single.lock() {
+            pinned.insert(job_id.clone());
+        }
+        self.create(job_id)
     }
 
     /// Snapshot the resident-dispatch state for a job (default when unset).
@@ -449,8 +467,15 @@ impl IvmJobRegistry {
             .ok_or_else(|| IvmError::execution(format!("IVM job not found: {job_id}")))?
             .clone();
 
-        // Only a fresh, unpartitioned, view-less job is a candidate for upgrade.
+        // Only a fresh, unpartitioned, view-less job is a candidate for upgrade —
+        // and never a job pinned single by a composition-capable caller.
+        let pinned = self
+            .pinned_single
+            .lock()
+            .map(|p| p.contains(job_id))
+            .unwrap_or(false);
         if let IvmJob::Single(flow) = &job
+            && !pinned
             && flow.view_names().map(|v| v.is_empty()).unwrap_or(false)
             && self.default_shards > 1
             && let Some(key) = partition_key_from_sql(&spec.body_sql)
@@ -478,6 +503,7 @@ impl IvmJobRegistry {
             .unwrap_or(false);
         // Drop the per-job step lock so a recreated same-id job gets a fresh one.
         let _ = self.step_locks.lock().map(|mut l| l.remove(job_id));
+        let _ = self.pinned_single.lock().map(|mut p| p.remove(job_id));
         // Drop dispatch bookkeeping (a recreated job starts unattached).
         let _ = self.dispatch.lock().map(|mut d| d.remove(job_id));
         removed
@@ -612,6 +638,24 @@ mod tests {
             is_recursive: false,
             lateness: vec![],
         }
+    }
+
+    #[test]
+    fn create_unpartitioned_keeps_a_shardable_view_single() {
+        // A GROUP BY view would normally auto-partition with shards>1, but a job
+        // created unpartitioned (composition-capable / view-DAG) must stay Single
+        // so a derived view can read its full output.
+        let reg = IvmJobRegistry::with_default_shards(3);
+        reg.create_unpartitioned("j".into()).unwrap();
+        reg.register_view("j", revenue_spec()).unwrap();
+        assert!(
+            matches!(reg.get("j").unwrap(), IvmJob::Single(_)),
+            "pinned-single job must not auto-partition"
+        );
+        // Sanity: a normal job with the same view DOES partition.
+        reg.create("k".into()).unwrap();
+        reg.register_view("k", revenue_spec()).unwrap();
+        assert!(matches!(reg.get("k").unwrap(), IvmJob::Partitioned(_)));
     }
 
     fn passthrough_spec() -> IncrementalViewSpec {

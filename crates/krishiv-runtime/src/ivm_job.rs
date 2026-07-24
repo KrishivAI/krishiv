@@ -55,7 +55,22 @@ impl RemoteIvmJob {
     /// `job_name` is used as the job ID when supplied; the coordinator assigns
     /// one automatically if `None`.
     pub async fn create(coordinator_http: &str, job_name: Option<&str>) -> RuntimeResult<Self> {
-        let job_id = execute_coordinator_ivm_create_job(coordinator_http, job_name).await?;
+        let job_id = execute_coordinator_ivm_create_job(coordinator_http, job_name, None).await?;
+        Ok(Self {
+            coordinator_http: coordinator_http.to_owned(),
+            job_id,
+        })
+    }
+
+    /// Like [`create`](Self::create), but pins the job to a single
+    /// (non-partitioned) flow so it can host a view-DAG (a derived view reading
+    /// the base view's full output). Used by `to_incremental` / `Session::view`.
+    pub async fn create_unpartitioned(
+        coordinator_http: &str,
+        job_name: Option<&str>,
+    ) -> RuntimeResult<Self> {
+        let job_id =
+            execute_coordinator_ivm_create_job(coordinator_http, job_name, Some(false)).await?;
         Ok(Self {
             coordinator_http: coordinator_http.to_owned(),
             job_id,

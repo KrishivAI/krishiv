@@ -58,7 +58,9 @@ impl IncrementalDataFrame {
                          connect the session with with_coordinator()/http_url",
                     )
                 })?;
-                (IvmJob::remote(&url, name).await?, None)
+                // Non-partitioned so the coordinator job can host a view-DAG
+                // (a derived view reading the base view's full output).
+                (IvmJob::remote_unpartitioned(&url, name).await?, None)
             }
             ExecutionMode::Embedded | ExecutionMode::SingleNode => {
                 // shards=1 disables auto-partitioning: an IncrementalDataFrame job

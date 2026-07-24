@@ -166,6 +166,11 @@ fn parse_schema(s: &SchemaJson) -> Option<arrow::datatypes::SchemaRef> {
 pub struct CreateJobRequest {
     /// Optional explicit job ID. If absent, a UUID v4 is generated.
     pub job_id: Option<String>,
+    /// When `Some(false)`, the job is pinned to a single (non-partitioned) flow
+    /// so it can host a view-DAG (a derived view reading the base view's full
+    /// output). Absent / `Some(true)` keeps the default auto-partitioning.
+    #[serde(default)]
+    pub partitioned: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -186,6 +191,8 @@ pub async fn api_ivm_create_job(
             registry
                 .restore_durable_snapshot(&job_id, &snapshot)
                 .map_err(ivm_err)?;
+        } else if body.partitioned == Some(false) {
+            registry.create_unpartitioned(job_id.clone()).map_err(ivm_err)?;
         } else {
             registry.create(job_id.clone()).map_err(ivm_err)?;
         }
@@ -1300,6 +1307,7 @@ mod tests {
             State(coordinator.clone()),
             Json(CreateJobRequest {
                 job_id: Some(job_id.to_owned()),
+                partitioned: None,
             }),
         )
         .await
@@ -1345,7 +1353,7 @@ mod tests {
         let resp = api_ivm_create_job(
             State(registry.clone()),
             State(coordinator.clone()),
-            Json(CreateJobRequest { job_id: None }),
+            Json(CreateJobRequest { job_id: None, partitioned: None }),
         )
         .await
         .expect("create");
@@ -1364,6 +1372,7 @@ mod tests {
                 State(coordinator.clone()),
                 Json(CreateJobRequest {
                     job_id: Some("job-a".into()),
+                    partitioned: None,
                 }),
             )
             .await
