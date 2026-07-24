@@ -84,6 +84,20 @@ def test_retired_stream_classes_are_gone():
         assert not hasattr(ks, n), f"{n} should have been retired"
 
 
+def test_keyed_state_and_process_functions_are_top_level_exported():
+    # The keyed-state family + Flink-style process functions used by
+    # transform_with_state / co_process / broadcast_process must be reachable as
+    # top-level `krishiv.X` (not only via the compiled `krishiv.krishiv` submodule)
+    # and honored by `from krishiv import *`.
+    from krishiv import krishiv as _sub
+    for n in ("ValueState", "ListState", "MapState", "AggregatingState",
+              "ProcessContext", "BroadcastContext",
+              "apply_process_function", "apply_async_io"):
+        assert hasattr(ks, n), f"{n} should be top-level exported"
+        assert n in ks.__all__, f"{n} missing from __all__"
+        assert getattr(ks, n) is getattr(_sub, n), f"{n} must be the submodule object"
+
+
 # ─────────────────────────── stateless verbs ───────────────────────────
 def test_filter():
     s = _session()
