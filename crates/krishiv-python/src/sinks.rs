@@ -71,7 +71,7 @@ impl PyKafkaSink {
             use krishiv_connectors::sink::Sink as _;
 
             let records: Vec<arrow::record_batch::RecordBatch> =
-                batches.into_iter().map(|b| b.into_inner()).collect();
+                batches.iter().map(|b| b.record_batch().clone()).collect();
             if records.is_empty() {
                 return Ok(0);
             }
@@ -163,7 +163,7 @@ impl PyIcebergSink {
             use std::path::PathBuf;
 
             let records: Vec<arrow::record_batch::RecordBatch> =
-                batches.into_iter().map(|b| b.into_inner()).collect();
+                batches.iter().map(|b| b.record_batch().clone()).collect();
             if records.is_empty() {
                 return Ok(0);
             }
@@ -222,7 +222,7 @@ impl PyCassandraSink {
             use krishiv_connectors::cassandra_sink::{CassandraConfig, CassandraSink};
 
             let records: Vec<arrow::record_batch::RecordBatch> =
-                batches.into_iter().map(|b| b.into_inner()).collect();
+                batches.iter().map(|b| b.record_batch().clone()).collect();
             if records.is_empty() {
                 return Ok(0);
             }
@@ -280,7 +280,7 @@ impl PyElasticsearchSink {
             use krishiv_connectors::elasticsearch_sink::{ElasticsearchConfig, ElasticsearchSink};
 
             let records: Vec<arrow::record_batch::RecordBatch> =
-                batches.into_iter().map(|b| b.into_inner()).collect();
+                batches.iter().map(|b| b.record_batch().clone()).collect();
             if records.is_empty() {
                 return Ok(0);
             }
@@ -345,7 +345,7 @@ impl PyHBaseSink {
             use krishiv_connectors::hbase_connector::{HBaseConfig, HBaseSink};
 
             let records: Vec<arrow::record_batch::RecordBatch> =
-                batches.into_iter().map(|b| b.into_inner()).collect();
+                batches.iter().map(|b| b.record_batch().clone()).collect();
             if records.is_empty() {
                 return Ok(0);
             }

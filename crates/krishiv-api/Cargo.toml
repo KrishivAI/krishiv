@@ -42,7 +42,7 @@ parquet = { workspace = true }
 twox-hash = { workspace = true }
 
 [features]
-kafka = ["krishiv-connectors/kafka"]
+kafka = ["krishiv-connectors/kafka", "krishiv-runtime/kafka"]
 # Enable Iceberg catalog integration (registers KrishivCatalog as DataFusion catalog provider).
 iceberg-catalog = [
     "dep:iceberg",

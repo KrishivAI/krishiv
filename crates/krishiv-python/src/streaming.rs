@@ -275,6 +275,7 @@ pub struct PyDataStreamWriter {
     options: HashMap<String, String>,
     foreach_batch_fn: Option<Py<PyAny>>,
     stream_manager: Option<krishiv_api::streaming_builder::StreamingQueryManager>,
+    format: Option<String>,
 }
 
 impl PyDataStreamWriter {
@@ -288,12 +289,22 @@ impl PyDataStreamWriter {
             options: HashMap::new(),
             foreach_batch_fn: None,
             stream_manager: None,
+            format: None,
         }
     }
 }
 
 #[pymethods]
 impl PyDataStreamWriter {
+    /// Set the sink format: ``"kafka"``, ``"parquet"``, ``"iceberg"``,
+    /// ``"console"``, ``"memory"``, or ``"foreach_batch"`` (default). Sink-specific
+    /// settings (e.g. Kafka ``topic`` / ``bootstrap.servers``, Parquet/Iceberg
+    /// ``path``) are supplied via :meth:`option`.
+    #[pyo3(signature = (name))]
+    fn format(&mut self, name: String) {
+        self.format = Some(name);
+    }
+
     /// Set the output mode: ``"append"`` (default), ``"update"``, or ``"complete"``.
     #[pyo3(signature = (mode))]
     fn output_mode(&mut self, mode: String) -> PyResult<()> {
@@ -385,6 +396,7 @@ impl PyDataStreamWriter {
         let options = self.options.clone();
         let foreach_fn_opt = self.foreach_batch_fn.take();
         let stream_manager = self.stream_manager.take();
+        let format = self.format.take();
 
         let query = py.detach(move || {
             // Build the writer.
@@ -392,6 +404,9 @@ impl PyDataStreamWriter {
                 .output_mode(output_mode)
                 .trigger(trigger);
 
+            if let Some(fmt) = format {
+                writer = writer.format(fmt);
+            }
             if let Some(manager) = stream_manager {
                 writer = writer.with_stream_manager(manager);
             }

@@ -1159,11 +1159,20 @@ fn build_sink_dispatcher(
     memory_sink: Arc<std::sync::Mutex<Vec<RecordBatch>>>,
     output_mode: StreamingOutputMode,
 ) -> impl Fn(Vec<RecordBatch>, i64) -> Result<()> {
-    let _ = options; // currently unused outside the supported formats
     // ST1: track the per-row "last emitted epoch" so Update mode can
     // emit only the rows whose epoch has changed (or is new).
     let update_state: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>> =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // Kafka sink is built lazily on the first micro-batch (reused across epochs
+    // so the rdkafka producer isn't recreated every batch). Only compiled with
+    // the `kafka` feature; without it, `format("kafka")` returns Unsupported.
+    #[cfg(feature = "kafka")]
+    let kafka_sink: Arc<std::sync::Mutex<Option<krishiv_connectors::kafka::KafkaSink>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    // Without the kafka feature the `options` map is only read by the (compiled-out)
+    // Kafka branch, so keep it referenced to avoid an unused-variable warning.
+    #[cfg(not(feature = "kafka"))]
+    let _ = &options;
     move |batches, epoch| match format {
         Some(StreamSinkFormat::ForeachBatch) | None => {
             if let Some(f) = foreach_fn.as_ref() {
@@ -1274,12 +1283,76 @@ fn build_sink_dispatcher(
             }
             Ok(())
         }
-        Some(StreamSinkFormat::Kafka) => Err(KrishivError::Unsupported {
-            feature: "format(\"kafka\") sink dispatch is not yet implemented; use \
-                      foreach_batch() and write to a KafkaSink from your callback. \
-                      See T4 in the Spark parity plan."
-                .to_string(),
-        }),
+        Some(StreamSinkFormat::Kafka) => {
+            #[cfg(feature = "kafka")]
+            {
+                use krishiv_connectors::kafka::{KafkaConfig, KafkaSink};
+                use krishiv_connectors::sink::Sink as _;
+                use krishiv_common::async_util::block_on;
+
+                let bootstrap = options
+                    .get("kafka.bootstrap.servers")
+                    .or_else(|| options.get("bootstrap.servers"))
+                    .cloned()
+                    .ok_or_else(|| KrishivError::InvalidConfig {
+                        message: "kafka sink requires option 'kafka.bootstrap.servers' \
+                                  (or 'bootstrap.servers')"
+                            .to_string(),
+                    })?;
+                let topic = options
+                    .get("kafka.topic")
+                    .or_else(|| options.get("topic"))
+                    .cloned()
+                    .ok_or_else(|| KrishivError::InvalidConfig {
+                        message: "kafka sink requires option 'topic' (or 'kafka.topic')"
+                            .to_string(),
+                    })?;
+
+                let mut guard = kafka_sink.lock().unwrap_or_else(|p| p.into_inner());
+                if guard.is_none() {
+                    let cfg = KafkaConfig {
+                        bootstrap_servers: bootstrap,
+                        topic,
+                        group_id: "krishiv-sink".to_string(),
+                        auto_commit_interval_ms: None,
+                        security_protocol: None,
+                        ssl_ca_location: None,
+                        ssl_certificate_location: None,
+                        ssl_key_location: None,
+                        ssl_key_password: None,
+                        sasl_username: None,
+                        sasl_password: None,
+                        sasl_mechanisms: None,
+                        enable_idempotence: None,
+                        transactional_id: None,
+                    };
+                    let sink = KafkaSink::new(cfg).map_err(|e| KrishivError::Runtime {
+                        message: format!("kafka sink init: {e}"),
+                    })?;
+                    *guard = Some(sink);
+                }
+                let sink = guard.as_mut().expect("kafka sink initialised above");
+                block_on(async {
+                    for batch in batches {
+                        sink.write_batch(batch).await?;
+                    }
+                    sink.flush().await
+                })
+                .map_err(|e| KrishivError::Runtime {
+                    message: format!("kafka sink write: {e}"),
+                })?;
+                Ok(())
+            }
+            #[cfg(not(feature = "kafka"))]
+            {
+                let _ = &batches;
+                Err(KrishivError::Unsupported {
+                    feature: "format(\"kafka\") requires the `kafka` Cargo feature; \
+                              rebuild with it enabled or use foreach_batch()."
+                        .to_string(),
+                })
+            }
+        }
         Some(StreamSinkFormat::Parquet) => Err(KrishivError::Unsupported {
             feature: "format(\"parquet\") sink dispatch is not yet implemented; use \
                       foreach_batch() and write to a ParquetSink from your callback. \

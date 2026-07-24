@@ -128,6 +128,40 @@ pub(crate) fn window_agg_to_expr(agg: &WindowAgg) -> AggExpr {
 /// - `None`: state is ephemeral (in a `tempdir`) and lives only for the
 ///   duration of this call. Suitable for one-shot batch SQL where the
 ///   operator's state does not need to outlive the call.
+// Sort bounded-window input by event time so the watermark advances
+// monotonically over the whole run. Bounded windowing has the entire dataset in
+// hand, so every row must land in its event-time window regardless of arrival
+// order. The operators emit and purge each window once the running watermark
+// passes its end, so unsorted input (Kafka rows consumed in key order, not date
+// order) lets a high early timestamp advance the watermark and silently drop
+// every later, earlier-timestamped row as "late". Late-dropping is correct for
+// unbounded execution but loses data for a bounded collect(); pre-sorting
+// restores bucket-all (SQL TUMBLE) semantics.
+fn sort_bounded_input_by_event_time(
+    batches: Vec<RecordBatch>,
+    event_time_column: &str,
+) -> ExecResult<Vec<RecordBatch>> {
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let schema = match batches.first() {
+        Some(b) if total_rows > 1 => b.schema(),
+        _ => return Ok(batches),
+    };
+    let combined = arrow::compute::concat_batches(&schema, &batches).map_err(ExecError::from)?;
+    let Some(ts) = combined.column_by_name(event_time_column) else {
+        // No event-time column (shouldn't happen for a validated window spec) —
+        // leave input untouched rather than fail.
+        return Ok(vec![combined]);
+    };
+    let indices = arrow::compute::sort_to_indices(ts.as_ref(), None, None).map_err(ExecError::from)?;
+    let columns = combined
+        .columns()
+        .iter()
+        .map(|col| arrow::compute::take(col.as_ref(), &indices, None).map_err(ExecError::from))
+        .collect::<ExecResult<Vec<_>>>()?;
+    let sorted = RecordBatch::try_new(schema, columns).map_err(ExecError::from)?;
+    Ok(vec![sorted])
+}
+
 pub fn execute_bounded_window(
     input_batches: Vec<RecordBatch>,
     spec: &WindowExecutionSpec,
@@ -138,6 +172,9 @@ pub fn execute_bounded_window(
     if input_batches.is_empty() {
         return Ok(Vec::new());
     }
+    // Bounded semantics: bucket every row into its event-time window regardless
+    // of arrival order (see `sort_bounded_input_by_event_time`).
+    let input_batches = sort_bounded_input_by_event_time(input_batches, &spec.event_time_column)?;
 
     let agg_exprs: Vec<AggExpr> = spec.agg_exprs.iter().map(window_agg_to_expr).collect();
 
@@ -800,6 +837,62 @@ mod tests {
         .unwrap();
         let out = execute_bounded_window(vec![batch], &spec, None).expect("execute");
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn bounded_window_buckets_out_of_order_rows_without_dropping() {
+        // Regression: bounded `collect()` must window every row regardless of
+        // arrival order. Rows arriving key-ordered (ts NOT monotonic) previously
+        // had a high early ts advance the watermark and purge later windows, so
+        // subsequent earlier-ts rows were silently dropped as "late" — losing
+        // almost all data versus the equivalent SQL TUMBLE.
+        use std::collections::HashMap;
+        let spec = WindowExecutionSpec {
+            key_column: "user_id".into(),
+            key_column_type: String::from("utf8"),
+            event_time_column: "ts".into(),
+            watermark_lag_ms: 0,
+            window_kind: WindowKind::Tumbling,
+            window_size_ms: 10_000,
+            slide_ms: None,
+            session_gap_ms: None,
+            agg_exprs: WindowExecutionSpec::default_count_agg(),
+            state_ttl_ms: None,
+            allowed_lateness_ms: None,
+            source_watermark_lags: HashMap::new(),
+            source_id_column: None,
+            window_timezone: None,
+        };
+        let one = |ts: i64| -> RecordBatch {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("user_id", DataType::Utf8, false),
+                Field::new("ts", DataType::Int64, false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["a"])) as _,
+                    Arc::new(Int64Array::from(vec![ts])) as _,
+                ],
+            )
+            .unwrap()
+        };
+        // 50000 first (advances the watermark), then earlier timestamps that
+        // would be late-dropped without the bounded pre-sort.
+        let batches = vec![one(50_000), one(1_000), one(2_000), one(60_000), one(3_000)];
+        let out = execute_bounded_window(batches, &spec, None).expect("execute");
+        let total: i64 = out
+            .iter()
+            .map(|b| {
+                let c = b.column_by_name("count").expect("count column");
+                let arr = c.as_any().downcast_ref::<Int64Array>().expect("i64 count");
+                (0..arr.len()).map(|i| arr.value(i)).sum::<i64>()
+            })
+            .sum();
+        assert_eq!(
+            total, 5,
+            "all 5 out-of-order rows must be bucketed into windows, not late-dropped"
+        );
     }
 
     fn join_batch(id: &str, ts: i64) -> RecordBatch {

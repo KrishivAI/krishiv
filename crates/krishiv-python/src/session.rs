@@ -1398,6 +1398,9 @@ impl PySession {
             let inner = self.inner.clone();
             let group_id = group_id.to_string();
             py.detach(move || {
+                // Enter the persistent global runtime: rdkafka spawns the
+                // consumer's poll thread on creation and needs a live reactor.
+                let _rt_guard = crate::RUNTIME.enter();
                 inner
                     .register_kafka_source(&name, arrow_schema, &brokers, &topic, &group_id)
                     .map_err(map_krishiv_error)

@@ -458,4 +458,57 @@ impl PyDataStreamReader {
             .map(|df| crate::dataframe::PyDataFrame { inner: df })
             .map_err(map_krishiv_error)
     }
+
+    /// Read a Kafka topic as a streaming source, returning a :class:`DataFrame`
+    /// that can be turned into a :class:`StreamingDataFrame` via
+    /// ``.to_streaming()`` (or fed directly into streaming SQL).
+    ///
+    /// ``schema`` is an optional Krishiv schema class describing the message
+    /// payload; when omitted the topic is exposed as a single ``value`` string
+    /// column. Requires the ``kafka`` feature (``pip install krishiv[kafka]``).
+    #[pyo3(signature = (brokers, topic, group_id = "krishiv".to_string(), schema = None))]
+    pub fn kafka(
+        &self,
+        #[allow(unused_variables)] py: Python<'_>,
+        brokers: String,
+        topic: String,
+        group_id: String,
+        schema: Option<Py<pyo3::types::PyType>>,
+    ) -> PyResult<crate::dataframe::PyDataFrame> {
+        #[cfg(not(feature = "kafka"))]
+        {
+            let _ = (brokers, topic, group_id, schema);
+            Err(crate::errors::ConnectorError::new_err(
+                "Kafka support requires the `kafka` feature (pip install krishiv[kafka])",
+            ))
+        }
+        #[cfg(feature = "kafka")]
+        {
+            use arrow::datatypes::{DataType, Field, Schema};
+            use std::sync::Arc;
+            let arrow_schema: arrow::datatypes::SchemaRef = if let Some(cls) = schema {
+                crate::schema::PySchema::arrow_schema_from_class(cls.bind(py))?
+            } else {
+                Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]))
+            };
+            let sanitized: String = topic
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                .collect();
+            let name = format!("kafka_{sanitized}");
+            // rdkafka eagerly spawns a poll thread when the consumer is created,
+            // which requires an active Tokio reactor. Enter the persistent global
+            // runtime so the consumer's background task lives on it (not on a
+            // transient one that would be torn down after this call returns).
+            let _rt_guard = crate::RUNTIME.enter();
+            self.session
+                .register_kafka_source(&name, arrow_schema, brokers, topic, group_id)
+                .map_err(map_krishiv_error)?;
+            let df = self
+                .session
+                .sql(format!("SELECT * FROM {name}"))
+                .map_err(map_krishiv_error)?;
+            Ok(crate::dataframe::PyDataFrame { inner: df })
+        }
+    }
 }
