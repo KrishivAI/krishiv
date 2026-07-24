@@ -2338,6 +2338,7 @@ impl Session {
             self.jobs.clone(),
             self.next_job_id.clone(),
             self.coordinator_url.clone(),
+            self.coordinator_http_url.clone(),
             self.runtime.clone(),
             self.registered_parquet.clone(),
         )

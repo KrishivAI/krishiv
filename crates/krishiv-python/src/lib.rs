@@ -19,7 +19,6 @@ mod incremental;
 mod incremental_dataframe;
 mod job_status;
 mod lakehouse;
-mod live_table;
 mod memo;
 mod metrics_api;
 mod migration;
@@ -54,7 +53,6 @@ pub use errors::{
 pub use expression::PyColumn;
 pub use incremental::{PyDeltaBatch, PyIvmJob, PyStepSummary, PyViewError};
 pub use job_status::PyJobStatus;
-pub use live_table::{PyChangeFeedIter, PyLiveTable};
 pub use pipeline_api::{PyMemorySink, PyPipeline};
 pub use prepared::PyPreparedStatement;
 pub use process_api::{
@@ -129,8 +127,6 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pipeline_api::PyMemorySink>()?;
     m.add_class::<incremental::PyStepSummary>()?;
     m.add_class::<incremental::PyViewError>()?;
-    m.add_class::<live_table::PyLiveTable>()?;
-    m.add_class::<live_table::PyChangeFeedIter>()?;
     m.add_class::<memo::MemoCacheInfo>()?;
 
     m.add_class::<sinks::PyParquetSink>()?;

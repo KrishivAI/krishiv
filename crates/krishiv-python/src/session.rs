@@ -17,7 +17,6 @@ use crate::batch::PyBatch;
 use crate::dataframe::PyDataFrame;
 use crate::errors::{UdfError as PyUdfError, map_krishiv_error};
 use crate::job_status::PyJobStatus;
-use crate::live_table::PyLiveTable;
 use crate::pipeline::StreamPipeline;
 use crate::query_handle::PyQueryHandle;
 use crate::relation::PyRelation;
@@ -1055,10 +1054,6 @@ impl PySession {
         self.inner
             .register_table_udf(udf)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-
-    pub fn live_table(&self, name: String, query: String) -> PyResult<PyLiveTable> {
-        crate::live_table::create_live_table(name, query, self.inner.live_table_registry().clone())
     }
 
     /// Create or attach to an incremental-view-maintenance job by name.

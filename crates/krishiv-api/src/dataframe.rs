@@ -208,6 +208,10 @@ pub struct DataFrame {
     jobs: Arc<Mutex<LocalJobRegistry>>,
     next_job_id: Arc<AtomicU64>,
     _coordinator_url: Option<String>,
+    /// Coordinator **HTTP** base URL (distinct from the Flight `_coordinator_url`),
+    /// used by `to_incremental` to reach the coordinator's IVM management API in
+    /// distributed mode. `None` in embedded mode.
+    coordinator_http_url: Option<String>,
     runtime: Arc<dyn ExecutionRuntime>,
     registered_parquet: Arc<DashMap<String, PathBuf>>,
     /// When set, this DataFrame was produced by `cache()` / `persist()` and
@@ -309,6 +313,7 @@ impl DataFrame {
             jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
             next_job_id: Arc::new(AtomicU64::new(1)),
             _coordinator_url: None,
+            coordinator_http_url: None,
             runtime: crate::session::shared_embedded_runtime()?,
             registered_parquet: Arc::new(DashMap::new()),
             force_local: false,
@@ -341,6 +346,7 @@ impl DataFrame {
         jobs: Arc<Mutex<LocalJobRegistry>>,
         next_job_id: Arc<AtomicU64>,
         coordinator_url: Option<String>,
+        coordinator_http_url: Option<String>,
         runtime: Arc<dyn ExecutionRuntime>,
         registered_parquet: Arc<DashMap<String, PathBuf>>,
     ) -> Self {
@@ -354,6 +360,7 @@ impl DataFrame {
             jobs,
             next_job_id,
             _coordinator_url: coordinator_url,
+            coordinator_http_url,
             runtime,
             registered_parquet,
             force_local: false,
@@ -382,6 +389,7 @@ impl DataFrame {
             jobs,
             next_job_id,
             _coordinator_url: None,
+            coordinator_http_url: None,
             runtime,
             registered_parquet,
             force_local: false,
@@ -578,14 +586,15 @@ Execution statistics:
             })?,
         };
         let output_schema = self.schema()?;
-        crate::IncrementalDataFrame::from_view_sql(
-            name,
-            body_sql,
-            output_schema,
-            self.mode,
-            self._coordinator_url.clone(),
-        )
-        .await
+        // IVM management lives on the coordinator's HTTP port (distinct from the
+        // Flight `_coordinator_url`); prefer it, falling back to the Flight URL
+        // for single-port/local setups where they coincide.
+        let ivm_url = self
+            .coordinator_http_url
+            .clone()
+            .or_else(|| self._coordinator_url.clone());
+        crate::IncrementalDataFrame::from_view_sql(name, body_sql, output_schema, self.mode, ivm_url)
+            .await
     }
 
     /// Collect results.
@@ -813,6 +822,7 @@ Execution statistics:
             jobs: self.jobs.clone(),
             next_job_id: self.next_job_id.clone(),
             _coordinator_url: self._coordinator_url.clone(),
+            coordinator_http_url: self.coordinator_http_url.clone(),
             runtime: self.runtime.clone(),
             registered_parquet: self.registered_parquet.clone(),
             force_local: self.force_local,
@@ -870,6 +880,7 @@ Execution statistics:
             jobs: self.jobs.clone(),
             next_job_id: self.next_job_id.clone(),
             _coordinator_url: self._coordinator_url.clone(),
+            coordinator_http_url: self.coordinator_http_url.clone(),
             runtime: self.runtime.clone(),
             registered_parquet: self.registered_parquet.clone(),
             force_local: self.force_local,
@@ -1789,6 +1800,7 @@ Execution statistics:
             jobs: self.jobs.clone(),
             next_job_id: self.next_job_id.clone(),
             _coordinator_url: self._coordinator_url.clone(),
+            coordinator_http_url: self.coordinator_http_url.clone(),
             runtime: self.runtime.clone(),
             registered_parquet: self.registered_parquet.clone(),
             force_local: self.force_local,

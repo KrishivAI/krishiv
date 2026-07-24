@@ -20,7 +20,6 @@ from .krishiv import (  # noqa: F401
     IcebergSink,
     KafkaSink,
     KrishivError,
-    LiveTable,
     ModeError,
     UdfError,
     ParquetSink,
@@ -252,7 +251,6 @@ __all__ = [
     "StreamingQueryProgress",
     "DataStreamWriter",
     "Schema",
-    "LiveTable",
     "AggExpr",
     "Batch",
     "ParquetSink",
@@ -309,15 +307,6 @@ __all__ = [
     "JobStatus",
     "sinks",
 ]
-
-try:
-    from .krishiv import LiveTable
-    _orig_live_anext = LiveTable.__anext__
-    async def _new_live_anext(self):
-        return _orig_live_anext(self)
-    LiveTable.__anext__ = _new_live_anext
-except (ImportError, AttributeError):
-    pass
 
 try:
     from .krishiv import DataFrameStream
