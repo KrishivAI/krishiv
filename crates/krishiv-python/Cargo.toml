@@ -43,6 +43,9 @@ default = []
 extension-module = ["pyo3/extension-module"]
 kafka = ["krishiv-connectors/kafka", "krishiv-api/kafka"]
 iceberg = ["krishiv-connectors/iceberg", "krishiv-api/iceberg-sink"]
+# Cloud object-store backends (S3/MinIO, GCS, Azure) — required for Iceberg
+# tables and other sinks whose `path` is an `s3://` URI.
+cloud = ["krishiv-connectors/cloud"]
 kinesis = ["krishiv-connectors/kinesis"]
 pulsar = ["krishiv-connectors/pulsar-source"]
 cassandra = ["krishiv-connectors/cassandra"]
