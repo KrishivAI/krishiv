@@ -16,6 +16,7 @@ mod engine_job;
 mod errors;
 mod expression;
 mod incremental;
+mod incremental_dataframe;
 mod job_status;
 mod lakehouse;
 mod live_table;
@@ -107,6 +108,7 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<expression::PyColumn>()?;
     m.add_class::<dataframe::PyGroupedDataFrame>()?;
     m.add_class::<dataframe::PyDataFrameStream>()?;
+    m.add_class::<incremental_dataframe::PyIncrementalDataFrame>()?;
     m.add_class::<query_handle::PyQueryHandle>()?;
     m.add_class::<engine_job::PyEngineJobHandle>()?;
     m.add_class::<engine_job::PyRunningJob>()?;

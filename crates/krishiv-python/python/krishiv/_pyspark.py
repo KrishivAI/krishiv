@@ -1082,6 +1082,57 @@ def _apply() -> None:
     # via `.collect()` or `.execute_stream_async()`. Aliasing it here only
     # produced a property that raised on access.
 
+    # ── Incremental (delta/IVM) surface — df.to_incremental() ────────────────
+    # The third mode of the unified DataFrame surface. The Rust core exposes
+    # apply / step / snapshot / last_output; the Z-set feed conveniences, the
+    # transaction() context manager, and the changes() async change-feed are
+    # pure Python here (evolve without a rebuild).
+    from .krishiv import (  # noqa: PLC0415
+        IncrementalDataFrame as _IDF,
+        DeltaBatch as _DB,
+    )
+
+    _IDF.insert = lambda self, batch, source=None: self.apply(
+        _DB.from_inserts(batch), source
+    )
+    _IDF.delete = lambda self, batch, source=None: self.apply(
+        _DB.from_deletes(batch), source
+    )
+    _IDF.update = lambda self, before, after, source=None: self.apply(
+        _DB.from_update(before, after), source
+    )
+    _IDF.apply_cdc = lambda self, event, source=None: self.apply(
+        _DB.from_cdc(event), source
+    )
+
+    class _IvmTransaction:
+        """Feeds buffer inside the block; one atomic tick fires on clean exit."""
+
+        def __init__(self, idf):
+            self._idf = idf
+
+        def __enter__(self):
+            self._idf._set_defer_step(True)
+            return self._idf
+
+        def __exit__(self, exc_type, exc, tb):
+            self._idf._set_defer_step(False)
+            if exc_type is None:
+                self._idf.step()
+            return False
+
+    _IDF.transaction = lambda self: _IvmTransaction(self)
+
+    async def _idf_changes(self):
+        """Async change-feed ("update" output mode): yields the output delta from
+        the most recent tick. Iterate after each ``apply``/``step`` to consume the
+        incremental output; ``snapshot()`` gives the full ("complete") state."""
+        out = self.last_output()
+        if out is not None:
+            yield out
+
+    _IDF.changes = _idf_changes
+
     # Phase 2: fluent STATELESS verbs on the streaming DataFrame — Spark's "same
     # DataFrame API for batch and streaming" (they push into the source stream
     # before windowing). `_col_sql` renders a Column arg to a SQL string.

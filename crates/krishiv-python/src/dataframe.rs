@@ -558,6 +558,26 @@ impl PyDataFrame {
         crate::streaming_dataframe::PyStreamingDataFrame::new(self.inner.clone())
     }
 
+    /// Convert this DataFrame into an :class:`IncrementalDataFrame` (delta/IVM
+    /// mode) named ``name`` (auto-generated if omitted) — the third conversion
+    /// alongside ``collect()`` (batch) and ``to_streaming()`` (streaming). Feed
+    /// ``DeltaBatch`` changes and read ``snapshot()`` / the output change-feed.
+    #[pyo3(signature = (name=None))]
+    pub fn to_incremental(
+        &self,
+        py: Python<'_>,
+        name: Option<String>,
+    ) -> PyResult<crate::incremental_dataframe::PyIncrementalDataFrame> {
+        let df = self.inner.clone();
+        let name = name.unwrap_or_else(crate::incremental_dataframe::next_view_name);
+        let inner = py
+            .detach(move || crate::RUNTIME.block_on(df.to_incremental(&name)))
+            .map_err(map_krishiv_error)?;
+        Ok(crate::incremental_dataframe::PyIncrementalDataFrame::new(
+            inner,
+        ))
+    }
+
     /// Return the schema as a list of `(column_name, arrow_type)` pairs.
     ///
     /// Example:
