@@ -141,7 +141,16 @@ impl PyStreamingQuery {
                     {
                         let guard = q.lock().unwrap_or_else(|p| p.into_inner());
                         if !guard.is_active() {
-                            return Ok(());
+                            // Distinguish a clean stop from a failure: a failed
+                            // query (e.g. a sink write error) must raise, not
+                            // return Ok — otherwise a silently-dropped write
+                            // looks successful.
+                            return match guard.exception() {
+                                Some(msg) => Err(krishiv_api::KrishivError::Runtime {
+                                    message: msg,
+                                }),
+                                None => Ok(()),
+                            };
                         }
                     }
                     if let Some(d) = deadline {
