@@ -1,732 +1,364 @@
-import asyncio
-import inspect
+"""Comprehensive coverage for the unified StreamingDataFrame API.
 
+The DataStream `Stream`/`KeyedStream`/`WindowedStream` classes were retired; all
+streaming goes through `StreamingDataFrame`. These tests are self-contained
+(in-memory / SQL sources, no Kafka broker) so they run in CI, and they exercise
+every method of the surface plus both the snake_case and Spark camelCase spellings.
+"""
+import asyncio
+
+import pyarrow as pa
 import pytest
 
 import krishiv as ks
-from krishiv.krishiv import MultiSourceWatermarkSpec
+from krishiv import agg as kagg
+from krishiv.krishiv import Batch
+
+DAY = 24 * 3600 * 1000
 
 
-def test_session_local_stream_creation():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    assert stream is not None
-    r = repr(stream)
-    assert "Stream" in r
-    assert "ts" in r
+def _session():
+    return ks.Session.embedded()
 
 
-def test_stream_key_by_single_column():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    keyed = stream.key_by("n")
-    assert "KeyedStream" in repr(keyed)
-    assert "n" in repr(keyed)
+def _events(s, name="events"):
+    """Register a keyed event table with out-of-order event_times across 3 keys
+    and multiple 30-day windows (exercises the bounded-window sort)."""
+    keys = ["a", "b", "c"]
+    rows = []
+    for i in range(300):
+        # event_time deliberately NOT monotonic w.r.t. row order
+        et = ((i * 37) % 300) * 10 * DAY
+        rows.append({"k": keys[i % 3], "v": float(i % 50), "event_time": et})
+    tbl = pa.Table.from_pylist(rows)
+    s.register_record_batches(name, [Batch(b) for b in tbl.to_batches()])
+    return s.sql(f"SELECT * FROM {name}"), tbl.num_rows
 
 
-def test_stream_key_by_multiple_columns():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS a, 2 AS b, 3 AS ts", "ts", 0)
-    keyed = stream.key_by("a", "b")
-    r = repr(keyed)
-    assert "a" in r
-    assert "b" in r
+def _collect_tbl(sdf):
+    batches = sdf.collect()
+    return pa.Table.from_batches([b.to_arrow() for b in batches]) if batches else None
 
 
-def test_stream_key_by_empty_raises():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
+async def _drain(stream_or_df, cap=100000, timeout=20):
+    st = await stream_or_df.execute_stream_async() if hasattr(stream_or_df, "execute_stream_async") else stream_or_df
+    out = []
+
+    async def loop():
+        async for b in st:
+            rb = b.to_arrow()
+            if rb.num_rows:
+                out.append(rb)
+            if sum(x.num_rows for x in out) >= cap:
+                break
+    try:
+        await asyncio.wait_for(loop(), timeout)
+    except asyncio.TimeoutError:
+        pass
+    return pa.Table.from_batches(out) if out else None
+
+
+# ─────────────────────────── entry points ───────────────────────────
+def test_to_streaming_returns_streaming_dataframe():
+    s = _session()
+    sdf = s.sql("SELECT 1 AS a").to_streaming()
+    assert type(sdf).__name__ == "StreamingDataFrame"
+
+
+def test_session_stream_returns_streaming_dataframe():
+    s = _session()
+    sdf = s.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
+    assert type(sdf).__name__ == "StreamingDataFrame"
+
+
+def test_memory_stream_returns_streaming_dataframe():
+    s = _session()
+    tbl = pa.table({"k": ["a", "b"], "v": [1, 2], "event_time": [0, DAY]})
+    sdf = s.memory_stream("mem", [Batch(b) for b in tbl.to_batches()], "event_time", 0)
+    assert type(sdf).__name__ == "StreamingDataFrame"
+
+
+def test_retired_stream_classes_are_gone():
+    for n in ("Stream", "KeyedStream", "WindowedStream", "ConnectedStreams",
+              "BroadcastStream", "WindowSpec", "MultiSourceWatermarkSpec"):
+        assert not hasattr(ks, n), f"{n} should have been retired"
+
+
+# ─────────────────────────── stateless verbs ───────────────────────────
+def test_filter():
+    s = _session()
+    src, _ = _events(s)
+    out = asyncio.run(_drain(src.to_streaming().filter("v > 25"), cap=50))
+    assert out is not None and all(v > 25 for v in out.column("v").to_pylist())
+
+
+def test_where_alias():
+    s = _session()
+    src, _ = _events(s)
+    out = asyncio.run(_drain(src.to_streaming().where("v > 25"), cap=50))
+    assert out is not None and all(v > 25 for v in out.column("v").to_pylist())
+
+
+def test_select():
+    s = _session()
+    src, _ = _events(s)
+    out = asyncio.run(_drain(src.to_streaming().select("k", "v"), cap=50))
+    assert out is not None and set(out.schema.names) == {"k", "v"}
+
+
+def test_with_column():
+    s = _session()
+    src, _ = _events(s)
+    out = asyncio.run(_drain(src.to_streaming().with_column("hi", "v > 25"), cap=50))
+    assert out is not None and "hi" in out.schema.names
+
+
+def test_drop_columns():
+    s = _session()
+    src, _ = _events(s)
+    out = asyncio.run(_drain(src.to_streaming().drop_columns(["v"]), cap=50))
+    assert out is not None and "v" not in out.schema.names
+
+
+def test_drop_duplicates():
+    s = _session()
+    src, _ = _events(s)
+    out = asyncio.run(_drain(src.to_streaming().drop_duplicates(subset=["k"]), cap=50))
+    assert out is not None and set(out.column("k").to_pylist()) <= {"a", "b", "c"}
+    assert out.num_rows == len(set(out.column("k").to_pylist()))
+
+
+# ─────────────────────────── windows + agg ───────────────────────────
+def test_tumbling_window_default_count_conserves_rows():
+    s = _session()
+    src, n = _events(s)
+    sdf = src.to_streaming().with_event_time("event_time").key_by("k").tumbling_window(30 * DAY)
+    t = _collect_tbl(sdf)
+    assert t is not None and sum(t.column("count").to_pylist()) == n
+
+
+def test_tumbling_window_agg_sum_count():
+    s = _session()
+    src, n = _events(s)
+    sdf = (src.to_streaming().with_event_time("event_time").key_by("k")
+           .tumbling_window(30 * DAY).agg(total=kagg.sum("v"), c=kagg.count()))
+    t = _collect_tbl(sdf)
+    assert t is not None and {"total", "c"} <= set(t.schema.names)
+    assert sum(t.column("c").to_pylist()) == n
+    truth = sum(src.collect().to_arrow().column("v").to_pylist())
+    assert abs(sum(t.column("total").to_pylist()) - truth) < 1e-6
+
+
+def test_agg_min_max_avg():
+    s = _session()
+    src, _ = _events(s)
+    sdf = (src.to_streaming().with_event_time("event_time").key_by("k")
+           .tumbling_window(3650 * DAY)  # one big window
+           .agg(mn=kagg.min("v"), mx=kagg.max("v"), av=kagg.mean("v")))
+    t = _collect_tbl(sdf)
+    assert t is not None and {"mn", "mx", "av"} <= set(t.schema.names)
+    assert min(t.column("mn").to_pylist()) >= 0
+
+
+def test_sliding_window_overlaps():
+    s = _session()
+    src, n = _events(s)
+    sdf = (src.to_streaming().with_event_time("event_time").key_by("k")
+           .sliding_window(60 * DAY, 30 * DAY))
+    t = _collect_tbl(sdf)
+    # size/slide = 2 → interior events counted in ~2 windows → total > n
+    assert t is not None and sum(t.column("count").to_pylist()) > n
+
+
+def test_session_window_conserves_rows():
+    s = _session()
+    src, n = _events(s)
+    sdf = (src.to_streaming().with_event_time("event_time").key_by("k")
+           .session_window(10 * DAY))
+    t = _collect_tbl(sdf)
+    assert t is not None and sum(t.column("count").to_pylist()) == n
+
+
+def test_out_of_order_rows_not_dropped():
+    """Regression: bounded windowing must bucket every row regardless of arrival
+    order (the input event_times are deliberately non-monotonic)."""
+    s = _session()
+    src, n = _events(s)
+    sdf = src.to_streaming().with_event_time("event_time").key_by("k").tumbling_window(30 * DAY)
+    t = _collect_tbl(sdf)
+    assert sum(t.column("count").to_pylist()) == n
+    assert set(t.column("k").to_pylist()) == {"a", "b", "c"}
+
+
+def test_sdf_window_matches_sql_tumble():
+    s = _session()
+    src, n = _events(s)
+    sql = s.sql(f"""SELECT k, window_start, COUNT(*) AS c
+                    FROM TUMBLE(TABLE events, DESCRIPTOR(event_time), {30 * DAY})
+                    GROUP BY k, window_start""").collect().to_arrow()
+    sdf_t = _collect_tbl(src.to_streaming().with_event_time("event_time").key_by("k").tumbling_window(30 * DAY))
+    assert sum(sql.column("c").to_pylist()) == sum(sdf_t.column("count").to_pylist()) == n
+
+
+# ─────────────────────────── camelCase spellings ───────────────────────────
+def test_camelcase_windows_and_verbs():
+    s = _session()
+    src, n = _events(s)
+    sdf = (src.to_streaming().withColumn("v2", "v * 2").keyBy("k")
+           .withWatermark("event_time", 0).tumblingWindow(30 * DAY).agg(c=kagg.count()))
+    t = _collect_tbl(sdf)
+    assert t is not None and sum(t.column("c").to_pylist()) == n
+
+
+def test_camelcase_sliding_session():
+    s = _session()
+    src, n = _events(s)
+    sl = _collect_tbl(src.to_streaming().withWatermark("event_time", 0).keyBy("k").slidingWindow(60 * DAY, 30 * DAY))
+    se = _collect_tbl(src.to_streaming().withWatermark("event_time", 0).keyBy("k").sessionWindow(10 * DAY))
+    assert sl is not None and se is not None
+    assert sum(se.column("count").to_pylist()) == n
+
+
+# ─────────────────────────── keyed state ───────────────────────────
+def test_transform_with_state_running_count():
+    s = _session()
+    src, _ = _events(s)
+
+    class RunningCount:
+        def on_event(self, key, batch, row, ctx):
+            raw = bytes(ctx.get_state())
+            c = (int.from_bytes(raw, "little") if raw else 0) + 1
+            ctx.set_state(c.to_bytes(8, "little"))
+            ctx.emit(Batch(pa.record_batch({"k": [str(key)], "running": [c]})))
+
+        def on_timer(self, key, fire_time_ms, ctx):
+            pass
+
+    sdf = src.to_streaming().key_by("k").transform_with_state(RunningCount())
+    out = asyncio.run(_drain(sdf, cap=300))
+    assert out is not None and max(out.column("running").to_pylist()) > 1
+
+
+def test_transform_with_state_camelcase():
+    s = _session()
+    src, _ = _events(s)
+
+    class Passthrough:
+        def on_event(self, key, batch, row, ctx):
+            ctx.emit(Batch(pa.record_batch({"k": [str(key)]})))
+
+        def on_timer(self, key, fire_time_ms, ctx):
+            pass
+
+    sdf = src.to_streaming().keyBy("k").transformWithState(Passthrough())
+    out = asyncio.run(_drain(sdf, cap=50))
+    assert out is not None and out.num_rows > 0
+
+
+# ─────────────────────────── stream-to-stream ───────────────────────────
+def test_co_process_connected_streams():
+    s = _session()
+    left, _ = _events(s, "co_left")
+    right, _ = _events(s, "co_right")
+
+    class Joiner:
+        def on_stream1(self, key, batch, row, ctx):
+            ctx.emit(Batch(pa.record_batch({"k": [str(key)], "side": ["L"]})))
+
+        def on_stream2(self, key, batch, row, ctx):
+            ctx.emit(Batch(pa.record_batch({"k": [str(key)], "side": ["R"]})))
+
+        def on_timer(self, key, fire_time_ms, ctx):
+            pass
+
+    out = asyncio.run(_drain(left.to_streaming().co_process(right.to_streaming(), "k", Joiner()), cap=600))
+    assert out is not None and set(out.column("side").to_pylist()) == {"L", "R"}
+
+
+def test_broadcast_process():
+    s = _session()
+    keyed, _ = _events(s, "bc_keyed")
+    rules = s.sql("SELECT r FROM (VALUES ('x'),('y')) AS t(r)")
+
+    class BC:
+        def on_keyed_event(self, key, batch, row, ctx):
+            ctx.emit(Batch(pa.record_batch({"k": [str(key)]})))
+
+        def on_broadcast_event(self, batch, row, ctx):
+            pass
+
+    out = asyncio.run(_drain(keyed.to_streaming().broadcast_process(rules.to_streaming(), "k", BC()), cap=300))
+    assert out is not None and out.num_rows > 0
+
+
+# ─────────────────────────── sinks ───────────────────────────
+def test_sink_parquet_roundtrip(tmp_path):
+    import glob
+    import pyarrow.parquet as pq
+    s = _session()
+    src, n = _events(s)
+    w = src.write_stream()
+    w.format("parquet"); w.option("path", str(tmp_path)); w.trigger("available_now")
+    w.start().await_termination(30000)
+    files = glob.glob(f"{tmp_path}/*.parquet")
+    assert files and sum(pq.read_table(f).num_rows for f in files) == n
+
+
+def test_sink_foreach_batch():
+    s = _session()
+    src, n = _events(s)
+    seen = {"rows": 0}
+
+    def fb(batches, epoch):
+        for b in batches:
+            seen["rows"] += b.to_arrow().num_rows
+
+    w = src.write_stream()
+    w.foreach_batch(fb); w.trigger("available_now")
+    w.start().await_termination(30000)
+    assert seen["rows"] == n
+
+
+def test_sink_console_smoke():
+    s = _session()
+    src, _ = _events(s)
+    w = src.write_stream()
+    w.format("console"); w.trigger("available_now")
+    w.start().await_termination(30000)  # must not raise
+
+
+def test_sink_entry_is_dataframe_write_stream():
+    # Streaming sinks live on the source DataFrame; a windowed StreamingDataFrame
+    # is consumed via collect()/execute_stream_async(), so its write_stream raises.
+    s = _session()
+    assert hasattr(s.sql("SELECT 1 a"), "write_stream")
     with pytest.raises(Exception):
-        stream.key_by()
+        s.sql("SELECT 1 a").to_streaming().write_stream()
 
 
-def test_stream_watermark():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 1000)
-    updated = stream.watermark("ts", 5000)
-    assert updated is not None
-    assert "ts" in repr(updated)
-
-
-def test_stream_with_watermark():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 1000)
-    updated = stream.with_watermark("ts", 3000)
-    assert updated is not None
-    assert "ts" in repr(updated)
-
-
-def test_stream_watermark_and_with_watermark_are_aliases():
-    session = ks.Session.local()
-    s1 = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    s2 = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    r1 = repr(s1.watermark("ts", 5000))
-    r2 = repr(s2.with_watermark("ts", 5000))
-    assert r1 == r2
-
-
-def test_stream_tumbling_window_ms():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    windowed = stream.tumbling_window_ms(5000)
-    assert "WindowedStream" in repr(windowed)
-    assert windowed.window_size_ms == 5000
-    assert windowed.window_kind == "tumbling"
-
-
-def test_stream_tumbling_window_secs():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    windowed = stream.tumbling_window(2)
-    assert windowed.window_size_ms == 2000
-    assert windowed.window_kind == "tumbling"
-
-
-def test_stream_sliding_window_ms():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    windowed = stream.sliding_window_ms(10000, 5000)
-    assert windowed.window_size_ms == 10000
-    assert windowed.slide_ms == 5000
-    assert windowed.window_kind == "sliding"
-
-
-def test_stream_session_window_ms():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    windowed = stream.session_window_ms(30000)
-    assert windowed.window_size_ms == 30000
-    assert windowed.session_gap_ms == 30000
-    assert windowed.window_kind == "session"
-    assert windowed.slide_ms is None
-
-
-def test_stream_broadcast():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    bcast = stream.broadcast()
-    r = repr(bcast)
-    assert "BroadcastStream" in r
-
-
-def test_stream_connect():
-    session = ks.Session.local()
-    s1 = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    s2 = session.stream("SELECT 2 AS n, 2000 AS ts", "ts", 0)
-    connected = s1.connect(s2)
-    r = repr(connected)
-    assert "ConnectedStreams" in r
-
-
-def test_stream_with_state_ttl():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    updated = stream.with_state_ttl(60000)
-    assert updated is not None
-    assert "ts" in repr(updated)
-
-
-def test_stream_with_multi_source_watermark():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    spec = (
-        MultiSourceWatermarkSpec()
-        .add_source("clicks", 5000)
-        .add_source("impressions", 10000)
-        .with_source_id_column("source_id")
-    )
-    updated = stream.with_multi_source_watermark(spec)
-    assert updated is not None
-    r = repr(spec)
-    assert "clicks" in r
-    assert "impressions" in r
-    assert "source_id" in r
-
-
-def test_stream_repr_contains_watermark_column():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS val, 999 AS event_time", "event_time", 5000)
-    r = repr(stream)
-    assert "event_time" in r
-
-
-def test_keyed_stream_window_with_spec():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    keyed = stream.key_by("n")
-    spec = ks.windows.tumbling(60000)
-    windowed = keyed.window(spec)
-    assert "WindowedStream" in repr(windowed)
-    assert windowed.window_size_ms == 60000
-    assert windowed.window_kind == "tumbling"
-
-
-def test_keyed_stream_sliding_window_spec():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    keyed = stream.key_by("n")
-    spec = ks.windows.sliding(10000, 5000)
-    windowed = keyed.window(spec)
-    assert windowed.window_size_ms == 10000
-    assert windowed.slide_ms == 5000
-    assert windowed.window_kind == "sliding"
-
-
-def test_keyed_stream_session_window_spec():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    keyed = stream.key_by("n")
-    spec = ks.windows.session(30000)
-    windowed = keyed.window(spec)
-    assert windowed.window_size_ms == 30000
-    assert windowed.session_gap_ms == 30000
-    assert windowed.window_kind == "session"
-
-
-def test_keyed_stream_tumbling_window_secs():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    keyed = stream.key_by("n")
-    windowed = keyed.tumbling_window(3)
-    assert windowed.window_size_ms == 3000
-    assert windowed.window_kind == "tumbling"
-
-
-def test_keyed_stream_tumbling_window_ms():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    keyed = stream.key_by("n")
-    windowed = keyed.tumbling_window_ms(5000)
-    assert windowed.window_size_ms == 5000
-    assert windowed.window_kind == "tumbling"
-
-
-def test_keyed_stream_sliding_window_ms():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    keyed = stream.key_by("n")
-    windowed = keyed.sliding_window_ms(10000, 5000)
-    assert windowed.window_size_ms == 10000
-    assert windowed.slide_ms == 5000
-    assert windowed.window_kind == "sliding"
-
-
-def test_keyed_stream_session_window_ms():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    keyed = stream.key_by("n")
-    windowed = keyed.session_window_ms(30000)
-    assert windowed.window_size_ms == 30000
-    assert windowed.session_gap_ms == 30000
-    assert windowed.window_kind == "session"
-
-
-def test_keyed_stream_connect():
-    session = ks.Session.local()
-    s1 = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    s2 = session.stream("SELECT 2 AS n, 2000 AS ts", "ts", 0)
-    k1 = s1.key_by("n")
-    k2 = s2.key_by("n")
-    connected = k1.connect(k2)
-    assert "ConnectedStreams" in repr(connected)
-
-
-def test_keyed_stream_with_multi_source_watermark():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    keyed = stream.key_by("n")
-    spec = (
-        MultiSourceWatermarkSpec()
-        .add_source("s1", 3000)
-        .with_source_id_column("sid")
-    )
-    updated = keyed.with_multi_source_watermark(spec)
-    assert "KeyedStream" in repr(updated)
-
-
-def test_windowed_stream_agg_count():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .tumbling_window(1)
-    )
-    result = windowed.agg(count=ks.agg.count())
-    assert "WindowedStream" in repr(result)
-
-
-def test_windowed_stream_agg_sum():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 100 AS val, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .tumbling_window(1)
-    )
-    result = windowed.agg(total=ks.agg.sum("val"))
-    assert "WindowedStream" in repr(result)
-
-
-def test_windowed_stream_agg_mean():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 100 AS val, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .tumbling_window(1)
-    )
-    result = windowed.agg(avg_val=ks.agg.mean("val"))
-    assert "WindowedStream" in repr(result)
-
-
-def test_windowed_stream_agg_min():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 50 AS val, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .tumbling_window(1)
-    )
-    result = windowed.agg(min_val=ks.agg.min("val"))
-    assert "WindowedStream" in repr(result)
-
-
-def test_windowed_stream_agg_max():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 50 AS val, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .tumbling_window(1)
-    )
-    result = windowed.agg(max_val=ks.agg.max("val"))
-    assert "WindowedStream" in repr(result)
-
-
-def test_windowed_stream_agg_multiple():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 100 AS val, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .tumbling_window(1)
-    )
-    result = windowed.agg(cnt=ks.agg.count(), total=ks.agg.sum("val"), avg_val=ks.agg.mean("val"))
-    assert "WindowedStream" in repr(result)
-
-
-def test_windowed_stream_agg_empty_raises():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .tumbling_window(1)
-    )
+def test_sink_failure_surfaces():
+    """A failed sink must raise from await_termination, not silently succeed."""
+    import os
+    os.environ.update(AWS_ENDPOINT_URL="http://127.0.0.1:9099", AWS_ACCESS_KEY_ID="x",
+                      AWS_SECRET_ACCESS_KEY="y", AWS_ALLOW_HTTP="true", AWS_REGION="us-east-1")
+    s = _session()
+    src, _ = _events(s)
+    w = src.write_stream()
+    w.format("iceberg"); w.option("path", "s3://nope/bad"); w.trigger("available_now")
     with pytest.raises(Exception):
-        windowed.agg()
-
-
-def test_windowed_stream_agg_with_custom_output_name():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 100 AS val, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .tumbling_window(1)
-    )
-    result = windowed.agg(my_sum=ks.agg.sum("val", "my_sum"))
-    assert "WindowedStream" in repr(result)
-
-
-def test_windowed_stream_collect():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .tumbling_window(1)
-    )
-    batches = windowed.collect()
-    assert isinstance(batches, list)
-
-
-def test_windowed_stream_try_next():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .tumbling_window(1)
-    )
-    result = windowed.try_next()
-    assert result is None or result is not None
-
-
-def test_windowed_stream_window_size_ms():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .tumbling_window_ms(15000)
-    )
-    assert windowed.window_size_ms == 15000
-
-
-def test_windowed_stream_slide_ms_tumbling():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .tumbling_window(1)
-    )
-    assert windowed.slide_ms is None
-
-
-def test_windowed_stream_slide_ms_sliding():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .sliding_window_ms(10000, 5000)
-    )
-    assert windowed.slide_ms == 5000
-
-
-def test_windowed_stream_session_gap_ms_none_for_tumbling():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .tumbling_window(1)
-    )
-    assert windowed.session_gap_ms is None
-
-
-def test_windowed_stream_session_gap_ms_for_session():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .session_window_ms(30000)
-    )
-    assert windowed.session_gap_ms == 30000
-
-
-def test_windowed_stream_window_kind():
-    session = ks.Session.local()
-    s = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0).key_by("n")
-    assert s.tumbling_window(1).window_kind == "tumbling"
-    assert s.sliding_window_ms(10000, 5000).window_kind == "sliding"
-    assert s.session_window_ms(30000).window_kind == "session"
-
-
-def test_windowed_stream_repr():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .tumbling_window(1)
-    )
-    r = repr(windowed)
-    assert "WindowedStream" in r
-
-
-def test_agg_expr_properties():
-    e = ks.agg.count()
-    assert e.function == "count"
-    assert e.input_column is None
-
-    s = ks.agg.sum("amount")
-    assert s.function == "sum"
-    assert s.input_column == "amount"
-
-    m = ks.agg.mean("score")
-    assert m.function == "mean"
-    assert m.input_column == "score"
-
-    lo = ks.agg.min("val")
-    assert lo.function == "min"
-    assert lo.input_column == "val"
-
-    hi = ks.agg.max("val")
-    assert hi.function == "max"
-    assert hi.input_column == "val"
-
-
-def test_agg_sum_requires_column():
-    with pytest.raises(Exception):
-        ks.agg.sum()
-
-
-def test_agg_mean_requires_column():
-    with pytest.raises(Exception):
-        ks.agg.mean()
-
-
-def test_window_spec_tumbling():
-    spec = ks.windows.tumbling(60000)
-    assert spec is not None
-
-
-def test_window_spec_sliding():
-    spec = ks.windows.sliding(10000, 5000)
-    assert spec is not None
-
-
-def test_window_spec_session():
-    spec = ks.windows.session(30000)
-    assert spec is not None
-
-
-def test_streaming_dataframe_to_streaming():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 100 AS val, 1000 AS ts")
-    sdf = df.to_streaming()
-    assert sdf is not None
-
-
-def test_streaming_dataframe_key_by():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 100 AS val, 1000 AS ts")
-    sdf = df.to_streaming()
-    result = sdf.key_by("n")
-    assert result is not None
-
-
-def test_streaming_dataframe_tumbling_window():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 100 AS val, 1000 AS ts")
-    sdf = df.to_streaming()
-    result = sdf.tumbling_window(60000)
-    assert result is not None
-
-
-def test_streaming_dataframe_sliding_window():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 100 AS val, 1000 AS ts")
-    sdf = df.to_streaming()
-    result = sdf.sliding_window(10000, 5000)
-    assert result is not None
-
-
-def test_streaming_dataframe_session_window():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 100 AS val, 1000 AS ts")
-    sdf = df.to_streaming()
-    result = sdf.session_window(30000)
-    assert result is not None
-
-
-def test_streaming_dataframe_with_event_time():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 1000 AS ts")
-    sdf = df.to_streaming()
-    result = sdf.with_event_time("ts")
-    assert result is not None
-
-
-def test_streaming_dataframe_with_watermark_lag():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 1000 AS ts")
-    sdf = df.to_streaming()
-    result = sdf.with_watermark_lag(5000)
-    assert result is not None
-
-
-def test_streaming_dataframe_with_side_output():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 1000 AS ts")
-    sdf = df.to_streaming()
-    result = sdf.with_side_output("late_events", 10000)
-    assert result is not None
-
-
-def test_streaming_dataframe_drop_duplicates():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 100 AS val, 1000 AS ts")
-    sdf = df.to_streaming()
-    result = sdf.drop_duplicates(subset=["n"])
-    assert result is not None
-
-
-def test_streaming_dataframe_chained():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 100 AS val, 1000 AS ts")
-    result = (
-        df.to_streaming()
-        .key_by("n")
-        .with_event_time("ts")
-        .with_watermark_lag(5000)
-        .tumbling_window(60000)
-    )
-    assert result is not None
-
-
-def test_streaming_dataframe_write_stream_raises():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 1000 AS ts")
-    sdf = df.to_streaming()
-    with pytest.raises(RuntimeError):
-        sdf.write_stream()
-
-
-def test_streaming_dataframe_execute_stream_async_returns_awaitable():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 100 AS val, 1000 AS ts")
-    sdf = df.to_streaming().key_by("n").tumbling_window(1000)
-    result = sdf.execute_stream_async()
-    assert inspect.isawaitable(result)
-    result.close()
-
-
-def test_dataframe_write_stream():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 1000 AS ts")
-    writer = df.write_stream()
-    assert writer is not None
-
-
-def test_data_stream_writer_output_mode():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 1000 AS ts")
-    writer = df.write_stream()
-    writer.output_mode("update")
-    r = repr(writer)
-    assert "update" in r
-
-
-def test_data_stream_writer_invalid_output_mode():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 1000 AS ts")
-    writer = df.write_stream()
-    with pytest.raises(RuntimeError):
-        writer.output_mode("invalid_mode")
-
-
-def test_data_stream_writer_trigger():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 1000 AS ts")
-    writer = df.write_stream()
-    writer.trigger("processing_time", 5000)
-    r = repr(writer)
-    assert "processing_time" in r
-
-
-def test_data_stream_writer_invalid_trigger():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 1000 AS ts")
-    writer = df.write_stream()
-    with pytest.raises(RuntimeError):
-        writer.trigger("bogus")
-
-
-def test_data_stream_writer_query_name():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 1000 AS ts")
-    writer = df.write_stream()
-    writer.query_name("my_job")
-    r = repr(writer)
-    assert "my_job" in r
-
-
-def test_data_stream_writer_option():
-    session = ks.Session.local()
-    df = session.sql("SELECT 1 AS n, 1000 AS ts")
-    writer = df.write_stream()
-    writer.option("checkpoint.location", "/tmp/ckpt")
-    r = repr(writer)
-    assert "DataStreamWriter" in r
-
-
-def test_multi_source_watermark_spec_builder():
-    spec = (
-        MultiSourceWatermarkSpec()
-        .add_source("a", 1000)
-        .add_source("b", 2000)
-        .with_source_id_column("src")
-    )
-    r = repr(spec)
-    assert "a" in r
-    assert "b" in r
-    assert "src" in r
-
-
-def test_multi_source_watermark_spec_empty():
-    spec = MultiSourceWatermarkSpec()
-    r = repr(spec)
-    assert "MultiSourceWatermarkSpec" in r
-
-
-async def _run_async_iteration():
-    session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    windowed = stream.key_by("n").tumbling_window(1)
-    seen = 0
-    async for batch in windowed:
-        assert batch.num_rows >= 1
-        seen += 1
-        if seen >= 1:
-            break
-    assert seen == 1
-
-
-def test_windowed_stream_async_iteration():
-    asyncio.run(_run_async_iteration())
-
-
-async def _run_async_iteration_multiple_batches():
-    session = ks.Session.local()
-    stream = session.stream(
-        "SELECT 1 AS n, 1000 AS ts UNION ALL SELECT 2 AS n, 2000 AS ts", "ts", 0
-    )
-    windowed = stream.key_by("n").tumbling_window(1)
-    seen = 0
-    async for batch in windowed:
-        seen += 1
-        if seen >= 3:
-            break
-    assert seen >= 1
-
-
-def test_windowed_stream_async_iteration_multiple_batches():
-    asyncio.run(_run_async_iteration_multiple_batches())
-
-
-def test_stream_full_pipeline_count():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .tumbling_window(1)
-    )
-    result = windowed.agg(count=ks.agg.count())
-    batches = result.collect()
-    assert isinstance(batches, list)
-
-
-def test_stream_full_pipeline_sum():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 100 AS val, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .tumbling_window(1)
-    )
-    result = windowed.agg(total=ks.agg.sum("val"))
-    batches = result.collect()
-    assert isinstance(batches, list)
-
-
-def test_stream_full_pipeline_sliding():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 100 AS val, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .sliding_window_ms(5000, 2000)
-    )
-    result = windowed.agg(cnt=ks.agg.count())
-    batches = result.collect()
-    assert isinstance(batches, list)
-
-
-def test_stream_full_pipeline_session():
-    session = ks.Session.local()
-    windowed = (
-        session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-        .key_by("n")
-        .session_window_ms(10000)
-    )
-    result = windowed.agg(cnt=ks.agg.count())
-    batches = result.collect()
-    assert isinstance(batches, list)
+        w.start().await_termination(20000)
+
+
+# ─────────────────────────── watermark / side output config ───────────────────────────
+def test_watermark_and_state_config_chain():
+    s = _session()
+    src, n = _events(s)
+    sdf = (src.to_streaming()
+           .with_event_time("event_time")
+           .with_watermark_lag(5 * DAY)
+           .with_state_ttl(3600_000)
+           .with_side_output("late", 5 * DAY)
+           .key_by("k")
+           .tumbling_window(30 * DAY))
+    t = _collect_tbl(sdf)
+    assert t is not None and sum(t.column("count").to_pylist()) > 0

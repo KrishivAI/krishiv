@@ -10,15 +10,16 @@ import krishiv as ks
 
 @pytest.mark.asyncio
 async def test_native_async_iteration_local_sql():
+    # StreamingDataFrame streams via execute_stream_async() (unified API);
+    # windowed results are bounded via collect().
     session = ks.Session.local()
-    stream = session.stream("SELECT 1 AS n, 1000 AS ts", "ts", 0)
-    windowed = stream.key_by("n").tumbling_window(1)
+    sdf = session.stream("SELECT n, ts FROM (VALUES (1, 1000), (2, 2000)) t(n, ts)", "ts", 0)
     seen = 0
-    async for batch in windowed:
+    stream = await sdf.execute_stream_async()
+    async for batch in stream:
         assert batch.num_rows >= 1
         seen += 1
-        if seen >= 1:
-            break
+        break
     assert seen == 1
 
 

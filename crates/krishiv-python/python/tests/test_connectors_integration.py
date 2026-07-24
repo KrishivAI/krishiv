@@ -21,7 +21,7 @@ def test_read_kafka_builds_stream_handle():
     except ks.ConnectorError as error:
         _skip_if_feature_missing(error)
     assert stream is not None
-    windowed = stream.with_watermark("ts", 1000).key_by("_raw").tumbling_window(60)
+    windowed = stream.withWatermark("ts", 1000).key_by("_raw").tumbling_window(60)
     assert windowed is not None
 
 
@@ -32,7 +32,7 @@ def test_read_iceberg_builds_stream_handle():
     except ks.ConnectorError as error:
         _skip_if_feature_missing(error)
     assert stream is not None
-    windowed = stream.with_watermark("ts", 1000).key_by("user_id").tumbling_window(30)
+    windowed = stream.withWatermark("ts", 1000).key_by("user_id").tumbling_window(30)
     assert windowed is not None
 
 
@@ -49,7 +49,7 @@ def test_read_kafka_live_broker_smoke():
         os.environ.get("KAFKA_TEST_TOPIC", "krishiv-test"),
         os.environ["KAFKA_BOOTSTRAP_SERVERS"],
     )
-    assert stream.with_watermark("ts", 5000) is not None
+    assert stream.withWatermark("ts", 5000) is not None
 
 
 @pytest.mark.integration

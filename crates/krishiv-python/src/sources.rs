@@ -115,7 +115,10 @@ pub fn read_kafka(
         };
         let gid = group_id.unwrap_or_else(|| "krishiv-default".to_string());
         // Register the topic as a SQL streaming table so `SELECT * FROM "{topic}"`
-        // works through the standard stream execution path.
+        // works through the standard stream execution path. rdkafka spawns the
+        // consumer's poll thread on creation and needs a live reactor, so enter
+        // the persistent global runtime first.
+        let _rt_guard = crate::RUNTIME.enter();
         session
             .inner
             .register_kafka_source(&topic, arrow_schema, &bootstrap_servers, &topic, gid)

@@ -1077,7 +1077,10 @@ def _apply() -> None:
         _parse_duration_ms(size), _parse_duration_ms(slide)
     )
     _SDF.sessionWindow = lambda self, gap: self.session_window(_parse_duration_ms(gap))
-    _SDF.writeStream = property(lambda self: self.write_stream())
+    # NB: no `_SDF.writeStream` alias — streaming sinks live on the source
+    # DataFrame (`df.write_stream()`); a windowed StreamingDataFrame is consumed
+    # via `.collect()` or `.execute_stream_async()`. Aliasing it here only
+    # produced a property that raised on access.
 
     # Phase 2: fluent STATELESS verbs on the streaming DataFrame — Spark's "same
     # DataFrame API for batch and streaming" (they push into the source stream
