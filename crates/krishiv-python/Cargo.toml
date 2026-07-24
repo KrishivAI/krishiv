@@ -42,7 +42,7 @@ tracing = { workspace = true }
 default = []
 extension-module = ["pyo3/extension-module"]
 kafka = ["krishiv-connectors/kafka", "krishiv-api/kafka"]
-iceberg = ["krishiv-connectors/iceberg"]
+iceberg = ["krishiv-connectors/iceberg", "krishiv-api/iceberg-sink"]
 kinesis = ["krishiv-connectors/kinesis"]
 pulsar = ["krishiv-connectors/pulsar-source"]
 cassandra = ["krishiv-connectors/cassandra"]

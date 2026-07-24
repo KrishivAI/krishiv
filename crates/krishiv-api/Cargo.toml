@@ -43,6 +43,13 @@ twox-hash = { workspace = true }
 
 [features]
 kafka = ["krishiv-connectors/kafka", "krishiv-runtime/kafka"]
+# Enables the checkpoint-aligned streaming Iceberg sink (format("iceberg")).
+iceberg-sink = ["krishiv-connectors/iceberg"]
+# Alias so downstream `krishiv-api/iceberg` resolves (krishiv-api has an optional
+# `iceberg` dependency whose implicit feature is suppressed by `dep:` syntax in
+# `iceberg-catalog`; without this explicit feature, a workspace-wide
+# `--features iceberg` from a dependent crate fails to resolve).
+iceberg = ["iceberg-sink"]
 # Enable Iceberg catalog integration (registers KrishivCatalog as DataFusion catalog provider).
 iceberg-catalog = [
     "dep:iceberg",

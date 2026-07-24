@@ -1151,12 +1151,129 @@ async fn run_streaming_task(
     }
 }
 
+/// Reused-across-epochs state for the transactional Iceberg sink dispatcher.
+#[cfg(feature = "iceberg-sink")]
+#[derive(Default)]
+struct IcebergDispatchState {
+    sink: Option<krishiv_connectors::lakehouse::streaming_sink::IcebergStreamingSink>,
+    /// Highest 2PC epoch already prepared. AvailableNow reuses epoch 0 across
+    /// micro-batches, so successive commits must still advance monotonically.
+    last_epoch: u64,
+}
+
+/// Drive one micro-batch through the checkpoint-aligned Iceberg 2PC sink.
+///
+/// `IcebergStreamingSink` owns its own current-thread runtime and blocks, so it
+/// is opened and driven on a `spawn_blocking` thread (never the async executor).
+/// The sink is staged, `pre_commit`ed and `commit_through`ed under a
+/// strictly-increasing epoch, giving each committed micro-batch its own Iceberg
+/// snapshot (exactly-once at the sink boundary).
+#[cfg(feature = "iceberg-sink")]
+fn iceberg_commit_epoch(
+    state: &Arc<Mutex<IcebergDispatchState>>,
+    options: &std::collections::HashMap<String, String>,
+    batches: Vec<RecordBatch>,
+    epoch: i64,
+) -> Result<()> {
+    use krishiv_common::async_util::block_on;
+    use krishiv_connectors::lakehouse::streaming_sink::{
+        schema_version_from_arrow, IcebergSinkMode, IcebergSinkTarget, IcebergStreamingSink,
+    };
+    use krishiv_connectors::two_phase::TransactionalSinkParticipant;
+
+    // Nothing to commit for an all-empty micro-batch.
+    let Some(schema) = batches.iter().find(|b| b.num_rows() > 0).map(|b| b.schema()) else {
+        return Ok(());
+    };
+
+    let root = options
+        .get("path")
+        .or_else(|| options.get("iceberg.path"))
+        .cloned()
+        .ok_or_else(|| KrishivError::InvalidConfig {
+            message: "iceberg sink requires option 'path' (the table root directory)".to_string(),
+        })?;
+    let table = options
+        .get("table")
+        .or_else(|| options.get("iceberg.table"))
+        .cloned()
+        .unwrap_or_else(|| "table".to_string());
+    let mode = match options.get("mode").map(|s| s.as_str()) {
+        Some("upsert") => IcebergSinkMode::Upsert,
+        _ => IcebergSinkMode::Append,
+    };
+    let key_columns: Vec<String> = options
+        .get("key_columns")
+        .map(|s| {
+            s.split(',')
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let op_column = options.get("op_column").cloned();
+    let target = IcebergSinkTarget {
+        root: root.into(),
+        table,
+        mode,
+        key_columns,
+        op_column: op_column.clone(),
+    };
+
+    // Strictly-increasing epoch for the 2PC prepare (see `last_epoch`).
+    let commit_epoch = {
+        let guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        (i64::max(epoch, 0) as u64).max(guard.last_epoch.saturating_add(1))
+    };
+
+    let state = state.clone();
+    block_on(async move {
+        // Move the sink onto the blocking thread and back — it must not be
+        // driven from the async executor.
+        let existing = state.lock().unwrap_or_else(|p| p.into_inner()).sink.take();
+        let joined = tokio::task::spawn_blocking(
+            move || -> krishiv_connectors::ConnectorResult<IcebergStreamingSink> {
+                let mut sink = match existing {
+                    Some(s) => s,
+                    None => {
+                        let sv =
+                            schema_version_from_arrow(schema.as_ref(), op_column.as_deref())?;
+                        IcebergStreamingSink::open(target, sv)?
+                    }
+                };
+                for batch in &batches {
+                    if batch.num_rows() > 0 {
+                        sink.stage(batch)?;
+                    }
+                }
+                sink.pre_commit(commit_epoch)?;
+                sink.commit_through(commit_epoch)?;
+                Ok(sink)
+            },
+        )
+        .await;
+        match joined {
+            Ok(Ok(sink)) => {
+                let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+                guard.sink = Some(sink);
+                guard.last_epoch = commit_epoch;
+                Ok(())
+            }
+            Ok(Err(e)) => Err(KrishivError::Runtime {
+                message: format!("iceberg sink: {e}"),
+            }),
+            Err(e) => Err(KrishivError::Runtime {
+                message: format!("iceberg sink task join: {e}"),
+            }),
+        }
+    })
+}
+
 /// Build a per-micro-batch sink closure that routes each batch to the
 /// configured [`StreamSinkFormat`], or to `foreach_fn` when no format is set.
 ///
-/// `options` is retained for future use (Kafka principal, Iceberg table id,
-/// Parquet base path) — currently only used by the `Memory` and `Console`
-/// sinks.
+/// `options` carries sink-specific settings (Kafka `bootstrap.servers`/`topic`,
+/// Parquet/Iceberg `path`, Iceberg `table`/`mode`/`key_columns`).
 fn build_sink_dispatcher(
     format: Option<StreamSinkFormat>,
     options: std::collections::HashMap<String, String>,
@@ -1174,9 +1291,17 @@ fn build_sink_dispatcher(
     #[cfg(feature = "kafka")]
     let kafka_sink: Arc<std::sync::Mutex<Option<krishiv_connectors::kafka::KafkaSink>>> =
         Arc::new(std::sync::Mutex::new(None));
-    // Without the kafka feature the `options` map is only read by the (compiled-out)
-    // Kafka branch, so keep it referenced to avoid an unused-variable warning.
-    #[cfg(not(feature = "kafka"))]
+    // Iceberg is a transactional (2PC / checkpoint-aligned) sink: it must be
+    // opened and driven off the async executor thread (it owns its own runtime),
+    // so the dispatcher hands each epoch to it via `spawn_blocking`. Reused
+    // across epochs so the table/runtime are opened once.
+    #[cfg(feature = "iceberg-sink")]
+    let iceberg_state: Arc<std::sync::Mutex<IcebergDispatchState>> =
+        Arc::new(std::sync::Mutex::new(IcebergDispatchState::default()));
+    // Without the kafka/iceberg features the `options` map is only read by the
+    // (compiled-out) sink branches, so keep it referenced to avoid an unused
+    // warning.
+    #[cfg(not(any(feature = "kafka", feature = "iceberg-sink")))]
     let _ = &options;
     move |batches, epoch| match format {
         Some(StreamSinkFormat::ForeachBatch) | None => {
@@ -1402,12 +1527,21 @@ fn build_sink_dispatcher(
             })?;
             Ok(())
         }
-        Some(StreamSinkFormat::Iceberg) => Err(KrishivError::Unsupported {
-            feature: "format(\"iceberg\") sink dispatch requires the checkpoint-barrier \
-                      protocol (IcebergStreamingSink is transactional / checkpoint-aligned). \
-                      Use foreach_batch() with an Iceberg writer, or the Kafka/Parquet sink."
-                .to_string(),
-        }),
+        Some(StreamSinkFormat::Iceberg) => {
+            #[cfg(feature = "iceberg-sink")]
+            {
+                iceberg_commit_epoch(&iceberg_state, &options, batches, epoch)
+            }
+            #[cfg(not(feature = "iceberg-sink"))]
+            {
+                let _ = &batches;
+                Err(KrishivError::Unsupported {
+                    feature: "format(\"iceberg\") requires the `iceberg-sink` Cargo feature \
+                              (pip install krishiv[iceberg]); or use foreach_batch()."
+                        .to_string(),
+                })
+            }
+        }
     }
 }
 

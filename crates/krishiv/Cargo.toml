@@ -75,7 +75,7 @@ state = ["krishiv-connectors/state"]
 cloud = ["krishiv-connectors/cloud"]
 # krishiv-sql no longer enables Iceberg by default, so the binary's iceberg
 # preset must re-enable it on the SQL layer to keep full/k8s builds unchanged.
-iceberg = ["krishiv-connectors/iceberg", "krishiv-sql/iceberg", "krishiv-executor/iceberg"]
+iceberg = ["krishiv-connectors/iceberg", "krishiv-sql/iceberg", "krishiv-executor/iceberg", "krishiv-api/iceberg-sink"]
 delta = ["krishiv-connectors/delta"]
 # jemalloc: replace the system allocator with jemalloc for lower contention and
 # smaller RSS on multi-threaded workloads. Enabled in all non-minimal presets.
