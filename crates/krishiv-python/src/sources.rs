@@ -8,7 +8,32 @@ use crate::dataframe::PyDataFrame;
 use crate::errors::ConnectorError;
 use crate::schema::validate_batch_against_schema_class;
 use crate::session::PySession;
-use crate::stream::PyStream;
+use crate::streaming_dataframe::PyStreamingDataFrame;
+
+/// Build a `StreamingDataFrame` over a SQL query against an engine-registered
+/// streaming source (Kafka/Kinesis/Pulsar/Iceberg). `watermark_col` empty means
+/// no event-time watermark is set. This is the single unified streaming entry —
+/// the old DataStream `Stream` classes were retired.
+#[cfg_attr(not(any(feature = "kafka", feature = "iceberg", feature = "kinesis", feature = "pulsar")), allow(dead_code))]
+fn streaming_df_from_sql(
+    session: &PySession,
+    sql: String,
+    watermark_col: &str,
+    lag_ms: u64,
+) -> PyResult<PyStreamingDataFrame> {
+    let df = session
+        .inner
+        .sql(sql)
+        .map_err(crate::errors::map_krishiv_error)?;
+    let mut sdf = PyStreamingDataFrame::new(df);
+    if !watermark_col.is_empty() {
+        sdf = sdf.with_event_time(watermark_col.to_string());
+        if lag_ms > 0 {
+            sdf = sdf.with_watermark_lag(lag_ms);
+        }
+    }
+    Ok(sdf)
+}
 
 #[pyfunction]
 #[pyo3(signature = (path, schema=None))]
@@ -69,7 +94,7 @@ pub fn read_kafka(
     bootstrap_servers: String,
     schema: Option<&Bound<'_, PyType>>,
     group_id: Option<String>,
-) -> PyResult<PyStream> {
+) -> PyResult<PyStreamingDataFrame> {
     #[cfg(not(feature = "kafka"))]
     {
         let _ = (session, &topic, &bootstrap_servers, schema, group_id);
@@ -96,12 +121,12 @@ pub fn read_kafka(
             .register_kafka_source(&topic, arrow_schema, &bootstrap_servers, &topic, gid)
             .map_err(crate::errors::map_krishiv_error)?;
         let escaped_topic = topic.replace('"', "\"\"");
-        Ok(PyStream::from_pipeline(
-            session.inner.clone(),
+        streaming_df_from_sql(
+            session,
             format!("SELECT * FROM \"{escaped_topic}\""),
-            String::new(),
+            "",
             0,
-        ))
+        )
     }
 }
 
@@ -120,7 +145,7 @@ pub fn read_iceberg(
     catalog_uri: String,
     table_name: String,
     schema: Option<&Bound<'_, PyType>>,
-) -> PyResult<PyStream> {
+) -> PyResult<PyStreamingDataFrame> {
     let _ = schema;
     #[cfg(not(feature = "iceberg"))]
     {
@@ -142,7 +167,7 @@ fn read_iceberg_impl(
     catalog_uri: String,
     table_name: String,
     schema: Option<&Bound<'_, PyType>>,
-) -> PyResult<PyStream> {
+) -> PyResult<PyStreamingDataFrame> {
     use crate::schema::PySchema;
     use std::sync::Arc;
 
@@ -201,7 +226,7 @@ fn read_iceberg_impl(
     // Validate catalog reachability via in-memory scan (empty table is OK).
     // Reuse the shared crate::RUNTIME instead of building a one-off runtime
     // per call, and release the GIL for the wait.
-    py.detach(|| {
+    let scanned = py.detach(|| {
         crate::RUNTIME.block_on(async {
             table
                 .scan(&_opts)
@@ -209,12 +234,15 @@ fn read_iceberg_impl(
                 .map_err(|e| ConnectorError::new_err(format!("Iceberg catalog error: {e}")))
         })
     })?;
-    Ok(PyStream::from_pipeline(
-        session.inner.clone(),
-        format!("iceberg:{}:{}", catalog_uri, table_ref.full_name()),
-        String::new(),
-        0,
-    ))
+    // Register the scanned rows as a SQL table so the source is a unified
+    // StreamingDataFrame (the old Stream/pipeline path was retired).
+    let table_name = format!("iceberg_{}", table_ref.full_name().replace('.', "_"));
+    session
+        .inner
+        .register_record_batches(&table_name, scanned)
+        .map_err(crate::errors::map_krishiv_error)?;
+    let escaped = table_name.replace('"', "\"\"");
+    streaming_df_from_sql(session, format!("SELECT * FROM \"{escaped}\""), "", 0)
 }
 
 // ── G13: Kinesis source ───────────────────────────────────────────────────────
@@ -242,7 +270,7 @@ pub fn read_kinesis(
     start_position: &str,
     max_batches: usize,
     batch_size: i32,
-) -> PyResult<PyStream> {
+) -> PyResult<PyStreamingDataFrame> {
     #[cfg(not(feature = "kinesis"))]
     {
         let _ = (
@@ -303,19 +331,15 @@ pub fn read_kinesis(
                         }
                     }
                     inner
-                        .register_memory_stream(&name, collected)
+                        .register_record_batches(&name, collected)
                         .map_err(krishiv_api::KrishivError::from)?;
                     Ok::<_, krishiv_api::KrishivError>(())
                 })
             })
             .map_err(crate::errors::map_krishiv_error)?;
         let _ = batches;
-        Ok(PyStream::from_pipeline(
-            session.inner.clone(),
-            format!("memory:{stream_name}"),
-            String::new(),
-            0,
-        ))
+        let escaped = stream_name.replace('"', "\"\"");
+        streaming_df_from_sql(session, format!("SELECT * FROM \"{escaped}\""), "", 0)
     }
 }
 
@@ -340,7 +364,7 @@ pub fn read_pulsar(
     subscription: &str,
     max_batches: usize,
     batch_size: usize,
-) -> PyResult<PyStream> {
+) -> PyResult<PyStreamingDataFrame> {
     #[cfg(not(feature = "pulsar"))]
     {
         let _ = (
@@ -382,17 +406,13 @@ pub fn read_pulsar(
                     }
                 }
                 inner
-                    .register_memory_stream(&name, collected)
+                    .register_record_batches(&name, collected)
                     .map_err(krishiv_api::KrishivError::from)
             })
         })
         .map_err(crate::errors::map_krishiv_error)?;
 
-        Ok(PyStream::from_pipeline(
-            session.inner.clone(),
-            format!("memory:{topic}"),
-            String::new(),
-            0,
-        ))
+        let escaped = topic.replace('"', "\"\"");
+        streaming_df_from_sql(session, format!("SELECT * FROM \"{escaped}\""), "", 0)
     }
 }

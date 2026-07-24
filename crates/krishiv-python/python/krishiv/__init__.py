@@ -29,10 +29,6 @@ from .krishiv import (  # noqa: F401
     Schema,
     SchemaError,
     Session,
-    Stream,
-    KeyedStream,
-    WindowedStream,
-    WindowSpec,
     StreamingDataFrame,
     AggExpr,
     Batch,
@@ -73,7 +69,6 @@ from .krishiv import (  # noqa: F401
 from .krishiv import sinks
 
 from .krishiv import agg
-from .krishiv import windows
 from . import functions
 from . import types
 from ._pyspark import Row, _apply as _apply_pyspark_compat
@@ -239,10 +234,6 @@ __all__ = [
     "GroupedDataFrame",
     "StreamingDataFrame",
     "Schema",
-    "Stream",
-    "KeyedStream",
-    "WindowedStream",
-    "WindowSpec",
     "LiveTable",
     "AggExpr",
     "Batch",
@@ -285,7 +276,6 @@ __all__ = [
     "agg",
     "functions",
     "types",
-    "windows",
     "udf",
     "Row",
     "SparkSession",
@@ -293,26 +283,6 @@ __all__ = [
     "JobStatus",
     "sinks",
 ]
-
-# Wrap __anext__ of Rust-defined async iterators to return coroutines
-# as required by newer Python versions (Python 3.13+)
-try:
-    from .krishiv import WindowedStream
-    _orig_windowed_anext = WindowedStream.__anext__
-    async def _new_windowed_anext(self):
-        # NOTE: unlike DataFrameStream below, WindowedStream is a PyO3
-        # `unsendable` pyclass (bound to the OS thread that created it), so
-        # its __anext__ cannot be offloaded to a thread-pool executor the
-        # way DataFrameStream's is -- pyo3 panics ("is unsendable, but sent
-        # to another thread") if it's touched from any other thread. The
-        # native __anext__ (stream.rs) still releases the GIL (py.detach)
-        # around its blocking recv, so other Python threads can make
-        # progress during the wait, but this call itself still blocks the
-        # calling event loop's thread until a batch arrives.
-        return _orig_windowed_anext(self)
-    WindowedStream.__anext__ = _new_windowed_anext
-except (ImportError, AttributeError):
-    pass
 
 try:
     from .krishiv import LiveTable

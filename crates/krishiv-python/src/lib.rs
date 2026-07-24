@@ -34,12 +34,11 @@ mod schema;
 mod session;
 mod sinks;
 mod sources;
-mod stream;
+mod stream_bridges;
 mod stream_exec;
 mod streaming;
 mod streaming_dataframe;
 mod udf;
-mod windows;
 
 mod vector_sinks;
 
@@ -68,10 +67,7 @@ pub use session::{PyOperationRegistry, PySession};
 pub use sinks::{
     PyCassandraSink, PyElasticsearchSink, PyHBaseSink, PyIcebergSink, PyKafkaSink, PyParquetSink,
 };
-pub use stream::{
-    PyBroadcastStream, PyConnectedStreams, PyKeyedStream, PyMultiSourceWatermarkSpec, PyStream,
-    PyWindowedStream,
-};
+pub use stream_bridges::PyBroadcastContext;
 pub use streaming::{
     PyDataStreamWriter, PyRemoteStreamingJob, PyStreamingQuery, PyStreamingQueryProgress,
 };
@@ -81,7 +77,6 @@ pub use vector_sinks::{
     PyInMemoryVectorSink, PyLanceDbSink, PyPgvectorSink, PyPineconeSink, PyQdrantSink,
     PyScoredChunk, PyWeaviateSink,
 };
-pub use windows::PyWindowSpec;
 
 // ---------------------------------------------------------------------------
 // Embedded Tokio runtime — shared by session async helpers and UDF bridge
@@ -115,20 +110,16 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<query_handle::PyQueryHandle>()?;
     m.add_class::<engine_job::PyEngineJobHandle>()?;
     m.add_class::<engine_job::PyRunningJob>()?;
-    m.add_class::<stream::PyStream>()?;
-    m.add_class::<stream::PyKeyedStream>()?;
-    m.add_class::<stream::PyWindowedStream>()?;
-    m.add_class::<stream::PyConnectedStreams>()?;
-    m.add_class::<stream::PyMultiSourceWatermarkSpec>()?;
-    m.add_class::<stream::PyBroadcastStream>()?;
-    m.add_class::<stream::PyBroadcastContext>()?;
+    // BroadcastContext is the callback context handed to `broadcast_process`
+    // handlers (the DataStream `Stream` classes were retired in favour of the
+    // unified StreamingDataFrame API).
+    m.add_class::<stream_bridges::PyBroadcastContext>()?;
     m.add_class::<batch::PyBatch>()?;
     m.add_class::<query_result::PyQueryResult>()?;
     m.add_class::<query_result::PyQueryResultIter>()?;
     m.add_class::<relation::PyRelation>()?;
     m.add_class::<job_status::PyJobStatus>()?;
     m.add_class::<schema::PySchema>()?;
-    m.add_class::<windows::PyWindowSpec>()?;
     m.add_class::<agg::PyAggExpr>()?;
     m.add_class::<incremental::PyDeltaBatch>()?;
     m.add_class::<incremental::PyIvmJob>()?;
@@ -225,7 +216,6 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     sinks::register_sinks_module(m.py(), m)?;
     agg::register_agg_module(m.py(), m)?;
-    windows::register_windows_module(m.py(), m)?;
     vector_sinks::register_ai_module(m.py(), m)?;
     metrics_api::register_metrics_module(m.py(), m)?;
 

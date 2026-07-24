@@ -15,6 +15,12 @@ impl PyStreamingDataFrame {
     pub fn new(df: krishiv_api::DataFrame) -> Self {
         Self { inner: df.stream() }
     }
+
+    /// Borrow the underlying engine `StreamingDataFrame` (e.g. to read its
+    /// execution spec when submitting a continuous job).
+    pub(crate) fn engine(&self) -> &krishiv_api::streaming_dataframe::StreamingDataFrame {
+        &self.inner
+    }
 }
 
 #[pymethods]
@@ -206,7 +212,7 @@ impl PyStreamingDataFrame {
         key_column: String,
         func: Py<PyAny>,
     ) -> PyResult<PyDataFrameStream> {
-        let bridge = crate::stream::co_bridge_from_func(py, &func)?;
+        let bridge = crate::stream_bridges::co_bridge_from_func(py, &func)?;
         let left_df = self.inner.source_df();
         let right_df = other.inner.source_df();
         let out = py.detach(move || -> PyResult<Vec<arrow::record_batch::RecordBatch>> {
@@ -245,7 +251,7 @@ impl PyStreamingDataFrame {
         key_column: String,
         func: Py<PyAny>,
     ) -> PyResult<PyDataFrameStream> {
-        let bridge = crate::stream::broadcast_bridge_from_func(py, &func)?;
+        let bridge = crate::stream_bridges::broadcast_bridge_from_func(py, &func)?;
         let keyed_df = self.inner.source_df();
         let broadcast_df = broadcast.inner.source_df();
         let out = py.detach(move || -> PyResult<Vec<arrow::record_batch::RecordBatch>> {

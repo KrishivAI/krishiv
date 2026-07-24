@@ -273,6 +273,13 @@ impl StreamingDataFrame {
             .map_err(KrishivError::from)
     }
 
+    /// The bounded-window execution spec this streaming DataFrame resolves to
+    /// (key + event time + window + aggregations), or `None` if no window has
+    /// been configured. Used to submit the DataFrame as a continuous job.
+    pub fn execution_spec(&self) -> Result<Option<LocalWindowExecutionSpec>> {
+        self.window_spec()
+    }
+
     /// Set watermark lag.
     pub fn with_watermark_lag(mut self, lag_ms: u64) -> Self {
         self.watermark_lag_ms = lag_ms;

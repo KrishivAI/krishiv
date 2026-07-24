@@ -21,8 +21,7 @@ use crate::live_table::PyLiveTable;
 use crate::pipeline::StreamPipeline;
 use crate::query_handle::PyQueryHandle;
 use crate::relation::PyRelation;
-use crate::stream::{PyStream, PyWindowedStream};
-use crate::stream_exec::spec_from_pipeline;
+use crate::streaming_dataframe::PyStreamingDataFrame;
 
 // ── G15 auth providers ────────────────────────────────────────────────────────────────
 
@@ -943,18 +942,23 @@ impl PySession {
     }
 
     #[pyo3(signature = (query, watermark_column, max_lateness_ms))]
+    /// Open a streaming DataFrame over a SQL query. The unified streaming entry
+    /// point (the old DataStream `Stream` classes were retired).
     pub fn stream(
         &self,
         query: String,
         watermark_column: String,
         max_lateness_ms: u64,
-    ) -> PyResult<PyStream> {
-        Ok(PyStream::from_pipeline(
-            self.inner.clone(),
-            query,
-            watermark_column,
-            max_lateness_ms,
-        ))
+    ) -> PyResult<PyStreamingDataFrame> {
+        let df = self.inner.sql(query).map_err(map_krishiv_error)?;
+        let mut sdf = PyStreamingDataFrame::new(df);
+        if !watermark_column.is_empty() {
+            sdf = sdf.with_event_time(watermark_column);
+            if max_lateness_ms > 0 {
+                sdf = sdf.with_watermark_lag(max_lateness_ms);
+            }
+        }
+        Ok(sdf)
     }
 
     #[pyo3(signature = (name_or_callable, callable=None, *, input_types=None, output_type=None, output_name=None))]
@@ -1077,7 +1081,7 @@ impl PySession {
         crate::pipeline_api::PyPipeline::new((*self.inner).clone(), name)
     }
 
-    /// Create a [`PyStream`] backed by in-memory batches (supports windowed `collect()` / `async for`).
+    /// Create a StreamingDataFrame backed by in-memory batches.
     #[pyo3(signature = (name, batches, watermark_column, max_lateness_ms))]
     pub fn memory_stream(
         &self,
@@ -1085,14 +1089,25 @@ impl PySession {
         batches: Vec<PyBatch>,
         watermark_column: String,
         max_lateness_ms: u64,
-    ) -> PyResult<PyStream> {
-        PyStream::from_memory(
-            self.inner.clone(),
-            name,
-            watermark_column,
-            max_lateness_ms,
-            batches,
-        )
+    ) -> PyResult<PyStreamingDataFrame> {
+        let record_batches: Vec<arrow::record_batch::RecordBatch> =
+            batches.iter().map(|b| b.record_batch().clone()).collect();
+        self.inner
+            .register_record_batches(&name, record_batches)
+            .map_err(map_krishiv_error)?;
+        let escaped = name.replace('"', "\"\"");
+        let df = self
+            .inner
+            .sql(format!("SELECT * FROM \"{escaped}\""))
+            .map_err(map_krishiv_error)?;
+        let mut sdf = PyStreamingDataFrame::new(df);
+        if !watermark_column.is_empty() {
+            sdf = sdf.with_event_time(watermark_column);
+            if max_lateness_ms > 0 {
+                sdf = sdf.with_watermark_lag(max_lateness_ms);
+            }
+        }
+        Ok(sdf)
     }
 
     pub fn memory_stream_collect(
@@ -1182,8 +1197,22 @@ impl PySession {
     }
 
     /// Submit a continuous streaming job. Returns the job id handle.
-    pub fn submit_stream_job(&self, name: String, stream: &PyWindowedStream) -> PyResult<String> {
-        let spec = spec_from_pipeline(&stream.pipeline)?;
+    /// `stream` must be a windowed StreamingDataFrame (`key_by` + window + agg).
+    pub fn submit_stream_job(
+        &self,
+        name: String,
+        stream: &PyStreamingDataFrame,
+    ) -> PyResult<String> {
+        let spec = stream
+            .engine()
+            .execution_spec()
+            .map_err(map_krishiv_error)?
+            .ok_or_else(|| {
+                PyRuntimeError::new_err(
+                    "submit_stream_job requires a windowed StreamingDataFrame \
+                     (use .with_event_time(..).key_by(..).tumbling_window(..).agg(..))",
+                )
+            })?;
         self.inner
             .submit_stream_job(name, spec)
             .map_err(map_krishiv_error)

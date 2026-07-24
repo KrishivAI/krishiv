@@ -1058,11 +1058,7 @@ def _apply() -> None:
     # ("10 minutes") or an int of milliseconds via _parse_duration_ms — which
     # also removes the native seconds-vs-milliseconds mismatch (`tumbling_window`
     # is seconds on Stream but milliseconds on StreamingDataFrame).
-    from .krishiv import (  # noqa: PLC0415
-        Stream as _Stream,
-        KeyedStream as _KeyedStream,
-        StreamingDataFrame as _SDF,
-    )
+    from .krishiv import StreamingDataFrame as _SDF  # noqa: PLC0415
 
     # -- Structured Streaming surface (the primary, "easier" one) --
     _SDF.withWatermark = lambda self, eventTimeColumn, delayThreshold: (
@@ -1115,35 +1111,3 @@ def _apply() -> None:
     # instead of a separate Stream/KeyedStream hierarchy. Requires keyBy(...).
     _SDF.transformWithState = lambda self, handler: self.transform_with_state(handler)
 
-    # -- DataStream surface: unit-consistent camelCase windows + one watermark --
-    _Stream.withWatermark = lambda self, column, delayThreshold: self.with_watermark(
-        column, _parse_duration_ms(delayThreshold)
-    )
-    for _cls in (_Stream, _KeyedStream):
-        _cls.tumblingWindow = lambda self, duration: self.tumbling_window_ms(
-            _parse_duration_ms(duration)
-        )
-        _cls.slidingWindow = lambda self, size, slide: self.sliding_window_ms(
-            _parse_duration_ms(size), _parse_duration_ms(slide)
-        )
-        _cls.sessionWindow = lambda self, gap: self.session_window_ms(
-            _parse_duration_ms(gap)
-        )
-    _Stream.keyBy = lambda self, *columns: self.key_by(*columns)
-
-    # Deprecate the pure-redundant Stream.watermark alias (identical to
-    # with_watermark) in favour of the canonical withWatermark.
-    _orig_stream_watermark = _Stream.watermark
-
-    def _stream_watermark_deprecated(self, column, max_lateness_ms):
-        import warnings  # noqa: PLC0415
-
-        warnings.warn(
-            "Stream.watermark() is deprecated; use withWatermark(col, delay) "
-            "(delay may be an int of ms or a string like '5 minutes').",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return _orig_stream_watermark(self, column, max_lateness_ms)
-
-    _Stream.watermark = _stream_watermark_deprecated
