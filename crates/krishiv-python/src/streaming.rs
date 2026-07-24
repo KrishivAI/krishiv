@@ -13,12 +13,13 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
+use krishiv_api::streaming_builder::{StreamSinkFormat, StreamingQueryState};
 use krishiv_api::{
     DataFrame, ForeachBatchFn, StreamingOutputMode, StreamingQuery, StreamingTrigger,
 };
@@ -76,14 +77,48 @@ impl PyStreamingQueryProgress {
 /// Returned by :py:meth:`DataStreamWriter.start`.
 #[pyclass(name = "StreamingQuery")]
 pub struct PyStreamingQuery {
-    inner: Arc<Mutex<StreamingQuery>>,
+    // All `StreamingQuery` methods are `&self`, so no Mutex is needed; the
+    // `Arc` lets `StreamingQueryManager.get()` hand back the same live handle.
+    inner: Arc<StreamingQuery>,
 }
 
 impl PyStreamingQuery {
     pub fn new(q: StreamingQuery) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(q)),
+            inner: Arc::new(q),
         }
+    }
+
+    pub(crate) fn from_arc(inner: Arc<StreamingQuery>) -> Self {
+        Self { inner }
+    }
+}
+
+fn progress_to_py(p: krishiv_api::streaming_builder::StreamingQueryProgress) -> PyStreamingQueryProgress {
+    PyStreamingQueryProgress {
+        epoch: p.epoch,
+        input_rows: p.input_rows,
+        output_rows: p.output_rows,
+        trigger: p.trigger,
+    }
+}
+
+fn output_mode_str(m: StreamingOutputMode) -> &'static str {
+    match m {
+        StreamingOutputMode::Append => "append",
+        StreamingOutputMode::Update => "update",
+        StreamingOutputMode::Complete => "complete",
+    }
+}
+
+fn sink_format_str(f: StreamSinkFormat) -> &'static str {
+    match f {
+        StreamSinkFormat::ForeachBatch => "foreach_batch",
+        StreamSinkFormat::Kafka => "kafka",
+        StreamSinkFormat::Parquet => "parquet",
+        StreamSinkFormat::Iceberg => "iceberg",
+        StreamSinkFormat::Console => "console",
+        StreamSinkFormat::Memory => "memory",
     }
 }
 
@@ -91,28 +126,17 @@ impl PyStreamingQuery {
 impl PyStreamingQuery {
     /// The query's unique ID string.
     fn id(&self) -> String {
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .id()
-            .to_string()
+        self.inner.id().to_string()
     }
 
     /// The query name if one was set.
     fn name(&self) -> Option<String> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .name()
-            .map(str::to_string)
+        self.inner.name().map(str::to_string)
     }
 
     /// ``True`` if the query is still running.
     fn is_active(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .is_active()
+        self.inner.is_active()
     }
 
     /// Request the query to stop.
@@ -120,7 +144,7 @@ impl PyStreamingQuery {
     /// Returns immediately; the background task may finish the current
     /// micro-batch before it actually stops.
     fn stop(&self) {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner()).stop();
+        self.inner.stop();
     }
 
     /// Block until the query terminates.
@@ -134,24 +158,17 @@ impl PyStreamingQuery {
         // so other Python threads are not frozen.
         py.detach(move || {
             RUNTIME.block_on(async move {
-                // Poll the is_active flag until done, respecting timeout.
                 let deadline =
                     timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
                 loop {
-                    {
-                        let guard = q.lock().unwrap_or_else(|p| p.into_inner());
-                        if !guard.is_active() {
-                            // Distinguish a clean stop from a failure: a failed
-                            // query (e.g. a sink write error) must raise, not
-                            // return Ok — otherwise a silently-dropped write
-                            // looks successful.
-                            return match guard.exception() {
-                                Some(msg) => Err(krishiv_api::KrishivError::Runtime {
-                                    message: msg,
-                                }),
-                                None => Ok(()),
-                            };
-                        }
+                    if !q.is_active() {
+                        // Distinguish a clean stop from a failure: a failed query
+                        // (e.g. a sink write error) must raise, not return Ok —
+                        // otherwise a silently-dropped write looks successful.
+                        return match q.exception() {
+                            Some(msg) => Err(krishiv_api::KrishivError::Runtime { message: msg }),
+                            None => Ok(()),
+                        };
                     }
                     if let Some(d) = deadline {
                         if tokio::time::Instant::now() >= d {
@@ -170,25 +187,70 @@ impl PyStreamingQuery {
 
     /// Return the latest progress snapshot, if any micro-batch has run.
     fn last_progress(&self) -> Option<PyStreamingQueryProgress> {
+        self.inner.last_progress().map(progress_to_py)
+    }
+
+    /// The last `n` progress snapshots, most recent last (Spark ``recentProgress``).
+    #[pyo3(signature = (n=10))]
+    fn recent_progress(&self, n: usize) -> Vec<PyStreamingQueryProgress> {
         self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .last_progress()
-            .map(|p| PyStreamingQueryProgress {
-                epoch: p.epoch,
-                input_rows: p.input_rows,
-                output_rows: p.output_rows,
-                trigger: p.trigger,
-            })
+            .recent_progress(n)
+            .into_iter()
+            .map(progress_to_py)
+            .collect()
+    }
+
+    /// The failure message iff the query is in a Failed state, else ``None``.
+    fn exception(&self) -> Option<String> {
+        self.inner.exception()
+    }
+
+    /// The configured output mode: ``"append"`` / ``"update"`` / ``"complete"``.
+    fn output_mode(&self) -> &'static str {
+        output_mode_str(self.inner.output_mode())
+    }
+
+    /// The configured sink format (``"kafka"``, ``"parquet"``, …), if any.
+    fn format(&self) -> Option<&'static str> {
+        self.inner.format().map(sink_format_str)
+    }
+
+    /// A status dict: ``state`` (active/stopped/failed), ``output_mode``,
+    /// ``trigger``, ``exception``, and ``last_progress``.
+    fn status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let s = self.inner.status();
+        let d = pyo3::types::PyDict::new(py);
+        let state = match &s.state {
+            StreamingQueryState::Active => "active",
+            StreamingQueryState::Stopped => "stopped",
+            StreamingQueryState::Failed(_) => "failed",
+        };
+        d.set_item("state", state)?;
+        d.set_item("output_mode", output_mode_str(s.output_mode))?;
+        d.set_item("trigger", s.trigger)?;
+        d.set_item("exception", s.exception)?;
+        match s.last_progress.map(progress_to_py) {
+            Some(p) => d.set_item("last_progress", pyo3::Py::new(py, p)?)?,
+            None => d.set_item("last_progress", py.None())?,
+        }
+        Ok(d)
+    }
+
+    /// The rows written to the in-memory sink (``format("memory")``).
+    fn memory_batches(&self) -> Vec<PyBatch> {
+        self.inner
+            .memory_batches()
+            .into_iter()
+            .map(PyBatch::from_record_batch)
+            .collect()
     }
 
     fn __repr__(&self) -> String {
-        let q = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         format!(
             "StreamingQuery(id={}, name={:?}, active={})",
-            q.id(),
-            q.name(),
-            q.is_active()
+            self.inner.id(),
+            self.inner.name(),
+            self.inner.is_active()
         )
     }
 }
@@ -271,6 +333,21 @@ impl PyStreamingQueryManager {
     /// Number of currently-active queries known to this manager.
     fn active_count(&self) -> usize {
         self.inner.active_count()
+    }
+
+    /// IDs of all queries this manager currently tracks (Spark ``sqm.active``).
+    fn active_ids(&self) -> Vec<String> {
+        self.inner.active_ids()
+    }
+
+    /// Look up a tracked query by its id (Spark ``sqm.get(id)``).
+    fn get(&self, id: &str) -> Option<PyStreamingQuery> {
+        self.inner.get(id).map(PyStreamingQuery::from_arc)
+    }
+
+    /// Look up a tracked query by its name.
+    fn get_by_name(&self, name: &str) -> Option<PyStreamingQuery> {
+        self.inner.get_by_name(name).map(PyStreamingQuery::from_arc)
     }
 }
 
@@ -358,6 +435,12 @@ impl PyDataStreamWriter {
     /// Set an arbitrary sink option (e.g. ``checkpoint.location``).
     #[pyo3(signature = (key, value))]
     fn option(&mut self, key: String, value: String) {
+        self.options.insert(key, value);
+    }
+
+    /// Alias for :meth:`option` — set a format-specific sink option (e.g.
+    /// ``format_option("kafka.bootstrap.servers", …)``).
+    fn format_option(&mut self, key: String, value: String) {
         self.options.insert(key, value);
     }
 

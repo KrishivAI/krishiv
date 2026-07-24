@@ -3,6 +3,8 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use krishiv_plan::window::{AggFilterCompareOp, AggFilterValue, FloatLiteral, WindowAggFilter};
+
 use crate::errors::QueryError;
 
 #[derive(Debug, Clone)]
@@ -10,6 +12,44 @@ pub struct AggDescriptor {
     pub function: AggKind,
     pub input_column: Option<String>,
     pub output_name: String,
+    /// Optional per-aggregate row predicate — the `AGG(x) FILTER (WHERE …)`
+    /// / conditional-aggregate lowering. Rows failing it don't feed the agg.
+    pub filter: Option<WindowAggFilter>,
+}
+
+fn parse_filter_op(op: &str) -> PyResult<AggFilterCompareOp> {
+    Ok(match op {
+        "=" | "==" => AggFilterCompareOp::Eq,
+        "!=" | "<>" => AggFilterCompareOp::NotEq,
+        "<" => AggFilterCompareOp::Lt,
+        "<=" => AggFilterCompareOp::LtEq,
+        ">" => AggFilterCompareOp::Gt,
+        ">=" => AggFilterCompareOp::GtEq,
+        other => {
+            return Err(QueryError::new_err(format!(
+                "unknown filter op '{other}'; use one of =, !=, <, <=, >, >="
+            )));
+        }
+    })
+}
+
+fn parse_filter_value(v: &Bound<'_, PyAny>) -> PyResult<AggFilterValue> {
+    // bool before int: Python bool is an int subclass.
+    if let Ok(b) = v.extract::<bool>() {
+        return Ok(AggFilterValue::Bool(b));
+    }
+    if let Ok(i) = v.extract::<i64>() {
+        return Ok(AggFilterValue::Int(i));
+    }
+    if let Ok(f) = v.extract::<f64>() {
+        return Ok(AggFilterValue::Float(FloatLiteral(f)));
+    }
+    if let Ok(s) = v.extract::<String>() {
+        return Ok(AggFilterValue::Utf8(s));
+    }
+    Err(QueryError::new_err(
+        "filter value must be str, int, float, or bool",
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +71,36 @@ pub struct PyAggExpr {
     pub input_column: Option<String>,
     #[pyo3(get)]
     pub output_name: String,
+    pub filter: Option<WindowAggFilter>,
+}
+
+#[pymethods]
+impl PyAggExpr {
+    /// Restrict this aggregate to rows where ``column <op> value`` — the
+    /// ``AGG(x) FILTER (WHERE …)`` / conditional-aggregate form. ``op`` is one
+    /// of ``= != < <= > >=``; ``value`` may be a str, int, float, or bool.
+    ///
+    /// e.g. ``ks.agg.sum("amount").filter("status", "=", "paid")``.
+    #[pyo3(signature = (column, op, value))]
+    fn filter(&self, column: String, op: String, value: Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self {
+            filter: Some(WindowAggFilter::Compare {
+                column,
+                op: parse_filter_op(&op)?,
+                value: parse_filter_value(&value)?,
+            }),
+            ..self.clone()
+        })
+    }
+
+    /// Restrict this aggregate to rows where ``column`` is not null.
+    #[pyo3(signature = (column))]
+    fn filter_not_null(&self, column: String) -> Self {
+        Self {
+            filter: Some(WindowAggFilter::IsNotNull { column }),
+            ..self.clone()
+        }
+    }
 }
 
 impl PyAggExpr {
@@ -59,6 +129,7 @@ impl PyAggExpr {
             function,
             input_column: self.input_column,
             output_name: self.output_name,
+            filter: self.filter,
         })
     }
 }
@@ -68,6 +139,7 @@ fn make_agg(function: &str, column: Option<String>, output_name: String) -> PyAg
         function: function.to_string(),
         input_column: column,
         output_name,
+        filter: None,
     }
 }
 

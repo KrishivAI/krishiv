@@ -121,6 +121,16 @@ impl PyStreamingDataFrame {
         }
     }
 
+    /// Like :meth:`drop_duplicates`, but keeps the seen-keys set in **durable,
+    /// state-backed** storage (RocksDB) so deduplication survives across an
+    /// unbounded stream (and restarts) instead of an in-memory set.
+    #[pyo3(signature = (*, subset))]
+    pub fn drop_duplicates_with_state(&self, subset: Vec<String>) -> Self {
+        Self {
+            inner: self.inner.clone().drop_duplicates_with_state(subset),
+        }
+    }
+
     // ── Stateless transforms (before windowing) — Spark's "same DataFrame API
     // for batch and streaming". Delegate to the underlying DataFrame. ──
     pub fn select(&self, columns: Vec<String>) -> PyResult<Self> {
@@ -293,6 +303,30 @@ impl PyStreamingDataFrame {
             })
             .map_err(map_krishiv_error)?;
         Ok(PyDataFrameStream::from_stream(stream))
+    }
+
+    /// Run the pipeline and return ``(main_stream, late_stream)``: records that
+    /// fall past the side-output lateness threshold are routed to
+    /// ``late_stream`` instead of being dropped. Requires
+    /// :meth:`with_side_output`. Poll both streams concurrently.
+    pub fn execute_stream_with_side_output_async(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<(PyDataFrameStream, PyDataFrameStream)> {
+        let inner = self.inner.clone();
+        let (main, late) = py
+            .detach(move || {
+                crate::session::block_on_async(async move {
+                    let streams = inner.execute_stream_with_side_output_async().await?;
+                    let (main, side) = streams.into_parts();
+                    Ok::<_, krishiv_api::KrishivError>((main, side.into_stream()))
+                })
+            })
+            .map_err(map_krishiv_error)?;
+        Ok((
+            PyDataFrameStream::from_stream(main),
+            PyDataFrameStream::from_stream(late),
+        ))
     }
 
     pub fn write_stream(&self) -> PyResult<crate::streaming::PyDataStreamWriter> {

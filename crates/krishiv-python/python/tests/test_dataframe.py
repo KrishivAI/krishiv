@@ -363,7 +363,9 @@ def test_sample(session):
         "UNION ALL SELECT 4 UNION ALL SELECT 5"
     )
     result = df.sample(0.5).collect()
-    assert 1 <= result.row_count <= 5
+    # sampling is probabilistic — a 50% sample of 5 rows can return anywhere
+    # from 0 to 5 rows (previously asserted >= 1, which flaked ~3% of runs).
+    assert 0 <= result.row_count <= 5
 
 
 def test_sample_full(session):

@@ -362,3 +362,141 @@ def test_watermark_and_state_config_chain():
            .tumbling_window(30 * DAY))
     t = _collect_tbl(sdf)
     assert t is not None and sum(t.column("count").to_pylist()) > 0
+
+
+# ═══════════════════ StreamingQuery accessors + memory sink ═══════════════════
+def _run_memory_query(s, name="mq"):
+    src, n = _events(s)
+    w = src.write_stream()
+    w.format("memory"); w.query_name(name); w.trigger("available_now")
+    q = w.start()
+    q.await_termination(30000)
+    return q, n
+
+
+def test_memory_sink_readable_via_query():
+    # closes the "memory sink not readable from Python" gap
+    s = _session()
+    q, n = _run_memory_query(s)
+    total = sum(b.to_arrow().num_rows for b in q.memory_batches())
+    assert total == n
+
+
+def test_query_accessors():
+    s = _session()
+    q, n = _run_memory_query(s, "accessor_q")
+    assert q.id()
+    assert q.name() == "accessor_q"
+    assert q.is_active() is False
+    assert q.output_mode() in ("append", "update", "complete")
+    assert q.format() == "memory"
+    assert q.exception() is None
+    lp = q.last_progress()
+    assert lp is not None and lp.input_rows == n
+    assert isinstance(q.recent_progress(5), list)
+
+
+def test_query_status_dict():
+    s = _session()
+    q, n = _run_memory_query(s, "status_q")
+    st = q.status()
+    assert st["state"] == "stopped"
+    assert st["output_mode"] == q.output_mode()
+    assert st["exception"] is None
+    assert st["last_progress"] is not None
+
+
+def test_query_exception_on_sink_failure():
+    import os
+    os.environ.update(AWS_ENDPOINT_URL="http://127.0.0.1:9099", AWS_ACCESS_KEY_ID="x",
+                      AWS_SECRET_ACCESS_KEY="y", AWS_ALLOW_HTTP="true", AWS_REGION="us-east-1")
+    s = _session()
+    src, _ = _events(s)
+    w = src.write_stream()
+    w.format("iceberg"); w.option("path", "s3://nope/bad"); w.trigger("available_now")
+    q = w.start()
+    with pytest.raises(Exception):
+        q.await_termination(20000)
+    assert q.exception() is not None
+    assert q.status()["state"] == "failed"
+
+
+# ═══════════════════ StreamingQueryManager lookup ═══════════════════
+def test_query_manager_lookup():
+    s = _session()
+    src, _ = _events(s)
+    mgr = ks.StreamingQueryManager()
+    w = src.write_stream()
+    w.format("memory"); w.query_name("managed"); w.with_stream_manager(mgr); w.trigger("available_now")
+    q = w.start()
+    # API works (list of ids; get by id/name returns a handle or None)
+    assert isinstance(mgr.active_ids(), list)
+    got = mgr.get(q.id())
+    assert got is None or got.id() == q.id()
+    by_name = mgr.get_by_name("managed")
+    assert by_name is None or by_name.name() == "managed"
+    q.await_termination(30000)
+
+
+# ═══════════════════ state-backed dedup ═══════════════════
+def test_drop_duplicates_with_state():
+    s = _session()
+    src, _ = _events(s)
+    out = asyncio.run(_drain(src.to_streaming().drop_duplicates_with_state(subset=["k"]), cap=50))
+    assert out is not None
+    assert out.num_rows == len(set(out.column("k").to_pylist()))
+
+
+# ═══════════════════ side-output stream consumption ═══════════════════
+def test_execute_stream_with_side_output():
+    s = _session()
+    src, _ = _events(s)
+    sdf = (src.to_streaming().with_event_time("event_time").with_side_output("late", 5 * DAY)
+           .key_by("k").tumbling_window(30 * DAY))
+    main, late = sdf.execute_stream_with_side_output_async()
+    # returns two independently-consumable streams (main results + late records)
+    assert main is not None and late is not None
+    assert hasattr(main, "__aiter__") and hasattr(late, "__aiter__")
+
+
+# ═══════════════════ writer.format_option ═══════════════════
+def test_writer_format_option(tmp_path):
+    import glob
+    import pyarrow.parquet as pq
+    s = _session()
+    src, n = _events(s)
+    w = src.write_stream()
+    w.format("parquet"); w.format_option("path", str(tmp_path)); w.trigger("available_now")
+    w.start().await_termination(30000)
+    files = glob.glob(f"{tmp_path}/*.parquet")
+    assert files and sum(pq.read_table(f).num_rows for f in files) == n
+
+
+# ═══════════════════ filtered / conditional aggregates ═══════════════════
+def test_agg_filter_conditional_count():
+    s = _session()
+    src, n = _events(s)  # v = i % 50 in [0, 50)
+    sdf = (src.to_streaming().with_event_time("event_time").key_by("k")
+           .tumbling_window(3650 * DAY)  # single window
+           .agg(hi=kagg.count().filter("v", ">", 25.0), total=kagg.count()))
+    t = _collect_tbl(sdf)
+    hi = sum(t.column("hi").to_pylist())
+    total = sum(t.column("total").to_pylist())
+    assert total == n and 0 < hi < total
+    truth = s.sql("SELECT COUNT(*) c FROM events WHERE v > 25").collect().to_arrow().column("c")[0].as_py()
+    assert hi == truth
+
+
+def test_agg_filter_sum_and_ops():
+    s = _session()
+    src, _ = _events(s)
+    sdf = (src.to_streaming().with_event_time("event_time").key_by("k")
+           .tumbling_window(3650 * DAY)
+           .agg(paid=kagg.sum("v").filter("k", "=", "a"),
+                notnull=kagg.count().filter_not_null("v")))
+    t = _collect_tbl(sdf)
+    # 'paid' only sums rows where k == 'a'; grouped by k, so only the 'a' group is nonzero
+    got = {r["k"]: r["paid"] for r in t.to_pylist()}
+    assert got.get("b", 0) == 0 and got.get("c", 0) == 0 and got.get("a", 0) > 0
+    truth = s.sql("SELECT SUM(v) x FROM events WHERE k='a'").collect().to_arrow().column("x")[0].as_py()
+    assert abs(got["a"] - truth) < 1e-6

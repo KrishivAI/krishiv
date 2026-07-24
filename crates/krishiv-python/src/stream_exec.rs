@@ -22,7 +22,7 @@ pub(crate) fn agg_descriptor_to_expr(desc: &AggDescriptor) -> AggExpr {
         AggKind::Mean => AggFunction::Avg,
     };
     AggExpr {
-        filter: None,
+        filter: desc.filter.clone(),
         function,
         input_column: desc.input_column.clone().unwrap_or_default(),
         output_column: desc.output_name.clone(),
