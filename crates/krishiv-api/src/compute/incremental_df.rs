@@ -25,6 +25,7 @@ pub struct IncrementalDataFrame {
     _registry: Option<SharedIvmJobRegistry>,
     view: String,
     sources: Vec<String>,
+    output_schema: SchemaRef,
 }
 
 impl IncrementalDataFrame {
@@ -44,7 +45,7 @@ impl IncrementalDataFrame {
         let spec = IncrementalViewSpec {
             name: name.to_string(),
             body_sql,
-            output_schema,
+            output_schema: output_schema.clone(),
             is_materialized: true,
             is_recursive: false,
             lateness: Vec::new(),
@@ -60,7 +61,12 @@ impl IncrementalDataFrame {
                 (IvmJob::remote(&url, name).await?, None)
             }
             ExecutionMode::Embedded | ExecutionMode::SingleNode => {
-                let registry: SharedIvmJobRegistry = Arc::new(IvmJobRegistry::new());
+                // shards=1 disables auto-partitioning: an IncrementalDataFrame job
+                // may gain derived views (Session::view view-DAG), and a partitioned
+                // job does not cascade to downstream views. Composition correctness
+                // outweighs single-view sharding here (in-process anyway).
+                let registry: SharedIvmJobRegistry =
+                    Arc::new(IvmJobRegistry::with_default_shards(1));
                 let job = IvmJob::embedded(&registry, name)?;
                 (job, Some(registry))
             }
@@ -71,7 +77,49 @@ impl IncrementalDataFrame {
             _registry: registry,
             view: name.to_string(),
             sources,
+            output_schema,
         })
+    }
+
+    /// Co-register a derived view into an existing base `job` (view-DAG): the
+    /// derived view's SQL references the base view by name, so the engine
+    /// executes them in topological order and a feed to the base cascades here.
+    /// Reached via `Session::view(iv)` + `to_incremental`.
+    pub(crate) async fn derive_on_job(
+        job: IvmJob,
+        name: &str,
+        body_sql: String,
+        output_schema: SchemaRef,
+    ) -> Result<Self> {
+        let sources = extract_source_names(&body_sql);
+        let spec = IncrementalViewSpec {
+            name: name.to_string(),
+            body_sql,
+            output_schema: output_schema.clone(),
+            is_materialized: true,
+            is_recursive: false,
+            lateness: Vec::new(),
+        };
+        job.register_view(spec).await?;
+        Ok(Self {
+            job,
+            _registry: None,
+            view: name.to_string(),
+            sources,
+            output_schema,
+        })
+    }
+
+    /// The underlying IVM job handle — for co-registering derived views into the
+    /// same job (`Session::view`).
+    pub fn shared_job(&self) -> IvmJob {
+        self.job.clone()
+    }
+
+    /// The view's declared output schema (used by `Session::view` to register the
+    /// base view as a client-side source for planning the derived query).
+    pub fn output_schema(&self) -> SchemaRef {
+        self.output_schema.clone()
     }
 
     /// Feed a change to a source. `source` may be omitted only when the view has
@@ -158,10 +206,15 @@ fn extract_source_names(sql: &str) -> Vec<String> {
             if rest.starts_with('(') {
                 continue; // subquery, not a base table
             }
-            let token: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
-                .collect();
+            // The unparser quotes reserved-word table names (e.g. `"returns"`);
+            // read the quoted identifier, otherwise a bare identifier.
+            let token: String = if let Some(inner) = rest.strip_prefix('"') {
+                inner.chars().take_while(|c| *c != '"').collect()
+            } else {
+                rest.chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+                    .collect()
+            };
             if !token.is_empty() && !out.contains(&token) {
                 out.push(token);
             }
@@ -184,6 +237,15 @@ mod tests {
     fn extracts_join_sources_and_dedups() {
         let s = extract_source_names(
             "SELECT o.k FROM orders o JOIN returns r ON o.k = r.k JOIN orders o2 ON o2.k = r.k",
+        );
+        assert_eq!(s, vec!["orders".to_string(), "returns".to_string()]);
+    }
+
+    #[test]
+    fn extracts_quoted_identifiers() {
+        // The unparser quotes reserved-word table names.
+        let s = extract_source_names(
+            "SELECT o.k FROM orders AS o JOIN \"returns\" AS r ON o.k = r.k",
         );
         assert_eq!(s, vec!["orders".to_string(), "returns".to_string()]);
     }

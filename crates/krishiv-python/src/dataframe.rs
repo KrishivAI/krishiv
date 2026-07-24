@@ -578,6 +578,18 @@ impl PyDataFrame {
         ))
     }
 
+    /// Internal (`Session.view`): tag this DataFrame as reading `iv`'s view
+    /// output so `to_incremental` co-registers the derived view into `iv`'s job
+    /// (the live view-DAG cascade).
+    pub fn _with_ivm_parent(
+        &self,
+        iv: PyRef<'_, crate::incremental_dataframe::PyIncrementalDataFrame>,
+    ) -> PyDataFrame {
+        PyDataFrame {
+            inner: self.inner.clone().with_ivm_parent(iv.inner.shared_job()),
+        }
+    }
+
     /// Return the schema as a list of `(column_name, arrow_type)` pairs.
     ///
     /// Example:

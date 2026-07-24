@@ -212,6 +212,11 @@ pub struct DataFrame {
     /// used by `to_incremental` to reach the coordinator's IVM management API in
     /// distributed mode. `None` in embedded mode.
     coordinator_http_url: Option<String>,
+    /// Set by `Session::view(iv)` when this DataFrame reads an existing
+    /// incremental view's output: `to_incremental` co-registers the derived view
+    /// into this base job (same registry / coordinator job) so a feed to the base
+    /// cascades to it — the live view-DAG. `None` for a normal root DataFrame.
+    ivm_parent: Option<crate::IvmJob>,
     runtime: Arc<dyn ExecutionRuntime>,
     registered_parquet: Arc<DashMap<String, PathBuf>>,
     /// When set, this DataFrame was produced by `cache()` / `persist()` and
@@ -314,6 +319,7 @@ impl DataFrame {
             next_job_id: Arc::new(AtomicU64::new(1)),
             _coordinator_url: None,
             coordinator_http_url: None,
+            ivm_parent: None,
             runtime: crate::session::shared_embedded_runtime()?,
             registered_parquet: Arc::new(DashMap::new()),
             force_local: false,
@@ -361,6 +367,7 @@ impl DataFrame {
             next_job_id,
             _coordinator_url: coordinator_url,
             coordinator_http_url,
+            ivm_parent: None,
             runtime,
             registered_parquet,
             force_local: false,
@@ -390,6 +397,7 @@ impl DataFrame {
             next_job_id,
             _coordinator_url: None,
             coordinator_http_url: None,
+            ivm_parent: None,
             runtime,
             registered_parquet,
             force_local: false,
@@ -586,6 +594,18 @@ Execution statistics:
             })?,
         };
         let output_schema = self.schema()?;
+        // View-DAG: if this DataFrame reads an existing view's output
+        // (Session::view), co-register the derived view into the SAME base job so
+        // a feed to the base cascades to it (topological multi-view IVM).
+        if let Some(parent) = &self.ivm_parent {
+            return crate::IncrementalDataFrame::derive_on_job(
+                parent.clone(),
+                name,
+                body_sql,
+                output_schema,
+            )
+            .await;
+        }
         // IVM management lives on the coordinator's HTTP port (distinct from the
         // Flight `_coordinator_url`); prefer it, falling back to the Flight URL
         // for single-port/local setups where they coincide.
@@ -595,6 +615,13 @@ Execution statistics:
             .or_else(|| self._coordinator_url.clone());
         crate::IncrementalDataFrame::from_view_sql(name, body_sql, output_schema, self.mode, ivm_url)
             .await
+    }
+
+    /// Tag this DataFrame as reading `parent`'s view output, so `to_incremental`
+    /// co-registers the derived view into `parent`'s job. Set by `Session::view`.
+    pub fn with_ivm_parent(mut self, parent: crate::IvmJob) -> Self {
+        self.ivm_parent = Some(parent);
+        self
     }
 
     /// Collect results.
@@ -823,6 +850,7 @@ Execution statistics:
             next_job_id: self.next_job_id.clone(),
             _coordinator_url: self._coordinator_url.clone(),
             coordinator_http_url: self.coordinator_http_url.clone(),
+            ivm_parent: self.ivm_parent.clone(),
             runtime: self.runtime.clone(),
             registered_parquet: self.registered_parquet.clone(),
             force_local: self.force_local,
@@ -881,6 +909,7 @@ Execution statistics:
             next_job_id: self.next_job_id.clone(),
             _coordinator_url: self._coordinator_url.clone(),
             coordinator_http_url: self.coordinator_http_url.clone(),
+            ivm_parent: self.ivm_parent.clone(),
             runtime: self.runtime.clone(),
             registered_parquet: self.registered_parquet.clone(),
             force_local: self.force_local,
@@ -1801,6 +1830,7 @@ Execution statistics:
             next_job_id: self.next_job_id.clone(),
             _coordinator_url: self._coordinator_url.clone(),
             coordinator_http_url: self.coordinator_http_url.clone(),
+            ivm_parent: self.ivm_parent.clone(),
             runtime: self.runtime.clone(),
             registered_parquet: self.registered_parquet.clone(),
             force_local: self.force_local,

@@ -1133,6 +1133,29 @@ def _apply() -> None:
 
     _IDF.changes = _idf_changes
 
+    # ── View-DAG composition — s.view(iv) ────────────────────────────────────
+    # Read an existing incremental view's output as a DataFrame, so
+    # `s.view(iv).groupBy(...).agg(...).to_incremental()` co-registers the derived
+    # view into iv's job — a feed to the base then cascades to it (topological
+    # multi-view IVM). The base view's schema is registered client-side (empty,
+    # schema-only) purely so the downstream query can be planned/unparsed; the
+    # engine resolves the real view.
+    def _session_view(self, iv):
+        import os  # noqa: PLC0415
+        import tempfile  # noqa: PLC0415
+
+        import pyarrow as pa  # noqa: PLC0415
+        import pyarrow.parquet as pq  # noqa: PLC0415
+
+        schema = iv.schema_batch().to_arrow().schema
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, f"{iv.name}.parquet")
+        pq.write_table(pa.Table.from_batches([], schema=schema), p)
+        self.register_parquet(iv.name, p)
+        return self.sql(f"SELECT * FROM {iv.name}")._with_ivm_parent(iv)
+
+    Session.view = _session_view
+
     # Phase 2: fluent STATELESS verbs on the streaming DataFrame — Spark's "same
     # DataFrame API for batch and streaming" (they push into the source stream
     # before windowing). `_col_sql` renders a Column arg to a SQL string.

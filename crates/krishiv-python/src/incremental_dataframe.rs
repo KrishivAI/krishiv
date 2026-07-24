@@ -60,6 +60,14 @@ impl PyIncrementalDataFrame {
         self.inner.source_names().to_vec()
     }
 
+    /// An empty batch carrying the view's output schema — used by
+    /// ``Session.view()`` to register this view as a client-side planning source
+    /// for a downstream (view-DAG) query.
+    fn schema_batch(&self) -> PyBatch {
+        let empty = arrow::record_batch::RecordBatch::new_empty(self.inner.output_schema());
+        PyBatch::from_record_batch(empty)
+    }
+
     /// Feed a change to a source and (unless inside a :meth:`transaction`)
     /// advance one tick. `source` may be omitted only when the view has exactly
     /// one source.
