@@ -3344,6 +3344,14 @@ pub trait KrishivDataFrameOps: Send + Sync {
     fn krishiv_logical_plan(&self) -> LogicalPlan;
     /// The original SQL query string, if any.
     fn query(&self) -> Option<&str>;
+    /// SQL text for the **current** logical plan (reflecting every applied
+    /// transform), suitable for defining an incremental view. Implemented via the
+    /// DataFusion unparser; the default errors for ops that cannot be unparsed.
+    fn to_sql(&self) -> SqlResult<String> {
+        Err(SqlError::Unsupported {
+            feature: "to_sql (plan unparsing) is not supported for this DataFrame".into(),
+        })
+    }
     /// Execute and return a record batch stream.
     async fn execute_stream(&self) -> SqlResult<SqlStream>;
 
@@ -4460,6 +4468,18 @@ impl KrishivDataFrameOps for SqlDataFrame {
     }
     fn query(&self) -> Option<&str> {
         SqlDataFrame::query(self)
+    }
+    fn to_sql(&self) -> SqlResult<String> {
+        // Unparse the CURRENT DataFusion logical plan (reflects all transforms).
+        // Fall back to the original query string if unparsing is unavailable.
+        match datafusion::sql::unparser::plan_to_sql(self.dataframe.logical_plan()) {
+            Ok(statement) => Ok(statement.to_string()),
+            Err(err) => self.query().map(str::to_string).ok_or_else(|| {
+                SqlError::Unsupported {
+                    feature: format!("cannot render DataFrame plan as SQL: {err}"),
+                }
+            }),
+        }
     }
     async fn execute_stream(&self) -> SqlResult<SqlStream> {
         SqlDataFrame::execute_stream(self).await

@@ -30,6 +30,29 @@ async fn sql_compat_group_by_count() {
 }
 
 #[tokio::test]
+async fn to_sql_unparses_current_plan_and_roundtrips() {
+    use krishiv_sql::KrishivDataFrameOps;
+    // A GROUP BY query is the interesting case for the unparser (aggregates +
+    // aliases). to_sql() must render the CURRENT plan as valid SQL that re-runs.
+    let df = SqlEngine::new()
+        .sql(
+            "SELECT n % 2 AS parity, COUNT(*) AS cnt \
+             FROM (VALUES (1),(2),(3),(4)) AS t(n) GROUP BY n % 2",
+        )
+        .await
+        .unwrap();
+    let sql = df.to_sql().expect("unparse plan to SQL");
+    assert!(
+        sql.to_uppercase().contains("GROUP BY"),
+        "unparsed SQL should preserve GROUP BY, got: {sql}"
+    );
+    // Re-execute the unparsed SQL: it must still yield the two parity groups.
+    let rerun = run(&sql).await;
+    let rows: usize = rerun.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 2, "re-run of unparsed SQL: {sql}");
+}
+
+#[tokio::test]
 async fn sql_compat_cte() {
     let r = run("WITH base AS (SELECT 42 AS v) SELECT v * 2 AS doubled FROM base").await;
     assert_eq!(r[0].num_rows(), 1);
