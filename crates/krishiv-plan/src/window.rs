@@ -278,7 +278,10 @@ pub fn validate_window_execution_spec(spec: &WindowExecutionSpec) -> Result<(), 
             "window event_time_column must not be empty",
         )));
     }
-    if spec.window_size_ms == 0 {
+    // Session windows have no fixed size — their extent is driven by
+    // `session_gap_ms` (validated below), so `window_size_ms == 0` is expected
+    // for them and must not be rejected here.
+    if spec.window_size_ms == 0 && spec.window_kind != WindowKind::Session {
         return Err(PlanError::Validation(String::from(
             "window_size_ms must be greater than zero",
         )));
@@ -809,6 +812,34 @@ fn split_stream_fields(payload: &str) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn session_window_validates_with_zero_window_size() {
+        use std::collections::HashMap;
+        // Regression: session windows have no fixed size (extent is driven by
+        // session_gap_ms), so window_size_ms == 0 must pass validation. It was
+        // previously rejected, making SDF.session_window().collect() unusable.
+        let make = |gap: Option<u64>| super::WindowExecutionSpec {
+            key_column: "user_id".into(),
+            key_column_type: super::default_key_type(),
+            event_time_column: "ts".into(),
+            watermark_lag_ms: 0,
+            window_kind: super::WindowKind::Session,
+            window_size_ms: 0,
+            slide_ms: None,
+            session_gap_ms: gap,
+            agg_exprs: vec![super::WindowAgg::count("count")],
+            state_ttl_ms: None,
+            allowed_lateness_ms: None,
+            source_watermark_lags: HashMap::new(),
+            source_id_column: None,
+            window_timezone: None,
+        };
+        super::validate_window_execution_spec(&make(Some(10_000)))
+            .expect("session window with window_size_ms == 0 must validate");
+        // A session window still requires a positive gap.
+        assert!(super::validate_window_execution_spec(&make(Some(0))).is_err());
+    }
 
     #[test]
     fn filtered_agg_fragment_round_trips_via_json() {
