@@ -598,18 +598,23 @@ impl Sink for KafkaSink {
         use std::time::Duration;
 
         let topic = self.config.topic.clone();
-        for row in 0..batch.num_rows() {
-            let json = Self::row_to_json(&batch, row);
-            let payload = json.to_string();
-            let record: FutureRecord<'_, str, str> = FutureRecord::to(&topic).payload(&payload);
-            self.producer
-                .send(record, Duration::from_secs(5))
-                .await
-                .map_err(|(e, _)| ConnectorError::Kafka {
-                    message: format!("rdkafka produce failed: {e}"),
-                    retriable: true,
-                })?;
-        }
+        // Serialize every row up front, then drive all deliveries CONCURRENTLY:
+        // awaiting `send()` per row serializes one broker round-trip per message
+        // (~tens of ms each), which made large batches unusably slow. Enqueuing
+        // all records and joining their delivery futures lets them pipeline.
+        let payloads: Vec<String> = (0..batch.num_rows())
+            .map(|row| Self::row_to_json(&batch, row).to_string())
+            .collect();
+        let deliveries = payloads.iter().map(|payload| {
+            let record: FutureRecord<'_, str, str> = FutureRecord::to(&topic).payload(payload);
+            self.producer.send(record, Duration::from_secs(5))
+        });
+        futures::future::try_join_all(deliveries)
+            .await
+            .map_err(|(e, _)| ConnectorError::Kafka {
+                message: format!("rdkafka produce failed: {e}"),
+                retriable: true,
+            })?;
         Ok(())
     }
 
