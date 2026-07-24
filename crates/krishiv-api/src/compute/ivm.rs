@@ -61,6 +61,16 @@ impl IvmJob {
         }
         Ok(())
     }
+
+    /// The most recent output delta produced for `view` (the change-feed item
+    /// from the last tick). Embedded only; a remote job returns `None` here
+    /// (its change-feed is exposed via the coordinator HTTP API).
+    pub fn view_output(&self, view: &str) -> Result<Option<DeltaBatch>> {
+        match self {
+            Self::Embedded(j) => Ok(j.view_output(view)?),
+            Self::Remote(_) => Ok(None),
+        }
+    }
 }
 
 impl Job for IvmJob {

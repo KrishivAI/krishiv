@@ -559,6 +559,35 @@ Execution statistics:
         }
     }
 
+    /// Convert this DataFrame into an incrementally-maintained view (delta/IVM
+    /// mode) named `name` — the third conversion alongside `collect()` (batch)
+    /// and `to_streaming()` (streaming). The DataFrame's plan becomes the view's
+    /// SQL body; the returned [`IncrementalDataFrame`](crate::IncrementalDataFrame)
+    /// feeds `DeltaBatch` changes and reads `snapshot()` / the output change-feed.
+    ///
+    /// Requires an SQL-backed DataFrame (built from `session.sql`/`table`/`read_*`),
+    /// whose scan leaves are the feedable sources. Inherits the session's mode.
+    pub async fn to_incremental(&self, name: &str) -> Result<crate::IncrementalDataFrame> {
+        let body_sql = match &self.sql_dataframe {
+            Some(ops) => ops.to_sql()?,
+            None => self.sql_query.clone().ok_or_else(|| {
+                KrishivError::unsupported(
+                    "to_incremental requires an SQL-backed DataFrame \
+                     (build it from session.sql/table/read_*)",
+                )
+            })?,
+        };
+        let output_schema = self.schema()?;
+        crate::IncrementalDataFrame::from_view_sql(
+            name,
+            body_sql,
+            output_schema,
+            self.mode,
+            self._coordinator_url.clone(),
+        )
+        .await
+    }
+
     /// Collect results.
     pub fn collect(&self) -> Result<QueryResult> {
         krishiv_common::async_util::block_on(self.collect_async())

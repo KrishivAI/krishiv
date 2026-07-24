@@ -229,6 +229,14 @@ impl EmbeddedIvmJob {
             .map_err(|e| RuntimeError::transport(e.to_string()))
     }
 
+    /// Peek the most recent output delta for `view` (the change-feed item from
+    /// the last tick; `None` if none produced yet). Does not consume it.
+    pub fn view_output(&self, view_name: &str) -> RuntimeResult<Option<DeltaBatch>> {
+        self.job()?
+            .view_output_peek(view_name)
+            .map_err(|e| RuntimeError::transport(e.to_string()))
+    }
+
     /// Run one local IVM tick asynchronously (DataFusion-backed).
     pub async fn step(&self) -> RuntimeResult<StepSummary> {
         self.job()?

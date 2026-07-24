@@ -53,8 +53,8 @@ pub use catalog::{
     ViewIdentifier,
 };
 pub use compute::{
-    Checkpointable, EmbeddedStreamJob, FeedableJob, IvmJob, Job, JobKind, StepReport, StreamJob,
-    ViewError, ViewErrorKind,
+    Checkpointable, EmbeddedStreamJob, FeedableJob, IncrementalDataFrame, IvmJob, Job, JobKind,
+    StepReport, StreamJob, ViewError, ViewErrorKind,
 };
 pub use connector_runtime::{
     ConnectorSinkProvider, ConnectorSourceProvider, DebeziumCdcSourceProvider,

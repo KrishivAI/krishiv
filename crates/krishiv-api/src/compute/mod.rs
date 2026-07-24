@@ -12,10 +12,12 @@
 //! (the one `feed` + `step`/`snapshot`), and [`Checkpointable`] (durable state).
 //! Batch is deliberately *not* a `Job` — it is one-shot and returns a `DataFrame`.
 
+mod incremental_df;
 mod ivm;
 pub mod job;
 mod stream;
 
+pub use incremental_df::IncrementalDataFrame;
 pub use ivm::IvmJob;
 pub use job::{Checkpointable, FeedableJob, Job, JobKind, StepReport, ViewError, ViewErrorKind};
 pub use stream::{EmbeddedStreamJob, StreamJob};
