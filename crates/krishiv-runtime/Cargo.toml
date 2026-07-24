@@ -39,12 +39,18 @@ base64 = { workspace = true }
 parquet = { workspace = true }
 webpki-root-certs = { workspace = true }
 krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["vector-sinks"], optional = true }
+object_store = { workspace = true, features = ["aws"], optional = true }
+bytes = { workspace = true, optional = true }
 
 [features]
 # cfg-only gate (no deps by design): enables the Kafka source-registration
 # runtime hooks; krishiv-flight-sql/kafka and krishiv-api/kafka forward here.
 kafka = []
 vector-sinks = ["dep:krishiv-connectors"]
+# Read `s3://` parquet tables client-side and inline them for distributed jobs
+# (so the coordinator never needs an S3 object store — closes the "coordinator
+# can't plan S3" gap for register_remote_parquet).
+cloud = ["dep:object_store", "dep:bytes"]
 
 [dev-dependencies]
 tokio = { workspace = true }

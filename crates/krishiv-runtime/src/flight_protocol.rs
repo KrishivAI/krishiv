@@ -160,6 +160,136 @@ pub(crate) fn inline_ipc_max_bytes() -> u64 {
         .unwrap_or(DEFAULT_INLINE_IPC_MAX_BYTES)
 }
 
+fn path_is_object_store(path: &std::path::Path) -> bool {
+    path.to_str()
+        .map(|s| s.starts_with("s3://") || s.starts_with("s3a://"))
+        .unwrap_or(false)
+}
+
+fn read_local_parquet(
+    path: &std::path::Path,
+    max_bytes: u64,
+) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let file = std::fs::File::open(path)
+        .map_err(|e| RuntimeError::transport(format!("open '{}': {e}", path.display())))?;
+    let on_disk = file
+        .metadata()
+        .map(|m| m.len())
+        .map_err(|e| RuntimeError::transport(format!("stat '{}': {e}", path.display())))?;
+    if on_disk > max_bytes {
+        return Err(RuntimeError::transport(format!(
+            "parquet table '{}' is {on_disk} bytes, over the inline-IPC cap of {max_bytes} \
+             (KRISHIV_INLINE_IPC_MAX_BYTES); ship it via a shared filesystem (path-based) \
+             or raise the cap",
+            path.display()
+        )));
+    }
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| RuntimeError::transport(format!("parquet reader for '{}': {e}", path.display())))?
+        .build()
+        .map_err(|e| RuntimeError::transport(format!("parquet build for '{}': {e}", path.display())))?;
+    reader
+        .collect::<Result<_, _>>()
+        .map_err(|e| RuntimeError::transport(format!("parquet read: {e}")))
+}
+
+#[cfg(feature = "cloud")]
+fn read_object_store_parquet(
+    path: &std::path::Path,
+    max_bytes: u64,
+) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
+    use object_store::path::Path as OsPath;
+    use object_store::{ObjectStore, ObjectStoreExt};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let uri = path
+        .to_str()
+        .ok_or_else(|| RuntimeError::transport("non-UTF8 object-store URI".to_string()))?;
+    let rest = uri
+        .strip_prefix("s3://")
+        .or_else(|| uri.strip_prefix("s3a://"))
+        .unwrap_or(uri);
+    let (bucket, key) = rest
+        .split_once('/')
+        .ok_or_else(|| RuntimeError::transport(format!("object-store URI '{uri}' has no object key")))?;
+    let store: std::sync::Arc<dyn ObjectStore> = build_s3_object_store(bucket)?;
+    let os_path = OsPath::from(key);
+    let data: bytes::Bytes = krishiv_common::async_util::block_on(async move {
+        let got = store
+            .get(&os_path)
+            .await
+            .map_err(|e| RuntimeError::transport(format!("s3 get: {e}")))?;
+        got.bytes()
+            .await
+            .map_err(|e| RuntimeError::transport(format!("s3 read: {e}")))
+    })?;
+    if data.len() as u64 > max_bytes {
+        return Err(RuntimeError::transport(format!(
+            "s3 parquet '{uri}' is {} bytes, over the inline-IPC cap of {max_bytes}",
+            data.len()
+        )));
+    }
+    let reader = ParquetRecordBatchReaderBuilder::try_new(data)
+        .map_err(|e| RuntimeError::transport(format!("parquet reader (s3) for '{uri}': {e}")))?
+        .build()
+        .map_err(|e| RuntimeError::transport(format!("parquet build (s3) for '{uri}': {e}")))?;
+    reader
+        .collect::<Result<_, _>>()
+        .map_err(|e| RuntimeError::transport(format!("parquet read (s3): {e}")))
+}
+
+#[cfg(not(feature = "cloud"))]
+fn read_object_store_parquet(
+    path: &std::path::Path,
+    _max_bytes: u64,
+) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
+    Err(RuntimeError::transport(format!(
+        "reading object-store parquet '{}' requires the `cloud` feature",
+        path.display()
+    )))
+}
+
+/// Build an S3 (or MinIO) object store from the standard AWS env vars —
+/// `AWS_ENDPOINT_URL` (marks a MinIO-style store), `AWS_ACCESS_KEY_ID`,
+/// `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`.
+#[cfg(feature = "cloud")]
+fn build_s3_object_store(
+    bucket: &str,
+) -> RuntimeResult<std::sync::Arc<dyn object_store::ObjectStore>> {
+    use object_store::ClientOptions;
+    use object_store::aws::AmazonS3Builder;
+
+    let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+    let mut client_opts = ClientOptions::new();
+    if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL")
+        && !endpoint.is_empty()
+    {
+        builder = builder.with_endpoint(endpoint);
+        client_opts = client_opts.with_allow_http(true);
+    }
+    if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID")
+        && !key.is_empty()
+    {
+        builder = builder.with_access_key_id(key);
+    }
+    if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY")
+        && !secret.is_empty()
+    {
+        builder = builder.with_secret_access_key(secret);
+    }
+    if let Ok(region) = std::env::var("AWS_REGION").or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        && !region.is_empty()
+    {
+        builder = builder.with_region(region);
+    }
+    builder = builder.with_client_options(client_opts);
+    let store = builder
+        .build()
+        .map_err(|e| RuntimeError::transport(format!("build s3 store for '{bucket}': {e}")))?;
+    Ok(std::sync::Arc::new(store))
+}
+
 /// Read a local parquet file and return base64-encoded Arrow IPC bytes.
 ///
 /// Shared by the Flight SQL comment protocol and the coordinator HTTP submit
@@ -179,34 +309,16 @@ pub(crate) fn parquet_file_to_ipc_b64_capped(
     max_bytes: u64,
 ) -> RuntimeResult<String> {
     use arrow::ipc::writer::StreamWriter;
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-    let file = std::fs::File::open(path)
-        .map_err(|e| RuntimeError::transport(format!("open '{}': {e}", path.display())))?;
-    let on_disk = file
-        .metadata()
-        .map(|m| m.len())
-        .map_err(|e| RuntimeError::transport(format!("stat '{}': {e}", path.display())))?;
-    if on_disk > max_bytes {
-        return Err(RuntimeError::transport(format!(
-            "parquet table '{}' is {on_disk} bytes, over the inline-IPC cap of {max_bytes} \
-             (KRISHIV_INLINE_IPC_MAX_BYTES); ship it via a shared filesystem (path-based) \
-             or raise the cap",
-            path.display()
-        )));
-    }
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| {
-            RuntimeError::transport(format!("parquet reader for '{}': {e}", path.display()))
-        })?
-        .build()
-        .map_err(|e| {
-            RuntimeError::transport(format!("parquet build for '{}': {e}", path.display()))
-        })?;
-
-    let batches: Vec<_> = reader
-        .collect::<Result<_, _>>()
-        .map_err(|e| RuntimeError::transport(format!("parquet read: {e}")))?;
+    // Read the batches from a local file or (with the `cloud` feature) an
+    // `s3://` object store — reading remote parquet CLIENT-side and inlining it
+    // is what lets distributed jobs use `register_remote_parquet` without the
+    // coordinator needing its own S3 object store.
+    let batches = if path_is_object_store(path) {
+        read_object_store_parquet(path, max_bytes)?
+    } else {
+        read_local_parquet(path, max_bytes)?
+    };
     if batches.is_empty() {
         return Ok(String::new());
     }
@@ -1151,5 +1263,34 @@ mod tests {
 
         // Default cap is the documented 64 MiB.
         assert_eq!(DEFAULT_INLINE_IPC_MAX_BYTES, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn object_store_paths_are_detected() {
+        use std::path::Path;
+        assert!(path_is_object_store(Path::new(
+            "s3://warehouse/wh/taxi/zones/data/x.parquet"
+        )));
+        assert!(path_is_object_store(Path::new("s3a://bucket/key.parquet")));
+        // Local paths (absolute, relative, and a bare filename) are not S3.
+        assert!(!path_is_object_store(Path::new("/data/local.parquet")));
+        assert!(!path_is_object_store(Path::new("./rel/t.parquet")));
+        assert!(!path_is_object_store(Path::new("t.parquet")));
+        // A path that merely mentions s3 mid-string is not an object-store URI.
+        assert!(!path_is_object_store(Path::new("/tmp/s3://not-a-scheme")));
+    }
+
+    #[test]
+    fn local_parquet_reader_respects_cap() {
+        let (_dir, path) = write_parquet(&test_batch());
+        // Under a generous cap the local reader returns the batch(es).
+        let batches = read_local_parquet(&path, 64 * 1024 * 1024).expect("under cap reads");
+        assert!(!batches.is_empty(), "small table should read at least one batch");
+        // A 1-byte cap is rejected before reading, naming the cap knob.
+        let err = read_local_parquet(&path, 1).expect_err("over cap must error");
+        assert!(
+            err.to_string().contains("inline-IPC cap"),
+            "error must name the cap: {err}"
+        );
     }
 }

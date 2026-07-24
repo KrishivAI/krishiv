@@ -159,7 +159,9 @@ impl PyIcebergSink {
         #[cfg(feature = "iceberg")]
         {
             use krishiv_common::async_util::block_on;
-            use krishiv_connectors::lakehouse::IcebergFsTable;
+            use krishiv_connectors::lakehouse::{
+                IcebergFsTable, IcebergTableRef, LakehouseTable, schema_version_from_arrow,
+            };
             use std::path::PathBuf;
 
             let records: Vec<arrow::record_batch::RecordBatch> =
@@ -169,7 +171,18 @@ impl PyIcebergSink {
             }
             let total_rows: usize = records.iter().map(|b| b.num_rows()).sum();
             let base = PathBuf::from(&self.catalog);
-            let tbl = IcebergFsTable::new(&base, self.table.clone(), records[0].schema())
+            // Parse the dotted table reference (`db.events`, `cat.ns.name`, or a
+            // bare `name`) into a structured `IcebergTableRef`.
+            let parts: Vec<&str> = self.table.split('.').filter(|s| !s.is_empty()).collect();
+            let (namespace, name) = match parts.as_slice() {
+                [] => ("default".to_string(), self.table.clone()),
+                [only] => ("default".to_string(), (*only).to_string()),
+                [ns @ .., last] => (ns.join("."), (*last).to_string()),
+            };
+            let table_ref = IcebergTableRef::new("default", namespace, name);
+            let schema_version = schema_version_from_arrow(records[0].schema().as_ref(), None)
+                .map_err(|e| PyRuntimeError::new_err(format!("iceberg schema: {e}")))?;
+            let tbl = IcebergFsTable::new(&base, table_ref, schema_version)
                 .map_err(|e| PyRuntimeError::new_err(format!("iceberg open: {e}")))?;
             block_on(tbl.append(records))
                 .map_err(|e| PyRuntimeError::new_err(format!("iceberg append: {e}")))?;
