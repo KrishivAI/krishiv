@@ -49,7 +49,12 @@ hand-written CSV writer. Confirmed live on the 3-node k3s cluster: a
 `registry-sink:csv` batch export failed on a real executor with exactly that
 message.
 
-**Fixed** by adding `CsvSinkDriver`, and guarded by
+**Fixed** by adding `CsvSinkDriver`, and **re-verified live on the same
+cluster**: with image `fast-b907ae23` the identical export now succeeds and the
+CSV lands on an executor on node s1 while the coordinator runs on s2 — a real
+cross-node registry dispatch, header plus all three rows intact, repeated three
+times. The probe is committed as `scripts/registry_sink_live_cert.py` so the
+claim can be re-checked rather than re-asserted. Guarded in CI by
 `sql_ddl_yes_cells_have_a_registered_driver`, which cross-checks every matrix
 row against `default_registry()`. `sql_ddl` is purely registry-generic, so a
 `yes` there is a falsifiable statement about the registry — the test now
