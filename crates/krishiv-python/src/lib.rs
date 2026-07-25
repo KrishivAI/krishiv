@@ -64,7 +64,8 @@ pub use relation::PyRelation;
 pub use schema::PySchema;
 pub use session::{PyOperationRegistry, PySession};
 pub use sinks::{
-    PyCassandraSink, PyElasticsearchSink, PyHBaseSink, PyIcebergSink, PyKafkaSink, PyParquetSink,
+    PyCassandraSink, PyConnectorSink, PyElasticsearchSink, PyHBaseSink, PyIcebergSink, PyKafkaSink,
+    PyParquetSink,
 };
 pub use stream_bridges::PyBroadcastContext;
 pub use streaming::{
@@ -130,6 +131,7 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<memo::MemoCacheInfo>()?;
 
     m.add_class::<sinks::PyParquetSink>()?;
+    m.add_class::<sinks::PyConnectorSink>()?;
     m.add_class::<sinks::PyKafkaSink>()?;
     m.add_class::<sinks::PyIcebergSink>()?;
     m.add_class::<sinks::PyCassandraSink>()?;

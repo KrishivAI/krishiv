@@ -34,9 +34,12 @@ use arrow::array::{BinaryBuilder, Int64Builder, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
-use pulsar::{
-    Consumer, DeserializeMessage, Message, MessageId, Payload, Pulsar, SubType, TokioExecutor,
-};
+// `Message`/`MessageId` are not root re-exports in pulsar 6.x — they live in
+// `pulsar::consumer` (`MessageData` is the id type carried on a consumed
+// message). Importing them from the crate root broke the `pulsar-source`
+// feature build outright.
+use pulsar::consumer::data::MessageData;
+use pulsar::{Consumer, DeserializeMessage, Payload, Pulsar, SubType, TokioExecutor};
 
 use crate::capabilities::ConnectorCapabilities;
 use crate::error::{ConnectorError, ConnectorResult};
@@ -129,7 +132,7 @@ pub struct PulsarSource {
     /// Messages read but not yet acknowledged.  The consumer holds them in
     /// unacked state until `ack_all_pending()` is called, providing
     /// at-least-once delivery semantics.
-    pending_messages: VecDeque<(String, Option<String>, i64, Vec<u8>, MessageId)>,
+    pending_messages: VecDeque<(String, Option<String>, i64, Vec<u8>, MessageData)>,
 }
 
 impl PulsarSource {
@@ -236,9 +239,13 @@ impl PulsarSource {
     /// the data. Calling before durability creates a gap where acknowledged
     /// messages are lost on crash.
     pub async fn ack_all_pending(&mut self) -> ConnectorResult<()> {
-        while let Some((_topic, _key, _ts, _data, msg_id)) = self.pending_messages.pop_front() {
+        while let Some((topic, _key, _ts, _data, msg_id)) = self.pending_messages.pop_front() {
+            // `Consumer::ack` needs the whole consumed `Message`, which we do
+            // not retain (only its id, so the pending buffer stays small);
+            // `ack_with_id` is the id-addressed form and needs the message's
+            // originating topic, which the pending entry already carries.
             self.consumer
-                .ack(&msg_id)
+                .ack_with_id(&topic, msg_id.id.clone())
                 .await
                 .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
         }

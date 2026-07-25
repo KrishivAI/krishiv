@@ -896,7 +896,13 @@ impl SinkProvider for ConnectorSinkProvider {
             })),
             "csv" => Ok(Box::new(CsvFileSinkWriter::create(&spec.uri)?)),
             "json" | "ndjson" => Ok(Box::new(JsonFileSinkWriter::create(&spec.uri)?)),
-            "s3" => {
+            // Every other kind dispatches through the one connector registry
+            // (#197 sink leg, mirroring the source provider above): whichever
+            // sink drivers `default_registry()` registers are reachable here,
+            // so this surface no longer needs a hardcoded allowlist to stay in
+            // step with the registry. An unregistered kind fails with the
+            // registry's own typed error instead of a stale surface-local one.
+            _ => {
                 let config = connector_config_from_sink_spec(spec);
                 let registry = default_registry();
                 let inner = registry
@@ -908,10 +914,6 @@ impl SinkProvider for ConnectorSinkProvider {
                     connector: spec.connector.clone(),
                 }))
             }
-            other => Err(EngineError::Sink(format!(
-                "connector '{other}' is not available as a job sink yet; \
-                 supported: parquet, csv, json, s3"
-            ))),
         }
     }
 }
@@ -949,7 +951,13 @@ fn connector_config_from_spec(
         let locator_key = match connector {
             "s3" => Some("object_path"),
             "s3-prefix" => Some("prefix"),
-            "parquet" | "parquet-directory" | "csv" | "json" | "ndjson" => Some("path"),
+            // Every path-addressed driver reads `path` (see the avro / csv /
+            // lakehouse drivers' `require_path`). Kinds addressed by structured
+            // endpoints instead (jdbc, kafka, elasticsearch, cassandra, hbase,
+            // kinesis, pulsar) carry their locator in `options`, so no `uri`
+            // mapping applies and one is not invented for them.
+            "parquet" | "parquet-directory" | "csv" | "json" | "ndjson" | "avro" | "iceberg"
+            | "delta" | "hudi" => Some("path"),
             _ => None,
         };
         if let Some(locator_key) = locator_key
@@ -1148,6 +1156,53 @@ mod tests {
             !msg.contains("is not available as a job source yet"),
             "must not use the retired hardcoded allowlist error: {msg}"
         );
+    }
+
+    /// #197 sink leg: the same fallthrough on the sink side. The provider's `_`
+    /// arm reaches `default_registry().open_sink()`, so every registered sink
+    /// driver (iceberg/delta/hudi/elasticsearch/cassandra/hbase/jdbc-sink/…) is
+    /// reachable from an ad-hoc SQL job, and an unregistered kind fails with the
+    /// registry's typed error rather than the retired allowlist message.
+    #[tokio::test]
+    async fn sql_job_sink_provider_dispatches_through_registry() {
+        use krishiv_engine_core::SinkProvider as _;
+
+        let provider = super::ConnectorSinkProvider;
+        let spec = SinkSpec::new("v", "definitely-not-a-connector", "irrelevant");
+        // `Box<dyn SinkWriter>` isn't `Debug`, so `expect_err` won't compile.
+        let msg = match provider.open(&spec).await {
+            Ok(_) => panic!("an unregistered connector kind must error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("unknown connector kind") || msg.contains("no sink driver registered"),
+            "expected a registry-dispatch error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("is not available as a job sink yet"),
+            "must not use the retired hardcoded allowlist error: {msg}"
+        );
+    }
+
+    /// A path-addressed sink kind newly reachable through the registry gets its
+    /// `uri` mapped to the driver's required `path` property. Without the
+    /// locator mapping the registry would reject the config as missing `path`,
+    /// so the fallthrough alone would not have made these kinds usable.
+    #[test]
+    fn path_addressed_sink_kinds_map_uri_to_path() {
+        for kind in ["avro", "iceberg", "delta", "hudi"] {
+            let spec = SinkSpec::new("v", kind, "/tmp/out");
+            let config = super::connector_config_from_sink_spec(&spec);
+            assert_eq!(
+                config.get("path"),
+                Some("/tmp/out"),
+                "{kind} sink must carry its uri as `path`"
+            );
+        }
+        // Endpoint-addressed kinds get no invented locator property.
+        let spec = SinkSpec::new("v", "elasticsearch", "http://es:9200");
+        let config = super::connector_config_from_sink_spec(&spec);
+        assert!(config.get("path").is_none());
     }
 
     #[derive(Debug, Clone)]

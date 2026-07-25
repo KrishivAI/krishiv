@@ -446,3 +446,99 @@ pub fn register_sinks_module(py: Python<'_>, parent: &Bound<'_, PyModule>) -> Py
     parent.add_submodule(&sinks)?;
     Ok(())
 }
+
+// ── Registry-generic sink (#197 python_sink leg) ─────────────────────────────
+
+/// Registry-dispatched sink — writes Arrow record batches through **any**
+/// connector sink driver registered in the engine's one connector registry.
+///
+/// The hand-written pyclasses above each bind a single connector; this one
+/// binds the registry itself, so a Python job reaches whatever sinks the build
+/// registers (`csv`, `avro`, `s3`, `delta`, `hudi`, `jdbc-sink`, …) without a
+/// new pyclass per kind. Availability is decided by the build's connector
+/// features: an unregistered kind raises the registry's own error rather than
+/// a surface-local "unsupported" message.
+///
+/// ```python
+/// from krishiv.sinks import ConnectorSink
+/// sink = ConnectorSink("csv", {"path": "/tmp/out.csv"})
+/// sink.write_batches(batches)
+/// ```
+///
+/// Delivery semantics are the driver's own and are at-least-once for the
+/// non-transactional drivers reached here: `write_batches` writes then flushes,
+/// and a failure mid-way can leave earlier batches already written. Exactly-once
+/// output requires the checkpoint-aligned two-phase-commit sinks, which are
+/// driven by the streaming runtime, not by this synchronous surface.
+#[pyclass(name = "ConnectorSink")]
+pub struct PyConnectorSink {
+    kind: String,
+    name: String,
+    options: std::collections::BTreeMap<String, String>,
+}
+
+#[pymethods]
+impl PyConnectorSink {
+    #[new]
+    #[pyo3(signature = (kind, options = None, name = None))]
+    pub fn new(
+        kind: String,
+        options: Option<std::collections::BTreeMap<String, String>>,
+        name: Option<String>,
+    ) -> Self {
+        Self {
+            kind,
+            name: name.unwrap_or_else(|| String::from("python-connector-sink")),
+            options: options.unwrap_or_default(),
+        }
+    }
+
+    #[getter]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// Write a list of `Batch` objects through the registered sink driver.
+    ///
+    /// Returns the number of rows written. Flush failures fail the call: the
+    /// flush is what makes the output durable, so a silent success here would
+    /// acknowledge unwritten rows.
+    pub fn write_batches(&self, batches: Vec<crate::batch::PyBatch>) -> PyResult<usize> {
+        use krishiv_common::async_util::block_on;
+        use krishiv_connectors::{ConnectorConfig, default_registry};
+
+        let records: Vec<arrow::record_batch::RecordBatch> =
+            batches.iter().map(|b| b.record_batch().clone()).collect();
+        let total_rows: usize = records.iter().map(|b| b.num_rows()).sum();
+
+        let mut config = ConnectorConfig::new(&self.name, &self.kind);
+        for (key, value) in &self.options {
+            config = config.with_property(key, value);
+        }
+
+        block_on(async move {
+            let registry = default_registry();
+            let mut sink = registry.open_sink(&config).await.map_err(|e| {
+                PyRuntimeError::new_err(format!("connector sink open ({}): {e}", config.kind))
+            })?;
+            for batch in records {
+                sink.write_batch_dyn(batch).await.map_err(|e| {
+                    PyRuntimeError::new_err(format!("connector sink write ({}): {e}", config.kind))
+                })?;
+            }
+            sink.flush_dyn().await.map_err(|e| {
+                PyRuntimeError::new_err(format!("connector sink flush ({}): {e}", config.kind))
+            })?;
+            Ok::<(), PyErr>(())
+        })?;
+        Ok(total_rows)
+    }
+
+    pub fn __repr__(&self) -> String {
+        format!(
+            "ConnectorSink(kind={:?}, options={} keys)",
+            self.kind,
+            self.options.len()
+        )
+    }
+}

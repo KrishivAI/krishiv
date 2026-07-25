@@ -15,6 +15,9 @@ use crate::two_phase::LocalParquetTwoPhaseCommitSink;
 #[non_exhaustive]
 pub enum OpenedTwoPhaseSink {
     LocalParquet(LocalParquetTwoPhaseCommitSink),
+    /// Exactly-once Kafka sink (`kafka-transactional`), broker-backed.
+    #[cfg(feature = "kafka")]
+    KafkaTransactional(crate::kafka_transactional_sink::RdkafkaTransactionalSink),
 }
 
 pub type OpenSourceFuture<'a> =

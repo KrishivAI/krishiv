@@ -286,11 +286,21 @@ lint:
 #    live-verified by `just test-external`)
 lint-features:
     @command -v cargo-hack >/dev/null 2>&1 || {{ cargo }} install cargo-hack --locked
-    {{ cargo }} hack check --each-feature --no-dev-deps -p krishiv-connectors \
-        --exclude-features pulsar-source,cassandra,elasticsearch,vortex,cloud
-    {{ cargo }} hack check --each-feature --no-dev-deps -p krishiv-sql \
-        --exclude-features rest-catalog,unity-catalog,glue-catalog
-    @echo "✓ per-feature builds clean (quarantined features: see docs/feature-graph.md)"
+    # No exclusions: the quarantine list was emptied 2026-07-25. Every optional
+    # connector/catalog feature must compile on its own — the previously
+    # excluded ones (pulsar-source, cassandra, elasticsearch) had genuinely
+    # rotted against their dependency APIs and shipped broken precisely because
+    # this guard skipped them. Do not re-add an --exclude-features escape hatch;
+    # fix the feature or delete it.
+    {{ cargo }} hack check --each-feature --no-dev-deps -p krishiv-connectors
+    {{ cargo }} hack check --each-feature --no-dev-deps -p krishiv-sql
+    @echo "✓ per-feature builds clean (no quarantined features)"
+
+# Phase 62 gate: every versioned compatibility promise must match the code and
+# have an enforcing test (docs/COMPATIBILITY.md drifts otherwise — it published
+# checkpoint metadata v2 while the engine wrote v3).
+compat-gate:
+    python3 scripts/compatibility_gate.py
 
 # Format then lint in one shot
 tidy: fmt lint

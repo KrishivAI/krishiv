@@ -42,7 +42,7 @@ pub use two_phase::LocalParquetTwoPhaseSinkDriver;
 pub use avro::{AvroSinkDriver, AvroSourceDriver};
 
 #[cfg(feature = "kafka")]
-pub use kafka::{KafkaSinkDriver, KafkaSourceDriver};
+pub use kafka::{KafkaSinkDriver, KafkaSourceDriver, KafkaTransactionalSinkDriver};
 
 #[cfg(feature = "lakehouse")]
 pub use lakehouse::{

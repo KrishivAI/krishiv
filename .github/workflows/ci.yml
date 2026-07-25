@@ -181,6 +181,8 @@ jobs:
         with:
           name: api-change-report
           path: target/api-change-report.json
+      - name: Compatibility promises match the code (Phase 62 gate)
+        run: python3 scripts/compatibility_gate.py
       - name: Check Markdown links
         run: python3 scripts/check_markdown_links.py
       - name: Validate release metadata

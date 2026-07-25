@@ -19,9 +19,11 @@ Items are not stable merely because they are public today.
 | Rust API | Preview | Breaking changes are allowed in a minor release and must be called out in `CHANGELOG.md`. |
 | Python API | Preview | Follows the Rust API where practical; changed names or behavior require release notes. |
 | CLI and configuration | Preview | Existing flags and keys should be deprecated for one minor release before removal when feasible. |
-| Task-fragment envelope | Versioned | Readers reject unsupported versions instead of silently interpreting them. |
-| Checkpoint metadata | Versioned | Writers emit v2; readers accept supported v1-v2 metadata. |
-| Savepoint metadata | Versioned | Import validates the declared format version before restore. |
+| Task-fragment envelope | Versioned | Readers reject unsupported versions (current v1) instead of silently interpreting them. |
+| Checkpoint metadata | Versioned | Writers emit v3; readers accept supported v1-v3 metadata. |
+| Savepoint metadata | Versioned | Import validates the declared format version (v1) before restore. |
+| Wire protocol (coordinator↔executor) | Versioned | Handshake carries the transport contract version (current R3.1); a peer announcing an unsupported version is rejected rather than assumed compatible. |
+| Metadata store | Explicitly described | Schema migrations run forward-only at boot; a store written by a newer engine is not downgraded. |
 | Operator state | Explicitly described | Stable operator identity and serializer compatibility are required for restore. |
 | Connector capability API | Preview | Capability declarations are conservative and connector certification is combination-specific. |
 | SQL behavior | DataFusion-based preview | Intentional semantic changes must be documented and covered by conformance tests. |
@@ -41,6 +43,23 @@ Items are not stable merely because they are public today.
 The exact delivery combinations are published in
 [`contracts/engine-semantics.md`](contracts/engine-semantics.md), and connector
 requirements are described in [`connector-sdk.md`](connector-sdk.md).
+
+### These promises are CI-enforced
+
+`scripts/compatibility_gate.py` (run by the `compat-gate` CI job) fails the
+build when a version number stated above stops matching the constant the engine
+compiles, or when the test that enforces a promise disappears:
+
+| Promise | Code constant | Enforcing test |
+|---|---|---|
+| Checkpoint metadata | `CheckpointMetadata::{MIN_SUPPORTED_VERSION, VERSION}` | `write_epoch_metadata_rejects_incompatible_version` |
+| Savepoint metadata | `SAVEPOINT_FORMAT_VERSION` | `import_rejects_unknown_format_version` |
+| Task-fragment envelope | `TASK_FRAGMENT_VERSION` | `rejects_unknown_fragment_version` |
+| Wire protocol | `TransportVersion::CURRENT` | `transport_version_exposes_compatibility` (the reject path itself is `ensure_transport_version` in the coordinator gRPC service, mirrored in the executor) |
+
+The prose above was wrong before this gate existed — it promised checkpoint
+metadata v2 while the engine had been writing v3 — which is exactly the drift
+the gate now prevents.
 
 ## Deprecation policy
 

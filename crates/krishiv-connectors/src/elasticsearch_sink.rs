@@ -106,11 +106,13 @@ impl ElasticsearchSink {
             transport_builder =
                 transport_builder.auth(Credentials::Basic(user.clone(), pass.clone()));
         }
-        // L4.1: Set request and connect timeouts to prevent indefinite hangs
-        // on stalled Elasticsearch connections.
-        transport_builder = transport_builder
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(5));
+        // L4.1: bound the request so a stalled Elasticsearch connection cannot
+        // hang a write forever. `TransportBuilder::timeout` is the whole-request
+        // deadline and covers connect as part of it; the client exposes no
+        // separate connect timeout (an earlier `.connect_timeout(..)` call here
+        // did not exist on this client version and broke the `elasticsearch`
+        // feature build outright).
+        transport_builder = transport_builder.timeout(std::time::Duration::from_secs(30));
 
         let transport = transport_builder
             .build()

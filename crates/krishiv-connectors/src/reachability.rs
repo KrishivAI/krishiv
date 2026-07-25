@@ -30,32 +30,41 @@
 //!   `VectorSink` roles (the factory only calls `ConnectorRole::Source`/`Sink`).
 //! - `sql_job`: the ad-hoc SQL job source/sink provider
 //!   (`krishiv-api::connector_runtime::{ConnectorSourceProvider,
-//!   ConnectorSinkProvider}`). A hardcoded allowlist, not registry-generic:
-//!   sources = parquet, parquet-directory, csv, json/ndjson, s3, s3-prefix; sinks =
-//!   parquet, csv, json/ndjson, s3 (note: **not** s3-prefix for sinks). `json`/
-//!   `ndjson` are not a [`ConnectorKind`] at all — a separate bespoke path, not
-//!   part of this matrix's rows.
+//!   ConnectorSinkProvider}`). Registry-generic on both sides as of #197: the
+//!   dedicated arms (parquet, parquet-directory, csv, json/ndjson, s3, s3-prefix)
+//!   exist only to keep blocking opens off the reactor and to preserve the
+//!   append-only file writers; every other kind falls through to
+//!   `default_registry().open_source()`/`open_sink()`. `json`/`ndjson` are not a
+//!   [`ConnectorKind`] at all — a separate bespoke path, not part of this
+//!   matrix's rows.
 //! - `distributed_job`: sources are registry-generic (`Arc<ConnectorRegistry>`
 //!   injected into the executor task runner — any registered `Source` driver is
-//!   reachable). Sinks are **not**: `OutputContractDescriptor`
-//!   (`krishiv-proto::task`) is a closed 7-variant enum reaching only Parquet
-//!   (`ParquetSink`/`ObjectParquetSink`, the latter still Parquet format written
-//!   to an object-store path — not a generic S3 sink), Iceberg (`IcebergSink`,
-//!   checkpoint-aligned two-phase commit, G7), and Kafka (`KafkaSink`, same
-//!   checkpoint-aligned two-phase commit, Phase 55). This source/sink asymmetry
-//!   is the core of the #197 finding.
+//!   reachable). Sinks reach the registry two ways, with different guarantees:
+//!   the typed `OutputContractDescriptor` (`krishiv-proto::task`) is still a
+//!   closed enum covering only Parquet (`ParquetSink`/`ObjectParquetSink`),
+//!   Iceberg (`IcebergSink`, checkpoint-aligned two-phase commit, G7) and Kafka
+//!   (`KafkaSink`, same, Phase 55) — those are the *exactly-once, barrier-aligned
+//!   streaming* sinks; separately the batch `registry-sink:<kind>|<base64-json>`
+//!   output contract streams a batch job's result into **any** registered `Sink`
+//!   driver (`krishiv-executor::fragment::batch::execute_registry_sink`), which
+//!   is at-least-once. So the original #197 asymmetry is closed for *reachability*
+//!   and now shows up as a *delivery-guarantee* difference per kind instead.
 //! - `python_sink`: `krishiv-python::sinks` — six hand-written pyclasses (Parquet,
-//!   Kafka, Iceberg, Cassandra, Elasticsearch, HBase), each `write_batches` a
-//!   synchronous `block_on(...)` wrapper, not a checkpointed two-phase-commit
-//!   participant like the Rust `IcebergSink`/`KafkaSink`. **Python source
+//!   Kafka, Iceberg, Cassandra, Elasticsearch, HBase) plus the registry-generic
+//!   `ConnectorSink(kind, options)` added by #197, which dispatches through
+//!   `default_registry().open_sink()` and so reaches every registered sink driver
+//!   without a pyclass per kind. All of them are synchronous `block_on(...)`
+//!   wrappers writing then flushing — at-least-once, not checkpointed
+//!   two-phase-commit participants like the Rust `IcebergSink`/`KafkaSink`.
+//!   **Python source
 //!   reachability is deliberately not a column here**: the declarative pipeline
 //!   API's `Ingest` only carries `Memory`/`Cdc` (`krishiv-python::pipeline_api`),
 //!   but Python likely has broader read access through the embedded
 //!   DataFrame/session API — that surface was not verified to the standard the
 //!   rest of this matrix holds itself to, so it is left out rather than guessed.
 //!
-//! None of the four surfaces reach the `TwoPhaseSink` role (`two-phase-parquet`)
-//! or any `VectorSink`-role kind (`memory-vector`/`qdrant`/`pgvector`/`lancedb`/
+//! None of the four surfaces reach the `TwoPhaseSink` role (`two-phase-parquet`,
+//! `kafka-transactional`) or any `VectorSink`-role kind (`memory-vector`/`qdrant`/`pgvector`/`lancedb`/
 //! `weaviate`/`pinecone`) — those roles have registered drivers but no dispatch
 //! path in this matrix reaches them.
 
@@ -142,6 +151,16 @@ impl ConnectorEntry {
 
 use Reach::{No, NotApplicable, Yes};
 
+/// Shared note for sink kinds whose distributed reach is the batch
+/// `registry-sink:` export contract only. That path streams a batch job's result
+/// into the driver and flushes before reporting success — at-least-once, since a
+/// retried attempt re-writes rows an earlier attempt may already have delivered.
+/// Exactly-once output on the distributed surface requires a checkpoint-aligned
+/// two-phase-commit sink (Iceberg/Kafka today).
+const BATCH_EXPORT_ONLY: &str =
+    "distributed reach is the batch registry-sink export (at-least-once, flushed \
+     before task success); no checkpoint-aligned streaming sink for this kind";
+
 /// The connector reachability matrix. Ordered by role-group (source, sink,
 /// two-phase-sink, vector-sink) then by first appearance of the kind.
 ///
@@ -168,48 +187,47 @@ pub static CONNECTORS: &[ConnectorEntry] = &[
     entry("pulsar", "source", "preview", Yes, Yes, Yes, NotApplicable),
     entry("jdbc", "source", "preview", Yes, Yes, Yes, NotApplicable),
     // ── sinks ────────────────────────────────────────────────────────────────
+    // #197 sink legs: `sql_job` now falls through to the registry
+    // (ConnectorSinkProvider `_` arm), `python_sink` gained the registry-generic
+    // `ConnectorSink` pyclass, and `distributed_job` gained the batch
+    // `registry-sink:` export contract. All three are registry-generic, so a
+    // registered Sink-role driver is reachable from all four surfaces. What
+    // still differs per kind is the *delivery guarantee* on the distributed
+    // surface — see BATCH_EXPORT_ONLY vs the two-phase-commit notes.
     entry("parquet", "sink", "preview", Yes, Yes, Yes, Yes),
-    entry("csv", "sink", "preview", Yes, Yes, No, No)
-        .with_note("not an OutputContractDescriptor variant; no Python CSV sink pyclass"),
-    entry("avro", "sink", "preview", Yes, No, No, No)
-        .with_note("not wired into the ad-hoc SQL job sink allowlist; no OutputContractDescriptor variant"),
-    entry("s3", "sink", "preview", Yes, Yes, Yes, No)
-        .with_note(
-            "distributed reach is ObjectParquetSink: Parquet format written to an \
-             object-store path, not a generic S3 sink of arbitrary format",
-        ),
-    entry("kafka", "sink", "preview", Yes, No, Yes, Yes)
-        .with_note(
-            "not wired into the ad-hoc SQL job sink allowlist; distributed reach is the \
-             checkpoint-aligned two-phase-commit KafkaSink (Phase 55)",
-        ),
-    entry("iceberg", "sink", "preview", Yes, No, Yes, Yes).with_note(
+    entry("csv", "sink", "preview", Yes, Yes, Yes, Yes).with_note(BATCH_EXPORT_ONLY),
+    entry("avro", "sink", "preview", Yes, Yes, Yes, Yes).with_note(BATCH_EXPORT_ONLY),
+    entry("s3", "sink", "preview", Yes, Yes, Yes, Yes).with_note(
+        "distributed reach is ObjectParquetSink (Parquet format written to an \
+         object-store path, with the staged-commit protocol) plus the generic \
+         batch registry-sink export; not a checkpoint-aligned streaming sink",
+    ),
+    entry("kafka", "sink", "preview", Yes, Yes, Yes, Yes).with_note(
+        "distributed reach is the checkpoint-aligned two-phase-commit KafkaSink \
+         (Phase 55): exactly-once for read_committed consumers",
+    ),
+    entry("iceberg", "sink", "preview", Yes, Yes, Yes, Yes).with_note(
         "distributed reach is the checkpoint-aligned two-phase-commit IcebergSink (G7)",
     ),
-    entry("delta", "sink", "experimental", Yes, No, No, No)
-        .with_note("no OutputContractDescriptor variant; no Python pyclass"),
-    entry("hudi", "sink", "experimental", Yes, No, No, No)
-        .with_note("no OutputContractDescriptor variant; no Python pyclass"),
-    entry("elasticsearch", "sink", "preview", Yes, No, No, Yes)
-        .with_note("has both a registry driver and a Python pyclass, but no OutputContractDescriptor variant"),
-    entry("cassandra", "sink", "preview", Yes, No, No, Yes)
-        .with_note("has both a registry driver and a Python pyclass, but no OutputContractDescriptor variant"),
-    entry("hbase", "sink", "preview", Yes, No, No, Yes)
-        .with_note("has both a registry driver and a Python pyclass, but no OutputContractDescriptor variant"),
-    entry("jdbc-sink", "sink", "preview", Yes, No, No, No)
-        .with_note("no OutputContractDescriptor variant; no Python pyclass, despite jdbc being source-reachable everywhere else"),
+    entry("delta", "sink", "experimental", Yes, Yes, Yes, Yes).with_note(BATCH_EXPORT_ONLY),
+    entry("hudi", "sink", "experimental", Yes, Yes, Yes, Yes).with_note(BATCH_EXPORT_ONLY),
+    entry("elasticsearch", "sink", "preview", Yes, Yes, Yes, Yes).with_note(BATCH_EXPORT_ONLY),
+    entry("cassandra", "sink", "preview", Yes, Yes, Yes, Yes).with_note(BATCH_EXPORT_ONLY),
+    entry("hbase", "sink", "preview", Yes, Yes, Yes, Yes).with_note(BATCH_EXPORT_ONLY),
+    entry("jdbc-sink", "sink", "preview", Yes, Yes, Yes, Yes).with_note(BATCH_EXPORT_ONLY),
     // ── two-phase-sink ───────────────────────────────────────────────────────
     entry("two-phase-parquet", "two-phase-sink", "preview", No, No, No, No).with_note(
         "registered in default_registry() as a TwoPhaseSink driver, but none of \
          these four surfaces dispatch to the TwoPhaseSink role at all",
     ),
-    // ── unregistered (kind exists, zero driver registration) ───────────────────
-    entry("kafka-transactional", "sink", "preview", No, No, No, No).with_note(
-        "ConnectorKind::KafkaTransactional exists and parses, but has NO driver \
-         registered in default_registry() today under any role — dormant/parked, \
-         a different gap class from the other rows above (those have a registered \
-         driver some surfaces just don't reach; this one is unreachable everywhere \
-         because nothing registers it)",
+    entry("kafka-transactional", "two-phase-sink", "preview", No, No, No, No).with_note(
+        "was dormant (a kind that parsed but had zero driver registration under any \
+         role); #197 registered KafkaTransactionalSinkDriver, so it is now a real \
+         TwoPhaseSink-role driver backed by RdkafkaTransactionalSink. Still \
+         unreachable from these four surfaces for the same reason as \
+         two-phase-parquet: none of them dispatch to the TwoPhaseSink role. The \
+         engine's exactly-once Kafka output ships through the streaming KafkaSink \
+         output contract instead, which drives the same underlying sink",
     ),
     // ── vector-sink ──────────────────────────────────────────────────────────
     // None of these four surfaces dispatch to the VectorSink role at all (see
@@ -267,7 +285,7 @@ pub fn generate_reference_markdown() -> String {
 
     out.push_str("## Roles no surface in this matrix reaches\n\n");
     out.push_str(
-        "`two-phase-sink` (`two-phase-parquet`) and `vector-sink` \
+        "`two-phase-sink` (`two-phase-parquet`, `kafka-transactional`) and `vector-sink` \
          (`memory-vector`/`qdrant`/`pgvector`/`lancedb`/`weaviate`/`pinecone`) each \
          have registered drivers in `default_registry()`, but none of `sql_ddl` \
          (only checks `Source`/`Sink` roles), `sql_job`, `distributed_job`, or \

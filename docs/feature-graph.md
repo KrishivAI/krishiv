@@ -85,29 +85,39 @@ cargo tree -p krishiv --no-default-features --features full     | grep -c iceber
 | `elasticsearch`, `cassandra`, `hbase`, `jdbc` | external sinks |
 | `vector-sinks` → `qdrant` / `pgvector` | AI/vector sinks |
 
-## Quarantined features (known-broken, tracked)
+## Previously quarantined features (all fixed, now guard-enforced)
 
-These optional, **non-preset** features do not currently compile: each rotted
-against a dependency-API upgrade and no build/CI ever exercised them in
-isolation, so the breakage went unnoticed. They are excluded from the
-`just lint-features` guard via `--exclude-features` so the guard stays green for
-the supported surface. They are **not** in any shipping preset (`local`, `full`,
-`extended`, or the deployment presets), so no supported build is affected.
+These optional, **non-preset** features had each rotted against a dependency-API
+upgrade while no build or CI job exercised them in isolation, so the breakage
+went unnoticed. All are fixed and enforced now; the table is kept as the record
+of what rotted and why, not as a list of live exclusions.
 
-| Crate | Feature | Root cause (dependency-API drift) |
-|-------|---------|-----------------------------------|
-| connectors | `pulsar-source` | `pulsar::{Message, MessageId}` import paths changed |
-| connectors | `cassandra` | `scylla` builder dropped `request_timeout`; `CassandraConfig` derives + manual `Debug` conflict |
-| connectors | `elasticsearch` | `TransportBuilder::connect_timeout` removed |
-| connectors | `vortex` | `vortex` import surface changed |
-| connectors | `cloud` | `object_store` 0.13 GCS `with_endpoint` removed; Azure builder type change |
-| sql | `rest-catalog` | `iceberg-catalog-rest` `RestCatalogConfig` / `RestCatalog::new` now private |
-| sql | `unity-catalog` | depends on `rest-catalog` |
-| sql | `glue-catalog` | depends on `rest-catalog` |
+**Quarantine list: EMPTY as of 2026-07-25.** Every optional feature below was
+fixed and the `--exclude-features` escape hatch removed from `just
+lint-features`, so the per-feature guard now enforces all of them.
 
-**To un-quarantine:** fix the connector/catalog against its current dependency
-API, drop it from the `--exclude-features` list in `just lint-features`, and the
-guard will enforce it from then on. Track each as its own follow-up task.
+| Crate | Feature | Root cause (dependency-API drift) | Fixed |
+|-------|---------|-----------------------------------|-------|
+| connectors | `pulsar-source` | `pulsar::{Message, MessageId}` import paths changed | 2026-07-25 — `Message`/`MessageData` now imported from `pulsar::consumer`; deferred ack uses `ack_with_id(topic, id)` since only the id is retained |
+| connectors | `cassandra` | `scylla` builder dropped `request_timeout`; `CassandraConfig` derives + manual `Debug` conflict | 2026-07-25 — request deadline moved to an `ExecutionProfile`, connect bounded by `connection_timeout`, duplicate `#[derive(Debug)]` dropped |
+| connectors | `elasticsearch` | `TransportBuilder::connect_timeout` removed | 2026-07-25 — whole-request `timeout` only (the client exposes no separate connect timeout) |
+| connectors | `vortex` | `vortex` import surface changed | already building; un-quarantined 2026-07-25 |
+| connectors | `cloud` | `object_store` 0.13 GCS `with_endpoint` removed; Azure builder type change | already building; un-quarantined 2026-07-25 |
+| sql | `rest-catalog` | `iceberg-catalog-rest` `RestCatalogConfig` / `RestCatalog::new` now private | already building; un-quarantined 2026-07-25 |
+| sql | `unity-catalog` | depends on `rest-catalog` | already building; un-quarantined 2026-07-25 |
+| sql | `glue-catalog` | depends on `rest-catalog` | already building; un-quarantined 2026-07-25 |
+
+**How this was missed:** the three genuinely-broken features were excluded from
+`just lint-features`, which is the only job that compiles them — `full` does not
+include elasticsearch/cassandra/pulsar-source, so no other CI target touched
+them. A connector can therefore be listed as reachable in the
+[connector reachability matrix](reference/connector-reachability-matrix.md) and
+still be unshippable. The guard now has no exclusions for exactly this reason.
+
+**If a feature rots again:** fix it against the current dependency API. Do not
+re-introduce an `--exclude-features` list in `just lint-features` — that is what
+let these three ship broken. A feature that cannot be kept building should be
+deleted (wire-or-delete, Phase 51), not hidden from the guard.
 
 `postgres-catalog` was similarly rotted (`FileWrite`/`FileRead` trait bounds,
 `TableCommit::into_parts`, `FileIOBuilder` factory injection, `TableCommit`

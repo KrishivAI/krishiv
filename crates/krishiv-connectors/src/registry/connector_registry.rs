@@ -250,6 +250,7 @@ pub fn default_registry() -> ConnectorRegistry {
     {
         registry.register_source(Arc::new(super::drivers::KafkaSourceDriver));
         registry.register_sink(Arc::new(super::drivers::KafkaSinkDriver));
+        registry.register_two_phase_sink(Arc::new(super::drivers::KafkaTransactionalSinkDriver));
     }
     #[cfg(feature = "lakehouse")]
     {

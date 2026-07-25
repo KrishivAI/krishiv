@@ -156,7 +156,7 @@ pub fn capability_matrix() -> Vec<CapabilityCell> {
 /// The certified end-to-end data-movement paths.
 pub fn data_path_matrix() -> Vec<DataPathCell> {
     use ConnectorMaturity::{Certified, Preview};
-    use DeliveryGuarantee::{EffectivelyOnce, ExactlyOnce};
+    use DeliveryGuarantee::{AtLeastOnce, EffectivelyOnce, ExactlyOnce};
     vec![
         DataPathCell {
             source: "Kafka",
@@ -189,6 +189,19 @@ pub fn data_path_matrix() -> Vec<DataPathCell> {
             status: Preview,
             evidence: "two-phase transactional Kafka sink (transactional_kafka); \
                        barrier-aligned prepare/commit — Preview: no prod kill-loop cert yet",
+        },
+        DataPathCell {
+            source: "batch SQL",
+            sink: "any registered connector sink (registry-sink batch export)",
+            delivery: AtLeastOnce,
+            status: Preview,
+            evidence: "#197 registry-sink output contract \
+                       (executor fragment::batch::execute_registry_sink) — writes then \
+                       flushes before reporting task success, so output is durable on \
+                       success but a retried attempt re-delivers. Preview: reaches every \
+                       registered sink driver (see the connector reachability matrix) but \
+                       has no barrier-aligned commit, so it is not a checkpointed \
+                       participant",
         },
     ]
 }

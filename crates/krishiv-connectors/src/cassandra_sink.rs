@@ -34,7 +34,9 @@ use crate::error::{ConnectorError, ConnectorResult};
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// Configuration for the Cassandra / ScyllaDB sink.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written below (not derived) so the impls do not conflict.
+#[derive(Clone)]
 pub struct CassandraConfig {
     /// Seed node address (e.g. `"127.0.0.1:9042"`).
     pub node: String,
@@ -82,9 +84,18 @@ pub struct CassandraSink {
 impl CassandraSink {
     /// Connect to the cluster.
     pub async fn connect(config: CassandraConfig) -> ConnectorResult<Self> {
-        let session = SessionBuilder::new()
+        // Bound both connect and per-request time so a wedged node cannot hang
+        // a write forever. In scylla 1.x the per-request deadline lives on the
+        // execution profile, not on `SessionBuilder` (a `SessionBuilder::
+        // request_timeout(..)` call here did not exist on this driver version
+        // and broke the `cassandra` feature build outright).
+        let profile = scylla::client::execution_profile::ExecutionProfile::builder()
+            .request_timeout(Some(std::time::Duration::from_secs(30)))
+            .build();
+        let session: scylla::client::session::Session = SessionBuilder::new()
             .known_node(&config.node)
-            .request_timeout(std::time::Duration::from_secs(30))
+            .connection_timeout(std::time::Duration::from_secs(5))
+            .default_execution_profile_handle(profile.into_handle())
             .build()
             .await
             .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
