@@ -170,13 +170,15 @@ impl IncrementalDataFrame {
     fn resolve_source(&self, source: Option<&str>) -> Result<String> {
         match source {
             Some(s) => Ok(s.to_string()),
-            None if self.sources.len() == 1 => Ok(self.sources[0].clone()),
-            None => Err(KrishivError::unsupported(format!(
-                "view '{}' reads {} sources {:?}; pass source=<name>",
-                self.view,
-                self.sources.len(),
-                self.sources
-            ))),
+            None => match self.sources.as_slice() {
+                [only] => Ok(only.clone()),
+                _ => Err(KrishivError::unsupported(format!(
+                    "view '{}' reads {} sources {:?}; pass source=<name>",
+                    self.view,
+                    self.sources.len(),
+                    self.sources
+                ))),
+            },
         }
     }
 }
@@ -198,8 +200,11 @@ fn extract_source_names(sql: &str) -> Vec<String> {
             let end = start + kw.len();
             search_from = end;
             // Require the keyword to be whitespace-delimited (not part of a word).
-            let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
-            let after_ok = end >= bytes.len() || bytes[end].is_ascii_whitespace();
+            let before_ok = start
+                .checked_sub(1)
+                .and_then(|i| bytes.get(i))
+                .is_none_or(|b| !b.is_ascii_alphanumeric());
+            let after_ok = bytes.get(end).is_none_or(|b| b.is_ascii_whitespace());
             if !before_ok || !after_ok {
                 continue;
             }

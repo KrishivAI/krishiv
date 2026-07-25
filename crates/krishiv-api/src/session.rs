@@ -1021,6 +1021,10 @@ impl SessionBuilder {
     }
 }
 
+/// A cloudpickled Python UDF/UDAF shipped to distributed executors:
+/// `(pickle base64, input Arrow type names, output type name)`.
+type ShippedPythonUdf = (String, Vec<String>, String);
+
 /// User-facing Krishiv session.
 #[derive(Clone)]
 pub struct Session {
@@ -1046,10 +1050,10 @@ pub struct Session {
     /// Cloudpickled Python UDFs to ship with distributed queries (name →
     /// (pickle base64, input Arrow type names, output type name)). Shipped as a
     /// comment directive so executors run them via a python worker subprocess.
-    python_udfs: Arc<DashMap<String, (String, Vec<String>, String)>>,
+    python_udfs: Arc<DashMap<String, ShippedPythonUdf>>,
     /// Cloudpickled Python aggregate UDFs (GROUPED_AGG), same value shape as
     /// [`Self::python_udfs`]; shipped as a `register-python-udaf` directive.
-    python_udafs: Arc<DashMap<String, (String, Vec<String>, String)>>,
+    python_udafs: Arc<DashMap<String, ShippedPythonUdf>>,
     registered_sources: Arc<DashMap<String, ConnectorConfig>>,
     registered_sinks: Arc<DashMap<String, ConnectorConfig>>,
     submitted_sql_jobs: Arc<DashMap<String, SubmittedSqlJobStatus>>,

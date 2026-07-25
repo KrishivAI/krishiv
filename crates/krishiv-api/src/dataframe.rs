@@ -873,7 +873,7 @@ Execution statistics:
         let batches = self.pre_collected.clone().ok_or_else(|| {
             KrishivError::unsupported("DataFrame has neither SQL ops nor collected data")
         })?;
-        if batches.iter().all(|b| b.num_rows() == 0) && batches.first().is_none() {
+        if batches.iter().all(|b| b.num_rows() == 0) && batches.is_empty() {
             return Err(KrishivError::unsupported(
                 "cannot transform an empty pre-collected DataFrame with no schema",
             ));
