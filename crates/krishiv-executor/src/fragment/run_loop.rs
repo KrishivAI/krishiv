@@ -1019,7 +1019,7 @@ impl ExecutorTaskRunner {
                             "connector '{}' cannot be a streaming sink: its flush finalizes the \
                              sink, so it cannot be flushed once per cycle. Use it as a batch \
                              export sink, or pick a connector whose driver declares \
-                             resumable_flush (csv, s3, kafka, jdbc-sink, elasticsearch, \
+                             resumable_flush (csv, kafka, jdbc-sink, elasticsearch, \
                              cassandra, hbase)",
                             config.kind
                         ),
@@ -1332,6 +1332,32 @@ mod tests {
         assert!(
             runner.rloop_connector_sinks.is_empty(),
             "a rejected sink must not be cached"
+        );
+
+        // s3 is rejected for a different reason worth pinning: its flush is
+        // repeatable but *destructive* — it rewrites one fixed object, so a
+        // second cycle would replace the first cycle's rows rather than append.
+        // It must not be usable as a streaming sink either.
+        let json = serde_json::json!({
+            "name": "rloop-test",
+            "properties": { "object_path": "s3://bucket/out.parquet" },
+        });
+        let s3_contract = krishiv_proto::OutputContract::new(
+            krishiv_proto::OutputContractKind::Sink,
+            format!(
+                "{}s3|{}",
+                crate::runner::REGISTRY_SINK_PREFIX,
+                base64::engine::general_purpose::STANDARD
+                    .encode(serde_json::to_vec(&json).unwrap()),
+            ),
+        );
+        let error = runner
+            .stage_rloop_connector("job-s3", &s3_contract, &[])
+            .await
+            .expect_err("s3 must not be a streaming sink");
+        assert!(
+            error.to_string().contains("cannot be a streaming sink"),
+            "{error}"
         );
     }
 

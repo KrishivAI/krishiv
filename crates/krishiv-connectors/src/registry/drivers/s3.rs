@@ -124,10 +124,16 @@ impl SinkDriver for S3SinkDriver {
         ConnectorDescriptor::new(
             ConnectorKind::S3,
             ConnectorRole::Sink,
+            // Deliberately NOT `resumable_flush`: `S3Sink::flush` serialises the
+            // pending batches into one Parquet object and `put`s it at a FIXED
+            // path, then clears `pending`. Flushing twice therefore replaces the
+            // first flush's rows with the second's — correct for a batch sink
+            // that flushes once, silent data loss if a streaming job flushed it
+            // per cycle. A streaming object sink needs a rolling-object writer,
+            // which is what the staged ObjectParquetSink path does for batch.
             ConnectorCapabilities::new()
                 .with_bounded()
-                .with_idempotent()
-                .with_resumable_flush(),
+                .with_idempotent(),
         )
     }
 

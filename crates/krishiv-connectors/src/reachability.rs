@@ -239,7 +239,10 @@ pub static CONNECTORS: &[ConnectorEntry] = &[
     entry("s3", "sink", "preview", Yes, Yes, Yes, Yes).with_note(
         "distributed reach is ObjectParquetSink (Parquet format written to an \
          object-store path, with the staged-commit protocol) plus the generic \
-         batch registry-sink export; not a checkpoint-aligned streaming sink",
+         batch registry-sink export. Batch only: the driver's flush rewrites one \
+         fixed object, so it does not declare resumable_flush and the streaming \
+         registry-sink path rejects it — a streaming object sink needs a \
+         rolling-object writer",
     ),
     entry("kafka", "sink", "preview", Yes, Yes, Yes, Yes).with_note(
         "distributed reach is the checkpoint-aligned two-phase-commit KafkaSink \
