@@ -1,3 +1,6 @@
+// A verification CLI: its report on stdout/stderr is the whole deliverable.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 //! Execute every TPC-H query once and report which succeed.
 //!
 //! Timing an unrunnable query is worse than not timing it: the benchmark

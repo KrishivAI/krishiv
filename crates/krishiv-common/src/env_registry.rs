@@ -742,7 +742,8 @@ pub static FLAGS: &[FlagSpec] = &[
         "KRISHIV_QUERY_MEMORY_LIMIT_BYTES",
         FlagKind::UInt,
         "cgroup-derived",
-        "Per-query FairSpillPool budget for embedded/IVM sessions.",
+        "Total FairSpillPool budget SHARED by every engine in the process \
+         (task slots, Flight SQL, IVM); 0 disables the limit.",
     ),
     rt(
         "KRISHIV_RACK_ID",
@@ -903,8 +904,9 @@ pub static FLAGS: &[FlagSpec] = &[
     rt(
         "KRISHIV_STAGE_TARGET_PARTITIONS",
         FlagKind::UInt,
-        "4",
-        "Planning-time partition count for distributed batch stages (scan + shuffle fan-out).",
+        "cluster-derived",
+        "Planning-time partition count for distributed batch stages (scan + \
+         shuffle fan-out); unset derives 2 tasks per live cluster slot.",
     ),
     rt(
         "KRISHIV_STATE_BACKEND",
@@ -963,14 +965,16 @@ pub static FLAGS: &[FlagSpec] = &[
     rt(
         "KRISHIV_TASK_SLOTS",
         FlagKind::UInt,
-        "CPU-derived",
-        "Executor task slots; unset derives from available CPU cores.",
+        "capacity-derived",
+        "Executor task slots; unset derives from CPU cores and the cgroup \
+         memory limit together. Also sizes per-task parallelism.",
     ),
     rt(
         "KRISHIV_TASK_TARGET_PARALLELISM",
         FlagKind::UInt,
         "cores/slots",
-        "DataFusion parallelism per executor task engine; unset = per-slot share of cores.",
+        "DataFusion parallelism per executor task engine; unset = per-slot \
+         share of cores, using the RESOLVED slot count (incl. --slots).",
     ),
     rt(
         "KRISHIV_TLS_CERT",

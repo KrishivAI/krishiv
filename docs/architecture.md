@@ -215,6 +215,68 @@ Their responsibilities include:
 Blocking filesystem/database work must not be hidden on async executor loops;
 implementations use explicit blocking boundaries where required.
 
+### 8.1 Capacity: slots, memory, and parallelism
+
+Three quantities govern how much work an executor takes and how it spends the
+machine on each piece:
+
+| quantity | meaning |
+|---|---|
+| `slots` | task fragments run concurrently; the placement weight the coordinator sees |
+| query pool | bytes available to DataFusion for execution |
+| task parallelism | DataFusion `target_partitions` inside one task |
+
+They are **not independent settings**. `krishiv_common::ExecutorCapacity`
+derives all three from one pair of facts — `available_parallelism()` and the
+cgroup memory limit, both of which a container reports correctly without
+operator input:
+
+```
+slots            = min(cores, query_pool / 256 MiB)      # memory only ever caps
+query_pool       = (cgroup_limit - 512 MiB) * 0.8        # shared, see below
+task_parallelism = max(1, cores / slots)
+```
+
+`KRISHIV_TASK_SLOTS` (or `--slots`), `KRISHIV_QUERY_MEMORY_LIMIT_BYTES`, and
+`KRISHIV_TASK_TARGET_PARALLELISM` override individual results, and an override
+feeds the same derivation — setting slots alone still resizes the parallelism
+share. Deployments are expected to set container CPU/memory limits and nothing
+else.
+
+**The query pool is shared, not divided.** One `FairSpillPool`
+(`krishiv_sql::process_query_pool`) backs every engine in the process: each
+task slot, the Flight SQL host, and IVM tick engines. This is what makes
+memory safety structural rather than arithmetic. Per-engine pools sized as a
+fraction of the container are claimed once *per engine*, so the total grows
+with concurrency and overshoots the container while every individual pool still
+reports headroom — the failure is an OOM kill with no prior signal. A single
+hard-capped pool cannot overshoot: adding a slot divides the same budget
+further. Because `FairSpillPool` apportions across live consumers, the bound
+costs nothing under low concurrency — a task running alone gets all of it.
+
+A consequence worth stating: **memory is not an admission criterion.** A task
+whose working set exceeds free memory spills; it does not fail. Placement
+therefore does not reject executors on a per-task memory estimate (doing so
+converts a slow query into a stalled one). The only memory gate on placement is
+`memory_threshold_bytes`, which excludes an executor whose *process* RSS is
+already near the container limit — a different condition, where admitting work
+would not help.
+
+**Stage width follows the cluster.** At plan time the coordinator reads its
+live schedulable slot total and targets `2 × slots` partitions
+(`resolve_stage_target_partitions`), bounded to `[2, 512]` so shuffle
+fragments — which grow as partitions² — stay in budget. More tasks than slots
+means a fast slot can pick up a second task while a slow one is still on its
+first, at the cost of extra shuffle fragments; this is the same 2–3× guidance
+Spark gives for the same reason. DataFusion bounds the count downward by file
+groups, so small inputs stay cheap without a size term. The embedded in-process
+runtime plans against its own capacity by the same rule.
+
+`ResourceProfile` carries `task_cpus` on the wire but nothing populates it: a
+task currently costs exactly one slot regardless of how many DataFusion
+partitions it runs. Making slots a CPU budget instead of a task count needs the
+planner to know each executor's per-slot core share, which it does not.
+
 ## 9. Shuffle architecture
 
 `krishiv-shuffle` exposes a backend abstraction with:

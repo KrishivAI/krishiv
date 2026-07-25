@@ -1,3 +1,7 @@
+// This binary's entire output is the corpus on stdout; it is a pipe source,
+// not a service.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 //! Print the TPC-H corpus as JSON on stdout.
 //!
 //! The distributed runner is a Python script (it drives the coordinator's HTTP
@@ -29,8 +33,15 @@ fn main() {
         "count": queries.len(),
         "queries": queries,
     });
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&out).expect("corpus serialises")
-    );
+    // Serialisation of a `json!` tree cannot fail, but a panic here would
+    // print a backtrace onto the very stdout the consumer is parsing. Exit
+    // with a diagnostic on stderr and a non-zero status instead, so the
+    // runner sees a failed pipe rather than corrupt JSON.
+    match serde_json::to_string_pretty(&out) {
+        Ok(json) => println!("{json}"),
+        Err(error) => {
+            eprintln!("failed to serialise the TPC-H corpus: {error}");
+            std::process::exit(1);
+        }
+    }
 }
