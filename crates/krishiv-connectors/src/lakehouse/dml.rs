@@ -1714,8 +1714,11 @@ mod tests {
         let ident = TableIdent::new(NamespaceIdent::new("pipe".into()), "growing".into());
 
         // Land the table with 2 rows via CTAS (existing, proven path).
-        let first = stream_of(&ctx, "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name)")
-            .await;
+        let first = stream_of(
+            &ctx,
+            "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name)",
+        )
+        .await;
         let ctas_report = land_ctas(Arc::clone(&catalog), &ident, false, &[], first)
             .await
             .unwrap();
@@ -1723,8 +1726,11 @@ mod tests {
 
         // A plain INSERT INTO must not need OR REPLACE and must not fail
         // the way ListingTable::insert_into does on a real catalog table.
-        let second =
-            stream_of(&ctx, "SELECT * FROM (VALUES (3, 'c'), (4, 'd')) AS t(id, name)").await;
+        let second = stream_of(
+            &ctx,
+            "SELECT * FROM (VALUES (3, 'c'), (4, 'd')) AS t(id, name)",
+        )
+        .await;
         let insert_report = iceberg_append_into(Arc::clone(&catalog), &ident, second)
             .await
             .unwrap();
@@ -1760,8 +1766,13 @@ mod tests {
         // The append must not have replaced the CTAS snapshot's data file —
         // a real append adds a file, it never rewrites/removes one.
         let scan = table.scan().build().unwrap();
-        let tasks: Vec<iceberg::scan::FileScanTask> =
-            scan.plan_files().await.unwrap().try_collect().await.unwrap();
+        let tasks: Vec<iceberg::scan::FileScanTask> = scan
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
         assert_eq!(
             tasks.len(),
             2,
@@ -1775,13 +1786,15 @@ mod tests {
         let ctx = SessionContext::new();
         // make_catalog_with_table's schema is (id: Long, name: String) —
         // this stream has a different column list entirely.
-        let stream = stream_of(&ctx, "SELECT * FROM (VALUES (1.5, true)) AS t(price, active)")
-            .await;
-        let err = iceberg_append_into(catalog, &ident, stream).await.unwrap_err();
-        assert!(
-            err.to_string().contains("does not match"),
-            "got: {err}"
-        );
+        let stream = stream_of(
+            &ctx,
+            "SELECT * FROM (VALUES (1.5, true)) AS t(price, active)",
+        )
+        .await;
+        let err = iceberg_append_into(catalog, &ident, stream)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not match"), "got: {err}");
     }
 
     #[tokio::test]
@@ -1789,10 +1802,7 @@ mod tests {
         let (catalog, _dir) = make_empty_catalog().await;
         let ctx = SessionContext::new();
         let ns = NamespaceIdent::new("pipe".into());
-        catalog
-            .create_namespace(&ns, HashMap::new())
-            .await
-            .unwrap();
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
         let ident = TableIdent::new(ns, "never_created".into());
         let stream = stream_of(&ctx, "SELECT * FROM (VALUES (1)) AS t(id)").await;
         // INSERT INTO must target an EXISTING table — CREATE [OR REPLACE]

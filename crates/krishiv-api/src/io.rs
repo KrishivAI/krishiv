@@ -552,14 +552,9 @@ impl DataFrameWriter {
         }
         let batches = self.dataframe.collect_async().await?.into_batches();
         let registry = default_registry();
-        let mut sink = registry
-            .open_sink(&config)
-            .await
-            .map_err(connector_error)?;
+        let mut sink = registry.open_sink(&config).await.map_err(connector_error)?;
         for batch in batches {
-            sink.write_batch_dyn(batch)
-                .await
-                .map_err(connector_error)?;
+            sink.write_batch_dyn(batch).await.map_err(connector_error)?;
         }
         sink.flush_dyn().await.map_err(connector_error)
     }

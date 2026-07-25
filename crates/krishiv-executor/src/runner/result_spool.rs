@@ -196,8 +196,7 @@ pub(crate) async fn drain_stream_with_spool(
             let seq = SPOOL_SEQ.fetch_add(1, Ordering::Relaxed);
             let task = tokio::task::spawn_blocking(move || {
                 let dir = spool_dir();
-                std::fs::create_dir_all(&dir)
-                    .map_err(|e| io_err("create result spool dir", &e))?;
+                std::fs::create_dir_all(&dir).map_err(|e| io_err("create result spool dir", &e))?;
                 let path = dir.join(format!("executor-{}-{}.arrow-ipc", std::process::id(), seq));
                 let file =
                     std::fs::File::create(&path).map_err(|e| io_err("create result spool", &e))?;
@@ -226,7 +225,9 @@ pub(crate) async fn drain_stream_with_spool(
     match (writer, spool_path) {
         (Some(w), Some(path)) => {
             let task = tokio::task::spawn_blocking(move || {
-                let mut inner = w.into_inner().map_err(|e| io_err("finish result spool", &e))?;
+                let mut inner = w
+                    .into_inner()
+                    .map_err(|e| io_err("finish result spool", &e))?;
                 use std::io::Write as _;
                 inner
                     .flush()

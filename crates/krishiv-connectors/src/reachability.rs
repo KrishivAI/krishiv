@@ -47,8 +47,14 @@
 //!   streaming* sinks; separately the batch `registry-sink:<kind>|<base64-json>`
 //!   output contract streams a batch job's result into **any** registered `Sink`
 //!   driver (`krishiv-executor::fragment::batch::execute_registry_sink`), which
-//!   is at-least-once. So the original #197 asymmetry is closed for *reachability*
-//!   and now shows up as a *delivery-guarantee* difference per kind instead.
+//!   is at-least-once — and, for drivers whose `flush` leaves the sink usable
+//!   (`ConnectorCapabilities::resumable_flush`), run-loop cycles stage into the
+//!   same registry-opened sink once per cycle
+//!   (`fragment::run_loop::stage_rloop_connector`). A terminal-flush driver
+//!   (Parquet finalizes its footer) is rejected when the streaming sink opens
+//!   rather than failing on the second cycle. So the original #197 asymmetry is
+//!   closed for *reachability* and now shows up as a *delivery-guarantee*
+//!   difference per kind instead.
 //! - `python_sink`: `krishiv-python::sinks` — six hand-written pyclasses (Parquet,
 //!   Kafka, Iceberg, Cassandra, Elasticsearch, HBase) plus the registry-generic
 //!   `ConnectorSink(kind, options)` added by #197, which dispatches through
@@ -157,9 +163,10 @@ use Reach::{No, NotApplicable, Yes};
 /// retried attempt re-writes rows an earlier attempt may already have delivered.
 /// Exactly-once output on the distributed surface requires a checkpoint-aligned
 /// two-phase-commit sink (Iceberg/Kafka today).
-const BATCH_EXPORT_ONLY: &str =
-    "distributed reach is the batch registry-sink export (at-least-once, flushed \
-     before task success); no checkpoint-aligned streaming sink for this kind";
+const BATCH_EXPORT_ONLY: &str = "distributed reach is the registry-sink contract: batch export always, plus \
+     per-cycle streaming when the driver declares resumable_flush. Both are \
+     at-least-once (flushed before success, but a replayed task/cycle \
+     re-delivers); no checkpoint-aligned two-phase commit for this kind";
 
 /// The connector reachability matrix. Ordered by role-group (source, sink,
 /// two-phase-sink, vector-sink) then by first appearance of the kind.
@@ -171,18 +178,50 @@ const BATCH_EXPORT_ONLY: &str =
 pub static CONNECTORS: &[ConnectorEntry] = &[
     // ── sources ──────────────────────────────────────────────────────────────
     entry("parquet", "source", "preview", Yes, Yes, Yes, NotApplicable),
-    entry("parquet-directory", "source", "preview", Yes, Yes, Yes, NotApplicable),
+    entry(
+        "parquet-directory",
+        "source",
+        "preview",
+        Yes,
+        Yes,
+        Yes,
+        NotApplicable,
+    ),
     entry("csv", "source", "preview", Yes, Yes, Yes, NotApplicable),
     // #197: the ad-hoc SQL job source provider now falls through to the
     // registry-generic dispatch (ConnectorSourceProvider `_` arm), so every
     // registered source driver is reachable here — matching `sql_ddl`.
     entry("avro", "source", "preview", Yes, Yes, Yes, NotApplicable),
     entry("s3", "source", "preview", Yes, Yes, Yes, NotApplicable),
-    entry("s3-prefix", "source", "preview", Yes, Yes, Yes, NotApplicable),
+    entry(
+        "s3-prefix",
+        "source",
+        "preview",
+        Yes,
+        Yes,
+        Yes,
+        NotApplicable,
+    ),
     entry("kafka", "source", "preview", Yes, Yes, Yes, NotApplicable),
     entry("iceberg", "source", "preview", Yes, Yes, Yes, NotApplicable),
-    entry("delta", "source", "experimental", Yes, Yes, Yes, NotApplicable),
-    entry("hudi", "source", "experimental", Yes, Yes, Yes, NotApplicable),
+    entry(
+        "delta",
+        "source",
+        "experimental",
+        Yes,
+        Yes,
+        Yes,
+        NotApplicable,
+    ),
+    entry(
+        "hudi",
+        "source",
+        "experimental",
+        Yes,
+        Yes,
+        Yes,
+        NotApplicable,
+    ),
     entry("kinesis", "source", "preview", Yes, Yes, Yes, NotApplicable),
     entry("pulsar", "source", "preview", Yes, Yes, Yes, NotApplicable),
     entry("jdbc", "source", "preview", Yes, Yes, Yes, NotApplicable),
@@ -206,9 +245,8 @@ pub static CONNECTORS: &[ConnectorEntry] = &[
         "distributed reach is the checkpoint-aligned two-phase-commit KafkaSink \
          (Phase 55): exactly-once for read_committed consumers",
     ),
-    entry("iceberg", "sink", "preview", Yes, Yes, Yes, Yes).with_note(
-        "distributed reach is the checkpoint-aligned two-phase-commit IcebergSink (G7)",
-    ),
+    entry("iceberg", "sink", "preview", Yes, Yes, Yes, Yes)
+        .with_note("distributed reach is the checkpoint-aligned two-phase-commit IcebergSink (G7)"),
     entry("delta", "sink", "experimental", Yes, Yes, Yes, Yes).with_note(BATCH_EXPORT_ONLY),
     entry("hudi", "sink", "experimental", Yes, Yes, Yes, Yes).with_note(BATCH_EXPORT_ONLY),
     entry("elasticsearch", "sink", "preview", Yes, Yes, Yes, Yes).with_note(BATCH_EXPORT_ONLY),
@@ -216,11 +254,29 @@ pub static CONNECTORS: &[ConnectorEntry] = &[
     entry("hbase", "sink", "preview", Yes, Yes, Yes, Yes).with_note(BATCH_EXPORT_ONLY),
     entry("jdbc-sink", "sink", "preview", Yes, Yes, Yes, Yes).with_note(BATCH_EXPORT_ONLY),
     // ── two-phase-sink ───────────────────────────────────────────────────────
-    entry("two-phase-parquet", "two-phase-sink", "preview", No, No, No, No).with_note(
+    entry(
+        "two-phase-parquet",
+        "two-phase-sink",
+        "preview",
+        No,
+        No,
+        No,
+        No,
+    )
+    .with_note(
         "registered in default_registry() as a TwoPhaseSink driver, but none of \
          these four surfaces dispatch to the TwoPhaseSink role at all",
     ),
-    entry("kafka-transactional", "two-phase-sink", "preview", No, No, No, No).with_note(
+    entry(
+        "kafka-transactional",
+        "two-phase-sink",
+        "preview",
+        No,
+        No,
+        No,
+        No,
+    )
+    .with_note(
         "was dormant (a kind that parsed but had zero driver registration under any \
          role); #197 registered KafkaTransactionalSinkDriver, so it is now a real \
          TwoPhaseSink-role driver backed by RdkafkaTransactionalSink. Still \
@@ -233,8 +289,16 @@ pub static CONNECTORS: &[ConnectorEntry] = &[
     // None of these four surfaces dispatch to the VectorSink role at all (see
     // "Roles no surface in this matrix reaches" below) — vector writes go
     // through a separate embedding-pipeline path this matrix doesn't cover.
-    entry("memory-vector", "vector-sink", "experimental", No, No, No, No)
-        .with_note("VectorSink role — see \"Roles no surface in this matrix reaches\" below"),
+    entry(
+        "memory-vector",
+        "vector-sink",
+        "experimental",
+        No,
+        No,
+        No,
+        No,
+    )
+    .with_note("VectorSink role — see \"Roles no surface in this matrix reaches\" below"),
     entry("qdrant", "vector-sink", "preview", No, No, No, No)
         .with_note("VectorSink role — see \"Roles no surface in this matrix reaches\" below"),
     entry("pgvector", "vector-sink", "preview", No, No, No, No)
@@ -266,7 +330,9 @@ pub fn generate_reference_markdown() -> String {
          why Python source reachability is not a column here.\n\n",
     );
 
-    out.push_str("| Kind | Role | Maturity | sql_ddl | sql_job | distributed_job | python_sink | Notes |\n");
+    out.push_str(
+        "| Kind | Role | Maturity | sql_ddl | sql_job | distributed_job | python_sink | Notes |\n",
+    );
     out.push_str("|---|---|---|---|---|---|---|---|\n");
     for e in CONNECTORS {
         out.push_str(&format!(

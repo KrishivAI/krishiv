@@ -613,8 +613,14 @@ Execution statistics:
             .coordinator_http_url
             .clone()
             .or_else(|| self._coordinator_url.clone());
-        crate::IncrementalDataFrame::from_view_sql(name, body_sql, output_schema, self.mode, ivm_url)
-            .await
+        crate::IncrementalDataFrame::from_view_sql(
+            name,
+            body_sql,
+            output_schema,
+            self.mode,
+            ivm_url,
+        )
+        .await
     }
 
     /// Tag this DataFrame as reading `parent`'s view output, so `to_incremental`

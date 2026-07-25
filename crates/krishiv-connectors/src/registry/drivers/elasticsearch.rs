@@ -1,7 +1,5 @@
 //! Elasticsearch sink driver.
 
-#![cfg(feature = "elasticsearch")]
-
 use std::future::Future;
 use std::pin::Pin;
 
@@ -23,7 +21,9 @@ impl SinkDriver for ElasticsearchSinkDriver {
             ConnectorRole::Sink,
             // Elasticsearch bulk indexing is not idempotent (retries may produce duplicates
             // unless the caller provides explicit document IDs).
-            ConnectorCapabilities::new().with_unbounded(),
+            ConnectorCapabilities::new()
+                .with_unbounded()
+                .with_resumable_flush(),
         )
     }
 

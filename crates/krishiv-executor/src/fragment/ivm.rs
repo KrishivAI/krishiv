@@ -527,9 +527,7 @@ mod tests {
     #[tokio::test]
     async fn resident_group_by_aggregate_first_tick_emits_delta() {
         use arrow::array::StringArray;
-        use krishiv_ivm::{
-            decode_delta_map, encode_ivm_attach_fragment, encode_ivm_tick_fragment,
-        };
+        use krishiv_ivm::{decode_delta_map, encode_ivm_attach_fragment, encode_ivm_tick_fragment};
 
         fn orders_schema() -> Arc<Schema> {
             Arc::new(Schema::new(vec![

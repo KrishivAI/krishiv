@@ -3753,7 +3753,9 @@ mod state_reader_tests {
         }
 
         let session = SessionBuilder::new().build().expect("session");
-        let df = session.read_state(&dir, "op1", "count").expect("read_state");
+        let df = session
+            .read_state(&dir, "op1", "count")
+            .expect("read_state");
         let batches = df.collect().expect("collect").into_batches();
 
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();

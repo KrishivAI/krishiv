@@ -98,9 +98,34 @@ impl SourceDriver for CsvSourceDriver {
 ///
 /// Config: `path` (required), `delimiter`, `has_header` (default true).
 struct CsvFileSink {
-    /// `None` once flushed — a flushed sink rejects further writes rather than
-    /// silently dropping them.
-    writer: Option<arrow::csv::Writer<File>>,
+    /// Kept open across flushes: `flush` syncs what has been written and leaves
+    /// the sink usable, so a streaming job can flush every cycle (the
+    /// `resumable_flush` capability). Taking the writer here would truncate the
+    /// next cycle's writes.
+    writer: arrow::csv::Writer<SyncedFile>,
+    file: std::sync::Arc<std::sync::Mutex<File>>,
+}
+
+/// `Write` adapter that shares the underlying file with the sink so `flush` can
+/// `sync_data()` it without consuming the arrow writer.
+struct SyncedFile(std::sync::Arc<std::sync::Mutex<File>>);
+
+impl std::io::Write for SyncedFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut file = self
+            .0
+            .lock()
+            .map_err(|_| std::io::Error::other("csv sink file lock poisoned"))?;
+        file.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut file = self
+            .0
+            .lock()
+            .map_err(|_| std::io::Error::other("csv sink file lock poisoned"))?;
+        file.flush()
+    }
 }
 
 impl Sink for CsvFileSink {
@@ -108,14 +133,11 @@ impl Sink for CsvFileSink {
         ConnectorCapabilities::new().with_bounded()
     }
 
-    async fn write_batch(&mut self, batch: arrow::record_batch::RecordBatch) -> ConnectorResult<()> {
-        let writer = self
-            .writer
-            .as_mut()
-            .ok_or_else(|| crate::error::ConnectorError::Config {
-                message: String::from("csv sink already flushed"),
-            })?;
-        writer
+    async fn write_batch(
+        &mut self,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> ConnectorResult<()> {
+        self.writer
             .write(&batch)
             .map_err(|error| crate::error::ConnectorError::Schema {
                 message: format!("csv sink write failed: {error}"),
@@ -123,14 +145,15 @@ impl Sink for CsvFileSink {
     }
 
     async fn flush(&mut self) -> ConnectorResult<()> {
-        // arrow-csv writes rows through on every `write`, so durability here is
-        // the underlying file's flush; take the writer so the file is closed.
-        if let Some(writer) = self.writer.take() {
-            use std::io::Write as _;
-            let mut file = writer.into_inner();
-            file.flush().map_err(crate::error::ConnectorError::Io)?;
-        }
-        Ok(())
+        // arrow-csv writes rows straight through, so durability is the file's:
+        // fsync it and leave the writer open for the next batch/cycle.
+        let file = self
+            .file
+            .lock()
+            .map_err(|_| crate::error::ConnectorError::Config {
+                message: String::from("csv sink file lock poisoned"),
+            })?;
+        file.sync_data().map_err(crate::error::ConnectorError::Io)
     }
 }
 
@@ -141,7 +164,9 @@ impl SinkDriver for CsvSinkDriver {
         ConnectorDescriptor::new(
             ConnectorKind::Csv,
             ConnectorRole::Sink,
-            ConnectorCapabilities::new().with_bounded(),
+            ConnectorCapabilities::new()
+                .with_bounded()
+                .with_resumable_flush(),
         )
     }
 
@@ -163,8 +188,10 @@ impl SinkDriver for CsvSinkDriver {
                 builder = builder.with_delimiter(delimiter);
             }
             let file = File::create(&path).map_err(crate::error::ConnectorError::Io)?;
+            let shared = std::sync::Arc::new(std::sync::Mutex::new(file));
             Ok(Box::new(CsvFileSink {
-                writer: Some(builder.build(file)),
+                writer: builder.build(SyncedFile(shared.clone())),
+                file: shared,
             }) as Box<dyn DynSink>)
         })
     }

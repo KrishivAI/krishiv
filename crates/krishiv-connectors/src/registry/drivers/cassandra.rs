@@ -1,7 +1,5 @@
 //! Cassandra sink driver.
 
-#![cfg(feature = "cassandra")]
-
 use std::future::Future;
 use std::pin::Pin;
 
@@ -24,7 +22,8 @@ impl SinkDriver for CassandraSinkDriver {
             // Cassandra INSERT operations are idempotent when using the same row key.
             ConnectorCapabilities::new()
                 .with_unbounded()
-                .with_idempotent(),
+                .with_idempotent()
+                .with_resumable_flush(),
         )
     }
 

@@ -347,7 +347,6 @@ mod connector_tests {
     // TwoPhaseCommitSink
     // -----------------------------------------------------------------------
 
-
     #[test]
     fn two_phase_commit_sink_prepare_commit_roundtrip() {
         use arrow::array::Int64Array;

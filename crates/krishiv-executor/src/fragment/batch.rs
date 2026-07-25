@@ -331,12 +331,13 @@ pub(crate) async fn execute_batch_fragment(
             .map_err(|error| ExecutorError::LocalExecution {
                 message: error.to_string(),
             })?;
-        let dataframe = engine
-            .sql(&query)
-            .await
-            .map_err(|error| ExecutorError::LocalExecution {
-                message: error.to_string(),
-            })?;
+        let dataframe =
+            engine
+                .sql(&query)
+                .await
+                .map_err(|error| ExecutorError::LocalExecution {
+                    message: error.to_string(),
+                })?;
 
         // #197 / Phase 67 export leg: a `registry-sink:` contract streams the
         // task's result batches into any registered connector sink (s3-files,
@@ -1162,11 +1163,12 @@ async fn execute_inmem_shuffle_write(
             restored_source_offsets,
         ))
         .await?;
-        let query =
-            limited_engine
+        let query = limited_engine
             .register_python_udfs_from_sql(query)
             .await
-            .map_err(|e| ExecutorError::LocalExecution { message: e.to_string() })?;
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: e.to_string(),
+            })?;
         let dataframe = crate::erased(limited_engine.sql(&query))
             .await
             .map_err(|e| ExecutorError::LocalExecution {
@@ -1884,7 +1886,7 @@ fn shuffle_seed_from_job_id(job_id: &str) -> u64 {
 /// containing `|`/`:`) cannot corrupt the contract framing. Property values are
 /// coerced to strings; a non-string JSON value is serialized back to its JSON
 /// text so nothing is silently dropped.
-fn parse_registry_sink_contract(
+pub(crate) fn parse_registry_sink_contract(
     description: &str,
 ) -> Result<krishiv_connectors::config::ConnectorConfig, String> {
     use base64::Engine as _;
@@ -1904,8 +1906,8 @@ fn parse_registry_sink_contract(
     let json_bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded.trim())
         .map_err(|e| format!("registry-sink config base64: {e}"))?;
-    let value: serde_json::Value =
-        serde_json::from_slice(&json_bytes).map_err(|e| format!("registry-sink config json: {e}"))?;
+    let value: serde_json::Value = serde_json::from_slice(&json_bytes)
+        .map_err(|e| format!("registry-sink config json: {e}"))?;
     let name = value
         .get("name")
         .and_then(|v| v.as_str())
@@ -1979,7 +1981,8 @@ async fn execute_registry_sink(
 
     let sql_stats = stats_handle.stats();
     if sql_stats.spill_bytes > 0 {
-        krishiv_metrics::global_metrics().record_spill(sql_stats.spill_bytes, sql_stats.spill_count);
+        krishiv_metrics::global_metrics()
+            .record_spill(sql_stats.spill_bytes, sql_stats.spill_count);
     }
     let runtime_stats = TaskRuntimeStats {
         input_rows: 0,
@@ -1989,8 +1992,10 @@ async fn execute_registry_sink(
         spill_bytes: sql_stats.spill_bytes,
         serialized_bytes: 0,
     };
-    Ok(ExecutorTaskOutput::sql(row_count, batch_count, column_count)
-        .with_runtime_stats(runtime_stats))
+    Ok(
+        ExecutorTaskOutput::sql(row_count, batch_count, column_count)
+            .with_runtime_stats(runtime_stats),
+    )
 }
 
 #[cfg(test)]
@@ -2011,15 +2016,18 @@ mod tests {
             .map(|(k, v)| ((*k).to_owned(), serde_json::Value::String((*v).to_owned())))
             .collect();
         let json = serde_json::json!({ "name": name, "properties": properties });
-        let encoded = base64::engine::general_purpose::STANDARD
-            .encode(serde_json::to_vec(&json).unwrap());
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&json).unwrap());
         format!("{}{kind}|{encoded}", crate::runner::REGISTRY_SINK_PREFIX)
     }
 
     #[test]
     fn parse_registry_sink_contract_round_trips_kind_and_properties() {
-        let contract =
-            registry_sink_contract("s3", "orders-export", &[("path", "s3://bucket/x|y"), ("format", "parquet")]);
+        let contract = registry_sink_contract(
+            "s3",
+            "orders-export",
+            &[("path", "s3://bucket/x|y"), ("format", "parquet")],
+        );
         let config = parse_registry_sink_contract(&contract).expect("parse");
         assert_eq!(config.kind, "s3");
         assert_eq!(config.name, "orders-export");
@@ -2094,9 +2102,9 @@ mod tests {
             _config: &'a krishiv_connectors::config::ConnectorConfig,
         ) -> krishiv_connectors::registry::OpenSinkFuture<'a> {
             let sink = self.sink.clone();
-            Box::pin(async move {
-                Ok(Box::new(sink) as Box<dyn krishiv_connectors::sink::DynSink>)
-            })
+            Box::pin(
+                async move { Ok(Box::new(sink) as Box<dyn krishiv_connectors::sink::DynSink>) },
+            )
         }
     }
 
@@ -2111,11 +2119,11 @@ mod tests {
 
         let sink = CollectingSink::default();
         let mut registry = krishiv_connectors::ConnectorRegistry::new();
-        registry.register_sink(std::sync::Arc::new(CollectingSinkDriver { sink: sink.clone() }));
-        let runner = crate::runner::ExecutorTaskRunner::new(
-            crate::ExecutorAssignmentInbox::new(),
-        )
-        .with_connector_registry(registry);
+        registry.register_sink(std::sync::Arc::new(CollectingSinkDriver {
+            sink: sink.clone(),
+        }));
+        let runner = crate::runner::ExecutorTaskRunner::new(crate::ExecutorAssignmentInbox::new())
+            .with_connector_registry(registry);
 
         let fragment = krishiv_plan::TypedTaskFragment::new(
             krishiv_plan::ExecutionKind::Batch,
@@ -2163,10 +2171,8 @@ mod tests {
             PlanFragment, StageId, TaskAttemptRef, TaskId,
         };
         // Empty registry: no driver registered for "s3".
-        let runner = crate::runner::ExecutorTaskRunner::new(
-            crate::ExecutorAssignmentInbox::new(),
-        )
-        .with_connector_registry(krishiv_connectors::ConnectorRegistry::new());
+        let runner = crate::runner::ExecutorTaskRunner::new(crate::ExecutorAssignmentInbox::new())
+            .with_connector_registry(krishiv_connectors::ConnectorRegistry::new());
         let fragment = krishiv_plan::TypedTaskFragment::new(
             krishiv_plan::ExecutionKind::Batch,
             "sql: SELECT 1 AS a",

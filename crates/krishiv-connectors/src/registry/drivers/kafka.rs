@@ -7,8 +7,8 @@ use crate::capabilities::ConnectorCapabilities;
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorResult;
 use crate::kafka::{KafkaConfig, KafkaSink, KafkaSource};
-use crate::registry::descriptor::ConnectorDescriptor;
 use crate::kafka_transactional_sink::RdkafkaTransactionalSink;
+use crate::registry::descriptor::ConnectorDescriptor;
 use crate::registry::driver::{OpenedTwoPhaseSink, SinkDriver, SourceDriver, TwoPhaseSinkDriver};
 use crate::registry::kind::{ConnectorKind, ConnectorRole};
 use crate::sink::DynSink;
@@ -49,7 +49,9 @@ impl SinkDriver for KafkaSinkDriver {
         ConnectorDescriptor::new(
             ConnectorKind::Kafka,
             ConnectorRole::Sink,
-            ConnectorCapabilities::new().with_unbounded(),
+            ConnectorCapabilities::new()
+                .with_unbounded()
+                .with_resumable_flush(),
         )
     }
 

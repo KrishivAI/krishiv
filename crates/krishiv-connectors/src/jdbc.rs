@@ -113,7 +113,6 @@ impl JdbcSource {
         self.last_key = Some(cursor);
         self
     }
-
 }
 
 impl Source for JdbcSource {
@@ -175,9 +174,11 @@ impl Source for JdbcSource {
         let schema = match &self.schema {
             Some(s) => Arc::clone(s),
             None => {
-                let first_row = rows.first().ok_or_else(|| ConnectorError::Io(
-                    std::io::Error::other("jdbc read_batch: rows became empty after the is_empty guard"),
-                ))?;
+                let first_row = rows.first().ok_or_else(|| {
+                    ConnectorError::Io(std::io::Error::other(
+                        "jdbc read_batch: rows became empty after the is_empty guard",
+                    ))
+                })?;
                 let s = Arc::new(pg_columns_to_schema(first_row.columns().iter().collect()));
                 self.schema = Some(Arc::clone(&s));
                 s
@@ -254,9 +255,10 @@ impl crate::offset::Offset for JdbcOffset {
         match tag {
             0 => {
                 let field = bytes.get(1..9).ok_or_else(|| truncated("Offset"))?;
-                let v = u64::from_le_bytes(field.try_into().map_err(|_| ConnectorError::Config {
-                    message: "offset decode failed".into(),
-                })?);
+                let v =
+                    u64::from_le_bytes(field.try_into().map_err(|_| ConnectorError::Config {
+                        message: "offset decode failed".into(),
+                    })?);
                 Ok(JdbcOffset::Offset(v))
             }
             1 => {
@@ -278,10 +280,11 @@ impl crate::offset::Offset for JdbcOffset {
                 let key_field = bytes
                     .get(key_start..key_start + 8)
                     .ok_or_else(|| truncated("Keyset key"))?;
-                let last_key =
-                    i64::from_le_bytes(key_field.try_into().map_err(|_| ConnectorError::Config {
+                let last_key = i64::from_le_bytes(key_field.try_into().map_err(|_| {
+                    ConnectorError::Config {
                         message: "keyset key decode failed".into(),
-                    })?);
+                    }
+                })?);
                 Ok(JdbcOffset::Keyset { column, last_key })
             }
             other => Err(ConnectorError::Config {
@@ -574,9 +577,9 @@ fn bind_column_value<'q>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::offset::Offset as _;
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
-    use crate::offset::Offset as _;
 
     /// Verify that `pg_rows_to_batch` round-trips a manually-constructed list
     /// of typed builders — no live database required.

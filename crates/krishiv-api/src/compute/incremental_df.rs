@@ -133,7 +133,11 @@ impl IncrementalDataFrame {
     }
 
     /// Feed a change and advance one tick.
-    pub async fn apply_and_step(&self, source: Option<&str>, delta: &DeltaBatch) -> Result<StepReport> {
+    pub async fn apply_and_step(
+        &self,
+        source: Option<&str>,
+        delta: &DeltaBatch,
+    ) -> Result<StepReport> {
         self.apply(source, delta).await?;
         self.step().await
     }
@@ -251,9 +255,8 @@ mod tests {
     #[test]
     fn extracts_quoted_identifiers() {
         // The unparser quotes reserved-word table names.
-        let s = extract_source_names(
-            "SELECT o.k FROM orders AS o JOIN \"returns\" AS r ON o.k = r.k",
-        );
+        let s =
+            extract_source_names("SELECT o.k FROM orders AS o JOIN \"returns\" AS r ON o.k = r.k");
         assert_eq!(s, vec!["orders".to_string(), "returns".to_string()]);
     }
 

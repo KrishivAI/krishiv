@@ -126,7 +126,8 @@ impl SinkDriver for S3SinkDriver {
             ConnectorRole::Sink,
             ConnectorCapabilities::new()
                 .with_bounded()
-                .with_idempotent(),
+                .with_idempotent()
+                .with_resumable_flush(),
         )
     }
 

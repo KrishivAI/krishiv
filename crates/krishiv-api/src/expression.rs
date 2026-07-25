@@ -166,11 +166,7 @@ impl Expr {
     }
     /// `(self [NOT] IN (a, b, …))` (PySpark `Column.isin`).
     pub fn is_in(self, list: Vec<Expr>, negated: bool) -> Self {
-        let items = list
-            .iter()
-            .map(Expr::as_sql)
-            .collect::<Vec<_>>()
-            .join(", ");
+        let items = list.iter().map(Expr::as_sql).collect::<Vec<_>>().join(", ");
         Self::raw(format!(
             "({} {}IN ({}))",
             self.as_sql(),
@@ -501,7 +497,10 @@ mod tests {
     #[test]
     fn pattern_and_membership_combinators() {
         assert_eq!(col("a").like(lit("x%")).as_sql(), "(\"a\" LIKE 'x%')");
-        assert_eq!(col("a").not_like(lit("x%")).as_sql(), "(\"a\" NOT LIKE 'x%')");
+        assert_eq!(
+            col("a").not_like(lit("x%")).as_sql(),
+            "(\"a\" NOT LIKE 'x%')"
+        );
         assert_eq!(col("a").ilike(lit("x%")).as_sql(), "(\"a\" ILIKE 'x%')");
         assert_eq!(
             col("a").is_in(vec![lit(1), lit(2)], false).as_sql(),

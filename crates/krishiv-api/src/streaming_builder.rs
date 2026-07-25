@@ -1177,12 +1177,16 @@ fn iceberg_commit_epoch(
 ) -> Result<()> {
     use krishiv_common::async_util::block_on;
     use krishiv_connectors::lakehouse::streaming_sink::{
-        schema_version_from_arrow, IcebergSinkMode, IcebergSinkTarget, IcebergStreamingSink,
+        IcebergSinkMode, IcebergSinkTarget, IcebergStreamingSink, schema_version_from_arrow,
     };
     use krishiv_connectors::two_phase::TransactionalSinkParticipant;
 
     // Nothing to commit for an all-empty micro-batch.
-    let Some(schema) = batches.iter().find(|b| b.num_rows() > 0).map(|b| b.schema()) else {
+    let Some(schema) = batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .map(|b| b.schema())
+    else {
         return Ok(());
     };
 
@@ -1236,8 +1240,7 @@ fn iceberg_commit_epoch(
                 let mut sink = match existing {
                     Some(s) => s,
                     None => {
-                        let sv =
-                            schema_version_from_arrow(schema.as_ref(), op_column.as_deref())?;
+                        let sv = schema_version_from_arrow(schema.as_ref(), op_column.as_deref())?;
                         IcebergStreamingSink::open(target, sv)?
                     }
                 };
@@ -1416,9 +1419,9 @@ fn build_sink_dispatcher(
         Some(StreamSinkFormat::Kafka) => {
             #[cfg(feature = "kafka")]
             {
+                use krishiv_common::async_util::block_on;
                 use krishiv_connectors::kafka::{KafkaConfig, KafkaSink};
                 use krishiv_connectors::sink::Sink as _;
-                use krishiv_common::async_util::block_on;
 
                 let bootstrap = options
                     .get("kafka.bootstrap.servers")

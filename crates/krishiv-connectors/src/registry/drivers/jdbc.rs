@@ -124,7 +124,9 @@ impl SinkDriver for JdbcSinkDriver {
         ConnectorDescriptor::new(
             ConnectorKind::JdbcSink,
             ConnectorRole::Sink,
-            ConnectorCapabilities::new().with_bounded(),
+            ConnectorCapabilities::new()
+                .with_bounded()
+                .with_resumable_flush(),
         )
     }
 

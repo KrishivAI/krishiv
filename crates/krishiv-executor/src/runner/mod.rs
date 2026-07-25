@@ -11,8 +11,8 @@ pub(crate) mod task_runner;
 mod runner_tests;
 
 pub use executor_task_runner::{
-    ExecutorTaskRunner, RunLoopBarrierContext, SharedContinuousNotify, SharedContinuousOutputs,
-    SharedCoordinatorClient, TaskStateBinding,
+    ExecutorTaskRunner, RloopConnectorSink, RunLoopBarrierContext, SharedContinuousNotify,
+    SharedContinuousOutputs, SharedCoordinatorClient, TaskStateBinding,
 };
 pub use result_spool::{
     INLINE_RESULT_MAX_BYTES_ENV, SpooledTaskResult, set_inline_result_max_bytes_for_tests,

@@ -895,7 +895,9 @@ async fn show_async_matches_show() {
 #[tokio::test]
 async fn dataframe_columns_reports_schema_order() {
     let session = Session::builder().build().unwrap();
-    let df = session.sql("SELECT 1 AS id, 'x' AS name, 2.0 AS amount").unwrap();
+    let df = session
+        .sql("SELECT 1 AS id, 'x' AS name, 2.0 AS amount")
+        .unwrap();
     // columns() is schema-ordered, not sorted.
     assert_eq!(
         df.columns().unwrap(),

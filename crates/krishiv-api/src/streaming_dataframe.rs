@@ -258,11 +258,13 @@ impl StreamingDataFrame {
     /// `BoundedWindow` Flight action) — while an embedded session runs it
     /// in-process. Requires `with_event_time` + `key_by` + a window.
     pub async fn collect_bounded(&self) -> Result<Vec<RecordBatch>> {
-        let spec = self.window_spec()?.ok_or_else(|| KrishivError::InvalidConfig {
-            message: "collect() on a streaming DataFrame requires a window + key \
+        let spec = self
+            .window_spec()?
+            .ok_or_else(|| KrishivError::InvalidConfig {
+                message: "collect() on a streaming DataFrame requires a window + key \
                       (use .with_event_time(..).key_by(..).tumbling_window(..).agg(..))"
-                .into(),
-        })?;
+                    .into(),
+            })?;
         // Resolve the source to input batches (runs distributed if the df is
         // remote), then hand them to the runtime's bounded-window operator.
         let input = self.df.collect_async().await?.into_batches();

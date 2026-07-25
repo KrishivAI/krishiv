@@ -961,7 +961,110 @@ impl ExecutorTaskRunner {
             let descriptor =
                 parsed.map_err(|message| ExecutorError::InvalidAssignment { message })?;
             crate::erased(self.stage_rloop_kafka(job_id, assignment, descriptor, outputs)).await?;
+        } else if contract
+            .description()
+            .trim()
+            .starts_with(crate::runner::REGISTRY_SINK_PREFIX)
+        {
+            crate::erased(self.stage_rloop_connector(job_id, contract, outputs)).await?;
         }
+        Ok(())
+    }
+
+    /// Stage a cycle's output into a registry-dispatched connector sink (#197).
+    ///
+    /// The streaming counterpart of the batch `registry-sink:` export: it makes
+    /// every registered sink driver reachable from a run-loop job, not just the
+    /// three that have a typed `OutputContractDescriptor` variant.
+    ///
+    /// **At-least-once, by construction.** The sink is opened once per job and
+    /// flushed at the end of each cycle, so committed cycles are durable — but
+    /// it is not a barrier-aligned two-phase participant, so a cycle replayed
+    /// after a failure re-delivers its rows. Exactly-once streaming output
+    /// still means the Iceberg (G7) or Kafka (Phase 55) sinks.
+    async fn stage_rloop_connector(
+        &self,
+        job_id: &str,
+        contract: &krishiv_proto::OutputContract,
+        outputs: &[RecordBatch],
+    ) -> ExecutorResult<()> {
+        let config = crate::fragment::batch::parse_registry_sink_contract(contract.description())
+            .map_err(|message| ExecutorError::InvalidAssignment { message })?;
+
+        // Open once per job: reopening every cycle would truncate file sinks and
+        // re-handshake network ones. `entry` alone cannot hold an async open, so
+        // check first, then insert — a lost race just drops one redundant sink.
+        let sink = match self.rloop_connector_sinks.get(job_id) {
+            Some(existing) => existing.clone(),
+            None => {
+                // Reject terminal-flush sinks up front. A Parquet file sink
+                // finalizes its footer on flush and can never take another row,
+                // so flushing it once per cycle would fail on cycle 2 with an
+                // opaque driver error partway into a running stream. The
+                // capability makes that a clean rejection at open instead.
+                let kind =
+                    krishiv_connectors::ConnectorKind::parse(&config.kind).map_err(|error| {
+                        ExecutorError::InvalidAssignment {
+                            message: format!("rloop registry-sink kind '{}': {error}", config.kind),
+                        }
+                    })?;
+                let resumable = self
+                    .connector_registry
+                    .sink_descriptor(kind)
+                    .map(|descriptor| descriptor.default_capabilities.resumable_flush())
+                    .unwrap_or(false);
+                if !resumable {
+                    return Err(ExecutorError::InvalidAssignment {
+                        message: format!(
+                            "connector '{}' cannot be a streaming sink: its flush finalizes the \
+                             sink, so it cannot be flushed once per cycle. Use it as a batch \
+                             export sink, or pick a connector whose driver declares \
+                             resumable_flush (csv, s3, kafka, jdbc-sink, elasticsearch, \
+                             cassandra, hbase)",
+                            config.kind
+                        ),
+                    });
+                }
+                let opened = self
+                    .connector_registry
+                    .open_sink(&config)
+                    .await
+                    .map_err(|error| ExecutorError::LocalExecution {
+                        message: format!("rloop registry-sink open ({}): {error}", config.kind),
+                    })?;
+                let handle: crate::runner::RloopConnectorSink =
+                    std::sync::Arc::new(tokio::sync::Mutex::new(opened));
+                self.rloop_connector_sinks
+                    .entry(job_id.to_owned())
+                    .or_insert_with(|| handle.clone())
+                    .clone()
+            }
+        };
+
+        let mut guard = sink.lock().await;
+        for batch in outputs {
+            guard
+                .write_batch_dyn(batch.clone())
+                .await
+                .map_err(|error| ExecutorError::LocalExecution {
+                    message: format!("rloop registry-sink write ({}): {error}", config.kind),
+                })?;
+        }
+        // Flush per cycle: what makes the cycle's output durable. A flush
+        // failure fails the cycle rather than reporting output that never
+        // landed.
+        guard
+            .flush_dyn()
+            .await
+            .map_err(|error| ExecutorError::LocalExecution {
+                message: format!("rloop registry-sink flush ({}): {error}", config.kind),
+            })?;
+        tracing::debug!(
+            job_id,
+            kind = %config.kind,
+            batches = outputs.len(),
+            "run-loop cycle staged into a registry-dispatched sink (at-least-once)"
+        );
         Ok(())
     }
 
@@ -1129,6 +1232,127 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// #197 streaming leg: a run-loop cycle whose output contract is
+    /// `registry-sink:` writes through the connector registry, reuses the sink
+    /// across cycles, and flushes each cycle. CSV is used because it has no
+    /// typed `OutputContractDescriptor` variant — success can only come from
+    /// registry dispatch.
+    #[tokio::test]
+    async fn rloop_registry_sink_writes_and_reuses_the_sink_across_cycles() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cycles.csv");
+        let json = serde_json::json!({
+            "name": "rloop-test",
+            "properties": { "path": path.to_string_lossy() },
+        });
+        let contract_str = format!(
+            "{}csv|{}",
+            crate::runner::REGISTRY_SINK_PREFIX,
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&json).unwrap()),
+        );
+        let contract = krishiv_proto::OutputContract::new(
+            krishiv_proto::OutputContractKind::Sink,
+            contract_str,
+        );
+
+        let runner = crate::runner::ExecutorTaskRunner::new(crate::ExecutorAssignmentInbox::new());
+        let schema =
+            std::sync::Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch = |values: Vec<i64>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![std::sync::Arc::new(Int64Array::from(values))],
+            )
+            .unwrap()
+        };
+
+        runner
+            .stage_rloop_connector("job-rs", &contract, &[batch(vec![1, 2])])
+            .await
+            .expect("first cycle");
+        assert_eq!(
+            runner.rloop_connector_sinks.len(),
+            1,
+            "sink is cached per job"
+        );
+        runner
+            .stage_rloop_connector("job-rs", &contract, &[batch(vec![3])])
+            .await
+            .expect("second cycle");
+        assert_eq!(
+            runner.rloop_connector_sinks.len(),
+            1,
+            "second cycle must reuse the open sink, not open another"
+        );
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        // Both cycles' rows are present and the header was written once — proof
+        // the second cycle appended to the same open writer instead of
+        // truncating the file by reopening it.
+        assert_eq!(written.matches("n\n").count(), 1, "{written}");
+        for value in ["1", "2", "3"] {
+            assert!(written.contains(value), "missing {value} in {written}");
+        }
+    }
+
+    /// A sink whose flush finalizes it (Parquet writes a footer) is rejected at
+    /// open, not on the second cycle. Without the `resumable_flush` gate this
+    /// failed mid-stream with a driver-level error — which is how the gate came
+    /// to exist.
+    #[tokio::test]
+    async fn rloop_registry_sink_rejects_a_terminal_flush_sink() {
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let json = serde_json::json!({
+            "name": "rloop-test",
+            "properties": { "path": dir.path().join("out.parquet").to_string_lossy() },
+        });
+        let contract = krishiv_proto::OutputContract::new(
+            krishiv_proto::OutputContractKind::Sink,
+            format!(
+                "{}parquet|{}",
+                crate::runner::REGISTRY_SINK_PREFIX,
+                base64::engine::general_purpose::STANDARD
+                    .encode(serde_json::to_vec(&json).unwrap()),
+            ),
+        );
+        let runner = crate::runner::ExecutorTaskRunner::new(crate::ExecutorAssignmentInbox::new());
+        let error = runner
+            .stage_rloop_connector("job-parquet", &contract, &[])
+            .await
+            .expect_err("a terminal-flush sink must be rejected at open");
+        let message = error.to_string();
+        assert!(message.contains("cannot be a streaming sink"), "{message}");
+        assert!(
+            runner.rloop_connector_sinks.is_empty(),
+            "a rejected sink must not be cached"
+        );
+    }
+
+    /// A malformed contract fails the cycle instead of silently discarding the
+    /// output — the same rule the batch export follows.
+    #[tokio::test]
+    async fn rloop_registry_sink_rejects_a_malformed_contract() {
+        let contract = krishiv_proto::OutputContract::new(
+            krishiv_proto::OutputContractKind::Sink,
+            format!(
+                "{}not-base64-and-no-pipe",
+                crate::runner::REGISTRY_SINK_PREFIX
+            ),
+        );
+        let runner = crate::runner::ExecutorTaskRunner::new(crate::ExecutorAssignmentInbox::new());
+        let error = runner
+            .stage_rloop_connector("job-bad", &contract, &[])
+            .await
+            .expect_err("malformed contract must fail the cycle");
+        assert!(error.to_string().contains("registry-sink"), "{error}");
+    }
 
     #[test]
     fn rloop_fragment_round_trips_identity() {

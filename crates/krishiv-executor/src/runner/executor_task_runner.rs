@@ -46,6 +46,12 @@ use crate::erased;
 /// through the transactional sink or queryable state, per the DUR-5 contract.
 pub type SharedContinuousOutputs = Arc<DashMap<String, Vec<RecordBatch>>>;
 
+/// A registry-opened streaming sink held across run-loop cycles (#197).
+///
+/// `tokio::sync::Mutex` (not `std`): the guard is held across `.await` points
+/// while the sink writes and flushes.
+pub type RloopConnectorSink = Arc<tokio::sync::Mutex<Box<dyn krishiv_connectors::sink::DynSink>>>;
+
 /// Shared per-buffer-key wakeup notifies for pushed continuous input.
 ///
 /// `push_continuous_input` notifies the key it appended under so a run-loop
@@ -275,6 +281,14 @@ pub struct ExecutorTaskRunner {
     /// `drain_continuous_output` so results never park in coordinator memory).
     pub(crate) continuous_outputs: SharedContinuousOutputs,
 
+    /// #197: per-job registry-dispatched streaming sinks, for run-loop jobs
+    /// carrying a `registry-sink:` output contract. Opened on the first cycle
+    /// that produces output and reused across cycles (reopening per cycle would
+    /// truncate file sinks and re-handshake network ones). Delivery is
+    /// at-least-once: each cycle flushes, but a re-executed cycle re-delivers,
+    /// unlike the barrier-aligned Iceberg/Kafka participants.
+    pub(crate) rloop_connector_sinks: Arc<DashMap<String, RloopConnectorSink>>,
+
     /// Phase 55: per-buffer-key input notifies shared with the gRPC service —
     /// the run-loop's µs-scale wakeup on pushed input.
     pub(crate) continuous_input_notify: SharedContinuousNotify,
@@ -366,6 +380,7 @@ impl ExecutorTaskRunner {
             loop_executors: Arc::new(DashMap::new()),
             continuous_inputs: Arc::new(DashMap::new()),
             continuous_connector_sources: Arc::new(DashMap::new()),
+            rloop_connector_sinks: Arc::new(DashMap::new()),
             streaming_advisors: Arc::new(DashMap::new()),
             live_lease: crate::grpc_client::SharedLeaseGeneration::new(
                 krishiv_proto::LeaseGeneration::initial(),

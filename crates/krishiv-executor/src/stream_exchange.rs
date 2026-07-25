@@ -168,11 +168,8 @@ impl StreamExchange {
                     request.metadata_mut().insert("authorization", value);
                 }
             }
-            match tokio::time::timeout(
-                EXCHANGE_RPC_TIMEOUT,
-                client.push_continuous_input(request),
-            )
-            .await
+            match tokio::time::timeout(EXCHANGE_RPC_TIMEOUT, client.push_continuous_input(request))
+                .await
             {
                 Ok(Ok(response)) => {
                     let decoded = wire::task_status_response_from_wire(response.into_inner())
@@ -290,8 +287,9 @@ mod tests {
         let batch = small_batch();
         let bytes = encode_ipc(std::slice::from_ref(&batch)).expect("encode must succeed");
 
-        let mut reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
-            .expect("bytes must be a valid arrow IPC stream");
+        let mut reader =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+                .expect("bytes must be a valid arrow IPC stream");
         let decoded = reader
             .next()
             .expect("exactly one batch was written")
@@ -365,7 +363,9 @@ mod tests {
             _request: tonic::Request<krishiv_proto::wire::v1::ExecutorTaskAssignment>,
         ) -> Result<tonic::Response<krishiv_proto::wire::v1::TaskStatusResponse>, tonic::Status>
         {
-            Err(tonic::Status::unimplemented("not used in stream_exchange tests"))
+            Err(tonic::Status::unimplemented(
+                "not used in stream_exchange tests",
+            ))
         }
 
         async fn cancel_task(
@@ -373,7 +373,9 @@ mod tests {
             _request: tonic::Request<krishiv_proto::wire::v1::TaskCancellationRequest>,
         ) -> Result<tonic::Response<krishiv_proto::wire::v1::TaskStatusResponse>, tonic::Status>
         {
-            Err(tonic::Status::unimplemented("not used in stream_exchange tests"))
+            Err(tonic::Status::unimplemented(
+                "not used in stream_exchange tests",
+            ))
         }
 
         async fn push_continuous_input(
@@ -405,9 +407,13 @@ mod tests {
         async fn drain_continuous_output(
             &self,
             _request: tonic::Request<krishiv_proto::wire::v1::DrainContinuousOutputRequest>,
-        ) -> Result<tonic::Response<krishiv_proto::wire::v1::DrainContinuousOutputResponse>, tonic::Status>
-        {
-            Err(tonic::Status::unimplemented("not used in stream_exchange tests"))
+        ) -> Result<
+            tonic::Response<krishiv_proto::wire::v1::DrainContinuousOutputResponse>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented(
+                "not used in stream_exchange tests",
+            ))
         }
     }
 
@@ -441,8 +447,10 @@ mod tests {
 
     #[tokio::test]
     async fn send_succeeds_when_peer_accepts() {
-        let (addr, calls, received, server) =
-            spawn_mock_peer(vec![MockOutcome::Disposition(TransportDisposition::Accepted)]).await;
+        let (addr, calls, received, server) = spawn_mock_peer(vec![MockOutcome::Disposition(
+            TransportDisposition::Accepted,
+        )])
+        .await;
         let exchange = StreamExchange::default();
         exchange
             .send(
@@ -463,8 +471,10 @@ mod tests {
 
     #[tokio::test]
     async fn send_treats_duplicate_disposition_as_success() {
-        let (addr, ..) =
-            spawn_mock_peer(vec![MockOutcome::Disposition(TransportDisposition::Duplicate)]).await;
+        let (addr, ..) = spawn_mock_peer(vec![MockOutcome::Disposition(
+            TransportDisposition::Duplicate,
+        )])
+        .await;
         let exchange = StreamExchange::default();
         exchange
             .send(

@@ -98,6 +98,14 @@ pub struct ConnectorCapabilities {
     supports_checkpoint: bool,
     /// Implements `TwoPhaseCommitSink` for exactly-once delivery (R6).
     supports_two_phase_commit: bool,
+    /// `flush()` makes prior writes durable and leaves the sink usable (#197).
+    ///
+    /// Not universal: a Parquet file sink finalizes its footer on flush and can
+    /// never accept another row, while an Elasticsearch or CSV sink can be
+    /// flushed after every batch forever. Streaming paths that flush once per
+    /// cycle must only use sinks that advertise this — otherwise the second
+    /// cycle fails at runtime, which is exactly how this flag was discovered.
+    resumable_flush: bool,
 }
 
 impl ConnectorCapabilities {
@@ -126,6 +134,20 @@ impl ConnectorCapabilities {
         self.bounded = false;
         debug_assert!(self.bounded ^ self.unbounded);
         self
+    }
+
+    /// Mark `flush()` as repeatable: prior writes become durable and the sink
+    /// stays open for more. Sinks that finalize on flush (Parquet footer, Avro
+    /// container close) must NOT set this.
+    #[must_use]
+    pub fn with_resumable_flush(mut self) -> Self {
+        self.resumable_flush = true;
+        self
+    }
+
+    /// Whether `flush()` leaves the sink usable — see [`Self::with_resumable_flush`].
+    pub fn resumable_flush(&self) -> bool {
+        self.resumable_flush
     }
 
     /// Validate capability invariants.

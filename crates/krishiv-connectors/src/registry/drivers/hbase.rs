@@ -1,7 +1,5 @@
 //! HBase sink driver.
 
-#![cfg(feature = "hbase")]
-
 use std::future::Future;
 use std::pin::Pin;
 
@@ -24,7 +22,8 @@ impl SinkDriver for HBaseSinkDriver {
             // HBase Put operations are idempotent (same row key overwrites previous value).
             ConnectorCapabilities::new()
                 .with_unbounded()
-                .with_idempotent(),
+                .with_idempotent()
+                .with_resumable_flush(),
         )
     }
 

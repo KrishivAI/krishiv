@@ -92,8 +92,8 @@ pub struct DataPathCell {
 /// cancel is non-cancellable by design (#224) and it carries lighter chaos
 /// coverage than the distributed batch/streaming paths.
 pub fn capability_matrix() -> Vec<CapabilityCell> {
-    use ConnectorMaturity::{Certified, Preview};
     use Compute::{BatchSql, Ivm, ParallelStreaming};
+    use ConnectorMaturity::{Certified, Preview};
     use Topology::{Distributed, SingleNode};
     vec![
         CapabilityCell {
@@ -240,11 +240,7 @@ pub fn render_markdown() -> String {
     for cell in data_path_matrix() {
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} |\n",
-            cell.source,
-            cell.sink,
-            cell.delivery,
-            cell.status,
-            cell.evidence,
+            cell.source, cell.sink, cell.delivery, cell.status, cell.evidence,
         ));
     }
     out
@@ -314,7 +310,8 @@ mod tests {
                     .filter(|c| c.compute == compute && c.topology == topology)
                     .count();
                 assert_eq!(
-                    matches, 1,
+                    matches,
+                    1,
                     "{}×{} must appear exactly once",
                     compute.as_str(),
                     topology.as_str()
