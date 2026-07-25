@@ -104,6 +104,7 @@ pub mod introspection_sql;
 
 pub mod kafka_table;
 pub mod lakehouse;
+pub mod object_store_registry;
 pub mod live_table;
 pub mod pipeline_ddl;
 pub mod pivot_sql;
@@ -870,22 +871,31 @@ impl SqlEngine {
                 target_partitions,
                 memory_limit_bytes,
             ));
-        if let Some(limit) = memory_limit_bytes {
-            // A FairSpillPool shares the limit across concurrently running
-            // operators and lets spill-capable operators (sort, hash join,
-            // aggregation) write to the default disk manager's temp files
-            // instead of failing outright when the pool is exhausted.
-            let runtime_env = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
-                .with_memory_pool(Arc::new(
+        {
+            // The lazy registry is installed unconditionally, not only when a
+            // memory limit is configured. An executor decoding a `dfplan:`
+            // fragment discovers which buckets the plan touches only by
+            // decoding it, and the decode is what needs the store — so there
+            // is no earlier point at which the bucket could be registered.
+            let mut runtime_builder = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+                .with_object_store_registry(Arc::new(
+                    crate::object_store_registry::LazyCloudObjectStoreRegistry::new(),
+                ));
+            if let Some(limit) = memory_limit_bytes {
+                // A FairSpillPool shares the limit across concurrently running
+                // operators and lets spill-capable operators (sort, hash join,
+                // aggregation) write to the default disk manager's temp files
+                // instead of failing outright when the pool is exhausted.
+                runtime_builder = runtime_builder.with_memory_pool(Arc::new(
                     datafusion::execution::memory_pool::FairSpillPool::new(limit),
-                ))
-                .build_arc()
-                .map_err(|e| SqlError::DataFusion {
-                    message: format!(
-                        "failed to build memory-limited DataFusion runtime \
-                         (limit {limit} bytes): {e}"
-                    ),
-                })?;
+                ));
+            }
+            let runtime_env = runtime_builder.build_arc().map_err(|e| SqlError::DataFusion {
+                message: format!(
+                    "failed to build DataFusion runtime \
+                     (memory limit {memory_limit_bytes:?} bytes): {e}"
+                ),
+            })?;
             state_builder = state_builder.with_runtime_env(runtime_env);
         }
         let mut state = state_builder.build();

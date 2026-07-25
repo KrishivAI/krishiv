@@ -5615,6 +5615,7 @@ dependencies = [
  "krishiv-runtime",
  "krishiv-sql",
  "parquet 58.3.0",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

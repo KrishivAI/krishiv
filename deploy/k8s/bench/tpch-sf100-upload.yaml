@@ -22,13 +22,17 @@ metadata:
 spec:
   # A failed mirror is resumable — `mc mirror` skips objects that already match
   # — so a retry is cheap and correct rather than a restart from zero.
-  backoffLimit: 3
+  backoffLimit: 4
   template:
     metadata:
       labels:
         app: tpch-sf100-upload
     spec:
-      restartPolicy: OnFailure
+      # `Never`, not `OnFailure`: OnFailure restarts the container inside the
+      # same pod, and each restart destroys the previous attempt's logs. The
+      # first run of this job failed four times and left nothing to read.
+      # With `Never` every attempt is its own pod and its output survives.
+      restartPolicy: Never
       # Must land on the node holding the generated files.
       nodeSelector:
         kubernetes.io/hostname: s2
@@ -53,10 +57,31 @@ spec:
               mc alias set store http://minio.krishiv-infra:9000 \
                 "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"
               mc mb --ignore-existing store/krishiv-bench
-              echo "mirroring $(du -sh /src | cut -f1) to store/krishiv-bench/tpch/sf100"
-              mc mirror --overwrite /src store/krishiv-bench/tpch/sf100
+              echo "source is $(du -sh /src | cut -f1)"
+              # One file per `mc cp` rather than one `mc mirror` over the whole
+              # tree. Mirror uploads many large objects concurrently, and the
+              # 26 GB lineitem directory is ~800 MB per file; the first attempt
+              # died partway into lineitem. Sequential copies keep the client's
+              # buffering bounded and make the failing object obvious from the
+              # log instead of dying somewhere inside a parallel batch.
+              #
+              # Shell globs, not `find`: the minio/mc image ships no find(1).
+              # The two glob levels cover the layout tpchgen produces —
+              # `<root>/<table>.parquet` for tables generated whole and
+              # `<root>/<table>/<table>.<n>.parquet` for those split with
+              # --parts.
+              for f in /src/*.parquet /src/*/*.parquet; do
+                [ -f "$f" ] || continue
+                rel="${f#/src/}"
+                if mc stat "store/krishiv-bench/tpch/sf100/$rel" >/dev/null 2>&1; then
+                  echo "skip $rel (already present)"
+                  continue
+                fi
+                echo "copy $rel"
+                mc cp "$f" "store/krishiv-bench/tpch/sf100/$rel"
+              done
               echo "--- uploaded ---"
-              mc du store/krishiv-bench/tpch/sf100
+              mc ls --recursive --summarize store/krishiv-bench/tpch/sf100 | tail -3
           volumeMounts:
             - name: src
               mountPath: /src

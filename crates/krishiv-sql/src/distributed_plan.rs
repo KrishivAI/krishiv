@@ -101,7 +101,24 @@ pub fn planning_session_context(target_partitions: usize) -> SessionContext {
         .options_mut()
         .optimizer
         .enable_round_robin_repartition = false;
-    SessionContext::new_with_config(config)
+    // Object-store tables must be plannable here: if schema inference fails,
+    // the caller reads that as "decline to stage" and the query silently runs
+    // as a single task on one executor.
+    match datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+        .with_object_store_registry(Arc::new(
+            crate::object_store_registry::LazyCloudObjectStoreRegistry::new(),
+        ))
+        .build_arc()
+    {
+        Ok(runtime) => SessionContext::new_with_config_rt(config, runtime),
+        // A runtime that will not build is not worth failing planning over —
+        // the default one still plans local paths, and object-store tables
+        // fall back to the single-task path as they did before.
+        Err(error) => {
+            tracing::warn!(%error, "cloud object-store registry unavailable for staged planning");
+            SessionContext::new_with_config(config)
+        }
+    }
 }
 
 /// Shuffle-store sub-stage key for one map task's output.
