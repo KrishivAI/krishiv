@@ -85,4 +85,4 @@ if [ "$MEASURED" = 0 ]; then
 fi
 
 echo "==> regression gate (budgets must have fresh measurements)"
-python3 "$ROOT/scripts/bench_gate.py" --require-fresh 8
+python3 "$ROOT/scripts/bench_gate.py" --tier nightly --require-fresh 8

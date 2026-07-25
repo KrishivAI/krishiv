@@ -30,6 +30,22 @@ def load_budgets(path: Path) -> dict[str, dict]:
     return {b["path"]: b for b in data["budgets"]}
 
 
+def filter_tier(budgets: dict[str, dict], tier: str | None) -> dict[str, dict]:
+    """Keep only the budgets belonging to `tier` (default tier: "nightly").
+
+    Budgets are split by tier because `--require-fresh` treats an unmeasured
+    budget as a FAILURE, and not every tier can run everywhere: the nightly CI
+    job has no TPC-H dataset, so declaring TPC-H budgets in the same set it
+    checks would fail the gate for an infrastructure reason rather than a
+    performance one. Each tier's runner checks only what it actually measures.
+    """
+    if tier is None:
+        return budgets
+    return {
+        path: b for path, b in budgets.items() if b.get("tier", "nightly") == tier
+    }
+
+
 def load_results(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -113,8 +129,15 @@ def main() -> int:
     require_fresh_days = None
     if "--require-fresh" in sys.argv:
         require_fresh_days = int(sys.argv[sys.argv.index("--require-fresh") + 1])
+    # --tier NAME: evaluate only the budgets that tier measures (see filter_tier).
+    tier = None
+    if "--tier" in sys.argv:
+        tier = sys.argv[sys.argv.index("--tier") + 1]
     root = Path(__file__).resolve().parent.parent
-    budgets = load_budgets(root / "benchmarks" / "budgets.json")
+    budgets = filter_tier(load_budgets(root / "benchmarks" / "budgets.json"), tier)
+    if tier is not None and not budgets:
+        print(f"FAIL: no budgets declared for tier {tier!r} — nothing to gate")
+        return 1
     results = load_results(root / "benchmarks" / "results.jsonl")
     warnings, failures = evaluate(budgets, results)
     measured = {r["path"] for r in results}

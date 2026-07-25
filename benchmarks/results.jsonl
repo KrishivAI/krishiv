@@ -7,3 +7,15 @@
 {"path": "nexmark_q8_person_region_100k_p50", "value_ms": 3.0559841590909094, "commit": "301a3f9e072a0710260295e8d8b52fd369e911fd", "date": "2026-07-21", "env": "dev-box"}
 {"path": "streaming_latency_embedded_p50", "value_ms": 0.14012947222222222, "commit": "034187a3cff8572f39b602c6df8fcbd5be768e3b", "date": "2026-07-21", "env": "dev-box"}
 {"path": "streaming_latency_single_node_p50", "value_ms": 0.14238066666666666, "commit": "034187a3cff8572f39b602c6df8fcbd5be768e3b", "date": "2026-07-21", "env": "dev-box"}
+{"path": "tpch_q1_sf1_p50", "value_ms": 97.43841737708333, "commit": "04d829ab698fc9f4fec6019e4a2cec6b7a0ac1f6", "date": "2026-07-25", "env": "dev-box"}
+{"path": "tpch_q3_sf1_p50", "value_ms": 156.03723608472222, "commit": "04d829ab698fc9f4fec6019e4a2cec6b7a0ac1f6", "date": "2026-07-25", "env": "dev-box"}
+{"path": "tpch_q5_sf1_p50", "value_ms": 233.66560325, "commit": "04d829ab698fc9f4fec6019e4a2cec6b7a0ac1f6", "date": "2026-07-25", "env": "dev-box"}
+{"path": "tpch_q6_sf1_p50", "value_ms": 70.76082913839286, "commit": "04d829ab698fc9f4fec6019e4a2cec6b7a0ac1f6", "date": "2026-07-25", "env": "dev-box"}
+{"path": "tpch_q10_sf1_p50", "value_ms": 164.7537281875, "commit": "04d829ab698fc9f4fec6019e4a2cec6b7a0ac1f6", "date": "2026-07-25", "env": "dev-box"}
+{"path": "tpch_q18_sf1_p50", "value_ms": 446.0436806, "commit": "04d829ab698fc9f4fec6019e4a2cec6b7a0ac1f6", "date": "2026-07-25", "env": "dev-box"}
+{"path": "tpch_q1_sf10_p50", "value_ms": 965.6085588333333, "commit": "04d829ab698fc9f4fec6019e4a2cec6b7a0ac1f6", "date": "2026-07-25", "env": "dev-box"}
+{"path": "tpch_q3_sf10_p50", "value_ms": 1599.17768925, "commit": "04d829ab698fc9f4fec6019e4a2cec6b7a0ac1f6", "date": "2026-07-25", "env": "dev-box"}
+{"path": "tpch_q5_sf10_p50", "value_ms": 2414.2718285, "commit": "04d829ab698fc9f4fec6019e4a2cec6b7a0ac1f6", "date": "2026-07-25", "env": "dev-box"}
+{"path": "tpch_q6_sf10_p50", "value_ms": 709.3368787, "commit": "04d829ab698fc9f4fec6019e4a2cec6b7a0ac1f6", "date": "2026-07-25", "env": "dev-box"}
+{"path": "tpch_q10_sf10_p50", "value_ms": 1901.903678, "commit": "04d829ab698fc9f4fec6019e4a2cec6b7a0ac1f6", "date": "2026-07-25", "env": "dev-box"}
+{"path": "tpch_q18_sf10_p50", "value_ms": 6572.030665, "commit": "04d829ab698fc9f4fec6019e4a2cec6b7a0ac1f6", "date": "2026-07-25", "env": "dev-box"}

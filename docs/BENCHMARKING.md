@@ -382,3 +382,43 @@ Findings:
 `benchmarks/budgets.json`'s `streaming_latency_single_node_p50` note is
 updated to reflect the fix; `benchmarks/results.jsonl` gets fresh rows for
 both `streaming_latency_*_p50`, tagged to this entry's commit.
+
+### 2026-07-25 — TPC-H enters the committed history (Phase 62 GA gate)
+
+TPC-H numbers previously lived only as one-off entries on this page, not in the
+gate-checked `benchmarks/results.jsonl` history every other benchmark uses —
+one of Phase 62's open deliverables. `scripts/bench-tpch-tier.sh` closes that:
+same criterion → `results.jsonl` → `bench_gate.py` pipeline, same provenance
+fields.
+
+First honest run: dev-box (23 GB RAM, otherwise idle — no engine builds
+running), embedded `SqlEngine` over the local Parquet dataset, criterion median
+of 10 samples per query.
+
+| Query | SF1 | SF10 | SF10/SF1 |
+|---|---:|---:|---:|
+| Q1 pricing summary | 97.4 ms | 965.6 ms | 9.9x |
+| Q3 shipping priority | 156.0 ms | 1599.2 ms | 10.3x |
+| Q5 local supplier volume | 233.7 ms | 2414.3 ms | 10.3x |
+| Q6 forecasting revenue | 70.8 ms | 709.3 ms | 10.0x |
+| Q10 returned item reporting | 164.8 ms | 1901.9 ms | 11.5x |
+| Q18 large volume customer | 446.0 ms | 6572.0 ms | **14.7x** |
+
+Five of six queries scale essentially linearly with the 10x data increase,
+which is what a scan-bound plan should do. **Q18 is the outlier at 14.7x** and
+is worth a look — it is the large-volume-customer query (`IN` subquery over a
+grouped aggregate feeding a second grouped aggregate), so a superlinear
+hash-aggregate or a spill at SF10 are both plausible. Recorded as an
+observation, not diagnosed: nothing here has profiled it.
+
+**Budgets** are declared at ~1.5x each measured median under `"tier": "tpch"`.
+They are *machine-specific* — re-baseline on whichever host runs the tier
+regularly rather than treating them as portable.
+
+`bench_gate.py` gained `--tier` for this. `--require-fresh` treats an unmeasured
+budget as a failure, so putting TPC-H budgets in the nightly set would have
+failed CI for an infrastructure reason (no dataset in CI) rather than a
+performance one. The nightly job now runs `--tier nightly --require-fresh 8`
+and never sees TPC-H; the TPC-H tier runs `--tier tpch --require-fresh 30` on a
+host that has the data. Verified both directions: deleting one TPC-H
+measurement fails the tpch tier with `STALE` and leaves the nightly tier green.

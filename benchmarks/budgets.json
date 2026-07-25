@@ -1,47 +1,131 @@
 {
-  "_doc": "Latency budgets for the engine's own nightly-measurable benchmarks (Phase 66). Each budget names its owner criterion group/id under crates/krishiv-bench/benches/ so scripts/bench-tier.sh knows where to read target/criterion/<path>/new/estimates.json. The gate (scripts/bench_gate.py, ported from the platform repo's Phase 29) flags results exceeding budget by >20% on two consecutive nightly runs. Units: milliseconds unless noted. Deliberately excludes TPC-H/TPC-DS budgets: those benches need KRISHIV_TPCH_DATA_DIR_*/KRISHIV_TPCDS_DATA_DIR pointing at multi-GB generated data that CI does not provision, so they self-skip today (see BENCHMARKING.md's 'What this gate does not cover yet') rather than being declared here and permanently failing --require-fresh for an infrastructure reason, not a performance one.",
-  "budgets": [
-    {
-      "path": "streaming_latency_embedded_p50",
-      "budget_ms": 1,
-      "benchmark": "cargo bench -p krishiv-bench --bench streaming_latency (streaming_latency_embedded/embedded_1k_row_batch_steady_state)",
-      "note": "documented target < 1ms; met at ~140us measuring one steady-state batch directly against ContinuousWindowExecutor (see BENCHMARKING.md's streaming_latency methodology-fix entry)"
-    },
-    {
-      "path": "streaming_latency_single_node_p50",
-      "budget_ms": 5,
-      "benchmark": "cargo bench -p krishiv-bench --bench streaming_latency (streaming_latency_single_node/single_node_1k_row_batch_steady_state)",
-      "note": "documented target < 5ms; met at ~142us after the streaming_latency rewrite (was MISSED at 11.7ms, a benchmark-methodology artifact of measuring one-time RocksDB-open cost as if it were per-batch cost, not a real engine regression — see BENCHMARKING.md)"
-    },
-    {
-      "path": "ivm_tick_p50_at_10m_rows",
-      "budget_ms": 2000,
-      "benchmark": "cargo bench -p krishiv-bench --bench ivm_vs_full_recompute (ivm_incremental_feed/10000000)",
-      "note": "budget borrowed from the platform repo's benchmarks/budgets.json pipeline_tick_p50 (post-G14 target) — the only recorded tick-latency SLO in either repo; feeds the Phase 64 entry-gate demand trigger (a view whose tick latency exceeds one-executor budget). Phase 51 measured 140.4ms at this point, well under budget — current data does not show the Phase 64 trigger firing"
-    },
-    {
-      "path": "nexmark_q1_currency_conversion_100k_p50",
-      "budget_ms": 3,
-      "benchmark": "cargo bench -p krishiv-bench --bench nexmark (nexmark_sql/q1_currency_conversion_100k)",
-      "note": "Phase 51 yardstick measured 1.61ms; budget gives ~2x headroom on shared/noisy hardware"
-    },
-    {
-      "path": "nexmark_q2_auction_filter_100k_p50",
-      "budget_ms": 10,
-      "benchmark": "cargo bench -p krishiv-bench --bench nexmark (nexmark_sql/q2_auction_filter_100k)",
-      "note": "Phase 51 yardstick measured 4.86ms; budget gives ~2x headroom on shared/noisy hardware"
-    },
-    {
-      "path": "nexmark_q5_auction_category_100k_p50",
-      "budget_ms": 8,
-      "benchmark": "cargo bench -p krishiv-bench --bench nexmark (nexmark_sql/q5_auction_category_100k)",
-      "note": "Phase 51 yardstick measured 3.80ms; budget gives ~2x headroom on shared/noisy hardware"
-    },
-    {
-      "path": "nexmark_q8_person_region_100k_p50",
-      "budget_ms": 3,
-      "benchmark": "cargo bench -p krishiv-bench --bench nexmark (nexmark_sql/q8_person_region_100k)",
-      "note": "Phase 51 yardstick measured 1.66ms; budget gives ~2x headroom on shared/noisy hardware"
-    }
-  ]
+ "_doc": "Latency budgets for the engine's own nightly-measurable benchmarks (Phase 66). Each budget names its owner criterion group/id under crates/krishiv-bench/benches/ so scripts/bench-tier.sh knows where to read target/criterion/<path>/new/estimates.json. The gate (scripts/bench_gate.py, ported from the platform repo's Phase 29) flags results exceeding budget by >20% on two consecutive nightly runs. Units: milliseconds unless noted. TPC-H budgets are declared under `\"tier\": \"tpch\"` and are evaluated ONLY by `scripts/bench-tpch-tier.sh --tier tpch` on a host that has the dataset; the nightly job passes `--tier nightly` so `--require-fresh` never fails on them. TPC-DS is still excluded entirely:  those benches need KRISHIV_TPCH_DATA_DIR_*/KRISHIV_TPCDS_DATA_DIR pointing at multi-GB generated data that CI does not provision, so they self-skip today (see BENCHMARKING.md's 'What this gate does not cover yet') rather than being declared here and permanently failing --require-fresh for an infrastructure reason, not a performance one.",
+ "budgets": [
+  {
+   "path": "streaming_latency_embedded_p50",
+   "budget_ms": 1,
+   "benchmark": "cargo bench -p krishiv-bench --bench streaming_latency (streaming_latency_embedded/embedded_1k_row_batch_steady_state)",
+   "note": "documented target < 1ms; met at ~140us measuring one steady-state batch directly against ContinuousWindowExecutor (see BENCHMARKING.md's streaming_latency methodology-fix entry)"
+  },
+  {
+   "path": "streaming_latency_single_node_p50",
+   "budget_ms": 5,
+   "benchmark": "cargo bench -p krishiv-bench --bench streaming_latency (streaming_latency_single_node/single_node_1k_row_batch_steady_state)",
+   "note": "documented target < 5ms; met at ~142us after the streaming_latency rewrite (was MISSED at 11.7ms, a benchmark-methodology artifact of measuring one-time RocksDB-open cost as if it were per-batch cost, not a real engine regression \u2014 see BENCHMARKING.md)"
+  },
+  {
+   "path": "ivm_tick_p50_at_10m_rows",
+   "budget_ms": 2000,
+   "benchmark": "cargo bench -p krishiv-bench --bench ivm_vs_full_recompute (ivm_incremental_feed/10000000)",
+   "note": "budget borrowed from the platform repo's benchmarks/budgets.json pipeline_tick_p50 (post-G14 target) \u2014 the only recorded tick-latency SLO in either repo; feeds the Phase 64 entry-gate demand trigger (a view whose tick latency exceeds one-executor budget). Phase 51 measured 140.4ms at this point, well under budget \u2014 current data does not show the Phase 64 trigger firing"
+  },
+  {
+   "path": "nexmark_q1_currency_conversion_100k_p50",
+   "budget_ms": 3,
+   "benchmark": "cargo bench -p krishiv-bench --bench nexmark (nexmark_sql/q1_currency_conversion_100k)",
+   "note": "Phase 51 yardstick measured 1.61ms; budget gives ~2x headroom on shared/noisy hardware"
+  },
+  {
+   "path": "nexmark_q2_auction_filter_100k_p50",
+   "budget_ms": 10,
+   "benchmark": "cargo bench -p krishiv-bench --bench nexmark (nexmark_sql/q2_auction_filter_100k)",
+   "note": "Phase 51 yardstick measured 4.86ms; budget gives ~2x headroom on shared/noisy hardware"
+  },
+  {
+   "path": "nexmark_q5_auction_category_100k_p50",
+   "budget_ms": 8,
+   "benchmark": "cargo bench -p krishiv-bench --bench nexmark (nexmark_sql/q5_auction_category_100k)",
+   "note": "Phase 51 yardstick measured 3.80ms; budget gives ~2x headroom on shared/noisy hardware"
+  },
+  {
+   "path": "nexmark_q8_person_region_100k_p50",
+   "budget_ms": 3,
+   "benchmark": "cargo bench -p krishiv-bench --bench nexmark (nexmark_sql/q8_person_region_100k)",
+   "note": "Phase 51 yardstick measured 1.66ms; budget gives ~2x headroom on shared/noisy hardware"
+  },
+  {
+   "path": "tpch_q1_sf1_p50",
+   "budget_ms": 150,
+   "tier": "tpch",
+   "benchmark": "scripts/bench-tpch-tier.sh (tpch_q1/q1_pricing_summary/sf1)",
+   "note": "first measured 2026-07-25 on dev-box at 97.4ms; budget is ~1.5x that. Baseline is machine-specific \u2014 re-baseline on whichever host runs this tier regularly rather than treating these as portable numbers."
+  },
+  {
+   "path": "tpch_q3_sf1_p50",
+   "budget_ms": 240,
+   "tier": "tpch",
+   "benchmark": "scripts/bench-tpch-tier.sh (tpch_q3/q3_shipping_priority/sf1)",
+   "note": "first measured 2026-07-25 on dev-box at 156.0ms; budget is ~1.5x that. Baseline is machine-specific \u2014 re-baseline on whichever host runs this tier regularly rather than treating these as portable numbers."
+  },
+  {
+   "path": "tpch_q5_sf1_p50",
+   "budget_ms": 360,
+   "tier": "tpch",
+   "benchmark": "scripts/bench-tpch-tier.sh (tpch_q5/q5_local_supplier_volume/sf1)",
+   "note": "first measured 2026-07-25 on dev-box at 233.7ms; budget is ~1.5x that. Baseline is machine-specific \u2014 re-baseline on whichever host runs this tier regularly rather than treating these as portable numbers."
+  },
+  {
+   "path": "tpch_q6_sf1_p50",
+   "budget_ms": 110,
+   "tier": "tpch",
+   "benchmark": "scripts/bench-tpch-tier.sh (tpch_q6/q6_forecasting_revenue/sf1)",
+   "note": "first measured 2026-07-25 on dev-box at 70.8ms; budget is ~1.5x that. Baseline is machine-specific \u2014 re-baseline on whichever host runs this tier regularly rather than treating these as portable numbers."
+  },
+  {
+   "path": "tpch_q10_sf1_p50",
+   "budget_ms": 250,
+   "tier": "tpch",
+   "benchmark": "scripts/bench-tpch-tier.sh (tpch_q10/q10_returned_item_reporting/sf1)",
+   "note": "first measured 2026-07-25 on dev-box at 164.8ms; budget is ~1.5x that. Baseline is machine-specific \u2014 re-baseline on whichever host runs this tier regularly rather than treating these as portable numbers."
+  },
+  {
+   "path": "tpch_q18_sf1_p50",
+   "budget_ms": 670,
+   "tier": "tpch",
+   "benchmark": "scripts/bench-tpch-tier.sh (tpch_q18/q18_large_volume_customer/sf1)",
+   "note": "first measured 2026-07-25 on dev-box at 446.0ms; budget is ~1.5x that. Baseline is machine-specific \u2014 re-baseline on whichever host runs this tier regularly rather than treating these as portable numbers."
+  },
+  {
+   "path": "tpch_q1_sf10_p50",
+   "budget_ms": 1450,
+   "tier": "tpch",
+   "benchmark": "scripts/bench-tpch-tier.sh (tpch_q1/q1_pricing_summary/sf10)",
+   "note": "first measured 2026-07-25 on dev-box at 965.6ms; budget is ~1.5x that. Baseline is machine-specific \u2014 re-baseline on whichever host runs this tier regularly rather than treating these as portable numbers."
+  },
+  {
+   "path": "tpch_q3_sf10_p50",
+   "budget_ms": 2400,
+   "tier": "tpch",
+   "benchmark": "scripts/bench-tpch-tier.sh (tpch_q3/q3_shipping_priority/sf10)",
+   "note": "first measured 2026-07-25 on dev-box at 1599.2ms; budget is ~1.5x that. Baseline is machine-specific \u2014 re-baseline on whichever host runs this tier regularly rather than treating these as portable numbers."
+  },
+  {
+   "path": "tpch_q5_sf10_p50",
+   "budget_ms": 3600,
+   "tier": "tpch",
+   "benchmark": "scripts/bench-tpch-tier.sh (tpch_q5/q5_local_supplier_volume/sf10)",
+   "note": "first measured 2026-07-25 on dev-box at 2414.3ms; budget is ~1.5x that. Baseline is machine-specific \u2014 re-baseline on whichever host runs this tier regularly rather than treating these as portable numbers."
+  },
+  {
+   "path": "tpch_q6_sf10_p50",
+   "budget_ms": 1100,
+   "tier": "tpch",
+   "benchmark": "scripts/bench-tpch-tier.sh (tpch_q6/q6_forecasting_revenue/sf10)",
+   "note": "first measured 2026-07-25 on dev-box at 709.3ms; budget is ~1.5x that. Baseline is machine-specific \u2014 re-baseline on whichever host runs this tier regularly rather than treating these as portable numbers."
+  },
+  {
+   "path": "tpch_q10_sf10_p50",
+   "budget_ms": 2850,
+   "tier": "tpch",
+   "benchmark": "scripts/bench-tpch-tier.sh (tpch_q10/q10_returned_item_reporting/sf10)",
+   "note": "first measured 2026-07-25 on dev-box at 1901.9ms; budget is ~1.5x that. Baseline is machine-specific \u2014 re-baseline on whichever host runs this tier regularly rather than treating these as portable numbers."
+  },
+  {
+   "path": "tpch_q18_sf10_p50",
+   "budget_ms": 9900,
+   "tier": "tpch",
+   "benchmark": "scripts/bench-tpch-tier.sh (tpch_q18/q18_large_volume_customer/sf10)",
+   "note": "first measured 2026-07-25 on dev-box at 6572.0ms; budget is ~1.5x that. Baseline is machine-specific \u2014 re-baseline on whichever host runs this tier regularly rather than treating these as portable numbers."
+  }
+ ]
 }

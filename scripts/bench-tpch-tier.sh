@@ -85,4 +85,4 @@ echo "==> recorded $MEASURED TPC-H measurements into benchmarks/results.jsonl"
 # a defensible headroom over the recorded medians, and only then is TPC-H
 # actually gated.
 echo "==> regression gate (TPC-H paths are ungated until budgets.json declares them)"
-python3 "$ROOT/scripts/bench_gate.py"
+python3 "$ROOT/scripts/bench_gate.py" --tier tpch --require-fresh 30
