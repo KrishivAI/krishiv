@@ -1,0 +1,186 @@
+# Phase 62 GA gate — 7-day chaos soak.
+#
+# Replaces the previous `cert-soak-driver`, which was a liveness loop: it ran
+# `select count(*) from (values ...)` and recorded "ok" if the call returned.
+# That proves the process is up, not that the engine is right, and no chaos was
+# ever injected — so it could not satisfy a gate whose text is "7 days with
+# chaos events injected daily".
+#
+# Two pieces, both in-cluster so the soak survives the operator's session
+# ending (a soak you have to babysit is not a 7-day soak):
+#
+#   ga-soak-driver   Deployment — runs correctness-checked queries continuously
+#                    and classifies every failure as CORRECTNESS or AVAILABILITY.
+#   ga-soak-chaos    CronJob — deletes one engine pod on a schedule.
+#
+# Apply:
+#   kubectl apply -f deploy/k8s/ga-soak/soak.yaml
+# Read:
+#   kubectl logs -n krishiv-cert deploy/ga-soak-driver | grep -E 'HEALTH|FAIL'
+# Verdict (the gate): zero CORRECTNESS_FAIL over the window. AVAILABILITY_FAIL
+# during a chaos kill is expected and is what recovery is being measured on;
+# a wrong answer is never expected and fails the gate outright.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ga-soak-chaos
+  namespace: krishiv-cert
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ga-soak-chaos
+  namespace: krishiv-cert
+rules:
+  # Narrowest grant that lets the chaos job do its job: list pods to pick a
+  # victim, delete that pod. No other verbs, no other resources, namespaced.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "get", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ga-soak-chaos
+  namespace: krishiv-cert
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ga-soak-chaos
+subjects:
+  - kind: ServiceAccount
+    name: ga-soak-chaos
+    namespace: krishiv-cert
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ga-soak-driver
+  namespace: krishiv-cert
+  labels: { app: ga-soak-driver }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ga-soak-driver }
+  template:
+    metadata:
+      labels: { app: ga-soak-driver }
+    spec:
+      # Deliberately no restartPolicy games: if the driver itself dies the
+      # Deployment restarts it and the restart count is visible evidence, not
+      # something the soak hides from itself.
+      containers:
+        - name: driver
+          image: localhost/krishiv:fast-b907ae23
+          imagePullPolicy: Never
+          env:
+            # cert-v2 runs SEC-7 hardened, so the driver is a real authenticated
+            # client. Two DIFFERENT credentials are in play and it matters which:
+            # the coordinator's gRPC/HTTP control plane checks
+            # KRISHIV_COORDINATOR_BEARER_TOKEN, while Flight SQL — the data plane
+            # `krishiv sql --remote` actually speaks — checks KRISHIV_API_KEYS
+            # server-side and sends KRISHIV_FLIGHT_API_KEY/KRISHIV_API_KEY
+            # client-side (krishiv-runtime/src/flight_client.rs). Wiring only the
+            # coordinator token got "missing Bearer token" on every query, which
+            # is the soak doing its job on its first run rather than reporting a
+            # green liveness number.
+            - name: KRISHIV_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: krishiv-cert-tokens
+                  key: apikeys
+            - name: KRISHIV_COORDINATOR_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: krishiv-cert-tokens
+                  key: coordinator
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              COORD="${KRISHIV_COORD:-http://cert-v2-coordinator:2003}"
+              echo "GA-SOAK START $(date -u +%FT%TZ) coord=$COORD image=fast-b907ae23"
+              n=0; ok=0; avail_fail=0; correct_fail=0
+              while true; do
+                n=$((n+1))
+                # Invariant 1 — scalar aggregate. sum(1..10)=55, count=10.
+                out=$(krishiv sql --remote -c "$COORD" --timeout 30 --query \
+                  "SELECT count(*) AS c, sum(x) AS s FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10)) AS t(x)" 2>&1)
+                if [ $? -ne 0 ]; then
+                  avail_fail=$((avail_fail+1))
+                  echo "AVAILABILITY_FAIL $(date -u +%FT%TZ) n=$n q=agg err=$(echo "$out" | tail -1)"
+                elif ! echo "$out" | grep -q '| 10 | 55 |'; then
+                  correct_fail=$((correct_fail+1))
+                  echo "CORRECTNESS_FAIL $(date -u +%FT%TZ) n=$n q=agg expected='| 10 | 55 |' got=$(echo "$out" | tr '\n' ' ')"
+                else
+                  # Invariant 2 — GROUP BY with a known shape. Two groups,
+                  # sums 9 and 12; exercises hash aggregation, not just a scan.
+                  out2=$(krishiv sql --remote -c "$COORD" --timeout 30 --query \
+                    "SELECT k, sum(v) AS s FROM (VALUES ('a',4),('b',5),('a',5),('b',7)) AS t(k,v) GROUP BY k ORDER BY k" 2>&1)
+                  if [ $? -ne 0 ]; then
+                    avail_fail=$((avail_fail+1))
+                    echo "AVAILABILITY_FAIL $(date -u +%FT%TZ) n=$n q=groupby err=$(echo "$out2" | tail -1)"
+                  elif echo "$out2" | grep -q '| a | 9  |' && echo "$out2" | grep -q '| b | 12 |'; then
+                    ok=$((ok+1))
+                  else
+                    correct_fail=$((correct_fail+1))
+                    echo "CORRECTNESS_FAIL $(date -u +%FT%TZ) n=$n q=groupby got=$(echo "$out2" | tr '\n' ' ')"
+                  fi
+                fi
+                if [ $((n % 20)) -eq 0 ]; then
+                  echo "GA-SOAK HEALTH $(date -u +%FT%TZ) n=$n ok=$ok availability_fail=$avail_fail correctness_fail=$correct_fail"
+                fi
+                sleep 30
+              done
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ga-soak-chaos
+  namespace: krishiv-cert
+spec:
+  # Every 6 hours = 4 chaos events per day, comfortably satisfying "chaos
+  # events injected daily" while leaving hours of steady-state between kills
+  # so recovery is actually observed rather than continuously masked.
+  schedule: "17 */6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 8
+  failedJobsHistoryLimit: 8
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          serviceAccountName: ga-soak-chaos
+          restartPolicy: Never
+          containers:
+            - name: chaos
+              image: docker.io/bitnami/kubectl:latest
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -e
+                  # Rotate victims by hour so executors are hit more often than
+                  # the coordinator: coordinator loss is the rarer, heavier
+                  # event and hammering it would mask executor-recovery bugs.
+                  H=$(date -u +%H)
+                  if [ "$H" = "05" ]; then
+                    SEL="app=cert-v2-coordinator"
+                  else
+                    SEL="app=cert-v2-exec-a"
+                    [ "$H" = "11" ] && SEL="app=cert-v2-exec-b"
+                  fi
+                  VICTIM=$(kubectl get pods -n krishiv-cert -l "$SEL" \
+                    -o jsonpath='{.items[0].metadata.name}')
+                  if [ -z "$VICTIM" ]; then
+                    echo "CHAOS SKIP $(date -u +%FT%TZ) selector=$SEL no-pod"
+                    exit 0
+                  fi
+                  echo "CHAOS KILL $(date -u +%FT%TZ) selector=$SEL pod=$VICTIM"
+                  kubectl delete pod -n krishiv-cert "$VICTIM" --wait=false
+              resources:
+                requests: { cpu: "20m", memory: "64Mi" }
+                limits: { cpu: "200m", memory: "256Mi" }
