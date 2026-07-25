@@ -218,9 +218,39 @@ impl Coordinator {
         let stage_work: Vec<StageWork> = {
             let mut job = self.find_job_mut(job_id)?;
             let preferred_nodes = job.preferred_nodes_by_stage(&executor_hosts);
+            // Only stages whose upstream shuffles have completed may be
+            // assigned. The launch loop already refuses to LAUNCH a task whose
+            // upstream is unfinished (see `JobRecord::launch_ready_tasks`), but
+            // assignment did not apply the same gate — so a downstream task was
+            // assigned, occupied an executor slot it could not use, got reaped
+            // by the 120 s "stuck in Assigned" watchdog, and was assigned
+            // again. With more tasks than slots that is a livelock, not a
+            // delay: upstream tasks never get a slot, so the upstream never
+            // completes, so the downstream never becomes launchable. Observed
+            // on TPC-H SF100 q5 (10 stages, 109 tasks, 11 slots) — the job sat
+            // for 25+ minutes with every executor idle, cycling
+            // s5/s6/s7 tasks through Assigned→Pending and never failing.
+            let succeeded_stage_ids: std::collections::HashSet<krishiv_proto::StageId> = job
+                .stages
+                .iter()
+                .filter(|s| s.state == krishiv_proto::StageState::Succeeded)
+                .map(|s| s.stage_id().clone())
+                .collect();
             job.stages
                 .iter_mut()
                 .map(|s| {
+                    let upstream_ready = s
+                        .spec
+                        .upstream_stage_ids()
+                        .iter()
+                        .all(|up| succeeded_stage_ids.contains(up));
+                    if !upstream_ready {
+                        return StageWork {
+                            pending: Vec::new(),
+                            prefs: Vec::new(),
+                            profile: s.spec.resource_profile().cloned(),
+                        };
+                    }
                     let preferred_node = preferred_nodes.get(s.stage_id()).cloned();
                     let mut pending = Vec::new();
                     let mut prefs = Vec::new();

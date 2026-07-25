@@ -171,9 +171,25 @@ impl SlotAwareScheduler {
         spec: &JobSpec,
         executors: &[ExecutorPlacement],
     ) -> SchedulerResult<Vec<TaskAssignment>> {
+        // Only stages with no upstream dependency are placeable at submission:
+        // nothing has run yet, so any stage that reads a shuffle cannot start.
+        //
+        // Placing them anyway is not a harmless head start — it is a livelock.
+        // The downstream task takes an executor slot, the launch loop refuses
+        // to launch it (its upstream is unfinished), the 120 s
+        // "stuck in Assigned" watchdog reaps it, and it is placed again. With
+        // more tasks than slots the upstream never gets a slot, so it never
+        // finishes, so the downstream never becomes launchable. Seen on TPC-H
+        // SF100 q5 (10 stages, 109 tasks, 11 slots): 25+ minutes with every
+        // executor idle and the job neither progressing nor failing.
+        //
+        // Downstream stages stay Pending and are placed by
+        // `assign_pending_tasks`, which applies the same gate once their
+        // upstream has actually succeeded.
         let task_ids: Vec<_> = spec
             .stages()
             .iter()
+            .filter(|stage| stage.upstream_stage_ids().is_empty())
             .flat_map(StageSpec::tasks)
             .map(|task| task.task_id().clone())
             .collect();

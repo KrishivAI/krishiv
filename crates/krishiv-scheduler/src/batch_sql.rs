@@ -631,6 +631,100 @@ mod tests {
         );
     }
 
+    /// Only stages whose upstream shuffles are complete may be ASSIGNED.
+    ///
+    /// The launch loop already gated on upstream completion, but assignment did
+    /// not: every stage's tasks were assigned at once, so downstream tasks took
+    /// executor slots they could not use, were reaped by the 120 s
+    /// "stuck in Assigned" watchdog, and were assigned again. When tasks
+    /// outnumber slots that is a livelock, not a delay — upstream tasks never
+    /// get a slot, so the upstream never finishes, so the downstream never
+    /// becomes launchable. TPC-H SF100 q5 (10 stages / 109 tasks / 11 slots)
+    /// sat for 25+ minutes with every executor idle and never failed.
+    ///
+    /// Asserting that no task of a downstream stage is Assigned while its
+    /// upstream is unfinished is what falsifies the bug; asserting the job
+    /// merely submitted does not.
+    #[tokio::test]
+    async fn downstream_stages_are_not_assigned_before_their_upstream_completes() {
+        use krishiv_proto::{
+            ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, LeaseGeneration,
+            TaskState,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = write_test_parquet(tmp.path());
+        let mut coord = Coordinator::new_active(None).unwrap();
+        // A real executor must exist, otherwise nothing is ever assigned and
+        // this test passes vacuously without touching the bug.
+        let exec_id = ExecutorId::try_new("gate-exec").unwrap();
+        coord
+            .register_executor(ExecutorDescriptor::new(exec_id.clone(), "localhost", 8))
+            .unwrap();
+        coord
+            .executor_heartbeat(
+                ExecutorHeartbeat::new(exec_id.clone(), ExecutorState::Healthy)
+                    .with_lease_generation(LeaseGeneration::initial()),
+            )
+            .unwrap();
+        let coordinator = SharedCoordinator::new(coord);
+
+        let path_tables = vec![BatchSqlTable {
+            table_name: "t".into(),
+            path: table_dir,
+        }];
+        let job_id = submit_batch_sql_job_with_paths(
+            &coordinator,
+            "SELECT category, COUNT(*) AS n FROM t GROUP BY category",
+            &[],
+            &path_tables,
+            false,
+        )
+        .await
+        .unwrap();
+
+        {
+            let mut coord = coordinator.write().await;
+            coord.assign_pending_tasks(&job_id).unwrap();
+        }
+
+        let coord = coordinator.read().await;
+        let detail = coord.job_detail_snapshot(&job_id).unwrap();
+        assert!(
+            detail.stages().len() > 1,
+            "test needs a multi-stage plan, got {}",
+            detail.stages().len()
+        );
+
+        // Nothing has run yet, so no stage has succeeded. In a staged
+        // aggregate the reduce stages (index >= 1) consume stage 0's shuffle,
+        // so none of their tasks may hold an executor assignment yet.
+        let assigned_downstream: Vec<&str> = detail
+            .stages()
+            .iter()
+            .skip(1)
+            .flat_map(|s| s.tasks())
+            .filter(|t| t.assigned_executor().is_some() || t.state() == TaskState::Assigned)
+            .map(|t| t.task_id().as_str())
+            .collect();
+        assert!(
+            assigned_downstream.is_empty(),
+            "downstream tasks {assigned_downstream:?} were assigned while stage 0 \
+             is unfinished — they occupy slots they cannot use, get reaped by the \
+             stuck-in-Assigned watchdog, and livelock the job"
+        );
+
+        // And the map stage DID get assigned, so the gate is not simply
+        // blocking everything.
+        assert!(
+            detail.stages()[0]
+                .tasks()
+                .iter()
+                .any(|t| t.assigned_executor().is_some()),
+            "the upstream stage must still be assignable"
+        );
+    }
+
     /// A query shape the stage builder declines still submits — as the
     /// single-task fallback with the path table attached as a LocalParquet
     /// input (capability honesty, no hard failure).
