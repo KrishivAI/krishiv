@@ -135,6 +135,107 @@ spec:
           resources:
             requests: { cpu: "50m", memory: "128Mi" }
             limits: { cpu: "500m", memory: "512Mi" }
+
+        # Second leg: the certification matrix certifies {batch SQL, parallel
+        # streaming, IVM} x {single-node, distributed}. The Flight SQL container
+        # above covers batch-SQL correctness only, and its inline VALUES data is
+        # small enough to run coordinator-local — measured: 2 executor task log
+        # lines in 10 minutes. This container drives the coordinator's HTTP
+        # control plane instead, which reaches the distributed job path and the
+        # full IVM lifecycle. The engine image ships no curl, hence a second
+        # image rather than a second loop in the first container.
+        - name: modes
+          image: docker.io/bitnami/kubectl:latest
+          env:
+            - name: KRISHIV_COORDINATOR_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: krishiv-cert-tokens
+                  key: coordinator
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              C=http://cert-v2-coordinator:2002
+              H="Authorization: Bearer $KRISHIV_COORDINATOR_BEARER_TOKEN"
+              # DeltaBatch wire format: "DLT1" || Arrow IPC, with an i64 _weight
+              # column. Three orders over two regions -> east=10+30=40, west=20.
+              # Baked in as a constant because a shell cannot build Arrow IPC;
+              # regenerate with scripts/ga_soak_delta.py if the schema changes.
+              DELTA='RExUMf/////gAAAAEAAAAAAACgAMAAYABQAIAAoAAAAAAQQADAAAAAgACAAAAAQACAAAAAQAAAADAAAAhAAAADgAAAAEAAAAmP///wAAAQIQAAAAGAAAAAQAAAAAAAAABwAAAF93ZWlnaHQA0P///wAAAAFAAAAAyP///wAAAQIQAAAAIAAAAAQAAAAAAAAABgAAAGFtb3VudAAACAAMAAgABwAIAAAAAAAAAUAAAAAQABQACAAGAAcADAAAABAAEAAAAAAAAQUQAAAAHAAAAAQAAAAAAAAABgAAAHJlZ2lvbgAABAAEAAQAAAD/////+AAAABQAAAAAAAAADAAWAAYABQAIAAwADAAAAAADBAAYAAAAUAAAAAAAAAAAAAoAGAAMAAQACAAKAAAAjAAAABAAAAADAAAAAAAAAAAAAAAHAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAQAAAAAAAAAAwAAAAAAAAAIAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAGAAAAAAAAAA4AAAAAAAAAAAAAAAAAAAAOAAAAAAAAAAYAAAAAAAAAAAAAAADAAAAAwAAAAAAAAAAAAAAAAAAAAMAAAAAAAAAAAAAAAAAAAADAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAIAAAADAAAAGVhc3R3ZXN0ZWFzdAAAAAAKAAAAAAAAABQAAAAAAAAAHgAAAAAAAAABAAAAAAAAAAEAAAAAAAAAAQAAAAAAAAD/////AAAAAA=='
+              VIEW='{"name":"rev","body_sql":"SELECT region, SUM(amount) AS total FROM orders GROUP BY region","is_materialized":true,"output_schema":{"fields":[{"name":"region","data_type":"Utf8","nullable":true},{"name":"total","data_type":"Int64","nullable":true}]}}'
+              echo "GA-SOAK-MODES START $(date -u +%FT%TZ) coord=$C"
+              n=0; ivm_ok=0; ivm_bad=0; batch_ok=0; batch_bad=0
+              while true; do
+                n=$((n+1))
+
+                # ── IVM leg ──────────────────────────────────────────────────
+                # Fresh job per cycle so the expected answer is constant and the
+                # create/register/feed/step/delete lifecycle is itself exercised.
+                J="ga-soak-ivm-$n"
+                curl -sf -o /dev/null -X POST $C/api/v1/ivm/jobs -H "$H" \
+                  -H 'content-type: application/json' \
+                  -d "{\"job_id\":\"$J\",\"partitioned\":false}" &&
+                curl -sf -o /dev/null -X POST $C/api/v1/ivm/jobs/$J/views -H "$H" \
+                  -H 'content-type: application/json' -d "$VIEW" &&
+                curl -sf -o /dev/null -X POST $C/api/v1/ivm/jobs/$J/sources/orders/feed \
+                  -H "$H" -H 'content-type: application/json' \
+                  -d "{\"delta_ipc_b64\":\"$DELTA\"}" &&
+                curl -sf -o /dev/null -X POST $C/api/v1/ivm/jobs/$J/step -H "$H"
+                if [ $? -ne 0 ]; then
+                  ivm_bad=$((ivm_bad+1))
+                  echo "AVAILABILITY_FAIL $(date -u +%FT%TZ) n=$n leg=ivm stage=lifecycle"
+                else
+                  ST=$(curl -sf $C/api/v1/ivm/jobs/$J/views/rev/stats -H "$H")
+                  # A materialized GROUP BY over that delta must settle at
+                  # exactly 2 rows from exactly 2 inserted rows. Checked as JSON
+                  # so no Arrow decoding is needed in a shell.
+                  case "$ST" in
+                    *'"num_rows":2'*'"rows_inserted_total":2'*) ivm_ok=$((ivm_ok+1)) ;;
+                    "") ivm_bad=$((ivm_bad+1)); echo "AVAILABILITY_FAIL $(date -u +%FT%TZ) n=$n leg=ivm stage=stats" ;;
+                    *) echo "CORRECTNESS_FAIL $(date -u +%FT%TZ) n=$n leg=ivm expected='num_rows:2,inserted:2' got=$ST" ;;
+                  esac
+                fi
+                curl -sf -o /dev/null -X DELETE $C/api/v1/ivm/jobs/$J -H "$H" 2>/dev/null
+
+                # ── distributed batch leg ────────────────────────────────────
+                # submit + poll is the path that actually dispatches tasks to
+                # executors, unlike the coordinator-local Flight SQL invariants.
+                JOB=$(curl -sf -X POST $C/api/v1/batch-sql/submit -H "$H" \
+                  -H 'content-type: application/json' \
+                  -d '{"query":"SELECT count(*) AS c, sum(x) AS s FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10)) AS t(x)"}' |
+                  sed -n 's/.*"job_id":"\([^"]*\)".*/\1/p')
+                if [ -z "$JOB" ]; then
+                  batch_bad=$((batch_bad+1))
+                  echo "AVAILABILITY_FAIL $(date -u +%FT%TZ) n=$n leg=batch stage=submit"
+                else
+                  STATE=""
+                  i=0
+                  while [ $i -lt 30 ]; do
+                    R=$(curl -sf $C/api/v1/batch-sql/$JOB -H "$H")
+                    case "$R" in
+                      *'"state":"Succeeded"'*) STATE=Succeeded; break ;;
+                      *'"state":"Failed"'*)    STATE=Failed; break ;;
+                    esac
+                    i=$((i+1)); sleep 1
+                  done
+                  if [ "$STATE" = "Succeeded" ]; then
+                    batch_ok=$((batch_ok+1))
+                  elif [ "$STATE" = "Failed" ]; then
+                    echo "CORRECTNESS_FAIL $(date -u +%FT%TZ) n=$n leg=batch job=$JOB state=Failed"
+                  else
+                    batch_bad=$((batch_bad+1))
+                    echo "AVAILABILITY_FAIL $(date -u +%FT%TZ) n=$n leg=batch job=$JOB state=timeout"
+                  fi
+                fi
+
+                if [ $((n % 10)) -eq 0 ]; then
+                  echo "GA-SOAK-MODES HEALTH $(date -u +%FT%TZ) n=$n ivm_ok=$ivm_ok ivm_fail=$ivm_bad batch_ok=$batch_ok batch_fail=$batch_bad"
+                fi
+                sleep 30
+              done
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
 ---
 apiVersion: batch/v1
 kind: CronJob
