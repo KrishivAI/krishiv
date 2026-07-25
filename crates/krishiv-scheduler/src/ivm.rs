@@ -139,6 +139,16 @@ impl IvmJob {
         }
     }
 
+    /// Whether `view` was registered as materialized — see
+    /// [`IncrementalFlow::view_is_materialized`]. A partitioned job reports the
+    /// shard-0 answer; every shard registers the same spec.
+    pub fn view_is_materialized(&self, view: &str) -> bool {
+        match self {
+            IvmJob::Single(f) => f.view_is_materialized(view),
+            IvmJob::Partitioned(p) => p.view_is_materialized(view),
+        }
+    }
+
     /// Return the spec for a named view (`None` if not registered).
     pub fn view_spec(&self, view: &str) -> IvmResult<Option<IncrementalViewSpec>> {
         match self {

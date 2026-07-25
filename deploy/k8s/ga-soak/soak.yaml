@@ -162,9 +162,11 @@ spec:
               # Baked in as a constant because a shell cannot build Arrow IPC;
               # regenerate with scripts/ga_soak_delta.py if the schema changes.
               DELTA='RExUMf/////gAAAAEAAAAAAACgAMAAYABQAIAAoAAAAAAQQADAAAAAgACAAAAAQACAAAAAQAAAADAAAAhAAAADgAAAAEAAAAmP///wAAAQIQAAAAGAAAAAQAAAAAAAAABwAAAF93ZWlnaHQA0P///wAAAAFAAAAAyP///wAAAQIQAAAAIAAAAAQAAAAAAAAABgAAAGFtb3VudAAACAAMAAgABwAIAAAAAAAAAUAAAAAQABQACAAGAAcADAAAABAAEAAAAAAAAQUQAAAAHAAAAAQAAAAAAAAABgAAAHJlZ2lvbgAABAAEAAQAAAD/////+AAAABQAAAAAAAAADAAWAAYABQAIAAwADAAAAAADBAAYAAAAUAAAAAAAAAAAAAoAGAAMAAQACAAKAAAAjAAAABAAAAADAAAAAAAAAAAAAAAHAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAQAAAAAAAAAAwAAAAAAAAAIAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAGAAAAAAAAAA4AAAAAAAAAAAAAAAAAAAAOAAAAAAAAAAYAAAAAAAAAAAAAAADAAAAAwAAAAAAAAAAAAAAAAAAAAMAAAAAAAAAAAAAAAAAAAADAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAIAAAADAAAAGVhc3R3ZXN0ZWFzdAAAAAAKAAAAAAAAABQAAAAAAAAAHgAAAAAAAAABAAAAAAAAAAEAAAAAAAAAAQAAAAAAAAD/////AAAAAA=='
+              SEVENTS='/////9gAAAAQAAAAAAAKAAwABgAFAAgACgAAAAABBAAMAAAACAAIAAAABAAIAAAABAAAAAMAAAB8AAAANAAAAAQAAACg////AAABAhAAAAAUAAAABAAAAAAAAAACAAAAdHMAANT///8AAAABQAAAAMz///8AAAECEAAAABwAAAAEAAAAAAAAAAEAAAB2AAAACAAMAAgABwAIAAAAAAAAAUAAAAAQABQACAAGAAcADAAAABAAEAAAAAAAAQUQAAAAGAAAAAQAAAAAAAAAAQAAAGsAAAAEAAQABAAAAAAAAAD/////+AAAABQAAAAAAAAADAAWAAYABQAIAAwADAAAAAADBAAYAAAASAAAAAAAAAAAAAoAGAAMAAQACAAKAAAAjAAAABAAAAADAAAAAAAAAAAAAAAHAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAQAAAAAAAAAAMAAAAAAAAAGAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAGAAAAAAAAAAwAAAAAAAAAAAAAAAAAAAAMAAAAAAAAAAYAAAAAAAAAAAAAAADAAAAAwAAAAAAAAAAAAAAAAAAAAMAAAAAAAAAAAAAAAAAAAADAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAACAAAAAwAAAGFiYQAAAAAAAgAAAAAAAAAHAAAAAAAAAAMAAAAAAAAA6AMAAAAAAADQBwAAAAAAALgLAAAAAAAA/////wAAAAA='
+              SWATERMARK='/////9gAAAAQAAAAAAAKAAwABgAFAAgACgAAAAABBAAMAAAACAAIAAAABAAIAAAABAAAAAMAAAB8AAAANAAAAAQAAACg////AAABAhAAAAAUAAAABAAAAAAAAAACAAAAdHMAANT///8AAAABQAAAAMz///8AAAECEAAAABwAAAAEAAAAAAAAAAEAAAB2AAAACAAMAAgABwAIAAAAAAAAAUAAAAAQABQACAAGAAcADAAAABAAEAAAAAAAAQUQAAAAGAAAAAQAAAAAAAAAAQAAAGsAAAAEAAQABAAAAAAAAAD/////+AAAABQAAAAAAAAADAAWAAYABQAIAAwADAAAAAADBAAYAAAAIAAAAAAAAAAAAAoAGAAMAAQACAAKAAAAjAAAABAAAAABAAAAAAAAAAAAAAAHAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAEAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAACAAAAAAAAAAYAAAAAAAAAAAAAAAAAAAAGAAAAAAAAAAIAAAAAAAAAAAAAAADAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAEAAABhAAAAAAAAAAAAAAAAAAAAQA0DAAAAAAD/////AAAAAA=='
               VIEW='{"name":"rev","body_sql":"SELECT region, SUM(amount) AS total FROM orders GROUP BY region","is_materialized":true,"output_schema":{"fields":[{"name":"region","data_type":"Utf8","nullable":true},{"name":"total","data_type":"Int64","nullable":true}]}}'
               echo "GA-SOAK-MODES START $(date -u +%FT%TZ) coord=$C"
-              n=0; ivm_ok=0; ivm_bad=0; batch_ok=0; batch_bad=0
+              n=0; ivm_ok=0; ivm_bad=0; batch_ok=0; batch_bad=0; stream_ok=0; stream_bad=0
               while true; do
                 n=$((n+1))
 
@@ -228,8 +230,63 @@ spec:
                   fi
                 fi
 
+                # ── streaming leg ────────────────────────────────────────────
+                # register a TUMBLE query -> push events -> push a watermark
+                # event past the window -> drain. A closed 60s window over the
+                # event payload yields exactly one output batch (a->5, b->7,
+                # window [0,60000)), verified by hand before this was wired in.
+                #
+                # SHAPE-CHECKED, NOT VALUE-CHECKED: drain returns Arrow IPC as a
+                # JSON byte array and a shell cannot decode it. This leg catches
+                # registration failure, push failure, a window that never closes,
+                # and a drain that returns nothing — it will NOT catch a wrong
+                # aggregate value. Said plainly rather than implied.
+                #
+                # A DRAIN IS REQUIRED BETWEEN PUSHES. The cycle model refuses a
+                # second push while a cycle is undrained: push -> push returns
+                # 409 and only unwedges after a drain. The first version of this
+                # leg pushed twice in a row and failed 10/10 with an opaque
+                # "register-or-push" — the sequence below is push, drain, push,
+                # drain, which is the actual contract.
+                SJ="ga-soak-stream-$n"
+                curl -sf -o /dev/null -X POST $C/api/v1/continuous-register-sql -H "$H" \
+                  -H 'content-type: application/json' \
+                  -d "{\"job_id\":\"$SJ\",\"sql\":\"SELECT k, SUM(v) AS total FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 60000) GROUP BY k\"}" &&
+                curl -sf -o /dev/null -X POST $C/api/v1/continuous-push -H "$H" \
+                  -H 'content-type: application/json' \
+                  -d "{\"job_id\":\"$SJ\",\"input_batches_b64\":\"$SEVENTS\"}" &&
+                curl -sf -o /dev/null -X POST $C/api/v1/continuous-drain -H "$H" \
+                  -H 'content-type: application/json' -d "{\"job_id\":\"$SJ\"}" &&
+                curl -sf -o /dev/null -X POST $C/api/v1/continuous-push -H "$H" \
+                  -H 'content-type: application/json' \
+                  -d "{\"job_id\":\"$SJ\",\"input_batches_b64\":\"$SWATERMARK\"}"
+                if [ $? -ne 0 ]; then
+                  stream_bad=$((stream_bad+1))
+                  echo "AVAILABILITY_FAIL $(date -u +%FT%TZ) n=$n leg=stream stage=register-or-push"
+                else
+                  DR=$(curl -sf -X POST $C/api/v1/continuous-drain -H "$H" \
+                    -H 'content-type: application/json' -d "{\"job_id\":\"$SJ\"}")
+                  if [ -z "$DR" ]; then
+                    stream_bad=$((stream_bad+1))
+                    echo "AVAILABILITY_FAIL $(date -u +%FT%TZ) n=$n leg=stream stage=drain"
+                  else
+                    # An empty drain means the window never closed: a real
+                    # streaming regression, not a transport failure.
+                    case "$DR" in
+                      *'"inline_record_batch_ipc":[]'*)
+                        # Counted, not just logged: the first version printed
+                        # CORRECTNESS_FAIL while HEALTH still read stream_fail=0,
+                        # which is exactly the kind of reassuring-but-wrong
+                        # summary this soak exists to avoid.
+                        stream_bad=$((stream_bad+1))
+                        echo "CORRECTNESS_FAIL $(date -u +%FT%TZ) n=$n leg=stream reason=window-produced-no-output" ;;
+                      *) stream_ok=$((stream_ok+1)) ;;
+                    esac
+                  fi
+                fi
+
                 if [ $((n % 10)) -eq 0 ]; then
-                  echo "GA-SOAK-MODES HEALTH $(date -u +%FT%TZ) n=$n ivm_ok=$ivm_ok ivm_fail=$ivm_bad batch_ok=$batch_ok batch_fail=$batch_bad"
+                  echo "GA-SOAK-MODES HEALTH $(date -u +%FT%TZ) n=$n ivm_ok=$ivm_ok ivm_fail=$ivm_bad batch_ok=$batch_ok batch_fail=$batch_bad stream_ok=$stream_ok stream_fail=$stream_bad"
                 fi
                 sleep 30
               done

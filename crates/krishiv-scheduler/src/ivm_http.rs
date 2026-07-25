@@ -760,6 +760,15 @@ pub struct SnapshotResponse {
     /// Base64-encoded Arrow IPC bytes of a `DeltaBatch` (all +1 weights).
     pub snapshot_ipc_b64: Option<String>,
     pub num_rows: usize,
+    /// Whether the view was registered with `is_materialized`.
+    ///
+    /// Without this, "you never asked for materialization" and "materialized
+    /// but currently empty" were byte-identical responses
+    /// (`{"snapshot_ipc_b64": null, "num_rows": 0}`), because
+    /// `RegisterViewRequest::is_materialized` is `#[serde(default)]` = false.
+    /// A caller hitting the default reads a correct engine as a broken one —
+    /// which is exactly what happened while building the Phase 62 soak.
+    pub materialized: bool,
 }
 
 pub async fn api_ivm_snapshot(
@@ -769,11 +778,13 @@ pub async fn api_ivm_snapshot(
     let flow = registry
         .get(&job_id)
         .ok_or_else(|| ivm_not_found(&job_id))?;
+    let materialized = flow.view_is_materialized(&view_name);
     let rb_opt = flow.snapshot(&view_name).map_err(ivm_err)?;
     match rb_opt {
         None => Ok(Json(SnapshotResponse {
             snapshot_ipc_b64: None,
             num_rows: 0,
+            materialized,
         })),
         Some(rb) => {
             let num_rows = rb.num_rows();
@@ -783,6 +794,7 @@ pub async fn api_ivm_snapshot(
             Ok(Json(SnapshotResponse {
                 snapshot_ipc_b64: Some(b64),
                 num_rows,
+                materialized,
             }))
         }
     }
@@ -1722,6 +1734,73 @@ mod tests {
     }
 
     // ── read-only view endpoints ──────────────────────────────────────────────
+
+    /// The `materialized` flag distinguishes "you never asked for
+    /// materialization" from "materialized but empty" — previously both
+    /// returned `{"snapshot_ipc_b64": null, "num_rows": 0}` and a caller who hit
+    /// the `#[serde(default)]` false could only conclude the engine was broken.
+    #[tokio::test]
+    async fn snapshot_reports_whether_the_view_is_materialized() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        api_ivm_create_job(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Json(CreateJobRequest {
+                job_id: Some("mat-flag".into()),
+                partitioned: Some(false),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Registered WITHOUT is_materialized (the request default).
+        let mut plain = revenue_view_request();
+        plain.name = "plain".into();
+        plain.is_materialized = false;
+        api_ivm_register_view(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("mat-flag".to_string()),
+            Json(plain),
+        )
+        .await
+        .unwrap();
+
+        let mut materialized = revenue_view_request();
+        materialized.name = "mat".into();
+        materialized.is_materialized = true;
+        api_ivm_register_view(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("mat-flag".to_string()),
+            Json(materialized),
+        )
+        .await
+        .unwrap();
+
+        let plain_snap = api_ivm_snapshot(
+            State(registry.clone()),
+            Path(("mat-flag".to_string(), "plain".to_string())),
+        )
+        .await
+        .unwrap();
+        let mat_snap = api_ivm_snapshot(
+            State(registry.clone()),
+            Path(("mat-flag".to_string(), "mat".to_string())),
+        )
+        .await
+        .unwrap();
+
+        // Both are empty right now — the flag is the only thing telling them
+        // apart, which is the whole point.
+        assert_eq!(plain_snap.num_rows, 0);
+        assert_eq!(mat_snap.num_rows, 0);
+        assert!(
+            !plain_snap.materialized,
+            "non-materialized view must say so"
+        );
+        assert!(mat_snap.materialized, "materialized view must say so");
+    }
 
     #[tokio::test]
     async fn snapshot_and_output_are_empty_before_any_step() {

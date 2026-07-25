@@ -31,6 +31,21 @@ use crate::{Coordinator, SchedulerError, SharedCoordinator};
 /// a much slower and less precise failure signal than an explicit bound.
 const RUN_LOOP_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Map a scheduler error to its HTTP status **and carry its message**.
+///
+/// `scheduler_status` alone throws the message away, so every failure on this
+/// surface reached the caller as a bare status code with an empty body. The
+/// cycle model's "push while a cycle is undrained" rejection is the sharpest
+/// example: the caller sees `409` and nothing else, with no hint that a drain
+/// is what unwedges it. That is a correct contract reported opaquely — it cost
+/// a full bisection to identify while building the Phase 62 soak.
+///
+/// Axum renders `(StatusCode, String)` as a plain-text body, so handlers that
+/// return this keep their status codes and gain an explanation.
+pub(crate) fn scheduler_error_response(error: &SchedulerError) -> (StatusCode, String) {
+    (scheduler_status(error), error.to_string())
+}
+
 fn scheduler_status(error: &SchedulerError) -> StatusCode {
     match error {
         SchedulerError::DuplicateJob { .. } => StatusCode::CONFLICT,
@@ -960,35 +975,43 @@ pub async fn api_continuous_stop_with_savepoint(
 pub async fn api_continuous_push(
     State(coordinator): State<SharedCoordinator>,
     Json(body): Json<ContinuousPushRequest>,
-) -> Result<Json<ContinuousPushResponse>, StatusCode> {
+) -> Result<Json<ContinuousPushResponse>, (StatusCode, String)> {
     use base64::Engine as _;
+    // Every rejection on this path now carries why. The push surface is the one
+    // callers drive in a loop, so an unexplained status code here is the most
+    // expensive kind of silence.
+    let bad = |message: &str| (StatusCode::BAD_REQUEST, message.to_owned());
     let ipc_bytes = base64::engine::general_purpose::STANDARD
         .decode(body.input_batches_b64.as_bytes())
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|error| bad(&format!("input_batches_b64 is not valid base64: {error}")))?;
     if ipc_bytes.is_empty()
         || crate::batch_sql::decode_inline_record_batches(std::slice::from_ref(&ipc_bytes))
-            .map_err(|_| StatusCode::BAD_REQUEST)?
+            .map_err(|error| {
+                bad(&format!(
+                    "input_batches_b64 is not a valid Arrow IPC stream: {error}"
+                ))
+            })?
             .is_empty()
     {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("continuous push carried no record batches"));
     }
 
-    let job_id =
-        krishiv_proto::JobId::try_new(&body.job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let job_id = krishiv_proto::JobId::try_new(&body.job_id)
+        .map_err(|error| bad(&format!("invalid job_id '{}': {error}", body.job_id)))?;
 
     // Phase 55: run-loop jobs receive pushes directly on their executors —
     // no coordinator fencing, no coordinator-buffered data (control-plane-
     // only invariant). The push is ingest API, never the execution driver.
     let run_loop = {
         let coord = coordinator.read().await;
-        run_loop_targets(&coord, &job_id).map_err(|error| scheduler_status(&error))?
+        run_loop_targets(&coord, &job_id).map_err(|error| scheduler_error_response(&error))?
     };
     if let Some(targets) = run_loop {
         push_run_loop_input(&coordinator, &job_id, targets, ipc_bytes)
             .await
             .map_err(|error| match error {
-                ContinuousStreamError::Scheduler(e) => scheduler_status(&e),
-                _ => StatusCode::SERVICE_UNAVAILABLE,
+                ContinuousStreamError::Scheduler(e) => scheduler_error_response(&e),
+                other => (StatusCode::SERVICE_UNAVAILABLE, other.to_string()),
             })?;
         return Ok(Json(ContinuousPushResponse { success: true }));
     }
@@ -1005,23 +1028,26 @@ pub async fn api_continuous_push(
         let mut coord = coordinator.write().await;
         coord
             .prepare_continuous_input_cycle(&job_id, vec![partition])
-            .map_err(|error| scheduler_status(&error))?;
+            .map_err(|error| scheduler_error_response(&error))?;
         let assignments = match coord.launch_assigned_task_assignments(&job_id) {
             Ok(assignments) if !assignments.is_empty() => assignments,
             Ok(_) => {
                 coord.abort_continuous_input_cycle(&job_id);
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    String::from("no task assignments were launched for this cycle"),
+                ));
             }
             Err(error) => {
                 coord.abort_continuous_input_cycle(&job_id);
-                return Err(scheduler_status(&error));
+                return Err(scheduler_error_response(&error));
             }
         };
         let targets = match coord.resolve_assignment_targets(assignments) {
             Ok(targets) => targets,
             Err(error) => {
                 coord.abort_continuous_input_cycle(&job_id);
-                return Err(scheduler_status(&error));
+                return Err(scheduler_error_response(&error));
             }
         };
         if targets
@@ -1029,7 +1055,10 @@ pub async fn api_continuous_push(
             .any(|(endpoint, _)| crate::is_in_process_task_endpoint(endpoint))
         {
             coord.abort_continuous_input_cycle(&job_id);
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                String::from("continuous push rejected: service unavailable"),
+            ));
         }
         let target_count = targets.len();
         (targets, coord.executor_channels.clone(), target_count)
@@ -1043,17 +1072,26 @@ pub async fn api_continuous_push(
                     .write()
                     .await
                     .abort_continuous_input_cycle(&job_id);
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    String::from("continuous push rejected: service unavailable"),
+                ));
             }
         };
     let mut coord = coordinator.write().await;
     if !coord.continuous_input_cycles.contains(&job_id) {
-        return Err(StatusCode::CONFLICT);
+        return Err((
+            StatusCode::CONFLICT,
+            String::from("continuous push rejected: conflict"),
+        ));
     }
     let accepted = coord.apply_assignment_dispatch_responses(&job_id, &responses);
     if accepted != target_count {
         coord.abort_continuous_input_cycle(&job_id);
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            String::from("continuous push rejected: service unavailable"),
+        ));
     }
 
     Ok(Json(ContinuousPushResponse { success: true }))
@@ -2362,7 +2400,7 @@ mod tests {
         )
         .await
         .expect_err("HTTP push must not pretend an in-process target was delivered");
-        assert_eq!(error, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
 
         let coord = coordinator.read().await;
         let job_id = krishiv_proto::JobId::try_new("cs-in-process-job").unwrap();
@@ -2591,7 +2629,7 @@ mod tests {
         )
         .await
         .expect_err("unknown push must fail");
-        assert_eq!(push, StatusCode::NOT_FOUND);
+        assert_eq!(push.0, StatusCode::NOT_FOUND);
 
         let drain = api_continuous_drain(
             State(coordinator),
@@ -2632,7 +2670,7 @@ mod tests {
         )
         .await
         .expect_err("second concurrent cycle must be fenced");
-        assert_eq!(error, StatusCode::CONFLICT);
+        assert_eq!(error.0, StatusCode::CONFLICT);
     }
 
     #[tokio::test]
@@ -2713,7 +2751,16 @@ mod tests {
         )
         .await
         .expect_err("undrained output must backpressure the next cycle");
-        assert_eq!(blocked_push, StatusCode::CONFLICT);
+        // The status is the contract (back-pressure, deliberate). The MESSAGE is
+        // the fix: this used to be a bare 409 with an empty body, so a caller
+        // driving pushes in a loop learned nothing about why it was refused or
+        // that a drain unwedges it. Assert both, so the explanation cannot be
+        // silently dropped again.
+        assert_eq!(blocked_push.0, StatusCode::CONFLICT);
+        assert!(
+            !blocked_push.1.trim().is_empty(),
+            "a 409 with an empty body tells the caller nothing"
+        );
 
         let mut coord = coordinator.write().await;
         let detail = coord.job_detail_snapshot(&job_id).unwrap();

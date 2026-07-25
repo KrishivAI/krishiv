@@ -234,6 +234,14 @@ impl PartitionedIncrementalFlow {
         self.concat_per_shard(|s| s.snapshot(view))
     }
 
+    /// Whether `view` is materialized — all shards carry the same spec, so
+    /// shard 0 is authoritative (mirrors [`Self::view_spec`]).
+    pub fn view_is_materialized(&self, view: &str) -> bool {
+        self.shards
+            .first()
+            .is_some_and(|shard| shard.view_is_materialized(view))
+    }
+
     pub fn view_spec(&self, view: &str) -> IvmResult<Option<IncrementalViewSpec>> {
         // All shards carry the same spec; read from shard 0.
         self.shards

@@ -1522,6 +1522,22 @@ impl IncrementalFlow {
         Ok(value)
     }
 
+    /// Whether `name` was registered as a materialized view.
+    ///
+    /// Callers need this to tell "not materialized" from "materialized but
+    /// empty": both produce `snapshot() == None`, and conflating them reads a
+    /// correct engine as a broken one.
+    pub fn view_is_materialized(&self, name: &str) -> bool {
+        let Ok(inner) = self.inner.lock() else {
+            return false;
+        };
+        inner
+            .view_registry
+            .get(name)
+            .map(|view| view.spec.is_materialized)
+            .unwrap_or(false)
+    }
+
     pub fn snapshot(&self, name: &str) -> IvmResult<Option<RecordBatch>> {
         let inner = self.inner.lock().map_err(lock_err)?;
         let view = inner.view_registry.get(name).map_err(delta_err)?;
