@@ -28,6 +28,34 @@ fn format_failure_message_truncates_long_message() {
     assert!(msg.ends_with('…'));
 }
 
+/// A huge fragment must not push the error out of the message.
+///
+/// `dfplan:` fragments are base64 physical plans and run to tens of kilobytes.
+/// Truncating the assembled string from the end kept the base64 and discarded
+/// the error, so a real SF100 failure reached the operator as kilobytes of
+/// plan with "Resources exhausted: Failed to allocate…" cut off entirely. The
+/// error is the diagnosis and has to survive.
+#[test]
+fn a_huge_fragment_does_not_swallow_the_error() {
+    let huge_fragment = format!("dfplan:v1:0:{}", "A".repeat(60_000));
+    let msg = format_failure_message(&huge_fragment, "Resources exhausted: allocate 34.0 MB");
+
+    assert!(
+        msg.contains("Resources exhausted: allocate 34.0 MB"),
+        "the error text must survive fragment truncation; got: {msg}"
+    );
+    assert!(
+        msg.len() <= TASK_FAILURE_MESSAGE_MAX_BYTES + 10,
+        "message still has to fit the RPC budget, got {} bytes",
+        msg.len()
+    );
+    // The fragment is still identifiable, just not reproduced in full.
+    assert!(
+        msg.contains("dfplan:v1:0:"),
+        "fragment kind must remain visible"
+    );
+}
+
 #[test]
 fn format_failure_message_within_limit() {
     let short_error = "short error";

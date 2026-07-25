@@ -34,25 +34,47 @@ pub(crate) const MAX_CHECKPOINT_ACK_RETRIES: u8 = 3;
 /// messages are truncated with `…` so they cannot blow past gRPC payload limits.
 pub(crate) const TASK_FAILURE_MESSAGE_MAX_BYTES: usize = 4096;
 
+/// Maximum bytes of the *fragment* echoed back in a failure message.
+///
+/// A `dfplan:` fragment is a base64-encoded physical plan and routinely runs to
+/// tens of kilobytes. It is context, not diagnosis.
+pub(crate) const TASK_FAILURE_FRAGMENT_MAX_BYTES: usize = 256;
+
+/// Truncate `s` to at most `max` bytes on a char boundary, appending `…`.
+fn truncate_on_char_boundary(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let mut end = max.saturating_sub(1);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_owned();
+    out.push('…');
+    out
+}
+
 /// Format an executor-side failure into a coordinator-visible message that
-/// includes the fragment description and the underlying error text.  Truncates
-/// at [`TASK_FAILURE_MESSAGE_MAX_BYTES`] so we cannot ship arbitrarily large
-/// strings through `task_status` RPCs.
+/// includes the fragment description and the underlying error text.
+///
+/// The fragment is truncated FIRST, and hard, before the error is appended.
+/// Truncating the assembled string from the end instead — which is what this
+/// did — threw away the error and kept the fragment, so a real failure
+/// ("Resources exhausted: Failed to allocate…", "No suitable object store
+/// found for s3://…") arrived at the operator as several kilobytes of base64
+/// with the actionable part cut off. The error is the diagnosis; it must
+/// survive. Short fragments (`sql: select 1`) are still echoed verbatim.
 pub(crate) fn format_failure_message(fragment: &str, error: &str) -> String {
+    let fragment = truncate_on_char_boundary(fragment.trim(), TASK_FAILURE_FRAGMENT_MAX_BYTES);
+    let error = error.trim();
     let mut buf = String::with_capacity(fragment.len() + error.len() + 32);
     buf.push_str("executor failed fragment '");
-    buf.push_str(fragment.trim());
+    buf.push_str(&fragment);
     buf.push_str("': ");
-    buf.push_str(error.trim());
-    if buf.len() > TASK_FAILURE_MESSAGE_MAX_BYTES {
-        let mut end = TASK_FAILURE_MESSAGE_MAX_BYTES.saturating_sub(1);
-        while !buf.is_char_boundary(end) && end > 0 {
-            end -= 1;
-        }
-        buf.truncate(end);
-        buf.push('…');
-    }
-    buf
+    buf.push_str(error);
+    // Belt and braces: a pathological error string still cannot blow past the
+    // gRPC payload budget.
+    truncate_on_char_boundary(&buf, TASK_FAILURE_MESSAGE_MAX_BYTES)
 }
 
 /// Sentinel embedded in a dfplan shuffle-read error string when the upstream
