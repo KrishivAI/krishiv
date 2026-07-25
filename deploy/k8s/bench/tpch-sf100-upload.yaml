@@ -1,0 +1,75 @@
+# Publish a locally-generated TPC-H dataset into the cluster's MinIO.
+#
+# The generator (`tpchgen-cli`) runs on a node's local disk because SF100 is
+# ~37 GB and streaming it in over the WAN from the build box would take longer
+# than generating it twice. This Job is the second half: it mirrors that local
+# directory into the object store the executors actually read from.
+#
+# The MinIO credentials are injected from the existing secret rather than being
+# passed on the command line, so they never appear in a Job spec, a shell
+# history, or a log line.
+#
+# Prereqs:
+#   - /data/tpch-sf100 populated on the node named by nodeSelector (see
+#     scripts/bench/gen_sf100.sh)
+#   - secret `minio-s3-creds` in this namespace with AWS_ACCESS_KEY_ID /
+#     AWS_SECRET_ACCESS_KEY
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tpch-sf100-upload
+  namespace: krishiv-apitest
+spec:
+  # A failed mirror is resumable — `mc mirror` skips objects that already match
+  # — so a retry is cheap and correct rather than a restart from zero.
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: tpch-sf100-upload
+    spec:
+      restartPolicy: OnFailure
+      # Must land on the node holding the generated files.
+      nodeSelector:
+        kubernetes.io/hostname: s2
+      containers:
+        - name: mc
+          image: minio/mc:latest
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: minio-s3-creds
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-s3-creds
+                  key: AWS_SECRET_ACCESS_KEY
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mc alias set store http://minio.krishiv-infra:9000 \
+                "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"
+              mc mb --ignore-existing store/krishiv-bench
+              echo "mirroring $(du -sh /src | cut -f1) to store/krishiv-bench/tpch/sf100"
+              mc mirror --overwrite /src store/krishiv-bench/tpch/sf100
+              echo "--- uploaded ---"
+              mc du store/krishiv-bench/tpch/sf100
+          volumeMounts:
+            - name: src
+              mountPath: /src
+              readOnly: true
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+      volumes:
+        - name: src
+          hostPath:
+            path: /data/tpch-sf100
+            type: Directory

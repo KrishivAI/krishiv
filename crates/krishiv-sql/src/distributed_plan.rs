@@ -491,20 +491,62 @@ fn plan_is_split_safe(plan: &Arc<dyn ExecutionPlan>) -> bool {
     safe && plan.children().iter().all(|c| plan_is_split_safe(c))
 }
 
-/// Plan a query over local parquet tables and cut it into stages
+/// Register the backing object store for an `s3://`/`s3a://` `path` on `ctx`.
+///
+/// DataFusion keys object stores by scheme+authority, so this registers once
+/// per bucket; re-registering the same bucket replaces the prior store. A
+/// no-op for local filesystem paths.
+///
+/// This mirrors `SqlEngine::register_s3_object_store_for_warehouse`, which
+/// does the same thing for the engine's long-lived context. The stage builder
+/// plans on a throwaway context instead, so it needs its own registration —
+/// that asymmetry is exactly what made object-store tables un-stageable.
+fn register_object_store_for_path(
+    ctx: &SessionContext,
+    path: &str,
+) -> SqlResult<()> {
+    if !(path.starts_with("s3://") || path.starts_with("s3a://")) {
+        return Ok(());
+    }
+    let url = url::Url::parse(path).map_err(|e| SqlError::DataFusion {
+        message: format!("staged planning: invalid object-store url {path}: {e}"),
+    })?;
+    let bucket = url.host_str().unwrap_or_default();
+    let store_url =
+        url::Url::parse(&format!("s3://{bucket}")).map_err(|e| SqlError::DataFusion {
+            message: format!("staged planning: invalid bucket url for {path}: {e}"),
+        })?;
+    let store = crate::build_s3_object_store(bucket).map_err(|e| SqlError::DataFusion {
+        message: format!("staged planning: object store init for {path}: {e}"),
+    })?;
+    ctx.register_object_store(&store_url, store);
+    Ok(())
+}
+
+/// Plan a query over parquet tables and cut it into stages
 /// (coordinator seam — keeps DataFusion types out of the scheduler crate).
 ///
 /// `tables` are `(table_name, path)` pairs; a path may be a single parquet
-/// file or a directory dataset. Planning happens on a fresh
-/// [`planning_session_context`], so krishiv SQL extensions (streaming
-/// windows, catalog DML, UDFs) fail to plan here and surface as `Err` —
-/// callers treat any error as "fall back to the single-task path".
+/// file or a directory dataset, on the local filesystem or in object storage.
+/// Planning happens on a fresh [`planning_session_context`], so krishiv SQL
+/// extensions (streaming windows, catalog DML, UDFs) fail to plan here and
+/// surface as `Err` — callers treat any error as "fall back to the
+/// single-task path".
 pub async fn build_stages_for_parquet_query(
     query: &str,
     tables: &[(String, String)],
 ) -> SqlResult<Option<DistributedStagePlan>> {
     let ctx = planning_session_context(stage_target_partitions_from_env());
     for (name, path) in tables {
+        // An `s3://` table needs its object store on the planning context
+        // before `register_parquet` can infer a schema. Without this the
+        // registration errors, the caller swallows the error as "decline to
+        // stage", and the job silently runs as a SINGLE task — an entire
+        // object-store-backed dataset scanned by one executor while the rest
+        // of the cluster idles. That degradation is invisible: the query still
+        // returns correct rows, just without any distribution. Local paths are
+        // unaffected (the helper is a no-op for them).
+        register_object_store_for_path(&ctx, path)?;
         ctx.register_parquet(
             name,
             path,
@@ -1066,6 +1108,52 @@ mod tests {
     use datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    /// The stage builder plans on a throwaway context, so it must register the
+    /// bucket's object store itself. When it did not, `register_parquet` on an
+    /// `s3://` path errored, the caller read that as "decline to stage", and
+    /// the whole dataset was scanned by a single executor — correct results,
+    /// silently zero distribution. Asserting the store is *resolvable
+    /// afterwards* falsifies that directly; asserting the call merely returned
+    /// `Ok` would not, since the pre-fix code never called it at all.
+    #[tokio::test]
+    async fn s3_paths_get_an_object_store_on_the_planning_context() {
+        // No environment setup: `build_s3_object_store` defaults the region and
+        // constructing a store does not contact the endpoint, so this stays a
+        // pure unit test rather than one that mutates process-wide env.
+        use datafusion::execution::object_store::ObjectStoreUrl;
+        let ctx = planning_session_context(4);
+        let url = ObjectStoreUrl::parse("s3://tpch-bucket").expect("bucket url");
+
+        assert!(
+            ctx.runtime_env().object_store(url.clone()).is_err(),
+            "a fresh planning context must not already know the bucket, \
+             otherwise this test cannot detect the registration"
+        );
+
+        register_object_store_for_path(&ctx, "s3://tpch-bucket/tpch/sf100/lineitem/")
+            .expect("registering an s3 path must succeed");
+
+        assert!(
+            ctx.runtime_env().object_store(url).is_ok(),
+            "after registration the planning context must resolve the bucket, \
+             or register_parquet will fail and the job will silently \
+             fall back to single-task execution"
+        );
+    }
+
+    /// Local paths must not be routed through the S3 builder — it reads
+    /// credentials from the environment and would fail on a machine that has
+    /// none, turning every ordinary filesystem-backed staged job into a
+    /// single-task job.
+    #[tokio::test]
+    async fn local_paths_are_left_alone_by_object_store_registration() {
+        let ctx = planning_session_context(4);
+        register_object_store_for_path(&ctx, "/home/krishiv-bench-data/tpch/sf1/lineitem.parquet")
+            .expect("a local path must be a no-op, not an error");
+        register_object_store_for_path(&ctx, "relative/dir")
+            .expect("a relative local path must be a no-op, not an error");
+    }
 
     /// Write a 4-file parquet dataset (1000 rows total) and return the
     /// directory path (registered as a multi-file table so scans genuinely

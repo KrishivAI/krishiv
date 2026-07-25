@@ -1742,7 +1742,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_reports_whether_the_view_is_materialized() {
         let (registry, coordinator) = test_deps_with_shards(1);
-        api_ivm_create_job(
+        let _ = api_ivm_create_job(
             State(registry.clone()),
             State(coordinator.clone()),
             Json(CreateJobRequest {
@@ -1757,7 +1757,7 @@ mod tests {
         let mut plain = revenue_view_request();
         plain.name = "plain".into();
         plain.is_materialized = false;
-        api_ivm_register_view(
+        let _ = api_ivm_register_view(
             State(registry.clone()),
             State(coordinator.clone()),
             Path("mat-flag".to_string()),
@@ -1769,7 +1769,7 @@ mod tests {
         let mut materialized = revenue_view_request();
         materialized.name = "mat".into();
         materialized.is_materialized = true;
-        api_ivm_register_view(
+        let _ = api_ivm_register_view(
             State(registry.clone()),
             State(coordinator.clone()),
             Path("mat-flag".to_string()),

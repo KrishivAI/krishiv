@@ -1,0 +1,220 @@
+# Executor topology for the SF100 TPC-H run.
+#
+# Three executors, one pinned per node. The default `replicas: 3` deployment
+# the API tests use does NOT give this: the scheduler is free to stack two
+# replicas on one node, and it did (two on s1, none on s3), which quietly turns
+# a "3-node benchmark" into a 2-node benchmark with double the contention on
+# one box. Pinning by hostname makes the topology a property of the manifest
+# rather than of whatever the scheduler felt like doing that morning.
+#
+# Memory is deliberately uneven. s2 also hosts the MinIO pod and the
+# coordinator, so its executor gets a smaller ceiling; s1 and s3 get the
+# headroom. At SF100 on 7 GB nodes every non-trivial query spills — that is the
+# honest operating point for this hardware, not a configuration mistake.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bench-exec-s1
+  namespace: krishiv-apitest
+  labels: { app: bench-exec, node: s1 }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: bench-exec, node: s1 }
+  template:
+    metadata:
+      labels: { app: bench-exec, node: s1 }
+    spec:
+      nodeSelector: { kubernetes.io/hostname: s1 }
+      containers:
+        - name: executor
+          image: localhost/krishiv:fast-b907ae23
+          imagePullPolicy: IfNotPresent
+          command:
+            - krishiv
+            - executor
+            - --connect
+            - --coordinator
+            - http://apitest-coordinator.krishiv-apitest.svc:2001
+            - --heartbeat-interval-secs
+            - "10"
+            - --slots
+            - "4"
+            - --http-addr
+            - 0.0.0.0:2002
+            - --task-grpc-addr
+            - 0.0.0.0:2005
+            - --barrier-grpc-addr
+            - 0.0.0.0:2006
+            - --durability-profile
+            - dev-local
+            - --shuffle-dir
+            - /scratch/shuffle
+            - --shuffle-flight-addr
+            - 0.0.0.0:2004
+          ports:
+            - { containerPort: 2002, name: health }
+            - { containerPort: 2004, name: shuffle-flight }
+            - { containerPort: 2005, name: task-grpc }
+            - { containerPort: 2006, name: barrier-grpc }
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: minio-s3-creds, key: AWS_ACCESS_KEY_ID } }
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: minio-s3-creds, key: AWS_SECRET_ACCESS_KEY } }
+            - name: AWS_ENDPOINT_URL
+              value: http://minio.krishiv-infra:9000
+            - name: AWS_ALLOW_HTTP
+              value: "true"
+            - name: AWS_REGION
+              value: us-east-1
+          resources:
+            requests: { cpu: "1", memory: "1Gi" }
+            limits: { cpu: "3500m", memory: "4500Mi" }
+          volumeMounts:
+            - { name: scratch, mountPath: /scratch }
+      volumes:
+        # Shuffle and spill land on the node's real disk (100 GB+ free after
+        # the image prune), not on a memory-backed emptyDir — spilling into
+        # tmpfs on a 7 GB node would just OOM the executor it was meant to save.
+        - name: scratch
+          hostPath: { path: /data/krishiv-bench-scratch, type: DirectoryOrCreate }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bench-exec-s2
+  namespace: krishiv-apitest
+  labels: { app: bench-exec, node: s2 }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: bench-exec, node: s2 }
+  template:
+    metadata:
+      labels: { app: bench-exec, node: s2 }
+    spec:
+      nodeSelector: { kubernetes.io/hostname: s2 }
+      containers:
+        - name: executor
+          image: localhost/krishiv:fast-b907ae23
+          imagePullPolicy: IfNotPresent
+          command:
+            - krishiv
+            - executor
+            - --connect
+            - --coordinator
+            - http://apitest-coordinator.krishiv-apitest.svc:2001
+            - --heartbeat-interval-secs
+            - "10"
+            - --slots
+            - "3"
+            - --http-addr
+            - 0.0.0.0:2002
+            - --task-grpc-addr
+            - 0.0.0.0:2005
+            - --barrier-grpc-addr
+            - 0.0.0.0:2006
+            - --durability-profile
+            - dev-local
+            - --shuffle-dir
+            - /scratch/shuffle
+            - --shuffle-flight-addr
+            - 0.0.0.0:2004
+          ports:
+            - { containerPort: 2002, name: health }
+            - { containerPort: 2004, name: shuffle-flight }
+            - { containerPort: 2005, name: task-grpc }
+            - { containerPort: 2006, name: barrier-grpc }
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: minio-s3-creds, key: AWS_ACCESS_KEY_ID } }
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: minio-s3-creds, key: AWS_SECRET_ACCESS_KEY } }
+            - name: AWS_ENDPOINT_URL
+              value: http://minio.krishiv-infra:9000
+            - name: AWS_ALLOW_HTTP
+              value: "true"
+            - name: AWS_REGION
+              value: us-east-1
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits: { cpu: "2500m", memory: "2500Mi" }
+          volumeMounts:
+            - { name: scratch, mountPath: /scratch }
+      volumes:
+        - name: scratch
+          hostPath: { path: /data/krishiv-bench-scratch, type: DirectoryOrCreate }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bench-exec-s3
+  namespace: krishiv-apitest
+  labels: { app: bench-exec, node: s3 }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: bench-exec, node: s3 }
+  template:
+    metadata:
+      labels: { app: bench-exec, node: s3 }
+    spec:
+      nodeSelector: { kubernetes.io/hostname: s3 }
+      containers:
+        - name: executor
+          image: localhost/krishiv:fast-b907ae23
+          imagePullPolicy: IfNotPresent
+          command:
+            - krishiv
+            - executor
+            - --connect
+            - --coordinator
+            - http://apitest-coordinator.krishiv-apitest.svc:2001
+            - --heartbeat-interval-secs
+            - "10"
+            - --slots
+            - "4"
+            - --http-addr
+            - 0.0.0.0:2002
+            - --task-grpc-addr
+            - 0.0.0.0:2005
+            - --barrier-grpc-addr
+            - 0.0.0.0:2006
+            - --durability-profile
+            - dev-local
+            - --shuffle-dir
+            - /scratch/shuffle
+            - --shuffle-flight-addr
+            - 0.0.0.0:2004
+          ports:
+            - { containerPort: 2002, name: health }
+            - { containerPort: 2004, name: shuffle-flight }
+            - { containerPort: 2005, name: task-grpc }
+            - { containerPort: 2006, name: barrier-grpc }
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: minio-s3-creds, key: AWS_ACCESS_KEY_ID } }
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: minio-s3-creds, key: AWS_SECRET_ACCESS_KEY } }
+            - name: AWS_ENDPOINT_URL
+              value: http://minio.krishiv-infra:9000
+            - name: AWS_ALLOW_HTTP
+              value: "true"
+            - name: AWS_REGION
+              value: us-east-1
+          resources:
+            requests: { cpu: "1", memory: "1Gi" }
+            limits: { cpu: "3500m", memory: "4500Mi" }
+          volumeMounts:
+            - { name: scratch, mountPath: /scratch }
+      volumes:
+        - name: scratch
+          hostPath: { path: /data/krishiv-bench-scratch, type: DirectoryOrCreate }

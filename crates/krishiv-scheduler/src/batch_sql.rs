@@ -365,9 +365,12 @@ async fn submit_batch_sql_job_inner(
     // signature for planning and the directive rides along on each stage
     // fragment so executors reconstruct the worker-backed UDF before decoding
     // the dfplan (see distributed_batch/distributed_plan). Shapes the builder
-    // declines — including Python AGGREGATE UDFs and object-store paths the
-    // coordinator cannot read to plan — fall back to the single-task `sql:`
-    // path, which carries the directive inside the fragment SQL.
+    // declines — including Python AGGREGATE UDFs — fall back to the
+    // single-task `sql:` path, which carries the directive inside the
+    // fragment SQL. `s3://` table paths DO stage: the stage builder registers
+    // the bucket's object store on its planning context, so the coordinator
+    // can infer their schemas (it previously could not, and every
+    // object-store-backed query quietly ran on one executor).
     let staged_stages =
         if !is_streaming && sink_contract.is_none() && tables.is_empty() && !path_tables.is_empty()
         {
