@@ -44,6 +44,26 @@ import urllib.request
 DEFAULT_TIMEOUT_S = 3600
 
 
+def _abridge(message: str, head: int = 120, tail: int = 320) -> str:
+    """Shorten a failure message while keeping the part that says why.
+
+    Truncating from the front is worse than useless here. An engine failure
+    reads `executor failed fragment '<serialised plan>': <cause>`, and the
+    plan is kilobytes of base64 — so `message[:200]` kept only the plan and
+    discarded the cause, leaving a report that said a query failed but not
+    why. That is the same defect the engine had in its own failure formatting;
+    fixing it there and repeating it in the harness wasted a benchmark run.
+
+    Keep both ends: the head identifies the fragment, the tail carries the
+    error.
+    """
+    message = message.strip()
+    if len(message) <= head + tail:
+        return message
+    elided = len(message) - head - tail
+    return f"{message[:head]} …[{elided} chars elided]… {message[-tail:]}"
+
+
 def load_corpus(corpus_json: str | None) -> list[dict]:
     """Return the 22-query corpus, from a file or by running the Rust binary."""
     if corpus_json:
@@ -252,7 +272,7 @@ def main() -> int:
         else:
             print(
                 f"FAIL {outcome['id']:>3} {outcome['name']:<34} "
-                f"{outcome['status']}: {outcome.get('error', '')[:200]}",
+                f"{outcome['status']}: {_abridge(outcome.get('error', ''))}",
                 flush=True,
             )
 

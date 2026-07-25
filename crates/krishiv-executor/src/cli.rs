@@ -77,7 +77,9 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
     // the shared query pool and the per-task DataFusion parallelism are sized
     // against the slot count this executor actually runs with — including when
     // it came from `--slots` rather than KRISHIV_TASK_SLOTS.
-    krishiv_common::executor_capacity::set_slots_override(slots);
+    if config.slots_explicit {
+        krishiv_common::executor_capacity::set_slots_override(slots);
+    }
     tracing::info!(
         capacity = %krishiv_common::ExecutorCapacity::detect().summary(),
         "executor capacity resolved"
@@ -1000,6 +1002,9 @@ struct ExecutorCliConfig {
     executor_id: String,
     host: String,
     slots: usize,
+    /// True when `slots` came from an operator (`--slots` or the env var)
+    /// rather than from the capacity derivation.
+    slots_explicit: bool,
     coordinator_endpoint: String,
     mode: ExecutorMode,
     heartbeat_interval_secs: u64,
@@ -1074,6 +1079,15 @@ impl ExecutorCliConfig {
             // count divides that budget more ways instead of claiming more of
             // the machine.
             slots: default_task_capacity(),
+            // Whether an operator chose the slot count, as opposed to it being
+            // derived. Only an operator's choice is republished to the
+            // capacity derivation — republishing a derived value would make it
+            // report itself as `Configured`, so the startup log would claim
+            // someone set a number nobody set.
+            slots_explicit: krishiv_common::env_usize(
+                krishiv_common::executor_capacity::TASK_SLOTS_ENV,
+            )
+            .is_some(),
             coordinator_endpoint: krishiv_common::coordinator_url_env()
                 .unwrap_or_else(|| String::from("http://127.0.0.1:2001")),
             mode: ExecutorMode::DryRun,
@@ -1128,6 +1142,7 @@ impl ExecutorCliConfig {
                     config.slots = value
                         .parse()
                         .map_err(|_| String::from("--slots must be a positive integer"))?;
+                    config.slots_explicit = true;
                 }
                 "--coordinator" => {
                     config.coordinator_endpoint = next_arg(&mut args, "--coordinator")?;
