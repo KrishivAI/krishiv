@@ -9,16 +9,16 @@ Which connector-kind drivers are dispatchable from each of Krishiv's four connec
 | `parquet` | source | preview | yes | yes | yes | n/a |  |
 | `parquet-directory` | source | preview | yes | yes | yes | n/a |  |
 | `csv` | source | preview | yes | yes | yes | n/a |  |
-| `avro` | source | preview | yes | no | yes | n/a | not wired into the ad-hoc SQL job source allowlist |
+| `avro` | source | preview | yes | yes | yes | n/a |  |
 | `s3` | source | preview | yes | yes | yes | n/a |  |
 | `s3-prefix` | source | preview | yes | yes | yes | n/a |  |
-| `kafka` | source | preview | yes | no | yes | n/a | not wired into the ad-hoc SQL job source allowlist |
-| `iceberg` | source | preview | yes | no | yes | n/a | not wired into the ad-hoc SQL job source allowlist |
-| `delta` | source | experimental | yes | no | yes | n/a | not wired into the ad-hoc SQL job source allowlist |
-| `hudi` | source | experimental | yes | no | yes | n/a | not wired into the ad-hoc SQL job source allowlist |
-| `kinesis` | source | preview | yes | no | yes | n/a | not wired into the ad-hoc SQL job source allowlist |
-| `pulsar` | source | preview | yes | no | yes | n/a | not wired into the ad-hoc SQL job source allowlist |
-| `jdbc` | source | preview | yes | no | yes | n/a | not wired into the ad-hoc SQL job source allowlist |
+| `kafka` | source | preview | yes | yes | yes | n/a |  |
+| `iceberg` | source | preview | yes | yes | yes | n/a |  |
+| `delta` | source | experimental | yes | yes | yes | n/a |  |
+| `hudi` | source | experimental | yes | yes | yes | n/a |  |
+| `kinesis` | source | preview | yes | yes | yes | n/a |  |
+| `pulsar` | source | preview | yes | yes | yes | n/a |  |
+| `jdbc` | source | preview | yes | yes | yes | n/a |  |
 | `parquet` | sink | preview | yes | yes | yes | yes |  |
 | `csv` | sink | preview | yes | yes | no | no | not an OutputContractDescriptor variant; no Python CSV sink pyclass |
 | `avro` | sink | preview | yes | no | no | no | not wired into the ad-hoc SQL job sink allowlist; no OutputContractDescriptor variant |

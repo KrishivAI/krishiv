@@ -632,7 +632,15 @@ impl SourceProvider for ConnectorSourceProvider {
                         .map_err(|e| EngineError::Source(e.to_string()))?;
                 Ok(Box::new(JsonFileSourceReader { inner }))
             }
-            "s3" | "s3-prefix" => {
+            // Registry-generic fallback (#197): any source driver registered in
+            // `default_registry()` is dispatchable here — kafka, iceberg, delta,
+            // hudi, kinesis, pulsar, jdbc, avro, s3, s3-prefix, … The parquet/csv/
+            // json arms above keep dedicated branches only to offload their
+            // blocking open() off the reactor; everything else flows through the
+            // one registry, closing the ad-hoc SQL job source reachability gaps.
+            // An unregistered kind still errors here (via `open_source`), now with
+            // the registry's "no source driver registered for kind" message.
+            _ => {
                 let config = connector_config_from_source_spec(spec);
                 let registry = default_registry();
                 let inner = registry
@@ -641,10 +649,6 @@ impl SourceProvider for ConnectorSourceProvider {
                     .map_err(|e| EngineError::Source(e.to_string()))?;
                 Ok(Box::new(DynSourceReader { inner }))
             }
-            other => Err(EngineError::Source(format!(
-                "connector '{other}' is not available as a job source yet; \
-                 supported: parquet, parquet-directory, csv, json, s3, s3-prefix"
-            ))),
         }
     }
 }
@@ -1114,6 +1118,37 @@ mod tests {
 
     use super::{RuntimeQueryExecutor, run_incremental_job_via_ivm, run_streaming_job_via_runtime};
     use crate::{CompiledJob, EngineKind, ExecutionMode, KrishivError, SinkSpec, SourceSpec};
+
+    /// #197: the ad-hoc SQL job source provider's `_` arm dispatches through
+    /// `default_registry()` rather than a hardcoded allowlist, so any registered
+    /// source driver (kafka/iceberg/jdbc/…) is reachable. An UNregistered kind
+    /// now errors with the registry's message, proving the fallthrough — the old
+    /// "is not available as a job source yet" allowlist error is gone.
+    #[tokio::test]
+    async fn sql_job_source_provider_dispatches_through_registry() {
+        use krishiv_engine_core::SourceProvider as _;
+
+        let provider = super::ConnectorSourceProvider;
+        let spec = SourceSpec::bounded("t", "definitely-not-a-connector", "irrelevant");
+        // `Box<dyn SourceReader>` isn't `Debug`, so `expect_err` won't compile.
+        let msg = match provider.open(&spec).await {
+            Ok(_) => panic!("an unregistered connector kind must error"),
+            Err(e) => e.to_string(),
+        };
+        // The `_` arm now reaches `default_registry().open_source()`, whose
+        // `ConnectorKind::parse` rejects an unknown kind ("unknown connector
+        // kind") — proof the dispatch went through the registry. A *registered*
+        // kind with no driver for the enabled features would instead say "no
+        // source driver registered"; accept either registry-path error.
+        assert!(
+            msg.contains("unknown connector kind") || msg.contains("no source driver registered"),
+            "expected a registry-dispatch error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("is not available as a job source yet"),
+            "must not use the retired hardcoded allowlist error: {msg}"
+        );
+    }
 
     #[derive(Debug, Clone)]
     struct CapturedRemoteTable {

@@ -154,24 +154,19 @@ pub static CONNECTORS: &[ConnectorEntry] = &[
     entry("parquet", "source", "preview", Yes, Yes, Yes, NotApplicable),
     entry("parquet-directory", "source", "preview", Yes, Yes, Yes, NotApplicable),
     entry("csv", "source", "preview", Yes, Yes, Yes, NotApplicable),
-    entry("avro", "source", "preview", Yes, No, Yes, NotApplicable)
-        .with_note("not wired into the ad-hoc SQL job source allowlist"),
+    // #197: the ad-hoc SQL job source provider now falls through to the
+    // registry-generic dispatch (ConnectorSourceProvider `_` arm), so every
+    // registered source driver is reachable here — matching `sql_ddl`.
+    entry("avro", "source", "preview", Yes, Yes, Yes, NotApplicable),
     entry("s3", "source", "preview", Yes, Yes, Yes, NotApplicable),
     entry("s3-prefix", "source", "preview", Yes, Yes, Yes, NotApplicable),
-    entry("kafka", "source", "preview", Yes, No, Yes, NotApplicable)
-        .with_note("not wired into the ad-hoc SQL job source allowlist"),
-    entry("iceberg", "source", "preview", Yes, No, Yes, NotApplicable)
-        .with_note("not wired into the ad-hoc SQL job source allowlist"),
-    entry("delta", "source", "experimental", Yes, No, Yes, NotApplicable)
-        .with_note("not wired into the ad-hoc SQL job source allowlist"),
-    entry("hudi", "source", "experimental", Yes, No, Yes, NotApplicable)
-        .with_note("not wired into the ad-hoc SQL job source allowlist"),
-    entry("kinesis", "source", "preview", Yes, No, Yes, NotApplicable)
-        .with_note("not wired into the ad-hoc SQL job source allowlist"),
-    entry("pulsar", "source", "preview", Yes, No, Yes, NotApplicable)
-        .with_note("not wired into the ad-hoc SQL job source allowlist"),
-    entry("jdbc", "source", "preview", Yes, No, Yes, NotApplicable)
-        .with_note("not wired into the ad-hoc SQL job source allowlist"),
+    entry("kafka", "source", "preview", Yes, Yes, Yes, NotApplicable),
+    entry("iceberg", "source", "preview", Yes, Yes, Yes, NotApplicable),
+    entry("delta", "source", "experimental", Yes, Yes, Yes, NotApplicable),
+    entry("hudi", "source", "experimental", Yes, Yes, Yes, NotApplicable),
+    entry("kinesis", "source", "preview", Yes, Yes, Yes, NotApplicable),
+    entry("pulsar", "source", "preview", Yes, Yes, Yes, NotApplicable),
+    entry("jdbc", "source", "preview", Yes, Yes, Yes, NotApplicable),
     // ── sinks ────────────────────────────────────────────────────────────────
     entry("parquet", "sink", "preview", Yes, Yes, Yes, Yes),
     entry("csv", "sink", "preview", Yes, Yes, No, No)
