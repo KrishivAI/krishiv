@@ -441,8 +441,10 @@ pub async fn spawn_coordinator_sidecars(
         // endpoint is the correct signal. Bound at http_port + 2 (2004 for the
         // standard 2002); skipped for an ephemeral (port 0) HTTP address, which
         // only appears in embedded/test configs that have no liveness probe.
-        if let Some(liveness_port) =
-            http_addr.port().checked_add(2).filter(|_| http_addr.port() != 0)
+        if let Some(liveness_port) = http_addr
+            .port()
+            .checked_add(2)
+            .filter(|_| http_addr.port() != 0)
         {
             let liveness_addr = SocketAddr::new(http_addr.ip(), liveness_port);
             if let Err(e) = std::thread::Builder::new()
@@ -459,8 +461,7 @@ pub async fn spawn_coordinator_sidecars(
                         }
                     };
                     rt.block_on(async move {
-                        let app =
-                            Router::new().route("/healthz", get(|| async { "ok\n" }));
+                        let app = Router::new().route("/healthz", get(|| async { "ok\n" }));
                         match TcpListener::bind(liveness_addr).await {
                             Ok(listener) => {
                                 tracing::info!(

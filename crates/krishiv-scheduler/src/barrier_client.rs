@@ -115,9 +115,7 @@ mod tests {
                     let stream = tokio_stream::pending();
                     Ok(tonic::Response::new(Box::pin(stream)))
                 }
-                MockBehavior::RejectCall => {
-                    Err(tonic::Status::unavailable("mock: call rejected"))
-                }
+                MockBehavior::RejectCall => Err(tonic::Status::unavailable("mock: call rejected")),
             }
         }
     }
@@ -157,8 +155,7 @@ mod tests {
 
     #[tokio::test]
     async fn inject_barrier_errors_when_the_stream_closes_without_an_ack() {
-        let (mut client, server) =
-            spawn_mock_barrier_server(MockBehavior::CloseWithoutAck).await;
+        let (mut client, server) = spawn_mock_barrier_server(MockBehavior::CloseWithoutAck).await;
         let err = inject_barrier(&mut client, barrier(1), Duration::from_secs(5))
             .await
             .unwrap_err();

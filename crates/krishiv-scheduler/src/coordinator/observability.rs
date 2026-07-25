@@ -126,9 +126,8 @@ mod tests {
     #[test]
     fn build_observability_report_errs_for_an_unknown_job() {
         let coordinator = Coordinator::active(CoordinatorId::try_new("obs-unknown").unwrap());
-        let err =
-            build_observability_report(&coordinator, &JobId::try_new("no-such-job").unwrap())
-                .unwrap_err();
+        let err = build_observability_report(&coordinator, &JobId::try_new("no-such-job").unwrap())
+            .unwrap_err();
         assert!(matches!(err, crate::SchedulerError::UnknownJob { .. }));
     }
 
@@ -143,14 +142,18 @@ mod tests {
             )
             .unwrap();
         coordinator
-            .executor_heartbeat(ExecutorHeartbeat::new(exec_id.clone(), ExecutorState::Healthy))
+            .executor_heartbeat(ExecutorHeartbeat::new(
+                exec_id.clone(),
+                ExecutorState::Healthy,
+            ))
             .unwrap();
 
         let job_id = JobId::try_new("obs-job").unwrap();
         let spec = JobSpec::new(job_id.clone(), "obs-job-name", JobKind::Batch).with_stage(
-            StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(
-                TaskSpec::new(TaskId::try_new("t0").unwrap(), "sql: select 1"),
-            ),
+            StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(TaskSpec::new(
+                TaskId::try_new("t0").unwrap(),
+                "sql: select 1",
+            )),
         );
         coordinator.submit_job(spec).unwrap();
 

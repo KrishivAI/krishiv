@@ -1432,7 +1432,10 @@ mod tests {
         let start = tokio::time::Instant::now();
         tokio::time::timeout(
             std::time::Duration::from_secs(8),
-            Coordinator::dispatch_cancel_targets(channels, vec![(format!("http://{addr}"), target)]),
+            Coordinator::dispatch_cancel_targets(
+                channels,
+                vec![(format!("http://{addr}"), target)],
+            ),
         )
         .await
         .expect(

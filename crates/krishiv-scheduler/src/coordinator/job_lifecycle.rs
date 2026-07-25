@@ -1199,9 +1199,10 @@ mod terminal_id_reuse_tests {
 
     fn single_task_job(job_id: &JobId, task_id: &str) -> JobSpec {
         JobSpec::new(job_id.clone(), "terminal-reuse-test", JobKind::Batch).with_stage(
-            StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(
-                TaskSpec::new(TaskId::try_new(task_id).unwrap(), "sql: select 1"),
-            ),
+            StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(TaskSpec::new(
+                TaskId::try_new(task_id).unwrap(),
+                "sql: select 1",
+            )),
         )
     }
 
@@ -1337,7 +1338,7 @@ mod terminal_id_reuse_tests {
     /// not only the in-memory view.
     #[test]
     fn reconcile_store_latched_terminal_jobs_persists_the_fix_even_when_the_store_itself_is_stale()
-     {
+    {
         let mut coordinator = Coordinator::new_active(None)
             .unwrap()
             .with_store(InMemoryMetadataStore::default());

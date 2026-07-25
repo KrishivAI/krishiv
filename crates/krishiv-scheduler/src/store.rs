@@ -1182,7 +1182,6 @@ pub(crate) fn parse_task_state(value: &str) -> SchedulerResult<TaskState> {
     }
 }
 
-
 /// Commands sent from the coordinator to the background store writer.
 #[derive(Debug)]
 enum StoreCommand {
@@ -1432,10 +1431,7 @@ impl NonBlockingStoreHandle {
     /// (see `Coordinator::submit_job`'s terminal-id-reuse branch) — clearing
     /// it any earlier would reopen the resurrection race this latch closes.
     pub fn forget_terminal_job(&self, job_id: &str) {
-        let mut terminal = self
-            .terminal_jobs
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut terminal = self.terminal_jobs.lock().unwrap_or_else(|p| p.into_inner());
         terminal.remove(job_id);
     }
 

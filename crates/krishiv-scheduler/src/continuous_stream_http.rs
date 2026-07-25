@@ -125,12 +125,31 @@ impl ContinuousJobMode {
     }
 }
 
-/// Streaming Iceberg sink target for a continuous job (G7).
+/// Streaming sink target for a continuous job.
+///
+/// Two shapes, distinguished by whether `connector` is set:
+/// - **Iceberg (G7, default)** — `root`/`table`/`mode`/`key_columns`/`op_column`
+///   build the checkpoint-aligned two-phase-commit `iceberg-sink:` contract.
+/// - **Any registered connector (#197)** — `connector` names a sink kind and
+///   `options` carries its driver properties, building a `registry-sink:`
+///   contract the executor opens through the connector registry. Delivery is
+///   at-least-once (flushed per cycle, replayed cycles re-deliver), and the
+///   driver must declare `resumable_flush` or the executor rejects it at open.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContinuousSinkSpec {
-    /// Local table root directory on the executor host.
+    /// Registered connector kind (`csv`, `elasticsearch`, `jdbc-sink`, …).
+    /// When set, this is a registry-dispatched sink and the Iceberg fields are
+    /// ignored.
+    #[serde(default)]
+    pub connector: Option<String>,
+    /// Driver properties for `connector` (`path`, `url`, `index`, …).
+    #[serde(default)]
+    pub options: std::collections::BTreeMap<String, String>,
+    /// Local table root directory on the executor host (Iceberg sinks).
+    #[serde(default)]
     pub root: String,
     /// Iceberg table name inside the root.
+    #[serde(default)]
     pub table: String,
     /// `append` (default) or `upsert`.
     #[serde(default = "default_sink_mode")]
@@ -148,9 +167,26 @@ fn default_sink_mode() -> String {
 }
 
 impl ContinuousSinkSpec {
-    /// Build the validated string sink contract
-    /// (`iceberg-sink:<root>|<table>|mode=...`) carried on the task spec.
+    /// Build the validated string sink contract carried on the task spec —
+    /// `registry-sink:<kind>|<base64-json>` when `connector` is set, otherwise
+    /// `iceberg-sink:<root>|<table>|mode=...`.
     fn contract_string(&self) -> crate::SchedulerResult<String> {
+        if let Some(kind) = self
+            .connector
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+        {
+            return self.registry_contract_string(kind);
+        }
+        if self.root.trim().is_empty() || self.table.trim().is_empty() {
+            return Err(SchedulerError::InvalidJob {
+                message: String::from(
+                    "continuous sink requires either `connector` (registry sink) or \
+                     `root` + `table` (Iceberg sink)",
+                ),
+            });
+        }
         let mut contract = format!(
             "{}{}|{}|mode={}",
             krishiv_proto::ICEBERG_SINK_PREFIX,
@@ -173,6 +209,30 @@ impl ContinuousSinkSpec {
                 message: "iceberg sink contract failed to round-trip".into(),
             }),
         }
+    }
+
+    /// Encode a registry-dispatched sink as `registry-sink:<kind>|<base64-json>`
+    /// (#197). Base64 so property values containing `|`/`:` cannot corrupt the
+    /// contract framing — the same encoding the batch export uses.
+    fn registry_contract_string(&self, kind: &str) -> crate::SchedulerResult<String> {
+        use base64::Engine as _;
+
+        let properties: serde_json::Map<String, serde_json::Value> = self
+            .options
+            .iter()
+            .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+            .collect();
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "name": format!("continuous-{kind}"),
+            "properties": properties,
+        }))
+        .map_err(|error| SchedulerError::InvalidJob {
+            message: format!("registry sink options are not encodable: {error}"),
+        })?;
+        Ok(format!(
+            "registry-sink:{kind}|{}",
+            base64::engine::general_purpose::STANDARD.encode(payload)
+        ))
     }
 }
 
@@ -795,9 +855,7 @@ async fn push_run_loop_input(
         ))
     })?
     .map_err(|status| {
-        ContinuousStreamError::Unavailable(format!(
-            "run-loop push to {endpoint} failed: {status}"
-        ))
+        ContinuousStreamError::Unavailable(format!("run-loop push to {endpoint} failed: {status}"))
     })?;
     Ok(())
 }
@@ -2066,12 +2124,59 @@ mod tests {
         )
         .await
         .unwrap();
+        use base64::Engine as _;
+
+        // #197: a continuous job can name any registered connector as its sink.
+        // The contract must be the registry form, not the Iceberg one — that is
+        // what routes the executor to stage_rloop_connector.
+        {
+            let spec = ContinuousSinkSpec {
+                connector: Some("csv".into()),
+                options: [("path".to_string(), "/tmp/stream|out.csv".to_string())]
+                    .into_iter()
+                    .collect(),
+                root: String::new(),
+                table: String::new(),
+                mode: default_sink_mode(),
+                key_columns: Vec::new(),
+                op_column: None,
+            };
+            let contract = spec.contract_string().expect("registry contract");
+            assert!(contract.starts_with("registry-sink:csv|"), "{contract}");
+            // Base64 body: a property value containing `|` cannot corrupt the framing.
+            let encoded = contract.split_once('|').unwrap().1;
+            let decoded: serde_json::Value = serde_json::from_slice(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .expect("base64"),
+            )
+            .expect("json");
+            assert_eq!(decoded["properties"]["path"], "/tmp/stream|out.csv");
+        }
+        // A sink spec naming neither a connector nor an Iceberg table is
+        // rejected at registration, not at the first cycle on an executor.
+        {
+            let empty = ContinuousSinkSpec {
+                connector: None,
+                options: Default::default(),
+                root: String::new(),
+                table: String::new(),
+                mode: default_sink_mode(),
+                key_columns: Vec::new(),
+                op_column: None,
+            };
+            let error = empty.contract_string().expect_err("must be rejected");
+            assert!(error.to_string().contains("connector"), "{error}");
+        }
+
         let _ = api_continuous_register(
             State(coordinator.clone()),
             Json(ContinuousRegisterRequest {
                 job_id: "cs-delivery-iceberg".into(),
                 spec: tumbling_spec(),
                 sink: Some(ContinuousSinkSpec {
+                    connector: None,
+                    options: Default::default(),
                     root: "/tmp/warehouse".into(),
                     table: "cycles".into(),
                     mode: "append".into(),
@@ -2693,10 +2798,7 @@ mod tests {
             .apply_task_update(succeeded)
             .unwrap();
         // Drain so the second cycle's undrained-output guard doesn't fire.
-        coordinator
-            .write()
-            .await
-            .take_job_inline_results(&job_id);
+        coordinator.write().await.take_job_inline_results(&job_id);
 
         // Second cycle: this is the recycle path — the task transitions
         // Succeeded -> Assigned again to prepare for the next push.

@@ -142,14 +142,8 @@ mod tests {
     fn two_task_streaming_job(job_id: &JobId) -> JobSpec {
         JobSpec::new(job_id.clone(), "streaming-job", JobKind::Streaming).with_stage(
             StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage")
-                .with_task(TaskSpec::new(
-                    TaskId::try_new("t0").unwrap(),
-                    "stream:tw",
-                ))
-                .with_task(TaskSpec::new(
-                    TaskId::try_new("t1").unwrap(),
-                    "stream:tw",
-                )),
+                .with_task(TaskSpec::new(TaskId::try_new("t0").unwrap(), "stream:tw"))
+                .with_task(TaskSpec::new(TaskId::try_new("t1").unwrap(), "stream:tw")),
         )
     }
 
@@ -241,7 +235,10 @@ mod tests {
             .register_executor(ExecutorDescriptor::new(exec_id.clone(), "host", 2))
             .unwrap();
         coord
-            .executor_heartbeat(ExecutorHeartbeat::new(exec_id.clone(), ExecutorState::Healthy))
+            .executor_heartbeat(ExecutorHeartbeat::new(
+                exec_id.clone(),
+                ExecutorState::Healthy,
+            ))
             .unwrap();
 
         let streaming_job = JobId::try_new("job-streaming").unwrap();

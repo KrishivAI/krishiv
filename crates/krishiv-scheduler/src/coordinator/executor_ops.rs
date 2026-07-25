@@ -1028,9 +1028,10 @@ mod stuck_assigned_reclaim_tests {
 
     fn single_task_job(job_id: &JobId, task_id: &str) -> JobSpec {
         JobSpec::new(job_id.clone(), "stuck-assigned-test", JobKind::Batch).with_stage(
-            StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(
-                TaskSpec::new(TaskId::try_new(task_id).unwrap(), "sql: select 1"),
-            ),
+            StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(TaskSpec::new(
+                TaskId::try_new(task_id).unwrap(),
+                "sql: select 1",
+            )),
         )
     }
 
@@ -1057,10 +1058,9 @@ mod stuck_assigned_reclaim_tests {
                     task.assigned_executor = Some(exec_id.clone());
                     task.state = TaskState::Assigned;
                     task.launch_in_flight = false;
-                    let two_min_ago =
-                        u64::try_from(krishiv_common::async_util::unix_now_ms())
-                            .unwrap_or(0)
-                            .saturating_sub(120_000);
+                    let two_min_ago = u64::try_from(krishiv_common::async_util::unix_now_ms())
+                        .unwrap_or(0)
+                        .saturating_sub(120_000);
                     task.assigned_at_ms = Some(two_min_ago);
                 }
             }
@@ -1109,8 +1109,7 @@ mod stuck_assigned_reclaim_tests {
 
     #[test]
     fn stuck_assigned_task_within_timeout_is_left_alone() {
-        let mut coordinator =
-            Coordinator::active(CoordinatorId::try_new("stuck-not-yet").unwrap());
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("stuck-not-yet").unwrap());
         coordinator.config = coordinator.config.with_stuck_assigned_reset_ms(60_000);
 
         let exec_id = ExecutorId::try_new("exec-fresh").unwrap();
@@ -1130,9 +1129,8 @@ mod stuck_assigned_reclaim_tests {
                     task.assigned_executor = Some(exec_id.clone());
                     task.state = TaskState::Assigned;
                     task.launch_in_flight = false;
-                    task.assigned_at_ms = Some(
-                        u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0),
-                    );
+                    task.assigned_at_ms =
+                        Some(u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0));
                 }
             }
         }

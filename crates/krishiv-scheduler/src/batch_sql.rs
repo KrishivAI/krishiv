@@ -368,11 +368,9 @@ async fn submit_batch_sql_job_inner(
     // declines — including Python AGGREGATE UDFs and object-store paths the
     // coordinator cannot read to plan — fall back to the single-task `sql:`
     // path, which carries the directive inside the fragment SQL.
-    let staged_stages = if !is_streaming
-        && sink_contract.is_none()
-        && tables.is_empty()
-        && !path_tables.is_empty()
-    {
+    let staged_stages =
+        if !is_streaming && sink_contract.is_none() && tables.is_empty() && !path_tables.is_empty()
+        {
             let table_refs: Vec<(String, std::path::PathBuf)> = path_tables
                 .iter()
                 .map(|t| (t.table_name.clone(), t.path.clone()))

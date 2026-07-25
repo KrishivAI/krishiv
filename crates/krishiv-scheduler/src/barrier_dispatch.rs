@@ -690,7 +690,12 @@ mod tests {
         let mut coord = Coordinator::active(CoordinatorId::try_new("endpoint-fallback").unwrap());
         let exec_id = descriptor.executor_id().clone();
         coord.register_executor(descriptor).unwrap();
-        coord.exec.executors.find_executor(&exec_id).unwrap().clone()
+        coord
+            .exec
+            .executors
+            .find_executor(&exec_id)
+            .unwrap()
+            .clone()
     }
 
     #[test]
@@ -749,9 +754,10 @@ mod tests {
             JobKind::Batch,
         )
         .with_stage(
-            StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(
-                TaskSpec::new(TaskId::try_new(task_id).unwrap(), description),
-            ),
+            StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(TaskSpec::new(
+                TaskId::try_new(task_id).unwrap(),
+                description,
+            )),
         );
         JobRecord::from_spec(spec, 1)
     }
@@ -788,7 +794,10 @@ mod tests {
         let id_a = stable_operator_id_for_task_id(Some(record_a), &task_id).unwrap();
         let id_b = stable_operator_id_for_task_id(Some(record_b), &task_id).unwrap();
 
-        assert_eq!(id_a, id_b, "identical fragment bodies must hash identically");
+        assert_eq!(
+            id_a, id_b,
+            "identical fragment bodies must hash identically"
+        );
         assert!(id_a.as_str().starts_with("op-h"));
     }
 

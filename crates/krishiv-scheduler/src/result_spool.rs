@@ -397,7 +397,8 @@ mod tests {
     fn int_batch(values: &[i64]) -> arrow::record_batch::RecordBatch {
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
-        let schema = std::sync::Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let schema =
+            std::sync::Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         arrow::record_batch::RecordBatch::try_new(
             schema,
             vec![std::sync::Arc::new(Int64Array::from(values.to_vec()))],
@@ -410,7 +411,9 @@ mod tests {
     /// test module, so we can construct one directly around a hand-encoded
     /// file instead of going through the chunk-receiving path above (which
     /// only exercises raw bytes, not Arrow IPC content).
-    fn ipc_spool(batches: &[arrow::record_batch::RecordBatch]) -> (TaskResultSpool, tempfile::TempDir) {
+    fn ipc_spool(
+        batches: &[arrow::record_batch::RecordBatch],
+    ) -> (TaskResultSpool, tempfile::TempDir) {
         use arrow::ipc::writer::StreamWriter;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("spool.arrows");
@@ -421,13 +424,7 @@ mod tests {
         }
         writer.finish().unwrap();
         let total_bytes = std::fs::metadata(&path).unwrap().len();
-        (
-            TaskResultSpool {
-                path,
-                total_bytes,
-            },
-            dir,
-        )
+        (TaskResultSpool { path, total_bytes }, dir)
     }
 
     #[test]
@@ -500,7 +497,10 @@ mod tests {
         writer.flush().await.unwrap();
 
         let on_disk = tokio::fs::read(&path).await.unwrap();
-        assert_eq!(on_disk, expected, "every byte must survive periodic syncing, in order");
+        assert_eq!(
+            on_disk, expected,
+            "every byte must survive periodic syncing, in order"
+        );
     }
 
     #[tokio::test]

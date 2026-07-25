@@ -139,7 +139,10 @@ where
 /// Like [`etcd_block_on`] but with an explicit bound, for callers (namely
 /// [`EtcdMetadataStore::refresh`]) whose legitimate cost differs from the
 /// single-key hot path's [`ETCD_RPC_TIMEOUT`].
-fn etcd_block_on_bounded<F>(fut: F, timeout: std::time::Duration) -> Result<F::Output, SchedulerError>
+fn etcd_block_on_bounded<F>(
+    fut: F,
+    timeout: std::time::Duration,
+) -> Result<F::Output, SchedulerError>
 where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
@@ -153,7 +156,10 @@ where
         rx.recv()
             .expect("etcd runtime dropped the task before sending a result")
             .map_err(|_elapsed| SchedulerError::Transport {
-                message: format!("etcd operation did not complete within {}s", timeout.as_secs()),
+                message: format!(
+                    "etcd operation did not complete within {}s",
+                    timeout.as_secs()
+                ),
             })
     };
     match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
@@ -246,17 +252,19 @@ impl EtcdMetadataStore {
             message: format!("etcd executors load failed: {e}"),
         })?;
 
-        let continuous_snapshots = load_continuous_snapshots(&mut kv).await.map_err(|e| {
-            SchedulerError::Transport {
-                message: format!("etcd continuous snapshots load failed: {e}"),
-            }
-        })?;
+        let continuous_snapshots =
+            load_continuous_snapshots(&mut kv)
+                .await
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!("etcd continuous snapshots load failed: {e}"),
+                })?;
 
-        let ivm_snapshots = load_ivm_snapshots(&mut kv)
-            .await
-            .map_err(|e| SchedulerError::Transport {
-                message: format!("etcd IVM snapshots load failed: {e}"),
-            })?;
+        let ivm_snapshots =
+            load_ivm_snapshots(&mut kv)
+                .await
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!("etcd IVM snapshots load failed: {e}"),
+                })?;
 
         let history = load_json_prefix::<JobHistoryRecord>(&mut kv, HISTORY_KEY_PREFIX)
             .await
@@ -334,12 +342,11 @@ impl MetadataStore for EtcdMetadataStore {
         let (jobs, executors, snapshots, ivm_snapshots, history) = etcd_block_on_bounded(
             async move {
                 let mut kv = wide_kv(&client);
-                let jobs =
-                    load_prefix::<PersistedJobRecord, JobRecord>(&mut kv, JOB_KEY_PREFIX)
-                        .await
-                        .map_err(|e| SchedulerError::Transport {
-                            message: format!("etcd jobs refresh failed: {e}"),
-                        })?;
+                let jobs = load_prefix::<PersistedJobRecord, JobRecord>(&mut kv, JOB_KEY_PREFIX)
+                    .await
+                    .map_err(|e| SchedulerError::Transport {
+                        message: format!("etcd jobs refresh failed: {e}"),
+                    })?;
                 let executors = load_prefix::<
                     PersistedExecutorDescriptor,
                     krishiv_proto::ExecutorDescriptor,
@@ -353,11 +360,12 @@ impl MetadataStore for EtcdMetadataStore {
                         message: format!("etcd continuous snapshots refresh failed: {e}"),
                     }
                 })?;
-                let ivm_snapshots = load_ivm_snapshots(&mut kv)
-                    .await
-                    .map_err(|e| SchedulerError::Transport {
-                        message: format!("etcd IVM snapshots refresh failed: {e}"),
-                    })?;
+                let ivm_snapshots =
+                    load_ivm_snapshots(&mut kv)
+                        .await
+                        .map_err(|e| SchedulerError::Transport {
+                            message: format!("etcd IVM snapshots refresh failed: {e}"),
+                        })?;
                 let history = load_json_prefix::<JobHistoryRecord>(&mut kv, HISTORY_KEY_PREFIX)
                     .await
                     .map_err(|e| SchedulerError::Transport {
@@ -476,7 +484,10 @@ impl MetadataStore for EtcdMetadataStore {
                 self.put_key(ivm_chunk_key(job_id, i as u32), chunk.to_vec())?;
             }
             // Commit: publish the manifest only after every chunk is durable.
-            self.put_key(ivm_key(job_id), ivm_manifest_header(codec, chunk_count, raw_len))?;
+            self.put_key(
+                ivm_key(job_id),
+                ivm_manifest_header(codec, chunk_count, raw_len),
+            )?;
             // Sweep surplus chunks (index >= chunk_count) from a larger prior
             // snapshot; the just-written chunks 0..chunk_count are untouched.
             self.delete_range(
@@ -939,8 +950,14 @@ mod tests {
         let end = prefix_range_end(IVM_KEY_PREFIX);
         assert_eq!(end, b"/krishiv/ivm0"); // '/' (0x2f) -> '0' (0x30)
         let under = b"/krishiv/ivm/some-job-id".to_vec();
-        assert!(under.as_slice() < end.as_slice(), "a prefixed key sorts before the range end");
-        assert!(IVM_KEY_PREFIX.as_bytes() < end.as_slice(), "the prefix itself sorts before its end");
+        assert!(
+            under.as_slice() < end.as_slice(),
+            "a prefixed key sorts before the range end"
+        );
+        assert!(
+            IVM_KEY_PREFIX.as_bytes() < end.as_slice(),
+            "the prefix itself sorts before its end"
+        );
     }
 
     #[test]
@@ -1093,7 +1110,11 @@ mod tests {
         // each bounded well under etcd's 1.5 MiB write ceiling.
         let raw = pseudo_random(3 * 1024 * 1024);
         let (manifest, chunks) = encode_ivm_for_test(&raw);
-        assert!(chunks.len() >= 3, "large snapshot must span chunks: {}", chunks.len());
+        assert!(
+            chunks.len() >= 3,
+            "large snapshot must span chunks: {}",
+            chunks.len()
+        );
         for (idx, chunk) in &chunks {
             assert!(
                 chunk.len() <= IVM_CHUNK_BYTES,
@@ -1142,9 +1163,15 @@ mod tests {
         let c0 = ivm_chunk_key("job", 0);
         let c1 = ivm_chunk_key("job", 1);
         let sibling = ivm_key("job-2"); // '-' (0x2d) > '#' (0x23)
-        assert!(manifest.as_str() < c0.as_str(), "manifest sorts before its chunks");
+        assert!(
+            manifest.as_str() < c0.as_str(),
+            "manifest sorts before its chunks"
+        );
         assert!(c0.as_str() < c1.as_str(), "chunks sort by ascending index");
-        assert!(c1.as_str() < sibling.as_str(), "a job's chunks sort before a sibling job");
+        assert!(
+            c1.as_str() < sibling.as_str(),
+            "a job's chunks sort before a sibling job"
+        );
         assert_eq!(ivm_chunk_key("job", 255), "/krishiv/ivm/job#000000ff");
         assert!(ivm_chunk_prefix("job").starts_with(&ivm_key("job")));
     }

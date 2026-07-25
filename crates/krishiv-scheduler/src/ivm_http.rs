@@ -192,7 +192,9 @@ pub async fn api_ivm_create_job(
                 .restore_durable_snapshot(&job_id, &snapshot)
                 .map_err(ivm_err)?;
         } else if body.partitioned == Some(false) {
-            registry.create_unpartitioned(job_id.clone()).map_err(ivm_err)?;
+            registry
+                .create_unpartitioned(job_id.clone())
+                .map_err(ivm_err)?;
         } else {
             registry.create(job_id.clone()).map_err(ivm_err)?;
         }
@@ -1324,8 +1326,7 @@ mod tests {
 
     /// Decode a snapshot/output payload back into (region → value) pairs.
     fn decode_delta_rows(b64: &str) -> Vec<(String, f64)> {
-        let ipc =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
+        let ipc = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
         let delta = deserialize_delta_batch(&ipc).unwrap();
         let data = delta.data_batch();
         let regions = data
@@ -1353,7 +1354,10 @@ mod tests {
         let resp = api_ivm_create_job(
             State(registry.clone()),
             State(coordinator.clone()),
-            Json(CreateJobRequest { job_id: None, partitioned: None }),
+            Json(CreateJobRequest {
+                job_id: None,
+                partitioned: None,
+            }),
         )
         .await
         .expect("create");
@@ -1400,9 +1404,12 @@ mod tests {
         .await;
         assert!(first.deleted);
 
-        let second =
-            api_ivm_delete_job(State(registry.clone()), State(coordinator), Path("gone".into()))
-                .await;
+        let second = api_ivm_delete_job(
+            State(registry.clone()),
+            State(coordinator),
+            Path("gone".into()),
+        )
+        .await;
         assert!(!second.deleted, "second delete of the same job is a no-op");
         assert!(registry.get("gone").is_none());
     }
@@ -2030,8 +2037,7 @@ mod tests {
         assert!(registry.get("j").is_none());
 
         // list still surfaces the durably-persisted job…
-        let listed =
-            api_ivm_list_jobs(State(registry.clone()), State(coordinator.clone())).await;
+        let listed = api_ivm_list_jobs(State(registry.clone()), State(coordinator.clone())).await;
         assert!(listed.job_ids.contains(&"j".to_owned()));
 
         // …and a state-reading handler that goes through ensure_ivm_job
@@ -2167,9 +2173,7 @@ mod tests {
         let delete = tokio::spawn({
             let (registry, coordinator, job_id) =
                 (registry.clone(), coordinator.clone(), job_id.clone());
-            async move {
-                api_ivm_delete_job(State(registry), State(coordinator), Path(job_id)).await
-            }
+            async move { api_ivm_delete_job(State(registry), State(coordinator), Path(job_id)).await }
         });
 
         // While the lock is held, deletion must not complete.
