@@ -1048,6 +1048,83 @@ fn an_executor_over_the_memory_pressure_threshold_takes_no_work() {
     );
 }
 
+// ── Stall watchdog: liveness, not a hidden task timeout ──────────────────
+
+/// A heartbeat that still lists a task as running must refresh its progress
+/// clock, so a long query is not failed for "no progress".
+///
+/// `last_progress_ms` was written once, when the task entered Running, and
+/// never again — nothing in the engine updated it. The 30-minute stall
+/// watchdog reading it was therefore a hard task timeout with a diagnosis it
+/// had not earned: any task legitimately running past 30 minutes was killed
+/// and told "no progress for 30 min", which was false. TPC-H SF100 q5 died
+/// that way against healthy, busy executors.
+#[test]
+fn a_heartbeat_listing_a_running_task_refreshes_its_progress_clock() {
+    allow_anonymous_for_tests();
+
+    use krishiv_proto::{ExecutorHeartbeat, ExecutorState, StageSpec, TaskSpec};
+
+    let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-stall").unwrap());
+    let exec_id = ExecutorId::try_new("exec-stall").unwrap();
+    let lease = coordinator
+        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-stall", 4))
+        .unwrap();
+
+    let job_id = JobId::try_new("job-stall").unwrap();
+    let task_id = TaskId::try_new("t-slow").unwrap();
+    coordinator
+        .submit_job(
+            JobSpec::new(job_id.clone(), "slow", JobKind::Batch).with_stage(
+                StageSpec::new(StageId::try_new("s0").unwrap(), "scan")
+                    .with_task(TaskSpec::new(task_id.clone(), "sql: SELECT 1")),
+            ),
+        )
+        .unwrap();
+    coordinator
+        .launch_assigned_task_assignments(&job_id)
+        .unwrap();
+    {
+        let jc = coordinator.job_coordinators.get(&job_id).unwrap();
+        let mut rec = jc.write_record();
+        for task in rec.stages.iter_mut().flat_map(|s| s.tasks_mut()) {
+            task.state = TaskState::Running;
+            task.assigned_executor = Some(exec_id.clone());
+            task.last_progress_ms = Some(
+                u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0),
+            );
+        }
+    }
+
+    // Backdate the progress clock as if the task had been running an hour.
+    let stale_ms = {
+        let jc = coordinator.job_coordinators.get(&job_id).unwrap();
+        let mut rec = jc.write_record();
+        let task = rec.stages.iter_mut().flat_map(|s| s.tasks_mut()).next().unwrap();
+        let stale = task.last_progress_ms.unwrap_or(0).saturating_sub(3_600_000);
+        task.last_progress_ms = Some(stale);
+        stale
+    };
+
+    // The executor heartbeats, still running the task — it is alive, not hung.
+    coordinator
+        .executor_heartbeat(
+            ExecutorHeartbeat::new(exec_id, ExecutorState::Healthy)
+                .with_lease_generation(lease)
+                .with_running_tasks(vec![task_id.clone()]),
+        )
+        .unwrap();
+
+    let jc = coordinator.job_coordinators.get(&job_id).unwrap();
+    let rec = jc.read_record();
+    let task = rec.stages.iter().flat_map(|s| s.tasks()).next().unwrap();
+    assert!(
+        task.last_progress_ms.unwrap_or(0) > stale_ms,
+        "a heartbeat reporting the task as running must refresh its progress clock, \
+         or the watchdog fails healthy long-running work"
+    );
+}
+
 // ── Phase 53: scheduler v2 named tests ───────────────────────────────────────
 
 /// Phase 53 speculation state machine: first completion wins — a straggler

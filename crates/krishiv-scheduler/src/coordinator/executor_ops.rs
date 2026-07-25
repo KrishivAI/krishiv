@@ -135,6 +135,34 @@ impl Coordinator {
         res
     }
 
+    /// Refresh `last_progress_ms` for every task `executor_id` reports as
+    /// still running, so the stall watchdog does not fail healthy work.
+    ///
+    /// See the call site in [`executor_heartbeat`] for why this exists.
+    fn refresh_progress_for_running_tasks(&mut self, executor_id: &ExecutorId) {
+        let Ok(exec_rec) = self.exec.executors.find_executor(executor_id) else {
+            return;
+        };
+        let running: std::collections::HashSet<krishiv_proto::TaskId> =
+            exec_rec.running_tasks().iter().cloned().collect();
+        if running.is_empty() {
+            return;
+        }
+        let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+        for jc in self.job_coordinators.values() {
+            let mut record = jc.write_record();
+            for stage in record.stages_mut() {
+                for task in stage.tasks_mut() {
+                    if task.state() == krishiv_proto::TaskState::Running
+                        && running.contains(task.task_id())
+                    {
+                        task.last_progress_ms = Some(now_ms);
+                    }
+                }
+            }
+        }
+    }
+
     /// Apply an executor heartbeat.
     ///
     /// For streaming executors re-attaching after a coordinator restart, the heartbeat may
@@ -163,6 +191,26 @@ impl Coordinator {
             krishiv_metrics::global_metrics()
                 .set_executor_slots_used(executor_id.as_str(), slots_used);
         }
+
+        // A task its executor still reports as running is not stalled.
+        //
+        // `last_progress_ms` was written exactly once — when the task entered
+        // Running — and never again, because nothing called anything that
+        // updated it. The 30-minute "stall detector" reading that field was
+        // therefore a hard task timeout wearing a diagnosis it had not earned:
+        // any task legitimately running longer than 30 minutes was killed and
+        // told "no progress for 30 min", which was false. TPC-H SF100 q5 died
+        // that way on a cluster whose executors were healthy and busy.
+        //
+        // Heartbeat liveness is the honest signal available on the wire today:
+        // it distinguishes "the executor is gone or wedged" (the condition the
+        // watchdog should catch, and which stops the heartbeat) from "this
+        // task is slow" (which it should not). It does not prove forward
+        // progress inside the task — a task deadlocked in-process still
+        // heartbeats — so it narrows the watchdog rather than replacing it.
+        // Detecting true intra-task stalls needs per-task row/byte counters on
+        // the status wire, which is a larger change than this fix.
+        self.refresh_progress_for_running_tasks(&executor_id);
 
         self.assign_pending_tasks_for_schedulable_jobs();
         for state in &streaming_states {
