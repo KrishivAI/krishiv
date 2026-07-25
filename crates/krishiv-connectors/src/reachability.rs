@@ -325,6 +325,62 @@ mod tests {
         );
     }
 
+    /// The matrix claims reachability; this checks the claim against the live
+    /// registry for every kind this build actually compiles.
+    ///
+    /// `sql_ddl` is purely registry-generic (it dispatches iff a driver is
+    /// registered for the role), so a `yes` there is a falsifiable statement
+    /// about `default_registry()` — and it was false: `csv`/sink claimed yes
+    /// while no CSV sink driver was ever registered, so every registry-generic
+    /// surface failed with "no sink driver registered for kind 'csv'". Rows
+    /// whose kind does not parse under this build's features are skipped (the
+    /// module doc explains why the table is not derived from the registry), but
+    /// the skip list is asserted to be a strict subset — if the *always-on*
+    /// kinds ever stop being checked, this test fails instead of silently
+    /// passing on an empty set.
+    #[test]
+    fn sql_ddl_yes_cells_have_a_registered_driver() {
+        use crate::registry::{ConnectorKind, ConnectorRegistry, ConnectorRole, default_registry};
+
+        let registry: ConnectorRegistry = default_registry();
+        let mut checked = 0usize;
+        let mut mismatches = Vec::new();
+        for entry in CONNECTORS {
+            let role = match entry.role {
+                "source" => ConnectorRole::Source,
+                "sink" => ConnectorRole::Sink,
+                // TwoPhaseSink/VectorSink rows are all `no` for sql_ddl by
+                // construction (the factory only dispatches Source/Sink), so
+                // there is nothing to falsify here.
+                _ => continue,
+            };
+            let Ok(kind) = ConnectorKind::parse(entry.kind) else {
+                continue; // feature not enabled in this build
+            };
+            checked += 1;
+            let registered = registry.has_driver(kind, role);
+            let claimed = entry.sql_ddl == Yes;
+            if registered != claimed {
+                mismatches.push(format!(
+                    "{}/{}: matrix says sql_ddl={}, registry has_driver={}",
+                    entry.kind, entry.role, entry.sql_ddl, registered
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "reachability matrix disagrees with default_registry(): {mismatches:#?}"
+        );
+        // parquet, parquet-directory, csv and s3 are registered unconditionally,
+        // as both roles where applicable — a build that checks fewer rows than
+        // that is not exercising the guard at all.
+        assert!(
+            checked >= 6,
+            "only {checked} rows were checkable; the guard is not covering the \
+             always-on kinds (silently-empty check)"
+        );
+    }
+
     #[test]
     fn every_row_has_a_unique_kind_role_pair() {
         let mut seen = std::collections::HashSet::new();

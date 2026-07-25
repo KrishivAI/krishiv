@@ -237,6 +237,39 @@ mod tests {
         .unwrap()
     }
 
+    /// Walks a whole `RecordBatch` through the per-cell conversion the sink's
+    /// `write_batch` uses, which the single-cell tests below do not cover:
+    /// every column of every row must convert, in schema order. (`make_batch`
+    /// existed with no caller at all until this test — a helper built for a
+    /// batch-level test that was never written.)
+    #[test]
+    fn arrow_batch_converts_every_cell_in_schema_order() {
+        let batch = make_batch();
+        let schema = batch.schema();
+        for row in 0..batch.num_rows() {
+            for (index, field) in schema.fields().iter().enumerate() {
+                let column = batch.column(index);
+                let value = arrow_scalar_to_cql(column.as_ref(), row, field.data_type());
+                assert!(
+                    value.is_some(),
+                    "row {row} column '{}' ({:?}) did not convert",
+                    field.name(),
+                    field.data_type()
+                );
+            }
+        }
+        // Spot-check the values themselves so a conversion that returns the
+        // wrong variant cannot pass on `is_some()` alone.
+        assert_eq!(
+            arrow_scalar_to_cql(batch.column(0).as_ref(), 1, &DataType::Utf8),
+            Some(CqlValue::Text(String::from("u2")))
+        );
+        assert_eq!(
+            arrow_scalar_to_cql(batch.column(1).as_ref(), 0, &DataType::Int32),
+            Some(CqlValue::Int(10))
+        );
+    }
+
     #[test]
     fn arrow_to_cql_boolean() {
         let arr = Arc::new(arrow::array::BooleanArray::from(vec![true, false]));

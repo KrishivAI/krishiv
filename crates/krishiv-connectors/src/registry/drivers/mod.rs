@@ -31,7 +31,7 @@ mod cassandra;
 #[cfg(feature = "hbase")]
 mod hbase;
 
-pub use csv::CsvSourceDriver;
+pub use csv::{CsvSinkDriver, CsvSourceDriver};
 #[cfg(feature = "jdbc")]
 pub use jdbc::{JdbcSinkDriver, JdbcSourceDriver};
 pub use parquet::{ParquetDirectorySourceDriver, ParquetSinkDriver, ParquetSourceDriver};

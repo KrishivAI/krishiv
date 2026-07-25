@@ -281,6 +281,11 @@ enum WriteTarget {
     Iceberg(Arc<dyn LakehouseTable>),
     Kafka(KafkaIoOptions),
     Database(DatabaseIoOptions),
+    /// Any registered connector sink, addressed by kind (#197).
+    Connector {
+        kind: String,
+        options: std::collections::BTreeMap<String, String>,
+    },
 }
 
 #[derive(Clone)]
@@ -342,6 +347,53 @@ impl DataFrameWriter {
         options.validate().map_err(connector_error)?;
         self.target = Some(WriteTarget::Database(options));
         Ok(self)
+    }
+
+    /// Write through **any registered connector sink**, addressed by kind
+    /// (#197): `csv`, `avro`, `s3`, `delta`, `hudi`, `elasticsearch`,
+    /// `cassandra`, `hbase`, `jdbc-sink`, … Which kinds exist is decided by the
+    /// build's connector features; an unregistered kind fails with the
+    /// registry's own error.
+    ///
+    /// ```no_run
+    /// # use krishiv_api::{Session, Result};
+    /// # fn main() -> Result<()> {
+    /// # let session = Session::builder().build()?;
+    /// # let df = session.sql("SELECT 1 AS n")?;
+    /// df.write()
+    ///     .connector("csv", [("path", "/tmp/out.csv")])?
+    ///     .save_target()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Delivery is **at-least-once**: the write is flushed before success is
+    /// reported, so output is durable, but a retried job re-delivers rows.
+    /// Exactly-once output needs the checkpoint-aligned Iceberg/Kafka sinks.
+    pub fn connector<I, K, V>(mut self, kind: &str, options: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let kind = kind.trim();
+        if kind.is_empty() {
+            return Err(invalid("connector kind is required"));
+        }
+        self.target = Some(WriteTarget::Connector {
+            kind: kind.to_owned(),
+            options: options
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+        });
+        Ok(self)
+    }
+
+    /// Blocking [`save_target_async`](Self::save_target_async), for targets
+    /// that carry their own destination (connector/Iceberg/…).
+    pub fn save_target(self) -> Result<()> {
+        krishiv_common::async_util::block_on(self.save_target_async())
     }
 
     pub fn format(mut self, format: &str) -> Result<Self> {
@@ -466,11 +518,50 @@ impl DataFrameWriter {
                 "bounded Kafka write for topic '{}' belongs to structured streaming Phase F",
                 options.topic
             ))),
-            WriteTarget::Database(options) => Err(KrishivError::unsupported(format!(
-                "database sink '{}' requires a registered database driver",
-                options.table
-            ))),
+            // A database write is a `jdbc-sink` connector write with the
+            // driver's own property names; routing it through the registry
+            // retires the old blanket "requires a registered database driver"
+            // error, which was untrue once the jdbc sink driver was registered.
+            WriteTarget::Database(options) => {
+                let mut properties = options.properties.clone();
+                properties.insert(String::from("url"), options.url.clone());
+                properties.insert(String::from("table"), options.table.clone());
+                self.save_connector_async("jdbc-sink", &properties).await
+            }
+            WriteTarget::Connector { kind, options } => {
+                self.save_connector_async(&kind, &options).await
+            }
         }
+    }
+
+    /// Collect and write through a registry-dispatched connector sink.
+    ///
+    /// The flush is mandatory before returning `Ok`: it is what makes the write
+    /// durable, so a flush failure must fail the call rather than report a
+    /// success that did not reach the sink.
+    async fn save_connector_async(
+        self,
+        kind: &str,
+        options: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        use krishiv_connectors::{ConnectorConfig, default_registry};
+
+        let mut config = ConnectorConfig::new(format!("krishiv-writer-{kind}"), kind);
+        for (key, value) in options {
+            config = config.with_property(key, value);
+        }
+        let batches = self.dataframe.collect_async().await?.into_batches();
+        let registry = default_registry();
+        let mut sink = registry
+            .open_sink(&config)
+            .await
+            .map_err(connector_error)?;
+        for batch in batches {
+            sink.write_batch_dyn(batch)
+                .await
+                .map_err(connector_error)?;
+        }
+        sink.flush_dyn().await.map_err(connector_error)
     }
 
     async fn save_files_async(self, path: PathBuf) -> Result<()> {
@@ -815,5 +906,60 @@ fn io_error(error: std::io::Error) -> KrishivError {
 fn invalid(message: impl Into<String>) -> KrishivError {
     KrishivError::InvalidConfig {
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod connector_writer_tests {
+    use crate::Session;
+
+    /// #197: `df.write().connector(kind, options)` dispatches through the one
+    /// connector registry, so a CSV sink — which has no dedicated writer target
+    /// — round-trips without a bespoke code path.
+    #[test]
+    fn connector_writer_round_trips_through_the_registry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("out.csv");
+        let session = Session::builder().build().expect("session");
+        let df = session
+            .sql("SELECT 1 AS n UNION ALL SELECT 2 AS n")
+            .expect("sql");
+
+        df.write()
+            .connector("csv", [("path", path.to_string_lossy().to_string())])
+            .expect("connector target")
+            .save_target()
+            .expect("save");
+
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert!(written.contains('1') && written.contains('2'), "{written}");
+    }
+
+    /// An unregistered kind fails with the registry's typed error rather than a
+    /// surface-local "unsupported" message — the same contract the sql_job and
+    /// Python surfaces now hold.
+    #[test]
+    fn connector_writer_rejects_unregistered_kind() {
+        let session = Session::builder().build().expect("session");
+        let df = session.sql("SELECT 1 AS n").expect("sql");
+        let error = df
+            .write()
+            .connector("definitely-not-a-connector", [("path", "/tmp/x")])
+            .expect("target accepted")
+            .save_target()
+            .expect_err("unregistered kind must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown connector kind")
+                || message.contains("no sink driver registered"),
+            "expected a registry-dispatch error, got: {message}"
+        );
+    }
+
+    #[test]
+    fn connector_writer_requires_a_kind() {
+        let session = Session::builder().build().expect("session");
+        let df = session.sql("SELECT 1 AS n").expect("sql");
+        assert!(df.write().connector("  ", [("path", "/tmp/x")]).is_err());
     }
 }

@@ -237,6 +237,7 @@ pub fn default_registry() -> ConnectorRegistry {
     registry.register_source(Arc::new(super::drivers::ParquetDirectorySourceDriver));
     registry.register_sink(Arc::new(super::drivers::ParquetSinkDriver));
     registry.register_source(Arc::new(super::drivers::CsvSourceDriver));
+    registry.register_sink(Arc::new(super::drivers::CsvSinkDriver));
     registry.register_source(Arc::new(super::drivers::S3SourceDriver));
     registry.register_source(Arc::new(super::drivers::S3PrefixSourceDriver));
     registry.register_sink(Arc::new(super::drivers::S3SinkDriver));
