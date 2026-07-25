@@ -73,6 +73,15 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
     let checkpoint_uri =
         apply_checkpoint_default(config.checkpoint_uri.clone(), durability_profile)?;
     let slots = config.slots;
+    // Publish the resolved slot count before anything builds a task engine, so
+    // the shared query pool and the per-task DataFusion parallelism are sized
+    // against the slot count this executor actually runs with — including when
+    // it came from `--slots` rather than KRISHIV_TASK_SLOTS.
+    krishiv_common::executor_capacity::set_slots_override(slots);
+    tracing::info!(
+        capacity = %krishiv_common::ExecutorCapacity::detect().summary(),
+        "executor capacity resolved"
+    );
     let mut runtime = ExecutorRuntime::new(config.into_executor_config()?);
     let readiness = ExecutorReadiness::new(task_grpc_addr.is_some(), barrier_grpc_addr.is_some());
 
@@ -1029,15 +1038,16 @@ enum ExecutorMode {
     Connect,
 }
 
-/// Default task-placement capacity for this executor: its available CPU
-/// parallelism. `available_parallelism` respects cgroup CPU limits (Linux
-/// 5.13+) and container CPU pinning, so a pod capped at N cores advertises N —
-/// no operator tuning of `KRISHIV_TASK_SLOTS` required. Falls back to 1 when the
-/// count is unavailable.
+/// Default task-placement capacity for this executor, from the process-wide
+/// [`krishiv_common::ExecutorCapacity`] derivation.
+///
+/// That derivation reads both CPU (`available_parallelism`, which respects
+/// cgroup CPU limits and container pinning) and the cgroup memory limit, and
+/// produces the slot count, the shared query-memory pool, and the per-task
+/// DataFusion parallelism as one decision. Deriving slots here independently
+/// is what previously let them disagree.
 fn default_task_capacity() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    krishiv_common::ExecutorCapacity::detect().slots.get()
 }
 
 impl ExecutorCliConfig {
@@ -1051,19 +1061,19 @@ impl ExecutorCliConfig {
             host: env::var("POD_IP")
                 .or_else(|_| env::var("HOSTNAME"))
                 .unwrap_or_else(|_| String::from("localhost")),
-            // Task capacity is a property of the machine, not an operator guess:
-            // it defaults to the executor's available CPU parallelism
-            // (`available_parallelism`, which honors cgroup CPU limits and
-            // container pinning). This is the greedy-placement load-balancing
-            // weight across executors — never a hard admission gate (placement
-            // resets its budget when exhausted; real overload protection is the
-            // coordinator's memory-estimate admission). `KRISHIV_TASK_SLOTS`
-            // remains an optional override for advanced oversubscribe/cap, but is
-            // no longer required to be set.
-            slots: env::var("KRISHIV_TASK_SLOTS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or_else(default_task_capacity),
+            // Task capacity is a property of the machine, not an operator
+            // guess: it is derived from this process's real CPU and memory
+            // (see `default_task_capacity`). `KRISHIV_TASK_SLOTS` remains an
+            // override for deliberate oversubscribe/cap, and is read inside
+            // the same derivation so that per-task memory and parallelism
+            // follow it — setting it here alone used to leave them stale.
+            //
+            // Slots are the greedy-placement load-balancing weight across
+            // executors, not a memory admission gate: the executor's query
+            // memory is one shared, hard-capped pool, so raising the slot
+            // count divides that budget more ways instead of claiming more of
+            // the machine.
+            slots: default_task_capacity(),
             coordinator_endpoint: krishiv_common::coordinator_url_env()
                 .unwrap_or_else(|| String::from("http://127.0.0.1:2001")),
             mode: ExecutorMode::DryRun,

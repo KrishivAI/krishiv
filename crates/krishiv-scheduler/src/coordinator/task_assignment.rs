@@ -161,9 +161,9 @@ impl Coordinator {
     /// Called after a stage retry (P1.24) to move tasks from `Pending` back to
     /// `Assigned` so `launch_assigned_tasks` can launch them.
     ///
-    /// SC10: each stage's `ResourceProfile` is used to filter the executor pool
-    /// before placement so that tasks with a large memory requirement are only
-    /// placed on executors that have enough headroom.
+    /// Placement considers every schedulable executor: memory is bounded
+    /// structurally by the executor's shared, hard-capped query pool rather
+    /// than by per-task admission (see `ExecutorRegistry::is_schedulable`).
     pub fn assign_pending_tasks(&mut self, job_id: &JobId) -> SchedulerResult<usize> {
         self.assign_pending_tasks_capped(job_id, None)
     }
@@ -206,14 +206,12 @@ impl Coordinator {
         let executor_hosts = self.exec.executors.executor_hosts();
         let inflight = self.inflight_tasks_by_executor();
 
-        // SC10: collect (pending_task_ids, locality prefs, resource_profile)
-        // per stage so we can filter executors per-stage. Also stamp
+        // Collect (pending_task_ids, locality prefs) per stage. Also stamp
         // `pending_since_ms` on first consideration (delay-scheduling anchor)
         // and skip tasks still inside their retry backoff window.
         struct StageWork {
             pending: Vec<TaskId>,
             prefs: Vec<crate::LocalityPreference>,
-            profile: Option<krishiv_proto::ResourceProfile>,
         }
         let stage_work: Vec<StageWork> = {
             let mut job = self.find_job_mut(job_id)?;
@@ -248,7 +246,6 @@ impl Coordinator {
                         return StageWork {
                             pending: Vec::new(),
                             prefs: Vec::new(),
-                            profile: s.spec.resource_profile().cloned(),
                         };
                     }
                     let preferred_node = preferred_nodes.get(s.stage_id()).cloned();
@@ -271,11 +268,7 @@ impl Coordinator {
                             pending_since_ms: t.pending_since_ms,
                         });
                     }
-                    StageWork {
-                        pending,
-                        prefs,
-                        profile: s.spec.resource_profile().cloned(),
-                    }
+                    StageWork { pending, prefs }
                 })
                 .collect()
         };
@@ -288,14 +281,10 @@ impl Coordinator {
             if work.pending.is_empty() || total >= budget {
                 continue;
             }
-            // SC10: use profile-filtered executor pool for this stage.
-            let mut executors = self
-                .exec
-                .executors
-                .schedulable_placements_for_profile(work.profile.as_ref());
+            let mut executors = self.exec.executors.schedulable_executor_placements();
             if executors.is_empty() {
-                // No executor satisfies this stage's resource requirements yet;
-                // leave the tasks Pending for the next dispatch tick.
+                // Every executor went away between the fast-path check above
+                // and here; leave the tasks Pending for the next dispatch tick.
                 continue;
             }
             // Overlay coordinator-side in-flight load (heartbeat-lag guard).

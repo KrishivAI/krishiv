@@ -134,7 +134,7 @@ pub(crate) async fn execute_batch_fragment(
 ) -> ExecutorResult<ExecutorTaskOutput> {
     // Reserve this task's share of the executor process memory budget for the
     // duration of the fragment; the guard releases the share on return.
-    let (engine_memory_limit, _process_memory_reservation) =
+    let (engine_memory, _process_memory_reservation) =
         crate::fragment::common::reserve_task_engine_memory(&memory_budget);
     let raw_fragment_body = task_fragment_body(assignment.plan_fragment().description())?;
     // A staged Python-UDF fragment carries the `/* krishiv-register-python-udf */`
@@ -187,7 +187,7 @@ pub(crate) async fn execute_batch_fragment(
             fragment,
             &python_udf_directives,
             udf_limits.clone(),
-            engine_memory_limit,
+            engine_memory,
         ))
         .await;
     }
@@ -204,7 +204,7 @@ pub(crate) async fn execute_batch_fragment(
                 shuffle_spec,
                 ctx,
                 udf_limits.clone(),
-                engine_memory_limit,
+                engine_memory,
                 Some(runner.connector_registry.as_ref()),
                 restored_source_offsets,
             ))
@@ -226,7 +226,7 @@ pub(crate) async fn execute_batch_fragment(
                 write_cfg,
                 store,
                 udf_limits.clone(),
-                engine_memory_limit,
+                engine_memory,
                 Some(runner.connector_registry.as_ref()),
                 restored_source_offsets,
             ))
@@ -245,7 +245,7 @@ pub(crate) async fn execute_batch_fragment(
         // for this task execution. The memory limit bounds DataFusion's pool
         // so sorts/joins/aggregations spill instead of growing unbounded.
         let engine = Arc::new(crate::fragment::common::task_sql_engine(
-            engine_memory_limit,
+            engine_memory,
             udf_limits,
         ));
         // Resolve governed `catalog.namespace.table` references (coordinator-mode
@@ -546,7 +546,7 @@ async fn execute_shuffle_write_fragment(
     spec: &str,
     ctx: &crate::runner::ShuffleContext,
     udf_limits: ResourceLimits,
-    engine_memory_limit: Option<usize>,
+    engine_memory: krishiv_sql::EngineMemory,
     registry: Option<&krishiv_connectors::ConnectorRegistry>,
     restored_source_offsets: Option<&[RestoredSourceOffset]>,
 ) -> ExecutorResult<ExecutorTaskOutput> {
@@ -597,7 +597,7 @@ async fn execute_shuffle_write_fragment(
 
     // Create a new SQL engine with UDF limits and the task's memory limit.
     let limited_engine = Arc::new(crate::fragment::common::task_sql_engine(
-        engine_memory_limit,
+        engine_memory,
         udf_limits,
     ));
     // Coordinator-mode catalog support: register the platform Iceberg REST
@@ -940,7 +940,7 @@ async fn execute_dfplan_fragment(
     fragment: &str,
     python_udf_directives: &str,
     udf_limits: ResourceLimits,
-    engine_memory_limit: Option<usize>,
+    engine_memory: krishiv_sql::EngineMemory,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_shuffle::{HashPartitioner, PartitionId, ShufflePartition, ShuffleStore as _};
 
@@ -955,7 +955,7 @@ async fn execute_dfplan_fragment(
     // The engine supplies the runtime environment (memory pool, spill) the
     // decoded plan executes under; no tables are registered on it.
     let engine = Arc::new(crate::fragment::common::task_sql_engine(
-        engine_memory_limit,
+        engine_memory,
         udf_limits,
     ));
     // Register any Python scalar UDF the staged fragment carries BEFORE decoding
@@ -1122,7 +1122,7 @@ async fn execute_inmem_shuffle_write(
     write_cfg: &krishiv_proto::ShuffleWriteConfig,
     store: &std::sync::Arc<krishiv_shuffle::ShuffleBackend>,
     udf_limits: ResourceLimits,
-    engine_memory_limit: Option<usize>,
+    engine_memory: krishiv_sql::EngineMemory,
     registry: Option<&krishiv_connectors::ConnectorRegistry>,
     restored_source_offsets: Option<&[RestoredSourceOffset]>,
 ) -> ExecutorResult<ExecutorTaskOutput> {
@@ -1131,7 +1131,7 @@ async fn execute_inmem_shuffle_write(
     let fragment_body = task_fragment_body(assignment.plan_fragment().description())?;
     // Create a new SQL engine with UDF limits and the task's memory limit.
     let limited_engine = Arc::new(crate::fragment::common::task_sql_engine(
-        engine_memory_limit,
+        engine_memory,
         udf_limits,
     ));
     // Coordinator-mode catalog support: register the platform Iceberg REST

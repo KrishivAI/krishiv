@@ -24,6 +24,7 @@ pub mod chaos;
 pub mod compute_pool;
 pub mod durability;
 pub mod env_registry;
+pub mod executor_capacity;
 pub mod hash;
 pub mod memory_budget;
 pub mod panic_util;
@@ -43,6 +44,7 @@ pub use env_registry::{
     EnvIssue, FlagKind, FlagScope, FlagSpec, coordinator_url_env, env_u64, env_usize,
     log_env_issues, truthy_env, validate_env,
 };
+pub use executor_capacity::{CapacitySource, ExecutorCapacity};
 pub use memory_budget::{MemoryBudget, cgroup_memory_limit_bytes};
 pub use panic_util::panic_payload_to_string;
 pub use production::{

@@ -62,19 +62,86 @@ pub const DFPLAN_BODY_PREFIX: &str = "dfplan:v1:";
 
 /// Env var overriding the target partition count used when planning a
 /// distributed batch query (bounds both scan parallelism and shuffle
-/// partition count). Default: 4.
+/// partition count). Unset, the count is derived from the cluster — see
+/// [`resolve_stage_target_partitions`].
 pub const STAGE_TARGET_PARTITIONS_ENV: &str = "KRISHIV_STAGE_TARGET_PARTITIONS";
 
 /// Env var that disables stage splitting entirely (`off`/`0`/`false`).
 pub const STAGE_SPLIT_ENV: &str = "KRISHIV_STAGE_SPLIT";
 
+/// How many tasks to create per available slot.
+///
+/// One task per slot fills the cluster in a single wave, but a single wave is
+/// as slow as its slowest task: any skew, any straggler, any cold cache is
+/// paid in full with no other work to overlap it. Splitting the same work into
+/// two waves lets fast slots pick up a second task while a slow one is still
+/// on its first, and halves the bytes each task holds at once. Spark's
+/// long-standing guidance is 2–3× the core count for the same reasons; 2 is
+/// the conservative end, since each extra wave also multiplies shuffle
+/// fragments by the partition count.
+const TASKS_PER_SLOT: usize = 2;
+
+/// Never plan fewer than this many partitions: below 2 there is no exchange to
+/// cut and the query degrades to a single task.
+const MIN_STAGE_PARTITIONS: usize = 2;
+
+/// Upper bound on planned partitions. Past this the shuffle fragment count
+/// (partitions², written and then fetched individually) costs more than the
+/// added parallelism returns.
+const MAX_STAGE_PARTITIONS: usize = 512;
+
+/// The compute capacity a query is being planned against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClusterCapacity {
+    /// Task slots currently schedulable across every live executor.
+    pub total_slots: usize,
+}
+
 /// Resolve the planning-time target partition count for distributed stages.
-pub fn stage_target_partitions_from_env() -> usize {
-    std::env::var(STAGE_TARGET_PARTITIONS_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&n| n >= 2)
-        .unwrap_or(4)
+///
+/// `cluster` is the live capacity the coordinator sees; `None` means the
+/// caller has no cluster view (the embedded in-process runtime), in which case
+/// the local machine's parallelism stands in for it.
+///
+/// This used to be the constant 4 regardless of anything. A 4-partition plan
+/// leaves a 32-slot cluster 87% idle, and on a 2-slot cluster it queues work
+/// two deep — the number was never related to the hardware it ran on. Deriving
+/// it from live slots is what makes a query fill the cluster it was actually
+/// submitted to.
+///
+/// The result is an upper bound, not a promise: DataFusion groups scan files
+/// into at most one partition per file group, so a query over three files
+/// plans three scan partitions however high this is set. Small inputs
+/// therefore stay cheap without needing a size term here.
+#[must_use]
+pub fn resolve_stage_target_partitions(cluster: Option<ClusterCapacity>) -> usize {
+    derive_stage_target_partitions(
+        std::env::var(STAGE_TARGET_PARTITIONS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok()),
+        cluster,
+        std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1),
+    )
+}
+
+/// The pure derivation behind [`resolve_stage_target_partitions`], with the
+/// environment and the machine passed in so it is testable (the workspace
+/// forbids `unsafe`, so tests cannot set environment variables).
+#[must_use]
+pub fn derive_stage_target_partitions(
+    explicit: Option<usize>,
+    cluster: Option<ClusterCapacity>,
+    local_cores: usize,
+) -> usize {
+    if let Some(explicit) = explicit.filter(|&n| n >= MIN_STAGE_PARTITIONS) {
+        return explicit;
+    }
+    cluster
+        .map_or(local_cores, |c| c.total_slots)
+        .saturating_mul(TASKS_PER_SLOT)
+        .clamp(MIN_STAGE_PARTITIONS, MAX_STAGE_PARTITIONS)
 }
 
 /// True unless stage splitting is disabled via [`STAGE_SPLIT_ENV`].
@@ -547,11 +614,20 @@ fn register_object_store_for_path(ctx: &SessionContext, path: &str) -> SqlResult
 /// extensions (streaming windows, catalog DML, UDFs) fail to plan here and
 /// surface as `Err` — callers treat any error as "fall back to the
 /// single-task path".
+/// `cluster` sizes the plan to the capacity it will run on; `None` falls back
+/// to the local machine (see [`resolve_stage_target_partitions`]).
 pub async fn build_stages_for_parquet_query(
     query: &str,
     tables: &[(String, String)],
+    cluster: Option<ClusterCapacity>,
 ) -> SqlResult<Option<DistributedStagePlan>> {
-    let ctx = planning_session_context(stage_target_partitions_from_env());
+    let target_partitions = resolve_stage_target_partitions(cluster);
+    tracing::debug!(
+        target_partitions,
+        total_slots = cluster.map(|c| c.total_slots),
+        "planning distributed stages"
+    );
+    let ctx = planning_session_context(target_partitions);
     for (name, path) in tables {
         // An `s3://` table needs its object store on the planning context
         // before `register_parquet` can infer a schema. Without this the
@@ -1167,15 +1243,21 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    /// The stage builder plans on a throwaway context, so it must register the
-    /// bucket's object store itself. When it did not, `register_parquet` on an
-    /// `s3://` path errored, the caller read that as "decline to stage", and
-    /// the whole dataset was scanned by a single executor — correct results,
-    /// silently zero distribution. Asserting the store is *resolvable
-    /// afterwards* falsifies that directly; asserting the call merely returned
-    /// `Ok` would not, since the pre-fix code never called it at all.
+    /// The stage builder plans on a throwaway context, so an `s3://` table must
+    /// resolve to an object store there. When it did not, `register_parquet`
+    /// errored, the caller read that as "decline to stage", and the whole
+    /// dataset was scanned by a single executor — correct results, silently
+    /// zero distribution.
+    ///
+    /// The property under test is that the bucket resolves, and that an
+    /// explicit registration takes precedence over the lazy fallback (explicit
+    /// registration is what carries endpoint and credential configuration).
+    /// This test previously opened by asserting a fresh context could *not*
+    /// resolve the bucket; installing `LazyCloudObjectStoreRegistry` on the
+    /// planning context made that precondition false, so the assertion, not
+    /// the behavior, was wrong.
     #[tokio::test]
-    async fn s3_paths_get_an_object_store_on_the_planning_context() {
+    async fn s3_paths_resolve_on_the_planning_context_and_explicit_registration_wins() {
         // No environment setup: `build_s3_object_store` defaults the region and
         // constructing a store does not contact the endpoint, so this stays a
         // pure unit test rather than one that mutates process-wide env.
@@ -1183,20 +1265,22 @@ mod tests {
         let ctx = planning_session_context(4);
         let url = ObjectStoreUrl::parse("s3://tpch-bucket").expect("bucket url");
 
-        assert!(
-            ctx.runtime_env().object_store(url.clone()).is_err(),
-            "a fresh planning context must not already know the bucket, \
-             otherwise this test cannot detect the registration"
-        );
+        let lazily_built = ctx
+            .runtime_env()
+            .object_store(url.clone())
+            .expect("the planning context must resolve an s3 bucket on demand");
 
         register_object_store_for_path(&ctx, "s3://tpch-bucket/tpch/sf100/lineitem/")
             .expect("registering an s3 path must succeed");
 
+        let explicit = ctx
+            .runtime_env()
+            .object_store(url)
+            .expect("after registration the planning context must resolve the bucket");
         assert!(
-            ctx.runtime_env().object_store(url).is_ok(),
-            "after registration the planning context must resolve the bucket, \
-             or register_parquet will fail and the job will silently \
-             fall back to single-task execution"
+            !Arc::ptr_eq(&lazily_built, &explicit),
+            "explicit registration must replace the lazily-constructed store, \
+             or configured endpoints and credentials would be ignored"
         );
     }
 
@@ -1272,6 +1356,68 @@ mod tests {
     ///
     /// Asserting on stage COUNT is what makes this a regression test: a plan
     /// that merely round-trips proves nothing about distribution.
+    #[test]
+    fn target_partitions_scale_with_the_cluster_not_a_constant() {
+        // The defect: this was 4 regardless of the cluster, so a large cluster
+        // sat mostly idle and a small one queued work behind itself.
+        let two_slots = ClusterCapacity { total_slots: 2 };
+        let thirty_two = ClusterCapacity { total_slots: 32 };
+        let small = derive_stage_target_partitions(None, Some(two_slots), 8);
+        let large = derive_stage_target_partitions(None, Some(thirty_two), 8);
+        assert!(
+            large > small,
+            "a 16x larger cluster planned {large} vs {small} partitions"
+        );
+        assert_eq!(large, 32 * TASKS_PER_SLOT);
+    }
+
+    #[test]
+    fn multiple_waves_per_slot_leave_room_to_absorb_stragglers() {
+        // One task per slot makes a stage as slow as its slowest task. More
+        // tasks than slots lets a fast slot take a second while a slow one is
+        // still on its first.
+        let cluster = ClusterCapacity { total_slots: 8 };
+        assert!(
+            derive_stage_target_partitions(None, Some(cluster), 8) > cluster.total_slots,
+            "a stage should plan more tasks than slots, not exactly one wave"
+        );
+    }
+
+    #[test]
+    fn an_explicit_setting_overrides_the_derivation() {
+        let cluster = ClusterCapacity { total_slots: 64 };
+        assert_eq!(derive_stage_target_partitions(Some(6), Some(cluster), 8), 6);
+        // ...but a value that would defeat stage splitting entirely does not:
+        // below 2 partitions there is no exchange to cut.
+        assert!(derive_stage_target_partitions(Some(1), Some(cluster), 8) >= MIN_STAGE_PARTITIONS);
+        assert!(derive_stage_target_partitions(Some(0), Some(cluster), 8) >= MIN_STAGE_PARTITIONS);
+    }
+
+    #[test]
+    fn no_cluster_view_falls_back_to_the_local_machine() {
+        // The embedded runtime and any caller without a coordinator.
+        assert_eq!(
+            derive_stage_target_partitions(None, None, 6),
+            6 * TASKS_PER_SLOT
+        );
+    }
+
+    #[test]
+    fn partition_counts_stay_inside_the_shuffle_fragment_budget() {
+        // Shuffle fragments grow as partitions², so an enormous cluster must
+        // not translate into an unbounded fragment count.
+        let huge = ClusterCapacity {
+            total_slots: usize::MAX,
+        };
+        assert_eq!(
+            derive_stage_target_partitions(None, Some(huge), 8),
+            MAX_STAGE_PARTITIONS
+        );
+        // A single-slot cluster still gets a splittable plan.
+        let one = ClusterCapacity { total_slots: 1 };
+        assert!(derive_stage_target_partitions(None, Some(one), 1) >= MIN_STAGE_PARTITIONS);
+    }
+
     #[tokio::test]
     async fn ungrouped_aggregate_splits_into_map_and_reduce_stages() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1284,6 +1430,7 @@ mod tests {
         let staged = build_stages_for_parquet_query(
             "SELECT SUM(amount) AS total, COUNT(*) AS n FROM t WHERE id >= 100",
             &tables,
+                    Some(ClusterCapacity { total_slots: 4 }),
         )
         .await
         .expect("planning must not error")
@@ -1328,6 +1475,7 @@ mod tests {
         let staged = build_stages_for_parquet_query(
             "SELECT category, SUM(amount) AS total FROM t GROUP BY category",
             &tables,
+                    Some(ClusterCapacity { total_slots: 4 }),
         )
         .await
         .expect("planning must not error")
@@ -1587,7 +1735,14 @@ mod tests {
 
     /// A plain scan (no exchange) is not worth splitting: builder says None.
     #[tokio::test]
-    async fn scan_only_plan_is_not_split() {
+    async fn scan_only_plan_declines_with_a_stated_reason() {
+        // A projection-and-filter plan has no exchange, so there is nothing to
+        // cut and it correctly runs as one task. What changed is how that is
+        // reported: declining used to be a bare `Ok(None)`, indistinguishable
+        // at the call site from every other reason to fall back, which is how
+        // a genuine planning bug hid behind "the planner declined" for a whole
+        // benchmarking session. The reason is now a value, and this asserts it
+        // says which plan property was missing.
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = write_test_parquet(tmp.path()).await;
         let plan_ctx = planning_session_context(4);
@@ -1604,10 +1759,12 @@ mod tests {
             .await
             .expect("sql");
         let plan = df.create_physical_plan().await.expect("physical plan");
+        let reason = build_distributed_stages(plan)
+            .expect_err("a scan-only plan has no exchange and must decline")
+            .to_string();
         assert!(
-            build_distributed_stages(plan)
-                .expect("build stages")
-                .is_none()
+            reason.contains("no exchange"),
+            "the decline must name the missing plan property, got: {reason}"
         );
     }
 

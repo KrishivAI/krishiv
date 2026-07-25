@@ -980,10 +980,10 @@ pub(crate) async fn execute_streaming_fragment(
         // Create a new SQL engine with UDF limits and the task's memory limit
         // for this task execution. The reservation guard holds this task's
         // share of the executor process budget until the fragment returns.
-        let (engine_memory_limit, _process_memory_reservation) =
+        let (engine_memory, _process_memory_reservation) =
             crate::fragment::common::reserve_task_engine_memory(&memory_budget);
         let engine = Arc::new(crate::fragment::common::task_sql_engine(
-            engine_memory_limit,
+            engine_memory,
             udf_limits,
         ));
 

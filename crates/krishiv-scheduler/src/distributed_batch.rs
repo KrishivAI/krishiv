@@ -13,7 +13,8 @@
 
 use krishiv_proto::{ShuffleWriteConfig, StageId, StageKind, StageSpec, TaskId, TaskSpec};
 use krishiv_sql::distributed_plan::{
-    DistributedStagePlan, build_stages_for_parquet_query, shuffle_stage_key, stage_split_enabled,
+    ClusterCapacity, DistributedStagePlan, build_stages_for_parquet_query, shuffle_stage_key,
+    stage_split_enabled,
 };
 
 /// Try to plan `query` over local parquet `tables` as shuffle-connected
@@ -28,8 +29,9 @@ use krishiv_sql::distributed_plan::{
 pub async fn plan_staged_batch_stages(
     query: &str,
     tables: &[(String, std::path::PathBuf)],
+    cluster: Option<ClusterCapacity>,
 ) -> Option<Vec<StageSpec>> {
-    match plan_staged_batch_stages_verbose(query, tables).await {
+    match plan_staged_batch_stages_verbose(query, tables, cluster).await {
         Ok(stages) => Some(stages),
         Err(reason) => {
             // WARN, not DEBUG. Declining to stage means the query runs as a
@@ -56,6 +58,7 @@ pub async fn plan_staged_batch_stages(
 pub async fn plan_staged_batch_stages_verbose(
     query: &str,
     tables: &[(String, std::path::PathBuf)],
+    cluster: Option<ClusterCapacity>,
 ) -> Result<Vec<StageSpec>, String> {
     if !stage_split_enabled() {
         return Err(format!(
@@ -92,7 +95,7 @@ pub async fn plan_staged_batch_stages_verbose(
         };
         table_paths.push((name.clone(), text.to_owned()));
     }
-    let staged = match build_stages_for_parquet_query(query, &table_paths).await {
+    let staged = match build_stages_for_parquet_query(query, &table_paths, cluster).await {
         Ok(Some(staged)) => staged,
         Ok(None) => return Err(String::from("planner produced no distributable stages")),
         Err(error) => return Err(error.to_string()),

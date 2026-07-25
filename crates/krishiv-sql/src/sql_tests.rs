@@ -459,6 +459,51 @@ mod tests {
         assert_eq!(resolve_query_memory_limit_bytes(Some(" 1024 ")), Some(1024));
     }
 
+    /// Every engine built without an explicit limit draws on the *same* pool.
+    ///
+    /// This is the invariant that bounds a process's execution memory. When
+    /// each engine built its own pool at a fraction of the container, a
+    /// process hosting several — executor task slots, the Flight SQL host, IVM
+    /// ticks — claimed that fraction once per engine and the sum ran past the
+    /// container, with every individual pool still reporting headroom right up
+    /// to the OOM kill.
+    #[test]
+    fn engines_without_an_explicit_limit_share_one_process_pool() {
+        match (
+            crate::EngineMemory::for_this_process(),
+            crate::EngineMemory::for_this_process(),
+        ) {
+            (
+                crate::EngineMemory::Shared { pool: a, .. },
+                crate::EngineMemory::Shared { pool: b, .. },
+            ) => assert!(
+                std::sync::Arc::ptr_eq(&a, &b),
+                "two engines must share one pool, not hold two pools of the same size"
+            ),
+            // No cgroup limit in this environment: unbounded is the correct
+            // answer, and is still one decision for the whole process.
+            (crate::EngineMemory::Unbounded, crate::EngineMemory::Unbounded) => {
+                assert!(crate::process_query_pool().is_none());
+            }
+            (a, b) => panic!("inconsistent process memory source: {a:?} / {b:?}"),
+        }
+    }
+
+    /// An explicit per-job limit still gets its own pool: an operator asking
+    /// for a hard cap on one query must get exactly that, not a share of the
+    /// process budget.
+    #[test]
+    fn an_explicit_limit_produces_a_private_pool() {
+        assert!(matches!(
+            crate::EngineMemory::from_limit(Some(64 * 1024 * 1024)),
+            crate::EngineMemory::Private(bytes) if bytes == 64 * 1024 * 1024
+        ));
+        assert!(matches!(
+            crate::EngineMemory::from_limit(None),
+            crate::EngineMemory::Unbounded
+        ));
+    }
+
     #[tokio::test]
     async fn memory_limited_engine_executes_queries_and_reports_limit() {
         let engine = SqlEngine::new_with_memory_limit(Some(64 * 1024 * 1024));

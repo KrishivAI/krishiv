@@ -597,9 +597,18 @@ impl InProcessStreamingRuntime {
                         .iter()
                         .map(|t| (t.table_name.clone(), t.path.clone()))
                         .collect();
+                    // The embedded runtime's "cluster" is this process, so it
+                    // plans against the same capacity derivation a standalone
+                    // executor uses. Passing no capacity would fall back to
+                    // raw core count and plan wider than the in-process slots
+                    // can run.
+                    let cluster = krishiv_sql::distributed_plan::ClusterCapacity {
+                        total_slots: krishiv_common::ExecutorCapacity::detect().slots.get(),
+                    };
                     block_on(krishiv_scheduler::plan_staged_batch_stages(
                         query,
                         &table_refs,
+                        Some(cluster),
                     ))
                 })
             } else {

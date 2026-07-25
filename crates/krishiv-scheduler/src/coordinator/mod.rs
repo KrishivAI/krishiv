@@ -1595,6 +1595,16 @@ impl Coordinator {
         &self.exec.executors
     }
 
+    /// Task slots across every executor that can currently accept work.
+    ///
+    /// The width a query should be planned to: it is how much the cluster can
+    /// run at once. `0` means no executor is schedulable — callers must treat
+    /// that as "capacity unknown", since a job submitted before the first
+    /// executor registers is not a job for an empty cluster.
+    pub fn total_schedulable_slots(&self) -> usize {
+        self.exec.executors.total_schedulable_slots()
+    }
+
     /// Heartbeat ticks since coordinator restart.
     pub fn ticks_since_restart(&self) -> u64 {
         self.exec.executors.current_tick

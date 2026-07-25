@@ -920,73 +920,23 @@ fn cascade_circuit_breaker_prunes_old_losses() {
     );
 }
 
-// ── SC10: ResourceProfile per-stage placement filtering ───────────────────
+// ── Memory admission: structural, not per-task ───────────────────────────
 
-/// Verify that `schedulable_placements_for_profile` filters out executors that
-/// cannot satisfy a stage's memory requirement, while returning the same set as
-/// the unfiltered path when no profile is given or the profile fits.
+/// A stage may declare a memory requirement larger than any executor's free
+/// memory and still be placed.
+///
+/// This inverts the previous behaviour deliberately. Placement used to reject
+/// executors whose reported free memory was below `ResourceProfile
+/// ::task_memory_bytes`, leaving the task Pending. Two things were wrong with
+/// it: nothing in the engine ever set a `ResourceProfile`, so the branch was
+/// unreachable outside this test; and a task that does not fit in memory does
+/// not fail, it spills. Refusing to place it converts a slower query into a
+/// stalled one.
+///
+/// What bounds memory now is structural — one hard-capped `FairSpillPool` per
+/// process — so admitting the task cannot overcommit the machine.
 #[test]
-fn resource_profile_filters_executors_by_memory() {
-    allow_anonymous_for_tests();
-
-    use krishiv_proto::{ExecutorHeartbeat, ExecutorState, ResourceProfile};
-
-    let coord_id = CoordinatorId::try_new("coord-rp").unwrap();
-    let mut coordinator = Coordinator::active(coord_id);
-
-    // One executor: 2 GiB limit, 256 MiB used → 1.75 GiB (1,879,048,192 bytes) available.
-    let exec_id = ExecutorId::try_new("exec-rp-1").unwrap();
-    let lease = coordinator
-        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-rp", 4))
-        .unwrap();
-
-    coordinator
-        .executor_heartbeat(
-            ExecutorHeartbeat::new(exec_id.clone(), ExecutorState::Healthy)
-                .with_lease_generation(lease)
-                .with_memory_used_bytes(256 * 1024 * 1024)
-                .with_memory_limit_bytes(2 * 1024 * 1024 * 1024),
-        )
-        .unwrap();
-
-    // No profile → executor is always eligible.
-    let unfiltered = coordinator
-        .exec
-        .executors
-        .schedulable_placements_for_profile(None);
-    assert_eq!(unfiltered.len(), 1, "unfiltered: executor must appear");
-
-    // Small profile (512 MiB) → fits within 1.75 GiB available.
-    let small = ResourceProfile {
-        task_cpus: 0.5,
-        task_memory_bytes: 512 * 1024 * 1024,
-    };
-    let fits = coordinator
-        .exec
-        .executors
-        .schedulable_placements_for_profile(Some(&small));
-    assert_eq!(fits.len(), 1, "512 MiB profile fits: executor must appear");
-
-    // Huge profile (3 GiB) → exceeds 1.75 GiB available.
-    let huge = ResourceProfile {
-        task_cpus: 1.0,
-        task_memory_bytes: 3 * 1024 * 1024 * 1024,
-    };
-    let rejected = coordinator
-        .exec
-        .executors
-        .schedulable_placements_for_profile(Some(&huge));
-    assert!(
-        rejected.is_empty(),
-        "3 GiB profile exceeds available memory: executor must be excluded"
-    );
-}
-
-/// When a stage with a large memory profile has its tasks reset to Pending
-/// (e.g. after a stage retry), `assign_pending_tasks` must leave those tasks
-/// Pending if no executor satisfies the requirement.
-#[test]
-fn resource_profile_assign_pending_respects_profile_after_retry() {
+fn a_stage_declaring_more_memory_than_is_free_is_still_placed() {
     allow_anonymous_for_tests();
 
     use krishiv_proto::{ExecutorHeartbeat, ExecutorState, ResourceProfile, StageSpec, TaskSpec};
@@ -994,7 +944,6 @@ fn resource_profile_assign_pending_respects_profile_after_retry() {
     let coord_id = CoordinatorId::try_new("coord-rp2").unwrap();
     let mut coordinator = Coordinator::active(coord_id);
 
-    // Submit with no executor first → all tasks start Pending.
     let huge_profile = ResourceProfile {
         task_cpus: 1.0,
         task_memory_bytes: 3 * 1024 * 1024 * 1024,
@@ -1007,12 +956,11 @@ fn resource_profile_assign_pending_respects_profile_after_retry() {
     let spec = JobSpec::new(job_id.clone(), "rp-heavy", JobKind::Batch).with_stage(stage);
     coordinator.submit_job(spec).unwrap();
 
-    // Register an executor with only 512 MiB available.
+    // One executor with only 512 MiB free — far less than the 3 GiB declared.
     let exec_id = ExecutorId::try_new("exec-rp2").unwrap();
     let lease = coordinator
         .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod2", 4))
         .unwrap();
-    // Heartbeat: 1 GiB limit, 512 MiB used → only 512 MiB free.
     coordinator
         .executor_heartbeat(
             ExecutorHeartbeat::new(exec_id.clone(), ExecutorState::Healthy)
@@ -1022,8 +970,6 @@ fn resource_profile_assign_pending_respects_profile_after_retry() {
         )
         .unwrap();
 
-    // Manually force the task back to Pending (simulating a retry after the
-    // executor registered without a memory snapshot).
     {
         let jc = coordinator.job_coordinators.get(&job_id).unwrap();
         let mut rec = jc.write_record();
@@ -1035,15 +981,70 @@ fn resource_profile_assign_pending_respects_profile_after_retry() {
         }
     }
 
-    // assign_pending_tasks must leave the task Pending — no executor satisfies 3 GiB.
     let placed = coordinator.assign_pending_tasks(&job_id).unwrap();
-    assert_eq!(placed, 0, "no executor satisfies 3 GiB requirement; placed={placed}");
+    assert_eq!(
+        placed, 1,
+        "the task must be placed and allowed to spill, not held Pending"
+    );
 
     let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+    assert_eq!(detail.stages()[0].tasks()[0].state(), TaskState::Assigned);
+}
+
+/// The reachable memory gate: an executor whose *process* RSS is past the
+/// configured pressure threshold takes no new work. This is a different
+/// condition from "this task might not fit" — the process is already close to
+/// being OOM-killed, and spilling a new task would not help.
+#[test]
+fn an_executor_over_the_memory_pressure_threshold_takes_no_work() {
+    allow_anonymous_for_tests();
+
+    use krishiv_proto::{ExecutorHeartbeat, ExecutorState};
+
+    let config = CoordinatorConfig::default().with_memory_threshold(1024 * 1024 * 1024);
+    let mut coordinator = Coordinator::active_with_config(
+        CoordinatorId::try_new("coord-rp").unwrap(),
+        config,
+    );
+
+    let exec_id = ExecutorId::try_new("exec-rp-1").unwrap();
+    let lease = coordinator
+        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-rp", 4))
+        .unwrap();
+
+    // Comfortably under the threshold → schedulable.
+    coordinator
+        .executor_heartbeat(
+            ExecutorHeartbeat::new(exec_id.clone(), ExecutorState::Healthy)
+                .with_lease_generation(lease)
+                .with_memory_used_bytes(256 * 1024 * 1024)
+                .with_memory_limit_bytes(2 * 1024 * 1024 * 1024),
+        )
+        .unwrap();
     assert_eq!(
-        detail.stages()[0].tasks()[0].state(),
-        TaskState::Pending,
-        "task must remain Pending when no executor can satisfy the resource profile"
+        coordinator.exec.executors.schedulable_executor_placements().len(),
+        1,
+        "an executor below the pressure threshold must be schedulable"
+    );
+    assert_eq!(coordinator.total_schedulable_slots(), 4);
+
+    // Past the threshold → excluded, and its slots leave the cluster total.
+    coordinator
+        .executor_heartbeat(
+            ExecutorHeartbeat::new(exec_id, ExecutorState::Healthy)
+                .with_lease_generation(lease)
+                .with_memory_used_bytes(1536 * 1024 * 1024)
+                .with_memory_limit_bytes(2 * 1024 * 1024 * 1024),
+        )
+        .unwrap();
+    assert!(
+        coordinator.exec.executors.schedulable_executor_placements().is_empty(),
+        "an executor past the pressure threshold must take no new work"
+    );
+    assert_eq!(
+        coordinator.total_schedulable_slots(),
+        0,
+        "planning must not count slots on an executor that cannot take work"
     );
 }
 

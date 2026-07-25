@@ -932,62 +932,51 @@ pub(crate) async fn read_shuffle_flight_partitions(
     Ok(table_batches.into_iter().collect())
 }
 
+/// This executor process's capacity, derived once from its real CPU and
+/// memory (see [`krishiv_common::ExecutorCapacity`]). Every per-task sizing
+/// decision reads it, so slots, the query pool, and per-task parallelism
+/// cannot drift apart the way three independent env lookups did.
+pub(crate) fn executor_capacity() -> &'static krishiv_common::ExecutorCapacity {
+    static CAPACITY: std::sync::LazyLock<krishiv_common::ExecutorCapacity> =
+        std::sync::LazyLock::new(krishiv_common::ExecutorCapacity::detect);
+    &CAPACITY
+}
+
 /// Translate a task's [`MemoryBudget`] limit into a DataFusion engine memory
-/// limit for the per-task `SqlEngine`. Tasks without an explicit limit fall
-/// back to the executor-wide `KRISHIV_QUERY_MEMORY_LIMIT_BYTES` default.
+/// limit for the per-task `SqlEngine`. `None` means the task has no private
+/// limit and should draw on the shared executor pool instead.
 pub(crate) fn task_engine_memory_limit(
     memory_budget: &krishiv_common::MemoryBudget,
 ) -> Option<usize> {
     memory_budget
         .limit()
         .map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX))
-        .or_else(krishiv_sql::query_memory_limit_from_env)
 }
 
 /// DataFusion `target_partitions` for engines created inside a task slot.
 ///
 /// [`krishiv_sql::SqlEngine::new`] defaults to the machine's full CPU
-/// parallelism — right for the embedded placement, but an executor runs up
-/// to `slots` fragments concurrently, so each per-task engine gets its
-/// per-slot share instead: `max(1, available_parallelism / slots)`, where
-/// `slots` mirrors the CLI's capacity derivation (`KRISHIV_TASK_SLOTS`, else
-/// available parallelism — which makes the default share exactly 1).
-/// `KRISHIV_TASK_TARGET_PARALLELISM` overrides the computed share directly.
+/// parallelism — right for the embedded placement, but an executor runs up to
+/// `slots` fragments concurrently, so each per-task engine gets its per-slot
+/// share: `max(1, cores / slots)`.
+///
+/// The share is taken from the resolved [`executor_capacity`], not from
+/// `KRISHIV_TASK_SLOTS` directly. Reading the environment variable here was a
+/// bug: `--slots N` on the command line sets the executor's real slot count
+/// without setting the variable, so the share was computed against the
+/// *default* slot count. On a 4-core executor started with `--slots 1` the
+/// single task got 1 partition instead of 4 and used a quarter of the CPU.
 pub(crate) fn task_engine_parallelism() -> std::num::NonZeroUsize {
-    let explicit = std::env::var("KRISHIV_TASK_TARGET_PARALLELISM")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .and_then(std::num::NonZeroUsize::new);
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1);
-    let slots = std::env::var("KRISHIV_TASK_SLOTS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0);
-    task_engine_parallelism_share(explicit, cores, slots)
+    executor_capacity().task_parallelism
 }
 
-/// Pure per-slot share computation behind [`task_engine_parallelism`].
-fn task_engine_parallelism_share(
-    explicit: Option<std::num::NonZeroUsize>,
-    cores: usize,
-    slots: Option<usize>,
-) -> std::num::NonZeroUsize {
-    if let Some(explicit) = explicit {
-        return explicit;
-    }
-    let slots = slots.unwrap_or(cores).max(1);
-    std::num::NonZeroUsize::new((cores / slots).max(1)).unwrap_or(std::num::NonZeroUsize::MIN)
-}
-
-/// Build the per-task SQL engine: the task's engine memory limit, its job's
-/// UDF resource limits, and the per-slot parallelism share.
+/// Build the per-task SQL engine: its memory source, its job's UDF resource
+/// limits, and the per-slot parallelism share.
 pub(crate) fn task_sql_engine(
-    engine_memory_limit: Option<usize>,
+    engine_memory: krishiv_sql::EngineMemory,
     udf_limits: krishiv_plan::udf::ResourceLimits,
 ) -> krishiv_sql::SqlEngine {
-    krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
+    krishiv_sql::SqlEngine::new_with_engine_memory(engine_memory)
         .with_target_parallelism(task_engine_parallelism())
         .with_udf_limits(udf_limits)
         // Give the task engine a UDF registry so Python UDFs shipped in the
@@ -1067,28 +1056,35 @@ impl Drop for ProcessMemoryReservation {
     }
 }
 
-/// Compute a task's effective engine memory limit under the shared
-/// executor process budget, reserving the granted amount for the task's
-/// lifetime.
+/// Decide where a task's DataFusion execution memory comes from, reserving
+/// against the explicit process budget when one is configured.
 ///
-/// Behaviour:
-/// - No process limit configured → the per-task limit (or env default)
-///   passes through unchanged with no reservation.
-/// - Process limit configured → the task's desired limit (per-task limit,
-///   env default, or the full process limit when neither is set) is reserved
-///   against the process budget. When the full amount is unavailable the
-///   task is granted the remaining capacity instead, and when the budget is
-///   fully exhausted a minimum grant of 32 MiB keeps the task progressing
-///   with aggressive spilling (bounded over-commit, logged).
+/// Three cases, in precedence order:
+/// - **The job set a per-task limit** → a private pool of exactly that size.
+///   An explicit request is honoured exactly.
+/// - **`KRISHIV_EXECUTOR_MEMORY_LIMIT_BYTES` is set** → the operator asked for
+///   hard per-task partitioning of a fixed process budget, so the reservation
+///   ladder below runs and the task gets a private pool of its grant.
+/// - **Neither** (the default) → the shared executor pool. Nothing is
+///   reserved and nothing is divided up front: `FairSpillPool` apportions
+///   live, so a task running alone gets the whole budget.
 ///
 /// The returned guard must be held for the duration of task execution.
 pub(crate) fn reserve_task_engine_memory(
     memory_budget: &krishiv_common::MemoryBudget,
-) -> (Option<usize>, Option<ProcessMemoryReservation>) {
+) -> (krishiv_sql::EngineMemory, Option<ProcessMemoryReservation>) {
     let desired = task_engine_memory_limit(memory_budget);
     let process = &*EXECUTOR_PROCESS_BUDGET;
     let Some(process_limit) = process.limit() else {
-        return (desired, None);
+        // No explicit process partitioning: a per-task limit stays private,
+        // everything else shares the executor pool.
+        return (
+            desired.map_or_else(
+                krishiv_sql::EngineMemory::for_this_process,
+                krishiv_sql::EngineMemory::Private,
+            ),
+            None,
+        );
     };
 
     let want = desired
@@ -1106,7 +1102,7 @@ pub(crate) fn reserve_task_engine_memory(
         if manager.try_reserve(MemoryRegion::Execution, want) {
             let granted = usize::try_from(want).unwrap_or(usize::MAX);
             return (
-                Some(granted),
+                krishiv_sql::EngineMemory::Private(granted),
                 Some(ProcessMemoryReservation {
                     bytes: want,
                     unified: true,
@@ -1126,7 +1122,7 @@ pub(crate) fn reserve_task_engine_memory(
             );
             let granted = usize::try_from(remaining).unwrap_or(usize::MAX);
             return (
-                Some(granted),
+                krishiv_sql::EngineMemory::Private(granted),
                 Some(ProcessMemoryReservation {
                     bytes: remaining,
                     unified: true,
@@ -1139,7 +1135,9 @@ pub(crate) fn reserve_task_engine_memory(
             "unified executor memory exhausted; task granted minimum engine limit"
         );
         return (
-            Some(usize::try_from(MIN_TASK_ENGINE_MEMORY_BYTES).unwrap_or(usize::MAX)),
+            krishiv_sql::EngineMemory::Private(
+                usize::try_from(MIN_TASK_ENGINE_MEMORY_BYTES).unwrap_or(usize::MAX),
+            ),
             None,
         );
     }
@@ -1147,7 +1145,7 @@ pub(crate) fn reserve_task_engine_memory(
     if process.try_reserve(want) {
         let granted = usize::try_from(want).unwrap_or(usize::MAX);
         return (
-            Some(granted),
+            krishiv_sql::EngineMemory::Private(granted),
             Some(ProcessMemoryReservation {
                 bytes: want,
                 unified: false,
@@ -1165,7 +1163,7 @@ pub(crate) fn reserve_task_engine_memory(
         );
         let granted = usize::try_from(remaining).unwrap_or(usize::MAX);
         return (
-            Some(granted),
+            krishiv_sql::EngineMemory::Private(granted),
             Some(ProcessMemoryReservation {
                 bytes: remaining,
                 unified: false,
@@ -1181,7 +1179,9 @@ pub(crate) fn reserve_task_engine_memory(
         "executor process memory budget exhausted; task granted minimum engine limit"
     );
     (
-        Some(usize::try_from(MIN_TASK_ENGINE_MEMORY_BYTES).unwrap_or(usize::MAX)),
+        krishiv_sql::EngineMemory::Private(
+            usize::try_from(MIN_TASK_ENGINE_MEMORY_BYTES).unwrap_or(usize::MAX),
+        ),
         None,
     )
 }
@@ -1501,57 +1501,66 @@ mod tests {
     }
 
     #[test]
-    fn task_engine_parallelism_share_defaults_to_one_per_slot() {
-        // Slots default to the core count → each task gets a share of 1.
-        assert_eq!(
-            super::task_engine_parallelism_share(None, 16, None).get(),
-            1
-        );
-        assert_eq!(super::task_engine_parallelism_share(None, 1, None).get(), 1);
-    }
-
-    #[test]
-    fn task_engine_parallelism_share_divides_cores_across_capped_slots() {
-        assert_eq!(
-            super::task_engine_parallelism_share(None, 16, Some(2)).get(),
-            8
-        );
-        // Oversubscribed slot counts floor at 1, never 0.
-        assert_eq!(
-            super::task_engine_parallelism_share(None, 4, Some(32)).get(),
-            1
+    fn task_parallelism_is_the_resolved_capacitys_per_slot_share() {
+        // The share comes from the resolved capacity rather than a second,
+        // independent reading of KRISHIV_TASK_SLOTS — that divergence is what
+        // made `--slots N` a no-op for per-task parallelism. The arithmetic
+        // itself is covered by krishiv_common::executor_capacity's tests.
+        let capacity = super::executor_capacity();
+        assert_eq!(super::task_engine_parallelism(), capacity.task_parallelism);
+        assert!(
+            capacity.task_parallelism.get() * capacity.slots.get() <= capacity.cores.get().max(1),
+            "per-slot shares must not oversubscribe the cores they divide"
         );
     }
 
     #[test]
-    fn task_engine_parallelism_share_explicit_override_wins() {
+    fn task_engine_memory_limit_is_none_without_an_explicit_task_budget() {
+        // `None` now means "draw on the shared executor pool", not "fall back
+        // to a private pool at the env default" — a per-task private pool is
+        // exactly the per-slot overcommit the shared pool exists to remove.
         assert_eq!(
-            super::task_engine_parallelism_share(std::num::NonZeroUsize::new(6), 16, Some(16))
-                .get(),
-            6
+            super::task_engine_memory_limit(&MemoryBudget::unlimited()),
+            None
         );
     }
 
     #[test]
-    fn task_engine_memory_limit_unlimited_budget_falls_back_to_env_default() {
-        // The env var is not set in unit tests, so an unlimited budget yields
-        // an unbounded engine.
-        let budget = MemoryBudget::unlimited();
-        assert_eq!(
-            super::task_engine_memory_limit(&budget),
-            krishiv_sql::query_memory_limit_from_env()
-        );
-    }
-
-    #[test]
-    fn reserve_task_engine_memory_passthrough_without_process_limit() {
+    fn an_explicit_task_budget_gets_a_private_pool() {
         // KRISHIV_EXECUTOR_MEMORY_LIMIT_BYTES is not set in unit tests, so the
-        // process budget is unlimited: the per-task limit passes through and
-        // no reservation guard is created.
+        // process budget is unlimited; the job's own limit is still honoured
+        // exactly and needs no reservation guard.
         let budget = MemoryBudget::limited(64 * 1024 * 1024);
-        let (limit, guard) = super::reserve_task_engine_memory(&budget);
-        assert_eq!(limit, Some(64 * 1024 * 1024));
+        let (memory, guard) = super::reserve_task_engine_memory(&budget);
+        assert!(
+            matches!(memory, krishiv_sql::EngineMemory::Private(bytes) if bytes == 64 * 1024 * 1024),
+            "expected a private 64 MiB pool, got {memory:?}"
+        );
         assert!(guard.is_none());
+    }
+
+    #[test]
+    fn tasks_without_a_budget_share_one_pool_rather_than_each_taking_one() {
+        // The property that makes executor memory safe: whatever the slot
+        // count, unbudgeted tasks all point at the *same* pool object, so the
+        // process cannot claim `slots × pool_size`.
+        let (first, _guard_a) = super::reserve_task_engine_memory(&MemoryBudget::unlimited());
+        let (second, _guard_b) = super::reserve_task_engine_memory(&MemoryBudget::unlimited());
+        match (first, second) {
+            (
+                krishiv_sql::EngineMemory::Shared { pool: a, .. },
+                krishiv_sql::EngineMemory::Shared { pool: b, .. },
+            ) => assert!(
+                Arc::ptr_eq(&a, &b),
+                "concurrent tasks must share one pool, not two of the same size"
+            ),
+            // No cgroup limit in the test environment: unbounded is correct,
+            // and is still one shared decision rather than per-task pools.
+            (krishiv_sql::EngineMemory::Unbounded, krishiv_sql::EngineMemory::Unbounded) => {
+                assert!(krishiv_sql::process_query_pool().is_none());
+            }
+            (a, b) => panic!("unbudgeted tasks got mismatched memory sources: {a:?} / {b:?}"),
+        }
     }
 
     #[test]

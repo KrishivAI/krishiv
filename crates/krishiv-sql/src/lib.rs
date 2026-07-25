@@ -405,6 +405,157 @@ pub fn query_memory_limit_from_env() -> Option<usize> {
 
 pub use krishiv_common::cgroup_memory_limit_bytes;
 
+/// DataFusion's memory-pool trait, re-exported so crates that only build
+/// engines (the executor) can hold a shared pool without depending on
+/// DataFusion directly.
+pub use datafusion::execution::memory_pool::MemoryPool;
+
+/// The one query memory pool for this process, sized by
+/// [`krishiv_common::ExecutorCapacity`] from the cgroup limit.
+///
+/// `None` when execution memory is unbounded: no cgroup limit (bare metal or
+/// an unconstrained container), or an explicit
+/// `KRISHIV_QUERY_MEMORY_LIMIT_BYTES=0`.
+///
+/// Built once. Every engine that does not carry an explicit per-job limit
+/// draws on it, so the total execution memory of the process is this number
+/// regardless of how many engines exist.
+pub fn process_query_pool() -> Option<&'static Arc<dyn MemoryPool>> {
+    static POOL: std::sync::LazyLock<Option<Arc<dyn MemoryPool>>> =
+        std::sync::LazyLock::new(|| {
+            let capacity = krishiv_common::ExecutorCapacity::detect();
+            let bytes = capacity.query_pool_bytes?;
+            tracing::info!(
+                capacity = %capacity.summary(),
+                "query memory: one shared FairSpillPool for this process"
+            );
+            Some(EngineMemory::shared_pool(
+                usize::try_from(bytes).unwrap_or(usize::MAX),
+            ))
+        });
+    POOL.as_ref()
+}
+
+/// One engine's expected share of [`process_query_pool`] when every slot is
+/// busy. Sizes spill reservations only; the pool itself is shared.
+fn process_query_pool_fair_share_bytes() -> usize {
+    krishiv_common::ExecutorCapacity::detect()
+        .min_task_memory_share_bytes()
+        .map_or(usize::MAX, |bytes| {
+            usize::try_from(bytes).unwrap_or(usize::MAX)
+        })
+}
+
+/// Where an engine's DataFusion execution memory comes from.
+///
+/// The distinction that matters is [`Private`](EngineMemory::Private) versus
+/// [`Shared`](EngineMemory::Shared). An executor runs `slots` task fragments
+/// at once; giving each its own pool means the process claims
+/// `slots × pool_size`, which is how a container gets OOM-killed while every
+/// individual pool still reports headroom. One pool shared by every task makes
+/// the executor's total execution memory a single hard number, and
+/// `FairSpillPool` divides it live across whoever is actually running — a task
+/// alone gets all of it, four tasks get a quarter each, and nobody has to
+/// predict the concurrency in advance.
+#[derive(Clone)]
+pub enum EngineMemory {
+    /// DataFusion's default unbounded pool: no accounting, no spill.
+    Unbounded,
+    /// A `FairSpillPool` of this size belonging to this engine alone.
+    /// Correct for one-engine-per-process deployments (embedded, gateway).
+    Private(usize),
+    /// A pool shared with every other engine in this process.
+    ///
+    /// `fair_share_bytes` is what this engine can expect when all slots are
+    /// busy. It sizes spill *reservations* only — the pool itself is the
+    /// shared object and is not bounded by this number.
+    Shared {
+        /// The process-wide pool.
+        pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+        /// This engine's expected share, for reservation sizing.
+        fair_share_bytes: usize,
+    },
+}
+
+impl EngineMemory {
+    /// A private pool of `bytes`, or [`Unbounded`](EngineMemory::Unbounded)
+    /// when there is no limit.
+    #[must_use]
+    pub fn from_limit(bytes: Option<usize>) -> Self {
+        bytes.map_or(Self::Unbounded, Self::Private)
+    }
+
+    /// Build a pool of `bytes` intended to be shared by several engines.
+    ///
+    /// The caller keeps the returned handle and passes clones of it in
+    /// [`EngineMemory::Shared`], which is what bounds their combined execution
+    /// memory rather than each engine's individually.
+    #[must_use]
+    pub fn shared_pool(bytes: usize) -> Arc<dyn MemoryPool> {
+        Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(
+            bytes,
+        ))
+    }
+
+    /// The default memory source for an engine built in this process: a share
+    /// of [`process_query_pool`].
+    ///
+    /// This is what makes the bound hold no matter how many engines a process
+    /// ends up with. A process can host the Flight SQL engine, several
+    /// executor task slots, and IVM tick engines at once; when each built its
+    /// own pool at a fraction of the container, the fractions summed past the
+    /// container and the container was OOM-killed while every pool still
+    /// reported headroom. One shared pool cannot oversubscribe, and
+    /// `FairSpillPool` divides it live — an engine running alone gets all of
+    /// it, so the bound costs nothing when there is no contention.
+    #[must_use]
+    pub fn for_this_process() -> Self {
+        match process_query_pool() {
+            Some(pool) => Self::Shared {
+                pool: Arc::clone(pool),
+                fair_share_bytes: process_query_pool_fair_share_bytes(),
+            },
+            None => Self::Unbounded,
+        }
+    }
+
+    /// The byte figure that should size spill reservations and session config,
+    /// or `None` when execution memory is unbounded.
+    #[must_use]
+    pub fn sizing_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Unbounded => None,
+            Self::Private(bytes) => Some(*bytes),
+            Self::Shared {
+                fair_share_bytes, ..
+            } => Some(*fair_share_bytes),
+        }
+    }
+
+    /// The pool to install on the runtime, or `None` for DataFusion's default.
+    fn pool(&self) -> Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>> {
+        match self {
+            Self::Unbounded => None,
+            Self::Private(bytes) => Some(Arc::new(
+                datafusion::execution::memory_pool::FairSpillPool::new(*bytes),
+            )),
+            Self::Shared { pool, .. } => Some(Arc::clone(pool)),
+        }
+    }
+}
+
+impl fmt::Debug for EngineMemory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unbounded => f.write_str("EngineMemory::Unbounded"),
+            Self::Private(bytes) => write!(f, "EngineMemory::Private({bytes})"),
+            Self::Shared {
+                fair_share_bytes, ..
+            } => write!(f, "EngineMemory::Shared(share={fair_share_bytes})"),
+        }
+    }
+}
+
 /// Programmatic override for [`runtime_filters_enabled_from_env`]
 /// (`u8::MAX` = unset). Exists because `std::env::set_var` is `unsafe`
 /// under edition 2024 and the workspace forbids unsafe code, so the
@@ -639,7 +790,7 @@ impl SqlEngine {
     /// Executor task engines deliberately scale this down to their per-slot
     /// share so concurrent tasks don't oversubscribe the machine.
     pub fn new() -> Self {
-        Self::new_with_memory_limit(query_memory_limit_from_env())
+        Self::new_with_engine_memory(EngineMemory::for_this_process())
     }
 
     /// Create a local SQL engine whose DataFusion execution memory is capped
@@ -654,12 +805,25 @@ impl SqlEngine {
     /// Shares [`SqlEngine::new`]'s fallback behavior for window helper UDF
     /// registration failures.
     pub fn new_with_memory_limit(memory_limit_bytes: Option<usize>) -> Self {
+        Self::new_with_engine_memory(EngineMemory::from_limit(memory_limit_bytes))
+    }
+
+    /// Create a local SQL engine over an explicit [`EngineMemory`] source.
+    ///
+    /// Prefer this over [`new_with_memory_limit`](Self::new_with_memory_limit)
+    /// when several engines live in one process: passing each of them
+    /// [`EngineMemory::Shared`] with the same pool bounds their *combined*
+    /// execution memory, which per-engine limits cannot do.
+    ///
+    /// Shares [`SqlEngine::new`]'s fallback behavior for window helper UDF
+    /// registration failures.
+    pub fn new_with_engine_memory(engine_memory: EngineMemory) -> Self {
         let parallelism = default_parallelism_from_env();
         match Self::build_local(
             None,
             WindowFnRegistration::Register,
             parallelism,
-            memory_limit_bytes,
+            engine_memory.clone(),
         ) {
             Ok(engine) => engine,
             Err(err) => {
@@ -672,7 +836,7 @@ impl SqlEngine {
                     None,
                     WindowFnRegistration::Skip,
                     parallelism,
-                    memory_limit_bytes,
+                    engine_memory.clone(),
                 )
                 .unwrap_or_else(|err| {
                     tracing::error!(
@@ -680,8 +844,13 @@ impl SqlEngine {
                         "memory-limited DataFusion runtime construction failed; \
                          falling back to an unbounded engine"
                     );
-                    Self::build_local(None, WindowFnRegistration::Skip, parallelism, None)
-                        .unwrap_or_else(|_| Self::build_absolute_minimal(parallelism))
+                    Self::build_local(
+                        None,
+                        WindowFnRegistration::Skip,
+                        parallelism,
+                        EngineMemory::Unbounded,
+                    )
+                    .unwrap_or_else(|_| Self::build_absolute_minimal(parallelism))
                 })
             }
         }
@@ -696,7 +865,7 @@ impl SqlEngine {
             None,
             WindowFnRegistration::Register,
             default_parallelism_from_env(),
-            query_memory_limit_from_env(),
+            EngineMemory::for_this_process(),
         )
     }
 
@@ -716,7 +885,7 @@ impl SqlEngine {
             Some(catalog),
             WindowFnRegistration::Register,
             default_parallelism_from_env(),
-            query_memory_limit_from_env(),
+            EngineMemory::for_this_process(),
         )
     }
 
@@ -854,8 +1023,9 @@ impl SqlEngine {
         krishiv_catalog: Option<Arc<RwLock<InMemoryCatalog>>>,
         window_fn_registration: WindowFnRegistration,
         target_partitions: NonZeroUsize,
-        memory_limit_bytes: Option<usize>,
+        engine_memory: EngineMemory,
     ) -> SqlResult<Self> {
+        let memory_limit_bytes = engine_memory.sizing_bytes();
         // Create streaming_sources first so it can be shared with KafkaTableFactory.
         // DDL-created Kafka tables (CREATE EXTERNAL TABLE … STORED AS KAFKA) then
         // correctly register in is_streaming_query.
@@ -881,14 +1051,15 @@ impl SqlEngine {
                 .with_object_store_registry(Arc::new(
                     crate::object_store_registry::LazyCloudObjectStoreRegistry::new(),
                 ));
-            if let Some(limit) = memory_limit_bytes {
-                // A FairSpillPool shares the limit across concurrently running
-                // operators and lets spill-capable operators (sort, hash join,
-                // aggregation) write to the default disk manager's temp files
-                // instead of failing outright when the pool is exhausted.
-                runtime_builder = runtime_builder.with_memory_pool(Arc::new(
-                    datafusion::execution::memory_pool::FairSpillPool::new(limit),
-                ));
+            if let Some(pool) = engine_memory.pool() {
+                // A FairSpillPool divides its capacity across concurrently
+                // running consumers and lets spill-capable operators (sort,
+                // hash join, aggregation) write to the default disk manager's
+                // temp files instead of failing outright when the pool is
+                // exhausted. Under `EngineMemory::Shared` that pool is the
+                // executor's single process-wide pool, so the consumers being
+                // divided across are every operator of every concurrent task.
+                runtime_builder = runtime_builder.with_memory_pool(pool);
             }
             let runtime_env = runtime_builder
                 .build_arc()

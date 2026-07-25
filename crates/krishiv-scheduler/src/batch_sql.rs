@@ -378,7 +378,19 @@ async fn submit_batch_sql_job_inner(
                 .iter()
                 .map(|t| (t.table_name.clone(), t.path.clone()))
                 .collect();
-            crate::distributed_batch::plan_staged_batch_stages(query, &table_refs).await
+            // Plan against the capacity that will actually run the query. The
+            // target partition count used to be a constant regardless of the
+            // cluster, which left large clusters mostly idle and queued work on
+            // small ones. Zero schedulable slots means "no executors yet", not
+            // "a cluster of size zero", so it is reported as unknown and the
+            // planner falls back to the local machine.
+            let cluster = {
+                let total_slots = coordinator.read().await.total_schedulable_slots();
+                (total_slots > 0).then_some(
+                    krishiv_sql::distributed_plan::ClusterCapacity { total_slots },
+                )
+            };
+            crate::distributed_batch::plan_staged_batch_stages(query, &table_refs, cluster).await
         } else {
             None
         };
