@@ -1,0 +1,215 @@
+{
+  "label": "distributed-3node-capacity-model",
+  "scale_factor": 100,
+  "coordinator": "http://213.199.60.184:31902",
+  "data_root": "s3://krishiv-bench/tpch/sf100",
+  "generated_at": "2026-07-25T21:46:12Z",
+  "succeeded": 14,
+  "attempted": 22,
+  "total_elapsed_s": 4689.353918002977,
+  "queries": [
+    {
+      "id": "q1",
+      "name": "pricing_summary",
+      "job_id": "batch-sql-1785002563294-0",
+      "status": "ok",
+      "elapsed_s": 166.61553266599367,
+      "result_batches": 1,
+      "stage_count": 2,
+      "task_count": 17
+    },
+    {
+      "id": "q2",
+      "name": "minimum_cost_supplier",
+      "job_id": "batch-sql-1785002729890-1",
+      "status": "ok",
+      "elapsed_s": 209.35057054599747,
+      "result_batches": 1,
+      "stage_count": 10,
+      "task_count": 145
+    },
+    {
+      "id": "q3",
+      "name": "shipping_priority",
+      "job_id": "batch-sql-1785002939254-2",
+      "status": "ok",
+      "elapsed_s": 632.4212246200041,
+      "result_batches": 1,
+      "stage_count": 5,
+      "task_count": 65
+    },
+    {
+      "id": "q4",
+      "name": "order_priority_checking",
+      "job_id": "batch-sql-1785003571677-3",
+      "status": "ok",
+      "elapsed_s": 238.89978116999555,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 49
+    },
+    {
+      "id": "q5",
+      "name": "local_supplier_volume",
+      "job_id": "batch-sql-1785003810579-4",
+      "status": "failed",
+      "error": "task stalled: no progress for 30 min",
+      "elapsed_s": 1807.652870652004
+    },
+    {
+      "id": "q6",
+      "name": "forecasting_revenue_change",
+      "job_id": "batch-sql-1785005618228-5",
+      "status": "ok",
+      "elapsed_s": 176.84507365099853,
+      "result_batches": 1,
+      "stage_count": 2,
+      "task_count": 17
+    },
+    {
+      "id": "q7",
+      "name": "volume_shipping",
+      "job_id": "batch-sql-1785005795078-6",
+      "status": "ok",
+      "elapsed_s": 1129.6956585529988,
+      "result_batches": 1,
+      "stage_count": 8,
+      "task_count": 113
+    },
+    {
+      "id": "q8",
+      "name": "national_market_share",
+      "job_id": "batch-sql-1785006924798-7",
+      "status": "failed",
+      "error": "task stalled: no progress for 30 min",
+      "elapsed_s": 1808.704583403989
+    },
+    {
+      "id": "q9",
+      "name": "product_type_profit_measure",
+      "job_id": "batch-sql-1785008733497-8",
+      "status": "failed",
+      "error": "task stalled: no progress for 30 min",
+      "elapsed_s": 1822.849465154999
+    },
+    {
+      "id": "q10",
+      "name": "returned_item_reporting",
+      "job_id": "batch-sql-1785010556337-9",
+      "status": "cancelled",
+      "error": "job was cancelled",
+      "elapsed_s": 462.2538451750006
+    },
+    {
+      "id": "q11",
+      "name": "important_stock_identification",
+      "job_id": "batch-sql-1785011018594-10",
+      "status": "ok",
+      "elapsed_s": 239.0547775060113,
+      "result_batches": 0,
+      "stage_count": 7,
+      "task_count": 97
+    },
+    {
+      "id": "q12",
+      "name": "shipping_modes_and_order_priority",
+      "job_id": "batch-sql-1785011257659-11",
+      "status": "ok",
+      "elapsed_s": 274.8548141779902,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 49
+    },
+    {
+      "id": "q13",
+      "name": "customer_distribution",
+      "job_id": "batch-sql-1785011532508-12",
+      "status": "ok",
+      "elapsed_s": 208.42892289499287,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 49
+    },
+    {
+      "id": "q14",
+      "name": "promotion_effect",
+      "job_id": "batch-sql-1785011740936-13",
+      "status": "ok",
+      "elapsed_s": 248.40846703399438,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 49
+    },
+    {
+      "id": "q15",
+      "name": "top_supplier",
+      "job_id": "batch-sql-1785011989351-14",
+      "status": "ok",
+      "elapsed_s": 370.7604642880033,
+      "result_batches": 1,
+      "stage_count": 5,
+      "task_count": 65
+    },
+    {
+      "id": "q16",
+      "name": "parts_supplier_relationship",
+      "job_id": "batch-sql-1785012360114-15",
+      "status": "ok",
+      "elapsed_s": 123.67627359600738,
+      "result_batches": 1,
+      "stage_count": 6,
+      "task_count": 81
+    },
+    {
+      "id": "q17",
+      "name": "small_quantity_order_revenue",
+      "job_id": "batch-sql-1785012483795-16",
+      "status": "failed",
+      "error": "task stalled: no progress for 30 min",
+      "elapsed_s": 1808.9838563490048
+    },
+    {
+      "id": "q18",
+      "name": "large_volume_customer",
+      "job_id": "batch-sql-1785014292776-17",
+      "status": "failed",
+      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"dfplan:v1:3:SqwHCtcCkgHTAgrQAnsidiI6MSwic3RhZ2UiOjEsIm1hcF90YXNrcyI6MTYsInBhcnRpdGlvbnMiOjE2LCJzY2hlbWFfaXBjX2I2NCI6Ii8vLy8vN2dBQUFBUUFBQUFBQUFLQUF3QUNnQUpBQVFBQ2dBQUFCQUFBQUFBQVFRQUNBQUlBQUFB\u2026': local stage fragment execution failed: DataFusion error: Resources exhausted: Failed to allocate additional 1058.2 KB for HashJoinInput[3] with 736.9 MB already allocated for this reservation - 509.6 KB remain available for the total memory pool: fair(pool_size: 1590.4 MB)",
+      "elapsed_s": 511.39476410800125
+    },
+    {
+      "id": "q19",
+      "name": "discounted_revenue",
+      "job_id": "batch-sql-1785014804209-18",
+      "status": "ok",
+      "elapsed_s": 269.272884659993,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 49
+    },
+    {
+      "id": "q20",
+      "name": "potential_part_promotion",
+      "job_id": "batch-sql-1785015073444-19",
+      "status": "ok",
+      "elapsed_s": 401.0694726399961,
+      "result_batches": 1,
+      "stage_count": 7,
+      "task_count": 97
+    },
+    {
+      "id": "q21",
+      "name": "suppliers_who_kept_orders_waiting",
+      "job_id": "batch-sql-1785015474519-20",
+      "status": "poll_failed",
+      "error": "<urlopen error [Errno 111] Connection refused>",
+      "elapsed_s": 497.6926652730035
+    },
+    {
+      "id": "q22",
+      "name": "global_sales_opportunity",
+      "status": "submit_failed",
+      "error": "<urlopen error [Errno 111] Connection refused>",
+      "elapsed_s": 0.009477191997575574
+    }
+  ]
+}

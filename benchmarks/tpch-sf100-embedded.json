@@ -1,0 +1,139 @@
+{
+  "label": "embedded-nvme-local",
+  "scale": 100,
+  "topology": "embedded-local-parquet",
+  "queries": [
+    {
+      "id": 1,
+      "name": "pricing_summary",
+      "status": "ok",
+      "elapsed_s": 24.62
+    },
+    {
+      "id": 2,
+      "name": "minimum_cost_supplier",
+      "status": "ok",
+      "elapsed_s": 9.58
+    },
+    {
+      "id": 3,
+      "name": "shipping_priority",
+      "status": "ok",
+      "elapsed_s": 79.27
+    },
+    {
+      "id": 4,
+      "name": "order_priority_checking",
+      "status": "ok",
+      "elapsed_s": 22.24
+    },
+    {
+      "id": 5,
+      "name": "local_supplier_volume",
+      "status": "ok",
+      "elapsed_s": 44.94
+    },
+    {
+      "id": 6,
+      "name": "forecasting_revenue_change",
+      "status": "ok",
+      "elapsed_s": 18.51
+    },
+    {
+      "id": 7,
+      "name": "volume_shipping",
+      "status": "ok",
+      "elapsed_s": 73.85
+    },
+    {
+      "id": 8,
+      "name": "national_market_share",
+      "status": "ok",
+      "elapsed_s": 36.87
+    },
+    {
+      "id": 9,
+      "name": "product_type_profit_measure",
+      "status": "ok",
+      "elapsed_s": 149.21
+    },
+    {
+      "id": 10,
+      "name": "returned_item_reporting",
+      "status": "ok",
+      "elapsed_s": 34.76
+    },
+    {
+      "id": 11,
+      "name": "important_stock_identification",
+      "status": "ok",
+      "elapsed_s": 7.28
+    },
+    {
+      "id": 12,
+      "name": "shipping_modes_and_order_priority",
+      "status": "ok",
+      "elapsed_s": 17.07
+    },
+    {
+      "id": 13,
+      "name": "customer_distribution",
+      "status": "ok",
+      "elapsed_s": 39.86
+    },
+    {
+      "id": 14,
+      "name": "promotion_effect",
+      "status": "ok",
+      "elapsed_s": 20.96
+    },
+    {
+      "id": 15,
+      "name": "top_supplier",
+      "status": "ok",
+      "elapsed_s": 25.59
+    },
+    {
+      "id": 16,
+      "name": "parts_supplier_relationship",
+      "status": "ok",
+      "elapsed_s": 4.68
+    },
+    {
+      "id": 17,
+      "name": "small_quantity_order_revenue",
+      "status": "ok",
+      "elapsed_s": 84.54
+    },
+    {
+      "id": 18,
+      "name": "large_volume_customer",
+      "status": "ok",
+      "elapsed_s": 189.79
+    },
+    {
+      "id": 19,
+      "name": "discounted_revenue",
+      "status": "ok",
+      "elapsed_s": 22.19
+    },
+    {
+      "id": 20,
+      "name": "potential_part_promotion",
+      "status": "ok",
+      "elapsed_s": 27.92
+    },
+    {
+      "id": 21,
+      "name": "suppliers_who_kept_orders_waiting",
+      "status": "ok",
+      "elapsed_s": 89.83
+    },
+    {
+      "id": 22,
+      "name": "global_sales_opportunity",
+      "status": "ok",
+      "elapsed_s": 5.6
+    }
+  ]
+}

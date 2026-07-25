@@ -47,10 +47,21 @@ pub const TASK_TARGET_PARALLELISM_ENV: &str = "KRISHIV_TASK_TARGET_PARALLELISM";
 /// the pool reports pressure, because the pool only sees what it accounts for.
 const PROCESS_OVERHEAD_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 
-/// Fraction of post-reserve memory handed to the query pool. The remainder
-/// absorbs the gap between what DataFusion accounts for and what it actually
-/// allocates (batch overshoot between pool checks, Arrow buffer rounding).
-const QUERY_POOL_FRACTION: f64 = 0.8;
+/// Fraction of post-reserve memory handed to the query pool.
+///
+/// The remainder is not slack — it is the memory the pool cannot see. A
+/// `MemoryPool` accounts for what operators *reserve through it*; it does not
+/// account for Arrow batches in flight between operators, shuffle write and
+/// fetch buffers, result spool chunks, or allocator fragmentation and
+/// retention. Sizing the pool at most of the container therefore still
+/// overcommits, just less obviously: the pool reports headroom while the
+/// process RSS walks past the cgroup limit and the kernel kills it.
+///
+/// This was 0.8, and it was still too high — the SF100 cluster run OOM-killed
+/// executors 11, 7 and 3 times with pools that never reported pressure. 0.6
+/// matches Spark's `spark.memory.fraction` default, which exists for exactly
+/// this reason after the same lesson.
+const QUERY_POOL_FRACTION: f64 = 0.6;
 
 /// Floor for a single task's fair share of the shared pool. Below this a task
 /// spills more than it computes, so slots are capped rather than divided
@@ -266,11 +277,18 @@ mod tests {
         let cap = ExecutorCapacity::derive(4, Some(2_684_354_560), None, None, None);
         assert_eq!(cap.slots.get(), 4, "4 cores support 4 concurrent tasks");
         assert_eq!(cap.slots_source, CapacitySource::Derived);
-        // (2.5 GiB - 512 MiB) * 0.8 ≈ 1.6 GiB, shared across all slots.
+        // (2.5 GiB - 512 MiB) * 0.6 ≈ 1.25 GiB, shared across all slots. The
+        // 40% left over is what the pool cannot see: Arrow batches in flight,
+        // shuffle buffers, allocator retention.
         let pool = cap.query_pool_bytes.expect("bounded container yields a pool");
         assert!(
-            (1_600_000_000..1_800_000_000).contains(&pool),
-            "pool {pool} outside the expected ~1.6 GiB band"
+            (1_150_000_000..1_350_000_000).contains(&pool),
+            "pool {pool} outside the expected ~1.25 GiB band"
+        );
+        assert!(
+            pool < 2_684_354_560 / 2,
+            "the pool must leave the majority of a small container to \
+             everything that does not allocate through it"
         );
         assert_eq!(cap.task_parallelism.get(), 1, "4 cores / 4 slots");
     }
@@ -341,22 +359,24 @@ mod tests {
 
     #[test]
     fn a_small_container_still_gets_a_pool_because_unbounded_means_oom_kill() {
-        // 600 MiB: after the 512 MiB overhead reserve only ~70 MiB is left for
-        // queries. That is tight, but a tight pool spills — an unbounded pool
-        // in a container this size gets the process killed instead.
-        let cap = ExecutorCapacity::derive(2, Some(629_145_600), None, None, None);
-        let pool = cap.query_pool_bytes.expect("a small container is still bounded");
+        // 900 MiB: after the 512 MiB overhead reserve, 60% of what is left is
+        // ~233 MiB for queries. Tight, but a tight pool spills — an unbounded
+        // pool in a container this size gets the process killed instead.
+        let cap = ExecutorCapacity::derive(2, Some(943_718_400), None, None, None);
+        let pool = cap
+            .query_pool_bytes
+            .expect("a small container is still bounded");
         assert!(pool >= MIN_VIABLE_POOL_BYTES);
-        // Memory, not cores, decides how many tasks may share it.
-        assert_eq!(cap.slots.get(), 1, "70 MiB cannot feed two 256 MiB shares");
+        assert_eq!(cap.slots.get(), 1, "233 MiB cannot feed two 256 MiB shares");
         assert_eq!(cap.task_parallelism.get(), 2, "the one task gets both cores");
     }
 
     #[test]
     fn a_container_below_the_viable_pool_floor_falls_back_to_unbounded() {
-        // 550 MiB leaves ~30 MiB after the reserve. A pool that small fails
-        // queries the process has the memory to complete, so it is not built.
-        let cap = ExecutorCapacity::derive(2, Some(576_716_800), None, None, None);
+        // 600 MiB leaves ~88 MiB after the reserve, and 60% of that is under
+        // the floor. A pool that small fails queries the process has the
+        // memory to complete, so it is not built.
+        let cap = ExecutorCapacity::derive(2, Some(629_145_600), None, None, None);
         assert_eq!(cap.query_pool_bytes, None);
         assert_eq!(cap.slots.get(), 2, "nothing but cores bounds an unbounded pool");
     }

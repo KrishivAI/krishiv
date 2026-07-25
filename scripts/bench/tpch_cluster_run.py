@@ -85,22 +85,63 @@ def load_corpus(corpus_json: str | None) -> list[dict]:
     return json.loads(proc.stdout)["queries"]
 
 
+# A coordinator restart, a rolling update, or a momentary connection refusal
+# is not a query result. Without a retry the benchmark records the blip as the
+# query's outcome: q21 and q22 were both reported failed on 2026-07-25 for
+# "Connection refused" while the engine was fine, which silently turns an
+# infrastructure hiccup into a fabricated engine failure.
+_TRANSIENT_RETRIES = 5
+_TRANSIENT_BACKOFF_S = 3.0
+
+
+def _with_retry(operation, what: str):
+    """Run `operation`, retrying transient transport errors with backoff.
+
+    Only connection-level failures retry. An HTTP error carrying a real
+    response (a 4xx from the coordinator rejecting the query) is the answer,
+    not a blip, and is raised immediately.
+    """
+    last: Exception | None = None
+    for attempt in range(_TRANSIENT_RETRIES):
+        try:
+            return operation()
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as err:
+            last = err
+            if attempt + 1 < _TRANSIENT_RETRIES:
+                delay = _TRANSIENT_BACKOFF_S * (2**attempt)
+                print(
+                    f"#   transient {what} error ({err}); "
+                    f"retry {attempt + 1}/{_TRANSIENT_RETRIES - 1} in {delay:.0f}s",
+                    flush=True,
+                )
+                time.sleep(delay)
+    raise RuntimeError(f"{what} failed after {_TRANSIENT_RETRIES} attempts: {last}")
+
+
 def post(url: str, body: dict, token: str | None, timeout: float) -> dict:
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    def once() -> dict:
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    return _with_retry(once, "POST")
 
 
 def get(url: str, token: str | None, timeout: float) -> dict:
-    req = urllib.request.Request(url, method="GET")
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    def once() -> dict:
+        req = urllib.request.Request(url, method="GET")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    return _with_retry(once, "GET")
 
 
 def table_path(data_root: str, table: str, single_file: set[str]) -> str:
