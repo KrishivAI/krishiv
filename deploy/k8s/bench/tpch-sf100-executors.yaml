@@ -29,7 +29,7 @@ spec:
       nodeSelector: { kubernetes.io/hostname: s1 }
       containers:
         - name: executor
-          image: localhost/krishiv:fast-b907ae23
+          image: localhost/krishiv:fast-be08b311
           imagePullPolicy: IfNotPresent
           command:
             - krishiv
@@ -42,7 +42,7 @@ spec:
             - --heartbeat-interval-secs
             - "10"
             - --slots
-            - "4"
+            - "3"
             - --http-addr
             - 0.0.0.0:2002
             - --task-grpc-addr
@@ -69,6 +69,10 @@ spec:
             # job died after five "executor losses" that were really just DNS.
             - name: POD_IP
               valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            # Sized against slots, not left to the 25%-of-cgroup default:
+            # slots x pool must fit the container. 3 x 1.4 GB < 4.5 GB.
+            - name: KRISHIV_QUERY_MEMORY_LIMIT_BYTES
+              value: "1400000000"
             - name: RUST_LOG
               value: info
             - name: AWS_ACCESS_KEY_ID
@@ -110,7 +114,7 @@ spec:
       nodeSelector: { kubernetes.io/hostname: s2 }
       containers:
         - name: executor
-          image: localhost/krishiv:fast-b907ae23
+          image: localhost/krishiv:fast-be08b311
           imagePullPolicy: IfNotPresent
           command:
             - krishiv
@@ -123,7 +127,7 @@ spec:
             - --heartbeat-interval-secs
             - "10"
             - --slots
-            - "3"
+            - "2"
             - --http-addr
             - 0.0.0.0:2002
             - --task-grpc-addr
@@ -150,6 +154,10 @@ spec:
             # job died after five "executor losses" that were really just DNS.
             - name: POD_IP
               valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            # Sized against slots, not left to the 25%-of-cgroup default:
+            # slots x pool must fit the container. 3 x 1.4 GB < 4.5 GB.
+            - name: KRISHIV_QUERY_MEMORY_LIMIT_BYTES
+              value: "1000000000"
             - name: RUST_LOG
               value: info
             - name: AWS_ACCESS_KEY_ID
@@ -188,7 +196,7 @@ spec:
       nodeSelector: { kubernetes.io/hostname: s3 }
       containers:
         - name: executor
-          image: localhost/krishiv:fast-b907ae23
+          image: localhost/krishiv:fast-be08b311
           imagePullPolicy: IfNotPresent
           command:
             - krishiv
@@ -201,7 +209,7 @@ spec:
             - --heartbeat-interval-secs
             - "10"
             - --slots
-            - "4"
+            - "3"
             - --http-addr
             - 0.0.0.0:2002
             - --task-grpc-addr
@@ -228,6 +236,10 @@ spec:
             # job died after five "executor losses" that were really just DNS.
             - name: POD_IP
               valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            # Sized against slots, not left to the 25%-of-cgroup default:
+            # slots x pool must fit the container. 3 x 1.4 GB < 4.5 GB.
+            - name: KRISHIV_QUERY_MEMORY_LIMIT_BYTES
+              value: "1400000000"
             - name: RUST_LOG
               value: info
             - name: AWS_ACCESS_KEY_ID

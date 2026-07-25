@@ -422,3 +422,59 @@ performance one. The nightly job now runs `--tier nightly --require-fresh 8`
 and never sees TPC-H; the TPC-H tier runs `--tier tpch --require-fresh 30` on a
 host that has the data. Verified both directions: deleting one TPC-H
 measurement fails the tpch tier with `STALE` and leaves the nightly tier green.
+
+### 2026-07-25 — TPC-H SF100 on the 3-node cluster (all 22 queries)
+
+Two things changed with this entry: the corpus went from 6 hand-written
+queries to **all 22**, and the benchmark moved from a single box to the
+3-node k3s cluster with the dataset in object storage.
+
+**Setup**
+
+- **Cluster**: 3 × (4 vCPU, 7 GiB RAM) k3s nodes (s1/s2/s3), Ubuntu 26.04.
+  One executor pinned per node (4/3/4 slots); coordinator co-resident. This
+  pinning is deliberate — the default `replicas: 3` Deployment had stacked two
+  executors on s1 and none on s3, which reads as a 3-node benchmark and is not
+  one. See `deploy/k8s/bench/tpch-sf100-executors.yaml`.
+- **Data**: TPC-H SF100 Parquet, `tpchgen-cli` v3.0.0, **39 GiB / 68 objects**
+  in MinIO (`s3://krishiv-bench/tpch/sf100`). Big tables are split into parts
+  (lineitem 32, orders 16, partsupp 8) so a scan has files to spread across
+  executors; nation and region are single files.
+- **Corpus**: `crates/krishiv-bench/src/tpch_queries.rs`, shared by the
+  single-node and cluster runners via `tpch_corpus` so both execute identical
+  SQL. All 22 verified executable against SF1 first
+  (`cargo run -p krishiv-bench --bin tpch_verify`), with row counts matching
+  the canonical answers (q9=175, q11=1048, q16=18314, q18=57, q22=7).
+- **Runner**: `scripts/bench/tpch_cluster_run.py` — submits each query to
+  `POST /api/v1/batch-sql/submit` and polls to completion.
+
+**Honest characterisation of this operating point.** 21 GiB of cluster RAM
+against a 39 GiB dataset means non-trivial queries spill; these are
+spill-inclusive numbers, not in-memory ones. All three executors read from a
+single MinIO pod, so the object store is a shared bottleneck — this measures
+Krishiv-on-a-small-MinIO, not Krishiv against S3-class bandwidth. Both are
+properties of this hardware, and neither is hidden by the numbers below.
+
+**What this run found before it produced any timing.** Submitting the corpus
+against `s3://` tables surfaced a chain of three defects, each hidden behind
+the previous one:
+
+1. The stage builder planned on a DataFusion context with no object store, so
+   `register_parquet` on an `s3://` path failed schema inference. The caller
+   reads any planning error as "decline to stage", so the job fell back to the
+   single-task path — **the whole dataset scanned by one executor while the
+   other two idled**, with correct results and no error. Measured cost on q6 at
+   SF100: **518 s single-task**. Fixed in `5ce98ead`.
+2. With staging fixed the fragment became a `dfplan:` stage, which then failed
+   to decode: `No suitable object store found for s3://`. A serialized physical
+   plan carries file paths but no way to register their store, and the executor
+   only learns which buckets a plan touches *by decoding it* — so resolution has
+   to be lazy. Fixed in `fcc48788` with `LazyCloudObjectStoreRegistry`.
+3. Executors advertised their pod hostname, which nothing in the cluster
+   resolves (no headless Service), so every task launch failed as a "transport
+   error" and the job died after five *apparent* executor losses that were
+   really DNS. Fixed in the manifest via `POD_IP` (downward API).
+
+The first is the one worth remembering: **a distributed engine silently
+degrading to single-node execution, with correct output and a debug-level log
+line as the only evidence.** A benchmark is what caught it.

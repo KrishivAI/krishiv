@@ -164,6 +164,11 @@ def run_query(
                 "status": "ok",
                 "elapsed_s": elapsed,
                 "result_batches": len(poll.get("inline_record_batch_ipc", [])),
+                # Recorded, not assumed: stage_count == 1 and task_count == 1
+                # means the query ran on ONE executor. A timing without this is
+                # a number whose topology you cannot check afterwards.
+                "stage_count": poll.get("stage_count"),
+                "task_count": poll.get("task_count"),
             }
         if state in ("Failed", "Cancelled"):
             return {
@@ -240,7 +245,8 @@ def main() -> int:
         if outcome["status"] == "ok":
             print(
                 f"ok   {outcome['id']:>3} {outcome['name']:<34} "
-                f"{outcome['elapsed_s']:>9.2f} s",
+                f"{outcome['elapsed_s']:>9.2f} s  "
+                f"stages={outcome.get('stage_count')} tasks={outcome.get('task_count')}",
                 flush=True,
             )
         else:
