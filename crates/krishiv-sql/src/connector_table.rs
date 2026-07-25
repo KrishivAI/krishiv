@@ -23,9 +23,11 @@ use crate::kafka_table::{KafkaPartitionStream, kafka_auto_commit_interval_ms, pr
 /// against one is a native DataFusion ListingTable read, not a connector source.
 fn is_object_store_url(location: &str) -> bool {
     let l = location.trim_start();
-    ["s3://", "s3a://", "gs://", "gcs://", "az://", "azure://", "abfs://", "abfss://"]
-        .iter()
-        .any(|scheme| l.starts_with(scheme))
+    [
+        "s3://", "s3a://", "gs://", "gcs://", "az://", "azure://", "abfs://", "abfss://",
+    ]
+    .iter()
+    .any(|scheme| l.starts_with(scheme))
 }
 
 /// Reject paths that escape the warehouse root via traversal or absolutes.

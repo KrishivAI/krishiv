@@ -328,8 +328,8 @@ impl PythonWorkerAggregateUdf {
 /// buffer. The buffer is a flat concatenation of `[u32 le len][ipc]` frames, so
 /// `accumulate` is O(batch) and `merge` is O(1) byte concatenation.
 fn push_state_frame(data: &mut Vec<u8>, ipc: &[u8]) -> Result<(), UdfError> {
-    let len = u32::try_from(ipc.len())
-        .map_err(|_| exec_err("aggregate state frame exceeds 4 GiB"))?;
+    let len =
+        u32::try_from(ipc.len()).map_err(|_| exec_err("aggregate state frame exceeds 4 GiB"))?;
     data.extend_from_slice(&len.to_le_bytes());
     data.extend_from_slice(ipc);
     Ok(())
@@ -558,8 +558,11 @@ mod tests {
         );
         let schema = Arc::new(udf.input_schema().clone());
         let mk = |vals: Vec<f64>| {
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Float64Array::from(vals))])
-                .unwrap()
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Float64Array::from(vals))],
+            )
+            .unwrap()
         };
 
         // Partition A accumulates {1,2,4}; partition B accumulates {8,16}.

@@ -70,6 +70,19 @@ pub struct BatchSqlPollResponse {
     /// Present when state == "Failed" or "Cancelled".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// How many stages the job was planned into.
+    ///
+    /// This is the client's only way to tell a distributed run from one that
+    /// quietly degraded to a single task. Staging is declined for many
+    /// legitimate reasons (DDL, unsupported plan shapes) and one illegitimate
+    /// one — a planning bug — and in every case the query still returns
+    /// correct rows. A caller benchmarking a cluster, or an operator wondering
+    /// why one node is hot, needs the execution shape as *data*, not as a log
+    /// line they have to know to go looking for.
+    pub stage_count: usize,
+    /// Total tasks across all stages. `stage_count == 1 && task_count == 1`
+    /// means the whole query ran on one executor.
+    pub task_count: usize,
 }
 
 /// `GET /api/v1/batch-sql/{job_id}` — poll a submitted batch SQL job.
@@ -83,12 +96,30 @@ pub async fn api_batch_sql_poll(
     use krishiv_proto::JobState;
     let job_id = krishiv_proto::JobId::try_new(&job_id_str).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let state = {
+    // Read the execution shape and any task-level failure reason in the same
+    // borrow as the state, so the response describes one consistent snapshot.
+    let (state, stage_count, task_count, failure_reason) = {
         let coord = coordinator.read().await;
-        coord
+        let snapshot = coord
             .job_snapshot(&job_id)
-            .map(|s| s.state())
-            .map_err(|_| StatusCode::NOT_FOUND)?
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        // The real reason a job failed lives on the task that failed. Returning
+        // a bare "job failed" forced every caller to go read executor logs to
+        // learn anything at all — which is how a plain "No suitable object
+        // store found for s3://" stayed invisible behind a generic string.
+        let failure_reason = coord.job_detail_snapshot(&job_id).ok().and_then(|detail| {
+            detail
+                .stages()
+                .iter()
+                .flat_map(|stage| stage.tasks())
+                .find_map(|task| task.last_failure_reason().map(str::to_owned))
+        });
+        (
+            snapshot.state(),
+            snapshot.stage_count(),
+            snapshot.task_count(),
+            failure_reason,
+        )
     };
 
     let resp = match state {
@@ -115,25 +146,38 @@ pub async fn api_batch_sql_poll(
                 state: "Succeeded".into(),
                 inline_record_batch_ipc: batches,
                 error: None,
+                stage_count,
+                task_count,
             }
         }
         JobState::Failed => BatchSqlPollResponse {
             job_id: job_id_str,
             state: "Failed".into(),
             inline_record_batch_ipc: vec![],
-            error: Some("job failed".into()),
+            // Prefer the failing task's own message; fall back to the generic
+            // string only when no task recorded a reason.
+            error: Some(
+                failure_reason
+                    .unwrap_or_else(|| String::from("job failed (no task reported a reason)")),
+            ),
+            stage_count,
+            task_count,
         },
         JobState::Cancelled => BatchSqlPollResponse {
             job_id: job_id_str,
             state: "Cancelled".into(),
             inline_record_batch_ipc: vec![],
             error: Some("job was cancelled".into()),
+            stage_count,
+            task_count,
         },
         s => BatchSqlPollResponse {
             job_id: job_id_str,
             state: format!("{s:?}"),
             inline_record_batch_ipc: vec![],
             error: None,
+            stage_count,
+            task_count,
         },
     };
     Ok(Json(resp))

@@ -43,6 +43,7 @@ use base64::Engine as _;
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -518,10 +519,7 @@ fn plan_is_split_safe(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// does the same thing for the engine's long-lived context. The stage builder
 /// plans on a throwaway context instead, so it needs its own registration —
 /// that asymmetry is exactly what made object-store tables un-stageable.
-fn register_object_store_for_path(
-    ctx: &SessionContext,
-    path: &str,
-) -> SqlResult<()> {
+fn register_object_store_for_path(ctx: &SessionContext, path: &str) -> SqlResult<()> {
     if !(path.starts_with("s3://") || path.starts_with("s3a://")) {
         return Ok(());
     }
@@ -958,15 +956,15 @@ pub fn build_distributed_stages(
     let root = match cut_exchanges(plan, &mut drafts) {
         Ok(root) => root,
         Err(Unsupported(reason)) => {
-            tracing::debug!(
-                reason,
-                "stage split unsupported; falling back to single task"
-            );
-            return Ok(None);
+            return Err(SqlError::DataFusion {
+                message: format!("stage split unsupported: {reason}"),
+            });
         }
     };
     if drafts.is_empty() {
-        return Ok(None);
+        return Err(SqlError::DataFusion {
+            message: String::from("plan has no exchange to cut, so it cannot be split into stages"),
+        });
     }
     drafts.push(StageDraft {
         plan: root,
@@ -978,11 +976,9 @@ pub fn build_distributed_stages(
     // leftover RepartitionExec would re-drive all inputs per task).
     for draft in &drafts {
         if let Some(reason) = find_unsupported_stage_node(&draft.plan) {
-            tracing::debug!(
-                reason,
-                "stage subtree not partition-independent; falling back to single task"
-            );
-            return Ok(None);
+            return Err(SqlError::DataFusion {
+                message: format!("stage subtree not partition-independent: {reason}"),
+            });
         }
     }
 
@@ -991,8 +987,9 @@ pub fn build_distributed_stages(
     for draft in drafts {
         let partition_count = draft.plan.output_partitioning().partition_count();
         if partition_count == 0 {
-            tracing::debug!("stage subtree has zero output partitions; falling back");
-            return Ok(None);
+            return Err(SqlError::DataFusion {
+                message: String::from("stage subtree has zero output partitions"),
+            });
         }
         let upstream_stage_indexes = collect_upstream_stage_indexes(&draft.plan);
         let bytes = match encode_dfplan_bytes(Arc::clone(&draft.plan), &codec) {
@@ -1051,6 +1048,50 @@ fn cut_exchanges(
             stage_index,
             map_task_count,
             *num_partitions,
+            schema,
+            None,
+        )));
+    }
+
+    // A gather (N partitions -> 1) is an exchange too, and cutting it is what
+    // makes ungrouped aggregates distributable. `SELECT sum(x) FROM lineitem`
+    // plans as Final(gather(Partial(scan))) with no hash exchange anywhere, so
+    // a cutter that only recognised RepartitionExec declined the whole query
+    // and one executor scanned the entire table — 518 s for TPC-H q6 at SF100
+    // on a 3-node cluster, with the other two nodes idle.
+    //
+    // Cutting here puts the Partial aggregate in a map stage (one task per file
+    // group, running everywhere) and the Final aggregate in a reduce stage
+    // reading a single shuffle partition. The shuffle writer already routes
+    // every row to partition 0 when no key column is given, so a keyless
+    // 1-partition output is exactly a gather.
+    if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>() {
+        let input = cut_exchanges(Arc::clone(coalesce.input()), stages)?;
+        let map_task_count = input.output_partitioning().partition_count();
+        if map_task_count <= 1 {
+            // Nothing to spread: a one-partition input gathers to itself, and
+            // a stage boundary here would add a shuffle round trip for no
+            // parallelism. Keep the node as-is.
+            return plan
+                .with_new_children(vec![input])
+                .map_err(|e| Unsupported(format!("gather rewrite: {e}")));
+        }
+        let schema = input.schema();
+        let stage_index = stages.len();
+        stages.push(StageDraft {
+            plan: input,
+            shuffle: Some(StageShuffleOutput {
+                key_columns: Vec::new(),
+                num_output_partitions: 1,
+            }),
+        });
+        // The read replaces the whole gather: coalesce(N->1) and
+        // shuffle(N->1)+read(partition 0) produce the same single stream, and
+        // CoalescePartitionsExec carries no ordering guarantee to preserve.
+        return Ok(Arc::new(ShuffleReadExec::new(
+            stage_index,
+            map_task_count,
+            1,
             schema,
             None,
         )));
@@ -1219,6 +1260,88 @@ mod tests {
     }
 
     /// ADR-0003 risk gate: a scan→filter→hash-aggregate plan round-trips
+    /// An ungrouped aggregate must split into stages.
+    ///
+    /// `SELECT sum(x) FROM t` plans as Final(gather(Partial(scan))) — there is
+    /// no hash exchange anywhere, because there are no grouping keys to hash
+    /// on. A cutter that only recognised `RepartitionExec` therefore declined
+    /// the entire query class and ran it as one task: TPC-H q6 at SF100 took
+    /// 518 s on a 3-node cluster with two nodes idle. The work is
+    /// embarrassingly parallel — partial aggregates per file group, combined
+    /// once — so declining was a pure loss.
+    ///
+    /// Asserting on stage COUNT is what makes this a regression test: a plan
+    /// that merely round-trips proves nothing about distribution.
+    #[tokio::test]
+    async fn ungrouped_aggregate_splits_into_map_and_reduce_stages() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write_test_parquet(tmp.path()).await;
+        let tables = vec![(
+            String::from("t"),
+            path.to_str().expect("utf8 path").to_owned(),
+        )];
+
+        let staged = build_stages_for_parquet_query(
+            "SELECT SUM(amount) AS total, COUNT(*) AS n FROM t WHERE id >= 100",
+            &tables,
+        )
+        .await
+        .expect("planning must not error")
+        .expect("an ungrouped aggregate must be stage-split, not declined");
+
+        assert!(
+            staged.stages.len() >= 2,
+            "expected a map stage and a reduce stage, got {} stage(s) — \
+             the gather was not cut, so the whole scan runs in one task",
+            staged.stages.len()
+        );
+
+        // The map stage gathers to exactly one reduce partition, and carries no
+        // hash key: every row goes to partition 0, which is what a gather means.
+        let map = &staged.stages[0];
+        let shuffle = map
+            .shuffle
+            .as_ref()
+            .expect("the map stage must write a shuffle output");
+        assert_eq!(
+            shuffle.num_output_partitions, 1,
+            "a gather must produce exactly one reduce partition"
+        );
+        assert!(
+            shuffle.key_columns.is_empty(),
+            "a gather has no partitioning key; got {:?}",
+            shuffle.key_columns
+        );
+    }
+
+    /// A grouped aggregate keeps cutting at the hash exchange, with real hash
+    /// keys — the gather cut must not have swallowed that path.
+    #[tokio::test]
+    async fn grouped_aggregate_still_cuts_at_the_hash_exchange() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write_test_parquet(tmp.path()).await;
+        let tables = vec![(
+            String::from("t"),
+            path.to_str().expect("utf8 path").to_owned(),
+        )];
+
+        let staged = build_stages_for_parquet_query(
+            "SELECT category, SUM(amount) AS total FROM t GROUP BY category",
+            &tables,
+        )
+        .await
+        .expect("planning must not error")
+        .expect("a grouped aggregate must be stage-split");
+
+        let map = &staged.stages[0];
+        let shuffle = map.shuffle.as_ref().expect("map stage writes a shuffle");
+        assert_eq!(
+            shuffle.key_columns,
+            vec![String::from("category")],
+            "a grouped aggregate must shuffle on its grouping key"
+        );
+    }
+
     /// through datafusion-proto on the pinned DataFusion and executes
     /// identically from a fresh context.
     #[tokio::test]

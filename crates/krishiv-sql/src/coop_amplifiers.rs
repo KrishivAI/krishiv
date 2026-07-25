@@ -22,10 +22,10 @@ use std::sync::Arc;
 use datafusion::common::Result;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::joins::{CrossJoinExec, NestedLoopJoinExec};
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
 
 /// Wraps input-amplifying operators in [`CooperativeExec`] so their output
 /// participates in cooperative scheduling. See the module docs for why the

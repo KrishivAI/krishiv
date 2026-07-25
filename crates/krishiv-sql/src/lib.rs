@@ -104,8 +104,8 @@ pub mod introspection_sql;
 
 pub mod kafka_table;
 pub mod lakehouse;
-pub mod object_store_registry;
 pub mod live_table;
+pub mod object_store_registry;
 pub mod pipeline_ddl;
 pub mod pivot_sql;
 pub mod python_udf;
@@ -890,12 +890,14 @@ impl SqlEngine {
                     datafusion::execution::memory_pool::FairSpillPool::new(limit),
                 ));
             }
-            let runtime_env = runtime_builder.build_arc().map_err(|e| SqlError::DataFusion {
-                message: format!(
-                    "failed to build DataFusion runtime \
+            let runtime_env = runtime_builder
+                .build_arc()
+                .map_err(|e| SqlError::DataFusion {
+                    message: format!(
+                        "failed to build DataFusion runtime \
                      (memory limit {memory_limit_bytes:?} bytes): {e}"
-                ),
-            })?;
+                    ),
+                })?;
             state_builder = state_builder.with_runtime_env(runtime_env);
         }
         let mut state = state_builder.build();
@@ -1647,11 +1649,7 @@ impl SqlEngine {
 
     /// Parse and register one `name:in1,in2:out:pickle_b64` directive body as a
     /// scalar or aggregate Python UDF.
-    async fn register_python_udf_directive(
-        &self,
-        body: &str,
-        is_aggregate: bool,
-    ) -> SqlResult<()> {
+    async fn register_python_udf_directive(&self, body: &str, is_aggregate: bool) -> SqlResult<()> {
         use base64::Engine as _;
         let mut parts = body.splitn(4, ':');
         let (name, in_types, out_type, pickle_b64) =
@@ -3382,10 +3380,7 @@ pub trait KrishivDataFrameOps: Send + Sync {
     /// Unnest (explode) one or more array/list columns, producing one output
     /// row per element. Multiple equal-length columns are zipped element-wise
     /// (DataFusion `DataFrame::unnest_columns`).
-    async fn unnest_columns(
-        &self,
-        columns: &[&str],
-    ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+    async fn unnest_columns(&self, columns: &[&str]) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 
     /// Group by expressions and compute aggregate expressions.
     async fn aggregate(
@@ -4484,11 +4479,12 @@ impl KrishivDataFrameOps for SqlDataFrame {
         // Fall back to the original query string if unparsing is unavailable.
         match datafusion::sql::unparser::plan_to_sql(self.dataframe.logical_plan()) {
             Ok(statement) => Ok(statement.to_string()),
-            Err(err) => self.query().map(str::to_string).ok_or_else(|| {
-                SqlError::Unsupported {
+            Err(err) => self
+                .query()
+                .map(str::to_string)
+                .ok_or_else(|| SqlError::Unsupported {
                     feature: format!("cannot render DataFrame plan as SQL: {err}"),
-                }
-            }),
+                }),
         }
     }
     async fn execute_stream(&self) -> SqlResult<SqlStream> {
@@ -4518,10 +4514,7 @@ impl KrishivDataFrameOps for SqlDataFrame {
         Ok(Box::new(self.with_new_dataframe(df, "select_exprs")))
     }
 
-    async fn unnest_columns(
-        &self,
-        columns: &[&str],
-    ) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+    async fn unnest_columns(&self, columns: &[&str]) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
         let df = self.dataframe.clone().unnest_columns(columns)?;
         Ok(Box::new(self.with_new_dataframe(df, "unnest")))
     }

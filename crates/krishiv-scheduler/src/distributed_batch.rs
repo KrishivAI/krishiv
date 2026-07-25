@@ -29,8 +29,39 @@ pub async fn plan_staged_batch_stages(
     query: &str,
     tables: &[(String, std::path::PathBuf)],
 ) -> Option<Vec<StageSpec>> {
+    match plan_staged_batch_stages_verbose(query, tables).await {
+        Ok(stages) => Some(stages),
+        Err(reason) => {
+            // WARN, not DEBUG. Declining to stage means the query runs as a
+            // single task: correct results, but the whole dataset scanned by
+            // one executor while the rest of the cluster idles. That is a
+            // performance cliff with no other symptom, and it hid a real bug
+            // for an entire benchmarking session because the only evidence was
+            // a debug line nobody had enabled. Anyone reading logs at default
+            // level should see when their cluster stopped being a cluster.
+            tracing::warn!(
+                reason = %reason,
+                "batch SQL will run as a SINGLE task (no stage split); \
+                 the query executes on one executor"
+            );
+            None
+        }
+    }
+}
+
+/// [`plan_staged_batch_stages`], but returning why staging was declined.
+///
+/// Split out so the reason is a value rather than a log side effect: tests
+/// assert on it, and the caller decides how loudly to report it.
+pub async fn plan_staged_batch_stages_verbose(
+    query: &str,
+    tables: &[(String, std::path::PathBuf)],
+) -> Result<Vec<StageSpec>, String> {
     if !stage_split_enabled() {
-        return None;
+        return Err(format!(
+            "stage splitting disabled via {}",
+            krishiv_sql::distributed_plan::STAGE_SPLIT_ENV
+        ));
     }
     // A Python scalar UDF query carries leading `/* krishiv-register-python-udf */`
     // directive(s). Split them off: they ride along on every stage fragment (so
@@ -48,22 +79,26 @@ pub async fn plan_staged_batch_stages(
         trimmed.len() >= prefix.len() && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix)
     });
     if !is_select {
-        return None;
+        return Err(String::from(
+            "not a plain SELECT/WITH query; DDL, DML and engine extensions \
+             keep single-task lifecycle semantics",
+        ));
     }
 
-    let table_paths: Vec<(String, String)> = tables
-        .iter()
-        .map(|(name, path)| Some((name.clone(), path.to_str()?.to_owned())))
-        .collect::<Option<_>>()?;
+    let mut table_paths: Vec<(String, String)> = Vec::with_capacity(tables.len());
+    for (name, path) in tables {
+        let Some(text) = path.to_str() else {
+            return Err(format!("table '{name}' has a non-UTF-8 path"));
+        };
+        table_paths.push((name.clone(), text.to_owned()));
+    }
     let staged = match build_stages_for_parquet_query(query, &table_paths).await {
         Ok(Some(staged)) => staged,
-        Ok(None) => return None,
-        Err(error) => {
-            tracing::debug!(%error, "staged batch planning failed; using single-task path");
-            return None;
-        }
+        Ok(None) => return Err(String::from("planner produced no distributable stages")),
+        Err(error) => return Err(error.to_string()),
     };
     stage_specs_from_plan(&staged, &udf_directives)
+        .ok_or_else(|| String::from("stage specs could not be built from the staged plan"))
 }
 
 /// Split leading `/* krishiv-register-python-udf:… */` scalar-UDF directive

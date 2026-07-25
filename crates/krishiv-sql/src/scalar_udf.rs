@@ -94,8 +94,8 @@ pub fn expand_scalar_sql_functions(
         return Ok(sql.to_string());
     }
     let dialect = GenericDialect {};
-    let mut statements =
-        Parser::parse_sql(&dialect, sql).map_err(|e| format!("cannot parse query for scalar-UDF expansion: {e}"))?;
+    let mut statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|e| format!("cannot parse query for scalar-UDF expansion: {e}"))?;
 
     // Bounded fixpoint so a function body that itself calls another registered
     // function is also expanded; the bound guards against a mutually-recursive
@@ -143,13 +143,19 @@ mod tests {
         defs.iter()
             .map(|(n, p, b)| {
                 let params: Vec<String> = p.iter().map(|s| s.to_string()).collect();
-                (n.to_lowercase(), ScalarSqlFunction::new(n, &params, b).unwrap())
+                (
+                    n.to_lowercase(),
+                    ScalarSqlFunction::new(n, &params, b).unwrap(),
+                )
             })
             .collect()
     }
 
     fn norm(s: &str) -> String {
-        s.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase()
+        s.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_lowercase()
     }
 
     #[test]
@@ -182,12 +188,13 @@ mod tests {
     #[test]
     fn leaves_unrelated_and_builtin_calls_untouched() {
         let funcs = reg(&[("tax", &["x"], "x * 1.1")]);
-        let out = expand_scalar_sql_functions(
-            "SELECT SUM(amount), UPPER(region) FROM sales",
-            &funcs,
-        )
-        .unwrap();
-        assert_eq!(norm(&out), norm("SELECT SUM(amount), UPPER(region) FROM sales"));
+        let out =
+            expand_scalar_sql_functions("SELECT SUM(amount), UPPER(region) FROM sales", &funcs)
+                .unwrap();
+        assert_eq!(
+            norm(&out),
+            norm("SELECT SUM(amount), UPPER(region) FROM sales")
+        );
     }
 
     #[test]

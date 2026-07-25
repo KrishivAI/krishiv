@@ -76,9 +76,7 @@ pub fn register_higher_order_spark_functions(ctx: &SessionContext) -> DFResult<(
     ctx.register_higher_order_function(Arc::new(HigherOrderUDF::new_from_impl(
         ArrayAllMatch::new(),
     )));
-    ctx.register_higher_order_function(Arc::new(HigherOrderUDF::new_from_impl(
-        ArrayReduce::new(),
-    )));
+    ctx.register_higher_order_function(Arc::new(HigherOrderUDF::new_from_impl(ArrayReduce::new())));
     Ok(())
 }
 
@@ -203,11 +201,8 @@ impl HigherOrderUDFImpl for ArrayReduce {
     fn invoke_with_args(&self, args: HigherOrderFunctionArgs) -> DFResult<ColumnarValue> {
         let num_rows = args.number_rows;
         let [list, init, merge] = take_function_args(self.name(), &args.args)?;
-        let (
-            ValueOrLambda::Value(list),
-            ValueOrLambda::Value(init),
-            ValueOrLambda::Lambda(merge),
-        ) = (list, init, merge)
+        let (ValueOrLambda::Value(list), ValueOrLambda::Value(init), ValueOrLambda::Lambda(merge)) =
+            (list, init, merge)
         else {
             return Err(DataFusionError::Execution(format!(
                 "{} expects (array, start, lambda)",
@@ -223,13 +218,19 @@ impl HigherOrderUDFImpl for ArrayReduce {
             DataType::List(_) => {
                 let list = list_array.as_list::<i32>();
                 (
-                    list.offsets().iter().map(|offset| i64::from(*offset)).collect(),
+                    list.offsets()
+                        .iter()
+                        .map(|offset| i64::from(*offset))
+                        .collect(),
                     Arc::clone(list.values()),
                 )
             }
             DataType::LargeList(_) => {
                 let list = list_array.as_list::<i64>();
-                (list.offsets().iter().copied().collect(), Arc::clone(list.values()))
+                (
+                    list.offsets().iter().copied().collect(),
+                    Arc::clone(list.values()),
+                )
             }
             other => {
                 return Err(DataFusionError::Execution(format!(

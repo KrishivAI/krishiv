@@ -52,7 +52,11 @@ mod tests {
         let df = engine.sql(&sql5).await.unwrap();
         let t = std::time::Instant::now();
         let out = tokio::time::timeout(std::time::Duration::from_secs(2), df.collect()).await;
-        eprintln!("5-way probe returned after {:?}: timed_out={}", t.elapsed(), out.is_err());
+        eprintln!(
+            "5-way probe returned after {:?}: timed_out={}",
+            t.elapsed(),
+            out.is_err()
+        );
         assert!(
             out.is_err(),
             "10^10-row aggregate finished within 2s?! (it should time out — \
@@ -126,7 +130,10 @@ mod tests {
             );
             let df = engine.sql(&sql).await.unwrap();
             let out = tokio::time::timeout(std::time::Duration::from_secs(2), df.collect()).await;
-            assert!(out.is_err(), "the 10^10-row aggregate should not finish in 2s");
+            assert!(
+                out.is_err(),
+                "the 10^10-row aggregate should not finish in 2s"
+            );
             drop(out);
             // Give aborts a moment to land, then measure.
             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
@@ -1689,8 +1696,8 @@ mod iceberg_catalog_tests {
 
     #[test]
     fn parse_dml_insert_values() {
-        let parsed = crate::parse_dml_insert("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
-            .expect("must parse");
+        let parsed =
+            crate::parse_dml_insert("INSERT INTO t VALUES (1, 'a'), (2, 'b')").expect("must parse");
         assert_eq!(parsed.table_ref, "t");
         assert!(parsed.columns.is_empty());
         assert!(parsed.inner_query.to_ascii_uppercase().contains("VALUES"));
@@ -1802,7 +1809,9 @@ mod iceberg_catalog_tests {
 
         // First insert lands into the empty table.
         let df = engine
-            .sql("INSERT INTO myns.growing SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name)")
+            .sql(
+                "INSERT INTO myns.growing SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name)",
+            )
             .await
             .unwrap();
         let batches = df.collect().await.unwrap();
