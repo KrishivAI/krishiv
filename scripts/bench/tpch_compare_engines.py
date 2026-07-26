@@ -238,6 +238,50 @@ def run_krishiv(binary: str, data_root: str, queries: list[dict],
     return out
 
 
+def median(values: list[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def merge_passes(passes: list[list[dict]]) -> list[dict]:
+    """Collapse repeated passes over the corpus into one median-timed result.
+
+    Repeating the *whole corpus* rather than each query back-to-back is
+    deliberate: running one query three times in a row measures how warm its
+    own working set is by the third go, which flatters later repetitions and
+    tells you nothing about a cold plan.
+
+    Two single runs of this corpus on the same box differed by -64% to +68%
+    per query, so a single sample cannot support any claim finer than an order
+    of magnitude. The median of N passes can.
+
+    Digests are compared across passes as well: an engine that returns
+    different answers to the same query on the same data is a correctness bug,
+    and it is invisible to any harness that only keeps the last result.
+    """
+    if len(passes) == 1:
+        return passes[0]
+    merged = []
+    for index in range(len(passes[0])):
+        samples = [p[index] for p in passes]
+        ok = [s for s in samples if s["status"] == "ok"]
+        base = dict(ok[0] if ok else samples[0])
+        if ok:
+            times = [s["elapsed_s"] for s in ok]
+            base["elapsed_s"] = round(median(times), 2)
+            base["samples_s"] = times
+            base["runs_ok"] = f"{len(ok)}/{len(samples)}"
+            digests = {s.get("digest") for s in ok}
+            if len(digests) > 1:
+                base["status"] = "nondeterministic"
+                base["error"] = f"differing digests across passes: {sorted(digests)}"
+        merged.append(base)
+    return merged
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", required=True)
@@ -245,6 +289,9 @@ def main() -> int:
     parser.add_argument("--krishiv", help="path to the krishiv binary")
     parser.add_argument("--engines", default="krishiv,duckdb,spark")
     parser.add_argument("--timeout", type=int, default=3600)
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="passes over the whole corpus per engine; "
+                             "reported time is the median (default 1)")
     parser.add_argument("--out")
     args = parser.parse_args()
 
@@ -255,19 +302,27 @@ def main() -> int:
     results: dict[str, list[dict]] = {}
 
     # Serial by construction: one engine finishes before the next starts.
+    # Every engine gets the same number of passes — giving one of them a median
+    # and the others a single sample would bias the comparison toward whichever
+    # got to discard its worst run.
     for engine in wanted:
-        print(f"\n=== {engine} ({len(queries)} queries) ===", flush=True)
-        if engine == "duckdb":
-            results[engine] = run_duckdb(args.data, queries, args.timeout)
-        elif engine == "spark":
-            results[engine] = run_spark(args.data, queries, args.timeout)
-        elif engine == "krishiv":
-            if not args.krishiv:
-                print("skipping krishiv: --krishiv not given", flush=True)
-                continue
-            results[engine] = run_krishiv(args.krishiv, args.data, queries, args.timeout)
-        else:
+        if engine == "krishiv" and not args.krishiv:
+            print("skipping krishiv: --krishiv not given", flush=True)
+            continue
+        if engine not in ("duckdb", "spark", "krishiv"):
             print(f"unknown engine {engine}", flush=True)
+            continue
+        passes = []
+        for attempt in range(1, args.repeat + 1):
+            print(f"\n=== {engine} ({len(queries)} queries) "
+                  f"pass {attempt}/{args.repeat} ===", flush=True)
+            if engine == "duckdb":
+                passes.append(run_duckdb(args.data, queries, args.timeout))
+            elif engine == "spark":
+                passes.append(run_spark(args.data, queries, args.timeout))
+            else:
+                passes.append(run_krishiv(args.krishiv, args.data, queries, args.timeout))
+        results[engine] = merge_passes(passes)
 
     print("\n=== summary ===", flush=True)
     for engine, rows in results.items():
@@ -305,7 +360,8 @@ def main() -> int:
     if args.out:
         with open(args.out, "w", encoding="utf-8") as handle:
             json.dump({"scale": 100, "data_root": args.data,
-                       "cores": os.cpu_count(), "engines": results},
+                       "cores": os.cpu_count(), "repeat": args.repeat,
+                       "engines": results},
                       handle, indent=2)
         print(f"\nwrote {args.out}", flush=True)
     return 0

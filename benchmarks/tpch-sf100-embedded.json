@@ -1,5 +1,5 @@
 {
-  "label": "embedded-nvme-local",
+  "label": "embedded-a7d31681",
   "scale": 100,
   "topology": "embedded-local-parquet",
   "queries": [
@@ -7,133 +7,133 @@
       "id": 1,
       "name": "pricing_summary",
       "status": "ok",
-      "elapsed_s": 24.62
+      "elapsed_s": 26.75
     },
     {
       "id": 2,
       "name": "minimum_cost_supplier",
       "status": "ok",
-      "elapsed_s": 9.58
+      "elapsed_s": 10.0
     },
     {
       "id": 3,
       "name": "shipping_priority",
       "status": "ok",
-      "elapsed_s": 79.27
+      "elapsed_s": 28.56
     },
     {
       "id": 4,
       "name": "order_priority_checking",
       "status": "ok",
-      "elapsed_s": 22.24
+      "elapsed_s": 10.64
     },
     {
       "id": 5,
       "name": "local_supplier_volume",
       "status": "ok",
-      "elapsed_s": 44.94
+      "elapsed_s": 37.06
     },
     {
       "id": 6,
       "name": "forecasting_revenue_change",
       "status": "ok",
-      "elapsed_s": 18.51
+      "elapsed_s": 11.81
     },
     {
       "id": 7,
       "name": "volume_shipping",
       "status": "ok",
-      "elapsed_s": 73.85
+      "elapsed_s": 101.9
     },
     {
       "id": 8,
       "name": "national_market_share",
       "status": "ok",
-      "elapsed_s": 36.87
+      "elapsed_s": 36.92
     },
     {
       "id": 9,
       "name": "product_type_profit_measure",
       "status": "ok",
-      "elapsed_s": 149.21
+      "elapsed_s": 75.2
     },
     {
       "id": 10,
       "name": "returned_item_reporting",
       "status": "ok",
-      "elapsed_s": 34.76
+      "elapsed_s": 30.94
     },
     {
       "id": 11,
       "name": "important_stock_identification",
       "status": "ok",
-      "elapsed_s": 7.28
+      "elapsed_s": 6.85
     },
     {
       "id": 12,
       "name": "shipping_modes_and_order_priority",
       "status": "ok",
-      "elapsed_s": 17.07
+      "elapsed_s": 16.76
     },
     {
       "id": 13,
       "name": "customer_distribution",
       "status": "ok",
-      "elapsed_s": 39.86
+      "elapsed_s": 32.48
     },
     {
       "id": 14,
       "name": "promotion_effect",
       "status": "ok",
-      "elapsed_s": 20.96
+      "elapsed_s": 19.84
     },
     {
       "id": 15,
       "name": "top_supplier",
       "status": "ok",
-      "elapsed_s": 25.59
+      "elapsed_s": 22.75
     },
     {
       "id": 16,
       "name": "parts_supplier_relationship",
       "status": "ok",
-      "elapsed_s": 4.68
+      "elapsed_s": 4.43
     },
     {
       "id": 17,
       "name": "small_quantity_order_revenue",
       "status": "ok",
-      "elapsed_s": 84.54
+      "elapsed_s": 81.66
     },
     {
       "id": 18,
       "name": "large_volume_customer",
       "status": "ok",
-      "elapsed_s": 189.79
+      "elapsed_s": 180.88
     },
     {
       "id": 19,
       "name": "discounted_revenue",
       "status": "ok",
-      "elapsed_s": 22.19
+      "elapsed_s": 20.16
     },
     {
       "id": 20,
       "name": "potential_part_promotion",
       "status": "ok",
-      "elapsed_s": 27.92
+      "elapsed_s": 28.28
     },
     {
       "id": 21,
       "name": "suppliers_who_kept_orders_waiting",
       "status": "ok",
-      "elapsed_s": 89.83
+      "elapsed_s": 84.28
     },
     {
       "id": 22,
       "name": "global_sales_opportunity",
       "status": "ok",
-      "elapsed_s": 5.6
+      "elapsed_s": 9.41
     }
   ]
 }
