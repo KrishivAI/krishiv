@@ -310,10 +310,11 @@ pub fn run_explain(command: &QueryCommand) -> CliResponse {
         Err(message) => return CliResponse::err(format!("{message}\n"), 1),
     };
     match block_on(async {
-        let df = query_dataframe(&session, command).await?;
         if command.analyze {
+            let df = analyze_dataframe(&session, command).await?;
             df.explain_analyze_async().await
         } else {
+            let df = query_dataframe(&session, command).await?;
             df.explain_async().await
         }
     }) {
@@ -334,6 +335,38 @@ async fn query_dataframe(
         QueryExecution::Local => session.execute_local_async(&command.query).await,
         QueryExecution::Remote => session.execute_remote_async(&command.query).await,
     }
+}
+
+/// Build the handle `--analyze` needs, which is not the same handle the other
+/// paths want.
+///
+/// `execute_local_async` runs the query and hands back its results; the planned
+/// DataFrame it went through is gone by the time we see the handle, so
+/// `explain_analyze_async` found `sql_dataframe: None` and failed with
+/// "needs a locally-planned query" for every `explain --analyze --local`
+/// invocation. Routing `--local` through the same SQL planning path as the
+/// default gives an equivalent local execution *and* keeps the plan, which is
+/// the whole point of ANALYZE.
+///
+/// `--remote` genuinely cannot work: the fragments run on executors and their
+/// metrics live there, so say that rather than fail with a plan-shaped error.
+async fn analyze_dataframe(
+    session: &Session,
+    command: &QueryCommand,
+) -> Result<DataFrame, KrishivError> {
+    if matches!(command.execution, QueryExecution::Remote) {
+        return Err(KrishivError::Runtime {
+            message: String::from(
+                "EXPLAIN ANALYZE reports metrics from the process that ran the plan, so it \
+                 cannot be combined with --remote: a distributed plan's metrics live on the \
+                 executors that ran its fragments. Re-run without --remote to analyze locally.",
+            ),
+        });
+    }
+    if let Some(api_key) = &command.api_key {
+        return session.sql_as_async(api_key, &command.query).await;
+    }
+    session.sql_async(&command.query).await
 }
 
 fn auth_from_env() -> Result<Arc<dyn AuthProvider>, String> {

@@ -111,6 +111,7 @@ pub mod pivot_sql;
 pub mod python_udf;
 pub mod recursive_cte;
 pub mod scalar_udf;
+pub mod semi_join_reduction;
 /// Spark SQL extensions: LATERAL VIEW, TABLESAMPLE, TRANSFORM, DESCRIBE EXTENDED, etc.
 pub mod spark_sql_ext;
 pub mod sqlstate;
@@ -1037,6 +1038,15 @@ impl SqlEngine {
             .with_physical_optimizer_rule(std::sync::Arc::new(
                 crate::coop_amplifiers::CooperativeAmplifiers::new(),
             ))
+            // Aggregates joined on their own grouping key only need the groups
+            // the join keeps; see `semi_join_reduction`. Registered on every
+            // session-construction site in this file — `build_absolute_minimal`
+            // has the same line, and a rule installed on only one of them is
+            // indistinguishable from a rule that works until you hit the other
+            // path.
+            .with_optimizer_rule(std::sync::Arc::new(
+                crate::semi_join_reduction::SemiJoinReductionThroughAggregate,
+            ))
             .with_config(build_single_node_session_config(
                 target_partitions,
                 memory_limit_bytes,
@@ -1145,6 +1155,12 @@ impl SqlEngine {
             .with_default_features()
             .with_physical_optimizer_rule(std::sync::Arc::new(
                 crate::coop_amplifiers::CooperativeAmplifiers::new(),
+            ))
+            // Same rule as the main constructor above — this fallback path
+            // plans real queries too, so omitting it here would make the
+            // optimization depend on which constructor happened to run.
+            .with_optimizer_rule(std::sync::Arc::new(
+                crate::semi_join_reduction::SemiJoinReductionThroughAggregate,
             ))
             .with_config(build_single_node_session_config(target_partitions, None))
             .build();

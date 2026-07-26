@@ -800,6 +800,15 @@ pub static FLAGS: &[FlagSpec] = &[
         "DataFusion dynamic (runtime) filters: TopK / join / aggregate predicates pushed into probe-side file scans at execution time (Phase 54). `off` disables all three via the DataFusion master switch.",
     ),
     rt(
+        "KRISHIV_SEMI_JOIN_REDUCTION",
+        FlagKind::Bool,
+        "on",
+        "Semi-join reduction through an aggregate: when a grouped aggregate is \
+         inner-joined on one of its own grouping keys, filter the aggregate's \
+         input to the surviving keys first. TPC-H q17 spends 88% of its compute \
+         building ~20M groups when the join keeps ~2000. `off` disables it.",
+    ),
+    rt(
         "KRISHIV_SESSION_IDLE_TIMEOUT_SECS",
         FlagKind::UInt,
         "0",
