@@ -1237,6 +1237,48 @@ mod tests {
     }
 
     #[test]
+    /// `--format json` must emit the rows themselves, not a drawn table.
+    ///
+    /// A benchmark harness comparing this engine's answers to DuckDB's or
+    /// Spark's cannot use the ASCII table: counting its lines counts borders
+    /// and padding, so "22/22 ok" could mean 22 queries returned the wrong
+    /// rows quickly. NDJSON makes the result set machine-checkable.
+    #[test]
+    fn sql_json_format_emits_one_json_object_per_row() {
+        let response = dispatch(&[
+            "sql",
+            "--format",
+            "json",
+            "--query",
+            "select 1 as value union all select 2 as value",
+        ]);
+        assert_eq!(response.exit_code, 0, "stdout: {}", response.stdout);
+        let lines: Vec<&str> = response
+            .stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        assert_eq!(lines.len(), 2, "expected one line per row: {lines:?}");
+        for line in lines {
+            let parsed: serde_json::Value =
+                serde_json::from_str(line).expect("each line must be valid JSON");
+            assert!(
+                parsed.get("value").is_some(),
+                "row must carry the projected column: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn sql_rejects_an_unknown_output_format() {
+        let response = dispatch(&["sql", "--format", "yaml", "--query", "select 1"]);
+        assert_ne!(response.exit_code, 0);
+        assert!(
+            response.stdout.contains("--format") || response.stderr.contains("--format"),
+            "the error must name the offending flag"
+        );
+    }
+
     fn sql_command_executes_literal_query() {
         let response = dispatch(&["sql", "--query", "select 1 as value"]);
         assert_eq!(response.exit_code, 0, "{}", response.stderr);

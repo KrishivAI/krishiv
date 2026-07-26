@@ -26,9 +26,23 @@ pub enum QueryExecution {
     Remote,
 }
 
+/// How `krishiv sql` renders a result set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputFormat {
+    /// Bordered ASCII table — readable, but decoration a program has to parse
+    /// around.
+    #[default]
+    Table,
+    /// Newline-delimited JSON, one object per row. What a benchmark harness or
+    /// any downstream program should consume: the rows, and nothing else.
+    Json,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryCommand {
     pub query: String,
+    /// Result rendering; `--format json` selects NDJSON.
+    pub format: OutputFormat,
     pub mode: ExecutionMode,
     pub parquet_tables: Vec<(String, PathBuf)>,
     pub execution: QueryExecution,
@@ -60,6 +74,7 @@ pub fn sql_help() -> String {
            --timeout <SECS>            Timeout in seconds for remote queries (default: 30)\n\
            --api-key <KEY>             Policy-enforced sql_as (requires KRISHIV_API_KEYS)\n\
            --parquet <table=path>      Register a Parquet table (repeatable)\n\
+           --format <table|json>       Result format (default: table; json = NDJSON rows)\n\
            -h, --help                  Show help\n\
          \n\
          Multi-statement: separate statements with semicolons. Only the last\n\
@@ -92,6 +107,7 @@ pub fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
     let mut query = None;
     let mut mode = ExecutionMode::Embedded;
     let mut parquet_tables = Vec::new();
+    let mut format = OutputFormat::default();
     let mut execution = QueryExecution::Default;
     let mut api_key = None;
     let mut timeout_secs = None;
@@ -121,6 +137,21 @@ pub fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
                     .get(idx)
                     .ok_or_else(|| String::from("missing value for --parquet"))?;
                 parquet_tables.push(parse_parquet_spec(value)?);
+            }
+            "--format" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| String::from("missing value for --format"))?;
+                format = match *value {
+                    "table" => OutputFormat::Table,
+                    "json" => OutputFormat::Json,
+                    other => {
+                        return Err(format!(
+                            "--format must be 'table' or 'json', got '{other}'"
+                        ));
+                    }
+                };
             }
             "--local" => {
                 if execution == QueryExecution::Remote {
@@ -169,6 +200,7 @@ pub fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
     }
     Ok(QueryCommand {
         query,
+        format,
         mode,
         parquet_tables,
         execution,
@@ -239,7 +271,10 @@ pub fn run_sql(command: &QueryCommand) -> CliResponse {
             let df = query_dataframe(&session, &stmt_cmd).await?;
             if i == last_idx {
                 let result = df.collect_async().await?;
-                result.pretty()
+                match stmt_cmd.format {
+                    OutputFormat::Table => result.pretty(),
+                    OutputFormat::Json => result.to_json_lines(),
+                }
             } else {
                 // Non-final statements: execute for side effects, discard result.
                 let _ = df.collect_async().await?;

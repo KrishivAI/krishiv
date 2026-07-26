@@ -134,6 +134,44 @@ impl QueryResult {
         self.batches.iter().map(RecordBatch::num_rows).sum()
     }
 
+    /// Serialize the result as newline-delimited JSON, one object per row.
+    ///
+    /// The ASCII table from [`pretty`](Self::pretty) is for humans: it pads,
+    /// truncates, and draws borders, so a program reading it has to guess
+    /// where the data ends and the decoration begins. Benchmark harnesses
+    /// comparing this engine's answers against another's need the rows
+    /// themselves — counting lines in a rendered table tells you how many
+    /// lines were rendered, not how many rows matched.
+    ///
+    /// Empty results yield an empty string rather than `[]`, so a caller can
+    /// count rows by counting lines.
+    pub fn to_json_lines(&self) -> Result<String, crate::error::KrishivError> {
+        let mut buffer = Vec::new();
+        {
+            let mut writer = arrow::json::LineDelimitedWriter::new(&mut buffer);
+            for batch in &self.batches {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                writer.write(batch).map_err(|error| {
+                    crate::error::KrishivError::Runtime {
+                        message: format!("failed to serialize result rows as JSON: {error}"),
+                    }
+                })?;
+            }
+            writer.finish().map_err(|error| {
+                crate::error::KrishivError::Runtime {
+                    message: format!("failed to finish JSON result serialization: {error}"),
+                }
+            })?;
+        }
+        String::from_utf8(buffer).map_err(|error| {
+            crate::error::KrishivError::Runtime {
+                message: format!("result JSON was not valid UTF-8: {error}"),
+            }
+        })
+    }
+
     /// Format the result as an ASCII table for CLI and tests.
     pub fn pretty(&self) -> Result<String, crate::error::KrishivError> {
         krishiv_sql::pretty_batches(&self.batches).map_err(Into::into)
