@@ -35,6 +35,25 @@ import sys
 import time
 
 SINGLE_FILE_TABLES = {"nation", "region"}
+
+# Stop before the disk is full rather than after. SF100 spills: a 39 GB input
+# on a box with ~24 GB free means any of the three engines can run it dry on
+# q9/q18/q21. Filling a disk is not a benchmark result — it corrupts every
+# later query on the box, and on the cluster this exact failure mode evicted an
+# executor and invalidated a whole sweep before anyone noticed it was a disk
+# problem at all.
+MIN_FREE_BYTES = 12 * 1024**3
+
+
+def free_bytes(path: str) -> int:
+    stats = os.statvfs(path)
+    return stats.f_bavail * stats.f_frsize
+
+
+def disk_headroom_ok(path: str) -> bool:
+    return free_bytes(path) >= MIN_FREE_BYTES
+
+
 TABLES = [
     "customer", "lineitem", "nation", "orders",
     "part", "partsupp", "region", "supplier",
@@ -90,6 +109,12 @@ def run_duckdb(data_root: str, queries: list[dict], timeout_s: int) -> list[dict
         )
     out = []
     for index, query in enumerate(queries, start=1):
+        if not disk_headroom_ok(data_root):
+            out.append({"id": index, "name": query["name"], "status": "skipped",
+                        "elapsed_s": 0.0,
+                        "error": f"disk below {MIN_FREE_BYTES // 1024**3} GiB free"})
+            print(f"  duckdb q{index:<3} skipped (low disk)", flush=True)
+            continue
         started = time.monotonic()
         try:
             rows = con.execute(query["sql"]).fetchall()
@@ -113,22 +138,35 @@ def run_spark(data_root: str, queries: list[dict], timeout_s: int) -> list[dict]
     from pyspark.sql import SparkSession
 
     cores = os.cpu_count() or 8
+    # Size the heap from the machine, not from a number typed once and never
+    # rechecked. This box has 23 GB total with ~8 GB already resident, so the
+    # 16g this used to request would have had the JVM and the page cache
+    # fighting over the same pages — and it was also *more* than Krishiv's own
+    # query pool (0.6 of RAM), which would have made the comparison flattering
+    # to Spark in one direction and starved by swapping in the other.
+    total_gib = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 1024**3
+    driver_gib = max(4, int(total_gib * 0.6))
     spark = (
         SparkSession.builder.appName("tpch-sf100")
         .master(f"local[{cores}]")
-        # Give Spark the same order of memory the Krishiv run had, so this is
-        # a comparison of engines rather than of heap sizes.
-        .config("spark.driver.memory", "16g")
+        .config("spark.driver.memory", f"{driver_gib}g")
         .config("spark.sql.shuffle.partitions", str(cores * 2))
         .config("spark.ui.enabled", "false")
         .getOrCreate()
     )
+    print(f"  spark driver heap {driver_gib}g of {total_gib:.0f} GiB", flush=True)
     spark.sparkContext.setLogLevel("ERROR")
     for table in TABLES:
         spark.read.parquet(table_path(data_root, table)).createOrReplaceTempView(table)
 
     out = []
     for index, query in enumerate(queries, start=1):
+        if not disk_headroom_ok(data_root):
+            out.append({"id": index, "name": query["name"], "status": "skipped",
+                        "elapsed_s": 0.0,
+                        "error": f"disk below {MIN_FREE_BYTES // 1024**3} GiB free"})
+            print(f"  spark q{index:<3} skipped (low disk)", flush=True)
+            continue
         started = time.monotonic()
         try:
             rows = [tuple(r) for r in spark.sql(query["sql"]).collect()]
@@ -153,6 +191,12 @@ def run_krishiv(binary: str, data_root: str, queries: list[dict],
                 timeout_s: int) -> list[dict]:
     out = []
     for index, query in enumerate(queries, start=1):
+        if not disk_headroom_ok(data_root):
+            out.append({"id": index, "name": query["name"], "status": "skipped",
+                        "elapsed_s": 0.0,
+                        "error": f"disk below {MIN_FREE_BYTES // 1024**3} GiB free"})
+            print(f"  krishiv q{index:<3} skipped (low disk)", flush=True)
+            continue
         # NDJSON, not the ASCII table: counting lines in a rendered table
         # counts borders and padding, which would let a wrong-but-fast result
         # pass as correct. This makes Krishiv's digest comparable to the other
