@@ -691,58 +691,9 @@ fn build_single_node_session_config(
             DEFAULT_SORT_SPILL_RESERVATION_BYTES,
         );
         config = config.with_sort_spill_reservation_bytes(scaled);
-
-        // Under a memory cap, prefer the join that can spill.
-        //
-        // DataFusion's hash join holds its whole build side in memory and has
-        // no spill path, so when the pool is exhausted the query *fails*:
-        //
-        //     Resources exhausted: Failed to allocate additional 1015.5 KB for
-        //     HashJoinInput[0] with 732.4 MB already allocated for this
-        //     reservation - 205.0 KB remain available
-        //
-        // That is TPC-H q18 on a 4500 MiB executor, where each task's share of
-        // the shared pool is ~798 MB. Nothing is leaking and no budget is
-        // wrong — the pool refused correctly. The gap is that the operator has
-        // nowhere to put the overflow.
-        //
-        // Sort-merge join spills. It is slower when the build side fits, which
-        // is why hash join stays the default *without* a cap: an embedded
-        // engine on 23 GB should take the fast path. But a query that finishes
-        // slowly beats a query that fails, and inside a container the kernel
-        // does not offer a third option. So the presence of a cgroup limit —
-        // the same signal the capacity model derives every other budget from —
-        // selects the spillable algorithm.
-        //
-        // `KRISHIV_PREFER_HASH_JOIN=on` restores hash join for a capped engine
-        // that is known to have room.
-        config = config.set_bool(
-            "datafusion.optimizer.prefer_hash_join",
-            prefer_hash_join_from_env().unwrap_or(false),
-        );
     }
     config
 }
-
-/// Explicit operator override for join-algorithm selection under a memory cap.
-///
-/// `None` means "decide from the memory limit" — see the reasoning in
-/// [`build_single_node_session_config`].
-fn prefer_hash_join_from_env() -> Option<bool> {
-    match std::env::var(PREFER_HASH_JOIN_ENV)
-        .ok()?
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "1" | "on" | "true" | "yes" => Some(true),
-        "0" | "off" | "false" | "no" => Some(false),
-        _ => None,
-    }
-}
-
-/// Environment override for preferring hash join under a memory cap.
-pub const PREFER_HASH_JOIN_ENV: &str = "KRISHIV_PREFER_HASH_JOIN";
 
 /// Iceberg catalogs registered via `with_iceberg_catalog`, paired with their
 /// DataFusion catalog name, behind a shared lock for `CALL system.<proc>`
