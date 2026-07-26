@@ -488,6 +488,45 @@ mod proto_tests {
         assert_eq!(round_trip_resp.llm_throttles(), response.llm_throttles());
     }
 
+    /// The executor deletes shuffle scratch for every job outside this set, so
+    /// the three states must stay distinguishable across the wire: an absent
+    /// set (reclaim nothing), an empty set (reclaim everything), and a
+    /// populated one. Only the flag separates the first two — an empty
+    /// `repeated string` looks identical either way.
+    #[test]
+    fn live_job_ids_round_trip_and_absence_is_not_an_empty_set() {
+        use crate::wire::{
+            executor_heartbeat_response_from_wire, executor_heartbeat_response_to_wire,
+        };
+
+        let base = || {
+            ExecutorHeartbeatResponse::new(
+                LeaseGeneration::initial(),
+                TransportDisposition::Accepted,
+            )
+        };
+        let round_trip = |resp: ExecutorHeartbeatResponse| {
+            executor_heartbeat_response_from_wire(executor_heartbeat_response_to_wire(resp)).unwrap()
+        };
+
+        // A coordinator that never reported: the executor must reclaim nothing.
+        // If this ever decodes as Some(empty), an upgraded executor talking to
+        // an older coordinator deletes the output of every running job.
+        assert_eq!(round_trip(base()).live_job_ids(), None);
+
+        // A coordinator reporting that nothing is live: reclaim everything.
+        let empty = round_trip(base().with_live_job_ids(std::collections::HashSet::new()));
+        assert_eq!(empty.live_job_ids(), Some(&std::collections::HashSet::new()));
+
+        // The ordinary case.
+        let ids: std::collections::HashSet<String> =
+            ["job-a".to_string(), "job-b".to_string()].into_iter().collect();
+        assert_eq!(
+            round_trip(base().with_live_job_ids(ids.clone())).live_job_ids(),
+            Some(&ids)
+        );
+    }
+
     #[test]
     fn source_throttle_commands_round_trip_on_wire() {
         use crate::wire::{
