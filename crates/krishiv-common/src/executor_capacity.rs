@@ -107,6 +107,24 @@ const QUERY_POOL_FRACTION: f64 = 0.6;
 /// remains is genuine slack for the allocations no budget can see.
 const SHUFFLE_STORE_FRACTION: f64 = 0.15;
 
+/// Fraction of post-reserve memory allowed to sit in page cache for shuffle
+/// output this executor wrote.
+///
+/// Small on purpose. The benefit is serving a same-node reduce read from RAM
+/// instead of a 270 MB/s disk, and at the ~3.5 MB partitions this workload
+/// produces, 5% of post-reserve still holds ~55 partitions — a real working
+/// set. The first attempt claimed 12.5% of the *whole* container, which took
+/// total claims to 90% and got executors OOM-killed; the cache was never the
+/// thing that needed to be large.
+const SHUFFLE_PAGE_CACHE_FRACTION: f64 = 0.05;
+
+/// Below this a page-cache ceiling is not worth enforcing — the bookkeeping
+/// costs more than the handful of partitions it would retain.
+const MIN_VIABLE_PAGE_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Environment override for the shuffle page-cache ceiling, in bytes.
+pub const SHUFFLE_PAGE_CACHE_ENV: &str = "KRISHIV_SHUFFLE_PAGE_CACHE_BYTES";
+
 /// Upper bound on the share of post-reserve memory any set of explicit budgets
 /// may claim. The remainder covers Arrow batches in flight between operators,
 /// object-store and gRPC buffers, and allocator retention — none of which is
@@ -191,6 +209,9 @@ pub struct ExecutorCapacity {
     /// Carved from the same container budget as `query_pool_bytes` — the two
     /// are shares of one quantity, not independent settings.
     pub shuffle_store_bytes: Option<u64>,
+    /// Ceiling on page cache held by committed-but-unconsumed shuffle output.
+    /// `None` means unbounded (no cgroup limit, or explicitly disabled).
+    pub page_cache_bytes: Option<u64>,
     /// DataFusion `target_partitions` for one task's engine — this executor's
     /// per-slot share of its cores.
     pub task_parallelism: NonZeroUsize,
@@ -223,6 +244,7 @@ impl ExecutorCapacity {
             crate::env_u64(QUERY_MEMORY_LIMIT_ENV),
             crate::env_usize(TASK_TARGET_PARALLELISM_ENV),
             crate::env_u64(SHUFFLE_STORE_LIMIT_ENV),
+            crate::env_u64(SHUFFLE_PAGE_CACHE_ENV),
         )
     }
 
@@ -240,6 +262,7 @@ impl ExecutorCapacity {
         memory_override: Option<u64>,
         parallelism_override: Option<usize>,
         shuffle_store_override: Option<u64>,
+        page_cache_override: Option<u64>,
     ) -> Self {
         let cores = NonZeroUsize::new(cores.max(1)).unwrap_or(NonZeroUsize::MIN);
 
@@ -287,6 +310,34 @@ impl ExecutorCapacity {
             }),
         };
 
+        // Page cache for shuffle output written by this executor. It belongs in
+        // this derivation, not beside it: the kernel charges it to the same
+        // `memory.max` as everything above, so a budget decided elsewhere is
+        // simply an unaccounted claim.
+        //
+        // It first shipped as 12.5% of the *whole* container, decided inside
+        // `page_cache` and invisible to [`ExecutorCapacity::accounted_bytes`].
+        // That put total claims at 90% of a 4500 MiB executor and left 435 MiB
+        // for everything unaccounted, and s2/s3 were OOM-killed on q8 with
+        // `anon=3312 file=585 cur=3935`. The ceiling test below exists to stop
+        // exactly that, and could not see a budget declared outside the struct.
+        let page_cache_bytes = match page_cache_override {
+            Some(0) => None,
+            Some(bytes) => Some(bytes),
+            None => memory_limit_bytes.and_then(|limit| {
+                let usable = limit.saturating_sub(PROCESS_OVERHEAD_RESERVE_BYTES);
+                #[expect(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "byte counts are far below f64's exact-integer range; \
+                              the product is non-negative and bounded by `usable`"
+                )]
+                let share = (usable as f64 * SHUFFLE_PAGE_CACHE_FRACTION) as u64;
+                (share >= MIN_VIABLE_PAGE_CACHE_BYTES).then_some(share)
+            }),
+        };
+
         // Slots are a concurrency decision, bounded by memory only to stop the
         // shared pool being divided into shares too small to compute with.
         // With an unbounded pool nothing bounds it but cores.
@@ -315,6 +366,7 @@ impl ExecutorCapacity {
             slots,
             query_pool_bytes,
             shuffle_store_bytes,
+            page_cache_bytes,
             task_parallelism,
             cores,
             memory_limit_bytes,
@@ -335,6 +387,7 @@ impl ExecutorCapacity {
         PROCESS_OVERHEAD_RESERVE_BYTES
             .saturating_add(self.query_pool_bytes.unwrap_or(0))
             .saturating_add(self.shuffle_store_bytes.unwrap_or(0))
+            .saturating_add(self.page_cache_bytes.unwrap_or(0))
     }
 
     /// The fair share of the query pool one task sees when all slots are busy.
@@ -385,7 +438,7 @@ mod tests {
     #[test]
     fn container_capacity_is_derived_without_any_operator_input() {
         // The SF100 benchmark executor: 4 cores, 2.5 GiB container.
-        let cap = ExecutorCapacity::derive(4, Some(2_684_354_560), None, None, None, None);
+        let cap = ExecutorCapacity::derive(4, Some(2_684_354_560), None, None, None, None, None);
         assert_eq!(cap.slots.get(), 4, "4 cores support 4 concurrent tasks");
         assert_eq!(cap.slots_source, CapacitySource::Derived);
         // (2.5 GiB - 512 MiB) * 0.6 ≈ 1.25 GiB, shared across all slots. The
@@ -410,7 +463,7 @@ mod tests {
         // of the cgroup each meant total claimed memory grew with slot count.
         // The shared pool is a single number, so it cannot.
         for slots in 1..=64 {
-            let cap = ExecutorCapacity::derive(64, Some(4 * GIB), Some(slots), None, None, None);
+            let cap = ExecutorCapacity::derive(64, Some(4 * GIB), Some(slots), None, None, None, None);
             let pool = cap.query_pool_bytes.expect("bounded container yields a pool");
             assert!(
                 pool < 4 * GIB,
@@ -424,7 +477,7 @@ mod tests {
     fn slots_are_capped_when_memory_cannot_feed_them() {
         // 16 cores in a 1.5 GiB container: pool ≈ 819 MiB, which supports 3
         // shares of 256 MiB — running 16 tasks would give each 51 MiB.
-        let cap = ExecutorCapacity::derive(16, Some(1_610_612_736), None, None, None, None);
+        let cap = ExecutorCapacity::derive(16, Some(1_610_612_736), None, None, None, None, None);
         assert!(
             cap.slots.get() < 16,
             "memory-starved executor advertised {} slots",
@@ -442,20 +495,20 @@ mod tests {
         // The regression: per-task parallelism used to be computed from the
         // KRISHIV_TASK_SLOTS env var, so `--slots 1` on a 4-core box left the
         // share at 1 instead of 4 and used a quarter of the CPU.
-        let cap = ExecutorCapacity::derive(4, Some(8 * GIB), Some(1), None, None, None);
+        let cap = ExecutorCapacity::derive(4, Some(8 * GIB), Some(1), None, None, None, None);
         assert_eq!(cap.slots.get(), 1);
         assert_eq!(cap.task_parallelism.get(), 4, "one task should get all cores");
     }
 
     #[test]
     fn parallelism_override_wins_over_the_derived_share() {
-        let cap = ExecutorCapacity::derive(8, Some(8 * GIB), Some(4), None, Some(3), None);
+        let cap = ExecutorCapacity::derive(8, Some(8 * GIB), Some(4), None, Some(3), None, None);
         assert_eq!(cap.task_parallelism.get(), 3);
     }
 
     #[test]
     fn explicit_zero_memory_means_unbounded_not_zero() {
-        let cap = ExecutorCapacity::derive(4, Some(8 * GIB), None, Some(0), None, None);
+        let cap = ExecutorCapacity::derive(4, Some(8 * GIB), None, Some(0), None, None, None);
         assert_eq!(cap.query_pool_bytes, None);
         assert_eq!(cap.memory_source, CapacitySource::Configured);
         assert!(cap.min_task_memory_share_bytes().is_none());
@@ -463,7 +516,7 @@ mod tests {
 
     #[test]
     fn no_cgroup_limit_yields_an_unbounded_pool_and_cpu_bound_slots() {
-        let cap = ExecutorCapacity::derive(8, None, None, None, None, None);
+        let cap = ExecutorCapacity::derive(8, None, None, None, None, None, None);
         assert_eq!(cap.query_pool_bytes, None);
         assert_eq!(cap.slots.get(), 8, "nothing but cores bounds an unbounded pool");
     }
@@ -473,7 +526,7 @@ mod tests {
         // 900 MiB: after the 512 MiB overhead reserve, 60% of what is left is
         // ~233 MiB for queries. Tight, but a tight pool spills — an unbounded
         // pool in a container this size gets the process killed instead.
-        let cap = ExecutorCapacity::derive(2, Some(943_718_400), None, None, None, None);
+        let cap = ExecutorCapacity::derive(2, Some(943_718_400), None, None, None, None, None);
         let pool = cap
             .query_pool_bytes
             .expect("a small container is still bounded");
@@ -487,14 +540,14 @@ mod tests {
         // 600 MiB leaves ~88 MiB after the reserve, and 60% of that is under
         // the floor. A pool that small fails queries the process has the
         // memory to complete, so it is not built.
-        let cap = ExecutorCapacity::derive(2, Some(629_145_600), None, None, None, None);
+        let cap = ExecutorCapacity::derive(2, Some(629_145_600), None, None, None, None, None);
         assert_eq!(cap.query_pool_bytes, None);
         assert_eq!(cap.slots.get(), 2, "nothing but cores bounds an unbounded pool");
     }
 
     #[test]
     fn zero_cores_and_zero_slots_still_produce_a_usable_capacity() {
-        let cap = ExecutorCapacity::derive(0, Some(8 * GIB), Some(0), None, None, None);
+        let cap = ExecutorCapacity::derive(0, Some(8 * GIB), Some(0), None, None, None, None);
         assert_eq!(cap.cores.get(), 1);
         assert_eq!(cap.slots.get(), 1);
         assert_eq!(cap.task_parallelism.get(), 1);
@@ -502,7 +555,7 @@ mod tests {
 
     #[test]
     fn summary_names_every_derived_quantity() {
-        let summary = ExecutorCapacity::derive(4, Some(4 * GIB), None, None, None, None).summary();
+        let summary = ExecutorCapacity::derive(4, Some(4 * GIB), None, None, None, None, None).summary();
         for expected in [
             "slots=",
             "cores=",
@@ -527,14 +580,15 @@ mod tests {
     fn budgets_always_fit_inside_the_container() {
         for limit_mib in [512_u64, 1024, 2500, 4096, 4500, 8192, 16384, 65536] {
             let limit = limit_mib * 1024 * 1024;
-            let cap = ExecutorCapacity::derive(8, Some(limit), None, None, None, None);
+            let cap = ExecutorCapacity::derive(8, Some(limit), None, None, None, None, None);
             let accounted = cap.accounted_bytes();
             assert!(
                 accounted <= limit,
                 "container {limit_mib}Mi: budgets total {accounted} bytes > limit {limit} \
-                 (query_pool={:?} shuffle_store={:?})",
+                 (query_pool={:?} shuffle_store={:?} page_cache={:?})",
                 cap.query_pool_bytes,
                 cap.shuffle_store_bytes,
+                cap.page_cache_bytes,
             );
 
             // And they must leave the unreservable remainder real slack, not
@@ -561,7 +615,7 @@ mod tests {
     fn the_executors_that_were_oom_killed_now_fit() {
         for limit_mib in [2500_u64, 4500] {
             let limit = limit_mib * 1024 * 1024;
-            let cap = ExecutorCapacity::derive(4, Some(limit), None, None, None, None);
+            let cap = ExecutorCapacity::derive(4, Some(limit), None, None, None, None, None);
             assert!(
                 cap.shuffle_store_bytes.is_some_and(|b| b < 2 * GIB),
                 "container {limit_mib}Mi still allows a 2 GiB shuffle store: {:?}",
@@ -574,10 +628,10 @@ mod tests {
     #[test]
     fn shuffle_store_override_is_taken_literally_and_zero_means_unbounded() {
         let configured =
-            ExecutorCapacity::derive(4, Some(4 * GIB), None, None, None, Some(123 * MIB));
+            ExecutorCapacity::derive(4, Some(4 * GIB), None, None, None, Some(123 * MIB), None);
         assert_eq!(configured.shuffle_store_bytes, Some(123 * MIB));
 
-        let unbounded = ExecutorCapacity::derive(4, Some(4 * GIB), None, None, None, Some(0));
+        let unbounded = ExecutorCapacity::derive(4, Some(4 * GIB), None, None, None, Some(0), None);
         assert_eq!(unbounded.shuffle_store_bytes, None);
     }
 
@@ -585,7 +639,7 @@ mod tests {
     /// is invented — the same rule the query pool already follows.
     #[test]
     fn no_cgroup_limit_leaves_both_budgets_unbounded() {
-        let cap = ExecutorCapacity::derive(8, None, None, None, None, None);
+        let cap = ExecutorCapacity::derive(8, None, None, None, None, None, None);
         assert_eq!(cap.query_pool_bytes, None);
         assert_eq!(cap.shuffle_store_bytes, None);
         assert_eq!(cap.accounted_bytes(), PROCESS_OVERHEAD_RESERVE_BYTES);

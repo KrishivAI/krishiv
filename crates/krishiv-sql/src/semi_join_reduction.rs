@@ -599,12 +599,16 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("o_orderkey", DataType::Int64, false),
             Field::new("o_custkey", DataType::Int64, false),
+            Field::new("o_totalprice", DataType::Int64, false),
+            Field::new("o_orderdate", DataType::Int64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(Int64Array::from(vec![1i64, 2, 3, 4, 5])),
                 Arc::new(Int64Array::from(vec![10i64, 20, 30, 40, 50])),
+                Arc::new(Int64Array::from(vec![100i64, 200, 300, 400, 500])),
+                Arc::new(Int64Array::from(vec![20260101i64, 20260102, 20260103, 20260104, 20260105])),
             ],
         )
         .unwrap();
@@ -882,6 +886,40 @@ mod tests {
             let without = rows(&context(false), sql).await;
             assert_eq!(with, without, "results diverged for:\n{sql}");
         }
+    }
+
+    /// The *verbatim* q18 shape — every projected column, all five grouping
+    /// keys, the ORDER BY and the LIMIT.
+    ///
+    /// The simplified `Q18_SHAPE` above fires; this one did not on real data,
+    /// so the difference lives in the SQL, not in the data. Keeping the full
+    /// form as its own test is what turns "the rule is inert in production"
+    /// into something reproducible in 0.2 s.
+    const Q18_VERBATIM: &str = "SELECT c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, \
+        sum(l_quantity) FROM customer, orders, lineitem \
+        WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey \
+                             HAVING sum(l_quantity) > 100) \
+          AND c_custkey = o_custkey AND o_orderkey = l_orderkey \
+        GROUP BY c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice \
+        ORDER BY o_totalprice DESC, o_orderdate LIMIT 100";
+
+    #[tokio::test]
+    async fn the_verbatim_q18_shape_is_also_pushed_down() {
+        let with = plan_of(&context(true), Q18_VERBATIM).await;
+        let semi = with.lines().position(|l| l.contains("Semi"));
+        let inner = with.lines().position(|l| l.contains("Inner Join"));
+        assert!(
+            semi.is_some() && inner.is_some(),
+            "expected both joins in:\n{with}"
+        );
+        assert!(
+            semi > inner,
+            "the real q18 shape must be pushed below the inner join too:\n{with}"
+        );
+        assert_eq!(
+            rows(&context(true), Q18_VERBATIM).await,
+            rows(&context(false), Q18_VERBATIM).await
+        );
     }
 
     /// An outer join below null-pads its non-preserved side, so a key that is

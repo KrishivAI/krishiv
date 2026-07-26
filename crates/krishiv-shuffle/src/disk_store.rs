@@ -169,8 +169,8 @@ impl LocalDiskShuffleStore {
             compression: ShuffleCompression::None,
             content_hashes: Arc::new(DashMap::new()),
             page_cache_budget: Arc::new(
-                krishiv_common::page_cache::ShufflePageCacheBudget::from_cgroup(
-                    krishiv_common::cgroup_memory_limit_bytes(),
+                krishiv_common::page_cache::ShufflePageCacheBudget::from_capacity(
+                    &krishiv_common::executor_capacity::ExecutorCapacity::detect(),
                 ),
             ),
         })

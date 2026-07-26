@@ -103,20 +103,9 @@ pub fn evict_file_best_effort(file: &std::fs::File) {
     }
 }
 
-/// Environment override for the shuffle page-cache ceiling, in bytes.
-pub const SHUFFLE_PAGE_CACHE_ENV: &str = "KRISHIV_SHUFFLE_PAGE_CACHE_BYTES";
-
-/// Share of the container handed to cached shuffle output.
-///
-/// Deliberately small and inside the slack the capacity model already leaves
-/// unclaimed: page cache is *reclaimable* (clean pages), unlike the heap
-/// budgets, so it does not need its own carve-out from the accounted fractions.
-/// On a 4500 MiB executor this is ~560 MB — a real working set, and a long way
-/// from the 1.7 GB that was getting containers killed.
-const SHUFFLE_PAGE_CACHE_FRACTION: f64 = 0.125;
-
-/// Default ceiling when there is no cgroup limit to derive one from.
-const DEFAULT_SHUFFLE_PAGE_CACHE_BYTES: u64 = 512 * 1024 * 1024;
+/// Ceiling used when the capacity model reports no bound — i.e. there is no
+/// cgroup limit to take a share of, so nothing is going to OOM-kill us anyway.
+const DEFAULT_SHUFFLE_PAGE_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// A bounded ceiling on page cache held by write-once files.
 ///
@@ -152,17 +141,22 @@ struct CacheState {
 }
 
 impl ShufflePageCacheBudget {
-    /// Build a budget from the container limit, honouring
-    /// [`SHUFFLE_PAGE_CACHE_ENV`].
-    pub fn from_cgroup(cgroup_limit_bytes: Option<u64>) -> Self {
-        let limit_bytes = std::env::var(SHUFFLE_PAGE_CACHE_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or_else(|| match cgroup_limit_bytes {
-                Some(limit) => ((limit as f64) * SHUFFLE_PAGE_CACHE_FRACTION) as u64,
-                None => DEFAULT_SHUFFLE_PAGE_CACHE_BYTES,
-            });
+    /// Build a budget from the one capacity decision this process already made.
+    ///
+    /// The ceiling is NOT derived here. Page cache is charged to the same
+    /// `memory.max` as the query pool and the shuffle store, so deciding it
+    /// separately is how it escaped [`crate::executor_capacity`]'s accounting
+    /// and pushed total claims to 90% of the container.
+    pub fn from_capacity(capacity: &crate::executor_capacity::ExecutorCapacity) -> Self {
+        Self::with_limit(
+            capacity
+                .page_cache_bytes
+                .unwrap_or(DEFAULT_SHUFFLE_PAGE_CACHE_BYTES),
+        )
+    }
+
+    /// Build a budget with an explicit ceiling.
+    pub fn with_limit(limit_bytes: u64) -> Self {
         Self {
             limit_bytes,
             state: std::sync::Mutex::new(CacheState::default()),
@@ -323,24 +317,25 @@ mod tests {
         assert_eq!(b.held_bytes(), 400);
     }
 
-    /// The ceiling must come from the container, not a hard-coded constant that
-    /// claims the same bytes on a 2 GiB executor and a 64 GiB one.
+    /// The ceiling must come from the shared capacity decision, so it is inside
+    /// the accounted total rather than a fourth claim beside it.
     #[test]
-    fn the_ceiling_is_derived_from_the_container() {
-        let small = ShufflePageCacheBudget::from_cgroup(Some(4_718_592_000));
-        let large = ShufflePageCacheBudget::from_cgroup(Some(64 * 1024 * 1024 * 1024));
+    fn the_ceiling_comes_from_the_capacity_model() {
+        use crate::executor_capacity::ExecutorCapacity;
+        let cap = ExecutorCapacity::derive(4, Some(4_718_592_000), None, None, None, None, None);
+        let budget = ShufflePageCacheBudget::from_capacity(&cap);
+        assert_eq!(budget.limit_bytes(), cap.page_cache_bytes.unwrap_or(0));
         assert!(
-            large.limit_bytes() > small.limit_bytes(),
-            "a bigger container should permit a bigger cache"
+            budget.limit_bytes() < 4_718_592_000 / 8,
+            "the cache must stay a small share of the container, got {}",
+            budget.limit_bytes()
         );
-        assert!(
-            small.limit_bytes() < 4_718_592_000 / 4,
-            "the cache must stay well inside the container's slack"
-        );
+
+        // No cgroup limit -> no derived ceiling -> documented fallback.
+        let unbounded = ExecutorCapacity::derive(4, None, None, None, None, None, None);
         assert_eq!(
-            ShufflePageCacheBudget::from_cgroup(None).limit_bytes(),
-            DEFAULT_SHUFFLE_PAGE_CACHE_BYTES,
-            "uncontained falls back to the documented default"
+            ShufflePageCacheBudget::from_capacity(&unbounded).limit_bytes(),
+            DEFAULT_SHUFFLE_PAGE_CACHE_BYTES
         );
     }
 }
