@@ -6,6 +6,37 @@ use std::sync::Arc;
 
 use krishiv_common::MemoryBudget;
 
+/// Reserve a shuffle-write batch against the task budget.
+///
+/// Every map task buffers its whole output before `write_partition` can take
+/// it, and that buffer is invisible to the DataFusion pool. This lives in one
+/// function because the buffering loop is written out three times in this file
+/// (`execute_shuffle_write_fragment`, `execute_dfplan_fragment`,
+/// `execute_inmem_shuffle_write`) and the first attempt at this fix patched
+/// only one of them — the executors kept being OOM-killed through the other
+/// two, with the new error never appearing in their logs because the code that
+/// raised it was not the code that ran.
+fn reserve_shuffle_batch(
+    budget: &MemoryBudget,
+    batch: &arrow::record_batch::RecordBatch,
+    held: &mut u64,
+) -> Result<(), ExecutorError> {
+    let bytes = batch.get_array_memory_size() as u64;
+    if budget.try_reserve(bytes) {
+        *held += bytes;
+        return Ok(());
+    }
+    Err(ExecutorError::LocalExecution {
+        message: format!(
+            "shuffle write buffer exhausted this task's memory budget: needed \
+             {bytes} more bytes on top of {held} already buffered (limit {:?}). \
+             The map output is held whole because the shuffle store has no \
+             append; reduce stage width or raise the executor memory limit.",
+            budget.limit(),
+        ),
+    })
+}
+
 /// Releases a shuffle-write buffer reservation when the task leaves the write
 /// path, however it leaves — including the `?` returns through the write loop,
 /// which is why this is a guard and not a pair of matched calls.
@@ -680,6 +711,10 @@ async fn execute_shuffle_write_fragment(
 
     let mut partition_batches: Vec<Vec<arrow::record_batch::RecordBatch>> =
         vec![Vec::new(); num_partitions as usize];
+    // Coordinator-supplied per-task allowance; `from_limit(None)` is
+    // unlimited, so an assignment without a limit keeps prior behaviour.
+    let shuffle_budget = MemoryBudget::from_limit(assignment.memory_limit_bytes());
+    let mut shuffle_held = 0u64;
     let mut total_rows: usize = 0;
     let mut output_schema: arrow::datatypes::SchemaRef =
         Arc::new(arrow::datatypes::Schema::empty());
@@ -728,10 +763,18 @@ async fn execute_shuffle_write_fragment(
             if bucket_batch.num_rows() > 0
                 && let Some(v) = partition_batches.get_mut(bucket_idx)
             {
+                if let Err(e) =
+                    reserve_shuffle_batch(&shuffle_budget, &bucket_batch, &mut shuffle_held)
+                {
+                    shuffle_budget.release(shuffle_held);
+                    return Err(e);
+                }
                 v.push(bucket_batch);
             }
         }
     }
+    let _shuffle_reservation =
+        ShuffleBufferReservation::new(Arc::clone(&shuffle_budget), shuffle_held);
 
     let mut outputs: Vec<krishiv_proto::ShufflePartitionOutput> =
         Vec::with_capacity(num_partitions as usize);
@@ -1228,6 +1271,10 @@ async fn execute_inmem_shuffle_write(
 
     let mut partition_batches: Vec<Vec<arrow::record_batch::RecordBatch>> =
         vec![Vec::new(); num_partitions as usize];
+    // Coordinator-supplied per-task allowance; `from_limit(None)` is
+    // unlimited, so an assignment without a limit keeps prior behaviour.
+    let shuffle_budget = MemoryBudget::from_limit(assignment.memory_limit_bytes());
+    let mut shuffle_held = 0u64;
     let mut total_rows: usize = 0;
     let mut output_schema: arrow::datatypes::SchemaRef =
         std::sync::Arc::new(arrow::datatypes::Schema::empty());
@@ -1286,10 +1333,20 @@ async fn execute_inmem_shuffle_write(
                     if bucket_batch.num_rows() > 0
                         && let Some(v) = partition_batches.get_mut(bucket_idx)
                     {
+                        if let Err(e) = reserve_shuffle_batch(
+                            &shuffle_budget, &bucket_batch, &mut shuffle_held)
+                        {
+                            shuffle_budget.release(shuffle_held);
+                            return Err(e);
+                        }
                         v.push(bucket_batch);
                     }
                 }
             } else if let Some(v) = partition_batches.first_mut() {
+                if let Err(e) = reserve_shuffle_batch(&shuffle_budget, &batch, &mut shuffle_held) {
+                    shuffle_budget.release(shuffle_held);
+                    return Err(e);
+                }
                 v.push(batch);
             }
         }
