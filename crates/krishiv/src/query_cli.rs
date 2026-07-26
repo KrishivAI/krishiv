@@ -57,6 +57,11 @@ pub struct QueryCommand {
     /// Remote coordinator (Flight) URL from the global `-c/--coordinator` flag.
     /// Takes precedence over `KRISHIV_COORDINATOR`; `None` ⇒ env fallback.
     pub coordinator_url: Option<String>,
+    /// `explain --analyze`: execute the query and report per-operator runtime
+    /// metrics instead of only the plan. A plan cannot answer why a query is
+    /// slow when the interesting operator is a dynamic filter, which is empty
+    /// until execution populates it.
+    pub analyze: bool,
 }
 
 pub fn sql_help() -> String {
@@ -108,6 +113,7 @@ pub fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
     let mut mode = ExecutionMode::Embedded;
     let mut parquet_tables = Vec::new();
     let mut format = OutputFormat::default();
+    let mut analyze = false;
     let mut execution = QueryExecution::Default;
     let mut api_key = None;
     let mut timeout_secs = None;
@@ -137,6 +143,9 @@ pub fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
                     .get(idx)
                     .ok_or_else(|| String::from("missing value for --parquet"))?;
                 parquet_tables.push(parse_parquet_spec(value)?);
+            }
+            "--analyze" => {
+                analyze = true;
             }
             "--format" => {
                 idx += 1;
@@ -207,6 +216,7 @@ pub fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
         api_key,
         timeout_secs,
         coordinator_url: None,
+        analyze,
     })
 }
 
@@ -301,7 +311,11 @@ pub fn run_explain(command: &QueryCommand) -> CliResponse {
     };
     match block_on(async {
         let df = query_dataframe(&session, command).await?;
-        df.explain_async().await
+        if command.analyze {
+            df.explain_analyze_async().await
+        } else {
+            df.explain_async().await
+        }
     }) {
         Ok(output) => CliResponse::ok(format!("{output}\n")),
         Err(error) => CliResponse::err(format!("{error}\n"), 1),
