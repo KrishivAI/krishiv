@@ -852,6 +852,55 @@ async fn heartbeat_loop(
     let mut sigterm = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
     let mut sigint = signal(SignalKind::interrupt()).map_err(|error| error.to_string())?;
 
+    // Executor-local shuffle GC.
+    //
+    // Shuffle output is written to *this node's* disk, but the only reclaim
+    // loop in the engine runs on the coordinator against the coordinator's own
+    // directory. Executor scratch therefore grew without bound: an SF100 TPC-H
+    // sweep left 31 finished jobs and 50 GB behind on a single node, which
+    // filled the disk, tripped the kubelet's DiskPressure taint, and got the
+    // executor evicted — a benchmark failure that looked like an engine bug.
+    //
+    // The live-job set comes from the coordinator on every heartbeat, so the
+    // decision of what is garbage stays with the component that actually knows.
+    // It is published here and consumed by a separate task: walking the tree is
+    // filesystem work, and the heartbeat cadence must not wait on it.
+    let (live_jobs_tx, live_jobs_rx) =
+        tokio::sync::watch::channel::<Option<std::collections::HashSet<String>>>(None);
+    if let Some(gc_dir) = shuffle_dir.clone() {
+        let mut rx = live_jobs_rx;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                // `None` means no coordinator has reported a live-job set yet
+                // (or the peer is too old to send one). Reclaiming on that
+                // would delete the shuffle output of every running job.
+                let Some(active) = rx.borrow_and_update().clone() else {
+                    continue;
+                };
+                let dir = gc_dir.clone();
+                let removed = tokio::task::spawn_blocking(move || {
+                    krishiv_shuffle::orphan::cleanup_orphans(&dir, &active)
+                })
+                .await;
+                match removed {
+                    Ok(Ok(n)) if n > 0 => tracing::info!(
+                        removed = n,
+                        dir = %gc_dir.display(),
+                        "executor shuffle GC: reclaimed orphaned partition files"
+                    ),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "executor shuffle GC failed")
+                    }
+                    Err(e) => tracing::warn!(error = %e, "executor shuffle GC task panicked"),
+                }
+            }
+        });
+    }
+
     let base_backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(30);
     let mut current_backoff = base_backoff;
@@ -927,6 +976,14 @@ async fn heartbeat_loop(
                                 "coordinator command worker exited; \
                                  restore/checkpoint commands dropped"
                             );
+                        }
+                        // Publish the coordinator's live-job set for the shuffle
+                        // GC task. Only overwrite when the coordinator actually
+                        // reported one: a peer that never sends the set must
+                        // leave the last authoritative value in place rather
+                        // than reset it to "unknown".
+                        if let Some(live) = heartbeat.live_job_ids() {
+                            let _ = live_jobs_tx.send(Some(live.clone()));
                         }
                         // R7.2: Apply source throttle limits from the coordinator heartbeat
                         // response.  The `SourceThrottleTable` is shared between the heartbeat

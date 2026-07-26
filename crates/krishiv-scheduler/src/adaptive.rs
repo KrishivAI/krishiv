@@ -94,4 +94,8 @@ pub struct ExecutorHeartbeatEffects {
     pub lease_generation: LeaseGeneration,
     /// Global minimum event-time watermark per job (ms since epoch).
     pub global_watermarks: std::collections::HashMap<krishiv_proto::JobId, i64>,
+    /// Jobs the coordinator still tracks, so the executor can reclaim local
+    /// shuffle scratch for every job directory outside this set. `None` when
+    /// the coordinator is not reporting — the executor then reclaims nothing.
+    pub live_job_ids: Option<std::collections::HashSet<String>>,
 }

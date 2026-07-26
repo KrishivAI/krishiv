@@ -190,6 +190,17 @@ message ExecutorHeartbeatResponse {
   // Computed from all executors running each job; executor uses this to
   // advance downstream aggregation windows.
   map<string, int64> global_watermarks = 12;
+  // Jobs the coordinator still tracks. Executors reclaim local shuffle
+  // scratch for every job directory NOT in this set.
+  repeated string live_job_ids = 13;
+  // Presence flag for `live_job_ids`, and the reason this is not just an
+  // empty-list check: on the wire, "the coordinator reports zero live jobs"
+  // and "the peer is too old to report at all" both arrive as an empty
+  // repeated field. Treating the second as the first would have an upgraded
+  // executor delete the shuffle output of every RUNNING job the moment it
+  // talked to an older coordinator. Old peers leave this false and the
+  // executor reclaims nothing.
+  bool live_jobs_authoritative = 14;
 }
 
 message ShuffleWriteConfigWire {

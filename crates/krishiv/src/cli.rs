@@ -1236,7 +1236,6 @@ mod tests {
         assert!(response.stderr.contains("unknown command: bogus"));
     }
 
-    #[test]
     /// `--format json` must emit the rows themselves, not a drawn table.
     ///
     /// A benchmark harness comparing this engine's answers to DuckDB's or
@@ -1279,6 +1278,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn sql_command_executes_literal_query() {
         let response = dispatch(&["sql", "--query", "select 1 as value"]);
         assert_eq!(response.exit_code, 0, "{}", response.stderr);

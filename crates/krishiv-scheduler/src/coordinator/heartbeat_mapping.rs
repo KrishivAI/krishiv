@@ -77,5 +77,11 @@ pub fn executor_heartbeat_response_from_effects(
     if !effects.global_watermarks.is_empty() {
         resp = resp.with_global_watermarks(effects.global_watermarks);
     }
+    // Unlike the fields above, an empty set here is meaningful — it says every
+    // job has finished, so the executor may reclaim all of its shuffle
+    // scratch. Only `None` (coordinator not reporting) is the silent case.
+    if let Some(live) = effects.live_job_ids {
+        resp = resp.with_live_job_ids(live);
+    }
     resp
 }

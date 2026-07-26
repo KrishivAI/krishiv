@@ -360,6 +360,11 @@ pub fn executor_heartbeat_response_to_wire(
             .iter()
             .map(|(k, &v)| (k.as_str().to_owned(), v))
             .collect(),
+        live_job_ids: value
+            .live_job_ids()
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_default(),
+        live_jobs_authoritative: value.live_job_ids().is_some(),
     }
 }
 
@@ -477,6 +482,12 @@ pub fn executor_heartbeat_response_from_wire(
             })
             .collect();
         response = response.with_global_watermarks(watermarks);
+    }
+    // Only an explicit flag makes the set authoritative: an old coordinator
+    // sends no ids and no flag, and must leave the executor reclaiming
+    // nothing rather than treating "silence" as "every job is finished".
+    if value.live_jobs_authoritative {
+        response = response.with_live_job_ids(value.live_job_ids.into_iter().collect());
     }
     Ok(response)
 }

@@ -90,5 +90,122 @@ pub fn cleanup_orphans(
             Err(e) => return Err(e.into()),
         }
     }
+
+    // Removing the files leaves the tree that held them — one directory per
+    // job, per stage, per map task. A long-lived executor accumulates those
+    // forever, and a directory entry costs an inode whether or not it holds
+    // bytes, so a filesystem can run out of inodes with disk left free.
+    for entry in std::fs::read_dir(base_dir)? {
+        let entry = entry?;
+        if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        let is_active = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| active_job_ids.contains(name));
+        if !is_active {
+            prune_empty_dirs(&path)?;
+        }
+    }
+
     Ok(deleted + already_gone)
+}
+
+/// Remove `dir` and its descendants, but only the ones that ended up empty.
+///
+/// Deliberately not `remove_dir_all`: [`scan_orphans`] only collects files it
+/// recognises as shuffle artifacts, so anything else under a job directory was
+/// put there by something other than the shuffle writer. Pruning bottom-up and
+/// stopping at the first non-empty directory keeps that restraint — an
+/// unrecognised file keeps its parents alive instead of being swept up.
+fn prune_empty_dirs(dir: &std::path::Path) -> ShuffleResult<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            prune_empty_dirs(&entry.path())?;
+        }
+    }
+    // Fails harmlessly with `DirectoryNotEmpty` when something survived.
+    match std::fs::remove_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.kind() == std::io::ErrorKind::DirectoryNotEmpty =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn write(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"x").unwrap();
+    }
+
+    /// The leak that filled a benchmark node: deleting the partition files
+    /// left every `job/stage/map` directory behind, so a long-lived executor
+    /// accumulated directory entries for the lifetime of the process.
+    #[test]
+    fn cleanup_prunes_the_directories_it_emptied() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path();
+        write(&base.join("job-done/s1.m0/0.parquet"));
+        write(&base.join("job-done/s1.m0/0.parquet.blake3"));
+        write(&base.join("job-done/s2.m1/3.lease"));
+
+        let active = HashSet::new();
+        cleanup_orphans(base, &active).unwrap();
+
+        assert!(
+            !base.join("job-done").exists(),
+            "the emptied job directory must be pruned, not just its files"
+        );
+    }
+
+    /// `scan_orphans` only collects files it recognises as shuffle artifacts.
+    /// Pruning must keep that restraint: an unrecognised file keeps its
+    /// parents alive rather than being swept up by a blanket remove_dir_all.
+    #[test]
+    fn cleanup_keeps_directories_holding_files_it_does_not_own() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path();
+        write(&base.join("job-done/s1.m0/0.parquet"));
+        write(&base.join("job-done/s1.m0/operator.log"));
+
+        cleanup_orphans(base, &HashSet::new()).unwrap();
+
+        assert!(!base.join("job-done/s1.m0/0.parquet").exists());
+        assert!(
+            base.join("job-done/s1.m0/operator.log").exists(),
+            "a file the shuffle writer did not create must survive"
+        );
+        assert!(base.join("job-done/s1.m0").exists());
+    }
+
+    /// The safety property the whole feature rests on: a running job's
+    /// partitions are never reclaimed while the coordinator still lists it.
+    #[test]
+    fn cleanup_never_touches_a_live_job() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path();
+        write(&base.join("job-live/s1.m0/0.parquet"));
+        write(&base.join("job-done/s1.m0/0.parquet"));
+
+        let active: HashSet<String> = ["job-live".to_string()].into_iter().collect();
+        cleanup_orphans(base, &active).unwrap();
+
+        assert!(
+            base.join("job-live/s1.m0/0.parquet").exists(),
+            "a live job's shuffle output must survive GC"
+        );
+        assert!(!base.join("job-done").exists());
+    }
 }

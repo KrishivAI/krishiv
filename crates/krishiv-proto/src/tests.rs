@@ -1107,6 +1107,8 @@ mod wire_fuzz {
                 initiate_checkpoints: vec![],
                 completed_checkpoints: vec![],
                 restore_checkpoints: vec![],
+                live_job_ids: vec![],
+                live_jobs_authoritative: false,
                 source_throttles: vec![],
                 trace_parent,
                 trace_state,

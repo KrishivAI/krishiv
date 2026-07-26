@@ -265,6 +265,12 @@ impl Coordinator {
             restore_commands,
             lease_generation,
             global_watermarks,
+            // Every heartbeat carries the live-job set. Executors write shuffle
+            // output to their own local disks, which nothing else ever reclaims:
+            // the coordinator's GC loop only sweeps the coordinator's own
+            // directory, so before this the scratch grew without bound until the
+            // node hit DiskPressure and the kubelet evicted the executor.
+            live_job_ids: Some(self.active_job_ids()),
         })
     }
 

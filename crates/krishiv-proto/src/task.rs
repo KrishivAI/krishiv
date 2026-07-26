@@ -721,6 +721,13 @@ pub struct ExecutorHeartbeatResponse {
     /// Aggregated from all executors running the job; executor uses this to
     /// advance downstream window aggregation.
     global_watermarks: std::collections::HashMap<crate::ids::JobId, i64>,
+    /// Jobs the coordinator still tracks, for executor-side shuffle GC.
+    ///
+    /// `None` means the coordinator did not report — which is NOT the same as
+    /// "no jobs are live". An executor that conflated the two would delete
+    /// the shuffle output of every running job whenever it heartbeat an
+    /// older coordinator, so the absent case must reclaim nothing.
+    live_job_ids: Option<std::collections::HashSet<String>>,
 }
 
 impl ExecutorHeartbeatResponse {
@@ -738,7 +745,24 @@ impl ExecutorHeartbeatResponse {
             restore_commands: Vec::new(),
             trace_context: None,
             global_watermarks: std::collections::HashMap::new(),
+            live_job_ids: None,
         }
+    }
+
+    /// Report the jobs the coordinator still tracks, so executors can reclaim
+    /// shuffle scratch for everything else.
+    #[must_use]
+    pub fn with_live_job_ids(mut self, ids: std::collections::HashSet<String>) -> Self {
+        self.live_job_ids = Some(ids);
+        self
+    }
+
+    /// Jobs the coordinator still tracks, or `None` if it did not report.
+    ///
+    /// Callers must treat `None` as "reclaim nothing" rather than "reclaim
+    /// everything" — see the field docs.
+    pub fn live_job_ids(&self) -> Option<&std::collections::HashSet<String>> {
+        self.live_job_ids.as_ref()
     }
 
     /// Override the transport version when mapping from a wire response.
