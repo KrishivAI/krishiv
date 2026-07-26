@@ -385,6 +385,26 @@ pub fn parse_dfplan_body(body: &str) -> SqlResult<(DfplanTaskSpec, Vec<u8>)> {
     Ok((spec, bytes))
 }
 
+/// Prove that encoded fragment bytes can be decoded again.
+///
+/// The coordinator and the executor decode with the same DataFusion codec, so
+/// a round trip here is a genuine rehearsal of what the executor will do —
+/// minus the table registrations, which fragments do not need because scan
+/// nodes carry their own file descriptions.
+///
+/// A bare `TaskContext` is enough: this is checking that the *proto shape* is
+/// decodable, not that the plan can run. Anything that needs session state to
+/// decode would fail on the executor too, which is exactly what we want to
+/// catch.
+fn verify_dfplan_roundtrip(bytes: &[u8], codec: &dyn PhysicalExtensionCodec) -> SqlResult<()> {
+    let ctx = SessionContext::new().task_ctx();
+    datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec(bytes, &ctx, codec)
+        .map(|_| ())
+        .map_err(|e| SqlError::DataFusion {
+            message: format!("physical plan proto decode: {e}"),
+        })
+}
+
 /// Decode a `dfplan:v1:` fragment body into (partition spec, plan).
 ///
 /// `ctx` supplies the runtime environment (object stores, UDFs) the decoded
@@ -1077,6 +1097,30 @@ pub fn build_distributed_stages(
                 return Ok(None);
             }
         };
+        // Encoding successfully is not the same as being shippable. Prove the
+        // bytes decode here, on the coordinator, before any executor is asked
+        // to run them.
+        //
+        // TPC-H q22 encodes cleanly and then dies on the executor with
+        // "ScalarSubqueryExpr can only be deserialized as part of a surrounding
+        // ScalarSubqueryExec": DataFusion's decoder needs a results context
+        // that only the enclosing exec supplies, and a stage boundary can put
+        // the expression in one fragment and its exec in another. The failure
+        // surfaces 30 minutes later, on a remote node, as an opaque fragment
+        // error.
+        //
+        // Checking the round trip rather than blacklisting one node type covers
+        // the whole class: any encode/decode asymmetry, present or future,
+        // degrades to the single-task path instead of failing the query. The
+        // cost is one decode per stage at planning time — a handful of small
+        // plans, against a query that runs for minutes.
+        if let Err(error) = verify_dfplan_roundtrip(&bytes, &codec) {
+            tracing::debug!(
+                %error,
+                "stage plan encodes but does not decode; falling back to single-task"
+            );
+            return Ok(None);
+        }
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let task_bodies = (0..partition_count)
             .map(|p| dfplan_task_body(&b64, p))
@@ -1242,6 +1286,52 @@ mod tests {
     use datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    /// A plan that encodes cleanly must still be rejected if it cannot be
+    /// decoded again, because the executor decodes with the same codec and
+    /// would fail there instead — remotely, minutes later, with an opaque
+    /// fragment error. That is how TPC-H q22 failed:
+    /// "ScalarSubqueryExpr can only be deserialized as part of a surrounding
+    /// ScalarSubqueryExec".
+    ///
+    /// Feeding the guard bytes that are not a valid plan proves it actually
+    /// inspects them rather than returning `Ok` unconditionally — a guard that
+    /// never fails is indistinguishable from no guard at all.
+    #[test]
+    fn the_roundtrip_guard_rejects_bytes_that_do_not_decode() {
+        let codec = DefaultPhysicalExtensionCodec {};
+        let err = verify_dfplan_roundtrip(b"not a physical plan proto", &codec)
+            .expect_err("undecodable bytes must be rejected");
+        assert!(
+            format!("{err}").contains("decode"),
+            "error should name the decode step, got: {err}"
+        );
+    }
+
+    /// The guard must not reject ordinary plans — otherwise every query
+    /// silently loses distribution, which is the failure mode that made the
+    /// s3:// registration bug so hard to see.
+    #[tokio::test]
+    async fn the_roundtrip_guard_accepts_an_ordinary_plan() {
+        let ctx = SessionContext::new();
+        ctx.sql("CREATE TABLE t AS VALUES (1, 'a'), (2, 'b')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let plan = ctx
+            .sql("SELECT column1 FROM t WHERE column1 > 1")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let codec = DefaultPhysicalExtensionCodec {};
+        let bytes = encode_dfplan_bytes(plan, &codec).expect("encode");
+        verify_dfplan_roundtrip(&bytes, &codec)
+            .expect("an ordinary plan must round-trip, or every query loses distribution");
+    }
 
     /// The stage builder plans on a throwaway context, so an `s3://` table must
     /// resolve to an object store there. When it did not, `register_parquet`
