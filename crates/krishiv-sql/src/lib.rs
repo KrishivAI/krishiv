@@ -1047,6 +1047,12 @@ impl SqlEngine {
             .with_optimizer_rule(std::sync::Arc::new(
                 crate::semi_join_reduction::SemiJoinReductionThroughAggregate,
             ))
+            // q18: a decorrelated IN-subquery semi-join lands at the top of the
+            // plan, so the most selective predicate runs after the joins it
+            // should have shrunk. Push it into the join input instead.
+            .with_optimizer_rule(std::sync::Arc::new(
+                crate::semi_join_reduction::SemiJoinPushdownThroughInnerJoin,
+            ))
             .with_config(build_single_node_session_config(
                 target_partitions,
                 memory_limit_bytes,
@@ -1161,6 +1167,12 @@ impl SqlEngine {
             // optimization depend on which constructor happened to run.
             .with_optimizer_rule(std::sync::Arc::new(
                 crate::semi_join_reduction::SemiJoinReductionThroughAggregate,
+            ))
+            // q18: a decorrelated IN-subquery semi-join lands at the top of the
+            // plan, so the most selective predicate runs after the joins it
+            // should have shrunk. Push it into the join input instead.
+            .with_optimizer_rule(std::sync::Arc::new(
+                crate::semi_join_reduction::SemiJoinPushdownThroughInnerJoin,
             ))
             .with_config(build_single_node_session_config(target_partitions, None))
             .build();
