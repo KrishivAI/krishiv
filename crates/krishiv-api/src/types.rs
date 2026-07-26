@@ -145,10 +145,21 @@ impl QueryResult {
     ///
     /// Empty results yield an empty string rather than `[]`, so a caller can
     /// count rows by counting lines.
+    ///
+    /// Nulls are written explicitly. Arrow's JSON writer omits null-valued
+    /// keys by default, which makes a row's key set depend on its *values*:
+    /// `select a, b` returns one key on the rows where `b` is null and two
+    /// where it is not. That silently breaks anything positional — a caller
+    /// doing `tuple(row.values())` gets short rows and misaligned columns —
+    /// and loses the distinction between "column absent" and "column null".
+    /// The rendered table already shows the column, so omitting it here also
+    /// made the two output formats disagree about the shape of the result.
     pub fn to_json_lines(&self) -> Result<String, crate::error::KrishivError> {
         let mut buffer = Vec::new();
         {
-            let mut writer = arrow::json::LineDelimitedWriter::new(&mut buffer);
+            let mut writer = arrow::json::WriterBuilder::new()
+                .with_explicit_nulls(true)
+                .build::<_, arrow::json::writer::LineDelimited>(&mut buffer);
             for batch in &self.batches {
                 if batch.num_rows() == 0 {
                     continue;
@@ -285,6 +296,53 @@ impl fmt::Display for StreamMode {
 mod tests {
     use super::*;
     use krishiv_engine_core::Placement;
+
+    /// A null must still occupy its column. Arrow's JSON writer drops
+    /// null-valued keys unless told otherwise, which made a row's shape depend
+    /// on its contents: the row with a value had three keys, the row without
+    /// had two. Anything reading positionally silently misaligned.
+    #[test]
+    fn json_lines_keep_null_columns_so_every_row_has_the_same_shape() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("c", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), Some(2)])),
+                Arc::new(StringArray::from(vec![None, Some("x")])),
+                Arc::new(Int64Array::from(vec![Some(3), None])),
+            ],
+        )
+        .expect("batch");
+
+        let lines = QueryResult::new(vec![batch])
+            .to_json_lines()
+            .expect("json lines");
+        let rows: Vec<serde_json::Value> = lines
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("valid json"))
+            .collect();
+
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            let object = row.as_object().expect("object");
+            assert_eq!(
+                object.keys().collect::<Vec<_>>(),
+                vec!["a", "b", "c"],
+                "every row must carry every column, got {row}"
+            );
+        }
+        assert_eq!(rows[0]["b"], serde_json::Value::Null);
+        assert_eq!(rows[1]["c"], serde_json::Value::Null);
+    }
 
     #[test]
     fn execution_mode_maps_to_canonical_placement() {

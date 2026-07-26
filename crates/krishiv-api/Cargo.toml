@@ -67,6 +67,9 @@ krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
 tempfile = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
+# Parses the NDJSON this crate emits, so the explicit-nulls test checks the
+# actual key set of each row rather than doing substring matching on the text.
+serde_json = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

@@ -159,8 +159,14 @@ spec:
             - name: AWS_REGION
               value: us-east-1
           resources:
+            # Identical to s1/s3. All three nodes are the same shape (4 CPU,
+            # 7.75 GiB allocatable), so the 2500m/2500Mi this used to carry was
+            # not a hardware constraint — it made s2 the first executor to be
+            # OOM-killed on every sweep and put one third of the cluster on
+            # different hardware terms than the rest, which is not a benchmark
+            # result anyone can interpret.
             requests: { cpu: "250m", memory: "512Mi" }
-            limits: { cpu: "2500m", memory: "2500Mi" }
+            limits: { cpu: "3500m", memory: "4500Mi" }
           volumeMounts:
             - { name: scratch, mountPath: /scratch }
       volumes:

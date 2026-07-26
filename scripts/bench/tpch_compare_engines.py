@@ -27,12 +27,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime
+import decimal
 import hashlib
 import json
 import os
 import subprocess
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from benchlock import machine_lock  # noqa: E402 - needs the path set above
 
 SINGLE_FILE_TABLES = {"nation", "region"}
 
@@ -74,25 +79,77 @@ def parquet_glob(data_root: str, table: str) -> str:
     return path if path.endswith(".parquet") else os.path.join(path, "**", "*.parquet")
 
 
+SIGNIFICANT_DIGITS = 6
+
+
+def canonical_value(value) -> str:
+    """Render a cell so that equal values compare equal across engines.
+
+    The three engines return the same number as three different Python types.
+    A TPC-H money column comes back from Spark as `Decimal('0.000000')`, from
+    DuckDB as `0.0`, and from Krishiv — which arrives over JSON — as `0.0`.
+    Hashing `str(value)` therefore hashed the type as much as the number, and
+    reported disagreements that did not exist: it flagged 17 of 22 queries,
+    including a DuckDB-versus-Spark difference on q1, which is a plain
+    four-row aggregate that both engines get right.
+
+    So numbers are compared as numbers. Exact integers keep every digit, which
+    matters because `count(*)` at SF100 runs to nine digits and rounding one
+    would hide precisely the kind of bug this check exists to catch. Anything
+    with a fractional part is rounded to `SIGNIFICANT_DIGITS`, because sums
+    over 600M rows legitimately differ in their low bits with summation order
+    and that is not a correctness failure.
+    """
+    if value is None:
+        return "\x00null"
+    if isinstance(value, bool):  # bool is an int subclass; check it first
+        return "true" if value else "false"
+    if isinstance(value, (int, float, decimal.Decimal)):
+        try:
+            number = value if isinstance(value, decimal.Decimal) \
+                else decimal.Decimal(str(value))
+        except (decimal.InvalidOperation, ValueError):
+            return str(value)
+        if not number.is_finite():
+            return str(number)
+        if number == number.to_integral_value():
+            return str(int(number))
+        rounded = decimal.Context(prec=SIGNIFICANT_DIGITS).create_decimal(number)
+        return format(rounded.normalize(), "f")
+    if isinstance(value, datetime.datetime):
+        return value.isoformat(sep=" ").replace(".000000", "")
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    return str(value)
+
+
 def fingerprint(rows: list[tuple]) -> dict:
     """Summarise a result set so two engines can be compared without storing it.
 
     Row count alone would pass a query that returned the right number of wrong
-    rows, so this also hashes the fully-ordered, stringified contents. Floats
-    are rounded to 6 significant digits first: TPC-H sums over 600M rows
-    legitimately differ in the last bits between engines depending on summation
-    order, and treating that as a correctness failure would be a false alarm.
+    rows, so the contents are hashed too — twice. `digest` preserves row order;
+    `digest_unordered` sorts the canonicalised rows first. TPC-H queries whose
+    ORDER BY does not fully determine a total order may return tied rows in any
+    sequence, and two engines permuting a tie are not disagreeing about the
+    answer. Keeping both lets a real difference in content be reported as a
+    failure while a difference in tie order is reported as what it is.
     """
-    digest = hashlib.sha256()
-    for row in rows:
-        for value in row:
-            if isinstance(value, float):
-                digest.update(f"{value:.6g}".encode())
-            else:
-                digest.update(str(value).encode())
-            digest.update(b"\x1f")
-        digest.update(b"\x1e")
-    return {"rows": len(rows), "digest": digest.hexdigest()[:16]}
+    canonical = [[canonical_value(cell) for cell in row] for row in rows]
+
+    def digest_of(sequence) -> str:
+        digest = hashlib.sha256()
+        for row in sequence:
+            for cell in row:
+                digest.update(cell.encode())
+                digest.update(b"\x1f")
+            digest.update(b"\x1e")
+        return digest.hexdigest()[:16]
+
+    return {
+        "rows": len(rows),
+        "digest": digest_of(canonical),
+        "digest_unordered": digest_of(sorted(canonical)),
+    }
 
 
 # ── engines ──────────────────────────────────────────────────────────────
@@ -274,10 +331,16 @@ def merge_passes(passes: list[list[dict]]) -> list[dict]:
             base["elapsed_s"] = round(median(times), 2)
             base["samples_s"] = times
             base["runs_ok"] = f"{len(ok)}/{len(samples)}"
-            digests = {s.get("digest") for s in ok}
-            if len(digests) > 1:
+            # Judge determinism on content, not on the order of tied rows —
+            # the same distinction the cross-engine check makes. An engine
+            # that returns different *rows* run to run is a correctness bug;
+            # one that permutes a tie is not.
+            contents = {s.get("digest_unordered") or s.get("digest") for s in ok}
+            if len(contents) > 1:
                 base["status"] = "nondeterministic"
-                base["error"] = f"differing digests across passes: {sorted(digests)}"
+                base["error"] = f"differing results across passes: {sorted(contents)}"
+            elif len({s.get("digest") for s in ok}) > 1:
+                base["tie_order_varies"] = True
         merged.append(base)
     return merged
 
@@ -301,28 +364,34 @@ def main() -> int:
     wanted = [e.strip() for e in args.engines.split(",") if e.strip()]
     results: dict[str, list[dict]] = {}
 
-    # Serial by construction: one engine finishes before the next starts.
-    # Every engine gets the same number of passes — giving one of them a median
-    # and the others a single sample would bias the comparison toward whichever
-    # got to discard its worst run.
-    for engine in wanted:
-        if engine == "krishiv" and not args.krishiv:
-            print("skipping krishiv: --krishiv not given", flush=True)
-            continue
-        if engine not in ("duckdb", "spark", "krishiv"):
-            print(f"unknown engine {engine}", flush=True)
-            continue
-        passes = []
-        for attempt in range(1, args.repeat + 1):
-            print(f"\n=== {engine} ({len(queries)} queries) "
-                  f"pass {attempt}/{args.repeat} ===", flush=True)
-            if engine == "duckdb":
-                passes.append(run_duckdb(args.data, queries, args.timeout))
-            elif engine == "spark":
-                passes.append(run_spark(args.data, queries, args.timeout))
-            else:
-                passes.append(run_krishiv(args.krishiv, args.data, queries, args.timeout))
-        results[engine] = merge_passes(passes)
+    # Serial by construction: one engine finishes before the next starts, and
+    # the machine lock extends that guarantee across processes. Serialising the
+    # engines inside one run is worthless if a second run of this same script
+    # is executing beside it — which is exactly what happened, undetected,
+    # because each caller script had its own name-matching guard that did not
+    # know about the others. Every engine also gets the same number of passes;
+    # giving one a median and the others a single sample would bias the
+    # comparison toward whichever got to discard its worst run.
+    with machine_lock(f"tpch_compare_engines {args.engines} repeat={args.repeat}"):
+        for engine in wanted:
+            if engine == "krishiv" and not args.krishiv:
+                print("skipping krishiv: --krishiv not given", flush=True)
+                continue
+            if engine not in ("duckdb", "spark", "krishiv"):
+                print(f"unknown engine {engine}", flush=True)
+                continue
+            passes = []
+            for attempt in range(1, args.repeat + 1):
+                print(f"\n=== {engine} ({len(queries)} queries) "
+                      f"pass {attempt}/{args.repeat} ===", flush=True)
+                if engine == "duckdb":
+                    passes.append(run_duckdb(args.data, queries, args.timeout))
+                elif engine == "spark":
+                    passes.append(run_spark(args.data, queries, args.timeout))
+                else:
+                    passes.append(
+                        run_krishiv(args.krishiv, args.data, queries, args.timeout))
+            results[engine] = merge_passes(passes)
 
     print("\n=== summary ===", flush=True)
     for engine, rows in results.items():
@@ -341,21 +410,35 @@ def main() -> int:
         for right in names[i + 1:]:
             print(f"\n=== {left} vs {right} result agreement ===", flush=True)
             agreed = 0
+            reordered = 0
             for a, b in zip(results[left], results[right]):
                 if a["status"] != "ok" or b["status"] != "ok":
                     continue
                 if a.get("digest") == b.get("digest"):
                     agreed += 1
+                elif a.get("digest_unordered") == b.get("digest_unordered"):
+                    # Same rows, different sequence. TPC-H does not always
+                    # impose a total order, so tied rows may come back in
+                    # either order. That is not a wrong answer, and calling it
+                    # one would bury the disagreements that matter.
+                    reordered += 1
+                    agreed += 1
+                    print(f"  tie-order q{a['id']} {a['name']}: same "
+                          f"{a.get('rows')} rows, different order", flush=True)
                 else:
                     mismatches += 1
                     print(f"  MISMATCH q{a['id']} {a['name']}: "
                           f"{left} rows={a.get('rows')} digest={a.get('digest')} vs "
                           f"{right} rows={b.get('rows')} digest={b.get('digest')}",
                           flush=True)
-            print(f"  {agreed} queries agreed", flush=True)
+            print(f"  {agreed} queries agreed"
+                  + (f" ({reordered} only up to tie order)" if reordered else ""),
+                  flush=True)
     if mismatches:
         print(f"\n{mismatches} result mismatches — timings below are not "
               f"comparable until these are explained", flush=True)
+    else:
+        print("\nall engines agreed on every comparable query", flush=True)
 
     if args.out:
         with open(args.out, "w", encoding="utf-8") as handle:

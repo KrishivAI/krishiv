@@ -5,6 +5,28 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use krishiv_common::MemoryBudget;
+
+/// Releases a shuffle-write buffer reservation when the task leaves the write
+/// path, however it leaves — including the `?` returns through the write loop,
+/// which is why this is a guard and not a pair of matched calls.
+struct ShuffleBufferReservation {
+    budget: Arc<MemoryBudget>,
+    bytes: u64,
+}
+
+impl ShuffleBufferReservation {
+    fn new(budget: Arc<MemoryBudget>, bytes: u64) -> Self {
+        Self { budget, bytes }
+    }
+}
+
+impl Drop for ShuffleBufferReservation {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.budget.release(self.bytes);
+        }
+    }
+}
 use krishiv_plan::udf::ResourceLimits;
 use krishiv_proto::{ExecutorTaskAssignment, TaskRuntimeStats};
 #[cfg(feature = "kafka")]
@@ -1017,9 +1039,49 @@ async fn execute_dfplan_fragment(
         let partitioner = key_column.map(|col| {
             HashPartitioner::new(col, num_partitions).with_seed(shuffle_seed_from_job_id(job_id))
         });
+        // The coordinator's per-task allowance. `from_limit(None)` yields an
+        // unlimited budget, so an assignment that carries no limit keeps the
+        // previous behaviour rather than inventing a cap the planner did not
+        // ask for.
+        let memory_budget = MemoryBudget::from_limit(assignment.memory_limit_bytes());
         let mut partition_batches: Vec<Vec<arrow::record_batch::RecordBatch>> =
             vec![Vec::new(); num_partitions as usize];
         let mut total_rows = 0usize;
+        // This loop holds the task's entire map output in memory until the
+        // stream ends — `write_partition` takes a whole partition, so there is
+        // nowhere to flush to part-way through. That buffer is invisible to
+        // the DataFusion pool, which only accounts what operators reserve
+        // through it, so at SF100 the executor's RSS walked past the cgroup
+        // limit while the pool still reported headroom and the kernel killed
+        // the process (exit 137). An OOM kill takes down every other task on
+        // the executor and surfaces to the coordinator as
+        // `task stalled: no progress for 30 min`, thirty minutes later.
+        //
+        // Reserving through the task budget cannot make the buffer smaller,
+        // but it changes who fails and how fast: this task fails immediately,
+        // by name, with a retryable error, and its siblings survive. Bounded
+        // spill-to-disk is the real cure and needs an appending
+        // `ShuffleStore` write API — until then, failing one task beats
+        // losing the executor.
+        let mut reserved_bytes = 0u64;
+        let reserve = |bytes: u64,
+                           reserved: &mut u64|
+         -> Result<(), ExecutorError> {
+            if memory_budget.try_reserve(bytes) {
+                *reserved += bytes;
+                return Ok(());
+            }
+            Err(ExecutorError::LocalExecution {
+                message: format!(
+                    "shuffle write buffer exhausted this task's memory budget: \
+                     needed {bytes} more bytes on top of {reserved} already held \
+                     for {num_partitions} partitions (budget limit {:?}). The map \
+                     output is buffered whole because the shuffle store has no \
+                     append; reduce stage width or raise the executor memory limit.",
+                    memory_budget.limit(),
+                ),
+            })
+        };
         while let Some(result) = stream.next().await {
             let batch = result.map_err(|e| ExecutorError::LocalExecution {
                 message: e.to_string(),
@@ -1038,13 +1100,29 @@ async fn execute_dfplan_fragment(
                     if bucket_batch.num_rows() > 0
                         && let Some(v) = partition_batches.get_mut(bucket_idx)
                     {
+                        if let Err(e) =
+                            reserve(bucket_batch.get_array_memory_size() as u64, &mut reserved_bytes)
+                        {
+                            memory_budget.release(reserved_bytes);
+                            return Err(e);
+                        }
                         v.push(bucket_batch);
                     }
                 }
             } else if let Some(v) = partition_batches.first_mut() {
+                if let Err(e) = reserve(batch.get_array_memory_size() as u64, &mut reserved_bytes) {
+                    memory_budget.release(reserved_bytes);
+                    return Err(e);
+                }
                 v.push(batch);
             }
         }
+        // Held until the batches have been handed to the store below, because
+        // `concat_batches` briefly doubles the largest partition — the
+        // concatenated copy and its inputs are both live. Released on drop so
+        // the `?` paths through the write loop cannot leak the reservation.
+        let _buffer_reservation =
+            ShuffleBufferReservation::new(Arc::clone(&memory_budget), reserved_bytes);
 
         let mut outputs: Vec<krishiv_proto::ShufflePartitionOutput> =
             Vec::with_capacity(num_partitions as usize);

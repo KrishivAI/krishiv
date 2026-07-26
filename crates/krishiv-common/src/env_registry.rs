@@ -872,6 +872,14 @@ pub static FLAGS: &[FlagSpec] = &[
         "Sort-shuffle writer in-memory buffer threshold before spilling a run.",
     ),
     rt(
+        "KRISHIV_SHUFFLE_STORE_BYTES",
+        FlagKind::UInt,
+        "cgroup-derived",
+        "Push-shuffle store ceiling, carved from the same container budget as \
+         the query pool so the two cannot together exceed the container; \
+         0 disables the limit.",
+    ),
+    rt(
         "KRISHIV_SHUFFLE_TOKEN",
         FlagKind::Secret,
         "unset",

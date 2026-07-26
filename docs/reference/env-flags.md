@@ -108,7 +108,7 @@ Regenerate with:
 | `KRISHIV_PLAN_CACHE_MAX_ENTRIES` | uint | `128` | Logical-plan cache capacity per SQL session. |
 | `KRISHIV_PRODUCTION` | bool | `false` | Production mode: tightens defaults (fail-closed metadata, auth requirements, connector restrictions). |
 | `KRISHIV_PYTHON_UDF_TIMEOUT_MS` | uint | `30000` | Per-call timeout for sandboxed Python UDF execution. |
-| `KRISHIV_QUERY_MEMORY_LIMIT_BYTES` | uint | `cgroup-derived` | Per-query FairSpillPool budget for embedded/IVM sessions. |
+| `KRISHIV_QUERY_MEMORY_LIMIT_BYTES` | uint | `cgroup-derived` | Total FairSpillPool budget SHARED by every engine in the process (task slots, Flight SQL, IVM); 0 disables the limit. |
 | `KRISHIV_RACK_ID` | text | `unset` | Rack identifier the executor advertises for RACK_LOCAL placement (Phase 53). Node identity is the executor host. |
 | `KRISHIV_REMOTE_EXEC` | bool | `mode-dependent` | Force remote (coordinator) execution on or off for API sessions. |
 | `KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH` | bool | `profile-dependent` | Require bearer auth on executor task gRPC even in dev profiles. |
@@ -129,12 +129,13 @@ Regenerate with:
 | `KRISHIV_SHUFFLE_MEMORY_BYTES` | uint | `268435456` | In-memory shuffle store budget before spill/rejection. |
 | `KRISHIV_SHUFFLE_PARTITIONS` | uint | `target-parallelism` | Default shuffle partition count for distributed plans. |
 | `KRISHIV_SHUFFLE_SPILL_THRESHOLD_BYTES` | uint | `67108864` | Sort-shuffle writer in-memory buffer threshold before spilling a run. |
+| `KRISHIV_SHUFFLE_STORE_BYTES` | uint | `cgroup-derived` | Push-shuffle store ceiling, carved from the same container budget as the query pool so the two cannot together exceed the container; 0 disables the limit. |
 | `KRISHIV_SHUFFLE_TOKEN` | secret | `unset` | Bearer token protecting shuffle service endpoints. |
 | `KRISHIV_SHUFFLE_TOKEN_FILE` | path | `unset` | File containing the shuffle bearer token; hot-reloaded. |
 | `KRISHIV_SHUFFLE_TOKEN_RELOAD_SECS` | uint | `30` | Interval for re-reading the shuffle token file. |
 | `KRISHIV_SHUFFLE_URI` | url | `unset` | Shuffle backend URI (file://, s3://, tiered://local;s3://…). |
 | `KRISHIV_STAGE_SPLIT` | bool | `on` | Distributed batch stage splitting (Phase 52); off/0/false runs batch SQL single-task. |
-| `KRISHIV_STAGE_TARGET_PARTITIONS` | uint | `4` | Planning-time partition count for distributed batch stages (scan + shuffle fan-out). |
+| `KRISHIV_STAGE_TARGET_PARTITIONS` | uint | `cluster-derived` | Planning-time partition count for distributed batch stages (scan + shuffle fan-out); unset derives 2 tasks per live cluster slot. |
 | `KRISHIV_STATE_BACKEND` | rocksdb \| disaggregated | `rocksdb` | Executor generic state backend; disaggregated = DFS-primary with local cache (requires KRISHIV_STATE_DFS_ROOT). |
 | `KRISHIV_STATE_DFS_ROOT` | path | `unset` | DFS/object-store root for the disaggregated state backend. |
 | `KRISHIV_STATE_DIR` | path | `unset` | Executor state-backend directory (RocksDB window/operator state). |
@@ -144,8 +145,8 @@ Regenerate with:
 | `KRISHIV_STREAM_PROFILE` | low-latency \| throughput | `low-latency` | Streaming loop profile: embedded checkpoint cadence and the distributed run-loop batch/linger dial (Phase 55). |
 | `KRISHIV_TARGET_PARALLELISM` | uint | `cores` | DataFusion target partition count for local execution. |
 | `KRISHIV_TASK_GRPC_ADDR` | host:port | `127.0.0.1:50052` | Executor task gRPC listen address. |
-| `KRISHIV_TASK_SLOTS` | uint | `CPU-derived` | Executor task slots; unset derives from available CPU cores. |
-| `KRISHIV_TASK_TARGET_PARALLELISM` | uint | `cores/slots` | DataFusion parallelism per executor task engine; unset = per-slot share of cores. |
+| `KRISHIV_TASK_SLOTS` | uint | `capacity-derived` | Executor task slots; unset derives from CPU cores and the cgroup memory limit together. Also sizes per-task parallelism. |
+| `KRISHIV_TASK_TARGET_PARALLELISM` | uint | `cores/slots` | DataFusion parallelism per executor task engine; unset = per-slot share of cores, using the RESOLVED slot count (incl. --slots). |
 | `KRISHIV_TLS_CERT` | path | `unset` | TLS certificate path for coordinator/executor gRPC servers. |
 | `KRISHIV_TLS_KEY` | path | `unset` | TLS private-key path for coordinator/executor gRPC servers. |
 | `KRISHIV_UI` | bool | `on` | Embedded web-UI off-switch: KRISHIV_UI=off boots the daemon without the always-on embedded UI factory (certified platform profile sets off). |

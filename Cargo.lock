@@ -5591,6 +5591,7 @@ dependencies = [
  "krishiv-sql",
  "krishiv-state",
  "parquet 58.3.0",
+ "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

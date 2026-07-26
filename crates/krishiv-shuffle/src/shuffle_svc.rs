@@ -133,10 +133,28 @@ pub async fn run_shuffle_svc(
     )?;
     let token = Arc::new(std::sync::RwLock::new(token_val));
     let ess_index = SortShuffleIndex::new();
+    // The push store's ceiling comes from the same container budget that sizes
+    // the query pool. It used to take its own 2 GiB default, which on a 4500Mi
+    // executor put total claims 0.45 GiB over the container and on a 2500Mi
+    // executor 1.22 GiB over — the executors were OOM-killed mid-sweep while
+    // the query pool, which could only see its own reservations, reported
+    // headroom throughout. `None` (no cgroup limit) keeps the previous
+    // unbounded behaviour, which is correct off a container.
+    let capacity = krishiv_common::ExecutorCapacity::detect();
+    let push_store = match capacity.shuffle_store_bytes {
+        Some(bytes) => PushShuffleStore::new()
+            .with_memory_limit(usize::try_from(bytes).unwrap_or(usize::MAX)),
+        None => PushShuffleStore::new(),
+    };
+    tracing::info!(
+        shuffle_store_bytes = ?capacity.shuffle_store_bytes,
+        container_bytes = ?capacity.memory_limit_bytes,
+        "push-shuffle store sized from the container budget"
+    );
     let state = ShuffleSvcState {
         store,
         ess_index,
-        push_store: PushShuffleStore::new(),
+        push_store,
         token,
     };
     let app = build_router(state.clone());

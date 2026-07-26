@@ -26,6 +26,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from benchlock import machine_lock  # noqa: E402 - needs the path set above
+
 # nation and region generate as a single file; the rest are directories of
 # parts. `--parquet name=path` accepts either, but the path has to be right.
 SINGLE_FILE_TABLES = {"nation", "region"}
@@ -89,18 +92,23 @@ def main() -> int:
     )
     print(f"# data root {args.data}", flush=True)
 
+    # Same machine-wide lock the comparison runner takes: an embedded sweep and
+    # a three-engine comparison are equally capable of ruining each other's
+    # numbers, and they are launched by different scripts that have no reason
+    # to know about one another.
     results = []
-    for index, query in enumerate(queries, start=1):
-        name = f"q{index} {query['name']}"
-        outcome = run_query(args.binary, args.data, query, args.timeout)
-        results.append({"id": index, "name": query["name"], **outcome})
-        if outcome["status"] == "ok":
-            print(f"ok    {name:<45} {outcome['elapsed_s']:>8.2f} s", flush=True)
-        else:
-            print(
-                f"FAIL  {name:<45} {outcome['status']}: {outcome.get('error', '')}",
-                flush=True,
-            )
+    with machine_lock(f"tpch_embedded_run {args.label}"):
+        for index, query in enumerate(queries, start=1):
+            name = f"q{index} {query['name']}"
+            outcome = run_query(args.binary, args.data, query, args.timeout)
+            results.append({"id": index, "name": query["name"], **outcome})
+            if outcome["status"] == "ok":
+                print(f"ok    {name:<45} {outcome['elapsed_s']:>8.2f} s", flush=True)
+            else:
+                print(
+                    f"FAIL  {name:<45} {outcome['status']}: {outcome.get('error', '')}",
+                    flush=True,
+                )
 
     ok = sum(1 for r in results if r["status"] == "ok")
     total = sum(r["elapsed_s"] for r in results if r["status"] == "ok")

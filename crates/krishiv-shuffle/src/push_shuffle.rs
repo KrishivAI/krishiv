@@ -36,7 +36,17 @@ pub type PushShuffleKey = (String, String, u32);
 /// ordered list of IPC payloads pushed by the map tasks.
 type PushShuffleMap = DashMap<PushShuffleKey, Vec<Vec<u8>>>;
 
-/// Default memory cap: 2 GiB.  Override via [`PushShuffleStore::with_memory_limit`].
+/// Fallback memory cap for a store built without a container budget: 2 GiB.
+///
+/// Production sizing does **not** come from here — `run_shuffle_svc` derives the
+/// ceiling from `ExecutorCapacity`, so the store's claim and the query pool's
+/// claim are shares of one container rather than two independent budgets. This
+/// constant only applies off a cgroup (tests, embedded use), where there is no
+/// container to divide and the previous unbounded-ish behaviour is correct.
+///
+/// Taking this default in a container is what OOM-killed every SF100 executor:
+/// 2 GiB here plus a query pool sized at 0.6 of the same container exceeded the
+/// container on both the 2500Mi and 4500Mi shapes.
 const DEFAULT_MEMORY_LIMIT_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// In-process store for push-based shuffle data.
