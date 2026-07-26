@@ -800,6 +800,16 @@ pub static FLAGS: &[FlagSpec] = &[
         "DataFusion dynamic (runtime) filters: TopK / join / aggregate predicates pushed into probe-side file scans at execution time (Phase 54). `off` disables all three via the DataFusion master switch.",
     ),
     rt(
+        "KRISHIV_PREFER_HASH_JOIN",
+        FlagKind::Bool,
+        "on when uncapped, off under a memory limit",
+        "Join algorithm preference. DataFusion's hash join cannot spill its \
+         build side, so under a cgroup memory limit the engine prefers \
+         sort-merge join, which can — a slower query beats a failed one \
+         (TPC-H q18: 'Resources exhausted ... HashJoinInput[0] ... 732.4 MB'). \
+         Set `on` to force hash join on a capped engine known to have room.",
+    ),
+    rt(
         "KRISHIV_SHUFFLE_PAGE_CACHE_BYTES",
         FlagKind::UInt,
         "12.5% of the cgroup limit (512 MiB uncontained)",
