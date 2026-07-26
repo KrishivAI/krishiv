@@ -130,9 +130,85 @@ pub fn cgroup_memory_limit_bytes() -> Option<u64> {
     None
 }
 
+/// What the cgroup is actually charged, split by kind.
+///
+/// The budgets in this crate all track *anonymous* memory — heap the process
+/// asked for. The kernel charges a container for more than that, and the
+/// difference is invisible to every `MemoryBudget` and to DataFusion's
+/// `MemoryPool`. On the SF100 benchmark that difference was 1.5–1.8 GB of a
+/// 4.5 GB limit, and three separate heap-side "fixes" failed to stop the OOM
+/// kills because the memory was never on the heap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CgroupMemoryUsage {
+    /// Total charged to the cgroup — what `memory.max` is compared against.
+    pub current_bytes: u64,
+    /// Anonymous memory: heap, stacks. What the budgets model.
+    pub anon_bytes: u64,
+    /// Page cache charged to this cgroup, including cache for files *this*
+    /// container wrote. Reclaimable while clean, but not while dirty — and a
+    /// burst of dirty pages is what turns this into an OOM kill rather than
+    /// into reclaim.
+    pub file_bytes: u64,
+}
+
+impl CgroupMemoryUsage {
+    /// Bytes charged to the cgroup that anonymous accounting cannot explain.
+    pub fn unaccounted_bytes(&self) -> u64 {
+        self.current_bytes.saturating_sub(self.anon_bytes)
+    }
+}
+
+/// Read the cgroup v2 memory breakdown, if one is present.
+///
+/// Returns `None` outside a cgroup v2 container (including on cgroup v1, whose
+/// `memory.stat` uses different keys) — callers treat that as "unconstrained"
+/// exactly like [`cgroup_memory_limit_bytes`] does.
+pub fn cgroup_memory_usage() -> Option<CgroupMemoryUsage> {
+    let current = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    let stat = std::fs::read_to_string("/sys/fs/cgroup/memory.stat").ok()?;
+    let mut anon = 0u64;
+    let mut file = 0u64;
+    for line in stat.lines() {
+        let mut parts = line.split_ascii_whitespace();
+        match (parts.next(), parts.next()) {
+            (Some("anon"), Some(v)) => anon = v.parse().unwrap_or(0),
+            (Some("file"), Some(v)) => file = v.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    Some(CgroupMemoryUsage {
+        current_bytes: current,
+        anon_bytes: anon,
+        file_bytes: file,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reader must degrade to `None` rather than panicking or inventing
+    /// numbers when there is no cgroup v2 to read — the same contract as
+    /// `cgroup_memory_limit_bytes`, and the reason callers can log it blindly.
+    #[test]
+    fn cgroup_usage_is_absent_or_internally_consistent() {
+        if let Some(usage) = cgroup_memory_usage() {
+            assert!(
+                usage.current_bytes >= usage.anon_bytes,
+                "anon ({}) cannot exceed total charge ({})",
+                usage.anon_bytes,
+                usage.current_bytes
+            );
+            assert_eq!(
+                usage.unaccounted_bytes(),
+                usage.current_bytes - usage.anon_bytes
+            );
+        }
+    }
 
     #[test]
     fn unlimited_always_accepts() {

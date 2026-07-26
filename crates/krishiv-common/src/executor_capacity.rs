@@ -29,6 +29,30 @@
 //!
 //! This is Spark's model — `spark.executor.cores` task slots over one unified
 //! `spark.memory.fraction` region — reached from the same reasoning.
+//!
+//! # What this model does *not* cover: page cache
+//!
+//! Every fraction below divides *anonymous* memory. A cgroup is also charged
+//! for page cache, including cache for files the container itself wrote, and
+//! that charge counts against `memory.max`.
+//!
+//! Measured on the SF100 benchmark (4500 MiB executors), the gap between what
+//! the cgroup was charged and what the process held as RSS was 1.5–1.8 GB —
+//! a third of the container — and it was almost entirely page cache for shuffle
+//! files this executor had written and would never read again. Three separate
+//! attempts to bound heap-side shuffle buffers therefore changed nothing: the
+//! memory was never on the heap, and the pool correctly reported headroom right
+//! up to the OOM kill.
+//!
+//! That is fixed at the source rather than by shrinking budgets here — see
+//! [`crate::page_cache`], which drops the cache behind write-once shuffle files
+//! once they are durable. The fractions below are deliberately left where the
+//! OOM investigation put them; re-raising [`QUERY_POOL_FRACTION`] is a separate,
+//! evidence-led change that needs a clean SF100 run to justify, not an
+//! assumption that the eviction bought back exactly that much.
+//!
+//! [`crate::memory_budget::cgroup_memory_usage`] exposes the split so this is
+//! observable next time instead of requiring the whole investigation again.
 
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};

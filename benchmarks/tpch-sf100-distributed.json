@@ -1,19 +1,19 @@
 {
-  "label": "distributed-3node-capacity-model",
+  "label": "distributed-3node-a7d31681",
   "scale_factor": 100,
   "coordinator": "http://213.199.60.184:31902",
   "data_root": "s3://krishiv-bench/tpch/sf100",
-  "generated_at": "2026-07-25T21:46:12Z",
+  "generated_at": "2026-07-26T05:52:12Z",
   "succeeded": 14,
   "attempted": 22,
-  "total_elapsed_s": 4689.353918002977,
+  "total_elapsed_s": 4371.438855808927,
   "queries": [
     {
       "id": "q1",
       "name": "pricing_summary",
-      "job_id": "batch-sql-1785002563294-0",
+      "job_id": "batch-sql-1785030431318-0",
       "status": "ok",
-      "elapsed_s": 166.61553266599367,
+      "elapsed_s": 187.65614581198315,
       "result_batches": 1,
       "stage_count": 2,
       "task_count": 17
@@ -21,9 +21,9 @@
     {
       "id": "q2",
       "name": "minimum_cost_supplier",
-      "job_id": "batch-sql-1785002729890-1",
+      "job_id": "batch-sql-1785030618987-1",
       "status": "ok",
-      "elapsed_s": 209.35057054599747,
+      "elapsed_s": 208.41399287598324,
       "result_batches": 1,
       "stage_count": 10,
       "task_count": 145
@@ -31,9 +31,9 @@
     {
       "id": "q3",
       "name": "shipping_priority",
-      "job_id": "batch-sql-1785002939254-2",
+      "job_id": "batch-sql-1785030827381-2",
       "status": "ok",
-      "elapsed_s": 632.4212246200041,
+      "elapsed_s": 562.1902279909991,
       "result_batches": 1,
       "stage_count": 5,
       "task_count": 65
@@ -41,9 +41,9 @@
     {
       "id": "q4",
       "name": "order_priority_checking",
-      "job_id": "batch-sql-1785003571677-3",
+      "job_id": "batch-sql-1785031389622-3",
       "status": "ok",
-      "elapsed_s": 238.89978116999555,
+      "elapsed_s": 242.665806014993,
       "result_batches": 1,
       "stage_count": 4,
       "task_count": 49
@@ -51,17 +51,17 @@
     {
       "id": "q5",
       "name": "local_supplier_volume",
-      "job_id": "batch-sql-1785003810579-4",
+      "job_id": "batch-sql-1785031632272-4",
       "status": "failed",
       "error": "task stalled: no progress for 30 min",
-      "elapsed_s": 1807.652870652004
+      "elapsed_s": 1831.2294046340103
     },
     {
       "id": "q6",
       "name": "forecasting_revenue_change",
-      "job_id": "batch-sql-1785005618228-5",
+      "job_id": "batch-sql-1785033463597-5",
       "status": "ok",
-      "elapsed_s": 176.84507365099853,
+      "elapsed_s": 197.32883071602555,
       "result_batches": 1,
       "stage_count": 2,
       "task_count": 17
@@ -69,9 +69,9 @@
     {
       "id": "q7",
       "name": "volume_shipping",
-      "job_id": "batch-sql-1785005795078-6",
+      "job_id": "batch-sql-1785033660945-6",
       "status": "ok",
-      "elapsed_s": 1129.6956585529988,
+      "elapsed_s": 896.7991392269905,
       "result_batches": 1,
       "stage_count": 8,
       "task_count": 113
@@ -79,33 +79,33 @@
     {
       "id": "q8",
       "name": "national_market_share",
-      "job_id": "batch-sql-1785006924798-7",
+      "job_id": "batch-sql-1785034557784-7",
       "status": "failed",
       "error": "task stalled: no progress for 30 min",
-      "elapsed_s": 1808.704583403989
+      "elapsed_s": 1838.9117568979855
     },
     {
       "id": "q9",
       "name": "product_type_profit_measure",
-      "job_id": "batch-sql-1785008733497-8",
+      "job_id": "batch-sql-1785036396757-8",
       "status": "failed",
       "error": "task stalled: no progress for 30 min",
-      "elapsed_s": 1822.849465154999
+      "elapsed_s": 1864.3365298040153
     },
     {
       "id": "q10",
       "name": "returned_item_reporting",
-      "job_id": "batch-sql-1785010556337-9",
+      "job_id": "batch-sql-1785038261093-9",
       "status": "cancelled",
       "error": "job was cancelled",
-      "elapsed_s": 462.2538451750006
+      "elapsed_s": 273.6731628169946
     },
     {
       "id": "q11",
       "name": "important_stock_identification",
-      "job_id": "batch-sql-1785011018594-10",
+      "job_id": "batch-sql-1785038534768-10",
       "status": "ok",
-      "elapsed_s": 239.0547775060113,
+      "elapsed_s": 197.7620867670048,
       "result_batches": 0,
       "stage_count": 7,
       "task_count": 97
@@ -113,9 +113,9 @@
     {
       "id": "q12",
       "name": "shipping_modes_and_order_priority",
-      "job_id": "batch-sql-1785011257659-11",
+      "job_id": "batch-sql-1785038732529-11",
       "status": "ok",
-      "elapsed_s": 274.8548141779902,
+      "elapsed_s": 252.85732354799984,
       "result_batches": 1,
       "stage_count": 4,
       "task_count": 49
@@ -123,9 +123,9 @@
     {
       "id": "q13",
       "name": "customer_distribution",
-      "job_id": "batch-sql-1785011532508-12",
+      "job_id": "batch-sql-1785038985405-12",
       "status": "ok",
-      "elapsed_s": 208.42892289499287,
+      "elapsed_s": 176.32195505299023,
       "result_batches": 1,
       "stage_count": 4,
       "task_count": 49
@@ -133,9 +133,9 @@
     {
       "id": "q14",
       "name": "promotion_effect",
-      "job_id": "batch-sql-1785011740936-13",
+      "job_id": "batch-sql-1785039161723-13",
       "status": "ok",
-      "elapsed_s": 248.40846703399438,
+      "elapsed_s": 282.573374745989,
       "result_batches": 1,
       "stage_count": 4,
       "task_count": 49
@@ -143,9 +143,9 @@
     {
       "id": "q15",
       "name": "top_supplier",
-      "job_id": "batch-sql-1785011989351-14",
+      "job_id": "batch-sql-1785039444305-14",
       "status": "ok",
-      "elapsed_s": 370.7604642880033,
+      "elapsed_s": 398.9196982959984,
       "result_batches": 1,
       "stage_count": 5,
       "task_count": 65
@@ -153,9 +153,9 @@
     {
       "id": "q16",
       "name": "parts_supplier_relationship",
-      "job_id": "batch-sql-1785012360114-15",
+      "job_id": "batch-sql-1785039843253-15",
       "status": "ok",
-      "elapsed_s": 123.67627359600738,
+      "elapsed_s": 107.82877361998544,
       "result_batches": 1,
       "stage_count": 6,
       "task_count": 81
@@ -163,25 +163,25 @@
     {
       "id": "q17",
       "name": "small_quantity_order_revenue",
-      "job_id": "batch-sql-1785012483795-16",
+      "job_id": "batch-sql-1785039951084-16",
       "status": "failed",
       "error": "task stalled: no progress for 30 min",
-      "elapsed_s": 1808.9838563490048
+      "elapsed_s": 1824.329593225004
     },
     {
       "id": "q18",
       "name": "large_volume_customer",
-      "job_id": "batch-sql-1785014292776-17",
+      "job_id": "batch-sql-1785041775487-17",
       "status": "failed",
-      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"dfplan:v1:3:SqwHCtcCkgHTAgrQAnsidiI6MSwic3RhZ2UiOjEsIm1hcF90YXNrcyI6MTYsInBhcnRpdGlvbnMiOjE2LCJzY2hlbWFfaXBjX2I2NCI6Ii8vLy8vN2dBQUFBUUFBQUFBQUFLQUF3QUNnQUpBQVFBQ2dBQUFCQUFBQUFBQVFRQUNBQUlBQUFB\u2026': local stage fragment execution failed: DataFusion error: Resources exhausted: Failed to allocate additional 1058.2 KB for HashJoinInput[3] with 736.9 MB already allocated for this reservation - 509.6 KB remain available for the total memory pool: fair(pool_size: 1590.4 MB)",
-      "elapsed_s": 511.39476410800125
+      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"dfplan:v1:0:SqwHCtcCkgHTAgrQAnsidiI6MSwic3RhZ2UiOjEsIm1hcF90YXNrcyI6MTYsInBhcnRpdGlvbnMiOjE2LCJzY2hlbWFfaXBjX2I2NCI6Ii8vLy8vN2dBQUFBUUFBQUFBQUFLQUF3QUNnQUpBQVFBQ2dBQUFCQUFBQUFBQVFRQUNBQUlBQUFB\u2026': local stage fragment execution failed: DataFusion error: Resources exhausted: Failed to allocate additional 1058.0 KB for HashJoinInput[0] with 339.0 MB already allocated for this reservation - 1022.9 KB remain available for the total memory pool: fair(pool_size: 1192.8 MB)",
+      "elapsed_s": 416.3341735349968
     },
     {
       "id": "q19",
       "name": "discounted_revenue",
-      "job_id": "batch-sql-1785014804209-18",
+      "job_id": "batch-sql-1785042191885-18",
       "status": "ok",
-      "elapsed_s": 269.272884659993,
+      "elapsed_s": 306.5336224460043,
       "result_batches": 1,
       "stage_count": 4,
       "task_count": 49
@@ -189,9 +189,9 @@
     {
       "id": "q20",
       "name": "potential_part_promotion",
-      "job_id": "batch-sql-1785015073444-19",
+      "job_id": "batch-sql-1785042498399-19",
       "status": "ok",
-      "elapsed_s": 401.0694726399961,
+      "elapsed_s": 353.5878786959802,
       "result_batches": 1,
       "stage_count": 7,
       "task_count": 97
@@ -199,17 +199,18 @@
     {
       "id": "q21",
       "name": "suppliers_who_kept_orders_waiting",
-      "job_id": "batch-sql-1785015474519-20",
-      "status": "poll_failed",
-      "error": "<urlopen error [Errno 111] Connection refused>",
-      "elapsed_s": 497.6926652730035
+      "job_id": "batch-sql-1785042851960-20",
+      "status": "failed",
+      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"dfplan:v1:0:StMGCqsDkgGnAwqkA3sidiI6MSwic3RhZ2UiOjEsIm1hcF90YXNrcyI6MTYsInBhcnRpdGlvbnMiOjE2LCJzY2hlbWFfaXBjX2I2NCI6Ii8vLy8vL2dBQUFBUUFBQUFBQUFLQUF3QUNnQUpBQVFBQ2dBQUFCQUFBQUFBQVFRQUNBQUlBQUFB\u2026': local stage fragment execution failed: DataFusion error: Execution error: shuffle read (stage 2, map 12, partition 0): KRV_SHUFFLE_MISSING(stage=s2.m12,partition=0): shuffle partition batch-sql-1785042851960-20/s2.m12/0 unreachable after 4 attempts (producer executor gone): transport error",
+      "elapsed_s": 2269.7410822910024
     },
     {
       "id": "q22",
       "name": "global_sales_opportunity",
-      "status": "submit_failed",
-      "error": "<urlopen error [Errno 111] Connection refused>",
-      "elapsed_s": 0.009477191997575574
+      "job_id": "batch-sql-1785045121746-21",
+      "status": "failed",
+      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"dfplan:v1:1:Yr51CvZzCvNzCsFxCr8FCrwFCiZ0cGNoL3NmMTAwL2N1c3RvbWVyL2N1c3RvbWVyLjEucGFycXVldBC0/qylARiAndGvnKff4hgqBRCF5aopMvoECgcSBVi48OQBEgQIAhIAGioKBBICOAESBxIFOLjw5AEaBBICWAAiBAgCEgAqBAgCEgAy\u2026': invalid task assignment: dfplan fragment: DataFusion error: physical plan proto decode: Internal error: ScalarSubqueryExpr can only be deserialized as part of a surrounding ScalarSubqueryExec.\nThis issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues",
+      "elapsed_s": 10.933285516977776
     }
   ]
 }

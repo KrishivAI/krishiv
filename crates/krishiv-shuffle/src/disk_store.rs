@@ -22,9 +22,87 @@ pub struct LocalDiskShuffleStore {
     content_hashes: Arc<DashMap<crate::store::PartitionKey, [u8; 32]>>,
 }
 
-/// Compute BLAKE3 hash over raw bytes (Parquet file content or similar).
+/// Compute BLAKE3 hash over raw bytes already held in memory.
+///
+/// Test-only, like its sole caller `local_store`. The production write and read
+/// paths deliberately do *not* use this: they hash through [`HashingWriter`] and
+/// [`blake3_hash_file`] respectively, neither of which needs the whole partition
+/// resident. Keeping this un-gated would invite a caller to reintroduce exactly
+/// the full-file copy those two exist to avoid.
+#[cfg(test)]
 pub(crate) fn blake3_hash(data: &[u8]) -> [u8; 32] {
     *blake3::hash(data).as_bytes()
+}
+
+/// How much of a file to hash per `read` call when verifying on the read path.
+///
+/// Large enough that syscall overhead is irrelevant against a 270 MB/s disk,
+/// small enough that verification costs a fixed 256 KiB regardless of partition
+/// size. The previous read path allocated a `Vec<u8>` the size of the whole
+/// partition purely so it could hash it.
+const HASH_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Hash the file at `path` without materialising it.
+///
+/// Returns `Ok(None)` if the file does not exist, matching the read path's
+/// treatment of a missing partition as "not present" rather than an error.
+fn blake3_hash_file(path: &Path) -> std::io::Result<Option<[u8; 32]>> {
+    use std::io::Read;
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; HASH_CHUNK_BYTES];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(Some(*hasher.finalize().as_bytes()))
+}
+
+/// A `Write` adapter that BLAKE3-hashes bytes as they pass through to `inner`.
+///
+/// This exists so the shuffle write path can produce its content hash without a
+/// second pass over the data. The digest covers exactly the bytes that reach the
+/// file, which is what the read path re-computes, so the two remain comparable.
+struct HashingWriter<W> {
+    inner: W,
+    hasher: blake3::Hasher,
+}
+
+impl<W: std::io::Write> HashingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+        }
+    }
+
+    /// Consume the adapter, returning the wrapped writer and the digest of
+    /// everything written through it.
+    fn finish(self) -> (W, [u8; 32]) {
+        let digest = *self.hasher.finalize().as_bytes();
+        (self.inner, digest)
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Hash only what the inner writer accepted, so a short write cannot
+        // desynchronise the digest from the file's contents.
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn encode_hash(hash: &[u8; 32]) -> String {
@@ -330,29 +408,44 @@ impl ShuffleStore for LocalDiskShuffleStore {
 
             // Phase 1 (continued): Write to a temp file alongside the final path.
             let tmp_path = final_path.with_extension(format!("tmp.{tmp_suffix}"));
-            {
+            // The BLAKE3 hash is computed as the Parquet bytes flow to disk.
+            //
+            // This used to write the file, then `std::fs::read` the whole thing
+            // back to hash it — a second, full-size copy of every shuffle
+            // partition in anonymous memory, accounted by no budget, once per
+            // partition per task. At SF100 that is the difference between a
+            // bounded writer and an unbounded one, and it is invisible to the
+            // DataFusion pool, so it never showed up as a spill. Hashing in-line
+            // is equivalent: the digest still covers exactly the bytes in the
+            // file, which is what the read path re-computes and compares.
+            let hash = {
                 let tmp_file =
                     std::fs::File::create(&tmp_path).map_err(|e| wrap_io_err(e, &tmp_path))?;
                 let schema = partition.schema.clone();
-                let mut writer = ArrowWriter::try_new(tmp_file, schema, Some(writer_props))
-                    .map_err(|e| io_err(format!("failed to create Parquet writer: {e}")))?;
+                let mut writer =
+                    ArrowWriter::try_new(HashingWriter::new(tmp_file), schema, Some(writer_props))
+                        .map_err(|e| io_err(format!("failed to create Parquet writer: {e}")))?;
                 for batch in &partition.batches {
                     writer
                         .write(batch)
                         .map_err(|e| io_err(format!("failed to write Parquet batch: {e}")))?;
                 }
-                // S4: Sync temp file to durable storage before commit.
-                let tmp_file = writer
+                let (tmp_file, hash) = writer
                     .into_inner()
-                    .map_err(|e| io_err(format!("failed to finalize Parquet writer: {e}")))?;
+                    .map_err(|e| io_err(format!("failed to finalize Parquet writer: {e}")))?
+                    .finish();
+                // S4: Sync temp file to durable storage before commit.
                 tmp_file.sync_all().map_err(|e| wrap_io_err(e, &tmp_path))?;
-            }
-
-            // Compute BLAKE3 hash over the written Parquet bytes so write-time
-            // and read-time hashes use the same encoding.
-            let parquet_bytes = std::fs::read(&tmp_path)
-                .map_err(|e| io_err(format!("failed to read temp file for hashing: {e}")))?;
-            let hash = blake3_hash(&parquet_bytes);
+                // Now that the pages are clean they can be dropped. Nothing on
+                // this node reads this file again — the consumer is a remote
+                // fetch over Flight — but under cgroup v2 the page cache is
+                // charged to *this* container's memory.max. Measured on the
+                // SF100 run, shuffle page cache held ~1.4 GB of a 4.5 GB
+                // executor limit at a zero hit rate. Must come after the
+                // fsync above: DONTNEED skips dirty pages.
+                krishiv_common::page_cache::evict_file_best_effort(&tmp_file);
+                hash
+            };
             let tmp_hash_path = final_hash_path.with_extension(format!("blake3.tmp.{tmp_suffix}"));
             {
                 let mut hash_file = std::fs::File::create(&tmp_hash_path)
@@ -472,6 +565,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
     async fn stream_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShuffleStream>> {
         let path = self.partition_path(id)?;
         let hash_path = self.partition_hash_path(id)?;
+        let evict_path = path.clone();
         let id = id.clone();
         let id_clone = id.clone();
         let content_hashes = Arc::clone(&self.content_hashes);
@@ -479,12 +573,19 @@ impl ShuffleStore for LocalDiskShuffleStore {
         let result = tokio::task::spawn_blocking(move || {
             use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-            let raw_bytes = match std::fs::read(&path) {
-                Ok(b) => b,
+            // Open the partition rather than slurping it. The previous version
+            // did `std::fs::read` into a `Vec<u8>` sized to the whole partition,
+            // hashed that buffer, then handed the same buffer to the Parquet
+            // reader as `Bytes` — so serving one shuffle fetch cost a full copy
+            // of the partition in anonymous memory, on top of the page cache the
+            // read itself populated. Parquet reads row groups on demand from a
+            // `File`, so the reader never needs the whole thing resident.
+            let data_file = match std::fs::File::open(&path) {
+                Ok(f) => f,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => {
                     return Err(io_err(format!(
-                        "failed to read partition file '{}': {e}",
+                        "failed to open partition file '{}': {e}",
                         path.display()
                     )));
                 }
@@ -533,7 +634,21 @@ impl ShuffleStore for LocalDiskShuffleStore {
                         actual: encode_hash(&persisted_hash),
                     });
                 }
-                let computed = blake3_hash(&raw_bytes);
+                // Verify by streaming the file in fixed-size chunks. Only done
+                // when a sidecar exists, matching the previous behaviour — a
+                // partition with no sidecar is read without verification.
+                let computed = match blake3_hash_file(&path) {
+                    Ok(Some(h)) => h,
+                    // The file vanished between open and verify: a concurrent
+                    // cleanup won, which the caller treats as "not present".
+                    Ok(None) => return Ok(None),
+                    Err(e) => {
+                        return Err(io_err(format!(
+                            "failed to hash partition file '{}': {e}",
+                            path.display()
+                        )));
+                    }
+                };
                 if computed != persisted_hash {
                     return Err(ShuffleError::ContentHashMismatch {
                         partition: format!("{:?}", key),
@@ -543,8 +658,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 }
             }
 
-            let parquet_bytes_frozen = bytes::Bytes::from(raw_bytes);
-            let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes_frozen)
+            let builder = ParquetRecordBatchReaderBuilder::try_new(data_file)
                 .map_err(|e| io_err(format!("failed to build Parquet reader: {e}")))?;
             let schema = builder.schema().clone();
             let reader = builder
@@ -560,23 +674,38 @@ impl ShuffleStore for LocalDiskShuffleStore {
             return Ok(None);
         };
 
-        let stream = futures::stream::unfold(Some(reader), move |reader_opt| async move {
-            let mut reader = reader_opt?;
-            let res = tokio::task::spawn_blocking(move || {
-                reader.next().map(|batch_res| (batch_res, reader))
-            })
-            .await;
-
-            match res {
-                Ok(Some((Ok(batch), reader))) => Some((Ok(batch), Some(reader))),
-                Ok(Some((Err(e), reader))) => Some((
-                    Err(io_err(format!("error reading Parquet batch: {e}"))),
-                    Some(reader),
-                )),
-                Ok(None) => None,
-                Err(e) => Some((Err(io_err(format!("spawn_blocking error: {e}"))), None)),
+        // Once this partition has been served its pages are dead weight — the
+        // consumer is a remote fetch, nothing re-reads it locally — but cgroup
+        // v2 charges the cache to this container. Evicting on drop covers both
+        // the stream running to completion and a fetch abandoned part-way.
+        struct EvictOnDrop(PathBuf);
+        impl Drop for EvictOnDrop {
+            fn drop(&mut self) {
+                krishiv_common::page_cache::evict_path_best_effort(&self.0);
             }
-        });
+        }
+
+        let stream = futures::stream::unfold(
+            Some((reader, EvictOnDrop(evict_path))),
+            move |state| async move {
+                let (mut reader, guard) = state?;
+                let res = tokio::task::spawn_blocking(move || {
+                    reader.next().map(|batch_res| (batch_res, reader))
+                })
+                .await;
+
+                match res {
+                    Ok(Some((Ok(batch), reader))) => Some((Ok(batch), Some((reader, guard)))),
+                    Ok(Some((Err(e), reader))) => Some((
+                        Err(io_err(format!("error reading Parquet batch: {e}"))),
+                        Some((reader, guard)),
+                    )),
+                    // Exhausted: `guard` drops here and the cache is released.
+                    Ok(None) => None,
+                    Err(e) => Some((Err(io_err(format!("spawn_blocking error: {e}"))), None)),
+                }
+            },
+        );
 
         Ok(Some(ShuffleStream {
             id: id_clone,
@@ -637,6 +766,89 @@ mod tests {
             stage_id: stage.to_string(),
             partition: part,
         }
+    }
+
+    /// The write path hashes as it streams to disk; the read path hashes by
+    /// streaming the file back. Those two must agree, or every read fails
+    /// `ContentHashMismatch`.
+    ///
+    /// This is the invariant that let the full-file `std::fs::read` on the
+    /// write path be removed: the digest is defined as "BLAKE3 of the bytes in
+    /// the file", and both sides now compute that without materialising it. The
+    /// partition here spans several `HASH_CHUNK_BYTES` chunks so the read side's
+    /// chunk loop is genuinely exercised rather than completing in one pass.
+    #[tokio::test]
+    async fn streamed_write_hash_matches_streamed_read_hash_across_chunks() {
+        let dir = tempdir().unwrap();
+        let store = LocalDiskShuffleStore::new(dir.path()).expect("store");
+        let partition = id("job-chunked", "stage-1", 0);
+
+        // ~400k rows of poorly-compressible values: comfortably more than one
+        // 256 KiB hash chunk once written as Parquet.
+        let values: Vec<i64> = (0..400_000i64).map(|i| i.wrapping_mul(2_654_435_761)).collect();
+        let sp = ShufflePartition {
+            id: partition.clone(),
+            schema: make_batch(&values).schema(),
+            batches: vec![make_batch(&values)],
+        };
+        store.write_partition(sp, 1).await.expect("write");
+
+        let path = store.partition_path(&partition).expect("path");
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > HASH_CHUNK_BYTES as u64,
+            "test needs a partition larger than one hash chunk to be meaningful"
+        );
+
+        // Reading verifies the sidecar against a freshly streamed digest.
+        let read = store
+            .read_partition(&partition)
+            .await
+            .expect("read must verify")
+            .expect("partition present");
+        let total: usize = read.batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, values.len());
+
+        // And the streaming digest agrees with the whole-buffer one, which is
+        // what the sidecar was compared against before this path was changed.
+        let streamed = blake3_hash_file(&path).unwrap().expect("file present");
+        let whole_buffer = blake3_hash(&std::fs::read(&path).unwrap());
+        assert_eq!(
+            streamed, whole_buffer,
+            "chunked hashing must equal whole-buffer hashing"
+        );
+    }
+
+    /// Verification must still *catch* corruption. Removing the read-back is
+    /// only safe if the hash is genuinely being checked — a fix that silently
+    /// stopped verifying would also make this suite pass.
+    #[tokio::test]
+    async fn a_corrupted_partition_is_still_rejected() {
+        let dir = tempdir().unwrap();
+        let store = LocalDiskShuffleStore::new(dir.path()).expect("store");
+        let partition = id("job-corrupt", "stage-1", 0);
+        let sp = ShufflePartition {
+            id: partition.clone(),
+            schema: make_batch(&[1, 2, 3]).schema(),
+            batches: vec![make_batch(&[1, 2, 3])],
+        };
+        store.write_partition(sp, 1).await.expect("write");
+
+        // Flip bytes in the middle of the committed file, leaving its length
+        // and its sidecar untouched.
+        let path = store.partition_path(&partition).expect("path");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Drop the in-memory hash so the sidecar comparison is what runs.
+        store.content_hashes.clear();
+
+        let result = store.read_partition(&partition).await;
+        assert!(
+            matches!(result, Err(ShuffleError::ContentHashMismatch { .. })),
+            "corrupted partition must be rejected, got {result:?}"
+        );
     }
 
     /// SH5: a shuffle write must produce a data file *and* a hash
