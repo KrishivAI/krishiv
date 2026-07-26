@@ -20,19 +20,31 @@ pub struct LocalDiskShuffleStore {
     compression: ShuffleCompression,
     // In-memory hash tracking for strict verification on read (DashMap matches object_store.rs pattern)
     content_hashes: Arc<DashMap<crate::store::PartitionKey, [u8; 32]>>,
+    // Ceiling on page cache held by committed-but-unconsumed partitions. Shared
+    // across every store clone so the bound is per-process, not per-handle —
+    // the kernel charges the container once, so there is only one budget to
+    // spend.
+    page_cache_budget: Arc<krishiv_common::page_cache::ShufflePageCacheBudget>,
 }
 
 /// Compute BLAKE3 hash over raw bytes already held in memory.
 ///
-/// Test-only, like its sole caller `local_store`. The production write and read
-/// paths deliberately do *not* use this: they hash through [`HashingWriter`] and
-/// [`blake3_hash_file`] respectively, neither of which needs the whole partition
-/// resident. Keeping this un-gated would invite a caller to reintroduce exactly
-/// the full-file copy those two exist to avoid.
-#[cfg(test)]
+/// Used by the read path when the partition was small enough to read in one
+/// pass, which costs nothing extra — the bytes are already there. The *write*
+/// path deliberately does not use this: it hashes through [`HashingWriter`] as
+/// bytes reach the disk, so it never needs a second copy of what it just wrote.
 pub(crate) fn blake3_hash(data: &[u8]) -> [u8; 32] {
     *blake3::hash(data).as_bytes()
 }
+
+/// Largest partition the read path will hold in memory to serve in one pass.
+///
+/// Above this it streams instead, so a pathological partition cannot exhaust
+/// the executor. Peak read-side cost is this times the number of concurrent
+/// partition reads. 32 MiB is roughly ten times the observed SF100 average
+/// (~3.5 MB), so the streaming fallback is genuinely exceptional rather than
+/// the case that quietly dominates.
+const INLINE_READ_LIMIT: u64 = 32 * 1024 * 1024;
 
 /// How much of a file to hash per `read` call when verifying on the read path.
 ///
@@ -156,6 +168,11 @@ impl LocalDiskShuffleStore {
             lease_tokens: Arc::new(RwLock::new(ahash::AHashMap::default())),
             compression: ShuffleCompression::None,
             content_hashes: Arc::new(DashMap::new()),
+            page_cache_budget: Arc::new(
+                krishiv_common::page_cache::ShufflePageCacheBudget::from_cgroup(
+                    krishiv_common::cgroup_memory_limit_bytes(),
+                ),
+            ),
         })
     }
 
@@ -377,6 +394,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
         let writer_props = parquet_writer_properties(self.compression);
         let lease_tokens = Arc::clone(&self.lease_tokens);
         let content_hashes = Arc::clone(&self.content_hashes);
+        let page_cache_budget = Arc::clone(&self.page_cache_budget);
         let parent_dir = final_path.parent().map(PathBuf::from);
 
         // P0.4: Wrap all blocking filesystem I/O in spawn_blocking so the
@@ -436,14 +454,6 @@ impl ShuffleStore for LocalDiskShuffleStore {
                     .finish();
                 // S4: Sync temp file to durable storage before commit.
                 tmp_file.sync_all().map_err(|e| wrap_io_err(e, &tmp_path))?;
-                // Now that the pages are clean they can be dropped. Nothing on
-                // this node reads this file again — the consumer is a remote
-                // fetch over Flight — but under cgroup v2 the page cache is
-                // charged to *this* container's memory.max. Measured on the
-                // SF100 run, shuffle page cache held ~1.4 GB of a 4.5 GB
-                // executor limit at a zero hit rate. Must come after the
-                // fsync above: DONTNEED skips dirty pages.
-                krishiv_common::page_cache::evict_file_best_effort(&tmp_file);
                 hash
             };
             let tmp_hash_path = final_hash_path.with_extension(format!("blake3.tmp.{tmp_suffix}"));
@@ -521,6 +531,18 @@ impl ShuffleStore for LocalDiskShuffleStore {
 
                 // Store hash for strict read verification (DashMap — no lock management needed)
                 content_hashes.insert(key.clone(), hash);
+
+                // Register the committed partition against the page-cache
+                // ceiling. This does NOT evict it: a reduce task on this node
+                // may read it back shortly, and serving that from RAM instead of
+                // a 270 MB/s disk is exactly what the cache is for. What it does
+                // is bound the total, so the oldest partitions are dropped once
+                // the working set exceeds the budget. The unbounded growth — a
+                // partition from the first stage still resident ten stages later
+                // — was the actual cause of the OOM kills, not the caching
+                // itself. Safe here because the data was fsynced above.
+                let cached_bytes = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
+                page_cache_budget.record_written(final_path.clone(), cached_bytes);
             } else {
                 // Newer writer won — silently discard this temp file.
                 let _ = std::fs::remove_file(&tmp_path);
@@ -569,26 +591,52 @@ impl ShuffleStore for LocalDiskShuffleStore {
         let id = id.clone();
         let id_clone = id.clone();
         let content_hashes = Arc::clone(&self.content_hashes);
+        let page_cache_budget = Arc::clone(&self.page_cache_budget);
 
         let result = tokio::task::spawn_blocking(move || {
             use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-            // Open the partition rather than slurping it. The previous version
-            // did `std::fs::read` into a `Vec<u8>` sized to the whole partition,
-            // hashed that buffer, then handed the same buffer to the Parquet
-            // reader as `Bytes` — so serving one shuffle fetch cost a full copy
-            // of the partition in anonymous memory, on top of the page cache the
-            // read itself populated. Parquet reads row groups on demand from a
-            // `File`, so the reader never needs the whole thing resident.
-            let data_file = match std::fs::File::open(&path) {
-                Ok(f) => f,
+            // Read the partition in ONE pass when it is small enough to hold,
+            // which is the overwhelmingly common case.
+            //
+            // The original code slurped every partition into a `Vec<u8>` with no
+            // ceiling — fast, but one oversized partition could exhaust the
+            // executor. Replacing that with "always stream" traded an unbounded
+            // buffer for a doubled read: a full pass to verify the hash, then the
+            // Parquet reader issuing positioned reads for row groups, both
+            // against a 270 MB/s disk. That is the wrong trade at the sizes that
+            // actually occur — SF100 shuffle partitions here average ~3.5 MB
+            // (8.6 GB across ~2500 files), so the buffer was never the problem;
+            // its unboundedness was.
+            //
+            // Bound it instead: below the threshold, one sequential read serves
+            // both the hash check and the Parquet reader from memory. Above it,
+            // fall back to streaming so a pathological partition still cannot
+            // blow the executor. Peak cost is therefore
+            // `INLINE_READ_LIMIT × concurrent reads`, which is accountable.
+            let data_len = match std::fs::metadata(&path) {
+                Ok(m) => m.len(),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => {
                     return Err(io_err(format!(
-                        "failed to open partition file '{}': {e}",
+                        "failed to stat partition file '{}': {e}",
                         path.display()
                     )));
                 }
+            };
+            let inline_bytes: Option<Vec<u8>> = if data_len <= INLINE_READ_LIMIT {
+                match std::fs::read(&path) {
+                    Ok(b) => Some(b),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => {
+                        return Err(io_err(format!(
+                            "failed to read partition file '{}': {e}",
+                            path.display()
+                        )));
+                    }
+                }
+            } else {
+                None
             };
 
             let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
@@ -634,20 +682,24 @@ impl ShuffleStore for LocalDiskShuffleStore {
                         actual: encode_hash(&persisted_hash),
                     });
                 }
-                // Verify by streaming the file in fixed-size chunks. Only done
-                // when a sidecar exists, matching the previous behaviour — a
-                // partition with no sidecar is read without verification.
-                let computed = match blake3_hash_file(&path) {
-                    Ok(Some(h)) => h,
-                    // The file vanished between open and verify: a concurrent
-                    // cleanup won, which the caller treats as "not present".
-                    Ok(None) => return Ok(None),
-                    Err(e) => {
-                        return Err(io_err(format!(
-                            "failed to hash partition file '{}': {e}",
-                            path.display()
-                        )));
-                    }
+                // Hash the buffer we already hold when we have one — no second
+                // trip to disk. Only the oversized fallback re-reads, and it
+                // streams in fixed chunks so verification stays O(1) in memory.
+                let computed = match &inline_bytes {
+                    Some(bytes) => blake3_hash(bytes),
+                    None => match blake3_hash_file(&path) {
+                        Ok(Some(h)) => h,
+                        // The file vanished between stat and verify: a
+                        // concurrent cleanup won, which the caller treats as
+                        // "not present".
+                        Ok(None) => return Ok(None),
+                        Err(e) => {
+                            return Err(io_err(format!(
+                                "failed to hash partition file '{}': {e}",
+                                path.display()
+                            )));
+                        }
+                    },
                 };
                 if computed != persisted_hash {
                     return Err(ShuffleError::ContentHashMismatch {
@@ -658,12 +710,42 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 }
             }
 
-            let builder = ParquetRecordBatchReaderBuilder::try_new(data_file)
-                .map_err(|e| io_err(format!("failed to build Parquet reader: {e}")))?;
-            let schema = builder.schema().clone();
-            let reader = builder
-                .build()
-                .map_err(|e| io_err(format!("failed to build Parquet batch reader: {e}")))?;
+            // Serve Parquet from the buffer we already read; only the oversized
+            // path opens the file and lets the reader fetch row groups on demand.
+            // The two builders are different types (`Bytes` vs `File` readers),
+            // so each branch finishes its own build and they meet at the reader,
+            // which is the same type either way.
+            let (schema, reader) = match inline_bytes {
+                Some(bytes) => {
+                    let builder =
+                        ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+                            .map_err(|e| io_err(format!("failed to build Parquet reader: {e}")))?;
+                    let schema = builder.schema().clone();
+                    let reader = builder.build().map_err(|e| {
+                        io_err(format!("failed to build Parquet batch reader: {e}"))
+                    })?;
+                    (schema, reader)
+                }
+                None => {
+                    let data_file = match std::fs::File::open(&path) {
+                        Ok(f) => f,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                        Err(e) => {
+                            return Err(io_err(format!(
+                                "failed to open partition file '{}': {e}",
+                                path.display()
+                            )));
+                        }
+                    };
+                    let builder = ParquetRecordBatchReaderBuilder::try_new(data_file)
+                        .map_err(|e| io_err(format!("failed to build Parquet reader: {e}")))?;
+                    let schema = builder.schema().clone();
+                    let reader = builder.build().map_err(|e| {
+                        io_err(format!("failed to build Parquet batch reader: {e}"))
+                    })?;
+                    (schema, reader)
+                }
+            };
 
             Ok::<_, ShuffleError>(Some((schema, reader)))
         })
@@ -674,19 +756,20 @@ impl ShuffleStore for LocalDiskShuffleStore {
             return Ok(None);
         };
 
-        // Once this partition has been served its pages are dead weight — the
-        // consumer is a remote fetch, nothing re-reads it locally — but cgroup
-        // v2 charges the cache to this container. Evicting on drop covers both
-        // the stream running to completion and a fetch abandoned part-way.
-        struct EvictOnDrop(PathBuf);
-        impl Drop for EvictOnDrop {
+        // Shuffle output is read once. After a partition has been served its
+        // cache has no remaining value, so release it and return the budget —
+        // this is what keeps the ceiling from being reached by live data in the
+        // first place. Doing it on drop covers both the stream running to
+        // completion and a fetch abandoned part-way.
+        struct ReleaseOnDrop(PathBuf, Arc<krishiv_common::page_cache::ShufflePageCacheBudget>);
+        impl Drop for ReleaseOnDrop {
             fn drop(&mut self) {
-                krishiv_common::page_cache::evict_path_best_effort(&self.0);
+                self.1.record_consumed(&self.0);
             }
         }
 
         let stream = futures::stream::unfold(
-            Some((reader, EvictOnDrop(evict_path))),
+            Some((reader, ReleaseOnDrop(evict_path, page_cache_budget))),
             move |state| async move {
                 let (mut reader, guard) = state?;
                 let res = tokio::task::spawn_blocking(move || {

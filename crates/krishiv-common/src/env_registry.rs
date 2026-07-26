@@ -800,6 +800,15 @@ pub static FLAGS: &[FlagSpec] = &[
         "DataFusion dynamic (runtime) filters: TopK / join / aggregate predicates pushed into probe-side file scans at execution time (Phase 54). `off` disables all three via the DataFusion master switch.",
     ),
     rt(
+        "KRISHIV_SHUFFLE_PAGE_CACHE_BYTES",
+        FlagKind::UInt,
+        "12.5% of the cgroup limit (512 MiB uncontained)",
+        "Ceiling on page cache held by committed-but-unconsumed shuffle \
+         partitions. Cached output serves same-node reduce reads from RAM \
+         instead of disk; the bound stops it growing unreclaimed across stages, \
+         which is what got executors OOM-killed at SF100.",
+    ),
+    rt(
         "KRISHIV_SEMI_JOIN_REDUCTION",
         FlagKind::Bool,
         "on",

@@ -103,6 +103,122 @@ pub fn evict_file_best_effort(file: &std::fs::File) {
     }
 }
 
+/// Environment override for the shuffle page-cache ceiling, in bytes.
+pub const SHUFFLE_PAGE_CACHE_ENV: &str = "KRISHIV_SHUFFLE_PAGE_CACHE_BYTES";
+
+/// Share of the container handed to cached shuffle output.
+///
+/// Deliberately small and inside the slack the capacity model already leaves
+/// unclaimed: page cache is *reclaimable* (clean pages), unlike the heap
+/// budgets, so it does not need its own carve-out from the accounted fractions.
+/// On a 4500 MiB executor this is ~560 MB — a real working set, and a long way
+/// from the 1.7 GB that was getting containers killed.
+const SHUFFLE_PAGE_CACHE_FRACTION: f64 = 0.125;
+
+/// Default ceiling when there is no cgroup limit to derive one from.
+const DEFAULT_SHUFFLE_PAGE_CACHE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// A bounded ceiling on page cache held by write-once files.
+///
+/// # Why this is not "evict immediately"
+///
+/// Dropping every partition's cache the moment it is durable does bound memory,
+/// but it also throws away the case the cache exists for: a reduce task reading
+/// a partition produced on the *same* node, which then pays a disk round-trip
+/// instead of a memory read. Remote fetches were always going to disk; same-node
+/// reads were not, and making them do so is a real cost on a 270 MB/s disk.
+///
+/// The original bug was never that the cache existed — it was that nothing ever
+/// dropped it, so a partition written during the first stage was still resident
+/// ten stages later. Bounding the total keeps the recent working set (where the
+/// hits are) and discards the stale tail (where the OOM was), which is what a
+/// cache is supposed to do.
+///
+/// Eviction is FIFO by write order. That is deliberately not LRU: shuffle output
+/// is read once, so "oldest written" is the best available proxy for "least
+/// likely to still be wanted", and it needs no per-read bookkeeping on the hot
+/// path.
+#[derive(Debug)]
+pub struct ShufflePageCacheBudget {
+    limit_bytes: u64,
+    state: std::sync::Mutex<CacheState>,
+}
+
+#[derive(Debug, Default)]
+struct CacheState {
+    /// Paths still believed to hold cache, oldest first.
+    resident: std::collections::VecDeque<(std::path::PathBuf, u64)>,
+    held_bytes: u64,
+}
+
+impl ShufflePageCacheBudget {
+    /// Build a budget from the container limit, honouring
+    /// [`SHUFFLE_PAGE_CACHE_ENV`].
+    pub fn from_cgroup(cgroup_limit_bytes: Option<u64>) -> Self {
+        let limit_bytes = std::env::var(SHUFFLE_PAGE_CACHE_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| match cgroup_limit_bytes {
+                Some(limit) => ((limit as f64) * SHUFFLE_PAGE_CACHE_FRACTION) as u64,
+                None => DEFAULT_SHUFFLE_PAGE_CACHE_BYTES,
+            });
+        Self {
+            limit_bytes,
+            state: std::sync::Mutex::new(CacheState::default()),
+        }
+    }
+
+    /// The ceiling this budget enforces.
+    pub fn limit_bytes(&self) -> u64 {
+        self.limit_bytes
+    }
+
+    /// Bytes currently believed resident.
+    pub fn held_bytes(&self) -> u64 {
+        self.state.lock().map(|s| s.held_bytes).unwrap_or(0)
+    }
+
+    /// Record a freshly-written, durable file and evict oldest entries until the
+    /// total is back under the ceiling.
+    ///
+    /// The caller must have fsynced first: `DONTNEED` skips dirty pages, so
+    /// evicting before the data is durable silently does nothing and the cache
+    /// stays charged.
+    pub fn record_written(&self, path: std::path::PathBuf, bytes: u64) {
+        let Ok(mut state) = self.state.lock() else {
+            // A poisoned lock must not fail a write that already succeeded;
+            // evict directly so memory is still bounded.
+            evict_path_best_effort(&path);
+            return;
+        };
+        state.resident.push_back((path, bytes));
+        state.held_bytes = state.held_bytes.saturating_add(bytes);
+        while state.held_bytes > self.limit_bytes {
+            let Some((old_path, old_bytes)) = state.resident.pop_front() else {
+                break;
+            };
+            state.held_bytes = state.held_bytes.saturating_sub(old_bytes);
+            evict_path_best_effort(&old_path);
+        }
+    }
+
+    /// Record that a partition has been fully served, and drop its cache.
+    ///
+    /// Shuffle output is read once, so once it has been consumed the cache has
+    /// no remaining value and is pure charge against the container.
+    pub fn record_consumed(&self, path: &Path) {
+        evict_path_best_effort(path);
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if let Some(pos) = state.resident.iter().position(|(p, _)| p == path) {
+            let (_, bytes) = state.resident.remove(pos).unwrap_or_default();
+            state.held_bytes = state.held_bytes.saturating_sub(bytes);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +253,94 @@ mod tests {
         let missing = std::env::temp_dir().join("krishiv-pgcache-does-not-exist-9e3f1a");
         assert!(evict_path(&missing).is_err());
         evict_path_best_effort(&missing); // must not panic
+    }
+
+    fn budget(limit: u64) -> ShufflePageCacheBudget {
+        ShufflePageCacheBudget {
+            limit_bytes: limit,
+            state: std::sync::Mutex::new(CacheState::default()),
+        }
+    }
+
+    /// The point of the bound: recent partitions stay cached so a same-node
+    /// reduce read is served from RAM, and only the excess is dropped. A policy
+    /// that evicted everything on write would bound memory too, but it would
+    /// also turn every same-node read into a disk round-trip.
+    #[test]
+    fn recent_partitions_stay_cached_and_only_the_excess_is_dropped() {
+        let b = budget(300);
+        b.record_written("/tmp/krishiv-pc-a".into(), 100);
+        b.record_written("/tmp/krishiv-pc-b".into(), 100);
+        assert_eq!(b.held_bytes(), 200, "under the ceiling, nothing is dropped");
+
+        b.record_written("/tmp/krishiv-pc-c".into(), 100);
+        assert_eq!(b.held_bytes(), 300, "exactly at the ceiling is still fine");
+
+        // One more pushes past it; the oldest is evicted, not the newest.
+        b.record_written("/tmp/krishiv-pc-d".into(), 100);
+        assert_eq!(b.held_bytes(), 300, "held stays bounded by the ceiling");
+        let resident = b.state.lock().unwrap();
+        let paths: Vec<_> = resident
+            .resident
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !paths.iter().any(|p| p.ends_with("-a")),
+            "oldest should have been evicted first, got {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("-d")),
+            "newest must be retained, got {paths:?}"
+        );
+    }
+
+    /// A partition larger than the whole ceiling must not wedge the budget: it
+    /// gets recorded, immediately trimmed, and the accounting stays consistent.
+    #[test]
+    fn a_partition_larger_than_the_ceiling_does_not_wedge_the_budget() {
+        let b = budget(100);
+        b.record_written("/tmp/krishiv-pc-huge".into(), 10_000);
+        assert_eq!(b.held_bytes(), 0, "oversized entry is trimmed straight back");
+        b.record_written("/tmp/krishiv-pc-small".into(), 50);
+        assert_eq!(b.held_bytes(), 50, "budget still usable afterwards");
+    }
+
+    /// Consuming a partition returns its budget, which is what keeps the
+    /// ceiling from being reached by data that is still live.
+    #[test]
+    fn consuming_a_partition_returns_its_budget() {
+        let b = budget(1000);
+        b.record_written("/tmp/krishiv-pc-x".into(), 400);
+        b.record_written("/tmp/krishiv-pc-y".into(), 400);
+        assert_eq!(b.held_bytes(), 800);
+
+        b.record_consumed(Path::new("/tmp/krishiv-pc-x"));
+        assert_eq!(b.held_bytes(), 400, "consumed bytes are released");
+
+        // Consuming something untracked must not corrupt the accounting.
+        b.record_consumed(Path::new("/tmp/krishiv-pc-never-written"));
+        assert_eq!(b.held_bytes(), 400);
+    }
+
+    /// The ceiling must come from the container, not a hard-coded constant that
+    /// claims the same bytes on a 2 GiB executor and a 64 GiB one.
+    #[test]
+    fn the_ceiling_is_derived_from_the_container() {
+        let small = ShufflePageCacheBudget::from_cgroup(Some(4_718_592_000));
+        let large = ShufflePageCacheBudget::from_cgroup(Some(64 * 1024 * 1024 * 1024));
+        assert!(
+            large.limit_bytes() > small.limit_bytes(),
+            "a bigger container should permit a bigger cache"
+        );
+        assert!(
+            small.limit_bytes() < 4_718_592_000 / 4,
+            "the cache must stay well inside the container's slack"
+        );
+        assert_eq!(
+            ShufflePageCacheBudget::from_cgroup(None).limit_bytes(),
+            DEFAULT_SHUFFLE_PAGE_CACHE_BYTES,
+            "uncontained falls back to the documented default"
+        );
     }
 }
