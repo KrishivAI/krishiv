@@ -3517,6 +3517,19 @@ pub trait KrishivDataFrameOps: Send + Sync {
     async fn collect_with_stats(&self) -> SqlResult<(Vec<RecordBatch>, SqlExecutionStats)>;
     /// Explain the physical and logical plan text (does not execute).
     async fn explain(&self) -> SqlResult<String>;
+
+    /// Execute and report per-operator runtime metrics.
+    ///
+    /// Defaults to an error rather than silently falling back to a plain
+    /// EXPLAIN: a caller asking for measurements must not be handed a plan
+    /// that looks like one.
+    async fn explain_analyze(&self) -> SqlResult<String> {
+        Err(SqlError::DataFusion {
+            message: String::from(
+                "EXPLAIN ANALYZE is not supported for this dataframe backend",
+            ),
+        })
+    }
     /// Explain the logical plan text without executing.
     fn explain_logical(&self) -> String;
     /// Build a Krishiv [`LogicalPlan`] wrapper for this DataFrame.
@@ -4057,6 +4070,30 @@ impl SqlDataFrame {
             .dataframe
             .clone()
             .explain(false, false)?
+            .collect()
+            .await?;
+        pretty_batches(&batches)
+    }
+
+    /// Execute the query and report per-operator runtime metrics.
+    ///
+    /// `explain` alone shows the plan the optimizer produced, which is enough
+    /// to confirm a query is *planned* well and not enough to explain why it
+    /// is slow. TPC-H q17 plans correctly here — decorrelated into a grouped
+    /// aggregate plus two partitioned hash joins, with projection and
+    /// predicate pushdown both active — and still runs ~6x DuckDB. The plan
+    /// shows `DynamicFilter [ empty ]` on the lineitem scans because dynamic
+    /// filters are populated at run time, so a static EXPLAIN can never say
+    /// whether the join's build side actually pruned the probe scan.
+    ///
+    /// Answering that needs the counters: rows emitted per operator, row
+    /// groups pruned, bytes scanned, time per partition. Those only exist
+    /// after execution, which is what `analyze` turns on.
+    pub async fn explain_analyze(&self) -> SqlResult<String> {
+        let batches = self
+            .dataframe
+            .clone()
+            .explain(false, true)?
             .collect()
             .await?;
         pretty_batches(&batches)
@@ -4626,6 +4663,10 @@ impl KrishivDataFrameOps for SqlDataFrame {
     async fn collect_with_stats(&self) -> SqlResult<(Vec<RecordBatch>, SqlExecutionStats)> {
         SqlDataFrame::collect_with_stats(self).await
     }
+    async fn explain_analyze(&self) -> SqlResult<String> {
+        SqlDataFrame::explain_analyze(self).await
+    }
+
     async fn explain(&self) -> SqlResult<String> {
         SqlDataFrame::explain(self).await
     }

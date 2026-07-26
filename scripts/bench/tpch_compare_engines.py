@@ -49,6 +49,19 @@ SINGLE_FILE_TABLES = {"nation", "region"}
 # problem at all.
 MIN_FREE_BYTES = 12 * 1024**3
 
+# Where the engines spill. This is NOT the data root, and conflating the two is
+# how a whole comparison was lost: the guard below measured free space on the
+# filesystem holding the parquet input, while Spark spilled shuffle blocks to
+# its default `spark.local.dir` of /tmp — a 12 GiB *tmpfs*, i.e. RAM. SF100
+# shuffle does not fit in 12 GiB, so Spark died with `DiskBlockObjectWriter:
+# Exception occurred while manually close the output stream` after five of six
+# passes had already run, and no results were written at all.
+#
+# Pointing it at real disk and checking *this* path is the fix. A guard that
+# measures a filesystem the workload never writes to is worse than no guard,
+# because it reports healthy right up to the failure.
+SPILL_DIR = os.environ.get("KRISHIV_BENCH_SPILL_DIR", "/data/bench-spill")
+
 
 def free_bytes(path: str) -> int:
     stats = os.statvfs(path)
@@ -56,7 +69,14 @@ def free_bytes(path: str) -> int:
 
 
 def disk_headroom_ok(path: str) -> bool:
-    return free_bytes(path) >= MIN_FREE_BYTES
+    """True when both the data path and the spill path have headroom.
+
+    Checked together because a run needs both, and whichever is tighter is the
+    one that ends it.
+    """
+    os.makedirs(SPILL_DIR, exist_ok=True)
+    return (free_bytes(path) >= MIN_FREE_BYTES
+            and free_bytes(SPILL_DIR) >= MIN_FREE_BYTES)
 
 
 TABLES = [
@@ -208,6 +228,19 @@ def run_spark(data_root: str, queries: list[dict], timeout_s: int) -> list[dict]
         .master(f"local[{cores}]")
         .config("spark.driver.memory", f"{driver_gib}g")
         .config("spark.sql.shuffle.partitions", str(cores * 2))
+        # Spill to real disk. The default is /tmp, which on this box is a
+        # 12 GiB tmpfs — so "spilling" meant moving shuffle blocks from heap
+        # into RAM, and SF100 exhausted it mid-run.
+        .config("spark.local.dir", SPILL_DIR)
+        # Reclaim shuffle files between queries instead of at session end.
+        # All 22 queries share one SparkSession, and the ContextCleaner only
+        # frees a query's shuffle blocks once its RDDs are garbage-collected —
+        # which, with a large heap and no memory pressure, may not happen for
+        # a long time. The spill therefore accumulated across the corpus until
+        # the disk guard tripped and skipped 17 of 22 queries. Nothing leaked:
+        # the directory was empty afterwards. It was peak, not growth, and
+        # collecting more eagerly flattens the peak.
+        .config("spark.cleaner.periodicGC.interval", "1min")
         .config("spark.ui.enabled", "false")
         .getOrCreate()
     )
@@ -227,6 +260,9 @@ def run_spark(data_root: str, queries: list[dict], timeout_s: int) -> list[dict]
         started = time.monotonic()
         try:
             rows = [tuple(r) for r in spark.sql(query["sql"]).collect()]
+            # Drop this query's cached blocks before the next one starts, so
+            # peak spill is one query's worth rather than the corpus's.
+            spark.catalog.clearCache()
             out.append({
                 "id": index, "name": query["name"], "status": "ok",
                 "elapsed_s": round(time.monotonic() - started, 2),

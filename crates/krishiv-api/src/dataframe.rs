@@ -550,6 +550,27 @@ Execution statistics:
             .session_window(gap_ms)
     }
 
+    /// Execute the query and report per-operator runtime metrics.
+    ///
+    /// `explain_async` returns the plan; this returns what the plan actually
+    /// did — rows per operator, row groups pruned, bytes scanned, elapsed
+    /// time per partition. That distinction decides real performance
+    /// questions: a plan can show a dynamic filter on a scan and still tell
+    /// you nothing, because the filter is only populated at run time.
+    ///
+    /// Local execution only. A remote plan's metrics live on the executors
+    /// that ran the fragments, so they are not reachable through this handle.
+    pub async fn explain_analyze_async(&self) -> Result<String> {
+        match &self.sql_dataframe {
+            Some(dataframe) => dataframe.explain_analyze().await.map_err(Into::into),
+            None => Err(KrishivError::Runtime {
+                message: String::from(
+                    "EXPLAIN ANALYZE needs a locally-planned query; this handle has none",
+                ),
+            }),
+        }
+    }
+
     pub async fn explain_async(&self) -> Result<String> {
         let is_local = !self.runtime.uses_remote_execution();
         if is_local {

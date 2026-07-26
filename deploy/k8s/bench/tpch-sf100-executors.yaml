@@ -29,7 +29,7 @@ spec:
       nodeSelector: { kubernetes.io/hostname: s1 }
       containers:
         - name: executor
-          image: localhost/krishiv:fast-a7d31681
+          image: localhost/krishiv:fast-68eb7ae5
           imagePullPolicy: IfNotPresent
           command:
             - krishiv
@@ -108,7 +108,7 @@ spec:
       nodeSelector: { kubernetes.io/hostname: s2 }
       containers:
         - name: executor
-          image: localhost/krishiv:fast-a7d31681
+          image: localhost/krishiv:fast-68eb7ae5
           imagePullPolicy: IfNotPresent
           command:
             - krishiv
@@ -190,7 +190,7 @@ spec:
       nodeSelector: { kubernetes.io/hostname: s3 }
       containers:
         - name: executor
-          image: localhost/krishiv:fast-a7d31681
+          image: localhost/krishiv:fast-68eb7ae5
           imagePullPolicy: IfNotPresent
           command:
             - krishiv
