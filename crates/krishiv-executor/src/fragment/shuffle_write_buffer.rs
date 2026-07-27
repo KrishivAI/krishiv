@@ -271,6 +271,24 @@ pub(crate) async fn drain_into_store(
 
     let num_partitions = buffer.num_partitions();
     let mut stats = Vec::with_capacity(num_partitions);
+    // One schema for the whole stage output, latched from the first batch that
+    // actually carries data.
+    //
+    // This used to be decided per partition — a partition with rows took its
+    // first batch's schema, an empty one took `fallback_schema` — so a stage
+    // could publish partitions that disagreed with each other whenever the two
+    // sources disagreed. They do disagree: `fallback_schema` is the plan's
+    // *declared* schema, and physical execution re-types expressions.
+    // TPC-H q17 aggregates `avg(l_quantity)`, declared `Decimal128(15, 2)` and
+    // produced as `Decimal128(30, 15)`, so its empty partitions were labelled
+    // one way and its full ones the other, and the reduce side rejected the
+    // mixture with "column types must match schema types".
+    //
+    // A partition's schema must not depend on whether it happened to receive
+    // rows. Prefer the observed schema (it is what the bytes are); fall back to
+    // the declared one only when this task produced no rows at all, which is
+    // the case `fallback_schema` exists for.
+    let observed_schema = buffer.pushed_schema();
     for index in 0..num_partitions {
         let partition = u32::try_from(index).map_err(|_| ExecutorError::LocalExecution {
             message: format!("shuffle partition index {index} exceeds u32"),
@@ -278,9 +296,8 @@ pub(crate) async fn drain_into_store(
         // `_reservation` must outlive `batches`: it is the pool's view of this
         // partition while it is concatenated and serialised.
         let (batches, _reservation) = buffer.drain_partition(index).await?.into_parts();
-        let schema = batches
-            .first()
-            .map(RecordBatch::schema)
+        let schema = observed_schema
+            .clone()
             .unwrap_or_else(|| Arc::clone(fallback_schema));
         let size_bytes: u64 = batches
             .iter()
@@ -338,6 +355,12 @@ pub(crate) struct ShuffleWriteBuffer {
     /// the pool just because it happened to ask first.
     soft_limit_bytes: u64,
     spill_dir: PathBuf,
+    /// Schema of the first row-carrying batch this task pushed.
+    ///
+    /// Latched here, not derived per partition at drain time, because a
+    /// partition's schema must not depend on whether it happened to receive
+    /// rows — see `drain_into_store`.
+    pushed_schema: Option<arrow::datatypes::SchemaRef>,
 }
 
 impl ShuffleWriteBuffer {
@@ -365,7 +388,17 @@ impl ShuffleWriteBuffer {
             pool,
             soft_limit_bytes,
             spill_dir,
+            pushed_schema: None,
         }
+    }
+
+    /// Schema of the first row-carrying batch pushed, if any.
+    ///
+    /// The whole stage output is labelled with this, so that a partition's
+    /// schema does not depend on whether it received rows — see
+    /// [`drain_into_store`].
+    pub(crate) fn pushed_schema(&self) -> Option<arrow::datatypes::SchemaRef> {
+        self.pushed_schema.clone()
     }
 
     /// The output partition space this buffer covers.
@@ -388,6 +421,9 @@ impl ShuffleWriteBuffer {
     pub(crate) async fn push(&mut self, index: usize, batch: RecordBatch) -> ExecutorResult<()> {
         if batch.num_rows() == 0 || index >= self.buckets.len() {
             return Ok(());
+        }
+        if self.pushed_schema.is_none() {
+            self.pushed_schema = Some(batch.schema());
         }
         let bytes = batch.get_array_memory_size();
         self.make_room_for(bytes).await?;
@@ -1031,5 +1067,96 @@ mod coalesce_tests {
         let one = coalesce_shuffle_batches(vec![batch(&schema, 3, 1)], &schema);
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].num_rows(), 3);
+    }
+}
+
+#[cfg(test)]
+mod uniform_schema_tests {
+    use super::*;
+    use arrow::array::{Decimal128Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    /// The two schemas q17 ended up mixing: what the plan *declares* for
+    /// `avg(l_quantity)` and what execution actually produces.
+    fn declared() -> arrow::datatypes::SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Decimal128(15, 2), true),
+        ]))
+    }
+    fn produced() -> arrow::datatypes::SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Decimal128(30, 15), true),
+        ]))
+    }
+
+    fn batch(rows: usize) -> RecordBatch {
+        let k = Int64Array::from(vec![7i64; rows]);
+        let v = Decimal128Array::from(vec![1i128; rows])
+            .with_precision_and_scale(30, 15)
+            .unwrap();
+        RecordBatch::try_new(produced(), vec![Arc::new(k), Arc::new(v)]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_partition_gets_one_schema_even_when_some_are_empty() {
+        // The q17 failure: partition 1 receives rows and is labelled
+        // Decimal128(30,15); partitions 0 and 2 receive none and used to be
+        // labelled Decimal128(15,2) from the declared fallback. The reduce
+        // side then saw one stage publishing two different schemas and
+        // refused the mixture.
+        let mut buffer = ShuffleWriteBuffer::new(3, None, u64::MAX, std::env::temp_dir());
+        buffer.push(1, batch(4)).await.unwrap();
+
+        let observed = buffer
+            .pushed_schema()
+            .expect("a row-carrying push must latch a schema");
+        assert_eq!(observed, produced());
+        assert_ne!(
+            observed,
+            declared(),
+            "the test is meaningless unless the two schemas differ"
+        );
+
+        // Draining every partition must report the same schema for all three.
+        let mut schemas = Vec::new();
+        for p in 0..3 {
+            let (batches, _res) = buffer.drain_partition(p).await.unwrap().into_parts();
+            let schema = buffer
+                .pushed_schema()
+                .unwrap_or_else(|| Arc::clone(&declared()));
+            if p == 1 {
+                assert!(!batches.is_empty(), "partition 1 had rows");
+            } else {
+                assert!(batches.is_empty(), "partition {p} had no rows");
+            }
+            schemas.push(schema);
+        }
+        assert!(
+            schemas.windows(2).all(|w| w[0] == w[1]),
+            "a stage must publish one schema, got {schemas:?}"
+        );
+        assert_eq!(schemas[0], produced());
+    }
+
+    #[tokio::test]
+    async fn a_task_that_produced_no_rows_has_no_observed_schema() {
+        // Nothing was pushed, so there is nothing to latch and the caller must
+        // fall back to the declared schema — which is the case the fallback
+        // exists for, and the only case it should be used in.
+        let buffer = ShuffleWriteBuffer::new(2, None, u64::MAX, std::env::temp_dir());
+        assert!(buffer.pushed_schema().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_empty_batch_does_not_latch_a_schema() {
+        // `push` ignores zero-row batches; they must not set the schema
+        // either, or an empty first batch would pin the wrong one.
+        let mut buffer = ShuffleWriteBuffer::new(2, None, u64::MAX, std::env::temp_dir());
+        buffer.push(0, batch(0)).await.unwrap();
+        assert!(buffer.pushed_schema().is_none());
+        buffer.push(0, batch(3)).await.unwrap();
+        assert_eq!(buffer.pushed_schema(), Some(produced()));
     }
 }
