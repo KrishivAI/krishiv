@@ -817,3 +817,44 @@ This also means `KRISHIV_SPILL_JOIN_BUILD_BYTES` matters most on the
 **coordinator** for staged plans, and on the **executors** for `sql:`
 fragments. Both are now set; the earlier note that it belongs only on the
 executors was half the picture.
+
+### D8 — the actual causal chain, corrected twice
+
+Two earlier attributions in this register were wrong. The coordinator's
+`info`-level pass summary settles it:
+
+```
+"hash_joins":3,"converted":1   "hash_joins":5,"converted":1
+"hash_joins":5,"converted":2   "hash_joins":7,"converted":1
+build_bytes: 2400000000  threshold: 250000000  mode: Partitioned  projected: true
+build_bytes:  911471322  threshold: 250000000  mode: Partitioned  projected: true
+build_bytes: 2560000000  threshold: 250000000  mode: Partitioned  projected: true
+build_bytes: 1800000000  threshold: 250000000  mode: Partitioned  projected: true
+```
+
+Five joins converted, with build sides of 0.9–2.6 GB against a 797.6 MB pool.
+Two things follow, and both contradict what was written above.
+
+**The mode is `Partitioned`, not `CollectLeft`.** The coordinator plans with
+real parallelism, so the joins it sees were always convertible. The
+CollectLeft relaxation (`1584280d`) is still correct — executor-side `sql:`
+fragments do plan at one partition — but it is *not* what unblocked these
+queries.
+
+**What unblocked them is the row-count estimator** (`769fb112`). Those
+build_bytes are round numbers: 2 400 000 000, 2 560 000 000, 1 800 000 000.
+They are `rows x schema width`, not measured bytes. Before that fallback,
+`total_byte_size` was `Absent` on these join inputs and Gate 2 returned
+`None` — which is exactly why the rule "never fired" despite being correctly
+registered and correctly thresholded.
+
+**And every converted join carries `projected: true`.** Without
+`reapply_projection` (`b443c309`) each conversion would have silently widened
+its output and broken the parent join's positional `on` — which is precisely
+the `Missing on the right: o_custkey index 3` run. So the two fixes are a
+pair: the estimator makes the rule *act*, the projection restore makes its
+action *valid*.
+
+Earlier claims in this file that "the AQE parallelism floor is what carried
+q7/q8" and that "zero joins converted" were both drawn from **executor** logs.
+The decision happens on the coordinator. Read the coordinator.
