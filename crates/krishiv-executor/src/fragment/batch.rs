@@ -842,17 +842,37 @@ async fn execute_shuffle_write_fragment(
 /// `shuffle_stage_key(stage, map_task)` wire contract shared with the
 /// coordinator's staged-job builder.
 ///
-/// Partitions written on this executor are read from the local store (a
-/// local miss reads as empty — map tasks write every partition, including
-/// empty ones). Partitions whose map task ran on another executor are
-/// fetched over Arrow Flight from the locations the coordinator attached to
-/// the assignment (`InputPartitionDescriptor::ShuffleFlight`); there a
-/// missing partition is an error, never silently empty.
+/// Partitions whose map task ran on another executor are fetched over Arrow
+/// Flight from the locations the coordinator attached to the assignment
+/// (`InputPartitionDescriptor::ShuffleFlight`). Everything else is read from
+/// the local store.
+///
+/// A1: a local miss is an ERROR naming the partition, never an empty read.
+/// The reduce side has three cases and only two used to be distinguishable —
+/// "written here and genuinely empty", "written here and lost", and "written
+/// on another executor and the coordinator never told me" all produced zero
+/// rows and `Ok`. The third is silent data loss on a query that reports
+/// success, which only a digest comparison would ever catch, and it is
+/// reachable whenever a producer reports an empty endpoint (an executor that
+/// came up before its shuffle Flight listener was configured, a restarted
+/// container that lost `--shuffle-addr`). It is not the same as "genuinely
+/// empty": map tasks publish every partition including the empty ones, so a
+/// legitimately-empty partition reads back as `Some(0 batches)`, and only a
+/// partition that was never written — or was deleted underneath us — reads
+/// back as `None`.
+///
+/// The error carries the `KRV_SHUFFLE_MISSING` marker so the coordinator
+/// regenerates the producer rather than failing outright; C1/C2 bound that
+/// loop and diagnose it when it does not converge.
 struct InmemDfplanShuffleReader {
     store: std::sync::Arc<krishiv_shuffle::ShuffleBackend>,
     job_id: String,
     /// `(sub-stage key, partition) → flight endpoint` for remote partitions.
     remote_endpoints: std::collections::HashMap<(String, u32), String>,
+    /// `(sub-stage key, partition)` the coordinator attached to THIS executor's
+    /// endpoint — positive evidence that a local read is the right branch,
+    /// rather than the absence of evidence for any other one.
+    local_partitions: std::collections::HashSet<(String, u32)>,
 }
 
 // Manual impl: `ShuffleBackend` itself does not derive Debug.
@@ -923,18 +943,48 @@ impl krishiv_sql::distributed_plan::ShufflePartitionReader for InmemDfplanShuffl
             });
         }
 
+        // A1: say which of the three cases this is, in the error, before the
+        // read — after it the distinction is gone.
+        let attached_locally = self
+            .local_partitions
+            .contains(&(stage_key.clone(), partition));
+        let attached_for_stage = self
+            .remote_endpoints
+            .keys()
+            .chain(self.local_partitions.iter())
+            .any(|(key, _)| key == &stage_key);
         let id = PartitionId {
             job_id: self.job_id.clone(),
-            stage_id: stage_key,
+            stage_id: stage_key.clone(),
             partition,
         };
         let store = std::sync::Arc::clone(&self.store);
         Box::pin(async move {
-            store
-                .read_partition(&id)
-                .await
-                .map(|found| found.map(|p| p.batches).unwrap_or_default())
-                .map_err(|e| e.to_string())
+            let found = store.read_partition(&id).await.map_err(|e| e.to_string())?;
+            match found {
+                Some(p) => Ok(p.batches),
+                None => {
+                    let provenance = if attached_locally {
+                        "the coordinator located it on THIS executor, so the local store lost it"
+                    } else if attached_for_stage {
+                        "the coordinator attached locations for this stage key but none for this \
+                         partition — the producer reported no endpoint for it (A1)"
+                    } else {
+                        "the coordinator attached no location for this stage key at all — either \
+                         the producer advertised no shuffle endpoint, or it ran here and its \
+                         output is gone (A1)"
+                    };
+                    Err(format!(
+                        "{}: shuffle partition job={} stage={} partition={} is not in the local \
+                         store and has no attached remote location; {provenance}. Reading it as \
+                         empty would silently drop rows from a query that reports success.",
+                        crate::runner::encode_missing_shuffle(&stage_key, partition),
+                        id.job_id,
+                        stage_key,
+                        partition,
+                    ))
+                }
+            }
         })
     }
 }
@@ -990,27 +1040,37 @@ async fn execute_dfplan_fragment(
         .as_ref()
         .map(|c| c.flight_endpoint.clone())
         .unwrap_or_default();
-    let remote_endpoints: std::collections::HashMap<(String, u32), String> = assignment
-        .input_partitions()
-        .iter()
-        .filter_map(|p| match p.descriptor() {
-            Some(krishiv_proto::InputPartitionDescriptor::ShuffleFlight {
-                flight_endpoint,
-                upstream_stage_id,
-                partition_id,
-                ..
-            }) if !flight_endpoint.is_empty() && *flight_endpoint != own_endpoint => Some((
-                (upstream_stage_id.as_str().to_owned(), *partition_id),
-                flight_endpoint.clone(),
-            )),
-            _ => None,
-        })
-        .collect();
+    let mut remote_endpoints: std::collections::HashMap<(String, u32), String> =
+        std::collections::HashMap::new();
+    let mut local_partitions: std::collections::HashSet<(String, u32)> =
+        std::collections::HashSet::new();
+    for input in assignment.input_partitions() {
+        let Some(krishiv_proto::InputPartitionDescriptor::ShuffleFlight {
+            flight_endpoint,
+            upstream_stage_id,
+            partition_id,
+            ..
+        }) = input.descriptor()
+        else {
+            continue;
+        };
+        let key = (upstream_stage_id.as_str().to_owned(), *partition_id);
+        // A1: an endpoint equal to ours is positive evidence that the partition
+        // is here, not merely the absence of evidence that it is elsewhere.
+        // Recording it separately is what lets a local miss say which of the
+        // three reduce-side cases it is.
+        if flight_endpoint.is_empty() || *flight_endpoint == own_endpoint {
+            local_partitions.insert(key);
+        } else {
+            remote_endpoints.insert(key, flight_endpoint.clone());
+        }
+    }
     let reader: Arc<dyn krishiv_sql::distributed_plan::ShufflePartitionReader> =
         Arc::new(InmemDfplanShuffleReader {
             store: Arc::clone(&store),
             job_id: job_id.to_owned(),
             remote_endpoints,
+            local_partitions,
         });
     let (schema, mut stream) = krishiv_sql::distributed_plan::execute_dfplan_body(
         fragment,
@@ -2272,6 +2332,7 @@ mod tests {
                 (stage_key, 3u32),
                 addr.to_string(),
             )]),
+            local_partitions: std::collections::HashSet::new(),
         };
         let batches = reader.read_partition(0, 0, 3).await.unwrap();
         server.abort();
@@ -2279,21 +2340,83 @@ mod tests {
         assert_eq!(batches[0].num_rows(), 3);
     }
 
-    /// Partitions with no remote location read from the local store, where a
-    /// miss is empty by contract (map tasks write every partition, including
-    /// empty ones).
+    /// A1: a partition with no attached location and nothing in the local
+    /// store is an ERROR naming it, never a silent empty read.
+    ///
+    /// This test used to assert the opposite — that a local miss reads empty —
+    /// which made "written on another executor and the coordinator never told
+    /// me" indistinguishable from "written here and genuinely empty". Both
+    /// produced zero rows and `Ok`, so the query reported success with rows
+    /// missing and only a digest comparison would ever have noticed. A
+    /// legitimately-empty partition is not affected: map tasks publish every
+    /// partition, so it reads back as `Some(0 batches)`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::unwrap_used)]
-    async fn dfplan_reader_local_miss_reads_empty() {
+    async fn dfplan_reader_local_miss_is_an_error_naming_the_partition() {
         let reader = InmemDfplanShuffleReader {
             store: Arc::new(ShuffleBackend::InMemory(Arc::new(
                 InMemoryShuffleStore::new(),
             ))),
             job_id: "job-dfplan-local".to_owned(),
             remote_endpoints: std::collections::HashMap::new(),
+            local_partitions: std::collections::HashSet::new(),
         };
-        let batches = reader.read_partition(0, 0, 0).await.unwrap();
-        assert!(batches.is_empty());
+        let error = reader
+            .read_partition(0, 0, 0)
+            .await
+            .expect_err("an unlocatable partition must not read as empty");
+        for needle in [
+            "KRV_SHUFFLE_MISSING",
+            &shuffle_stage_key(0, 0),
+            "job-dfplan-local",
+            "partition=0",
+        ] {
+            assert!(
+                error.contains(needle),
+                "the error must name {needle}; got: {error}"
+            );
+        }
+    }
+
+    /// The half of A1 that must NOT change: a partition the map task wrote on
+    /// this executor still reads locally, and an empty one still reads as zero
+    /// rows rather than erroring. Written through the real disk store so the
+    /// "published but empty" case is genuinely on disk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::unwrap_used)]
+    async fn dfplan_reader_reads_a_published_empty_partition_locally() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+        let backend = Arc::new(ShuffleBackend::Local(Arc::clone(&disk)));
+        let stage_key = shuffle_stage_key(0, 0);
+
+        // Partition 0 receives no rows; the map path publishes it anyway.
+        map_write_through_production_path(
+            &backend,
+            "job-dfplan-empty-local",
+            &stage_key,
+            2,
+            64 * 1024 * 1024,
+            dir.path().to_path_buf(),
+            &[0, 64],
+        )
+        .await;
+
+        let reader = InmemDfplanShuffleReader {
+            store: backend,
+            job_id: "job-dfplan-empty-local".to_owned(),
+            remote_endpoints: std::collections::HashMap::new(),
+            local_partitions: std::collections::HashSet::from([(stage_key, 0u32)]),
+        };
+        let batches = reader
+            .read_partition(0, 0, 0)
+            .await
+            .expect("a published-but-empty partition must still read locally");
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            0,
+            "a genuinely empty partition reads as zero rows, not as an error"
+        );
     }
 
     /// Build the map-side buffer, feed it, and drain it into `store` through
@@ -2387,6 +2510,7 @@ mod tests {
                 ))),
                 job_id: job_id.to_owned(),
                 remote_endpoints,
+                local_partitions: std::collections::HashSet::new(),
             },
             server,
         )

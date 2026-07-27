@@ -420,6 +420,27 @@ impl JobRecord {
                 };
                 for p in meta.shuffle_partitions() {
                     if p.flight_endpoint.is_empty() {
+                        // SOTA §1: the writer-reported size vector is the
+                        // existence map. A zero-byte partition with no endpoint
+                        // is unremarkable — nothing to fetch. A NONZERO one is
+                        // an unlocatable partition that the consumer will read
+                        // from its own local store and, before A1, silently
+                        // read as empty. Say so where the location is dropped,
+                        // because that is the only place both facts are in hand.
+                        if p.size_bytes > 0 && executor_leases.len() > 1 {
+                            tracing::error!(
+                                job_id = %self.spec.job_id(),
+                                stage_id = %write_cfg.stage_id,
+                                partition_id = p.partition_id,
+                                task_id = %task.task_id(),
+                                executor = ?task.assigned_executor.as_ref().map(ExecutorId::as_str),
+                                size_bytes = p.size_bytes,
+                                "producer reported a NONZERO shuffle partition with no Flight \
+                                 endpoint on a multi-executor job; its consumers cannot locate it. \
+                                 The producing executor most likely started without a shuffle \
+                                 Flight address"
+                            );
+                        }
                         continue;
                     }
                     locations.push(InputPartition::typed(
