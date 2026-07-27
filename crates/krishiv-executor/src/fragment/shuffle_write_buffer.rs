@@ -49,10 +49,22 @@
 //!    reads the spill files back one partition at a time.
 //!
 //! Peak memory becomes `soft ceiling + one partition`, independent of input
-//! size, instead of the whole map output. When even that cannot be satisfied
-//! the pool returns its ordinary `Resources exhausted` error, so the failure
-//! mode is a named, retryable task error rather than a SIGKILL that takes
-//! every sibling task on the executor down with it.
+//! size, instead of the whole map output.
+//!
+//! What it deliberately does **not** do is fail the task when the pool is
+//! full. Spilling frees memory only while something is buffered; once every
+//! partition is on disk, the batch in hand already exists and dropping it
+//! would lose rows. Those allocations are admitted and *recorded* (see
+//! [`account_unavoidable`]). The first version refused them instead, and live
+//! TPC-H q3 found the hole within one sweep: the process-wide `FairSpillPool`
+//! gives each spillable consumer `(pool - unspillable) / num_spill`, so a hash
+//! join build side on the same fragment could leave this buffer unable to grow
+//! on its FIRST batch, with nothing buffered to spill. The map task then failed
+//! deterministically — which the coordinator sees only as a consumer reporting
+//! a missing upstream partition, so it regenerated the producer eight times and
+//! failed the job on the regeneration budget instead of surfacing the real
+//! error. Bounding memory is the point of this type; failing queries that fit
+//! is not.
 //!
 //! Spill files are fsynced and then dropped from the page cache before the
 //! next write. Page cache on shuffle files is charged to the container's
@@ -144,6 +156,101 @@ impl DrainedPartition {
     }
 }
 
+/// What one drained partition cost, reported back to the call site so it can
+/// build its `ShufflePartitionOutput` and metrics without re-walking batches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PartitionWriteStat {
+    pub(crate) partition: u32,
+    pub(crate) size_bytes: u64,
+    pub(crate) rows: u64,
+    pub(crate) write_elapsed_us: u64,
+}
+
+/// Drain every output partition of `buffer` into `store`, in partition order.
+///
+/// # The contract this function exists to hold
+///
+/// A map task must publish its **whole** partition space, including partitions
+/// that received no rows. The reduce side treats the two cases differently: a
+/// *local* miss reads as empty by convention, but a *remote* fetch of a
+/// partition that was never written is an error, which the coordinator answers
+/// by invalidating the producer and regenerating it. A producer that
+/// deterministically skips an empty partition therefore regenerates into the
+/// same gap until the regeneration budget is exhausted and the job fails —
+/// TPC-H q3 did exactly that, eight times at ~2.5 s intervals, on one
+/// partition.
+///
+/// The loop is `0..num_partitions`, never "the partitions that got rows", and
+/// it lives here rather than being open-coded at each call site so that the
+/// three map-write paths cannot drift apart on it.
+///
+/// `pre_write` sees each partition (schema and batches) immediately before it
+/// is handed to the store — that is where the push-shuffle mirror and hot-key
+/// accounting hook in.
+pub(crate) async fn drain_into_store(
+    buffer: &mut ShuffleWriteBuffer,
+    store: &krishiv_shuffle::ShuffleBackend,
+    id_for: impl Fn(u32) -> krishiv_shuffle::PartitionId,
+    fallback_schema: &arrow::datatypes::SchemaRef,
+    lease_token: u64,
+    mut pre_write: impl FnMut(u32, &arrow::datatypes::SchemaRef, &[RecordBatch]) -> ExecutorResult<()>,
+) -> ExecutorResult<Vec<PartitionWriteStat>> {
+    use krishiv_shuffle::{ShufflePartition, ShuffleStore as _};
+
+    let num_partitions = buffer.num_partitions();
+    let mut stats = Vec::with_capacity(num_partitions);
+    for index in 0..num_partitions {
+        let partition = u32::try_from(index).map_err(|_| ExecutorError::LocalExecution {
+            message: format!("shuffle partition index {index} exceeds u32"),
+        })?;
+        // `_reservation` must outlive `batches`: it is the pool's view of this
+        // partition while it is concatenated and serialised.
+        let (batches, _reservation) = buffer.drain_partition(index).await?.into_parts();
+        let schema = batches
+            .first()
+            .map(RecordBatch::schema)
+            .unwrap_or_else(|| Arc::clone(fallback_schema));
+        let size_bytes: u64 = batches
+            .iter()
+            .map(|b| b.get_array_memory_size() as u64)
+            .sum();
+        let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        // Coalesce the per-source-batch fragments into one well-sized batch:
+        // better downstream columnar throughput and less per-batch overhead in
+        // the store. A schema disagreement (possible once batches have made a
+        // round trip through IPC) falls back to writing them individually.
+        let batches = if batches.len() > 1 {
+            arrow::compute::concat_batches(&schema, &batches)
+                .map(|b| vec![b])
+                .unwrap_or(batches)
+        } else {
+            batches
+        };
+        pre_write(partition, &schema, &batches)?;
+        let write_started = std::time::Instant::now();
+        store
+            .write_partition(
+                ShufflePartition {
+                    id: id_for(partition),
+                    schema,
+                    batches,
+                },
+                lease_token,
+            )
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!("shuffle write failed for partition {partition}: {e}"),
+            })?;
+        stats.push(PartitionWriteStat {
+            partition,
+            size_bytes,
+            rows,
+            write_elapsed_us: write_started.elapsed().as_micros() as u64,
+        });
+    }
+    Ok(stats)
+}
+
 /// Hash-partitioned map output, bounded in memory and spilled to local disk.
 ///
 /// Push every bucket batch with [`push`](Self::push), then take each partition
@@ -195,6 +302,11 @@ impl ShuffleWriteBuffer {
         }
     }
 
+    /// The output partition space this buffer covers.
+    pub(crate) fn num_partitions(&self) -> usize {
+        self.buckets.len()
+    }
+
     /// Total in-memory bytes currently held across all partitions.
     pub(crate) fn buffered_bytes(&self) -> usize {
         self.bucket_bytes.iter().sum()
@@ -223,51 +335,58 @@ impl ShuffleWriteBuffer {
     }
 
     /// Reserve `bytes`, spilling the largest partition as many times as it
-    /// takes. Fails only when nothing is left to spill and the pool still
-    /// refuses — the honest "this task cannot run in this much memory".
+    /// takes.
+    ///
+    /// # Why this never fails
+    ///
+    /// Spilling frees memory only while there is something buffered to spill.
+    /// Once every partition is on disk, the incoming batch has nowhere else to
+    /// go: it already exists — the partitioner allocated it before this
+    /// function was called — and dropping it would lose rows. So when the pool
+    /// refuses and there is nothing left to spill, the batch is admitted and
+    /// the allocation is *recorded* rather than refused.
+    ///
+    /// Refusing was the first version's behaviour and it was wrong in a way
+    /// that live TPC-H q3 found immediately. The task engine's pool is the
+    /// process-wide `FairSpillPool`; a spillable consumer's share is
+    /// `(pool_size - unspillable) / num_spill`, so a hash join build side on
+    /// the same fragment can leave this buffer unable to grow on its FIRST
+    /// batch, with an empty buffer and therefore nothing to spill. The map
+    /// task then failed deterministically — and a producer that always fails
+    /// looks to the coordinator like a consumer reporting a missing upstream
+    /// partition, so it regenerated the producer eight times and failed the
+    /// job on the regeneration budget instead of reporting the real error.
+    ///
+    /// Bounding memory is the point of this type, but the bound is the soft
+    /// ceiling plus one batch — not "fail the query when the pool is busy".
     async fn make_room_for(&mut self, bytes: usize) -> ExecutorResult<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
         loop {
-            let over_soft_limit =
-                (self.buffered_bytes() + bytes) as u64 > self.soft_limit_bytes && bytes > 0;
-            if !over_soft_limit {
-                match &self.reservation {
-                    Some(reservation) => match reservation.try_grow(bytes) {
-                        Ok(()) => return Ok(()),
-                        Err(pool_error) => {
-                            if !self.spill_largest().await? {
-                                return Err(ExecutorError::LocalExecution {
-                                    message: format!(
-                                        "shuffle write buffer could not reserve {bytes} bytes \
-                                         from the task memory pool with nothing left to spill: \
-                                         {pool_error}"
-                                    ),
-                                });
-                            }
-                            continue;
-                        }
-                    },
-                    None => return Ok(()),
+            if (self.buffered_bytes() + bytes) as u64 > self.soft_limit_bytes {
+                if self.spill_largest().await? {
+                    continue;
                 }
+                break;
             }
-            if !self.spill_largest().await? {
-                // Nothing in memory to spill and still over the soft ceiling:
-                // this single batch is larger than the whole allowance. Let it
-                // through rather than failing — one batch has to be resident
-                // for the partitioner to have produced it at all, and the pool
-                // (checked above on the next iteration) remains the hard bound.
-                if let Some(reservation) = &self.reservation {
-                    reservation
-                        .try_grow(bytes)
-                        .map_err(|e| ExecutorError::LocalExecution {
-                            message: format!(
-                                "shuffle write buffer could not reserve a single {bytes}-byte \
-                                 batch from the task memory pool: {e}"
-                            ),
-                        })?;
-                }
+            let Some(reservation) = &self.reservation else {
                 return Ok(());
+            };
+            match reservation.try_grow(bytes) {
+                Ok(()) => return Ok(()),
+                Err(_) => {
+                    if self.spill_largest().await? {
+                        continue;
+                    }
+                    break;
+                }
             }
         }
+        if let Some(reservation) = &self.reservation {
+            account_unavoidable(reservation, bytes, "buffering one map-output batch");
+        }
+        Ok(())
     }
 
     /// Spill the largest in-memory partition to a local Arrow IPC file.
@@ -419,7 +538,11 @@ impl ShuffleWriteBuffer {
                 .register(p)
         });
         if let Some(reservation) = &drained_reservation {
-            account_unavoidable(reservation, in_memory_bytes, index);
+            account_unavoidable(
+                reservation,
+                in_memory_bytes,
+                "handing over one output partition",
+            );
         }
 
         let mut batches = Vec::new();
@@ -448,7 +571,7 @@ impl ShuffleWriteBuffer {
                     .iter()
                     .map(RecordBatch::get_array_memory_size)
                     .sum();
-                account_unavoidable(reservation, bytes, index);
+                account_unavoidable(reservation, bytes, "reading back one spilled run");
             }
             batches.extend(restored);
         }
@@ -477,27 +600,32 @@ impl ShuffleWriteBuffer {
     }
 }
 
-/// Record bytes the drain path has no way to avoid holding.
+/// Record bytes this buffer has no way to avoid holding.
 ///
-/// One whole output partition has to be resident: it is the smallest unit
-/// [`krishiv_shuffle::ShuffleStore::write_partition`] accepts, and there is
-/// nothing left to spill once it is being handed over. So the reservation is
-/// grown even when the pool would refuse — refusing here would fail a query
-/// that can actually run, and *skipping* the accounting is precisely the bug
-/// this module exists to fix: an unrecorded allocation is one the pool cannot
-/// make anyone else back off for. The overshoot is logged rather than hidden.
-fn account_unavoidable(reservation: &MemoryReservation, bytes: usize, partition: usize) {
+/// Two places qualify. Draining hands over one whole output partition, the
+/// smallest unit [`krishiv_shuffle::ShuffleStore::write_partition`] accepts,
+/// with nothing left to spill. Buffering admits one batch that the partitioner
+/// has already allocated once every partition is on disk. In both the memory
+/// is committed before the pool is consulted, so the only question is whether
+/// the pool gets to *know* about it.
+///
+/// It does. Refusing would fail a query that can actually run — that is the
+/// TPC-H q3 regression — and skipping the accounting is precisely the bug this
+/// module exists to fix: an unrecorded allocation is one the pool cannot make
+/// anyone else back off for. So the reservation grows either way and the
+/// overshoot is logged rather than hidden.
+fn account_unavoidable(reservation: &MemoryReservation, bytes: usize, what: &str) {
     if bytes == 0 {
         return;
     }
     if let Err(error) = reservation.try_grow(bytes) {
         tracing::warn!(
-            partition,
             bytes,
+            what,
             %error,
-            "shuffle write drain exceeded the task memory pool holding one output \
-             partition; recording the allocation so the pool stays honest. Raise the \
-             stage's partition count to make each partition smaller."
+            "shuffle write buffer exceeded the task memory pool on an allocation it \
+             cannot avoid; recording it so the pool stays honest. Raise the stage's \
+             partition count to make each partition smaller."
         );
         reservation.grow(bytes);
     }
@@ -681,6 +809,61 @@ mod tests {
             0,
             "every reservation must be released once the batches are gone"
         );
+    }
+
+    /// The q3 regression: a map task must not fail because some OTHER operator
+    /// is already holding the pool.
+    ///
+    /// The task engine's pool is the process-wide `FairSpillPool`, shared with
+    /// every operator of every concurrent task — and a spillable consumer's
+    /// share is `(pool - unspillable) / num_spill`, so a hash join build side
+    /// on the same fragment can leave the shuffle write buffer unable to grow
+    /// on its very FIRST batch. With nothing buffered there is nothing to
+    /// spill, and the first version of this buffer treated that as fatal.
+    ///
+    /// It is not fatal: one batch has to be resident for the partitioner to
+    /// have produced it. Failing instead killed the producer task
+    /// deterministically, which the coordinator sees only as "missing upstream
+    /// shuffle partitions" on the consumer — it regenerates the producer, the
+    /// producer fails identically, and the job dies when the regeneration
+    /// budget runs out. TPC-H q3 did exactly that, 8 times.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pool_held_by_another_operator_does_not_fail_the_map_write() {
+        const POOL_BYTES: usize = 256 * 1024;
+        let pool = pool_of(POOL_BYTES);
+        // Stand in for the fragment's hash join: an unspillable consumer that
+        // has already taken the whole pool.
+        let squatter = MemoryConsumer::new("PretendHashJoinInput")
+            .with_can_spill(false)
+            .register(&pool);
+        squatter
+            .try_grow(POOL_BYTES)
+            .expect("precondition: the squatter must be able to take the pool");
+
+        let mut buffer =
+            ShuffleWriteBuffer::new(4, Some(Arc::clone(&pool)), u64::MAX, temp_dir("contended"));
+        // The very first push, with an empty buffer and a pool that will
+        // refuse: nothing to spill, nothing to fall back on.
+        let first = buffer.push(0, batch(0, 1024)).await;
+        assert!(
+            first.is_ok(),
+            "a contended pool must not fail the map write: {:?}",
+            first.err()
+        );
+        for i in 1..16 {
+            buffer
+                .push(i % 4, batch(i as i64 * 1024, 1024))
+                .await
+                .unwrap_or_else(|e| panic!("push {i} failed under pool contention: {e}"));
+        }
+
+        // And every row must still be there.
+        let mut total = 0usize;
+        for partition in 0..4 {
+            let drained = buffer.drain_partition(partition).await.unwrap();
+            total += drained.batches.iter().map(|b| b.num_rows()).sum::<usize>();
+        }
+        assert_eq!(total, 16 * 1024, "rows lost under pool contention");
     }
 
     /// Without a pool the soft ceiling is still a real bound.
