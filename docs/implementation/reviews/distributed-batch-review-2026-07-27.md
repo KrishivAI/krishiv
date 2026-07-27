@@ -936,3 +936,48 @@ reason that guard exists. The guard held.
 q10 failed identically on the previous image too, and the 2026-07-26 sweep
 recorded it as "lost shuffle" — three occurrences, one signature. Whatever it
 is, it predates tonight's changes and is not affected by them.
+
+### Cycle 2 regression sweep — six fixed, one regressed, one 6x slower
+
+Comparing `benchmarks/tpch-sf100-full22-ca0315d7.json` against the stored
+`tpch-sf100-distributed.json` baseline, so the claims below are measured, not
+inferred:
+
+| verdict | queries |
+|---|---|
+| **FIXED** | q5, q8, q9, q18, q21, q22 |
+| **REGRESSED** | q19 (ok 306.5 s → failed) |
+| still failing, *not* a regression | q10 (cancelled in both), q17 (failed in both) |
+| faster | q1 0.28x, q6 0.26x, q11 0.29x, q15 0.39x, q14 0.48x, q4 0.50x, q13 0.52x, q20 0.62x, q12 0.64x, q7 0.67x, q16 0.70x, q3 0.74x |
+| **6.3x SLOWER** | q2 (208.4 s → 1317.3 s) |
+
+Two corrections this table forces:
+
+* **q17 is not a regression.** It failed in the baseline too, so the
+  declared-vs-produced schema disagreement predates every change in this
+  session. Only q19 is new.
+* **q22 "FIXED" is qualified.** It completes, but as a *single task* — it is
+  correct and not distributed, which is a pass on the completion goal and a
+  fail on the distribution goal. The reason it declines was logged at `debug`
+  on a coordinator running at `info`, so three sweeps produced no evidence;
+  that is now `warn`.
+
+#### q2 — the one performance regression (open, deliberately not "fixed")
+
+208 s → 1317 s. Two candidate causes, both introduced this session, both
+one-environment-variable experiments on the cluster:
+
+1. `KRISHIV_SPILL_JOIN_BUILD_BYTES` — the row-count build-size estimator
+   (`769fb112`) made the spillable-join rule fire far more often, and
+   `estimated_build_bytes_from_rows` assumes 32 bytes per variable-length
+   column, which over-counts a projected build side. partsupp at SF100 is
+   80 M rows, so it converts, and the query then sorts 80 M rows.
+2. `KRISHIV_BROADCAST_JOIN_BYTES` — the D1 broadcast threshold raised
+   DataFusion's 1 MiB default to 32 MiB, changing which side is collected.
+
+**Not changed tonight, on purpose.** The obvious mitigation — demanding a
+safety margin before trusting a row-derived estimate — would have to reject a
+911 MB estimate against a ~732 MB threshold to help q2, and 911 MB is exactly
+q8's build side. A margin large enough to fix q2 un-fixes q8. Correctness
+before throughput: the six queries that now complete are worth more than q2's
+minutes, and the isolation experiment is cheap to run later.
