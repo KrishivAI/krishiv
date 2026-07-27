@@ -537,10 +537,24 @@ impl Coordinator {
         // This handles the case where a producer executor's shuffle data is lost
         // (disk failure, eviction, restart) after the produce stage already succeeded.
         if terminal_state == TaskState::Failed && !missing_partitions.is_empty() {
+            // Identify *which* partitions, not just how many. A bare
+            // `missing_count: 1` cannot distinguish "the producer never wrote
+            // partition 7" from "the consumer asked the wrong executor for
+            // it", and both regenerate into the same failure. TPC-H q10 has
+            // hit this three times across three sweeps and each investigation
+            // had to start from nothing, because the one fact that would have
+            // narrowed it — the partition index and its producing stage — was
+            // discarded at the log line.
+            let missing_ids: Vec<String> = missing_partitions
+                .iter()
+                .map(|m| format!("{}/{}", m.stage_id().as_str(), m.partition_id()))
+                .collect();
             tracing::warn!(
                 job_id = %job_id,
                 stage_id = %stage_id,
                 missing_count = missing_partitions.len(),
+                missing = %missing_ids.join(","),
+                executor = %executor_id_for_circuit,
                 "consumer task reported missing upstream shuffle partitions; invalidating producers"
             );
             let max_regen = self.config.max_shuffle_regen_attempts();
@@ -565,6 +579,7 @@ impl Coordinator {
                     tracing::error!(
                         job_id = %job_id,
                         diagnosis = %diagnosis,
+                        missing = %missing_ids.join(","),
                         "shuffle regeneration reproduced an identical miss; failing job fast"
                     );
                     let _ = self.cancel_job(&job_id);
