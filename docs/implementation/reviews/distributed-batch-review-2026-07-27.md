@@ -859,7 +859,48 @@ Earlier claims in this file that "the AQE parallelism floor is what carried
 q7/q8" and that "zero joins converted" were both drawn from **executor** logs.
 The decision happens on the coordinator. Read the coordinator.
 
-### D10 — q10 fails on a deterministic missing shuffle partition (open)
+### D10 — q10 fails on a deterministic missing shuffle partition (ROOT-CAUSED, fixed `6b0b63ae`)
+
+**The partition was never missing.** The executor logs carry the real error,
+which never reached the coordinator:
+
+```
+transient shuffle fetch failure; retrying
+  endpoint=10.42.0.39:2004 stage_id=s1.m2 partition_id=0 attempt=1 max_attempts=4
+  error: Tonic error: code: 'Operation was attempted past the valid range',
+         message: "Error, decoded message length too large:
+                   found 5117681 bytes, the limit is: 4194304 bytes"
+```
+
+tonic defaults to a **4 MiB** message limit; neither the shuffle Flight client
+nor its server ever raised it. The shuffle writer coalesces into **8 MiB**
+batches (`SHUFFLE_COALESCE_TARGET_BYTES`), so a coalesced batch serialises to
+~5 MB of IPC and *cannot be fetched at all*. Three defects then compounded:
+
+1. the transport could not carry what the writer produced;
+2. the failure was classified **retryable**, so four attempts were spent on a
+   deterministic error; and
+3. an exhausted retry is deliberately reported as `NotFound`, which the
+   consumer relays as a **missing shuffle partition** — so the coordinator
+   regenerated a 5.6 GB producer stage whose output was intact, got the
+   identical result, and failed the job fast. Its own diagnosis
+   (`writer-reported size 5621547940 bytes`) was accurate and pointed at the
+   size all along.
+
+Fixed by setting the limits explicitly (256 MiB, overridable via
+`KRISHIV_SHUFFLE_GRPC_MAX_MESSAGE_BYTES`), classifying tonic's `OutOfRange` as
+permanent rather than transient, and pinning the coalesce-target/wire-limit
+relationship in a test (`shuffle_batches_fit_the_wire_limit`) so the two
+constants in two crates cannot drift apart again.
+
+**Correction to the note below**: the entry said the failure "predates
+tonight's changes and is not affected by them". Half right. The unconfigured
+4 MiB limit is long-standing, but what pushed batches past it is this
+session's 8 MiB shuffle coalescing (`f3e3cc62`) — so the trigger *is* recent
+even though the latent defect is not.
+
+#### Original entry (kept for the reasoning trail)
+
 
 q10 is **not** part of the hash-join family. On `fast-b443c309` it failed as:
 
