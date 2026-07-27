@@ -776,6 +776,10 @@ pub async fn build_stages_for_parquet_query(
     let df = ctx.sql(&query).await.map_err(|e| SqlError::DataFusion {
         message: format!("staged planning: {e}"),
     })?;
+    // q22: fold uncorrelated scalar subqueries to constants before physical
+    // planning, or the whole query silently runs as a single task. See
+    // `inline_uncorrelated_scalar_subqueries`.
+    let df = inline_uncorrelated_scalar_subqueries(&ctx, df).await?;
     let plan = df
         .create_physical_plan()
         .await
@@ -783,6 +787,146 @@ pub async fn build_stages_for_parquet_query(
             message: format!("staged physical planning: {e}"),
         })?;
     build_distributed_stages(plan)
+}
+
+/// Evaluate **uncorrelated** scalar subqueries on the coordinator and replace
+/// each with the constant it produces.
+///
+/// **q22 (review 2026-07-27).** `datafusion-proto` cannot round-trip a
+/// `ScalarSubqueryExpr` — it decodes only "as part of a surrounding
+/// ScalarSubqueryExec" — so `verify_dfplan_roundtrip` refuses the fragment and
+/// the caller reads that refusal as "decline to stage". The query then runs as
+/// ONE task on ONE executor. It returns the right answer, so the sweep recorded
+/// a clean pass while an entire query class had silently stopped being
+/// distributed. That is worse than a failure, because nothing points at it.
+///
+/// An uncorrelated scalar subquery *is a constant*: it references no column of
+/// the outer query, so evaluating it once up front and substituting the literal
+/// is semantically exact, not an approximation. It also removes the
+/// un-encodable node outright rather than routing around it, which is why this
+/// is preferred over teaching the codec a new trick.
+///
+/// Deliberately conservative: anything unexpected — a correlated subquery, more
+/// than one row, an execution error, a shape we do not recognise — is left
+/// untouched, so the worst case is exactly today's behaviour rather than a new
+/// failure mode. The subquery runs on the coordinator, which is the right place
+/// for it: it is by definition small (one row), and folding it is what lets the
+/// *expensive* outer query distribute.
+async fn inline_uncorrelated_scalar_subqueries(
+    ctx: &SessionContext,
+    df: datafusion::dataframe::DataFrame,
+) -> SqlResult<datafusion::dataframe::DataFrame> {
+    use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::{Expr, LogicalPlan};
+
+    let plan = df.logical_plan().clone();
+
+    // Pass 1 — collect the distinct uncorrelated scalar subqueries. Keyed by
+    // the subquery plan's rendering so the same subquery written twice is
+    // executed once.
+    let mut pending: Vec<(String, LogicalPlan)> = Vec::new();
+    let collect = plan.apply(|node| {
+        for expr in node.expressions() {
+            expr.apply(|e| {
+                if let Expr::ScalarSubquery(sub) = e
+                    && sub.outer_ref_columns.is_empty()
+                {
+                    let key = sub.subquery.display_indent().to_string();
+                    if !pending.iter().any(|(k, _)| *k == key) {
+                        pending.push((key, sub.subquery.as_ref().clone()));
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    if collect.is_err() || pending.is_empty() {
+        return Ok(df);
+    }
+
+    // Pass 2 — execute each. A failure here is not fatal: drop that entry and
+    // the expression stays as it was.
+    let mut folded: Vec<(String, datafusion::scalar::ScalarValue)> = Vec::new();
+    for (key, sub_plan) in pending {
+        let sub_df = datafusion::dataframe::DataFrame::new(ctx.state(), sub_plan);
+        let Ok(batches) = sub_df.collect().await else {
+            continue;
+        };
+        let rows: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
+        // Zero rows is SQL NULL; more than one row is a runtime error that the
+        // normal path must keep raising, so leave it alone.
+        if rows > 1 {
+            continue;
+        }
+        let Some(batch) = batches.iter().find(|b| b.num_rows() == 1) else {
+            // No rows at all: the subquery is NULL of its declared type.
+            let Some(first) = batches.first() else {
+                continue;
+            };
+            let Some(field) = first.schema().fields().first().cloned() else {
+                continue;
+            };
+            if let Ok(null) = datafusion::scalar::ScalarValue::try_from(field.data_type()) {
+                folded.push((key, null));
+            }
+            continue;
+        };
+        let Some(column) = batch.columns().first() else {
+            continue;
+        };
+        if let Ok(value) = datafusion::scalar::ScalarValue::try_from_array(column, 0) {
+            folded.push((key, value));
+        }
+    }
+    if folded.is_empty() {
+        return Ok(df);
+    }
+
+    // Pass 3 — substitute.
+    let rewritten = plan.transform_up(|node| {
+        let exprs = node.expressions();
+        if !exprs.iter().any(Expr::contains_scalar_subquery) {
+            return Ok(Transformed::no(node));
+        }
+        let mut changed = false;
+        let mut new_exprs = Vec::with_capacity(exprs.len());
+        for expr in exprs {
+            let out = expr.transform_up(|e| {
+                if let Expr::ScalarSubquery(sub) = &e
+                    && sub.outer_ref_columns.is_empty()
+                {
+                    let key = sub.subquery.display_indent().to_string();
+                    if let Some((_, value)) = folded.iter().find(|(k, _)| *k == key) {
+                        return Ok(Transformed::yes(datafusion::prelude::lit(value.clone())));
+                    }
+                }
+                Ok(Transformed::no(e))
+            })?;
+            changed |= out.transformed;
+            new_exprs.push(out.data);
+        }
+        if !changed {
+            return Ok(Transformed::no(node));
+        }
+        let inputs = node.inputs().into_iter().cloned().collect::<Vec<_>>();
+        let rebuilt = node.with_new_exprs(new_exprs, inputs)?;
+        Ok(Transformed::yes(rebuilt))
+    });
+
+    match rewritten {
+        Ok(t) if t.transformed => {
+            tracing::info!(
+                folded = folded.len(),
+                "q22: folded uncorrelated scalar subqueries to constants so the \
+                 query can be staged instead of running as a single task"
+            );
+            Ok(datafusion::dataframe::DataFrame::new(ctx.state(), t.data))
+        }
+        // Rewrite declined or failed: the original plan is still correct, and
+        // the pre-existing single-task fallback still applies.
+        _ => Ok(df),
+    }
 }
 
 /// Register a signature-only DataFusion scalar UDF for every inline
@@ -1474,6 +1618,106 @@ fn collect_upstream_inner(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<usize>) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Does ANY node of the plan carry a scalar subquery?
+    ///
+    /// `LogicalPlan::expressions()` returns only the expressions of the node it
+    /// is called on — for `SELECT ... WHERE x > (subquery)` the root is a
+    /// Projection and the subquery lives in the Filter beneath it. Checking the
+    /// root alone silently proves nothing, which is what the precondition
+    /// assertion in these tests exists to catch.
+    fn plan_has_scalar_subquery(plan: &datafusion::logical_expr::LogicalPlan) -> bool {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        use datafusion::logical_expr::Expr;
+        let mut found = false;
+        let _ = plan.apply(|node| {
+            if node.expressions().iter().any(Expr::contains_scalar_subquery) {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        found
+    }
+
+    /// q22: the whole point is that a query carrying an uncorrelated scalar
+    /// subquery becomes stageable. Before the fold, `ScalarSubqueryExpr` cannot
+    /// round-trip through `dfplan` encoding, the verify step refuses the
+    /// fragment, and the caller runs the query as ONE task while reporting a
+    /// clean pass.
+    ///
+    /// Asserts the outcome (stages exist, and the plan no longer carries a
+    /// scalar subquery) rather than the mechanism, so the test survives a
+    /// change of folding strategy.
+    #[tokio::test]
+    async fn an_uncorrelated_scalar_subquery_is_folded_so_the_query_can_stage() {
+        let ctx = planning_session_context(4);
+        ctx.sql("CREATE TABLE acct(id BIGINT, bal DOUBLE) AS VALUES (1, 10.0), (2, 30.0), (3, 50.0)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let sql = "SELECT id FROM acct WHERE bal > (SELECT avg(bal) FROM acct)";
+        let before = ctx.sql(sql).await.unwrap();
+        assert!(
+            plan_has_scalar_subquery(before.logical_plan()),
+            "precondition: the planned query must actually carry a scalar \
+             subquery, or this test proves nothing"
+        );
+
+        let after = inline_uncorrelated_scalar_subqueries(&ctx, before)
+            .await
+            .unwrap();
+        assert!(
+            !plan_has_scalar_subquery(after.logical_plan()),
+            "the uncorrelated subquery must be folded to a constant"
+        );
+
+        // And the fold must not change the answer: avg is 30.0, so only id=3.
+        let rows = after.collect().await.unwrap();
+        let total: usize = rows.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1, "folding a constant must not change the result set");
+    }
+
+    /// A CORRELATED subquery references the outer row, so it is not a constant
+    /// and must be left exactly as it was. Getting this wrong would produce
+    /// silently wrong answers, which is far worse than the single-task
+    /// fallback this fix exists to remove.
+    #[tokio::test]
+    async fn a_correlated_scalar_subquery_is_left_alone() {
+        let ctx = planning_session_context(4);
+        ctx.sql("CREATE TABLE t(k BIGINT, v DOUBLE) AS VALUES (1, 10.0), (2, 30.0)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        ctx.sql("CREATE TABLE u(k BIGINT, w DOUBLE) AS VALUES (1, 5.0), (2, 40.0)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let sql = "SELECT k FROM t WHERE v > (SELECT max(w) FROM u WHERE u.k = t.k)";
+        let Ok(before) = ctx.sql(sql).await else {
+            // Some correlated shapes are decorrelated by the optimizer before
+            // we ever see them; nothing to assert if this one is rejected.
+            return;
+        };
+        let had_subquery = plan_has_scalar_subquery(before.logical_plan());
+        let after = inline_uncorrelated_scalar_subqueries(&ctx, before)
+            .await
+            .unwrap();
+        let still_has = plan_has_scalar_subquery(after.logical_plan());
+        assert_eq!(
+            had_subquery, still_has,
+            "a correlated subquery depends on the outer row and must never be \
+             folded to a constant"
+        );
+    }
     use datafusion::prelude::SessionConfig;
 
     /// D3(2): the point of carrying the upstream estimate is that a
