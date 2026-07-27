@@ -6,58 +6,14 @@ use std::sync::Arc;
 
 use krishiv_common::MemoryBudget;
 
-/// Reserve a shuffle-write batch against the task budget.
-///
-/// Every map task buffers its whole output before `write_partition` can take
-/// it, and that buffer is invisible to the DataFusion pool. This lives in one
-/// function because the buffering loop is written out three times in this file
-/// (`execute_shuffle_write_fragment`, `execute_dfplan_fragment`,
-/// `execute_inmem_shuffle_write`) and the first attempt at this fix patched
-/// only one of them — the executors kept being OOM-killed through the other
-/// two, with the new error never appearing in their logs because the code that
-/// raised it was not the code that ran.
-fn reserve_shuffle_batch(
-    budget: &MemoryBudget,
-    batch: &arrow::record_batch::RecordBatch,
-    held: &mut u64,
-) -> Result<(), ExecutorError> {
-    let bytes = batch.get_array_memory_size() as u64;
-    if budget.try_reserve(bytes) {
-        *held += bytes;
-        return Ok(());
-    }
-    Err(ExecutorError::LocalExecution {
-        message: format!(
-            "shuffle write buffer exhausted this task's memory budget: needed \
-             {bytes} more bytes on top of {held} already buffered (limit {:?}). \
-             The map output is held whole because the shuffle store has no \
-             append; reduce stage width or raise the executor memory limit.",
-            budget.limit(),
-        ),
-    })
-}
-
-/// Releases a shuffle-write buffer reservation when the task leaves the write
-/// path, however it leaves — including the `?` returns through the write loop,
-/// which is why this is a guard and not a pair of matched calls.
-struct ShuffleBufferReservation {
-    budget: Arc<MemoryBudget>,
-    bytes: u64,
-}
-
-impl ShuffleBufferReservation {
-    fn new(budget: Arc<MemoryBudget>, bytes: u64) -> Self {
-        Self { budget, bytes }
-    }
-}
-
-impl Drop for ShuffleBufferReservation {
-    fn drop(&mut self) {
-        if self.bytes > 0 {
-            self.budget.release(self.bytes);
-        }
-    }
-}
+// All three map-side shuffle-write paths in this file
+// (`execute_shuffle_write_fragment`, `execute_dfplan_fragment`,
+// `execute_inmem_shuffle_write`) buffer their hash-partitioned output through
+// `crate::fragment::shuffle_write_buffer::ShuffleWriteBuffer`. They are wired
+// to the same type deliberately: the previous guard here was open-coded three
+// times, an earlier fix patched only one copy, and the executors kept being
+// OOM-killed through the other two with the new error never appearing in their
+// logs because the code that raised it was not the code that ran.
 use krishiv_plan::udf::ResourceLimits;
 use krishiv_proto::{ExecutorTaskAssignment, TaskRuntimeStats};
 #[cfg(feature = "kafka")]
@@ -709,12 +665,14 @@ async fn execute_shuffle_write_fragment(
             })?;
     }
 
-    let mut partition_batches: Vec<Vec<arrow::record_batch::RecordBatch>> =
-        vec![Vec::new(); num_partitions as usize];
-    // Coordinator-supplied per-task allowance; `from_limit(None)` is
-    // unlimited, so an assignment without a limit keeps prior behaviour.
-    let shuffle_budget = MemoryBudget::from_limit(assignment.memory_limit_bytes());
-    let mut shuffle_held = 0u64;
+    // Bounded, pool-accounted, spilling map-side buffer — see
+    // `shuffle_write_buffer` for why holding the whole map output in a plain
+    // `Vec<Vec<RecordBatch>>` OOM-killed executors at SF100.
+    let mut buffer = crate::fragment::shuffle_write_buffer::ShuffleWriteBuffer::for_task(
+        num_partitions as usize,
+        &limited_engine,
+        Some(ctx.local_dir.clone()),
+    );
     let mut total_rows: usize = 0;
     let mut output_schema: arrow::datatypes::SchemaRef =
         Arc::new(arrow::datatypes::Schema::empty());
@@ -760,27 +718,17 @@ async fn execute_shuffle_write_fragment(
                 message: format!("hash partition failed: {e}"),
             })?;
         for (bucket_idx, bucket_batch) in buckets.into_iter().enumerate() {
-            if bucket_batch.num_rows() > 0
-                && let Some(v) = partition_batches.get_mut(bucket_idx)
-            {
-                if let Err(e) =
-                    reserve_shuffle_batch(&shuffle_budget, &bucket_batch, &mut shuffle_held)
-                {
-                    shuffle_budget.release(shuffle_held);
-                    return Err(e);
-                }
-                v.push(bucket_batch);
-            }
+            buffer.push(bucket_idx, bucket_batch).await?;
         }
     }
-    let _shuffle_reservation =
-        ShuffleBufferReservation::new(Arc::clone(&shuffle_budget), shuffle_held);
 
     let mut outputs: Vec<krishiv_proto::ShufflePartitionOutput> =
         Vec::with_capacity(num_partitions as usize);
 
-    for (p, part_batches) in partition_batches.into_iter().enumerate() {
-        let p = p as u32;
+    for p in 0..num_partitions {
+        // `_reservation` must outlive `part_batches` — it is the pool's view
+        // of this partition while it is concatenated and serialised.
+        let (part_batches, _reservation) = buffer.drain_partition(p as usize).await?.into_parts();
         let id = PartitionId {
             job_id: job_id.to_owned(),
             stage_id: stage_id.to_owned(),
@@ -1082,49 +1030,22 @@ async fn execute_dfplan_fragment(
         let partitioner = key_column.map(|col| {
             HashPartitioner::new(col, num_partitions).with_seed(shuffle_seed_from_job_id(job_id))
         });
-        // The coordinator's per-task allowance. `from_limit(None)` yields an
-        // unlimited budget, so an assignment that carries no limit keeps the
-        // previous behaviour rather than inventing a cap the planner did not
-        // ask for.
-        let memory_budget = MemoryBudget::from_limit(assignment.memory_limit_bytes());
-        let mut partition_batches: Vec<Vec<arrow::record_batch::RecordBatch>> =
-            vec![Vec::new(); num_partitions as usize];
+        // Bounded, pool-accounted, spilling map-side buffer. The
+        // `Vec<Vec<RecordBatch>>` this replaces held the task's ENTIRE map
+        // output — `write_partition` takes a whole partition, so there was
+        // nowhere to flush part-way through — and was invisible to the
+        // DataFusion pool. At SF100 the `dist-s4` fragment of q8/q9 (the raw
+        // lineitem scan, hash-partitioned by `l_partkey`, no join to prune it)
+        // put ~2 GiB of Arrow data in that buffer per task, RSS walked past
+        // the cgroup limit while the pool still reported headroom, and the
+        // kernel SIGKILLed the executor. See `shuffle_write_buffer` for the
+        // full evidence.
+        let mut buffer = crate::fragment::shuffle_write_buffer::ShuffleWriteBuffer::for_task(
+            num_partitions as usize,
+            &engine,
+            runner.shuffle.as_ref().map(|c| c.local_dir.clone()),
+        );
         let mut total_rows = 0usize;
-        // This loop holds the task's entire map output in memory until the
-        // stream ends — `write_partition` takes a whole partition, so there is
-        // nowhere to flush to part-way through. That buffer is invisible to
-        // the DataFusion pool, which only accounts what operators reserve
-        // through it, so at SF100 the executor's RSS walked past the cgroup
-        // limit while the pool still reported headroom and the kernel killed
-        // the process (exit 137). An OOM kill takes down every other task on
-        // the executor and surfaces to the coordinator as
-        // `task stalled: no progress for 30 min`, thirty minutes later.
-        //
-        // Reserving through the task budget cannot make the buffer smaller,
-        // but it changes who fails and how fast: this task fails immediately,
-        // by name, with a retryable error, and its siblings survive. Bounded
-        // spill-to-disk is the real cure and needs an appending
-        // `ShuffleStore` write API — until then, failing one task beats
-        // losing the executor.
-        let mut reserved_bytes = 0u64;
-        let reserve = |bytes: u64,
-                           reserved: &mut u64|
-         -> Result<(), ExecutorError> {
-            if memory_budget.try_reserve(bytes) {
-                *reserved += bytes;
-                return Ok(());
-            }
-            Err(ExecutorError::LocalExecution {
-                message: format!(
-                    "shuffle write buffer exhausted this task's memory budget: \
-                     needed {bytes} more bytes on top of {reserved} already held \
-                     for {num_partitions} partitions (budget limit {:?}). The map \
-                     output is buffered whole because the shuffle store has no \
-                     append; reduce stage width or raise the executor memory limit.",
-                    memory_budget.limit(),
-                ),
-            })
-        };
         while let Some(result) = stream.next().await {
             let batch = result.map_err(|e| ExecutorError::LocalExecution {
                 message: e.to_string(),
@@ -1140,37 +1061,21 @@ async fn execute_dfplan_fragment(
                         message: format!("dfplan hash partition failed: {e}"),
                     })?;
                 for (bucket_idx, bucket_batch) in buckets.into_iter().enumerate() {
-                    if bucket_batch.num_rows() > 0
-                        && let Some(v) = partition_batches.get_mut(bucket_idx)
-                    {
-                        if let Err(e) =
-                            reserve(bucket_batch.get_array_memory_size() as u64, &mut reserved_bytes)
-                        {
-                            memory_budget.release(reserved_bytes);
-                            return Err(e);
-                        }
-                        v.push(bucket_batch);
-                    }
+                    buffer.push(bucket_idx, bucket_batch).await?;
                 }
-            } else if let Some(v) = partition_batches.first_mut() {
-                if let Err(e) = reserve(batch.get_array_memory_size() as u64, &mut reserved_bytes) {
-                    memory_budget.release(reserved_bytes);
-                    return Err(e);
-                }
-                v.push(batch);
+            } else {
+                buffer.push(0, batch).await?;
             }
         }
-        // Held until the batches have been handed to the store below, because
-        // `concat_batches` briefly doubles the largest partition — the
-        // concatenated copy and its inputs are both live. Released on drop so
-        // the `?` paths through the write loop cannot leak the reservation.
-        let _buffer_reservation =
-            ShuffleBufferReservation::new(Arc::clone(&memory_budget), reserved_bytes);
 
         let mut outputs: Vec<krishiv_proto::ShufflePartitionOutput> =
             Vec::with_capacity(num_partitions as usize);
-        for (p, part_batches) in partition_batches.into_iter().enumerate() {
-            let p = p as u32;
+        for p in 0..num_partitions {
+            // `_reservation` must outlive `part_batches`: it is what keeps the
+            // pool's view of this partition honest while `concat_batches`
+            // briefly doubles it and the store serialises it.
+            let (part_batches, _reservation) =
+                buffer.drain_partition(p as usize).await?.into_parts();
             let part_schema = part_batches
                 .first()
                 .map(|b| b.schema())
@@ -1269,12 +1174,16 @@ async fn execute_inmem_shuffle_write(
     let stage_id = write_cfg.stage_id.as_str();
     let key_column = write_cfg.key_columns.first().map(String::as_str);
 
-    let mut partition_batches: Vec<Vec<arrow::record_batch::RecordBatch>> =
-        vec![Vec::new(); num_partitions as usize];
-    // Coordinator-supplied per-task allowance; `from_limit(None)` is
-    // unlimited, so an assignment without a limit keeps prior behaviour.
-    let shuffle_budget = MemoryBudget::from_limit(assignment.memory_limit_bytes());
-    let mut shuffle_held = 0u64;
+    // Bounded, pool-accounted, spilling map-side buffer — see
+    // `shuffle_write_buffer`. `inmem_shuffle` is a misnomer on a real
+    // deployment: the executor wires the SAME disk-backed store here, so the
+    // whole-output buffer this replaces was the executor's peak heap on this
+    // path too.
+    let mut buffer = crate::fragment::shuffle_write_buffer::ShuffleWriteBuffer::for_task(
+        num_partitions as usize,
+        &limited_engine,
+        None,
+    );
     let mut total_rows: usize = 0;
     let mut output_schema: arrow::datatypes::SchemaRef =
         std::sync::Arc::new(arrow::datatypes::Schema::empty());
@@ -1330,24 +1239,10 @@ async fn execute_inmem_shuffle_write(
                         message: format!("hash partition failed: {e}"),
                     })?;
                 for (bucket_idx, bucket_batch) in buckets.into_iter().enumerate() {
-                    if bucket_batch.num_rows() > 0
-                        && let Some(v) = partition_batches.get_mut(bucket_idx)
-                    {
-                        if let Err(e) = reserve_shuffle_batch(
-                            &shuffle_budget, &bucket_batch, &mut shuffle_held)
-                        {
-                            shuffle_budget.release(shuffle_held);
-                            return Err(e);
-                        }
-                        v.push(bucket_batch);
-                    }
+                    buffer.push(bucket_idx, bucket_batch).await?;
                 }
-            } else if let Some(v) = partition_batches.first_mut() {
-                if let Err(e) = reserve_shuffle_batch(&shuffle_budget, &batch, &mut shuffle_held) {
-                    shuffle_budget.release(shuffle_held);
-                    return Err(e);
-                }
-                v.push(batch);
+            } else {
+                buffer.push(0, batch).await?;
             }
         }
     }
@@ -1355,8 +1250,10 @@ async fn execute_inmem_shuffle_write(
     let mut outputs: Vec<krishiv_proto::ShufflePartitionOutput> =
         Vec::with_capacity(num_partitions as usize);
 
-    for (p, part_batches) in partition_batches.into_iter().enumerate() {
-        let p = p as u32;
+    for p in 0..num_partitions {
+        // `_reservation` must outlive `part_batches` — it is the pool's view
+        // of this partition while it is concatenated and serialised.
+        let (part_batches, _reservation) = buffer.drain_partition(p as usize).await?.into_parts();
         let id = PartitionId {
             job_id: job_id.to_owned(),
             stage_id: stage_id.to_owned(),

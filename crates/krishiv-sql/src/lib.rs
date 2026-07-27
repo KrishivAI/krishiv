@@ -112,9 +112,9 @@ pub mod python_udf;
 pub mod recursive_cte;
 pub mod scalar_udf;
 pub mod semi_join_reduction;
-pub mod spillable_join;
 /// Spark SQL extensions: LATERAL VIEW, TABLESAMPLE, TRANSFORM, DESCRIBE EXTENDED, etc.
 pub mod spark_sql_ext;
+pub mod spillable_join;
 pub mod sqlstate;
 pub mod subquery;
 pub mod unnest_sql;
@@ -411,6 +411,14 @@ pub use krishiv_common::cgroup_memory_limit_bytes;
 /// engines (the executor) can hold a shared pool without depending on
 /// DataFusion directly.
 pub use datafusion::execution::memory_pool::MemoryPool;
+
+/// The consumer/reservation half of the same pool API.
+///
+/// Re-exported for the same reason as [`MemoryPool`]: the executor's map-side
+/// shuffle-write buffer has to reserve its bytes through the task engine's
+/// pool — a buffer the pool cannot see is a buffer the container limit cannot
+/// govern — and it should not take a DataFusion dependency to do it.
+pub use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 
 /// The one query memory pool for this process, sized by
 /// [`krishiv_common::ExecutorCapacity`] from the cgroup limit.
@@ -3570,9 +3578,7 @@ pub trait KrishivDataFrameOps: Send + Sync {
     /// that looks like one.
     async fn explain_analyze(&self) -> SqlResult<String> {
         Err(SqlError::DataFusion {
-            message: String::from(
-                "EXPLAIN ANALYZE is not supported for this dataframe backend",
-            ),
+            message: String::from("EXPLAIN ANALYZE is not supported for this dataframe backend"),
         })
     }
     /// Explain the logical plan text without executing.
