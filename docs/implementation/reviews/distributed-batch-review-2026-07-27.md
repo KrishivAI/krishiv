@@ -683,3 +683,62 @@ the threshold roughly right by accident.
 **Unproven.** None of the three commits above has run against q7–q10; they
 need a rebuilt image and a re-run. The classification above is what the
 evidence supports, not a claim that the sweep is fixed.
+
+### D8 root-caused — the spill rule was structurally unreachable
+
+The five hash-join failures (q7, q8, q9, q10, q18) have one cause, and it is
+not a threshold or a statistic.
+
+A task engine is built with `target_partitions = cores / slots`
+(`task_engine_parallelism`, `fragment/common.rs`). On a 3-core executor
+running 3 slots that is **1**. DataFusion does not emit
+`PartitionMode::Partitioned` at one partition — it emits `CollectLeft`.
+`SpillableJoinSelection`'s Gate 3 accepted only `Partitioned`. So every join
+in every fragment was declined, and the rule converted **zero** joins in
+three hours across three executors while five queries died on exactly the
+build sides it exists to rescue.
+
+Its premise was wrong too. "CollectLeft build sides are small by
+construction" — they are not. `CollectLeft` is chosen from an *estimate* and
+buffers the whole build side, so a wrong estimate makes it the worst mode to
+be in. q9 and q10 each took the entire 797 MB pool that way.
+
+Why no test caught it: the rule's tests force `target_partitions = 4`
+specifically to obtain a partitioned join. They exercised the one
+configuration production never runs. The new tests pin the *premise* — that
+DataFusion really does produce `CollectLeft` at one partition — so they
+cannot silently stop testing anything.
+
+Fixed in `1584280d`: `CollectLeft` converts when the plan has a single
+partition, using non-partition-preserving sorts. At one partition "sorted" is
+sort-merge's entire requirement, so the conversion is simpler there than in
+the partitioned case.
+
+### D9 — a stage published two different schemas for one output
+
+`drain_into_store` chose each partition's schema independently: rows → that
+batch's schema, no rows → the plan's declared `fallback_schema`. Those
+disagree wherever physical planning re-types an expression, so a stage could
+publish partitions that contradicted each other. q17 aggregates
+`avg(l_quantity)`: declared `Decimal128(15, 2)`, produced
+`Decimal128(30, 15)`. Its empty partitions were labelled one way and its full
+ones the other, and the reduce side refused the mixture — "column types must
+match schema types, expected Decimal128(15, 2) but found Decimal128(30, 15)".
+
+Fixed in `a7b7db2e`: `ShuffleWriteBuffer` latches the first row-carrying
+batch's schema on `push`, and the drain labels the whole partition space with
+it. Latched at push, not at drain, because draining walks partitions in index
+order — latching there would still mix whenever partition 0 is empty and a
+later one is not.
+
+**Attribution correction.** An earlier note in this register blamed q17 on A2.
+That was wrong: q17 was already failing in the 2026-07-26 run (1824 s), before
+A2 existed, and its fragment is `dfplan:` — a path A2 never touched.
+
+### Instrumentation lesson
+
+The per-gate logging added in `769fb112` to answer "which gate declined" was
+written at `tracing::debug!`. Executors run `RUST_LOG=info`. The diagnostic
+added specifically to debug this was invisible in the only environment that
+had the bug. Diagnostics for production failures belong at the level
+production runs.
