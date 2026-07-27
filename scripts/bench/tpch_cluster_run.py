@@ -127,6 +127,20 @@ _TRANSIENT_RETRIES = 5
 _TRANSIENT_BACKOFF_S = 3.0
 
 
+def _is_timeout(err: Exception) -> bool:
+    """Whether `err` is a read/connect timeout rather than a refused socket.
+
+    urllib wraps a socket timeout in `URLError`, so the type alone does not
+    distinguish "the server never answered" from "nothing was listening".
+    """
+    if isinstance(err, TimeoutError):
+        return True
+    reason = getattr(err, "reason", None)
+    if isinstance(reason, TimeoutError):
+        return True
+    return "timed out" in str(err).lower()
+
+
 def _with_retry(operation, what: str):
     """Run `operation`, retrying transient transport errors with backoff.
 
@@ -142,6 +156,20 @@ def _with_retry(operation, what: str):
             raise
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as err:
             last = err
+            # A *timeout* on a submit is not a transport blip. `submit` plans
+            # the query synchronously, so a timeout means the coordinator is
+            # still planning — and retrying starts a second planning attempt
+            # for the same query alongside the first. q15 did exactly that:
+            # five overlapping plans of one SF100 query, each logged as
+            # `planning distributed stages`, on a coordinator that was already
+            # the reason the first one was slow. Fail fast instead; the caller
+            # records `submit_failed`, which is the honest result.
+            if _is_timeout(err) and what == "POST":
+                raise RuntimeError(
+                    f"{what} timed out; not retried — a submit timeout means the "
+                    f"coordinator is still planning, and retrying would run a "
+                    f"second plan of the same query alongside the first: {err}"
+                ) from err
             if attempt + 1 < _TRANSIENT_RETRIES:
                 delay = _TRANSIENT_BACKOFF_S * (2**attempt)
                 print(

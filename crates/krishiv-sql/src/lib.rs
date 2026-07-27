@@ -420,6 +420,16 @@ pub use datafusion::execution::memory_pool::MemoryPool;
 /// govern — and it should not take a DataFusion dependency to do it.
 pub use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 
+/// The record-batch stream trait, re-exported for the same reason as
+/// [`MemoryPool`].
+///
+/// A fragment's real output schema is the one its *stream* declares, not the
+/// one its `DataFrame` does — physical planning re-types expressions, and
+/// TPC-H q17 shipped batches of `Decimal128(30, 15)` under a logical schema
+/// that said `Decimal128(15, 2)`. Reading it needs this trait in scope, and
+/// the executor should not take a DataFusion dependency to do that.
+pub use datafusion::physical_plan::RecordBatchStream;
+
 /// The one query memory pool for this process, sized by
 /// [`krishiv_common::ExecutorCapacity`] from the cgroup limit.
 ///
@@ -4186,14 +4196,41 @@ impl SqlDataFrame {
     }
 
     async fn execute_stream_boxed_body(&self) -> SqlResult<SqlStream> {
+        Ok(self.execute_stream_with_schema_boxed_body().await?.1)
+    }
+
+    /// Execute, returning the stream **and the schema its batches actually
+    /// carry**.
+    ///
+    /// [`SqlStream`] is a bare `Pin<Box<dyn Stream>>`, so wrapping
+    /// DataFusion's stream throws away the one thing only it knows: the
+    /// physical output schema. `KrishivDataFrameOps::schema` is not a
+    /// substitute — that is the *logical* schema, and physical planning
+    /// re-types expressions. TPC-H q17's `avg(l_quantity)` is
+    /// `Decimal128(15, 2)` logically and `Decimal128(30, 15)` in the batches,
+    /// and a caller that labelled those batches with the logical schema
+    /// produced shuffle partitions whose rows violated their own schema.
+    ///
+    /// Callers that need to declare a schema before the first batch arrives —
+    /// or when no batch ever arrives — want this, not `schema()`.
+    pub fn execute_stream_with_schema(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = SqlResult<(SchemaRef, SqlStream)>> + Send + '_>,
+    > {
+        Box::pin(self.execute_stream_with_schema_boxed_body())
+    }
+
+    async fn execute_stream_with_schema_boxed_body(&self) -> SqlResult<(SchemaRef, SqlStream)> {
         let df_stream = self.dataframe.clone().execute_stream().await?;
+        let schema = df_stream.schema();
         use futures::StreamExt;
         let mapped = df_stream.map(|res| {
             res.map_err(|e| SqlError::DataFusion {
                 message: e.to_string(),
             })
         });
-        Ok(Box::pin(mapped))
+        Ok((schema, Box::pin(mapped)))
     }
 
     /// Execute and collect this DataFrame, also returning lightweight runtime statistics.

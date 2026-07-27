@@ -812,6 +812,39 @@ pub async fn build_stages_for_parquet_query(
 /// failure mode. The subquery runs on the coordinator, which is the right place
 /// for it: it is by definition small (one row), and folding it is what lets the
 /// *expensive* outer query distribute.
+/// Input bytes above which a scalar subquery is not worth folding on the
+/// coordinator.
+///
+/// The coordinator is a control plane, not a worker: it typically has a
+/// fraction of an executor's cores and pool. Anything it evaluates inline is
+/// single-node, un-spillable in practice, and blocks the submit handler. 256
+/// MiB is generous for a genuine constant lookup and far below a fact-table
+/// scan.
+const MAX_FOLDABLE_SUBQUERY_INPUT_BYTES: usize = 256 * 1024 * 1024;
+
+/// Whether `df`'s subquery is small enough to evaluate on the coordinator.
+///
+/// Unknown size counts as *not* cheap. That is the conservative direction
+/// here: the penalty for declining to fold is the pre-existing single-task
+/// fallback, while the penalty for folding something huge is a coordinator
+/// that stops answering submits.
+async fn subquery_is_cheap_to_fold(df: &datafusion::dataframe::DataFrame) -> bool {
+    use datafusion::common::stats::Precision;
+
+    let Ok(plan) = df.clone().create_physical_plan().await else {
+        return false;
+    };
+    let Ok(stats) = plan.partition_statistics(None) else {
+        return false;
+    };
+    match stats.total_byte_size {
+        Precision::Exact(bytes) | Precision::Inexact(bytes) => {
+            bytes <= MAX_FOLDABLE_SUBQUERY_INPUT_BYTES
+        }
+        Precision::Absent => false,
+    }
+}
+
 async fn inline_uncorrelated_scalar_subqueries(
     ctx: &SessionContext,
     df: datafusion::dataframe::DataFrame,
@@ -850,6 +883,27 @@ async fn inline_uncorrelated_scalar_subqueries(
     let mut folded: Vec<(String, datafusion::scalar::ScalarValue)> = Vec::new();
     for (key, sub_plan) in pending {
         let sub_df = datafusion::dataframe::DataFrame::new(ctx.state(), sub_plan);
+        // Cheapness gate. A scalar subquery *returns* one row; that says
+        // nothing about what it costs to *compute*. TPC-H q15's
+        // `(SELECT max(total_revenue) FROM revenue0)` aggregates 600 M
+        // lineitem rows to produce its single value — so folding it ran a
+        // full SF100 aggregate single-node on the coordinator, inside the
+        // synchronous submit handler, and `/batch-sql/submit` stopped
+        // answering within the client's 60 s timeout. The client then
+        // retried, and each retry started another one.
+        //
+        // Judge by the subquery's *input*, not its output. Over the
+        // threshold, leave the expression alone: that is exactly the
+        // pre-existing behaviour (the query declines to stage and runs as one
+        // task), which is a known, survivable cost — unlike a coordinator
+        // that stops accepting work.
+        if !subquery_is_cheap_to_fold(&sub_df).await {
+            tracing::info!(
+                subquery = %key.lines().next().unwrap_or_default(),
+                "scalar subquery too large to fold on the coordinator; leaving it in the plan"
+            );
+            continue;
+        }
         let Ok(batches) = sub_df.collect().await else {
             continue;
         };

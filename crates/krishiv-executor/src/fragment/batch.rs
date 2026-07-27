@@ -637,13 +637,8 @@ async fn execute_shuffle_write_fragment(
         .map_err(|e| ExecutorError::LocalExecution {
             message: e.to_string(),
         })?;
-    // A2: capture the fragment's declared output schema before the frame is
-    // consumed. See the `output_schema` initialiser below for why.
-    let declared_output_schema: arrow::datatypes::SchemaRef =
-        krishiv_sql::KrishivDataFrameOps::schema(&dataframe);
-    let mut sql_stream =
-        dataframe
-            .execute_stream()
+    let (physical_output_schema, mut sql_stream) =
+        crate::erased(dataframe.execute_stream_with_schema())
             .await
             .map_err(|e| ExecutorError::LocalExecution {
                 message: e.to_string(),
@@ -684,9 +679,19 @@ async fn execute_shuffle_write_fragment(
     // while the reduce side declares the coordinator's schema regardless
     // (`RecordBatchStreamAdapter::new` does not validate that yielded batches
     // match it). Downstream operators then received batches whose schema
-    // disagreed with the plan. The executing stream knows the fragment's real
-    // output schema before the first batch arrives, so take it from there.
-    let mut output_schema: arrow::datatypes::SchemaRef = declared_output_schema;
+    // disagreed with the plan.
+    //
+    // Take it from the *stream*, not from the DataFrame. The first version of
+    // this fix used `DataFrame::schema()`, which is the plan's **logical**
+    // schema, and the two disagree wherever physical planning re-types an
+    // expression: TPC-H q17's `avg(l_quantity)` is `Decimal128(15, 2)`
+    // logically and `Decimal128(30, 15)` in the batches the stream actually
+    // yields, so every partition was written with a schema its own rows
+    // violated — "column types must match schema types". The stream's schema
+    // is the physical one, is known before the first batch, and is correct
+    // when there are no batches at all, which is the case A2 exists for.
+    let mut output_schema: arrow::datatypes::SchemaRef =
+        physical_output_schema;
     let mut hot_key_acc = HotKeyAccumulator::new();
     let mut ess_writer: Option<krishiv_shuffle::SortShuffleWriter> = if ctx.ess_index.is_some() {
         Some(
