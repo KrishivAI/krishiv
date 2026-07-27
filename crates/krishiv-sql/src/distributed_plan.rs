@@ -1541,7 +1541,16 @@ pub fn build_distributed_stages(
             Err(error) => {
                 // Plans over non-serializable providers (memory tables,
                 // custom scans) fall back rather than fail the query.
-                tracing::debug!(%error, "stage plan not proto-serializable; falling back");
+                //
+                // At `warn`: declining to distribute is not a detail, it is the
+                // difference between a query using the cluster and one task
+                // scanning the whole table. This was `debug` on a coordinator
+                // that runs at `info`, so TPC-H q22 quietly ran serially for
+                // three sweeps with nothing in the logs saying why.
+                tracing::warn!(
+                    %error,
+                    "stage plan is not proto-serializable; running this query as a SINGLE TASK"
+                );
                 return Ok(None);
             }
         };
@@ -1553,9 +1562,9 @@ pub fn build_distributed_stages(
         if let Err(error) =
             verify_dfplan_roundtrip(&bytes, &codec, &decode_ctx, Some(stage_schema.as_ref()))
         {
-            tracing::debug!(
+            tracing::warn!(
                 %error,
-                "stage plan encodes but does not decode; falling back to single-task"
+                "stage plan encodes but does not decode; running this query as a SINGLE TASK"
             );
             return Ok(None);
         }

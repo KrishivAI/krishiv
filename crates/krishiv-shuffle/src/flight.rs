@@ -687,17 +687,41 @@ pub fn shuffle_grpc_max_message_bytes() -> usize {
         .unwrap_or(SHUFFLE_GRPC_MAX_MESSAGE_BYTES)
 }
 
-/// `true` when a fetch failure is plausibly transient and worth retrying.
+/// Classify an error from the Flight record-batch stream.
 ///
-/// `InvalidData` is where an IPC/gRPC decode failure lands, and a message that
-/// does not decode this time will not decode next time: retrying burns the
-/// budget and — worse — an exhausted retry is reported as a *missing
-/// partition*, which sends the coordinator off to regenerate a producer whose
-/// output was never lost. Deterministic failures must stay deterministic.
+/// Most stream failures are worth another attempt — a connection reset
+/// mid-stream surfaces here as a truncated decode, and that is transient. A
+/// *message-size violation* is not: the producer's message is larger than this
+/// side will decode, and it will be exactly as large next time. tonic reports
+/// it as `OutOfRange`, so classify on the status code rather than on the
+/// message text.
+///
+/// The distinction matters far more than it looks. A retry that never succeeds
+/// is ultimately reported as `NotFound`, which the consumer relays as a
+/// *missing shuffle partition* — so a size limit made the coordinator
+/// regenerate a 5.6 GB producer stage whose output was intact, twice, and then
+/// fail the job (TPC-H q10 at SF100).
+fn flight_stream_error(error: arrow_flight::error::FlightError) -> io::Error {
+    if let arrow_flight::error::FlightError::Tonic(status) = &error
+        && status.code() == tonic::Code::OutOfRange
+    {
+        return io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "shuffle message exceeds the transport limit ({} bytes; override with {}): {error}",
+                shuffle_grpc_max_message_bytes(),
+                SHUFFLE_GRPC_MAX_MESSAGE_BYTES_ENV,
+            ),
+        );
+    }
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+/// `true` when a fetch failure is plausibly transient and worth retrying.
 fn is_retryable_fetch_error(error: &io::Error) -> bool {
     !matches!(
         error.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData
+        io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
     )
 }
 
@@ -760,10 +784,7 @@ impl FlightShuffleClient {
         let decoder = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
             stream.map_err(arrow_flight::error::FlightError::from),
         );
-        let batches: Vec<RecordBatch> = decoder
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
-            .try_collect()
-            .await?;
+        let batches: Vec<RecordBatch> = decoder.map_err(flight_stream_error).try_collect().await?;
         Ok(batches)
     }
 
@@ -1289,6 +1310,43 @@ mod tests {
         assert!(!is_retryable_fetch_error(&missing));
         let bad_endpoint = std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad url");
         assert!(!is_retryable_fetch_error(&bad_endpoint));
+    }
+
+    /// A message-size violation must be permanent, and must not be reported as
+    /// a missing partition.
+    ///
+    /// It was neither. The producer's message exceeded tonic's 4 MiB default,
+    /// which is deterministic, but the failure was classified transient — so
+    /// four attempts were burnt on it and the exhausted retry was surfaced as
+    /// `NotFound`, which the consumer relays as "shuffle partition missing".
+    /// The coordinator then regenerated a 5.6 GB producer stage whose output
+    /// was perfectly intact and failed the job when the second attempt agreed
+    /// with the first. TPC-H q10 at SF100, every sweep.
+    #[test]
+    fn a_message_size_violation_is_permanent_not_a_missing_partition() {
+        let oversized = flight_stream_error(arrow_flight::error::FlightError::Tonic(Box::new(
+            tonic::Status::out_of_range(
+                "Error, decoded message length too large: found 5117681 bytes, \
+                 the limit is: 4194304 bytes",
+            ),
+        )));
+        assert!(
+            !is_retryable_fetch_error(&oversized),
+            "retrying a size violation cannot succeed, and an exhausted retry is \
+             reported as a missing partition"
+        );
+        assert_eq!(oversized.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            oversized.to_string().contains(SHUFFLE_GRPC_MAX_MESSAGE_BYTES_ENV),
+            "the error must name the knob that fixes it: {oversized}"
+        );
+
+        // A genuinely truncated stream stays retryable: a connection reset
+        // mid-stream lands here and the next attempt may well succeed.
+        let truncated = flight_stream_error(arrow_flight::error::FlightError::DecodeError(
+            String::from("unexpected end of stream"),
+        ));
+        assert!(is_retryable_fetch_error(&truncated));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
