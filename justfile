@@ -116,17 +116,27 @@ docker-fast-prod tag="":
 
 # Build the k8s image locally and load into the local docker daemon.
 # For single-node dev use: just docker-single-node (faster, smaller)
+#
+# FEATURES is the `prod` preset, NOT "k8s,jemalloc". That older value omitted
+# `cloud` and `kafka`, so the image it produced could not read s3:// at all —
+# it could not have run a benchmark or reached object storage, with no runtime
+# signal beyond `krishiv capabilities`. A capability-incomplete image has
+# already shipped once from exactly this mistake; see the flag-minimization
+# work and `scripts/build-fast-engine.sh`, which verifies the same markers.
 docker-local:
     docker buildx build --load \
-        --build-arg FEATURES="k8s,jemalloc" \
+        --build-arg FEATURES="prod" \
         -f deploy/docker/Dockerfile.distributed \
         -t {{ image }} .
     @echo "✓ loaded {{ image }} into local docker (use k3s ctr images import for k3s)"
+    @docker run --rm --entrypoint krishiv {{ image }} capabilities
 
 # Build the k8s image and push to registry (single-arch, fast path for dev)
+# `prod` preset for the same reason as docker-local: a pushed image missing
+# `cloud`/`kafka` is worse than a failed build, because nothing reports it.
 docker-push:
     docker buildx build --push \
-        --build-arg FEATURES="k8s,jemalloc" \
+        --build-arg FEATURES="prod" \
         -f deploy/docker/Dockerfile.distributed \
         -t {{ registry_image }} .
 
