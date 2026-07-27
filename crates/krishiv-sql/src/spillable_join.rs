@@ -35,10 +35,18 @@
 //!    regression. The cost of guessing "small" wrongly is the status quo —
 //!    q18 fails as it does today — while the cost of guessing "big" wrongly
 //!    is a q2-shaped timeout on healthy queries.
-//! 3. **Only `PartitionMode::Partitioned` joins convert.** CollectLeft joins
-//!    have small build sides by construction, and partitioned inputs are
-//!    already hashed on the join keys — exactly the distribution sort-merge
-//!    needs, so the conversion only adds per-partition sorts, not exchanges.
+//! 3. **The join mode must be convertible.** `Partitioned` inputs are already
+//!    hashed on the join keys — the distribution sort-merge needs — so the
+//!    conversion adds per-partition sorts, not exchanges. `CollectLeft`
+//!    converts too *when the plan has a single partition*, where sorting alone
+//!    satisfies sort-merge. Anything else keeps hash join.
+//!
+//!    This bullet used to read "CollectLeft build sides are small by
+//!    construction". They are not: `CollectLeft` is picked from an estimate
+//!    and buffers the whole build side. Worse, a task engine plans with
+//!    `target_partitions = cores / slots`, which is **1** on a 3-core, 3-slot
+//!    executor — so *every* join was CollectLeft and the rule converted
+//!    nothing at all while five SF100 queries died on it.
 //!
 //! The sorts are inserted explicitly (with partitioning preserved) rather than
 //! left to `EnforceSorting`, because appended optimizer rules run *after* the
@@ -52,7 +60,7 @@ use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
 use datafusion::physical_plan::sorts::sort::SortExec;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use std::sync::Arc;
 
 /// Environment override for the build-size threshold, in bytes.
@@ -144,22 +152,42 @@ impl SpillableJoinSelection {
         hash_join: &HashJoinExec,
         threshold: u64,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        // Gate 3: sort-merge needs both sides hash-distributed on the join
-        // keys, which only `Partitioned` guarantees. `CollectLeft` cannot be
-        // converted in place — but it is *not* safe to ignore, so it is
-        // reported rather than silently skipped: `CollectLeft` is chosen from
-        // an estimate, and when that estimate is wrong it is the worst mode to
-        // be in, because the whole build side is materialised on every
-        // partition. TPC-H q9/SF100 failed at 797.5 MB of `HashJoinInput`
-        // against a 797.6 MB pool.
-        if !matches!(hash_join.partition_mode(), PartitionMode::Partitioned) {
-            tracing::debug!(
-                mode = ?hash_join.partition_mode(),
-                threshold,
-                "spillable-join: not converting a non-partitioned join"
-            );
-            return Ok(None);
-        }
+        // Gate 3: the join mode must be convertible to sort-merge.
+        // `CollectLeft` is convertible exactly when the plan has one partition
+        // — which, on this engine, is the *common* case rather than an edge
+        // case. A task engine is built with
+        // `target_partitions = cores / slots`, and a 3-core executor running 3
+        // slots gets **1**. DataFusion never emits `Partitioned` at one
+        // partition, so every join in every fragment was `CollectLeft`, and
+        // this gate turned all of them away: the rule converted zero joins in
+        // three hours across three executors while five SF100 queries died on
+        // build sides it was written to rescue.
+        //
+        // The original premise — "CollectLeft build sides are small by
+        // construction" — is false. `CollectLeft` is chosen from an *estimate*
+        // and buffers the whole build side, so a wrong estimate makes it the
+        // worst mode to be in, not the safest. q9 and q10 each took the entire
+        // 797 MB pool this way.
+        //
+        // Sort-merge needs its inputs sorted on the join keys and co-located.
+        // With one partition, "sorted" is the whole requirement — there is no
+        // distribution to preserve — so the conversion is *simpler* here than
+        // in the partitioned case, not riskier.
+        let single_partition = hash_join.left().output_partitioning().partition_count() == 1
+            && hash_join.right().output_partitioning().partition_count() == 1;
+        let preserve_partitioning = match hash_join.partition_mode() {
+            PartitionMode::Partitioned => true,
+            PartitionMode::CollectLeft if single_partition => false,
+            mode => {
+                tracing::debug!(
+                    ?mode,
+                    single_partition,
+                    threshold,
+                    "spillable-join: join mode is not convertible"
+                );
+                return Ok(None);
+            }
+        };
         // Gate 2: the build side must be *known* to be large. Absent statistics
         // keep hash join — guessing "big" is how the reverted session-wide
         // switch timed out q2.
@@ -205,8 +233,10 @@ impl SpillableJoinSelection {
             return Ok(None);
         }
 
-        // Sort both sides on the join keys, preserving the existing hash
-        // partitioning so no exchange is re-planned.
+        // Sort both sides on the join keys. Partition preservation follows the
+        // mode decided above: keep it for `Partitioned` (so no exchange is
+        // re-planned), drop it for single-partition `CollectLeft` (where there
+        // is nothing to preserve).
         let on = hash_join.on();
         let left_keys: Vec<PhysicalSortExpr> = on
             .iter()
@@ -229,11 +259,11 @@ impl SpillableJoinSelection {
 
         let sorted_left = Arc::new(
             SortExec::new(left_ordering, Arc::clone(hash_join.left()))
-                .with_preserve_partitioning(true),
+                .with_preserve_partitioning(preserve_partitioning),
         );
         let sorted_right = Arc::new(
             SortExec::new(right_ordering, Arc::clone(hash_join.right()))
-                .with_preserve_partitioning(true),
+                .with_preserve_partitioning(preserve_partitioning),
         );
 
         // Let SortMergeJoinExec's own validation decide whether this join
@@ -252,6 +282,7 @@ impl SpillableJoinSelection {
                 tracing::info!(
                     build_bytes,
                     threshold,
+                    mode = ?hash_join.partition_mode(),
                     join_type = ?hash_join.join_type(),
                     "hash join build side exceeds per-task memory share; using sort-merge join"
                 );
@@ -506,5 +537,111 @@ mod row_count_fallback_tests {
         let est = estimated_build_bytes_from_rows(&stats_with(Precision::Exact(usize::MAX), 1), &s)
             .expect("a known row count always yields an estimate");
         assert!(est > u64::from(u32::MAX), "estimate collapsed to {est}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod collect_left_tests {
+    use super::*;
+    use datafusion::physical_plan::displayable;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+
+    /// A session that plans exactly the way a task engine does on a saturated
+    /// executor: one target partition, because `cores / slots` is 1. This is
+    /// the configuration in which every join is `CollectLeft` — the shape the
+    /// rule used to skip entirely.
+    fn single_partition_ctx() -> SessionContext {
+        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1))
+    }
+
+    fn shows(plan: &Arc<dyn ExecutionPlan>, name: &str) -> bool {
+        displayable(plan.as_ref()).indent(true).to_string().contains(name)
+    }
+
+    async fn one_partition_join_plan(ctx: &SessionContext) -> Arc<dyn ExecutionPlan> {
+        ctx.sql("CREATE TABLE l(k INT, v INT) AS VALUES (1, 10), (2, 20), (3, 30)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        ctx.sql("CREATE TABLE r(k INT, w INT) AS VALUES (1, 100), (2, 200)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        ctx.sql("SELECT l.v, r.w FROM l JOIN r ON l.k = r.k")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_single_partition_plan_really_does_produce_collect_left() {
+        // Pins the premise the fix rests on. If DataFusion ever stops choosing
+        // CollectLeft at one partition, the tests below stop testing anything
+        // and this one says so first.
+        let ctx = single_partition_ctx();
+        let plan = one_partition_join_plan(&ctx).await;
+        assert!(
+            shows(&plan, "CollectLeft"),
+            "expected CollectLeft at target_partitions=1, got:\n{}",
+            displayable(plan.as_ref()).indent(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_large_collect_left_join_becomes_sort_merge() {
+        // The regression that mattered: with a threshold below the build side,
+        // the rule must now convert. Before this fix it returned the plan
+        // untouched no matter how large the build side was.
+        let ctx = single_partition_ctx();
+        let plan = one_partition_join_plan(&ctx).await;
+        let rule = SpillableJoinSelection::with_threshold(Some(1));
+        let out = rule.optimize(plan, ctx.copied_config().options()).unwrap();
+        assert!(
+            shows(&out, "SortMergeJoin"),
+            "CollectLeft join was not converted:\n{}",
+            displayable(out.as_ref()).indent(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_small_collect_left_join_is_left_alone() {
+        // Hash join is the right algorithm when it fits; the fix must not
+        // convert everything just because it now *can*.
+        let ctx = single_partition_ctx();
+        let plan = one_partition_join_plan(&ctx).await;
+        let rule = SpillableJoinSelection::with_threshold(Some(64 * 1024 * 1024));
+        let out = rule.optimize(plan, ctx.copied_config().options()).unwrap();
+        assert!(shows(&out, "HashJoin"), "small join should stay a hash join");
+        assert!(!shows(&out, "SortMergeJoin"));
+    }
+
+    #[tokio::test]
+    async fn the_converted_plan_returns_the_same_rows() {
+        // A spillable plan that answers differently is not a fix. Compare the
+        // converted plan's output against the hash-join plan's.
+        use datafusion::physical_plan::collect;
+        let ctx = single_partition_ctx();
+        let plan = one_partition_join_plan(&ctx).await;
+        let task_ctx = ctx.task_ctx();
+
+        let hash_rows = collect(Arc::clone(&plan), Arc::clone(&task_ctx)).await.unwrap();
+        let converted = SpillableJoinSelection::with_threshold(Some(1))
+            .optimize(plan, ctx.copied_config().options())
+            .unwrap();
+        assert!(shows(&converted, "SortMergeJoin"));
+        let smj_rows = collect(converted, task_ctx).await.unwrap();
+
+        let total = |b: &[arrow::array::RecordBatch]| -> usize {
+            b.iter().map(arrow::array::RecordBatch::num_rows).sum()
+        };
+        assert_eq!(total(&hash_rows), total(&smj_rows), "row count changed");
+        assert_eq!(total(&smj_rows), 2, "expected the two matching keys");
     }
 }
