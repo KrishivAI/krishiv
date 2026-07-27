@@ -49,6 +49,10 @@ import urllib.request
 # report its real elapsed time; a genuine hang still shows up, just later.
 DEFAULT_TIMEOUT_S = 7200
 
+# Compiling the corpus binary is setup, not measurement. Bound it on its own so
+# a stalled build reports as a build failure instead of eating the run.
+CORPUS_BUILD_TIMEOUT_S = 1800
+
 
 def _abridge(message: str, head: int = 120, tail: int = 320) -> str:
     """Shorten a failure message while keeping the part that says why.
@@ -71,19 +75,42 @@ def _abridge(message: str, head: int = 120, tail: int = 320) -> str:
 
 
 def load_corpus(corpus_json: str | None) -> list[dict]:
-    """Return the 22-query corpus, from a file or by running the Rust binary."""
+    """Return the 22-query corpus, from a file or by running the Rust binary.
+
+    The cargo path is silent and can take many minutes on a cold target dir —
+    it compiles the workspace in release. That cost a benchmark run: a
+    `--only q6` invocation under a 600 s wrapper spent the whole budget in
+    rustc and was read as a q6 hang, when q6 on the cluster takes 35 s. So
+    announce the compile before it starts and bound it separately from the
+    benchmark's own budget, and point at `--corpus-json` for repeat runs.
+    """
     if corpus_json:
         with open(corpus_json, encoding="utf-8") as handle:
             return json.load(handle)["queries"]
-    proc = subprocess.run(
-        [
-            "cargo", "run", "-q", "-p", "krishiv-bench",
-            "--bin", "tpch_corpus", "--release",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
+    print(
+        "# building tpch_corpus (cargo, release) — a cold target dir takes "
+        "minutes; pass --corpus-json to skip this on repeat runs",
+        file=sys.stderr,
+        flush=True,
     )
+    try:
+        proc = subprocess.run(
+            [
+                "cargo", "run", "-q", "-p", "krishiv-bench",
+                "--bin", "tpch_corpus", "--release",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=CORPUS_BUILD_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit(
+            f"the corpus build did not finish in {CORPUS_BUILD_TIMEOUT_S}s. This is a "
+            "build problem, not a benchmark result — build it once with "
+            "`cargo run -q -p krishiv-bench --bin tpch_corpus --release > corpus.json` "
+            "and rerun with --corpus-json corpus.json."
+        ) from None
     if proc.returncode != 0:
         raise SystemExit(
             f"cannot load the query corpus (cargo exit {proc.returncode}):\n{proc.stderr}"

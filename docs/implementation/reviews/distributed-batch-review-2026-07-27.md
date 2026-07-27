@@ -593,3 +593,46 @@ process's cgroup and the coordinator's is not the executors'.
    `KRISHIV_BATCH_SQL_TIMEOUT_SECS` for the synchronous Flight SQL path.
 5. Batch 2 harness (E2) — still the structural answer to the regression
    pattern; unchanged in value by anything above.
+
+---
+
+## Live finding, sweep of 2026-07-27 (`fast-955f14d4`, SF100 on node-local MinIO)
+
+### D7 — the shuffle-write drain materialises a whole output partition
+
+Every executor logs this during q2's shuffle stages:
+
+```
+shuffle write buffer exceeded the task memory pool on an allocation it
+cannot avoid ... bytes=413647392 what="reading back one spilled run"
+error=Resources exhausted: Failed to allocate additional 394.5 MB for
+ShuffleWriteBufferDrain with 10.1 MB already allocated - 379.2 MB remain
+available for the total memory pool: fair(pool_size: 797.6 MB)
+```
+
+`ShuffleWriteBuffer::drain_partition`
+(`crates/krishiv-executor/src/fragment/shuffle_write_buffer.rs:500`) reads
+every spilled run *and* the in-memory bucket into one `Vec<RecordBatch>`
+before returning. Its doc comment calls that "the smallest unit
+`ShuffleStore::write_partition` can accept" — which is accurate, and is
+exactly the problem: `write_partition` takes a whole `ShufflePartition`
+(`crates/krishiv-shuffle/src/store.rs:51`), so the spill-to-disk path buys
+no peak-memory reduction at the point it matters. A partition that spilled
+*because* it did not fit is then reassembled in full to be written.
+
+Severity is bounded, and deliberately so: `account_unavoidable` records the
+overage instead of failing the allocation, so the query completes and the
+pool stays honest rather than lying about its own accounting. This is a
+throughput/robustness finding, not a correctness one — but it is a real
+architectural bottleneck, which is what this sweep exists to find.
+
+The remediation advice the message gives the operator ("raise the stage's
+partition count") is also misdirected: the engine chose that partition
+count itself, from `total_slots`. An operator cannot act on it.
+
+**Fix**: make the write path streaming — `write_partition` (or a new
+`write_partition_stream`) should accept a `ShuffleStream` so the disk and
+object-store backends serialise run-by-run and the drain never holds more
+than one run. The in-memory backend still materialises by definition, which
+is fine: it is the tier that is meant to hold the data. Batched with the
+rest rather than shipped mid-sweep.
