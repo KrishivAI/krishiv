@@ -637,6 +637,10 @@ async fn execute_shuffle_write_fragment(
         .map_err(|e| ExecutorError::LocalExecution {
             message: e.to_string(),
         })?;
+    // A2: capture the fragment's declared output schema before the frame is
+    // consumed. See the `output_schema` initialiser below for why.
+    let declared_output_schema: arrow::datatypes::SchemaRef =
+        krishiv_sql::KrishivDataFrameOps::schema(&dataframe);
     let mut sql_stream =
         dataframe
             .execute_stream()
@@ -674,8 +678,15 @@ async fn execute_shuffle_write_fragment(
         Some(ctx.local_dir.clone()),
     );
     let mut total_rows: usize = 0;
-    let mut output_schema: arrow::datatypes::SchemaRef =
-        Arc::new(arrow::datatypes::Schema::empty());
+    // A2 (review 2026-07-27): this was `Schema::empty()`, replaced only by the
+    // first NON-EMPTY batch. A map task whose entire input is filtered out
+    // therefore wrote every one of its partitions with a zero-column schema,
+    // while the reduce side declares the coordinator's schema regardless
+    // (`RecordBatchStreamAdapter::new` does not validate that yielded batches
+    // match it). Downstream operators then received batches whose schema
+    // disagreed with the plan. The executing stream knows the fragment's real
+    // output schema before the first batch arrives, so take it from there.
+    let mut output_schema: arrow::datatypes::SchemaRef = declared_output_schema;
     let mut hot_key_acc = HotKeyAccumulator::new();
     let mut ess_writer: Option<krishiv_shuffle::SortShuffleWriter> = if ctx.ess_index.is_some() {
         Some(

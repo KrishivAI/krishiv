@@ -856,6 +856,23 @@ pub struct ShuffleReadExec {
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
     reader: Option<Arc<dyn ShufflePartitionReader>>,
+    /// D3(2): estimated size of the stage feeding this read.
+    ///
+    /// Without this, `partition_statistics` falls through to DataFusion's
+    /// `Statistics::new_unknown` and **every shuffle-fed join side reports
+    /// `Precision::Absent`**. `SpillableJoinSelection` keeps hash join on
+    /// absent statistics by design (guessing "big" is what took q2 from 189 s
+    /// past a 2400 s timeout), so the rule could never fire on a distributed
+    /// plan no matter where it was registered — q18 failed with
+    /// `Resources exhausted: HashJoinInput` on every run. A6 registers the
+    /// rule; this is what lets it decide anything.
+    ///
+    /// It is the *planning-time estimate* of the subtree that was cut, taken
+    /// at the moment of the cut, not a post-execution measurement: the plan is
+    /// built and optimized before any stage runs, so measured sizes do not
+    /// exist yet. Reported as `Inexact` for exactly that reason.
+    upstream_rows: Option<usize>,
+    upstream_bytes: Option<usize>,
 }
 
 impl ShuffleReadExec {
@@ -878,7 +895,47 @@ impl ShuffleReadExec {
             schema,
             properties,
             reader,
+            upstream_rows: None,
+            upstream_bytes: None,
         }
+    }
+
+    /// Attach the cut subtree's estimated size. See [`Self::upstream_rows`].
+    #[must_use]
+    pub fn with_upstream_estimate(
+        mut self,
+        rows: Option<usize>,
+        bytes: Option<usize>,
+    ) -> Self {
+        self.upstream_rows = rows;
+        self.upstream_bytes = bytes;
+        self
+    }
+
+    /// The estimate as `(rows, bytes)`, for encoding onto the wire.
+    pub fn upstream_estimate(&self) -> (Option<usize>, Option<usize>) {
+        (self.upstream_rows, self.upstream_bytes)
+    }
+
+    /// Read the usable part of a `Statistics`: a `Precision::Absent` value
+    /// stays `None` so an unknown estimate is never laundered into a
+    /// confident one.
+    fn precision_value(p: &datafusion::common::stats::Precision<usize>) -> Option<usize> {
+        match p {
+            datafusion::common::stats::Precision::Exact(v)
+            | datafusion::common::stats::Precision::Inexact(v) => Some(*v),
+            datafusion::common::stats::Precision::Absent => None,
+        }
+    }
+
+    /// Capture a cut subtree's estimate at the point the exchange is replaced.
+    pub fn estimate_of(plan: &Arc<dyn ExecutionPlan>) -> (Option<usize>, Option<usize>) {
+        plan.partition_statistics(None).map_or((None, None), |s| {
+            (
+                Self::precision_value(&s.num_rows),
+                Self::precision_value(&s.total_byte_size),
+            )
+        })
     }
 
     pub fn upstream_stage_index(&self) -> usize {
@@ -924,6 +981,31 @@ impl ExecutionPlan for ShuffleReadExec {
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    /// D3(2): report the cut subtree's estimate instead of "unknown".
+    ///
+    /// `Inexact` is the honest precision — this is a planning-time estimate of
+    /// a stage that has not run. Absent stays absent: a rule that keys on
+    /// known-size (as `SpillableJoinSelection` deliberately does) must still
+    /// be able to tell "no idea" from "small".
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> datafusion::error::Result<Arc<datafusion::common::Statistics>> {
+        use datafusion::common::stats::Precision;
+        let partitions = self.properties.partitioning.partition_count().max(1);
+        // A per-partition question gets the even-split share. Shuffle output is
+        // hash-partitioned, so even split is the right null hypothesis; skew is
+        // AQE's business and it works from measured sizes, not from this.
+        let divisor = if partition.is_some() { partitions } else { 1 };
+        let scale = |v: Option<usize>| -> Precision<usize> {
+            v.map_or(Precision::Absent, |v| Precision::Inexact(v / divisor))
+        };
+        let mut stats = datafusion::common::Statistics::new_unknown(&self.schema);
+        stats.num_rows = scale(self.upstream_rows);
+        stats.total_byte_size = scale(self.upstream_bytes);
+        Ok(Arc::new(stats))
     }
 
     fn execute(
@@ -972,6 +1054,13 @@ struct ShuffleReadNodePayload {
     map_tasks: usize,
     partitions: usize,
     schema_ipc_b64: String,
+    /// D3(2): planning-time estimate of the upstream stage. `#[serde(default)]`
+    /// keeps `v: 1` fragments from an older coordinator decodable — they simply
+    /// carry no estimate, which is the pre-fix behaviour and stays correct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upstream_rows: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upstream_bytes: Option<usize>,
 }
 
 fn schema_to_ipc_bytes(schema: &arrow::datatypes::Schema) -> Result<Vec<u8>, String> {
@@ -1030,13 +1119,20 @@ impl PhysicalExtensionCodec for KrishivPhysicalCodec {
             .decode(payload.schema_ipc_b64.as_bytes())
             .map_err(|e| DataFusionError::Internal(format!("shuffle-read schema b64: {e}")))?;
         let schema = schema_from_ipc_bytes(&schema_bytes).map_err(DataFusionError::Internal)?;
-        Ok(Arc::new(ShuffleReadExec::new(
-            payload.stage,
-            payload.map_tasks,
-            payload.partitions,
-            schema,
-            self.reader.clone(),
-        )))
+        Ok(Arc::new(
+            ShuffleReadExec::new(
+                payload.stage,
+                payload.map_tasks,
+                payload.partitions,
+                schema,
+                self.reader.clone(),
+            )
+            // D3(2): carry the estimate across the wire so the plan the
+            // executor holds describes the same sizes the coordinator
+            // optimized against. Absent on a fragment encoded by an older
+            // coordinator, which reads exactly as it did before.
+            .with_upstream_estimate(payload.upstream_rows, payload.upstream_bytes),
+        ))
     }
 
     fn try_encode(
@@ -1051,12 +1147,15 @@ impl PhysicalExtensionCodec for KrishivPhysicalCodec {
             ))
         })?;
         let schema_bytes = schema_to_ipc_bytes(&read.schema).map_err(DataFusionError::Internal)?;
+        let (upstream_rows, upstream_bytes) = read.upstream_estimate();
         let payload = ShuffleReadNodePayload {
             v: 1,
             stage: read.upstream_stage_index,
             map_tasks: read.num_map_tasks,
             partitions: read.partition_count(),
             schema_ipc_b64: base64::engine::general_purpose::STANDARD.encode(&schema_bytes),
+            upstream_rows,
+            upstream_bytes,
         };
         let json = serde_json::to_vec(&payload)
             .map_err(|e| DataFusionError::Internal(format!("shuffle-read node encode: {e}")))?;
@@ -1217,6 +1316,9 @@ fn cut_exchanges(
             return Err(Unsupported(String::from("hash exchange over empty input")));
         }
         let schema = input.schema();
+        // D3(2): capture the estimate before `input` is moved into the stage —
+        // this is the only point where the cut subtree is still in hand.
+        let estimate = ShuffleReadExec::estimate_of(&input);
         let stage_index = stages.len();
         stages.push(StageDraft {
             plan: input,
@@ -1225,13 +1327,16 @@ fn cut_exchanges(
                 num_output_partitions: *num_partitions,
             }),
         });
-        return Ok(Arc::new(ShuffleReadExec::new(
-            stage_index,
-            map_task_count,
-            *num_partitions,
-            schema,
-            None,
-        )));
+        return Ok(Arc::new(
+            ShuffleReadExec::new(
+                stage_index,
+                map_task_count,
+                *num_partitions,
+                schema,
+                None,
+            )
+            .with_upstream_estimate(estimate.0, estimate.1),
+        ));
     }
 
     // A gather (N partitions -> 1) is an exchange too, and cutting it is what
@@ -1258,6 +1363,8 @@ fn cut_exchanges(
                 .map_err(|e| Unsupported(format!("gather rewrite: {e}")));
         }
         let schema = input.schema();
+        // D3(2): as in the hash-exchange arm, capture before the move.
+        let estimate = ShuffleReadExec::estimate_of(&input);
         let stage_index = stages.len();
         stages.push(StageDraft {
             plan: input,
@@ -1269,13 +1376,10 @@ fn cut_exchanges(
         // The read replaces the whole gather: coalesce(N->1) and
         // shuffle(N->1)+read(partition 0) produce the same single stream, and
         // CoalescePartitionsExec carries no ordering guarantee to preserve.
-        return Ok(Arc::new(ShuffleReadExec::new(
-            stage_index,
-            map_task_count,
-            1,
-            schema,
-            None,
-        )));
+        return Ok(Arc::new(
+            ShuffleReadExec::new(stage_index, map_task_count, 1, schema, None)
+                .with_upstream_estimate(estimate.0, estimate.1),
+        ));
     }
 
     let children = plan.children();
@@ -1341,6 +1445,75 @@ fn collect_upstream_inner(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<usize>) {
 
 #[cfg(test)]
 mod tests {
+
+    /// D3(2): the point of carrying the upstream estimate is that a
+    /// shuffle-fed join side stops reporting `Absent`. This asserts the
+    /// property the optimizer rules actually key on, not the field value —
+    /// `SpillableJoinSelection` returns `Ok(None)` on `Absent` by design, so
+    /// "absent" and "known" is the whole distinction that matters.
+    #[test]
+    fn a_shuffle_read_reports_its_upstream_estimate_instead_of_unknown() {
+        use datafusion::common::stats::Precision;
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Int64, false),
+        ]));
+
+        let unknown = ShuffleReadExec::new(0, 4, 4, Arc::clone(&schema), None);
+        assert_eq!(
+            unknown.partition_statistics(None).unwrap().total_byte_size,
+            Precision::Absent,
+            "a read with no estimate must stay Absent — inventing a size is how \
+             a spill decision gets made on a guess"
+        );
+
+        let known = ShuffleReadExec::new(0, 4, 4, Arc::clone(&schema), None)
+            .with_upstream_estimate(Some(1_000), Some(800_000));
+        let whole = known.partition_statistics(None).unwrap();
+        assert_eq!(whole.num_rows, Precision::Inexact(1_000));
+        assert_eq!(
+            whole.total_byte_size,
+            Precision::Inexact(800_000),
+            "the whole-plan question gets the whole stage's size"
+        );
+
+        let one = known.partition_statistics(Some(0)).unwrap();
+        assert_eq!(
+            one.total_byte_size,
+            Precision::Inexact(200_000),
+            "a per-partition question gets the even-split share of 4 partitions"
+        );
+    }
+
+    /// The estimate has to survive the wire, or the executor runs a plan whose
+    /// sizes disagree with the plan the coordinator optimized.
+    #[test]
+    fn the_upstream_estimate_survives_encode_decode() {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let node: Arc<dyn ExecutionPlan> = Arc::new(
+            ShuffleReadExec::new(3, 2, 4, schema, None)
+                .with_upstream_estimate(Some(77), Some(4_096)),
+        );
+        let codec = KrishivPhysicalCodec::coordinator();
+        let mut buf = Vec::new();
+        codec.try_encode(Arc::clone(&node), &mut buf).unwrap();
+
+        let ctx = crate::SqlEngine::new_with_engine_memory(crate::EngineMemory::Unbounded);
+        let task_ctx = ctx.session_context().task_ctx();
+        let decoded = codec.try_decode(&buf, &[], &task_ctx).unwrap();
+
+        // Re-encode and compare bytes rather than downcasting: it asserts the
+        // same property (the estimate made the trip intact) and it also catches
+        // a field that decodes but is dropped on the way back out.
+        let mut round_tripped = Vec::new();
+        codec.try_encode(decoded, &mut round_tripped).unwrap();
+        assert_eq!(
+            String::from_utf8(round_tripped).unwrap(),
+            String::from_utf8(buf).unwrap(),
+            "the upstream estimate must survive encode -> decode -> encode"
+        );
+    }
     use super::*;
     use arrow::record_batch::RecordBatch;
     use datafusion::physical_plan::displayable;
