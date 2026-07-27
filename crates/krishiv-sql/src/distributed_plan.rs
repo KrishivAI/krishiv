@@ -397,22 +397,56 @@ pub fn parse_dfplan_body(body: &str) -> SqlResult<(DfplanTaskSpec, Vec<u8>)> {
 /// installed, and the throwaway context did not.
 ///
 /// So the verification context must mirror the executor's decode environment.
-/// [`planning_session_context`] builds precisely that — the same lazy cloud
-/// registry the executor runtime carries — which makes this a genuine
-/// rehearsal of the executor's decode instead of a stricter parody of it.
+///
+/// A5 (review 2026-07-27): mirroring the executor's *object-store registry* was
+/// only half of that. The executor decodes on `krishiv-executor`'s
+/// `task_sql_engine`, a real [`crate::SqlEngine`] carrying Krishiv's whole
+/// function registry, dialect and config; this rehearsed against
+/// `planning_session_context`, a bare `SessionContext` carrying none of it. A
+/// fragment referencing any engine-registered UDF therefore decoded fine on the
+/// executor and failed here — and a failed verify means "decline to stage", so
+/// the query silently ran as a single task. `ctx` must come from
+/// [`fragment_decode_session_context`]; it is passed in so the stage builder
+/// pays for building it once per query rather than once per stage.
 ///
 /// What it is for: TPC-H q22 encodes cleanly and dies on the executor with
 /// "ScalarSubqueryExpr can only be deserialized as part of a surrounding
 /// ScalarSubqueryExec" — a real encode/decode asymmetry in datafusion-proto.
 /// Catching it here converts a remote failure minutes in to an instant local
 /// fallback.
-fn verify_dfplan_roundtrip(bytes: &[u8], codec: &dyn PhysicalExtensionCodec) -> SqlResult<()> {
-    let ctx = planning_session_context(1).task_ctx();
-    datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec(bytes, &ctx, codec)
+fn verify_dfplan_roundtrip(
+    bytes: &[u8],
+    codec: &dyn PhysicalExtensionCodec,
+    ctx: &Arc<TaskContext>,
+) -> SqlResult<()> {
+    datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec(bytes, ctx, codec)
         .map(|_| ())
         .map_err(|e| SqlError::DataFusion {
             message: format!("physical plan proto decode: {e}"),
         })
+}
+
+/// The session context a `dfplan:v1:` fragment is **decoded** on.
+///
+/// A5: the round-trip guard is the one contract on this path exercised from
+/// both sides, and it was rehearsing the decode against the wrong session. The
+/// executor decodes on `krishiv-executor`'s `task_sql_engine`, i.e. a real
+/// [`crate::SqlEngine`] — its function registry, its SQL dialect, its config,
+/// its object-store registry. `planning_session_context` is a bare
+/// `SessionContext` that shares none of that, so a fragment referencing any
+/// Krishiv-registered UDF (`get_json_object`, `tumble_start`, …) decoded fine
+/// on the executor and failed here — and the caller reads a failed verify as
+/// "decline to stage", which silently runs the whole query as a single task.
+///
+/// Built from the same constructor the executor uses, differing only in the
+/// memory source: nothing executes on this context, so the rehearsal takes an
+/// unbounded pool instead of the task's per-slot share. `target_partitions`
+/// is likewise irrelevant — a fragment is decoded, never re-planned.
+#[must_use]
+pub fn fragment_decode_session_context() -> SessionContext {
+    crate::SqlEngine::new_with_engine_memory(crate::EngineMemory::Unbounded)
+        .session_context()
+        .clone()
 }
 
 /// Decode a `dfplan:v1:` fragment body into (partition spec, plan).
@@ -1089,6 +1123,10 @@ pub fn build_distributed_stages(
     }
 
     let codec = KrishivPhysicalCodec::coordinator();
+    // One executor-equivalent decode context for the whole query: building a
+    // `SqlEngine` registers the full UDF set, and every stage rehearses against
+    // the same one the executor would use (A5).
+    let decode_ctx = fragment_decode_session_context().task_ctx();
     let mut stages = Vec::with_capacity(drafts.len());
     for draft in drafts {
         let partition_count = draft.plan.output_partitioning().partition_count();
@@ -1112,7 +1150,7 @@ pub fn build_distributed_stages(
         // the decode locally (same codec, same object-store registry as the
         // executor's runtime) so an encode/decode asymmetry degrades to
         // correct-but-serial execution instead of a remote fragment failure.
-        if let Err(error) = verify_dfplan_roundtrip(&bytes, &codec) {
+        if let Err(error) = verify_dfplan_roundtrip(&bytes, &codec, &decode_ctx) {
             tracing::debug!(
                 %error,
                 "stage plan encodes but does not decode; falling back to single-task"
@@ -1305,8 +1343,12 @@ mod tests {
     #[test]
     fn the_roundtrip_guard_rejects_bytes_that_do_not_decode() {
         let codec = DefaultPhysicalExtensionCodec {};
-        let err = verify_dfplan_roundtrip(b"not a physical plan proto", &codec)
-            .expect_err("undecodable bytes must be rejected");
+        let err = verify_dfplan_roundtrip(
+            b"not a physical plan proto",
+            &codec,
+            &fragment_decode_session_context().task_ctx(),
+        )
+        .expect_err("undecodable bytes must be rejected");
         assert!(format!("{err}").contains("decode"), "got: {err}");
     }
 
@@ -1336,6 +1378,62 @@ mod tests {
             .expect("the verify context must resolve s3 buckets like the executor runtime");
     }
 
+    /// A5: the guard rehearses the decode against the wrong session.
+    ///
+    /// The executor decodes a fragment on `task_sql_engine`, a real
+    /// `SqlEngine` carrying Krishiv's registered UDFs. The guard decoded on
+    /// `planning_session_context`, a bare `SessionContext` that carries none
+    /// of them — so a fragment referencing `get_json_object` (a Phase-60 front
+    /// door function, always available on the engine) fails the guard, the
+    /// caller reads that as "decline to stage", and the query silently runs as
+    /// a single task on one executor.
+    ///
+    /// The plan is built on the engine and decoded through the guard, which is
+    /// exactly the asymmetry: encode-side capability the verify side lacks.
+    #[tokio::test]
+    async fn the_roundtrip_guard_accepts_a_fragment_using_an_engine_udf() {
+        let engine = crate::SqlEngine::new_with_engine_memory(crate::EngineMemory::Unbounded);
+        let ctx = engine.session_context();
+        ctx.sql("CREATE TABLE docs AS VALUES ('{\"a\":1}'), ('{\"a\":2}')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        // The argument must be a column: a literal one is const-folded away and
+        // the encoded plan then carries no UDF reference at all.
+        let plan = ctx
+            .sql("SELECT get_json_object(column1, '$.a') AS a FROM docs")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let codec = DefaultPhysicalExtensionCodec {};
+        let bytes = encode_dfplan_bytes(plan, &codec).expect("encode");
+
+        // Precondition: the bare planning context genuinely cannot decode it,
+        // or this test proves nothing about which context the guard uses.
+        let bare = planning_session_context(1).task_ctx();
+        assert!(
+            datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec(
+                &bytes, &bare, &codec
+            )
+            .is_err(),
+            "precondition: a bare planning context must NOT resolve engine UDFs"
+        );
+
+        verify_dfplan_roundtrip(
+            &bytes,
+            &codec,
+            &fragment_decode_session_context().task_ctx(),
+        )
+        .expect(
+            "the guard must decode on the engine the executor uses; failing here \
+             silently degrades the query to a single task",
+        );
+    }
+
     /// And it must not reject ordinary plans, or every query silently loses
     /// distribution — the worse failure of the two.
     #[tokio::test]
@@ -1348,7 +1446,12 @@ mod tests {
             .await.unwrap().create_physical_plan().await.unwrap();
         let codec = DefaultPhysicalExtensionCodec {};
         let bytes = encode_dfplan_bytes(plan, &codec).expect("encode");
-        verify_dfplan_roundtrip(&bytes, &codec).expect("ordinary plans must pass");
+        verify_dfplan_roundtrip(
+            &bytes,
+            &codec,
+            &fragment_decode_session_context().task_ctx(),
+        )
+        .expect("ordinary plans must pass");
     }
 
     #[tokio::test]
