@@ -955,7 +955,7 @@ async fn execute_dfplan_fragment(
     udf_limits: ResourceLimits,
     engine_memory: krishiv_sql::EngineMemory,
 ) -> ExecutorResult<ExecutorTaskOutput> {
-    use krishiv_shuffle::{HashPartitioner, PartitionId, ShufflePartition, ShuffleStore as _};
+    use krishiv_shuffle::{HashPartitioner, PartitionId};
 
     let store = runner
         .inmem_shuffle
@@ -1068,55 +1068,36 @@ async fn execute_dfplan_fragment(
             }
         }
 
-        let mut outputs: Vec<krishiv_proto::ShufflePartitionOutput> =
-            Vec::with_capacity(num_partitions as usize);
-        for p in 0..num_partitions {
-            // `_reservation` must outlive `part_batches`: it is what keeps the
-            // pool's view of this partition honest while `concat_batches`
-            // briefly doubles it and the store serialises it.
-            let (part_batches, _reservation) =
-                buffer.drain_partition(p as usize).await?.into_parts();
-            let part_schema = part_batches
-                .first()
-                .map(|b| b.schema())
-                .unwrap_or_else(|| Arc::clone(&schema));
-            let size_bytes: u64 = part_batches
-                .iter()
-                .map(|b| b.get_array_memory_size() as u64)
-                .sum();
-            let part_batches = if part_batches.len() > 1 {
-                arrow::compute::concat_batches(&part_schema, &part_batches)
-                    .map(|b| vec![b])
-                    .unwrap_or(part_batches)
-            } else {
-                part_batches
-            };
-            store
-                .write_partition(
-                    ShufflePartition {
-                        id: PartitionId {
-                            job_id: job_id.to_owned(),
-                            stage_id: write_cfg.stage_id.as_str().to_owned(),
-                            partition: p,
-                        },
-                        schema: part_schema,
-                        batches: part_batches,
-                    },
-                    write_cfg.lease_token,
+        // Publishes the WHOLE partition space, empties included — see
+        // `drain_into_store` for why a skipped empty partition strands its
+        // remote consumer until the job's regeneration budget runs out.
+        let stage_id = write_cfg.stage_id.as_str().to_owned();
+        let stats = crate::fragment::shuffle_write_buffer::drain_into_store(
+            &mut buffer,
+            store.as_ref(),
+            move |partition| PartitionId {
+                job_id: job_id.to_owned(),
+                stage_id: stage_id.clone(),
+                partition,
+            },
+            &schema,
+            write_cfg.lease_token,
+            |_, _, _| Ok(()),
+        )
+        .await?;
+        // Advertise this executor's shuffle flight endpoint so the coordinator
+        // can route downstream tasks on other executors here ("" = in-process
+        // only, local store reads).
+        let outputs: Vec<krishiv_proto::ShufflePartitionOutput> = stats
+            .iter()
+            .map(|s| {
+                krishiv_proto::ShufflePartitionOutput::new(
+                    s.partition,
+                    s.size_bytes,
+                    own_endpoint.as_str(),
                 )
-                .await
-                .map_err(|e| ExecutorError::LocalExecution {
-                    message: format!("dfplan shuffle write failed for partition {p}: {e}"),
-                })?;
-            // Advertise this executor's shuffle flight endpoint so the
-            // coordinator can route downstream tasks on other executors
-            // here ("" = in-process only, local store reads).
-            outputs.push(krishiv_proto::ShufflePartitionOutput::new(
-                p,
-                size_bytes,
-                own_endpoint.as_str(),
-            ));
-        }
+            })
+            .collect();
         return Ok(ExecutorTaskOutput::shuffle_write(total_rows, outputs));
     }
 
@@ -2313,5 +2294,201 @@ mod tests {
         };
         let batches = reader.read_partition(0, 0, 0).await.unwrap();
         assert!(batches.is_empty());
+    }
+
+    /// Build the map-side buffer, feed it, and drain it into `store` through
+    /// the same `drain_into_store` the three production map-write paths use.
+    ///
+    /// Taking the production function (rather than re-typing its loop) is what
+    /// keeps these tests from passing vacuously against a drain that skips
+    /// partitions.
+    #[allow(clippy::unwrap_used)]
+    async fn map_write_through_production_path(
+        store: &Arc<ShuffleBackend>,
+        job_id: &str,
+        stage_key: &str,
+        num_partitions: usize,
+        soft_limit_bytes: u64,
+        spill_dir: std::path::PathBuf,
+        rows_per_partition: &[usize],
+    ) -> (
+        Vec<crate::fragment::shuffle_write_buffer::PartitionWriteStat>,
+        usize,
+    ) {
+        use crate::fragment::shuffle_write_buffer::{ShuffleWriteBuffer, drain_into_store};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let mut buffer = ShuffleWriteBuffer::new(
+            num_partitions,
+            Some(krishiv_sql::EngineMemory::shared_pool(64 * 1024 * 1024)),
+            soft_limit_bytes,
+            spill_dir,
+        );
+        for (partition, rows) in rows_per_partition.iter().enumerate() {
+            // Several batches per partition so the spill variant has something
+            // to split across runs.
+            for chunk in 0..4usize {
+                if *rows == 0 {
+                    continue;
+                }
+                let values: Vec<i64> = (0..*rows as i64)
+                    .map(|i| (partition as i64) * 1_000_000 + (chunk as i64) * 1_000 + i)
+                    .collect();
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from(values))],
+                )
+                .unwrap();
+                buffer.push(partition, batch).await.unwrap();
+            }
+        }
+        let spills = buffer.spill_count();
+        let job = job_id.to_owned();
+        let stage = stage_key.to_owned();
+        let stats = drain_into_store(
+            &mut buffer,
+            store,
+            move |partition| PartitionId {
+                job_id: job.clone(),
+                stage_id: stage.clone(),
+                partition,
+            },
+            &schema,
+            1,
+            |_, _, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        (stats, spills)
+    }
+
+    /// Serve `store` over Flight and return a reader that fetches every
+    /// partition of `stage_key` REMOTELY — the case where a partition the map
+    /// task never wrote is an error rather than an empty read.
+    #[allow(clippy::unwrap_used)]
+    async fn remote_reader_for(
+        store: &Arc<LocalDiskShuffleStore>,
+        job_id: &str,
+        stage_key: &str,
+        num_partitions: u32,
+    ) -> (InmemDfplanShuffleReader, tokio::task::JoinHandle<()>) {
+        let (addr, server) =
+            krishiv_shuffle::flight::serve("127.0.0.1:0".parse().unwrap(), Arc::clone(store))
+                .await
+                .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let remote_endpoints = (0..num_partitions)
+            .map(|p| ((stage_key.to_owned(), p), addr.to_string()))
+            .collect();
+        (
+            InmemDfplanShuffleReader {
+                store: Arc::new(ShuffleBackend::InMemory(Arc::new(
+                    InMemoryShuffleStore::new(),
+                ))),
+                job_id: job_id.to_owned(),
+                remote_endpoints,
+            },
+            server,
+        )
+    }
+
+    /// TPC-H q3's live failure, as a test.
+    ///
+    /// A map task whose hash layout leaves a partition with zero rows must
+    /// still publish that partition. Its remote consumer fetches over Flight,
+    /// where "never written" is an error, not an empty read — so a skipped
+    /// empty partition makes the consumer report a missing upstream, the
+    /// coordinator regenerate the producer, and the producer reproduce the
+    /// same gap until the regeneration budget is exhausted and the job fails.
+    ///
+    /// The assertion is on the REMOTE read specifically: a local read returns
+    /// empty on a miss and would pass whether or not the partition exists,
+    /// which is exactly the vacuous version of this test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::unwrap_used)]
+    async fn map_write_publishes_partitions_that_received_no_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+        let backend = Arc::new(ShuffleBackend::Local(Arc::clone(&disk)));
+        let stage_key = shuffle_stage_key(0, 0);
+
+        // Partitions 1 and 3 get rows; 0 and 2 get none — the q3 shape.
+        let (stats, spills) = map_write_through_production_path(
+            &backend,
+            "job-empty-partition",
+            &stage_key,
+            4,
+            64 * 1024 * 1024,
+            dir.path().to_path_buf(),
+            &[0, 128, 0, 128],
+        )
+        .await;
+        assert_eq!(spills, 0, "this case must not spill; it isolates emptiness");
+        assert_eq!(stats.len(), 4, "every partition must be published");
+
+        let (reader, server) = remote_reader_for(&disk, "job-empty-partition", &stage_key, 4).await;
+        let mut results = Vec::new();
+        for partition in 0..4usize {
+            results.push(reader.read_partition(0, 0, partition).await);
+        }
+        server.abort();
+
+        for (partition, result) in results.iter().enumerate() {
+            let batches = result.as_ref().unwrap_or_else(|e| {
+                panic!(
+                    "partition {partition} must be fetchable remotely, got missing/error: {e}. \
+                     A map task that skips its empty partitions strands its consumer forever."
+                )
+            });
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            let expected = if partition % 2 == 0 { 0 } else { 128 * 4 };
+            assert_eq!(rows, expected, "partition {partition} row count");
+        }
+    }
+
+    /// The same contract once the buffer has actually spilled: partitions that
+    /// went to disk must come back whole, and partitions that were empty must
+    /// still be published rather than lost among the spilled ones.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::unwrap_used)]
+    async fn spilled_map_write_lands_every_partition_in_the_served_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+        let backend = Arc::new(ShuffleBackend::Local(Arc::clone(&disk)));
+        let stage_key = shuffle_stage_key(1, 2);
+
+        // A 4 KiB ceiling against ~48 KiB of payload forces repeated spills.
+        let (stats, spills) = map_write_through_production_path(
+            &backend,
+            "job-spilled-partition",
+            &stage_key,
+            4,
+            4 * 1024,
+            dir.path().to_path_buf(),
+            &[512, 0, 512, 512],
+        )
+        .await;
+        assert!(spills > 0, "test must actually exercise the spill path");
+        assert_eq!(stats.len(), 4, "every partition must be published");
+
+        let (reader, server) =
+            remote_reader_for(&disk, "job-spilled-partition", &stage_key, 4).await;
+        let mut results = Vec::new();
+        for partition in 0..4usize {
+            results.push(reader.read_partition(1, 2, partition).await);
+        }
+        server.abort();
+
+        for (partition, result) in results.iter().enumerate() {
+            let batches = result
+                .as_ref()
+                .unwrap_or_else(|e| panic!("partition {partition} missing after spill: {e}"));
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            let expected = if partition == 1 { 0 } else { 512 * 4 };
+            assert_eq!(
+                rows, expected,
+                "partition {partition} lost rows across the spill boundary"
+            );
+        }
     }
 }
