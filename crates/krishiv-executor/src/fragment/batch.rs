@@ -111,78 +111,6 @@ use crate::{ExecutorError, ExecutorResult};
 
 const WINDOW_PREFIX: &str = "window:";
 
-/// Byte target for one coalesced shuffle-output batch.
-///
-/// Large enough that the downstream columnar reader is not paying per-batch
-/// overhead on thousands of tiny batches (the reason DB-3 coalesced at all),
-/// small enough that building one is not itself a memory event.
-const SHUFFLE_COALESCE_TARGET_BYTES: usize = 8 * 1024 * 1024;
-
-/// Coalesce `batches` into groups of roughly [`SHUFFLE_COALESCE_TARGET_BYTES`].
-///
-/// DB-3 originally concatenated every sub-batch of an output partition into a
-/// single `RecordBatch`. That is right for the common case — one small batch
-/// per source batch — and wrong for exactly the partitions that hurt: a
-/// partition that spilled did so *because* it did not fit, and concatenating
-/// it builds a second, full-size copy alongside the first before the old one
-/// is dropped. On SF100 that showed up as `ShuffleWriteBufferDrain` allocations
-/// of 400–500 MB against a 797 MB shared pool.
-///
-/// Grouping to a byte target keeps the coalescing benefit and caps the extra
-/// copy at one group. Batches already at or above the target pass through
-/// untouched rather than being copied for no reason.
-///
-/// A failed `concat` is not fatal: the group is emitted as its original
-/// batches. The partition's contents are identical either way — only the
-/// batching differs — so degrading to un-coalesced output is better than
-/// failing a task over a layout optimisation.
-fn coalesce_shuffle_batches(
-    batches: Vec<arrow::record_batch::RecordBatch>,
-    schema: &arrow::datatypes::SchemaRef,
-) -> Vec<arrow::record_batch::RecordBatch> {
-    use arrow::record_batch::RecordBatch;
-
-    if batches.len() <= 1 {
-        return batches;
-    }
-    let mut out: Vec<RecordBatch> = Vec::new();
-    let mut group: Vec<RecordBatch> = Vec::new();
-    let mut group_bytes = 0usize;
-
-    // Concatenate one accumulated group, or pass it through if concat fails.
-    fn flush(group: Vec<RecordBatch>, schema: &arrow::datatypes::SchemaRef, out: &mut Vec<RecordBatch>) {
-        if group.len() <= 1 {
-            out.extend(group);
-            return;
-        }
-        match arrow::compute::concat_batches(schema, &group) {
-            Ok(batch) => out.push(batch),
-            Err(error) => {
-                tracing::debug!(%error, "shuffle batch coalesce failed; writing uncoalesced");
-                out.extend(group);
-            }
-        }
-    }
-
-    for batch in batches {
-        let bytes = batch.get_array_memory_size();
-        if bytes >= SHUFFLE_COALESCE_TARGET_BYTES {
-            flush(std::mem::take(&mut group), schema, &mut out);
-            group_bytes = 0;
-            out.push(batch);
-            continue;
-        }
-        if group_bytes + bytes > SHUFFLE_COALESCE_TARGET_BYTES && !group.is_empty() {
-            flush(std::mem::take(&mut group), schema, &mut out);
-            group_bytes = 0;
-        }
-        group_bytes += bytes;
-        group.push(batch);
-    }
-    flush(group, schema, &mut out);
-    out
-}
-
 /// Execute a batch (terminal) stage fragment.
 /// Split leading `/* krishiv-register-python-udf(a)f:… */` directive comment(s)
 /// off the front of a fragment body. Returns the joined directives and the
@@ -830,7 +758,8 @@ async fn execute_shuffle_write_fragment(
         // DB-3: coalesce sub-batches into well-sized batches before writing to
         // the shuffle store, bounded by a byte target rather than swallowing
         // the whole partition — see `coalesce_shuffle_batches`.
-        let part_batches = coalesce_shuffle_batches(part_batches, &schema);
+        let part_batches =
+            super::shuffle_write_buffer::coalesce_shuffle_batches(part_batches, &schema);
 
         // T12: if a push-shuffle store is wired, serialise partition to IPC
         // before transferring ownership to write_partition.
@@ -1385,7 +1314,8 @@ async fn execute_inmem_shuffle_write(
             .iter()
             .map(|b| b.get_array_memory_size() as u64)
             .sum();
-        let part_batches = coalesce_shuffle_batches(part_batches, &schema);
+        let part_batches =
+            super::shuffle_write_buffer::coalesce_shuffle_batches(part_batches, &schema);
         let partition = ShufflePartition {
             id,
             schema,
@@ -2685,87 +2615,5 @@ mod tests {
                 "partition {partition} lost rows across the spill boundary"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod coalesce_tests {
-    use super::{SHUFFLE_COALESCE_TARGET_BYTES, coalesce_shuffle_batches};
-    use arrow::array::{Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-    use std::sync::Arc;
-
-    fn schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("n", DataType::Int64, false),
-            Field::new("s", DataType::Utf8, false),
-        ]))
-    }
-
-    /// `rows` rows of a fixed-width payload, so byte size is predictable.
-    fn batch(schema: &Arc<Schema>, rows: usize, tag: i64) -> RecordBatch {
-        let n = Int64Array::from(vec![tag; rows]);
-        let s = StringArray::from(vec!["x".repeat(64); rows]);
-        RecordBatch::try_new(schema.clone(), vec![Arc::new(n), Arc::new(s)]).unwrap()
-    }
-
-    fn total_rows(batches: &[RecordBatch]) -> usize {
-        batches.iter().map(RecordBatch::num_rows).sum()
-    }
-
-    #[test]
-    fn coalesces_many_small_batches_into_fewer() {
-        // The DB-3 benefit this must not lose: hundreds of tiny batches
-        // should not reach the store as hundreds of tiny batches.
-        let schema = schema();
-        let input: Vec<_> = (0..200).map(|i| batch(&schema, 4, i)).collect();
-        let rows_in = total_rows(&input);
-        let out = coalesce_shuffle_batches(input, &schema);
-        assert!(out.len() < 20, "expected heavy coalescing, got {}", out.len());
-        assert_eq!(total_rows(&out), rows_in, "coalescing must not lose rows");
-    }
-
-    #[test]
-    fn never_builds_a_batch_far_past_the_target() {
-        // The regression this exists for: a partition big enough to have
-        // spilled must not be concatenated into one batch, because that is a
-        // second full-size copy of the thing that already did not fit.
-        let schema = schema();
-        // ~64 KiB of payload per batch, 600 batches ≈ 40 MiB total.
-        let input: Vec<_> = (0..600).map(|i| batch(&schema, 800, i)).collect();
-        let rows_in = total_rows(&input);
-        let out = coalesce_shuffle_batches(input, &schema);
-        assert_eq!(total_rows(&out), rows_in, "coalescing must not lose rows");
-        assert!(out.len() > 1, "a 40 MiB partition must not become one batch");
-        for b in &out {
-            assert!(
-                b.get_array_memory_size() < SHUFFLE_COALESCE_TARGET_BYTES * 2,
-                "coalesced batch of {} bytes overshoots the {SHUFFLE_COALESCE_TARGET_BYTES} target",
-                b.get_array_memory_size(),
-            );
-        }
-    }
-
-    #[test]
-    fn passes_an_already_large_batch_through_uncopied() {
-        let schema = schema();
-        let big = batch(&schema, 200_000, 7);
-        assert!(big.get_array_memory_size() >= SHUFFLE_COALESCE_TARGET_BYTES);
-        let rows_in = big.num_rows() + 4;
-        let out = coalesce_shuffle_batches(vec![big, batch(&schema, 4, 8)], &schema);
-        assert_eq!(total_rows(&out), rows_in);
-        // The large batch is emitted as-is rather than concatenated with its
-        // small neighbour, which would copy 200k rows to append 4.
-        assert_eq!(out.len(), 2);
-    }
-
-    #[test]
-    fn short_inputs_are_returned_unchanged() {
-        let schema = schema();
-        assert!(coalesce_shuffle_batches(vec![], &schema).is_empty());
-        let one = coalesce_shuffle_batches(vec![batch(&schema, 3, 1)], &schema);
-        assert_eq!(one.len(), 1);
-        assert_eq!(one[0].num_rows(), 3);
     }
 }
