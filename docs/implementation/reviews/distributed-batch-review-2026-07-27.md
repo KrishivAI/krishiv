@@ -636,3 +636,50 @@ object-store backends serialise run-by-run and the drain never holds more
 than one run. The in-memory backend still materialises by definition, which
 is fine: it is the tier that is meant to hold the data. Batched with the
 rest rather than shipped mid-sweep.
+
+### D8 — four queries die on un-spillable hash joins; the rule that exists to prevent it never fires
+
+Sweep `sweep-955f14d4-nodelocal`, SF100, 3 executors x 3 slots, 797.6 MB
+shared pool per executor. Four of the first fourteen queries failed, all
+with one signature:
+
+| query | `HashJoinInput` held | short by |
+|-------|---------------------|----------|
+| q7  | 424.8 MB | 128 KB |
+| q8  | 425.0 MB | 160 KB |
+| q9  | 797.5 MB | 96 KB |
+| q10 | 796.5 MB | 2.3 MB |
+
+`SpillableJoinSelection` is registered on the executor path
+(`with_krishiv_optimizer_rules`, which the fragment session builder uses),
+and it converted **zero** joins across all three executors in three hours.
+A rule that declines silently is indistinguishable from a rule that was
+never installed, which is why attributing this needed a live investigation
+rather than a log line.
+
+**Two distinct sub-causes, and the numbers separate them.**
+
+*q7 and q8 failed by kilobytes.* At the same moment, the same pool was
+holding 138–142 MB of `ShuffleWriteBufferDrain` (logged on s2 and s3 at
+13:47). The drain was not a bystander — it was consuming the budget the
+join needed. This is D7: the shuffle write reassembled whole output
+partitions. Bounded in `90cdc419` + `f3e3cc62` (all three coalesce sites).
+
+*q9 and q10 consumed the entire pool.* 797.5 / 796.5 MB of a 797.6 MB pool
+means the build side alone exceeds everything available, so no amount of
+freed drain memory saves them — the join had to become spillable and did
+not. The threshold is not the problem: the executor falls back to
+`min_task_memory_share_bytes * 0.5` ≈ 398 MB, well under the observed
+sizes. The *estimate* is. `769fb112` adds a row-count-derived estimate for
+when `total_byte_size` is `Absent`, plus per-gate logging so the next run
+states which gate declines rather than leaving it to inference.
+
+**Deployment note that is not the cause but is still wrong:**
+`KRISHIV_SPILL_JOIN_BUILD_BYTES` was set on the coordinator only. Fragments
+re-plan on the executor, so the executor is where the rule reads it — the
+coordinator's copy has no effect on fragment planning. The fallback made
+the threshold roughly right by accident.
+
+**Unproven.** None of the three commits above has run against q7–q10; they
+need a rebuilt image and a re-run. The classification above is what the
+evidence supports, not a claim that the sweep is fixed.
