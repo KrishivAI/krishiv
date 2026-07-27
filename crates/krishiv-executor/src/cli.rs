@@ -865,6 +865,16 @@ async fn heartbeat_loop(
     // decision of what is garbage stays with the component that actually knows.
     // It is published here and consumed by a separate task: walking the tree is
     // filesystem work, and the heartbeat cadence must not wait on it.
+    //
+    // A8: an *absent* set is handled below (`None` skips the sweep), but a
+    // present-but-INCOMPLETE one is the dangerous case — a coordinator
+    // failover, a sharded coordinator, or a window in which a running job is
+    // not yet in the map. Acting on the first such observation deletes a live
+    // job's committed shuffle output within one tick, the consumer reports it
+    // missing, the producer regenerates it, and the next tick deletes it again.
+    // `OrphanReclaimTracker` requires three consecutive absences AND ≥120 s
+    // before reclaiming anything; at a 60 s tick that is ~3 minutes of
+    // consistent evidence.
     let (live_jobs_tx, live_jobs_rx) =
         tokio::sync::watch::channel::<Option<std::collections::HashSet<String>>>(None);
     if let Some(gc_dir) = shuffle_dir.clone() {
@@ -872,6 +882,10 @@ async fn heartbeat_loop(
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Held across ticks: "consecutive" is only meaningful with history.
+            let mut tracker = krishiv_shuffle::OrphanReclaimTracker::new(
+                krishiv_shuffle::OrphanReclaimPolicy::default(),
+            );
             loop {
                 ticker.tick().await;
                 // `None` means no coordinator has reported a live-job set yet
@@ -881,10 +895,25 @@ async fn heartbeat_loop(
                     continue;
                 };
                 let dir = gc_dir.clone();
-                let removed = tokio::task::spawn_blocking(move || {
-                    krishiv_shuffle::orphan::cleanup_orphans(&dir, &active)
-                })
-                .await;
+                let (removed, returned) = {
+                    let joined = tokio::task::spawn_blocking(move || {
+                        let result = tracker.observe_and_cleanup(&dir, &active);
+                        (tracker, result)
+                    })
+                    .await;
+                    match joined {
+                        Ok((t, result)) => (Ok(result), Some(t)),
+                        Err(e) => (Err(e), None),
+                    }
+                };
+                // The tracker moves into the blocking task and comes back with
+                // it; a panicked sweep loses its history, which only costs the
+                // affected jobs another grace period.
+                tracker = returned.unwrap_or_else(|| {
+                    krishiv_shuffle::OrphanReclaimTracker::new(
+                        krishiv_shuffle::OrphanReclaimPolicy::default(),
+                    )
+                });
                 match removed {
                     Ok(Ok(n)) if n > 0 => tracing::info!(
                         removed = n,

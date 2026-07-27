@@ -55,7 +55,7 @@ pub use krishiv_common::{
 pub use memory_store::InMemoryShuffleStore;
 pub use metadata::{PartitionState, ShuffleMetadata};
 pub use object_store::ObjectStoreShuffleStore;
-pub use orphan::{cleanup_orphans, scan_orphans};
+pub use orphan::{OrphanReclaimPolicy, OrphanReclaimTracker, cleanup_orphans, scan_orphans};
 pub use partitioner::{HashPartitioner, SaltSpec, SaltedHashPartitioner};
 pub use path::ShufflePath;
 pub use push_shuffle::PushShuffleStore;
