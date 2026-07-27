@@ -829,6 +829,12 @@ impl Coordinator {
         let mut jobs_needing_restore_seed: Vec<JobId> = Vec::new();
         for (job_id, job_arc) in &self.job_coordinators {
             let mut job = job_arc.write_record();
+            // C2 / SOTA §3: losing an executor changes where a regenerated
+            // producer can land, so a missing-partition report that arrives
+            // after this point is a genuinely new situation rather than the
+            // same one repeating. Bumped for every job, not just the ones
+            // holding work here — placement candidates are cluster-wide.
+            job.bump_recovery_epoch();
             let mut job_affected = false;
             for stage in &mut job.stages {
                 let mut stage_affected = false;

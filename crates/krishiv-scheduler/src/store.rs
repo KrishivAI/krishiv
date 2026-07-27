@@ -884,6 +884,12 @@ impl TryFrom<PersistedJobRecord> for JobRecord {
             retry_backoff_cap_ms: 30_000,
             // Phase 58: transient regeneration counter, reset on restore.
             shuffle_regen_total: 0,
+            // C2: regeneration history is in-memory recovery state, not durable
+            // job state. A restored coordinator has no prior observation to
+            // compare against, so it starts every partition's history empty and
+            // re-earns the fail-fast evidence from live reports.
+            shuffle_regen: std::collections::HashMap::new(),
+            recovery_epoch: 0,
         })
     }
 }

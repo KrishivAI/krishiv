@@ -66,6 +66,16 @@ pub struct JobRecord {
     /// counter — reset on coordinator restart, which itself re-plans from
     /// durable metadata.
     pub(crate) shuffle_regen_total: u32,
+    /// C2: regeneration history per `(stage_key, partition)`. Keyed on the
+    /// addressing form the consumer reported, which is what makes "the same
+    /// miss again" decidable at all.
+    pub(crate) shuffle_regen: HashMap<ShuffleRegenKey, ShuffleRegenAttempt>,
+    /// Recovery epoch: bumped whenever something happened that could change
+    /// the outcome of re-running a producer — an executor lost, deregistered,
+    /// or fenced as a prior incarnation. SOTA §3's invariant is that every
+    /// retry either changes an input condition or stops; this counter is how
+    /// the coordinator tells the two apart.
+    pub(crate) recovery_epoch: u64,
 }
 
 /// Phase 58: result of attempting shuffle-partition regeneration for a job.
@@ -76,9 +86,121 @@ pub(crate) enum ShuffleRegenOutcome {
     NoneAffected,
     /// Producing map tasks were reset to Pending for re-execution.
     Regenerated,
-    /// The job has regenerated shuffle output too many times; the caller must
-    /// fail it as unrecoverable rather than loop.
-    BudgetExhausted { attempts: u32, limit: u32 },
+    /// C2 / SOTA §3: the same `(stage_key, partition)` was reported missing a
+    /// second time with nothing changed in between — no executor loss, no
+    /// re-registration, the same placement. A retry that changes no input
+    /// condition cannot succeed, so the caller must fail the job now with the
+    /// attached evidence instead of spending the rest of the budget
+    /// rediscovering it.
+    RepeatedMiss { diagnosis: String },
+    /// The `(stage_key, partition)` has been regenerated too many times; the
+    /// caller must fail the job as unrecoverable rather than loop.
+    BudgetExhausted {
+        attempts: u32,
+        limit: u32,
+        diagnosis: String,
+    },
+}
+
+/// Identity of one regeneration target: the addressing key the consumer
+/// reported (`sN.mM` sub-stage key or coordinator stage id) plus the partition.
+pub(crate) type ShuffleRegenKey = (StageId, u32);
+
+/// Everything the coordinator knows about one missing partition at the moment
+/// it is reported.
+///
+/// C2: the terminal regeneration error used to name nothing at all — not the
+/// partition, not the producer, not the executor — which is why one live
+/// occurrence cost a whole debugging session. Capturing the evidence at report
+/// time is what turns the next occurrence into a diagnosis. Per SOTA §1 the
+/// writer-reported size is the load-bearing field: it separates "the writer
+/// never published this partition" (`None`) from "the writer published it and
+/// the store lost it" (`Some(n)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShuffleRegenDiagnosis {
+    /// Addressing key the consumer used.
+    reported_stage_id: String,
+    partition_id: u32,
+    /// Coordinator stage owning the producing task.
+    producer_stage_id: String,
+    producer_task_id: String,
+    /// Where the producer ran when it wrote the output now reported missing.
+    producer_executor: Option<String>,
+    /// Flight endpoint the producer advertised for this partition. `None` =
+    /// the producer reported no location at all, so the consumer took the
+    /// LOCAL branch and could never have fetched it (finding A1).
+    reported_endpoint: Option<String>,
+    /// Writer-reported size for this partition (SOTA §1's existence map).
+    /// `None` = the producer never reported this partition.
+    reported_size_bytes: Option<u64>,
+    /// Job recovery epoch at capture time.
+    epoch: u64,
+}
+
+impl std::fmt::Display for ShuffleRegenDiagnosis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stage {} partition {} produced by task {} (coordinator stage {}) on executor {} \
+             advertised endpoint {} writer-reported size {} at recovery epoch {}",
+            self.reported_stage_id,
+            self.partition_id,
+            self.producer_task_id,
+            self.producer_stage_id,
+            self.producer_executor.as_deref().unwrap_or("<unassigned>"),
+            self.reported_endpoint
+                .as_deref()
+                .map_or("<none reported — consumer read LOCALLY (A1)>", |e| e),
+            self.reported_size_bytes.map_or_else(
+                || String::from("<never reported>"),
+                |b| format!("{b} bytes")
+            ),
+            self.epoch,
+        )
+    }
+}
+
+impl ShuffleRegenDiagnosis {
+    fn capture(
+        m: &MissingShufflePartition,
+        producer_stage_id: &StageId,
+        task: &TaskRecord,
+        epoch: u64,
+    ) -> Self {
+        let reported = task.output_metadata.as_ref().and_then(|meta| {
+            meta.shuffle_partitions()
+                .iter()
+                .find(|p| p.partition_id == m.partition_id())
+        });
+        Self {
+            reported_stage_id: m.stage_id().as_str().to_owned(),
+            partition_id: m.partition_id(),
+            producer_stage_id: producer_stage_id.as_str().to_owned(),
+            producer_task_id: task.task_id().as_str().to_owned(),
+            producer_executor: task
+                .assigned_executor
+                .as_ref()
+                .map(|e| e.as_str().to_owned()),
+            reported_endpoint: reported
+                .filter(|p| !p.flight_endpoint.is_empty())
+                .map(|p| p.flight_endpoint.clone()),
+            reported_size_bytes: reported.map(|p| p.size_bytes),
+            epoch,
+        }
+    }
+}
+
+/// Regeneration history for one `(stage_key, partition)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShuffleRegenAttempt {
+    /// How many times this exact partition has been regenerated.
+    attempts: u32,
+    /// Recovery epoch at the last attempt. Equal epochs on two consecutive
+    /// reports means nothing about placement or cluster membership changed
+    /// between them.
+    epoch: u64,
+    /// Evidence captured at the last attempt.
+    diagnosis: ShuffleRegenDiagnosis,
 }
 
 /// Does a consumer's missing-partition report name this task's shuffle output?
@@ -139,7 +261,20 @@ impl JobRecord {
             shuffle_output: HashMap::new(),
             resource_usage: ResourceUsage::default(),
             shuffle_regen_total: 0,
+            shuffle_regen: HashMap::new(),
+            recovery_epoch: 0,
         }
+    }
+
+    /// Record that cluster membership changed (executor lost, deregistered, or
+    /// fenced as a stale incarnation).
+    ///
+    /// C2/SOTA §3: a regeneration attempt is only worth making if something
+    /// changed since the last one. This is that "something" — after it, an
+    /// otherwise-identical missing-partition report is a *new* situation and
+    /// earns a fresh attempt instead of the fail-fast short-circuit.
+    pub(crate) fn bump_recovery_epoch(&mut self) {
+        self.recovery_epoch = self.recovery_epoch.saturating_add(1);
     }
 
     /// Phase 53: override the task retry backoff policy (base doubles per
@@ -785,35 +920,82 @@ impl JobRecord {
         // reported-missing partition? A stale or duplicate consumer report can
         // reference partitions that were already re-produced or never existed —
         // that must not consume the regeneration budget or fail the job.
-        let mut any_match = false;
-        'detect: for stage in &self.stages {
+        //
+        // C2: the pass now also captures the evidence while the producer record
+        // is in hand — the terminal error is only a diagnosis if the facts were
+        // collected at report time, and by the time the budget runs out the
+        // producer has been reset and the endpoints overwritten.
+        let epoch = self.recovery_epoch;
+        let mut diagnoses: Vec<(ShuffleRegenKey, ShuffleRegenDiagnosis)> = Vec::new();
+        for stage in &self.stages {
             let stage_id = stage.spec.stage_id();
             for task in &stage.tasks {
                 if task.state != TaskState::Succeeded {
                     continue;
                 }
-                if missing
-                    .iter()
-                    .any(|m| missing_report_addresses_task(m, stage_id, task))
-                {
-                    any_match = true;
-                    break 'detect;
+                for m in missing {
+                    if !missing_report_addresses_task(m, stage_id, task) {
+                        continue;
+                    }
+                    diagnoses.push((
+                        (m.stage_id().clone(), m.partition_id()),
+                        ShuffleRegenDiagnosis::capture(m, stage_id, task, epoch),
+                    ));
                 }
             }
         }
-        if !any_match {
+        if diagnoses.is_empty() {
             return ShuffleRegenOutcome::NoneAffected;
+        }
+
+        // C2 / SOTA §3: the same partition missing twice with the same recovery
+        // epoch means the re-run reproduced the failure exactly — same
+        // placement, same store, same result. Nothing is gained by a third
+        // attempt, and everything is gained by stopping with both observations
+        // attached.
+        for (key, diagnosis) in &diagnoses {
+            if let Some(previous) = self.shuffle_regen.get(key)
+                && previous.epoch == epoch
+            {
+                return ShuffleRegenOutcome::RepeatedMiss {
+                    diagnosis: format!(
+                        "shuffle partition reported missing twice with no executor loss in \
+                         between — regenerating it a third time cannot change the outcome. \
+                         First report: {}. This report: {}",
+                        previous.diagnosis, diagnosis
+                    ),
+                };
+            }
         }
 
         // Phase 58: enforce the regeneration budget BEFORE mutating so a
         // persistently-lost producer fails the job instead of looping forever.
         if self.shuffle_regen_total >= max_regen {
+            let diagnosis = diagnoses
+                .iter()
+                .map(|(_, d)| d.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
             return ShuffleRegenOutcome::BudgetExhausted {
                 attempts: self.shuffle_regen_total,
                 limit: max_regen,
+                diagnosis,
             };
         }
         self.shuffle_regen_total += 1;
+        for (key, diagnosis) in diagnoses {
+            let entry = self
+                .shuffle_regen
+                .entry(key)
+                .or_insert_with(|| ShuffleRegenAttempt {
+                    attempts: 0,
+                    epoch,
+                    diagnosis: diagnosis.clone(),
+                });
+            entry.attempts = entry.attempts.saturating_add(1);
+            entry.epoch = epoch;
+            entry.diagnosis = diagnosis;
+        }
 
         let job_id_str = self.spec.job_id().as_str().to_owned();
         let mut affected = false;
@@ -1478,12 +1660,24 @@ mod shuffle_regen_tests {
 
     /// Mark the single producer task Succeeded with one shuffle partition (id 0)
     /// so it is a valid regeneration target.
+    ///
+    /// The assigned executor is part of the fixture, not decoration: C2's
+    /// diagnosis has to name where the producer ran, and a fixture that leaves
+    /// it unset would let a diagnosis that names nothing pass.
     fn succeed_producer(job: &mut JobRecord) {
+        // Three published partitions with distinct sizes: enough for the
+        // per-partition budget test to use distinct keys, and the sizes are
+        // what SOTA §1 calls the existence map — the diagnosis must quote them.
+        // Partition 3 stays deliberately unpublished (see the sub-stage-key
+        // test, which relies on a report the metadata cannot resolve).
         let meta = TaskOutputMetadata::new("shuffle", 10, 1, 1).with_shuffle_partitions(vec![
             ShufflePartitionOutput::new(0, 1024, "http://producer-host:9000"),
+            ShufflePartitionOutput::new(1, 2048, "http://producer-host:9000"),
+            ShufflePartitionOutput::new(2, 4096, "http://producer-host:9000"),
         ]);
         let task = &mut job.stages[0].tasks[0];
         task.state = TaskState::Succeeded;
+        task.assigned_executor = Some(krishiv_proto::ExecutorId::try_new("exec-p0").unwrap());
         task.output_metadata = Some(meta);
         job.stages[0].refresh_state();
         job.refresh_state();
@@ -1567,10 +1761,13 @@ mod shuffle_regen_tests {
     /// re-run the producer, the next one reports `BudgetExhausted` so the caller
     /// fails the job instead of looping forever. A report that matches no
     /// succeeded producer consumes no budget.
+    ///
+    /// Each round names a *different* partition: an identical repeat is C2's
+    /// fail-fast case and never reaches the budget at all.
     #[test]
     fn shuffle_regeneration_is_bounded_then_exhausts() {
         let (mut job, stage_id) = producer_job();
-        let missing = vec![MissingShufflePartition::new(stage_id, 0)];
+        let round = |p: u32| vec![MissingShufflePartition::new(stage_id.clone(), p)];
 
         // A stale report referencing a stage that owns no matching partition
         // must not consume the regeneration budget.
@@ -1587,28 +1784,151 @@ mod shuffle_regen_tests {
         // Two real regenerations are within budget (limit = 2). Each resets the
         // producer to Pending, so re-succeed it before the next consumer failure.
         assert_eq!(
-            job.invalidate_specific_shuffle_partitions(&missing, 2),
+            job.invalidate_specific_shuffle_partitions(&round(0), 2),
             ShuffleRegenOutcome::Regenerated
         );
         assert_eq!(job.stages[0].tasks[0].state, TaskState::Pending);
         succeed_producer(&mut job);
 
         assert_eq!(
-            job.invalidate_specific_shuffle_partitions(&missing, 2),
+            job.invalidate_specific_shuffle_partitions(&round(1), 2),
             ShuffleRegenOutcome::Regenerated
         );
         succeed_producer(&mut job);
 
         // The third real regeneration exceeds the budget → the caller must fail.
-        assert_eq!(
-            job.invalidate_specific_shuffle_partitions(&missing, 2),
+        match job.invalidate_specific_shuffle_partitions(&round(2), 2) {
             ShuffleRegenOutcome::BudgetExhausted {
-                attempts: 2,
-                limit: 2,
+                attempts,
+                limit,
+                diagnosis,
+            } => {
+                assert_eq!((attempts, limit), (2, 2));
+                assert!(
+                    diagnosis.contains("task-0"),
+                    "the terminal error must name the producing task: {diagnosis}"
+                );
             }
-        );
+            other => panic!("expected BudgetExhausted, got {other:?}"),
+        }
         // On exhaustion the producer is NOT reset — it stays as it was.
         assert_eq!(job.stages[0].tasks[0].state, TaskState::Succeeded);
+    }
+
+    /// C2 / SOTA §3: the second identical `(stage, partition)` miss — same
+    /// placement, no executor loss in between — proves the re-run reproduced
+    /// the failure exactly. It must stop there, with a diagnosis naming the
+    /// stage, the partition, the producing task, the executor it ran on, the
+    /// endpoint it advertised and the size it reported writing.
+    ///
+    /// The live failure this replaces read, in full: "job … lost shuffle output
+    /// and regenerated it 8 times (limit 8); the producing stage cannot durably
+    /// retain its output".
+    #[test]
+    fn second_identical_miss_fails_fast_with_a_full_diagnosis() {
+        let (mut job, stage_id) = producer_job();
+        let missing = vec![MissingShufflePartition::new(stage_id, 0)];
+
+        assert_eq!(
+            job.invalidate_specific_shuffle_partitions(&missing, 8),
+            ShuffleRegenOutcome::Regenerated
+        );
+        // The producer re-runs and re-publishes — and the consumer reports the
+        // very same partition missing again.
+        succeed_producer(&mut job);
+
+        match job.invalidate_specific_shuffle_partitions(&missing, 8) {
+            ShuffleRegenOutcome::RepeatedMiss { diagnosis } => {
+                for needle in [
+                    "stage-0",
+                    "partition 0",
+                    "task-0",
+                    "exec-p0",
+                    "http://producer-host:9000",
+                    "1024 bytes",
+                ] {
+                    assert!(
+                        diagnosis.contains(needle),
+                        "the diagnosis must name {needle}; got: {diagnosis}"
+                    );
+                }
+            }
+            other => panic!("the second identical miss must fail fast, got {other:?}"),
+        }
+        assert!(
+            job.shuffle_regen_total < 8,
+            "failing fast must cost less than the whole budget"
+        );
+    }
+
+    /// The other half of the SOTA §3 contract: when something *did* change
+    /// between the two reports — an executor was lost, so the regenerated
+    /// producer can land somewhere else — the identical report earns a fresh
+    /// attempt instead of the fail-fast short-circuit.
+    #[test]
+    fn an_executor_loss_between_misses_earns_another_regeneration() {
+        let (mut job, stage_id) = producer_job();
+        let missing = vec![MissingShufflePartition::new(stage_id, 0)];
+
+        assert_eq!(
+            job.invalidate_specific_shuffle_partitions(&missing, 8),
+            ShuffleRegenOutcome::Regenerated
+        );
+        succeed_producer(&mut job);
+        job.bump_recovery_epoch();
+
+        assert_eq!(
+            job.invalidate_specific_shuffle_partitions(&missing, 8),
+            ShuffleRegenOutcome::Regenerated,
+            "placement can change after an executor loss, so the retry is not futile"
+        );
+    }
+
+    /// A diagnosis that cannot distinguish "the writer never published this
+    /// partition" from "the writer published it and the store lost it" is not a
+    /// diagnosis (SOTA §1: the writer-reported size vector is the existence
+    /// map). Partition 3 is addressed through the sub-stage key and appears in
+    /// no `ShufflePartitionOutput`, so the evidence must say so explicitly.
+    #[test]
+    fn diagnosis_distinguishes_never_published_from_lost() {
+        use krishiv_proto::ShuffleWriteConfig;
+
+        let spec = JobSpec::new(
+            JobId::try_new("unpublished-job").unwrap(),
+            "unpublished",
+            JobKind::Batch,
+        )
+        .with_stage(
+            StageSpec::new(StageId::try_new("dist-s0").unwrap(), "map").with_task(
+                TaskSpec::new(TaskId::try_new("dist-s0-t2").unwrap(), "dfplan:v1:body")
+                    .with_shuffle_write(ShuffleWriteConfig {
+                        stage_id: StageId::try_new("s0.m2").unwrap(),
+                        num_partitions: 4,
+                        key_columns: Vec::new(),
+                        lease_token: 0,
+                    }),
+            ),
+        );
+        let mut job = JobRecord::from_spec(spec, 4);
+        succeed_producer(&mut job);
+
+        let missing = vec![MissingShufflePartition::new(
+            StageId::try_new("s0.m2").unwrap(),
+            3,
+        )];
+        assert_eq!(
+            job.invalidate_specific_shuffle_partitions(&missing, 8),
+            ShuffleRegenOutcome::Regenerated
+        );
+        succeed_producer(&mut job);
+
+        match job.invalidate_specific_shuffle_partitions(&missing, 8) {
+            ShuffleRegenOutcome::RepeatedMiss { diagnosis } => assert!(
+                diagnosis.contains("never reported"),
+                "an unpublished partition must be named as such, not guessed at: {diagnosis}"
+            ),
+            other => panic!("expected the fail-fast diagnosis, got {other:?}"),
+        }
     }
 
     /// Phase 58 (live chaos-gate wedge, 2026-07-16): a dfplan consumer reports

@@ -552,19 +552,42 @@ impl Coordinator {
             match regen {
                 ShuffleRegenOutcome::Regenerated => self.exec.notify.notify_waiters(),
                 ShuffleRegenOutcome::NoneAffected => {}
+                // C2 / SOTA §3: the identical partition missed twice with
+                // nothing changed in between. Retrying is provably useless, so
+                // stop at attempt two and hand the operator both observations
+                // instead of eight anonymous ones.
+                ShuffleRegenOutcome::RepeatedMiss { diagnosis } => {
+                    let message = format!(
+                        "job {job_id} failed: the same shuffle partition was reported \
+                         missing twice with no executor loss in between, so regenerating \
+                         it again cannot help. {diagnosis}"
+                    );
+                    tracing::error!(
+                        job_id = %job_id,
+                        diagnosis = %diagnosis,
+                        "shuffle regeneration reproduced an identical miss; failing job fast"
+                    );
+                    let _ = self.cancel_job(&job_id);
+                    return Err(SchedulerError::Transport { message });
+                }
                 // Phase 58: the producing stage cannot durably retain its output.
                 // Stop the regenerate/refetch loop and fail the job with a
                 // terminal reason (mirrors the fatal spooled-result path below).
-                ShuffleRegenOutcome::BudgetExhausted { attempts, limit } => {
+                ShuffleRegenOutcome::BudgetExhausted {
+                    attempts,
+                    limit,
+                    diagnosis,
+                } => {
                     let message = format!(
                         "job {job_id} lost shuffle output and regenerated it {attempts} \
                          times (limit {limit}); the producing stage cannot durably retain \
-                         its output — failing the job as unrecoverable"
+                         its output — failing the job as unrecoverable. {diagnosis}"
                     );
                     tracing::error!(
                         job_id = %job_id,
                         attempts,
                         limit,
+                        diagnosis = %diagnosis,
                         "shuffle regeneration budget exhausted; failing job"
                     );
                     let _ = self.cancel_job(&job_id);
