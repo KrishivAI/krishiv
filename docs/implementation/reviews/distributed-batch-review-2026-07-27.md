@@ -858,3 +858,40 @@ action *valid*.
 Earlier claims in this file that "the AQE parallelism floor is what carried
 q7/q8" and that "zero joins converted" were both drawn from **executor** logs.
 The decision happens on the coordinator. Read the coordinator.
+
+### D10 — q10 fails on a deterministic missing shuffle partition (open)
+
+q10 is **not** part of the hash-join family. On `fast-b443c309` it failed as:
+
+```
+consumer task reported missing upstream shuffle partitions; invalidating producers
+  job_id=batch-sql-1785177479774-3  stage_id=dist-s2  missing_count=1   (x7)
+ERROR shuffle regeneration reproduced an identical miss; failing job fast
+  diagnosis: shuffle partition reported missing twice with no executor loss
+```
+
+The harness surfaces this as `cancelled: job was cancelled`, which is why it
+reads like an infrastructure blip and not a bug. It is a bug: the same
+partition is missing after regeneration, with no executor lost — so the
+producer deterministically does not publish it, or the consumer
+deterministically looks in the wrong place.
+
+**Ruled out — the shuffle-scratch GC.** It ran in the same window
+(`removed: 1476 / 2283 / 1209`) but reclaimed job `…-2`, which had already
+finished. Its `OrphanReclaimTracker` requires three consecutive absences and
+≥120 s before touching anything, and the A8 comment in
+`krishiv-executor/src/cli.rs` describes precisely this failure mode as the
+reason that guard exists. The guard held.
+
+**Still open.** Candidates, in the order worth testing:
+1. A producer path that does not publish its whole partition space. The
+   `drain_into_store` contract covers the paths that use it — the empty
+   partition must still be written, or a *remote* fetch of it is an error —
+   but the skew-split map-range and push-store paths should be re-checked
+   against the same contract.
+2. Consumer-side endpoint routing: fetching partition N from the wrong
+   executor reports the same "missing" with the file present elsewhere.
+
+q10 failed identically on the previous image too, and the 2026-07-26 sweep
+recorded it as "lost shuffle" — three occurrences, one signature. Whatever it
+is, it predates tonight's changes and is not affected by them.
