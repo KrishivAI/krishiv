@@ -145,6 +145,43 @@ impl SpillableJoinSelection {
         Self { threshold_bytes }
     }
 
+
+    /// Restore `hash_join`'s built-in projection on top of `converted`.
+    ///
+    /// A no-op when the join carried none, which is the common case.
+    fn reapply_projection(
+        converted: Arc<dyn ExecutionPlan>,
+        hash_join: &HashJoinExec,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_plan::projection::ProjectionExec;
+
+        let Some(projection) = hash_join.projection.as_ref() else {
+            return Ok(converted);
+        };
+        let schema = converted.schema();
+        let mut exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> =
+            Vec::with_capacity(projection.len());
+        for &index in projection.iter() {
+            let Some(field) = schema.fields().get(index) else {
+                // The projection does not address this plan's schema after all.
+                // Refusing here is safe: the caller keeps the hash join.
+                return datafusion::error::Result::Err(
+                    datafusion::error::DataFusionError::Plan(format!(
+                        "spillable-join: projection index {index} is outside the \
+                         converted join's {} columns",
+                        schema.fields().len()
+                    )),
+                );
+            };
+            exprs.push((
+                Arc::new(Column::new(field.name(), index)),
+                field.name().clone(),
+            ));
+        }
+        Ok(Arc::new(ProjectionExec::try_new(exprs, converted)?))
+    }
+
     /// Whether this hash join should become a sort-merge join, and if so, the
     /// converted node.
     fn convert(
@@ -196,7 +233,16 @@ impl SpillableJoinSelection {
         // from a rule that was never installed. Three SF100 queries died on
         // un-spillable hash joins while this rule sat registered and converted
         // nothing, and the logs could not say which gate turned each one away.
-        let stats = hash_join.left().partition_statistics(None)?;
+        let stats = match hash_join.left().partition_statistics(None) {
+            Ok(stats) => stats,
+            // An error computing statistics is not evidence of a large build
+            // side, and this rule is an optimisation: declining is always a
+            // valid answer, failing the query never is.
+            Err(error) => {
+                tracing::debug!(%error, "spillable-join: statistics unavailable, keeping hash join");
+                return Ok(None);
+            }
+        };
         let build_bytes = match stats.total_byte_size {
             Precision::Exact(bytes) | Precision::Inexact(bytes) => bytes as u64,
             // `total_byte_size` absent does not mean "size unknown" — DataFusion
@@ -279,14 +325,30 @@ impl SpillableJoinSelection {
             hash_join.null_equality(),
         ) {
             Ok(smj) => {
+                // `HashJoinExec` has a built-in projection; `SortMergeJoinExec`
+                // does not (there is a TODO to that effect in DataFusion's
+                // source). Converting a projected join therefore silently
+                // widens the output back to the full left++right schema, and
+                // the *parent* join's positional `on` columns then point at the
+                // wrong fields — live q7/q8/q9 failed with
+                // `Missing on the right: Column { name: "o_custkey", index: 3 }`.
+                //
+                // Reproduce the projection explicitly. The join's projection
+                // indices address the same full join schema `SortMergeJoinExec`
+                // produces (DataFusion validates them against it with
+                // `can_project(&join_schema, ..)`), so selecting those indices
+                // off the converted join yields the identical output columns,
+                // order and names.
+                let converted = Self::reapply_projection(Arc::new(smj), hash_join)?;
                 tracing::info!(
                     build_bytes,
                     threshold,
                     mode = ?hash_join.partition_mode(),
                     join_type = ?hash_join.join_type(),
+                    projected = hash_join.contains_projection(),
                     "hash join build side exceeds per-task memory share; using sort-merge join"
                 );
-                Ok(Some(Arc::new(smj)))
+                Ok(Some(converted))
             }
             Err(error) => {
                 tracing::debug!(%error, "sort-merge conversion declined; keeping hash join");
@@ -319,6 +381,7 @@ impl PhysicalOptimizerRule for SpillableJoinSelection {
         };
         let mut seen = 0usize;
         let mut converted = 0usize;
+        let mut declined_on_error = 0usize;
         let out = plan
             .transform_up(|node| {
                 // `ExecutionPlan: Any` — upcast to downcast (DF 54 has no `as_any`).
@@ -327,12 +390,29 @@ impl PhysicalOptimizerRule for SpillableJoinSelection {
                     return Ok(Transformed::no(node));
                 };
                 seen += 1;
-                match self.convert(hash_join, threshold)? {
-                    Some(plan) => {
+                // A rule that rewrites plans for *memory* reasons must never be
+                // the reason a query fails. Live q7/q8/q9 turned an internal
+                // refusal ("the left or right side of the join does not have
+                // all columns on `on`") into a failed fragment, trading an
+                // out-of-memory error for a planning error — strictly worse,
+                // because the un-converted plan at least had a chance of
+                // fitting. Declining is always available; erroring is not.
+                match self.convert(hash_join, threshold) {
+                    Ok(Some(plan)) => {
                         converted += 1;
                         Ok(Transformed::yes(plan))
                     }
-                    None => Ok(Transformed::no(node)),
+                    Ok(None) => Ok(Transformed::no(node)),
+                    Err(error) => {
+                        declined_on_error += 1;
+                        tracing::warn!(
+                            %error,
+                            mode = ?hash_join.partition_mode(),
+                            join_type = ?hash_join.join_type(),
+                            "spillable-join: conversion errored; keeping hash join"
+                        );
+                        Ok(Transformed::no(node))
+                    }
                 }
             })
             .map(|t| t.data)?;
@@ -341,9 +421,13 @@ impl PhysicalOptimizerRule for SpillableJoinSelection {
         // previously identical from outside, which is what made three SF100
         // failures take a live investigation to attribute.
         if seen > 0 {
-            tracing::debug!(
+            // At info, not debug: executors run RUST_LOG=info, and the
+            // debug-level version of this line was invisible in the only
+            // environment that had the bug it was added to diagnose.
+            tracing::info!(
                 hash_joins = seen,
                 converted,
+                declined_on_error,
                 threshold,
                 "spillable-join: pass complete"
             );
@@ -643,5 +727,161 @@ mod collect_left_tests {
         };
         assert_eq!(total(&hash_rows), total(&smj_rows), "row count changed");
         assert_eq!(total(&smj_rows), 2, "expected the two matching keys");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod never_fails_the_query_tests {
+    use super::*;
+    use datafusion::physical_plan::displayable;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+
+    /// A plan whose joins the rule will want to convert.
+    async fn joined_plan(ctx: &SessionContext) -> Arc<dyn ExecutionPlan> {
+        ctx.sql("CREATE TABLE a(k INT, v INT) AS VALUES (1, 1), (2, 2)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        ctx.sql("CREATE TABLE b(k INT, w INT) AS VALUES (1, 9)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        ctx.sql("CREATE TABLE c(k INT, z INT) AS VALUES (1, 5)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        // Two stacked joins: `transform_up` converts the inner one first, so
+        // the outer one is asked about a child the rule already rewrote — the
+        // shape that produced the live failure.
+        ctx.sql("SELECT a.v, b.w, c.z FROM a JOIN b ON a.k = b.k JOIN c ON a.k = c.k")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stacked_joins_never_make_the_rule_return_an_error() {
+        // The live regression: q7/q8/q9 stopped failing with "Resources
+        // exhausted" and started failing with
+        // `spillable_join_selection / Error during planning: The left or right
+        // side of the join does not have all columns on "on"`. Trading an
+        // out-of-memory error for a planning error is strictly worse — the
+        // un-converted plan at least had a chance of fitting. This rule is an
+        // optimisation and must always be able to decline.
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let plan = joined_plan(&ctx).await;
+        let out = SpillableJoinSelection::with_threshold(Some(1))
+            .optimize(plan, ctx.copied_config().options());
+        assert!(
+            out.is_ok(),
+            "the rule must never fail a plan; got {:?}",
+            out.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plan_the_rule_declines_is_returned_unchanged_and_still_runs() {
+        use datafusion::physical_plan::collect;
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let plan = joined_plan(&ctx).await;
+        let before = displayable(plan.as_ref()).indent(true).to_string();
+        let task_ctx = ctx.task_ctx();
+
+        // Threshold far above anything here: every join declines.
+        let out = SpillableJoinSelection::with_threshold(Some(1 << 40))
+            .optimize(Arc::clone(&plan), ctx.copied_config().options())
+            .unwrap();
+        assert_eq!(
+            before,
+            displayable(out.as_ref()).indent(true).to_string(),
+            "declining must leave the plan untouched"
+        );
+        let rows = collect(out, task_ctx).await.unwrap();
+        let total: usize = rows.iter().map(arrow::array::RecordBatch::num_rows).sum();
+        assert_eq!(total, 1, "the declined plan must still produce the join result");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod projection_tests {
+    use super::*;
+    use datafusion::physical_plan::{collect, displayable};
+    use datafusion::prelude::{SessionConfig, SessionContext};
+
+    /// Two stacked joins where the inner one projects a subset of its columns.
+    /// This is q10's shape: `customer JOIN orders JOIN lineitem`, where the
+    /// middle join carries a projection and the outer join's `on` addresses
+    /// its output positionally.
+    async fn stacked_projected_plan(ctx: &SessionContext) -> Arc<dyn ExecutionPlan> {
+        for ddl in [
+            "CREATE TABLE c(c_custkey INT, c_name VARCHAR) AS VALUES (1, 'a'), (2, 'b')",
+            "CREATE TABLE o(o_orderkey INT, o_custkey INT, o_total INT) AS VALUES (10, 1, 5)",
+            "CREATE TABLE l(l_orderkey INT, l_qty INT) AS VALUES (10, 3)",
+        ] {
+            ctx.sql(ddl).await.unwrap().collect().await.unwrap();
+        }
+        ctx.sql(
+            "SELECT c.c_name, l.l_qty \
+             FROM c JOIN o ON c.c_custkey = o.o_custkey \
+                    JOIN l ON o.o_orderkey = l.l_orderkey",
+        )
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn converting_a_projected_join_keeps_the_output_columns() {
+        // The live failure: converting a join that carries a projection widened
+        // its output back to the full left++right schema, so the parent join's
+        // positional `on` broke with
+        // `Missing on the right: Column { name: "o_custkey", index: 3 }`.
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let plan = stacked_projected_plan(&ctx).await;
+        let before_schema = plan.schema();
+
+        let out = SpillableJoinSelection::with_threshold(Some(1))
+            .optimize(Arc::clone(&plan), ctx.copied_config().options())
+            .expect("the rule must not fail the plan");
+
+        assert_eq!(
+            out.schema(),
+            before_schema,
+            "conversion changed the plan's output schema:\n{}",
+            displayable(out.as_ref()).indent(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_converted_projected_plan_returns_the_same_rows() {
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let plan = stacked_projected_plan(&ctx).await;
+        let task_ctx = ctx.task_ctx();
+
+        let before = collect(Arc::clone(&plan), Arc::clone(&task_ctx)).await.unwrap();
+        let out = SpillableJoinSelection::with_threshold(Some(1))
+            .optimize(plan, ctx.copied_config().options())
+            .unwrap();
+        let after = collect(out, task_ctx).await.unwrap();
+
+        let rows = |b: &[arrow::array::RecordBatch]| -> usize {
+            b.iter().map(arrow::array::RecordBatch::num_rows).sum()
+        };
+        assert_eq!(rows(&before), rows(&after), "row count changed");
+        assert_eq!(rows(&after), 1, "expected the single matching row");
+        let cols = |b: &[arrow::array::RecordBatch]| b.first().map(|x| x.num_columns());
+        assert_eq!(cols(&before), cols(&after), "column count changed");
     }
 }
