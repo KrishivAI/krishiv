@@ -894,6 +894,15 @@ pub static FLAGS: &[FlagSpec] = &[
         "Default shuffle partition count for distributed plans.",
     ),
     rt(
+        "KRISHIV_SHUFFLE_SERVE_CONCURRENCY",
+        FlagKind::UInt,
+        "cgroup-derived",
+        "Concurrent shuffle Flight `do_get` responses one executor will serve; \
+         bounds the aggregate bytes held for consumers across all peers. \
+         Derived from the page-cache budget in units of the 32 MiB inline-read \
+         limit, floor 2.",
+    ),
+    rt(
         "KRISHIV_SHUFFLE_SPILL_THRESHOLD_BYTES",
         FlagKind::UInt,
         "67108864",

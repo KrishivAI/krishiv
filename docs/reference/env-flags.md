@@ -131,6 +131,7 @@ Regenerate with:
 | `KRISHIV_SHUFFLE_FLIGHT_ADDR` | host:port | `unset` | Shuffle Flight transport listen address (executor). |
 | `KRISHIV_SHUFFLE_MEMORY_BYTES` | uint | `268435456` | In-memory shuffle store budget before spill/rejection. |
 | `KRISHIV_SHUFFLE_PARTITIONS` | uint | `target-parallelism` | Default shuffle partition count for distributed plans. |
+| `KRISHIV_SHUFFLE_SERVE_CONCURRENCY` | uint | `cgroup-derived` | Concurrent shuffle Flight `do_get` responses one executor will serve; bounds the aggregate bytes held for consumers across all peers. Derived from the page-cache budget in units of the 32 MiB inline-read limit, floor 2. |
 | `KRISHIV_SHUFFLE_SPILL_THRESHOLD_BYTES` | uint | `67108864` | Sort-shuffle writer in-memory buffer threshold before spilling a run. |
 | `KRISHIV_SHUFFLE_STORE_BYTES` | uint | `cgroup-derived` | Push-shuffle store ceiling, carved from the same container budget as the query pool so the two cannot together exceed the container; 0 disables the limit. |
 | `KRISHIV_SHUFFLE_TOKEN` | secret | `unset` | Bearer token protecting shuffle service endpoints. |

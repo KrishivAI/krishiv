@@ -81,6 +81,47 @@ fn parse_ticket(ticket_bytes: &[u8]) -> Result<(String, String, u32), Status> {
     Ok((job_id, stage_id, partition_id))
 }
 
+/// Environment override for the shuffle Flight server's concurrent `do_get`
+/// cap. Unset derives it from [`ExecutorCapacity`].
+pub const SHUFFLE_SERVE_CONCURRENCY_ENV: &str = "KRISHIV_SHUFFLE_SERVE_CONCURRENCY";
+
+/// Floor for the serve cap: below two, one slow consumer serialises the whole
+/// reduce side of a stage.
+const MIN_SERVE_CONCURRENCY: usize = 2;
+
+/// Cap when no cgroup limit is visible (no container, or page-cache accounting
+/// disabled). `8 × INLINE_READ_LIMIT` = 256 MiB resident at peak, which is the
+/// same order as the reduce-side fetch semaphore's default.
+const DEFAULT_SERVE_CONCURRENCY: usize = 8;
+
+/// How many `do_get` responses this executor may have in flight at once.
+///
+/// B1: `SHUFFLE_FETCH_SEMAPHORE` on the executor bounds each **consumer**, not
+/// the aggregate arriving at one **producer**. On a 3-node cluster the ceiling
+/// was 3 × 8 = 24 concurrent `do_get` against a single executor, i.e. up to
+/// ~768 MiB of anonymous memory outside the DataFusion pool, in the same
+/// process that is also running map tasks — and it scales linearly with nodes
+/// or with `KRISHIV_SHUFFLE_FETCH_CONCURRENCY`. Compounding it, both
+/// `write_partition` and `stream_partition` run in `spawn_blocking`, whose
+/// default pool is 512 threads.
+///
+/// Sized in units of `INLINE_READ_LIMIT` out of the page-cache budget the same
+/// capacity derivation already carves for committed-but-unconsumed shuffle
+/// output, so the two numbers come from one decision rather than two.
+fn serve_concurrency_limit() -> usize {
+    if let Some(explicit) = std::env::var(SHUFFLE_SERVE_CONCURRENCY_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return explicit.max(1);
+    }
+    krishiv_common::ExecutorCapacity::detect()
+        .page_cache_bytes
+        .map(|bytes| usize::try_from(bytes / crate::disk_store::INLINE_READ_LIMIT).unwrap_or(1))
+        .unwrap_or(DEFAULT_SERVE_CONCURRENCY)
+        .max(MIN_SERVE_CONCURRENCY)
+}
+
 /// Arrow Flight shuffle service backed by any [`ShuffleStore`] implementation.
 ///
 /// A3: Generic over `S` so callers can back the service with `LocalDiskShuffleStore`,
@@ -88,11 +129,46 @@ fn parse_ticket(ticket_bytes: &[u8]) -> Result<(String, String, u32), Status> {
 #[derive(Clone)]
 pub struct ShuffleFlightService<S: ShuffleStore + Send + Sync + 'static> {
     store: Arc<S>,
+    /// B1: aggregate cap on in-flight `do_get` responses. A permit is held for
+    /// the *response stream's* lifetime, not the handler future's, because that
+    /// is how long the bytes it read stay resident.
+    serve_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl<S: ShuffleStore + Send + Sync + 'static> ShuffleFlightService<S> {
     pub fn new(store: Arc<S>) -> Self {
-        Self { store }
+        Self::with_serve_limit(store, serve_concurrency_limit())
+    }
+
+    /// [`Self::new`] with an explicit cap, so tests can drive the bound without
+    /// mutating process-global environment state.
+    pub fn with_serve_limit(store: Arc<S>, limit: usize) -> Self {
+        Self {
+            store,
+            serve_permits: Arc::new(tokio::sync::Semaphore::new(limit.max(1))),
+        }
+    }
+}
+
+/// Response stream that holds a serve permit until the client is done with it.
+///
+/// `do_get` returns as soon as the reader is constructed, but for any partition
+/// at or below `INLINE_READ_LIMIT` the store has already read the whole file
+/// into memory and that buffer lives for the lifetime of the response. Dropping
+/// the permit when the handler returns would therefore bound nothing.
+struct PermitHoldingStream<T> {
+    inner: BoxedFlightStream<T>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl<T> futures::Stream for PermitHoldingStream<T> {
+    type Item = Result<T, Status>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.get_mut().inner.as_mut().poll_next(cx)
     }
 }
 
@@ -244,6 +320,14 @@ impl<S: ShuffleStore + Send + Sync + 'static> FlightService for ShuffleFlightSer
             partition,
         };
 
+        // B1: take the permit BEFORE the store reads anything. The bound is on
+        // resident bytes, and the store materialises the partition inside
+        // `stream_partition` for anything at or below `INLINE_READ_LIMIT`.
+        let permit = Arc::clone(&self.serve_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("shuffle serve semaphore closed"))?;
+
         let partition_data = self
             .store
             .stream_partition(&id)
@@ -263,7 +347,10 @@ impl<S: ShuffleStore + Send + Sync + 'static> FlightService for ShuffleFlightSer
             .build(stream);
 
         let mapped = encoder.map_err(|e| Status::internal(format!("flight encode: {e}")));
-        Ok(Response::new(Box::pin(mapped) as Self::DoGetStream))
+        Ok(Response::new(Box::pin(PermitHoldingStream {
+            inner: Box::pin(mapped) as BoxedFlightStream<FlightData>,
+            _permit: permit,
+        }) as Self::DoGetStream))
     }
 
     async fn do_put(
@@ -418,9 +505,25 @@ pub(crate) async fn serve_with_token<S: ShuffleStore + Send + Sync + 'static>(
     store: Arc<S>,
     token: Option<String>,
 ) -> io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    serve_with_token_and_limit(addr, store, token, serve_concurrency_limit()).await
+}
+
+/// [`serve_with_token`] with an explicit serve-concurrency cap (B1), so tests
+/// can prove the bound without mutating process-global environment state.
+pub(crate) async fn serve_with_token_and_limit<S: ShuffleStore + Send + Sync + 'static>(
+    addr: SocketAddr,
+    store: Arc<S>,
+    token: Option<String>,
+    serve_limit: usize,
+) -> io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
-    let service = ShuffleFlightService::new(store);
+    tracing::debug!(
+        %local_addr,
+        serve_limit,
+        "shuffle flight server bounding concurrent do_get responses"
+    );
+    let service = ShuffleFlightService::with_serve_limit(store, serve_limit);
     let incoming = tonic::transport::server::TcpIncoming::from(listener);
     // One interceptor type for both auth-on and auth-off so `add_service`
     // receives a single concrete service type. When `token` is `None` the
@@ -843,6 +946,150 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 3);
         assert_eq!(result[0].num_columns(), 2);
+    }
+
+    /// Counts how many `stream_partition` calls the server has in flight, and
+    /// holds each one long enough that an unbounded server would overlap them
+    /// all. Delegates everything else to the real disk store, so the bytes on
+    /// the wire are real.
+    struct ConcurrencyProbeStore {
+        inner: Arc<LocalDiskShuffleStore>,
+        live: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+        hold: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl ShuffleStore for ConcurrencyProbeStore {
+        async fn register_partition_lease(
+            &self,
+            id: PartitionId,
+            lease_token: u64,
+        ) -> crate::ShuffleResult<()> {
+            self.inner.register_partition_lease(id, lease_token).await
+        }
+
+        async fn write_partition(
+            &self,
+            partition: ShufflePartition,
+            lease_token: u64,
+        ) -> crate::ShuffleResult<()> {
+            self.inner.write_partition(partition, lease_token).await
+        }
+
+        async fn read_partition(
+            &self,
+            id: &PartitionId,
+        ) -> crate::ShuffleResult<Option<ShufflePartition>> {
+            self.inner.read_partition(id).await
+        }
+
+        async fn stream_partition(
+            &self,
+            id: &PartitionId,
+        ) -> crate::ShuffleResult<Option<crate::ShuffleStream>> {
+            use std::sync::atomic::Ordering;
+            let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(self.hold).await;
+            let result = self.inner.stream_partition(id).await;
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+
+        async fn delete_job_partitions(&self, job_id: &str) -> crate::ShuffleResult<()> {
+            self.inner.delete_job_partitions(job_id).await
+        }
+    }
+
+    /// B1: the shuffle Flight **server** must bound its own concurrency.
+    ///
+    /// `SHUFFLE_FETCH_SEMAPHORE` bounds each consumer, never the aggregate
+    /// arriving at one producer: on a 3-node cluster that was 3 x 8 = 24
+    /// concurrent `do_get` against one executor, each holding up to
+    /// `INLINE_READ_LIMIT` (32 MiB) of anonymous memory outside the DataFusion
+    /// pool, in the process that is also running map tasks. The failure mode is
+    /// an executor SIGKILLed with anon-RSS above the pool and no "Resources
+    /// exhausted" in the log — indistinguishable at the symptom level from the
+    /// map-side buffer bug that was just fixed.
+    ///
+    /// Driven through the real `serve` path and the real Flight client: eight
+    /// concurrent fetches against a cap of two must all succeed, and the server
+    /// must never have had more than two partitions open at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_flight_server_bounds_concurrent_do_get() {
+        use std::sync::atomic::Ordering;
+
+        const PARTITIONS: u32 = 8;
+        const LIMIT: usize = 2;
+
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+        let batch = make_test_batch();
+        for partition in 0..PARTITIONS {
+            let id = PartitionId {
+                job_id: "job-serve-cap".to_owned(),
+                stage_id: "s0".to_owned(),
+                partition,
+            };
+            disk.register_partition_lease(id.clone(), 1).await.unwrap();
+            disk.write_partition(
+                ShufflePartition {
+                    id,
+                    schema: batch.schema(),
+                    batches: vec![batch.clone()],
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        }
+
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = Arc::new(ConcurrencyProbeStore {
+            inner: Arc::clone(&disk),
+            live: Arc::clone(&live),
+            peak: Arc::clone(&peak),
+            hold: std::time::Duration::from_millis(120),
+        });
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (local_addr, server_handle) = serve_with_token_and_limit(addr, probe, None, LIMIT)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let endpoint = local_addr.to_string();
+        let mut fetches = Vec::new();
+        for partition in 0..PARTITIONS {
+            let endpoint = endpoint.clone();
+            fetches.push(tokio::spawn(async move {
+                FlightShuffleClient::fetch(&endpoint, "job-serve-cap", "s0", partition).await
+            }));
+        }
+        let mut fetched = 0usize;
+        for handle in fetches {
+            let batches = handle.await.unwrap().unwrap();
+            assert_eq!(batches.len(), 1);
+            fetched += 1;
+        }
+        server_handle.abort();
+
+        assert_eq!(
+            fetched, PARTITIONS as usize,
+            "the cap must throttle consumers, never fail them"
+        );
+        let observed = peak.load(Ordering::SeqCst);
+        assert!(
+            observed <= LIMIT,
+            "the server held {observed} partitions open at once against a cap of {LIMIT}; \
+             an unbounded server is {PARTITIONS} x INLINE_READ_LIMIT of untracked anon memory"
+        );
+        assert!(
+            observed > 1,
+            "the probe must actually overlap requests, or the bound proves nothing (peak {observed})"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

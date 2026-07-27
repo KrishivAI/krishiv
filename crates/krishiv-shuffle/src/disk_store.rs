@@ -44,7 +44,7 @@ pub(crate) fn blake3_hash(data: &[u8]) -> [u8; 32] {
 /// partition reads. 32 MiB is roughly ten times the observed SF100 average
 /// (~3.5 MB), so the streaming fallback is genuinely exceptional rather than
 /// the case that quietly dominates.
-const INLINE_READ_LIMIT: u64 = 32 * 1024 * 1024;
+pub(crate) const INLINE_READ_LIMIT: u64 = 32 * 1024 * 1024;
 
 /// How much of a file to hash per `read` call when verifying on the read path.
 ///
