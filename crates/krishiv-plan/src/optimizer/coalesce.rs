@@ -30,16 +30,20 @@ pub struct CoalesceRule {
     /// Used to determine `target_partitions = ceil(total_bytes / target_partition_bytes)`
     /// when inserting a `CoalescePartitions` node.  Default: 128 MiB.
     target_partition_bytes: u64,
+    /// Floor on the coalesced partition count — see [`Self::with_min_partitions`].
+    min_partitions: usize,
 }
 
 impl CoalesceRule {
     /// Create a new `CoalesceRule` with the given minimum partition byte threshold.
     ///
-    /// Uses the default `target_partition_bytes` of 128 MiB.
+    /// Uses the default `target_partition_bytes` of 128 MiB and no parallelism
+    /// floor; see [`Self::with_min_partitions`].
     pub fn new(min_partition_bytes: u64) -> Self {
         Self {
             min_partition_bytes,
             target_partition_bytes: DEFAULT_TARGET_PARTITION_BYTES,
+            min_partitions: 1,
         }
     }
 
@@ -53,6 +57,49 @@ impl CoalesceRule {
     /// Return the configured `target_partition_bytes`.
     pub fn target_partition_bytes(&self) -> u64 {
         self.target_partition_bytes
+    }
+
+    /// Never coalesce below `min_partitions` partitions.
+    ///
+    /// Sizing partitions purely by bytes answers "how big should a partition
+    /// be" and never asks "how many workers are there". A stage whose whole
+    /// output is under `target_partition_bytes` collapses to a single group,
+    /// so it runs as one task on one core — measured live on TPC-H q2 at
+    /// SF100, where four stages coalesced to 1 partition and the cluster sat
+    /// at one busy core per executor with eight of nine slots idle. Bytes were
+    /// small; the *work* over them was not, and coalescing cannot see that.
+    ///
+    /// Callers pass the live slot count so the floor tracks the actual
+    /// cluster. This mirrors Spark's `coalescePartitions.parallelismFirst`,
+    /// which shrinks the advisory partition size for the same reason.
+    ///
+    /// The floor is advisory in one direction only: it never *raises* the
+    /// partition count above what the stage already has, because coalescing
+    /// may only merge.
+    #[must_use]
+    pub fn with_min_partitions(mut self, min_partitions: usize) -> Self {
+        self.min_partitions = min_partitions.max(1);
+        self
+    }
+
+    /// Return the configured parallelism floor.
+    pub fn min_partitions(&self) -> usize {
+        self.min_partitions
+    }
+
+    /// Bytes per merged group, shrunk so grouping cannot fall below the floor.
+    ///
+    /// `total_bytes / min_partitions` is the largest group size that still
+    /// leaves `min_partitions` groups. Taking the min with the configured
+    /// target means the floor only ever makes partitions *smaller* — it can
+    /// never inflate them past the size the operator asked for.
+    fn effective_target_bytes(&self, total_bytes: u128) -> u128 {
+        let configured = u128::from(self.target_partition_bytes.max(1));
+        if self.min_partitions <= 1 || total_bytes == 0 {
+            return configured;
+        }
+        let by_parallelism = total_bytes.div_ceil(self.min_partitions as u128).max(1);
+        configured.min(by_parallelism)
     }
 
     /// Compute coalesce advice from per-partition stats, without modifying the plan.
@@ -92,7 +139,17 @@ impl CoalesceRule {
         let mut groups: Vec<Vec<usize>> = Vec::new();
         let mut current_small: Vec<usize> = Vec::new();
         let mut current_small_bytes = 0u128;
-        let target_bytes = u128::from(self.target_partition_bytes.max(1));
+        let total_bytes: u128 = stats
+            .iter()
+            .map(|s| {
+                u128::from(if s.serialized_bytes > 0 {
+                    s.serialized_bytes
+                } else {
+                    s.memory_bytes
+                })
+            })
+            .sum();
+        let target_bytes = self.effective_target_bytes(total_bytes);
 
         for i in order {
             let Some(s) = stats.get(i) else {
@@ -256,5 +313,92 @@ impl AqeRule for CoalesceRule {
                 .with_op(NodeOp::CoalescePartitions { target_partitions }),
         );
         Some(rewritten.with_coalesced_partition_count(target_partitions))
+    }
+}
+
+#[cfg(test)]
+mod parallelism_floor_tests {
+    use super::CoalesceRule;
+    use crate::optimizer::RuntimeStats;
+
+    /// `n` partitions of `bytes` each — the shape a shuffle stage reports.
+    fn stats(n: usize, bytes: u64) -> Vec<RuntimeStats> {
+        (0..n)
+            .map(|_| RuntimeStats {
+                serialized_bytes: bytes,
+                ..RuntimeStats::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn without_a_floor_a_small_stage_collapses_to_one_partition() {
+        // The behaviour being fixed, pinned so the fix is visibly a change:
+        // 18 partitions of 1 MiB is 18 MiB total, under the 128 MiB target,
+        // so byte-only sizing merges the whole stage into a single task.
+        let rule = CoalesceRule::new(64 * 1024 * 1024);
+        let advice = rule.advise(&stats(18, 1024 * 1024));
+        assert_eq!(advice.groups.len(), 1);
+    }
+
+    #[test]
+    fn a_floor_keeps_a_small_stage_spread_across_the_cluster() {
+        let rule = CoalesceRule::new(64 * 1024 * 1024).with_min_partitions(9);
+        let advice = rule.advise(&stats(18, 1024 * 1024));
+        assert_eq!(
+            advice.groups.len(),
+            9,
+            "coalescing must not drop below the cluster's schedulable width",
+        );
+        // Still a real reduction — 18 partitions became 9, not 18.
+        assert!(advice.groups.len() < 18);
+    }
+
+    #[test]
+    fn the_floor_never_invents_partitions_the_stage_does_not_have() {
+        // Four partitions on a nine-slot cluster stay four: coalescing merges,
+        // it cannot split. Asking for nine groups from four inputs would be a
+        // different rule (skew splitting), and silently producing empty groups
+        // would hand the scheduler tasks with no work.
+        let rule = CoalesceRule::new(64 * 1024 * 1024).with_min_partitions(9);
+        let advice = rule.advise(&stats(4, 1024 * 1024));
+        assert!(advice.groups.len() <= 4);
+        assert!(advice.groups.iter().all(|g| !g.is_empty()));
+    }
+
+    #[test]
+    fn the_floor_only_shrinks_partitions_never_grows_them() {
+        // A stage already larger than the target must not have its partitions
+        // inflated past `target_partition_bytes` just because the floor is
+        // low: total/min_partitions could otherwise exceed the target.
+        let rule = CoalesceRule::new(64 * 1024 * 1024)
+            .with_target_partition_bytes(8 * 1024 * 1024)
+            .with_min_partitions(2);
+        // 16 x 4 MiB = 64 MiB total; total/2 = 32 MiB > the 8 MiB target.
+        let advice = rule.advise(&stats(16, 4 * 1024 * 1024));
+        // Groups are capped by the 8 MiB target (2 partitions each), not by
+        // the 32 MiB the floor alone would allow.
+        assert_eq!(advice.groups.len(), 8);
+    }
+
+    #[test]
+    fn a_floor_of_one_is_exactly_the_old_behaviour() {
+        let stats = stats(18, 1024 * 1024);
+        let plain = CoalesceRule::new(64 * 1024 * 1024);
+        let floored = CoalesceRule::new(64 * 1024 * 1024).with_min_partitions(1);
+        assert_eq!(plain.advise(&stats), floored.advise(&stats));
+    }
+
+    #[test]
+    fn every_input_partition_survives_grouping() {
+        // Whatever the floor, coalescing is a partition of the index set:
+        // losing an index loses that partition's rows.
+        for floor in [1usize, 3, 9, 64] {
+            let rule = CoalesceRule::new(64 * 1024 * 1024).with_min_partitions(floor);
+            let advice = rule.advise(&stats(18, 1024 * 1024));
+            let mut seen: Vec<usize> = advice.groups.iter().flatten().copied().collect();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..18).collect::<Vec<_>>(), "floor={floor}");
+        }
     }
 }

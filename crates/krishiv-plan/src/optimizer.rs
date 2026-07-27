@@ -635,6 +635,19 @@ pub fn default_logical_optimizer() -> Optimizer {
 /// Rules that require runtime statistics will be no-ops until stats feed
 /// is wired (see `AqeOptimizer::apply`).
 pub fn default_aqe_optimizer() -> AqeOptimizer {
+    default_aqe_optimizer_with_parallelism(1)
+}
+
+/// [`default_aqe_optimizer`] whose coalescing will not drop a stage below
+/// `min_partitions` partitions.
+///
+/// Pass the cluster's live schedulable slot count. Coalescing sized purely by
+/// bytes will happily reduce a stage to one partition — and therefore one task
+/// on one core — whenever its whole output fits in one target-sized partition,
+/// no matter how much CPU the rows cost to produce. TPC-H q2 at SF100 hit this
+/// on four of its eleven stages and took 24 minutes on a nine-slot cluster
+/// that was one-ninth busy. See [`CoalesceRule::with_min_partitions`].
+pub fn default_aqe_optimizer_with_parallelism(min_partitions: usize) -> AqeOptimizer {
     let mut optimizer = AqeOptimizer::new();
     // 1. Promote/demote broadcast joins from observed sizes before bucket
     //    counts are re-derived, so AutoPartitionRule sees the final exchange
@@ -644,7 +657,9 @@ pub fn default_aqe_optimizer() -> AqeOptimizer {
         DEFAULT_MAX_BROADCAST_BYTES,
     )));
     optimizer.add_guarded_rule(Box::new(AutoPartitionRule::new(64)));
-    optimizer.add_guarded_rule(Box::new(CoalesceRule::new(64 * 1024 * 1024)));
+    optimizer.add_guarded_rule(Box::new(
+        CoalesceRule::new(64 * 1024 * 1024).with_min_partitions(min_partitions),
+    ));
     // Skew-join salting runs last so it sees the final partition shape.
     optimizer.add_guarded_rule(Box::new(SkewJoinRule::with_default_factor(
         DEFAULT_SKEW_THRESHOLD,
@@ -657,7 +672,16 @@ pub fn default_aqe_optimizer() -> AqeOptimizer {
 /// stats collected by `ANALYZE TABLE` / Iceberg auto-stats instead of the
 /// static per-operator coefficients.
 pub fn default_aqe_optimizer_with_stats() -> AqeOptimizer {
-    default_aqe_optimizer().with_cost_model(std::sync::Arc::new(CboCostModel {
-        registry: stats::global_table_stats().clone(),
-    }))
+    default_aqe_optimizer_with_stats_and_parallelism(1)
+}
+
+/// [`default_aqe_optimizer_with_stats`] with a coalescing parallelism floor.
+///
+/// See [`default_aqe_optimizer_with_parallelism`].
+pub fn default_aqe_optimizer_with_stats_and_parallelism(min_partitions: usize) -> AqeOptimizer {
+    default_aqe_optimizer_with_parallelism(min_partitions).with_cost_model(std::sync::Arc::new(
+        CboCostModel {
+            registry: stats::global_table_stats().clone(),
+        },
+    ))
 }

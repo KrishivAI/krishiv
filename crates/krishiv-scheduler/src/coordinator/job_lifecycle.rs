@@ -702,7 +702,16 @@ impl Coordinator {
                     && !stats.is_empty()
                     && stats.iter().any(|s| s.serialized_bytes > 0)
                 {
-                    let aqe = krishiv_plan::optimizer::default_aqe_optimizer_with_stats();
+                    // Coalescing must not shrink a stage below the cluster's
+                    // schedulable width, or a stage whose bytes fit one target
+                    // partition runs as one task while every other slot idles
+                    // (q2/SF100: four stages coalesced to 1, 24 min on a
+                    // nine-slot cluster). Slots are read live, so the floor
+                    // tracks executors joining and leaving.
+                    let aqe =
+                        krishiv_plan::optimizer::default_aqe_optimizer_with_stats_and_parallelism(
+                            self.total_schedulable_slots().max(1),
+                        );
                     // T1: synthesize a minimal physical plan from the stats
                     // so the AQE rules have at least one node to rewrite.
                     // The scheduler doesn't preserve the original physical
@@ -1137,7 +1146,9 @@ impl Coordinator {
         job_id: JobId,
         plan: &PhysicalPlan,
     ) -> SchedulerResult<SubmitOutcome> {
-        let aqe = krishiv_plan::optimizer::default_aqe_optimizer_with_stats();
+        let aqe = krishiv_plan::optimizer::default_aqe_optimizer_with_stats_and_parallelism(
+            self.total_schedulable_slots().max(1),
+        );
         let (optimized, _applied) = aqe.apply(plan.clone(), &[])?;
         self.submit_job(job_spec_from_physical_plan(job_id, &optimized)?)
     }
