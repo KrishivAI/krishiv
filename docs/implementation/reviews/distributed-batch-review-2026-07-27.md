@@ -742,3 +742,49 @@ written at `tracing::debug!`. Executors run `RUST_LOG=info`. The diagnostic
 added specifically to debug this was invisible in the only environment that
 had the bug. Diagnostics for production failures belong at the level
 production runs.
+
+### D9 correction — the q17 schema disagreement is at the plan-encoding boundary
+
+The uniform-schema change (`a7b7db2e`) did **not** fix q17: it failed again
+with the identical `Decimal128(15, 2)` vs `Decimal128(30, 15)` message. That
+disproves the drain-labelling hypothesis. The change is still correct on its
+own terms — a stage must not publish two schemas — but it was aimed a layer
+too low.
+
+The actual divergence: `ShuffleReadExec` (`distributed_plan.rs:1082`) carries
+a `schema: SchemaRef` **baked into the encoded fragment at coordinator
+planning time**, while its batches come from whatever the map task produced.
+For `avg(l_quantity)` those disagree. The likely mechanism is the proto
+round-trip: `datafusion-proto` re-resolves aggregate UDFs by name on decode,
+and a decimal `avg` re-resolved on the executor can coerce to a different
+return type than the coordinator's plan declared.
+
+Fixing it properly means one of:
+1. the read side adopts the schema the shuffle stream actually carries rather
+   than the encoded one (cheap, and consistent with "the bytes are the
+   truth"); or
+2. the codec round-trips the aggregate's resolved return type so the decoded
+   plan cannot disagree with the encoder (correct, larger).
+
+Not attempted this session. Tracked so the next attempt starts from the
+evidence rather than re-deriving it.
+
+### D8 — evidence the CollectLeft fix works, and what it exposed next
+
+Live on `fast-99ff3d23`, executors logged real conversions for the first
+time: `build_bytes: 911471322, threshold: 250000000, mode: CollectLeft,
+join_type: Inner`. Before, the rule had converted zero joins ever.
+
+Converting then hit a second DataFusion asymmetry: `HashJoinExec` has a
+built-in projection (`pub projection: Option<ProjectionRef>`) and
+`SortMergeJoinExec` does not — its source carries a TODO to that effect. So
+a converted join silently widened back to the full left++right schema and
+broke the *parent* join's positional `on`:
+
+  q7/q8/q9: Missing on the right: {Column { name: "o_custkey", index: 3 }}
+  q18:      Input field name o_totalprice does not match with the
+            projection expression o_orderdate
+
+Fixed in `b443c309` by rebuilding the projection over the converted join.
+The rule also can no longer fail a plan: an optimisation performed for memory
+reasons must never be why a query dies.
