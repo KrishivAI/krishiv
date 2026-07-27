@@ -360,3 +360,73 @@ Sequenced so that each batch is independently verifiable and no fix multiplies a
 17. **D1** — coordinator-mediated runtime filters for q8/q9. Large; do it last and behind a flag, with the dual-run corpus comparison as the correctness gate — and note that the dual-run switch only became meaningful at step 10.
 
 **Deliberately not scheduled:** B5 (ESS / push-shuffle — confirmed unreachable), A9 (inert lease tokens — document instead), D6 (plan duplication — real but not on any critical path).
+
+---
+
+## Addendum 2026-07-27 — the storage substrate invalidates every timing in this document
+
+Measured after the register was written, on the same 3-node cluster the
+sweep runs on:
+
+| path | storageclass | measured (`dd`, `iflag/oflag=direct`) |
+|---|---|---|
+| `minio-0` `/data` — **the sweep's data source** | **longhorn** | **2.4 MB/s read · 2.9 MB/s write** |
+| `minio-bench-s1` `/data` | local-path | 325 MB/s write |
+| `minio-bench-s3` `/data` | local-path | 298 MB/s write |
+
+The Longhorn volume reported `robustness: healthy` and `rebuildStatus:
+null` at the time — this is steady state, not a rebuild artifact. There was
+concurrent mirror read load, so the idle figure is somewhat better; the
+order of magnitude is the finding.
+
+`minio-0` serves every executor scan, and its read path is
+executor → S3 API over the pod network → MinIO → **Longhorn engine →
+network → replica on another node**. Two network hops per byte, through a
+replicated block device chosen for durability, over three separate VPS
+hosts.
+
+### What this invalidates
+
+Every **elapsed-time** number cited anywhere in this register or in the
+sweep records is dominated by storage I/O, not by the engine. 39 GiB at
+single-digit MB/s is hours of pure I/O before any operator runs. Concretely:
+
+- "q17: 221 s of a 252 s query" (D4) and "88 % of all compute" — the
+  *proportion* survives (it came from operator-level accounting) but the
+  absolute sizing does not.
+- D1's "the single biggest sweep-time win" — the 600 M-row shuffle is a
+  real ~2 GiB/task of network traffic and remains a genuine bottleneck,
+  but its rank was inflated by a storage-bound baseline.
+- D5's "3.6 s of serial latency per reduce partition" — noise against a
+  1000 s query, material against the ~10x faster query this becomes.
+
+### What this does **not** invalidate
+
+Lenses A, B and C in full, and the *structural* claims of Lens D. None of
+those were derived from a stopwatch: they are statements about what the
+code does — an unregistered optimizer rule, a budget counted per job, a
+partition that reads as empty, a `.flatten()` that is sequential by
+construction. A faster disk changes none of them.
+
+### Revised Batch 4 order
+
+Storage was the binding constraint, so the *next* constraint has never been
+observed. On first principles it is CPU, which promotes **D2**:
+
+14. **D2** — intra-task parallelism (was 16). A `dist-s4` task is
+    single-threaded by construction; with a 100x faster scan feeding it,
+    one core per 33 M-row task becomes the binding limit. Fix A
+    (`flatten_unordered(k)`, map stages only) is *small* and should be
+    measured first.
+15. **B2** — streaming shuffle reads (prerequisite for 16).
+16. **D5** — bounded byte-aware prefetch.
+17. **D1** — coordinator-mediated runtime filters. Unchanged position:
+    still large, still last, still behind a flag.
+
+### Standing rule this establishes
+
+**No performance conclusion may be drawn from a cluster sweep until the
+dataset is on local-path storage and the run is re-baselined.** The
+regression budgets in Phase 66 must be rebuilt on that baseline; the
+existing SF100 history is a record of Longhorn's throughput and should be
+labelled as such rather than deleted.
