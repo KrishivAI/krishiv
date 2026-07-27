@@ -164,29 +164,54 @@ pub fn stage_split_enabled() -> bool {
 /// hash exchanges — which the builder cuts into shuffle boundaries — are
 /// allowed into the plan.
 pub fn planning_session_context(target_partitions: usize) -> SessionContext {
-    let mut config = SessionConfig::new().with_target_partitions(target_partitions.max(1));
+    // A6: this was `SessionConfig::new()` — a bare DataFusion config carrying
+    // none of the engine's settings, so `KRISHIV_RUNTIME_FILTERS` was a no-op
+    // distributed, the SQL dialect differed from the one the query was written
+    // against, and the batch size was DataFusion's rather than the engine's.
+    // Sharing `build_single_node_session_config` is what makes the staged plan
+    // the same plan the engine would have produced.
+    let tp = std::num::NonZeroUsize::new(target_partitions.max(1))
+        .unwrap_or(std::num::NonZeroUsize::MIN);
+    let mut config = crate::build_single_node_session_config(tp, None);
+    // The one deliberate divergence, and the reason this cannot simply call a
+    // SqlEngine constructor: a RoundRobinBatch exchange left inside a stage
+    // subtree would make every task of that stage re-execute all input
+    // partitions. Only hash exchanges — which the builder cuts into shuffle
+    // boundaries — may enter a staged plan.
     config
         .options_mut()
         .optimizer
         .enable_round_robin_repartition = false;
+
+    // A6: the rules. `planning_session_context` is where every distributed
+    // query is planned, and it carried no engine rules at all — so
+    // `SpillableJoinSelection` (q18), the semi-join reductions (q17) and
+    // `CooperativeAmplifiers` (distributed cancel) were dead on exactly the
+    // path being benchmarked. See `crate::with_krishiv_optimizer_rules`.
+    let state_builder = crate::with_krishiv_optimizer_rules(
+        datafusion::execution::session_state::SessionStateBuilder::new().with_default_features(),
+    )
+    .with_config(config);
+
     // Object-store tables must be plannable here: if schema inference fails,
     // the caller reads that as "decline to stage" and the query silently runs
     // as a single task on one executor.
-    match datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+    let state_builder = match datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
         .with_object_store_registry(Arc::new(
             crate::object_store_registry::LazyCloudObjectStoreRegistry::new(),
         ))
         .build_arc()
     {
-        Ok(runtime) => SessionContext::new_with_config_rt(config, runtime),
+        Ok(runtime) => state_builder.with_runtime_env(runtime),
         // A runtime that will not build is not worth failing planning over —
         // the default one still plans local paths, and object-store tables
         // fall back to the single-task path as they did before.
         Err(error) => {
             tracing::warn!(%error, "cloud object-store registry unavailable for staged planning");
-            SessionContext::new_with_config(config)
+            state_builder
         }
-    }
+    };
+    SessionContext::new_with_state(state_builder.build())
 }
 
 /// Shuffle-store sub-stage key for one map task's output.
@@ -1413,7 +1438,6 @@ mod tests {
     /// documents the gap in a form that turns green the moment it lands rather
     /// than in prose that can rot.
     #[test]
-    #[ignore = "A6: staging context lacks engine rules — Batch 3"]
     fn the_staging_context_carries_the_engines_optimizer_rules() {
         let engine = crate::SqlEngine::new_with_engine_memory(crate::EngineMemory::Unbounded);
         let (engine_logical, engine_physical) = optimizer_rule_names(engine.session_context());

@@ -646,7 +646,64 @@ const MIN_SORT_SPILL_RESERVATION_BYTES: usize = 64 * 1024;
 /// failing outright because the reservation itself doesn't fit. Pools at or
 /// above `4 * DEFAULT_SORT_SPILL_RESERVATION_BYTES` (40MB) are unaffected —
 /// this only kicks in for genuinely memory-constrained deployments.
-fn build_single_node_session_config(
+/// Install Krishiv's optimizer rules on a session-state builder.
+///
+/// **A6 (review 2026-07-27).** These rules used to be written out at each
+/// construction site, with a comment at one of them warning that "a rule
+/// installed on only one of them is indistinguishable from a rule that works
+/// until you hit the other path". That warning was correct and the drift
+/// happened anyway: there is a *third* site — `planning_session_context`, the
+/// context the coordinator plans **every distributed query** on — and it
+/// carried none of these. The consequence was that two shipped performance
+/// fixes did not apply to the path being benchmarked:
+///
+/// - `SpillableJoinSelection` is what lets q18's oversized hash-join build
+///   side become a spillable sort-merge join. Unregistered, q18 fails with
+///   `Resources exhausted: HashJoinInput` on every distributed run.
+/// - `SemiJoinReductionThroughAggregate` is 88 % of q17's runtime.
+/// - `CooperativeAmplifiers` is what lets distributed cancellation preempt an
+///   amplifying operator at all.
+///
+/// Registering them in one place is the actual fix: a new construction site
+/// now has to *opt out* to be wrong, and `SessionStateBuilder` is consumed and
+/// returned so this composes into an existing chain.
+///
+/// Note on `SpillableJoinSelection::from_capacity()`: it reads the *calling
+/// process's* cgroup. On an executor that is right; on the coordinator it
+/// describes the coordinator, not the executors the plan will run on. The
+/// threshold is overridable via `KRISHIV_SPILL_JOIN_BUILD_BYTES`, which is the
+/// supported way to make coordinator-side planning use the executor's real
+/// per-task share until the capacity is plumbed through the stage builder.
+#[must_use]
+pub fn with_krishiv_optimizer_rules(
+    builder: datafusion::execution::session_state::SessionStateBuilder,
+) -> datafusion::execution::session_state::SessionStateBuilder {
+    builder
+        .with_physical_optimizer_rule(std::sync::Arc::new(
+            crate::coop_amplifiers::CooperativeAmplifiers::new(),
+        ))
+        // q18: a hash-join build side that exceeds the per-task memory share
+        // fails under a cgroup cap because hash join cannot spill. This rule
+        // converts exactly those joins — known-large build sides only — to
+        // sort-merge, which can. See `spillable_join` for why this is per-join
+        // and not a session config bit.
+        .with_physical_optimizer_rule(std::sync::Arc::new(
+            crate::spillable_join::SpillableJoinSelection::from_capacity(),
+        ))
+        // Aggregates joined on their own grouping key only need the groups the
+        // join keeps; see `semi_join_reduction`.
+        .with_optimizer_rule(std::sync::Arc::new(
+            crate::semi_join_reduction::SemiJoinReductionThroughAggregate,
+        ))
+        // q18: a decorrelated IN-subquery semi-join lands at the top of the
+        // plan, so the most selective predicate runs after the joins it should
+        // have shrunk. Push it into the join input instead.
+        .with_optimizer_rule(std::sync::Arc::new(
+            crate::semi_join_reduction::SemiJoinPushdownThroughInnerJoin,
+        ))
+}
+
+pub(crate) fn build_single_node_session_config(
     target_partitions: NonZeroUsize,
     memory_limit_bytes: Option<usize>,
 ) -> datafusion::prelude::SessionConfig {
@@ -1042,38 +1099,14 @@ impl SqlEngine {
         let streaming_sources: Arc<RwLock<std::collections::HashSet<String>>> =
             Arc::new(RwLock::new(std::collections::HashSet::new()));
 
-        let mut state_builder = datafusion::execution::session_state::SessionStateBuilder::new()
-            .with_default_features()
-            .with_physical_optimizer_rule(std::sync::Arc::new(
-                crate::coop_amplifiers::CooperativeAmplifiers::new(),
-            ))
-            // q18: a hash-join build side that exceeds the per-task memory
-            // share fails under a cgroup cap because hash join cannot spill.
-            // This rule converts exactly those joins — known-large build
-            // sides only — to sort-merge, which can. See `spillable_join`
-            // for why this is per-join and not a session config bit.
-            .with_physical_optimizer_rule(std::sync::Arc::new(
-                crate::spillable_join::SpillableJoinSelection::from_capacity(),
-            ))
-            // Aggregates joined on their own grouping key only need the groups
-            // the join keeps; see `semi_join_reduction`. Registered on every
-            // session-construction site in this file — `build_absolute_minimal`
-            // has the same line, and a rule installed on only one of them is
-            // indistinguishable from a rule that works until you hit the other
-            // path.
-            .with_optimizer_rule(std::sync::Arc::new(
-                crate::semi_join_reduction::SemiJoinReductionThroughAggregate,
-            ))
-            // q18: a decorrelated IN-subquery semi-join lands at the top of the
-            // plan, so the most selective predicate runs after the joins it
-            // should have shrunk. Push it into the join input instead.
-            .with_optimizer_rule(std::sync::Arc::new(
-                crate::semi_join_reduction::SemiJoinPushdownThroughInnerJoin,
-            ))
-            .with_config(build_single_node_session_config(
-                target_partitions,
-                memory_limit_bytes,
-            ));
+        let mut state_builder = with_krishiv_optimizer_rules(
+            datafusion::execution::session_state::SessionStateBuilder::new()
+                .with_default_features(),
+        )
+        .with_config(build_single_node_session_config(
+            target_partitions,
+            memory_limit_bytes,
+        ));
         {
             // The lazy registry is installed unconditionally, not only when a
             // memory limit is configured. An executor decoding a `dfplan:`
@@ -1174,33 +1207,12 @@ impl SqlEngine {
     fn build_absolute_minimal(target_partitions: NonZeroUsize) -> Self {
         let streaming_sources: Arc<RwLock<std::collections::HashSet<String>>> =
             Arc::new(RwLock::new(std::collections::HashSet::new()));
-        let mut state = datafusion::execution::session_state::SessionStateBuilder::new()
-            .with_default_features()
-            .with_physical_optimizer_rule(std::sync::Arc::new(
-                crate::coop_amplifiers::CooperativeAmplifiers::new(),
-            ))
-            // q18: a hash-join build side that exceeds the per-task memory
-            // share fails under a cgroup cap because hash join cannot spill.
-            // This rule converts exactly those joins — known-large build
-            // sides only — to sort-merge, which can. See `spillable_join`
-            // for why this is per-join and not a session config bit.
-            .with_physical_optimizer_rule(std::sync::Arc::new(
-                crate::spillable_join::SpillableJoinSelection::from_capacity(),
-            ))
-            // Same rule as the main constructor above — this fallback path
-            // plans real queries too, so omitting it here would make the
-            // optimization depend on which constructor happened to run.
-            .with_optimizer_rule(std::sync::Arc::new(
-                crate::semi_join_reduction::SemiJoinReductionThroughAggregate,
-            ))
-            // q18: a decorrelated IN-subquery semi-join lands at the top of the
-            // plan, so the most selective predicate runs after the joins it
-            // should have shrunk. Push it into the join input instead.
-            .with_optimizer_rule(std::sync::Arc::new(
-                crate::semi_join_reduction::SemiJoinPushdownThroughInnerJoin,
-            ))
-            .with_config(build_single_node_session_config(target_partitions, None))
-            .build();
+        let mut state = with_krishiv_optimizer_rules(
+            datafusion::execution::session_state::SessionStateBuilder::new()
+                .with_default_features(),
+        )
+        .with_config(build_single_node_session_config(target_partitions, None))
+        .build();
         crate::connector_table::register_connector_table_factories(
             state.table_factories_mut(),
             streaming_sources.clone(),
