@@ -385,6 +385,36 @@ pub fn parse_dfplan_body(body: &str) -> SqlResult<(DfplanTaskSpec, Vec<u8>)> {
     Ok((spec, bytes))
 }
 
+/// Prove that encoded fragment bytes can be decoded again.
+///
+/// This existed once before (b278d67b) and was reverted: the first version
+/// verified against a bare `SessionContext::new()`, whose runtime has no
+/// object-store registry, so every fragment scanning `s3://` failed the check
+/// and *silently fell back to single-task* — q1 ran as 1 task instead of 13
+/// and took 595 s instead of 156 s. The commit message claimed "anything
+/// needing session state to decode would fail on the executor too", which was
+/// exactly backwards: the executor's runtime has `LazyCloudObjectStoreRegistry`
+/// installed, and the throwaway context did not.
+///
+/// So the verification context must mirror the executor's decode environment.
+/// [`planning_session_context`] builds precisely that — the same lazy cloud
+/// registry the executor runtime carries — which makes this a genuine
+/// rehearsal of the executor's decode instead of a stricter parody of it.
+///
+/// What it is for: TPC-H q22 encodes cleanly and dies on the executor with
+/// "ScalarSubqueryExpr can only be deserialized as part of a surrounding
+/// ScalarSubqueryExec" — a real encode/decode asymmetry in datafusion-proto.
+/// Catching it here converts a remote failure minutes in to an instant local
+/// fallback.
+fn verify_dfplan_roundtrip(bytes: &[u8], codec: &dyn PhysicalExtensionCodec) -> SqlResult<()> {
+    let ctx = planning_session_context(1).task_ctx();
+    datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec(bytes, &ctx, codec)
+        .map(|_| ())
+        .map_err(|e| SqlError::DataFusion {
+            message: format!("physical plan proto decode: {e}"),
+        })
+}
+
 /// Decode a `dfplan:v1:` fragment body into (partition spec, plan).
 ///
 /// `ctx` supplies the runtime environment (object stores, UDFs) the decoded
@@ -1077,6 +1107,18 @@ pub fn build_distributed_stages(
                 return Ok(None);
             }
         };
+        // Encoding successfully is not the same as being shippable — q22's
+        // fragments encode and then fail to decode on the executor. Rehearse
+        // the decode locally (same codec, same object-store registry as the
+        // executor's runtime) so an encode/decode asymmetry degrades to
+        // correct-but-serial execution instead of a remote fragment failure.
+        if let Err(error) = verify_dfplan_roundtrip(&bytes, &codec) {
+            tracing::debug!(
+                %error,
+                "stage plan encodes but does not decode; falling back to single-task"
+            );
+            return Ok(None);
+        }
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let task_bodies = (0..partition_count)
             .map(|p| dfplan_task_body(&b64, p))
@@ -1256,6 +1298,59 @@ mod tests {
     /// resolve the bucket; installing `LazyCloudObjectStoreRegistry` on the
     /// planning context made that precondition false, so the assertion, not
     /// the behavior, was wrong.
+    ///
+    /// The round-trip guard must reject bytes that do not decode — feeding it
+    /// garbage proves it inspects them rather than returning Ok
+    /// unconditionally.
+    #[test]
+    fn the_roundtrip_guard_rejects_bytes_that_do_not_decode() {
+        let codec = DefaultPhysicalExtensionCodec {};
+        let err = verify_dfplan_roundtrip(b"not a physical plan proto", &codec)
+            .expect_err("undecodable bytes must be rejected");
+        assert!(format!("{err}").contains("decode"), "got: {err}");
+    }
+
+    /// The regression that got the first guard reverted: it verified against a
+    /// bare context with no object-store registry, so every s3-scanning
+    /// fragment failed the check and silently fell back to single-task (q1:
+    /// 13 tasks -> 1 task, 156 s -> 595 s). The verify context must resolve
+    /// object stores exactly like the executor's runtime — this asserts the
+    /// capability delta that broke, without needing a network round trip
+    /// (constructing a lazy store does not contact the endpoint).
+    #[test]
+    fn the_verify_context_resolves_object_stores_like_the_executor() {
+        use datafusion::execution::object_store::ObjectStoreUrl;
+        let url = ObjectStoreUrl::parse("s3://roundtrip-bucket").expect("url");
+
+        // A bare context cannot resolve the bucket — the first guard's bug.
+        assert!(
+            SessionContext::new().runtime_env().object_store(url.clone()).is_err(),
+            "precondition: a bare context must NOT resolve s3, or this test proves nothing"
+        );
+
+        // The context the guard actually uses must.
+        planning_session_context(1)
+            .task_ctx()
+            .runtime_env()
+            .object_store(url)
+            .expect("the verify context must resolve s3 buckets like the executor runtime");
+    }
+
+    /// And it must not reject ordinary plans, or every query silently loses
+    /// distribution — the worse failure of the two.
+    #[tokio::test]
+    async fn the_roundtrip_guard_accepts_an_ordinary_plan() {
+        let ctx = SessionContext::new();
+        ctx.sql("CREATE TABLE t AS VALUES (1, 'a'), (2, 'b')")
+            .await.unwrap().collect().await.unwrap();
+        let plan = ctx
+            .sql("SELECT column1 FROM t WHERE column1 > 1")
+            .await.unwrap().create_physical_plan().await.unwrap();
+        let codec = DefaultPhysicalExtensionCodec {};
+        let bytes = encode_dfplan_bytes(plan, &codec).expect("encode");
+        verify_dfplan_roundtrip(&bytes, &codec).expect("ordinary plans must pass");
+    }
+
     #[tokio::test]
     async fn s3_paths_resolve_on_the_planning_context_and_explicit_registration_wins() {
         // No environment setup: `build_s3_object_store` defaults the region and

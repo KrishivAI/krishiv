@@ -800,6 +800,16 @@ pub static FLAGS: &[FlagSpec] = &[
         "DataFusion dynamic (runtime) filters: TopK / join / aggregate predicates pushed into probe-side file scans at execution time (Phase 54). `off` disables all three via the DataFusion master switch.",
     ),
     rt(
+        "KRISHIV_SPILL_JOIN_BUILD_BYTES",
+        FlagKind::UInt,
+        "50% of the per-task memory share (disabled when uncapped)",
+        "Hash-join build sides with a KNOWN size estimate above this many bytes \
+         are planned as sort-merge joins, which can spill, instead of hash \
+         joins, which cannot (TPC-H q18: 'Resources exhausted ... \
+         HashJoinInput[0] ... 732.4 MB'). Unknown estimates and uncapped \
+         engines keep hash join.",
+    ),
+    rt(
         "KRISHIV_SHUFFLE_PAGE_CACHE_BYTES",
         FlagKind::UInt,
         "12.5% of the cgroup limit (512 MiB uncontained)",

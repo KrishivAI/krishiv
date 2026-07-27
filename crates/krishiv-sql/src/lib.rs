@@ -112,6 +112,7 @@ pub mod python_udf;
 pub mod recursive_cte;
 pub mod scalar_udf;
 pub mod semi_join_reduction;
+pub mod spillable_join;
 /// Spark SQL extensions: LATERAL VIEW, TABLESAMPLE, TRANSFORM, DESCRIBE EXTENDED, etc.
 pub mod spark_sql_ext;
 pub mod sqlstate;
@@ -1038,6 +1039,14 @@ impl SqlEngine {
             .with_physical_optimizer_rule(std::sync::Arc::new(
                 crate::coop_amplifiers::CooperativeAmplifiers::new(),
             ))
+            // q18: a hash-join build side that exceeds the per-task memory
+            // share fails under a cgroup cap because hash join cannot spill.
+            // This rule converts exactly those joins — known-large build
+            // sides only — to sort-merge, which can. See `spillable_join`
+            // for why this is per-join and not a session config bit.
+            .with_physical_optimizer_rule(std::sync::Arc::new(
+                crate::spillable_join::SpillableJoinSelection::from_capacity(),
+            ))
             // Aggregates joined on their own grouping key only need the groups
             // the join keeps; see `semi_join_reduction`. Registered on every
             // session-construction site in this file — `build_absolute_minimal`
@@ -1161,6 +1170,14 @@ impl SqlEngine {
             .with_default_features()
             .with_physical_optimizer_rule(std::sync::Arc::new(
                 crate::coop_amplifiers::CooperativeAmplifiers::new(),
+            ))
+            // q18: a hash-join build side that exceeds the per-task memory
+            // share fails under a cgroup cap because hash join cannot spill.
+            // This rule converts exactly those joins — known-large build
+            // sides only — to sort-merge, which can. See `spillable_join`
+            // for why this is per-join and not a session config bit.
+            .with_physical_optimizer_rule(std::sync::Arc::new(
+                crate::spillable_join::SpillableJoinSelection::from_capacity(),
             ))
             // Same rule as the main constructor above — this fallback path
             // plans real queries too, so omitting it here would make the
