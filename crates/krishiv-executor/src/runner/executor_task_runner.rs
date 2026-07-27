@@ -814,14 +814,27 @@ impl ExecutorTaskRunner {
         let is_continuous_cycle = fragment_body.starts_with("stream:loop:");
         let is_run_loop = fragment_body.starts_with(crate::fragment::run_loop::STREAM_RLOOP_PREFIX);
 
+        // B6 (review 2026-07-27): `assignment.memory_limit_bytes()` is populated
+        // ONLY from a JobSpec namespace quota. Batch queries set none, so on
+        // every sweep this resolved to `None` — meaning each UDF ran with no
+        // memory cap and every `MemoryBudget` consumer was `unlimited()`. That
+        // is the exact trap behind 9e762878: "the code that would have reported
+        // the overflow was disarmed on exactly the deployment that overflowed".
+        //
+        // The executor knows its own real per-slot share, so fall back to it
+        // rather than to "unlimited". A namespace quota, when present, still
+        // wins — it is a deliberate policy ceiling and may be lower.
+        let task_memory_limit = assignment.memory_limit_bytes().or_else(|| {
+            krishiv_common::executor_capacity::ExecutorCapacity::detect_cached()
+                .min_task_memory_share_bytes()
+        });
         // Build resource limits from assignment (propagated from job spec).
         let udf_limits = krishiv_plan::udf::ResourceLimits {
-            max_memory_bytes: assignment.memory_limit_bytes(),
+            max_memory_bytes: task_memory_limit,
             max_execution_time_ms: assignment.cpu_limit_nanos().map(|n| n / 1_000_000),
         };
         // Shared memory budget for all operators within this task.
-        let memory_budget =
-            krishiv_common::MemoryBudget::from_limit(assignment.memory_limit_bytes());
+        let memory_budget = krishiv_common::MemoryBudget::from_limit(task_memory_limit);
 
         let execute_result = match model {
             crate::ExecutionModel::Batch => {

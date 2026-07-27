@@ -800,6 +800,20 @@ pub static FLAGS: &[FlagSpec] = &[
         "DataFusion dynamic (runtime) filters: TopK / join / aggregate predicates pushed into probe-side file scans at execution time (Phase 54). `off` disables all three via the DataFusion master switch.",
     ),
     rt(
+        "KRISHIV_BROADCAST_JOIN_BYTES",
+        FlagKind::UInt,
+        "33554432 (32 MiB), staged path only",
+        "Build-side byte ceiling under which a join is BROADCAST rather than \
+         hash-shuffled, on the distributed staged path only (embedded keeps \
+         DataFusion's 1 MiB default, which is right for a single process where \
+         a shuffle is a memcpy). Here a shuffle is the pod network, measured at \
+         ~11 MiB/s across separate hosts: TPC-H q8/q9 hash-partition the raw \
+         600M-row lineitem scan — ~36 GiB on the wire — because the filtered \
+         dimension side lands just over 1 MiB and so is not eligible to \
+         broadcast. Bounded by the per-task memory share, since the build side \
+         is collected per task.",
+    ),
+    rt(
         "KRISHIV_SPILL_JOIN_BUILD_BYTES",
         FlagKind::UInt,
         "50% of the per-task memory share (disabled when uncapped)",

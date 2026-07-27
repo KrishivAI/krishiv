@@ -233,6 +233,23 @@ impl ExecutorCapacity {
     /// `memory.limit_in_bytes`), so a container gets its container's capacity
     /// with no operator input. Outside a container both fall back to the
     /// machine, which is the correct answer there too.
+    /// [`Self::detect`], computed once per process.
+    ///
+    /// Capacity is a property of the container, not of the moment: cgroup
+    /// limits and core counts do not change while the process runs. `detect`
+    /// re-reads cgroup files and six environment variables on every call, and
+    /// it sits on paths that run per task and per query — so this is both
+    /// wasted syscalls and, more importantly, a door for two tasks sharing one
+    /// process to disagree about the capacity they are dividing between them.
+    ///
+    /// Tests that need to vary the inputs call [`Self::derive`] directly, which
+    /// is why this caches rather than `detect` itself.
+    #[must_use]
+    pub fn detect_cached() -> Self {
+        static CACHED: std::sync::OnceLock<ExecutorCapacity> = std::sync::OnceLock::new();
+        CACHED.get_or_init(Self::detect).clone()
+    }
+
     #[must_use]
     pub fn detect() -> Self {
         Self::derive(

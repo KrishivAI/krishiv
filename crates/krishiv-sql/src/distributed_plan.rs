@@ -51,7 +51,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties as _, Partitioning,
     PlanProperties, SendableRecordBatchStream,
 };
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::SessionContext;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use futures::{StreamExt as _, TryStreamExt as _};
 
@@ -68,6 +68,11 @@ pub const STAGE_TARGET_PARTITIONS_ENV: &str = "KRISHIV_STAGE_TARGET_PARTITIONS";
 
 /// Env var that disables stage splitting entirely (`off`/`0`/`false`).
 pub const STAGE_SPLIT_ENV: &str = "KRISHIV_STAGE_SPLIT";
+
+/// Build-side byte ceiling under which a join is broadcast rather than
+/// hash-shuffled, on the **staged** path only. See `planning_session_context`
+/// for why the distributed default differs from DataFusion's.
+pub const BROADCAST_JOIN_BYTES_ENV: &str = "KRISHIV_BROADCAST_JOIN_BYTES";
 
 /// How many tasks to create per available slot.
 ///
@@ -182,6 +187,30 @@ pub fn planning_session_context(target_partitions: usize) -> SessionContext {
         .options_mut()
         .optimizer
         .enable_round_robin_repartition = false;
+
+    // D1 interim (review 2026-07-27): broadcast a small build side instead of
+    // hash-shuffling both sides of the join.
+    //
+    // DataFusion's defaults are 1 MiB / 128k rows, tuned for a single process
+    // where a shuffle is a memcpy. Here a shuffle is the pod network, measured
+    // at ~11 MiB/s across three separate VPS hosts. q8/q9 hash-partition the
+    // raw 600 M-row `lineitem` scan — ~36 GiB on the wire, a ~55-minute floor —
+    // because the filtered dimension side lands just over 1 MiB and so is not
+    // eligible to broadcast. Collecting a few tens of MiB once per task is
+    // enormously cheaper than moving lineitem, and it is bounded: the build
+    // side is collected into the task's memory pool, whose per-task share on
+    // this cluster is ~732 MB, so the ceiling below is ~4% of it.
+    //
+    // Deliberately set only on the STAGED path — the embedded engine keeps
+    // DataFusion's defaults, where they are correct.
+    let broadcast_bytes = std::env::var(BROADCAST_JOIN_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(32 * 1024 * 1024);
+    let opts = config.options_mut();
+    opts.optimizer.hash_join_single_partition_threshold = broadcast_bytes;
+    opts.optimizer.hash_join_single_partition_threshold_rows = 1_000_000;
 
     // A6: the rules. `planning_session_context` is where every distributed
     // query is planned, and it carried no engine rules at all — so
@@ -1445,6 +1474,7 @@ fn collect_upstream_inner(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<usize>) {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::prelude::SessionConfig;
 
     /// D3(2): the point of carrying the upstream estimate is that a
     /// shuffle-fed join side stops reporting `Absent`. This asserts the

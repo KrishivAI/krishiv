@@ -85,7 +85,7 @@ impl SpillableJoinSelection {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|n| *n > 0)
             .or_else(|| {
-                let share = krishiv_common::executor_capacity::ExecutorCapacity::detect()
+                let share = krishiv_common::executor_capacity::ExecutorCapacity::detect_cached()
                     .min_task_memory_share_bytes()?;
                 #[expect(
                     clippy::cast_precision_loss,
