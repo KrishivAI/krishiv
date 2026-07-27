@@ -497,3 +497,53 @@ throughput testbed. Distributed SF100 numbers measured here characterise
 the link, not the engine, and must be published with the topology stated
 or not published at all. Engine *compute* claims belong on the single-node
 path until a better-connected cluster exists.
+
+---
+
+## The actual goal, restated (user, 2026-07-27): all 22 queries complete
+
+This is a **completion and correctness gate, not a throughput gate**. Elapsed
+time matters only where it turns into a *failure*. Every recorded failure now
+maps to a specific fix, and nothing on the list is unexplained:
+
+| query | observed failure | cause | fix | batch |
+|---|---|---|---|---|
+| q10 | `KRV_SHUFFLE_MISSING(s0.m6, p0)` | producer output lost, regeneration gave up blind | A8 + A1 + C1 + C2 | 1 |
+| q18 | `Resources exhausted: HashJoinInput` | `SpillableJoinSelection` never registered on the staging context, **and** its gate reads statistics `ShuffleReadExec` never provides | **A6 + D3(2)** | 3 |
+| q17 | passes, 88 % of it one avoidable aggregate | `SemiJoinReductionThroughAggregate` is registered on `SqlEngine` only | **A6** | 3 |
+| q22 | *(no longer fails)* — degrades to a **single task** | `ScalarSubqueryExpr` cannot round-trip; the guard declines to stage and silently falls back | evaluate the uncorrelated scalar subquery on the coordinator, substitute the literal | **new, see below** |
+| q8, q9 | `task stalled: no progress for 30 min` | phantom tasks (fixed, `eaec83d8`) **and** ~36 GiB shuffled over an 11 MiB/s pod network = ~55 min floor | D1 interim: broadcast instead of cut when the build side is small | 4 → **promote** |
+
+### q22 is not green — it is quiet
+
+The round-trip guard (`verify_dfplan_roundtrip`) converts an un-encodable
+fragment into "decline to stage", and the caller reads that as "run the whole
+query as one task". The query returns a correct answer, so the sweep records a
+pass. **A whole query class silently losing distribution is exactly the kind of
+architectural bottleneck this review exists to surface**, and a green cell is
+the worst possible way to report it.
+
+Two fixes, both defensible; the first is preferred because it removes the
+un-encodable node rather than routing around it:
+1. **Evaluate uncorrelated scalar subqueries on the coordinator before
+   encoding** and substitute the resulting literal. Semantically exact — it
+   *is* a constant — and q22 then stages like any other query.
+2. Keep the fallback but make it **loud**: a staged-plan decline must be
+   reported on the job record and surfaced by the bench driver, never
+   silently absorbed. Do this one regardless of (1), for every future
+   decline.
+
+### Timeout audit (done 2026-07-27, no bug found in the sweep path)
+
+- `batch_sql_timeout()` (default **300 s**, `KRISHIV_BATCH_SQL_TIMEOUT_SECS`,
+  **unset on the bench coordinator**) guards `poll_batch_sql_outcome` and
+  `execute_batch_sql_sink_coordinated` — i.e. the **synchronous** execute
+  path. The bench driver uses async `submit` + client-side poll, which that
+  deadline never touches. This is why q21 completed at 2028 s.
+- **Separate, real, and not this sweep's problem:** any SF100-class query run
+  through the *synchronous* surface (Flight SQL — the normal user path) dies
+  at 5 minutes by default. Worth raising the default or documenting it.
+- Driver per-query timeout is **3600 s** (`DEFAULT_TIMEOUT_S`). q8/q9's
+  ~55-minute shuffle floor sits uncomfortably close to it. Raise it for the
+  verification sweep so a slow-but-honest query reports its real elapsed time
+  instead of a `timeout` that hides whether the engine was healthy.
