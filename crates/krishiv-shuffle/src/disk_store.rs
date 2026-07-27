@@ -72,7 +72,12 @@ fn blake3_hash_file(path: &Path) -> std::io::Result<Option<[u8; 32]>> {
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
+        // `Read` promises `n <= buf.len()`; a reader that breaks that promise
+        // would silently corrupt the digest, so refuse rather than panic.
+        let chunk = buf
+            .get(..n)
+            .ok_or_else(|| std::io::Error::other("reader reported more bytes than requested"))?;
+        hasher.update(chunk);
     }
     Ok(Some(*hasher.finalize().as_bytes()))
 }
@@ -108,7 +113,13 @@ impl<W: std::io::Write> std::io::Write for HashingWriter<W> {
         // Hash only what the inner writer accepted, so a short write cannot
         // desynchronise the digest from the file's contents.
         let n = self.inner.write(buf)?;
-        self.hasher.update(&buf[..n]);
+        // `Write` promises `n <= buf.len()`; hashing outside the slice the
+        // writer actually accepted would desynchronise the digest, so a writer
+        // that breaks that promise is an error, not a panic.
+        let accepted = buf
+            .get(..n)
+            .ok_or_else(|| std::io::Error::other("writer accepted more bytes than offered"))?;
+        self.hasher.update(accepted);
         Ok(n)
     }
 
@@ -761,7 +772,10 @@ impl ShuffleStore for LocalDiskShuffleStore {
         // this is what keeps the ceiling from being reached by live data in the
         // first place. Doing it on drop covers both the stream running to
         // completion and a fetch abandoned part-way.
-        struct ReleaseOnDrop(PathBuf, Arc<krishiv_common::page_cache::ShufflePageCacheBudget>);
+        struct ReleaseOnDrop(
+            PathBuf,
+            Arc<krishiv_common::page_cache::ShufflePageCacheBudget>,
+        );
         impl Drop for ReleaseOnDrop {
             fn drop(&mut self) {
                 self.1.record_consumed(&self.0);
@@ -868,7 +882,9 @@ mod tests {
 
         // ~400k rows of poorly-compressible values: comfortably more than one
         // 256 KiB hash chunk once written as Parquet.
-        let values: Vec<i64> = (0..400_000i64).map(|i| i.wrapping_mul(2_654_435_761)).collect();
+        let values: Vec<i64> = (0..400_000i64)
+            .map(|i| i.wrapping_mul(2_654_435_761))
+            .collect();
         let sp = ShufflePartition {
             id: partition.clone(),
             schema: make_batch(&values).schema(),

@@ -245,7 +245,7 @@ fn push_semi_below(
                     return Ok(None);
                 };
                 // Only a straight column pass-through is safe to follow.
-                let Expr::Column(inner) = &proj.expr[idx] else {
+                let Some(Expr::Column(inner)) = proj.expr.get(idx) else {
                     return Ok(None);
                 };
                 mapped.push((inner.clone(), pk.clone()));
@@ -446,7 +446,7 @@ fn push_through(
             // Only a straight column pass-through is safe to descend: an
             // expression could change the key's value, so the semi-join would
             // be filtering on something other than what the join compares.
-            let Expr::Column(inner) = &proj.expr[idx] else {
+            let Some(Expr::Column(inner)) = proj.expr.get(idx) else {
                 return Ok(None);
             };
             let inner = inner.clone();
@@ -464,7 +464,7 @@ fn push_through(
             if idx >= agg.group_expr.len() {
                 return Ok(None);
             }
-            let Expr::Column(group_col) = &agg.group_expr[idx] else {
+            let Some(Expr::Column(group_col)) = agg.group_expr.get(idx) else {
                 return Ok(None);
             };
             if already_reduced(&agg.input) {
@@ -502,10 +502,7 @@ fn already_reduced(plan: &LogicalPlan) -> bool {
 /// Returns the subtree projected down to the key alone, plus the key's name
 /// inside it. `None` means there is no filter on this side — the semi-join
 /// would then remove nothing while costing an extra pass, so the rule declines.
-fn selective_key_source(
-    plan: &LogicalPlan,
-    key: &Column,
-) -> Result<Option<(LogicalPlan, Column)>> {
+fn selective_key_source(plan: &LogicalPlan, key: &Column) -> Result<Option<(LogicalPlan, Column)>> {
     let Some(source) = descend_to_filter(plan, key) else {
         return Ok(None);
     };
@@ -529,8 +526,8 @@ fn descend_to_filter(plan: &LogicalPlan, key: &Column) -> Option<(LogicalPlan, C
             let (qualifier, field) = alias.input.schema().qualified_field(idx);
             descend_to_filter(&alias.input, &Column::new(qualifier.cloned(), field.name()))
         }
-        LogicalPlan::Projection(proj) => match &proj.expr[idx] {
-            Expr::Column(inner) => descend_to_filter(&proj.input, &inner.clone()),
+        LogicalPlan::Projection(proj) => match proj.expr.get(idx) {
+            Some(Expr::Column(inner)) => descend_to_filter(&proj.input, &inner.clone()),
             _ => None,
         },
         LogicalPlan::Join(join) => {
@@ -608,7 +605,13 @@ mod tests {
                 Arc::new(Int64Array::from(vec![1i64, 2, 3, 4, 5])),
                 Arc::new(Int64Array::from(vec![10i64, 20, 30, 40, 50])),
                 Arc::new(Int64Array::from(vec![100i64, 200, 300, 400, 500])),
-                Arc::new(Int64Array::from(vec![20260101i64, 20260102, 20260103, 20260104, 20260105])),
+                Arc::new(Int64Array::from(vec![
+                    20260101i64,
+                    20260102,
+                    20260103,
+                    20260104,
+                    20260105,
+                ])),
             ],
         )
         .unwrap();
@@ -845,12 +848,10 @@ mod tests {
         // Position of the semi-join relative to the inner joins is the whole
         // point: deeper means it filters an input rather than the output.
         fn depth_of_semi(plan: &str) -> Option<usize> {
-            plan.lines()
-                .position(|l| l.contains("Semi"))
+            plan.lines().position(|l| l.contains("Semi"))
         }
         fn depth_of_first_inner(plan: &str) -> Option<usize> {
-            plan.lines()
-                .position(|l| l.contains("Inner Join"))
+            plan.lines().position(|l| l.contains("Inner Join"))
         }
         let (ws, wi) = (depth_of_semi(&with), depth_of_first_inner(&with));
         let (bs, bi) = (depth_of_semi(&without), depth_of_first_inner(&without));
