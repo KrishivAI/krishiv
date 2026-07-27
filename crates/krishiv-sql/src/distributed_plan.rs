@@ -1378,6 +1378,101 @@ mod tests {
             .expect("the verify context must resolve s3 buckets like the executor runtime");
     }
 
+    /// Logical and physical optimizer rule names installed on a session.
+    fn optimizer_rule_names(ctx: &SessionContext) -> (Vec<String>, Vec<String>) {
+        let state = ctx.state();
+        (
+            state
+                .optimizers()
+                .iter()
+                .map(|r| r.name().to_owned())
+                .collect(),
+            state
+                .physical_optimizers()
+                .iter()
+                .map(|r| r.name().to_owned())
+                .collect(),
+        )
+    }
+
+    /// E4 (review 2026-07-27): the staged planner must carry the same optimizer
+    /// rules as the engine, or every rule the engine installs is dead on the
+    /// distributed path.
+    ///
+    /// This is the whole of finding A6 in one assertion, and it currently
+    /// FAILS: `planning_session_context` is a bare `SessionContext`, so it
+    /// carries none of `CooperativeAmplifiers` (distributed cancel cannot
+    /// preempt an amplifying operator without it), `SpillableJoinSelection`
+    /// (q18's shipped fix), `SemiJoinReductionThroughAggregate` or
+    /// `SemiJoinPushdownThroughInnerJoin` (q17's shipped fix — 88 % of a 252 s
+    /// query). Two shipped performance fixes do not apply to the path being
+    /// benchmarked, and nothing said so.
+    ///
+    /// Left executable-but-ignored deliberately: the fix is A6 (Batch 3, plan
+    /// the staged query on `SqlEngine`'s own `SessionStateBuilder`), and this
+    /// documents the gap in a form that turns green the moment it lands rather
+    /// than in prose that can rot.
+    #[test]
+    #[ignore = "A6: staging context lacks engine rules — Batch 3"]
+    fn the_staging_context_carries_the_engines_optimizer_rules() {
+        let engine = crate::SqlEngine::new_with_engine_memory(crate::EngineMemory::Unbounded);
+        let (engine_logical, engine_physical) = optimizer_rule_names(engine.session_context());
+        let staging = planning_session_context(engine.target_parallelism().get());
+        let (staging_logical, staging_physical) = optimizer_rule_names(&staging);
+
+        assert_eq!(
+            engine_logical, staging_logical,
+            "the staged planner must run the engine's logical optimizer rules; \
+             missing here means SemiJoinReductionThroughAggregate / \
+             SemiJoinPushdownThroughInnerJoin never fire distributed (D4)"
+        );
+        assert_eq!(
+            engine_physical, staging_physical,
+            "the staged planner must run the engine's physical optimizer rules; \
+             missing here means SpillableJoinSelection (D3) and \
+             CooperativeAmplifiers (distributed cancel) never fire"
+        );
+
+        // The config half of A6: the four runtime-filter switches and the
+        // lambda-capable dialect are what make `KRISHIV_RUNTIME_FILTERS` mean
+        // anything distributed, and what let a Phase-60 lambda query stage at
+        // all instead of silently degrading to one task.
+        let engine_opts = engine.session_context().copied_config();
+        let staging_opts = staging.copied_config();
+        for option in [
+            "datafusion.optimizer.enable_dynamic_filter_pushdown",
+            "datafusion.optimizer.enable_join_dynamic_filter_pushdown",
+            "datafusion.optimizer.enable_topk_dynamic_filter_pushdown",
+            "datafusion.optimizer.enable_aggregate_dynamic_filter_pushdown",
+        ] {
+            assert_eq!(
+                engine_opts
+                    .options()
+                    .entries()
+                    .iter()
+                    .find(|e| e.key == option)
+                    .map(|e| e.value.clone()),
+                staging_opts
+                    .options()
+                    .entries()
+                    .iter()
+                    .find(|e| e.key == option)
+                    .map(|e| e.value.clone()),
+                "{option} must match the engine's setting on the staged planner"
+            );
+        }
+        assert_eq!(
+            engine_opts.options().sql_parser.dialect,
+            staging_opts.options().sql_parser.dialect,
+            "the staged planner must parse in the engine's dialect"
+        );
+        assert_eq!(
+            engine_opts.options().execution.batch_size,
+            staging_opts.options().execution.batch_size,
+            "the staged planner must use the engine's batch size"
+        );
+    }
+
     /// A5: the guard rehearses the decode against the wrong session.
     ///
     /// The executor decodes a fragment on `task_sql_engine`, a real
