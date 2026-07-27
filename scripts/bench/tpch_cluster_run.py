@@ -41,7 +41,13 @@ import urllib.request
 # Tables that live in a per-table subdirectory (generated with --parts). A
 # directory path registers as a multi-file dataset, which is what gives the
 # scan more than one partition to spread across executors.
-DEFAULT_TIMEOUT_S = 3600
+# Measured 2026-07-27: the pod network these executors shuffle over runs at
+# ~11 MiB/s (flannel VXLAN, three separate VPS hosts). q8/q9 shuffle ~36 GiB,
+# so ~55 minutes is their *honest* floor, not a hang. At 3600 s they reported
+# `timeout` — which hides whether the engine was healthy behind a number that
+# only describes the link. Give an honest-but-slow query room to finish and
+# report its real elapsed time; a genuine hang still shows up, just later.
+DEFAULT_TIMEOUT_S = 7200
 
 
 def _abridge(message: str, head: int = 120, tail: int = 320) -> str:
@@ -218,6 +224,18 @@ def run_query(
         state = poll.get("state", "")
         if state == "Succeeded":
             elapsed = time.monotonic() - started
+            # Recorded, not assumed: stage_count == 1 and task_count == 1
+            # means the query ran on ONE executor. A timing without this is
+            # a number whose topology you cannot check afterwards.
+            stage_count = poll.get("stage_count")
+            task_count = poll.get("task_count")
+            # A query that declines to stage still returns the right answer, so
+            # it reports as a clean pass — which is how q22 hid the fact that
+            # `ScalarSubqueryExpr` cannot round-trip through the fragment
+            # encoding and the whole query silently fell back to a single task.
+            # "Correct but not distributed" is a finding, not a success; the
+            # sweep exists to catch exactly this.
+            distributed = bool(task_count and task_count > 1)
             return {
                 "id": query["id"],
                 "name": query["name"],
@@ -225,11 +243,9 @@ def run_query(
                 "status": "ok",
                 "elapsed_s": elapsed,
                 "result_batches": len(poll.get("inline_record_batch_ipc", [])),
-                # Recorded, not assumed: stage_count == 1 and task_count == 1
-                # means the query ran on ONE executor. A timing without this is
-                # a number whose topology you cannot check afterwards.
-                "stage_count": poll.get("stage_count"),
-                "task_count": poll.get("task_count"),
+                "stage_count": stage_count,
+                "task_count": task_count,
+                "distributed": distributed,
             }
         if state in ("Failed", "Cancelled"):
             return {
@@ -304,10 +320,15 @@ def main() -> int:
         )
         results.append(outcome)
         if outcome["status"] == "ok":
+            # A single-task pass gets its own marker. It is still a correct
+            # answer, so it stays in the ok column, but it must never look
+            # identical to a query that actually used the cluster.
+            marker = "ok  " if outcome.get("distributed") else "ok/1"
             print(
-                f"ok   {outcome['id']:>3} {outcome['name']:<34} "
+                f"{marker} {outcome['id']:>3} {outcome['name']:<34} "
                 f"{outcome['elapsed_s']:>9.2f} s  "
-                f"stages={outcome.get('stage_count')} tasks={outcome.get('task_count')}",
+                f"stages={outcome.get('stage_count')} tasks={outcome.get('task_count')}"
+                f"{'' if outcome.get('distributed') else '   << NOT DISTRIBUTED'}",
                 flush=True,
             )
         else:
@@ -318,11 +339,23 @@ def main() -> int:
             )
 
     ok = [r for r in results if r["status"] == "ok"]
+    single_task = [r for r in ok if not r.get("distributed")]
     total = sum(r["elapsed_s"] for r in ok)
     print(
         f"\n{len(ok)} / {len(results)} queries succeeded; "
         f"total {total:.1f} s across the successful ones"
     )
+    if single_task:
+        # Surfaced at the bottom as well as inline, because the summary line is
+        # what gets pasted into a status update and "17/22" alone would carry
+        # none of this.
+        ids = ", ".join(r["id"] for r in single_task)
+        print(
+            f"WARNING: {len(single_task)} of those ran as a SINGLE TASK and did "
+            f"not use the cluster: {ids}\n"
+            f"         Correct answers, but the distributed path declined to "
+            f"stage them — investigate before treating this run as a pass."
+        )
 
     record = {
         "label": args.label,
