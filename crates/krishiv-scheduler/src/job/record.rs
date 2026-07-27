@@ -970,18 +970,32 @@ impl JobRecord {
 
         // Phase 58: enforce the regeneration budget BEFORE mutating so a
         // persistently-lost producer fails the job instead of looping forever.
-        if self.shuffle_regen_total >= max_regen {
-            let diagnosis = diagnoses
-                .iter()
-                .map(|(_, d)| d.to_string())
-                .collect::<Vec<_>>()
-                .join("; ");
+        //
+        // C1: the budget is per `(stage_key, partition)`, not cumulative per
+        // job. One executor loss surfaces as one report per producer it held,
+        // discovered one round trip at a time (A3) — 18 map tasks over 3
+        // executors is ~6 distinct producers on the lost node — so a cumulative
+        // counter of 8 fails a HEALTHY cluster part-way through recovering a
+        // single loss, and a second loss during the same query guarantees it.
+        // Keyed per partition, one loss costs exactly one unit of each affected
+        // partition's own budget, while a *durably* lost partition still fails
+        // the job — sooner than before, and with the diagnosis attached.
+        if let Some((exhausted_key, diagnosis)) = diagnoses.iter().find(|(key, _)| {
+            self.shuffle_regen
+                .get(key)
+                .is_some_and(|attempt| attempt.attempts >= max_regen)
+        }) {
+            let attempts = self
+                .shuffle_regen
+                .get(exhausted_key)
+                .map_or(0, |attempt| attempt.attempts);
             return ShuffleRegenOutcome::BudgetExhausted {
-                attempts: self.shuffle_regen_total,
+                attempts,
                 limit: max_regen,
-                diagnosis,
+                diagnosis: diagnosis.to_string(),
             };
         }
+        // Retained for observability only — no longer a failure gate.
         self.shuffle_regen_total += 1;
         for (key, diagnosis) in diagnoses {
             let entry = self
@@ -1762,12 +1776,13 @@ mod shuffle_regen_tests {
     /// fails the job instead of looping forever. A report that matches no
     /// succeeded producer consumes no budget.
     ///
-    /// Each round names a *different* partition: an identical repeat is C2's
-    /// fail-fast case and never reaches the budget at all.
+    /// C1: the bound is per `(stage_key, partition)`, so this drives ONE
+    /// partition past it, bumping the recovery epoch between rounds — otherwise
+    /// C2's short-circuit fires first and the budget is never reached.
     #[test]
     fn shuffle_regeneration_is_bounded_then_exhausts() {
         let (mut job, stage_id) = producer_job();
-        let round = |p: u32| vec![MissingShufflePartition::new(stage_id.clone(), p)];
+        let missing = vec![MissingShufflePartition::new(stage_id, 0)];
 
         // A stale report referencing a stage that owns no matching partition
         // must not consume the regeneration budget.
@@ -1784,20 +1799,22 @@ mod shuffle_regen_tests {
         // Two real regenerations are within budget (limit = 2). Each resets the
         // producer to Pending, so re-succeed it before the next consumer failure.
         assert_eq!(
-            job.invalidate_specific_shuffle_partitions(&round(0), 2),
+            job.invalidate_specific_shuffle_partitions(&missing, 2),
             ShuffleRegenOutcome::Regenerated
         );
         assert_eq!(job.stages[0].tasks[0].state, TaskState::Pending);
         succeed_producer(&mut job);
+        job.bump_recovery_epoch();
 
         assert_eq!(
-            job.invalidate_specific_shuffle_partitions(&round(1), 2),
+            job.invalidate_specific_shuffle_partitions(&missing, 2),
             ShuffleRegenOutcome::Regenerated
         );
         succeed_producer(&mut job);
+        job.bump_recovery_epoch();
 
         // The third real regeneration exceeds the budget → the caller must fail.
-        match job.invalidate_specific_shuffle_partitions(&round(2), 2) {
+        match job.invalidate_specific_shuffle_partitions(&missing, 2) {
             ShuffleRegenOutcome::BudgetExhausted {
                 attempts,
                 limit,
@@ -1813,6 +1830,83 @@ mod shuffle_regen_tests {
         }
         // On exhaustion the producer is NOT reset — it stays as it was.
         assert_eq!(job.stages[0].tasks[0].state, TaskState::Succeeded);
+    }
+
+    /// C1: losing ONE executor must not fail a healthy job.
+    ///
+    /// A consumer discovers dead producers one round trip at a time (A3), so a
+    /// node holding six map tasks surfaces as six *distinct* missing-partition
+    /// reports in quick succession. Against a cumulative per-job counter of 8
+    /// that is six units for a single, entirely recoverable loss — and a second
+    /// loss during the same query pushes past the limit and fails the job as
+    /// "unrecoverable" while the cluster is healthy. That arithmetic is the
+    /// best explanation on file for the eight budget units burned at ~2.5 s
+    /// intervals on the SF100 sweep.
+    ///
+    /// Keyed per `(stage_key, partition)`, one loss costs one unit of each
+    /// affected partition's own budget: all six recover under a limit of 2.
+    #[test]
+    fn one_executor_loss_costs_one_unit_per_partition_not_six_per_job() {
+        use krishiv_proto::{ExecutorId, ShuffleWriteConfig};
+
+        const PRODUCERS: u32 = 6;
+        let mut stage = StageSpec::new(StageId::try_new("dist-s0").unwrap(), "map stage");
+        for m in 0..PRODUCERS {
+            stage = stage.with_task(
+                TaskSpec::new(
+                    TaskId::try_new(format!("dist-s0-t{m}")).unwrap(),
+                    "dfplan:v1:body",
+                )
+                .with_shuffle_write(ShuffleWriteConfig {
+                    stage_id: StageId::try_new(format!("s0.m{m}")).unwrap(),
+                    num_partitions: 4,
+                    key_columns: Vec::new(),
+                    lease_token: 0,
+                }),
+            );
+        }
+        let spec = JobSpec::new(
+            JobId::try_new("one-loss-job").unwrap(),
+            "one-loss",
+            JobKind::Batch,
+        )
+        .with_stage(stage);
+        let mut job = JobRecord::from_spec(spec, 4);
+
+        // All six map tasks succeeded on the executor that then died.
+        let dead = ExecutorId::try_new("exec-dead").unwrap();
+        for task in &mut job.stages[0].tasks {
+            task.state = TaskState::Succeeded;
+            task.assigned_executor = Some(dead.clone());
+            task.output_metadata = Some(
+                TaskOutputMetadata::new("shuffle", 10, 1, 1).with_shuffle_partitions(vec![
+                    ShufflePartitionOutput::new(0, 1024, "http://exec-dead:9000"),
+                ]),
+            );
+        }
+        job.stages[0].refresh_state();
+        job.refresh_state();
+
+        // The consumer discovers them one at a time. A budget of 2 is well
+        // below six reports, which is exactly the point.
+        for m in 0..PRODUCERS {
+            let missing = vec![MissingShufflePartition::new(
+                StageId::try_new(format!("s0.m{m}")).unwrap(),
+                0,
+            )];
+            assert_eq!(
+                job.invalidate_specific_shuffle_partitions(&missing, 2),
+                ShuffleRegenOutcome::Regenerated,
+                "producer {m} of a single executor loss must still be regenerable; \
+                 a cumulative per-job budget fails a healthy cluster here"
+            );
+            // Re-run it, as the scheduler would, before the next discovery.
+            let task = &mut job.stages[0].tasks[m as usize];
+            task.state = TaskState::Succeeded;
+            task.assigned_executor = Some(ExecutorId::try_new("exec-live").unwrap());
+            job.stages[0].refresh_state();
+            job.refresh_state();
+        }
     }
 
     /// C2 / SOTA §3: the second identical `(stage, partition)` miss — same
