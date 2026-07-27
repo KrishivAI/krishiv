@@ -716,3 +716,150 @@ fn stall_detection_respects_progress_updates() {
         "task with recent progress must NOT be flagged as stalled"
     );
 }
+
+/// C3 (review 2026-07-27): the stall watchdog must route through the ordinary
+/// retry budget, not hard-fail the job.
+///
+/// `apply_stall_resets` set `TaskState::Failed` directly. Any Failed task makes
+/// its stage Failed and any Failed stage makes the job Failed, so a single
+/// stall killed a job that had retries configured and never even incremented
+/// `failure_count`. TPC-H SF100 q5 died this way on a cluster whose executors
+/// were healthy and busy.
+#[test]
+fn stalled_task_is_retried_instead_of_failing_the_job() {
+    use krishiv_common::async_util::unix_now_ms;
+
+    let mut coordinator =
+        Coordinator::active(CoordinatorId::try_new("coord-stall-retry").unwrap());
+    coordinator.config = coordinator.config.with_task_stall_timeout_ms(60_000);
+
+    let exec_id = ExecutorId::try_new("exec-stall-retry").unwrap();
+    coordinator
+        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-stall", 1))
+        .unwrap();
+
+    let job_id = JobId::try_new("job-stall-retry").unwrap();
+    let stage_id = StageId::try_new("stage-stall").unwrap();
+    let task_id = TaskId::try_new("task-stall-1").unwrap();
+    let spec = JobSpec::new(job_id.clone(), "stall-retry", JobKind::Batch).with_stage(
+        StageSpec::new(stage_id.clone(), "stage")
+            .with_max_task_attempts(3)
+            .with_task(TaskSpec::new(task_id.clone(), "batch")),
+    );
+    coordinator.submit_job(spec).unwrap();
+
+    {
+        let jc = coordinator.job_coordinator(&job_id).unwrap();
+        let mut record = jc.write_record();
+        for stage in record.stages_mut() {
+            for task in stage.tasks_mut() {
+                task.assigned_executor = Some(exec_id.clone());
+                task.state = TaskState::Running;
+                task.attempt = 1;
+                task.launch_in_flight = false;
+                task.assigned_at_ms = Some(u64::try_from(unix_now_ms()).unwrap_or(0) - 120_000);
+                task.last_progress_ms = None;
+            }
+        }
+    }
+
+    let work = coordinator.collect_stall_cancel_work();
+    assert_eq!(work.len(), 1, "the stalled task must be detected");
+    coordinator.apply_stall_resets(&work);
+
+    let jc = coordinator.job_coordinator(&job_id).unwrap();
+    let record = jc.read_record();
+    let task = &record.stages()[0].tasks()[0];
+    assert_eq!(
+        task.state(),
+        TaskState::Pending,
+        "a stalled task with attempts left must be re-queued, not failed"
+    );
+    assert_eq!(
+        task.failure_count,
+        1,
+        "the stall must be counted against the task's retry budget"
+    );
+    assert!(
+        task.assigned_executor().is_none(),
+        "the stalled assignment must be cleared so the retry can be re-placed"
+    );
+    assert_ne!(
+        record.state(),
+        JobState::Failed,
+        "one stall must not fail a job that still has task attempts left"
+    );
+}
+
+/// The second half of C3: once the stall reset no longer makes the job
+/// terminal, the executor's own late report for the cancelled attempt must not
+/// cascade into a stage failure either. It is a stale attempt (the assignment
+/// was cleared) and must be rejected as such.
+#[test]
+fn late_executor_report_for_a_stalled_attempt_does_not_fail_the_stage() {
+    use krishiv_common::async_util::unix_now_ms;
+
+    let mut coordinator =
+        Coordinator::active(CoordinatorId::try_new("coord-stall-late").unwrap());
+    coordinator.config = coordinator.config.with_task_stall_timeout_ms(60_000);
+
+    let exec_id = ExecutorId::try_new("exec-stall-late").unwrap();
+    coordinator
+        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-late", 1))
+        .unwrap();
+
+    let job_id = JobId::try_new("job-stall-late").unwrap();
+    let stage_id = StageId::try_new("stage-late").unwrap();
+    let task_id = TaskId::try_new("task-late-1").unwrap();
+    let spec = JobSpec::new(job_id.clone(), "stall-late", JobKind::Batch).with_stage(
+        StageSpec::new(stage_id.clone(), "stage")
+            .with_max_task_attempts(3)
+            .with_task(TaskSpec::new(task_id.clone(), "batch")),
+    );
+    coordinator.submit_job(spec).unwrap();
+
+    {
+        let jc = coordinator.job_coordinator(&job_id).unwrap();
+        let mut record = jc.write_record();
+        for stage in record.stages_mut() {
+            for task in stage.tasks_mut() {
+                task.assigned_executor = Some(exec_id.clone());
+                task.state = TaskState::Running;
+                task.attempt = 1;
+                task.assigned_at_ms = Some(u64::try_from(unix_now_ms()).unwrap_or(0) - 120_000);
+                task.last_progress_ms = None;
+            }
+        }
+    }
+
+    let work = coordinator.collect_stall_cancel_work();
+    coordinator.apply_stall_resets(&work);
+
+    // The cancel RPC lands and the executor reports the attempt Failed.
+    let late = TaskStatusUpdate::new(
+        job_id.clone(),
+        stage_id,
+        task_id,
+        exec_id,
+        TaskState::Failed,
+        1,
+    );
+    let outcome = coordinator.apply_task_update(late);
+    assert!(
+        outcome.is_err() || outcome.as_ref().is_ok_and(|o| *o == TaskUpdateOutcome::Duplicate),
+        "a report for the cancelled attempt must be rejected as stale, not applied"
+    );
+
+    let jc = coordinator.job_coordinator(&job_id).unwrap();
+    let record = jc.read_record();
+    assert_ne!(
+        record.state(),
+        JobState::Failed,
+        "the executor's own late report for a stalled attempt must not fail the job"
+    );
+    assert_eq!(
+        record.stages()[0].tasks()[0].failure_count,
+        1,
+        "the late report must not be counted a second time"
+    );
+}

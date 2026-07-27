@@ -703,6 +703,45 @@ impl JobRecord {
         Ok(outcome)
     }
 
+    /// C3: apply a stall-watchdog reset through the ordinary failure path.
+    ///
+    /// The watchdog cancels the task on the executor and then reports the stall
+    /// here. Routing it through [`StageRecord::fail_stalled_task`] gives it the
+    /// same retry budget, backoff and stage-retry fallback every other failure
+    /// gets, instead of hard-failing the job on the first stall.
+    ///
+    /// Returns `true` when the named attempt was still Running.
+    pub(crate) fn apply_stall_failure(
+        &mut self,
+        stage_id: &StageId,
+        task_id: &TaskId,
+        attempt: u32,
+        reason: String,
+    ) -> SchedulerResult<bool> {
+        let max_stage_retries = self.max_stage_retries;
+        let base_ms = self.retry_backoff_base_ms;
+        let cap_ms = self.retry_backoff_cap_ms;
+        let Some(stage) = self
+            .stages
+            .iter_mut()
+            .find(|stage| stage.stage_id() == stage_id)
+        else {
+            return Ok(false);
+        };
+        let applied = stage.fail_stalled_task(
+            task_id,
+            attempt,
+            reason,
+            max_stage_retries,
+            base_ms,
+            cap_ms,
+        )?;
+        if applied {
+            self.refresh_state();
+        }
+        Ok(applied)
+    }
+
     pub(crate) fn cancel(&mut self) {
         self.state = JobState::Cancelled;
         for stage in &mut self.stages {
@@ -1257,77 +1296,159 @@ impl StageRecord {
         }
 
         if update.state() == TaskState::Failed {
-            // Try per-task retry first: if this specific task still has attempts remaining,
-            // reset only that task to Pending rather than retrying the entire stage
-            // (which would reset even succeeded tasks).
-            let task = self
-                .tasks
-                .get_mut(task_idx)
-                .ok_or_else(|| SchedulerError::UnknownTask {
-                    task_id: update.task_id().clone(),
-                })?;
-            task.failure_count = task.failure_count.saturating_add(1);
-            let task_failure_count = task.failure_count;
-
-            // FetchFailed semantics (Spark parity): a consumer that failed
-            // because an upstream shuffle partition is unavailable is not at
-            // fault — its producer is re-queued by the caller's
-            // missing-partition branch and regenerated under the separate
-            // `max_shuffle_regen` budget. Give such failures a generous retry
-            // budget so a multi-producer executor loss (which surfaces as
-            // several *sequential* fetch failures, one lost producer at a
-            // time) still converges, instead of the default
-            // `max_task_attempts = 1` failing the whole job after the first
-            // lost producer. The productive path is bounded by
-            // `max_shuffle_regen` (the job fails cleanly on durable loss);
-            // this cap only backstops a pathological no-op report loop.
             let missing_shuffle = !update.missing_shuffle_partitions().is_empty();
-            let effective_attempts = if missing_shuffle {
-                max_task_attempts.max(MISSING_SHUFFLE_MAX_ATTEMPTS)
-            } else {
-                max_task_attempts
-            };
-
-            if task_failure_count < effective_attempts {
-                let task =
-                    self.tasks
-                        .get_mut(task_idx)
-                        .ok_or_else(|| SchedulerError::UnknownTask {
-                            task_id: update.task_id().clone(),
-                        })?;
-                task.state = TaskState::Pending;
-                task.assigned_executor = None;
-                task.launch_in_flight = false;
-                if missing_shuffle {
-                    // The consumer's upstream-ready gate already holds it until
-                    // the regenerated producer re-succeeds, so an extra failure
-                    // backoff would only delay recovery.
-                    task.retry_backoff_until_ms = None;
-                } else {
-                    // Phase 53: exponential backoff before re-assignment —
-                    // base * 2^(failures-1), capped. Failure-driven retries only;
-                    // executor-loss and speculation resets stay immediate.
-                    let exp = task_failure_count.saturating_sub(1).min(16);
-                    let delay_ms = retry_backoff_base_ms
-                        .saturating_mul(1u64 << exp)
-                        .min(retry_backoff_cap_ms);
-                    let now_ms =
-                        u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
-                    task.retry_backoff_until_ms = Some(now_ms.saturating_add(delay_ms));
-                }
-                self.refresh_state();
-                return Ok(TaskUpdateOutcome::Applied);
-            }
-
-            // Per-task attempts exhausted — fall back to whole-stage retry if configured.
-            if self.retry_count < max_stage_retries {
-                self.retry_stage();
+            if self.account_task_failure(
+                task_idx,
+                missing_shuffle,
+                max_task_attempts,
+                max_stage_retries,
+                retry_backoff_base_ms,
+                retry_backoff_cap_ms,
+            )? {
                 return Ok(TaskUpdateOutcome::Applied);
             }
         }
 
         self.refresh_state();
         Ok(TaskUpdateOutcome::Applied)
+    }
+
+    /// Apply the ordinary failure accounting to `task_idx`.
+    ///
+    /// Counts the failure, retries the task if it has attempts left (with
+    /// backoff), otherwise falls back to a whole-stage retry. Returns `true`
+    /// when the failure was absorbed by a retry — the caller must then leave
+    /// the task alone.
+    ///
+    /// Shared by the executor-reported failure path and the coordinator's stall
+    /// watchdog (C3), so a stalled task is retried exactly like any other
+    /// failure rather than hard-failing its job. A second implementation of
+    /// this policy is what the watchdog used to be.
+    fn account_task_failure(
+        &mut self,
+        task_idx: usize,
+        missing_shuffle: bool,
+        max_task_attempts: u32,
+        max_stage_retries: u32,
+        retry_backoff_base_ms: u64,
+        retry_backoff_cap_ms: u64,
+    ) -> SchedulerResult<bool> {
+        // Try per-task retry first: if this specific task still has attempts
+        // remaining, reset only that task to Pending rather than retrying the
+        // entire stage (which would reset even succeeded tasks).
+        let unknown = || SchedulerError::InvalidJob {
+            message: format!(
+                "task index {task_idx} out of range for stage {}",
+                self.spec.stage_id()
+            ),
+        };
+        let task = self.tasks.get_mut(task_idx).ok_or_else(unknown)?;
+        task.failure_count = task.failure_count.saturating_add(1);
+        let task_failure_count = task.failure_count;
+
+        // FetchFailed semantics (Spark parity): a consumer that failed
+        // because an upstream shuffle partition is unavailable is not at
+        // fault — its producer is re-queued by the caller's
+        // missing-partition branch and regenerated under the separate
+        // `max_shuffle_regen` budget. Give such failures a generous retry
+        // budget so a multi-producer executor loss (which surfaces as
+        // several *sequential* fetch failures, one lost producer at a
+        // time) still converges, instead of the default
+        // `max_task_attempts = 1` failing the whole job after the first
+        // lost producer. The productive path is bounded by
+        // `max_shuffle_regen` (the job fails cleanly on durable loss);
+        // this cap only backstops a pathological no-op report loop.
+        let effective_attempts = if missing_shuffle {
+            max_task_attempts.max(MISSING_SHUFFLE_MAX_ATTEMPTS)
+        } else {
+            max_task_attempts
+        };
+
+        if task_failure_count < effective_attempts {
+            let task = self.tasks.get_mut(task_idx).ok_or_else(unknown)?;
+            task.state = TaskState::Pending;
+            task.assigned_executor = None;
+            task.launch_in_flight = false;
+            if missing_shuffle {
+                // The consumer's upstream-ready gate already holds it until
+                // the regenerated producer re-succeeds, so an extra failure
+                // backoff would only delay recovery.
+                task.retry_backoff_until_ms = None;
+            } else {
+                // Phase 53: exponential backoff before re-assignment —
+                // base * 2^(failures-1), capped. Failure-driven retries only;
+                // executor-loss and speculation resets stay immediate.
+                let exp = task_failure_count.saturating_sub(1).min(16);
+                let delay_ms = retry_backoff_base_ms
+                    .saturating_mul(1u64 << exp)
+                    .min(retry_backoff_cap_ms);
+                let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+                task.retry_backoff_until_ms = Some(now_ms.saturating_add(delay_ms));
+            }
+            self.refresh_state();
+            return Ok(true);
+        }
+
+        // Per-task attempts exhausted — fall back to whole-stage retry if configured.
+        if self.retry_count < max_stage_retries {
+            self.retry_stage();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// C3: route a watchdog stall reset through the same failure accounting as
+    /// any other failure.
+    ///
+    /// `apply_stall_resets` used to set `TaskState::Failed` directly. Any Failed
+    /// task makes its stage Failed and any Failed stage makes the job Failed, so
+    /// the watchdog was the one failure path in the coordinator with no retry at
+    /// all — it never incremented `failure_count` and never reset to Pending.
+    /// Worse, once the job record was terminal the executor's own subsequent
+    /// Failed/Cancelled report was discarded as `Duplicate`, so the result of
+    /// the cancel RPC that had just been sent was thrown away.
+    ///
+    /// Returns `true` when the named attempt was still Running and was accounted
+    /// for.
+    pub(crate) fn fail_stalled_task(
+        &mut self,
+        task_id: &TaskId,
+        attempt: u32,
+        reason: String,
+        max_stage_retries: u32,
+        retry_backoff_base_ms: u64,
+        retry_backoff_cap_ms: u64,
+    ) -> SchedulerResult<bool> {
+        let max_task_attempts = self.spec.max_task_attempts();
+        let Some(task_idx) = self.tasks.iter().position(|task| {
+            task.task_id() == task_id
+                && task.attempt() == attempt
+                && task.state() == TaskState::Running
+        }) else {
+            return Ok(false);
+        };
+        {
+            let Some(task) = self.tasks.get_mut(task_idx) else {
+                return Ok(false);
+            };
+            task.state = TaskState::Failed;
+            task.last_failure_reason = Some(reason);
+            task.launch_in_flight = false;
+            task.assigned_at_ms = None;
+            task.last_progress_ms = None;
+        }
+        // A stall is not an upstream-data failure, so it takes the ordinary
+        // (strict) attempt budget, not the FetchFailed one.
+        self.account_task_failure(
+            task_idx,
+            false,
+            max_task_attempts,
+            max_stage_retries,
+            retry_backoff_base_ms,
+            retry_backoff_cap_ms,
+        )?;
+        self.refresh_state();
+        Ok(true)
     }
 
     pub(crate) fn cancel(&mut self) {

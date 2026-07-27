@@ -1729,46 +1729,47 @@ impl Coordinator {
         work
     }
 
-    /// Apply stall resets: mark each task in `work` as Failed and clear
-    /// in-flight state. Must be called after cancel RPCs are sent.
+    /// Apply stall resets: account each task in `work` as a failure. Must be
+    /// called after cancel RPCs are sent.
+    ///
+    /// C3 (review 2026-07-27): this used to set `TaskState::Failed` directly.
+    /// `StageRecord::refresh_state` turns any Failed task into a Failed stage
+    /// and `JobRecord::refresh_state` turns any Failed stage into a Failed job,
+    /// so the watchdog was the only failure path in the coordinator with no
+    /// retry at all — it never incremented `failure_count`, never reset to
+    /// Pending, and never consulted `max_task_attempts`. It also poisoned the
+    /// cancel it had just issued: once the job record was terminal,
+    /// `job_lifecycle`'s `already_terminal` guard returned `Duplicate` for the
+    /// executor's own Failed/Cancelled report, discarding the result of the RPC.
+    /// A single stall killed the job.
+    ///
+    /// Routing through `JobRecord::apply_stall_failure` gives a stalled task the
+    /// same budget, backoff and stage-retry fallback as any other failure.
     pub(crate) fn apply_stall_resets(&mut self, work: &[StallCancelWork]) {
         for item in work {
             let Some(jc) = self.job_coordinators.get(&item.job_id) else {
                 continue;
             };
-            let mut record = jc.write_record();
-            for stage in record.stages_mut() {
-                if stage.stage_id() != &item.stage_id {
-                    continue;
-                }
-                let mut stage_affected = false;
-                for task in stage.tasks_mut() {
-                    if task.task_id() != &item.task_id || task.attempt() != item.attempt {
-                        continue;
-                    }
-                    if task.state() != krishiv_proto::TaskState::Running {
-                        continue;
-                    }
-                    tracing::warn!(
-                        task_id = %item.task_id,
-                        stall_secs = item.stall_secs,
-                        "resetting stalled task (no progress for >30 min)"
-                    );
-                    task.state = krishiv_proto::TaskState::Failed;
-                    task.last_failure_reason = Some(format!(
-                        "task stalled: no progress for {} min",
-                        item.stall_secs / 60,
-                    ));
-                    task.launch_in_flight = false;
-                    task.assigned_at_ms = None;
-                    task.last_progress_ms = None;
-                    stage_affected = true;
-                }
-                if stage_affected {
-                    stage.refresh_state();
-                }
+            let reason = format!("task stalled: no progress for {} min", item.stall_secs / 60);
+            let applied = {
+                let mut record = jc.write_record();
+                record.apply_stall_failure(&item.stage_id, &item.task_id, item.attempt, reason)
+            };
+            match applied {
+                Ok(true) => tracing::warn!(
+                    job_id = %item.job_id,
+                    task_id = %item.task_id,
+                    stall_secs = item.stall_secs,
+                    "stalled task failed through the ordinary retry path"
+                ),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    job_id = %item.job_id,
+                    task_id = %item.task_id,
+                    %error,
+                    "could not apply stall reset"
+                ),
             }
-            record.refresh_state();
         }
     }
 
