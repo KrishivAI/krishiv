@@ -232,6 +232,345 @@ fn executor_deregister_while_task_running_resets_it_for_reassignment() {
     );
 }
 
+/// Third instance of the executor-loss bug class (`mark_executor_lost` →
+/// `deregister_executor` #188 → registration), root-caused live on a 3-node
+/// TPC-H SF100 cluster 2026-07-27: a container OOMKilled and restarted **in
+/// place** keeps its pod, its executor id and all its endpoints, so the
+/// endpoint-change fence above never fires. The new process re-registers,
+/// registration treats it as an idempotent lease refresh, and the dead
+/// incarnation's `Running` tasks become phantoms — the coordinator counts
+/// them as running while every executor heartbeats an empty running set.
+/// Only the 30-minute stall watchdog breaks the deadlock, then the retry
+/// OOMs again: q8/q9 never completed.
+#[test]
+fn executor_reregistering_as_a_new_incarnation_recovers_its_running_tasks() {
+    allow_anonymous_for_tests();
+
+    let exec_id = ExecutorId::try_new("exec-oomkilled").unwrap();
+    let coord_id = CoordinatorId::try_new("coord-oomkilled").unwrap();
+    let job_id = JobId::try_new("job-oomkilled").unwrap();
+
+    let mut coordinator = Coordinator::active(coord_id);
+    let lease_gen = coordinator
+        .register_executor(
+            ExecutorDescriptor::new(exec_id.clone(), "pod-oom", 1)
+                .with_task_endpoint("http://pod-oom:2005")
+                .with_incarnation_id("incarnation-1"),
+        )
+        .unwrap();
+
+    coordinator
+        .submit_job(single_task_job(job_id.clone()))
+        .unwrap();
+    let assignments = coordinator
+        .launch_assigned_task_assignments(&job_id)
+        .unwrap();
+    let first_attempt = assignments.first().unwrap().attempt_id().as_u32();
+    let assign = assignments.first().unwrap().clone();
+
+    coordinator
+        .apply_task_update(
+            TaskStatusUpdate::new(
+                assign.job_id().clone(),
+                assign.stage_id().clone(),
+                assign.task_id().clone(),
+                exec_id.clone(),
+                TaskState::Running,
+                first_attempt,
+            )
+            .with_lease_generation(lease_gen),
+        )
+        .unwrap();
+    {
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        assert_eq!(
+            detail.stages()[0].tasks()[0].state(),
+            TaskState::Running,
+            "precondition: the task must be Running on the doomed incarnation"
+        );
+    }
+
+    // The kubelet restarts the container in place: same pod, same executor
+    // id, same endpoints, brand-new process.
+    coordinator
+        .register_executor(
+            ExecutorDescriptor::new(exec_id.clone(), "pod-oom", 1)
+                .with_task_endpoint("http://pod-oom:2005")
+                .with_incarnation_id("incarnation-2"),
+        )
+        .unwrap();
+
+    {
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        assert_ne!(
+            detail.stages()[0].tasks()[0].state(),
+            TaskState::Running,
+            "a task Running on a dead incarnation must not stay Running — no \
+             process is executing it, so it is a phantom that only the \
+             30-minute stall watchdog would ever clear"
+        );
+    }
+
+    let relaunch = coordinator
+        .launch_assigned_task_assignments(&job_id)
+        .unwrap();
+    assert_eq!(
+        relaunch.len(),
+        1,
+        "the recovered task must be immediately re-dispatchable"
+    );
+    assert!(
+        relaunch[0].attempt_id().as_u32() > first_attempt,
+        "the re-dispatch must be a fresh attempt so the dead incarnation's \
+         late status reports stay fenced"
+    );
+}
+
+/// Same live bug, shuffle half (TPC-H q10 `KRV_SHUFFLE_MISSING`): the
+/// restarted container's shuffle store is empty, but consumers still hold
+/// locations pointing at it. Registration must invalidate the dead
+/// incarnation's shuffle outputs — exactly as `mark_executor_lost` does — so
+/// the producing tasks re-run instead of consumers failing their fetches.
+#[test]
+fn executor_reregistering_as_a_new_incarnation_invalidates_its_shuffle_output() {
+    use krishiv_proto::ShufflePartitionOutput;
+
+    allow_anonymous_for_tests();
+
+    let exec_id = ExecutorId::try_new("exec-shuffle-oom").unwrap();
+    let coord_id = CoordinatorId::try_new("coord-shuffle-oom").unwrap();
+    let job_id = JobId::try_new("job-shuffle-oom").unwrap();
+    let stage0_id = StageId::try_new("stage-shuffle-oom-0").unwrap();
+    let stage1_id = StageId::try_new("stage-shuffle-oom-1").unwrap();
+    let task0_id = TaskId::try_new("task-shuffle-oom-0").unwrap();
+
+    let mut coordinator = Coordinator::active(coord_id);
+    let lease_gen = coordinator
+        .register_executor(
+            ExecutorDescriptor::new(exec_id.clone(), "pod-shuffle", 2)
+                .with_task_endpoint("http://pod-shuffle:2005")
+                .with_incarnation_id("incarnation-1"),
+        )
+        .unwrap();
+
+    coordinator
+        .submit_job(
+            JobSpec::new(job_id.clone(), "shuffle-oom-test", JobKind::Batch)
+                .with_stage(
+                    StageSpec::new(stage0_id.clone(), "shuffle write").with_task(TaskSpec::new(
+                        task0_id.clone(),
+                        "shuffle-write:hash:col:4",
+                    )),
+                )
+                .with_stage(
+                    StageSpec::new(stage1_id, "aggregate")
+                        .with_upstream_stage(stage0_id)
+                        .with_task(TaskSpec::new(
+                            TaskId::try_new("task-shuffle-oom-1").unwrap(),
+                            "sql: SELECT 1",
+                        )),
+                ),
+        )
+        .unwrap();
+
+    let assignments = coordinator
+        .launch_assigned_task_assignments(&job_id)
+        .unwrap();
+    let assign = assignments.first().unwrap().clone();
+    let shuffle_meta = TaskOutputMetadata::new("shuffle", 4, 1, 1).with_shuffle_partitions(
+        (0u32..4)
+            .map(|p| ShufflePartitionOutput::new(p, 1, "http://pod-shuffle:2003"))
+            .collect(),
+    );
+    coordinator
+        .apply_task_update(
+            TaskStatusUpdate::new(
+                assign.job_id().clone(),
+                assign.stage_id().clone(),
+                assign.task_id().clone(),
+                exec_id.clone(),
+                TaskState::Succeeded,
+                assign.attempt_id().as_u32(),
+            )
+            .with_lease_generation(lease_gen)
+            .with_output_metadata(shuffle_meta),
+        )
+        .unwrap();
+    {
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        assert_eq!(
+            detail.stages()[0].tasks()[0].state(),
+            TaskState::Succeeded,
+            "precondition: the producer must have succeeded with remote shuffle"
+        );
+    }
+
+    coordinator
+        .register_executor(
+            ExecutorDescriptor::new(exec_id.clone(), "pod-shuffle", 2)
+                .with_task_endpoint("http://pod-shuffle:2005")
+                .with_incarnation_id("incarnation-2"),
+        )
+        .unwrap();
+
+    let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+    assert_ne!(
+        detail.stages()[0].tasks()[0].state(),
+        TaskState::Succeeded,
+        "shuffle output served from a restarted container's local store is \
+         gone; the producing task must be re-queued rather than left \
+         Succeeded for consumers to fetch from an empty store"
+    );
+}
+
+/// The counterweight to the two tests above: an executor may re-register
+/// WITHOUT having restarted — the heartbeat loop re-registers whenever the
+/// coordinator answers `StaleLease`/`UnknownExecutor` (lease bump, coordinator
+/// failover). That is the same live process, still executing its tasks, and
+/// resetting them would double-dispatch real work.
+#[test]
+fn executor_reregistering_with_the_same_incarnation_keeps_its_running_tasks() {
+    allow_anonymous_for_tests();
+
+    let exec_id = ExecutorId::try_new("exec-same-incarnation").unwrap();
+    let coord_id = CoordinatorId::try_new("coord-same-incarnation").unwrap();
+    let job_id = JobId::try_new("job-same-incarnation").unwrap();
+
+    let descriptor = ExecutorDescriptor::new(exec_id.clone(), "pod-alive", 1)
+        .with_task_endpoint("http://pod-alive:2005")
+        .with_incarnation_id("incarnation-1");
+
+    let mut coordinator = Coordinator::active(coord_id);
+    let lease_gen = coordinator.register_executor(descriptor.clone()).unwrap();
+
+    coordinator
+        .submit_job(single_task_job(job_id.clone()))
+        .unwrap();
+    let assignments = coordinator
+        .launch_assigned_task_assignments(&job_id)
+        .unwrap();
+    let assign = assignments.first().unwrap().clone();
+    coordinator
+        .apply_task_update(
+            TaskStatusUpdate::new(
+                assign.job_id().clone(),
+                assign.stage_id().clone(),
+                assign.task_id().clone(),
+                exec_id.clone(),
+                TaskState::Running,
+                assign.attempt_id().as_u32(),
+            )
+            .with_lease_generation(lease_gen),
+        )
+        .unwrap();
+
+    coordinator.register_executor(descriptor).unwrap();
+
+    let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+    assert_eq!(
+        detail.stages()[0].tasks()[0].state(),
+        TaskState::Running,
+        "a lease-refresh re-registration from the SAME process must leave its \
+         Running tasks alone; resetting them would run the same work twice"
+    );
+    assert_eq!(
+        detail.stages()[0].tasks()[0].assigned_executor(),
+        Some(&exec_id),
+        "the surviving incarnation must keep its assignment"
+    );
+}
+
+/// Missing-incarnation policy, half one: a peer that advertises no
+/// incarnation id (older executor binary during a rolling upgrade) cannot be
+/// proven to be the same process, so a re-registration while it owns Running
+/// work is treated as a loss. Duplicate execution is bounded — the re-dispatch
+/// bumps the attempt id and `apply_status_update` rejects any report from the
+/// superseded attempt — whereas the alternative is the 30-minute phantom hang
+/// this whole change exists to remove.
+#[test]
+fn executor_reregistering_without_an_incarnation_id_recovers_running_work() {
+    allow_anonymous_for_tests();
+
+    let exec_id = ExecutorId::try_new("exec-no-incarnation").unwrap();
+    let coord_id = CoordinatorId::try_new("coord-no-incarnation").unwrap();
+    let job_id = JobId::try_new("job-no-incarnation").unwrap();
+
+    let descriptor = ExecutorDescriptor::new(exec_id.clone(), "pod-legacy", 1)
+        .with_task_endpoint("http://pod-legacy:2005");
+
+    let mut coordinator = Coordinator::active(coord_id);
+    let lease_gen = coordinator.register_executor(descriptor.clone()).unwrap();
+
+    coordinator
+        .submit_job(single_task_job(job_id.clone()))
+        .unwrap();
+    let assignments = coordinator
+        .launch_assigned_task_assignments(&job_id)
+        .unwrap();
+    let assign = assignments.first().unwrap().clone();
+    coordinator
+        .apply_task_update(
+            TaskStatusUpdate::new(
+                assign.job_id().clone(),
+                assign.stage_id().clone(),
+                assign.task_id().clone(),
+                exec_id.clone(),
+                TaskState::Running,
+                assign.attempt_id().as_u32(),
+            )
+            .with_lease_generation(lease_gen),
+        )
+        .unwrap();
+
+    coordinator.register_executor(descriptor).unwrap();
+
+    let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+    assert_ne!(
+        detail.stages()[0].tasks()[0].state(),
+        TaskState::Running,
+        "an unidentifiable peer's Running work must be recovered, not left to \
+         the stall watchdog"
+    );
+}
+
+/// Missing-incarnation policy, half two: the unknown-incarnation fence is
+/// scoped to `Running` work only. An `Assigned`-but-unacknowledged launch is
+/// already handled correctly by the reopen path below the fence (idempotent
+/// redelivery), so fencing on it would needlessly mark a healthy executor
+/// lost — and, in a cluster of unidentifiable peers, feed the SC11 cascade
+/// circuit breaker a loss on every ordinary lease refresh.
+#[test]
+fn executor_reregistering_without_an_incarnation_id_does_not_fence_on_assigned_work() {
+    allow_anonymous_for_tests();
+
+    let exec_id = ExecutorId::try_new("exec-assigned-only").unwrap();
+    let coord_id = CoordinatorId::try_new("coord-assigned-only").unwrap();
+    let job_id = JobId::try_new("job-assigned-only").unwrap();
+
+    let descriptor = ExecutorDescriptor::new(exec_id.clone(), "pod-assigned", 1)
+        .with_task_endpoint("http://pod-assigned:2005");
+
+    let mut coordinator = Coordinator::active(coord_id);
+    coordinator.register_executor(descriptor.clone()).unwrap();
+    coordinator
+        .submit_job(single_task_job(job_id.clone()))
+        .unwrap();
+    assert_eq!(coordinator.launch_assigned_tasks(&job_id).unwrap(), 1);
+
+    coordinator.register_executor(descriptor).unwrap();
+
+    assert_eq!(
+        coordinator.executor_snapshots()[0].state(),
+        ExecutorState::Registered,
+        "an Assigned-only re-registration must not mark the executor lost"
+    );
+    assert_eq!(
+        coordinator.launch_assigned_tasks(&job_id).unwrap(),
+        1,
+        "the unacknowledged launch must still be reopened for redelivery"
+    );
+}
+
 /// Phase 2.9: After a shuffle stage completes with serialized_bytes reported,
 /// the AQE coalesce hint is stored on the coordinator.
 #[test]

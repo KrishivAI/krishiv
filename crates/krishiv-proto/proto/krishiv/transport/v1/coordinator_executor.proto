@@ -45,6 +45,10 @@ message ExecutorDescriptor {
   // Rack identifier for RACK_LOCAL placement (Phase 53); empty = unknown rack.
   // Node identity for NODE_LOCAL placement is `host`.
   string rack_id = 6;
+  // Per-process incarnation id, regenerated on every executor start; empty =
+  // peer does not advertise one. Distinguishes a restarted process behind a
+  // stable executor_id from the same process refreshing a stale lease.
+  string incarnation_id = 7;
 }
 
 message RegisterExecutorRequest {

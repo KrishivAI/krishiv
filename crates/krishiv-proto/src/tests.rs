@@ -327,6 +327,35 @@ mod proto_tests {
         );
     }
 
+    /// P0.17: every descriptor field must survive the wire in both
+    /// directions. The incarnation id in particular is load-bearing — the
+    /// coordinator fences a restarted executor's in-flight work by comparing
+    /// it, so a field silently dropped by a conversion reverts the fence to
+    /// "unknown incarnation" for every peer.
+    #[test]
+    fn registration_descriptor_round_trips_every_field() {
+        let descriptor =
+            ExecutorDescriptor::new(ExecutorId::try_new("exec-1").unwrap(), "pod-a", 2)
+                .with_task_endpoint("http://127.0.0.1:9091")
+                .with_barrier_endpoint("http://127.0.0.1:9092")
+                .with_rack_id("rack-7")
+                .with_incarnation_id("11111111-2222-3333-4444-555555555555");
+        let request = RegisterExecutorRequest::new(descriptor.clone());
+
+        let wire = crate::wire::register_executor_request_to_wire(request);
+        assert_eq!(
+            wire.descriptor.as_ref().unwrap().incarnation_id,
+            "11111111-2222-3333-4444-555555555555"
+        );
+        let round_trip = crate::wire::register_executor_request_from_wire(wire).unwrap();
+
+        assert_eq!(round_trip.descriptor(), &descriptor);
+        assert_eq!(
+            round_trip.descriptor().incarnation_id(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+    }
+
     #[test]
     fn deregistration_round_trips_through_wire_contract() {
         let request = DeregisterExecutorRequest::new(
@@ -506,7 +535,8 @@ mod proto_tests {
             )
         };
         let round_trip = |resp: ExecutorHeartbeatResponse| {
-            executor_heartbeat_response_from_wire(executor_heartbeat_response_to_wire(resp)).unwrap()
+            executor_heartbeat_response_from_wire(executor_heartbeat_response_to_wire(resp))
+                .unwrap()
         };
 
         // A coordinator that never reported: the executor must reclaim nothing.
@@ -516,11 +546,15 @@ mod proto_tests {
 
         // A coordinator reporting that nothing is live: reclaim everything.
         let empty = round_trip(base().with_live_job_ids(std::collections::HashSet::new()));
-        assert_eq!(empty.live_job_ids(), Some(&std::collections::HashSet::new()));
+        assert_eq!(
+            empty.live_job_ids(),
+            Some(&std::collections::HashSet::new())
+        );
 
         // The ordinary case.
-        let ids: std::collections::HashSet<String> =
-            ["job-a".to_string(), "job-b".to_string()].into_iter().collect();
+        let ids: std::collections::HashSet<String> = ["job-a".to_string(), "job-b".to_string()]
+            .into_iter()
+            .collect();
         assert_eq!(
             round_trip(base().with_live_job_ids(ids.clone())).live_job_ids(),
             Some(&ids)
@@ -1018,9 +1052,18 @@ mod wire_fuzz {
                 arb_string(),
                 arb_string(),
                 arb_string(),
+                arb_string(),
             )
                 .prop_map(
-                    |(executor_id, host, slots, task_endpoint, barrier_endpoint, rack_id)| {
+                    |(
+                        executor_id,
+                        host,
+                        slots,
+                        task_endpoint,
+                        barrier_endpoint,
+                        rack_id,
+                        incarnation_id,
+                    )| {
                         v1::ExecutorDescriptor {
                             executor_id,
                             host,
@@ -1028,6 +1071,7 @@ mod wire_fuzz {
                             task_endpoint,
                             barrier_endpoint,
                             rack_id,
+                            incarnation_id,
                         }
                     },
                 ),

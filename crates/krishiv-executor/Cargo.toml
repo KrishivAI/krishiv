@@ -46,6 +46,7 @@ tokio-stream.workspace = true
 tonic.workspace = true
 thiserror = { workspace = true }
 tracing.workspace = true
+uuid = { workspace = true }
 
 [dev-dependencies]
 arrow.workspace = true

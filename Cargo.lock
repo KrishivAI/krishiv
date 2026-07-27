@@ -5827,6 +5827,7 @@ dependencies = [
  "tonic 0.14.6",
  "tracing",
  "twox-hash",
+ "uuid",
 ]
 
 [[package]]

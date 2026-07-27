@@ -13,6 +13,7 @@ pub struct ExecutorDescriptor {
     task_endpoint: Option<String>,
     barrier_endpoint: Option<String>,
     rack_id: Option<String>,
+    incarnation_id: Option<String>,
 }
 
 impl ExecutorDescriptor {
@@ -25,6 +26,7 @@ impl ExecutorDescriptor {
             task_endpoint: None,
             barrier_endpoint: None,
             rack_id: None,
+            incarnation_id: None,
         }
     }
 
@@ -100,6 +102,28 @@ impl ExecutorDescriptor {
     /// Optional rack identifier for locality-aware placement.
     pub fn rack_id(&self) -> Option<&str> {
         self.rack_id.as_deref()
+    }
+
+    /// Identify the executor *process* behind a stable executor id.
+    ///
+    /// The executor id survives a container restart; the incarnation id does
+    /// not. It is generated once per process at startup, so a coordinator
+    /// comparing the stored descriptor's incarnation with an incoming
+    /// registration's can tell a restarted process (its Running tasks and
+    /// shuffle outputs died with it) from the same live process refreshing a
+    /// stale lease (its work must be left alone).
+    #[must_use]
+    pub fn with_incarnation_id(mut self, incarnation_id: impl Into<String>) -> Self {
+        let incarnation_id = incarnation_id.into();
+        if !incarnation_id.trim().is_empty() {
+            self.incarnation_id = Some(incarnation_id);
+        }
+        self
+    }
+
+    /// Per-process incarnation id; `None` for peers that do not advertise one.
+    pub fn incarnation_id(&self) -> Option<&str> {
+        self.incarnation_id.as_deref()
     }
 }
 

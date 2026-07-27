@@ -13,34 +13,21 @@ impl Coordinator {
     ) -> SchedulerResult<LeaseGeneration> {
         self.ensure_active()?;
         let executor_id = descriptor.executor_id().clone();
-        let endpoint_changed = self
-            .exec
-            .executors
-            .find_executor(&executor_id)
-            .ok()
-            .filter(|record| {
-                record.state().can_accept_work()
-                    || matches!(record.state(), krishiv_proto::ExecutorState::Draining)
-            })
-            .is_some_and(|record| {
-                let previous = record.descriptor();
-                previous.host() != descriptor.host()
-                    || previous.task_endpoint() != descriptor.task_endpoint()
-                    || previous.barrier_endpoint() != descriptor.barrier_endpoint()
-            });
-        if endpoint_changed {
-            // A stable logical id with a different pod/endpoint is a new
-            // executor incarnation, not an ordinary lease refresh. Treat the
-            // old incarnation as lost before registration so Running work is
-            // replayed and shuffle locations pointing at the deleted pod are
+        if let Some(reason) = self.prior_incarnation_fence_reason(&descriptor) {
+            // A stable logical id behind a new process is a new executor
+            // incarnation, not an ordinary lease refresh. Treat the old
+            // incarnation as lost before registration so Running work is
+            // replayed and shuffle locations pointing at the dead process are
             // invalidated. Without this, a fast Kubernetes replacement can
             // beat heartbeat timeout and leave a reduce task fetching forever
-            // from the old pod IP.
+            // from a store that no longer holds its partitions.
             tracing::warn!(
                 executor_id = %executor_id,
                 new_host = %descriptor.host(),
                 new_task_endpoint = ?descriptor.task_endpoint(),
-                "executor endpoint changed; fencing prior incarnation"
+                new_incarnation_id = ?descriptor.incarnation_id(),
+                reason,
+                "executor re-registered as a new incarnation; fencing prior incarnation"
             );
             self.mark_executor_lost(&executor_id)?;
         }
@@ -86,6 +73,91 @@ impl Coordinator {
             self.exec.notify.notify_waiters();
         }
         res
+    }
+
+    /// Decide whether a registration supersedes a *different* process behind
+    /// the same executor id, returning why if so.
+    ///
+    /// Third entry point of the same bug class: `mark_executor_lost` always
+    /// ran the recovery pipeline, `deregister_executor` was fixed to (#188),
+    /// and registration was the last one still admitting a replacement
+    /// process without recovering what the previous one was holding. Found
+    /// live 2026-07-27 on TPC-H SF100 — an OOMKilled container restarted in
+    /// place keeps its pod, id and endpoints, so the endpoint check below
+    /// never fired and the dead process's Running tasks became phantoms until
+    /// the 30-minute stall watchdog.
+    ///
+    /// An executor also re-registers *without* restarting (the heartbeat loop
+    /// re-registers on `StaleLease`/`UnknownExecutor`, e.g. after coordinator
+    /// failover), so this must never fence on registration alone: that would
+    /// double-dispatch work a live process is still executing.
+    fn prior_incarnation_fence_reason(
+        &self,
+        descriptor: &ExecutorDescriptor,
+    ) -> Option<&'static str> {
+        let record = self
+            .exec
+            .executors
+            .find_executor(descriptor.executor_id())
+            .ok()?;
+        if !(record.state().can_accept_work()
+            || matches!(record.state(), krishiv_proto::ExecutorState::Draining))
+        {
+            // Already Lost or Removed: the recovery pipeline has run for this
+            // record, and re-running it would double-count the loss.
+            return None;
+        }
+
+        let previous = record.descriptor();
+        if previous.host() != descriptor.host()
+            || previous.task_endpoint() != descriptor.task_endpoint()
+            || previous.barrier_endpoint() != descriptor.barrier_endpoint()
+        {
+            return Some("endpoint changed");
+        }
+
+        match (previous.incarnation_id(), descriptor.incarnation_id()) {
+            (Some(before), Some(now)) if before == now => None,
+            (Some(_), Some(_)) => Some("incarnation id changed"),
+            // Neither side can prove the process survived (a peer that
+            // predates incarnation ids, on either end of a rolling upgrade).
+            // Recover rather than trust it, but only for `Running` work,
+            // where the alternative is a guaranteed 30-minute phantom hang
+            // and the cost is bounded: re-dispatch bumps the attempt id and
+            // `apply_status_update` rejects every report from the superseded
+            // attempt, so a still-live duplicate cannot corrupt job state.
+            // `Assigned` work is deliberately excluded — the reopen path in
+            // `register_executor` already redelivers it idempotently, so
+            // fencing on it would mark healthy executors lost (and feed the
+            // SC11 cascade breaker) on every ordinary lease refresh.
+            _ => self
+                .executor_owns_unrecoverable_output(descriptor.executor_id())
+                .then_some("incarnation unknown while holding in-flight work"),
+        }
+    }
+
+    /// Whether losing this executor right now would strand work: a `Running`
+    /// task, or shuffle output only it can serve.
+    fn executor_owns_unrecoverable_output(&self, executor_id: &ExecutorId) -> bool {
+        self.job_coordinators.values().any(|job_coordinator| {
+            let job = job_coordinator.read_record();
+            job.stages().iter().any(|stage| {
+                stage.tasks().iter().any(|task| {
+                    if task.assigned_executor() != Some(executor_id) {
+                        return false;
+                    }
+                    match task.state() {
+                        TaskState::Running => true,
+                        TaskState::Succeeded => task.output_metadata().is_some_and(|meta| {
+                            meta.shuffle_partitions()
+                                .iter()
+                                .any(|partition| !partition.flight_endpoint.is_empty())
+                        }),
+                        _ => false,
+                    }
+                })
+            })
+        })
     }
 
     /// Deregister an executor with a valid lease generation.

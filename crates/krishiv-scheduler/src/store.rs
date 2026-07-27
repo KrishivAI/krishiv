@@ -459,6 +459,13 @@ pub(crate) struct PersistedExecutorDescriptor {
     task_endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     barrier_endpoint: Option<String>,
+    /// Persisted so a coordinator restart does not forget which process it
+    /// was talking to: the re-attaching executor would otherwise present an
+    /// incarnation the restored descriptor cannot match, and registration
+    /// would fence a live executor's streaming work during the re-attach
+    /// grace window it exists to protect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    incarnation_id: Option<String>,
 }
 
 impl From<&ExecutorDescriptor> for PersistedExecutorDescriptor {
@@ -469,6 +476,7 @@ impl From<&ExecutorDescriptor> for PersistedExecutorDescriptor {
             slots: d.slots(),
             task_endpoint: d.task_endpoint().map(str::to_string),
             barrier_endpoint: d.barrier_endpoint().map(str::to_string),
+            incarnation_id: d.incarnation_id().map(str::to_string),
         }
     }
 }
@@ -486,6 +494,9 @@ impl TryFrom<PersistedExecutorDescriptor> for ExecutorDescriptor {
         }
         if let Some(ep) = p.barrier_endpoint {
             d = d.with_barrier_endpoint(ep);
+        }
+        if let Some(incarnation_id) = p.incarnation_id {
+            d = d.with_incarnation_id(incarnation_id);
         }
         Ok(d)
     }
@@ -1690,6 +1701,39 @@ impl NonBlockingStoreHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The incarnation id must survive the metadata store, or a coordinator
+    /// restart would restore a descriptor that cannot match the re-attaching
+    /// process — and registration would fence a live executor's work during
+    /// exactly the re-attach grace window meant to protect it. A descriptor
+    /// persisted before this field existed must still load (serde default).
+    #[test]
+    fn persisted_executor_descriptor_round_trips_incarnation_id() {
+        let descriptor = ExecutorDescriptor::new(
+            ExecutorId::try_new("exec-persist").expect("executor id"),
+            "pod-persist",
+            2,
+        )
+        .with_task_endpoint("http://pod-persist:2005")
+        .with_incarnation_id("incarnation-1");
+
+        let json = serde_json::to_string(&PersistedExecutorDescriptor::from(&descriptor))
+            .expect("serialise");
+        assert!(
+            json.contains("\"incarnation_id\":\"incarnation-1\""),
+            "missing field in {json}"
+        );
+        let persisted: PersistedExecutorDescriptor =
+            serde_json::from_str(&json).expect("deserialise");
+        let round = ExecutorDescriptor::try_from(persisted).expect("convert");
+        assert_eq!(round, descriptor);
+
+        let legacy: PersistedExecutorDescriptor =
+            serde_json::from_str(r#"{"executor_id":"exec-old","host":"pod-old","slots":1}"#)
+                .expect("deserialise legacy record written before the field existed");
+        let legacy = ExecutorDescriptor::try_from(legacy).expect("convert");
+        assert_eq!(legacy.incarnation_id(), None);
+    }
 
     /// SC3: `PersistedTaskRecord` round-trips the new
     /// `assigned_at_tick` / `last_progress_tick` fields through JSON.

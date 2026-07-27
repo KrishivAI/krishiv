@@ -1086,6 +1086,7 @@ fn executor_descriptor_to_wire(value: &ExecutorDescriptor) -> v1::ExecutorDescri
         task_endpoint: value.task_endpoint().unwrap_or_default().to_owned(),
         barrier_endpoint: value.barrier_endpoint().unwrap_or_default().to_owned(),
         rack_id: value.rack_id().unwrap_or_default().to_owned(),
+        incarnation_id: value.incarnation_id().unwrap_or_default().to_owned(),
     }
 }
 
@@ -1107,6 +1108,9 @@ fn executor_descriptor_from_wire(value: v1::ExecutorDescriptor) -> WireResult<Ex
     }
     if !value.rack_id.is_empty() {
         descriptor = descriptor.with_rack_id(value.rack_id);
+    }
+    if !value.incarnation_id.is_empty() {
+        descriptor = descriptor.with_incarnation_id(value.incarnation_id);
     }
     Ok(descriptor)
 }

@@ -1591,6 +1591,38 @@ mod tests {
         assert_eq!(config.mode, ExecutorMode::DryRun);
     }
 
+    /// The coordinator fences an executor's in-flight work when the
+    /// incarnation id it advertises changes, so every descriptor this process
+    /// ever builds must carry the same one. A per-descriptor or per-config id
+    /// would make an ordinary lease-refresh re-registration look like a
+    /// restart and reset tasks the process is still running.
+    #[test]
+    fn every_descriptor_from_one_process_carries_the_same_incarnation_id() {
+        let config = ExecutorConfig::new("exec-incarnation", "pod-a", 1, "http://coordinator")
+            .unwrap()
+            .with_task_endpoint("http://pod-a:2005");
+        let first = config.descriptor();
+        let second = config.descriptor();
+        let from_other_config = ExecutorConfig::new("exec-other", "pod-b", 1, "http://coordinator")
+            .unwrap()
+            .descriptor();
+
+        let incarnation = first
+            .incarnation_id()
+            .expect("descriptor must advertise one");
+        assert_eq!(second.incarnation_id(), Some(incarnation));
+        assert_eq!(
+            from_other_config.incarnation_id(),
+            Some(incarnation),
+            "the id identifies the process, not the config"
+        );
+        assert_eq!(
+            config.clone().descriptor().incarnation_id(),
+            Some(incarnation),
+            "cloning the config must not mint a new incarnation"
+        );
+    }
+
     #[test]
     fn stale_heartbeat_does_not_advance_runtime_or_shared_lease() {
         let mut runtime = ExecutorRuntime::new(

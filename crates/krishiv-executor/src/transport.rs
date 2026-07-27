@@ -114,6 +114,17 @@ impl ExecutorConfig {
         })
     }
 
+    /// Incarnation id for this executor *process*.
+    ///
+    /// Process-global rather than per-config: a config rebuilt inside one
+    /// running process must not look like a restart to the coordinator, which
+    /// fences a changed incarnation's in-flight work. Only a genuinely new
+    /// process may present a new id.
+    fn incarnation_id() -> &'static str {
+        static INCARNATION_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        INCARNATION_ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
+    }
+
     #[must_use]
     /// Advertised task gRPC endpoint, when one has been bound.
     pub fn task_endpoint(&self) -> Option<&str> {
@@ -188,7 +199,8 @@ impl ExecutorConfig {
     /// Build an executor descriptor for registration.
     pub fn descriptor(&self) -> ExecutorDescriptor {
         let mut d =
-            ExecutorDescriptor::new(self.executor_id.clone(), self.host.clone(), self.slots);
+            ExecutorDescriptor::new(self.executor_id.clone(), self.host.clone(), self.slots)
+                .with_incarnation_id(Self::incarnation_id());
         if let Some(ep) = &self.task_endpoint {
             d = d.with_task_endpoint(ep);
         }
