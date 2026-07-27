@@ -547,3 +547,49 @@ un-encodable node rather than routing around it:
   ~55-minute shuffle floor sits uncomfortably close to it. Raise it for the
   verification sweep so a slow-but-honest query reports its real elapsed time
   instead of a `timeout` that hides whether the engine was healthy.
+
+---
+
+## Landed 2026-07-27 (this run)
+
+| finding | commit | verification |
+|---|---|---|
+| C2 diagnosis-bearing regeneration error | `bfd94175` | scheduler suite |
+| A5 round-trip on the executor's own engine | `e03e2fa5` | sql suite |
+| E4 rule-parity test (red, then green under A6) | `13b314eb` / `d3c8f5b8` | passes |
+| C1 regen budget per-partition | `db6156ba` | scheduler suite |
+| C3 stall resets through the retry budget | `1790e5da` | scheduler suite |
+| A8 shuffle-GC grace period | `b2a0e060` | executor suite |
+| A1 unlocatable partition is an error | `74fcae1e` | executor suite |
+| B1 Flight server concurrency bound | `c2f0ae00` | shuffle suite |
+| **A6 staged planning on the engine's rules+config** | `d3c8f5b8` | E4 green, 474 sql tests |
+| **D3(2) shuffle-read statistics** | `95091077` | 2 new tests, 476 sql tests |
+| A2 real fallback schema | `95091077` | 304 executor tests |
+| bench driver: single-task is not a pass | `bd213464` | — |
+
+Suites green at `95091077`: 549 scheduler · 304 executor · 164 shuffle ·
+476 sql.
+
+**q18 needs both A6 and D3(2)** and now has them: the rule is registered
+*and* the statistics its gate reads are no longer `Absent`. Whether the
+threshold is right on the coordinator is a deployment question —
+`KRISHIV_SPILL_JOIN_BUILD_BYTES` must be set to the executor's per-task
+share (~732 MB observed in q18's own failure message, so ~366 MB at the
+rule's half-share default), because `from_capacity()` reads the calling
+process's cgroup and the coordinator's is not the executors'.
+
+### Still open, in priority order
+
+1. **q22** — evaluate the uncorrelated scalar subquery on the coordinator
+   and substitute the literal, so the query stages instead of silently
+   running as one task. The driver now *reports* the degradation
+   (`ok/1 … NOT DISTRIBUTED`); the engine still causes it.
+2. **D1 interim** — do not cut the exchange when the join's build side is
+   small enough to broadcast. This is q8/q9's real cost: ~36 GiB over an
+   11 MiB/s pod network.
+3. **B6** — `memory_limit_bytes` is `None` on every batch task and still
+   arms things; arm it or delete it.
+4. Deployment: `KRISHIV_SPILL_JOIN_BUILD_BYTES` (above) and
+   `KRISHIV_BATCH_SQL_TIMEOUT_SECS` for the synchronous Flight SQL path.
+5. Batch 2 harness (E2) — still the structural answer to the regression
+   pattern; unchanged in value by anything above.
