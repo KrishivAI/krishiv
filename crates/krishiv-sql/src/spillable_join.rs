@@ -67,6 +67,39 @@ pub const SPILL_JOIN_BUILD_BYTES_ENV: &str = "KRISHIV_SPILL_JOIN_BUILD_BYTES";
 /// algorithm when it fits.
 const BUILD_FRACTION_OF_TASK_SHARE: f64 = 0.5;
 
+/// Bytes assumed for a column whose type carries no fixed width.
+///
+/// Varlen columns (`Utf8`, `Binary`, and their `View`/`Large` forms) have no
+/// width until the data arrives. 32 bytes is deliberately modest: this
+/// estimate only ever *adds* conversions, so overestimating would convert
+/// joins that would have fitted, and sort-merge is the slower plan when hash
+/// join fits. Under-guessing costs nothing that is not already the status quo.
+const ASSUMED_VARLEN_COLUMN_BYTES: usize = 32;
+
+/// Build-side bytes derived from a row count when `total_byte_size` is absent.
+///
+/// Returns `None` when the row count is absent too — the one case where the
+/// planner genuinely knows nothing and guessing would be a coin flip.
+fn estimated_build_bytes_from_rows(
+    stats: &datafusion::common::Statistics,
+    build_schema: &arrow::datatypes::Schema,
+) -> Option<u64> {
+    let rows = match stats.num_rows {
+        Precision::Exact(rows) | Precision::Inexact(rows) => rows,
+        Precision::Absent => return None,
+    };
+    let row_width: usize = build_schema
+        .fields()
+        .iter()
+        .map(|f| {
+            f.data_type()
+                .primitive_width()
+                .unwrap_or(ASSUMED_VARLEN_COLUMN_BYTES)
+        })
+        .sum();
+    u64::try_from(rows.saturating_mul(row_width.max(1))).ok()
+}
+
 /// Convert hash joins whose estimated build side cannot fit the per-task
 /// memory share into sort-merge joins, which can spill.
 #[derive(Debug)]
@@ -111,21 +144,64 @@ impl SpillableJoinSelection {
         hash_join: &HashJoinExec,
         threshold: u64,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        // Gate 3: only partitioned joins. CollectLeft build sides are small by
-        // construction, and partitioned inputs already carry the hash
-        // distribution sort-merge needs.
+        // Gate 3: sort-merge needs both sides hash-distributed on the join
+        // keys, which only `Partitioned` guarantees. `CollectLeft` cannot be
+        // converted in place — but it is *not* safe to ignore, so it is
+        // reported rather than silently skipped: `CollectLeft` is chosen from
+        // an estimate, and when that estimate is wrong it is the worst mode to
+        // be in, because the whole build side is materialised on every
+        // partition. TPC-H q9/SF100 failed at 797.5 MB of `HashJoinInput`
+        // against a 797.6 MB pool.
         if !matches!(hash_join.partition_mode(), PartitionMode::Partitioned) {
+            tracing::debug!(
+                mode = ?hash_join.partition_mode(),
+                threshold,
+                "spillable-join: not converting a non-partitioned join"
+            );
             return Ok(None);
         }
         // Gate 2: the build side must be *known* to be large. Absent statistics
         // keep hash join — guessing "big" is how the reverted session-wide
         // switch timed out q2.
+        //
+        // Logged, because a rule that silently declines is indistinguishable
+        // from a rule that was never installed. Three SF100 queries died on
+        // un-spillable hash joins while this rule sat registered and converted
+        // nothing, and the logs could not say which gate turned each one away.
         let stats = hash_join.left().partition_statistics(None)?;
         let build_bytes = match stats.total_byte_size {
             Precision::Exact(bytes) | Precision::Inexact(bytes) => bytes as u64,
-            Precision::Absent => return Ok(None),
+            // `total_byte_size` absent does not mean "size unknown" — DataFusion
+            // often has a row count when it has no byte size (a shuffle read, a
+            // filter over a scan with row stats). Deriving bytes from rows uses
+            // information the planner already holds instead of surrendering at
+            // the first absent field, which is how q9/SF100 kept a hash join
+            // whose build side then took 797.5 MB of a 797.6 MB pool.
+            //
+            // Still conservative: if the row count is *also* absent we keep the
+            // hash join rather than guess, because guessing "big" for every
+            // join is the session-wide switch that timed q2 out.
+            Precision::Absent => match estimated_build_bytes_from_rows(
+                &stats,
+                &hash_join.left().schema(),
+            ) {
+                Some(bytes) => bytes,
+                None => {
+                    tracing::debug!(
+                        threshold,
+                        "spillable-join: build-side size and row count both unknown, \
+                         keeping hash join"
+                    );
+                    return Ok(None);
+                }
+            },
         };
         if build_bytes <= threshold {
+            tracing::debug!(
+                build_bytes,
+                threshold,
+                "spillable-join: build side fits, keeping hash join"
+            );
             return Ok(None);
         }
 
@@ -207,20 +283,41 @@ impl PhysicalOptimizerRule for SpillableJoinSelection {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Gate 1: no cap, no change.
         let Some(threshold) = self.threshold_bytes else {
+            tracing::debug!("spillable-join: no memory cap configured, rule inactive");
             return Ok(plan);
         };
-        plan.transform_up(|node| {
-            // `ExecutionPlan: Any` — upcast to downcast (DF 54 has no `as_any`).
-            let any = node.as_ref() as &dyn std::any::Any;
-            let Some(hash_join) = any.downcast_ref::<HashJoinExec>() else {
-                return Ok(Transformed::no(node));
-            };
-            match self.convert(hash_join, threshold)? {
-                Some(converted) => Ok(Transformed::yes(converted)),
-                None => Ok(Transformed::no(node)),
-            }
-        })
-        .map(|t| t.data)
+        let mut seen = 0usize;
+        let mut converted = 0usize;
+        let out = plan
+            .transform_up(|node| {
+                // `ExecutionPlan: Any` — upcast to downcast (DF 54 has no `as_any`).
+                let any = node.as_ref() as &dyn std::any::Any;
+                let Some(hash_join) = any.downcast_ref::<HashJoinExec>() else {
+                    return Ok(Transformed::no(node));
+                };
+                seen += 1;
+                match self.convert(hash_join, threshold)? {
+                    Some(plan) => {
+                        converted += 1;
+                        Ok(Transformed::yes(plan))
+                    }
+                    None => Ok(Transformed::no(node)),
+                }
+            })
+            .map(|t| t.data)?;
+        // One line that distinguishes "no hash joins in this plan", "joins seen
+        // and left alone", and "rule not installed" — three states that were
+        // previously identical from outside, which is what made three SF100
+        // failures take a live investigation to attribute.
+        if seen > 0 {
+            tracing::debug!(
+                hash_joins = seen,
+                converted,
+                threshold,
+                "spillable-join: pass complete"
+            );
+        }
+        Ok(out)
     }
 }
 
@@ -319,5 +416,95 @@ mod tests {
         let optimized = rule.optimize(Arc::clone(&plan), &ConfigOptions::default()).unwrap();
         assert!(contains(&optimized, "HashJoinExec"));
         assert!(!contains(&optimized, "SortMergeJoin"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod row_count_fallback_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::{ColumnStatistics, Statistics};
+
+    fn schema(fields: Vec<Field>) -> Schema {
+        Schema::new(fields)
+    }
+
+    fn stats_with(num_rows: Precision<usize>, columns: usize) -> Statistics {
+        Statistics {
+            num_rows,
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::new_unknown(); columns],
+        }
+    }
+
+    #[test]
+    fn absent_rows_and_bytes_yields_no_estimate() {
+        // The one case where the planner truly knows nothing: keep hash join
+        // rather than guess. This is the guard against re-creating the
+        // session-wide switch that timed q2 out.
+        let s = schema(vec![Field::new("k", DataType::Int64, false)]);
+        assert_eq!(
+            estimated_build_bytes_from_rows(&stats_with(Precision::Absent, 1), &s),
+            None
+        );
+    }
+
+    #[test]
+    fn a_row_count_gives_an_estimate_when_byte_size_is_absent() {
+        // The q9 case: rows known, bytes not. 1M rows x one 8-byte column.
+        let s = schema(vec![Field::new("k", DataType::Int64, false)]);
+        assert_eq!(
+            estimated_build_bytes_from_rows(&stats_with(Precision::Exact(1_000_000), 1), &s),
+            Some(8_000_000)
+        );
+    }
+
+    #[test]
+    fn inexact_row_counts_count_too() {
+        // Post-filter estimates are Inexact; refusing them would leave the
+        // fallback inert on exactly the plans that need it.
+        let s = schema(vec![Field::new("k", DataType::Int64, false)]);
+        assert_eq!(
+            estimated_build_bytes_from_rows(&stats_with(Precision::Inexact(1_000), 1), &s),
+            Some(8_000)
+        );
+    }
+
+    #[test]
+    fn varlen_columns_get_a_modest_assumed_width() {
+        // Utf8 has no fixed width. The estimate must still produce something,
+        // and must not be wild: one Int64 + one Utf8 = 8 + 32 per row.
+        let s = schema(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]);
+        let want = 100 * (8 + ASSUMED_VARLEN_COLUMN_BYTES as u64);
+        assert_eq!(
+            estimated_build_bytes_from_rows(&stats_with(Precision::Exact(100), 2), &s),
+            Some(want)
+        );
+    }
+
+    #[test]
+    fn a_zero_row_build_side_estimates_zero_not_unknown() {
+        // Zero rows must not be conflated with "unknown": an empty build side
+        // is the strongest possible reason to keep the hash join, and a `None`
+        // here would read as "no information" instead.
+        let s = schema(vec![Field::new("k", DataType::Int64, false)]);
+        assert_eq!(
+            estimated_build_bytes_from_rows(&stats_with(Precision::Exact(0), 1), &s),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn a_huge_row_count_does_not_overflow_into_a_small_estimate() {
+        // Saturating arithmetic: an absurd row count must stay absurd rather
+        // than wrap around to something that looks like it fits.
+        let s = schema(vec![Field::new("k", DataType::Int64, false)]);
+        let est = estimated_build_bytes_from_rows(&stats_with(Precision::Exact(usize::MAX), 1), &s)
+            .expect("a known row count always yields an estimate");
+        assert!(est > u64::from(u32::MAX), "estimate collapsed to {est}");
     }
 }
