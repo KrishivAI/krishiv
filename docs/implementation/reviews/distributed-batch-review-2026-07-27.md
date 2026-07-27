@@ -430,3 +430,70 @@ dataset is on local-path storage and the run is re-baselined.** The
 regression budgets in Phase 66 must be rebuilt on that baseline; the
 existing SF100 history is a record of Longhorn's throughput and should be
 labelled as such rather than deleted.
+
+### Correction to the addendum above — the network, not the disk, is the floor
+
+The disk measurement above was real but it was not the binding constraint.
+Measured back-to-back on the same link, same load (200 MiB, `nc`, s3 → s1):
+
+| path | measured | vs local disk |
+|---|---|---|
+| node local disk (`local-path`) | ~300 MB/s | 1x |
+| **host network** (bypasses the CNI) | **40 MiB/s** | 7x slower |
+| **pod network** (flannel VXLAN — *what the engine actually uses*) | **11 MiB/s** | **27x slower** |
+
+Pod MTU is 1450, correct for VXLAN over a 1500 host — this is not the
+classic MTU-fragmentation bug. The ~3.6x overlay penalty is encapsulation
+cost (these are three separate VPS hosts; flannel backend is `vxlan`,
+`host-gw` is unavailable because they are not L2-adjacent).
+
+**Every byte the engine shuffles crosses the pod network at ~11 MiB/s.**
+
+### What that does to the numbers in this register
+
+- q8/q9 shuffle ~36 GiB of Arrow (18 tasks x ~2 GiB). At 11 MiB/s that is
+  **~55 minutes of pure network time**, floor, perfectly pipelined. The
+  "no progress for 30 min" watchdog fires *during honest work*. The
+  phantom-task bug (`eaec83d8`) was real and worth fixing, but it was
+  never the whole story — this alone reproduces the symptom.
+- A full `lineitem` scan from central MinIO is 39 GiB over the same
+  network: ~1 hour before the first operator does anything useful.
+
+### Revised Batch 4 order — again, and this one is measurement-backed
+
+The previous revision promoted D2 (intra-task parallelism) on the
+first-principles guess that CPU was next after storage. That guess was
+wrong: **network is next, by a wide margin.** Bytes-on-the-wire beats
+cores.
+
+14. **D1** — coordinator-mediated runtime filters / broadcast-instead-of-cut.
+    Was last in both prior orderings; it is now first, because it is the
+    only fix that *removes bytes from the wire* rather than moving them
+    faster. Every 1 GiB not shuffled is ~90 seconds returned.
+15. **B2** — streaming shuffle reads (still a prerequisite for 16, and at
+    11 MiB/s the materialise-then-consume pattern holds buffers ~27x
+    longer than a local-disk mental model assumes).
+16. **D5** — bounded byte-aware prefetch. Overlapping the wire matters
+    *more* when the wire is the bottleneck, not less.
+17. **D2** — intra-task parallelism. Still real, still small, but a
+    second core cannot help a task waiting on an 11 MiB/s fetch. Measure
+    it on scan/aggregate-heavy queries (q1, q6), not shuffle-heavy ones.
+
+### Infrastructure item, outside this register's scope
+
+The overlay costs ~3.6x and the node-local storage work now underway
+removes the *scan* traffic from it, but not the *shuffle* traffic. Whether
+the VXLAN penalty is recoverable (checksum-offload workarounds on virtio
+NICs are a documented k3s/flannel issue with this exact signature) is worth
+one careful experiment — but changing CNI settings on the production
+cluster risks the cross-node routing outage this cluster already suffered
+once (2026-07-22). **Not to be attempted unattended.**
+
+### Honesty consequence for Phase 62 / Phase 66
+
+This cluster is three VPS hosts on a ~90 Mbit/s effective pod network. It
+is an excellent correctness and fault-tolerance testbed and a poor
+throughput testbed. Distributed SF100 numbers measured here characterise
+the link, not the engine, and must be published with the topology stated
+or not published at all. Engine *compute* claims belong on the single-node
+path until a better-connected cluster exists.
