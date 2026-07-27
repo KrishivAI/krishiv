@@ -169,6 +169,21 @@ pub fn stage_split_enabled() -> bool {
 /// hash exchanges — which the builder cuts into shuffle boundaries — are
 /// allowed into the plan.
 pub fn planning_session_context(target_partitions: usize) -> SessionContext {
+    planning_session_context_with_join_threshold(target_partitions, None)
+}
+
+/// As [`planning_session_context`], with the spillable-join build-side
+/// threshold supplied instead of derived from this process's cgroup.
+///
+/// `None` keeps the derived threshold, which is what production uses. Tests
+/// pin it because the rule's behaviour is the whole difference between a
+/// 3-core executor with a ~700 MB per-task share and a build box with tens of
+/// gigabytes: a defect that only appears once joins actually convert is
+/// invisible on the machine the tests run on.
+pub fn planning_session_context_with_join_threshold(
+    target_partitions: usize,
+    spill_join_build_bytes: Option<u64>,
+) -> SessionContext {
     // A6: this was `SessionConfig::new()` — a bare DataFusion config carrying
     // none of the engine's settings, so `KRISHIV_RUNTIME_FILTERS` was a no-op
     // distributed, the SQL dialect differed from the one the query was written
@@ -217,8 +232,9 @@ pub fn planning_session_context(target_partitions: usize) -> SessionContext {
     // `SpillableJoinSelection` (q18), the semi-join reductions (q17) and
     // `CooperativeAmplifiers` (distributed cancel) were dead on exactly the
     // path being benchmarked. See `crate::with_krishiv_optimizer_rules`.
-    let state_builder = crate::with_krishiv_optimizer_rules(
+    let state_builder = crate::with_krishiv_optimizer_rules_with_join_threshold(
         datafusion::execution::session_state::SessionStateBuilder::new().with_default_features(),
+        spill_join_build_bytes,
     )
     .with_config(config);
 
@@ -3168,5 +3184,361 @@ mod roundtrip_schema_guard_tests {
         let bytes = encode_dfplan_bytes(plan, &codec).unwrap();
         verify_dfplan_roundtrip(&bytes, &codec, &ctx.task_ctx(), None)
             .expect("decode-only checking must still pass");
+    }
+}
+
+/// Staged TPC-H over a miniature fixture: the whole cut-encode-ship-execute
+/// path, in process.
+///
+/// The SF100 cluster is the only place several of this module's defects have
+/// ever appeared, and a cluster cycle costs an hour. These tests run the same
+/// path — the same planner, the same stage cut, the same fragment bodies, the
+/// same `ShuffleReadExec` — over a few hundred rows, so a schema disagreement
+/// between what a stage *declares* and what it *produces* fails in seconds on
+/// a laptop instead of in an overnight sweep.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod staged_tpch_tests {
+    use super::*;
+    use arrow::record_batch::RecordBatch;
+    use datafusion::prelude::{ParquetReadOptions, SessionContext};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// q17 and q19 verbatim from the benchmark corpus (`krishiv-bench`), which
+    /// is the point: a paraphrase would not reproduce the plan shape.
+    const Q17: &str = "SELECT sum(l_extendedprice) / 7.0 AS avg_yearly FROM lineitem, part \
+         WHERE p_partkey = l_partkey AND p_brand = 'Brand#23' AND p_container = 'MED BOX' \
+         AND l_quantity < (SELECT 0.2 * avg(l_quantity) FROM lineitem \
+                           WHERE l_partkey = p_partkey)";
+
+    const Q19: &str = "SELECT sum(l_extendedprice * (1 - l_discount)) AS revenue \
+         FROM lineitem, part \
+         WHERE (p_partkey = l_partkey AND p_brand = 'Brand#12' \
+           AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG') \
+           AND l_quantity >= 1 AND l_quantity <= 11 AND p_size BETWEEN 1 AND 5 \
+           AND l_shipmode IN ('AIR', 'AIR REG') AND l_shipinstruct = 'DELIVER IN PERSON') \
+         OR (p_partkey = l_partkey AND p_brand = 'Brand#23' \
+           AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK') \
+           AND l_quantity >= 10 AND l_quantity <= 20 AND p_size BETWEEN 1 AND 10 \
+           AND l_shipmode IN ('AIR', 'AIR REG') AND l_shipinstruct = 'DELIVER IN PERSON') \
+         OR (p_partkey = l_partkey AND p_brand = 'Brand#34' \
+           AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG') \
+           AND l_quantity >= 20 AND l_quantity <= 30 AND p_size BETWEEN 1 AND 15 \
+           AND l_shipmode IN ('AIR', 'AIR REG') AND l_shipinstruct = 'DELIVER IN PERSON')";
+
+    #[derive(Debug, Default)]
+    struct StageStore {
+        partitions: Mutex<HashMap<(usize, usize, usize), Vec<RecordBatch>>>,
+    }
+
+    impl ShufflePartitionReader for Arc<StageStore> {
+        fn read_partition(
+            &self,
+            upstream_stage_index: usize,
+            map_task_index: usize,
+            partition: usize,
+        ) -> futures::future::BoxFuture<'static, Result<Vec<RecordBatch>, String>> {
+            let batches = self
+                .partitions
+                .lock()
+                .expect("store lock")
+                .get(&(upstream_stage_index, map_task_index, partition))
+                .cloned()
+                .unwrap_or_default();
+            Box::pin(async move { Ok(batches) })
+        }
+    }
+
+    fn write_parquet(path: &std::path::Path, batch: &RecordBatch) {
+        let file = std::fs::File::create(path).expect("create parquet");
+        let mut writer =
+            datafusion::parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None)
+                .expect("writer init");
+        writer.write(batch).expect("write batch");
+        writer.close().expect("close writer");
+    }
+
+    /// Miniature `lineitem` and `part`, two files each so map stages get more
+    /// than one task. Column types match the TPC-H DDL — the `Decimal128(15,2)`
+    /// money columns especially, since the defect under test is a decimal
+    /// precision disagreement.
+    fn write_tpch_fixture(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        use arrow::array::{Decimal128Array, Int32Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let lineitem_schema = Arc::new(Schema::new(vec![
+            Field::new("l_partkey", DataType::Int64, false),
+            Field::new("l_quantity", DataType::Decimal128(15, 2), false),
+            Field::new("l_extendedprice", DataType::Decimal128(15, 2), false),
+            Field::new("l_discount", DataType::Decimal128(15, 2), false),
+            Field::new("l_shipmode", DataType::Utf8, false),
+            Field::new("l_shipinstruct", DataType::Utf8, false),
+        ]));
+        let part_schema = Arc::new(Schema::new(vec![
+            Field::new("p_partkey", DataType::Int64, false),
+            Field::new("p_brand", DataType::Utf8, false),
+            Field::new("p_container", DataType::Utf8, false),
+            Field::new("p_size", DataType::Int32, false),
+        ]));
+        let money = |values: Vec<i128>| -> Arc<dyn arrow::array::Array> {
+            Arc::new(
+                Decimal128Array::from(values)
+                    .with_precision_and_scale(15, 2)
+                    .expect("decimal(15,2)"),
+            )
+        };
+
+        let lineitem_dir = dir.join("lineitem");
+        std::fs::create_dir_all(&lineitem_dir).expect("lineitem dir");
+        for file_index in 0..2i64 {
+            let keys: Vec<i64> = (0..200).map(|i| (file_index * 200 + i) % 60).collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&lineitem_schema),
+                vec![
+                    Arc::new(Int64Array::from(keys.clone())),
+                    money(keys.iter().map(|k| i128::from(k % 30 + 1) * 100).collect()),
+                    money(keys.iter().map(|k| i128::from(k + 1) * 1_000).collect()),
+                    money(keys.iter().map(|k| i128::from(k % 10)).collect()),
+                    Arc::new(StringArray::from(
+                        keys.iter()
+                            .map(|k| if k % 2 == 0 { "AIR" } else { "RAIL" })
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        keys.iter()
+                            .map(|k| {
+                                if k % 3 == 0 {
+                                    "DELIVER IN PERSON"
+                                } else {
+                                    "TAKE BACK RETURN"
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("lineitem batch");
+            write_parquet(&lineitem_dir.join(format!("l-{file_index}.parquet")), &batch);
+        }
+
+        let part_dir = dir.join("part");
+        std::fs::create_dir_all(&part_dir).expect("part dir");
+        for file_index in 0..2i64 {
+            let keys: Vec<i64> = (0..30).map(|i| file_index * 30 + i).collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&part_schema),
+                vec![
+                    Arc::new(Int64Array::from(keys.clone())),
+                    Arc::new(StringArray::from(
+                        keys.iter()
+                            .map(|k| match k % 3 {
+                                0 => "Brand#12",
+                                1 => "Brand#23",
+                                _ => "Brand#34",
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        keys.iter()
+                            .map(|k| match k % 4 {
+                                0 => "SM BOX",
+                                1 => "MED BOX",
+                                2 => "LG BOX",
+                                _ => "JUMBO BOX",
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int32Array::from(
+                        keys.iter().map(|k| (k % 15 + 1) as i32).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("part batch");
+            write_parquet(&part_dir.join(format!("p-{file_index}.parquet")), &batch);
+        }
+        (lineitem_dir, part_dir)
+    }
+
+    async fn tpch_context(dir: &std::path::Path, join_threshold: Option<u64>) -> SessionContext {
+        let (lineitem, part) = write_tpch_fixture(dir);
+        let ctx = planning_session_context_with_join_threshold(4, join_threshold);
+        for (name, path) in [("lineitem", lineitem), ("part", part)] {
+            ctx.register_parquet(
+                name,
+                path.to_str().expect("utf8 path"),
+                ParquetReadOptions::default(),
+            )
+            .await
+            .expect("register parquet");
+        }
+        ctx
+    }
+
+    /// Consistent test-side routing; any consistent hash is correct here.
+    fn route(batch: &RecordBatch, key_column: &str, num_partitions: usize) -> Vec<RecordBatch> {
+        use std::hash::{Hash as _, Hasher as _};
+        let key_idx = batch.schema().index_of(key_column).expect("key column");
+        let column = batch.column(key_idx);
+        let mut selections: Vec<Vec<u32>> = vec![Vec::new(); num_partitions];
+        for row in 0..batch.num_rows() {
+            let value = arrow::util::display::array_value_to_string(column, row).expect("value");
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            value.hash(&mut hasher);
+            let bucket = (hasher.finish() as usize) % num_partitions;
+            selections[bucket].push(row as u32);
+        }
+        selections
+            .into_iter()
+            .map(|rows| {
+                let indices = arrow::array::UInt32Array::from(rows);
+                arrow::compute::take_record_batch(batch, &indices).expect("take")
+            })
+            .collect()
+    }
+
+    /// Run every stage in dependency order, exactly as the cluster does.
+    async fn run_staged(ctx: &SessionContext, sql: &str) -> Result<Vec<RecordBatch>, String> {
+        let df = ctx.sql(sql).await.map_err(|e| e.to_string())?;
+        let plan = df.create_physical_plan().await.map_err(|e| e.to_string())?;
+        let staged = build_distributed_stages(plan)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| String::from("declined to stage"))?;
+
+        let store = Arc::new(StageStore::default());
+        let exec_ctx = fragment_decode_session_context();
+        let mut result = Vec::new();
+        for (stage_index, stage) in staged.stages.iter().enumerate() {
+            for (task_index, body) in stage.task_bodies.iter().enumerate() {
+                let reader: Arc<dyn ShufflePartitionReader> = Arc::new(Arc::clone(&store));
+                let (declared, mut stream) = execute_dfplan_body(body, &exec_ctx, Some(reader))
+                    .map_err(|e| format!("stage {stage_index} task {task_index} start: {e}"))?;
+                while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                    let batch = batch
+                        .map_err(|e| format!("stage {stage_index} task {task_index}: {e}"))?;
+                    // The invariant the cluster depends on and this harness
+                    // would otherwise hide: the store here hands the *same*
+                    // batches back, so a stage whose declared schema disagrees
+                    // with its produced batches sails through in process and
+                    // only dies on the wire, where the reduce side concatenates
+                    // real IPC data against the declared schema and Arrow says
+                    // "column types must match schema types".
+                    if batch.schema() != declared {
+                        return Err(format!(
+                            "stage {stage_index} task {task_index} declares {declared:?} but \
+                             produced {:?}; ShuffleReadExec labels the reduce side with the \
+                             declared schema, so this disagreement becomes a reduce-side Arrow \
+                             error on a real cluster",
+                            batch.schema()
+                        ));
+                    }
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    match &stage.shuffle {
+                        None => result.push(batch),
+                        Some(shuffle) => match shuffle.key_columns.first() {
+                            Some(key) => {
+                                for (bucket, part) in
+                                    route(&batch, key, shuffle.num_output_partitions)
+                                        .into_iter()
+                                        .enumerate()
+                                {
+                                    if part.num_rows() > 0 {
+                                        store
+                                            .partitions
+                                            .lock()
+                                            .expect("store lock")
+                                            .entry((stage_index, task_index, bucket))
+                                            .or_default()
+                                            .push(part);
+                                    }
+                                }
+                            }
+                            // A keyless shuffle is a gather: everything to 0.
+                            None => store
+                                .partitions
+                                .lock()
+                                .expect("store lock")
+                                .entry((stage_index, task_index, 0))
+                                .or_default()
+                                .push(batch),
+                        },
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn render(batches: &[RecordBatch]) -> Vec<String> {
+        let mut rows: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows()).map(move |r| {
+                    (0..b.num_columns())
+                        .map(|c| {
+                            arrow::util::display::array_value_to_string(b.column(c), r)
+                                .expect("cell")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    async fn direct(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
+        ctx.sql(sql)
+            .await
+            .expect("sql")
+            .collect()
+            .await
+            .expect("direct execution")
+    }
+
+    /// The staged answer must equal the single-node answer, with and without
+    /// the spillable-join conversion active.
+    ///
+    /// `Some(0)` forces every join whose build size is known to convert to
+    /// sort-merge — the state a memory-capped executor is in, and the state
+    /// this build box never reaches on its own. The rule claims to preserve
+    /// the join's output schema exactly (`schema_check()` returns true), so
+    /// converting *more* joins than production would must still be correct;
+    /// if it is not, the claim is false.
+    async fn staged_matches_direct(sql: &str, join_threshold: Option<u64>, label: &str) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = tpch_context(tmp.path(), join_threshold).await;
+        let expected = render(&direct(&ctx, sql).await);
+        let actual = run_staged(&ctx, sql)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: staged execution failed: {e}"));
+        assert_eq!(
+            render(&actual),
+            expected,
+            "{label}: staged result differs from single-node execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_q17_matches_direct_execution() {
+        staged_matches_direct(Q17, None, "q17/unconverted").await;
+    }
+
+    #[tokio::test]
+    async fn staged_q17_matches_direct_execution_with_converted_joins() {
+        staged_matches_direct(Q17, Some(0), "q17/converted").await;
+    }
+
+    #[tokio::test]
+    async fn staged_q19_matches_direct_execution() {
+        staged_matches_direct(Q19, None, "q19/unconverted").await;
+    }
+
+    #[tokio::test]
+    async fn staged_q19_matches_direct_execution_with_converted_joins() {
+        staged_matches_direct(Q19, Some(0), "q19/converted").await;
     }
 }

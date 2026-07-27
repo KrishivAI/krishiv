@@ -741,6 +741,17 @@ async fn execute_shuffle_write_fragment(
     let mut outputs: Vec<krishiv_proto::ShufflePartitionOutput> =
         Vec::with_capacity(num_partitions as usize);
 
+    // One schema for this task's whole output, latched from the first batch
+    // that carried data — the same rule `drain_into_store` follows, and for
+    // the same reason. Deciding per partition made a partition's schema depend
+    // on whether it happened to receive rows: full ones took the *produced*
+    // schema, empty ones took the plan's *declared* one, and physical
+    // execution re-types expressions, so the two disagree (q17 declares
+    // `Decimal128(15, 2)` for `avg(l_quantity)` and produces
+    // `Decimal128(30, 15)`). The reduce side concatenates across map tasks and
+    // rejects the mixture.
+    let observed_schema = buffer.pushed_schema();
+    super::shuffle_write_buffer::warn_on_schema_divergence(observed_schema.as_ref(), &output_schema);
     for p in 0..num_partitions {
         // `_reservation` must outlive `part_batches` — it is the pool's view
         // of this partition while it is concatenated and serialised.
@@ -750,9 +761,8 @@ async fn execute_shuffle_write_fragment(
             stage_id: stage_id.to_owned(),
             partition: p,
         };
-        let schema = part_batches
-            .first()
-            .map(|b| b.schema())
+        let schema = observed_schema
+            .clone()
             .unwrap_or_else(|| output_schema.clone());
         let size_bytes: u64 = part_batches
             .iter()
@@ -1302,6 +1312,10 @@ async fn execute_inmem_shuffle_write(
     let mut outputs: Vec<krishiv_proto::ShufflePartitionOutput> =
         Vec::with_capacity(num_partitions as usize);
 
+    // One schema for this task's whole output — see the identical latch in the
+    // shuffle-write path above and in `drain_into_store`.
+    let observed_schema = buffer.pushed_schema();
+    super::shuffle_write_buffer::warn_on_schema_divergence(observed_schema.as_ref(), &output_schema);
     for p in 0..num_partitions {
         // `_reservation` must outlive `part_batches` — it is the pool's view
         // of this partition while it is concatenated and serialised.
@@ -1311,9 +1325,8 @@ async fn execute_inmem_shuffle_write(
             stage_id: stage_id.to_owned(),
             partition: p,
         };
-        let schema = part_batches
-            .first()
-            .map(|b| b.schema())
+        let schema = observed_schema
+            .clone()
             .unwrap_or_else(|| output_schema.clone());
         let size_bytes: u64 = part_batches
             .iter()

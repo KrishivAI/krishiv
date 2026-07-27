@@ -1,0 +1,245 @@
+{
+  "label": "full22-ca0315d7",
+  "scale_factor": 100,
+  "coordinator": "http://213.199.60.184:31902",
+  "data_root": "s3://krishiv-bench/tpch/sf100",
+  "generated_at": "2026-07-27T22:50:34Z",
+  "succeeded": 19,
+  "attempted": 22,
+  "total_elapsed_s": 12180.48540181898,
+  "queries": [
+    {
+      "id": "q1",
+      "name": "pricing_summary",
+      "job_id": "batch-sql-1785179504574-0",
+      "status": "ok",
+      "elapsed_s": 52.89633474099537,
+      "result_batches": 1,
+      "stage_count": 2,
+      "task_count": 7,
+      "distributed": true
+    },
+    {
+      "id": "q2",
+      "name": "minimum_cost_supplier",
+      "job_id": "batch-sql-1785179557450-1",
+      "status": "ok",
+      "elapsed_s": 1317.2971535219986,
+      "result_batches": 1,
+      "stage_count": 11,
+      "task_count": 181,
+      "distributed": true
+    },
+    {
+      "id": "q3",
+      "name": "shipping_priority",
+      "job_id": "batch-sql-1785180874771-2",
+      "status": "ok",
+      "elapsed_s": 414.110139532997,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    },
+    {
+      "id": "q4",
+      "name": "order_priority_checking",
+      "job_id": "batch-sql-1785181288877-3",
+      "status": "ok",
+      "elapsed_s": 121.54960729299637,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    },
+    {
+      "id": "q5",
+      "name": "local_supplier_volume",
+      "job_id": "batch-sql-1785181410424-4",
+      "status": "ok",
+      "elapsed_s": 726.8980009009974,
+      "result_batches": 1,
+      "stage_count": 7,
+      "task_count": 109,
+      "distributed": true
+    },
+    {
+      "id": "q6",
+      "name": "forecasting_revenue_change",
+      "job_id": "batch-sql-1785182137330-5",
+      "status": "ok",
+      "elapsed_s": 51.06137714199576,
+      "result_batches": 1,
+      "stage_count": 2,
+      "task_count": 19,
+      "distributed": true
+    },
+    {
+      "id": "q7",
+      "name": "volume_shipping",
+      "job_id": "batch-sql-1785182188388-6",
+      "status": "ok",
+      "elapsed_s": 601.945744204997,
+      "result_batches": 1,
+      "stage_count": 7,
+      "task_count": 109,
+      "distributed": true
+    },
+    {
+      "id": "q8",
+      "name": "national_market_share",
+      "job_id": "batch-sql-1785182790333-7",
+      "status": "ok",
+      "elapsed_s": 214.02353840100113,
+      "result_batches": 1,
+      "stage_count": 8,
+      "task_count": 127,
+      "distributed": true
+    },
+    {
+      "id": "q9",
+      "name": "product_type_profit_measure",
+      "job_id": "batch-sql-1785183004364-8",
+      "status": "ok",
+      "elapsed_s": 387.3384397600021,
+      "result_batches": 1,
+      "stage_count": 8,
+      "task_count": 127,
+      "distributed": true
+    },
+    {
+      "id": "q10",
+      "name": "returned_item_reporting",
+      "job_id": "batch-sql-1785183391698-9",
+      "status": "cancelled",
+      "error": "job was cancelled",
+      "elapsed_s": 720.3277100010018
+    },
+    {
+      "id": "q11",
+      "name": "important_stock_identification",
+      "job_id": "batch-sql-1785184112028-10",
+      "status": "ok",
+      "elapsed_s": 58.209488049993524,
+      "result_batches": 0,
+      "stage_count": 3,
+      "task_count": 37,
+      "distributed": true
+    },
+    {
+      "id": "q12",
+      "name": "shipping_modes_and_order_priority",
+      "job_id": "batch-sql-1785184170237-11",
+      "status": "ok",
+      "elapsed_s": 162.0301691719942,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    },
+    {
+      "id": "q13",
+      "name": "customer_distribution",
+      "job_id": "batch-sql-1785184332268-12",
+      "status": "ok",
+      "elapsed_s": 92.17132039301214,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    },
+    {
+      "id": "q14",
+      "name": "promotion_effect",
+      "job_id": "batch-sql-1785184424439-13",
+      "status": "ok",
+      "elapsed_s": 135.63753027700295,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    },
+    {
+      "id": "q15",
+      "name": "top_supplier",
+      "job_id": "batch-sql-1785184560099-14",
+      "status": "ok",
+      "elapsed_s": 156.9078426519991,
+      "result_batches": 1,
+      "stage_count": 3,
+      "task_count": 37,
+      "distributed": true
+    },
+    {
+      "id": "q16",
+      "name": "parts_supplier_relationship",
+      "job_id": "batch-sql-1785184716985-15",
+      "status": "ok",
+      "elapsed_s": 75.36849517200608,
+      "result_batches": 1,
+      "stage_count": 6,
+      "task_count": 91,
+      "distributed": true
+    },
+    {
+      "id": "q17",
+      "name": "small_quantity_order_revenue",
+      "job_id": "batch-sql-1785184792363-16",
+      "status": "failed",
+      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"dfplan:v1:0:QqwPEjsiORITChEKD2xfZXh0ZW5kZWRwcmljZSIDc3VtQh1zdW0obGluZWl0ZW0ubF9leHRlbmRlZHByaWNlKSKtDiKqDgr/DZIC+w0K1gdS0wcKqgcipwcKkQZCjgYKDQoLCglsX3BhcnRrZXkSMyIxEhAKDgoKbF9xdWFudGl0eRABIgNh\u2026': local stage fragment execution failed: DataFusion error: Arrow error: Invalid argument error: column types must match schema types, expected Decimal128(15, 2) but found Decimal128(30, 15) at column index 0",
+      "elapsed_s": 92.33625280699925
+    },
+    {
+      "id": "q18",
+      "name": "large_volume_customer",
+      "job_id": "batch-sql-1785184884697-17",
+      "status": "ok",
+      "elapsed_s": 951.0261833760014,
+      "result_batches": 1,
+      "stage_count": 7,
+      "task_count": 109,
+      "distributed": true
+    },
+    {
+      "id": "q19",
+      "name": "discounted_revenue",
+      "job_id": "batch-sql-1785185835727-18",
+      "status": "failed",
+      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"dfplan:v1:0:QpwUEowCIokCElkaVxoITXVsdGlwbHkiEwoRCg9sX2V4dGVuZGVkcHJpY2UiNho0GgVNaW51cyIZEheiARQKEAAAAAAAAAAAAAAAAAAAAAEQFCIQCg4KCmxfZGlzY291bnQQASIDc3VtQqYBH2RhdGFmdXNpb25faHVtYW5fZGlzcGxheV9h\u2026': local stage fragment execution failed: DataFusion error: Arrow error: Invalid argument error: column types must match schema types, expected Decimal128(15, 2) but found Utf8View at column index 0",
+      "elapsed_s": 136.79402654900332
+    },
+    {
+      "id": "q20",
+      "name": "potential_part_promotion",
+      "job_id": "batch-sql-1785185972552-19",
+      "status": "ok",
+      "elapsed_s": 220.16490339099255,
+      "result_batches": 1,
+      "stage_count": 6,
+      "task_count": 91,
+      "distributed": true
+    },
+    {
+      "id": "q21",
+      "name": "suppliers_who_kept_orders_waiting",
+      "job_id": "batch-sql-1785186192695-20",
+      "status": "ok",
+      "elapsed_s": 6311.27992986,
+      "result_batches": 1,
+      "stage_count": 8,
+      "task_count": 127,
+      "distributed": true
+    },
+    {
+      "id": "q22",
+      "name": "global_sales_opportunity",
+      "job_id": "batch-sql-1785192503996-21",
+      "status": "ok",
+      "elapsed_s": 130.56920397799695,
+      "result_batches": 1,
+      "stage_count": 1,
+      "task_count": 1,
+      "distributed": false
+    }
+  ]
+}

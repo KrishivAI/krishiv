@@ -688,6 +688,20 @@ const MIN_SORT_SPILL_RESERVATION_BYTES: usize = 64 * 1024;
 pub fn with_krishiv_optimizer_rules(
     builder: datafusion::execution::session_state::SessionStateBuilder,
 ) -> datafusion::execution::session_state::SessionStateBuilder {
+    with_krishiv_optimizer_rules_with_join_threshold(builder, None)
+}
+
+/// As [`with_krishiv_optimizer_rules`], with the spillable-join build-side
+/// threshold given explicitly; `None` derives it from this process's capacity.
+#[must_use]
+pub fn with_krishiv_optimizer_rules_with_join_threshold(
+    builder: datafusion::execution::session_state::SessionStateBuilder,
+    spill_join_build_bytes: Option<u64>,
+) -> datafusion::execution::session_state::SessionStateBuilder {
+    let spillable_join = match spill_join_build_bytes {
+        Some(bytes) => crate::spillable_join::SpillableJoinSelection::with_threshold(Some(bytes)),
+        None => crate::spillable_join::SpillableJoinSelection::from_capacity(),
+    };
     builder
         .with_physical_optimizer_rule(std::sync::Arc::new(
             crate::coop_amplifiers::CooperativeAmplifiers::new(),
@@ -697,9 +711,7 @@ pub fn with_krishiv_optimizer_rules(
         // converts exactly those joins — known-large build sides only — to
         // sort-merge, which can. See `spillable_join` for why this is per-join
         // and not a session config bit.
-        .with_physical_optimizer_rule(std::sync::Arc::new(
-            crate::spillable_join::SpillableJoinSelection::from_capacity(),
-        ))
+        .with_physical_optimizer_rule(std::sync::Arc::new(spillable_join))
         // Aggregates joined on their own grouping key only need the groups the
         // join keeps; see `semi_join_reduction`.
         .with_optimizer_rule(std::sync::Arc::new(

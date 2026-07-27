@@ -1,0 +1,60 @@
+{
+  "label": "retest-99ff3d23",
+  "scale_factor": 100,
+  "coordinator": "http://213.199.60.184:31902",
+  "data_root": "s3://krishiv-bench/tpch/sf100",
+  "generated_at": "2026-07-27T17:46:11Z",
+  "succeeded": 0,
+  "attempted": 6,
+  "total_elapsed_s": 0,
+  "queries": [
+    {
+      "id": "q7",
+      "name": "volume_shipping",
+      "job_id": "batch-sql-1785173647672-0",
+      "status": "failed",
+      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"sql: SELECT supp_nation, cust_nation, l_year, sum(volume) AS revenue FROM ( SELECT n1.n_name AS supp_nation, n2.n_name AS cust_nation, EXTRACT(YEAR FROM l_shipdate) AS l_year, l_extendedprice \u2026': local stage fragment execution failed: DataFusion error: spillable_join_selection\ncaused by\nError during planning: The left or right side of the join does not have all columns on \"on\": \nMissing on the left: {}\nMissing on the right: {Column { name: \"o_custkey\", index: 4 }}",
+      "elapsed_s": 9.031926171999658
+    },
+    {
+      "id": "q8",
+      "name": "national_market_share",
+      "job_id": "batch-sql-1785173656692-1",
+      "status": "failed",
+      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"sql: SELECT o_year, sum(CASE WHEN nation = 'BRAZIL' THEN volume ELSE 0 END) / sum(volume) AS mkt_share FROM ( SELECT EXTRACT(YEAR FROM o_orderdate) AS o_year, l_extendedprice * (1 - l_discount\u2026': local stage fragment execution failed: DataFusion error: spillable_join_selection\ncaused by\nError during planning: The left or right side of the join does not have all columns on \"on\": \nMissing on the left: {}\nMissing on the right: {Column { name: \"o_custkey\", index: 3 }}",
+      "elapsed_s": 3.752076490993204
+    },
+    {
+      "id": "q9",
+      "name": "product_type_profit_measure",
+      "job_id": "batch-sql-1785173660444-2",
+      "status": "failed",
+      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"sql: SELECT nation, o_year, sum(amount) AS sum_profit FROM ( SELECT n_name AS nation, EXTRACT(YEAR FROM o_orderdate) AS o_year, l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity \u2026': local stage fragment execution failed: DataFusion error: spillable_join_selection\ncaused by\nError during planning: The left or right side of the join does not have all columns on \"on\": \nMissing on the left: {}\nMissing on the right: {Column { name: \"l_orderkey\", index: 0 }}",
+      "elapsed_s": 3.6582773510017432
+    },
+    {
+      "id": "q10",
+      "name": "returned_item_reporting",
+      "job_id": "batch-sql-1785173664103-3",
+      "status": "cancelled",
+      "error": "job was cancelled",
+      "elapsed_s": 554.795169103003
+    },
+    {
+      "id": "q17",
+      "name": "small_quantity_order_revenue",
+      "job_id": "batch-sql-1785174218893-4",
+      "status": "failed",
+      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"dfplan:v1:2:Qv4OEjsiORITChEKD2xfZXh0ZW5kZWRwcmljZSIDc3VtQh1zdW0obGluZWl0ZW0ubF9leHRlbmRlZHByaWNlKSL/DZIC+w0K1gdS0wcKqgcipwcKkQZCjgYKDQoLCglsX3BhcnRrZXkSMyIxEhAKDgoKbF9xdWFudGl0eRABIgNhdmdCGGF2\u2026': local stage fragment execution failed: DataFusion error: Arrow error: Invalid argument error: column types must match schema types, expected Decimal128(15, 2) but found Decimal128(30, 15) at column index 0",
+      "elapsed_s": 149.04171466700063
+    },
+    {
+      "id": "q18",
+      "name": "large_volume_customer",
+      "job_id": "batch-sql-1785174367935-5",
+      "status": "failed",
+      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"sql: SELECT c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, sum(l_quantity) FROM customer, orders, lineitem WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey H\u2026': local stage fragment execution failed: DataFusion error: spillable_join_selection\ncaused by\nInternal error: Assertion failed: col.name() == matching_name: Input field name o_totalprice does not match with the projection expression o_orderdate.\nThis issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues",
+      "elapsed_s": 3.727264681001543
+    }
+  ]
+}

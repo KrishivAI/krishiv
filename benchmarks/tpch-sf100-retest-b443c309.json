@@ -1,0 +1,72 @@
+{
+  "label": "retest-b443c309",
+  "scale_factor": 100,
+  "coordinator": "http://213.199.60.184:31902",
+  "data_root": "s3://krishiv-bench/tpch/sf100",
+  "generated_at": "2026-07-27T19:09:19Z",
+  "succeeded": 4,
+  "attempted": 6,
+  "total_elapsed_s": 2354.334015000997,
+  "queries": [
+    {
+      "id": "q7",
+      "name": "volume_shipping",
+      "job_id": "batch-sql-1785176093931-0",
+      "status": "ok",
+      "elapsed_s": 746.6097907080039,
+      "result_batches": 1,
+      "stage_count": 7,
+      "task_count": 37,
+      "distributed": true
+    },
+    {
+      "id": "q8",
+      "name": "national_market_share",
+      "job_id": "batch-sql-1785176840526-1",
+      "status": "ok",
+      "elapsed_s": 239.31351716099743,
+      "result_batches": 1,
+      "stage_count": 8,
+      "task_count": 127,
+      "distributed": true
+    },
+    {
+      "id": "q9",
+      "name": "product_type_profit_measure",
+      "job_id": "batch-sql-1785177079832-2",
+      "status": "ok",
+      "elapsed_s": 399.9405757019995,
+      "result_batches": 1,
+      "stage_count": 8,
+      "task_count": 127,
+      "distributed": true
+    },
+    {
+      "id": "q10",
+      "name": "returned_item_reporting",
+      "job_id": "batch-sql-1785177479774-3",
+      "status": "cancelled",
+      "error": "job was cancelled",
+      "elapsed_s": 785.9858042499982
+    },
+    {
+      "id": "q17",
+      "name": "small_quantity_order_revenue",
+      "job_id": "batch-sql-1785178265770-4",
+      "status": "failed",
+      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"dfplan:v1:1:QqwPEjsiORITChEKD2xfZXh0ZW5kZWRwcmljZSIDc3VtQh1zdW0obGluZWl0ZW0ubF9leHRlbmRlZHByaWNlKSKtDiKqDgr/DZIC+w0K1gdS0wcKqgcipwcKkQZCjgYKDQoLCglsX3BhcnRrZXkSMyIxEhAKDgoKbF9xdWFudGl0eRABIgNh\u2026': local stage fragment execution failed: DataFusion error: Arrow error: Invalid argument error: column types must match schema types, expected Decimal128(15, 2) but found Decimal128(30, 15) at column index 0",
+      "elapsed_s": 125.13585352799419
+    },
+    {
+      "id": "q18",
+      "name": "large_volume_customer",
+      "job_id": "batch-sql-1785178390893-5",
+      "status": "ok",
+      "elapsed_s": 968.4701314299964,
+      "result_batches": 1,
+      "stage_count": 7,
+      "task_count": 109,
+      "distributed": true
+    }
+  ]
+}

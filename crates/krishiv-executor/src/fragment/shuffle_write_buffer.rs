@@ -259,6 +259,47 @@ pub(crate) struct PartitionWriteStat {
 /// `pre_write` sees each partition (schema and batches) immediately before it
 /// is handed to the store — that is where the push-shuffle mirror and hot-key
 /// accounting hook in.
+/// Report a stage whose *produced* batches disagree with its *declared* plan
+/// schema, naming both.
+///
+/// This disagreement is not survivable: `ShuffleReadExec` labels the reduce
+/// side's stream with the coordinator's declared schema, so the reduce side
+/// concatenates real IPC data against the wrong types and Arrow reports
+/// `column types must match schema types, expected X but found Y at column
+/// index N` — several operators away from the stage that caused it, with
+/// nothing in the message identifying which stage that was. TPC-H q17 and q19
+/// at SF100 both die this way, and neither error says so.
+///
+/// Logging at `warn` rather than failing: the write itself is well-formed and
+/// self-consistent (every partition of this task carries the observed schema),
+/// and a diagnostic must not be the reason a query that might still succeed
+/// does not.
+pub(crate) fn warn_on_schema_divergence(
+    observed: Option<&arrow::datatypes::SchemaRef>,
+    declared: &arrow::datatypes::SchemaRef,
+) {
+    let Some(observed) = observed else {
+        return;
+    };
+    if observed.as_ref() == declared.as_ref() {
+        return;
+    }
+    let fields = |schema: &arrow::datatypes::Schema| {
+        schema
+            .fields()
+            .iter()
+            .map(|f| format!("{}:{}", f.name(), f.data_type()))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    tracing::warn!(
+        declared = %fields(declared),
+        produced = %fields(observed),
+        "stage output schema disagrees with the plan's declared schema; the reduce side \
+         labels this stage's data with the DECLARED schema and will reject it"
+    );
+}
+
 pub(crate) async fn drain_into_store(
     buffer: &mut ShuffleWriteBuffer,
     store: &krishiv_shuffle::ShuffleBackend,
@@ -289,6 +330,7 @@ pub(crate) async fn drain_into_store(
     // the declared one only when this task produced no rows at all, which is
     // the case `fallback_schema` exists for.
     let observed_schema = buffer.pushed_schema();
+    warn_on_schema_divergence(observed_schema.as_ref(), fallback_schema);
     for index in 0..num_partitions {
         let partition = u32::try_from(index).map_err(|_| ExecutorError::LocalExecution {
             message: format!("shuffle partition index {index} exceeds u32"),
@@ -995,6 +1037,30 @@ mod coalesce_tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
+
+    /// A coalesced batch has to fit through the shuffle transport.
+    ///
+    /// It did not. The writer coalesced to 8 MiB while tonic's *default* 4 MiB
+    /// decode limit was left in place on both the shuffle Flight client and
+    /// server, so every fetch of a coalesced partition failed with
+    /// `decoded message length too large: found 5117681 bytes, the limit is:
+    /// 4194304 bytes`. The consumer then reported the partition **missing**,
+    /// the coordinator regenerated a 5.6 GB producer stage, reproduced the
+    /// identical failure and killed the job — TPC-H q10 at SF100, every sweep.
+    ///
+    /// Two constants in two crates have to stay in a relationship for the
+    /// shuffle to work at all, so assert the relationship rather than trusting
+    /// that whoever edits one remembers the other.
+    #[test]
+    fn shuffle_batches_fit_the_wire_limit() {
+        let wire = krishiv_shuffle::flight::shuffle_grpc_max_message_bytes();
+        assert!(
+            SHUFFLE_COALESCE_TARGET_BYTES * 2 <= wire,
+            "the shuffle writer coalesces to {SHUFFLE_COALESCE_TARGET_BYTES} bytes but the \
+             transport will only carry {wire}; a coalesced partition cannot be fetched, and \
+             the failure is reported as a missing partition rather than a transport error"
+        );
+    }
 
     fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![

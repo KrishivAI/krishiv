@@ -528,8 +528,16 @@ pub(crate) async fn serve_with_token_and_limit<S: ShuffleStore + Send + Sync + '
     // One interceptor type for both auth-on and auth-off so `add_service`
     // receives a single concrete service type. When `token` is `None` the
     // interceptor is a pass-through.
-    let intercepted = FlightServiceServer::with_interceptor(
-        service,
+    // The message-size limits belong on the server itself: `with_interceptor`
+    // returns an `InterceptedService`, which does not expose them, so raising
+    // them afterwards is not possible — build the sized server first and wrap
+    // it.
+    let wire_limit = shuffle_grpc_max_message_bytes();
+    let sized = FlightServiceServer::new(service)
+        .max_decoding_message_size(wire_limit)
+        .max_encoding_message_size(wire_limit);
+    let intercepted = tonic::service::interceptor::InterceptedService::new(
+        sized,
         move |req: Request<()>| -> Result<Request<()>, Status> {
             let provided = req
                 .metadata()
@@ -649,11 +657,47 @@ impl FetchRetryPolicy {
     }
 }
 
+/// Largest gRPC message the shuffle transport will encode or decode.
+///
+/// tonic defaults to **4 MiB**, and nothing here ever raised it. The shuffle
+/// writer coalesces into 8 MiB batches, so a single coalesced batch serialises
+/// to ~5 MB of IPC and every fetch of it died with
+/// `decoded message length too large: found 5117681 bytes, the limit is:
+/// 4194304 bytes`. Because that error was classified retryable and an
+/// exhausted retry is reported as `NotFound`, the consumer told the
+/// coordinator the partition was *missing*; the coordinator regenerated a
+/// 5.6 GB producer stage, got the identical result, and failed the job.
+/// TPC-H q10 at SF100 died this way on every sweep.
+///
+/// The limit must exceed the shuffle writer's coalesce target with room to
+/// spare — `shuffle_batches_fit_the_wire_limit` in `krishiv-executor` pins
+/// that relationship so the two constants cannot drift apart again.
+pub const SHUFFLE_GRPC_MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
+
+/// `KRISHIV_SHUFFLE_GRPC_MAX_MESSAGE_BYTES` override for the wire limit.
+pub const SHUFFLE_GRPC_MAX_MESSAGE_BYTES_ENV: &str = "KRISHIV_SHUFFLE_GRPC_MAX_MESSAGE_BYTES";
+
+/// The configured gRPC message limit for the shuffle transport.
+#[must_use]
+pub fn shuffle_grpc_max_message_bytes() -> usize {
+    std::env::var(SHUFFLE_GRPC_MAX_MESSAGE_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(SHUFFLE_GRPC_MAX_MESSAGE_BYTES)
+}
+
 /// `true` when a fetch failure is plausibly transient and worth retrying.
+///
+/// `InvalidData` is where an IPC/gRPC decode failure lands, and a message that
+/// does not decode this time will not decode next time: retrying burns the
+/// budget and — worse — an exhausted retry is reported as a *missing
+/// partition*, which sends the coordinator off to regenerate a producer whose
+/// output was never lost. Deterministic failures must stay deterministic.
 fn is_retryable_fetch_error(error: &io::Error) -> bool {
     !matches!(
         error.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
+        io::ErrorKind::NotFound | io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData
     )
 }
 
@@ -685,7 +729,10 @@ impl FlightShuffleClient {
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
 
-        let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
+        let limit = shuffle_grpc_max_message_bytes();
+        let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel)
+            .max_decoding_message_size(limit)
+            .max_encoding_message_size(limit);
         let ticket_text = format!("{job_id}/{stage_id}/{partition_id}");
         let ticket = Ticket {
             ticket: ticket_text.into_bytes().into(),
@@ -843,7 +890,10 @@ impl FlightShuffleClient {
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
 
-        let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
+        let limit = shuffle_grpc_max_message_bytes();
+        let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel)
+            .max_decoding_message_size(limit)
+            .max_encoding_message_size(limit);
 
         let ticket_text = format!("{job_id}/{stage_id}/{partition_id}");
         let descriptor = FlightDescriptor {
