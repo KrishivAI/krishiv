@@ -788,3 +788,32 @@ broke the *parent* join's positional `on`:
 Fixed in `b443c309` by rebuilding the projection over the converted join.
 The rule also can no longer fail a plan: an optimisation performed for memory
 reasons must never be why a query dies.
+
+### Where the spill rule actually runs (and why q7/q8 now pass)
+
+Live on `fast-b443c309`, q7 passed at 746.61 s (7 stages, 37 tasks) and q8 at
+239.31 s (8 stages, **127** tasks) — both previously dead on
+`Resources exhausted: HashJoinInput`.
+
+Neither converted a single join. Executors logged **zero** `spillable-join`
+lines; the coordinator logged three `pass complete`. That is the correct
+topology and worth stating plainly, because it was not obvious:
+
+- **Staged (`dfplan:`) fragments are decoded pre-optimized.** The executor
+  runs no physical optimizer rules on them, so `SpillableJoinSelection` is
+  inert there by construction. The decision is made once, on the coordinator,
+  and travels inside the encoded plan.
+- **Only `sql:` fragments re-plan on the executor**, which is where the
+  executor-side registration matters.
+
+So the fix that actually carried q7 and q8 is the **AQE coalesce parallelism
+floor** (`90cdc419`): stages are no longer collapsed to one partition, per-task
+build sides shrink accordingly (q8: 127 tasks), and the hash joins simply fit.
+The CollectLeft conversion and the projection restoration are still correct and
+still needed — they are what stops a genuinely oversized build side from
+killing a query — but they are not why these two went green.
+
+This also means `KRISHIV_SPILL_JOIN_BUILD_BYTES` matters most on the
+**coordinator** for staged plans, and on the **executors** for `sql:`
+fragments. Both are now set; the earlier note that it belongs only on the
+executors was half the picture.
