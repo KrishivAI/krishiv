@@ -472,12 +472,42 @@ fn verify_dfplan_roundtrip(
     bytes: &[u8],
     codec: &dyn PhysicalExtensionCodec,
     ctx: &Arc<TaskContext>,
+    expected_schema: Option<&arrow::datatypes::Schema>,
 ) -> SqlResult<()> {
-    datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec(bytes, ctx, codec)
-        .map(|_| ())
-        .map_err(|e| SqlError::DataFusion {
-            message: format!("physical plan proto decode: {e}"),
-        })
+    let decoded =
+        datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec(bytes, ctx, codec)
+            .map_err(|e| SqlError::DataFusion {
+                message: format!("physical plan proto decode: {e}"),
+            })?;
+    // Decoding is not the same as reconstructing. A fragment can decode into a
+    // plan whose *output type* differs from the one the coordinator encoded —
+    // `datafusion-proto` re-resolves aggregate UDFs by name, and a decimal
+    // `avg` re-resolved on the executor can coerce to a different return type.
+    // Nothing downstream notices: `ShuffleReadExec` labels its stream with the
+    // schema the coordinator baked in, `RecordBatchStreamAdapter` does not
+    // validate, and the disagreement only surfaces much later, deep in an
+    // executor, as a bare Arrow error. TPC-H q17:
+    //
+    //   column types must match schema types, expected Decimal128(15, 2)
+    //   but found Decimal128(30, 15) at column index 0
+    //
+    // The guard already exists to answer "can the executor rebuild this?", and
+    // producing the same columns is the minimum meaning of that. Checking it
+    // here turns a remote runtime failure into a local, named refusal that
+    // degrades to correct-but-serial execution.
+    if let Some(expected) = expected_schema
+        && decoded.schema().as_ref() != expected
+    {
+        return Err(SqlError::DataFusion {
+            message: format!(
+                "decoded plan schema differs from the encoded plan's; the fragment would \
+                 produce columns the reader does not expect.\n  encoded: {expected:?}\n  \
+                 decoded: {:?}",
+                decoded.schema()
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// The session context a `dfplan:v1:` fragment is **decoded** on.
@@ -1487,6 +1517,9 @@ pub fn build_distributed_stages(
             });
         }
         let upstream_stage_indexes = collect_upstream_stage_indexes(&draft.plan);
+        // Captured before the plan is encoded: this is what the executor must
+        // reproduce, and what `ShuffleReadExec` will label the stream with.
+        let stage_schema = draft.plan.schema();
         let bytes = match encode_dfplan_bytes(Arc::clone(&draft.plan), &codec) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -1501,7 +1534,9 @@ pub fn build_distributed_stages(
         // the decode locally (same codec, same object-store registry as the
         // executor's runtime) so an encode/decode asymmetry degrades to
         // correct-but-serial execution instead of a remote fragment failure.
-        if let Err(error) = verify_dfplan_roundtrip(&bytes, &codec, &decode_ctx) {
+        if let Err(error) =
+            verify_dfplan_roundtrip(&bytes, &codec, &decode_ctx, Some(stage_schema.as_ref()))
+        {
             tracing::debug!(
                 %error,
                 "stage plan encodes but does not decode; falling back to single-task"
@@ -1873,6 +1908,7 @@ mod tests {
             b"not a physical plan proto",
             &codec,
             &fragment_decode_session_context().task_ctx(),
+            None,
         )
         .expect_err("undecodable bytes must be rejected");
         assert!(format!("{err}").contains("decode"), "got: {err}");
@@ -2047,6 +2083,7 @@ mod tests {
             &bytes,
             &codec,
             &fragment_decode_session_context().task_ctx(),
+            None,
         )
         .expect(
             "the guard must decode on the engine the executor uses; failing here \
@@ -2070,6 +2107,7 @@ mod tests {
             &bytes,
             &codec,
             &fragment_decode_session_context().task_ctx(),
+            None,
         )
         .expect("ordinary plans must pass");
     }
@@ -3052,5 +3090,83 @@ mod tests {
             !dfplan_body_is_split_safe(agg_body),
             "final aggregation must NOT be split-safe"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod roundtrip_schema_guard_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    /// A schema deliberately unlike anything the encoded plan produces.
+    fn alien_schema() -> Schema {
+        Schema::new(vec![Field::new("not_a_real_column", DataType::Boolean, true)])
+    }
+
+    #[tokio::test]
+    async fn the_guard_rejects_a_decode_whose_schema_differs() {
+        // The property the guard was missing. It only ever checked that decode
+        // *succeeded*, so a fragment could decode into a plan producing
+        // different column types and ship anyway — `ShuffleReadExec` labels its
+        // stream with the coordinator's schema, `RecordBatchStreamAdapter` does
+        // not validate, and the disagreement surfaced much later inside an
+        // executor as a bare Arrow error (q17: Decimal128(15,2) declared,
+        // Decimal128(30,15) produced).
+        let ctx = fragment_decode_session_context();
+        ctx.sql("CREATE TABLE t(a INT) AS VALUES (1), (2)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let plan = ctx
+            .sql("SELECT a FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let codec = KrishivPhysicalCodec::coordinator();
+        let bytes = encode_dfplan_bytes(Arc::clone(&plan), &codec).unwrap();
+        let task_ctx = ctx.task_ctx();
+
+        // Its own schema passes.
+        verify_dfplan_roundtrip(&bytes, &codec, &task_ctx, Some(plan.schema().as_ref()))
+            .expect("a plan must round-trip against its own schema");
+
+        // A different schema is refused, and the message names the mismatch so
+        // the fallback is explainable rather than mysterious.
+        let err = verify_dfplan_roundtrip(&bytes, &codec, &task_ctx, Some(&alien_schema()))
+            .expect_err("a schema disagreement must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("decoded plan schema differs"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn passing_no_expected_schema_keeps_the_old_decode_only_behaviour() {
+        // Callers that only care whether the bytes decode (the existing
+        // regression tests) must keep working unchanged.
+        let ctx = fragment_decode_session_context();
+        ctx.sql("CREATE TABLE t2(a INT) AS VALUES (1)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let plan = ctx
+            .sql("SELECT a FROM t2")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let codec = KrishivPhysicalCodec::coordinator();
+        let bytes = encode_dfplan_bytes(plan, &codec).unwrap();
+        verify_dfplan_roundtrip(&bytes, &codec, &ctx.task_ctx(), None)
+            .expect("decode-only checking must still pass");
     }
 }
