@@ -1539,6 +1539,47 @@ mod tests {
         assert!(guard.is_none());
     }
 
+    /// A per-slot *share* must never become a per-task *cap*.
+    ///
+    /// The two are opposites and were conflated: `min_task_memory_share_bytes`
+    /// is the arithmetic share a task sees when every slot is busy, and it is
+    /// documented as sizing spill reservations only. Feeding it into a task's
+    /// `MemoryBudget` instead turns it into a hard ceiling — the task gets a
+    /// *private* pool of that size and can never touch the rest of the shared
+    /// pool, even running alone. TPC-H q10 at SF100 died asking for 6.9 MB
+    /// against a 797.6 MB private pool while the executor's shared pool held
+    /// 2392 MiB, ~1.6 GB of it idle in the same process.
+    ///
+    /// Asserting on the *pool identity* is what makes this a real test: a
+    /// budgeted task gets `Private`, an unbudgeted one gets `Shared`, and only
+    /// an explicit quota may produce the former.
+    #[test]
+    fn a_fair_share_must_not_become_a_private_pool() {
+        let share = krishiv_common::executor_capacity::ExecutorCapacity::detect_cached()
+            .min_task_memory_share_bytes();
+        let Some(share) = share else {
+            // No cgroup limit here: there is no share to mistake for a cap.
+            return;
+        };
+        // What the regression did: budget = the fair share.
+        let (as_budget, _g1) = super::reserve_task_engine_memory(&MemoryBudget::limited(share));
+        assert!(
+            matches!(as_budget, krishiv_sql::EngineMemory::Private(_)),
+            "a limited budget must produce a private pool — which is exactly why \
+             the per-slot share must not be used as one"
+        );
+        // What an unbudgeted batch task must get instead.
+        let (unbudgeted, _g2) = super::reserve_task_engine_memory(&MemoryBudget::unlimited());
+        assert!(
+            matches!(
+                unbudgeted,
+                krishiv_sql::EngineMemory::Shared { .. } | krishiv_sql::EngineMemory::Unbounded
+            ),
+            "a task with no explicit quota must draw on the shared pool, so it can \
+             use the whole budget when no other slot is competing"
+        );
+    }
+
     #[test]
     fn tasks_without_a_budget_share_one_pool_rather_than_each_taking_one() {
         // The property that makes executor memory safe: whatever the slot

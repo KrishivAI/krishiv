@@ -824,17 +824,37 @@ impl ExecutorTaskRunner {
         // The executor knows its own real per-slot share, so fall back to it
         // rather than to "unlimited". A namespace quota, when present, still
         // wins — it is a deliberate policy ceiling and may be lower.
-        let task_memory_limit = assignment.memory_limit_bytes().or_else(|| {
+        let udf_memory_limit = assignment.memory_limit_bytes().or_else(|| {
             krishiv_common::executor_capacity::ExecutorCapacity::detect_cached()
                 .min_task_memory_share_bytes()
         });
         // Build resource limits from assignment (propagated from job spec).
         let udf_limits = krishiv_plan::udf::ResourceLimits {
-            max_memory_bytes: task_memory_limit,
+            max_memory_bytes: udf_memory_limit,
             max_execution_time_ms: assignment.cpu_limit_nanos().map(|n| n / 1_000_000),
         };
-        // Shared memory budget for all operators within this task.
-        let memory_budget = krishiv_common::MemoryBudget::from_limit(task_memory_limit);
+        // The engine's memory budget is NOT the UDF guardrail, and conflating
+        // them cost TPC-H q10 at SF100.
+        //
+        // B6 above is right for a UDF: a cap that exists reports overflow, and
+        // the per-slot share is the honest figure to cap at. It is wrong for
+        // the *engine pool*. A `MemoryBudget` with a limit makes
+        // `reserve_task_engine_memory` hand the task a **private**
+        // `FairSpillPool` of exactly that size — so every task ran against
+        // 797 MiB (the "when all slots are busy" share) instead of the
+        // executor's single shared 2392 MiB pool, and q10's TopK died asking
+        // for 6.9 MB while ~1.6 GB of that pool sat idle in the same process.
+        //
+        // The shared pool already provides the bound this fallback was
+        // reaching for: it cannot be oversubscribed no matter how many engines
+        // the process hosts, and `FairSpillPool` divides it live, so a task
+        // running alone gets all of it and contending tasks converge on their
+        // share without anyone being pre-capped at the worst case.
+        //
+        // Only an explicit `assignment.memory_limit_bytes()` — a namespace
+        // quota, a deliberate policy ceiling — may partition the pool.
+        let memory_budget =
+            krishiv_common::MemoryBudget::from_limit(assignment.memory_limit_bytes());
 
         let execute_result = match model {
             crate::ExecutionModel::Batch => {
