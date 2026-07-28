@@ -108,6 +108,44 @@ fn estimated_build_bytes_from_rows(
     u64::try_from(rows.saturating_mul(row_width.max(1))).ok()
 }
 
+/// This join's estimated build-side bytes, or `None` when the planner knows
+/// neither a byte size nor a row count for it.
+///
+/// `total_byte_size` absent does not mean "size unknown" — DataFusion often has
+/// a row count when it has no byte size (a shuffle read, a filter over a scan
+/// with row stats). Deriving bytes from rows uses information the planner
+/// already holds instead of surrendering at the first absent field, which is
+/// how q9/SF100 kept a hash join whose build side then took 797.5 MB of a
+/// 797.6 MB pool.
+///
+/// Still conservative: with the row count *also* absent this returns `None` and
+/// the caller keeps the hash join, because guessing "big" for every join is the
+/// session-wide switch that timed q2 out.
+fn build_bytes_estimate(hash_join: &HashJoinExec) -> Option<u64> {
+    // An error computing statistics is not evidence of a large build side, and
+    // this rule is an optimisation: declining is always a valid answer.
+    let stats = hash_join.left().partition_statistics(None).ok()?;
+    match stats.total_byte_size {
+        Precision::Exact(bytes) | Precision::Inexact(bytes) => u64::try_from(bytes).ok(),
+        Precision::Absent => {
+            estimated_build_bytes_from_rows(&stats, &hash_join.left().schema())
+        }
+    }
+}
+
+/// Every hash join's build estimate in `plan`, in no particular order.
+fn collect_build_estimates(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<u64>) {
+    let any = plan.as_ref() as &dyn std::any::Any;
+    if let Some(hash_join) = any.downcast_ref::<HashJoinExec>()
+        && let Some(bytes) = build_bytes_estimate(hash_join)
+    {
+        out.push(bytes);
+    }
+    for child in plan.children() {
+        collect_build_estimates(child, out);
+    }
+}
+
 /// Convert hash joins whose estimated build side cannot fit the per-task
 /// memory share into sort-merge joins, which can spill.
 #[derive(Debug)]
@@ -137,6 +175,48 @@ impl SpillableJoinSelection {
                 Some((share as f64 * BUILD_FRACTION_OF_TASK_SHARE) as u64)
             });
         Self { threshold_bytes }
+    }
+
+    /// The per-join threshold to actually apply, once the **total** unspillable
+    /// build footprint of the plan is taken into account.
+    ///
+    /// `threshold` describes how much build memory a task can afford. It was
+    /// being asked of each join *individually*, which is the wrong question:
+    /// a hash join build side cannot spill, every join in a fragment holds its
+    /// build side at once, and they all draw on one pool. TPC-H q10 at SF100
+    /// planned **8 hash joins and converted 1** — the other 7 each sat under
+    /// 250 MB and together exhausted a 2.6 GB pool, after which the next join
+    /// was refused 877 bytes and the query died.
+    ///
+    /// So the budget applies to the sum. Largest joins convert first (they free
+    /// the most per conversion, and sort-merge suits a big side better) until
+    /// what remains fits. Returning a per-join threshold rather than a set of
+    /// nodes keeps the existing single-threshold mechanism and needs no node
+    /// identity, which `ExecutionPlan` does not offer.
+    ///
+    /// A strict generalisation: with no aggregate pressure this returns
+    /// `threshold` unchanged, so a plan that was fine before still converts
+    /// exactly what it did before — the q2 regression risk is unchanged.
+    fn effective_threshold(plan: &Arc<dyn ExecutionPlan>, threshold: u64) -> u64 {
+        let mut sizes = Vec::new();
+        collect_build_estimates(plan, &mut sizes);
+        let mut remaining = sizes.iter().copied().fold(0u64, u64::saturating_add);
+        if remaining <= threshold {
+            return threshold;
+        }
+        sizes.sort_unstable_by(|a, b| b.cmp(a));
+        for size in &sizes {
+            remaining = remaining.saturating_sub(*size);
+            if remaining <= threshold {
+                // `convert` compares with `<=`, so step just below this size to
+                // make a join of exactly it convert.
+                return size.saturating_sub(1);
+            }
+        }
+        // Even converting everything with a known size does not fit. Convert
+        // all of them: a plan that spills is slow, a plan that cannot allocate
+        // is dead.
+        0
     }
 
     /// Explicit threshold, for tests.
@@ -233,42 +313,13 @@ impl SpillableJoinSelection {
         // from a rule that was never installed. Three SF100 queries died on
         // un-spillable hash joins while this rule sat registered and converted
         // nothing, and the logs could not say which gate turned each one away.
-        let stats = match hash_join.left().partition_statistics(None) {
-            Ok(stats) => stats,
-            // An error computing statistics is not evidence of a large build
-            // side, and this rule is an optimisation: declining is always a
-            // valid answer, failing the query never is.
-            Err(error) => {
-                tracing::debug!(%error, "spillable-join: statistics unavailable, keeping hash join");
-                return Ok(None);
-            }
-        };
-        let build_bytes = match stats.total_byte_size {
-            Precision::Exact(bytes) | Precision::Inexact(bytes) => bytes as u64,
-            // `total_byte_size` absent does not mean "size unknown" — DataFusion
-            // often has a row count when it has no byte size (a shuffle read, a
-            // filter over a scan with row stats). Deriving bytes from rows uses
-            // information the planner already holds instead of surrendering at
-            // the first absent field, which is how q9/SF100 kept a hash join
-            // whose build side then took 797.5 MB of a 797.6 MB pool.
-            //
-            // Still conservative: if the row count is *also* absent we keep the
-            // hash join rather than guess, because guessing "big" for every
-            // join is the session-wide switch that timed q2 out.
-            Precision::Absent => match estimated_build_bytes_from_rows(
-                &stats,
-                &hash_join.left().schema(),
-            ) {
-                Some(bytes) => bytes,
-                None => {
-                    tracing::debug!(
-                        threshold,
-                        "spillable-join: build-side size and row count both unknown, \
-                         keeping hash join"
-                    );
-                    return Ok(None);
-                }
-            },
+        let Some(build_bytes) = build_bytes_estimate(hash_join) else {
+            tracing::debug!(
+                threshold,
+                "spillable-join: build-side size and row count both unknown, \
+                 keeping hash join"
+            );
+            return Ok(None);
         };
         if build_bytes <= threshold {
             tracing::debug!(
@@ -375,10 +426,13 @@ impl PhysicalOptimizerRule for SpillableJoinSelection {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Gate 1: no cap, no change.
-        let Some(threshold) = self.threshold_bytes else {
+        let Some(configured) = self.threshold_bytes else {
             tracing::debug!("spillable-join: no memory cap configured, rule inactive");
             return Ok(plan);
         };
+        // The budget is on the SUM of un-converted build sides, not on each one
+        // separately — see `effective_threshold`.
+        let threshold = Self::effective_threshold(&plan, configured);
         let mut seen = 0usize;
         let mut converted = 0usize;
         let mut declined_on_error = 0usize;
@@ -429,6 +483,8 @@ impl PhysicalOptimizerRule for SpillableJoinSelection {
                 converted,
                 declined_on_error,
                 threshold,
+                configured_threshold = configured,
+                budget_tightened = threshold < configured,
                 "spillable-join: pass complete"
             );
         }
@@ -808,6 +864,147 @@ mod never_fails_the_query_tests {
         let rows = collect(out, task_ctx).await.unwrap();
         let total: usize = rows.iter().map(arrow::array::RecordBatch::num_rows).sum();
         assert_eq!(total, 1, "the declined plan must still produce the join result");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod budget_tests {
+    use super::*;
+
+    /// Estimates as the rule actually sees them.
+    ///
+    /// Arrow rounds buffer allocations, so a source built to "look like" 200
+    /// bytes reports ~296. Asserting on nominal sizes tested the allocator;
+    /// these tests measure first and assert the *invariant*.
+    fn estimates(plan: &Arc<dyn ExecutionPlan>) -> Vec<u64> {
+        let mut sizes = Vec::new();
+        collect_build_estimates(plan, &mut sizes);
+        sizes
+    }
+
+    /// The threshold is a budget on the SUM, not a per-join allowance.
+    ///
+    /// q10's SF100 shape: several joins that each fit comfortably and together
+    /// do not. Under the old per-join rule every one of these is under the
+    /// budget, nothing converts, and the pool is exhausted at run time.
+    #[test]
+    fn joins_that_each_fit_but_together_do_not_are_converted() {
+        let plan = plan_with_build_sizes(&[200; 8]);
+        let sizes = estimates(&plan);
+        let largest = *sizes.iter().max().expect("fixture has joins");
+        let total: u64 = sizes.iter().copied().fold(0, u64::saturating_add);
+
+        // A budget every join fits under individually, that the sum exceeds —
+        // exactly the state q10 was in.
+        let budget = largest;
+        assert!(
+            total > budget,
+            "fixture must create aggregate pressure: total {total} vs budget {budget}"
+        );
+
+        let effective = SpillableJoinSelection::effective_threshold(&plan, budget);
+        let retained: u64 = sizes
+            .iter()
+            .copied()
+            .filter(|s| *s <= effective)
+            .fold(0, u64::saturating_add);
+        assert!(
+            retained <= budget,
+            "after conversion the un-converted sum is {retained}, over the {budget} budget \
+             (effective threshold {effective}, sizes {sizes:?})"
+        );
+    }
+
+    /// No aggregate pressure → the configured threshold is untouched, so a plan
+    /// that behaved acceptably before behaves identically. This bounds the q2
+    /// regression risk: converting more joins than necessary is what made q2 6x
+    /// slower, and this only tightens under real pressure.
+    #[test]
+    fn without_pressure_the_configured_threshold_is_unchanged() {
+        let plan = plan_with_build_sizes(&[50, 60]);
+        let total: u64 = estimates(&plan).iter().copied().fold(0, u64::saturating_add);
+        let generous = total + 1;
+        assert_eq!(
+            SpillableJoinSelection::effective_threshold(&plan, generous),
+            generous,
+            "a total that fits the budget must not tighten anything"
+        );
+    }
+
+    /// One oversized join still converts on its own, as before.
+    #[test]
+    fn a_single_oversized_join_still_converts() {
+        let plan = plan_with_build_sizes(&[900]);
+        let sizes = estimates(&plan);
+        let largest = *sizes.iter().max().expect("fixture has a join");
+        let effective = SpillableJoinSelection::effective_threshold(&plan, largest - 1);
+        assert!(
+            effective < largest,
+            "an over-budget join must end up above the effective threshold \
+             ({effective} vs {largest})"
+        );
+    }
+
+    /// A plan with no hash joins must not tighten anything, and must not panic
+    /// on the empty-sizes path.
+    #[test]
+    fn a_plan_without_joins_is_left_alone() {
+        let plan = plan_with_build_sizes(&[]);
+        assert_eq!(SpillableJoinSelection::effective_threshold(&plan, 250), 250);
+    }
+
+    /// Build a plan whose hash joins report the given build-side byte sizes.
+    ///
+    /// `effective_threshold` reads estimates through `partition_statistics`, so
+    /// the sizes have to come from real statistics rather than being injected.
+    /// `MemoryExec` over batches of a known width gives that.
+    fn plan_with_build_sizes(sizes: &[u64]) -> Arc<dyn ExecutionPlan> {
+        // Built directly rather than planned from SQL: the point is to control
+        // the build estimates exactly, and a planner is free to reorder joins.
+        let mut plan: Arc<dyn ExecutionPlan> = sized_source(1);
+        for size in sizes {
+            plan = Arc::new(
+                HashJoinExec::try_new(
+                    sized_source(*size),
+                    Arc::clone(&plan),
+                    vec![(
+                        Arc::new(datafusion::physical_expr::expressions::Column::new("k", 0)),
+                        Arc::new(datafusion::physical_expr::expressions::Column::new("k", 0)),
+                    )],
+                    None,
+                    &datafusion::common::JoinType::Inner,
+                    None,
+                    PartitionMode::CollectLeft,
+                    datafusion::common::NullEquality::NullEqualsNothing,
+                    false,
+                )
+                .expect("hash join"),
+            );
+        }
+        plan
+    }
+
+    /// A single-column source whose statistics report `bytes` total.
+    fn sized_source(bytes: u64) -> Arc<dyn ExecutionPlan> {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        // 4 bytes per Int32 row, so `bytes / 4` rows reports ~`bytes`.
+        let rows = usize::try_from(bytes / 4).unwrap_or(1).max(1);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![0; rows]))],
+        )
+        .expect("batch");
+        datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+            &[vec![batch]],
+            schema,
+            None,
+        )
+        .expect("memory exec")
     }
 }
 
