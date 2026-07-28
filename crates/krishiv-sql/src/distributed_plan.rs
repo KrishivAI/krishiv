@@ -1378,6 +1378,7 @@ impl ExecutionPlan for ShuffleReadExec {
         })?;
         let stage = self.upstream_stage_index;
         let schema = Arc::clone(&self.schema);
+        let expected = Arc::clone(&self.schema);
         let stream = futures::stream::iter(0..self.num_map_tasks)
             .then(move |map_task| {
                 let reader = Arc::clone(&reader);
@@ -1385,6 +1386,7 @@ impl ExecutionPlan for ShuffleReadExec {
                     reader
                         .read_partition(stage, map_task, partition)
                         .await
+                        .map(|batches| (map_task, batches))
                         .map_err(|e| {
                             DataFusionError::Execution(format!(
                                 "shuffle read (stage {stage}, map {map_task}, partition \
@@ -1393,12 +1395,86 @@ impl ExecutionPlan for ShuffleReadExec {
                         })
                 }
             })
-            .map_ok(|batches| {
-                futures::stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>))
+            .map_ok(move |(map_task, batches)| {
+                let expected = Arc::clone(&expected);
+                futures::stream::iter(batches.into_iter().map(move |batch| {
+                    check_shuffle_batch_schema(&expected, batch, stage, map_task, partition)
+                }))
             })
             .try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
+}
+
+/// Reject a shuffle batch whose columns disagree with the schema this read
+/// declares, naming the stage, map task, partition and column.
+///
+/// `ShuffleReadExec` labels its stream with the schema the **coordinator**
+/// baked into the fragment, and `RecordBatchStreamAdapter` does not check that
+/// the batches it yields match. So when a map stage produces something else,
+/// nothing objects here — the rows flow on and die later, in whichever
+/// downstream operator first builds a `RecordBatch` against the plan's schema,
+/// as a bare Arrow error with no stage, no partition and no producer:
+///
+///   column types must match schema types, expected Decimal128(15, 2)
+///   but found Decimal128(30, 15) at column index 0
+///
+/// That is TPC-H q17 at SF100, and it names nothing that identifies where the
+/// disagreement came from. Checking at the seam turns it into an error that
+/// does. This is the boundary between two independently-produced schemas, so
+/// it is the only place with both of them in hand.
+///
+/// Deliberately narrow: column **count** and column **types** only. Those are
+/// exactly what makes Arrow fail, and they cannot differ legitimately. Field
+/// metadata and nullability can and do differ harmlessly across a Parquet read
+/// and an IPC round trip, so comparing whole `Schema`s here would reject
+/// correct queries.
+fn check_shuffle_batch_schema(
+    expected: &SchemaRef,
+    batch: arrow::record_batch::RecordBatch,
+    stage: usize,
+    map_task: usize,
+    partition: usize,
+) -> Result<arrow::record_batch::RecordBatch, DataFusionError> {
+    let actual = batch.schema();
+    // Same allocation is the overwhelmingly common case — the map task and the
+    // reader share it — so this costs a pointer compare per batch.
+    if Arc::ptr_eq(expected, &actual) {
+        return Ok(batch);
+    }
+    let where_ = || format!("stage {stage}, map {map_task}, partition {partition}");
+    if expected.fields().len() != actual.fields().len() {
+        return Err(DataFusionError::Execution(format!(
+            "shuffle read ({}) produced {} columns but the plan declares {}; \
+             the map stage did not produce the schema the reduce side was planned \
+             against.\n  declared: {:?}\n  produced: {:?}",
+            where_(),
+            actual.fields().len(),
+            expected.fields().len(),
+            expected.fields(),
+            actual.fields(),
+        )));
+    }
+    for (index, (want, got)) in expected
+        .fields()
+        .iter()
+        .zip(actual.fields().iter())
+        .enumerate()
+    {
+        if want.data_type() != got.data_type() {
+            return Err(DataFusionError::Execution(format!(
+                "shuffle read ({}) column {index} ({}) is {:?} but the plan declares {:?} \
+                 ({}); the map stage did not produce the schema the reduce side was \
+                 planned against",
+                where_(),
+                got.name(),
+                got.data_type(),
+                want.data_type(),
+                want.name(),
+            )));
+        }
+    }
+    Ok(batch)
 }
 
 // ── Extension codec ────────────────────────────────────────────────────────
@@ -2809,6 +2885,90 @@ mod tests {
     fn non_dfplan_body_is_rejected() {
         let err = parse_dfplan_body("sql: SELECT 1").unwrap_err();
         assert!(err.to_string().contains("not a dfplan:v1: fragment"));
+    }
+
+    /// The shuffle seam names the producer when the two sides disagree.
+    ///
+    /// Without this check the mismatch flows on and dies in whichever
+    /// downstream operator first builds a batch against the plan's schema —
+    /// q17's bare `expected Decimal128(15, 2) but found Decimal128(30, 15)`,
+    /// which identifies no stage, no partition and no map task.
+    #[test]
+    fn a_shuffle_batch_that_contradicts_the_declared_schema_is_named_not_passed_on() {
+        use arrow::array::{Int64Array, StringViewArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // q19's exact disagreement: the plan declares the revenue decimal, the
+        // batch carries a `Utf8View` string column (Parquet reads produce view
+        // types by default in DataFusion 54).
+        let declared: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "revenue",
+            DataType::Decimal128(15, 2),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "p_brand",
+                DataType::Utf8View,
+                false,
+            )])),
+            vec![Arc::new(StringViewArray::from(vec!["Brand#23"]))],
+        )
+        .expect("utf8view batch");
+
+        let error = check_shuffle_batch_schema(&declared, batch, 3, 7, 5)
+            .expect_err("a contradicting batch must not be passed on");
+        let text = error.to_string();
+        for expected in ["stage 3", "map 7", "partition 5", "revenue", "p_brand"] {
+            assert!(
+                text.contains(expected),
+                "error must name {expected}, got: {text}"
+            );
+        }
+
+        // Arity disagreement is reported too, and separately.
+        let two_col = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![2])),
+            ],
+        )
+        .expect("two column batch");
+        let error = check_shuffle_batch_schema(&declared, two_col, 0, 0, 0)
+            .expect_err("column-count disagreement must not be passed on");
+        assert!(
+            error.to_string().contains("2 columns but the plan declares 1"),
+            "got: {error}"
+        );
+    }
+
+    /// The check must not reject a batch that merely carries different field
+    /// metadata or nullability — those differ harmlessly across a Parquet read
+    /// and an IPC round trip, and rejecting them would fail correct queries.
+    #[test]
+    fn matching_column_types_pass_even_when_metadata_and_nullability_differ() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let declared: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, false).with_metadata(
+                [(String::from("origin"), String::from("coordinator"))]
+                    .into_iter()
+                    .collect(),
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("batch");
+
+        check_shuffle_batch_schema(&declared, batch, 0, 0, 0)
+            .expect("metadata and nullability differences must not fail the query");
     }
 
     /// In-memory [`ShufflePartitionReader`] + writer used to execute a
