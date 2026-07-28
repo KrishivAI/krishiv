@@ -13,6 +13,7 @@ pub mod phase_i;
 
 pub mod tpcds;
 /// The 22 TPC-H queries shared by the single-node and distributed runners.
+pub mod tpch_fixture;
 pub mod tpch_queries;
 
 pub mod tpch {

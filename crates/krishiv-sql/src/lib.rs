@@ -726,7 +726,16 @@ pub fn with_krishiv_optimizer_rules_with_join_threshold(
     spill_join_build_bytes: Option<u64>,
 ) -> datafusion::execution::session_state::SessionStateBuilder {
     let spillable_join = match spill_join_build_bytes {
-        Some(bytes) => crate::spillable_join::SpillableJoinSelection::with_threshold(Some(bytes)),
+        // Honour the grace-hash-join flag here too. An explicit threshold means
+        // "convert at this size", not "and use the old algorithm" — before this,
+        // every distributed query planned through
+        // `planning_session_context_with_options` silently forced sort-merge, so
+        // the flag could not be exercised on the path that actually plans
+        // cluster work.
+        Some(bytes) => crate::spillable_join::SpillableJoinSelection::with_threshold_and_grace(
+            Some(bytes),
+            crate::grace_hash_join::enabled(),
+        ),
         None => crate::spillable_join::SpillableJoinSelection::from_capacity(),
     };
     builder
