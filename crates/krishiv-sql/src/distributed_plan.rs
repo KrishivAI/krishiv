@@ -43,9 +43,11 @@ use base64::Engine as _;
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::logical_expr::execution_props::ScalarSubqueryResults;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::scalar_subquery::{ScalarSubqueryExec, ScalarSubqueryLink};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties as _, Partitioning,
@@ -1530,6 +1532,52 @@ pub struct DistributedStagePlan {
 struct StageDraft {
     plan: Arc<dyn ExecutionPlan>,
     shuffle: Option<StageShuffleOutput>,
+    /// Set when this stage subtree was cut out from beneath a
+    /// [`ScalarSubqueryExec`]. See [`StageSubqueryContext`].
+    subqueries: Option<StageSubqueryContext>,
+}
+
+/// The uncorrelated-scalar-subquery context a stage subtree was cut out from.
+///
+/// DataFusion's physical planner wraps the WHOLE plan in a single
+/// [`ScalarSubqueryExec`] at the root (`physical_planner.rs`,
+/// `create_initial_plan`): that node runs each subquery once and stores the
+/// scalar in a shared results container, and every `ScalarSubqueryExpr` left
+/// in the plan reads its value out of that container by index.
+///
+/// Cutting the plan into stages severs that relationship. TPC-H q22's
+/// `c_acctbal > (SELECT avg(c_acctbal) …)` sits in a filter *below* the hash
+/// exchange, so the map stage ships the `ScalarSubqueryExpr` while the
+/// `ScalarSubqueryExec` that populates it stays behind in the result stage.
+/// The fragment encodes happily and then refuses to decode —
+///
+/// > ScalarSubqueryExpr can only be deserialized as part of a surrounding
+/// > ScalarSubqueryExec
+///
+/// — which the caller reads as "decline to stage", running all of q22 as ONE
+/// task. That is our stage cut breaking an invariant, not an upstream
+/// serialization gap: `datafusion-proto` round-trips `ScalarSubqueryExec`
+/// perfectly well, and re-establishes the container↔expr link on decode.
+///
+/// So a severed stage is repaired by giving it back the wrapper it lost. The
+/// links are carried here, uncut, and re-applied to whichever stages actually
+/// need them (see `build_distributed_stages`).
+struct StageSubqueryContext {
+    /// The subquery plans, exactly as planned — never cut into stages.
+    ///
+    /// `ScalarSubqueryExec` evaluates each through
+    /// `execute_stream`, which coalesces the plan to one partition and runs it
+    /// whole. A subquery containing a `ShuffleReadExec` would therefore have a
+    /// task read a sibling stage's output out of dependency order, so
+    /// `cut_exchanges` deliberately does not descend into them.
+    links: Vec<ScalarSubqueryLink>,
+    /// The root exec's results container.
+    ///
+    /// Shared rather than freshly allocated so the coordinator-side plan stays
+    /// internally consistent (its exprs hold this same container). Identity is
+    /// irrelevant to what executors run: decoding a fragment mints a fresh
+    /// container and wires that stage's exprs to it.
+    results: ScalarSubqueryResults,
 }
 
 /// Internal marker for shapes the builder cannot prove correct.
@@ -1544,6 +1592,12 @@ struct Unsupported(String);
 pub fn build_distributed_stages(
     plan: Arc<dyn ExecutionPlan>,
 ) -> SqlResult<Option<DistributedStagePlan>> {
+    // Before cutting: a broadcast join whose unmatched build rows are emitted
+    // only after the last probe partition cannot be split one-partition-per-task
+    // without silently dropping those rows. Convert such joins to
+    // hash-partitioned ones, which are split-safe by construction.
+    let plan = redistribute_unsplittable_broadcast_joins(plan)?;
+
     let mut drafts: Vec<StageDraft> = Vec::new();
     let root = match cut_exchanges(plan, &mut drafts) {
         Ok(root) => root,
@@ -1561,6 +1615,9 @@ pub fn build_distributed_stages(
     drafts.push(StageDraft {
         plan: root,
         shuffle: None,
+        // The root keeps whatever `ScalarSubqueryExec` it was planned with, so
+        // it is never the severed side.
+        subqueries: None,
     });
 
     // Prove every stage subtree is partition-independent: no exchange may
@@ -1588,41 +1645,59 @@ pub fn build_distributed_stages(
             });
         }
         let upstream_stage_indexes = collect_upstream_stage_indexes(&draft.plan);
-        // Captured before the plan is encoded: this is what the executor must
-        // reproduce, and what `ShuffleReadExec` will label the stream with.
-        let stage_plan = Arc::clone(&draft.plan);
-        let bytes = match encode_dfplan_bytes(Arc::clone(&draft.plan), &codec) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                // Plans over non-serializable providers (memory tables,
-                // custom scans) fall back rather than fail the query.
-                //
-                // At `warn`: declining to distribute is not a detail, it is the
-                // difference between a query using the cluster and one task
-                // scanning the whole table. This was `debug` on a coordinator
-                // that runs at `info`, so TPC-H q22 quietly ran serially for
-                // three sweeps with nothing in the logs saying why.
-                tracing::warn!(
-                    %error,
-                    "stage plan is not proto-serializable; running this query as a SINGLE TASK"
-                );
-                return Ok(None);
-            }
-        };
-        // Encoding successfully is not the same as being shippable — q22's
-        // fragments encode and then fail to decode on the executor. Rehearse
-        // the decode locally (same codec, same object-store registry as the
+        // Encoding successfully is not the same as being shippable — a fragment
+        // can encode and then fail to decode on the executor. Rehearse the
+        // decode locally (same codec, same object-store registry as the
         // executor's runtime) so an encode/decode asymmetry degrades to
         // correct-but-serial execution instead of a remote fragment failure.
-        if let Err(error) =
-            verify_dfplan_roundtrip(&bytes, &codec, &decode_ctx, Some(&stage_plan))
-        {
+        //
+        // A stage cut out from beneath a `ScalarSubqueryExec` gets two attempts:
+        // bare first, then wrapped. Trying bare first is what keeps the repair
+        // precise — only the stage that genuinely carries a `ScalarSubqueryExpr`
+        // pays to re-evaluate the subquery, and the rest of the query's stages
+        // are shipped exactly as before. There is no generic way to ask a
+        // physical plan "do you contain this expression" (`ExecutionPlan` has no
+        // expression accessor), and the decoder's own answer is the
+        // authoritative one anyway.
+        let attempts = match &draft.subqueries {
+            Some(context) => vec![
+                Arc::clone(&draft.plan),
+                wrap_in_scalar_subquery_exec(Arc::clone(&draft.plan), context),
+            ],
+            None => vec![Arc::clone(&draft.plan)],
+        };
+        let mut shippable = None;
+        let mut last_error = None;
+        for stage_plan in attempts {
+            let bytes = match encode_dfplan_bytes(Arc::clone(&stage_plan), &codec) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    // Plans over non-serializable providers (memory tables,
+                    // custom scans) fall back rather than fail the query.
+                    last_error = Some(error.to_string());
+                    continue;
+                }
+            };
+            match verify_dfplan_roundtrip(&bytes, &codec, &decode_ctx, Some(&stage_plan)) {
+                Ok(()) => {
+                    shippable = Some(bytes);
+                    break;
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        let Some(bytes) = shippable else {
+            // At `warn`: declining to distribute is not a detail, it is the
+            // difference between a query using the cluster and one task
+            // scanning the whole table. This was `debug` on a coordinator that
+            // runs at `info`, so TPC-H q22 quietly ran serially for three
+            // sweeps with nothing in the logs saying why.
             tracing::warn!(
-                %error,
-                "stage plan encodes but does not decode; running this query as a SINGLE TASK"
+                error = %last_error.unwrap_or_else(|| String::from("unknown")),
+                "stage plan cannot be encoded and decoded; running this query as a SINGLE TASK"
             );
             return Ok(None);
-        }
+        };
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let task_bodies = (0..partition_count)
             .map(|p| dfplan_task_body(&b64, p))
@@ -1668,6 +1743,7 @@ fn cut_exchanges(
                 key_columns,
                 num_output_partitions: *num_partitions,
             }),
+            subqueries: None,
         });
         return Ok(Arc::new(
             ShuffleReadExec::new(
@@ -1714,6 +1790,7 @@ fn cut_exchanges(
                 key_columns: Vec::new(),
                 num_output_partitions: 1,
             }),
+            subqueries: None,
         });
         // The read replaces the whole gather: coalesce(N->1) and
         // shuffle(N->1)+read(partition 0) produce the same single stream, and
@@ -1722,6 +1799,46 @@ fn cut_exchanges(
             ShuffleReadExec::new(stage_index, map_task_count, 1, schema, None)
                 .with_upstream_estimate(estimate.0, estimate.1),
         ));
+    }
+
+    // An uncorrelated scalar subquery is not an exchange, but it is a boundary:
+    // `ScalarSubqueryExec::children()` returns `[main_input, subquery…]`, and
+    // the generic recursion below would treat a subquery plan as ordinary
+    // pipeline and cut it. It must not: a subquery runs *whole* inside whatever
+    // task evaluates it, so a `ShuffleReadExec` left in one would read a
+    // sibling stage's output out of dependency order.
+    //
+    // Cut only the main input, and record the subquery context on every stage
+    // that came out of it — those are exactly the stages that may have been
+    // severed from the wrapper their `ScalarSubqueryExpr` nodes need. See
+    // [`StageSubqueryContext`].
+    if let Some(subquery_exec) = plan.downcast_ref::<ScalarSubqueryExec>() {
+        let first_new_stage = stages.len();
+        let input = cut_exchanges(Arc::clone(subquery_exec.input()), stages)?;
+        let context = || StageSubqueryContext {
+            links: subquery_exec.subqueries().to_vec(),
+            results: subquery_exec.results().clone(),
+        };
+        if let Some(new_stages) = stages.get_mut(first_new_stage..) {
+            for draft in new_stages {
+                // Nested levels compose: an inner exec records its own
+                // subqueries first, and only stages with no context yet belong
+                // to this level.
+                draft.subqueries.get_or_insert_with(context);
+            }
+        }
+        // Rebuild in `children()` order: main input first, subqueries after.
+        let mut children = Vec::with_capacity(subquery_exec.subqueries().len() + 1);
+        children.push(input);
+        children.extend(
+            subquery_exec
+                .subqueries()
+                .iter()
+                .map(|link| Arc::clone(&link.plan)),
+        );
+        return plan
+            .with_new_children(children)
+            .map_err(|e| Unsupported(format!("scalar-subquery rewrite: {e}")));
     }
 
     let children = plan.children();
@@ -1742,6 +1859,160 @@ fn cut_exchanges(
         .map_err(|e| Unsupported(format!("plan rewrite: {e}")))
 }
 
+/// Join types whose unmatched BUILD-side rows are emitted only after every
+/// probe partition has been seen.
+///
+/// `HashJoinExec` tracks which build rows matched in a shared bitmap and emits
+/// the unmatched ones from whichever probe partition finishes last
+/// (`report_probe_completed`). Everything else streams straight through from
+/// the probe side and needs no such rendezvous.
+fn emits_unmatched_build_rows(join_type: datafusion::logical_expr::JoinType) -> bool {
+    use datafusion::logical_expr::JoinType;
+    matches!(
+        join_type,
+        JoinType::Left
+            | JoinType::LeftAnti
+            | JoinType::LeftSemi
+            | JoinType::LeftMark
+            | JoinType::Full
+    )
+}
+
+/// Is this join a broadcast join that cannot survive being split across tasks?
+///
+/// `PartitionMode::CollectLeft` sizes its probe-completion counter from the
+/// PLAN's probe partition count (`hash_join/exec.rs`: `probe_threads_count =
+/// self.right().output_partitioning().partition_count()`). A distributed task
+/// executes exactly ONE partition of that plan, so the counter is decremented
+/// once and never reaches "last probe" — and the unmatched build rows are
+/// never emitted at all.
+///
+/// That is a silent wrong answer, not an error: TPC-H q22's `NOT EXISTS`
+/// anti-join returned ZERO rows per task, and nothing in the plan, the logs or
+/// the schema said so. `PartitionMode::Partitioned` passes `1` for the same
+/// counter — each task owns a disjoint hash range and is its own last probe —
+/// which is why the fix is to convert rather than to decline.
+///
+/// A single-partition probe side is safe as it stands: the count is already 1.
+fn is_unsplittable_broadcast_join(
+    join: &datafusion::physical_plan::joins::HashJoinExec,
+) -> bool {
+    use datafusion::physical_plan::joins::PartitionMode;
+    *join.partition_mode() == PartitionMode::CollectLeft
+        && emits_unmatched_build_rows(*join.join_type())
+        && join.right().output_partitioning().partition_count() > 1
+}
+
+/// Convert broadcast joins that cannot be split into hash-partitioned joins
+/// that can (see [`is_unsplittable_broadcast_join`]).
+///
+/// Both sides gain a hash exchange on the join keys, which the stage cutter
+/// then turns into ordinary map stages — so the join keeps running across the
+/// cluster instead of being declined back to a single task.
+///
+/// The build side's `CoalescePartitionsExec` is dropped when present: it exists
+/// only to satisfy `CollectLeft`'s `Distribution::SinglePartition` requirement,
+/// and keeping it would funnel the whole build side through one partition
+/// before re-splitting it.
+fn redistribute_unsplittable_broadcast_joins(
+    plan: Arc<dyn ExecutionPlan>,
+) -> SqlResult<Arc<dyn ExecutionPlan>> {
+    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+
+    // Bottom-up: children are rewritten before the node that joins them, so a
+    // converted child's new partitioning is what the parent sees.
+    let children = plan.children();
+    let plan = if children.is_empty() {
+        plan
+    } else {
+        let mut new_children = Vec::with_capacity(children.len());
+        let mut changed = false;
+        for child in children {
+            let rewritten = redistribute_unsplittable_broadcast_joins(Arc::clone(child))?;
+            changed = changed || !Arc::ptr_eq(&rewritten, child);
+            new_children.push(rewritten);
+        }
+        if changed {
+            plan.with_new_children(new_children)
+                .map_err(|e| SqlError::DataFusion {
+                    message: format!("broadcast-join redistribution rewrite: {e}"),
+                })?
+        } else {
+            plan
+        }
+    };
+
+    let Some(join) = plan.downcast_ref::<HashJoinExec>() else {
+        return Ok(plan);
+    };
+    if !is_unsplittable_broadcast_join(join) {
+        return Ok(plan);
+    }
+
+    let partitions = join.right().output_partitioning().partition_count();
+    let (left_keys, right_keys): (Vec<_>, Vec<_>) = join
+        .on()
+        .iter()
+        .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
+        .unzip();
+
+    let build_side = match join
+        .left()
+        .downcast_ref::<CoalescePartitionsExec>()
+    {
+        Some(coalesce) => Arc::clone(coalesce.input()),
+        None => Arc::clone(join.left()),
+    };
+    let exchange = |input: Arc<dyn ExecutionPlan>,
+                    keys: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>>|
+     -> SqlResult<Arc<dyn ExecutionPlan>> {
+        RepartitionExec::try_new(input, Partitioning::Hash(keys, partitions))
+            .map(|r| Arc::new(r) as Arc<dyn ExecutionPlan>)
+            .map_err(|e| SqlError::DataFusion {
+                message: format!("broadcast-join redistribution exchange: {e}"),
+            })
+    };
+
+    let converted = join
+        .builder()
+        .with_new_children(vec![
+            exchange(build_side, left_keys)?,
+            exchange(Arc::clone(join.right()), right_keys)?,
+        ])
+        .and_then(|b| {
+            b.with_partition_mode(PartitionMode::Partitioned)
+                .recompute_properties()
+                .reset_state()
+                .build_exec()
+        })
+        .map_err(|e| SqlError::DataFusion {
+            message: format!("broadcast-join redistribution rebuild: {e}"),
+        })?;
+    tracing::debug!(
+        join_type = ?join.join_type(),
+        partitions,
+        "converted an unsplittable broadcast join to a hash-partitioned join"
+    );
+    Ok(converted)
+}
+
+/// Give a severed stage subtree back the [`ScalarSubqueryExec`] wrapper its
+/// `ScalarSubqueryExpr` nodes need in order to decode and to resolve.
+///
+/// A pass-through node: it reports its input's partitioning and statistics
+/// verbatim, so wrapping changes neither the stage's task count nor its
+/// shuffle keys — only whether the fragment can be rebuilt on an executor.
+fn wrap_in_scalar_subquery_exec(
+    plan: Arc<dyn ExecutionPlan>,
+    context: &StageSubqueryContext,
+) -> Arc<dyn ExecutionPlan> {
+    Arc::new(ScalarSubqueryExec::new(
+        plan,
+        context.links.clone(),
+        context.results.clone(),
+    ))
+}
+
 /// Extract plain column names from hash-partitioning expressions.
 fn hash_expr_column_names(
     exprs: &[Arc<dyn datafusion::physical_expr::PhysicalExpr>],
@@ -1759,6 +2030,32 @@ fn hash_expr_column_names(
 fn find_unsupported_stage_node(plan: &Arc<dyn ExecutionPlan>) -> Option<String> {
     if plan.is::<RepartitionExec>() {
         return Some(String::from("RepartitionExec inside stage subtree"));
+    }
+    // The safety net behind `redistribute_unsplittable_broadcast_joins`. If a
+    // broadcast join that emits unmatched build rows ever reaches a stage
+    // subtree unconverted, declining to stage is the only correct outcome:
+    // shipping it returns the wrong ANSWER rather than an error, and a wrong
+    // answer that looks like a clean pass is the worst failure this builder
+    // can produce.
+    if let Some(join) = plan.downcast_ref::<datafusion::physical_plan::joins::HashJoinExec>()
+        && is_unsplittable_broadcast_join(join)
+    {
+        return Some(format!(
+            "broadcast {:?} join inside a stage subtree: its unmatched build rows are \
+             emitted only after the last probe partition, which a task executing one \
+             partition can never observe",
+            join.join_type()
+        ));
+    }
+    // A scalar subquery is executed WHOLE by whichever task evaluates it —
+    // `ScalarSubqueryExec` runs each through `execute_stream`, which coalesces
+    // the plan to a single partition. An exchange inside one is therefore
+    // ordinary single-node execution, not a violation of the task-per-partition
+    // model, and the rule below must not reach into it: descending would reject
+    // any query whose subquery happens to contain a hash exchange and quietly
+    // run the whole thing as one task.
+    if let Some(subquery_exec) = plan.downcast_ref::<ScalarSubqueryExec>() {
+        return find_unsupported_stage_node(subquery_exec.input());
     }
     for child in plan.children() {
         if let Some(reason) = find_unsupported_stage_node(child) {
@@ -3547,25 +3844,8 @@ mod staged_tpch_tests {
         (customer_dir, orders_dir)
     }
 
-    /// Why q22 runs as a single task, pinned as a fact rather than a mystery.
-    ///
-    /// Its `c_acctbal > (SELECT avg(c_acctbal) ...)` leaves a
-    /// `ScalarSubqueryExpr` in the physical plan. `datafusion-proto` encodes it
-    /// and then refuses to decode it — "can only be deserialized as part of a
-    /// surrounding ScalarSubqueryExec" — so the stage builder cannot ship the
-    /// fragment and correctly falls back to one task rather than failing the
-    /// query on an executor minutes later.
-    ///
-    /// This is an upstream serialization gap, not a Krishiv bug, and the
-    /// fallback is the right behaviour while it stands. The test asserts the
-    /// *reason*: when DataFusion round-trips this expression, or when the
-    /// coordinator learns to evaluate an expensive scalar subquery as its own
-    /// distributed job and substitute the literal (the q15 fold, but
-    /// distributed), this test fails and says q22 can be distributed now.
-    #[tokio::test]
-    async fn q22_declines_staging_because_a_scalar_subquery_cannot_decode() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let (customer, orders) = write_q22_fixture(tmp.path());
+    async fn q22_context(dir: &std::path::Path) -> SessionContext {
+        let (customer, orders) = write_q22_fixture(dir);
         let ctx = planning_session_context(4);
         for (name, path) in [("customer", customer), ("orders", orders)] {
             ctx.register_parquet(
@@ -3576,6 +3856,25 @@ mod staged_tpch_tests {
             .await
             .expect("register parquet");
         }
+        ctx
+    }
+
+    /// The q22 defect and its repair, both pinned in one test.
+    ///
+    /// `c_acctbal > (SELECT avg(c_acctbal) …)` leaves a `ScalarSubqueryExpr` in
+    /// a filter below the exchange, while the `ScalarSubqueryExec` that
+    /// populates it — which DataFusion puts at the very ROOT of the plan —
+    /// stays behind in the result stage. The map fragment then encodes happily
+    /// and refuses to decode, and the builder reads that as "decline to stage",
+    /// running all of q22 as ONE task.
+    ///
+    /// Asserting BOTH halves is the point. Without the first assertion the test
+    /// would keep passing if the severing ever stopped happening, and the
+    /// repair would be a no-op nobody noticed.
+    #[tokio::test]
+    async fn a_severed_scalar_subquery_stage_does_not_decode_until_the_wrapper_is_restored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = q22_context(tmp.path()).await;
         let plan = ctx
             .sql(Q22)
             .await
@@ -3590,29 +3889,203 @@ mod staged_tpch_tests {
         drafts.push(StageDraft {
             plan: root,
             shuffle: None,
+            subqueries: None,
         });
+        assert!(
+            drafts.iter().any(|d| d.subqueries.is_some()),
+            "q22 must cut at least one stage out from beneath the ScalarSubqueryExec, \
+             or there is nothing for the repair to act on"
+        );
+
         let codec = KrishivPhysicalCodec::coordinator();
         let decode_ctx = fragment_decode_session_context().task_ctx();
-        let mut reasons = Vec::new();
+        let mut saw_severed_stage = false;
         for draft in &drafts {
+            let Some(context) = &draft.subqueries else {
+                continue;
+            };
             let bytes =
-                encode_dfplan_bytes(Arc::clone(&draft.plan), &codec).expect("q22 stages encode");
-            if let Err(error) =
-                verify_dfplan_roundtrip(&bytes, &codec, &decode_ctx, Some(&draft.plan))
-            {
-                reasons.push(error.to_string());
-            }
+                encode_dfplan_bytes(Arc::clone(&draft.plan), &codec).expect("q22 stage encodes");
+            let Err(error) = verify_dfplan_roundtrip(&bytes, &codec, &decode_ctx, Some(&draft.plan))
+            else {
+                // This stage carried no `ScalarSubqueryExpr`; nothing severed.
+                continue;
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("ScalarSubqueryExpr can only be deserialized"),
+                "expected the severed-wrapper decode failure, got: {error}"
+            );
+            saw_severed_stage = true;
+
+            let repaired = wrap_in_scalar_subquery_exec(Arc::clone(&draft.plan), context);
+            let bytes =
+                encode_dfplan_bytes(Arc::clone(&repaired), &codec).expect("repaired stage encodes");
+            verify_dfplan_roundtrip(&bytes, &codec, &decode_ctx, Some(&repaired))
+                .expect("restoring the wrapper must make the fragment decodable");
         }
         assert!(
-            reasons
-                .iter()
-                .any(|r| r.contains("ScalarSubqueryExpr can only be deserialized")),
-            "q22's decline should still be the scalar-subquery decode gap; got: {reasons:?}"
+            saw_severed_stage,
+            "precondition: a q22 stage must actually fail to decode bare, or this \
+             test proves nothing about the repair"
+        );
+    }
+
+    /// Bar 2 for q22: it must genuinely use the cluster, not merely return the
+    /// right answer on one executor. A staged plan that produced one task per
+    /// stage would satisfy `Some(_)` and still be a single-task query.
+    #[tokio::test]
+    async fn q22_distributes_instead_of_running_as_a_single_task() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = q22_context(tmp.path()).await;
+        let plan = ctx
+            .sql(Q22)
+            .await
+            .expect("sql")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+
+        let staged = build_distributed_stages(plan)
+            .expect("build stages")
+            .expect("q22 must stage: a severed scalar-subquery wrapper is repaired, not declined");
+        assert!(
+            staged.stages.len() >= 2,
+            "expected a map stage and a result stage, got {}",
+            staged.stages.len()
         );
         assert!(
-            build_distributed_stages(plan).expect("build stages").is_none(),
-            "q22 must degrade to single-task while that gap stands, not ship a broken fragment"
+            staged.stages.iter().any(|s| s.task_count() > 1),
+            "some stage must run more than one task, or 'distributed' means nothing: {:?}",
+            staged
+                .stages
+                .iter()
+                .map(DistributedStage::task_count)
+                .collect::<Vec<_>>()
         );
+    }
+
+    /// The silent wrong-answer bug q22 exposed, pinned deterministically.
+    ///
+    /// `PartitionMode::CollectLeft` emits its unmatched BUILD rows only after
+    /// the last probe partition reports in. A distributed task executes ONE
+    /// partition, so that rendezvous never happens and those rows are dropped —
+    /// no error, no schema mismatch, just a wrong answer. q22's `NOT EXISTS`
+    /// returned zero rows per task.
+    ///
+    /// Built by hand rather than planned from SQL, deliberately: DataFusion
+    /// usually SWAPS the inputs so the smaller side builds, turning `LeftAnti`
+    /// into `RightAnti` — which streams from the probe side and is perfectly
+    /// safe to split. That swap is why this shape is rare, why it survived
+    /// every sweep unnoticed, and why a test that just runs a `NOT EXISTS`
+    /// query proves nothing: it would silently exercise the safe plan. The
+    /// end-to-end proof over a real severed plan is
+    /// `staged_q22_matches_direct_execution`.
+    #[tokio::test]
+    async fn an_unsplittable_broadcast_join_is_detected_and_converted() {
+        use datafusion::logical_expr::JoinType;
+        use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = q22_context(tmp.path()).await;
+        let scan = |sql: &'static str| {
+            let ctx = ctx.clone();
+            async move {
+                ctx.sql(sql)
+                    .await
+                    .expect("sql")
+                    .create_physical_plan()
+                    .await
+                    .expect("physical plan")
+            }
+        };
+        let build = scan("SELECT c_custkey FROM customer").await;
+        let probe = scan("SELECT o_custkey FROM orders").await;
+        assert!(
+            probe.output_partitioning().partition_count() > 1,
+            "precondition: the probe side must have several partitions, or there \
+             is no rendezvous to miss"
+        );
+
+        let on = vec![(
+            datafusion::physical_plan::expressions::col("c_custkey", &build.schema())
+                .expect("build key"),
+            datafusion::physical_plan::expressions::col("o_custkey", &probe.schema())
+                .expect("probe key"),
+        )];
+        let unsafe_join: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                Arc::new(CoalescePartitionsExec::new(build)),
+                probe,
+                on,
+                None,
+                &JoinType::LeftAnti,
+                None,
+                PartitionMode::CollectLeft,
+                datafusion::common::NullEquality::NullEqualsNothing,
+                false,
+            )
+            .expect("hand-built broadcast anti-join"),
+        );
+
+        let join_ref = unsafe_join
+            .downcast_ref::<HashJoinExec>()
+            .expect("hash join");
+        assert!(
+            is_unsplittable_broadcast_join(join_ref),
+            "a CollectLeft LeftAnti join over a multi-partition probe must be \
+             recognised as unsplittable"
+        );
+        assert!(
+            find_unsupported_stage_node(&unsafe_join).is_some(),
+            "and the stage guard must refuse it, so it can never ship unconverted"
+        );
+
+        let converted = redistribute_unsplittable_broadcast_joins(Arc::clone(&unsafe_join))
+            .expect("conversion must succeed");
+        let converted_join = converted
+            .downcast_ref::<HashJoinExec>()
+            .expect("still a hash join");
+        assert_eq!(
+            *converted_join.partition_mode(),
+            PartitionMode::Partitioned,
+            "conversion must switch to the mode whose probe counter is per-task"
+        );
+        assert!(
+            !is_unsplittable_broadcast_join(converted_join),
+            "the converted join must no longer be unsplittable"
+        );
+        assert_eq!(
+            *converted_join.join_type(),
+            JoinType::LeftAnti,
+            "conversion must not change the join's meaning"
+        );
+        assert_eq!(
+            converted.schema(),
+            unsafe_join.schema(),
+            "conversion must preserve the join's output schema"
+        );
+    }
+
+    /// And the repaired plan must still compute q22's actual answer. The
+    /// wrapper is re-evaluated per stage, so every task resolves the subquery
+    /// independently — this is what proves they all resolve it to the same
+    /// value the single-node plan uses.
+    #[tokio::test]
+    async fn staged_q22_matches_direct_execution() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = q22_context(tmp.path()).await;
+        let expected = render(&direct(&ctx, Q22).await);
+        let actual = run_staged(&ctx, Q22)
+            .await
+            .unwrap_or_else(|e| panic!("q22: staged execution failed: {e}"));
+        assert_eq!(
+            render(&actual),
+            expected,
+            "q22: staged result differs from single-node execution"
+        );
+        assert!(!expected.is_empty(), "the q22 fixture must produce rows");
     }
 
     async fn tpch_context(dir: &std::path::Path, join_threshold: Option<u64>) -> SessionContext {

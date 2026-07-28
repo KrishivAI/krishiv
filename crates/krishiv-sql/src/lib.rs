@@ -4227,9 +4227,7 @@ impl SqlDataFrame {
     /// or when no batch ever arrives — want this, not `schema()`.
     pub fn execute_stream_with_schema(
         &self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = SqlResult<(SchemaRef, SqlStream)>> + Send + '_>,
-    > {
+    ) -> futures::future::BoxFuture<'_, SqlResult<(SchemaRef, SqlStream)>> {
         Box::pin(self.execute_stream_with_schema_boxed_body())
     }
 
