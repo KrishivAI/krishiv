@@ -152,21 +152,143 @@ Measured: **81.07% regions, 68.67% functions, 78.07% lines** (11,475 regions,
       **mtime** (a spill lives for the whole map task, 20-60 min at SF100, so
       any safe threshold reclaims nothing).
 
+- [x] **D7 streaming write** (`85d81234`). `ShuffleStore::write_partition_stream`
+      takes a stream of batches. The default collects and delegates, so
+      in-memory and tee-ing tiered stores are untouched; `LocalDiskShuffleStore`
+      overrides it (batches cross a depth-2 channel to a blocking `ArrowWriter`
+      and are dropped as each is serialised) and `write_partition` now routes
+      *through* it, so one place opens the temp file, hashes, and commits.
+      `ShuffleBackend` dispatches to the concrete store — forwarding to the
+      trait default there would silently collect and undo the call.
+
+- [x] **The push-shuffle completeness gate was write-only state**
+      (`55d97dcb`). `expected_pushes` was written by `set_expected_pushes` and
+      read by *nothing*, while three doc comments — the field, the setter, and
+      the `POST /ess/expect/…` route — all promised `merge_read` waits for
+      every declared push. A reduce task fetching `/ess/merged/…` between two
+      map pushes got a well-formed Arrow stream missing some map tasks' rows.
+      Nothing downstream distinguishes that from a genuinely smaller
+      partition, so the query returned a **wrong answer and succeeded**.
+      Alongside: `gc_job`/`gc_stage` never cleared the counts (leak, plus a
+      stale gate on a reused job id), and `merge_read` cloned the chunk list
+      then concatenated it, holding two copies of a partition on the path whose
+      purpose is avoiding N fetches of it.
+
+- [x] **`ess_read_partition` sized an allocation from the index file**
+      (`55d97dcb`). `let len = (end - start) as usize` on a non-monotonic index
+      underflows — debug panics in the handler, release wraps to near
+      `u64::MAX` and hands it to `vec![0u8; len]`, aborting the process. A
+      crash mid-index-write is enough. Descending pairs and offsets past EOF
+      are now refused as bad requests.
+
+- [x] **`shuffle_svc.rs` 6.61% → covered** (`55d97dcb`). Its auth is a
+      per-handler `check_bearer_token` call rather than middleware, so a new
+      handler that forgets it is silently open; the added test enumerates every
+      data route and asserts both a wrong token and no token are refused.
+
+- [x] **`storage_uri.rs` 0.00% → covered.** `s3_shuffle_store` extracted: the
+      bucket/prefix split, the `"shuffle"` default, and the client construction
+      were duplicated verbatim between the two callers with nothing keeping
+      them in step. Empty bucket now refused by name.
+
+- [x] **Staging files leaked on every write failure** (`85d81234`). Any error
+      after `File::create` — a Parquet write error, a source-stream error, a
+      poisoned lease lock — left a `*.tmp.N`, and the only thing that removed
+      those was `cleanup_temp_files` at store construction, i.e. at executor
+      boot, which a node that filled its disk cannot do. A `StagingFiles` drop
+      guard reclaims at the point of failure. Same shape as the spill-file
+      finding above, same fix.
+
 ### Open
 
-- [ ] `shuffle_svc.rs` at 6.61% — 44 untested functions
-- [ ] `storage_uri.rs` at 0.00%
-- [ ] D7 streaming write: `ShuffleStore::write_partition` takes a whole
-      partition and has no append (`store.rs:51`), which forces the executor
-      to materialise one. `LocalDiskShuffleStore` writes via `ArrowWriter`,
-      which accepts batches incrementally, so this is buildable without a
-      format change.
 - [ ] `flight.rs` 61 untested fns — the path a coalesced partition travels,
       and the tonic 4 MiB decode limit already broke q10 once
+- [ ] `range_partitioner.rs` at 58.01%
 
 ---
 
-## 2, 4–27. Not yet started
+## 2. krishiv-executor — in progress
+
+### Map of the crate
+
+The distributed-batch critical path is `fragment/` + `runner/`. **Which
+map-write path SF100 takes** is the first thing to know: the bench submits SQL,
+the coordinator plans dfplan fragments, and the failure strings say
+`krishiv-fragment:{"version":1,"execution_kind":"Batch","body":"dfplan:v1:…`.
+That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
+(~758) and not `execute_inmem_shuffle_write` (~1322).
+
+### Fixed
+
+- [x] **The drain declared a whole partition to the pool** (`85d81234`).
+      `ShuffleWriteBuffer::drain_partition_stream` reads spilled runs back one
+      Arrow batch at a time, unlinks and evicts each run's file the moment it
+      is exhausted, and coalesces to the 8 MB target incrementally. What it
+      declares is the un-spilled tail plus a constant 24 MB window.
+
+      Measured on the same input: the collecting drain declared 8.5 MB for a
+      ~8 MB partition and 34.2 MB for a ~32 MB one; the streaming drain
+      declares ~25 MB for both. The test asserts the gap stays within the soft
+      ceiling and fails against the old behaviour by 25.6 MB.
+
+- [x] **The result spool left its whole size in the cgroup's page cache**
+      (`31dae758`). The same accounting hole, in the same process, that was
+      already found and fixed on the shuffle path — memory the DataFusion pool
+      cannot see, growing with data size, invisible as a spill. The write left
+      every byte resident and the sequential read back left the whole file
+      resident until `SpooledTaskResult` drops, which is *after* the push.
+      Write side now fsyncs then evicts (`DONTNEED` skips dirty pages, so the
+      order matters); read side evicts each chunk once it is in the buffer
+      being sent.
+
+- [x] **`truncate_on_char_boundary` could return `max + 2` bytes**
+      (`26267f9d`). `…` is three UTF-8 bytes and was appended *after*
+      truncating to `max - 1`. It is the last guard before a task failure goes
+      on the wire. Neither it nor `format_failure_message` had any test, though
+      `format_failure_message` produces every failure line an operator reads
+      off a cluster run.
+
+- [x] **`PushShuffleClient::with_timeout` reported a timeout it did not
+      enforce** (`26267f9d`) — it set the field unconditionally and rebuilt the
+      HTTP client only `if let Ok(...)`. The existing test asserted the private
+      field, so it could not catch this. `fetch_merged` also ended in
+      `bytes.to_vec()`, a second full copy of a merged partition.
+
+- [x] **`LocalParquetPartition` parsing had no tests** (`26267f9d`), including
+      the duplicate-table-name refusal — a second partition with the same name
+      would silently shadow the first in the session context, so the task would
+      read one file and report success for both.
+
+### Open
+
+- [ ] **`PushShuffleClient` has zero constructors in the workspace.** The ESS
+      server routes are live via `krishiv shuffle-svc`, but nothing builds the
+      client; `ctx.push_store` is the in-process `PushShuffleStore`, a
+      different type. Wire-or-delete decision, not an audit fix.
+- [ ] **The reduce side is the mirror of D7 and still collects.**
+      `ShufflePartitionReader::read_partition` (krishiv-sql) is typed
+      `Result<Vec<RecordBatch>, String>`, so `InmemDfplanShuffleReader`
+      materialises one whole partition per call. Bounded by partition size
+      rather than by the stage, so much milder than the map side was — but
+      fixing it means changing the trait, i.e. a krishiv-sql change.
+- [ ] `read_shuffle_flight_partitions` (`fragment/common.rs`) collects **every**
+      shuffle input of a task into one `Vec` before the engine sees any of it,
+      outside the pool. Only the legacy typed paths (batch.rs:76, :299) call
+      it, not dfplan.
+- [ ] `execute_shuffle_write` (batch.rs ~758) still collects; it has the
+      push-shuffle IPC mirror, which needs all batches when `ctx.push_store` is
+      `Some`, so converting it means a conditional path. Not on the SF100 route.
+- [ ] `fragment/common.rs` (2172) and `fragment/run_loop.rs` (1480) not yet
+      read end to end.
+- [ ] Executor `running_task_count: 3` self-reported on all three nodes while
+      the job reports `run=3` total, two nodes near-idle. It comes from
+      `heartbeat_mapping.rs:14` ← `request.running_attempts()`, and a blocked
+      reduce task waiting on an upstream map stage looks identical. Needs
+      stage-level evidence before it is called a scheduling bug.
+
+---
+
+## 4–27. Not yet started
 
 Each crate gets the same treatment and its own section here: measured
 coverage, a table of uncovered-region concentration, a fixed list with commit
