@@ -457,6 +457,30 @@ pub fn process_query_pool() -> Option<&'static Arc<dyn MemoryPool>> {
     POOL.as_ref()
 }
 
+/// A `FairSpillPool` of `bytes`, wrapped so spillable consumers cannot occupy
+/// the whole of it.
+///
+/// The single constructor for every bounded pool in this crate. Bare
+/// `FairSpillPool` lets N spillable consumers — each politely inside its own
+/// fair share — take the entire budget between them, after which an operator
+/// that *cannot* spill is refused even a few hundred bytes and nothing can
+/// reclaim anything. TPC-H q10 and q11 died that way at SF100 (877 B refused by
+/// a 2.3 GB pool). See [`crate::unspillable_headroom`].
+///
+/// Both `Private` and `Shared` route through here deliberately: the first
+/// version guarded only the shared pool, and every executor task engine is
+/// `Private`, so the protection was absent from the one deployment that needed
+/// it. One constructor is what keeps that from being possible.
+fn guarded_fair_pool(bytes: usize) -> Arc<dyn MemoryPool> {
+    let inner: Arc<dyn MemoryPool> =
+        Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(bytes));
+    Arc::new(crate::unspillable_headroom::UnspillableHeadroomPool::new(
+        inner,
+        bytes,
+        crate::unspillable_headroom::headroom_bytes(bytes),
+    ))
+}
+
 /// One engine's expected share of [`process_query_pool`] when every slot is
 /// busy. Sizes spill reservations only; the pool itself is shared.
 fn process_query_pool_fair_share_bytes() -> usize {
@@ -513,17 +537,7 @@ impl EngineMemory {
     /// memory rather than each engine's individually.
     #[must_use]
     pub fn shared_pool(bytes: usize) -> Arc<dyn MemoryPool> {
-        // Wrapped, not bare: `FairSpillPool` lets spillable consumers occupy
-        // the whole budget between them and then refuses an operator that
-        // cannot spill even a few hundred bytes. That is how TPC-H q10 and q11
-        // died at SF100. See `unspillable_headroom`.
-        let inner: Arc<dyn MemoryPool> =
-            Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(bytes));
-        Arc::new(crate::unspillable_headroom::UnspillableHeadroomPool::new(
-            inner,
-            bytes,
-            crate::unspillable_headroom::headroom_bytes(bytes),
-        ))
+        guarded_fair_pool(bytes)
     }
 
     /// The default memory source for an engine built in this process: a share
@@ -565,9 +579,12 @@ impl EngineMemory {
     fn pool(&self) -> Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>> {
         match self {
             Self::Unbounded => None,
-            Self::Private(bytes) => Some(Arc::new(
-                datafusion::execution::memory_pool::FairSpillPool::new(*bytes),
-            )),
+            // Guarded, like `shared_pool` — and this is the path that matters
+            // on the cluster. Every executor task engine is built with
+            // `EngineMemory::Private` (krishiv-executor `task_sql_engine`), so
+            // wrapping only the shared pool would have left the headroom
+            // switched off in exactly the deployment q10/q11 failed in.
+            Self::Private(bytes) => Some(guarded_fair_pool(*bytes)),
             Self::Shared { pool, .. } => Some(Arc::clone(pool)),
         }
     }

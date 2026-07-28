@@ -325,6 +325,44 @@ mod tests {
             .expect("capacity came back after spilling");
     }
 
+    /// **Every** bounded `EngineMemory` must install the guard — most of all
+    /// `Private`, which is what the executor uses.
+    ///
+    /// The first version of this fix wrapped only `EngineMemory::shared_pool`.
+    /// Every executor task engine is built with `EngineMemory::Private`
+    /// (krishiv-executor `task_sql_engine`), so the protection was absent from
+    /// the one deployment q10 and q11 fail in — the code shipped, the tests
+    /// passed, and nothing on the cluster changed. Asserting behaviour through
+    /// the real constructor is what makes that visible.
+    #[test]
+    fn both_bounded_engine_memories_install_the_guard() {
+        const SIZE: usize = 1024 * 1024;
+        for (label, pool) in [
+            ("Private", crate::EngineMemory::Private(SIZE).pool()),
+            ("Shared", Some(crate::EngineMemory::shared_pool(SIZE))),
+        ] {
+            let pool = pool.unwrap_or_else(|| panic!("{label} must install a pool"));
+            assert_eq!(
+                pool.name(),
+                "fair+unspillable-headroom",
+                "{label} installed an unguarded pool"
+            );
+            // Behaviour, not just the name: a lone spiller must be refused the
+            // whole budget so a hash join build side keeps a floor.
+            let spiller = MemoryConsumer::new("s").with_can_spill(true).register(&pool);
+            assert!(
+                spiller.try_grow(SIZE).is_err(),
+                "{label}: a lone spiller took the entire pool, so the guard is absent"
+            );
+            spiller
+                .try_grow(SIZE / 4 * 3)
+                .unwrap_or_else(|e| panic!("{label}: the ceiling itself must be reachable — {e}"));
+            let join = MemoryConsumer::new("HashJoinInput").register(&pool);
+            join.try_grow(877)
+                .unwrap_or_else(|e| panic!("{label}: headroom absent — {e}"));
+        }
+    }
+
     /// Zero headroom is the documented escape hatch and must behave exactly
     /// like the pool it wraps.
     #[test]
