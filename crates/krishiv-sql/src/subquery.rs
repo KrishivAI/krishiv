@@ -10,11 +10,7 @@
 
 use std::collections::HashSet;
 
-use datafusion::sql::sqlparser::ast::visit_relations;
-use datafusion::sql::sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select, SelectItem, SetExpr,
-    Statement,
-};
+use datafusion::sql::sqlparser::ast::{Expr, Query, Statement, visit_expressions, visit_relations};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 
@@ -61,121 +57,57 @@ pub fn detect_subqueries(sql: &str) -> SqlResult<Vec<DetectedSubquery>> {
     let mut found = Vec::new();
 
     for stmt in &stmts {
-        if let Statement::Query(q) = stmt {
-            collect_subqueries_from_query(q, &mut found);
-        }
+        collect_subqueries(stmt, &mut found);
     }
 
     Ok(found)
 }
 
-fn collect_subqueries_from_query(query: &Query, out: &mut Vec<DetectedSubquery>) {
-    if let SetExpr::Select(sel) = query.body.as_ref() {
-        collect_from_select(sel, out);
-    }
-}
-
-fn collect_from_select(sel: &Select, out: &mut Vec<DetectedSubquery>) {
-    for item in &sel.projection {
-        match item {
-            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                collect_from_expr(e, out);
-            }
-            _ => {}
-        }
-    }
-    if let Some(e) = &sel.selection {
-        collect_from_expr(e, out);
-    }
-    if let Some(e) = &sel.having {
-        collect_from_expr(e, out);
-    }
-}
-
-fn collect_from_expr(expr: &Expr, out: &mut Vec<DetectedSubquery>) {
-    match expr {
-        Expr::InSubquery {
-            subquery, negated, ..
-        } => {
-            let kind = if *negated {
-                SubqueryKind::NotInSubquery
-            } else {
-                SubqueryKind::InSubquery
-            };
-            out.push(DetectedSubquery {
-                kind,
+/// Push every subquery occurrence anywhere inside `node`.
+///
+/// This walks the AST with sqlparser's own expression visitor rather than a
+/// hand-written traversal. The hand-written one descended only
+/// `SetExpr::Select` and a fixed list of `Expr` variants, so it silently saw
+/// nothing in a `UNION` branch, a CTE, a derived table, a `JOIN ... ON`
+/// condition, or even a parenthesised predicate (`Expr::Nested`) — and this
+/// module's whole job is to *reject* streaming subqueries, so each gap was a
+/// way past the guard rather than a missing nicety. Delegating to the visitor
+/// makes the coverage a property of the parser instead of of this list.
+///
+/// The visitor already recurses through subquery bodies, so nested occurrences
+/// are reported without descending explicitly.
+fn collect_subqueries<V>(node: &V, out: &mut Vec<DetectedSubquery>)
+where
+    V: datafusion::sql::sqlparser::ast::Visit,
+{
+    let _ = visit_expressions(node, |expr| {
+        match expr {
+            Expr::InSubquery {
+                subquery, negated, ..
+            } => out.push(DetectedSubquery {
+                kind: if *negated {
+                    SubqueryKind::NotInSubquery
+                } else {
+                    SubqueryKind::InSubquery
+                },
                 inner_query: subquery.to_string(),
-            });
-            collect_subqueries_from_query(subquery, out);
-        }
-        Expr::Exists { subquery, negated } => {
-            let kind = if *negated {
-                SubqueryKind::NotExists
-            } else {
-                SubqueryKind::Exists
-            };
-            out.push(DetectedSubquery {
-                kind,
+            }),
+            Expr::Exists { subquery, negated } => out.push(DetectedSubquery {
+                kind: if *negated {
+                    SubqueryKind::NotExists
+                } else {
+                    SubqueryKind::Exists
+                },
                 inner_query: subquery.to_string(),
-            });
-            collect_subqueries_from_query(subquery, out);
-        }
-        Expr::Subquery(q) => {
-            out.push(DetectedSubquery {
+            }),
+            Expr::Subquery(q) => out.push(DetectedSubquery {
                 kind: SubqueryKind::Scalar,
                 inner_query: q.to_string(),
-            });
-            collect_subqueries_from_query(q, out);
+            }),
+            _ => {}
         }
-        Expr::BinaryOp { left, right, .. } => {
-            collect_from_expr(left, out);
-            collect_from_expr(right, out);
-        }
-        Expr::UnaryOp { expr, .. } => collect_from_expr(expr, out),
-        Expr::IsNull(e) | Expr::IsNotNull(e) => collect_from_expr(e, out),
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            collect_from_expr(expr, out);
-            collect_from_expr(low, out);
-            collect_from_expr(high, out);
-        }
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            if let Some(e) = operand {
-                collect_from_expr(e, out);
-            }
-            for cw in conditions {
-                collect_from_expr(&cw.condition, out);
-                collect_from_expr(&cw.result, out);
-            }
-            if let Some(e) = else_result {
-                collect_from_expr(e, out);
-            }
-        }
-        Expr::Function(f) => {
-            if let FunctionArguments::List(list) = &f.args {
-                for fa in &list.args {
-                    let inner = match fa {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
-                        FunctionArg::Named {
-                            arg: FunctionArgExpr::Expr(e),
-                            ..
-                        } => Some(e),
-                        _ => None,
-                    };
-                    if let Some(e) = inner {
-                        collect_from_expr(e, out);
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
 }
 
 // ── Streaming guard ───────────────────────────────────────────────────────────
@@ -208,9 +140,9 @@ pub fn validate_no_streaming_subqueries(
     };
 
     for stmt in &stmts {
-        if let Statement::Query(q) = stmt {
+        {
             let mut subqueries = Vec::new();
-            collect_subqueries_from_query(q, &mut subqueries);
+            collect_subqueries(stmt, &mut subqueries);
             for sq in &subqueries {
                 let inner_stmts =
                     Parser::parse_sql(&GenericDialect {}, &sq.inner_query).unwrap_or_default();
@@ -369,5 +301,96 @@ mod tests {
         let sql = "SELECT CASE WHEN x > 0 THEN 'pos' ELSE 'neg' END FROM t";
         let found = detect_subqueries(sql).unwrap();
         assert!(found.is_empty());
+    }
+
+    // ── Places the hand-written traversal never looked ────────────────────
+    //
+    // Each of these parses to a node the old walk did not descend, so it
+    // reported zero subqueries and `validate_no_streaming_subqueries` waved
+    // the statement through. They are listed one per construct because the
+    // failure mode is silent: a guard that returns `Ok(())` looks exactly
+    // like a guard that ran.
+
+    /// `query.body` is a `SetOperation`, not a `Select`.
+    #[test]
+    fn finds_a_subquery_in_a_union_branch() {
+        let sql = "SELECT a FROM t WHERE a IN (SELECT id FROM s) UNION ALL SELECT b FROM u";
+        let found = detect_subqueries(sql).unwrap();
+        assert_eq!(found.len(), 1, "union branch not scanned: {found:?}");
+        assert_eq!(found[0].kind, SubqueryKind::InSubquery);
+    }
+
+    /// `query.with` was never visited at all.
+    #[test]
+    fn finds_a_subquery_inside_a_cte() {
+        let sql = "WITH c AS (SELECT id FROM t WHERE id IN (SELECT id FROM s)) SELECT * FROM c";
+        let found = detect_subqueries(sql).unwrap();
+        assert_eq!(found.len(), 1, "CTE body not scanned: {found:?}");
+    }
+
+    /// Join constraints live in `sel.from`, which was not walked.
+    #[test]
+    fn finds_a_subquery_in_a_join_condition() {
+        let sql = "SELECT * FROM a JOIN b ON b.id IN (SELECT id FROM s)";
+        let found = detect_subqueries(sql).unwrap();
+        assert_eq!(found.len(), 1, "join condition not scanned: {found:?}");
+    }
+
+    /// A derived table is a whole query hiding in `sel.from`.
+    #[test]
+    fn finds_a_subquery_inside_a_derived_table() {
+        let sql = "SELECT * FROM (SELECT id FROM t WHERE id IN (SELECT id FROM s)) d";
+        let found = detect_subqueries(sql).unwrap();
+        assert_eq!(found.len(), 1, "derived table not scanned: {found:?}");
+    }
+
+    /// Parentheses alone were enough to hide a subquery: they wrap the
+    /// predicate in `Expr::Nested`, which the old `collect_from_expr` did not
+    /// match, so it stopped there.
+    #[test]
+    fn finds_a_subquery_behind_parentheses() {
+        let sql = "SELECT * FROM t WHERE (id IN (SELECT id FROM s))";
+        let found = detect_subqueries(sql).unwrap();
+        assert_eq!(found.len(), 1, "parenthesised predicate not scanned: {found:?}");
+    }
+
+    /// The point of the module: the guard must not be bypassable by writing
+    /// the same query with a UNION.
+    #[test]
+    fn the_streaming_guard_is_not_bypassed_by_a_union() {
+        let sql = "SELECT a FROM events WHERE a IN (SELECT id FROM live_stream) \
+                   UNION ALL SELECT b FROM other";
+        let mut streaming = HashSet::new();
+        streaming.insert("live_stream".into());
+        assert!(
+            validate_no_streaming_subqueries(sql, &streaming).is_err(),
+            "a streaming subquery in a UNION branch slipped past the guard"
+        );
+    }
+
+    /// Same, hidden in a CTE.
+    #[test]
+    fn the_streaming_guard_is_not_bypassed_by_a_cte() {
+        let sql = "WITH c AS (SELECT id FROM events WHERE id IN (SELECT id FROM live_stream)) \
+                   SELECT * FROM c";
+        let mut streaming = HashSet::new();
+        streaming.insert("live_stream".into());
+        assert!(
+            validate_no_streaming_subqueries(sql, &streaming).is_err(),
+            "a streaming subquery in a CTE slipped past the guard"
+        );
+    }
+
+    /// A statement that is not a bare `Query` — the old loop matched only
+    /// `Statement::Query`, so `INSERT ... SELECT` was never examined.
+    #[test]
+    fn the_streaming_guard_examines_insert_select() {
+        let sql = "INSERT INTO sink SELECT id FROM events WHERE id IN (SELECT id FROM live_stream)";
+        let mut streaming = HashSet::new();
+        streaming.insert("live_stream".into());
+        assert!(
+            validate_no_streaming_subqueries(sql, &streaming).is_err(),
+            "INSERT ... SELECT was not examined"
+        );
     }
 }
