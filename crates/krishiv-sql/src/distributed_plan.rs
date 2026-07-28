@@ -708,6 +708,46 @@ pub fn is_dfplan_body(body: &str) -> bool {
 /// tables registered on it. Map-stage plans read upstream shuffle data
 /// through `reader`; passing `None` leaves any [`ShuffleReadExec`] leaves
 /// unexecutable (coordinator-side decode).
+/// Convert over-budget hash joins in a decoded fragment to the grace hash join.
+///
+/// # Why this runs after decode, and not during planning
+///
+/// [`crate::grace_hash_join::GraceHashJoinExec`] is a Krishiv node, and
+/// `datafusion-proto` cannot serialize it. When the rule that produces it ran on
+/// the *coordinator*, the encoded stage plan became unencodable, and the
+/// scheduler's answer to an unencodable stage is to give up on staging and run
+/// the query as a **single task**. Turning the flag on therefore looked like a
+/// memory fix while quietly un-distributing q10 and q21 — a silent Bar-2
+/// regression, which is the worst shape a bug can take here.
+///
+/// Running it here is not a workaround, it is the right layer. Which algorithm
+/// an operator uses to spill depends on the memory *this executor* has at *this
+/// moment*; it is not part of what the plan means, so it does not belong on the
+/// wire. The coordinator keeps converting known-large joins to sort-merge (which
+/// proto handles), and this pass picks up what is left.
+///
+/// That residue is exactly the failure case: the joins the coordinator declined
+/// because their build sides looked small enough are the ones that together
+/// exhaust the pool and refuse a later join 877 bytes.
+///
+/// Off unless [`crate::grace_hash_join::enabled`]. A failure to rewrite returns
+/// the plan untouched — a spill strategy must never be why a query dies.
+fn apply_local_spill_strategy(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    use datafusion::physical_optimizer::PhysicalOptimizerRule;
+
+    if !crate::grace_hash_join::enabled() {
+        return plan;
+    }
+    let rule = crate::spillable_join::SpillableJoinSelection::from_capacity();
+    match rule.optimize(Arc::clone(&plan), &datafusion::common::config::ConfigOptions::default()) {
+        Ok(rewritten) => rewritten,
+        Err(error) => {
+            tracing::warn!(%error, "local spill strategy declined; running the decoded plan as-is");
+            plan
+        }
+    }
+}
+
 pub fn execute_dfplan_body(
     body: &str,
     session: &SessionContext,
@@ -730,6 +770,9 @@ pub fn execute_dfplan_body(
     };
     let task_ctx = session.task_ctx();
     let (spec, plan) = decode_dfplan_task(body, &task_ctx, &codec)?;
+    // Choose the spill strategy here, on the executor, not upstream: see
+    // `apply_local_spill_strategy`.
+    let plan = apply_local_spill_strategy(plan);
     let partition_count = plan.output_partitioning().partition_count();
     if let Some(&bad) = spec.partitions.iter().find(|&&p| p >= partition_count) {
         return Err(SqlError::DataFusion {

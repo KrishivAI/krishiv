@@ -726,16 +726,19 @@ pub fn with_krishiv_optimizer_rules_with_join_threshold(
     spill_join_build_bytes: Option<u64>,
 ) -> datafusion::execution::session_state::SessionStateBuilder {
     let spillable_join = match spill_join_build_bytes {
-        // Honour the grace-hash-join flag here too. An explicit threshold means
-        // "convert at this size", not "and use the old algorithm" — before this,
-        // every distributed query planned through
-        // `planning_session_context_with_options` silently forced sort-merge, so
-        // the flag could not be exercised on the path that actually plans
-        // cluster work.
-        Some(bytes) => crate::spillable_join::SpillableJoinSelection::with_threshold_and_grace(
-            Some(bytes),
-            crate::grace_hash_join::enabled(),
-        ),
+        // Deliberately NOT grace-aware: this builder plans the stages the
+        // coordinator has to *encode*, and `GraceHashJoinExec` is a Krishiv
+        // node that `datafusion-proto` cannot serialize. A grace join here made
+        // the whole fragment fail to encode, and the scheduler's response to an
+        // unencodable stage plan is to run the query as a SINGLE TASK — so
+        // enabling the flag silently un-distributed q10 and q21 while looking
+        // like a memory fix.
+        //
+        // Grace is applied on the executor instead, after decode, by
+        // `distributed_plan::apply_local_spill_strategy`. Which algorithm an
+        // operator uses to spill is a local execution decision; it has no
+        // business on the wire.
+        Some(bytes) => crate::spillable_join::SpillableJoinSelection::with_threshold(Some(bytes)),
         None => crate::spillable_join::SpillableJoinSelection::from_capacity(),
     };
     builder

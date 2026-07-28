@@ -1622,3 +1622,73 @@ mod join_filter_order_tests {
         assert_eq!(format!("{}", out.expression()), "l1@1");
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod encodability_tests {
+    use super::*;
+    use crate::grace_hash_join::GraceHashJoinExec;
+    use datafusion::prelude::SessionContext;
+
+    fn grace_joins(plan: &Arc<dyn ExecutionPlan>) -> usize {
+        let any = plan.as_ref() as &dyn std::any::Any;
+        usize::from(any.downcast_ref::<GraceHashJoinExec>().is_some())
+            + plan.children().iter().map(|c| grace_joins(c)).sum::<usize>()
+    }
+
+    /// The staging planner must never produce a grace hash join.
+    ///
+    /// `GraceHashJoinExec` is a Krishiv node and `datafusion-proto` cannot
+    /// serialize it. A stage plan containing one fails to encode, and the
+    /// scheduler's response to an unencodable stage plan is to run the whole
+    /// query as a SINGLE TASK — so the flag read as a memory fix while silently
+    /// un-distributing q10 and q21 on the cluster:
+    ///
+    /// ```text
+    /// stage plan cannot be encoded and decoded; running this query as a
+    /// SINGLE TASK ... Unsupported plan and extension codec failed
+    /// ```
+    ///
+    /// Grace belongs on the executor, after decode
+    /// (`distributed_plan::apply_local_spill_strategy`). This pins the
+    /// separation: whatever the environment says, the path that plans stages
+    /// stays encodable.
+    #[tokio::test]
+    async fn the_staging_planner_never_emits_an_unencodable_grace_join() {
+        // Exactly how `planning_session_context_with_options` builds its rules.
+        let rule = SpillableJoinSelection::with_threshold(Some(1));
+        let ctx = SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_target_partitions(1),
+        );
+        for ddl in [
+            "CREATE TABLE l(k INT, v INT) AS VALUES (1, 10), (2, 20)",
+            "CREATE TABLE r(k INT, w INT) AS VALUES (1, 100), (2, 200)",
+        ] {
+            ctx.sql(ddl).await.unwrap().collect().await.unwrap();
+        }
+        let plan = ctx
+            .sql("SELECT l.v, r.w FROM l JOIN r ON l.k = r.k")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let out = rule.optimize(plan, ctx.copied_config().options()).unwrap();
+        assert_eq!(
+            grace_joins(&out),
+            0,
+            "the staging planner produced a grace join, which cannot be encoded:\n{}",
+            datafusion::physical_plan::displayable(out.as_ref()).indent(true)
+        );
+        // And it did convert *something*, so this is not passing because the
+        // rule declined everything.
+        assert!(
+            datafusion::physical_plan::displayable(out.as_ref())
+                .indent(true)
+                .to_string()
+                .contains("SortMergeJoin"),
+            "the rule declined entirely, so encodability was never at stake"
+        );
+    }
+}
