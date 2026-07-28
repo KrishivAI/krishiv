@@ -10,17 +10,32 @@
 //! # Execution model
 //!
 //! ```text
-//! accumulator = execute(base_query)
+//! working = accumulator = execute(base_query)
 //! for i in 0..max_iterations:
-//!     delta = execute(recursive_query with cte_name = accumulator)
+//!     delta = execute(recursive_query with cte_name = working)
 //!     if delta is empty: break (fixpoint)
 //!     accumulator = accumulator UNION ALL delta
+//!     working = delta
 //! return accumulator
 //! ```
 //!
 //! Each iteration materialises `delta` fully before the next starts. This is
-//! the "naïve" fixpoint strategy, suitable for transitive-closure and
-//! tree-traversal queries on bounded datasets.
+//! the semi-naïve strategy, suitable for transitive-closure and tree-traversal
+//! queries on bounded datasets.
+//!
+//! The recursive self-reference resolves to the **previous iteration's output**
+//! — the "working table" — not to everything accumulated so far. That is what
+//! SQL specifies, and it is not a refinement: substituting the accumulation
+//! re-derives every earlier row on every pass, so `SELECT n + 1 FROM cte WHERE
+//! n < 3` seeded with `{1}` yields `{2}`, then `{2, 3}`, then `{2, 3, 3, 4}` —
+//! duplicates under `UNION ALL`, and no fixpoint.
+//!
+//! # Status
+//!
+//! Nothing calls into this module yet: [`parse_recursive_cte`] has no callers
+//! and [`krishiv_plan::NodeOp::RecursiveCte`] is never constructed outside
+//! tests, so `WITH RECURSIVE` reaches DataFusion unmodified today. The
+//! semantics above are written down so that wiring it up is a wiring job.
 
 use arrow::record_batch::RecordBatch;
 use datafusion::sql::sqlparser::ast::{Query, SetExpr, SetOperator, SetQuantifier, Statement};
@@ -56,9 +71,14 @@ pub struct RecursiveCteStatement {
 /// Returns `Err` when the SQL is syntactically invalid.
 pub fn parse_recursive_cte(sql: &str) -> SqlResult<Option<RecursiveCteStatement>> {
     let trimmed = sql.trim().trim_end_matches(';');
-    let upper = trimmed.to_ascii_uppercase();
 
-    if !upper.starts_with("WITH RECURSIVE") {
+    // Cheap reject only. This used to be `starts_with("WITH RECURSIVE")`,
+    // which is a claim about *formatting*, not about the statement: a leading
+    // comment, a newline between the two words, or two spaces all made a
+    // perfectly ordinary recursive CTE invisible. Whether the statement is
+    // recursive is decided below by `with.recursive`, which is the parser's
+    // answer rather than ours.
+    if !trimmed.to_ascii_uppercase().contains("RECURSIVE") {
         return Ok(None);
     }
 
@@ -175,8 +195,10 @@ where
     // memory while appearing to respect max_iterations.
     const MAX_ACCUMULATED_ROWS: usize = 10_000_000;
 
-    // Seed: execute the base query.
+    // Seed: execute the base query. The seed is both the first working table
+    // and the first contents of the result.
     let base_batches = execute_fn(&stmt.base_query)?;
+    let mut working = base_batches.clone();
     let mut accumulator = base_batches;
 
     let mut iterations = 0u32;
@@ -197,8 +219,11 @@ where
             });
         }
 
-        // Register the current accumulator so the recursive branch can reference it.
-        register_batches_fn(&stmt.name, &accumulator)?;
+        // The self-reference resolves to the *working table* — the previous
+        // iteration's output — not to everything accumulated so far. Binding
+        // it to the accumulation re-derives every earlier row on every pass,
+        // which under UNION ALL duplicates rows and never reaches a fixpoint.
+        register_batches_fn(&stmt.name, &working)?;
 
         let delta = execute_fn(&stmt.recursive_query)?;
         let delta_rows: usize = delta.iter().map(|b| b.num_rows()).sum();
@@ -207,7 +232,8 @@ where
             break; // fixpoint reached
         }
 
-        accumulator.extend(delta);
+        accumulator.extend(delta.iter().cloned());
+        working = delta;
         iterations += 1;
     }
 
@@ -255,33 +281,123 @@ mod tests {
         assert!(result.is_none());
     }
 
+    /// Plain `UNION` is not the supported body and must be refused.
+    ///
+    /// The previous version of this test accepted `Ok(Some(_))`, `Ok(None)`
+    /// *and* `Err(_)` — every possible outcome — so it could not fail, and it
+    /// justified that with a comment claiming "sqlparser parses UNION and
+    /// UNION ALL identically at the AST level". It does not: the two differ by
+    /// `SetQuantifier`, which is exactly what `split_union_all` matches on.
     #[test]
     fn rejects_non_union_all_body() {
-        // UNION (not UNION ALL) is not the recursive CTE pattern.
         let sql = "\
             WITH RECURSIVE cte AS (\
               SELECT 1 AS n \
               UNION \
               SELECT n + 1 FROM cte\
             ) SELECT * FROM cte";
-        let result = parse_recursive_cte(sql);
-        // sqlparser parses UNION and UNION ALL identically at the AST level, so
-        // this returns Ok(Some(...)) — verify the parsed base query contains the
-        // UNION body and that the caller must distinguish UNION vs UNION ALL.
-        match result {
-            Ok(Some(stmt)) => {
-                assert!(
-                    stmt.recursive_query.to_uppercase().contains("SELECT"),
-                    "recursive query should reference the CTE"
-                );
-            }
-            Ok(None) => {
-                // Also acceptable if the parser doesn't recognise this form.
-            }
-            Err(_) => {
-                // Parse error is acceptable for malformed CTE.
-            }
+        assert!(
+            parse_recursive_cte(sql).is_err(),
+            "UNION (without ALL) is not the recursive-CTE body this supports"
+        );
+    }
+
+    /// Detection must survive ordinary formatting.
+    #[test]
+    fn detection_survives_comments_and_whitespace() {
+        for sql in [
+            "-- build the closure\nWITH RECURSIVE cte AS (SELECT 1 AS n UNION ALL \
+             SELECT n + 1 FROM cte WHERE n < 3) SELECT * FROM cte",
+            "WITH\n  RECURSIVE cte AS (SELECT 1 AS n UNION ALL \
+             SELECT n + 1 FROM cte WHERE n < 3) SELECT * FROM cte",
+            "  with recursive cte as (select 1 as n union all \
+             select n + 1 from cte where n < 3) select * from cte",
+        ] {
+            assert!(
+                parse_recursive_cte(sql).unwrap().is_some(),
+                "formatting hid a recursive CTE:\n{sql}"
+            );
         }
+    }
+
+    /// The self-reference must resolve to the previous iteration's output.
+    ///
+    /// This is the semantics SQL specifies, and the reason it matters is
+    /// concrete: binding the self-reference to the whole accumulation
+    /// re-derives every earlier row on every pass. The mock below actually
+    /// evaluates `n + 1 WHERE n < 4` against whatever was registered, so it
+    /// reproduces that divergence rather than returning canned rows — the two
+    /// pre-existing executor tests ignore the registered table entirely and
+    /// therefore cannot tell the two behaviours apart.
+    #[test]
+    fn the_working_table_is_the_previous_delta_not_the_accumulation() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::cell::RefCell;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
+        let registered: RefCell<Vec<i32>> = RefCell::new(Vec::new());
+
+        let make = |values: Vec<i32>| -> Vec<RecordBatch> {
+            if values.is_empty() {
+                return vec![];
+            }
+            vec![
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))])
+                    .expect("batch"),
+            ]
+        };
+        let read = |batches: &[RecordBatch]| -> Vec<i32> {
+            batches
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .expect("int32")
+                        .values()
+                        .to_vec()
+                })
+                .collect()
+        };
+
+        let stmt = RecursiveCteStatement {
+            name: "cte".into(),
+            base_query: "SELECT 1 AS n".into(),
+            recursive_query: "SELECT n + 1 FROM cte WHERE n < 4".into(),
+            max_iterations: DEFAULT_MAX_ITERATIONS,
+        };
+
+        let execute = |sql: &str| -> SqlResult<Vec<RecordBatch>> {
+            if sql.contains("SELECT 1") {
+                return Ok(make(vec![1]));
+            }
+            // Evaluate the recursive term against the registered working table.
+            let out: Vec<i32> = registered
+                .borrow()
+                .iter()
+                .filter(|n| **n < 4)
+                .map(|n| n + 1)
+                .collect();
+            Ok(make(out))
+        };
+        let register = |_name: &str, batches: &[RecordBatch]| -> SqlResult<()> {
+            *registered.borrow_mut() = read(batches);
+            Ok(())
+        };
+
+        let result = execute_recursive_cte(&stmt, execute, register).expect("run");
+        let rows = read(&result.batches);
+
+        assert_eq!(
+            rows,
+            vec![1, 2, 3, 4],
+            "each value must appear exactly once; duplicates mean the \
+             self-reference saw the accumulation instead of the working table"
+        );
+        assert!(!result.hit_limit, "this reaches a fixpoint");
+        assert_eq!(result.iterations, 3);
     }
 
     #[test]
