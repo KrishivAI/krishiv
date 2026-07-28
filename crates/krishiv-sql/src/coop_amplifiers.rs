@@ -26,6 +26,7 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::joins::{CrossJoinExec, NestedLoopJoinExec};
+use datafusion::physical_plan::unnest::UnnestExec;
 
 /// Wraps input-amplifying operators in [`CooperativeExec`] so their output
 /// participates in cooperative scheduling. See the module docs for why the
@@ -44,6 +45,17 @@ fn is_amplifier(plan: &dyn ExecutionPlan) -> bool {
     let any = plan as &dyn std::any::Any;
     any.downcast_ref::<CrossJoinExec>().is_some()
         || any.downcast_ref::<NestedLoopJoinExec>().is_some()
+        // The module docs have always named unnest as a member of this class
+        // and it was never actually matched: one row in, one row per list
+        // element out, with no leaf of its own between it and the consumer.
+        || any.downcast_ref::<UnnestExec>().is_some()
+}
+
+/// Is this node already a [`CooperativeExec`]?
+fn is_cooperative(plan: &dyn ExecutionPlan) -> bool {
+    (plan as &dyn std::any::Any)
+        .downcast_ref::<CooperativeExec>()
+        .is_some()
 }
 
 impl PhysicalOptimizerRule for CooperativeAmplifiers {
@@ -54,12 +66,26 @@ impl PhysicalOptimizerRule for CooperativeAmplifiers {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_up(|node| {
             if is_amplifier(node.as_ref()) {
-                Ok(Transformed::yes(
+                return Ok(Transformed::yes(
                     Arc::new(CooperativeExec::new(node)) as Arc<dyn ExecutionPlan>
-                ))
-            } else {
-                Ok(Transformed::no(node))
+                ));
             }
+            // Collapse a doubled wrapper, so applying the rule to a plan it has
+            // already run on is a no-op. `transform_up` visits children first:
+            // an amplifier that was *already* wrapped gets a second wrapper
+            // when we reach it, and the pre-existing one is then visited with
+            // that as its child. Without this the plan would gain a layer per
+            // pass, and each layer costs a poll indirection on every batch.
+            if is_cooperative(node.as_ref())
+                && node
+                    .children()
+                    .first()
+                    .is_some_and(|child| is_cooperative(child.as_ref()))
+                && let Some(child) = node.children().first()
+            {
+                return Ok(Transformed::yes(Arc::clone(child)));
+            }
+            Ok(Transformed::no(node))
         })
         .map(|t| t.data)
     }
@@ -71,5 +97,78 @@ impl PhysicalOptimizerRule for CooperativeAmplifiers {
     fn schema_check(&self) -> bool {
         // A CooperativeExec wrapper is schema-transparent.
         true
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_plan::displayable;
+
+    fn leaf() -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        MemorySourceConfig::try_new_exec(&[vec![]], schema, None).unwrap()
+    }
+
+    fn optimize(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        CooperativeAmplifiers::new()
+            .optimize(plan, &ConfigOptions::default())
+            .unwrap()
+    }
+
+    fn rendered(plan: &Arc<dyn ExecutionPlan>) -> String {
+        format!("{}", displayable(plan.as_ref()).indent(false))
+    }
+
+    /// The operator class the rule exists for must actually be wrapped.
+    #[test]
+    fn a_cross_join_is_wrapped() {
+        let join = Arc::new(CrossJoinExec::new(leaf(), leaf())) as Arc<dyn ExecutionPlan>;
+        assert_eq!(rendered(&join).matches("Cooperative").count(), 0);
+        let out = optimize(join);
+        assert_eq!(
+            rendered(&out).matches("Cooperative").count(),
+            1,
+            "cross join not wrapped:\n{}",
+            rendered(&out)
+        );
+    }
+
+    /// Running the rule on a plan it has already run on must change nothing.
+    ///
+    /// Without the collapse, `transform_up` adds a wrapper every pass: it
+    /// visits the amplifier before the wrapper already above it, so the old
+    /// wrapper simply ends up on top of the new one. Each layer is a poll
+    /// indirection on every batch for the rest of the query.
+    #[test]
+    fn optimizing_twice_is_a_no_op() {
+        let join = Arc::new(CrossJoinExec::new(leaf(), leaf())) as Arc<dyn ExecutionPlan>;
+        let once = optimize(join);
+        let twice = optimize(Arc::clone(&once));
+        assert_eq!(
+            rendered(&once),
+            rendered(&twice),
+            "the rule is not idempotent; a second pass added a layer"
+        );
+        assert_eq!(
+            rendered(&twice).matches("Cooperative").count(),
+            1,
+            "expected exactly one wrapper:\n{}",
+            rendered(&twice)
+        );
+    }
+
+    /// A plan with nothing to amplify must come back untouched — the rule
+    /// costs a poll indirection, so it should only be paid where it buys
+    /// preemptibility.
+    #[test]
+    fn a_plan_without_an_amplifier_is_left_alone() {
+        let plan = leaf();
+        let out = optimize(Arc::clone(&plan));
+        assert_eq!(rendered(&plan), rendered(&out));
+        assert_eq!(rendered(&out).matches("Cooperative").count(), 0);
     }
 }
