@@ -55,8 +55,8 @@ where
 {
     let mut row_count: u64 = 0;
     let mut null_count: u64 = 0;
-    let mut min_value: Option<String> = None;
-    let mut max_value: Option<String> = None;
+    let mut min_value: Option<Extremum> = None;
+    let mut max_value: Option<Extremum> = None;
     let mut distinct: HashSet<String> = HashSet::new();
     let mut hit_cap = false;
 
@@ -97,10 +97,10 @@ where
         .with_null_count(null_count)
         .with_collected_at_secs(now_secs);
     if let Some(m) = min_value {
-        stats = stats.with_min(m);
+        stats = stats.with_min(m.text);
     }
     if let Some(m) = max_value {
-        stats = stats.with_max(m);
+        stats = stats.with_max(m.text);
     }
     if !hit_cap {
         stats = stats.with_distinct_count(distinct.len() as u64);
@@ -125,7 +125,7 @@ pub fn analyze_batch_per_column(batch: &RecordBatch) -> Vec<ColumnStatistics> {
                 .with_null_count(array.null_count() as u64)
                 .with_collected_at_secs(now_secs);
             if let Some((min, max)) = min_max_string(array) {
-                stats = stats.with_min(min).with_max(max);
+                stats = stats.with_min(min.text).with_max(max.text);
             }
             if array.len() <= EXACT_NDV_CAP {
                 let distinct: HashSet<String> = string_values(array).collect();
@@ -138,26 +138,91 @@ pub fn analyze_batch_per_column(batch: &RecordBatch) -> Vec<ColumnStatistics> {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn update_min(slot: &mut Option<String>, candidate: String) {
+/// An extreme value, kept with the sort key that produced it.
+///
+/// `key` is the Arrow row encoding of the value: a byte string whose
+/// `Ord` agrees with the column's own type order. It is what makes the
+/// comparison typed. `dt` guards the comparison, because two encodings
+/// are only comparable when they came from the same data type.
+#[derive(Clone)]
+struct Extremum {
+    key: Option<Vec<u8>>,
+    text: String,
+    dt: DataType,
+}
+
+/// Order two candidates: by sort key when they are comparable, else by text.
+///
+/// Falling back to text is the old behaviour and is wrong for numbers
+/// ("10" < "9"), but it only applies where there is genuinely nothing
+/// better: comparing values of two *different* types, which the
+/// table-level record does when it folds every column into one min/max.
+fn less(a: &Extremum, b: &Extremum) -> bool {
+    match (&a.key, &b.key) {
+        (Some(ak), Some(bk)) if a.dt == b.dt => ak < bk,
+        _ => a.text < b.text,
+    }
+}
+
+fn update_min(slot: &mut Option<Extremum>, candidate: Extremum) {
     match slot {
-        Some(existing) if existing.as_str() <= candidate.as_str() => {}
+        Some(existing) if !less(&candidate, existing) => {}
         _ => *slot = Some(candidate),
     }
 }
 
-fn update_max(slot: &mut Option<String>, candidate: String) {
+fn update_max(slot: &mut Option<Extremum>, candidate: Extremum) {
     match slot {
-        Some(existing) if existing.as_str() >= candidate.as_str() => {}
+        Some(existing) if !less(existing, &candidate) => {}
         _ => *slot = Some(candidate),
     }
 }
 
-/// Return `(min_string, max_string)` over the visible (non-null) values
-/// of `array`, or `None` if the array is empty / all-null.
-fn min_max_string(array: &dyn Array) -> Option<(String, String)> {
-    let mut min_v: Option<String> = None;
-    let mut max_v: Option<String> = None;
-    for value in string_values(array) {
+/// Byte-comparable sort keys for every row of `array`.
+///
+/// `None` when the type has no row encoding (the converter rejects it), in
+/// which case callers fall back to comparing the rendered text.
+fn sort_keys(array: &dyn Array) -> Option<Vec<Vec<u8>>> {
+    use arrow::row::{RowConverter, SortField};
+    let field = SortField::new(array.data_type().clone());
+    let converter = RowConverter::new(vec![field]).ok()?;
+    let rows = converter
+        .convert_columns(&[arrow::array::make_array(array.to_data())])
+        .ok()?;
+    Some((0..rows.num_rows()).map(|i| rows.row(i).as_ref().to_vec()).collect())
+}
+
+/// Render every value of `array` the way Arrow itself displays it.
+///
+/// The previous version matched five concrete types and fell through to
+/// `format!("{:?}", array.slice(i, 1))` for everything else — the Debug of
+/// a one-row array, i.e. a multi-line blob with the array's type header in
+/// it. Decimal128 and Date32 both landed there, which is most of a TPC-H
+/// table, so distinct counts counted formatted blobs and min/max compared
+/// them. `ArrayFormatter` handles every Arrow type in one path.
+fn value_texts(array: &dyn Array) -> Vec<Option<String>> {
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
+    match ArrayFormatter::try_new(array, &FormatOptions::default()) {
+        Ok(formatter) => (0..array.len())
+            .map(|i| {
+                if array.is_null(i) {
+                    None
+                } else {
+                    Some(formatter.value(i).to_string())
+                }
+            })
+            .collect(),
+        // A type the formatter cannot render is still worth counting as
+        // *something*, but never as a fabricated value.
+        Err(_) => vec![None; array.len()],
+    }
+}
+
+/// Return `(min, max)` over the visible (non-null) values of `array`.
+fn min_max_string(array: &dyn Array) -> Option<(Extremum, Extremum)> {
+    let mut min_v: Option<Extremum> = None;
+    let mut max_v: Option<Extremum> = None;
+    for value in extrema_candidates(array) {
         update_min(&mut min_v, value.clone());
         update_max(&mut max_v, value);
     }
@@ -167,64 +232,26 @@ fn min_max_string(array: &dyn Array) -> Option<(String, String)> {
     }
 }
 
+/// Non-null values of `array` as comparable candidates.
+fn extrema_candidates(array: &dyn Array) -> Vec<Extremum> {
+    let keys = sort_keys(array);
+    let dt = array.data_type().clone();
+    value_texts(array)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, text)| {
+            text.map(|text| Extremum {
+                key: keys.as_ref().and_then(|k| k.get(i).cloned()),
+                text,
+                dt: dt.clone(),
+            })
+        })
+        .collect()
+}
+
 /// Iterator over the stringified non-null values of `array`.
-fn string_values(array: &dyn Array) -> Box<dyn Iterator<Item = String> + '_> {
-    // Use a concrete path per Arrow DataType. The fall-through uses
-    // `Debug` so the table-level stats work for any column type.
-    let data_type = array.data_type().clone();
-    match data_type {
-        DataType::Int32 => Box::new((0..array.len()).filter_map(move |i| {
-            if array.is_null(i) {
-                None
-            } else {
-                let arr = array.as_any().downcast_ref::<arrow::array::Int32Array>()?;
-                Some(arr.value(i).to_string())
-            }
-        })),
-        DataType::Int64 => Box::new((0..array.len()).filter_map(move |i| {
-            if array.is_null(i) {
-                None
-            } else {
-                let arr = array.as_any().downcast_ref::<arrow::array::Int64Array>()?;
-                Some(arr.value(i).to_string())
-            }
-        })),
-        DataType::Float64 => Box::new((0..array.len()).filter_map(move |i| {
-            if array.is_null(i) {
-                None
-            } else {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::Float64Array>()?;
-                Some(format!("{}", arr.value(i)))
-            }
-        })),
-        DataType::Utf8 => Box::new((0..array.len()).filter_map(move |i| {
-            if array.is_null(i) {
-                None
-            } else {
-                let arr = array.as_any().downcast_ref::<arrow::array::StringArray>()?;
-                Some(arr.value(i).to_string())
-            }
-        })),
-        DataType::Boolean => Box::new((0..array.len()).filter_map(move |i| {
-            if array.is_null(i) {
-                None
-            } else {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::BooleanArray>()?;
-                Some(arr.value(i).to_string())
-            }
-        })),
-        _ => Box::new((0..array.len()).filter_map(move |i| {
-            if array.is_null(i) {
-                None
-            } else {
-                Some(format!("{:?}", array.slice(i, 1)))
-            }
-        })),
-    }
+fn string_values(array: &dyn Array) -> impl Iterator<Item = String> + '_ {
+    value_texts(array).into_iter().flatten()
 }
 
 #[cfg(test)]
@@ -318,6 +345,82 @@ mod tests {
         assert_eq!(per_col[0].row_count, Some(3));
         assert_eq!(per_col[0].distinct_count, Some(2));
         assert_eq!(per_col[1].distinct_count, Some(2));
+    }
+
+    /// Numeric min/max must order as numbers.
+    ///
+    /// The old code stringified first and compared with `str::<=`, so this
+    /// returned min "10", max "9". Every existing test used single digits,
+    /// where lexicographic and numeric order happen to agree — which is why
+    /// the bug survived: the suite could not tell the two apart.
+    #[test]
+    fn min_and_max_order_numerically_not_lexicographically() {
+        let batch = batch_int(vec![Some(9), Some(10), Some(100), Some(2)]);
+        let stats = analyze_batch(&batch);
+        assert_eq!(stats.min_value.as_deref(), Some("2"));
+        assert_eq!(stats.max_value.as_deref(), Some("100"));
+    }
+
+    /// Negative values order below positive ones.
+    #[test]
+    fn min_and_max_handle_negative_numbers() {
+        let batch = batch_int(vec![Some(5), Some(-40), Some(-3)]);
+        let stats = analyze_batch(&batch);
+        assert_eq!(stats.min_value.as_deref(), Some("-40"));
+        assert_eq!(stats.max_value.as_deref(), Some("5"));
+    }
+
+    /// Cross-batch merging must stay typed too — the per-batch extremes are
+    /// correct individually and could still be combined with a string compare.
+    #[test]
+    fn min_and_max_stay_numeric_across_batches() {
+        let b1 = batch_int(vec![Some(9)]);
+        let b2 = batch_int(vec![Some(10)]);
+        let stats = analyze_record_batches([&b1, &b2]);
+        assert_eq!(stats.min_value.as_deref(), Some("9"));
+        assert_eq!(stats.max_value.as_deref(), Some("10"));
+    }
+
+    /// Types outside the old five-way match fell through to
+    /// `format!("{:?}", array.slice(i, 1))` — the Debug of a one-row array.
+    /// Decimal128 and Date32 are most of a TPC-H table, so their stats were
+    /// counts of formatted blobs rather than of values.
+    #[test]
+    fn a_date_column_produces_real_values_not_debug_blobs() {
+        use arrow::array::Date32Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Date32Array::from(vec![Some(19000), Some(18000)]))],
+        )
+        .unwrap();
+        let stats = analyze_batch(&batch);
+        let min = stats.min_value.expect("a date column must produce a min");
+        assert!(
+            !min.contains('\n') && !min.contains("PrimitiveArray"),
+            "min is a Debug blob, not a value: {min:?}"
+        );
+        assert_eq!(min, "2019-04-14");
+        assert_eq!(stats.distinct_count, Some(2));
+    }
+
+    /// Decimals must order by value, and render as decimals.
+    #[test]
+    fn a_decimal_column_orders_by_value() {
+        use arrow::array::Decimal128Array;
+        let array = Decimal128Array::from(vec![Some(925i128), Some(1050), Some(30)])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "p",
+            DataType::Decimal128(10, 2),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+        let stats = analyze_batch(&batch);
+        assert_eq!(stats.min_value.as_deref(), Some("0.30"));
+        assert_eq!(stats.max_value.as_deref(), Some("10.50"));
+        assert_eq!(stats.distinct_count, Some(3));
     }
 
     #[test]
