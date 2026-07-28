@@ -187,7 +187,18 @@ Things that are not one crate's problem.
       replacement executor lands in `ImagePullBackOff` and the node stays down
       even after disk is freed. Local images with no registry have no recovery
       path.
-- [ ] **D7 — `ShuffleWriteBuffer::drain_partition` reads every spilled run of
+- [x] **D7 starvation — one drain's overshoot zeroed every consumer's share**
+      (`c8736a52`). Confirmed as the q10 SF100 failure on a clean cluster with
+      no orphan: `Failed to allocate additional 877.0 B for HashJoinInput`.
+      `account_unavoidable` grew an unspillable reservation past the pool;
+      `FairSpillPool` computes `pool_size - (unspillable + spillable)` in both
+      branches, so that saturates availability to zero for everyone — and
+      nothing can back off, because the reservation that did it cannot spill.
+      The bytes are still admitted and logged; they are no longer written into
+      the pool's arithmetic. Also explains why `UnspillableHeadroomPool` never
+      logged its ceiling: it bounds spillable consumers and delegates
+      unspillable ones straight through.
+- [ ] **D7 remainder — `ShuffleWriteBuffer::drain_partition` reads every spilled run of
       a partition back into memory at once**, held by a `can_spill(false)`
       consumer, and `account_unavoidable` grows it past the pool
       unconditionally. In `FairSpillPool` an oversized *unspillable* total
