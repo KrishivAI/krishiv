@@ -150,5 +150,22 @@ Things that are not one crate's problem.
       partition and has no append — but `LocalDiskShuffleStore` uses
       `ArrowWriter`, which accepts batches incrementally, so a streaming write
       is buildable.
+- [x] **Abandoning a benchmark query left it running on the cluster.** The
+      coordinator has no notion of a client going away; the harness never
+      cancelled. Every killed sweep left its query executing, holding slots
+      and scratch. Two q10 jobs ran at once; the abandoned one held 3 tasks
+      and 30 completed stages while the new one sat at `running=0` behind it.
+      This faked a scheduling bug, a shuffle skew, and a disk eviction.
+      Fixed `4de7e025` — cancel on poll failure, timeout, SIGINT/SIGTERM/
+      SIGHUP, and interpreter exit.
+- [ ] **One executor runs everything while the others idle.** Reproduces on a
+      clean cluster with no orphan. `/api/v1/executors` reports all three
+      `Healthy` with `running_task_count: 3` (9 total) while the job reports
+      `run=3` and two executors burn 1 millicore. Six are phantom. **But**
+      `running_tasks` is self-reported by the executor
+      (`heartbeat_mapping.rs:14` <- `request.running_attempts()`), and if one
+      node holds the map stage the others' reduce tasks are legitimately
+      blocked on its shuffle output. Needs stage-level evidence before it is
+      called a scheduler bug.
 - [ ] **`krishiv-python` is excluded from `just test` and `just lint`**, so
       Rust breakage there is invisible to CI.
