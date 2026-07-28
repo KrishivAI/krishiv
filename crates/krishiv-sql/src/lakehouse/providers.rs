@@ -172,19 +172,136 @@ pub async fn register_scan_batches(
     Ok(())
 }
 
-/// Apply `AS OF` qualifiers by re-registering pinned delta/hudi tables.
+/// Apply `AS OF` qualifiers by re-registering pinned delta tables.
+///
+/// # Why this refuses instead of skipping
+///
+/// [`super::as_of::preprocess_as_of_sql`] **removes** the `AS OF` clause from
+/// the SQL before DataFusion ever sees it, and collects a ref for *every*
+/// table it appears on — not only `delta.`-prefixed ones. So anything this
+/// function declines to honour is not merely unsupported: the qualifier has
+/// already been erased, the query runs against the current snapshot, and
+/// nothing anywhere reports it. A user asking for last quarter's numbers
+/// silently receives today's.
+///
+/// Two shapes used to fall into that hole:
+///
+///   * any table not named `delta.<path>` — an Iceberg or catalog table with
+///     `VERSION AS OF 3` was collected and then dropped on the floor;
+///   * `delta.<path>` with a **timestamp**, because the spec was matched with
+///     `AsOfSpec::Version(v) => Some(v), _ => None`, and `None` is exactly how
+///     [`register_delta_uri`] spells "open the latest version".
+///
+/// Both now error. Returning wrong data quietly is the one outcome a
+/// time-travel query must never produce.
 pub async fn apply_as_of_refs(
     ctx: &SessionContext,
     refs: &[super::as_of::AsOfTableRef],
 ) -> SqlResult<()> {
-    for reference in refs {
-        if let Some(path) = reference.table.strip_prefix("delta.") {
-            let version = match reference.spec {
-                AsOfSpec::Version(v) => Some(v),
-                _ => None,
-            };
-            register_delta_uri(ctx, &reference.table.replace('.', "_"), path, version).await?;
-        }
+    for reference in refs.iter() {
+        let Some(path) = reference.table.strip_prefix("delta.") else {
+            return Err(SqlError::Unsupported {
+                feature: format!(
+                    "time travel on '{}': AS OF is currently resolved only for Delta tables \
+                     referenced as delta.<path>. The qualifier has already been stripped from \
+                     the query, so continuing would silently read the current snapshot instead \
+                     of the requested one.",
+                    reference.table
+                ),
+            });
+        };
+        let version = match reference.spec {
+            AsOfSpec::Version(v) => v,
+            AsOfSpec::Timestamp(ts) => {
+                return Err(SqlError::Unsupported {
+                    feature: format!(
+                        "time travel on '{}' AS OF {ts}: resolving a timestamp to a Delta \
+                         version is not implemented (DeltaTableHandle::open takes a version \
+                         number). Use VERSION AS OF <n>. Proceeding would read the current \
+                         snapshot, not the one at that timestamp.",
+                        reference.table
+                    ),
+                });
+            }
+        };
+        register_delta_uri(
+            ctx,
+            &reference.table.replace('.', "_"),
+            path,
+            Some(version),
+        )
+        .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use super::super::as_of::AsOfTableRef;
+    use chrono::TimeZone;
+
+    fn ctx() -> SessionContext {
+        SessionContext::new()
+    }
+
+    /// No qualifiers, nothing to do — the common path must stay quiet.
+    #[tokio::test]
+    async fn no_refs_is_a_no_op() {
+        assert!(apply_as_of_refs(&ctx(), &[]).await.is_ok());
+    }
+
+    /// The silent-wrong-answer case: a time-travel qualifier on a table this
+    /// cannot pin. `preprocess_as_of_sql` has already deleted the clause from
+    /// the SQL, so skipping it means running against the current snapshot with
+    /// no diagnostic anywhere.
+    #[tokio::test]
+    async fn a_non_delta_table_cannot_be_silently_ignored() {
+        let refs = vec![AsOfTableRef {
+            table: "orders".into(),
+            spec: AsOfSpec::Version(3),
+        }];
+        let err = apply_as_of_refs(&ctx(), &refs)
+            .await
+            .expect_err("AS OF on a non-delta table must not be dropped on the floor");
+        let msg = err.to_string();
+        assert!(msg.contains("orders"), "must name the table: {msg}");
+        assert!(
+            msg.contains("current snapshot"),
+            "must say what the alternative would have done: {msg}"
+        );
+    }
+
+    /// A timestamp on a Delta table used to become `version = None`, which is
+    /// how `register_delta_uri` spells "latest" — so the query silently read
+    /// the present.
+    #[tokio::test]
+    async fn a_timestamp_spec_is_refused_rather_than_read_as_latest() {
+        let ts = chrono::Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+        let refs = vec![AsOfTableRef {
+            table: "delta./tmp/does-not-matter".into(),
+            spec: AsOfSpec::Timestamp(ts),
+        }];
+        let err = apply_as_of_refs(&ctx(), &refs)
+            .await
+            .expect_err("a timestamp must not silently resolve to the latest version");
+        assert!(
+            err.to_string().contains("VERSION AS OF"),
+            "the error should point at the supported spelling: {err}"
+        );
+    }
+
+    /// Every spec variant must be handled explicitly. If a third one is added,
+    /// this fails to compile rather than falling into a `_ => None` arm — which
+    /// is precisely how the timestamp case became a silent latest-version read.
+    #[test]
+    fn every_as_of_spec_variant_is_accounted_for() {
+        let ts = chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        for spec in [AsOfSpec::Version(1), AsOfSpec::Timestamp(ts)] {
+            match spec {
+                AsOfSpec::Version(_) | AsOfSpec::Timestamp(_) => {}
+            }
+        }
+    }
 }
