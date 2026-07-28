@@ -4650,3 +4650,87 @@ mod staged_tpch_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod codec_completeness_tests {
+    /// Every custom `ExecutionPlan` in this crate must be either encodable by
+    /// [`KrishivPhysicalCodec`] or explicitly declared execution-local.
+    ///
+    /// # The failure this prevents
+    ///
+    /// `datafusion-proto` cannot encode a node the extension codec does not
+    /// know. The scheduler's response to a stage plan it cannot encode is not an
+    /// error — it is to abandon staging and run the whole query as a **single
+    /// task**:
+    ///
+    /// ```text
+    /// stage plan cannot be encoded and decoded; running this query as a
+    /// SINGLE TASK ... Unsupported plan and extension codec failed
+    /// ```
+    ///
+    /// So adding an operator without a codec entry does not break loudly. It
+    /// quietly un-distributes every query the operator touches while continuing
+    /// to report success. `GraceHashJoinExec` did exactly that to TPC-H q10,
+    /// q17, q19 and q21 — hours of cluster time reading as passes.
+    ///
+    /// A source scan rather than a type-level check because Rust cannot
+    /// enumerate trait impls at runtime; this mirrors
+    /// `krishiv_common::env_registry`'s
+    /// `every_flag_read_in_source_is_declared`, which exists for the same
+    /// reason.
+    #[test]
+    fn every_custom_execution_plan_is_encodable_or_declared_local() {
+        // Nodes that may appear in a plan the coordinator encodes. Adding one
+        // here without a `try_encode`/`try_decode` arm re-opens the bug.
+        const ENCODABLE: &[&str] = &["ShuffleReadExec"];
+        // Nodes that are constructed only AFTER decode and never serialized.
+        // `GraceHashJoinExec` is chosen per-executor from live memory pressure
+        // (`apply_local_spill_strategy`); `OnceStreamExec` wraps an already-open
+        // spill-file stream, which has no meaning on another machine.
+        const EXECUTION_LOCAL: &[&str] = &["GraceHashJoinExec", "OnceStreamExec"];
+
+        let mut found = Vec::new();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![dir];
+        while let Some(path) = stack.pop() {
+            for entry in std::fs::read_dir(&path).expect("read src") {
+                let entry = entry.expect("dir entry").path();
+                if entry.is_dir() {
+                    stack.push(entry);
+                    continue;
+                }
+                if entry.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&entry).expect("read file");
+                for line in text.lines() {
+                    if let Some(rest) = line.trim().strip_prefix("impl ExecutionPlan for ") {
+                        let name = rest
+                            .trim_end_matches(" {")
+                            .split(['<', ' '])
+                            .next()
+                            .unwrap_or(rest)
+                            .to_string();
+                        found.push(name);
+                    }
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        assert!(!found.is_empty(), "the scan found no ExecutionPlan impls at all");
+
+        let undeclared: Vec<&String> = found
+            .iter()
+            .filter(|n| !ENCODABLE.contains(&n.as_str()) && !EXECUTION_LOCAL.contains(&n.as_str()))
+            .collect();
+        assert!(
+            undeclared.is_empty(),
+            "custom ExecutionPlan(s) {undeclared:?} are neither encodable nor declared \
+             execution-local. If such a node can reach a stage plan, the coordinator will \
+             silently run the query as a SINGLE TASK. Add a codec arm, or confine it to \
+             post-decode and list it in EXECUTION_LOCAL."
+        );
+    }
+}
