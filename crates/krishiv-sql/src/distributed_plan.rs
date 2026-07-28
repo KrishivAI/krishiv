@@ -4354,6 +4354,42 @@ mod staged_tpch_tests {
         assert!(!expected.is_empty(), "the q22 fixture must produce rows");
     }
 
+    /// `avg` over a decimal, cut so the Final aggregate lands in a different
+    /// stage from its Partial — q17's shape, reduced to the one operator.
+    ///
+    /// `datafusion-proto` carries no output type for an aggregate: the decoder
+    /// resolves the UDAF by name and `AggregateExprBuilder::build()` re-derives
+    /// the return type from the resolved function and its *input* types. A
+    /// Final aggregate's inputs are the Partial's **state** columns, not the
+    /// original column, so if the rebuild reads them as ordinary inputs it
+    /// produces a wider decimal than the coordinator planned — which is exactly
+    /// what q17 reports from SF100:
+    ///
+    ///   expected Decimal128(15, 2) but found Decimal128(30, 15)
+    ///
+    /// Both the ungrouped (gather-cut) and grouped (hash-exchange-cut) forms
+    /// are covered: they take different arms of `cut_exchanges`.
+    #[tokio::test]
+    async fn a_final_avg_over_a_decimal_survives_the_fragment_round_trip() {
+        for sql in [
+            "SELECT avg(l_quantity) FROM lineitem",
+            "SELECT l_partkey, avg(l_quantity) FROM lineitem GROUP BY l_partkey",
+            "SELECT sum(l_extendedprice) / 7.0 FROM lineitem",
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let ctx = tpch_context_with_broadcast(tmp.path(), None, None).await;
+            let expected = render(&direct(&ctx, sql).await);
+            let actual = run_staged(&ctx, sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: staged execution failed: {e}"));
+            assert_eq!(
+                render(&actual),
+                expected,
+                "{sql}: staged result differs from single-node execution"
+            );
+        }
+    }
+
     /// A reduce stage really does read two distinct upstream stages once
     /// broadcasting is off — the precondition the three tests above depend on.
     /// Without this, a planner change that quietly restored a broadcast join
