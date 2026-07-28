@@ -542,15 +542,6 @@ fn first_schema_difference(
     decoded: &Arc<dyn ExecutionPlan>,
     path: &str,
 ) -> Option<String> {
-    if original.schema() != decoded.schema() {
-        return Some(format!(
-            "at {path} ({} vs {}):\n  encoded: {:?}\n  decoded: {:?}",
-            original.name(),
-            decoded.name(),
-            original.schema(),
-            decoded.schema()
-        ));
-    }
     let original_children = original.children();
     let decoded_children = decoded.children();
     if original_children.len() != decoded_children.len() {
@@ -571,6 +562,21 @@ fn first_schema_difference(
         if let Some(difference) = first_schema_difference(a, b, &child_path) {
             return Some(difference);
         }
+    }
+    // Children first, deliberately. `datafusion-proto` carries no output type
+    // for an aggregate: `AggregateExprBuilder::build()` re-derives it from the
+    // resolved UDAF and the *input* types (see `physical_plan/mod.rs`, the
+    // `UserDefinedAggrFunction` arm). Types therefore propagate upward, so the
+    // deepest disagreeing node is the cause and every node above it is that
+    // cause's shadow. Reporting the root first named the symptom.
+    if original.schema() != decoded.schema() {
+        return Some(format!(
+            "at {path} ({} vs {}):\n  encoded: {:?}\n  decoded: {:?}",
+            original.name(),
+            decoded.name(),
+            original.schema(),
+            decoded.schema()
+        ));
     }
     None
 }
