@@ -67,7 +67,9 @@ pub use shuffle_svc::SortShuffleIndex;
 pub use sort_shuffle_writer::{SortShuffleFiles, SortShuffleWriter};
 pub use spillable::SpillableShuffleBackend;
 pub use storage_uri::{open_shuffle_backend_from_uri, open_tiered_shuffle_backend};
-pub use store::{PartitionId, ShuffleBackend, ShufflePartition, ShuffleStore, ShuffleStream};
+pub use store::{
+    PartitionId, ShuffleBackend, ShuffleBatchStream, ShufflePartition, ShuffleStore, ShuffleStream,
+};
 pub use tiered_store::TieredShuffleStore;
 
 #[cfg(test)]

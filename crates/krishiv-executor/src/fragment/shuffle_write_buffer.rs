@@ -228,6 +228,46 @@ impl DrainedPartition {
     }
 }
 
+/// Rows and bytes a streaming drain actually moved.
+///
+/// The collecting drain could measure the partition before writing it, because
+/// it held the whole thing. A streaming drain cannot — nothing ever sees all
+/// the batches at once — so the count is accumulated as they pass and read back
+/// after the write completes.
+#[derive(Debug, Default)]
+pub(crate) struct DrainTally {
+    rows: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl DrainTally {
+    /// Total rows observed. Only meaningful once the stream is exhausted.
+    pub(crate) fn rows(&self) -> u64 {
+        self.rows.load(Ordering::Relaxed)
+    }
+
+    /// Total in-memory bytes observed, measured on the batches as they were
+    /// drained — i.e. before coalescing, matching what the collecting drain
+    /// reported.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    fn observe(&self, batch: &RecordBatch) {
+        self.rows.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+        self.bytes
+            .fetch_add(batch.get_array_memory_size() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Memory the streaming drain declares for its in-flight window.
+///
+/// One coalesce group being built, one finished group in the channel, one being
+/// serialised. This is the number that replaces "however large this partition
+/// happens to be" — constant, and small enough that a `FairSpillPool` share can
+/// hold it.
+const STREAM_WINDOW_BYTES: usize = 3 * SHUFFLE_COALESCE_TARGET_BYTES;
+
 /// What one drained partition cost, reported back to the call site so it can
 /// build its `ShufflePartitionOutput` and metrics without re-walking batches.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -256,9 +296,13 @@ pub(crate) struct PartitionWriteStat {
 /// it lives here rather than being open-coded at each call site so that the
 /// three map-write paths cannot drift apart on it.
 ///
-/// `pre_write` sees each partition (schema and batches) immediately before it
-/// is handed to the store — that is where the push-shuffle mirror and hot-key
-/// accounting hook in.
+/// `pre_write` sees each partition's index and schema immediately before it is
+/// handed to the store.
+///
+/// It used to be given the partition's batches too. It no longer can be:
+/// nothing on this path holds a whole partition any more (see
+/// [`ShuffleWriteBuffer::drain_partition_stream`]), which is the point. A hook
+/// that needs the bytes has to consume the stream itself.
 /// Report a stage whose *produced* batches disagree with its *declared* plan
 /// schema, naming both.
 ///
@@ -306,9 +350,9 @@ pub(crate) async fn drain_into_store(
     id_for: impl Fn(u32) -> krishiv_shuffle::PartitionId,
     fallback_schema: &arrow::datatypes::SchemaRef,
     lease_token: u64,
-    mut pre_write: impl FnMut(u32, &arrow::datatypes::SchemaRef, &[RecordBatch]) -> ExecutorResult<()>,
+    mut pre_write: impl FnMut(u32, &arrow::datatypes::SchemaRef) -> ExecutorResult<()>,
 ) -> ExecutorResult<Vec<PartitionWriteStat>> {
-    use krishiv_shuffle::{ShufflePartition, ShuffleStore as _};
+    use krishiv_shuffle::ShuffleStore as _;
 
     let num_partitions = buffer.num_partitions();
     let mut stats = Vec::with_capacity(num_partitions);
@@ -335,41 +379,25 @@ pub(crate) async fn drain_into_store(
         let partition = u32::try_from(index).map_err(|_| ExecutorError::LocalExecution {
             message: format!("shuffle partition index {index} exceeds u32"),
         })?;
-        // `_reservation` must outlive `batches`: it is the pool's view of this
-        // partition while it is concatenated and serialised.
-        let (batches, _reservation) = buffer.drain_partition(index).await?.into_parts();
         let schema = observed_schema
             .clone()
             .unwrap_or_else(|| Arc::clone(fallback_schema));
-        let size_bytes: u64 = batches
-            .iter()
-            .map(|b| b.get_array_memory_size() as u64)
-            .sum();
-        let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
-        // Coalesce the per-source-batch fragments into well-sized batches:
-        // better downstream columnar throughput and less per-batch overhead in
-        // the store, bounded by a byte target so a partition that spilled is
-        // not rebuilt whole in memory to be written out.
-        let batches = coalesce_shuffle_batches(batches, &schema);
-        pre_write(partition, &schema, &batches)?;
+        pre_write(partition, &schema)?;
+        // The stream owns the drain's pool reservation and releases it on drop,
+        // whether the write finished or failed. Peak residency is one coalesce
+        // group, not one partition.
+        let (batches, tally) = buffer.drain_partition_stream(index, Arc::clone(&schema));
         let write_started = std::time::Instant::now();
         store
-            .write_partition(
-                ShufflePartition {
-                    id: id_for(partition),
-                    schema,
-                    batches,
-                },
-                lease_token,
-            )
+            .write_partition_stream(id_for(partition), schema, batches, lease_token)
             .await
             .map_err(|e| ExecutorError::LocalExecution {
                 message: format!("shuffle write failed for partition {partition}: {e}"),
             })?;
         stats.push(PartitionWriteStat {
             partition,
-            size_bytes,
-            rows,
+            size_bytes: tally.bytes(),
+            rows: tally.rows(),
             write_elapsed_us: write_started.elapsed().as_micros() as u64,
         });
     }
@@ -735,6 +763,101 @@ impl ShuffleWriteBuffer {
         })
     }
 
+    /// Take every batch of output partition `index` as a **stream**, in push
+    /// order, coalesced to [`SHUFFLE_COALESCE_TARGET_BYTES`].
+    ///
+    /// This is [`drain_partition`](Self::drain_partition) without the
+    /// materialisation. Spilled runs are read back one Arrow batch at a time
+    /// rather than one whole run at a time, and each run's file is unlinked and
+    /// dropped from the page cache the moment it is exhausted. Peak residency
+    /// for the call is the in-memory tail (already bounded by the soft ceiling)
+    /// plus [`STREAM_WINDOW_BYTES`], instead of the entire partition.
+    ///
+    /// The returned [`DrainTally`] is filled in as the stream is consumed;
+    /// read it only after the stream has been driven to completion.
+    pub(crate) fn drain_partition_stream(
+        &mut self,
+        index: usize,
+        schema: arrow::datatypes::SchemaRef,
+    ) -> (krishiv_shuffle::ShuffleBatchStream, Arc<DrainTally>) {
+        let in_memory = self
+            .buckets
+            .get_mut(index)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        let in_memory_bytes = self
+            .bucket_bytes
+            .get_mut(index)
+            .map(|slot| std::mem::replace(slot, 0))
+            .unwrap_or(0);
+        // Hand the bytes over to the drained partition's own reservation
+        // rather than double-counting them across both.
+        if let Some(reservation) = &self.reservation
+            && in_memory_bytes > 0
+        {
+            reservation.shrink(in_memory_bytes.min(reservation.size()));
+        }
+        let runs = self
+            .spills
+            .get_mut(index)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        if !runs.is_empty() {
+            tracing::debug!(
+                partition = index,
+                runs = runs.len(),
+                rows = runs.iter().map(|r| r.rows).sum::<usize>(),
+                "streaming spilled shuffle write runs back for one partition"
+            );
+        }
+
+        let reservation = self.pool.as_ref().map(|p| {
+            MemoryConsumer::new("ShuffleWriteBufferDrain")
+                .with_can_spill(false)
+                .register(p)
+        });
+        if let Some(reservation) = &reservation {
+            // Two claims, both bounded. The tail is genuinely resident for the
+            // whole drain; the window is the streaming machinery's ceiling.
+            // Neither is "however large this partition turned out to be", which
+            // is what used to saturate the pool to zero for every consumer.
+            account_unavoidable(
+                reservation,
+                in_memory_bytes,
+                "holding one output partition's un-spilled tail",
+            );
+            account_unavoidable(
+                reservation,
+                STREAM_WINDOW_BYTES,
+                "shuffle write streaming window",
+            );
+        }
+
+        let tally = Arc::new(DrainTally::default());
+        let source = DrainSource {
+            runs: runs.into(),
+            current: None,
+            current_run: None,
+            pending: std::collections::VecDeque::new(),
+            in_memory: in_memory.into_iter(),
+            schema,
+            tally: Arc::clone(&tally),
+            _reservation: reservation,
+        };
+
+        let stream = futures::stream::unfold(Some(source), |state| async move {
+            let mut source = state?;
+            match source.next_coalesced().await {
+                Ok(Some(batch)) => Some((Ok(batch), Some(source))),
+                Ok(None) => None,
+                // Stop after an error: the write is already doomed, and
+                // continuing would only produce a partition missing rows.
+                Err(e) => Some((Err(e), None)),
+            }
+        });
+        (Box::pin(stream), tally)
+    }
+
     /// Build the buffer a map task should use: bounded by the task engine's
     /// own DataFusion pool, spilling into the executor's shuffle scratch
     /// directory when one is configured.
@@ -753,14 +876,180 @@ impl ShuffleWriteBuffer {
     }
 }
 
+type SpillReader = arrow::ipc::reader::StreamReader<std::io::BufReader<std::fs::File>>;
+
+/// Produces one partition's batches in push order without materialising it.
+///
+/// Order is the same contract the collecting drain held: every spilled run
+/// oldest-first, then whatever never spilled. What changed is granularity — a
+/// run is read back a batch at a time, so an 800 MB partition costs one batch
+/// of residency instead of 800 MB.
+struct DrainSource {
+    /// Spilled runs still to read, oldest first.
+    runs: std::collections::VecDeque<SpillRun>,
+    /// Reader for the run currently being read back.
+    current: Option<SpillReader>,
+    /// The run `current` belongs to. Held so its file is unlinked and evicted
+    /// exactly when the reader is exhausted, not at the end of the drain.
+    current_run: Option<SpillRun>,
+    /// Batches already pulled — and already counted into `tally` — that must be
+    /// re-emitted before anything new is read. A batch that did not fit the
+    /// coalesce group lands here, as does the remainder of a group whose
+    /// `concat` failed. Kept separate from the sources so it is never counted
+    /// twice.
+    pending: std::collections::VecDeque<RecordBatch>,
+    in_memory: std::vec::IntoIter<RecordBatch>,
+    schema: arrow::datatypes::SchemaRef,
+    tally: Arc<DrainTally>,
+    /// The pool's view of this drain. Dropped with the stream, which is what
+    /// releases the reservation on both the success and the abandoned path.
+    _reservation: Option<MemoryReservation>,
+}
+
+impl DrainSource {
+    /// The next batch as it was buffered — one IPC batch, or one in-memory
+    /// fragment. Counted into the tally here, before coalescing, so the
+    /// reported size matches what the collecting drain reported.
+    async fn next_raw(&mut self) -> Result<Option<RecordBatch>, krishiv_shuffle::ShuffleError> {
+        if let Some(batch) = self.pending.pop_front() {
+            return Ok(Some(batch));
+        }
+        loop {
+            if let Some(reader) = self.current.take() {
+                // One `spawn_blocking` per batch, matching the read path in
+                // `LocalDiskShuffleStore::stream_partition`: the IPC reader is
+                // a blocking iterator, and moving it in and out of the blocking
+                // pool is what gives cancellation a yield point.
+                let pulled = tokio::task::spawn_blocking(move || {
+                    let mut reader = reader;
+                    let item = reader.next();
+                    (item, reader)
+                })
+                .await
+                .map_err(|e| shuffle_io("shuffle spill read join", &e))?;
+                match pulled {
+                    (Some(Ok(batch)), reader) => {
+                        self.current = Some(reader);
+                        self.tally.observe(&batch);
+                        return Ok(Some(batch));
+                    }
+                    (Some(Err(e)), _) => {
+                        return Err(shuffle_io("read shuffle spill", &e));
+                    }
+                    (None, _) => {
+                        // Run exhausted: release its disk and page cache now,
+                        // so a partition with many runs never has more than one
+                        // of them on disk-and-cache at a time longer than
+                        // needed.
+                        if let Some(run) = self.current_run.take() {
+                            evict_and_drop(run);
+                        }
+                        continue;
+                    }
+                }
+            }
+            if let Some(run) = self.runs.pop_front() {
+                let path = run.path.clone();
+                let reader = tokio::task::spawn_blocking(move || -> ExecutorResult<SpillReader> {
+                    let file =
+                        std::fs::File::open(&path).map_err(|e| io_err("open shuffle spill", &e))?;
+                    arrow::ipc::reader::StreamReader::try_new(std::io::BufReader::new(file), None)
+                        .map_err(|e| io_err("open shuffle spill reader", &e))
+                })
+                .await
+                .map_err(|e| shuffle_io("shuffle spill open join", &e))?
+                .map_err(|e| shuffle_io("shuffle spill open", &e))?;
+                self.current = Some(reader);
+                self.current_run = Some(run);
+                continue;
+            }
+            return Ok(match self.in_memory.next() {
+                Some(batch) => {
+                    self.tally.observe(&batch);
+                    Some(batch)
+                }
+                None => None,
+            });
+        }
+    }
+
+    /// The next batch to write: raw batches accumulated up to
+    /// [`SHUFFLE_COALESCE_TARGET_BYTES`].
+    ///
+    /// Same purpose as [`coalesce_shuffle_batches`] — a Parquet file of
+    /// thousands of tiny row groups reads badly — but incremental, so the
+    /// grouping never needs the partition in hand. A batch already at or above
+    /// the target passes through uncopied.
+    async fn next_coalesced(
+        &mut self,
+    ) -> Result<Option<RecordBatch>, krishiv_shuffle::ShuffleError> {
+        let mut group: Vec<RecordBatch> = Vec::new();
+        let mut group_bytes = 0usize;
+        while let Some(batch) = self.next_raw().await? {
+            let bytes = batch.get_array_memory_size();
+            if bytes >= SHUFFLE_COALESCE_TARGET_BYTES {
+                if group.is_empty() {
+                    return Ok(Some(batch));
+                }
+                self.pending.push_front(batch);
+                return Ok(Some(self.concat(group)));
+            }
+            group_bytes += bytes;
+            group.push(batch);
+            if group_bytes >= SHUFFLE_COALESCE_TARGET_BYTES {
+                return Ok(Some(self.concat(group)));
+            }
+        }
+        if group.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(self.concat(group)))
+        }
+    }
+
+    /// Concatenate a group, or hand back its first batch and re-queue the rest.
+    ///
+    /// A failed `concat` is a layout problem, not a data one — the same
+    /// judgement [`coalesce_shuffle_batches`] makes. Degrading to uncoalesced
+    /// output keeps every row; failing the task over it would not.
+    fn concat(&mut self, mut group: Vec<RecordBatch>) -> RecordBatch {
+        if group.len() == 1
+            && let Some(batch) = group.pop()
+        {
+            return batch;
+        }
+        match arrow::compute::concat_batches(&self.schema, &group) {
+            Ok(batch) => batch,
+            Err(error) => {
+                tracing::debug!(%error, "shuffle batch coalesce failed; writing uncoalesced");
+                let mut iter = group.into_iter();
+                let first = iter.next();
+                // Re-queue the rest at the FRONT, in order, so push order
+                // survives the degradation. They were counted into the tally on
+                // the way in and must not be counted again, which is exactly
+                // what `pending` is for.
+                for batch in iter.rev() {
+                    self.pending.push_front(batch);
+                }
+                // `first` is `None` only for an empty group, which
+                // `next_coalesced` never passes.
+                first.unwrap_or_else(|| RecordBatch::new_empty(Arc::clone(&self.schema)))
+            }
+        }
+    }
+}
+
+fn shuffle_io(context: &str, e: &dyn std::fmt::Display) -> krishiv_shuffle::ShuffleError {
+    krishiv_shuffle::ShuffleError::Io(std::io::Error::other(format!("{context}: {e}")))
+}
+
 /// Record bytes this buffer has no way to avoid holding.
 ///
-/// Two places qualify. Draining hands over one whole output partition, the
-/// smallest unit [`krishiv_shuffle::ShuffleStore::write_partition`] accepts,
-/// with nothing left to spill. Buffering admits one batch that the partitioner
-/// has already allocated once every partition is on disk. In both the memory
-/// is committed before the pool is consulted, so the only question is whether
-/// the pool gets to *know* about it.
+/// Two places qualify. Draining declares the un-spilled tail it is about to
+/// hand over plus its fixed streaming window. Buffering admits one batch that
+/// the partitioner has already allocated once every partition is on disk. In
+/// both the memory is committed before the pool is consulted, so the only
+/// question is whether the pool gets to *know* about it.
 ///
 /// Refusing would fail a query that can actually run — that is the TPC-H q3
 /// regression — so the bytes are always admitted. What changed is what happens
@@ -794,12 +1083,13 @@ impl ShuffleWriteBuffer {
 /// simply stops claiming that everyone is out of memory because one consumer
 /// that cannot yield exceeded its share.
 ///
-/// The real fix is for the drain not to need a whole partition resident at
-/// once: `ShuffleStore::write_partition` takes a complete partition and has no
-/// append, while `LocalDiskShuffleStore` writes through `ArrowWriter`, which
-/// accepts batches incrementally. Until that streaming write exists, this
-/// keeps one operator's unavoidable peak from becoming every operator's
-/// failure.
+/// The structural fix now exists alongside this one:
+/// [`ShuffleWriteBuffer::drain_partition_stream`] feeds
+/// [`krishiv_shuffle::ShuffleStore::write_partition_stream`], so the drain
+/// never asks for a whole partition and the number reaching this function is
+/// the tail plus a constant window. This function remains the backstop for the
+/// buffering side, where the partitioner has already allocated the batch before
+/// anyone is consulted.
 fn account_unavoidable(reservation: &MemoryReservation, bytes: usize, what: &str) {
     if bytes == 0 {
         return;
@@ -972,6 +1262,210 @@ mod tests {
                 "partition {partition} lost or reordered rows across the spill boundary"
             );
         }
+    }
+
+    /// Drain a partition as a stream and collect what it produced.
+    async fn stream_out(
+        buffer: &mut ShuffleWriteBuffer,
+        partition: usize,
+    ) -> (Vec<RecordBatch>, Arc<DrainTally>) {
+        use futures::StreamExt as _;
+        let schema = buffer
+            .pushed_schema()
+            .unwrap_or_else(|| batch(0, 1).schema());
+        let (mut stream, tally) = buffer.drain_partition_stream(partition, schema);
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(item.expect("streaming drain must not fail"));
+        }
+        (out, tally)
+    }
+
+    /// The streaming drain must be the *same drain*: every row, in push order,
+    /// across the spill boundary.
+    ///
+    /// Compared against [`ShuffleWriteBuffer::drain_partition`] on an
+    /// identically-filled buffer rather than against a hard-coded list, because
+    /// the claim being tested is equivalence. A test that only checked "some
+    /// rows came back" would pass on a drain that silently dropped a spilled
+    /// run — which is exactly the failure mode this replaces.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_streaming_drain_yields_the_same_rows_in_the_same_order() {
+        const POOL_BYTES: usize = 256 * 1024;
+        async fn fill(buffer: &mut ShuffleWriteBuffer) {
+            for i in 0..48i64 {
+                buffer
+                    .push((i % 3) as usize, batch(i * 4096, 4096))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let mut collecting = ShuffleWriteBuffer::new(
+            3,
+            Some(pool_of(POOL_BYTES)),
+            POOL_BYTES as u64,
+            temp_dir("stream-ref"),
+        );
+        fill(&mut collecting).await;
+        assert!(
+            collecting.spill_count() > 0,
+            "test must actually cross the spill boundary"
+        );
+
+        let mut streaming = ShuffleWriteBuffer::new(
+            3,
+            Some(pool_of(POOL_BYTES)),
+            POOL_BYTES as u64,
+            temp_dir("stream-act"),
+        );
+        fill(&mut streaming).await;
+
+        for partition in 0..3 {
+            let want: Vec<i64> = collecting
+                .drain_partition(partition)
+                .await
+                .unwrap()
+                .batches
+                .iter()
+                .flat_map(int_values)
+                .collect();
+            let (batches, tally) = stream_out(&mut streaming, partition).await;
+            let got: Vec<i64> = batches.iter().flat_map(int_values).collect();
+            assert_eq!(
+                got, want,
+                "partition {partition}: the streaming drain diverged from the collecting one"
+            );
+            assert_eq!(
+                tally.rows(),
+                want.len() as u64,
+                "partition {partition}: the tally must count every row the stream produced"
+            );
+        }
+    }
+
+    /// The point of the streaming drain: what it declares to the pool must not
+    /// depend on how large the partition is.
+    ///
+    /// The collecting drain declared the whole partition as an *unspillable*
+    /// consumer. `FairSpillPool` computes availability as
+    /// `pool_size - (unspillable + spillable)` in both branches, so that
+    /// declaration scaled with the data until it saturated every other
+    /// consumer's share to zero — the q10/q21
+    /// `Failed to allocate additional 877.0 B for HashJoinInput`.
+    ///
+    /// So the assertion is not "uses less memory" (which a smaller test input
+    /// would satisfy by accident) but "quadrupling the partition does not
+    /// change the declaration".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn what_the_streaming_drain_declares_does_not_grow_with_the_partition() {
+        use futures::StreamExt as _;
+        const POOL_BYTES: usize = 512 * 1024 * 1024;
+        const SOFT_LIMIT: u64 = 256 * 1024;
+
+        // Peak pool reservation observed while draining a single partition
+        // holding `batches` batches of 4096 rows.
+        async fn peak_for(batches: i64, tag: &str) -> (usize, usize) {
+            let pool = pool_of(POOL_BYTES);
+            let mut buffer = ShuffleWriteBuffer::new(
+                1,
+                Some(Arc::clone(&pool)),
+                SOFT_LIMIT,
+                temp_dir(&format!("decl-{tag}")),
+            );
+            for i in 0..batches {
+                buffer.push(0, batch(i * 4096, 4096)).await.unwrap();
+            }
+            assert!(
+                buffer.spill_count() > 0,
+                "{tag}: test must cross the spill boundary to be meaningful"
+            );
+            let total = buffer.spill_count();
+            let schema = buffer.pushed_schema().expect("rows were pushed");
+            let (mut stream, _tally) = buffer.drain_partition_stream(0, schema);
+            let mut peak = pool.reserved();
+            while let Some(item) = stream.next().await {
+                item.expect("drain");
+                peak = peak.max(pool.reserved());
+            }
+            (peak, total)
+        }
+
+        // ~8 MB and ~32 MB of Arrow data. The gap is deliberately larger than
+        // the streaming window, so a drain that declared the partition would
+        // show a ~24 MB difference here and a drain that declares a window
+        // shows at most the tail.
+        let (small_peak, small_runs) = peak_for(256, "small").await;
+        let (large_peak, large_runs) = peak_for(1024, "large").await;
+        assert!(
+            large_runs > small_runs,
+            "the larger input must actually spill more runs ({large_runs} vs {small_runs})"
+        );
+        assert!(
+            large_peak.abs_diff(small_peak) <= SOFT_LIMIT as usize,
+            "a 4x larger partition moved what the drain declared to the pool by \
+             {} bytes ({small_peak} -> {large_peak}). The declaration must be a \
+             constant window plus the un-spilled tail, not the partition — that \
+             scaling is what saturated FairSpillPool to zero for every consumer.",
+            large_peak.abs_diff(small_peak)
+        );
+        assert!(
+            large_peak <= STREAM_WINDOW_BYTES + SOFT_LIMIT as usize,
+            "the declaration must stay within the streaming window plus the soft \
+             ceiling, got {large_peak}"
+        );
+    }
+
+    /// Each spilled run's file must be reclaimed as the stream passes it, not
+    /// all at the end.
+    ///
+    /// A partition with many runs otherwise keeps every one of them on disk for
+    /// the whole write — which is how a node ends up with 74 GB of live scratch
+    /// and a kubelet evicting it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spilled_runs_are_unlinked_as_the_stream_passes_them() {
+        use futures::StreamExt as _;
+        const POOL_BYTES: usize = 256 * 1024;
+        let dir = temp_dir("unlink");
+        let mut buffer = ShuffleWriteBuffer::new(
+            1,
+            Some(pool_of(POOL_BYTES)),
+            POOL_BYTES as u64,
+            dir.clone(),
+        );
+        for i in 0..48i64 {
+            buffer.push(0, batch(i * 4096, 4096)).await.unwrap();
+        }
+        let spills = buffer.spill_count();
+        assert!(spills >= 4, "need several runs to observe reclamation, got {spills}");
+
+        let count_files = || {
+            std::fs::read_dir(&dir)
+                .map(|d| d.filter_map(|e| e.ok()).count())
+                .unwrap_or(0)
+        };
+        assert_eq!(count_files(), spills, "every run should be on disk before the drain");
+
+        let schema = buffer.pushed_schema().expect("rows were pushed");
+        let (mut stream, _tally) = buffer.drain_partition_stream(0, schema);
+        // Pull one batch: at least the first run must still be open, but the
+        // whole set must not still be resident by the time the stream ends.
+        stream.next().await.expect("first batch").expect("ok");
+        let mut min_seen = count_files();
+        while let Some(item) = stream.next().await {
+            item.expect("drain");
+            min_seen = min_seen.min(count_files());
+        }
+        assert_eq!(
+            count_files(),
+            0,
+            "every spilled run must be unlinked by the time the stream ends"
+        );
+        assert!(
+            min_seen < spills,
+            "runs must be reclaimed DURING the stream, not only at the end \
+             (fewest files seen mid-stream: {min_seen} of {spills})"
+        );
     }
 
     /// Draining releases everything: no reservation may outlive the batches.

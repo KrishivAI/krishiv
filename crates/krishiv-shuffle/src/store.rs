@@ -22,8 +22,14 @@ pub struct ShufflePartition {
 pub struct ShuffleStream {
     pub id: PartitionId,
     pub schema: SchemaRef,
-    pub batches: futures::stream::BoxStream<'static, ShuffleResult<RecordBatch>>,
+    pub batches: ShuffleBatchStream,
 }
+
+/// An owned stream of a single partition's batches, in write order.
+///
+/// Used by both the read side ([`ShuffleStream`]) and the write side
+/// ([`ShuffleStore::write_partition_stream`]).
+pub type ShuffleBatchStream = futures::stream::BoxStream<'static, ShuffleResult<RecordBatch>>;
 
 /// An async shuffle store that persists inter-stage partition data.
 ///
@@ -53,6 +59,52 @@ pub trait ShuffleStore: Send + Sync {
         partition: ShufflePartition,
         lease_token: u64,
     ) -> ShuffleResult<()>;
+
+    /// Write a partition from a stream of batches, so the producer never needs
+    /// the whole partition resident.
+    ///
+    /// # Why this exists
+    ///
+    /// [`write_partition`](Self::write_partition) takes a complete
+    /// `Vec<RecordBatch>`, which made "one output partition" the smallest unit
+    /// a map task could hand over. At SF100 that is hundreds of megabytes held
+    /// as an *unspillable* consumer of the DataFusion pool — and because
+    /// `FairSpillPool` computes availability as
+    /// `pool_size - (unspillable + spillable)` in both branches, one oversized
+    /// unspillable reservation saturates availability to zero for *every*
+    /// consumer. TPC-H q10 and q21 both died on the resulting
+    /// `Failed to allocate additional 877.0 B for HashJoinInput`: a few hundred
+    /// bytes refused by a multi-gigabyte pool because a drain had already
+    /// declared more than the pool holds.
+    ///
+    /// The default implementation collects and delegates, so a store that
+    /// genuinely needs the whole partition (in-memory, tee-ing tiered writes)
+    /// keeps working unchanged. Stores whose serialiser accepts batches
+    /// incrementally — [`crate::LocalDiskShuffleStore`] writes through
+    /// `ArrowWriter` — override it and never materialise the partition.
+    async fn write_partition_stream(
+        &self,
+        id: PartitionId,
+        schema: SchemaRef,
+        batches: ShuffleBatchStream,
+        lease_token: u64,
+    ) -> ShuffleResult<()> {
+        use futures::StreamExt as _;
+        let mut batches = batches;
+        let mut collected = Vec::new();
+        while let Some(batch) = batches.next().await {
+            collected.push(batch?);
+        }
+        self.write_partition(
+            ShufflePartition {
+                id,
+                schema,
+                batches: collected,
+            },
+            lease_token,
+        )
+        .await
+    }
 
     /// Read a partition. Returns `None` if not yet written.
     async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>>;
@@ -114,6 +166,28 @@ impl ShuffleStore for ShuffleBackend {
             Self::InMemory(s) => s.write_partition(partition, lease_token).await,
             Self::Tiered(s) => s.write_partition(partition, lease_token).await,
             Self::Object(s) => s.write_partition(partition, lease_token).await,
+        }
+    }
+
+    async fn write_partition_stream(
+        &self,
+        id: PartitionId,
+        schema: SchemaRef,
+        batches: ShuffleBatchStream,
+        lease_token: u64,
+    ) -> ShuffleResult<()> {
+        // Dispatch to the concrete store so `LocalDiskShuffleStore`'s genuine
+        // streaming override is reached. Forwarding to the trait default here
+        // would collect the partition first and quietly undo the point of the
+        // call — the exact shape of bug this audit keeps finding.
+        match self {
+            Self::Local(s) => s.write_partition_stream(id, schema, batches, lease_token).await,
+            Self::InMemory(s) => {
+                s.write_partition_stream(id, schema, batches, lease_token)
+                    .await
+            }
+            Self::Tiered(s) => s.write_partition_stream(id, schema, batches, lease_token).await,
+            Self::Object(s) => s.write_partition_stream(id, schema, batches, lease_token).await,
         }
     }
 

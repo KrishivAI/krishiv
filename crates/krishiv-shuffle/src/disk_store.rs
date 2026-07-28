@@ -128,6 +128,42 @@ impl<W: std::io::Write> std::io::Write for HashingWriter<W> {
     }
 }
 
+/// A partition's identity and schema, without its data.
+///
+/// The streaming write path needs both before the first batch arrives (the
+/// paths come from the id, `ArrowWriter` needs the schema), but must not hold
+/// the batches — that is the whole point. Keeping them in one struct means the
+/// blocking writer captures exactly this and nothing else.
+struct PartitionMeta {
+    id: PartitionId,
+    schema: arrow::datatypes::SchemaRef,
+}
+
+/// Removes the staging files unless the write committed.
+///
+/// Before this, any failure after `File::create` — a Parquet write error, a
+/// source-stream error, a poisoned lease lock — left `*.tmp.N` behind, and the
+/// only thing that ever removed those was `cleanup_temp_files` at store
+/// construction, i.e. at executor boot. On a node that filled its disk, that
+/// boot is exactly what cannot happen. Same failure mode as the spill files in
+/// `krishiv_shuffle::orphan`, and the same fix: reclaim at the point of
+/// failure, not at the next start.
+struct StagingFiles {
+    data: PathBuf,
+    hash: PathBuf,
+    committed: bool,
+}
+
+impl Drop for StagingFiles {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let _ = std::fs::remove_file(&self.data);
+        let _ = std::fs::remove_file(&self.hash);
+    }
+}
+
 fn encode_hash(hash: &[u8; 32]) -> String {
     hash.iter().fold(String::with_capacity(64), |mut s, b| {
         use std::fmt::Write;
@@ -366,11 +402,39 @@ impl ShuffleStore for LocalDiskShuffleStore {
         Ok(())
     }
 
+    /// Write a fully-materialised partition.
+    ///
+    /// Delegates to [`Self::write_partition_stream`] so both entry points share
+    /// one implementation: there is exactly one place that opens the temp file,
+    /// hashes, and commits, and no way for the two to drift apart on the lease
+    /// protocol or the rename order.
     async fn write_partition(
         &self,
         partition: ShufflePartition,
         lease_token: u64,
     ) -> ShuffleResult<()> {
+        let ShufflePartition { id, schema, batches } = partition;
+        let stream = futures::stream::iter(batches.into_iter().map(Ok));
+        self.write_partition_stream(id, schema, Box::pin(stream), lease_token)
+            .await
+    }
+
+    /// Write a partition without ever holding it whole.
+    ///
+    /// Batches are pulled from `batches` on the async side and handed to a
+    /// blocking `ArrowWriter` over a depth-2 channel, so at most a couple of
+    /// batches are in flight and each is dropped as soon as it has been
+    /// serialised. Peak write-side memory is therefore one batch, not one
+    /// partition — see [`ShuffleStore::write_partition_stream`] for the pool
+    /// starvation that made this necessary.
+    async fn write_partition_stream(
+        &self,
+        id: PartitionId,
+        schema: arrow::datatypes::SchemaRef,
+        batches: crate::store::ShuffleBatchStream,
+        lease_token: u64,
+    ) -> ShuffleResult<()> {
+        let partition = PartitionMeta { id, schema };
         let key = (
             partition.id.job_id.clone(),
             partition.id.stage_id.clone(),
@@ -408,9 +472,15 @@ impl ShuffleStore for LocalDiskShuffleStore {
         let page_cache_budget = Arc::clone(&self.page_cache_budget);
         let parent_dir = final_path.parent().map(PathBuf::from);
 
+        // Depth 2: enough that the producer is never the reason the writer
+        // stalls, small enough that "in flight" is a couple of batches rather
+        // than a partition. This bound is the whole point of the streaming
+        // path, so it must stay small.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ShuffleResult<arrow::record_batch::RecordBatch>>(2);
+
         // P0.4: Wrap all blocking filesystem I/O in spawn_blocking so the
         // async executor thread is never stalled by synchronous disk calls.
-        tokio::task::spawn_blocking(move || {
+        let writer_task = tokio::task::spawn_blocking(move || {
             use parquet::arrow::ArrowWriter;
             use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -437,6 +507,13 @@ impl ShuffleStore for LocalDiskShuffleStore {
 
             // Phase 1 (continued): Write to a temp file alongside the final path.
             let tmp_path = final_path.with_extension(format!("tmp.{tmp_suffix}"));
+            let tmp_hash_path = final_hash_path.with_extension(format!("blake3.tmp.{tmp_suffix}"));
+            // Every `?` from here on unlinks both staging files on the way out.
+            let mut staging = StagingFiles {
+                data: tmp_path.clone(),
+                hash: tmp_hash_path.clone(),
+                committed: false,
+            };
             // The BLAKE3 hash is computed as the Parquet bytes flow to disk.
             //
             // This used to write the file, then `std::fs::read` the whole thing
@@ -454,9 +531,13 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 let mut writer =
                     ArrowWriter::try_new(HashingWriter::new(tmp_file), schema, Some(writer_props))
                         .map_err(|e| io_err(format!("failed to create Parquet writer: {e}")))?;
-                for batch in &partition.batches {
+                // Pull batches as the producer yields them and drop each one as
+                // soon as it is serialised, so the writer's residency is a batch
+                // rather than a partition.
+                while let Some(batch) = rx.blocking_recv() {
+                    let batch = batch?;
                     writer
-                        .write(batch)
+                        .write(&batch)
                         .map_err(|e| io_err(format!("failed to write Parquet batch: {e}")))?;
                 }
                 let (tmp_file, hash) = writer
@@ -467,7 +548,6 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 tmp_file.sync_all().map_err(|e| wrap_io_err(e, &tmp_path))?;
                 hash
             };
-            let tmp_hash_path = final_hash_path.with_extension(format!("blake3.tmp.{tmp_suffix}"));
             {
                 let mut hash_file = std::fs::File::create(&tmp_hash_path)
                     .map_err(|e| wrap_io_err(e, &tmp_hash_path))?;
@@ -506,6 +586,13 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 //   sidecar as "no verification" (warn + skip) so the
                 //   partition is still readable.
                 // - Crash after both renames: fully committed.
+                // From here the staging files are being *moved*, not abandoned:
+                // a rename leaves nothing at the old path, and a failure
+                // between the two renames is handled by the read path's
+                // missing-sidecar tolerance rather than by deleting committed
+                // data. Disarm the guard before the first rename so it can
+                // never unlink a file that is now the live partition.
+                staging.committed = true;
                 std::fs::rename(&tmp_path, &final_path).map_err(|e| {
                     io_err(format!(
                         "failed to rename temp partition '{}' → '{}': {e}",
@@ -555,9 +642,8 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 let cached_bytes = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
                 page_cache_budget.record_written(final_path.clone(), cached_bytes);
             } else {
-                // Newer writer won — silently discard this temp file.
-                let _ = std::fs::remove_file(&tmp_path);
-                let _ = std::fs::remove_file(&tmp_hash_path);
+                // Newer writer won. `staging` is still armed, so returning
+                // here unlinks both temp files.
                 // B4: Report the actual current token as `expected`, not
                 // `lease_token + 1` (which was wrong when tokens advance by more than 1).
                 let current = {
@@ -572,9 +658,28 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 });
             }
             Ok(())
-        })
-        .await
-        .map_err(|e| io_err(format!("spawn_blocking join error: {e}")))?
+        });
+
+        // Feed the writer. A send failure means the writer already returned, so
+        // its error — not a channel-closed message — is what the caller needs;
+        // stop feeding and let the join below report it.
+        {
+            use futures::StreamExt as _;
+            let mut batches = batches;
+            while let Some(batch) = batches.next().await {
+                if tx.send(batch).await.is_err() {
+                    break;
+                }
+            }
+        }
+        // Closing the channel is what ends the writer's receive loop. It must
+        // happen before the await or the two deadlock: the writer would block
+        // on `blocking_recv` forever while this task blocks on the join.
+        drop(tx);
+
+        writer_task
+            .await
+            .map_err(|e| io_err(format!("spawn_blocking join error: {e}")))?
     }
 
     async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>> {
@@ -971,6 +1076,128 @@ mod tests {
             .expect("partition present");
         assert_eq!(read.batches.len(), 1);
         assert_eq!(read.batches[0].num_rows(), 3);
+    }
+
+    /// The streaming write must produce a file the read path accepts, with the
+    /// same rows in the same order as the collecting write.
+    ///
+    /// Checked against the collecting path directly rather than against a
+    /// hard-coded expectation, because the whole claim of
+    /// `write_partition_stream` is that it is the *same write* with a different
+    /// residency — an assertion that could pass while the two diverged would
+    /// prove nothing.
+    #[tokio::test]
+    async fn streaming_and_collecting_writes_produce_the_same_partition() {
+        let dir = tempdir().unwrap();
+        let store = LocalDiskShuffleStore::new(dir.path()).expect("store");
+        let batches: Vec<RecordBatch> = (0..8)
+            .map(|g: i64| make_batch(&[g * 10, g * 10 + 1, g * 10 + 2]))
+            .collect();
+        let schema = batches[0].schema();
+
+        let collected_id = id("job-collect", "stage-1", 0);
+        store
+            .write_partition(
+                ShufflePartition {
+                    id: collected_id.clone(),
+                    schema: schema.clone(),
+                    batches: batches.clone(),
+                },
+                1,
+            )
+            .await
+            .expect("collecting write");
+
+        let streamed_id = id("job-stream", "stage-1", 0);
+        store
+            .write_partition_stream(
+                streamed_id.clone(),
+                schema.clone(),
+                Box::pin(futures::stream::iter(batches.clone().into_iter().map(Ok))),
+                1,
+            )
+            .await
+            .expect("streaming write");
+
+        let values = |p: &ShufflePartition| -> Vec<i64> {
+            p.batches
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("int column")
+                        .values()
+                        .to_vec()
+                })
+                .collect()
+        };
+        let a = store
+            .read_partition(&collected_id)
+            .await
+            .unwrap()
+            .expect("collected present");
+        let b = store
+            .read_partition(&streamed_id)
+            .await
+            .unwrap()
+            .expect("streamed present");
+        let expected: Vec<i64> = (0..8).flat_map(|g: i64| [g * 10, g * 10 + 1, g * 10 + 2]).collect();
+        assert_eq!(values(&a), expected, "collecting write lost or reordered rows");
+        assert_eq!(values(&b), expected, "streaming write lost or reordered rows");
+    }
+
+    /// A partition whose source stream fails part-way must not commit, and must
+    /// not leave staging files behind.
+    ///
+    /// Before the `StagingFiles` guard, every failure after `File::create` left
+    /// a `*.tmp.N`, and the only thing that ever removed those was
+    /// `cleanup_temp_files` at store construction — i.e. at executor boot,
+    /// which is exactly what a node that filled its disk cannot do.
+    #[tokio::test]
+    async fn a_failed_stream_commits_nothing_and_leaves_no_staging_files() {
+        let dir = tempdir().unwrap();
+        let store = LocalDiskShuffleStore::new(dir.path()).expect("store");
+        let partition = id("job-fail", "stage-1", 0);
+        let good = make_batch(&[1, 2, 3]);
+        let schema = good.schema();
+
+        let items: Vec<ShuffleResult<RecordBatch>> = vec![
+            Ok(good),
+            Err(ShuffleError::Io(std::io::Error::other("upstream exploded"))),
+        ];
+        let err = store
+            .write_partition_stream(
+                partition.clone(),
+                schema,
+                Box::pin(futures::stream::iter(items)),
+                1,
+            )
+            .await
+            .expect_err("a failing source must fail the write");
+        assert!(
+            err.to_string().contains("upstream exploded"),
+            "the source's error must reach the caller, got: {err}"
+        );
+
+        assert!(
+            store.read_partition(&partition).await.unwrap().is_none(),
+            "a failed write must not publish a partition"
+        );
+        let stage_dir = dir.path().join("job-fail").join("stage-1");
+        let leftovers: Vec<String> = std::fs::read_dir(&stage_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.contains(".tmp."))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "staging files must be reclaimed at the point of failure, found {leftovers:?}"
+        );
     }
 
     /// SH5: a shuffle partition whose hash sidecar is missing must

@@ -1163,7 +1163,7 @@ async fn execute_dfplan_fragment(
             },
             &schema,
             write_cfg.lease_token,
-            |_, _, _| Ok(()),
+            |_, _| Ok(()),
         )
         .await?;
         // Advertise this executor's shuffle flight endpoint so the coordinator
@@ -2497,7 +2497,7 @@ mod tests {
             },
             &schema,
             1,
-            |_, _, _| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
