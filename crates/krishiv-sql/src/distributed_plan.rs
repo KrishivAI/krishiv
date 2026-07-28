@@ -186,6 +186,27 @@ pub fn planning_session_context_with_join_threshold(
     target_partitions: usize,
     spill_join_build_bytes: Option<u64>,
 ) -> SessionContext {
+    planning_session_context_with_options(target_partitions, spill_join_build_bytes, None)
+}
+
+/// As [`planning_session_context_with_join_threshold`], with the broadcast
+/// (`CollectLeft`) build-side ceiling supplied instead of read from
+/// [`BROADCAST_JOIN_BYTES_ENV`].
+///
+/// `None` keeps the env-or-default value, which is what production uses.
+///
+/// Pinning it is the only way to reach the *cluster's* join shape from a test.
+/// The staged path broadcasts any build side under 32 MiB, and every fixture
+/// small enough to run in-process is far under that — so a two-table join that
+/// hash-shuffles **both** sides at SF100, and therefore plans a reduce stage
+/// with two `ShuffleReadExec` leaves reading two different upstream stages,
+/// collapses in tests to one broadcast join with a single shuffle input. The
+/// two shapes exercise different code, and only the small one was ever tested.
+pub fn planning_session_context_with_options(
+    target_partitions: usize,
+    spill_join_build_bytes: Option<u64>,
+    broadcast_join_bytes: Option<usize>,
+) -> SessionContext {
     // A6: this was `SessionConfig::new()` — a bare DataFusion config carrying
     // none of the engine's settings, so `KRISHIV_RUNTIME_FILTERS` was a no-op
     // distributed, the SQL dialect differed from the one the query was written
@@ -220,14 +241,20 @@ pub fn planning_session_context_with_join_threshold(
     //
     // Deliberately set only on the STAGED path — the embedded engine keeps
     // DataFusion's defaults, where they are correct.
-    let broadcast_bytes = std::env::var(BROADCAST_JOIN_BYTES_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(32 * 1024 * 1024);
+    let broadcast_bytes = broadcast_join_bytes.unwrap_or_else(|| {
+        std::env::var(BROADCAST_JOIN_BYTES_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(32 * 1024 * 1024)
+    });
     let opts = config.options_mut();
     opts.optimizer.hash_join_single_partition_threshold = broadcast_bytes;
-    opts.optimizer.hash_join_single_partition_threshold_rows = 1_000_000;
+    // Both ceilings gate the same decision, so a caller asking for "never
+    // broadcast" (0 bytes) must get the row ceiling zeroed too — otherwise a
+    // small build side still collects and the request is silently ignored.
+    opts.optimizer.hash_join_single_partition_threshold_rows =
+        if broadcast_bytes == 0 { 0 } else { 1_000_000 };
 
     // A6: the rules. `planning_session_context` is where every distributed
     // query is planned, and it carried no engine rules at all — so
@@ -3845,8 +3872,15 @@ mod staged_tpch_tests {
     }
 
     async fn q22_context(dir: &std::path::Path) -> SessionContext {
+        q22_context_with_broadcast(dir, None).await
+    }
+
+    async fn q22_context_with_broadcast(
+        dir: &std::path::Path,
+        broadcast_bytes: Option<usize>,
+    ) -> SessionContext {
         let (customer, orders) = write_q22_fixture(dir);
-        let ctx = planning_session_context(4);
+        let ctx = planning_session_context_with_options(4, None, broadcast_bytes);
         for (name, path) in [("customer", customer), ("orders", orders)] {
             ctx.register_parquet(
                 name,
@@ -4088,9 +4122,18 @@ mod staged_tpch_tests {
         assert!(!expected.is_empty(), "the q22 fixture must produce rows");
     }
 
-    async fn tpch_context(dir: &std::path::Path, join_threshold: Option<u64>) -> SessionContext {
+    /// `broadcast_bytes: Some(0)` reproduces the cluster's join shape: neither
+    /// side is small enough to collect, so both hash-shuffle and the reduce
+    /// stage gets **two** `ShuffleReadExec` leaves over two upstream stages.
+    /// Every other test here runs the broadcast shape, because a fixture that
+    /// fits in a process is always under the 32 MiB ceiling.
+    async fn tpch_context_with_broadcast(
+        dir: &std::path::Path,
+        join_threshold: Option<u64>,
+        broadcast_bytes: Option<usize>,
+    ) -> SessionContext {
         let (lineitem, part) = write_tpch_fixture(dir);
-        let ctx = planning_session_context_with_join_threshold(4, join_threshold);
+        let ctx = planning_session_context_with_options(4, join_threshold, broadcast_bytes);
         for (name, path) in [("lineitem", lineitem), ("part", part)] {
             ctx.register_parquet(
                 name,
@@ -4237,8 +4280,17 @@ mod staged_tpch_tests {
     /// converting *more* joins than production would must still be correct;
     /// if it is not, the claim is false.
     async fn staged_matches_direct(sql: &str, join_threshold: Option<u64>, label: &str) {
+        staged_matches_direct_with_broadcast(sql, join_threshold, None, label).await;
+    }
+
+    async fn staged_matches_direct_with_broadcast(
+        sql: &str,
+        join_threshold: Option<u64>,
+        broadcast_bytes: Option<usize>,
+        label: &str,
+    ) {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let ctx = tpch_context(tmp.path(), join_threshold).await;
+        let ctx = tpch_context_with_broadcast(tmp.path(), join_threshold, broadcast_bytes).await;
         let expected = render(&direct(&ctx, sql).await);
         let actual = run_staged(&ctx, sql)
             .await
@@ -4268,5 +4320,69 @@ mod staged_tpch_tests {
     #[tokio::test]
     async fn staged_q19_matches_direct_execution_with_converted_joins() {
         staged_matches_direct(Q19, Some(0), "q19/converted").await;
+    }
+
+    /// The shape the cluster actually runs: no broadcast, so both join sides
+    /// hash-shuffle and the reduce stage reads two upstream stages.
+    ///
+    /// q17 and q19 pass every broadcast-shaped test above and still fail at
+    /// SF100 with a bare Arrow type error, so the defect lives in what the
+    /// broadcast shape never builds.
+    #[tokio::test]
+    async fn staged_q17_matches_direct_execution_without_broadcast() {
+        staged_matches_direct_with_broadcast(Q17, None, Some(0), "q17/no-broadcast").await;
+    }
+
+    #[tokio::test]
+    async fn staged_q19_matches_direct_execution_without_broadcast() {
+        staged_matches_direct_with_broadcast(Q19, None, Some(0), "q19/no-broadcast").await;
+    }
+
+    #[tokio::test]
+    async fn staged_q22_matches_direct_execution_without_broadcast() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = q22_context_with_broadcast(tmp.path(), Some(0)).await;
+        let expected = render(&direct(&ctx, Q22).await);
+        let actual = run_staged(&ctx, Q22)
+            .await
+            .unwrap_or_else(|e| panic!("q22/no-broadcast: staged execution failed: {e}"));
+        assert_eq!(
+            render(&actual),
+            expected,
+            "q22/no-broadcast: staged result differs from single-node execution"
+        );
+        assert!(!expected.is_empty(), "the q22 fixture must produce rows");
+    }
+
+    /// A reduce stage really does read two distinct upstream stages once
+    /// broadcasting is off — the precondition the three tests above depend on.
+    /// Without this, a planner change that quietly restored a broadcast join
+    /// would turn them into duplicates of the tests they were written to
+    /// complement, and nothing would say so.
+    #[tokio::test]
+    async fn without_broadcast_a_reduce_stage_reads_two_upstream_stages() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = tpch_context_with_broadcast(tmp.path(), None, Some(0)).await;
+        let plan = ctx
+            .sql(Q19)
+            .await
+            .expect("sql")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let staged = build_distributed_stages(plan)
+            .expect("staging must not error")
+            .expect("q19 must stage");
+        let widest = staged
+            .stages
+            .iter()
+            .map(|stage| stage.upstream_stage_indexes.len())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            widest >= 2,
+            "expected a stage reading 2+ upstream stages, widest was {widest}; \
+             the no-broadcast tests are not exercising the cluster's join shape"
+        );
     }
 }
