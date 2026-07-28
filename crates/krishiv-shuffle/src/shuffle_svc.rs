@@ -325,6 +325,42 @@ async fn ess_read_partition(
             StatusCode::BAD_REQUEST
         })?;
 
+    // The index file decides how many bytes this handler allocates, so it has
+    // to be checked against the data file rather than trusted.
+    //
+    // `let len = (end - start) as usize` on a non-monotonic index underflows:
+    // a debug build panics inside the handler, and a release build wraps to a
+    // number near `u64::MAX` and hands it straight to `vec![0u8; len]`, which
+    // aborts the process on allocation failure. An index truncated by a crash
+    // mid-write, or one whose last offset outlives a re-written data file, is
+    // enough — no malice required. Both are refused here as client errors,
+    // which is what they are.
+    if end < start {
+        tracing::error!(
+            partition,
+            start,
+            end,
+            "ESS index is not monotonic; refusing to size a read from it"
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let data_len = tokio::fs::metadata(&files.data_path)
+        .await
+        .map(|m| m.len())
+        .map_err(|e| {
+            tracing::error!(error = %e, "ESS stat data file failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    if end > data_len {
+        tracing::error!(
+            partition,
+            end,
+            data_len,
+            "ESS index points past the end of the data file"
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     if start == end {
         // Empty partition: return an empty body with the correct content type.
         return Ok((
@@ -498,3 +534,358 @@ fn check_bearer_token(
 
 // SEC-3 (Phase 63) startup fail-closed guard now lives in [`crate::token_auth`]
 // and is shared with the Flight shuffle server; its unit tests live there.
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::ShufflePartition;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt as _;
+
+    const TOKEN: &str = "s3cr3t-shuffle-token";
+
+    fn batch(values: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values.to_vec()))]).unwrap()
+    }
+
+    fn state_with(dir: &Path) -> ShuffleSvcState {
+        ShuffleSvcState {
+            store: Arc::new(LocalDiskShuffleStore::new(dir).unwrap()),
+            ess_index: SortShuffleIndex::new(),
+            push_store: PushShuffleStore::new(),
+            token: Arc::new(std::sync::RwLock::new(Some(TOKEN.to_string()))),
+        }
+    }
+
+    /// Issue one request against a fresh router built from `state`.
+    async fn call(
+        state: &ShuffleSvcState,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+        body: Body,
+    ) -> (StatusCode, Vec<u8>) {
+        let mut req = Request::builder().method(method).uri(uri);
+        if let Some(t) = token {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        let response = build_router(state.clone())
+            .oneshot(req.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024 * 1024)
+            .await
+            .unwrap();
+        (status, bytes.to_vec())
+    }
+
+    /// Write an ESS index file with the given offsets and register it.
+    fn register_ess(state: &ShuffleSvcState, dir: &Path, data: &[u8], offsets: &[u64]) {
+        let data_path = dir.join("ess.data");
+        let index_path = dir.join("ess.index");
+        std::fs::write(&data_path, data).unwrap();
+        let mut raw = Vec::with_capacity(offsets.len() * 8);
+        for o in offsets {
+            raw.extend_from_slice(&o.to_le_bytes());
+        }
+        std::fs::write(&index_path, raw).unwrap();
+        state.ess_index.register(
+            "job",
+            "stage",
+            SortShuffleFiles {
+                data_path,
+                index_path,
+                // The index carries `partition_count + 1` offsets.
+                partition_count: (offsets.len() - 1) as u32,
+            },
+        );
+    }
+
+    /// Every route that touches shuffle data must reject a wrong token.
+    ///
+    /// This file had **6.61% coverage** while serving intermediate query data
+    /// between executors, and the auth check is a per-handler call rather than
+    /// middleware — so a new handler that simply forgets to call
+    /// `check_bearer_token` is unauthenticated and nothing notices. Enumerating
+    /// the routes here is the only thing that makes that visible.
+    #[tokio::test]
+    async fn every_data_route_refuses_a_wrong_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with(dir.path());
+        let routes = [
+            ("GET", "/shuffle/job/stage/0"),
+            ("GET", "/ess/job/stage/0"),
+            ("POST", "/ess/gc/job"),
+            ("POST", "/ess/push/job/stage/task/0"),
+            ("GET", "/ess/merged/job/stage/0"),
+            ("POST", "/ess/push-gc/job"),
+            ("POST", "/ess/expect/job/stage/0?count=1"),
+        ];
+        for (method, uri) in routes {
+            let (status, _) = call(&state, method, uri, Some("wrong"), Body::empty()).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} accepted a wrong bearer token"
+            );
+            let (status, _) = call(&state, method, uri, None, Body::empty()).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} accepted a request with no bearer token"
+            );
+        }
+    }
+
+    /// `/healthz` is deliberately open — it carries no data and a liveness
+    /// probe has no credentials.
+    #[tokio::test]
+    async fn healthz_is_reachable_without_a_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with(dir.path());
+        let (status, body) = call(&state, "GET", "/healthz", None, Body::empty()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"ok\n");
+    }
+
+    #[tokio::test]
+    async fn a_written_partition_is_served_as_arrow_ipc() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with(dir.path());
+        let store = LocalDiskShuffleStore::new(dir.path()).unwrap();
+        store
+            .write_partition(
+                ShufflePartition {
+                    id: PartitionId {
+                        job_id: "job".into(),
+                        stage_id: "stage".into(),
+                        partition: 0,
+                    },
+                    schema: batch(&[1, 2, 3]).schema(),
+                    batches: vec![batch(&[1, 2, 3])],
+                },
+                1,
+            )
+            .await
+            .unwrap();
+
+        let (status, body) =
+            call(&state, "GET", "/shuffle/job/stage/0", Some(TOKEN), Body::empty()).await;
+        assert_eq!(status, StatusCode::OK);
+        let reader =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(body), None).unwrap();
+        let rows: Vec<i64> = reader
+            .flat_map(|b| {
+                b.unwrap()
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(rows, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn a_partition_that_was_never_written_is_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with(dir.path());
+        let (status, _) =
+            call(&state, "GET", "/shuffle/job/stage/7", Some(TOKEN), Body::empty()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_ess_partition_is_served_from_its_byte_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with(dir.path());
+        register_ess(&state, dir.path(), b"AAAABBBBCC", &[0, 4, 8, 10]);
+        for (partition, want) in [(0u32, &b"AAAA"[..]), (1, b"BBBB"), (2, b"CC")] {
+            let (status, body) = call(
+                &state,
+                "GET",
+                &format!("/ess/job/stage/{partition}"),
+                Some(TOKEN),
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "partition {partition}");
+            assert_eq!(body, want, "partition {partition} served the wrong range");
+        }
+    }
+
+    /// A non-monotonic index used to reach `let len = (end - start) as usize`.
+    ///
+    /// Debug builds panicked inside the handler; release builds wrapped to a
+    /// number near `u64::MAX` and passed it to `vec![0u8; len]`, aborting the
+    /// process on allocation failure. A crash mid-index-write is enough to
+    /// produce one — this is a robustness bug, not a security scenario, and it
+    /// takes down the whole shuffle service rather than one request.
+    #[tokio::test]
+    async fn a_non_monotonic_ess_index_is_refused_instead_of_sizing_an_allocation_from_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with(dir.path());
+        // Partition 0 claims to run from byte 8 back to byte 0.
+        register_ess(&state, dir.path(), b"AAAABBBB", &[8, 0, 8]);
+        let (status, _) = call(&state, "GET", "/ess/job/stage/0", Some(TOKEN), Body::empty()).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a descending offset pair must be refused, not turned into a length"
+        );
+    }
+
+    /// An index whose last offset outlives a re-written (shorter) data file
+    /// would `read_exact` past EOF. That surfaces as a 500 either way, but the
+    /// allocation happens first — so it is refused before the `vec![0u8; len]`.
+    #[tokio::test]
+    async fn an_ess_index_pointing_past_the_data_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with(dir.path());
+        register_ess(&state, dir.path(), b"AAAA", &[0, 4_000_000_000]);
+        let (status, _) = call(&state, "GET", "/ess/job/stage/0", Some(TOKEN), Body::empty()).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an offset past EOF must be refused before it sizes a buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ess_partition_beyond_the_partition_count_is_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with(dir.path());
+        register_ess(&state, dir.path(), b"AAAA", &[0, 4]);
+        let (status, _) = call(&state, "GET", "/ess/job/stage/9", Some(TOKEN), Body::empty()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ess_gc_drops_the_index_entry_for_that_job_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with(dir.path());
+        register_ess(&state, dir.path(), b"AAAA", &[0, 4]);
+        state.ess_index.register(
+            "other-job",
+            "stage",
+            SortShuffleFiles {
+                data_path: dir.path().join("ess.data"),
+                index_path: dir.path().join("ess.index"),
+                partition_count: 1,
+            },
+        );
+
+        let (status, _) = call(&state, "POST", "/ess/gc/job", Some(TOKEN), Body::empty()).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(state.ess_index.get("job", "stage").is_none());
+        assert!(
+            state.ess_index.get("other-job", "stage").is_some(),
+            "GC must be scoped to the job it was asked about"
+        );
+    }
+
+    /// The push path end to end: expected-count gating, then push, then merge.
+    ///
+    /// `merge_read` returning `None` before every expected push has arrived is
+    /// what stops a reduce task reading a partial partition, so the test
+    /// asserts the 404 *before* asserting the success.
+    #[tokio::test]
+    async fn pushed_partitions_merge_only_once_every_expected_push_arrives() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with(dir.path());
+
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/ess/expect/job/stage/0?count=2",
+            Some(TOKEN),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/ess/push/job/stage/task-a/0",
+            Some(TOKEN),
+            Body::from(b"AAAA".to_vec()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, _) =
+            call(&state, "GET", "/ess/merged/job/stage/0", Some(TOKEN), Body::empty()).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a merged read must not serve a partition that is still missing a push"
+        );
+
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/ess/push/job/stage/task-b/0",
+            Some(TOKEN),
+            Body::from(b"BBBB".to_vec()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) =
+            call(&state, "GET", "/ess/merged/job/stage/0", Some(TOKEN), Body::empty()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.len(), 8, "both pushes must appear in the merged stream");
+
+        let (status, _) = call(&state, "POST", "/ess/push-gc/job", Some(TOKEN), Body::empty()).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) =
+            call(&state, "GET", "/ess/merged/job/stage/0", Some(TOKEN), Body::empty()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "GC must drop pushed data");
+    }
+
+    /// `?count=0` is rejected: it would mean "this partition expects nothing",
+    /// which `merge_read` cannot distinguish from "not configured".
+    #[tokio::test]
+    async fn an_expected_push_count_of_zero_is_a_bad_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with(dir.path());
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/ess/expect/job/stage/0?count=0",
+            Some(TOKEN),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// With no token configured the service is open by design — the fail-closed
+    /// decision is made once at startup by
+    /// `token_auth::require_shuffle_token_or_fail`, not per request. Pinning
+    /// this means a change that made `check_bearer_token` fail closed would
+    /// surface here rather than as a dev-mode outage.
+    #[tokio::test]
+    async fn with_no_token_configured_requests_are_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state_with(dir.path());
+        state.token = Arc::new(std::sync::RwLock::new(None));
+        let (status, _) =
+            call(&state, "GET", "/shuffle/job/stage/0", None, Body::empty()).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an unauthenticated service must reach the handler (404 = no such partition)"
+        );
+    }
+}

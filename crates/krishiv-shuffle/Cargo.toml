@@ -45,6 +45,10 @@ async-trait = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# `ServiceExt::oneshot`, so the shuffle service's routes can be exercised as a
+# router rather than by binding a port. axum already depends on tower; this only
+# brings the trait into the tests' scope.
+tower = { workspace = true, features = ["util"] }
 
 [[bin]]
 name = "krishiv-shuffle-svc"

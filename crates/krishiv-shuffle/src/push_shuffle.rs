@@ -137,23 +137,57 @@ impl PushShuffleStore {
     /// Return the merged Arrow IPC stream for `(job_id, stage_id, partition)`.
     ///
     /// The stream is the **concatenation** of all pushed IPC payloads in the
-    /// order they were pushed.  Returns `None` if no data has been pushed.
+    /// order they were pushed. Returns `None` if no data has been pushed, or —
+    /// when [`set_expected_pushes`](Self::set_expected_pushes) has declared a
+    /// count for this partition — if fewer than that many pushes have arrived.
+    ///
+    /// # The gate this restores
+    ///
+    /// `expected_pushes` was written by `set_expected_pushes` and read by
+    /// nothing. Three doc comments (the field, the setter, and the
+    /// `POST /ess/expect/…` route) all promised that a merged read waits for
+    /// every declared push, and none of them was true: the map was pure
+    /// write-only state.
+    ///
+    /// What that costs is not an error — it is a **wrong answer**. A reduce
+    /// task fetching `/ess/merged/…` between two map pushes gets a partition
+    /// containing some map tasks' rows and not others, which is a
+    /// well-formed Arrow stream that simply has fewer rows in it. Nothing
+    /// downstream can tell that apart from a partition that genuinely had
+    /// those rows, so the query returns a smaller result and succeeds.
+    ///
+    /// Gating only applies where a count was declared, so a caller that never
+    /// calls `set_expected_pushes` sees exactly the previous behaviour.
     pub fn merge_read(&self, job_id: &str, stage_id: &str, partition: u32) -> Option<Vec<u8>> {
-        let chunks: Vec<Vec<u8>> = {
-            let entry = self
-                .inner
-                .get(&(job_id.to_owned(), stage_id.to_owned(), partition))?;
-            if entry.is_empty() {
-                return None;
-            }
-            entry.clone()
-        };
-        if chunks.len() == 1 {
-            return chunks.into_iter().next();
+        let key = (job_id.to_owned(), stage_id.to_owned(), partition);
+        let expected = self.expected_pushes.get(&key).map(|e| *e.value());
+        let entry = self.inner.get(&key)?;
+        if entry.is_empty() {
+            return None;
         }
-        let total: usize = chunks.iter().map(|b| b.len()).sum();
+        if let Some(expected) = expected
+            && entry.len() < expected
+        {
+            tracing::debug!(
+                job_id,
+                stage_id,
+                partition,
+                have = entry.len(),
+                expected,
+                "merged read withheld: not every map task has pushed this partition yet"
+            );
+            return None;
+        }
+        // Build the result under the read guard. Cloning the chunk list first
+        // and concatenating after held two full copies of the partition at
+        // once, on a path whose whole reason to exist is avoiding N fetches of
+        // it. There is no await here, so the guard is held for a memcpy.
+        if let [only] = entry.as_slice() {
+            return Some(only.clone());
+        }
+        let total: usize = entry.iter().map(|b| b.len()).sum();
         let mut merged = Vec::with_capacity(total);
-        for chunk in &chunks {
+        for chunk in entry.iter() {
             merged.extend_from_slice(chunk);
         }
         Some(merged)
@@ -176,6 +210,11 @@ impl PushShuffleStore {
             .map(|e| e.value().iter().map(|b| b.len()).sum::<usize>())
             .sum();
         self.inner.retain(|(jid, _, _), _| jid != job_id);
+        // The expected-push counts are keyed by job too, and nothing else ever
+        // removes them. Leaving them behind leaks one small entry per partition
+        // per job for the lifetime of the process, and — worse — a later job
+        // that reuses the id would inherit a stale gate.
+        self.expected_pushes.retain(|(jid, _, _), _| jid != job_id);
         self.total_bytes.fetch_sub(
             freed.min(self.total_bytes.load(Ordering::Relaxed)),
             Ordering::Relaxed,
@@ -191,6 +230,8 @@ impl PushShuffleStore {
             .map(|e| e.value().iter().map(|b| b.len()).sum::<usize>())
             .sum();
         self.inner
+            .retain(|(jid, sid, _), _| jid != job_id || sid != stage_id);
+        self.expected_pushes
             .retain(|(jid, sid, _), _| jid != job_id || sid != stage_id);
         self.total_bytes.fetch_sub(
             freed.min(self.total_bytes.load(Ordering::Relaxed)),
@@ -275,6 +316,75 @@ mod tests {
         store.push("j", "s", 0, ipc(1, 100)).unwrap();
         store.push("j", "s", 1, ipc(2, 200)).unwrap();
         assert_eq!(store.total_bytes(), 300);
+    }
+
+    /// The gate that did not exist: a merged read must withhold a partition
+    /// until every declared map-task push has arrived.
+    ///
+    /// `expected_pushes` was written by `set_expected_pushes` and read by
+    /// nothing, so a reduce task fetching between two map pushes received a
+    /// well-formed Arrow stream containing only some of the map tasks' rows.
+    /// Nothing downstream can distinguish that from a partition that genuinely
+    /// had fewer rows, so the query returns a wrong answer and *succeeds* —
+    /// which is why the failure never showed up as an error.
+    #[test]
+    fn a_merged_read_withholds_a_partition_until_every_expected_push_arrives() {
+        let store = PushShuffleStore::new();
+        store.set_expected_pushes("j", "s", 0, 3);
+
+        store.push("j", "s", 0, ipc(0xAA, 10)).unwrap();
+        assert!(
+            store.merge_read("j", "s", 0).is_none(),
+            "1 of 3 pushes must not be served"
+        );
+        store.push("j", "s", 0, ipc(0xBB, 10)).unwrap();
+        assert!(
+            store.merge_read("j", "s", 0).is_none(),
+            "2 of 3 pushes must not be served"
+        );
+
+        store.push("j", "s", 0, ipc(0xCC, 10)).unwrap();
+        let merged = store
+            .merge_read("j", "s", 0)
+            .expect("the partition must be served once every push has arrived");
+        assert_eq!(merged.len(), 30);
+    }
+
+    /// A partition with no declared count behaves exactly as before, so wiring
+    /// the gate cannot stall a caller that never sets one.
+    #[test]
+    fn a_partition_with_no_declared_count_is_served_immediately() {
+        let store = PushShuffleStore::new();
+        store.push("j", "s", 0, ipc(0xAA, 10)).unwrap();
+        assert!(store.merge_read("j", "s", 0).is_some());
+    }
+
+    /// Counts are keyed by job, and only `gc_job`/`gc_stage` ever removed
+    /// anything — from the *data* map. A job id reused after GC would otherwise
+    /// inherit the previous job's gate and withhold a complete partition
+    /// forever.
+    #[test]
+    fn gc_clears_the_expected_counts_as_well_as_the_data() {
+        let store = PushShuffleStore::new();
+        store.set_expected_pushes("j", "s", 0, 2);
+        store.push("j", "s", 0, ipc(1, 10)).unwrap();
+        store.gc_job("j");
+
+        // Same ids again, one push, no new declaration.
+        store.push("j", "s", 0, ipc(2, 10)).unwrap();
+        assert!(
+            store.merge_read("j", "s", 0).is_some(),
+            "a stale expected-push count survived GC and withheld a complete partition"
+        );
+
+        store.set_expected_pushes("j2", "s", 0, 2);
+        store.push("j2", "s", 0, ipc(1, 10)).unwrap();
+        store.gc_stage("j2", "s");
+        store.push("j2", "s", 0, ipc(2, 10)).unwrap();
+        assert!(
+            store.merge_read("j2", "s", 0).is_some(),
+            "gc_stage must clear that stage's expected-push counts too"
+        );
     }
 
     #[test]
