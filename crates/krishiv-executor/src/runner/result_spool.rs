@@ -232,6 +232,32 @@ pub(crate) async fn drain_stream_with_spool(
                 inner
                     .flush()
                     .map_err(|e| io_err("flush result spool", &e))?;
+                // Durable first, then evicted. `DONTNEED` silently skips dirty
+                // pages, so evicting before the fsync would leave the container
+                // charged for every byte just written — which is the whole
+                // failure being avoided.
+                //
+                // The kernel charges page cache on this file to the executor's
+                // cgroup. A spooled result exists precisely because it did not
+                // fit the inline budget, so leaving it resident re-creates, on
+                // the result path, the accounting hole that OOM-killed
+                // executors on the *shuffle* path: memory the DataFusion pool
+                // cannot see, growing with result size, freed only when the
+                // handle drops — which is after the chunks have been pushed,
+                // i.e. after the window that matters. `spill_largest` in
+                // `fragment/shuffle_write_buffer.rs` does exactly this for the
+                // same reason; the result spool was simply never given the same
+                // treatment. Re-reading costs one sequential pass at
+                // `RESULT_CHUNK_BYTES` at a time, which is bounded.
+                let file = inner.get_ref();
+                if let Err(e) = file.sync_all() {
+                    // Not fatal: the spool is read back by this same host and
+                    // does not have to survive a crash. Worth saying, because
+                    // an un-synced file cannot be evicted either.
+                    tracing::debug!(error = %e, path = %path.display(), "result spool fsync failed");
+                } else {
+                    krishiv_common::page_cache::evict_file_best_effort(file);
+                }
                 drop(inner);
                 std::fs::metadata(&path)
                     .map_err(|e| io_err("stat result spool", &e))
@@ -251,6 +277,15 @@ pub(crate) async fn drain_stream_with_spool(
 ///
 /// Reads the spool file in `RESULT_CHUNK_BYTES` slices; only one chunk is in
 /// memory at a time. The final chunk carries the total byte count.
+///
+/// "One chunk at a time" was true of the *heap* and not of the **page cache**,
+/// which the kernel charges to the executor's cgroup all the same. A sequential
+/// read of a multi-hundred-megabyte spool leaves all of it resident from the
+/// first chunk until `SpooledTaskResult` drops — i.e. until after the whole
+/// push has finished, which is exactly the window under pressure. Each chunk is
+/// therefore evicted once it has been read. The cost is read-ahead, and the
+/// push is bounded by the gRPC hop to the coordinator rather than by a 270 MB/s
+/// local disk, so that is the cheap side of the trade.
 pub(crate) fn spool_chunk_stream(
     ids: TaskAttemptRef,
     path: PathBuf,
@@ -277,6 +312,9 @@ pub(crate) fn spool_chunk_stream(
                     .await
                     .map_err(|e| tonic::Status::internal(format!("read result spool: {e}")))?;
                 let sent = sent + want as u64;
+                // The bytes are in `buf` now; their page-cache copy is pure
+                // cost from here.
+                krishiv_common::page_cache::evict_path_best_effort(&path);
                 let mut chunk = TaskResultChunk::new(ids, buf);
                 if sent >= total_bytes {
                     chunk = chunk.with_last(total_bytes);
