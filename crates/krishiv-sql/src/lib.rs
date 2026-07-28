@@ -98,6 +98,7 @@ pub mod connector_table;
 pub mod coop_amplifiers;
 pub mod create_function_ddl;
 pub mod distributed_plan;
+pub mod grace_hash_join;
 pub mod grammar;
 pub mod incremental_view;
 pub mod introspection_sql;

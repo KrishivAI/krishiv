@@ -51,6 +51,19 @@
 //! The sorts are inserted explicitly (with partitioning preserved) rather than
 //! left to `EnforceSorting`, because appended optimizer rules run *after* the
 //! enforcement passes — a requirement declared here would never be satisfied.
+//!
+//! # Which spillable algorithm
+//!
+//! Sort-merge is not the only way to make a join spill, and it is the worse
+//! one: it sorts *both* inputs in full even when nearly all the data would have
+//! fitted, which is what cost q2 6.3x. [`crate::grace_hash_join`] partitions
+//! both sides by key and joins bucket by bucket instead — no sorting, and the
+//! buckets that fit never reach the disk.
+//!
+//! So when `grace` is set the rule tries that first and keeps sort-merge as the
+//! fallback for shapes it refuses. It is **off by default**: sort-merge is what
+//! the SF100 sweeps have actually been measured against, and a newer operator
+//! earns the default by beating it on the cluster.
 
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Precision;
@@ -153,6 +166,13 @@ pub struct SpillableJoinSelection {
     /// Build-size threshold in bytes; `None` disables the rule entirely
     /// (no memory cap → nothing to protect against).
     threshold_bytes: Option<u64>,
+    /// Send oversized joins to [`crate::grace_hash_join`] instead of sort-merge.
+    ///
+    /// A field rather than an environment read at the point of use: the choice
+    /// is then visible in the rule's own state, and a test can exercise both
+    /// paths without mutating process-wide environment that every other test in
+    /// the binary shares.
+    grace: bool,
 }
 
 impl SpillableJoinSelection {
@@ -174,7 +194,10 @@ impl SpillableJoinSelection {
                 )]
                 Some((share as f64 * BUILD_FRACTION_OF_TASK_SHARE) as u64)
             });
-        Self { threshold_bytes }
+        Self {
+            threshold_bytes,
+            grace: crate::grace_hash_join::enabled(),
+        }
     }
 
     /// The per-join threshold to actually apply, once the **total** unspillable
@@ -219,12 +242,55 @@ impl SpillableJoinSelection {
         0
     }
 
-    /// Explicit threshold, for tests.
+    /// Explicit threshold, for tests. Keeps the sort-merge conversion.
     #[must_use]
     pub fn with_threshold(threshold_bytes: Option<u64>) -> Self {
-        Self { threshold_bytes }
+        Self {
+            threshold_bytes,
+            grace: false,
+        }
     }
 
+    /// Explicit threshold and algorithm, for tests.
+    #[must_use]
+    pub fn with_threshold_and_grace(threshold_bytes: Option<u64>, grace: bool) -> Self {
+        Self {
+            threshold_bytes,
+            grace,
+        }
+    }
+
+
+    /// Replace `hash_join` with the spilling grace hash join.
+    ///
+    /// No projection to restore and no sorts to insert: the operator keeps the
+    /// original join whole and joins it a bucket at a time, so its type, filter,
+    /// null equality and built-in projection come along unchanged. That is the
+    /// whole reason to prefer it — `reapply_projection` exists only because
+    /// `SortMergeJoinExec` drops the projection, and getting those indices wrong
+    /// is what broke live q7/q8/q9.
+    fn grace_join(
+        &self,
+        hash_join: &HashJoinExec,
+        build_bytes: u64,
+        threshold: u64,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // `builder()` clones the node; `reset_state()` drops the original's
+        // collected build side and dynamic filter so the copy starts clean.
+        let template = Arc::new(hash_join.builder().reset_state().build()?);
+        let buckets = crate::grace_hash_join::bucket_count(build_bytes, threshold);
+        let budget = usize::try_from(threshold).unwrap_or(usize::MAX);
+        let grace = crate::grace_hash_join::GraceHashJoinExec::try_new(template, buckets, budget)?;
+        tracing::info!(
+            build_bytes,
+            threshold,
+            buckets,
+            mode = ?hash_join.partition_mode(),
+            join_type = ?hash_join.join_type(),
+            "hash join build side exceeds per-task memory share; using grace hash join"
+        );
+        Ok(Arc::new(grace))
+    }
 
     /// Restore `hash_join`'s built-in projection on top of `converted`.
     ///
@@ -328,6 +394,29 @@ impl SpillableJoinSelection {
                 "spillable-join: build side fits, keeping hash join"
             );
             return Ok(None);
+        }
+
+        // The build side is too big. Two ways to make it spill:
+        //
+        //   grace hash join — partition both sides by key and join bucket by
+        //     bucket, each bucket an ordinary in-memory hash join. Nothing is
+        //     sorted, and the buckets that would have fitted never touch disk.
+        //   sort-merge — sort *both* sides in full, always. Correct, spillable,
+        //     and the reason q2 went from 208 s to 1317 s.
+        //
+        // Grace is strictly the better trade when it applies, so it is tried
+        // first; sort-merge remains the fallback for the shapes it refuses
+        // (today: a broadcast join, whose sides have different partition
+        // counts). Off by default — see `grace_hash_join::enabled`.
+        if self.grace {
+            match self.grace_join(hash_join, build_bytes, threshold) {
+                Ok(converted) => return Ok(Some(converted)),
+                Err(error) => tracing::debug!(
+                    %error,
+                    build_bytes,
+                    "spillable-join: grace hash join declined; trying sort-merge"
+                ),
+            }
         }
 
         // Sort both sides on the join keys. Partition preservation follows the
@@ -1147,5 +1236,117 @@ mod projection_tests {
 
         assert_eq!(cells(&before), cells(&after), "converted plan changed the data");
         assert_eq!(cells(&after), vec![String::from("a|3")], "expected the single matching row");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod grace_tests {
+    use super::*;
+    use crate::grace_hash_join::GraceHashJoinExec;
+    use datafusion::physical_plan::{collect, displayable};
+    use datafusion::prelude::{SessionConfig, SessionContext};
+
+    async fn joined_plan(ctx: &SessionContext) -> Arc<dyn ExecutionPlan> {
+        ctx.sql("CREATE TABLE l(k INT, v INT) AS VALUES (1, 10), (2, 20), (3, 30)")
+            .await.unwrap().collect().await.unwrap();
+        ctx.sql("CREATE TABLE r(k INT, w INT) AS VALUES (1, 100), (2, 200), (2, 201)")
+            .await.unwrap().collect().await.unwrap();
+        ctx.sql("SELECT l.v, r.w FROM l JOIN r ON l.k = r.k")
+            .await.unwrap().create_physical_plan().await.unwrap()
+    }
+
+    fn grace_joins(plan: &Arc<dyn ExecutionPlan>) -> usize {
+        // `ExecutionPlan: Any` — upcast to downcast (DF 54 has no `as_any`).
+        let any = plan.as_ref() as &dyn std::any::Any;
+        usize::from(any.downcast_ref::<GraceHashJoinExec>().is_some())
+            + plan.children().iter().map(|c| grace_joins(c)).sum::<usize>()
+    }
+
+    /// With the flag on, an oversized build side becomes a grace hash join
+    /// rather than a sort-merge join.
+    #[tokio::test]
+    async fn an_oversized_join_becomes_a_grace_hash_join_when_enabled() {
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let plan = joined_plan(&ctx).await;
+        let out = SpillableJoinSelection::with_threshold_and_grace(Some(1), true)
+            .optimize(plan, ctx.copied_config().options())
+            .unwrap();
+        assert_eq!(
+            grace_joins(&out),
+            1,
+            "expected a grace hash join:\n{}",
+            displayable(out.as_ref()).indent(true)
+        );
+        assert!(
+            !displayable(out.as_ref()).indent(true).to_string().contains("SortMergeJoin"),
+            "grace should have been preferred over sort-merge"
+        );
+    }
+
+    /// The flag defaults off, so today's deployed behaviour is untouched: the
+    /// same plan still converts to sort-merge.
+    #[tokio::test]
+    async fn with_the_flag_off_the_sort_merge_conversion_is_unchanged() {
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let plan = joined_plan(&ctx).await;
+        let out = SpillableJoinSelection::with_threshold(Some(1))
+            .optimize(plan, ctx.copied_config().options())
+            .unwrap();
+        assert_eq!(grace_joins(&out), 0, "the flag is off; no grace join should appear");
+        assert!(
+            displayable(out.as_ref()).indent(true).to_string().contains("SortMergeJoin"),
+            "the sort-merge path must still work"
+        );
+    }
+
+    /// The substituted plan answers identically. A join that spills but returns
+    /// different rows is worse than the failure it prevents.
+    #[tokio::test]
+    async fn the_grace_plan_returns_the_same_rows() {
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let plan = joined_plan(&ctx).await;
+        let task_ctx = ctx.task_ctx();
+        let baseline = collect(Arc::clone(&plan), Arc::clone(&task_ctx)).await.unwrap();
+
+        let out = SpillableJoinSelection::with_threshold_and_grace(Some(1), true)
+            .optimize(plan, ctx.copied_config().options())
+            .unwrap();
+        assert_eq!(grace_joins(&out), 1, "the rule declined; this proved nothing");
+        let converted = collect(out, task_ctx).await.unwrap();
+
+        let cells = |bs: &[arrow::array::RecordBatch]| -> Vec<String> {
+            let mut rows: Vec<String> = bs
+                .iter()
+                .flat_map(|b| {
+                    (0..b.num_rows()).map(move |r| {
+                        (0..b.num_columns())
+                            .map(|c| {
+                                arrow::util::display::array_value_to_string(b.column(c), r)
+                                    .expect("cell")
+                            })
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    })
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(cells(&baseline), cells(&converted));
+        assert_eq!(cells(&converted), vec!["10|100", "20|200", "20|201"]);
+    }
+
+    /// A shape the grace join refuses must fall back, not fail the query. The
+    /// rule's contract is that it can always decline.
+    #[tokio::test]
+    async fn a_refused_shape_falls_back_instead_of_failing() {
+        // Two partitions on one side and one on the other is the broadcast
+        // shape `GraceHashJoinExec::try_new` rejects.
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+        let plan = joined_plan(&ctx).await;
+        let out = SpillableJoinSelection::with_threshold_and_grace(Some(1), true)
+            .optimize(Arc::clone(&plan), ctx.copied_config().options());
+        assert!(out.is_ok(), "a refusal must never fail the plan: {:?}", out.err());
     }
 }
