@@ -318,7 +318,26 @@ impl SpillableJoinSelection {
             });
         Self {
             threshold_bytes,
+            // NOT grace-aware. `from_capacity` is reached from the coordinator's
+            // planning context (`spill_join_build_bytes: None`), and a grace
+            // join in a stage plan cannot be encoded, which collapses the whole
+            // query to a single task. Grace is opted into explicitly by
+            // `for_local_execution`, which only the post-decode executor path
+            // calls.
+            grace: false,
+        }
+    }
+
+    /// Same threshold as [`Self::from_capacity`], but allowed to choose the
+    /// grace hash join.
+    ///
+    /// Only for plans that are already decoded and will not be serialized —
+    /// see `distributed_plan::apply_local_spill_strategy`.
+    #[must_use]
+    pub fn for_local_execution() -> Self {
+        Self {
             grace: crate::grace_hash_join::enabled(),
+            ..Self::from_capacity()
         }
     }
 
@@ -345,23 +364,38 @@ impl SpillableJoinSelection {
     fn effective_threshold(plan: &Arc<dyn ExecutionPlan>, threshold: u64) -> u64 {
         let mut sizes = Vec::new();
         collect_build_estimates(plan, &mut sizes);
-        let mut remaining = sizes.iter().copied().fold(0u64, u64::saturating_add);
-        if remaining <= threshold {
+        let total = sizes.iter().copied().fold(0u64, u64::saturating_add);
+        if total <= threshold {
             return threshold;
         }
-        sizes.sort_unstable_by(|a, b| b.cmp(a));
+        // Keep the SMALLEST joins as hash joins and convert upward, because the
+        // question is "which joins can we afford to leave un-spillable", and the
+        // cheapest ones are the ones worth keeping. Walk ascending, accumulate,
+        // and cut at the first join that would put the retained set over budget:
+        // that join and every larger one converts.
+        //
+        // The first version walked *descending* and returned the largest join's
+        // size, which is routinely far ABOVE the configured threshold — so the
+        // "budget" loosened the rule instead of tightening it, converting only
+        // the single biggest join where the plain per-join threshold would have
+        // converted every join over budget. Seen live on q10 as
+        // `threshold=974064839 configured_threshold=250000000`, and it is why
+        // this fix never moved q10 or q11.
+        sizes.sort_unstable();
+        let mut retained = 0u64;
         for size in &sizes {
-            remaining = remaining.saturating_sub(*size);
-            if remaining <= threshold {
+            if retained.saturating_add(*size) > threshold {
                 // `convert` compares with `<=`, so step just below this size to
-                // make a join of exactly it convert.
-                return size.saturating_sub(1);
+                // make a join of exactly it convert. Never above the configured
+                // threshold: a budget may only ever tighten.
+                return size.saturating_sub(1).min(threshold);
             }
+            retained = retained.saturating_add(*size);
         }
-        // Even converting everything with a known size does not fit. Convert
-        // all of them: a plan that spills is slow, a plan that cannot allocate
-        // is dead.
-        0
+        // Every join fits when taken in ascending order, which the total check
+        // above already ruled out; keep the configured threshold rather than
+        // invent one.
+        threshold
     }
 
     /// Explicit threshold, for tests. Keeps the sort-merge conversion.
@@ -1189,7 +1223,7 @@ mod budget_tests {
     /// `effective_threshold` reads estimates through `partition_statistics`, so
     /// the sizes have to come from real statistics rather than being injected.
     /// `MemoryExec` over batches of a known width gives that.
-    fn plan_with_build_sizes(sizes: &[u64]) -> Arc<dyn ExecutionPlan> {
+    pub(super) fn plan_with_build_sizes(sizes: &[u64]) -> Arc<dyn ExecutionPlan> {
         // Built directly rather than planned from SQL: the point is to control
         // the build estimates exactly, and a planner is free to reorder joins.
         let mut plan: Arc<dyn ExecutionPlan> = sized_source(1);
@@ -1689,6 +1723,86 @@ mod encodability_tests {
                 .to_string()
                 .contains("SortMergeJoin"),
             "the rule declined entirely, so encodability was never at stake"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod budget_never_loosens_tests {
+    use super::*;
+
+    /// A budget may only ever TIGHTEN the configured threshold.
+    ///
+    /// `effective_threshold` returns the largest join's size, and that is
+    /// routinely far above the configured threshold — so unclamped it converted
+    /// only the single biggest join where the plain per-join rule would have
+    /// converted every join over budget. Live on TPC-H q10:
+    ///
+    /// ```text
+    /// threshold=974064839  configured_threshold=250000000  budget_tightened=false
+    /// ```
+    ///
+    /// The whole point of the budget is to convert MORE under aggregate
+    /// pressure. Returning a looser threshold inverted it, which is why the fix
+    /// never moved q10 or q11.
+    #[test]
+    fn the_effective_threshold_never_exceeds_the_configured_one() {
+        // One huge join plus small ones: the huge one alone blows the budget,
+        // which is the shape that produced the inverted threshold.
+        for configured in [1_u64, 1_000, 250_000_000] {
+            let plan = super::budget_tests::plan_with_build_sizes(&[900, 40, 30, 20]);
+            let effective = SpillableJoinSelection::effective_threshold(&plan, configured);
+            assert!(
+                effective <= configured,
+                "effective threshold {effective} LOOSENED the configured {configured}"
+            );
+        }
+    }
+
+    /// And it still converts at least what the plain threshold would have.
+    #[test]
+    fn everything_over_the_configured_threshold_still_converts() {
+        let plan = super::budget_tests::plan_with_build_sizes(&[900, 400, 300]);
+        let mut sizes = Vec::new();
+        collect_build_estimates(&plan, &mut sizes);
+        let configured = *sizes.iter().min().expect("fixture has joins");
+        let effective = SpillableJoinSelection::effective_threshold(&plan, configured);
+        let converted = sizes.iter().filter(|s| **s > effective).count();
+        let would_have = sizes.iter().filter(|s| **s > configured).count();
+        assert!(
+            converted >= would_have,
+            "the budget converted {converted} joins where the plain threshold \
+             would have converted {would_have}"
+        );
+    }
+
+    /// The point of the budget: what is LEFT as hash joins must fit the budget.
+    ///
+    /// This is the property q10 needed and never had. Several joins that each
+    /// sit under the threshold, whose sum does not — the retained set has to
+    /// come in under budget, or the pool is exhausted at run time exactly as
+    /// before.
+    #[test]
+    fn the_joins_left_as_hash_joins_fit_the_budget() {
+        let plan = super::budget_tests::plan_with_build_sizes(&[200; 8]);
+        let mut sizes = Vec::new();
+        collect_build_estimates(&plan, &mut sizes);
+        let total: u64 = sizes.iter().copied().fold(0, u64::saturating_add);
+        // A budget every join clears individually, that the sum does not.
+        let budget = *sizes.iter().max().expect("fixture has joins") * 2;
+        assert!(total > budget, "fixture must create aggregate pressure");
+
+        let effective = SpillableJoinSelection::effective_threshold(&plan, budget);
+        let retained: u64 = sizes
+            .iter()
+            .copied()
+            .filter(|s| *s <= effective)
+            .fold(0, u64::saturating_add);
+        assert!(
+            retained <= budget,
+            "un-converted joins sum to {retained}, over the {budget} budget \
+             (effective {effective}, sizes {sizes:?})"
         );
     }
 }

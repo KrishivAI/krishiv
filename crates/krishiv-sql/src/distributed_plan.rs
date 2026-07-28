@@ -738,7 +738,7 @@ fn apply_local_spill_strategy(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn Execution
     if !crate::grace_hash_join::enabled() {
         return plan;
     }
-    let rule = crate::spillable_join::SpillableJoinSelection::from_capacity();
+    let rule = crate::spillable_join::SpillableJoinSelection::for_local_execution();
     match rule.optimize(Arc::clone(&plan), &datafusion::common::config::ConfigOptions::default()) {
         Ok(rewritten) => rewritten,
         Err(error) => {

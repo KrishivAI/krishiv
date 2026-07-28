@@ -5607,6 +5607,7 @@ dependencies = [
  "arrow 58.3.0",
  "criterion",
  "datafusion 54.0.0",
+ "futures",
  "krishiv-api",
  "krishiv-dataflow",
  "krishiv-delta",
