@@ -41,16 +41,34 @@ pub(crate) const TASK_FAILURE_MESSAGE_MAX_BYTES: usize = 4096;
 pub(crate) const TASK_FAILURE_FRAGMENT_MAX_BYTES: usize = 256;
 
 /// Truncate `s` to at most `max` bytes on a char boundary, appending `…`.
+///
+/// "At most `max` bytes" is the whole point — [`format_failure_message`] uses
+/// this as the last guard before a message goes on the wire, so the number has
+/// to be a real ceiling. It was not: `…` is **three** UTF-8 bytes and was
+/// appended *after* truncating to `max - 1`, so the result could come back at
+/// `max + 2`. Harmless against a 4096-byte budget with slack, and exactly the
+/// kind of guard that is wrong in the direction nobody checks. The ellipsis is
+/// now part of the budget rather than added to it.
 fn truncate_on_char_boundary(s: &str, max: usize) -> String {
+    const ELLIPSIS: &str = "…";
     if s.len() <= max {
         return s.to_owned();
     }
-    let mut end = max.saturating_sub(1);
+    // Below the ellipsis's own width there is no room to signal truncation;
+    // emitting it anyway would be the overflow this exists to prevent.
+    let budget = if max >= ELLIPSIS.len() {
+        max - ELLIPSIS.len()
+    } else {
+        max
+    };
+    let mut end = budget;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
     let mut out = s[..end].to_owned();
-    out.push('…');
+    if max >= ELLIPSIS.len() {
+        out.push_str(ELLIPSIS);
+    }
     out
 }
 
@@ -301,5 +319,169 @@ mod missing_shuffle_tests {
         let (stage, part) = parse_missing_shuffle_marker(&s).expect("parses");
         assert_eq!(stage, "s10.m0");
         assert_eq!(part, 42);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod failure_message_tests {
+    use super::*;
+
+    /// The ceiling has to be a real ceiling: this is the last guard before a
+    /// failure message goes on the wire.
+    ///
+    /// `…` is three UTF-8 bytes and used to be appended *after* truncating to
+    /// `max - 1`, so the result came back at `max + 2`.
+    #[test]
+    fn truncation_never_exceeds_the_stated_maximum() {
+        let long = "x".repeat(1000);
+        for max in [0usize, 1, 2, 3, 4, 10, 255, 256, 999] {
+            let out = truncate_on_char_boundary(&long, max);
+            assert!(
+                out.len() <= max,
+                "max={max}: truncation produced {} bytes",
+                out.len()
+            );
+        }
+    }
+
+    /// Truncation must not split a multi-byte character — a `String` cannot
+    /// hold invalid UTF-8, so getting this wrong is a panic, not a bad string.
+    #[test]
+    fn truncation_lands_on_a_char_boundary_for_multibyte_input() {
+        // Four-byte characters, so almost every byte offset is mid-character.
+        let emoji = "🌍".repeat(50);
+        for max in 0..40 {
+            let out = truncate_on_char_boundary(&emoji, max);
+            assert!(out.len() <= max, "max={max} produced {} bytes", out.len());
+            assert!(emoji.starts_with(out.trim_end_matches('…')));
+        }
+    }
+
+    #[test]
+    fn input_within_the_budget_is_returned_untouched() {
+        assert_eq!(truncate_on_char_boundary("short", 64), "short");
+        assert_eq!(truncate_on_char_boundary("exact", 5), "exact");
+    }
+
+    /// The regression that made real cluster failures unreadable: a `dfplan:`
+    /// fragment runs to tens of kilobytes of base64, and truncating the
+    /// *assembled* message from the end kept the fragment and threw away the
+    /// error. The error is the diagnosis; it has to survive.
+    #[test]
+    fn a_huge_fragment_does_not_push_the_error_out_of_the_message() {
+        let fragment = format!("dfplan:v1:0:{}", "QUFB".repeat(5000));
+        let error = "Resources exhausted: Failed to allocate additional 877.0 B for HashJoinInput";
+        let msg = format_failure_message(&fragment, error);
+        assert!(
+            msg.ends_with(error),
+            "the error must survive intact; got: {msg}"
+        );
+        assert!(
+            msg.len() <= TASK_FAILURE_MESSAGE_MAX_BYTES,
+            "message is {} bytes, over the wire budget",
+            msg.len()
+        );
+        assert!(
+            msg.contains("dfplan:v1:0:"),
+            "enough of the fragment must survive to identify it: {msg}"
+        );
+    }
+
+    /// Short fragments are context worth keeping whole.
+    #[test]
+    fn a_short_fragment_is_echoed_verbatim() {
+        let msg = format_failure_message("sql: select 1", "table not found");
+        assert_eq!(
+            msg,
+            "executor failed fragment 'sql: select 1': table not found"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod local_parquet_tests {
+    use super::*;
+
+    fn described(id: u32, description: &str) -> InputPartition {
+        InputPartition::new(id.to_string(), description.to_owned())
+    }
+
+    #[test]
+    fn a_descriptor_string_is_split_into_table_and_path() {
+        let parsed = LocalParquetPartition::parse(&described(0, "local-parquet:orders:/data/o.pq"))
+            .expect("parse")
+            .expect("recognised");
+        assert_eq!(parsed.table_name(), "orders");
+        assert_eq!(parsed.path(), Path::new("/data/o.pq"));
+    }
+
+    /// A path containing `:` (a URI, a Windows drive) must keep its colons:
+    /// `split_once` takes the FIRST separator, so only the table name is cut.
+    #[test]
+    fn only_the_first_colon_separates_the_table_from_the_path() {
+        let parsed = LocalParquetPartition::parse(&described(
+            0,
+            "local-parquet:orders:file:///data/o.pq",
+        ))
+        .expect("parse")
+        .expect("recognised");
+        assert_eq!(parsed.table_name(), "orders");
+        assert_eq!(parsed.path(), Path::new("file:///data/o.pq"));
+    }
+
+    #[test]
+    fn a_partition_of_another_kind_is_not_claimed() {
+        let parsed = LocalParquetPartition::parse(&described(0, "shuffle-write:whatever"))
+            .expect("parse must not error on a foreign descriptor");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn an_empty_table_name_or_path_is_rejected_by_name() {
+        for (desc, want) in [
+            ("local-parquet::/data/o.pq", "table name"),
+            ("local-parquet:orders:", "path"),
+        ] {
+            let err = LocalParquetPartition::parse(&described(0, desc))
+                .expect_err("must be refused");
+            assert!(
+                err.to_string().contains(want),
+                "{desc}: error must name the missing field, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_descriptor_without_a_colon_is_refused() {
+        let err = LocalParquetPartition::parse(&described(0, "local-parquet:orders"))
+            .expect_err("must be refused");
+        assert!(err.to_string().contains("local-parquet:<table>:<path>"));
+    }
+
+    /// Two partitions registering the same table name would have the second
+    /// silently shadow the first in the session context, so the task would read
+    /// one file and report success for both.
+    #[test]
+    fn a_duplicate_table_name_across_partitions_is_refused() {
+        let partitions = vec![
+            described(0, "local-parquet:orders:/data/a.pq"),
+            described(1, "local-parquet:orders:/data/b.pq"),
+        ];
+        let err = parse_local_parquet_partitions(&partitions).expect_err("must be refused");
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn distinct_tables_and_foreign_partitions_coexist() {
+        let partitions = vec![
+            described(0, "local-parquet:orders:/data/a.pq"),
+            described(1, "shuffle-write:s1"),
+            described(2, "local-parquet:lineitem:/data/b.pq"),
+        ];
+        let parsed = parse_local_parquet_partitions(&partitions).expect("parse");
+        let names: Vec<&str> = parsed.iter().map(|p| p.table_name()).collect();
+        assert_eq!(names, vec!["orders", "lineitem"]);
     }
 }

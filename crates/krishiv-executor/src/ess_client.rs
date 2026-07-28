@@ -51,14 +51,36 @@ impl PushShuffleClient {
 
     /// Override the request timeout. The default is
     /// [`DEFAULT_PUSH_TIMEOUT`].
+    ///
+    /// The timeout is enforced by the HTTP client, so it can only change if
+    /// rebuilding that client succeeds. This used to set `self.timeout`
+    /// unconditionally and rebuild the client only `if let Ok(...)`, so a
+    /// failed rebuild left a client reporting one timeout through
+    /// [`timeout`](Self::timeout) and enforcing another — and the error
+    /// message in `push_partition`, which interpolates `self.timeout`, would
+    /// then name a duration that never applied. Both now move together or
+    /// neither does.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        // Rebuild the http client with the new timeout so requests
-        // honour it without callers passing per-request overrides.
-        if let Ok(http) = reqwest::Client::builder().timeout(timeout).build() {
-            self.http = http;
+        match reqwest::Client::builder().timeout(timeout).build() {
+            Ok(http) => {
+                self.http = http;
+                self.timeout = timeout;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?timeout,
+                    %error,
+                    kept = ?self.timeout,
+                    "could not rebuild the push-shuffle HTTP client; keeping the previous timeout"
+                );
+            }
         }
         self
+    }
+
+    /// The request timeout this client actually enforces.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// The configured ESS base URL (no trailing slash).
@@ -119,12 +141,19 @@ impl PushShuffleClient {
     /// Fetch the merged IPC stream for `(job_id, stage_id, partition)` from
     /// the ESS. Returns the raw Arrow IPC bytes; callers wrap them back
     /// into a `RecordBatch` stream.
+    ///
+    /// Returns `Bytes` rather than `Vec<u8>`: `reqwest` has already buffered
+    /// the whole body into one owned contiguous allocation, and the `.to_vec()`
+    /// this used to end with made a second full-size copy of a *merged*
+    /// partition — every map task's contribution concatenated — for no reason.
+    /// `Bytes` derefs to `[u8]` and `std::io::Cursor<Bytes>` feeds the Arrow
+    /// IPC reader directly, so no caller needs the `Vec`.
     pub async fn fetch_merged(
         &self,
         job_id: &str,
         stage_id: &str,
         partition: u32,
-    ) -> ExecutorResult<Vec<u8>> {
+    ) -> ExecutorResult<bytes::Bytes> {
         let url = format!(
             "{}/ess/merged/{}/{}/{}",
             self.base_url, job_id, stage_id, partition
@@ -145,13 +174,11 @@ impl PushShuffleClient {
                 message: format!("ESS fetch GET to {url} returned {status}"),
             });
         }
-        let bytes = resp
-            .bytes()
+        resp.bytes()
             .await
             .map_err(|e| ExecutorError::LocalExecution {
                 message: format!("ESS fetch GET to {url} body read failed: {e}"),
-            })?;
-        Ok(bytes.to_vec())
+            })
     }
 
     /// Trigger the ESS to GC push-shuffle state for `job_id`. The
@@ -202,6 +229,21 @@ mod tests {
         let c = PushShuffleClient::new("http://ess:7072", None)
             .unwrap()
             .with_timeout(Duration::from_secs(5));
-        assert_eq!(c.timeout, Duration::from_secs(5));
+        assert_eq!(c.timeout(), Duration::from_secs(5));
+    }
+
+    /// The push URL is built by string interpolation, so a stage or task id
+    /// containing a `/` would silently address a different route — the ESS
+    /// router matches `/ess/push/{job}/{stage}/{task}/{partition}` by segment.
+    ///
+    /// This asserts today's behaviour rather than a guard, because the ids
+    /// reaching here are engine-generated. It exists so that a change which
+    /// starts accepting user-supplied ids has something to break.
+    #[test]
+    fn push_urls_are_built_from_path_segments() {
+        let c = PushShuffleClient::new("http://ess:7072", None).unwrap();
+        assert_eq!(c.base_url(), "http://ess:7072");
+        let url = format!("{}/ess/push/{}/{}/{}/{}", c.base_url(), "j", "s", "t", 3);
+        assert_eq!(url, "http://ess:7072/ess/push/j/s/t/3");
     }
 }

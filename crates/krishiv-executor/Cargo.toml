@@ -24,6 +24,9 @@ base64 = { workspace = true }
 constant_time_eq = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
+# `Bytes` for the ESS fetch path: reqwest already buffers the body into one,
+# and returning it avoids a second full-size copy of a merged partition.
+bytes = { workspace = true }
 indexmap = { workspace = true }
 twox-hash = { workspace = true }
 krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
