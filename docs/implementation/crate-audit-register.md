@@ -120,7 +120,53 @@ Uncovered-region concentration (this decides what to test next):
 
 ---
 
-## 2–27. Not yet started
+## 3. krishiv-shuffle — in progress
+
+Measured: **81.07% regions, 68.67% functions, 78.07% lines** (11,475 regions,
+2,172 uncovered).
+
+| file | uncovered | cover | note |
+|---|---|---|---|
+| shuffle_svc.rs | **438** | **6.61%** | 44 untested fns — biggest hole in the crate |
+| flight.rs | 296 | 76.64% | 61 untested fns; the shuffle transport |
+| disk_store.rs | 281 | 73.76% | the store the cluster uses |
+| range_partitioner.rs | 236 | 58.01% | |
+| storage_uri.rs | **181** | **0.00%** | never executed by any test |
+| sort_shuffle_writer.rs | 164 | 77.41% | |
+| object_store.rs | 114 | 66.47% | |
+
+### Fixed
+
+- [x] **Spill files were reclaimable only by a boot that could not happen**
+      (`7e8c9a26`). Spills are written flat in the scratch root so
+      `scan_orphans` cannot delete a live task's data — which also made them
+      invisible to the sweeper, leaving `cleanup_temp_files` at store
+      construction as the only reclaim path. An executor died holding 74 GB on
+      a 145 GB node; the kubelet GC'd the engine image to reclaim disk, the
+      replacement hit `ImagePullBackOff`, and the boot that would have freed
+      the space could not run. Added ownership-stamped spill names and
+      `reclaim_foreign_spills`, wired into the periodic sweep.
+
+      Two rules that look right and are not, recorded so they are not retried:
+      **pid** (container PID namespace reuses it across restarts) and
+      **mtime** (a spill lives for the whole map task, 20-60 min at SF100, so
+      any safe threshold reclaims nothing).
+
+### Open
+
+- [ ] `shuffle_svc.rs` at 6.61% — 44 untested functions
+- [ ] `storage_uri.rs` at 0.00%
+- [ ] D7 streaming write: `ShuffleStore::write_partition` takes a whole
+      partition and has no append (`store.rs:51`), which forces the executor
+      to materialise one. `LocalDiskShuffleStore` writes via `ArrowWriter`,
+      which accepts batches incrementally, so this is buildable without a
+      format change.
+- [ ] `flight.rs` 61 untested fns — the path a coalesced partition travels,
+      and the tonic 4 MiB decode limit already broke q10 once
+
+---
+
+## 2, 4–27. Not yet started
 
 Each crate gets the same treatment and its own section here: measured
 coverage, a table of uncovered-region concentration, a fixed list with commit
