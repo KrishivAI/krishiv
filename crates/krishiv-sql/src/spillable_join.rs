@@ -842,6 +842,55 @@ mod projection_tests {
         .unwrap()
     }
 
+    /// Number of `SortMergeJoinExec` nodes anywhere in `plan`.
+    ///
+    /// The precondition every test below depends on. `convert` has six ways to
+    /// decline (mode, absent statistics, build side under threshold, no sort
+    /// keys, `SortMergeJoinExec::try_new` refusing, projection out of range),
+    /// and every one of them returns the plan **unchanged** — which passes an
+    /// assertion that the output still matches the input. Without this count, a
+    /// rule that silently stopped converting would leave the whole module
+    /// green.
+    fn sort_merge_join_count(plan: &Arc<dyn ExecutionPlan>) -> usize {
+        // `ExecutionPlan: Any` — upcast to downcast (DF 54 has no `as_any`).
+        let any = plan.as_ref() as &dyn std::any::Any;
+        let here = usize::from(any.downcast_ref::<SortMergeJoinExec>().is_some());
+        here + plan
+            .children()
+            .iter()
+            .map(|c| sort_merge_join_count(c))
+            .sum::<usize>()
+    }
+
+    /// Whether any `HashJoinExec` in `plan` carries a built-in projection —
+    /// the condition `reapply_projection` exists for.
+    fn has_projected_hash_join(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        let any = plan.as_ref() as &dyn std::any::Any;
+        any.downcast_ref::<HashJoinExec>()
+            .is_some_and(HashJoinExec::contains_projection)
+            || plan.children().iter().any(|c| has_projected_hash_join(c))
+    }
+
+    /// Every cell, row-sorted — not a row count.
+    fn cells(batches: &[arrow::array::RecordBatch]) -> Vec<String> {
+        let mut rows: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows()).map(move |r| {
+                    (0..b.num_columns())
+                        .map(|c| {
+                            arrow::util::display::array_value_to_string(b.column(c), r)
+                                .expect("cell")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
     #[tokio::test]
     async fn converting_a_projected_join_keeps_the_output_columns() {
         // The live failure: converting a join that carries a projection widened
@@ -851,11 +900,21 @@ mod projection_tests {
         let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
         let plan = stacked_projected_plan(&ctx).await;
         let before_schema = plan.schema();
+        assert!(
+            has_projected_hash_join(&plan),
+            "fixture must build a hash join carrying a projection, or this tests nothing:\n{}",
+            displayable(plan.as_ref()).indent(true)
+        );
 
         let out = SpillableJoinSelection::with_threshold(Some(1))
             .optimize(Arc::clone(&plan), ctx.copied_config().options())
             .expect("the rule must not fail the plan");
 
+        assert!(
+            sort_merge_join_count(&out) > 0,
+            "the rule declined, so the conversion under test never ran:\n{}",
+            displayable(out.as_ref()).indent(true)
+        );
         assert_eq!(
             out.schema(),
             before_schema,
@@ -864,24 +923,32 @@ mod projection_tests {
         );
     }
 
+    /// The values, not the shape.
+    ///
+    /// `reapply_projection` re-indexes the join's projection against the
+    /// *converted* join's schema and takes each output column's name from that
+    /// schema too. If those indices ever addressed different columns, the names
+    /// and types would still line up — they are read from the same place the
+    /// data is — so a schema comparison, a row count and a column count would
+    /// all agree while every value was wrong. Only comparing cells catches it.
     #[tokio::test]
-    async fn the_converted_projected_plan_returns_the_same_rows() {
+    async fn the_converted_projected_plan_returns_the_same_values() {
         let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
         let plan = stacked_projected_plan(&ctx).await;
         let task_ctx = ctx.task_ctx();
+        assert!(has_projected_hash_join(&plan), "fixture must project");
 
         let before = collect(Arc::clone(&plan), Arc::clone(&task_ctx)).await.unwrap();
         let out = SpillableJoinSelection::with_threshold(Some(1))
             .optimize(plan, ctx.copied_config().options())
             .unwrap();
+        assert!(
+            sort_merge_join_count(&out) > 0,
+            "the rule declined, so the conversion under test never ran"
+        );
         let after = collect(out, task_ctx).await.unwrap();
 
-        let rows = |b: &[arrow::array::RecordBatch]| -> usize {
-            b.iter().map(arrow::array::RecordBatch::num_rows).sum()
-        };
-        assert_eq!(rows(&before), rows(&after), "row count changed");
-        assert_eq!(rows(&after), 1, "expected the single matching row");
-        let cols = |b: &[arrow::array::RecordBatch]| b.first().map(|x| x.num_columns());
-        assert_eq!(cols(&before), cols(&after), "column count changed");
+        assert_eq!(cells(&before), cells(&after), "converted plan changed the data");
+        assert_eq!(cells(&after), vec![String::from("a|3")], "expected the single matching row");
     }
 }
