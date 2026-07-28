@@ -71,6 +71,7 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::Result;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::joins::utils::JoinFilter;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
@@ -144,6 +145,127 @@ fn build_bytes_estimate(hash_join: &HashJoinExec) -> Option<u64> {
             estimated_build_bytes_from_rows(&stats, &hash_join.left().schema())
         }
     }
+}
+
+/// Reorder a join filter so that every left-side column precedes every
+/// right-side one.
+///
+/// # The bug this works around
+///
+/// DataFusion's sort-merge join builds the filter's intermediate batch as
+/// **all left columns followed by all right columns**
+/// (`joins/sort_merge_join/filter.rs::get_filter_columns`, reached from
+/// `materializing_stream.rs`):
+///
+/// ```text
+/// filter_columns.extend(left_columns);   // every Left entry, in order
+/// filter_columns.extend(right_columns);  // then every Right entry
+/// ```
+///
+/// But `JoinFilter::schema()` is ordered by `column_indices` **as given**, and
+/// `HashJoinExec` builds the batch in that same given order. So a filter whose
+/// `column_indices` name a right-side column before a left-side one is correct
+/// under hash join and wrong under sort-merge: the batch's columns no longer
+/// line up with the schema, and Arrow refuses it.
+///
+/// That is TPC-H q17 and q19 at SF100, verbatim:
+///
+/// ```text
+/// q17: expected Decimal128(15, 2) but found Decimal128(30, 15) at column index 0
+/// q19: expected Decimal128(15, 2) but found Utf8View        at column index 0
+/// ```
+///
+/// Both filters name `l_quantity` (right) first, so column 0 received the left
+/// side's first column instead — the `0.2 * avg(l_quantity)` expression in q17,
+/// `p_brand` in q19. Neither query is doing anything unusual; any filter that
+/// mentions the probe side first hits it.
+///
+/// (DataFusion's own *other* sort-merge path, `bitwise_stream.rs`'s
+/// `evaluate_filter_for_inner_row`, iterates `column_indices` in order and is
+/// correct. The two paths disagree with each other, which is what makes this a
+/// DataFusion bug rather than a contract we were misreading.)
+///
+/// # The fix
+///
+/// Permute `column_indices` and the intermediate schema into the order
+/// sort-merge is going to materialise anyway, and rewrite the filter
+/// expression's column indices to match. The filter then means exactly what it
+/// meant before, expressed in the layout the operator actually builds.
+///
+/// Returns `None` when the filter cannot be normalised (a `JoinSide::None`
+/// entry, or an expression column outside the intermediate schema), in which
+/// case the caller keeps the hash join — declining is always safe.
+fn left_first_filter(filter: &JoinFilter) -> Option<JoinFilter> {
+    use datafusion::common::JoinSide;
+    use datafusion::physical_expr::expressions::Column;
+
+    let indices = filter.column_indices();
+    let mut order: Vec<usize> = Vec::with_capacity(indices.len());
+    order.extend(
+        indices
+            .iter()
+            .enumerate()
+            .filter(|(_, ci)| ci.side == JoinSide::Left)
+            .map(|(at, _)| at),
+    );
+    order.extend(
+        indices
+            .iter()
+            .enumerate()
+            .filter(|(_, ci)| ci.side == JoinSide::Right)
+            .map(|(at, _)| at),
+    );
+    // A side we do not understand (`JoinSide::None`) would be dropped by the
+    // partition above; refuse rather than silently lose a filter column.
+    if order.len() != indices.len() {
+        return None;
+    }
+    // Already left-first: hand back the filter untouched so the common case
+    // allocates nothing and stays byte-identical.
+    if order.iter().enumerate().all(|(to, from)| to == *from) {
+        return Some(filter.clone());
+    }
+
+    let mut moved_to = vec![0usize; indices.len()];
+    for (to, &from) in order.iter().enumerate() {
+        *moved_to.get_mut(from)? = to;
+    }
+
+    let fields = filter.schema().fields();
+    let mut permuted = Vec::with_capacity(order.len());
+    for &from in &order {
+        permuted.push(fields.get(from)?.as_ref().clone());
+    }
+    let schema = Arc::new(arrow::datatypes::Schema::new(permuted));
+    let column_indices: Vec<_> = order
+        .iter()
+        .map(|&from| indices.get(from).cloned())
+        .collect::<Option<Vec<_>>>()?;
+
+    // The filter expression addresses the intermediate schema positionally, so
+    // permuting that schema means re-pointing every column in the expression.
+    type Expr = Arc<dyn datafusion::physical_expr::PhysicalExpr>;
+    let original: Expr = Arc::clone(filter.expression());
+    let expression = original
+        .transform(|node: Expr| {
+            // `PhysicalExpr: Any` — upcast to downcast, as elsewhere in this file.
+            let any = node.as_ref() as &dyn std::any::Any;
+            let Some(column) = any.downcast_ref::<Column>() else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(&to) = moved_to.get(column.index()) else {
+                return Err(datafusion::error::DataFusionError::Internal(format!(
+                    "join filter column {} is outside its {}-column intermediate schema",
+                    column.index(),
+                    moved_to.len()
+                )));
+            };
+            Ok(Transformed::yes(Arc::new(Column::new(column.name(), to)) as Expr))
+        })
+        .ok()?
+        .data;
+
+    Some(JoinFilter::new(expression, column_indices, schema))
 }
 
 /// Every hash join's build estimate in `plan`, in no particular order.
@@ -452,6 +574,25 @@ impl SpillableJoinSelection {
                 .with_preserve_partitioning(preserve_partitioning),
         );
 
+        // Sort-merge materialises the filter's columns left-side-first
+        // regardless of the order `column_indices` declares, so a filter that
+        // names a right-side column first has to be permuted into that layout
+        // or the batch will not match its own schema. See `left_first_filter` —
+        // this is q17 and q19 at SF100.
+        let filter = match hash_join.filter() {
+            Some(filter) => match left_first_filter(filter) {
+                Some(normalised) => Some(normalised),
+                None => {
+                    tracing::debug!(
+                        "spillable-join: join filter cannot be reordered for sort-merge, \
+                         keeping hash join"
+                    );
+                    return Ok(None);
+                }
+            },
+            None => None,
+        };
+
         // Let SortMergeJoinExec's own validation decide whether this join
         // shape (type, filter) is supported; on refusal, keep the hash join
         // rather than fail the query.
@@ -459,7 +600,7 @@ impl SpillableJoinSelection {
             sorted_left,
             sorted_right,
             on.to_vec(),
-            hash_join.filter().cloned(),
+            filter,
             *hash_join.join_type(),
             sort_options,
             hash_join.null_equality(),
@@ -1348,5 +1489,136 @@ mod grace_tests {
         let out = SpillableJoinSelection::with_threshold_and_grace(Some(1), true)
             .optimize(Arc::clone(&plan), ctx.copied_config().options());
         assert!(out.is_ok(), "a refusal must never fail the plan: {:?}", out.err());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod join_filter_order_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::JoinSide;
+    use datafusion::physical_expr::expressions::{BinaryExpr, Column};
+    use datafusion::physical_plan::joins::utils::ColumnIndex;
+
+    /// A filter naming the right side first — the shape q17 and q19 produce.
+    /// Intermediate schema is `[q: Decimal (right), b: Utf8 (left)]`.
+    fn right_first() -> JoinFilter {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("q", DataType::Decimal128(15, 2), true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let expression = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("q", 0)),
+            datafusion::logical_expr::Operator::Lt,
+            Arc::new(Column::new("b", 1)),
+        ));
+        JoinFilter::new(
+            expression,
+            vec![
+                ColumnIndex { index: 0, side: JoinSide::Right },
+                ColumnIndex { index: 0, side: JoinSide::Left },
+            ],
+            schema,
+        )
+    }
+
+    /// Sort-merge materialises `[all left] ++ [all right]`, so the normalised
+    /// filter must declare exactly that order.
+    #[test]
+    fn a_right_first_filter_is_reordered_to_left_first() {
+        let out = left_first_filter(&right_first()).expect("normalisable");
+        assert_eq!(
+            out.column_indices()
+                .iter()
+                .map(|c| c.side)
+                .collect::<Vec<_>>(),
+            vec![JoinSide::Left, JoinSide::Right],
+        );
+        assert_eq!(
+            out.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+            vec!["b".to_string(), "q".to_string()],
+            "the intermediate schema must follow the new column order"
+        );
+    }
+
+    /// Reordering the schema without re-pointing the expression would leave a
+    /// filter that reads the wrong columns — the same class of silent wrong
+    /// answer, just moved. `q` was at 0 and must now be at 1.
+    #[test]
+    fn the_expression_is_repointed_at_the_new_positions() {
+        let out = left_first_filter(&right_first()).expect("normalisable");
+        let rendered = format!("{}", out.expression());
+        assert!(
+            rendered.contains("q@1") && rendered.contains("b@0"),
+            "expression still points at the old positions: {rendered}"
+        );
+    }
+
+    /// A filter already in left-first order is returned unchanged, so the
+    /// common case costs nothing and cannot be perturbed.
+    #[test]
+    fn an_already_left_first_filter_is_untouched() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Utf8, true),
+            Field::new("q", DataType::Decimal128(15, 2), true),
+        ]));
+        let expression = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("b", 0)),
+            datafusion::logical_expr::Operator::Lt,
+            Arc::new(Column::new("q", 1)),
+        ));
+        let filter = JoinFilter::new(
+            expression,
+            vec![
+                ColumnIndex { index: 0, side: JoinSide::Left },
+                ColumnIndex { index: 0, side: JoinSide::Right },
+            ],
+            schema,
+        );
+        let out = left_first_filter(&filter).expect("normalisable");
+        assert_eq!(format!("{}", out.expression()), format!("{}", filter.expression()));
+        assert_eq!(out.column_indices(), filter.column_indices());
+    }
+
+    /// Interleaved sides keep their relative order within each side — that is
+    /// what `get_filter_columns` produces, and anything else would mis-map.
+    #[test]
+    fn relative_order_within_each_side_is_preserved() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("r0", DataType::Int32, true),
+            Field::new("l0", DataType::Int32, true),
+            Field::new("r1", DataType::Int32, true),
+            Field::new("l1", DataType::Int32, true),
+        ]));
+        let filter = JoinFilter::new(
+            Arc::new(Column::new("l1", 3)),
+            vec![
+                ColumnIndex { index: 7, side: JoinSide::Right },
+                ColumnIndex { index: 5, side: JoinSide::Left },
+                ColumnIndex { index: 9, side: JoinSide::Right },
+                ColumnIndex { index: 6, side: JoinSide::Left },
+            ],
+            schema,
+        );
+        let out = left_first_filter(&filter).expect("normalisable");
+        assert_eq!(
+            out.column_indices()
+                .iter()
+                .map(|c| (c.side, c.index))
+                .collect::<Vec<_>>(),
+            vec![
+                (JoinSide::Left, 5),
+                (JoinSide::Left, 6),
+                (JoinSide::Right, 7),
+                (JoinSide::Right, 9),
+            ],
+        );
+        // l1 was the 4th column (index 3) and is now the 2nd (index 1).
+        assert_eq!(format!("{}", out.expression()), "l1@1");
     }
 }

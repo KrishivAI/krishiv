@@ -4498,6 +4498,31 @@ mod staged_tpch_tests {
         staged_matches_direct_with_broadcast(Q19, None, Some(0), "q19/no-broadcast").await;
     }
 
+    /// The cell the matrix was missing — and the only one the cluster is in.
+    ///
+    /// The conversion tests above all run the *broadcast* shape, and the
+    /// no-broadcast tests all run *unconverted* joins. SF100 does both at once:
+    /// no build side is under the 32 MiB ceiling, so both sides hash-shuffle,
+    /// **and** the build sides are far over the spill threshold, so
+    /// `SpillableJoinSelection` rewrites them to sort-merge. Two settings that
+    /// are each covered alone and never together.
+    ///
+    /// That combination is what `reapply_projection` runs in: a projected join
+    /// whose converted form is a `SortMergeJoinExec` (which has no projection of
+    /// its own) sitting under a shuffle, where the reduce side concatenates real
+    /// IPC data against the declared schema.
+    #[tokio::test]
+    async fn staged_q17_matches_direct_execution_converted_and_without_broadcast() {
+        staged_matches_direct_with_broadcast(Q17, Some(0), Some(0), "q17/converted+no-broadcast")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn staged_q19_matches_direct_execution_converted_and_without_broadcast() {
+        staged_matches_direct_with_broadcast(Q19, Some(0), Some(0), "q19/converted+no-broadcast")
+            .await;
+    }
+
     #[tokio::test]
     async fn staged_q22_matches_direct_execution_without_broadcast() {
         let tmp = tempfile::tempdir().expect("tempdir");
