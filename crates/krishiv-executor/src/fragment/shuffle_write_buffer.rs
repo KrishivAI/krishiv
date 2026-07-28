@@ -574,10 +574,19 @@ impl ShuffleWriteBuffer {
         //    removes those at store construction, i.e. at executor boot and
         //    never concurrently with a task, so runs orphaned by a SIGKILL are
         //    reclaimed on the next start instead of accumulating.
-        let path = self.spill_dir.join(format!(
-            "shuffle-write-{}-{seq}-p{index}.tmp.arrow-ipc",
-            std::process::id()
-        ));
+        //  * stamped with this process's owner id rather than its pid, so the
+        //    periodic orphan sweep can tell a live spill from one left by a
+        //    dead executor. A pid cannot: executors run in a container PID
+        //    namespace and a restart is routinely handed the same pid. Before
+        //    this, the only thing that ever reclaimed a spill was
+        //    `cleanup_temp_files` at store construction — and an executor that
+        //    dies on a full disk cannot boot to run it (2026-07-28: 74 GB
+        //    stranded on a 145 GB node, whose kubelet then GC'd the engine
+        //    image, so the boot that would have freed the space could not
+        //    happen).
+        let path = self
+            .spill_dir
+            .join(krishiv_shuffle::spill_file_name(seq, index));
         let dir = self.spill_dir.clone();
         let write_path = path.clone();
 

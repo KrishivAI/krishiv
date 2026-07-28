@@ -155,8 +155,135 @@ impl OrphanReclaimTracker {
             }
         }
 
-        cleanup_orphans(base_dir, &protected)
+        // Spill files live outside the job-directory tree this sweep walks, so
+        // they need their own pass. Without it the only thing that ever
+        // reclaims them is executor boot — which is exactly what cannot happen
+        // when a full disk has caused the kubelet to evict the image.
+        let spills = reclaim_foreign_spills(base_dir)?;
+
+        Ok(cleanup_orphans(base_dir, &protected)? + spills)
     }
+}
+
+/// Identity of *this* process instance, for naming spill files.
+///
+/// # Why not the pid
+///
+/// Spill files used to be named with `std::process::id()`, and the plan was
+/// that a sweeper could delete any file not belonging to the running process.
+/// That does not hold here: executors run in a container PID namespace, so a
+/// restarted executor is routinely handed the same pid as the one it replaced,
+/// and a dead process's files would look live forever.
+///
+/// # Why not mtime
+///
+/// The other obvious rule — "delete `.tmp.` files older than N minutes" — is
+/// worse than useless. A spill lives from the moment it is written until the
+/// partition is drained, which is the whole map task; at SF100 that is twenty
+/// minutes to an hour. Any age threshold long enough to be safe is too long to
+/// reclaim anything, and any threshold short enough to reclaim deletes live
+/// spills mid-task.
+///
+/// So the file carries the identity of the process that created it. A file
+/// stamped with a different owner is definitionally from a process that is
+/// gone, whatever pid it had and however recently it was written.
+pub fn spill_owner_id() -> u64 {
+    static OWNER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *OWNER.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // Two executors could start in the same nanosecond on the same host;
+        // mixing in the pid makes the pair unique without relying on either
+        // alone.
+        nanos.rotate_left(17) ^ u64::from(std::process::id())
+    })
+}
+
+/// Prefix every shuffle-write spill file shares, so the sweeper can recognise
+/// one without knowing how the rest of the name is built.
+pub const SPILL_FILE_PREFIX: &str = "shuffle-write-";
+
+/// Name a shuffle-write spill file so [`reclaim_foreign_spills`] can tell
+/// whether it belongs to a live process.
+///
+/// The `.tmp.` marker is load-bearing beyond this module:
+/// `LocalDiskShuffleStore::cleanup_temp_files` removes such files at store
+/// construction, which is what reclaims them on a normal executor restart.
+#[must_use]
+pub fn spill_file_name(sequence: u64, partition: usize) -> String {
+    format!(
+        "{SPILL_FILE_PREFIX}{owner}-{sequence}-p{partition}.tmp.arrow-ipc",
+        owner = spill_owner_id()
+    )
+}
+
+/// Owner recorded in a spill file name, if it is one.
+fn spill_file_owner(file_name: &str) -> Option<u64> {
+    let rest = file_name.strip_prefix(SPILL_FILE_PREFIX)?;
+    if !rest.contains(".tmp.") {
+        return None;
+    }
+    rest.split('-').next()?.parse().ok()
+}
+
+/// Delete shuffle-write spill files left behind by processes that are gone.
+///
+/// # The leak this closes
+///
+/// Spill files are written **flat** in the scratch root rather than under a
+/// job directory, deliberately: [`scan_orphans`] treats every directory as a
+/// job id and would delete a live task's spills. The cost of that choice is
+/// that the orphan sweeper cannot see them at all, so the only thing that ever
+/// reclaimed them was `cleanup_temp_files` at executor boot.
+///
+/// That is fine until the executor cannot boot. Measured 2026-07-28: an
+/// executor died with 74 GB of spill files on a 145 GB node; the kubelet then
+/// reclaimed disk by garbage-collecting container images, which put the
+/// replacement executor into `ImagePullBackOff` — so the boot that would have
+/// freed the space could not happen, and the node stayed out of the cluster
+/// until a human deleted the files. A reclaim path that only runs on a
+/// successful restart is no reclaim path for the case that needs it.
+///
+/// Files owned by this process are never touched, so a live spill is safe
+/// regardless of age.
+pub fn reclaim_foreign_spills(base_dir: &Path) -> ShuffleResult<usize> {
+    if !base_dir.exists() {
+        return Ok(0);
+    }
+    let mine = spill_owner_id();
+    let mut deleted = 0usize;
+    for entry in std::fs::read_dir(base_dir)? {
+        let entry = entry?;
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        let Some(owner) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(spill_file_owner)
+        else {
+            continue;
+        };
+        if owner == mine {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => deleted += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if deleted > 0 {
+        tracing::info!(
+            deleted,
+            dir = %base_dir.display(),
+            "reclaimed shuffle-write spill files left by a previous process"
+        );
+    }
+    Ok(deleted)
 }
 
 /// Scan `base_dir` for local shuffle artifacts whose job directory is not in
@@ -475,6 +602,96 @@ mod tests {
         assert!(
             base.join("job-done/s1.m0/0.parquet").exists(),
             "a zero-grace policy must still be clamped to the defaults"
+        );
+    }
+
+    // ── shuffle-write spill files ────────────────────────────────────────
+
+    /// A spill this process is still using must survive the sweep, however
+    /// long the task has been running. This is why ownership beats mtime: a
+    /// map task at SF100 holds its spills for twenty minutes to an hour, so
+    /// any age rule short enough to reclaim would delete live data.
+    #[test]
+    fn a_live_processes_own_spills_are_never_reclaimed() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path();
+        let mine = base.join(spill_file_name(1, 5));
+        write(&mine);
+
+        let deleted = reclaim_foreign_spills(base).unwrap();
+
+        assert_eq!(deleted, 0);
+        assert!(mine.exists(), "this process's own spill must survive");
+    }
+
+    /// The leak: an executor that dies leaves its spills behind, and nothing
+    /// reclaims them until a successful boot — which is precisely what a full
+    /// disk prevents.
+    #[test]
+    fn spills_from_a_dead_process_are_reclaimed() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path();
+        // Same shape as a real name, stamped with somebody else's owner id.
+        let theirs = base.join("shuffle-write-11111111-7-p3.tmp.arrow-ipc");
+        write(&theirs);
+        let mine = base.join(spill_file_name(7, 3));
+        write(&mine);
+
+        let deleted = reclaim_foreign_spills(base).unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(!theirs.exists(), "a dead process's spill must be reclaimed");
+        assert!(mine.exists(), "and ours must not be");
+    }
+
+    /// The owner id must actually distinguish processes. A pid would not: a
+    /// restarted executor in a container PID namespace is routinely handed the
+    /// same pid as the one it replaced.
+    #[test]
+    fn the_owner_id_is_stable_within_a_process_and_not_the_pid() {
+        assert_eq!(spill_owner_id(), spill_owner_id(), "must be stable");
+        assert_ne!(
+            spill_owner_id(),
+            u64::from(std::process::id()),
+            "a bare pid is reused across container restarts"
+        );
+        let name = spill_file_name(3, 9);
+        assert_eq!(spill_file_owner(&name), Some(spill_owner_id()));
+    }
+
+    /// The sweep must not mistake a partition file, or anything else living in
+    /// the scratch root, for a spill.
+    #[test]
+    fn reclaiming_spills_ignores_everything_that_is_not_one() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path();
+        write(&base.join("job-live/s1.m0/0.parquet"));
+        write(&base.join("notes.txt"));
+        write(&base.join("shuffle-write-nonsense.arrow-ipc")); // no .tmp. marker
+
+        assert_eq!(reclaim_foreign_spills(base).unwrap(), 0);
+        assert!(base.join("job-live/s1.m0/0.parquet").exists());
+        assert!(base.join("notes.txt").exists());
+        assert!(base.join("shuffle-write-nonsense.arrow-ipc").exists());
+    }
+
+    /// The periodic sweep is the path that matters — reclaiming only on boot
+    /// is no reclaim path for a node whose executor cannot start.
+    #[test]
+    fn the_periodic_sweep_reclaims_foreign_spills_too() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path();
+        let theirs = base.join("shuffle-write-22222222-1-p0.tmp.arrow-ipc");
+        write(&theirs);
+
+        let mut tracker = OrphanReclaimTracker::new(OrphanReclaimPolicy::default());
+        tracker
+            .observe_and_cleanup_at(base, &HashSet::new(), Instant::now())
+            .unwrap();
+
+        assert!(
+            !theirs.exists(),
+            "the sweep must reclaim spills, not only job directories"
         );
     }
 
