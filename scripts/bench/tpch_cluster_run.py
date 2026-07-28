@@ -30,8 +30,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -205,6 +207,87 @@ def get(url: str, token: str | None, timeout: float) -> dict:
     return _with_retry(once, "GET")
 
 
+# ── Orphaned jobs ────────────────────────────────────────────────────────────
+#
+# Submitting a job and then walking away does not stop it. The coordinator has
+# no notion of "the client that asked for this went home": a batch-SQL job runs
+# until it finishes, fails, or is explicitly cancelled. Nothing here ever
+# cancelled, so every sweep killed mid-flight — every `pkill` in a redeploy
+# script, every ^C, every `timeout` — left its query executing on the cluster.
+#
+# Measured 2026-07-28, and it invalidated most of a day's runs. Two q10 jobs
+# were Running at once: the abandoned one held 3 tasks and 30 completed stages
+# and kept writing shuffle scratch, while the new one sat at
+# `running=0, assigned=0` behind it. The symptoms read as engine bugs — one
+# executor at 732 millicores and two at 1–2, a node's disk climbing to 74 GB
+# until the kubelet evicted the coordinator — and none of them were. Cancelling
+# the orphan moved the new job to `running=3` immediately and released 11 GB.
+#
+# So the harness owns the job for its whole lifetime: cancel on timeout, on a
+# poll that stops answering, on a signal, and on interpreter exit.
+_INFLIGHT: dict[str, str | None] = {"coordinator": None, "job_id": None, "token": None}
+
+
+def _remember_inflight(coordinator: str, job_id: str, token: str | None) -> None:
+    _INFLIGHT.update(coordinator=coordinator, job_id=job_id, token=token)
+
+
+def _forget_inflight() -> None:
+    _INFLIGHT["job_id"] = None
+
+
+def cancel_inflight(reason: str) -> None:
+    """Best-effort cancel of the job this process is currently waiting on.
+
+    Deliberately does not go through `post`/`_with_retry`: this runs from
+    signal and exit paths where the priority is to get one request out quickly
+    and never raise. A failure to cancel is reported, not propagated — there is
+    nothing useful left to do with it.
+    """
+    job_id = _INFLIGHT.get("job_id")
+    coordinator = _INFLIGHT.get("coordinator")
+    if not job_id or not coordinator:
+        return
+    _forget_inflight()
+    url = f"{coordinator}/api/v1/jobs/{job_id}/cancel"
+    try:
+        req = urllib.request.Request(url, data=b"", method="POST")
+        token = _INFLIGHT.get("token")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+        print(f"# cancelled {job_id} ({reason})", file=sys.stderr, flush=True)
+    except Exception as error:  # noqa: BLE001 - best effort by design
+        print(
+            f"# WARNING: could not cancel {job_id} ({reason}): {error}\n"
+            f"#          it may still be running and holding cluster capacity; "
+            f"cancel it with\n"
+            f"#          curl -X POST {url}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _install_cancel_handlers() -> None:
+    """Cancel the in-flight job on ^C, SIGTERM, and normal interpreter exit."""
+    atexit.register(cancel_inflight, "interpreter exit")
+
+    def handler(signum, _frame):
+        cancel_inflight(f"signal {signal.Signals(signum).name}")
+        # Restore default disposition and re-raise so the exit status still
+        # reflects the signal rather than a clean 0.
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            # Not on the main thread, or the platform lacks the signal.
+            pass
+
+
 def table_path(data_root: str, table: str, single_file: set[str]) -> str:
     """Resolve a table to its path under `data_root`.
 
@@ -261,6 +344,9 @@ def run_query(
         }
 
     job_id = submitted["job_id"]
+    # From here until a terminal state, this process owns the job: if it dies
+    # or gives up, the job must not keep running on the cluster.
+    _remember_inflight(coordinator, job_id, token)
     deadline = started + timeout_s
     while True:
         try:
@@ -268,6 +354,10 @@ def run_query(
                 f"{coordinator}/api/v1/batch-sql/{job_id}", token, timeout=60
             )
         except Exception as error:  # noqa: BLE001
+            # We have stopped watching, so nobody is left to notice this job.
+            # Leaving it running is how one abandoned q10 starved the next one
+            # for an hour while filling a node's disk.
+            cancel_inflight("poll failed")
             return {
                 "id": query["id"],
                 "name": query["name"],
@@ -291,6 +381,7 @@ def run_query(
             # "Correct but not distributed" is a finding, not a success; the
             # sweep exists to catch exactly this.
             distributed = bool(task_count and task_count > 1)
+            _forget_inflight()
             return {
                 "id": query["id"],
                 "name": query["name"],
@@ -303,6 +394,7 @@ def run_query(
                 "distributed": distributed,
             }
         if state in ("Failed", "Cancelled"):
+            _forget_inflight()
             return {
                 "id": query["id"],
                 "name": query["name"],
@@ -314,6 +406,11 @@ def run_query(
                 "elapsed_s": time.monotonic() - started,
             }
         if time.monotonic() > deadline:
+            # Giving up on a query is not the same as stopping it. Without this
+            # the timed-out job keeps running while the sweep moves to the next
+            # query, so the next query's timing includes an unrelated query's
+            # load — and the two compete for the same slots and scratch disk.
+            cancel_inflight(f"timed out after {timeout_s:.0f}s")
             return {
                 "id": query["id"],
                 "name": query["name"],
@@ -345,6 +442,9 @@ def main() -> int:
     )
     args = parser.parse_args()
     single_file = {t.strip() for t in args.single_file_tables.split(",") if t.strip()}
+    # Before anything is submitted: a job this process starts must not outlive
+    # it. See the comment on `_INFLIGHT`.
+    _install_cancel_handlers()
 
     token = os.environ.get("KRISHIV_COORDINATOR_BEARER_TOKEN")
     corpus = load_corpus(args.corpus_json)
