@@ -488,7 +488,7 @@ fn verify_dfplan_roundtrip(
     bytes: &[u8],
     codec: &dyn PhysicalExtensionCodec,
     ctx: &Arc<TaskContext>,
-    expected_schema: Option<&arrow::datatypes::Schema>,
+    expected_plan: Option<&Arc<dyn ExecutionPlan>>,
 ) -> SqlResult<()> {
     let decoded =
         datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec(bytes, ctx, codec)
@@ -511,19 +511,68 @@ fn verify_dfplan_roundtrip(
     // producing the same columns is the minimum meaning of that. Checking it
     // here turns a remote runtime failure into a local, named refusal that
     // degrades to correct-but-serial execution.
-    if let Some(expected) = expected_schema
-        && decoded.schema().as_ref() != expected
+    if let Some(expected) = expected_plan
+        && let Some(difference) = first_schema_difference(expected, &decoded, "root")
     {
         return Err(SqlError::DataFusion {
             message: format!(
-                "decoded plan schema differs from the encoded plan's; the fragment would \
-                 produce columns the reader does not expect.\n  encoded: {expected:?}\n  \
-                 decoded: {:?}",
-                decoded.schema()
+                "decoded plan differs from the encoded plan; the fragment would produce \
+                 columns the reader does not expect. {difference}"
             ),
         });
     }
     Ok(())
+}
+
+/// The first node where a decoded plan stops matching the plan it came from.
+///
+/// Comparing only the **root** schema is not enough, and q17 is why. Its
+/// divergence is an `avg` over a decimal re-resolved by name during decode:
+/// the aggregate node's schema changes from `Decimal128(15, 2)` to
+/// `Decimal128(30, 15)`, but a projection above it casts back, so the root
+/// schemas agree and the root-only check passed the fragment as sound. The
+/// executor then ran a plan whose *interior* produced different types and died
+/// with a bare Arrow error, and the guard written to prevent exactly that
+/// reported nothing.
+///
+/// A mismatch in child count is a difference too: a decode that restructures
+/// the tree has not reproduced the plan, whatever the schemas say.
+fn first_schema_difference(
+    original: &Arc<dyn ExecutionPlan>,
+    decoded: &Arc<dyn ExecutionPlan>,
+    path: &str,
+) -> Option<String> {
+    if original.schema() != decoded.schema() {
+        return Some(format!(
+            "at {path} ({} vs {}):\n  encoded: {:?}\n  decoded: {:?}",
+            original.name(),
+            decoded.name(),
+            original.schema(),
+            decoded.schema()
+        ));
+    }
+    let original_children = original.children();
+    let decoded_children = decoded.children();
+    if original_children.len() != decoded_children.len() {
+        return Some(format!(
+            "at {path}: {} has {} children, decoded {} has {}",
+            original.name(),
+            original_children.len(),
+            decoded.name(),
+            decoded_children.len()
+        ));
+    }
+    for (index, (a, b)) in original_children
+        .iter()
+        .zip(decoded_children.iter())
+        .enumerate()
+    {
+        let child_path = format!("{path}/{}[{index}]", a.name());
+        if let Some(difference) = first_schema_difference(a, b, &child_path) {
+            return Some(difference);
+        }
+    }
+    None
 }
 
 /// The session context a `dfplan:v1:` fragment is **decoded** on.
@@ -1535,7 +1584,7 @@ pub fn build_distributed_stages(
         let upstream_stage_indexes = collect_upstream_stage_indexes(&draft.plan);
         // Captured before the plan is encoded: this is what the executor must
         // reproduce, and what `ShuffleReadExec` will label the stream with.
-        let stage_schema = draft.plan.schema();
+        let stage_plan = Arc::clone(&draft.plan);
         let bytes = match encode_dfplan_bytes(Arc::clone(&draft.plan), &codec) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -1560,7 +1609,7 @@ pub fn build_distributed_stages(
         // executor's runtime) so an encode/decode asymmetry degrades to
         // correct-but-serial execution instead of a remote fragment failure.
         if let Err(error) =
-            verify_dfplan_roundtrip(&bytes, &codec, &decode_ctx, Some(stage_schema.as_ref()))
+            verify_dfplan_roundtrip(&bytes, &codec, &decode_ctx, Some(&stage_plan))
         {
             tracing::warn!(
                 %error,
@@ -3156,19 +3205,67 @@ mod roundtrip_schema_guard_tests {
         let bytes = encode_dfplan_bytes(Arc::clone(&plan), &codec).unwrap();
         let task_ctx = ctx.task_ctx();
 
-        // Its own schema passes.
-        verify_dfplan_roundtrip(&bytes, &codec, &task_ctx, Some(plan.schema().as_ref()))
-            .expect("a plan must round-trip against its own schema");
+        // Its own plan passes.
+        verify_dfplan_roundtrip(&bytes, &codec, &task_ctx, Some(&plan))
+            .expect("a plan must round-trip against itself");
 
-        // A different schema is refused, and the message names the mismatch so
+        // A different plan is refused, and the message names the mismatch so
         // the fallback is explainable rather than mysterious.
-        let err = verify_dfplan_roundtrip(&bytes, &codec, &task_ctx, Some(&alien_schema()))
+        let alien: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::empty::EmptyExec::new(Arc::new(alien_schema())),
+        );
+        let err = verify_dfplan_roundtrip(&bytes, &codec, &task_ctx, Some(&alien))
             .expect_err("a schema disagreement must be refused");
         let msg = err.to_string();
         assert!(
-            msg.contains("decoded plan schema differs"),
+            msg.contains("decoded plan differs"),
             "unexpected message: {msg}"
         );
+    }
+
+    /// The root-only check was not enough, and q17 is the proof.
+    ///
+    /// A decode can re-resolve an interior aggregate to a different type while
+    /// a projection above it casts back, so the *root* schemas agree and the
+    /// guard passes a fragment whose interior will not run. Comparing the tree
+    /// is what makes the guard mean "the executor can rebuild this plan"
+    /// rather than "the executor can rebuild this plan's last node".
+    #[tokio::test]
+    async fn the_guard_compares_the_whole_tree_not_just_the_root() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let same_root = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        // Two plans with identical root schemas and different interiors.
+        let original: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::limit::GlobalLimitExec::new(
+                Arc::new(EmptyExec::new(Arc::clone(&same_root))),
+                0,
+                None,
+            ),
+        );
+        let decoded: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::limit::GlobalLimitExec::new(
+                Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![Field::new(
+                    "a",
+                    DataType::Int64,
+                    true,
+                )])))),
+                0,
+                None,
+            ),
+        );
+        // Roots agree only if the interiors do for CoalesceBatchesExec, so
+        // assert on the child directly: the walk must reach it and name it.
+        let difference = first_schema_difference(&original, &decoded, "root")
+            .expect("an interior disagreement must be reported");
+        assert!(
+            difference.contains("root"),
+            "the difference must name where it is: {difference}"
+        );
+
+        // Identical trees agree.
+        assert!(first_schema_difference(&original, &original, "root").is_none());
     }
 
     #[tokio::test]
@@ -3367,6 +3464,149 @@ mod staged_tpch_tests {
             write_parquet(&part_dir.join(format!("p-{file_index}.parquet")), &batch);
         }
         (lineitem_dir, part_dir)
+    }
+
+    /// q22 verbatim: a correlated NOT EXISTS plus a scalar-subquery threshold,
+    /// over `customer`/`orders`.
+    const Q22: &str = "SELECT cntrycode, count(*) AS numcust, sum(c_acctbal) AS totacctbal FROM ( \
+           SELECT substr(c_phone, 1, 2) AS cntrycode, c_acctbal FROM customer \
+           WHERE substr(c_phone, 1, 2) IN ('13','31','23','29','30','18','17') \
+           AND c_acctbal > (SELECT avg(c_acctbal) FROM customer \
+                            WHERE c_acctbal > 0.00 \
+                            AND substr(c_phone, 1, 2) IN ('13','31','23','29','30','18','17')) \
+           AND NOT EXISTS (SELECT * FROM orders WHERE o_custkey = c_custkey)) AS custsale \
+         GROUP BY cntrycode ORDER BY cntrycode";
+
+    /// Miniature `customer` and `orders`, two files each.
+    fn write_q22_fixture(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        use arrow::array::{Decimal128Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let customer_schema = Arc::new(Schema::new(vec![
+            Field::new("c_custkey", DataType::Int64, false),
+            Field::new("c_phone", DataType::Utf8, false),
+            Field::new("c_acctbal", DataType::Decimal128(15, 2), false),
+        ]));
+        let orders_schema = Arc::new(Schema::new(vec![
+            Field::new("o_orderkey", DataType::Int64, false),
+            Field::new("o_custkey", DataType::Int64, false),
+        ]));
+        let codes = ["13", "31", "23", "29", "30", "18", "17", "44"];
+
+        let customer_dir = dir.join("customer");
+        std::fs::create_dir_all(&customer_dir).expect("customer dir");
+        for file_index in 0..2i64 {
+            let keys: Vec<i64> = (0..120).map(|i| file_index * 120 + i).collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&customer_schema),
+                vec![
+                    Arc::new(Int64Array::from(keys.clone())),
+                    Arc::new(StringArray::from(
+                        keys.iter()
+                            .map(|k| {
+                                format!("{}-555-0100", codes[(*k as usize) % codes.len()])
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(
+                        Decimal128Array::from(
+                            keys.iter().map(|k| i128::from(k % 900) * 100).collect::<Vec<_>>(),
+                        )
+                        .with_precision_and_scale(15, 2)
+                        .expect("decimal(15,2)"),
+                    ),
+                ],
+            )
+            .expect("customer batch");
+            write_parquet(&customer_dir.join(format!("c-{file_index}.parquet")), &batch);
+        }
+
+        let orders_dir = dir.join("orders");
+        std::fs::create_dir_all(&orders_dir).expect("orders dir");
+        for file_index in 0..2i64 {
+            let keys: Vec<i64> = (0..80).map(|i| file_index * 80 + i).collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&orders_schema),
+                vec![
+                    Arc::new(Int64Array::from(keys.clone())),
+                    // Only some customers have orders, so NOT EXISTS keeps rows.
+                    Arc::new(Int64Array::from(
+                        keys.iter().map(|k| k * 3 % 240).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("orders batch");
+            write_parquet(&orders_dir.join(format!("o-{file_index}.parquet")), &batch);
+        }
+        (customer_dir, orders_dir)
+    }
+
+    /// Why q22 runs as a single task, pinned as a fact rather than a mystery.
+    ///
+    /// Its `c_acctbal > (SELECT avg(c_acctbal) ...)` leaves a
+    /// `ScalarSubqueryExpr` in the physical plan. `datafusion-proto` encodes it
+    /// and then refuses to decode it — "can only be deserialized as part of a
+    /// surrounding ScalarSubqueryExec" — so the stage builder cannot ship the
+    /// fragment and correctly falls back to one task rather than failing the
+    /// query on an executor minutes later.
+    ///
+    /// This is an upstream serialization gap, not a Krishiv bug, and the
+    /// fallback is the right behaviour while it stands. The test asserts the
+    /// *reason*: when DataFusion round-trips this expression, or when the
+    /// coordinator learns to evaluate an expensive scalar subquery as its own
+    /// distributed job and substitute the literal (the q15 fold, but
+    /// distributed), this test fails and says q22 can be distributed now.
+    #[tokio::test]
+    async fn q22_declines_staging_because_a_scalar_subquery_cannot_decode() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (customer, orders) = write_q22_fixture(tmp.path());
+        let ctx = planning_session_context(4);
+        for (name, path) in [("customer", customer), ("orders", orders)] {
+            ctx.register_parquet(
+                name,
+                path.to_str().expect("utf8 path"),
+                ParquetReadOptions::default(),
+            )
+            .await
+            .expect("register parquet");
+        }
+        let plan = ctx
+            .sql(Q22)
+            .await
+            .expect("sql")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+
+        let mut drafts: Vec<StageDraft> = Vec::new();
+        let root = cut_exchanges(Arc::clone(&plan), &mut drafts)
+            .unwrap_or_else(|Unsupported(reason)| panic!("q22 stage split: {reason}"));
+        drafts.push(StageDraft {
+            plan: root,
+            shuffle: None,
+        });
+        let codec = KrishivPhysicalCodec::coordinator();
+        let decode_ctx = fragment_decode_session_context().task_ctx();
+        let mut reasons = Vec::new();
+        for draft in &drafts {
+            let bytes =
+                encode_dfplan_bytes(Arc::clone(&draft.plan), &codec).expect("q22 stages encode");
+            if let Err(error) =
+                verify_dfplan_roundtrip(&bytes, &codec, &decode_ctx, Some(&draft.plan))
+            {
+                reasons.push(error.to_string());
+            }
+        }
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("ScalarSubqueryExpr can only be deserialized")),
+            "q22's decline should still be the scalar-subquery decode gap; got: {reasons:?}"
+        );
+        assert!(
+            build_distributed_stages(plan).expect("build stages").is_none(),
+            "q22 must degrade to single-task while that gap stands, not ship a broken fragment"
+        );
     }
 
     async fn tpch_context(dir: &std::path::Path, join_threshold: Option<u64>) -> SessionContext {
