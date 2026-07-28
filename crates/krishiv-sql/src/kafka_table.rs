@@ -20,6 +20,17 @@ pub(crate) fn kafka_auto_commit_interval_ms() -> Option<u64> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(krishiv_common::DurabilityProfile::DevLocal);
+    auto_commit_interval_for(profile)
+}
+
+/// The auto-commit decision itself, separated from reading the environment.
+///
+/// Kept pure so it can be tested directly: mutating process environment from
+/// a test is unsound under a multi-threaded runner, and the workspace denies
+/// the `unsafe` that edition 2024 requires for `set_var`.
+pub(crate) fn auto_commit_interval_for(
+    profile: krishiv_common::DurabilityProfile,
+) -> Option<u64> {
     if krishiv_common::requires_manual_kafka_commit(profile) {
         None
     } else {
@@ -179,8 +190,19 @@ async fn flush_pending(
 
 /// Project and cast a raw connector batch to the declared table schema.
 ///
-/// Missing columns → typed null arrays.
-/// Cast failures → null arrays with a tracing warning (no silent data loss).
+/// A column the message does not carry becomes a typed null array, so a
+/// sparse payload still matches the declared schema.
+///
+/// A value that is present but does not parse into the declared type becomes
+/// **null**: `arrow::compute::cast` is lenient by default, so casting the
+/// string `"not-a-number"` to `Int64` yields null rather than an error. That
+/// is a row silently losing a field, and this function warns when it happens
+/// — counting the nulls the cast introduced, since the kernel does not report
+/// them. Without the warning the loss is invisible, which is what "no silent
+/// data loss" was always supposed to rule out.
+///
+/// A type *pair* with no cast kernel at all is still a hard error, and the
+/// caller turns that into a terminated stream.
 pub(crate) fn project_batch(
     batch: &RecordBatch,
     schema: &SchemaRef,
@@ -189,14 +211,29 @@ pub(crate) fn project_batch(
     for field in schema.fields() {
         let col = if let Ok(idx) = batch.schema().index_of(field.name()) {
             let src = batch.column(idx);
-            arrow::compute::cast(src, field.data_type()).map_err(|e| {
+            let casted = arrow::compute::cast(src, field.data_type()).map_err(|e| {
                 arrow::error::ArrowError::CastError(format!(
                     "Kafka column '{}': cast from {} to {} failed: {e}",
                     field.name(),
                     src.data_type(),
                     field.data_type(),
                 ))
-            })?
+            })?;
+            // A lenient cast reports nothing when it cannot parse a value — it
+            // just emits null. The only evidence is that nulls appeared where
+            // the source had none, so that is what we count.
+            let dropped = casted.null_count().saturating_sub(src.null_count());
+            if dropped > 0 {
+                tracing::warn!(
+                    column = %field.name(),
+                    from = %src.data_type(),
+                    to = %field.data_type(),
+                    dropped,
+                    "Kafka value(s) did not parse into the declared column type and \
+                     became null; the rows are kept and only this field is lost"
+                );
+            }
+            casted
         } else {
             arrow::array::new_null_array(field.data_type(), batch.num_rows())
         };
@@ -221,4 +258,212 @@ pub fn create_kafka_streaming_table(
     let partition = Arc::new(KafkaPartitionStream::new(schema.clone(), source));
     let table = StreamingTable::try_new(schema, vec![partition])?;
     Ok(Arc::new(table))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, Int32Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn declared() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]))
+    }
+
+    fn batch_of(fields: Vec<Field>, cols: Vec<arrow::array::ArrayRef>) -> RecordBatch {
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
+    }
+
+    /// A widening cast is applied, not merely accepted: the output must carry
+    /// the *declared* type, since the reduce side labels data with it.
+    #[test]
+    fn a_castable_column_is_cast_to_the_declared_type() {
+        let raw = batch_of(
+            vec![
+                Field::new("id", DataType::Int32, true),
+                Field::new("name", DataType::Utf8, true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        );
+        let out = project_batch(&raw, &declared()).expect("castable");
+        assert_eq!(out.schema(), declared());
+        let ids = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("cast to int64");
+        assert_eq!(ids.values(), &[1i64, 2]);
+    }
+
+    /// A column the message omits becomes typed nulls rather than a failure —
+    /// this is what lets a sparse payload satisfy the declared schema.
+    #[test]
+    fn a_missing_column_becomes_typed_nulls() {
+        let raw = batch_of(
+            vec![Field::new("id", DataType::Int64, true)],
+            vec![Arc::new(Int64Array::from(vec![7]))],
+        );
+        let out = project_batch(&raw, &declared()).expect("missing column is allowed");
+        assert_eq!(out.num_rows(), 1);
+        assert_eq!(out.column(1).null_count(), 1, "absent column must be null");
+        assert_eq!(out.schema(), declared());
+    }
+
+    /// A value that does not parse becomes null rather than failing the
+    /// batch — `arrow::compute::cast` is lenient — and the row survives with
+    /// only that field lost.
+    ///
+    /// This is the case the doc comment promised would not be *silent*. The
+    /// cast kernel reports nothing, so the only signal is the null that
+    /// appeared where the source had a value; `project_batch` counts exactly
+    /// that and warns.
+    #[test]
+    fn an_unparseable_value_becomes_null_and_keeps_the_row() {
+        let raw = batch_of(
+            vec![Field::new("id", DataType::Utf8, true)],
+            vec![Arc::new(StringArray::from(vec![Some("7"), Some("nope")]))],
+        );
+        let out = project_batch(&raw, &declared()).expect("lenient cast does not fail");
+        assert_eq!(out.num_rows(), 2, "both rows must survive");
+        let ids = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!(!ids.is_null(0), "the parseable value is kept");
+        assert_eq!(ids.value(0), 7);
+        assert!(ids.is_null(1), "the unparseable value becomes null");
+    }
+
+    /// Columns are selected by name, so a different message field order is
+    /// not a reordering of the output.
+    #[test]
+    fn columns_are_matched_by_name_not_position() {
+        let raw = batch_of(
+            vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("id", DataType::Int64, true),
+            ],
+            vec![
+                Arc::new(StringArray::from(vec!["z"])),
+                Arc::new(Int64Array::from(vec![9])),
+            ],
+        );
+        let out = project_batch(&raw, &declared()).expect("reordered");
+        let ids = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(ids.values(), &[9i64], "id must come from the 'id' field");
+    }
+
+    /// Fields the table did not declare are dropped.
+    #[test]
+    fn undeclared_columns_are_ignored() {
+        let raw = batch_of(
+            vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("name", DataType::Utf8, true),
+                Field::new("extra", DataType::Utf8, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(StringArray::from(vec!["ignored"])),
+            ],
+        );
+        let out = project_batch(&raw, &declared()).expect("extra column");
+        assert_eq!(out.num_columns(), 2);
+        assert_eq!(out.schema(), declared());
+    }
+
+    #[tokio::test]
+    async fn flushing_nothing_sends_nothing() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut pending = Vec::new();
+        flush_pending(&tx, &declared(), &mut pending).await.unwrap();
+        drop(tx);
+        assert!(rx.recv().await.is_none(), "an empty flush must not send");
+    }
+
+    /// Several buffered messages arrive downstream as one batch, with every
+    /// row preserved and in order — that is the whole point of coalescing.
+    #[tokio::test]
+    async fn flushing_coalesces_into_one_batch_preserving_order() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let schema = declared();
+        let mut pending: Vec<RecordBatch> = (0..3)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(vec![i])),
+                        Arc::new(StringArray::from(vec![format!("r{i}")])),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        flush_pending(&tx, &schema, &mut pending).await.unwrap();
+        assert!(pending.is_empty(), "flush must drain the buffer");
+
+        let got = rx.recv().await.expect("one batch").expect("ok");
+        assert_eq!(got.num_rows(), 3, "three messages must arrive as three rows");
+        let ids = got.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(ids.values(), &[0i64, 1, 2], "order must be preserved");
+    }
+
+    /// A dropped receiver is how a cancelled query reaches the consumer loop;
+    /// the flush must report it so polling stops instead of spinning forever.
+    #[tokio::test]
+    async fn flushing_to_a_dropped_receiver_reports_the_cancellation() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        drop(rx);
+        let schema = declared();
+        let mut pending = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(vec![1])),
+                    Arc::new(StringArray::from(vec!["a"])),
+                ],
+            )
+            .unwrap(),
+        ];
+        assert!(
+            flush_pending(&tx, &schema, &mut pending).await.is_err(),
+            "a dropped receiver must surface as an error so the loop breaks"
+        );
+    }
+
+    /// A profile that owns its offsets must not also have rdkafka committing
+    /// behind its back: both durable profiles align commits with checkpoint
+    /// barriers, so auto-commit has to be off unconditionally.
+    #[test]
+    fn durable_profiles_disable_auto_commit() {
+        use krishiv_common::DurabilityProfile;
+        for profile in [
+            DurabilityProfile::SingleNodeDurable,
+            DurabilityProfile::DistributedDurable,
+        ] {
+            assert_eq!(
+                auto_commit_interval_for(profile),
+                None,
+                "{profile:?} commits on checkpoint barriers, not on a timer"
+            );
+        }
+    }
+
+    /// Dev-local is at-least-once via auto-commit — but only when the process
+    /// is not in production mode, since `requires_manual_kafka_commit`
+    /// consults that too. Asserting a fixed value here would make the test
+    /// depend on ambient environment, so it pins the interval only in the
+    /// case where auto-commit applies at all.
+    #[test]
+    fn dev_local_auto_commit_uses_the_documented_interval() {
+        use krishiv_common::DurabilityProfile;
+        if let Some(ms) = auto_commit_interval_for(DurabilityProfile::DevLocal) {
+            assert_eq!(ms, STREAMING_AUTO_COMMIT_MS);
+        }
+    }
 }
