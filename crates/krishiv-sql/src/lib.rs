@@ -118,6 +118,7 @@ pub mod spillable_join;
 pub mod sqlstate;
 pub mod subquery;
 pub mod unnest_sql;
+pub mod unspillable_headroom;
 
 pub mod coverage;
 mod higher_order_functions;
@@ -512,8 +513,16 @@ impl EngineMemory {
     /// memory rather than each engine's individually.
     #[must_use]
     pub fn shared_pool(bytes: usize) -> Arc<dyn MemoryPool> {
-        Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(
+        // Wrapped, not bare: `FairSpillPool` lets spillable consumers occupy
+        // the whole budget between them and then refuses an operator that
+        // cannot spill even a few hundred bytes. That is how TPC-H q10 and q11
+        // died at SF100. See `unspillable_headroom`.
+        let inner: Arc<dyn MemoryPool> =
+            Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(bytes));
+        Arc::new(crate::unspillable_headroom::UnspillableHeadroomPool::new(
+            inner,
             bytes,
+            crate::unspillable_headroom::headroom_bytes(bytes),
         ))
     }
 
