@@ -824,6 +824,53 @@ pub static FLAGS: &[FlagSpec] = &[
          engines keep hash join.",
     ),
     rt(
+        "KRISHIV_SHUFFLE_GRPC_MAX_MESSAGE_BYTES",
+        FlagKind::UInt,
+        "268435456 (256 MiB)",
+        "Maximum gRPC message the shuffle transport will send or decode. Must \
+         exceed the shuffle writer's coalesce target with room to spare, or a \
+         map task produces a partition the reduce side refuses to decode — \
+         tonic reports OutOfRange, the consumer retries forever and finally \
+         reports NotFound, which reads as a lost shuffle rather than an \
+         oversized message. TPC-H q10 at SF100 died this way on every sweep.",
+    ),
+    rt(
+        "KRISHIV_GRACE_HASH_JOIN",
+        FlagKind::Bool,
+        "off",
+        "Send an over-threshold hash join to the grace hash join — partition \
+         both sides by key and join bucket by bucket, each bucket an ordinary \
+         in-memory hash join — instead of converting it to a sort-merge join. \
+         Sort-merge sorts BOTH inputs in full even when nearly all the data \
+         would have fitted, which cost TPC-H q2 6.3x (208s -> 1317s); grace \
+         sorts nothing and only the buckets that overflow reach disk. Off by \
+         default: sort-merge is what the SF100 sweeps have been measured \
+         against, and a newer operator earns the default by beating it on the \
+         cluster. Falls back to sort-merge for shapes it refuses (today, a \
+         broadcast join whose sides have different partition counts).",
+    ),
+    rt(
+        "KRISHIV_GRACE_HASH_JOIN_BUCKETS",
+        FlagKind::UInt,
+        "32, or enough that a bucket lands near half the per-task share",
+        "Hash buckets the grace hash join partitions each side into when the \
+         build side overflows its budget. Clamped to [2, 256]. Larger is \
+         safer: a bucket is one temp file and one small in-memory join, while \
+         too few buckets means a bucket that still does not fit, which is the \
+         failure the operator exists to prevent.",
+    ),
+    rt(
+        "KRISHIV_UNSPILLABLE_HEADROOM_PERCENT",
+        FlagKind::UInt,
+        "25",
+        "Percent of the query memory pool reserved for consumers that CANNOT \
+         spill (a hash-join build side is the main one). FairSpillPool caps \
+         spillable consumers at a share of the pool but lets unspillable ones \
+         take only what remains after both classes, so N spillers each inside \
+         their own share can together leave nothing for a small hash join — \
+         which is how a 2.6 GB pool refused 877 bytes. 0 disables the guard.",
+    ),
+    rt(
         "KRISHIV_SHUFFLE_PAGE_CACHE_BYTES",
         FlagKind::UInt,
         "12.5% of the cgroup limit (512 MiB uncontained)",
