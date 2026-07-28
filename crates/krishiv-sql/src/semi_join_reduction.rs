@@ -377,10 +377,15 @@ impl OptimizerRule for SemiJoinReductionThroughAggregate {
             let (Expr::Column(left_col), Expr::Column(right_col)) = (left_key, right_key) else {
                 continue;
             };
-            // Either side may hold the aggregate; try both orientations.
-            for (agg_side, agg_key, probe_side, probe_key) in [
-                (&join.right, right_col, &join.left, left_col),
-                (&join.left, left_col, &join.right, right_col),
+            // Either side may hold the aggregate; try both orientations. Which
+            // side we are on is carried explicitly rather than recovered with
+            // `Arc::ptr_eq(agg_side, &join.right)`: when both children happen
+            // to be the *same* `Arc` — a self-join whose two sides share a
+            // subtree — that comparison is true for the left orientation too,
+            // and the rewrite would be spliced into the wrong child.
+            for (agg_is_right, agg_side, agg_key, probe_side, probe_key) in [
+                (true, &join.right, right_col, &join.left, left_col),
+                (false, &join.left, left_col, &join.right, right_col),
             ] {
                 let Some((probe, probe_col)) = selective_key_source(probe_side, probe_key)? else {
                     continue;
@@ -388,7 +393,7 @@ impl OptimizerRule for SemiJoinReductionThroughAggregate {
                 let Some(new_side) = push_through(agg_side, agg_key, &probe, &probe_col)? else {
                     continue;
                 };
-                let rebuilt = if Arc::ptr_eq(agg_side, &join.right) {
+                let rebuilt = if agg_is_right {
                     Join {
                         right: Arc::new(new_side),
                         ..join.clone()
