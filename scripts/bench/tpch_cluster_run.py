@@ -349,11 +349,22 @@ def main() -> int:
     token = os.environ.get("KRISHIV_COORDINATOR_BEARER_TOKEN")
     corpus = load_corpus(args.corpus_json)
     if args.only:
-        wanted = {q.strip() for q in args.only.split(",") if q.strip()}
-        corpus = [q for q in corpus if q["id"] in wanted]
-        missing = wanted - {q["id"] for q in corpus}
+        # Order matters, so `wanted` is a LIST and the corpus is rebuilt in its
+        # order. This used to be a set intersection, which silently kept the
+        # corpus's own q1..q22 ordering: asking for `--only q10,q11,q16,...` to
+        # front-load the queries under investigation ran q1 first and the
+        # request looked honoured because every id asked for did eventually run.
+        # When a sweep is being used to chase specific failures, running them
+        # last is the whole cost.
+        wanted = [q.strip() for q in args.only.split(",") if q.strip()]
+        by_id = {q["id"]: q for q in corpus}
+        missing = sorted({q for q in wanted if q not in by_id})
         if missing:
-            raise SystemExit(f"unknown query ids: {sorted(missing)}")
+            raise SystemExit(f"unknown query ids: {missing}")
+        seen: set[str] = set()
+        corpus = [
+            by_id[q] for q in wanted if not (q in seen or seen.add(q))
+        ]
 
     print(
         f"# {args.label}: {len(corpus)} queries at SF{args.scale} "
