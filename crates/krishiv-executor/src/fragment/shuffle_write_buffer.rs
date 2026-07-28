@@ -762,11 +762,44 @@ impl ShuffleWriteBuffer {
 /// is committed before the pool is consulted, so the only question is whether
 /// the pool gets to *know* about it.
 ///
-/// It does. Refusing would fail a query that can actually run — that is the
-/// TPC-H q3 regression — and skipping the accounting is precisely the bug this
-/// module exists to fix: an unrecorded allocation is one the pool cannot make
-/// anyone else back off for. So the reservation grows either way and the
-/// overshoot is logged rather than hidden.
+/// Refusing would fail a query that can actually run — that is the TPC-H q3
+/// regression — so the bytes are always admitted. What changed is what happens
+/// to the pool when they do not fit.
+///
+/// # Why the overshoot is no longer forced into the pool
+///
+/// This used to call `reservation.grow(bytes)` after `try_grow` failed, on the
+/// reasoning that an unrecorded allocation is one the pool cannot make anyone
+/// else back off for. That reasoning does not survive contact with
+/// `FairSpillPool`. Both of its branches compute availability as
+/// `pool_size - (unspillable + spillable)`, so pushing an **unspillable**
+/// reservation past the pool size saturates that to zero — for *every*
+/// consumer, spillable or not. And nothing can back off in response, because
+/// this reservation is by definition unspillable: the growth produces no
+/// reclamation, only refusals.
+///
+/// TPC-H q10 at SF100 died on exactly that, repeatedly:
+///
+/// ```text
+/// Resources exhausted: Failed to allocate additional 877.0 B for HashJoinInput
+/// ```
+///
+/// 877 bytes refused by a multi-gigabyte pool, because a drain had already
+/// declared more than the pool holds. The join it starves is a *different*
+/// operator that could have run.
+///
+/// So the overshoot is recorded where it can be seen — a warning naming the
+/// amount — but is not written into the pool's arithmetic, where its only
+/// effect is to fail unrelated operators. The bytes are still held; the pool
+/// simply stops claiming that everyone is out of memory because one consumer
+/// that cannot yield exceeded its share.
+///
+/// The real fix is for the drain not to need a whole partition resident at
+/// once: `ShuffleStore::write_partition` takes a complete partition and has no
+/// append, while `LocalDiskShuffleStore` writes through `ArrowWriter`, which
+/// accepts batches incrementally. Until that streaming write exists, this
+/// keeps one operator's unavoidable peak from becoming every operator's
+/// failure.
 fn account_unavoidable(reservation: &MemoryReservation, bytes: usize, what: &str) {
     if bytes == 0 {
         return;
@@ -777,10 +810,11 @@ fn account_unavoidable(reservation: &MemoryReservation, bytes: usize, what: &str
             what,
             %error,
             "shuffle write buffer exceeded the task memory pool on an allocation it \
-             cannot avoid; recording it so the pool stays honest. Raise the stage's \
-             partition count to make each partition smaller."
+             cannot avoid. The bytes are held but NOT added to the pool: this \
+             reservation cannot spill, so inflating it past the pool size would \
+             zero every other consumer's share without freeing anything. Raise the \
+             stage's partition count to make each partition smaller."
         );
-        reservation.grow(bytes);
     }
 }
 
@@ -1017,6 +1051,53 @@ mod tests {
             total += drained.batches.iter().map(|b| b.num_rows()).sum::<usize>();
         }
         assert_eq!(total, 16 * 1024, "rows lost under pool contention");
+    }
+
+    /// The q10 failure, as a unit test: a drain that cannot avoid holding more
+    /// than the pool must not make an unrelated operator fail.
+    ///
+    /// `FairSpillPool` computes availability as
+    /// `pool_size - (unspillable + spillable)` in **both** branches, so an
+    /// unspillable reservation pushed past the pool size saturates every
+    /// consumer's share to zero — and nothing can back off in response, because
+    /// the reservation that did it cannot spill. On the cluster this read as
+    /// `Failed to allocate additional 877.0 B for HashJoinInput`: a few hundred
+    /// bytes refused by a multi-gigabyte pool, failing a join that could have
+    /// run.
+    ///
+    /// Asserting through a real drain rather than calling `account_unavoidable`
+    /// directly, so the test fails if the drain stops using it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drain_that_overshoots_does_not_starve_other_operators() {
+        const POOL_BYTES: usize = 256 * 1024;
+        let pool = pool_of(POOL_BYTES);
+        let mut buffer =
+            ShuffleWriteBuffer::new(1, Some(Arc::clone(&pool)), u64::MAX, temp_dir("overshoot"));
+
+        // Push far more than the pool holds into a single partition, so the
+        // drain has to hand over more than the pool can cover.
+        for i in 0..64 {
+            buffer
+                .push(0, batch(i as i64 * 4096, 4096))
+                .await
+                .unwrap_or_else(|e| panic!("push {i}: {e}"));
+        }
+        let drained = buffer.drain_partition(0).await.unwrap();
+        assert!(
+            drained.batches.iter().map(|b| b.num_rows()).sum::<usize>() > 0,
+            "the drain must still hand the rows over"
+        );
+
+        // The property: an unrelated operator can still be admitted while the
+        // drained partition is resident.
+        let join = MemoryConsumer::new("HashJoinInput").register(&pool);
+        join.try_grow(877).unwrap_or_else(|e| {
+            panic!(
+                "a drain's unavoidable overshoot starved an unrelated join of 877 B \
+                 (pool reserved {}): {e}",
+                pool.reserved()
+            )
+        });
     }
 
     /// Without a pool the soft ceiling is still a real bound.
