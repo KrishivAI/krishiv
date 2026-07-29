@@ -70,14 +70,32 @@ impl BarrierInjector {
         self.pending.push_back(barrier);
     }
 
-    /// Pop the next barrier if sources have finished emitting pre-barrier records.
+    /// Pop the next injectable barrier, discarding any stale or duplicate
+    /// epochs ahead of it.
+    ///
+    /// # Why this is a loop
+    ///
+    /// It used to pop one barrier and, if that one was stale, `return None` —
+    /// having already removed it. `None` is the caller's signal for "no barrier
+    /// is available", so a single duplicate at the head of the queue hid a
+    /// perfectly good barrier sitting directly behind it until the caller's
+    /// next poll, and a run of `n` duplicates cost `n` polls. The coordinator
+    /// is meanwhile waiting on an ack with a 120 s deadline.
+    ///
+    /// Duplicates are not hypothetical: the coordinator re-sends a barrier when
+    /// an ack is slow, which is exactly when the extra delay is least
+    /// affordable. `None` now means the queue holds nothing injectable, which
+    /// is what every caller already assumed it meant.
     pub fn next_barrier(&mut self) -> Option<CheckpointBarrier> {
-        let next = self.pending.pop_front()?;
-        if next.epoch <= self.last_injected_epoch {
-            return None;
+        while let Some(next) = self.pending.pop_front() {
+            if next.epoch > self.last_injected_epoch {
+                self.last_injected_epoch = next.epoch;
+                return Some(next);
+            }
+            // Stale or duplicate epoch: drop it and keep looking rather than
+            // reporting the whole queue empty.
         }
-        self.last_injected_epoch = next.epoch;
-        Some(next)
+        None
     }
 }
 
@@ -169,6 +187,42 @@ mod tests {
         assert_eq!(inj.next_barrier().unwrap().epoch, 2);
     }
 
+    /// A duplicate must not hide the barrier queued behind it.
+    ///
+    /// This asserted the opposite: after `[1, 1-dup, 2]` it expected epoch 1,
+    /// then `None`, then epoch 2 — encoding the bug, because `None` is the
+    /// caller's "nothing to inject" signal and epoch 2 was already sitting in
+    /// the queue. A run of duplicates cost one poll each while the coordinator
+    /// waited on the ack.
+    #[test]
+    fn a_duplicate_does_not_hide_the_barrier_behind_it() {
+        let mut inj = BarrierInjector::new();
+        inj.enqueue(make_checkpoint_barrier("job", 1, "cp-1"));
+        inj.enqueue(make_checkpoint_barrier("job", 1, "cp-1-dup"));
+        inj.enqueue(make_checkpoint_barrier("job", 2, "cp-2"));
+
+        assert_eq!(inj.next_barrier().unwrap().epoch, 1);
+        assert_eq!(
+            inj.next_barrier().unwrap().epoch,
+            2,
+            "the duplicate must be skipped, not reported as an empty queue"
+        );
+        assert!(inj.next_barrier().is_none(), "now it really is empty");
+    }
+
+    /// Several stale epochs in a row are all skipped in one call.
+    #[test]
+    fn a_run_of_stale_epochs_is_skipped_in_one_poll() {
+        let mut inj = BarrierInjector::new();
+        inj.enqueue(make_checkpoint_barrier("job", 9, "cp-9"));
+        assert_eq!(inj.next_barrier().unwrap().epoch, 9);
+        for stale in [3, 4, 9, 2] {
+            inj.enqueue(make_checkpoint_barrier("job", stale, "stale"));
+        }
+        inj.enqueue(make_checkpoint_barrier("job", 10, "cp-10"));
+        assert_eq!(inj.next_barrier().unwrap().epoch, 10);
+    }
+
     #[test]
     fn barrier_injector_new_is_empty() {
         let mut inj = BarrierInjector::new();
@@ -248,7 +302,7 @@ mod tests {
         inj.enqueue(make_checkpoint_barrier("job", 1, "cp-1-dup"));
         inj.enqueue(make_checkpoint_barrier("job", 2, "cp-2"));
         assert_eq!(inj.next_barrier().unwrap().epoch, 1);
-        assert!(inj.next_barrier().is_none());
         assert_eq!(inj.next_barrier().unwrap().epoch, 2);
+        assert!(inj.next_barrier().is_none());
     }
 }
