@@ -587,3 +587,44 @@ Every one was a comment and its code disagreeing. No grep finds that, because
 the defect is not in the code's shape — it is in the gap between what the code
 does and what the file says it does. Scanning tells you a crate has none of the
 defects you already know about. Only reading tells you what it has.
+
+## krishiv-executor: barrier subsystem read 2026-07-29
+
+Three files read end to end: `barrier_grpc.rs` (the crate's worst-covered
+module at 33%), `barrier_transport.rs`, `barrier.rs`.
+
+**Two defects fixed.**
+
+- `11de2e99` — `ExecutorBarrierService::background_tasks` was documented as
+  "aborted when the service is dropped"; nothing aborted them. One leaked task
+  per `barrier_stream` RPC on a long-lived executor. The obvious fix is wrong:
+  the service is `Clone`, so a `Drop` on it would abort streams the surviving
+  clones still serve. Moved the `Vec` behind its own type inside the shared
+  `Arc`, so the abort runs once when the last holder goes.
+- `3b32bf70` — `BarrierInjector::next_barrier` popped a stale barrier,
+  discarded it, and returned `None`. `None` means "nothing to inject", so one
+  duplicate hid a valid barrier behind it for a whole poll. The coordinator
+  re-sends barriers when an ack is slow, so this cost most exactly when it
+  could least afford to. Two existing tests encoded the bug.
+
+**Open finding — the simulator has diverged from production.**
+
+`barrier.rs` is entirely `#[cfg(test)]`: a `BarrierSimulator` plus 11 tests,
+with ~5 more in `sections/gap6.rs.inc`. Every one of those tests exercises the
+simulator's *own* methods (`process_barrier`, `snapshots`). It implements
+`BarrierSource`, so it could serve as a test double for production operators —
+nothing uses it that way.
+
+That was merely phantom coverage until `3b32bf70`. It is now worse: the
+simulator models stale-epoch handling as **`Err`**, while production now
+**skips and continues**. A reader comparing them would take the simulator for a
+specification and be wrong, and ~16 tests report green on a policy the engine no
+longer implements.
+
+Recommended disposition is delete (the capability — barrier epoch ordering —
+ships as `BarrierInjector`, which now has direct tests for both the skip and the
+monotonicity). Not done here: it spans three files at the tail of a long
+session, and a half-applied multi-file deletion is worse than a recorded
+finding. Whoever picks this up should delete `barrier.rs`, the `BarrierSimulator`
+block in `gap6.rs.inc`, and the import in `core.rs.inc` — or, if the model is
+wanted, make it call the real `BarrierInjector` so it cannot drift again.
