@@ -532,3 +532,29 @@ headroom, not a caveat on their validity.
 
 - [ ] Enable Arrow IPC body compression on the shuffle Flight path, keep it
       configurable, and A/B it on q8/q9 (the two most shuffle-heavy queries).
+
+### krishiv-shuffle coverage as of 2026-07-29
+
+Read end to end (findings fixed and committed): `flight.rs`, `disk_store.rs`,
+`shuffle_svc.rs`, `sort_shuffle_writer.rs`, `partitioner.rs`, `memory_store.rs`,
+`compression.rs`, `push_shuffle.rs`, `store.rs`, `lease_persistence.rs`.
+Deleted after confirming they were unreachable: `range_partitioner.rs`,
+`spillable.rs`.
+
+**Not yet read end to end** — `orphan.rs` (716), `object_store.rs` (520),
+`storage_uri.rs` (260), `local_store.rs` (238), `tiered_store.rs` (125),
+`token_auth.rs` (123), `metadata.rs` (104), `error.rs` (94), `lib.rs` (72),
+`tests.rs` (39), `path.rs` (36).
+
+Those eleven were put through a *targeted scan* for the five defect shapes this
+audit has actually been finding — silent skip on a failed lookup, `debug_assert`
+guards that vanish in release, status/branch decisions taken by matching an
+error's rendered string, whole-collection materialisation on a hot path, and a
+lock held across `.await`. The scan came back clean; the only `try_collect` hit
+(`object_store.rs:506`) collects object *paths* on the GC path, where
+collecting before `delete_stream` is the correct object-store idiom.
+
+A clean scan is weaker evidence than a read. Every bug fixed in this crate came
+from reading a file whole and noticing that a comment and its code disagreed —
+which no grep finds. These eleven are covered against known shapes, not
+audited; do not record the crate as complete until they are read.
