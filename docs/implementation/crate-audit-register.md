@@ -530,8 +530,17 @@ Note when reading the numbers: the Krishiv SF100 results recorded on
 2026-07-29 were produced with **no shuffle compression of any kind**. That is
 headroom, not a caveat on their validity.
 
-- [ ] Enable Arrow IPC body compression on the shuffle Flight path, keep it
-      configurable, and A/B it on q8/q9 (the two most shuffle-heavy queries).
+- [x] Enable Arrow IPC body compression on the shuffle Flight path, keep it
+      configurable. Done (`b80d4559`), default LZ4, 4.54x measured on a
+      shuffle-shaped payload.
+- [x] Compress partitions at rest too — both stores defaulted to `None` on
+      every path a distributed query uses (`7ead8933`), 7.55x measured.
+- [ ] **A/B both on q8/q9** (the two most shuffle-heavy queries). Neither has
+      been measured end to end on the cluster: the running image predates them,
+      and rebuilding mid-sweep would have invalidated the locality comparison
+      and the Spark baseline. Until that A/B runs, the ratios above are
+      microbenchmarks, not query speedups — a partition that never crossed the
+      wire saves nothing.
 
 ### krishiv-shuffle coverage as of 2026-07-29
 
@@ -541,20 +550,40 @@ Read end to end (findings fixed and committed): `flight.rs`, `disk_store.rs`,
 Deleted after confirming they were unreachable: `range_partitioner.rs`,
 `spillable.rs`.
 
-**Not yet read end to end** — `orphan.rs` (716), `object_store.rs` (520),
-`storage_uri.rs` (260), `local_store.rs` (238), `tiered_store.rs` (125),
-`token_auth.rs` (123), `metadata.rs` (104), `error.rs` (94), `lib.rs` (72),
-`tests.rs` (39), `path.rs` (36).
+The remaining eleven — `orphan.rs`, `object_store.rs`, `storage_uri.rs`,
+`local_store.rs`, `tiered_store.rs`, `token_auth.rs`, `metadata.rs`,
+`error.rs`, `lib.rs`, `tests.rs`, `path.rs` — have now been read end to end
+as well. **The crate is complete.**
 
-Those eleven were put through a *targeted scan* for the five defect shapes this
-audit has actually been finding — silent skip on a failed lookup, `debug_assert`
-guards that vanish in release, status/branch decisions taken by matching an
-error's rendered string, whole-collection materialisation on a hot path, and a
-lock held across `.await`. The scan came back clean; the only `try_collect` hit
-(`object_store.rs:506`) collects object *paths* on the GC path, where
-collecting before `delete_stream` is the correct object-store idiom.
+#### What the reads found that the scan did not
 
-A clean scan is weaker evidence than a read. Every bug fixed in this crate came
-from reading a file whole and noticing that a comment and its code disagreed —
-which no grep finds. These eleven are covered against known shapes, not
-audited; do not record the crate as complete until they are read.
+The eleven had been through a *targeted scan* for the five defect shapes this
+audit had been finding (silent skip on a failed lookup, `debug_assert` guards
+that vanish in release, branch decisions taken by matching an error's rendered
+string, whole-collection materialisation on a hot path, a lock held across
+`.await`). That scan came back clean. Reading them found five more defects,
+none of which matches any of those five shapes:
+
+| File | Defect |
+|---|---|
+| `tiered_store.rs` | `register_partition_lease` used `try_join!`, cancelling one tier on the other's error — contradicting the comment two functions below explaining why that is wrong. Tiers could hold different fencing tokens while reads fall back local→remote. |
+| `coordinator_daemon.rs` (found *from* `orphan.rs`) | The coordinator's orphan GC called `cleanup_orphans` directly, reclaiming on the first absence. `OrphanReclaimTracker`'s own doc names `job_coordinators.keys()` — the coordinator's set — as the hazard, and the executor got the protection while the coordinator did not. |
+| `storage_uri.rs` | `open_tiered_shuffle_backend` stated its durability-profile rule in a doc comment and enforced nothing, so the same `s3://` URI was accepted or refused depending on whether a local dir was also set. |
+| `object_store.rs`, `disk_store.rs` | Both stores defaulted to `ShuffleCompression::None`; the only production caller that ever set a codec was `shuffle_svc`. Every backend a distributed query uses wrote partitions raw. 7.55x measured. |
+| `object_store.rs` | `stream_partition` copied the whole fetched object via `to_vec()`, justified by a comment claiming `Bytes` could not be moved into `spawn_blocking` — it can. |
+
+`local_store.rs` turned out to be a `#[cfg(test)]`-only parallel store with its
+own on-disk format that nothing ships; deleted, with its one load-bearing
+property re-proven against the real formats.
+
+#### The conclusion to carry forward
+
+A clean scan is weaker evidence than a read, and this is now measured rather
+than asserted: the scan cleared eleven files, and reading those same eleven
+produced five defects — one of them a durability bug in the fencing path, one a
+GC that could delete a live job's shuffle output on a coordinator failover.
+
+Every one was a comment and its code disagreeing. No grep finds that, because
+the defect is not in the code's shape — it is in the gap between what the code
+does and what the file says it does. Scanning tells you a crate has none of the
+defects you already know about. Only reading tells you what it has.
