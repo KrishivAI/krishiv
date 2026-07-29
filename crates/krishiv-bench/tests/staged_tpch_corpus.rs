@@ -22,6 +22,15 @@
 //! It runs in seconds. The point is that a bug like q17's should never again be
 //! something a cluster has to discover.
 
+// Integration-test crate: helpers run outside `#[test]` fns, so clippy.toml's
+// `allow-unwrap-in-tests` does not reach them. A panic is the failure signal here.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use krishiv_bench::tpch_fixture::{fixture_ddl, row_producing_queries};
@@ -91,7 +100,12 @@ fn route(batch: &RecordBatch, key_column: &str, num_partitions: usize) -> Vec<Re
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         value.hash(&mut hasher);
         let bucket = usize::try_from(hasher.finish() % num_partitions as u64).unwrap_or(0);
-        selections[bucket].push(u32::try_from(row).expect("row fits u32"));
+        // `bucket` is `hash % num_partitions`, so it is in range — but index it
+        // through `get_mut` anyway; the workspace denies `indexing_slicing`
+        // because that argument has to be re-derived by every future reader.
+        if let Some(sel) = selections.get_mut(bucket) {
+            sel.push(u32::try_from(row).expect("row fits u32"));
+        }
     }
     selections
         .into_iter()

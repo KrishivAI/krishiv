@@ -1,5 +1,9 @@
+//! Gap-coverage tests. The inner module is named `tests`, not `gap_tests`:
+//! the file is already declared as `mod gap_tests;`, so repeating the name
+//! produced `gap_tests::gap_tests` (clippy::module_inception) — invisible
+//! until `just lint` started passing --all-targets.
 #[cfg(test)]
-mod gap_tests {
+mod tests {
     use crate::delta_batch::DeltaBatch;
     use crate::error::DeltaError;
     use crate::lateness::SourceOrdinal;

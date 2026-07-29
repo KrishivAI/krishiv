@@ -1,3 +1,12 @@
+// Benchmark harness: a panic is the failure signal, and clippy.toml's
+// `allow-*-in-tests` does not cover bench targets.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 use krishiv_api::session::SessionBuilder;
 use std::time::Instant;
 

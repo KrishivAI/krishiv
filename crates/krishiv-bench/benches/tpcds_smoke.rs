@@ -10,6 +10,15 @@
 //! Data path: `KRISHIV_TPCDS_DATA_DIR` env var pointing to the
 //! directory of Parquet files.
 
+// Benchmark harness: a panic is the failure signal, and clippy.toml's
+// `allow-*-in-tests` does not cover bench targets.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use krishiv_bench::tpcds;
 use std::time::Duration;

@@ -5,6 +5,16 @@
 //! that incremental = batch. Krishiv here validates the same invariant
 //! empirically.
 
+// Integration-test crate: helpers here run outside `#[test]` fns, so clippy's
+// `allow-unwrap-in-tests` (clippy.toml) does not reach them. A panic is still
+// the correct failure signal in a test.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use krishiv_delta::{DeltaBatch, IncrementalViewSpec};

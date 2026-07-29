@@ -342,11 +342,11 @@ mod tests {
             "state map must stay capped at max_keys regardless of key cardinality"
         );
         assert!(
-            !op.states.contains_key(&b"k1".to_vec()),
+            !op.states.contains_key(b"k1".as_slice()),
             "least-recently-active key k1 must have been evicted"
         );
-        assert!(op.states.contains_key(&b"k2".to_vec()));
-        assert!(op.states.contains_key(&b"k3".to_vec()));
+        assert!(op.states.contains_key(b"k2".as_slice()));
+        assert!(op.states.contains_key(b"k3".as_slice()));
     }
 
     #[test]
@@ -379,7 +379,7 @@ mod tests {
         assert_eq!(
             restored
                 .states
-                .get(&b"k1".to_vec())
+                .get(b"k1".as_slice())
                 .map(|s| s.last_event_ms),
             Some(42)
         );

@@ -1,5 +1,14 @@
 //! End-to-end integration tests for distributed execution (InProcessCluster, Flight SQL, coordinator lifecycle).
 
+// Integration-test crate: helpers run outside `#[test]` fns, so clippy.toml's
+// `allow-unwrap-in-tests` does not reach them. A panic is the failure signal here.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 use std::net::SocketAddr;
 use std::sync::Arc;
 

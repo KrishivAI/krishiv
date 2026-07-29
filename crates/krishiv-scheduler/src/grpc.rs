@@ -990,27 +990,6 @@ fn status_from_wire_error(error: wire::WireError) -> tonic::Status {
     tonic::Status::invalid_argument(error.to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::request_with_metadata;
-
-    #[test]
-    fn request_with_metadata_preserves_authorization_header() {
-        let mut metadata = tonic::metadata::MetadataMap::new();
-        metadata.insert(
-            "authorization",
-            tonic::metadata::MetadataValue::from_static("Bearer coord-secret"),
-        );
-
-        let request = request_with_metadata((), metadata);
-
-        let auth = request
-            .metadata()
-            .get("authorization")
-            .and_then(|value| value.to_str().ok());
-        assert_eq!(auth, Some("Bearer coord-secret"));
-    }
-}
 
 pub(crate) fn status_from_scheduler_error(error: SchedulerError) -> tonic::Status {
     match error {
@@ -1036,5 +1015,27 @@ pub(crate) fn status_from_scheduler_error(error: SchedulerError) -> tonic::Statu
         SchedulerError::Transport { .. }
         | SchedulerError::ExecutorUnavailable { .. }
         | SchedulerError::Store { .. } => tonic::Status::unavailable(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_with_metadata;
+
+    #[test]
+    fn request_with_metadata_preserves_authorization_header() {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        metadata.insert(
+            "authorization",
+            tonic::metadata::MetadataValue::from_static("Bearer coord-secret"),
+        );
+
+        let request = request_with_metadata((), metadata);
+
+        let auth = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(auth, Some("Bearer coord-secret"));
     }
 }

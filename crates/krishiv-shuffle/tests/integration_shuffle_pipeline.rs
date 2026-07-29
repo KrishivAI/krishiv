@@ -1,5 +1,15 @@
 #![forbid(unsafe_code)]
 
+// Integration-test crate: helpers here run outside `#[test]` fns, so clippy's
+// `allow-unwrap-in-tests` (clippy.toml) does not reach them. A panic is still
+// the correct failure signal in a test.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 use std::collections::HashSet;
 use std::sync::Arc;
 

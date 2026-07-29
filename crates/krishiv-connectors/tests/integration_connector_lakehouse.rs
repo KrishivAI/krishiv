@@ -1,3 +1,12 @@
+// Integration-test crate: helpers run outside `#[test]` fns, so clippy.toml's
+// `allow-unwrap-in-tests` does not reach them.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 use std::sync::Arc;
 
 use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray};
@@ -524,24 +533,22 @@ async fn lakehouse_concurrent_writes_no_duplication() {
     let total_rows: usize = scanned.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 1, "only one writer's batch should be visible");
 
-    let successful_value = if result_a.is_ok() {
-        let col = scanned[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        col.value(0)
-    } else {
-        let col = scanned[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        col.value(0)
-    };
-    assert!(
-        successful_value == 1 || successful_value == 2,
-        "the committed value should be from one of the writers"
+    // Writer A appends 1, writer B appends 2, so the surviving row identifies
+    // which writer won. This used to be an `if result_a.is_ok()` whose two
+    // branches were byte-identical, leaving only "the value is 1 or 2" — which
+    // passes even when the row on disk belongs to the writer whose commit was
+    // *rejected*, the exact corruption this test exists to rule out. (Found by
+    // clippy::if_same_then_else once `just lint` began covering test targets.)
+    let expected = if result_a.is_ok() { 1 } else { 2 };
+    let col = scanned[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(
+        col.value(0),
+        expected,
+        "the visible row must belong to the writer whose commit succeeded"
     );
 }
 

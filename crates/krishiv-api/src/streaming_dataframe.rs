@@ -1626,8 +1626,8 @@ mod tests {
             inner_join: false,
         };
         let reference = temporal_join(
-            &[stream.clone()],
-            &[table.clone()],
+            std::slice::from_ref(&stream),
+            std::slice::from_ref(&table),
             &spec,
             "version_ts",
             60_000,
@@ -1668,8 +1668,8 @@ mod tests {
             max_buffer_per_side: 1000,
         };
         let reference = interval_join(
-            &[left.clone()],
-            &[right.clone()],
+            std::slice::from_ref(&left),
+            std::slice::from_ref(&right),
             "event_ts",
             "event_ts",
             "k",

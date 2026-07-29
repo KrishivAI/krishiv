@@ -972,8 +972,10 @@ mod tests {
     fn cep_key_state_serde_skips_partial_but_preserves_metadata() {
         // `partial` is skipped because `RecordBatch` doesn't impl Serialize;
         // `last_event_ms` must survive the round trip.
-        let mut state = CepKeyState::default();
-        state.last_event_ms = 1_234_567;
+        let state = CepKeyState {
+            last_event_ms: 1_234_567,
+            ..Default::default()
+        };
         let json = serde_json::to_string(&state).unwrap();
         let restored: CepKeyState = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.last_event_ms, 1_234_567);

@@ -1464,7 +1464,7 @@ mod tests {
     #[test]
     fn catalog_result_ok() {
         let r: CatalogResult<i32> = Ok(42);
-        assert_eq!(r.unwrap(), 42);
+        assert_eq!(r.ok(), Some(42));
     }
 
     #[test]

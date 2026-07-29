@@ -8,3 +8,25 @@
 disallowed-methods = [
   { path = "krishiv_common::async_util::block_on", reason = "sync-over-async bridge: only allow-listed boundary modules may call this; async code must await instead (docs/implementation/async-contract.md)" },
 ]
+
+# The workspace denies unwrap/expect/panic/indexing_slicing (Cargo.toml
+# [workspace.lints.clippy]) because each one is a runtime panic in a daemon.
+# In a test, a panic is the *reporting mechanism* — `unwrap()` on a value the
+# test just constructed is how a failure is signalled, and rewriting it into
+# error handling makes tests longer and worse at their job.
+#
+# Until now the two were reconciled by never linting test code at all: `just
+# lint` ran without `--all-targets`, so every `#[cfg(test)]` module in the
+# workspace was invisible to clippy. That silence was not a policy, it was a
+# gap — it also hid genuine defects in test code, and it meant a contributor
+# adding a test could not be told anything by the linter.
+#
+# These options say the same thing deliberately: panic-shaped lints are for
+# production code, and everything else applies everywhere. `just lint` now
+# passes `--all-targets`, so tests are linted for real.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-print-in-tests = true
+allow-dbg-in-tests = false

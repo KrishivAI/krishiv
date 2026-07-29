@@ -1259,7 +1259,7 @@ mod fair_scheduler_tests {
             .iter()
             .filter(|a| {
                 let idx: usize = a.task_id().as_str()[1..].parse().unwrap();
-                idx % 2 == 0
+                idx.is_multiple_of(2)
             })
             .count();
         let light = assignments.len() - heavy;

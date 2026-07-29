@@ -18,6 +18,15 @@
 //! that. These tests stand up the real service on a real port and drive the
 //! real client at it.
 
+// Integration-test crate: helpers run outside `#[test]` fns, so clippy.toml's
+// `allow-unwrap-in-tests` does not reach them. A panic is the failure signal here.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 use std::time::Duration;
 
 use krishiv_executor::ess_client::PushShuffleClient;

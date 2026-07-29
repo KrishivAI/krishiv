@@ -6,6 +6,15 @@
 //! This demonstrates batch SQL over a registered in-memory table that simulates
 //! a bounded stream source.
 
+// Benchmark harness: a panic is the failure signal, and clippy.toml's
+// `allow-*-in-tests` does not cover bench targets.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 use std::sync::Arc;
 
 use arrow::array::{Int64Array, StringArray};

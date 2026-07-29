@@ -776,7 +776,7 @@ mod window_props {
             // size = 1000ms, slide = 125 * 2^shift (so slide divides size evenly)
             let slide_ms: u64 = 125 << slide_shift; // 125, 250, 500, 1000
             let size_ms: u64 = 1000;
-            let expected_fan_out = (size_ms + slide_ms - 1) / slide_ms; // ceil(size/slide)
+            let expected_fan_out = size_ms.div_ceil(slide_ms);
 
             let spec = SlidingWindowSpec {
                 key_column: "k".into(),

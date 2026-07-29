@@ -140,10 +140,9 @@ fn window_state_payload(keys: &[&str]) -> Vec<u8> {
                 "continuous-window".to_owned(),
                 "tumbling".to_owned(),
                 state_key,
-                format!(
-                    "{{\"values\":[1],\"has_value\":[true],\"avg_sums\":[],\"avg_counts\":[]}}"
-                )
-                .into_bytes(),
+                r#"{"values":[1],"has_value":[true],"avg_sums":[],"avg_counts":[]}"#
+                    .as_bytes()
+                    .to_vec(),
             )
         })
         .collect();

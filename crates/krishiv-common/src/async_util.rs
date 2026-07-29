@@ -94,6 +94,13 @@ pub fn unix_now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    // The tests for `block_on` must call `block_on`. clippy.toml disallows it
+    // outside allow-listed sync-surface boundary modules, and the module that
+    // *defines* the bridge is where its behaviour has to be pinned down — three
+    // of the tests below exist because a specific runtime nesting case used to
+    // panic. This allow is the narrowest possible: the bridge's own tests.
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
 
     #[test]

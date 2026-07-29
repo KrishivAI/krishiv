@@ -592,7 +592,11 @@ pub(super) fn concat_registry_batches(batches: &[RecordBatch]) -> Result<RecordB
     };
     let mut target = first.schema();
     validate_unique_schema_fields(&target)?;
-    for batch in &batches[1..] {
+    // `.iter().skip(1)` rather than `&batches[1..]`: the slice is provably in
+    // range here (the `first()` guard above returns on empty), but the workspace
+    // denies `indexing_slicing` because that reasoning has to be re-done by
+    // every future reader, and one refactor of the guard turns it into a panic.
+    for batch in batches.iter().skip(1) {
         target = merge_compatible_schemas(&target, &batch.schema())?;
     }
     let normalizer = crate::schema_normalize::SchemaNormalizeOperator::new(target.clone());

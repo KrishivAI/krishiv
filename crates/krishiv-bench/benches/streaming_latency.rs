@@ -36,6 +36,15 @@
 //! (per `docs/README.md:50`); this benchmark only compiles when the
 //! workspace `cargo bench` invocation is used.
 
+// Benchmark harness: a panic is the failure signal, and clippy.toml's
+// `allow-*-in-tests` does not cover bench targets.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, StringArray};
@@ -58,7 +67,7 @@ fn make_events_batch(n: usize, ts_base: i64) -> RecordBatch {
     let user_ids: Vec<String> = (0..n).map(|i| format!("u{}", i % 100)).collect();
     let user_id_refs: Vec<&str> = user_ids.iter().map(|s| s.as_str()).collect();
     let ts_values: Vec<i64> = (0..n as i64).map(|i| ts_base + i).collect();
-    let v_values: Vec<i64> = (0..n as i64).map(|i| i).collect();
+    let v_values: Vec<i64> = (0..n as i64).collect();
     RecordBatch::try_new(
         schema,
         vec![

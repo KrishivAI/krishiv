@@ -11,7 +11,7 @@ fn chaos_coordinator_failover_mid_ack_fencing() {
     // In real flow this would be rejected by the != fencing rule.
     // Here we assert the harness can model the timing window.
     assert!(
-        h.is_partitioned(&exec) == false,
+        !h.is_partitioned(&exec),
         "recovery should have happened"
     );
 }
@@ -28,7 +28,7 @@ fn chaos_lease_race_duplicate_assignment() {
     h.simulate_message_loss("task-assignment");
 
     // Harness records the conditions under which duplicates could occur.
-    assert!(h.delays.len() > 0 || h.partitions.len() > 0);
+    assert!(!h.delays.is_empty() || !h.partitions.is_empty());
 }
 
 #[test]
@@ -95,12 +95,12 @@ fn chaos_daemon_waits_on_both_notifiers() {
     let mut h = MiniSimulationHarness::new();
     let exec = ExecutorId::try_new("dual-notify").unwrap();
 
-    h.simulate_concurrent_partitions(&[exec.clone()]);
+    h.simulate_concurrent_partitions(std::slice::from_ref(&exec));
     h.simulate_lease_bump();
 
     // The harness + recent code changes model the conditions where dual-notify
     // waiting would matter for fast recovery.
-    assert!(h.partitions.len() > 0);
+    assert!(!h.partitions.is_empty());
 }
 
 #[test]
@@ -118,7 +118,7 @@ fn chaos_jcp_stage_count_reflects_real_ownership() {
 
     // In real integrated flow the JCP would report its owned stage count.
     // This test asserts the modeling conditions for that future.
-    assert!(h.is_partitioned(&exec) || h.delays.len() > 0);
+    assert!(h.is_partitioned(&exec) || !h.delays.is_empty());
 }
 
 #[test]
@@ -143,7 +143,7 @@ fn chaos_jcp_methods_remain_usable_under_heavy_injection() {
     // are resilient concepts even when the harness models extreme failure.
     let mut h = MiniSimulationHarness::new();
     let execs: Vec<_> = (0..5)
-        .map(|i| ExecutorId::try_new(&format!("jcp-stress-{}", i)).unwrap())
+        .map(|i| ExecutorId::try_new(format!("jcp-stress-{i}")).unwrap())
         .collect();
 
     h.simulate_concurrent_partitions(&execs);
@@ -1030,11 +1030,18 @@ fn chaos_track_b_jcp_owned_recovery_under_cb_and_partition() {
     assert!(!h.is_partitioned(&bad) || h.current_tick() > 6);
 }
 
-#[test]
-fn job_coordinator_owns_heartbeat_and_launch_eligibility_methods() {
+#[tokio::test]
+async fn job_coordinator_owns_heartbeat_and_launch_eligibility_methods() {
     // Track B major ownership: the new JCP methods for per-job heartbeat
     // staleness detection and launch eligibility are real and callable.
     // This proves the delegation added in advance_heartbeat_tick is live.
+    //
+    // This was `#[test]` with `let _ = jc.has_tasks_eligible_for_launch();`.
+    // The method is `async`, so that built a future and dropped it without
+    // polling: the test claimed to prove the surface "real and callable" while
+    // executing none of it, and would have passed with the body replaced by
+    // `unreachable!()`. Caught by clippy::let_underscore_future once `just
+    // lint` began covering test targets.
     use krishiv_proto::JobId;
 
     let job_id = JobId::try_new("jcp-heartbeat-launch-ownership").unwrap();
@@ -1042,9 +1049,11 @@ fn job_coordinator_owns_heartbeat_and_launch_eligibility_methods() {
     let job = crate::job::JobRecord::from_spec(spec, 0);
     let jc = crate::job_coordinator::JobCoordinator::new(job_id.clone(), job);
 
-    // Exercise the new owned surface. The async versions are already
-    // wired into the heartbeat tick hot path.
-    let _ = jc.has_tasks_eligible_for_launch();
+    // A freshly-built job has no assigned task, so nothing is launch-eligible.
+    assert!(
+        !jc.has_tasks_eligible_for_launch().await,
+        "a job whose tasks are not assigned yet must report nothing eligible"
+    );
 }
 
 #[test]

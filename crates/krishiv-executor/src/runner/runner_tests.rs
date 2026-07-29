@@ -59,7 +59,7 @@ fn a_huge_fragment_does_not_swallow_the_error() {
 #[test]
 fn format_failure_message_within_limit() {
     let short_error = "short error";
-    let msg = format_failure_message("fragment", &short_error);
+    let msg = format_failure_message("fragment", short_error);
     assert!(!msg.ends_with('…'));
     assert!(msg.contains("short error"));
 }

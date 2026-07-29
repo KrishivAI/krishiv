@@ -654,8 +654,7 @@ mod tests {
         let err = engine
             .sql("ANALYZE TABLE aqe_stats_bad_t WITH CHEESE")
             .await
-            .err()
-            .expect("trailing clause must error");
+            .expect_err("trailing clause must error");
         assert!(err.to_string().contains("unexpected trailing clause"));
     }
 
@@ -1918,11 +1917,12 @@ fn parquet_scan_output_rows(
             "{}",
             datafusion::physical_plan::displayable(node.as_ref()).one_line()
         );
-        if display.contains("DataSourceExec") && display.contains("parquet") {
-            if let Some(rows) = node.metrics().and_then(|m| m.output_rows()) {
-                *total += rows as u64;
-                *found = true;
-            }
+        if display.contains("DataSourceExec")
+            && display.contains("parquet")
+            && let Some(rows) = node.metrics().and_then(|m| m.output_rows())
+        {
+            *total += rows as u64;
+            *found = true;
         }
         for child in node.children() {
             walk(child, total, found);

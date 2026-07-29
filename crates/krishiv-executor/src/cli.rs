@@ -1586,6 +1586,39 @@ fn apply_checkpoint_default(
     }
 }
 
+
+/// Bridges streaming progress snapshots from runner tasks to the heartbeat loop
+/// via a shared DashMap. Runner tasks write progress; the heartbeat loop drains
+/// and attaches reports to the next `ExecutorHeartbeat`.
+struct ProgressBufferCallback {
+    buffer: Arc<dashmap::DashMap<String, krishiv_proto::StreamingProgressReport>>,
+}
+
+impl crate::runner::StreamingProgressCallback for ProgressBufferCallback {
+    fn on_progress(&self, snapshot: &crate::runner::StreamingProgressSnapshot) {
+        let key = format!("{}:{}", snapshot.job_id, snapshot.task_id);
+        let (Ok(job_id), Ok(task_id)) = (
+            krishiv_proto::JobId::try_new(snapshot.job_id.clone()),
+            krishiv_proto::TaskId::try_new(snapshot.task_id.clone()),
+        ) else {
+            tracing::warn!(
+                job_id = %snapshot.job_id,
+                task_id = %snapshot.task_id,
+                "skipping streaming progress report with invalid job_id/task_id"
+            );
+            return;
+        };
+        let report = krishiv_proto::StreamingProgressReport::new(job_id, task_id)
+            .with_watermark_ms(snapshot.watermark_ms)
+            .with_rows_emitted(snapshot.rows_emitted)
+            .with_batches_emitted(snapshot.batches_emitted)
+            .with_state_bytes(snapshot.state_bytes)
+            .with_source_offset(snapshot.source_offset.clone().unwrap_or_default())
+            .with_timestamp_ms(snapshot.timestamp_ms);
+        self.buffer.insert(key, report);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2118,37 +2151,5 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("unknown option"));
-    }
-}
-
-/// Bridges streaming progress snapshots from runner tasks to the heartbeat loop
-/// via a shared DashMap. Runner tasks write progress; the heartbeat loop drains
-/// and attaches reports to the next `ExecutorHeartbeat`.
-struct ProgressBufferCallback {
-    buffer: Arc<dashmap::DashMap<String, krishiv_proto::StreamingProgressReport>>,
-}
-
-impl crate::runner::StreamingProgressCallback for ProgressBufferCallback {
-    fn on_progress(&self, snapshot: &crate::runner::StreamingProgressSnapshot) {
-        let key = format!("{}:{}", snapshot.job_id, snapshot.task_id);
-        let (Ok(job_id), Ok(task_id)) = (
-            krishiv_proto::JobId::try_new(snapshot.job_id.clone()),
-            krishiv_proto::TaskId::try_new(snapshot.task_id.clone()),
-        ) else {
-            tracing::warn!(
-                job_id = %snapshot.job_id,
-                task_id = %snapshot.task_id,
-                "skipping streaming progress report with invalid job_id/task_id"
-            );
-            return;
-        };
-        let report = krishiv_proto::StreamingProgressReport::new(job_id, task_id)
-            .with_watermark_ms(snapshot.watermark_ms)
-            .with_rows_emitted(snapshot.rows_emitted)
-            .with_batches_emitted(snapshot.batches_emitted)
-            .with_state_bytes(snapshot.state_bytes)
-            .with_source_offset(snapshot.source_offset.clone().unwrap_or_default())
-            .with_timestamp_ms(snapshot.timestamp_ms);
-        self.buffer.insert(key, report);
     }
 }

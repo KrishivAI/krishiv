@@ -475,7 +475,6 @@ mod tests {
         let limits = ResourceLimits {
             max_execution_time_ms: Some(5_000),
             max_memory_bytes: Some(64 * 1024 * 1024),
-            ..ResourceLimits::default()
         };
 
         // Should succeed and register the (empty) set of UDFs with the supplied limits

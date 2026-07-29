@@ -14,6 +14,15 @@
 //!   acceptance gate.  These are annotated as simulations in their doc
 //!   comments so the distinction is explicit.
 
+// Integration-test crate: helpers run outside `#[test]` fns, so clippy.toml's
+// `allow-unwrap-in-tests` does not reach them. A panic is the failure signal here.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 use krishiv_common::chaos::{FaultInjector, FaultMode};
 
 /// A stale fencing token (different from the current leader) is rejected by

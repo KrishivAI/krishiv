@@ -139,7 +139,7 @@ mod phase3_recovery {
         for snap in &operator_snapshots {
             let bytes = storage.read_bytes(&snap.snapshot_path).unwrap().unwrap();
             manifest.insert_bytes(
-                &format!("{}/{}/state.bin", snap.operator_id, snap.task_id),
+                format!("{}/{}/state.bin", snap.operator_id, snap.task_id),
                 &bytes,
             );
         }

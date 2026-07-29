@@ -3,6 +3,15 @@
 //! Each test uses `#[tokio::test(flavor = "multi_thread")]` and exercises real
 //! Arrow `RecordBatch` data with proper schemas.
 
+// Integration-test crate: helpers run outside `#[test]` fns, so clippy.toml's
+// `allow-unwrap-in-tests` does not reach them. A panic is the failure signal here.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 use std::collections::HashMap;
 use std::sync::Arc;
 

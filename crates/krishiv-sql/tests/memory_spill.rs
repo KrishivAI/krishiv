@@ -15,6 +15,15 @@
 //! there) — so the positive case succeeding is evidence spill is engaged,
 //! not that the data happened to fit anyway.
 
+// Integration-test crate: helpers run outside `#[test]` fns, so clippy.toml's
+// `allow-unwrap-in-tests` does not reach them. A panic is the failure signal here.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 use std::sync::Arc;
 
 use arrow::array::{Int64Array, StringArray};

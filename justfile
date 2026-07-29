@@ -268,11 +268,25 @@ fmt:
     {{ cargo }} fmt --check
 
 # Run clippy across the workspace
+#
+# `--all-targets` is load-bearing: without it clippy sees only the lib/bin
+# targets, so every `#[cfg(test)]` module, `tests/` crate, bench and example in
+# the workspace went unlinted. That was not a policy, it was a gap — and it hid
+# real defects, not just style. Turning it on found, among others: a chaos test
+# that built a future and dropped it without awaiting (so it proved nothing), a
+# concurrent-commit test whose if/else branches were identical (so it accepted
+# the losing writer's data), 565 lines of production code sitting after a test
+# module in cli.rs, and a production `&batches[1..]` that only compiles under a
+# feature flag and had therefore never been linted at all.
+#
+# The panic-shaped lints (unwrap/expect/panic/indexing) are relaxed inside tests
+# via clippy.toml, so this does not ask tests to stop panicking on failure.
 lint:
     {{ cargo }} clippy \
         --workspace \
         --exclude krishiv-python \
         --exclude krishiv-chaos \
+        --all-targets \
         -- -D warnings
     # krishiv-sql's `default = []` means a plain --workspace pass above never
     # enables iceberg-datafusion/local-catalog, so execute_iceberg_ctas and

@@ -1,5 +1,14 @@
 //! Barrier injection tests (R16 S1.2).
 
+// Integration-test crate: helpers run outside `#[test]` fns, so clippy.toml's
+// `allow-unwrap-in-tests` does not reach them. A panic is the failure signal here.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 use krishiv_dataflow::queue::{OperatorMessage, operator_queue};
 use krishiv_executor::barrier_transport::{BarrierInjector, make_checkpoint_barrier};
 

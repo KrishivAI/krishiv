@@ -5,6 +5,15 @@
 //!
 //! This demonstrates the minimal embedded-mode usage pattern.
 
+// Benchmark harness: a panic is the failure signal, and clippy.toml's
+// `allow-*-in-tests` does not cover bench targets.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 use std::sync::Arc;
 
 use arrow::array::{Int64Array, StringArray};

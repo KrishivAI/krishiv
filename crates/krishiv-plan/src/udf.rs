@@ -502,7 +502,7 @@ mod tests {
                     message: "expected Int64".into(),
                 })?;
 
-            let mut current: i64 = read_i64_state(&state);
+            let mut current: i64 = read_i64_state(state);
 
             for v in col.iter().flatten() {
                 current += v;

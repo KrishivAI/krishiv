@@ -1,5 +1,14 @@
 //! Key-group backend tests (R16 S4.1).
 
+// Integration-test crate: helpers run outside `#[test]` fns, so clippy.toml's
+// `allow-unwrap-in-tests` does not reach them. A panic is the failure signal here.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 use krishiv_state::key_group::{
     NUM_KEY_GROUPS, key_group_for_key, key_group_ranges_for_parallelism,
 };

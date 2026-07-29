@@ -4,9 +4,10 @@
 //! `KRISHIV_BLESS_CORPUS=1 cargo test -p krishiv-conformance` — then review
 //! the corpus diff like any other code change.
 
-// Test harness: panicking on setup/corpus failure is the assertion.
-#![allow(clippy::expect_used, clippy::panic)]
-
+// Test harness: panicking on setup/corpus failure is the assertion. Helpers here
+// run outside `#[test]` fns, so clippy.toml's `allow-*-in-tests` does not reach
+// them.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use std::path::PathBuf;
 
 use krishiv_conformance::{EmbeddedDriver, SessionDriver};
