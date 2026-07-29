@@ -115,7 +115,9 @@ impl InMemoryShuffleStore {
 }
 
 enum ReadResult {
-    Data(ShufflePartition),
+    /// The partition, plus the hash recorded at write time. Carried out of the
+    /// lock so verification happens without the store serialized behind it.
+    Data(ShufflePartition, Option<[u8; 32]>),
     Spilled,
     NotFound,
 }
@@ -323,13 +325,40 @@ impl ShuffleStore for InMemoryShuffleStore {
 
         // Lock once, read state, drop guard — then do async I/O outside the lock.
         // The `?` inside the block propagates LockPoisoned to the function caller.
+        // Take the partition handle and its expected hash under the lock, then
+        // verify OUTSIDE it.
+        //
+        // The integrity check used to run `compute_simple_partition_hash` — a
+        // blake3 pass over every buffer of every column of every batch — while
+        // holding `self.state`, the single Mutex that guards *all* shuffle
+        // state. Every read therefore did work proportional to the partition's
+        // size with the whole store serialized behind it, so one reader hashing
+        // a large partition blocked every concurrent write, read and eviction.
+        // The single-Mutex design (A4) removed a deadlock risk; hashing under it
+        // turned that lock into a throughput ceiling.
+        //
+        // Cloning a `ShufflePartition` first is cheap: its batches are
+        // Arc-backed, so the clone copies pointers, not buffers. Nothing can
+        // mutate the batches behind those Arcs, so verifying after the guard
+        // drops checks exactly the same bytes it checked before.
         let action: ReadResult = {
             let st = self.state.lock().map_err(|_| ShuffleError::LockPoisoned)?;
             if st.spilled.contains(&key) {
                 ReadResult::Spilled
             } else if let Some(partition) = st.partitions.get(&key) {
-                if let Some(&stored_hash) = st.content_hashes.get(&key) {
-                    let computed = compute_simple_partition_hash(partition);
+                ReadResult::Data(partition.clone(), st.content_hashes.get(&key).copied())
+            } else {
+                // Not in memory and not spilled — either never written or the write
+                // failed (e.g. stale token). The caller can retry; returning Ok(None)
+                // is correct semantics because no committed data exists yet.
+                ReadResult::NotFound
+            }
+        }; // guard dropped here, before hashing and before any .await
+
+        match action {
+            ReadResult::Data(p, stored_hash) => {
+                if let Some(stored_hash) = stored_hash {
+                    let computed = compute_simple_partition_hash(&p);
                     if computed != stored_hash {
                         return Err(ShuffleError::ContentHashMismatch {
                             partition: format!("{key:?}"),
@@ -338,17 +367,8 @@ impl ShuffleStore for InMemoryShuffleStore {
                         });
                     }
                 }
-                ReadResult::Data(partition.clone())
-            } else {
-                // Not in memory and not spilled — either never written or the write
-                // failed (e.g. stale token). The caller can retry; returning Ok(None)
-                // is correct semantics because no committed data exists yet.
-                ReadResult::NotFound
+                Ok(Some(p))
             }
-        }; // guard dropped here, before any .await
-
-        match action {
-            ReadResult::Data(p) => Ok(Some(p)),
             ReadResult::NotFound => Ok(None),
             ReadResult::Spilled => match &self.spill_store {
                 Some(spill) => spill.read_partition(id).await,
