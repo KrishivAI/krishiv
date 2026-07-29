@@ -19,7 +19,23 @@ NS=krishiv-apitest
 IMAGE=localhost/krishiv-spark:3.5.3
 DATA=s3a://krishiv-bench/tpch/sf100
 S3_ENDPOINT=http://minio-bench-local.krishiv-infra.svc.cluster.local:9000
-APISERVER="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
+# The API server URL, from the caller if supplied.
+#
+# This script runs *inside* the Spark image, which has no kubectl — reading it
+# with `kubectl config view` here failed the whole submission with
+# "kubectl: command not found" after the harness had already scaled Krishiv's
+# executors to zero. spark-submit talks to the API server directly and never
+# needed kubectl; only this one lookup did. The caller (which runs on the host,
+# where kubectl exists) passes it in, and the kubectl path stays as a fallback
+# for interactive use from a machine that has one.
+APISERVER="${KRISHIV_APISERVER:-}"
+if [ -z "$APISERVER" ]; then
+  command -v kubectl >/dev/null 2>&1 || {
+    echo "error: set KRISHIV_APISERVER (no kubectl in this image)" >&2
+    exit 2
+  }
+  APISERVER="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
+fi
 ONLY="${1:-}"
 
 echo "# api server : $APISERVER"
@@ -34,6 +50,25 @@ exec /opt/spark/bin/spark-submit \
   --conf spark.kubernetes.container.image="$IMAGE" \
   --conf spark.kubernetes.container.image.pullPolicy=Never \
   --conf spark.kubernetes.authenticate.driver.serviceAccountName=spark-bench \
+  \
+  `# ── Submission credentials: CA + service-account token ─────────────` \
+  `# Not kubeconfig auto-discovery, and not client certs.` \
+  `#` \
+  `# Auto-discovery fails because the Spark image runs as uid 185 and cannot` \
+  `# read a root-owned ~/.kube mount; fabric8 then silently falls back to the` \
+  `# JVM trust store and rejects the k3s CA with "PKIX path building failed" —` \
+  `# an error naming TLS, not the permission problem behind it.` \
+  `#` \
+  `# Client certs fail because k3s issues an EC client key and fabric8 hands` \
+  `# every key to its PKCS#1 (RSA) decoder, dying on "Invalid DER: object is` \
+  `# not integer". Converting the key to PKCS#8 and setting clientKeyAlgo=EC` \
+  `# both failed to change that.` \
+  `#` \
+  `# A bearer token has no key to parse. The runner mints a short-lived one for` \
+  `# the spark-bench service account, which is the identity the driver already` \
+  `# runs as — so submission and driver authenticate as the same principal.` \
+  --conf spark.kubernetes.authenticate.submission.caCertFile="${KRISHIV_KUBE_PEMS:-/kube}/ca.pem" \
+  --conf spark.kubernetes.authenticate.submission.oauthTokenFile="${KRISHIV_KUBE_PEMS:-/kube}/token" \
   \
   `# ── Executors: matched to bench-exec-s{1,2,3} ────────────────────────` \
   `# Krishiv: limits cpu 3800m / mem 5000Mi, requests cpu 250m / mem 512Mi,` \
@@ -62,14 +97,17 @@ exec /opt/spark/bin/spark-submit \
   --conf spark.hadoop.fs.s3a.endpoint="$S3_ENDPOINT" \
   --conf spark.hadoop.fs.s3a.path.style.access=true \
   --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
-  --conf spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.EnvironmentVariableCredentialsProvider \
+  `# The env-var provider lives in the AWS SDK, not the hadoop-aws package;` \
+  `# org.apache.hadoop.fs.s3a.EnvironmentVariableCredentialsProvider does not` \
+  `# exist and fails at first read with ClassNotFoundException.` \
+  --conf spark.hadoop.fs.s3a.aws.credentials.provider=com.amazonaws.auth.EnvironmentVariableCredentialsProvider \
   --conf spark.kubernetes.driver.secretKeyRef.AWS_ACCESS_KEY_ID=minio-s3-creds:AWS_ACCESS_KEY_ID \
   --conf spark.kubernetes.driver.secretKeyRef.AWS_SECRET_ACCESS_KEY=minio-s3-creds:AWS_SECRET_ACCESS_KEY \
   --conf spark.kubernetes.executor.secretKeyRef.AWS_ACCESS_KEY_ID=minio-s3-creds:AWS_ACCESS_KEY_ID \
   --conf spark.kubernetes.executor.secretKeyRef.AWS_SECRET_ACCESS_KEY=minio-s3-creds:AWS_SECRET_ACCESS_KEY \
   \
   `# ── The job + corpus arrive via a ConfigMap mounted at /opt/job ─────` \
-  --conf spark.kubernetes.driver.podTemplateFile=/opt/job/driver-pod-template.yaml \
+  --conf spark.kubernetes.driver.podTemplateFile=/opt/job/spark-driver-pod-template.yaml \
   \
   local:///opt/job/tpch_spark_run.py \
     --data "$DATA" \
