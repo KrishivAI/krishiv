@@ -300,10 +300,26 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
 
 ### Open
 
-- [ ] **`PushShuffleClient` has zero constructors in the workspace.** The ESS
-      server routes are live via `krishiv shuffle-svc`, but nothing builds the
-      client; `ctx.push_store` is the in-process `PushShuffleStore`, a
-      different type. Wire-or-delete decision, not an audit fix.
+- [ ] **Two of the three map-write paths are unreachable.** `dfplan` is the
+      only live one.
+
+      * `execute_shuffle_write` (batch.rs ~758): nothing anywhere *constructs*
+        a `shuffle-write:` fragment. The string appears only in the executor's
+        own dispatch (`batch.rs:209`), one error message, and five doc
+        comments — no scheduler, no coordinator, no test. Checked before
+        converting it to the streaming write, which would have been effort
+        spent on dead code.
+      * `PushShuffleClient`: zero constructors. The ESS server routes are live
+        via `krishiv shuffle-svc`, but nothing builds the client;
+        `ctx.push_store` is the in-process `PushShuffleStore`, a different type.
+        It is at least **verified** now (`d666748f`) —
+        `tests/ess_push_shuffle_e2e.rs` stands the real service up on a real
+        port and drives the real client at it, so the two are known to agree on
+        routes, auth, and the merged-read gate.
+
+      Both carried real bugs fixed this pass that could never have been hit.
+      Wire-or-delete is a product decision, not an audit fix — but it should be
+      made, and it now rests on information rather than a guess.
 - [ ] **The reduce side is the mirror of D7 and still collects.**
       `ShufflePartitionReader::read_partition` (krishiv-sql) is typed
       `Result<Vec<RecordBatch>, String>`, so `InmemDfplanShuffleReader`
@@ -314,9 +330,6 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
       shuffle input of a task into one `Vec` before the engine sees any of it,
       outside the pool. Only the legacy typed paths (batch.rs:76, :299) call
       it, not dfplan.
-- [ ] `execute_shuffle_write` (batch.rs ~758) still collects; it has the
-      push-shuffle IPC mirror, which needs all batches when `ctx.push_store` is
-      `Some`, so converting it means a conditional path. Not on the SF100 route.
 - [ ] `fragment/common.rs` (2172) and `fragment/run_loop.rs` (1480) not yet
       read end to end.
 - [ ] Executor `running_task_count: 3` self-reported on all three nodes while
