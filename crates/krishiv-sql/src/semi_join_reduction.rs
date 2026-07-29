@@ -80,19 +80,61 @@
 //! Set `KRISHIV_SEMI_JOIN_REDUCTION=off` to disable.
 
 use datafusion::common::tree_node::Transformed;
-use datafusion::common::{Column, DFSchema, Result};
+use datafusion::common::{Column, DFSchema, NullEquality, Result};
 use datafusion::logical_expr::{
     Aggregate, Expr, Join, JoinType, LogicalPlan, LogicalPlanBuilder, Projection, SubqueryAlias,
 };
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use std::sync::Arc;
 
-/// Environment switch for the rule.
+/// Environment switch for reduction *through an aggregate* (the q17 rule).
 pub const SEMI_JOIN_REDUCTION_ENV: &str = "KRISHIV_SEMI_JOIN_REDUCTION";
+
+/// Environment switch for pushdown *through an inner join* (the q18 rule).
+///
+/// # Why this is a separate switch, and why it defaults off
+///
+/// One variable used to gate both rules, which meant the two could not be
+/// measured apart — and they turn out to pull in opposite directions on the
+/// SF100 corpus. Counting stages that collapse to a single output partition,
+/// with the pushdown rule on versus off:
+///
+/// ```text
+///   q2   5 -> 1     q21  3 -> 0     q17  3 -> 2     q18  0 -> 0
+/// ```
+///
+/// It makes three of the four *less* distributed, and is neutral on q18 — the
+/// query it was written for. The aggregate rule, by contrast, is what wins q17
+/// (54.8 s against Spark's 440.7 s, 8.0x), so the two must not share a switch.
+///
+/// The pushdown rule was also the sole source of the nested-loop joins that
+/// cost q2 18.4x; that bug is fixed (see `push_semi_below`), but a rewrite
+/// that has not yet demonstrated a win on any query should not be on by
+/// default. Set `KRISHIV_SEMI_JOIN_PUSHDOWN=on` to measure it.
+pub const SEMI_JOIN_PUSHDOWN_ENV: &str = "KRISHIV_SEMI_JOIN_PUSHDOWN";
 
 /// Whether semi-join reduction through aggregates is enabled (default: yes).
 pub fn semi_join_reduction_enabled() -> bool {
     enabled_from(&std::env::var(SEMI_JOIN_REDUCTION_ENV).unwrap_or_default())
+}
+
+/// Whether semi-join pushdown through an inner join is enabled (default: no).
+///
+/// Opt-in, unlike [`semi_join_reduction_enabled`] — see
+/// [`SEMI_JOIN_PUSHDOWN_ENV`] for the measurements behind that default.
+pub fn semi_join_pushdown_enabled() -> bool {
+    // Still gated by the umbrella switch, so turning that off disables both.
+    semi_join_reduction_enabled()
+        && opted_in(&std::env::var(SEMI_JOIN_PUSHDOWN_ENV).unwrap_or_default())
+}
+
+/// The opt-in switch's parsing, kept pure for the same reason as
+/// [`enabled_from`].
+fn opted_in(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "on" | "true" | "yes"
+    )
 }
 
 /// The switch's parsing, separated from reading the environment.
@@ -176,7 +218,23 @@ fn enabled_from(value: &str) -> bool {
 /// The outer semi-join is *replaced* rather than duplicated, so there is no
 /// fixed-point concern: after one application the top node is an inner join.
 #[derive(Debug, Default)]
-pub struct SemiJoinPushdownThroughInnerJoin;
+pub struct SemiJoinPushdownThroughInnerJoin {
+    /// Bypass [`semi_join_pushdown_enabled`] and always apply.
+    ///
+    /// The env switch cannot be exercised from a test: mutating process
+    /// environment is unsound under a multi-threaded runner and `set_var` is
+    /// unsafe since edition 2024, which this workspace denies. Without this
+    /// the rule's own tests would silently test nothing once the default
+    /// flipped to off — the exact failure mode the audit keeps finding.
+    forced: bool,
+}
+
+impl SemiJoinPushdownThroughInnerJoin {
+    /// The rule with its env gate bypassed, for tests and explicit opt-in.
+    pub fn forced() -> Self {
+        Self { forced: true }
+    }
+}
 
 impl OptimizerRule for SemiJoinPushdownThroughInnerJoin {
     fn name(&self) -> &str {
@@ -195,7 +253,7 @@ impl OptimizerRule for SemiJoinPushdownThroughInnerJoin {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        if !semi_join_reduction_enabled() {
+        if !self.forced && !semi_join_pushdown_enabled() {
             return Ok(Transformed::no(plan));
         }
         let LogicalPlan::Join(semi) = &plan else {
@@ -407,16 +465,31 @@ fn push_semi_below(
 
             // Rebuild the semi-join around the chosen child, keeping the
             // original orientation so the ON pairs still line up.
-            let on: Vec<Expr> = pairs
+            //
+            // These go in as **equijoin keys**, not as predicate expressions.
+            // `join_on` would park them in the join's `filter` and leave
+            // `extract_equijoin_predicate` to hoist them into `on` later — but
+            // that rule has already run by the time this one fires, so nothing
+            // hoists them and the physical planner sees a join with no keys.
+            // It then picks `NestedLoopJoinExec`: an O(n*m) scan of a pure
+            // equi-join.
+            //
+            // That is not hypothetical. It is what this rule did to TPC-H q2,
+            // measured at 1424 s against Spark's 78 s (18.4x, the second
+            // largest loss of the 22). `stage_dump` counts two
+            // `NestedLoopJoinExec` nodes in q2 with the rule on and **zero**
+            // with `KRISHIV_SEMI_JOIN_REDUCTION=off` — the rule written to
+            // make q18 faster was making q2 eighteen times slower.
+            let (left_keys, right_keys): (Vec<Column>, Vec<Column>) = pairs
                 .iter()
                 .map(|(fk, pk)| {
                     if filtered_is_right {
-                        Expr::Column(pk.clone()).eq(Expr::Column(fk.clone()))
+                        (pk.clone(), fk.clone())
                     } else {
-                        Expr::Column(fk.clone()).eq(Expr::Column(pk.clone()))
+                        (fk.clone(), pk.clone())
                     }
                 })
-                .collect();
+                .unzip();
             // The residual may only reference the child we are landing on and
             // the probe. If it still names a column from the *other* child,
             // the existence test genuinely depends on the joined row and this
@@ -431,44 +504,29 @@ fn push_semi_below(
                 }
             }
 
-            let mut reduced = if filtered_is_right {
-                LogicalPlanBuilder::from(probe.clone()).join_on(
+            // The residual rides in as the join's `filter`, which is what that
+            // field is for. Semi/anti join schemas are the filtered side's
+            // schema regardless of the filter, so this cannot disturb the shape
+            // the parent join was built against.
+            let residual = residual.cloned();
+            let reduced = if filtered_is_right {
+                LogicalPlanBuilder::from(probe.clone()).join_detailed(
                     target.as_ref().clone(),
                     join_type,
-                    on,
+                    (left_keys, right_keys),
+                    residual,
+                    NullEquality::NullEqualsNothing,
                 )?
             } else {
-                LogicalPlanBuilder::from(target.as_ref().clone()).join_on(
+                LogicalPlanBuilder::from(target.as_ref().clone()).join_detailed(
                     probe.clone(),
                     join_type,
-                    on,
+                    (left_keys, right_keys),
+                    residual,
+                    NullEquality::NullEqualsNothing,
                 )?
             }
             .build()?;
-
-            // Re-attach the residual by **conjunction, never replacement**.
-            //
-            // `join_on` does not put the equality predicates into `on`: it
-            // parks the whole conjunction in `filter` and leaves
-            // `extract_equijoin_predicate` to hoist the equalities later.
-            // Assigning `filter = residual` therefore discarded the join keys,
-            // producing `LeftAnti Join: Filter: l_suppkey != l_suppkey` with an
-            // empty `on` — an anti-join that matches almost every row and so
-            // deletes the entire result. It returned an empty answer rather
-            // than a wrong one only by luck of this query's shape.
-            //
-            // Semi/anti join schemas are the filtered side's schema regardless
-            // of the filter, so widening it cannot disturb the shape the parent
-            // join was built against.
-            if let Some(filter) = residual {
-                let LogicalPlan::Join(rebuilt_semi) = &mut reduced else {
-                    return Ok(None);
-                };
-                rebuilt_semi.filter = Some(match rebuilt_semi.filter.take() {
-                    Some(existing) => existing.and(filter.clone()),
-                    None => filter.clone(),
-                });
-            }
 
             let rebuilt = if target_is_right {
                 Join {
@@ -620,11 +678,17 @@ fn push_through(
             if already_reduced(&agg.input) {
                 return Ok(None);
             }
+            // Equijoin keys, not a predicate expression — see the note in
+            // `push_semi_below`. `join_on` parks equalities in `filter`, and
+            // by the time this rule runs nothing hoists them into `on` any
+            // more, so the physical planner falls back to a nested-loop join.
             let reduced = LogicalPlanBuilder::from(agg.input.as_ref().clone())
-                .join_on(
+                .join_detailed(
                     probe.clone(),
                     JoinType::LeftSemi,
-                    [Expr::Column(group_col.clone()).eq(Expr::Column(probe_key.clone()))],
+                    (vec![group_col.clone()], vec![probe_key.clone()]),
+                    None,
+                    NullEquality::NullEqualsNothing,
                 )?
                 .build()?;
             // LeftSemi preserves the left schema exactly, so the grouping and
@@ -871,7 +935,7 @@ mod tests {
         if with_rule {
             builder = builder
                 .with_optimizer_rule(Arc::new(SemiJoinReductionThroughAggregate))
-                .with_optimizer_rule(Arc::new(SemiJoinPushdownThroughInnerJoin));
+                .with_optimizer_rule(Arc::new(SemiJoinPushdownThroughInnerJoin::forced()));
         }
         let ctx = SessionContext::new_with_state(builder.build());
         ctx.register_table("lineitem", line_table()).unwrap();
@@ -1263,6 +1327,58 @@ mod tests {
             rows(&context(false), sql).await,
             "a straddling residual must not change the answer"
         );
+    }
+
+    /// Physical plan text, which is where a missing equijoin key becomes
+    /// visible: the logical plan looks fine either way.
+    async fn physical_plan_of(ctx: &SessionContext, sql: &str) -> String {
+        let logical = ctx.sql(sql).await.unwrap().into_optimized_plan().unwrap();
+        let physical = ctx.state().create_physical_plan(&logical).await.unwrap();
+        format!(
+            "{}",
+            datafusion::physical_plan::displayable(physical.as_ref()).indent(false)
+        )
+    }
+
+    /// **The rule must never turn an equi-join into a nested loop.**
+    ///
+    /// It did, and this is the most expensive bug the audit found. The
+    /// rewrites were built with `join_on`, which does not populate the join's
+    /// `on` list — it parks the whole conjunction in `filter` and relies on
+    /// `extract_equijoin_predicate` to hoist the equalities afterwards. That
+    /// rule has already run by the time these fire, so nothing hoisted them,
+    /// and the physical planner saw a join with no keys and chose
+    /// `NestedLoopJoinExec` — an O(n*m) scan of a pure equi-join.
+    ///
+    /// On TPC-H q2 at SF100 that was 1424 s against Spark's 78 s (18.4x).
+    /// `stage_dump` counted two `NestedLoopJoinExec` nodes with the rule on
+    /// and zero with `KRISHIV_SEMI_JOIN_REDUCTION=off`: the optimization was
+    /// the pessimization.
+    ///
+    /// Every prior test here passed throughout, because they compare answers
+    /// and logical-plan shape — both of which stayed correct. Only the
+    /// physical plan showed it.
+    #[tokio::test]
+    async fn the_rewrites_never_produce_a_nested_loop_join() {
+        for sql in [
+            Q17_SHAPE,
+            Q18_SHAPE,
+            Q18_VERBATIM,
+            Q21_VERBATIM,
+            // q2's shape: a correlated scalar subquery whose decorrelation
+            // feeds the pushdown rule.
+            "SELECT s.s_name FROM supplier s, lineitem l \
+             WHERE s.s_suppkey = l.l_suppkey \
+               AND l.l_quantity = (SELECT min(l2.l_quantity) FROM lineitem l2 \
+                                   WHERE l2.l_orderkey = l.l_orderkey)",
+        ] {
+            let plan = physical_plan_of(&context(true), sql).await;
+            assert!(
+                !plan.contains("NestedLoopJoin"),
+                "the rewrite produced a nested-loop join — an equi-join lost \
+                 its keys — for:\n{sql}\n\n{plan}"
+            );
+        }
     }
 
     /// An outer join below null-pads its non-preserved side, so a key that is
