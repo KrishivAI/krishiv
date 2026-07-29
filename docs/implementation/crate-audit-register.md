@@ -491,3 +491,44 @@ than left implicit, because "it exists and has tests" reads as "it works".
       `coordinator_daemon.rs:232` are invisible to CI. Same blind-spot class
       the justfile already documents for `krishiv-sql` immediately above the
       lint recipe.
+
+## Shuffle bytes cross a 7.6 MB/s wire uncompressed (2026-07-29)
+
+Not a bug — a gap, and on this cluster probably the largest remaining
+performance lever. Recorded with evidence so it can be measured rather than
+argued.
+
+**Nothing on the shuffle path compresses anything.**
+
+- Disk: `LocalDiskShuffleStore`'s default is `ShuffleCompression::None`
+  (`disk_store.rs:216`), and the production construction site
+  (`executor/src/cli.rs:640`) never calls `.with_compression()`. Only
+  `shuffle_svc.rs:107` (the ESS, itself unwired) asks for Lz4.
+- Wire: no `send_compressed`, `accept_compressed`, or `CompressionEncoding`
+  anywhere in `krishiv-shuffle`, `krishiv-executor`, or `krishiv-runtime`.
+  `tonic` is declared with `features = ["transport", "tls-ring"]` — no
+  `gzip`/`zstd` — so gRPC compression is not merely off, it is not
+  compiled in.
+
+**Why it matters here.** Measured 2026-07-29: node-local object reads run at
+150–286 MB/s, while pod-to-pod traffic runs at ~7.6 MB/s (39 GiB mirror,
+timed). Reduce tasks fetch shuffle partitions from other executors over Arrow
+Flight, so roughly two thirds of every shuffle crosses the slow link. The
+existing note that q8/q9's ~36 GiB shuffle is "55 minutes of pure wire" is the
+same observation from the other end.
+
+**The right lever is Arrow-native, not gRPC-level.** Arrow IPC supports body
+compression (`LZ4_FRAME`, `ZSTD`) via
+`IpcWriteOptions::try_with_compression`, carried in the record-batch metadata
+and decompressed by any conforming reader with no protocol negotiation. That
+composes with `FlightDataEncoderBuilder::with_options` and needs no tonic
+feature change. LZ4 compresses at roughly 100x the speed of this link, so
+there is no plausible regime on *this* cluster where it loses; on a 10 GbE
+fabric the trade-off is real and it should stay configurable.
+
+Note when reading the numbers: the Krishiv SF100 results recorded on
+2026-07-29 were produced with **no shuffle compression of any kind**. That is
+headroom, not a caveat on their validity.
+
+- [ ] Enable Arrow IPC body compression on the shuffle Flight path, keep it
+      configurable, and A/B it on q8/q9 (the two most shuffle-heavy queries).
