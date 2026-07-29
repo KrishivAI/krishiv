@@ -437,3 +437,57 @@ Things that are not one crate's problem.
       called a scheduler bug.
 - [ ] **`krishiv-python` is excluded from `just test` and `just lint`**, so
       Rust breakage there is invisible to CI.
+
+## krishiv-shuffle — unreachable surface (2026-07-29)
+
+A reachability pass over every remaining module found that a large part of
+this crate is not reachable from the running engine. Recorded here rather
+than left implicit, because "it exists and has tests" reads as "it works".
+
+- [x] **`SaltedHashPartitioner` / `SaltSpec` — DELETED** (373 lines incl.
+      tests, `2379763c`). Nothing constructed one; `salt` does not appear in
+      krishiv-scheduler, krishiv-executor or krishiv-proto at all, so its doc
+      claim that "the scheduler never applies salt overrides to streaming
+      jobs" implied a batch path that did not exist. Skew mitigation is
+      already shipped by reduce-side range splitting in
+      `coordinator/aqe.rs` — flag-gated (`KRISHIV_AQE_SKEW_SPLIT`), metered
+      (`aqe_skew_splits_total`), tested. A second unreachable implementation
+      of a solved problem, whose "only safe when the consumer merges
+      sub-partitions" scope was a comment rather than a precondition.
+- [ ] **`sort_shuffle_writer.rs` (584 lines) — unwired, ESS family.**
+      Constructed only when `ctx.ess_index.is_some()`; `ess_index` is `None`
+      at all three construction sites (`executor/src/cli.rs:618,629,661`) and
+      nothing anywhere sets it. **Blocker before wiring**: every output path
+      is `{job_id}_{stage_id}` — data, index, and spill files — with no
+      map-task identity, and `SortShuffleIndex` is keyed the same way. A
+      stage has one task per partition and the executor runs three slots, so
+      two tasks of one stage on one executor overwrite each other and the
+      second `register()` evicts the first. Asserted by
+      `two_tasks_of_one_stage_overwrite_each_others_output`, which proves
+      task A's rows disappear with no error. Spark's layout carries `mapId`;
+      there is no counterpart here. Invert that test into the correctness
+      check when task identity is added.
+- [ ] **`range_partitioner.rs` (536 lines) — unwired.** `RangePartitioner`,
+      `RangeSampler` and `RangeBound` are referenced *only* by the `pub use`
+      in `lib.rs`. Range partitioning is the basis of a distributed sorted
+      output; today ordering is produced by a final merge instead, which is
+      adequate at TPC-H result sizes and not equivalent in general. Wire or
+      delete — do not leave.
+- [ ] **`spillable.rs` (308 lines) — unwired.** `SpillableShuffleBackend` has
+      no constructor outside its own tests; the only other mentions are a doc
+      comment and the `pub use`. It is a thin composition of
+      `InMemoryShuffleStore` + `LocalDiskShuffleStore` that callers already
+      build directly, plus budget/UMM accounting.
+      **Consequence worth naming: `MemoryRegion::Shuffle` is never populated
+      in production.** Outside this file the region appears only in the
+      `UnifiedMemoryManager`'s own definition and tests, so the UMM reserves
+      `shuffle_min_fraction` of the pool for a consumer that never reports a
+      byte. Second hazard: this store does not override
+      `write_partition_stream`, so wiring it as-is would silently inherit the
+      collecting default — the D7 bug.
+- [ ] **`etcd` feature fails the repo's own clippy bar.** `just lint` runs
+      `--workspace` without `--all-features`, so the 8 `indexing`/`unwrap`
+      denials in `etcd_metadata.rs` and the `block_on` in
+      `coordinator_daemon.rs:232` are invisible to CI. Same blind-spot class
+      the justfile already documents for `krishiv-sql` immediately above the
+      lint recipe.
