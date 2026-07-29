@@ -278,6 +278,32 @@ def cancel_inflight(reason: str) -> None:
         with urllib.request.urlopen(req, timeout=15) as resp:
             resp.read()
         print(f"# cancelled {job_id} ({reason})", file=sys.stderr, flush=True)
+    except urllib.error.HTTPError as error:
+        # 404 means the coordinator has no such job — it already reached a
+        # terminal state, or never existed. There is nothing running and
+        # nothing to warn about; the cancel was simply unnecessary. Reporting
+        # it as "may still be running and holding cluster capacity" sent the
+        # reader looking for a phantom job on every clean shutdown.
+        #
+        # Anything else (notably 409, which the coordinator returns when it
+        # refuses the cancel) does mean the job may still be consuming the
+        # cluster, and stays loud.
+        if error.code == 404:
+            print(
+                f"# {job_id} was already finished when the cancel arrived ({reason})",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(
+                f"# WARNING: coordinator refused to cancel {job_id} "
+                f"(HTTP {error.code}, {reason}): {error}\n"
+                f"#          it may still be running and holding cluster capacity; "
+                f"cancel it with\n"
+                f"#          curl -X POST {url}",
+                file=sys.stderr,
+                flush=True,
+            )
     except Exception as error:  # noqa: BLE001 - best effort by design
         print(
             f"# WARNING: could not cancel {job_id} ({reason}): {error}\n"

@@ -740,10 +740,18 @@ async fn api_job_cancel(
             Json(serde_json::json!({"cancelled": true, "job_id": job_id_str})),
         ),
         Err(error) => {
-            let status = if error.to_string().contains("not found") {
-                axum::http::StatusCode::NOT_FOUND
-            } else {
-                axum::http::StatusCode::CONFLICT
+            // Match the variant, not the rendered message. This tested
+            // `error.to_string().contains("not found")`, but the error renders
+            // as `unknown job: {id}` — the substring never appeared, so every
+            // unknown job answered 409 Conflict instead of 404 Not Found. A
+            // caller cancelling a job that has already finished (or never
+            // existed) was told the cancel had been *refused*, which reads as
+            // "it may still be running and holding capacity" — the opposite of
+            // what happened. The bench harness printed exactly that warning on
+            // every clean shutdown.
+            let status = match error {
+                crate::SchedulerError::UnknownJob { .. } => axum::http::StatusCode::NOT_FOUND,
+                _ => axum::http::StatusCode::CONFLICT,
             };
             (
                 status,
@@ -2099,6 +2107,59 @@ mod parse_tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(json["cancelled"], serde_json::json!(true));
+    }
+
+    /// Cancelling a job the coordinator does not know is 404, not 409.
+    ///
+    /// The status was chosen by `error.to_string().contains("not found")`, but
+    /// `SchedulerError::UnknownJob` renders as `unknown job: {id}` — the
+    /// substring is never present, so this branch was dead and *every* unknown
+    /// job fell through to 409 Conflict. The distinction matters to callers:
+    /// 404 means "there is nothing to cancel", while 409 means "the cancel was
+    /// refused and the job may still be consuming the cluster". The bench
+    /// harness reported the latter on every clean shutdown because of this.
+    ///
+    /// The sibling test above only ever cancels a job that exists, which is
+    /// why the dead branch survived.
+    #[tokio::test]
+    async fn cancelling_an_unknown_job_is_not_found_not_conflict() {
+        use crate::CoordinatorDaemonConfig;
+        use crate::coordinator_http_router;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let _ = crate::auth::set_allow_anonymous();
+
+        let coordinator = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-cancel-unknown").unwrap(),
+        ));
+        let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DevLocal);
+        let router = coordinator_http_router(coordinator, &config);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/jobs/job-never-submitted/cancel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "an unknown job has nothing to cancel; 409 would tell the caller the \
+             cancel was refused and the job may still hold cluster capacity"
+        );
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["cancelled"], serde_json::json!(false));
     }
 
     /// SEC-1 (Phase 63) regression: IVM job-submission and queryable-state
