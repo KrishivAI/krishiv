@@ -711,13 +711,12 @@ const STREAMING_IDLE_FLOOR_US: u64 = 50;
 /// in the low-latency profile (the default).
 const STREAMING_CHECKPOINT_EVERY: u32 = 4;
 
-/// Latency-vs-throughput tuning for the continuous streaming loop, resolved
-/// once from the `KRISHIV_STREAM_PROFILE` environment variable.
+/// Batches processed between checkpoints under `profile`.
 ///
 /// The continuous loop already emits every drained batch immediately — the
 /// equivalent of Flink's `execution.buffer-timeout = 0` — and wakes on the
 /// source `data_notify` within ~50 µs, so the *latency floor* is already low.
-/// This profile makes the remaining latency-vs-throughput trade an explicit,
+/// The profile makes the remaining latency-vs-throughput trade an explicit,
 /// named knob rather than a hardcoded constant:
 ///
 /// - `low-latency` (default): checkpoint every [`STREAMING_CHECKPOINT_EVERY`]
@@ -725,11 +724,10 @@ const STREAMING_CHECKPOINT_EVERY: u32 = 4;
 /// - `throughput`: checkpoint less often (the per-epoch fsync stall is then
 ///   amortized over more work), trading a higher recovery-replay bound and a
 ///   larger latency tail for sustained rows/sec.
-/// Batches processed between checkpoints under `profile`.
 ///
-/// The profile itself lives in `krishiv_common::streaming_dials`; the cadence
-/// is engine-specific, so it stays here rather than being pushed into a crate
-/// that has no checkpoints.
+/// [`StreamProfile`] itself lives in `krishiv_common::streaming_dials`, shared
+/// with the distributed run-loop. The *cadence* is engine-specific and stays
+/// here rather than being pushed into a crate that has no checkpoints.
 fn checkpoint_every(profile: StreamProfile) -> u32 {
     match profile {
         StreamProfile::LowLatency => STREAMING_CHECKPOINT_EVERY,
