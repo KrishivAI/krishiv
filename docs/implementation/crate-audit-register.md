@@ -339,6 +339,26 @@ hashes, and an open list. Sections are appended as the audit reaches them.
 
 Things that are not one crate's problem.
 
+- [ ] **The streaming dials exist twice, byte-identically.**
+      `idle_tick_interval()` (`KRISHIV_IDLE_TICK_MS`, default 500) is duplicated
+      between `krishiv-executor/src/fragment/run_loop.rs` and
+      `krishiv-engines/src/lib.rs`, and the `KRISHIV_STREAM_PROFILE`
+      `"throughput"` test is duplicated between `run_loop.rs::stream_linger` and
+      `krishiv-engines`' `StreamProfile::parse`. They agree **today** — checked,
+      no drift — but this is exactly the shape that produced the
+      `task_engine_parallelism` bug, where one site read `KRISHIV_TASK_SLOTS`
+      and the other read the real slot count, so `--slots 1` on a 4-core
+      executor silently used a quarter of the CPU.
+
+      Not fixed here because `krishiv-engines` does not depend on
+      `krishiv-common` (where `env_registry` already lives), so the consolidation
+      is a new crate dependency rather than a move. Worth doing; wants a
+      deliberate decision, not a 4 a.m. one.
+
+      A sweep of every `KRISHIV_*` read from more than one site found no other
+      duplicate *behavioural* dial — the rest are either registry/doctor
+      declarations or genuinely independent consumers.
+
 - [ ] **A killed executor never reclaims its shuffle scratch.** 74 GB was
       stranded on one node when its executor died in `Error`; normal
       termination reclaims fine (s1/s2 went GB → KB on their own). On 145 GB
