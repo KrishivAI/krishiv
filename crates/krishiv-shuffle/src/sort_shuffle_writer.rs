@@ -196,10 +196,26 @@ impl SortShuffleWriter {
                 }
             }
         }
-        // Spill if over budget.
-        let total: usize = self.bucket_bytes.iter().sum();
-        if total as u64 > self.spill_threshold_bytes {
+        // Spill until back under budget — not once per push.
+        //
+        // This was a single `if`: one push spilled at most one bucket. With `n`
+        // partitions the largest bucket holds roughly `total / n`, so a push
+        // that adds more than that leaves the writer *above* the threshold and
+        // still growing. At 200 partitions and an 8 MB push the net motion is
+        // +5.5 MB per call — the threshold is crossed once and then never
+        // enforced again, so "spills at 512 MiB" was a threshold the writer
+        // announced and did not hold.
+        //
+        // `spill_largest_bucket` is a no-op when the largest bucket is already
+        // empty, so loop on observed progress rather than on the predicate
+        // alone: that terminates even if every bucket is empty while the
+        // accounting says otherwise, instead of spinning forever.
+        while self.buffered_bytes() as u64 > self.spill_threshold_bytes {
+            let before = self.buffered_bytes();
             self.spill_largest_bucket()?;
+            if self.buffered_bytes() >= before {
+                break;
+            }
         }
         Ok(())
     }
@@ -554,6 +570,114 @@ mod tests {
             .unwrap();
         let values: Vec<i64> = (0..arr.len()).map(|i| arr.value(i)).collect();
         assert_eq!(values, vec![1, 2, 5, 8]);
+    }
+
+    /// The spill threshold must actually bound buffered memory.
+    ///
+    /// With many partitions, one spill per push reclaims only about `1/n` of
+    /// what is buffered, so a push that adds more than that leaves the writer
+    /// permanently over the threshold. Twelve pushes into sixteen partitions
+    /// with a 4 KB budget is enough to separate the two behaviours: the old
+    /// single-`if` code ends far above the threshold, the loop ends at or
+    /// under it.
+    #[test]
+    fn the_spill_threshold_actually_bounds_buffered_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let threshold = 4096u64;
+        let mut writer = SortShuffleWriter::new_with_spill_threshold(
+            "job-bound", "stage1", "k", 16, dir.path(), threshold,
+        )
+        .unwrap();
+
+        for round in 0..12i64 {
+            let keys: Vec<i64> = (0..512).map(|i| round * 512 + i).collect();
+            writer.push(make_batch(&keys)).unwrap();
+            assert!(
+                writer.buffered_bytes() as u64 <= threshold,
+                "after push {round} the writer buffers {} bytes against a {threshold}-byte \
+                 threshold; spilling one bucket per push reclaims ~1/n and never catches up",
+                writer.buffered_bytes()
+            );
+        }
+
+        // And the data still round-trips through all those spills.
+        let files = writer.flush().unwrap();
+        let offsets = files.read_offsets().unwrap();
+        assert_eq!(offsets.len(), 17);
+        let data_len = std::fs::metadata(&files.data_path).unwrap().len();
+        assert_eq!(*offsets.last().unwrap(), data_len);
+        assert!(data_len > 0, "6144 rows must survive the spill cycle");
+    }
+
+    /// Two tasks of the same stage collide on every output path.
+    ///
+    /// This is a design gap, not a typo, and it is why the sort-shuffle writer
+    /// must not be wired as-is. Every filename is built from `job_id` and
+    /// `stage_id` only — `{job}_{stage}.data`, `{job}_{stage}.index`, and
+    /// `{job}_{stage}_{bucket}_spill{seq}.ipc` — with no map-task identity
+    /// anywhere. A stage has one task per partition and this engine runs three
+    /// slots per executor, so two tasks of the same stage on one executor
+    /// overwrite each other's data and index files and the second `register()`
+    /// into `SortShuffleIndex` (keyed `(job_id, stage_id)`) evicts the first.
+    /// The reduce side then reads one task's output and reports success.
+    ///
+    /// Spark's equivalent layout is per map task
+    /// (`shuffle_<shuffleId>_<mapId>_0.data`); `mapId` has no counterpart here.
+    ///
+    /// The test asserts the collision rather than the fix, so it documents the
+    /// blocker precisely and will fail the moment someone adds task identity —
+    /// at which point it should be inverted into the correctness check.
+    #[test]
+    fn two_tasks_of_one_stage_overwrite_each_others_output() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut task_a = SortShuffleWriter::new("job-x", "stage-0", "k", 2, dir.path()).unwrap();
+        task_a.push(make_batch(&[1, 2, 3, 4])).unwrap();
+        let files_a = task_a.flush().unwrap();
+        assert_eq!(keys_in(&files_a), vec![1, 2, 3, 4], "task A wrote its rows");
+
+        let mut task_b = SortShuffleWriter::new("job-x", "stage-0", "k", 2, dir.path()).unwrap();
+        task_b.push(make_batch(&[5, 6, 7, 8])).unwrap();
+        let files_b = task_b.flush().unwrap();
+
+        assert_eq!(
+            files_a.data_path, files_b.data_path,
+            "no map-task identity in the path, so the second task writes the first task's file"
+        );
+        // Byte length is not a witness here: 4 and 6 Int64 rows pad to the same
+        // IPC block size, so only the values show the loss.
+        assert_eq!(
+            keys_in(&files_a),
+            vec![5, 6, 7, 8],
+            "task B's rows replaced task A's in the shared file; A's rows are gone \
+             and neither writer reported an error"
+        );
+    }
+
+    /// Every key in a sort-shuffle data file, read through its index offsets.
+    fn keys_in(files: &SortShuffleFiles) -> Vec<i64> {
+        use arrow::ipc::reader::StreamReader;
+        let data = std::fs::read(&files.data_path).unwrap();
+        let offsets = files.read_offsets().unwrap();
+        let mut keys = Vec::new();
+        for w in offsets.windows(2) {
+            let (start, end) = (w[0] as usize, w[1] as usize);
+            if end <= start {
+                continue;
+            }
+            let reader = StreamReader::try_new(Cursor::new(&data[start..end]), None).unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let arr = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                keys.extend((0..arr.len()).map(|i| arr.value(i)));
+            }
+        }
+        keys.sort_unstable();
+        keys
     }
 
     #[test]
