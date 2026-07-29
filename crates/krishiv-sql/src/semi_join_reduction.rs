@@ -92,25 +92,35 @@ pub const SEMI_JOIN_REDUCTION_ENV: &str = "KRISHIV_SEMI_JOIN_REDUCTION";
 
 /// Environment switch for pushdown *through an inner join* (the q18 rule).
 ///
-/// # Why this is a separate switch, and why it defaults off
+/// # Why this is a separate switch, and why it defaults ON
 ///
-/// One variable used to gate both rules, which meant the two could not be
-/// measured apart — and they turn out to pull in opposite directions on the
-/// SF100 corpus. Counting stages that collapse to a single output partition,
-/// with the pushdown rule on versus off:
+/// One variable used to gate both rules, so neither could be measured alone.
+/// Split so they can be. The pushdown rule was then briefly defaulted **off**,
+/// on the strength of a stage-shape proxy: counting stages that collapse to a
+/// single output partition, with it on versus off,
 ///
 /// ```text
 ///   q2   5 -> 1     q21  3 -> 0     q17  3 -> 2     q18  0 -> 0
 /// ```
 ///
-/// It makes three of the four *less* distributed, and is neutral on q18 — the
-/// query it was written for. The aggregate rule, by contrast, is what wins q17
-/// (54.8 s against Spark's 440.7 s, 8.0x), so the two must not share a switch.
+/// which read as "worse on three, neutral on q18 — the query it was written
+/// for". **That conclusion was wrong, and the measurement that refuted it is
+/// the only one that counts:**
 ///
-/// The pushdown rule was also the sole source of the nested-loop joins that
-/// cost q2 18.4x; that bug is fixed (see `push_semi_below`), but a rewrite
-/// that has not yet demonstrated a win on any query should not be on by
-/// default. Set `KRISHIV_SEMI_JOIN_PUSHDOWN=on` to measure it.
+/// ```text
+///   q18 SF100, rule off : FAILED — Resources exhausted, ExternalSorter could
+///                         not get its first 2.1 MB of a 2.6 GB pool
+///   q18 SF100, rule on  : 424.3 s, succeeded (and 2.33x faster than the
+///                         987 s it took before this session)
+/// ```
+///
+/// Neutral on stage shape is not neutral on memory. With the rule off, q18's
+/// most selective predicate — ~570 surviving orders out of 150M — runs above
+/// the whole four-way join, so the joins carry the full customer/orders/
+/// lineitem cross-section and there is nothing left in the pool for the sort.
+/// The rule is what makes the query fit at all.
+///
+/// So: on by default. `KRISHIV_SEMI_JOIN_PUSHDOWN=off` disables it.
 pub const SEMI_JOIN_PUSHDOWN_ENV: &str = "KRISHIV_SEMI_JOIN_PUSHDOWN";
 
 /// Whether semi-join reduction through aggregates is enabled (default: yes).
@@ -118,23 +128,14 @@ pub fn semi_join_reduction_enabled() -> bool {
     enabled_from(&std::env::var(SEMI_JOIN_REDUCTION_ENV).unwrap_or_default())
 }
 
-/// Whether semi-join pushdown through an inner join is enabled (default: no).
+/// Whether semi-join pushdown through an inner join is enabled (default: yes).
 ///
-/// Opt-in, unlike [`semi_join_reduction_enabled`] — see
-/// [`SEMI_JOIN_PUSHDOWN_ENV`] for the measurements behind that default.
+/// See [`SEMI_JOIN_PUSHDOWN_ENV`] for why the default is on, and for the one
+/// revision where it was not.
 pub fn semi_join_pushdown_enabled() -> bool {
     // Still gated by the umbrella switch, so turning that off disables both.
     semi_join_reduction_enabled()
-        && opted_in(&std::env::var(SEMI_JOIN_PUSHDOWN_ENV).unwrap_or_default())
-}
-
-/// The opt-in switch's parsing, kept pure for the same reason as
-/// [`enabled_from`].
-fn opted_in(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "on" | "true" | "yes"
-    )
+        && enabled_from(&std::env::var(SEMI_JOIN_PUSHDOWN_ENV).unwrap_or_default())
 }
 
 /// The switch's parsing, separated from reading the environment.

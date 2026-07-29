@@ -759,13 +759,10 @@ pub fn with_krishiv_optimizer_rules_with_join_threshold(
         // plan, so the most selective predicate runs after the joins it should
         // have shrunk. Push it into the join input instead.
         //
-        // Registered but **off by default** — it reads
-        // `KRISHIV_SEMI_JOIN_PUSHDOWN` and declines unless opted in. Measured
-        // on SF100 it makes q2, q21 and q17 collapse more stages to a single
-        // partition and does nothing measurable for q18, the query it was
-        // written for; it was also the sole source of the nested-loop joins
-        // that cost q2 18.4x. It stays registered so the switch can turn it on
-        // for a measured comparison rather than needing a rebuild.
+        // On by default: with it off, q18 at SF100 does not merely slow down,
+        // it FAILS — the sort cannot get its first 2.1 MB because the joins
+        // hold the whole 2.6 GB pool. With it on, 424 s. See
+        // `SEMI_JOIN_PUSHDOWN_ENV`.
         .with_optimizer_rule(std::sync::Arc::new(
             crate::semi_join_reduction::SemiJoinPushdownThroughInnerJoin::default(),
         ))
