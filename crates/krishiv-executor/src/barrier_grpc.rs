@@ -33,8 +33,45 @@ pub struct ExecutorBarrierService {
     pub state_backend_kind: String,
     /// How long to wait for a checkpoint to complete before returning deadline_exceeded.
     pub checkpoint_timeout_secs: u64,
-    /// Background barrier-stream processing tasks; aborted when the service is dropped.
-    background_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Background barrier-stream processing tasks; aborted when the last clone
+    /// of the service is dropped (see [`BackgroundTasks`]).
+    background_tasks: Arc<BackgroundTasks>,
+}
+
+/// Handles to the tasks spawned by [`ExecutorBarrierService::barrier_stream`].
+///
+/// # Why this is a type and not a bare `Mutex<Vec<..>>`
+///
+/// The field was documented as "aborted when the service is dropped" and
+/// nothing aborted anything: the handles were collected, pruned of finished
+/// ones, and otherwise left to run. Each `barrier_stream` call spawns a task
+/// that loops on `inbound.message()`, so on a long-lived executor the tasks
+/// accumulated for the life of the process and only ever ended when their peer
+/// closed the stream.
+///
+/// It cannot be a `Drop` on the service itself — `ExecutorBarrierService` is
+/// `Clone`, and every clone dropping would abort tasks the surviving clones
+/// still serve. Putting the `Drop` behind the shared `Arc` gives the documented
+/// behaviour exactly: the abort runs once, when the last holder goes away.
+#[derive(Default)]
+struct BackgroundTasks(Mutex<Vec<tokio::task::JoinHandle<()>>>);
+
+impl BackgroundTasks {
+    /// Record a spawned task, dropping handles that have already finished.
+    fn push(&self, handle: tokio::task::JoinHandle<()>) {
+        let mut tasks = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        tasks.retain(|h| !h.is_finished());
+        tasks.push(handle);
+    }
+}
+
+impl Drop for BackgroundTasks {
+    fn drop(&mut self) {
+        let tasks = self.0.get_mut().unwrap_or_else(|p| p.into_inner());
+        for handle in tasks.drain(..) {
+            handle.abort();
+        }
+    }
 }
 
 impl ExecutorBarrierService {
@@ -50,7 +87,7 @@ impl ExecutorBarrierService {
             checkpoint_uri: None,
             state_backend_kind: String::new(),
             checkpoint_timeout_secs: 120,
-            background_tasks: Arc::new(Mutex::new(Vec::new())),
+            background_tasks: Arc::new(BackgroundTasks::default()),
         }
     }
 
@@ -207,11 +244,7 @@ impl BarrierService for ExecutorBarrierService {
                 }
             }
         });
-        {
-            let mut tasks = bg.lock().unwrap_or_else(|p| p.into_inner());
-            tasks.retain(|h| !h.is_finished());
-            tasks.push(handle);
-        }
+        bg.push(handle);
         Ok(tonic::Response::new(ReceiverStream::new(rx)))
     }
 }
@@ -268,6 +301,50 @@ mod tests {
 
         assert_eq!(service.key_group_range_for_task("task-1"), (1024, 2047));
         assert_eq!(service.key_group_range_for_task("task-2"), (0, 32_767));
+    }
+
+    /// The field's doc promised the tasks are "aborted when the service is
+    /// dropped" and nothing aborted them. This pins both halves: a surviving
+    /// clone keeps them running, and the last one going away stops them.
+    #[tokio::test]
+    async fn background_tasks_abort_only_when_the_last_holder_drops() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct CancelFlag(Arc<AtomicBool>);
+        impl Drop for CancelFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let tasks = Arc::new(BackgroundTasks::default());
+        tasks.push(tokio::spawn(async move {
+            let _guard = CancelFlag(flag);
+            std::future::pending::<()>().await;
+        }));
+        tokio::task::yield_now().await;
+
+        let survivor = Arc::clone(&tasks);
+        drop(tasks);
+        tokio::task::yield_now().await;
+        assert!(
+            !cancelled.load(Ordering::SeqCst),
+            "a surviving clone still serves this stream; the task must keep running"
+        );
+
+        drop(survivor);
+        for _ in 0..100 {
+            if cancelled.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "the last holder dropped: the background task must be aborted"
+        );
     }
 
     #[test]
