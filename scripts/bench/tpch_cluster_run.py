@@ -166,6 +166,8 @@ def _with_retry(operation, what: str):
             # `planning distributed stages`, on a coordinator that was already
             # the reason the first one was slow. Fail fast instead; the caller
             # records `submit_failed`, which is the honest result.
+            #
+            # See SUBMIT_TIMEOUT_S for why the bound is what it is.
             if _is_timeout(err) and what == "POST":
                 raise RuntimeError(
                     f"{what} timed out; not retried — a submit timeout means the "
@@ -181,6 +183,24 @@ def _with_retry(operation, what: str):
                 )
                 time.sleep(delay)
     raise RuntimeError(f"{what} failed after {_TRANSIENT_RETRIES} attempts: {last}")
+
+
+# How long to wait for `POST /api/v1/batch-sql/submit`.
+#
+# The endpoint's own doc says it "returns immediately with the job id" and
+# "never blocks waiting for the job to complete" — but it plans the query
+# inside the handler, so its latency scales with plan complexity and data size,
+# not with the network. At SF100 that bit twice: q11 and q15 both took ~65 s to
+# plan against the previous 60 s bound and were recorded as `submit_failed`
+# while the coordinator went on to plan them successfully.
+#
+# Raising this does not make planning fast — it stops a slow plan being
+# indistinguishable from an unreachable coordinator. The elapsed time is still
+# recorded per query, so a submit that takes minutes shows up as exactly that
+# rather than disappearing into a failure count. The engine-side fix is to make
+# submit genuinely asynchronous; until then a client cannot tell the two apart
+# without waiting.
+SUBMIT_TIMEOUT_S = 600
 
 
 def post(url: str, body: dict, token: str | None, timeout: float) -> dict:
@@ -323,7 +343,7 @@ def run_query(
     started = time.monotonic()
     try:
         submitted = post(
-            f"{coordinator}/api/v1/batch-sql/submit", body, token, timeout=60
+            f"{coordinator}/api/v1/batch-sql/submit", body, token, timeout=SUBMIT_TIMEOUT_S
         )
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", "replace")[:400]

@@ -712,6 +712,21 @@ async fn api_job_cancel(
             );
         }
     };
+    // A job can be cancelled before the coordinator has ever heard of it: the
+    // batch-SQL submit hands back an id and plans in the background, so there
+    // is a window where the client holds an id for a job with no spec yet.
+    // Answering that with 404 would leave the plan to finish and start a query
+    // nobody is waiting for.
+    if crate::batch_sql_http::cancel_if_planning(&job_id_str) {
+        return (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({
+                "cancelled": true,
+                "job_id": job_id_str,
+                "note": "cancelled while still planning"
+            })),
+        );
+    }
     // cancel_job_and_notify (not plain cancel_job): the assigned executors
     // must hear about the cancel or a batch task runs to completion and
     // burns its core for nothing — that was the #217 zombie. Unlike the

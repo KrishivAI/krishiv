@@ -219,9 +219,17 @@ pub async fn execute_batch_sql_sink_coordinated(
     tables: &[BatchSqlInlineTable],
     sink_contract: &str,
 ) -> SchedulerResult<JobId> {
-    let job_id =
-        submit_batch_sql_job_inner(coordinator, query, tables, &[], false, Some(sink_contract))
-            .await?;
+    let job_id = next_batch_sql_job_id()?;
+    submit_batch_sql_job_inner(
+        coordinator,
+        job_id.clone(),
+        query,
+        tables,
+        &[],
+        false,
+        Some(sink_contract),
+    )
+    .await?;
 
     let notify = {
         let coord = coordinator.read().await;
@@ -308,7 +316,18 @@ pub async fn submit_batch_sql_job(
     tables: &[BatchSqlInlineTable],
     is_streaming: bool,
 ) -> SchedulerResult<JobId> {
-    submit_batch_sql_job_inner(coordinator, query, tables, &[], is_streaming, None).await
+    let job_id = next_batch_sql_job_id()?;
+    submit_batch_sql_job_inner(
+        coordinator,
+        job_id.clone(),
+        query,
+        tables,
+        &[],
+        is_streaming,
+        None,
+    )
+    .await?;
+    Ok(job_id)
 }
 
 /// [`submit_batch_sql_job`] with additional path-registered tables.
@@ -328,31 +347,77 @@ pub async fn submit_batch_sql_job_with_paths(
     path_tables: &[BatchSqlTable],
     is_streaming: bool,
 ) -> SchedulerResult<JobId> {
-    submit_batch_sql_job_inner(coordinator, query, tables, path_tables, is_streaming, None).await
+    let job_id = next_batch_sql_job_id()?;
+    submit_batch_sql_job_inner(
+        coordinator,
+        job_id.clone(),
+        query,
+        tables,
+        path_tables,
+        is_streaming,
+        None,
+    )
+    .await?;
+    Ok(job_id)
 }
 
-async fn submit_batch_sql_job_inner(
-    coordinator: &SharedCoordinator,
-    query: &str,
-    tables: &[BatchSqlInlineTable],
-    path_tables: &[BatchSqlTable],
-    is_streaming: bool,
-    sink_contract: Option<&str>,
-) -> SchedulerResult<JobId> {
-    use base64::Engine as _;
-
-    // BATCH-4: Append a process-unique counter to avoid job-ID collisions
-    // when two batch SQL jobs are submitted in the same millisecond.
+/// Mint the next batch-SQL job id.
+///
+/// Split out from submission so a caller can hold the id *before* the query is
+/// planned. The HTTP surface needs that: planning happens inside the submit
+/// call and its latency scales with plan complexity and data size rather than
+/// with the network, so a client that must wait for it cannot tell a slow plan
+/// from an unreachable coordinator. Handing back the id first lets the plan run
+/// in the background and be polled like any other job state.
+///
+/// BATCH-4: the process-unique counter avoids job-id collisions when two batch
+/// SQL jobs are submitted in the same millisecond.
+pub fn next_batch_sql_job_id() -> SchedulerResult<JobId> {
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     static BATCH_SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = BATCH_SEQ.fetch_add(1, AtomicOrdering::SeqCst);
-    let job_id = JobId::try_new(format!(
+    JobId::try_new(format!(
         "{BATCH_SQL_JOB_PREFIX}{}-{seq}",
         krishiv_common::async_util::unix_now_ms()
     ))
     .map_err(|error| SchedulerError::InvalidJob {
         message: error.to_string(),
-    })?;
+    })
+}
+
+/// Plan `query` and submit it to `coordinator` under an id the caller already
+/// holds. See [`next_batch_sql_job_id`].
+pub async fn plan_and_submit_batch_sql_job(
+    coordinator: &SharedCoordinator,
+    job_id: JobId,
+    query: &str,
+    tables: &[BatchSqlInlineTable],
+    path_tables: &[BatchSqlTable],
+    is_streaming: bool,
+) -> SchedulerResult<()> {
+    submit_batch_sql_job_inner(
+        coordinator,
+        job_id,
+        query,
+        tables,
+        path_tables,
+        is_streaming,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_batch_sql_job_inner(
+    coordinator: &SharedCoordinator,
+    job_id: JobId,
+    query: &str,
+    tables: &[BatchSqlInlineTable],
+    path_tables: &[BatchSqlTable],
+    is_streaming: bool,
+    sink_contract: Option<&str>,
+) -> SchedulerResult<()> {
+    use base64::Engine as _;
 
     // Phase 52: attempt partition-parallel staged execution for plain batch
     // SELECTs over path-registered parquet tables. The stage builder pins
@@ -506,7 +571,7 @@ async fn submit_batch_sql_job_inner(
     coord.ensure_active()?;
     coord.submit_job(spec)?;
     coord.register_job_input_partitions(job_id.clone(), input_partitions);
-    Ok(job_id)
+    Ok(())
 }
 
 /// Decode inline Arrow IPC payloads into record batches.
