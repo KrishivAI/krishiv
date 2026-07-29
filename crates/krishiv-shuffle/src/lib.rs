@@ -59,7 +59,7 @@ pub use orphan::{
     OrphanReclaimPolicy, OrphanReclaimTracker, cleanup_orphans, reclaim_foreign_spills,
     scan_orphans, spill_file_name, spill_owner_id,
 };
-pub use partitioner::{HashPartitioner, SaltSpec, SaltedHashPartitioner};
+pub use partitioner::HashPartitioner;
 pub use path::ShufflePath;
 pub use push_shuffle::PushShuffleStore;
 pub use range_partitioner::{RangeBound, RangePartitioner, RangeSampler};
