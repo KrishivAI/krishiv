@@ -577,3 +577,119 @@ async fn in_memory_spill_to_disk_and_read_back() {
     assert_eq!(v0.value(1), 2);
     assert_eq!(v0.value(2), 3);
 }
+
+// ── Streaming write (D7) ─────────────────────────────────────────────────────
+
+/// A partition written as a **stream** must be byte-for-byte the same partition
+/// as one written whole, through the same `ShuffleBackend` dispatch a real
+/// executor uses.
+///
+/// The unit tests cover the two writers in isolation. This covers the thing
+/// that actually broke queries: `ShuffleBackend::write_partition_stream` must
+/// dispatch to `LocalDiskShuffleStore`'s override. Forwarding to the trait
+/// default there would collect the partition first — the write would still
+/// succeed, every row would still arrive, and the entire point of the change
+/// would be silently undone with no test able to tell. So this asserts the
+/// round trip *and* pins the backend path.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_partition_round_trips_through_the_backend() {
+    use futures::StreamExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(krishiv_shuffle::ShuffleBackend::Local(Arc::new(
+        LocalDiskShuffleStore::new(dir.path()).unwrap(),
+    )));
+
+    // Several batches, so the writer's receive loop runs more than once.
+    let batches: Vec<RecordBatch> = (0..6)
+        .map(|g| make_simple_batch((g * 10..g * 10 + 10).collect()))
+        .collect();
+    let schema = batches[0].schema();
+    let expected: Vec<i32> = (0..60).collect();
+
+    let id = PartitionId {
+        job_id: "job-stream".to_owned(),
+        stage_id: "stage-0".to_owned(),
+        partition: 0,
+    };
+    backend
+        .write_partition_stream(
+            id.clone(),
+            schema,
+            Box::pin(futures::stream::iter(batches.into_iter().map(Ok))),
+            1,
+        )
+        .await
+        .expect("streaming write must succeed through the backend");
+
+    let read = backend
+        .read_partition(&id)
+        .await
+        .unwrap()
+        .expect("partition must exist after a streaming write");
+    let got: Vec<i32> = read
+        .batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(got, expected, "streaming write lost or reordered rows");
+
+    // And the streaming reader sees the same thing, since that is what a remote
+    // reduce task fetches.
+    let mut stream = backend
+        .stream_partition(&id)
+        .await
+        .unwrap()
+        .expect("partition must stream back");
+    let mut streamed_rows = 0usize;
+    while let Some(batch) = stream.batches.next().await {
+        streamed_rows += batch.unwrap().num_rows();
+    }
+    assert_eq!(streamed_rows, expected.len());
+}
+
+/// The lease protocol must hold on the streaming path too: a stale writer that
+/// streams its partition after a newer attempt has claimed it must be rejected,
+/// not silently overwrite the newer data.
+///
+/// This is the invariant a zombie map task violates, and `write_partition` and
+/// `write_partition_stream` now share one implementation precisely so it cannot
+/// hold on one and not the other.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_streaming_writer_is_rejected_like_a_stale_whole_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalDiskShuffleStore::new(dir.path()).unwrap();
+    let id = PartitionId {
+        job_id: "job-lease".to_owned(),
+        stage_id: "stage-0".to_owned(),
+        partition: 0,
+    };
+
+    // A newer attempt claims the partition.
+    store.register_partition_lease(id.clone(), 9).await.unwrap();
+
+    let batch = make_simple_batch(vec![1, 2, 3]);
+    let result = store
+        .write_partition_stream(
+            id.clone(),
+            batch.schema(),
+            Box::pin(futures::stream::iter(vec![Ok(batch)])),
+            3, // stale
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "a streaming write with a stale lease token must be rejected"
+    );
+    assert!(
+        store.read_partition(&id).await.unwrap().is_none(),
+        "a rejected streaming write must not leave data behind"
+    );
+}
