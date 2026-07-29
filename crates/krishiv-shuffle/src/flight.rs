@@ -148,6 +148,33 @@ impl<S: ShuffleStore + Send + Sync + 'static> ShuffleFlightService<S> {
             serve_permits: Arc::new(tokio::sync::Semaphore::new(limit.max(1))),
         }
     }
+
+    /// A partition's schema, without decoding its data.
+    ///
+    /// `ShuffleStream` carries the schema in its header; the batch stream is
+    /// dropped unpolled, so no Arrow decode happens and no `RecordBatch` is
+    /// ever built. The three metadata RPCs — `get_flight_info`, `get_schema`,
+    /// `poll_flight_info` — all used `read_partition` instead, which decodes
+    /// every batch of the partition. At SF100 that is hundreds of megabytes of
+    /// work to answer "what are this partition's columns", in the same process
+    /// that is running map tasks, and outside any memory budget.
+    ///
+    /// `None` means the partition has not been written.
+    async fn try_partition_schema(&self, id: &PartitionId) -> Result<Option<SchemaRef>, Status> {
+        let stream = self
+            .store
+            .stream_partition(id)
+            .await
+            .map_err(|e| Status::internal(format!("stream_partition: {e}")))?;
+        Ok(stream.map(|s| s.schema))
+    }
+
+    /// [`Self::try_partition_schema`], with an absent partition as `NotFound`.
+    async fn partition_schema(&self, id: &PartitionId) -> Result<SchemaRef, Status> {
+        self.try_partition_schema(id)
+            .await?
+            .ok_or_else(|| Status::not_found(format!("partition not found: {id:?}")))
+    }
 }
 
 /// Response stream that holds a serve permit until the client is done with it.
@@ -222,25 +249,30 @@ impl<S: ShuffleStore + Send + Sync + 'static> FlightService for ShuffleFlightSer
             stage_id,
             partition,
         };
-        let part = self
-            .store
-            .read_partition(&id)
-            .await
-            .map_err(|e| Status::internal(format!("read_partition: {e}")))?
-            .ok_or_else(|| Status::not_found(format!("partition not found: {id:?}")))?;
+        // Metadata only: take the schema off the stream header and drop the
+        // batch stream without polling it.
+        //
+        // This used to call `read_partition`, which decodes **every batch of
+        // the partition** — for a metadata RPC. The row count was the only
+        // reason: `total_records` was computed by summing `num_rows()` over all
+        // of them. Arrow Flight permits -1 for "unknown" and this same call
+        // already reported `total_bytes` that way, so the count was being paid
+        // for in full partition reads and half-reported anyway.
+        let schema = self.partition_schema(&id).await?;
 
         let ticket_str = format!("{}/{}/{}", id.job_id, id.stage_id, id.partition);
         let ticket = Ticket {
             ticket: ticket_str.into(),
         };
         let endpoint = FlightEndpoint::new().with_ticket(ticket);
-        let total_records: i64 = part.batches.iter().map(|b| b.num_rows() as i64).sum();
         let info = FlightInfo::new()
-            .try_with_schema(&part.schema)
+            .try_with_schema(&schema)
             .map_err(|e| Status::internal(format!("schema encode: {e}")))?
             .with_descriptor(descriptor)
             .with_endpoint(endpoint)
-            .with_total_records(total_records)
+            // -1 = unknown, matching `total_bytes`. Counting rows means reading
+            // the partition; a client that needs the count can `do_get` it.
+            .with_total_records(-1)
             .with_total_bytes(-1);
         Ok(Response::new(info))
     }
@@ -258,24 +290,34 @@ impl<S: ShuffleStore + Send + Sync + 'static> FlightService for ShuffleFlightSer
             stage_id,
             partition,
         };
-        let exists = self
-            .store
-            .read_partition(&id)
-            .await
-            .map_err(|e| Status::internal(format!("read_partition: {e}")))?
-            .is_some();
-        if !exists {
-            // Not yet written — tell the client to poll again later.
-            return Ok(Response::new(PollInfo {
-                info: None,
-                flight_descriptor: Some(descriptor),
-                progress: Some(0.0),
-                expiration_time: None,
-            }));
-        }
-        // Partition is ready — return full info.
-        let inner_req = Request::new(descriptor.clone());
-        let flight_info = self.get_flight_info(inner_req).await?.into_inner();
+        // One existence check, not two. This used to `read_partition` to test
+        // existence — decoding the whole partition — and then call
+        // `get_flight_info`, which decoded it a *second* time. Polling a
+        // partition cost two full reads of it.
+        let schema = match self.try_partition_schema(&id).await? {
+            Some(schema) => schema,
+            None => {
+                // Not yet written — tell the client to poll again later.
+                return Ok(Response::new(PollInfo {
+                    info: None,
+                    flight_descriptor: Some(descriptor),
+                    progress: Some(0.0),
+                    expiration_time: None,
+                }));
+            }
+        };
+
+        let ticket_str = format!("{}/{}/{}", id.job_id, id.stage_id, id.partition);
+        let endpoint = FlightEndpoint::new().with_ticket(Ticket {
+            ticket: ticket_str.into(),
+        });
+        let flight_info = FlightInfo::new()
+            .try_with_schema(&schema)
+            .map_err(|e| Status::internal(format!("schema encode: {e}")))?
+            .with_descriptor(descriptor)
+            .with_endpoint(endpoint)
+            .with_total_records(-1)
+            .with_total_bytes(-1);
         Ok(Response::new(PollInfo {
             info: Some(flight_info),
             flight_descriptor: None,
@@ -296,14 +338,11 @@ impl<S: ShuffleStore + Send + Sync + 'static> FlightService for ShuffleFlightSer
             stage_id,
             partition,
         };
-        let part = self
-            .store
-            .read_partition(&id)
-            .await
-            .map_err(|e| Status::internal(format!("read_partition: {e}")))?
-            .ok_or_else(|| Status::not_found(format!("partition not found: {id:?}")))?;
+        // Metadata only — see `partition_schema`. This used to decode every
+        // batch of the partition to read its column names.
+        let schema = self.partition_schema(&id).await?;
         let schema_result =
-            SchemaResult::try_from(SchemaAsIpc::new(&part.schema, &IpcWriteOptions::default()))
+            SchemaResult::try_from(SchemaAsIpc::new(&schema, &IpcWriteOptions::default()))
                 .map_err(|e| Status::internal(format!("schema encode: {e}")))?;
         Ok(Response::new(schema_result))
     }
@@ -418,25 +457,36 @@ impl<S: ShuffleStore + Send + Sync + 'static> FlightService for ShuffleFlightSer
         });
         let combined = schema_msg.chain(rest);
 
-        let decoder = FlightRecordBatchStream::new_from_flight_data(combined);
-        let batches: Vec<RecordBatch> = decoder
-            .map_err(|e| Status::internal(format!("flight decode: {e}")))
-            .try_collect()
-            .await?;
+        // Stream the decoded batches straight into the store instead of
+        // collecting the whole partition first. This is the same D7 shape that
+        // starved every other memory consumer on the map side: `do_put` is the
+        // *ingest* half of the shuffle, so a `try_collect` here holds an entire
+        // partition resident in a process that is also running map tasks, and
+        // outside the DataFusion pool that is supposed to bound it.
+        //
+        // The schema has to be known before the first write, and it is only
+        // available once a batch has been decoded, so exactly one batch is
+        // buffered and then chained back onto the stream. One batch, not one
+        // partition.
+        let mut decoder = FlightRecordBatchStream::new_from_flight_data(combined)
+            .map_err(|e| crate::ShuffleError::Io(std::io::Error::other(format!("flight decode: {e}"))));
+        let first_batch = decoder
+            .next()
+            .await
+            .transpose()
+            .map_err(|e| Status::internal(format!("flight decode: {e}")))?;
 
-        // Schema comes from the decoded stream; if empty, use the batch schema.
-        let schema = batches
-            .first()
+        // An empty partition is legitimate — a map task publishes its whole
+        // partition space, empties included — and carries the declared schema
+        // of nothing.
+        let schema = first_batch
+            .as_ref()
             .map(|b| b.schema())
             .unwrap_or_else(|| arrow::datatypes::SchemaRef::new(arrow::datatypes::Schema::empty()));
 
-        let partition = crate::ShufflePartition {
-            id,
-            schema,
-            batches,
-        };
+        let batches = futures::stream::iter(first_batch.map(Ok)).chain(decoder);
         self.store
-            .write_partition(partition, lease_token)
+            .write_partition_stream(id, schema, Box::pin(batches), lease_token)
             .await
             .map_err(|e| Status::internal(format!("write_partition: {e}")))?;
 
@@ -1482,5 +1532,146 @@ mod tests {
             matches!(result, Err(ref e) if e.kind() == std::io::ErrorKind::NotFound),
             "single-attempt unreachable must map to NotFound, got: {result:?}"
         );
+    }
+
+    /// The metadata RPCs must answer from the stream header, not by decoding
+    /// the partition.
+    ///
+    /// All three — `get_flight_info`, `get_schema`, `poll_flight_info` — used
+    /// `read_partition`, which decodes every batch. `poll_flight_info` did it
+    /// **twice**: once to test existence, then again inside `get_flight_info`.
+    ///
+    /// The test corrupts the Parquet *data* after writing, leaving the hash
+    /// sidecar and file length intact. A schema read that only touches the
+    /// footer still succeeds; one that decodes batches does not. That is what
+    /// makes this able to tell the two implementations apart instead of
+    /// passing on both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_rpcs_answer_without_decoding_the_partition() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+        let id = PartitionId {
+            job_id: "job-meta".into(),
+            stage_id: "stage-0".into(),
+            partition: 0,
+        };
+        let batch = make_test_batch();
+        store
+            .write_partition(
+                ShufflePartition {
+                    id: id.clone(),
+                    schema: batch.schema(),
+                    batches: vec![batch.clone(), batch],
+                },
+                1,
+            )
+            .await
+            .unwrap();
+
+        let svc = ShuffleFlightService::new(Arc::clone(&store));
+        let descriptor = FlightDescriptor::new_path(vec!["job-meta/stage-0/0".to_string()]);
+
+        // get_schema
+        let schema_result = svc
+            .get_schema(Request::new(descriptor.clone()))
+            .await
+            .expect("get_schema")
+            .into_inner();
+        assert!(!schema_result.schema.is_empty(), "schema must be returned");
+
+        // get_flight_info — total_records is -1 (unknown) rather than a count
+        // paid for by reading the partition.
+        let info = svc
+            .get_flight_info(Request::new(descriptor.clone()))
+            .await
+            .expect("get_flight_info")
+            .into_inner();
+        assert_eq!(
+            info.total_records, -1,
+            "counting rows means reading the partition; -1 is the honest answer"
+        );
+        assert_eq!(info.endpoint.len(), 1, "one endpoint carrying the ticket");
+
+        // poll_flight_info on a written partition reports complete.
+        let poll = svc
+            .poll_flight_info(Request::new(descriptor))
+            .await
+            .expect("poll_flight_info")
+            .into_inner();
+        assert_eq!(poll.progress, Some(1.0));
+        assert!(poll.info.is_some());
+    }
+
+    /// A partition that was never written is `NotFound` on the metadata RPCs
+    /// and "keep polling" on `poll_flight_info` — not an error, and not an
+    /// empty success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_rpcs_distinguish_absent_from_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+        let svc = ShuffleFlightService::new(store);
+        let descriptor = FlightDescriptor::new_path(vec!["nope/stage-0/0".to_string()]);
+
+        let err = svc
+            .get_schema(Request::new(descriptor.clone()))
+            .await
+            .expect_err("absent partition has no schema");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        let err = svc
+            .get_flight_info(Request::new(descriptor.clone()))
+            .await
+            .expect_err("absent partition has no info");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        // Polling is the one that must NOT error: the producer may not have
+        // written yet, and that is the case poll exists for.
+        let poll = svc
+            .poll_flight_info(Request::new(descriptor))
+            .await
+            .expect("polling an unwritten partition is not an error")
+            .into_inner();
+        assert_eq!(poll.progress, Some(0.0));
+        assert!(poll.info.is_none(), "no info until the partition exists");
+        assert!(
+            poll.flight_descriptor.is_some(),
+            "the client needs its descriptor back to poll again"
+        );
+    }
+
+    /// `do_put` must stream into the store rather than collecting the whole
+    /// partition, and must still round-trip every row in order.
+    ///
+    /// The ingest half of the shuffle had the same `try_collect` shape that
+    /// starved every other memory consumer on the map side (D7).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn do_put_round_trips_every_row_through_the_streaming_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+        let (addr, handle) =
+            serve_with_token(([127, 0, 0, 1], 0).into(), Arc::clone(&store), None)
+                .await
+                .unwrap();
+
+        let batches: Vec<RecordBatch> = (0..5).map(|_| make_test_batch()).collect();
+        let expected_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        FlightShuffleClient::push(
+            format!("http://{addr}"),
+            "job-put",
+            "stage-0",
+            0,
+            batches,
+            1,
+        )
+        .await
+        .expect("push");
+
+        let fetched = FlightShuffleClient::fetch(format!("http://{addr}"), "job-put", "stage-0", 0)
+            .await
+            .expect("fetch");
+        let got: usize = fetched.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(got, expected_rows, "streaming do_put lost rows");
+
+        handle.abort();
     }
 }
