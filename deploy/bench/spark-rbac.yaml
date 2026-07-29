@@ -1,0 +1,48 @@
+# RBAC for the Spark-on-Kubernetes baseline run.
+#
+# In cluster mode the driver runs as a pod and creates/deletes its own executor
+# pods through the API server, so it needs a ServiceAccount with rights over
+# pods (and configmaps, which Spark uses to ship driver conf to executors).
+# Scoped to a Role in one namespace, not a ClusterRole — the driver has no
+# business seeing anything outside its own run.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spark-bench
+  namespace: krishiv-apitest
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spark-bench
+  namespace: krishiv-apitest
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete", "deletecollection"]
+  - apiGroups: [""]
+    resources: ["pods/log", "pods/status"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spark-bench
+  namespace: krishiv-apitest
+subjects:
+  - kind: ServiceAccount
+    name: spark-bench
+    namespace: krishiv-apitest
+roleRef:
+  kind: Role
+  name: spark-bench
+  apiGroup: rbac.authorization.k8s.io

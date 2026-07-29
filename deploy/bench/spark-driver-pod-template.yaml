@@ -1,0 +1,22 @@
+# Driver pod template: mounts the job ConfigMap at /opt/job.
+#
+# In cluster mode the driver pod has no access to the submitting machine's
+# filesystem, so the application file and the query corpus have to travel with
+# it. A ConfigMap is the least machinery that does that here — no object-store
+# upload path to configure, no extra credentials on the submitting host, and the
+# corpus is only ~14 KB.
+#
+# `local://` in the submit line refers to a path inside the *container*, which
+# is exactly what this mount provides.
+apiVersion: v1
+kind: Pod
+spec:
+  volumes:
+    - name: job
+      configMap:
+        name: spark-tpch-job
+  containers:
+    - name: spark-kubernetes-driver
+      volumeMounts:
+        - name: job
+          mountPath: /opt/job
