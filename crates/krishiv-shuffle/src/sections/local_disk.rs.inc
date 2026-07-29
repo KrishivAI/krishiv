@@ -191,3 +191,108 @@ async fn disk_store_zstd_compression_preserves_data() {
     }
 }
 
+
+// ── compression at rest ───────────────────────────────────────────────
+
+/// Shuffle partitions must be compressed at rest by default.
+///
+/// Both stores constructed themselves with `ShuffleCompression::None`, and the
+/// only production caller that ever set a codec was `shuffle_svc`. Every path
+/// a distributed query actually uses — the executor's local, object, and
+/// tiered backends — took the default, so partitions were written raw to the
+/// slowest resources in the system while `with_compression` sat there tested
+/// and uncalled.
+///
+/// Asserting *round-trip* alongside size is the point: Parquet records its
+/// codec in file metadata, so a reader needs no configuration to read a
+/// compressed partition. That property is what makes the default safe to flip
+/// under partitions already on disk.
+#[tokio::test]
+async fn the_disk_store_compresses_by_default_and_still_round_trips() {
+    fn shuffle_shaped(job: &str) -> ShufflePartition {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        // Join keys and a low-cardinality dimension: the shape real shuffle
+        // payloads have, and the shape that compresses.
+        let keys: Vec<i64> = (0..20_000).map(|i| i % 500).collect();
+        let regions: Vec<&str> = (0..20_000)
+            .map(|i| ["AFRICA", "AMERICA", "ASIA", "EUROPE", "MIDDLE EAST"][i % 5])
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(keys)),
+                Arc::new(StringArray::from(regions)),
+            ],
+        )
+        .unwrap();
+        ShufflePartition {
+            id: PartitionId {
+                job_id: job.to_owned(),
+                stage_id: "s0".to_owned(),
+                partition: 0,
+            },
+            schema,
+            batches: vec![batch],
+        }
+    }
+
+    fn tree_bytes(dir: &std::path::Path) -> u64 {
+        let mut total = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let meta = entry.metadata().unwrap();
+            total += if meta.is_dir() {
+                tree_bytes(&entry.path())
+            } else {
+                meta.len()
+            };
+        }
+        total
+    }
+
+    let plain_dir = tempfile::tempdir().unwrap();
+    let plain = LocalDiskShuffleStore::new(plain_dir.path())
+        .unwrap()
+        .with_compression(ShuffleCompression::None);
+    plain
+        .write_partition(shuffle_shaped("job-plain"), 1)
+        .await
+        .unwrap();
+
+    let default_dir = tempfile::tempdir().unwrap();
+    let defaulted = LocalDiskShuffleStore::new(default_dir.path()).unwrap();
+    let expected = shuffle_shaped("job-default");
+    let id = expected.id.clone();
+    defaulted.write_partition(expected.clone(), 1).await.unwrap();
+
+    let plain_bytes = tree_bytes(plain_dir.path());
+    let default_bytes = tree_bytes(default_dir.path());
+    assert!(
+        default_bytes < plain_bytes,
+        "the default store must compress at rest: {default_bytes} >= {plain_bytes} bytes"
+    );
+
+    // ...and the compressed partition must read back byte-for-byte identical
+    // through a reader given no codec configuration at all.
+    let read = defaulted.read_partition(&id).await.unwrap().unwrap();
+    let got: usize = read.batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(got, 20_000, "row count must survive the round trip");
+    // Parquet reads back one batch per row group, so the rows must be
+    // reassembled before comparing — the split is a storage detail, not a
+    // difference in the data.
+    let expected_batch = expected.batches.first().unwrap();
+    let actual = arrow::compute::concat_batches(&read.schema, &read.batches).unwrap();
+    assert_eq!(
+        actual.column(0),
+        expected_batch.column(0),
+        "keys must survive"
+    );
+    assert_eq!(
+        actual.column(1),
+        expected_batch.column(1),
+        "strings must survive"
+    );
+}

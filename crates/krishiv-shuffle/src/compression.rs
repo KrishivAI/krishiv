@@ -86,6 +86,70 @@ pub fn ipc_write_options_for(requested: &str) -> arrow::ipc::writer::IpcWriteOpt
     }
 }
 
+/// Selects the codec for shuffle partitions **at rest** — Parquet on local
+/// disk, Arrow IPC in the object store.
+///
+/// `lz4` (default) | `zstd` | `none`. Separate from
+/// [`WIRE_COMPRESSION_ENV`] because the two are different trades: the wire
+/// pays CPU once per transfer, storage pays it once per write and saves it on
+/// every re-read (and on the object-store path, on every byte that crosses to
+/// MinIO twice — once written, once fetched).
+pub const STORAGE_COMPRESSION_ENV: &str = "KRISHIV_SHUFFLE_STORAGE_COMPRESSION";
+
+/// Codec for newly-written shuffle partitions.
+///
+/// # Why the default is not `None`
+///
+/// Both stores defaulted to [`ShuffleCompression::None`], and the only
+/// production caller that ever set a codec was `shuffle_svc`, which passes
+/// `Lz4` to the local disk store. Every other path — the executor's local,
+/// object, and tiered backends, i.e. the ones a distributed query actually
+/// uses — took the default. So shuffle partitions were written uncompressed to
+/// local disk and to the object store, while one unrelated HTTP service path
+/// compressed. `with_compression` existed, was tested, and was never called
+/// outside tests on those paths.
+///
+/// That is expensive here for the same reason wire compression was: an
+/// object-store partition crosses the pod network twice, and shuffle payloads
+/// are join keys and grouped measures — the shape that compresses.
+///
+/// Measured by `the_disk_store_compresses_by_default_and_still_round_trips` on
+/// a 20k-row shuffle-shaped partition: **34,965 bytes of Parquet uncompressed
+/// -> 4,630 with LZ4, 7.55x**. Higher than the 4.54x the same corpus gives on
+/// the wire, because Parquet's dictionary and run-length encodings compose
+/// with the codec instead of competing with it.
+///
+/// Both formats are self-describing — Parquet records its codec in file
+/// metadata, Arrow IPC in each record-batch message — so this is safe to
+/// change under running data in both directions: an old reader reads new
+/// compressed partitions, and a new reader reads old uncompressed ones.
+pub fn default_storage_compression() -> ShuffleCompression {
+    let requested = std::env::var(STORAGE_COMPRESSION_ENV)
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_else(|_| String::from("lz4"));
+    storage_compression_for(&requested)
+}
+
+/// The storage-codec decision, without reading the environment.
+///
+/// Split from [`default_storage_compression`] for the same reason
+/// [`ipc_write_options_for`] is: this crate forbids `unsafe`, so a test cannot
+/// set an env var to exercise the mapping.
+pub fn storage_compression_for(requested: &str) -> ShuffleCompression {
+    match requested {
+        "none" | "off" | "" => ShuffleCompression::None,
+        "zstd" => ShuffleCompression::Zstd,
+        "lz4" | "lz4_frame" => ShuffleCompression::Lz4,
+        other => {
+            tracing::warn!(
+                "{STORAGE_COMPRESSION_ENV}='{other}' is not one of lz4|zstd|none; \
+                 falling back to lz4"
+            );
+            ShuffleCompression::Lz4
+        }
+    }
+}
+
 /// Compression algorithm for shuffle block data.
 ///
 /// Used in [`ShuffleWriteConfig`] and [`ShuffleReadConfig`] to specify
@@ -247,6 +311,21 @@ mod wire_compression_tests {
         let typo = encode(ipc_write_options_for("lz44"), &batch).len();
         let plain = encode(IpcWriteOptions::default(), &batch).len();
         assert!(typo < plain, "a typo must not turn compression off");
+    }
+
+    /// The storage codec maps the same vocabulary as the wire one, with the
+    /// same refusal to silently disable itself on a typo.
+    #[test]
+    fn the_storage_codec_maps_the_same_vocabulary_as_the_wire() {
+        assert_eq!(storage_compression_for("lz4"), ShuffleCompression::Lz4);
+        assert_eq!(storage_compression_for("zstd"), ShuffleCompression::Zstd);
+        assert_eq!(storage_compression_for("none"), ShuffleCompression::None);
+        assert_eq!(storage_compression_for("off"), ShuffleCompression::None);
+        assert_eq!(
+            storage_compression_for("lz44"),
+            ShuffleCompression::Lz4,
+            "a typo must not turn compression off"
+        );
     }
 
     #[test]

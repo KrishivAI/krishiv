@@ -213,7 +213,7 @@ impl LocalDiskShuffleStore {
         Ok(Self {
             base_dir,
             lease_tokens: Arc::new(RwLock::new(ahash::AHashMap::default())),
-            compression: ShuffleCompression::None,
+            compression: crate::compression::default_storage_compression(),
             content_hashes: Arc::new(DashMap::new()),
             page_cache_budget: Arc::new(
                 krishiv_common::page_cache::ShufflePageCacheBudget::from_capacity(

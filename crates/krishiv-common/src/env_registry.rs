@@ -842,14 +842,30 @@ pub static FLAGS: &[FlagSpec] = &[
          lz4 | zstd | none. Reduce tasks fetch their input from other \
          executors over Flight, so most of every shuffle crosses the pod \
          network — measured at ~7.6 MB/s here against 150-286 MB/s for a \
-         node-local read. Nothing else on the path compresses: the disk store \
-         defaults to None and tonic is built without a compression feature, so \
-         gRPC-level compression is unavailable rather than merely off. The \
-         codec travels in each record-batch message, so a reader decompresses \
-         without negotiation and a peer sending uncompressed data still \
-         works. LZ4 runs two orders of magnitude faster than this link, so the \
-         default is one-sided here; set `none` on a fast fabric, where the CPU \
-         cost becomes comparable to the transfer it saves.",
+         node-local read. tonic is built without a compression feature, so \
+         gRPC-level compression is unavailable rather than merely off; this is \
+         the layer that covers the transfer. Compression at rest is a separate \
+         knob (KRISHIV_SHUFFLE_STORAGE_COMPRESSION). The codec travels in each \
+         record-batch message, so a reader decompresses without negotiation and \
+         a peer sending uncompressed data still works. LZ4 runs two orders of \
+         magnitude faster than this link, so the default is one-sided here; set \
+         `none` on a fast fabric, where the CPU cost becomes comparable to the \
+         transfer it saves.",
+    ),
+    rt(
+        "KRISHIV_SHUFFLE_STORAGE_COMPRESSION",
+        FlagKind::Enum(&["lz4", "zstd", "none"]),
+        "lz4",
+        "Codec for shuffle partitions at rest — Parquet on local disk, Arrow \
+         IPC in the object store: lz4 | zstd | none. Both stores previously \
+         constructed themselves with None, and the only production caller that \
+         ever set a codec was the shuffle HTTP service; every backend a \
+         distributed query actually uses (local, object, tiered) took the \
+         default, so partitions were written raw. An object-store partition \
+         crosses the pod network twice, once written and once fetched. Both \
+         formats are self-describing — Parquet records its codec in file \
+         metadata, Arrow IPC in each record-batch message — so changing this \
+         is safe under partitions already written, in both directions.",
     ),
     rt(
         "KRISHIV_GRACE_HASH_JOIN",

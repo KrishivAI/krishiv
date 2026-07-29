@@ -35,7 +35,7 @@ impl ObjectStoreShuffleStore {
             prefix,
             lease_tokens: Arc::new(DashMap::new()),
             content_hashes: Arc::new(DashMap::new()),
-            compression: ShuffleCompression::None,
+            compression: crate::compression::default_storage_compression(),
         }
     }
 
@@ -453,9 +453,15 @@ impl ShuffleStore for ObjectStoreShuffleStore {
         // B2: The IPC bytes from the object store are NOT outer-compressed —
         // compression is embedded at the IPC record-batch level. Pass `data`
         // directly to StreamReader without a double-decompress step.
-        // Convert to Vec<u8> so the owned bytes can be moved into spawn_blocking.
-        let ipc_bytes: Vec<u8> = data.to_vec();
-        let cursor = std::io::Cursor::new(ipc_bytes);
+        //
+        // `data` is moved into the cursor as-is. It used to be copied with
+        // `to_vec()`, justified as needed "so the owned bytes can be moved into
+        // spawn_blocking" — but `Bytes` is already owned, `Send + 'static`, and
+        // `AsRef<[u8]>`, so it satisfies both `Cursor` and the move on its own.
+        // The copy bought nothing and doubled peak resident bytes for the whole
+        // life of the stream, on the path whose entire purpose is to avoid
+        // holding a partition in memory.
+        let cursor = std::io::Cursor::new(data);
         let reader =
             StreamReader::try_new(cursor, None).map_err(|e| crate::error::io_err(e.to_string()))?;
         let schema = reader.schema();
