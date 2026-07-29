@@ -382,7 +382,7 @@ impl<S: ShuffleStore + Send + Sync + 'static> FlightService for ShuffleFlightSer
 
         let encoder = FlightDataEncoderBuilder::new()
             .with_schema(schema)
-            .with_options(IpcWriteOptions::default())
+            .with_options(crate::compression::wire_ipc_write_options())
             .build(stream);
 
         let mapped = encoder.map_err(|e| Status::internal(format!("flight encode: {e}")));
@@ -986,7 +986,7 @@ impl FlightShuffleClient {
         let encoder = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .with_flight_descriptor(Some(descriptor))
-            .with_options(IpcWriteOptions::default())
+            .with_options(crate::compression::wire_ipc_write_options())
             .build(batch_stream);
 
         // Collect encoder output first to propagate encoding errors before streaming.

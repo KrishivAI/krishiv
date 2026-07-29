@@ -835,6 +835,23 @@ pub static FLAGS: &[FlagSpec] = &[
          oversized message. TPC-H q10 at SF100 died this way on every sweep.",
     ),
     rt(
+        "KRISHIV_SHUFFLE_WIRE_COMPRESSION",
+        FlagKind::Enum(&["lz4", "zstd", "none"]),
+        "lz4",
+        "Arrow IPC body compression for shuffle partitions on the wire: \
+         lz4 | zstd | none. Reduce tasks fetch their input from other \
+         executors over Flight, so most of every shuffle crosses the pod \
+         network — measured at ~7.6 MB/s here against 150-286 MB/s for a \
+         node-local read. Nothing else on the path compresses: the disk store \
+         defaults to None and tonic is built without a compression feature, so \
+         gRPC-level compression is unavailable rather than merely off. The \
+         codec travels in each record-batch message, so a reader decompresses \
+         without negotiation and a peer sending uncompressed data still \
+         works. LZ4 runs two orders of magnitude faster than this link, so the \
+         default is one-sided here; set `none` on a fast fabric, where the CPU \
+         cost becomes comparable to the transfer it saves.",
+    ),
+    rt(
         "KRISHIV_GRACE_HASH_JOIN",
         FlagKind::Bool,
         "off",
