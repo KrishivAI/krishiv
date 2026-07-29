@@ -583,7 +583,7 @@ async fn heartbeat_loop(
         // This is the preferred topology for distributed-durable deployments.
         let backend =
             if let (true, Some(local_dir)) = (uri.starts_with("s3://"), shuffle_dir.as_deref()) {
-                open_tiered_shuffle_backend(local_dir, &uri).map_err(|e| {
+                open_tiered_shuffle_backend(local_dir, &uri, durability_profile).map_err(|e| {
                     format!(
                         "tiered shuffle (local={} s3={uri}): {e}",
                         local_dir.display()

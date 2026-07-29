@@ -89,6 +89,25 @@ fn s3_shuffle_store(rest: &str, context: &str) -> ShuffleResult<Arc<ObjectStoreS
     )))
 }
 
+/// Refuse an object-store shuffle under a profile that must not use one.
+///
+/// Shared by the plain and tiered entry points. They had the same rule stated
+/// in two places — one as an `if`, one only as a doc comment — and only the
+/// `if` was enforced, so the same `s3://` URI was accepted or refused depending
+/// on whether a local dir happened to also be configured.
+fn check_s3_profile(profile: DurabilityProfile, context: &str) -> ShuffleResult<()> {
+    if profile != DurabilityProfile::DistributedDurable && profile != DurabilityProfile::DevLocal {
+        return Err(ShuffleError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{context} requires distributed-durable or dev-local profile \
+                 (got '{profile}')"
+            ),
+        )));
+    }
+    Ok(())
+}
+
 /// Open a shuffle backend for the configured URI and durability profile.
 ///
 /// - `file://path` or bare path — local disk shuffle store
@@ -118,14 +137,7 @@ pub fn open_shuffle_backend_from_uri(
     }
 
     if let Some(rest) = trimmed.strip_prefix("s3://") {
-        if profile != DurabilityProfile::DistributedDurable
-            && profile != DurabilityProfile::DevLocal
-        {
-            return Err(ShuffleError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "s3:// shuffle requires distributed-durable or dev-local profile",
-            )));
-        }
+        check_s3_profile(profile, "s3:// shuffle")?;
         let object = s3_shuffle_store(rest, "s3 shuffle store")?;
         return Ok(Arc::new(ShuffleBackend::Object(object)));
     }
@@ -141,11 +153,18 @@ pub fn open_shuffle_backend_from_uri(
 /// `local_dir` is the local cache directory (created if absent).
 /// `s3_uri` must be an `s3://bucket[/prefix]` URI.
 ///
-/// Only valid for `DistributedDurable` (or `DevLocal` for testing).
+/// Only valid for `DistributedDurable` (or `DevLocal` for testing) — the same
+/// rule [`open_shuffle_backend_from_uri`] applies to a bare `s3://` URI, and
+/// `profile` is taken here so it is enforced rather than merely documented.
+/// It was documented-only, so a deployment that set both a local shuffle dir
+/// and an `s3://` URI took this path and skipped a check the other path made:
+/// the identical URI was accepted or refused depending on an unrelated setting.
 pub fn open_tiered_shuffle_backend(
     local_dir: &std::path::Path,
     s3_uri: &str,
+    profile: DurabilityProfile,
 ) -> ShuffleResult<Arc<ShuffleBackend>> {
+    check_s3_profile(profile, "tiered shuffle")?;
     let local = Arc::new(LocalDiskShuffleStore::new(local_dir)?);
 
     let rest = s3_uri.strip_prefix("s3://").ok_or_else(|| {
@@ -242,7 +261,7 @@ mod tests {
     fn the_tiered_path_shares_the_same_bucket_validation() {
         let dir = tempfile::tempdir().unwrap();
         let err = expect_refused(
-            open_tiered_shuffle_backend(dir.path(), "s3://"),
+            open_tiered_shuffle_backend(dir.path(), "s3://", DurabilityProfile::DevLocal),
             "s3:// with no bucket cannot be opened",
         );
         assert!(err.contains("no bucket"), "{err}");
@@ -252,9 +271,36 @@ mod tests {
     fn the_tiered_remote_must_be_an_s3_uri() {
         let dir = tempfile::tempdir().unwrap();
         let err = expect_refused(
-            open_tiered_shuffle_backend(dir.path(), "file:///tmp/nope"),
+            open_tiered_shuffle_backend(dir.path(), "file:///tmp/nope", DurabilityProfile::DevLocal),
             "a tiered remote must be object storage",
         );
         assert!(err.contains("must be s3://"), "{err}");
+    }
+
+    /// The profile rule must not depend on which entry point you reach.
+    ///
+    /// It was stated as an `if` on one path and only as a doc comment on the
+    /// other, so the same `s3://` URI under the same profile was refused or
+    /// accepted according to whether a local shuffle dir happened to be set —
+    /// the setting that decides *tiered vs plain*, which has nothing to do with
+    /// whether object-store shuffle is permitted at all.
+    #[test]
+    fn both_entry_points_refuse_s3_under_a_non_distributed_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = DurabilityProfile::SingleNodeDurable;
+        let plain = expect_refused(
+            open_shuffle_backend_from_uri("s3://bucket/pfx", profile),
+            "the plain path must refuse s3 under single-node-durable",
+        );
+        let tiered = expect_refused(
+            open_tiered_shuffle_backend(dir.path(), "s3://bucket/pfx", profile),
+            "the tiered path must refuse s3 under single-node-durable too",
+        );
+        for err in [&plain, &tiered] {
+            assert!(
+                err.contains("distributed-durable"),
+                "the refusal must name the requirement: {err}"
+            );
+        }
     }
 }
