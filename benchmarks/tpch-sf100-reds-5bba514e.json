@@ -1,0 +1,36 @@
+{
+  "label": "reds-5bba514e",
+  "scale_factor": 100,
+  "coordinator": "http://213.199.60.184:31902",
+  "data_root": "s3://krishiv-bench/tpch/sf100",
+  "generated_at": "2026-07-28T03:44:30Z",
+  "succeeded": 0,
+  "attempted": 3,
+  "total_elapsed_s": 0,
+  "queries": [
+    {
+      "id": "q10",
+      "name": "returned_item_reporting",
+      "job_id": "batch-sql-1785207560010-0",
+      "status": "failed",
+      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"dfplan:v1:0:Sp0JCogDkgGEAwqBA3sidiI6MSwic3RhZ2UiOjAsIm1hcF90YXNrcyI6NiwicGFydGl0aW9ucyI6Niwic2NoZW1hX2lwY19iNjQiOiIvLy8vLzdnQUFBQVFBQUFBQUFBS0FBd0FDZ0FKQUFRQUNnQUFBQkFBQUFBQUFRUUFDQUFJQUFBQUJB\u2026': local stage fragment execution failed: DataFusion error: Execution error: shuffle read (stage 1, map 0, partition 0): KRV_SHUFFLE_MISSING(stage=s1.m0,partition=0): shuffle partition batch-sql-1785207560010-0/s1.m0/0 unreachable after 4 attempts (producer executor gone): transport error",
+      "elapsed_s": 2370.5966812950064
+    },
+    {
+      "id": "q17",
+      "name": "small_quantity_order_revenue",
+      "job_id": "batch-sql-1785209930594-1",
+      "status": "failed",
+      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"dfplan:v1:0:QqwPEjsiORITChEKD2xfZXh0ZW5kZWRwcmljZSIDc3VtQh1zdW0obGluZWl0ZW0ubF9leHRlbmRlZHByaWNlKSKtDiKqDgr/DZIC+w0K1gdS0wcKqgcipwcKkQZCjgYKDQoLCglsX3BhcnRrZXkSMyIxEhAKDgoKbF9xdWFudGl0eRABIgNh\u2026': local stage fragment execution failed: DataFusion error: Arrow error: Invalid argument error: column types must match schema types, expected Decimal128(15, 2) but found Decimal128(30, 15) at column index 0",
+      "elapsed_s": 169.91769746900536
+    },
+    {
+      "id": "q19",
+      "name": "discounted_revenue",
+      "job_id": "batch-sql-1785210100516-2",
+      "status": "failed",
+      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"dfplan:v1:0:QpwUEowCIokCElkaVxoITXVsdGlwbHkiEwoRCg9sX2V4dGVuZGVkcHJpY2UiNho0GgVNaW51cyIZEheiARQKEAAAAAAAAAAAAAAAAAAAAAEQFCIQCg4KCmxfZGlzY291bnQQASIDc3VtQqYBH2RhdGFmdXNpb25faHVtYW5fZGlzcGxheV9h\u2026': local stage fragment execution failed: DataFusion error: Arrow error: Invalid argument error: column types must match schema types, expected Decimal128(15, 2) but found Utf8View at column index 0",
+      "elapsed_s": 170.4639909559919
+    }
+  ]
+}

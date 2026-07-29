@@ -230,7 +230,7 @@ async fn every_tpch_query_stages_to_the_same_answer_in_every_configuration() {
     for (label, threshold, broadcast) in MATRIX {
         let ctx = context(*threshold, *broadcast).await;
         for query in TPCH_QUERIES {
-            let expected = match ctx.sql(query.sql).await {
+            let expected = match ctx.sql(&query.sql_at_scale(1.0)).await {
                 Ok(df) => match df.collect().await {
                     Ok(batches) => cells(&batches),
                     Err(e) => {
@@ -243,7 +243,7 @@ async fn every_tpch_query_stages_to_the_same_answer_in_every_configuration() {
                     continue;
                 }
             };
-            match run_staged(&ctx, query.sql).await {
+            match run_staged(&ctx, &query.sql_at_scale(1.0)).await {
                 Ok(actual) => {
                     checked += 1;
                     let actual = cells(&actual);
@@ -291,7 +291,7 @@ async fn the_fixture_still_produces_rows_for_the_queries_it_claims() {
             .find(|q| q.id == *id)
             .unwrap_or_else(|| panic!("{id} is not in the corpus"));
         let batches = ctx
-            .sql(query.sql)
+            .sql(&query.sql_at_scale(1.0))
             .await
             .unwrap_or_else(|e| panic!("{id}: {e}"))
             .collect()
@@ -317,7 +317,7 @@ async fn every_query_plans_against_the_fixture_schema() {
     let ctx = context(None, None).await;
     let mut broken = Vec::new();
     for query in TPCH_QUERIES {
-        if let Err(e) = ctx.sql(query.sql).await {
+        if let Err(e) = ctx.sql(&query.sql_at_scale(1.0)).await {
             broken.push(format!("{}: {e}", query.id));
         }
     }

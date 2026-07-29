@@ -30,6 +30,14 @@ async fn main() -> std::process::ExitCode {
             std::process::exit(2);
         });
 
+    // Q11's threshold is scale-dependent; the env var names the scale so the
+    // verifier checks the same SQL the runner will execute.
+    let scale_factor: f64 = std::env::var("KRISHIV_TPCH_SCALE_FACTOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &f64| v.is_finite() && *v > 0.0)
+        .unwrap_or(1.0);
+
     let mut failures = 0usize;
     let mut failed_ids: BTreeSet<&str> = BTreeSet::new();
 
@@ -55,7 +63,7 @@ async fn main() -> std::process::ExitCode {
         }
 
         let started = Instant::now();
-        match engine.sql(query.sql).await {
+        match engine.sql(&query.sql_at_scale(scale_factor)[..]).await {
             Err(error) => {
                 println!("FAIL {:>3} {:<32} plan: {error}", query.id, query.name);
                 failures += 1;

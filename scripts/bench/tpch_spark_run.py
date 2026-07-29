@@ -82,6 +82,12 @@ def main() -> int:
 
     with open(args.corpus_json, encoding="utf-8") as handle:
         corpus = json.load(handle)
+    # The corpus file is `{"count": N, "queries": [...]}`; a bare list is also
+    # accepted. Iterating the dict directly yielded its *keys* — the strings
+    # "count" and "queries" — and died on `query["sql"]` with "string indices
+    # must be integers", 28 s into the run, after every table had registered.
+    if isinstance(corpus, dict):
+        corpus = corpus["queries"]
     wanted = [q.strip() for q in args.only.split(",") if q.strip()]
     if wanted:
         by_id = {q["id"]: q for q in corpus}

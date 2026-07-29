@@ -1,0 +1,240 @@
+{
+  "label": "full22-clean-7e891150",
+  "scale_factor": 100,
+  "coordinator": "http://213.199.60.184:31902",
+  "data_root": "s3://krishiv-bench/tpch/sf100",
+  "generated_at": "2026-07-28T22:45:41Z",
+  "succeeded": 18,
+  "attempted": 22,
+  "total_elapsed_s": 14173.21244284013,
+  "queries": [
+    {
+      "id": "q10",
+      "name": "returned_item_reporting",
+      "job_id": "batch-sql-1785261767757-2",
+      "status": "failed",
+      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"dfplan:v1:0:QpkbCg0KCwoJY19jdXN0a2V5CgwKCgoGY19uYW1lEAEKDwoNCgljX2FjY3RiYWwQBAoNCgsKB2NfcGhvbmUQAwoMCgoKBm5fbmFtZRAICg8KDQoJY19hZGRyZXNzEAIKDwoNCgljX2NvbW1lbnQQBRKOAiKLAhJbGlkaCE11bHRpcGx5IhUK\u2026': local stage fragment execution failed: DataFusion error: Resources exhausted: Failed to allocate additional 877.0 B for HashJoinInput with 0.0 B already allocated for this reservation - 0.0 B remain available for the total memory pool: fair(pool_size: 2.6 GB)",
+      "elapsed_s": 1312.9483149609878
+    },
+    {
+      "id": "q11",
+      "name": "important_stock_identification",
+      "status": "submit_failed",
+      "error": "POST timed out; not retried \u2014 a submit timeout means the coordinator is still planning, and retrying would run a second plan of the same query alongside the first: timed out",
+      "elapsed_s": 60.066255418001674
+    },
+    {
+      "id": "q17",
+      "name": "small_quantity_order_revenue",
+      "job_id": "batch-sql-1785263140779-4",
+      "status": "ok",
+      "elapsed_s": 1133.5450064599863,
+      "result_batches": 1,
+      "stage_count": 6,
+      "task_count": 91,
+      "distributed": true
+    },
+    {
+      "id": "q19",
+      "name": "discounted_revenue",
+      "job_id": "batch-sql-1785264274310-5",
+      "status": "ok",
+      "elapsed_s": 815.4661648100009,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    },
+    {
+      "id": "q21",
+      "name": "suppliers_who_kept_orders_waiting",
+      "job_id": "batch-sql-1785265089768-6",
+      "status": "failed",
+      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"dfplan:v1:0:SqIHCsMDkgG/Awq8A3sidiI6MSwic3RhZ2UiOjEsIm1hcF90YXNrcyI6MTgsInBhcnRpdGlvbnMiOjE4LCJzY2hlbWFfaXBjX2I2NCI6Ii8vLy8vL2dBQUFBUUFBQUFBQUFLQUF3QUNnQUpBQVFBQ2dBQUFCQUFBQUFBQVFRQUNBQUlBQUFB\u2026': local stage fragment execution failed: DataFusion error: Resources exhausted: Failed to allocate additional 131.4 KB for HashJoinInput[0] with 0.0 B already allocated for this reservation - 0.0 B remain available for the total memory pool: fair(pool_size: 2.6 GB)",
+      "elapsed_s": 1367.7360067920235
+    },
+    {
+      "id": "q9",
+      "name": "product_type_profit_measure",
+      "job_id": "batch-sql-1785266457513-7",
+      "status": "ok",
+      "elapsed_s": 1154.3821383579925,
+      "result_batches": 1,
+      "stage_count": 8,
+      "task_count": 127,
+      "distributed": true
+    },
+    {
+      "id": "q8",
+      "name": "national_market_share",
+      "job_id": "batch-sql-1785267611887-8",
+      "status": "ok",
+      "elapsed_s": 948.7702821580169,
+      "result_batches": 1,
+      "stage_count": 8,
+      "task_count": 127,
+      "distributed": true
+    },
+    {
+      "id": "q7",
+      "name": "volume_shipping",
+      "job_id": "batch-sql-1785268560663-9",
+      "status": "ok",
+      "elapsed_s": 1186.4490013870236,
+      "result_batches": 1,
+      "stage_count": 7,
+      "task_count": 109,
+      "distributed": true
+    },
+    {
+      "id": "q2",
+      "name": "minimum_cost_supplier",
+      "job_id": "batch-sql-1785269747107-10",
+      "status": "ok",
+      "elapsed_s": 2459.406790142006,
+      "result_batches": 1,
+      "stage_count": 11,
+      "task_count": 181,
+      "distributed": true
+    },
+    {
+      "id": "q18",
+      "name": "large_volume_customer",
+      "job_id": "batch-sql-1785272206522-11",
+      "status": "ok",
+      "elapsed_s": 854.0062707110192,
+      "result_batches": 1,
+      "stage_count": 7,
+      "task_count": 109,
+      "distributed": true
+    },
+    {
+      "id": "q1",
+      "name": "pricing_summary",
+      "job_id": "batch-sql-1785273060553-12",
+      "status": "ok",
+      "elapsed_s": 358.36789380101254,
+      "result_batches": 1,
+      "stage_count": 2,
+      "task_count": 19,
+      "distributed": true
+    },
+    {
+      "id": "q3",
+      "name": "shipping_priority",
+      "job_id": "batch-sql-1785273418896-13",
+      "status": "ok",
+      "elapsed_s": 669.5596417710185,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    },
+    {
+      "id": "q4",
+      "name": "order_priority_checking",
+      "job_id": "batch-sql-1785274088460-14",
+      "status": "ok",
+      "elapsed_s": 346.58501897301176,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    },
+    {
+      "id": "q5",
+      "name": "local_supplier_volume",
+      "job_id": "batch-sql-1785274435043-15",
+      "status": "ok",
+      "elapsed_s": 1087.5759349409782,
+      "result_batches": 1,
+      "stage_count": 7,
+      "task_count": 109,
+      "distributed": true
+    },
+    {
+      "id": "q6",
+      "name": "forecasting_revenue_change",
+      "job_id": "batch-sql-1785275522625-16",
+      "status": "ok",
+      "elapsed_s": 300.3414161330147,
+      "result_batches": 1,
+      "stage_count": 2,
+      "task_count": 19,
+      "distributed": true
+    },
+    {
+      "id": "q12",
+      "name": "shipping_modes_and_order_priority",
+      "job_id": "batch-sql-1785275823024-17",
+      "status": "ok",
+      "elapsed_s": 405.3728794300114,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    },
+    {
+      "id": "q13",
+      "name": "customer_distribution",
+      "job_id": "batch-sql-1785276228335-18",
+      "status": "ok",
+      "elapsed_s": 296.616391751013,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    },
+    {
+      "id": "q14",
+      "name": "promotion_effect",
+      "job_id": "batch-sql-1785276524951-19",
+      "status": "ok",
+      "elapsed_s": 746.49523400201,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    },
+    {
+      "id": "q15",
+      "name": "top_supplier",
+      "status": "submit_failed",
+      "error": "POST timed out; not retried \u2014 a submit timeout means the coordinator is still planning, and retrying would run a second plan of the same query alongside the first: timed out",
+      "elapsed_s": 60.055669814988505
+    },
+    {
+      "id": "q16",
+      "name": "parts_supplier_relationship",
+      "job_id": "batch-sql-1785277331533-21",
+      "status": "ok",
+      "elapsed_s": 129.5256525450095,
+      "result_batches": 1,
+      "stage_count": 6,
+      "task_count": 91,
+      "distributed": true
+    },
+    {
+      "id": "q20",
+      "name": "potential_part_promotion",
+      "job_id": "batch-sql-1785277461062-22",
+      "status": "ok",
+      "elapsed_s": 873.7584200869896,
+      "result_batches": 1,
+      "stage_count": 6,
+      "task_count": 91,
+      "distributed": true
+    },
+    {
+      "id": "q22",
+      "name": "global_sales_opportunity",
+      "job_id": "batch-sql-1785278334838-23",
+      "status": "ok",
+      "elapsed_s": 406.98830538001494,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    }
+  ]
+}

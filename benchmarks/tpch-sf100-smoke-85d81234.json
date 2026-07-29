@@ -1,0 +1,34 @@
+{
+  "label": "smoke-85d81234",
+  "scale_factor": 100,
+  "coordinator": "http://213.199.60.184:31902",
+  "data_root": "s3://krishiv-bench/tpch/sf100",
+  "generated_at": "2026-07-28T22:58:30Z",
+  "succeeded": 2,
+  "attempted": 2,
+  "total_elapsed_s": 562.4297949879838,
+  "queries": [
+    {
+      "id": "q6",
+      "name": "forecasting_revenue_change",
+      "job_id": "batch-sql-1785278947919-0",
+      "status": "ok",
+      "elapsed_s": 78.51070864399662,
+      "result_batches": 1,
+      "stage_count": 2,
+      "task_count": 13,
+      "distributed": true
+    },
+    {
+      "id": "q3",
+      "name": "shipping_priority",
+      "job_id": "batch-sql-1785279026404-1",
+      "status": "ok",
+      "elapsed_s": 483.91908634398715,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    }
+  ]
+}

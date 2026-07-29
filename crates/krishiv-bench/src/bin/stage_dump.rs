@@ -54,6 +54,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(18);
+    // Plans are dumped to explain cluster runs, which are SF100; Q11's
+    // threshold is scale-dependent, so a mismatched scale would dump a plan
+    // for SQL the cluster never ran.
+    let scale_factor: f64 = std::env::var("SF")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &f64| v.is_finite() && *v > 0.0)
+        .unwrap_or(100.0);
     let ids: Vec<String> = args.collect();
 
     for query in TPCH_QUERIES
@@ -79,7 +87,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         }
-        let sql = register_python_udf_signatures_and_strip(&ctx, query.sql)?;
+        let bound = query.sql_at_scale(scale_factor);
+        let sql = register_python_udf_signatures_and_strip(&ctx, &bound)?;
         let df = match ctx.sql(&sql).await {
             Ok(df) => df,
             Err(error) => {

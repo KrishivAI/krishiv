@@ -131,12 +131,31 @@ fn enabled_from(value: &str) -> bool {
 ///
 /// # The rewrite
 ///
-/// For an inner join whose output feeds a semi-join keyed on columns from only
-/// one side:
+/// For an inner join whose output feeds a semi- or anti-join keyed on columns
+/// from only one side:
 ///
 /// ```text
 ///   SemiJoin(Inner(A, B), S)  on A.k     ==>  Inner(SemiJoin(A, S) on A.k, B)
+///   AntiJoin(Inner(A, B), S)  on A.k     ==>  Inner(AntiJoin(A, S) on A.k, B)
 /// ```
+///
+/// # Anti joins and residual filters
+///
+/// Both were originally refused — anti joins as needing "their own reasoning",
+/// and any join carrying a residual `filter` because it "may reference both
+/// sides". Between them those two guards made the rule **inert on TPC-H q21**,
+/// whose `EXISTS`/`NOT EXISTS` produce exactly a semi *and* an anti join, each
+/// carrying `l_suppkey <> l_suppkey`. q21 was the slowest query in the SF100
+/// sweep at 4309 s against Spark's 391 s — the largest single loss of the 22 —
+/// with the most selective predicate in the query running above the whole
+/// four-way join.
+///
+/// The reasoning does carry over. For both kinds the existence test is a
+/// function of the filtered row and the probe alone, so a row of `Inner(A, B)`
+/// passes exactly when its `A` row passes. The residual is carried down and
+/// **remapped at each level** (see `remap_residual`) rather than refused, and
+/// re-attached only where every column it names resolves into the child being
+/// landed on or the probe.
 ///
 /// # Why it is safe
 ///
@@ -145,7 +164,8 @@ fn enabled_from(value: &str) -> bool {
 ///   before it, and filtering earlier would keep different rows.
 /// - **Every semi-join key must resolve into one side.** If the keys straddle
 ///   `A` and `B`, the existence test genuinely depends on the joined row and
-///   cannot be evaluated before the join.
+///   cannot be evaluated before the join. The same test is applied to the
+///   residual's columns.
 /// - **Row multiplicity is preserved.** A semi-join emits each surviving row
 ///   at most once and adds no columns, so `Inner(SemiJoin(A,S), B)` produces
 ///   exactly the rows of `Inner(A,B)` whose `A.k` had a match — which is the
@@ -182,16 +202,21 @@ impl OptimizerRule for SemiJoinPushdownThroughInnerJoin {
             return Ok(Transformed::no(plan));
         };
         // `filtered` is the side whose rows survive; `probe` only supplies the
-        // existence test. Anti joins are excluded: pushing a "not exists" down
-        // an inner join is not the same rewrite and needs its own reasoning.
+        // existence test.
+        //
+        // Anti joins ride along with semi joins. The earlier version excluded
+        // them, on the grounds that "not exists" needed its own reasoning — it
+        // does, and the reasoning comes out the same. For both kinds the test
+        // is a function of the filtered row and the probe alone, so a row of
+        // `Inner(A, B)` passes exactly when its `A` row passes; pushing the
+        // test onto `A` keeps the same rows, and semi/anti both emit each
+        // surviving row exactly once, so multiplicity through `B` is unchanged.
         let filtered_is_right = match semi.join_type {
-            JoinType::LeftSemi => false,
-            JoinType::RightSemi => true,
+            JoinType::LeftSemi | JoinType::LeftAnti => false,
+            JoinType::RightSemi | JoinType::RightAnti => true,
             _ => return Ok(Transformed::no(plan)),
         };
-        if semi.on.is_empty() || semi.filter.is_some() {
-            // A residual filter may reference both sides, so it cannot be
-            // assumed to survive the move.
+        if semi.on.is_empty() {
             return Ok(Transformed::no(plan));
         }
         let (filtered, probe) = if filtered_is_right {
@@ -215,11 +240,63 @@ impl OptimizerRule for SemiJoinPushdownThroughInnerJoin {
             });
         }
 
-        match push_semi_below(filtered, &pairs, probe, filtered_is_right)? {
+        match push_semi_below(
+            filtered,
+            &pairs,
+            probe,
+            filtered_is_right,
+            semi.filter.as_ref(),
+            semi.join_type,
+        )? {
             Some(rewritten) => Ok(Transformed::yes(rewritten)),
             None => Ok(Transformed::no(plan)),
         }
     }
+}
+
+/// Rewrite the residual filter's references to *this* level's columns into the
+/// level below, leaving probe-side columns untouched.
+///
+/// Returns `None` when some referenced column cannot be followed down (a
+/// computed projection expression, say), in which case the caller declines the
+/// whole rewrite. `Some(None)` means there was no residual to carry.
+///
+/// The pair keys are already remapped by schema position at each level; the
+/// residual has to make the same journey or it would reference names that no
+/// longer exist below. That mismatch is why the residual case was originally
+/// refused outright rather than remapped.
+fn remap_residual(
+    residual: Option<&Expr>,
+    schema: &DFSchema,
+    lower: &dyn Fn(usize) -> Option<Column>,
+) -> Option<Option<Expr>> {
+    use datafusion::common::tree_node::TreeNode;
+
+    // No residual is not a refusal — it is the common case.
+    let Some(expr) = residual.cloned() else {
+        return Some(None);
+    };
+    let mut unfollowable = false;
+    let rewritten = expr
+        .transform(|e| {
+            if let Expr::Column(c) = &e
+                && let Some(idx) = index_of(schema, c)
+            {
+                return match lower(idx) {
+                    Some(inner) => Ok(Transformed::yes(Expr::Column(inner))),
+                    None => {
+                        unfollowable = true;
+                        Ok(Transformed::no(e))
+                    }
+                };
+            }
+            Ok(Transformed::no(e))
+        })
+        .ok()?;
+    if unfollowable {
+        return None;
+    }
+    Some(Some(rewritten.data))
 }
 
 /// Carry a semi-join down to the inner join it should be filtering.
@@ -236,6 +313,8 @@ fn push_semi_below(
     pairs: &[(Column, Column)],
     probe: &LogicalPlan,
     filtered_is_right: bool,
+    residual: Option<&Expr>,
+    join_type: JoinType,
 ) -> Result<Option<LogicalPlan>> {
     match plan {
         LogicalPlan::Projection(proj) => {
@@ -250,7 +329,21 @@ fn push_semi_below(
                 };
                 mapped.push((inner.clone(), pk.clone()));
             }
-            let Some(new_input) = push_semi_below(&proj.input, &mapped, probe, filtered_is_right)?
+            let lower = |idx: usize| match proj.expr.get(idx) {
+                Some(Expr::Column(inner)) => Some(inner.clone()),
+                _ => None,
+            };
+            let Some(residual) = remap_residual(residual, &proj.schema, &lower) else {
+                return Ok(None);
+            };
+            let Some(new_input) = push_semi_below(
+                &proj.input,
+                &mapped,
+                probe,
+                filtered_is_right,
+                residual.as_ref(),
+                join_type,
+            )?
             else {
                 return Ok(None);
             };
@@ -268,7 +361,21 @@ fn push_semi_below(
                 let (qualifier, field) = alias.input.schema().qualified_field(idx);
                 mapped.push((Column::new(qualifier.cloned(), field.name()), pk.clone()));
             }
-            let Some(new_input) = push_semi_below(&alias.input, &mapped, probe, filtered_is_right)?
+            let lower = |idx: usize| {
+                let (qualifier, field) = alias.input.schema().qualified_field(idx);
+                Some(Column::new(qualifier.cloned(), field.name()))
+            };
+            let Some(residual) = remap_residual(residual, &alias.schema, &lower) else {
+                return Ok(None);
+            };
+            let Some(new_input) = push_semi_below(
+                &alias.input,
+                &mapped,
+                probe,
+                filtered_is_right,
+                residual.as_ref(),
+                join_type,
+            )?
             else {
                 return Ok(None);
             };
@@ -310,20 +417,58 @@ fn push_semi_below(
                     }
                 })
                 .collect();
-            let reduced = if filtered_is_right {
+            // The residual may only reference the child we are landing on and
+            // the probe. If it still names a column from the *other* child,
+            // the existence test genuinely depends on the joined row and this
+            // rewrite would evaluate it against rows that do not exist yet.
+            if let Some(filter) = residual {
+                for col in filter.column_refs() {
+                    if index_of(target.schema(), col).is_none()
+                        && index_of(probe.schema(), col).is_none()
+                    {
+                        return Ok(None);
+                    }
+                }
+            }
+
+            let mut reduced = if filtered_is_right {
                 LogicalPlanBuilder::from(probe.clone()).join_on(
                     target.as_ref().clone(),
-                    JoinType::RightSemi,
+                    join_type,
                     on,
                 )?
             } else {
                 LogicalPlanBuilder::from(target.as_ref().clone()).join_on(
                     probe.clone(),
-                    JoinType::LeftSemi,
+                    join_type,
                     on,
                 )?
             }
             .build()?;
+
+            // Re-attach the residual by **conjunction, never replacement**.
+            //
+            // `join_on` does not put the equality predicates into `on`: it
+            // parks the whole conjunction in `filter` and leaves
+            // `extract_equijoin_predicate` to hoist the equalities later.
+            // Assigning `filter = residual` therefore discarded the join keys,
+            // producing `LeftAnti Join: Filter: l_suppkey != l_suppkey` with an
+            // empty `on` — an anti-join that matches almost every row and so
+            // deletes the entire result. It returned an empty answer rather
+            // than a wrong one only by luck of this query's shape.
+            //
+            // Semi/anti join schemas are the filtered side's schema regardless
+            // of the filter, so widening it cannot disturb the shape the parent
+            // join was built against.
+            if let Some(filter) = residual {
+                let LogicalPlan::Join(rebuilt_semi) = &mut reduced else {
+                    return Ok(None);
+                };
+                rebuilt_semi.filter = Some(match rebuilt_semi.filter.take() {
+                    Some(existing) => existing.and(filter.clone()),
+                    None => filter.clone(),
+                });
+            }
 
             let rebuilt = if target_is_right {
                 Join {
@@ -567,21 +712,40 @@ mod tests {
     use datafusion::prelude::SessionContext;
 
     /// `lineitem`-shaped: many rows per key.
+    ///
+    /// Carries `l_suppkey` and the commit/receipt dates as well, so the q21
+    /// shape (`EXISTS`/`NOT EXISTS` correlated on `l_orderkey` and comparing
+    /// `l_suppkey`) can be exercised against the same fixture. Each order gets
+    /// four lines with four *different* suppliers, and one line per order is
+    /// late, which is what makes both the semi and the anti test non-trivial.
     fn line_table() -> Arc<MemTable> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("l_partkey", DataType::Int64, false),
             Field::new("l_orderkey", DataType::Int64, false),
             Field::new("l_quantity", DataType::Int64, false),
+            Field::new("l_suppkey", DataType::Int64, false),
+            Field::new("l_commitdate", DataType::Int64, false),
+            Field::new("l_receiptdate", DataType::Int64, false),
         ]));
         // keys 1..=5, four rows each with distinct quantities
         let mut keys = Vec::new();
         let mut orders = Vec::new();
         let mut qty = Vec::new();
+        let mut supp = Vec::new();
+        let mut commit = Vec::new();
+        let mut receipt = Vec::new();
         for k in 1..=5i64 {
             for q in 1..=4i64 {
                 keys.push(k);
                 orders.push(k);
                 qty.push(k * 10 + q);
+                // four distinct suppliers per order, drawn from 1..=4
+                supp.push(q);
+                commit.push(100i64);
+                // exactly one late line per order, and which supplier is late
+                // varies with the order, so the anti-join keeps some suppliers
+                // and drops others rather than all-or-nothing.
+                receipt.push(if q == (k % 4) + 1 { 200 } else { 50 });
             }
         }
         let batch = RecordBatch::try_new(
@@ -590,6 +754,45 @@ mod tests {
                 Arc::new(Int64Array::from(keys)),
                 Arc::new(Int64Array::from(orders)),
                 Arc::new(Int64Array::from(qty)),
+                Arc::new(Int64Array::from(supp)),
+                Arc::new(Int64Array::from(commit)),
+                Arc::new(Int64Array::from(receipt)),
+            ],
+        )
+        .unwrap();
+        Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+    }
+
+    /// `supplier`-shaped, for the q21 shape.
+    fn supplier_table() -> Arc<MemTable> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s_suppkey", DataType::Int64, false),
+            Field::new("s_name", DataType::Utf8, false),
+            Field::new("s_nationkey", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["s1", "s2", "s3", "s4"])),
+                Arc::new(Int64Array::from(vec![7i64, 7, 8, 7])),
+            ],
+        )
+        .unwrap();
+        Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+    }
+
+    /// `nation`-shaped, for the q21 shape.
+    fn nation_table() -> Arc<MemTable> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n_nationkey", DataType::Int64, false),
+            Field::new("n_name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![7i64, 8])),
+                Arc::new(StringArray::from(vec!["SAUDI ARABIA", "OTHER"])),
             ],
         )
         .unwrap();
@@ -603,6 +806,7 @@ mod tests {
             Field::new("o_custkey", DataType::Int64, false),
             Field::new("o_totalprice", DataType::Int64, false),
             Field::new("o_orderdate", DataType::Int64, false),
+            Field::new("o_orderstatus", DataType::Utf8, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -617,6 +821,9 @@ mod tests {
                     20260104,
                     20260105,
                 ])),
+                // Not all 'F': a status filter that removes nothing would let a
+                // broken pushdown pass by accident.
+                Arc::new(StringArray::from(vec!["F", "F", "F", "O", "F"])),
             ],
         )
         .unwrap();
@@ -671,6 +878,8 @@ mod tests {
         ctx.register_table("part", part_table()).unwrap();
         ctx.register_table("orders", orders_table()).unwrap();
         ctx.register_table("customer", customer_table()).unwrap();
+        ctx.register_table("supplier", supplier_table()).unwrap();
+        ctx.register_table("nation", nation_table()).unwrap();
         ctx
     }
 
@@ -925,6 +1134,134 @@ mod tests {
         assert_eq!(
             rows(&context(true), Q18_VERBATIM).await,
             rows(&context(false), Q18_VERBATIM).await
+        );
+    }
+
+    // ── q21 shape: semi AND anti joins carrying a residual filter ──────────
+
+    /// The verbatim q21 shape — the slowest query in the SF100 sweep.
+    ///
+    /// Measured 4309 s against Spark's 391 s (11.0x), the single largest
+    /// absolute loss of the 22. Its `EXISTS`/`NOT EXISTS` decorrelate to a
+    /// `LeftSemi` and a `LeftAnti` **each carrying a residual filter**
+    /// (`l_suppkey <> l_suppkey`), and the pushdown rule declined on both
+    /// counts — `filter.is_some()` and anti-joins being excluded outright. So
+    /// the most selective predicate in the query ran last, above the whole
+    /// four-way join, exactly the shape the q18 work was meant to fix.
+    const Q21_VERBATIM: &str = "SELECT s_name, count(*) AS numwait \
+        FROM supplier, lineitem l1, orders, nation \
+        WHERE s_suppkey = l1.l_suppkey AND o_orderkey = l1.l_orderkey \
+          AND o_orderstatus = 'F' AND l1.l_receiptdate > l1.l_commitdate \
+          AND EXISTS (SELECT * FROM lineitem l2 \
+                      WHERE l2.l_orderkey = l1.l_orderkey \
+                        AND l2.l_suppkey <> l1.l_suppkey) \
+          AND NOT EXISTS (SELECT * FROM lineitem l3 \
+                          WHERE l3.l_orderkey = l1.l_orderkey \
+                            AND l3.l_suppkey <> l1.l_suppkey \
+                            AND l3.l_receiptdate > l3.l_commitdate) \
+          AND s_nationkey = n_nationkey AND n_name = 'SAUDI ARABIA' \
+        GROUP BY s_name ORDER BY numwait DESC, s_name LIMIT 100";
+
+    /// The property that decides whether any of this was worth doing.
+    ///
+    /// A residual filter that is carried to the wrong level, or an anti-join
+    /// pushed where the null semantics differ, produces a *faster wrong
+    /// answer* — the one outcome worse than the 4309 s.
+    #[tokio::test]
+    async fn q21_results_are_identical_with_and_without_the_rule() {
+        let with = rows(&context(true), Q21_VERBATIM).await;
+        let without = rows(&context(false), Q21_VERBATIM).await;
+        assert_eq!(with, without, "q21 diverged under the rewrite");
+        assert!(
+            !with.is_empty(),
+            "the q21 fixture must produce rows or it proves nothing"
+        );
+    }
+
+    /// Each half of the relaxation, isolated: a bare `EXISTS` (semi + residual)
+    /// and a bare `NOT EXISTS` (anti + residual). Testing only the full q21
+    /// would let one of the two regress silently behind the other.
+    #[tokio::test]
+    async fn semi_and_anti_with_a_residual_each_keep_their_answers() {
+        for sql in [
+            // EXISTS: LeftSemi carrying `l_suppkey <> l_suppkey`
+            "SELECT s_name FROM supplier, lineitem l1 \
+             WHERE s_suppkey = l1.l_suppkey \
+               AND EXISTS (SELECT * FROM lineitem l2 \
+                           WHERE l2.l_orderkey = l1.l_orderkey \
+                             AND l2.l_suppkey <> l1.l_suppkey)",
+            // NOT EXISTS: LeftAnti carrying the same residual
+            "SELECT s_name FROM supplier, lineitem l1 \
+             WHERE s_suppkey = l1.l_suppkey \
+               AND NOT EXISTS (SELECT * FROM lineitem l3 \
+                               WHERE l3.l_orderkey = l1.l_orderkey \
+                                 AND l3.l_suppkey <> l1.l_suppkey \
+                                 AND l3.l_receiptdate > l3.l_commitdate)",
+            // anti-join whose residual makes it keep *everything*, and one
+            // that makes it keep nothing — the two ends of the range
+            "SELECT s_name FROM supplier, lineitem l1 \
+             WHERE s_suppkey = l1.l_suppkey \
+               AND NOT EXISTS (SELECT * FROM lineitem l3 \
+                               WHERE l3.l_orderkey = l1.l_orderkey \
+                                 AND l3.l_suppkey <> l1.l_suppkey \
+                                 AND l3.l_quantity > 100000)",
+        ] {
+            let with = rows(&context(true), sql).await;
+            let without = rows(&context(false), sql).await;
+            assert_eq!(with, without, "results diverged for:\n{sql}");
+        }
+    }
+
+    /// The rewrite must actually fire on q21, not merely stay correct by
+    /// declining. `filter.is_some()` used to reject this shape outright, so a
+    /// results-only test would have passed against the unfixed rule.
+    #[tokio::test]
+    async fn the_q21_semi_and_anti_joins_are_pushed_below_the_inner_join() {
+        let with = plan_of(&context(true), Q21_VERBATIM).await;
+        let without = plan_of(&context(false), Q21_VERBATIM).await;
+
+        let first_inner = |p: &str| p.lines().position(|l| l.contains("Inner Join"));
+        let first_semi = |p: &str| {
+            p.lines()
+                .position(|l| l.contains("LeftSemi") || l.contains("LeftAnti"))
+        };
+
+        let (bs, bi) = (first_semi(&without), first_inner(&without));
+        assert!(
+            bs.is_some() && bi.is_some() && bs < bi,
+            "baseline should have the existence joins above the inner join:\n{without}"
+        );
+
+        let (ws, wi) = (first_semi(&with), first_inner(&with));
+        assert!(
+            ws.is_some() && wi.is_some(),
+            "expected both join kinds in:\n{with}"
+        );
+        assert!(
+            ws > wi,
+            "q21's existence joins must be pushed below the inner join:\n{with}"
+        );
+    }
+
+    /// A residual that straddles both children of the inner join genuinely
+    /// depends on the joined row, so the rewrite must still decline.
+    ///
+    /// This is the guard the relaxation could most easily have dropped: the
+    /// residual is carried down, and without the column check it would be
+    /// re-attached at a level where one of its columns does not exist yet.
+    #[tokio::test]
+    async fn a_residual_straddling_both_children_is_not_pushed() {
+        let sql = "SELECT s_name FROM supplier, lineitem l1, orders \
+            WHERE s_suppkey = l1.l_suppkey AND o_orderkey = l1.l_orderkey \
+              AND EXISTS (SELECT * FROM lineitem l2 \
+                          WHERE l2.l_orderkey = l1.l_orderkey \
+                            AND l2.l_quantity > orders.o_totalprice)";
+        // Correctness is the assertion; whether it fires is the optimizer's
+        // choice, but it must not produce a different answer either way.
+        assert_eq!(
+            rows(&context(true), sql).await,
+            rows(&context(false), sql).await,
+            "a straddling residual must not change the answer"
         );
     }
 

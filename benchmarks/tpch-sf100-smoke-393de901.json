@@ -1,0 +1,23 @@
+{
+  "label": "smoke-393de901",
+  "scale_factor": 100,
+  "coordinator": "http://213.199.60.184:31902",
+  "data_root": "s3://krishiv-bench/tpch/sf100",
+  "generated_at": "2026-07-29T03:24:30Z",
+  "succeeded": 1,
+  "attempted": 1,
+  "total_elapsed_s": 77.32210305001354,
+  "queries": [
+    {
+      "id": "q6",
+      "name": "forecasting_revenue_change",
+      "job_id": "batch-sql-1785295393217-0",
+      "status": "ok",
+      "elapsed_s": 77.32210305001354,
+      "result_batches": 1,
+      "stage_count": 2,
+      "task_count": 13,
+      "distributed": true
+    }
+  ]
+}
