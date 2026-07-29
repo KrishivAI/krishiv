@@ -58,7 +58,7 @@ silent wrong answer, (3) size × test-thinness.
 
 ---
 
-## 1. krishiv-sql — first slice complete
+## 1. krishiv-sql — 7 of 54 files read whole ("first slice")
 
 Measured coverage: **78.01% regions, 70.84% functions, 76.87% lines.**
 
@@ -120,7 +120,18 @@ Uncovered-region concentration (this decides what to test next):
 
 ---
 
-## 3. krishiv-shuffle — in progress
+## 3. krishiv-shuffle — 7 of 24 files read whole
+
+**A crate is "covered" only when every file has been read end to end.** This
+section previously implied more than was done: the open-item list was closed,
+which is not the same thing. Read whole so far — `store.rs`, `local_store.rs`,
+`disk_store.rs`, `shuffle_svc.rs`, `push_shuffle.rs`, `storage_uri.rs`,
+`orphan.rs` (3,956 of 9,269 lines). Remaining, largest first: `flight.rs`
+(1486), `partitioner.rs` (743), `sort_shuffle_writer.rs` (584),
+`range_partitioner.rs` (536), `object_store.rs` (520), `memory_store.rs` (382),
+`spillable.rs` (308), `tiered_store.rs` (125), `token_auth.rs` (123),
+`metadata.rs` (104), `error.rs` (94), `compression.rs` (67),
+`lease_persistence.rs` (50), `path.rs` (36).
 
 Measured: **81.07% regions, 68.67% functions, 78.07% lines** (11,475 regions,
 2,172 uncovered).
@@ -207,7 +218,13 @@ Measured: **81.07% regions, 68.67% functions, 78.07% lines** (11,475 regions,
 
 ---
 
-## 2. krishiv-executor — in progress
+## 2. krishiv-executor — 5 of 32 files read whole
+
+Read whole: `fragment/shuffle_write_buffer.rs`, `runner/partition.rs`,
+`runner/result_spool.rs`, `transport.rs`, `ess_client.rs`. `fragment/batch.rs`
+and `fragment/common.rs` read in regions only. Everything else unread —
+`cli.rs` (2154), `runner/executor_task_runner.rs` (1992),
+`fragment/run_loop.rs` (1480), `fragment/streaming.rs` (1358) are the largest.
 
 Measured **2026-07-29**: **75.34% regions, 62.44% functions, 73.96% lines**
 (27,312 regions, 6,736 uncovered).
