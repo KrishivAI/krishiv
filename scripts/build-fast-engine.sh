@@ -23,8 +23,26 @@ SHA="$(git -C "$REPO" rev-parse --short HEAD)"
 TAG="${1:-localhost/krishiv:fast-$SHA}"
 TARGET_DIR="$REPO/target/prod-image"
 
-echo "== cargo build (prod preset; isolated target dir)"
-(cd "$REPO" && CARGO_TARGET_DIR="$TARGET_DIR" \
+# `x86-64-v3` (AVX2 + BMI2 + FMA), not the default baseline and not `native`.
+#
+# Why this is a correction and not a tuning knob: Spark runs on the JVM, whose
+# JIT inspects the CPU at runtime and emits AVX2 by itself. A Rust binary is
+# AOT-compiled, so without this flag it targets the `x86-64` baseline — roughly
+# SSE2 — and Arrow's vectorised kernels never see the machine's actual SIMD.
+# Benchmarking a baseline-compiled AOT binary against a JIT that self-tunes
+# measures the build flags, not the engines.
+#
+# `v3` rather than `native`: `.cargo/config.toml` explains why `native` is not
+# set globally — it silently produces a binary that runs only on the builder.
+# `v3` names a floor instead of a machine. Verified 2026-07-29 that the build
+# box and all three cluster nodes report avx2/bmi2/fma (AMD EPYC, no AVX-512),
+# so the floor holds everywhere this image runs. If a node without AVX2 ever
+# joins, it will fault loudly on first instruction rather than mis-execute —
+# check `/proc/cpuinfo` before widening the fleet.
+RUSTFLAGS_BENCH="${RUSTFLAGS:-} -C target-cpu=x86-64-v3"
+
+echo "== cargo build (prod preset; isolated target dir; target-cpu=x86-64-v3)"
+(cd "$REPO" && CARGO_TARGET_DIR="$TARGET_DIR" RUSTFLAGS="$RUSTFLAGS_BENCH" \
     cargo build --locked --release -p krishiv --no-default-features --features prod)
 
 BIN="$TARGET_DIR/release/krishiv"
