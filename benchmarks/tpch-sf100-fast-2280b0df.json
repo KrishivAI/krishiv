@@ -1,0 +1,251 @@
+{
+  "label": "broadcast-fix-fast-2280b0df",
+  "scale_factor": 100,
+  "coordinator": "http://213.199.60.184:31902",
+  "data_root": "s3://krishiv-bench/tpch/sf100",
+  "generated_at": "2026-07-29T21:45:44Z",
+  "succeeded": 21,
+  "attempted": 22,
+  "total_elapsed_s": 6514.36984153607,
+  "queries": [
+    {
+      "id": "q1",
+      "name": "pricing_summary",
+      "job_id": "batch-sql-1785354424335-0",
+      "status": "ok",
+      "elapsed_s": 36.53634306701133,
+      "result_batches": 1,
+      "stage_count": 2,
+      "task_count": 19,
+      "distributed": true
+    },
+    {
+      "id": "q2",
+      "name": "minimum_cost_supplier",
+      "job_id": "batch-sql-1785354460825-1",
+      "status": "ok",
+      "elapsed_s": 103.60065787300118,
+      "result_batches": 1,
+      "stage_count": 14,
+      "task_count": 235,
+      "distributed": true
+    },
+    {
+      "id": "q3",
+      "name": "shipping_priority",
+      "job_id": "batch-sql-1785354564438-2",
+      "status": "ok",
+      "elapsed_s": 179.70162021301803,
+      "result_batches": 1,
+      "stage_count": 5,
+      "task_count": 73,
+      "distributed": true
+    },
+    {
+      "id": "q4",
+      "name": "order_priority_checking",
+      "job_id": "batch-sql-1785354744139-3",
+      "status": "ok",
+      "elapsed_s": 53.4690868339967,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    },
+    {
+      "id": "q5",
+      "name": "local_supplier_volume",
+      "job_id": "batch-sql-1785354797610-4",
+      "status": "ok",
+      "elapsed_s": 341.57025231199805,
+      "result_batches": 1,
+      "stage_count": 7,
+      "task_count": 109,
+      "distributed": true
+    },
+    {
+      "id": "q6",
+      "name": "forecasting_revenue_change",
+      "job_id": "batch-sql-1785355139180-5",
+      "status": "ok",
+      "elapsed_s": 22.293788307986688,
+      "result_batches": 1,
+      "stage_count": 2,
+      "task_count": 19,
+      "distributed": true
+    },
+    {
+      "id": "q7",
+      "name": "volume_shipping",
+      "job_id": "batch-sql-1785355161473-6",
+      "status": "ok",
+      "elapsed_s": 281.3833411690139,
+      "result_batches": 1,
+      "stage_count": 7,
+      "task_count": 109,
+      "distributed": true
+    },
+    {
+      "id": "q8",
+      "name": "national_market_share",
+      "job_id": "batch-sql-1785355442862-7",
+      "status": "ok",
+      "elapsed_s": 375.1427752520249,
+      "result_batches": 1,
+      "stage_count": 9,
+      "task_count": 145,
+      "distributed": true
+    },
+    {
+      "id": "q9",
+      "name": "product_type_profit_measure",
+      "job_id": "batch-sql-1785355818000-8",
+      "status": "ok",
+      "elapsed_s": 576.3998540200118,
+      "result_batches": 1,
+      "stage_count": 9,
+      "task_count": 145,
+      "distributed": true
+    },
+    {
+      "id": "q10",
+      "name": "returned_item_reporting",
+      "job_id": "batch-sql-1785356394403-9",
+      "status": "ok",
+      "elapsed_s": 3262.043015695992,
+      "result_batches": 1,
+      "stage_count": 6,
+      "task_count": 91,
+      "distributed": true
+    },
+    {
+      "id": "q11",
+      "name": "important_stock_identification",
+      "job_id": "batch-sql-1785359656830-10",
+      "status": "ok",
+      "elapsed_s": 22.91181470299489,
+      "result_batches": 1,
+      "stage_count": 3,
+      "task_count": 37,
+      "distributed": true
+    },
+    {
+      "id": "q12",
+      "name": "shipping_modes_and_order_priority",
+      "job_id": "batch-sql-1785359679744-11",
+      "status": "ok",
+      "elapsed_s": 81.20573772501666,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    },
+    {
+      "id": "q13",
+      "name": "customer_distribution",
+      "job_id": "batch-sql-1785359760950-12",
+      "status": "ok",
+      "elapsed_s": 71.99627695101663,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    },
+    {
+      "id": "q14",
+      "name": "promotion_effect",
+      "job_id": "batch-sql-1785359832947-13",
+      "status": "ok",
+      "elapsed_s": 45.81174381100573,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    },
+    {
+      "id": "q15",
+      "name": "top_supplier",
+      "job_id": "batch-sql-1785359878758-14",
+      "status": "ok",
+      "elapsed_s": 71.70904468899244,
+      "result_batches": 1,
+      "stage_count": 3,
+      "task_count": 37,
+      "distributed": true
+    },
+    {
+      "id": "q16",
+      "name": "parts_supplier_relationship",
+      "job_id": "batch-sql-1785359950471-15",
+      "status": "ok",
+      "elapsed_s": 54.72425725898938,
+      "result_batches": 1,
+      "stage_count": 6,
+      "task_count": 91,
+      "distributed": true
+    },
+    {
+      "id": "q17",
+      "name": "small_quantity_order_revenue",
+      "job_id": "batch-sql-1785360005239-16",
+      "status": "ok",
+      "elapsed_s": 339.23455677498714,
+      "result_batches": 1,
+      "stage_count": 8,
+      "task_count": 127,
+      "distributed": true
+    },
+    {
+      "id": "q18",
+      "name": "large_volume_customer",
+      "job_id": "batch-sql-1785360344439-17",
+      "status": "ok",
+      "elapsed_s": 382.7639146349975,
+      "result_batches": 1,
+      "stage_count": 7,
+      "task_count": 109,
+      "distributed": true
+    },
+    {
+      "id": "q19",
+      "name": "discounted_revenue",
+      "job_id": "batch-sql-1785360727215-18",
+      "status": "ok",
+      "elapsed_s": 50.69848648001789,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    },
+    {
+      "id": "q20",
+      "name": "potential_part_promotion",
+      "job_id": "batch-sql-1785360777916-19",
+      "status": "ok",
+      "elapsed_s": 103.08137790998444,
+      "result_batches": 1,
+      "stage_count": 7,
+      "task_count": 109,
+      "distributed": true
+    },
+    {
+      "id": "q21",
+      "name": "suppliers_who_kept_orders_waiting",
+      "job_id": "batch-sql-1785360880997-20",
+      "status": "failed",
+      "error": "executor failed fragment 'krishiv-fragment:{\"version\":1,\"execution_kind\":\"Batch\",\"body\":\"dfplan:v1:4:SuMGCsMDkgG/Awq8A3sidiI6MSwic3RhZ2UiOjUsIm1hcF90YXNrcyI6MTgsInBhcnRpdGlvbnMiOjE4LCJzY2hlbWFfaXBjX2I2NCI6Ii8vLy8vL2dBQUFBUUFBQUFBQUFLQUF3QUNnQUpBQVFBQ2dBQUFCQUFBQUFBQVFRQUNBQUlBQU\u2026': local stage fragment execution failed: DataFusion error: Resources exhausted: Failed to allocate additional 838.7 KB for HashJoinInput[4] with 806.0 MB already allocated for this reservation - 79.7 KB remain available for the total memory pool: fair(pool_size: 2.6 GB)",
+      "elapsed_s": 605.9078074120043
+    },
+    {
+      "id": "q22",
+      "name": "global_sales_opportunity",
+      "job_id": "batch-sql-1785361486906-21",
+      "status": "ok",
+      "elapsed_s": 58.09189585401327,
+      "result_batches": 1,
+      "stage_count": 4,
+      "task_count": 55,
+      "distributed": true
+    }
+  ]
+}

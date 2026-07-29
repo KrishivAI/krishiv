@@ -135,10 +135,41 @@ fn estimated_build_bytes_from_rows(
 /// Still conservative: with the row count *also* absent this returns `None` and
 /// the caller keeps the hash join, because guessing "big" for every join is the
 /// session-wide switch that timed q2 out.
+///
+/// # The one estimate that is treated as unbounded
+///
+/// An estimate of **zero bytes and zero rows** on a join that is being asked to
+/// build a hash table is not a measurement — it is the estimator giving up, and
+/// this rule must not read it as "fits comfortably".
+///
+/// TPC-H q21 at SF100 is the case. Its `NOT EXISTS` becomes a `LeftAnti`
+/// self-join over `lineitem`, which DataFusion estimates as
+/// `outer_rows - semi_estimate` = `593462145 - 593462145` = 0
+/// (`joins/utils.rs`). The real intermediate is tens of millions of rows. That
+/// single zero poisoned **two** independent decisions: the broadcast choice
+/// (see `distributed_plan::broadcast_build_estimate_is_empty`) and this one. With
+/// the broadcast side fixed so the join is hash-partitioned, each task then had
+/// to build its own share as a hash table — and q21 died with
+/// `Resources exhausted: HashJoinInput[4] with 806.0 MB already allocated` out
+/// of a 2.6 GB pool, having previously merely been slow.
+///
+/// So a degenerate zero reports `u64::MAX`: assume it does not fit and pick the
+/// spillable algorithm. The cost of being wrong is a spillable join over an
+/// empty relation, which is free; the cost of trusting it is a failed query.
 fn build_bytes_estimate(hash_join: &HashJoinExec) -> Option<u64> {
     // An error computing statistics is not evidence of a large build side, and
     // this rule is an optimisation: declining is always a valid answer.
     let stats = hash_join.left().partition_statistics(None).ok()?;
+    // An explicit zero is a *claim* that the relation is empty, and it is the
+    // claim this function refuses to believe. `Absent` is different — an honest
+    // "I do not know" — and keeps the existing policy of leaving the hash join
+    // alone, which is what stops this rule from re-creating the q2 timeout.
+    let claims_empty = |p: Precision<usize>| {
+        matches!(p, Precision::Exact(0) | Precision::Inexact(0))
+    };
+    if claims_empty(stats.num_rows) || claims_empty(stats.total_byte_size) {
+        return Some(u64::MAX);
+    }
     match stats.total_byte_size {
         Precision::Exact(bytes) | Precision::Inexact(bytes) => u64::try_from(bytes).ok(),
         Precision::Absent => {

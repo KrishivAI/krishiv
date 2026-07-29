@@ -253,10 +253,17 @@ pub fn planning_session_context_with_options(
     // DataFusion's defaults, where they are correct.
     //
     // A build side that only *looks* small is caught afterwards by
-    // [`is_oversized_broadcast_join`], which re-checks the same ceilings and
-    // demands a positive estimate — DataFusion happily broadcasts on an
-    // estimate of zero rows, which is how q21 serialised.
-    let broadcast_bytes = broadcast_join_bytes.unwrap_or_else(|| broadcast_ceilings().0);
+    // [`is_degenerate_broadcast_join`], but only for the one case DataFusion
+    // gets wrong: it happily broadcasts on an estimate of ZERO rows, which is
+    // how q21 serialised. The ceiling itself is left entirely to DataFusion —
+    // overriding it cost q8 4x and q9 2.5x on the cluster.
+    let broadcast_bytes = broadcast_join_bytes.unwrap_or_else(|| {
+        std::env::var(BROADCAST_JOIN_BYTES_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_BROADCAST_JOIN_BYTES)
+    });
     let opts = config.options_mut();
     opts.optimizer.hash_join_single_partition_threshold = broadcast_bytes;
     // Both ceilings gate the same decision, so a caller asking for "never
@@ -1832,6 +1839,29 @@ pub fn build_distributed_stages_with_udf_directives(
     // hash-partitioned ones, which are split-safe by construction.
     let plan = redistribute_unsplittable_broadcast_joins(plan)?;
 
+    // Re-run the spillable-join rule over the rewritten plan.
+    //
+    // This is a sequencing fix, not a belt-and-braces repeat. `SpillableJoinSelection`
+    // is a physical optimizer rule, so it ran BEFORE the rewrite above — when
+    // q21's joins were still `CollectLeft` over a multi-partition probe, a shape
+    // it declines by design (`convertible_mode`). The rewrite then turns them
+    // into `Partitioned` joins whose build side each task must hold as a hash
+    // table, and nothing had re-examined whether it fits.
+    //
+    // Measured: with the rewrite but without this pass, q21 at SF100 stopped
+    // being slow and started FAILING — `Resources exhausted: HashJoinInput[4]
+    // with 806.0 MB already allocated` out of a 2.6 GB pool. One degenerate
+    // statistic was poisoning two decisions; fixing only the first turned a slow
+    // query into a broken one.
+    let plan = {
+        use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
+        crate::spillable_join::SpillableJoinSelection::from_capacity()
+            .optimize(plan, &datafusion::common::config::ConfigOptions::default())
+    }
+        .map_err(|e| SqlError::DataFusion {
+            message: format!("spillable-join pass over the redistributed plan: {e}"),
+        })?;
+
     let mut drafts: Vec<StageDraft> = Vec::new();
     let root = match cut_exchanges(plan, &mut drafts) {
         Ok(root) => root,
@@ -2141,68 +2171,60 @@ fn is_unsplittable_broadcast_join(
         && join.right().output_partitioning().partition_count() > 1
 }
 
-/// Byte and row ceilings under which a build side may be broadcast.
+/// Does this build side's estimate say the relation is **empty**?
 ///
-/// Shared with [`planning_session_context_with_options`], which hands the same
-/// numbers to DataFusion, so the rule below cannot drift from the decision it
-/// is second-guessing.
-fn broadcast_ceilings() -> (usize, usize) {
-    let bytes = std::env::var(BROADCAST_JOIN_BYTES_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_BROADCAST_JOIN_BYTES);
-    (bytes, DEFAULT_BROADCAST_JOIN_ROWS)
-}
-
-/// Is this build side **provably** small enough to broadcast?
+/// Not "small" — empty. This is deliberately the narrowest possible
+/// disagreement with DataFusion, and the narrowness is the whole design.
 ///
-/// "Provably" is the whole point. DataFusion's
-/// `supports_collect_by_thresholds` asks `estimate < ceiling`, which a
-/// degenerate estimate of **zero** passes more convincingly than any real
-/// small table — and a zero estimate is not a measurement, it is the
-/// estimator giving up.
-///
-/// TPC-H q21, at SF100, verbatim: its `NOT EXISTS` becomes a `LeftAnti` join
-/// whose two sides are both `lineitem` on `l_orderkey`, so DataFusion's
+/// DataFusion's `supports_collect_by_thresholds` asks `estimate < ceiling`,
+/// which a degenerate estimate of **zero** passes more convincingly than any
+/// real small table. TPC-H q21 at SF100, verbatim: its `NOT EXISTS` becomes a
+/// `LeftAnti` join whose two sides are both `lineitem` on `l_orderkey`, so
 /// `estimate_join_statistics` computes `outer_rows - semi_estimate` =
-/// `593462145 - 593462145` = **0** (`joins/utils.rs`, the semi/anti arm). The
-/// real output is tens of millions of rows. Three `CollectLeft` joins stacked
-/// above it each believed they were broadcasting nothing, so the stage cutter
-/// gathered that intermediate to ONE partition three times over
-/// (`shuffle=([], 1)` in the stage dump) and the whole top half of the query
-/// ran on a single task.
+/// `593462145 - 593462145` = **0 rows, 0 bytes** (`joins/utils.rs`, the
+/// semi/anti arm). The real output is tens of millions of rows. Three
+/// `CollectLeft` joins stacked above it each believed they were broadcasting
+/// nothing, so the stage cutter gathered that intermediate to ONE partition
+/// three times over (`shuffle=([], 1)` in the stage dump) and the whole top
+/// half of the query ran on a single task.
 ///
-/// Requiring a *positive* estimate below the ceiling inverts the failure: a
-/// genuinely empty relation now costs one extra pair of hash exchanges over an
-/// empty stream, and a mis-estimated one no longer serialises the query.
-fn broadcast_build_is_provably_small(
+/// # Why this does not also enforce a ceiling
+///
+/// It used to, and that was a **measured regression**. An earlier version of
+/// this rule demanded a positive estimate *below the ceiling*, which converted
+/// q8's and q9's `CollectLeft` build sides — estimated at `rows=~4000000,
+/// bytes=absent`, i.e. above the 1M row ceiling but perfectly plausible. On the
+/// cluster q8 went 92 s -> 375 s and q9 226 s -> 576 s, because the alternative
+/// to broadcasting those few million rows is hash-partitioning the 600M-row
+/// `lineitem` scan across an ~11 MiB/s pod network. That ceiling is DataFusion's
+/// decision to make and it was already made with the numbers this rule can see;
+/// second-guessing it lost more than the q21 bug cost.
+///
+/// So: a positive estimate is trusted, however large. Only "the planner thinks
+/// there is nothing here" is overridden — because for a non-empty relation that
+/// is not a measurement, it is the estimator giving up. A genuinely empty
+/// relation pays one extra pair of hash exchanges over an empty stream.
+fn broadcast_build_estimate_is_empty(
     join: &datafusion::physical_plan::joins::HashJoinExec,
 ) -> bool {
     use datafusion::common::stats::Precision;
 
-    let (ceiling_bytes, ceiling_rows) = broadcast_ceilings();
     let Ok(stats) = join.left().partition_statistics(None) else {
-        // No statistics at all is not evidence of smallness either.
+        // Statistics that will not compute are not evidence of anything; leave
+        // the plan alone rather than rewrite on no information.
         return false;
     };
-    // Byte size first, exactly as DataFusion prefers it; rows only when bytes
-    // are absent, so the two agree on which number is authoritative.
-    match stats.total_byte_size {
-        Precision::Exact(bytes) | Precision::Inexact(bytes) => {
-            bytes > 0 && bytes <= ceiling_bytes
-        }
-        Precision::Absent => match stats.num_rows {
-            Precision::Exact(rows) | Precision::Inexact(rows) => {
-                rows > 0 && rows <= ceiling_rows
-            }
-            Precision::Absent => false,
-        },
-    }
+    let positive = |p: Precision<usize>| match p {
+        Precision::Exact(v) | Precision::Inexact(v) => v > 0,
+        Precision::Absent => false,
+    };
+    // Either number being positive is enough to believe the relation is real.
+    // Only when BOTH say zero-or-nothing is the estimate degenerate.
+    !positive(stats.num_rows) && !positive(stats.total_byte_size)
 }
 
-/// Is this a broadcast join whose build side is too big — or too poorly
-/// estimated — to be worth gathering into one partition?
+/// Is this a broadcast join chosen on an estimate that says its build side is
+/// empty when it is not?
 ///
 /// Distinct from [`is_unsplittable_broadcast_join`], which is a *correctness*
 /// test. This one is about throughput, and the two must stay separate: the
@@ -2214,7 +2236,7 @@ fn broadcast_build_is_provably_small(
 /// Only fires where there is parallelism to lose: if both the probe side and
 /// the build side's own input are already single-partition, the gather costs
 /// nothing and the exchanges would be pure overhead.
-fn is_oversized_broadcast_join(join: &datafusion::physical_plan::joins::HashJoinExec) -> bool {
+fn is_degenerate_broadcast_join(join: &datafusion::physical_plan::joins::HashJoinExec) -> bool {
     use datafusion::physical_plan::joins::PartitionMode;
 
     if *join.partition_mode() != PartitionMode::CollectLeft {
@@ -2226,7 +2248,7 @@ fn is_oversized_broadcast_join(join: &datafusion::physical_plan::joins::HashJoin
     if join.null_aware {
         return false;
     }
-    if broadcast_build_is_provably_small(join) {
+    if !broadcast_build_estimate_is_empty(join) {
         return false;
     }
     let build_input_partitions = match join
@@ -2239,9 +2261,9 @@ fn is_oversized_broadcast_join(join: &datafusion::physical_plan::joins::HashJoin
     join.right().output_partitioning().partition_count() > 1 || build_input_partitions > 1
 }
 
-/// Convert broadcast joins that cannot be split — or that should not have been
-/// broadcast at all — into hash-partitioned joins
-/// (see [`is_unsplittable_broadcast_join`] and [`is_oversized_broadcast_join`]).
+/// Convert broadcast joins that cannot be split — or that were chosen on an
+/// estimate claiming their build side is empty — into hash-partitioned joins
+/// (see [`is_unsplittable_broadcast_join`] and [`is_degenerate_broadcast_join`]).
 ///
 /// Both sides gain a hash exchange on the join keys, which the stage cutter
 /// then turns into ordinary map stages — so the join keeps running across the
@@ -2283,7 +2305,7 @@ fn redistribute_unsplittable_broadcast_joins(
         return Ok(plan);
     };
     let unsplittable = is_unsplittable_broadcast_join(join);
-    if !unsplittable && !is_oversized_broadcast_join(join) {
+    if !unsplittable && !is_degenerate_broadcast_join(join) {
         return Ok(plan);
     }
 
@@ -4575,11 +4597,11 @@ mod staged_tpch_tests {
         let join_ref = join.downcast_ref::<HashJoinExec>().expect("hash join");
 
         assert!(
-            !broadcast_build_is_provably_small(join_ref),
+            broadcast_build_estimate_is_empty(join_ref),
             "a zero estimate is the estimator giving up, not a measurement"
         );
         assert!(
-            is_oversized_broadcast_join(join_ref),
+            is_degenerate_broadcast_join(join_ref),
             "so the join must be recognised as one that should not broadcast"
         );
         // The correctness gate must stay untouched: an Inner join drops no
@@ -4635,11 +4657,11 @@ mod staged_tpch_tests {
         let join_ref = join.downcast_ref::<HashJoinExec>().expect("hash join");
 
         assert!(
-            broadcast_build_is_provably_small(join_ref),
-            "a small parquet scan has exact statistics and is provably small"
+            !broadcast_build_estimate_is_empty(join_ref),
+            "a non-empty parquet scan must report a positive estimate"
         );
         assert!(
-            !is_oversized_broadcast_join(join_ref),
+            !is_degenerate_broadcast_join(join_ref),
             "so it must keep its broadcast"
         );
         let after =
@@ -4651,6 +4673,73 @@ mod staged_tpch_tests {
                 .partition_mode(),
             PartitionMode::CollectLeft,
             "the rule must leave a legitimately small broadcast alone"
+        );
+    }
+
+    /// The regression this rule caused once, pinned so it cannot come back.
+    ///
+    /// An earlier version demanded a positive estimate *below a ceiling*. That
+    /// converted q8's and q9's `CollectLeft` build sides — estimated at
+    /// `rows=~4000000, bytes=absent`, above the 1M row ceiling but entirely
+    /// plausible — and on the cluster **q8 went 92 s -> 375 s and q9 226 s ->
+    /// 576 s**, because the alternative to broadcasting a few million rows is
+    /// hash-partitioning the 600M-row `lineitem` scan across an ~11 MiB/s pod
+    /// network.
+    ///
+    /// The ceiling is DataFusion's call, made with the same numbers this rule
+    /// can see. A large but positive estimate must therefore be left alone; only
+    /// "the planner thinks this is empty" is overridden.
+    #[tokio::test]
+    async fn a_large_but_positive_estimate_keeps_its_broadcast() {
+        use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = q22_context(tmp.path()).await;
+        // A cross join squares the row estimate, which is how a build side
+        // reaches a number far above any ceiling while staying honest — the
+        // shape of q8/q9's estimate, reachable without SF100.
+        let join = collect_left_over(
+            &ctx,
+            "SELECT a.c_custkey FROM customer a CROSS JOIN customer b",
+            "c_custkey",
+            false,
+            datafusion::logical_expr::JoinType::Inner,
+        )
+        .await;
+        let join_ref = join.downcast_ref::<HashJoinExec>().expect("hash join");
+
+        let stats = join_ref
+            .left()
+            .partition_statistics(None)
+            .expect("statistics");
+        assert!(
+            matches!(
+                stats.num_rows,
+                datafusion::common::stats::Precision::Exact(n)
+                    | datafusion::common::stats::Precision::Inexact(n) if n > 0
+            ),
+            "precondition: the build side must estimate a positive row count, \
+             got {:?}",
+            stats.num_rows
+        );
+        assert!(
+            !broadcast_build_estimate_is_empty(join_ref),
+            "a positive estimate is a measurement, however large"
+        );
+        assert!(
+            !is_degenerate_broadcast_join(join_ref),
+            "and must not be converted — overriding DataFusion's ceiling cost \
+             q8 4x and q9 2.5x"
+        );
+        let after =
+            redistribute_unsplittable_broadcast_joins(Arc::clone(&join)).expect("conversion");
+        assert_eq!(
+            *after
+                .downcast_ref::<HashJoinExec>()
+                .expect("still a hash join")
+                .partition_mode(),
+            PartitionMode::CollectLeft,
+            "the plan must come back untouched"
         );
     }
 
@@ -4677,12 +4766,12 @@ mod staged_tpch_tests {
         let join_ref = join.downcast_ref::<HashJoinExec>().expect("hash join");
 
         assert!(
-            !broadcast_build_is_provably_small(join_ref),
-            "precondition: its build side looks oversized, so only the \
+            broadcast_build_estimate_is_empty(join_ref),
+            "precondition: its build-side estimate is degenerate, so only the \
              null-aware check can be what spares it"
         );
         assert!(
-            !is_oversized_broadcast_join(join_ref),
+            !is_degenerate_broadcast_join(join_ref),
             "a null-aware anti join must never be converted for throughput"
         );
     }
