@@ -71,8 +71,9 @@
 //! - **Skew.** One key larger than the budget lands in one bucket and that
 //!   bucket is still an in-memory join. Recursive re-partitioning would need a
 //!   second hash seed, which `BatchPartitioner` does not expose. The bucket
-//!   count is therefore chosen generously, and an over-budget bucket is logged
-//!   rather than silently retried.
+//!   count is therefore chosen generously, and an over-budget bucket is warned
+//!   about by name in `join_bucket` — with its size and the budget it broke —
+//!   rather than being retried or passing silently.
 //! - **Disk.** `buckets` temporary files per side stay open while partitioning.
 
 use arrow::datatypes::SchemaRef;
@@ -467,6 +468,7 @@ async fn join(
                     &probe_spills,
                     build_schema,
                     probe_schema,
+                    build_budget,
                     &context,
                 )
                 .await
@@ -495,6 +497,7 @@ async fn join_bucket(
     probe_spills: &SpillManager,
     build_schema: SchemaRef,
     probe_schema: SchemaRef,
+    build_budget: usize,
     context: &Arc<TaskContext>,
 ) -> Result<SendableRecordBatchStream> {
     // Both sides empty means no row of either input hashed here: nothing to
@@ -518,7 +521,43 @@ async fn join_bucket(
         None => Vec::new(),
     };
     let bucket_bytes: usize = build.iter().map(get_record_batch_memory_size).sum();
-    tracing::debug!(bucket, bucket_bytes, "grace-hash-join: joining bucket");
+
+    // Account for the bucket we just read back.
+    //
+    // This was unreserved, in the operator whose whole purpose is to stop
+    // unaccounted build sides from exhausting the pool. The rows are resident
+    // twice over: once in this `Vec` (held by `MemorySourceConfig` for the
+    // life of the join) and again in the hash table the inner `HashJoinExec`
+    // builds from it, which *is* reserved. So peak residency was about double
+    // the bucket with only half of it visible — and on a skewed bucket the
+    // invisible half is exactly what pushes the executor over.
+    //
+    // `can_spill(false)`: these rows have already been through the disk and
+    // there is nowhere further to put them. Saying so lets a `FairSpillPool`
+    // account for them honestly rather than counting on a spill that cannot
+    // happen.
+    let reservation = MemoryConsumer::new(format!("GraceHashJoinBucket[{bucket}]"))
+        .with_can_spill(false)
+        .register(context.memory_pool());
+    reservation.try_grow(bucket_bytes)?;
+
+    if bucket_bytes > build_budget {
+        // The skew limit named in this module's docs. It used to claim such a
+        // bucket "is logged" — it was not, because `build_budget` never
+        // reached here and every bucket logged the same line at debug. One
+        // key larger than the budget still lands in one bucket; the join will
+        // attempt it, and this is the warning that says why the pool is about
+        // to be under pressure.
+        tracing::warn!(
+            bucket,
+            bucket_bytes,
+            build_budget,
+            "grace-hash-join: bucket build side exceeds the per-task budget \
+             (key skew); joining it anyway, which may exhaust the pool"
+        );
+    } else {
+        tracing::debug!(bucket, bucket_bytes, "grace-hash-join: joining bucket");
+    }
 
     let probe: SendableRecordBatchStream = match probe_file {
         Some(file) => probe_spills.read_spill_as_stream(file, None)?,
@@ -530,7 +569,22 @@ async fn join_bucket(
 
     let build_exec = memory_source(vec![build], build_schema)?;
     let probe_exec = Arc::new(OnceStreamExec::new(probe_schema, probe));
-    bucket_join(template, build_exec, probe_exec)?.execute(0, Arc::clone(context))
+    let schema = template.schema();
+    let joined = bucket_join(template, build_exec, probe_exec)?.execute(0, Arc::clone(context))?;
+
+    // Carry the reservation with the stream so it is released when this
+    // bucket's output is finished or dropped — not when this function returns,
+    // which is before a single row has been read.
+    let guarded = futures::stream::unfold(
+        (joined, reservation),
+        |(mut stream, reservation)| async move {
+            stream
+                .next()
+                .await
+                .map(|batch| (batch, (stream, reservation)))
+        },
+    );
+    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, guarded)))
 }
 
 /// A single-partition scan over in-memory batches.
@@ -953,6 +1007,54 @@ mod tests {
             let actual = cells(Arc::clone(&grace) as Arc<dyn ExecutionPlan>, &ctx).await;
             assert!(spill_files(&grace) > 0, "{null_equality:?} stayed in memory");
             assert_eq!(actual, expected, "{null_equality:?} disagreed");
+        }
+    }
+
+    /// Bucket reservations must be released, not leaked.
+    ///
+    /// Each bucket's build side is read back from disk into a `Vec` that the
+    /// join then holds — memory that went entirely unaccounted until it was
+    /// reserved, in the operator whose whole purpose is to keep build sides
+    /// from exhausting the pool. Reserving it is only half the job: the
+    /// reservation has to be dropped when the bucket's output is finished,
+    /// which is long after `join_bucket` returns.
+    ///
+    /// Running the same plan repeatedly against one bounded pool is the cheap
+    /// way to catch a leak: if a bucket's bytes were never given back, a later
+    /// run would be refused.
+    #[tokio::test]
+    async fn bucket_reservations_are_released_after_each_run() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+
+        // Small enough that unreleased buckets would accumulate into a refusal,
+        // large enough that one honest run fits.
+        let env = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(4 * 1024 * 1024)))
+            .build_arc()
+            .expect("runtime env");
+        let ctx = SessionContext::new_with_config_rt(Default::default(), env);
+
+        let mut previous: Option<Vec<String>> = None;
+        for run in 0..4 {
+            let grace = Arc::new(
+                GraceHashJoinExec::try_new(
+                    hash_join(JoinType::Inner, NullEquality::NullEqualsNothing, None),
+                    4,
+                    1,
+                )
+                .expect("grace join"),
+            );
+            assert!(
+                spill_files(&grace) == 0,
+                "fresh node should not report spills before running"
+            );
+            let rows = cells(Arc::clone(&grace) as Arc<dyn ExecutionPlan>, &ctx).await;
+            assert!(!rows.is_empty(), "run {run} produced nothing");
+            if let Some(first) = &previous {
+                assert_eq!(&rows, first, "run {run} disagreed with the first run");
+            }
+            previous = Some(rows);
         }
     }
 
