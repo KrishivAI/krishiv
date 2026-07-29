@@ -268,16 +268,68 @@ fn left_first_filter(filter: &JoinFilter) -> Option<JoinFilter> {
     Some(JoinFilter::new(expression, column_indices, schema))
 }
 
-/// Every hash join's build estimate in `plan`, in no particular order.
-fn collect_build_estimates(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<u64>) {
-    let any = plan.as_ref() as &dyn std::any::Any;
-    if let Some(hash_join) = any.downcast_ref::<HashJoinExec>()
-        && let Some(bytes) = build_bytes_estimate(hash_join)
-    {
-        out.push(bytes);
+/// What the budget needs to know about one hash join in the plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JoinFacts {
+    /// Estimated build-side bytes, or `None` when the planner knows neither a
+    /// byte size nor a row count.
+    bytes: Option<u64>,
+    /// Whether [`SpillableJoinSelection::convert`] can convert this join's
+    /// *mode* at all. A join it will refuse holds its build side whatever the
+    /// budget decides, so pretending otherwise mis-spends the budget.
+    convertible: bool,
+}
+
+impl JoinFacts {
+    /// Bytes this join is certain to hold if left alone. Unknown counts as 0 —
+    /// the same assumption the per-join gate makes when it keeps a join whose
+    /// size it cannot estimate.
+    fn retained_bytes(self) -> u64 {
+        self.bytes.unwrap_or(0)
     }
+
+    /// Whether the budget is free to choose for this join.
+    ///
+    /// Only joins that are both convertible and measurable are candidates: an
+    /// unknown size keeps its hash join at the per-join gate regardless.
+    fn is_candidate(self) -> bool {
+        self.convertible && self.bytes.is_some()
+    }
+}
+
+/// Facts for every hash join in `plan`, **in `transform_up` order**.
+///
+/// Post-order (children before parent, children left to right) is exactly the
+/// order `TreeNode::transform_up` visits nodes, which is what lets the caller
+/// pair the Nth fact with the Nth join it is asked to rewrite. `ExecutionPlan`
+/// offers no node identity and `transform_up` rebuilds parents as their
+/// children change — so pointers are useless here, but position is stable.
+fn collect_join_facts(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<JoinFacts>) {
     for child in plan.children() {
-        collect_build_estimates(child, out);
+        collect_join_facts(child, out);
+    }
+    let any = plan.as_ref() as &dyn std::any::Any;
+    if let Some(hash_join) = any.downcast_ref::<HashJoinExec>() {
+        out.push(JoinFacts {
+            bytes: build_bytes_estimate(hash_join),
+            convertible: convertible_mode(hash_join).is_some(),
+        });
+    }
+}
+
+/// Whether this join's mode can become sort-merge, and with what partitioning.
+///
+/// `Some(preserve_partitioning)` when convertible, `None` when not. Split out
+/// of `convert` so the budget can ask the question without doing the work —
+/// counting a join the rule will refuse is how the budget ends up tightening
+/// against memory that never gets freed.
+fn convertible_mode(hash_join: &HashJoinExec) -> Option<bool> {
+    let single_partition = hash_join.left().output_partitioning().partition_count() == 1
+        && hash_join.right().output_partitioning().partition_count() == 1;
+    match hash_join.partition_mode() {
+        PartitionMode::Partitioned => Some(true),
+        PartitionMode::CollectLeft if single_partition => Some(false),
+        _ => None,
     }
 }
 
@@ -364,60 +416,74 @@ impl SpillableJoinSelection {
     /// The walk was fixed to ascending; the prose was not, and described an
     /// algorithm that no longer existed.)
     ///
-    /// Returning a per-join threshold rather than a set of nodes keeps the
-    /// existing single-threshold mechanism and needs no node identity, which
-    /// `ExecutionPlan` does not offer. Two consequences worth knowing:
+    /// The decision is **per join**, keyed by position in `transform_up` order.
     ///
-    /// - **Equal-sized joins are all-or-nothing.** No single threshold can
-    ///   retain two of three joins that are the same size, so a plan whose
-    ///   joins tie converts all of them once the sum breaks the budget. Since
-    ///   sort-merge is the slower plan, that over-converts — the safe direction
-    ///   for memory, the wrong one for time. Ties are not exotic: sibling joins
-    ///   over similarly-sized shuffle inputs estimate identically.
-    /// - **The budget counts joins `convert` will refuse.** Estimates are
-    ///   collected from every `HashJoinExec`, but a join whose mode is not
-    ///   convertible keeps its build side regardless. The threshold then
-    ///   tightens on account of memory that will not actually be freed,
-    ///   converting smaller joins while the real consumer stays.
+    /// An earlier version returned a single tightened threshold instead, which
+    /// kept the existing mechanism but could not express two things:
     ///
-    /// A strict generalisation: with no aggregate pressure this returns
-    /// `threshold` unchanged, so a plan that was fine before still converts
-    /// exactly what it did before — the q2 regression risk is unchanged.
-    fn effective_threshold(plan: &Arc<dyn ExecutionPlan>, threshold: u64) -> u64 {
-        let mut sizes = Vec::new();
-        collect_build_estimates(plan, &mut sizes);
-        let total = sizes.iter().copied().fold(0u64, u64::saturating_add);
+    /// - **Equal-sized joins became all-or-nothing.** No one threshold can
+    ///   retain two of three joins of identical size, so a plan whose joins tie
+    ///   converted all of them once the sum broke the budget — over-converting
+    ///   to the slower sort-merge plan. Ties are not exotic: sibling joins over
+    ///   similarly-sized shuffle inputs estimate identically.
+    /// - **The budget counted joins `convert` would refuse.** A join whose mode
+    ///   is unconvertible holds its build side regardless, so the threshold
+    ///   tightened against memory that was never going to be freed, converting
+    ///   smaller joins while the real consumer stayed.
+    ///
+    /// Both were written off as needing node identity that `ExecutionPlan` does
+    /// not offer. It does not offer *pointer* identity — `transform_up` rebuilds
+    /// parents as their children change — but post-order **position** is stable,
+    /// and that is all this needs.
+    ///
+    /// Unconvertible and unmeasurable joins are charged to the budget first,
+    /// since they are retained no matter what. The remainder is spent on the
+    /// candidates smallest-first: the question is "which joins can we afford to
+    /// leave un-spillable", and the cheapest ones are the ones worth keeping.
+    ///
+    /// A strict generalisation: with no aggregate pressure every join is
+    /// retained here and the per-join gate decides as it always did, so a plan
+    /// that was fine before behaves identically — the q2 regression risk is
+    /// unchanged.
+    fn conversion_decisions(facts: &[JoinFacts], threshold: u64) -> Vec<bool> {
+        let total = facts
+            .iter()
+            .map(|f| f.retained_bytes())
+            .fold(0u64, u64::saturating_add);
+        // No aggregate pressure: let the per-join gate decide, as before.
         if total <= threshold {
-            return threshold;
+            return vec![false; facts.len()];
         }
-        // Keep the SMALLEST joins as hash joins and convert upward, because the
-        // question is "which joins can we afford to leave un-spillable", and the
-        // cheapest ones are the ones worth keeping. Walk ascending, accumulate,
-        // and cut at the first join that would put the retained set over budget:
-        // that join and every larger one converts.
-        //
-        // The first version walked *descending* and returned the largest join's
-        // size, which is routinely far ABOVE the configured threshold — so the
-        // "budget" loosened the rule instead of tightening it, converting only
-        // the single biggest join where the plain per-join threshold would have
-        // converted every join over budget. Seen live on q10 as
-        // `threshold=974064839 configured_threshold=250000000`, and it is why
-        // this fix never moved q10 or q11.
-        sizes.sort_unstable();
-        let mut retained = 0u64;
-        for size in &sizes {
-            if retained.saturating_add(*size) > threshold {
-                // `convert` compares with `<=`, so step just below this size to
-                // make a join of exactly it convert. Never above the configured
-                // threshold: a budget may only ever tighten.
-                return size.saturating_sub(1).min(threshold);
+
+        // Joins the rule cannot convert are retained whatever we decide, so
+        // their bytes come off the top rather than pretending they are
+        // available to spend.
+        let unavoidable = facts
+            .iter()
+            .filter(|f| !f.is_candidate())
+            .map(|f| f.retained_bytes())
+            .fold(0u64, u64::saturating_add);
+        let mut budget = threshold.saturating_sub(unavoidable);
+
+        let mut candidates: Vec<(usize, u64)> = facts
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.is_candidate())
+            .map(|(at, f)| (at, f.retained_bytes()))
+            .collect();
+        // Smallest first, and `sort_by_key` is stable, so equal sizes are
+        // retained in plan order — deterministic rather than arbitrary.
+        candidates.sort_by_key(|(_, bytes)| *bytes);
+
+        let mut convert = vec![false; facts.len()];
+        for (at, bytes) in candidates {
+            if bytes <= budget {
+                budget -= bytes;
+            } else if let Some(slot) = convert.get_mut(at) {
+                *slot = true;
             }
-            retained = retained.saturating_add(*size);
         }
-        // Every join fits when taken in ascending order, which the total check
-        // above already ruled out; keep the configured threshold rather than
-        // invent one.
-        threshold
+        convert
     }
 
     /// Explicit threshold, for tests. Keeps the sort-merge conversion.
@@ -534,20 +600,13 @@ impl SpillableJoinSelection {
         // With one partition, "sorted" is the whole requirement — there is no
         // distribution to preserve — so the conversion is *simpler* here than
         // in the partitioned case, not riskier.
-        let single_partition = hash_join.left().output_partitioning().partition_count() == 1
-            && hash_join.right().output_partitioning().partition_count() == 1;
-        let preserve_partitioning = match hash_join.partition_mode() {
-            PartitionMode::Partitioned => true,
-            PartitionMode::CollectLeft if single_partition => false,
-            mode => {
-                tracing::debug!(
-                    ?mode,
-                    single_partition,
-                    threshold,
-                    "spillable-join: join mode is not convertible"
-                );
-                return Ok(None);
-            }
+        let Some(preserve_partitioning) = convertible_mode(hash_join) else {
+            tracing::debug!(
+                mode = ?hash_join.partition_mode(),
+                threshold,
+                "spillable-join: join mode is not convertible"
+            );
+            return Ok(None);
         };
         // Gate 2: the build side must be *known* to be large. Absent statistics
         // keep hash join — guessing "big" is how the reverted session-wide
@@ -565,14 +624,11 @@ impl SpillableJoinSelection {
             );
             return Ok(None);
         };
-        if build_bytes <= threshold {
-            tracing::debug!(
-                build_bytes,
-                threshold,
-                "spillable-join: build side fits, keeping hash join"
-            );
-            return Ok(None);
-        }
+        // No `build_bytes <= threshold` test here any more: whether this join
+        // can be afforded is a whole-plan question, decided once in
+        // `conversion_decisions` and passed in by the caller. Asking it again
+        // per join is what let seven joins each sit under the threshold and
+        // together exhaust the pool.
 
         // The build side is too big. Two ways to make it spill:
         //
@@ -717,8 +773,13 @@ impl PhysicalOptimizerRule for SpillableJoinSelection {
             return Ok(plan);
         };
         // The budget is on the SUM of un-converted build sides, not on each one
-        // separately — see `effective_threshold`.
-        let threshold = Self::effective_threshold(&plan, configured);
+        // separately — see `conversion_decisions`. Decisions are indexed by
+        // position in `transform_up` order, which `collect_join_facts` mirrors.
+        let mut facts = Vec::new();
+        collect_join_facts(&plan, &mut facts);
+        let decisions = Self::conversion_decisions(&facts, configured);
+        let threshold = configured;
+        let mut at = 0usize;
         let mut seen = 0usize;
         let mut converted = 0usize;
         let mut declined_on_error = 0usize;
@@ -729,7 +790,18 @@ impl PhysicalOptimizerRule for SpillableJoinSelection {
                 let Some(hash_join) = any.downcast_ref::<HashJoinExec>() else {
                     return Ok(Transformed::no(node));
                 };
+                let index = at;
+                at += 1;
                 seen += 1;
+                // Not chosen by the budget: leave it a hash join.
+                //
+                // `unwrap_or(false)` rather than a panic: if the two traversals
+                // ever disagreed about how many joins exist, converting nothing
+                // is the safe answer — this rule must never be the reason a
+                // query fails.
+                if !decisions.get(index).copied().unwrap_or(false) {
+                    return Ok(Transformed::no(node));
+                }
                 // A rule that rewrites plans for *memory* reasons must never be
                 // the reason a query fails. Live q7/q8/q9 turned an internal
                 // refusal ("the left or right side of the join does not have
@@ -768,9 +840,10 @@ impl PhysicalOptimizerRule for SpillableJoinSelection {
                 hash_joins = seen,
                 converted,
                 declined_on_error,
-                threshold,
                 configured_threshold = configured,
-                budget_tightened = threshold < configured,
+                chosen_by_budget = decisions.iter().filter(|d| **d).count(),
+                unconvertible = facts.iter().filter(|f| !f.convertible).count(),
+                unmeasurable = facts.iter().filter(|f| f.bytes.is_none()).count(),
                 "spillable-join: pass complete"
             );
         }
@@ -1158,15 +1231,29 @@ mod never_fails_the_query_tests {
 mod budget_tests {
     use super::*;
 
-    /// Estimates as the rule actually sees them.
+    /// Facts as the rule actually sees them.
     ///
     /// Arrow rounds buffer allocations, so a source built to "look like" 200
     /// bytes reports ~296. Asserting on nominal sizes tested the allocator;
     /// these tests measure first and assert the *invariant*.
-    fn estimates(plan: &Arc<dyn ExecutionPlan>) -> Vec<u64> {
-        let mut sizes = Vec::new();
-        collect_build_estimates(plan, &mut sizes);
-        sizes
+    fn facts(plan: &Arc<dyn ExecutionPlan>) -> Vec<JoinFacts> {
+        let mut out = Vec::new();
+        collect_join_facts(plan, &mut out);
+        out
+    }
+
+    fn sizes_of(facts: &[JoinFacts]) -> Vec<u64> {
+        facts.iter().map(|f| f.retained_bytes()).collect()
+    }
+
+    /// Bytes left un-converted under `decisions`.
+    fn retained(facts: &[JoinFacts], decisions: &[bool]) -> u64 {
+        facts
+            .iter()
+            .zip(decisions)
+            .filter(|(_, convert)| !**convert)
+            .map(|(f, _)| f.retained_bytes())
+            .fold(0, u64::saturating_add)
     }
 
     /// The threshold is a budget on the SUM, not a per-join allowance.
@@ -1177,7 +1264,8 @@ mod budget_tests {
     #[test]
     fn joins_that_each_fit_but_together_do_not_are_converted() {
         let plan = plan_with_build_sizes(&[200; 8]);
-        let sizes = estimates(&plan);
+        let facts = facts(&plan);
+        let sizes = sizes_of(&facts);
         let largest = *sizes.iter().max().expect("fixture has joins");
         let total: u64 = sizes.iter().copied().fold(0, u64::saturating_add);
 
@@ -1189,32 +1277,27 @@ mod budget_tests {
             "fixture must create aggregate pressure: total {total} vs budget {budget}"
         );
 
-        let effective = SpillableJoinSelection::effective_threshold(&plan, budget);
-        let retained: u64 = sizes
-            .iter()
-            .copied()
-            .filter(|s| *s <= effective)
-            .fold(0, u64::saturating_add);
+        let decisions = SpillableJoinSelection::conversion_decisions(&facts, budget);
         assert!(
-            retained <= budget,
-            "after conversion the un-converted sum is {retained}, over the {budget} budget \
-             (effective threshold {effective}, sizes {sizes:?})"
+            retained(&facts, &decisions) <= budget,
+            "the un-converted sum {} exceeds the {budget} budget (sizes {sizes:?})",
+            retained(&facts, &decisions)
         );
     }
 
-    /// No aggregate pressure → the configured threshold is untouched, so a plan
-    /// that behaved acceptably before behaves identically. This bounds the q2
+    /// No aggregate pressure → nothing is chosen for conversion, so a plan that
+    /// behaved acceptably before behaves identically. This bounds the q2
     /// regression risk: converting more joins than necessary is what made q2 6x
-    /// slower, and this only tightens under real pressure.
+    /// slower, and this only acts under real pressure.
     #[test]
-    fn without_pressure_the_configured_threshold_is_unchanged() {
+    fn without_pressure_nothing_is_chosen() {
         let plan = plan_with_build_sizes(&[50, 60]);
-        let total: u64 = estimates(&plan).iter().copied().fold(0, u64::saturating_add);
-        let generous = total + 1;
-        assert_eq!(
-            SpillableJoinSelection::effective_threshold(&plan, generous),
-            generous,
-            "a total that fits the budget must not tighten anything"
+        let facts = facts(&plan);
+        let total: u64 = sizes_of(&facts).iter().copied().fold(0, u64::saturating_add);
+        let decisions = SpillableJoinSelection::conversion_decisions(&facts, total + 1);
+        assert!(
+            decisions.iter().all(|convert| !convert),
+            "a total that fits the budget must convert nothing: {decisions:?}"
         );
     }
 
@@ -1222,53 +1305,88 @@ mod budget_tests {
     #[test]
     fn a_single_oversized_join_still_converts() {
         let plan = plan_with_build_sizes(&[900]);
-        let sizes = estimates(&plan);
-        let largest = *sizes.iter().max().expect("fixture has a join");
-        let effective = SpillableJoinSelection::effective_threshold(&plan, largest - 1);
-        assert!(
-            effective < largest,
-            "an over-budget join must end up above the effective threshold \
-             ({effective} vs {largest})"
-        );
+        let facts = facts(&plan);
+        let largest = *sizes_of(&facts).iter().max().expect("fixture has a join");
+        let decisions = SpillableJoinSelection::conversion_decisions(&facts, largest - 1);
+        assert_eq!(decisions, vec![true], "an over-budget join must convert");
     }
 
-    /// A plan with no hash joins must not tighten anything, and must not panic
-    /// on the empty-sizes path.
+    /// A plan with no hash joins must decide nothing, and must not panic on the
+    /// empty path.
     #[test]
     fn a_plan_without_joins_is_left_alone() {
         let plan = plan_with_build_sizes(&[]);
-        assert_eq!(SpillableJoinSelection::effective_threshold(&plan, 250), 250);
+        let facts = facts(&plan);
+        assert!(facts.is_empty());
+        assert!(SpillableJoinSelection::conversion_decisions(&facts, 250).is_empty());
     }
 
-    /// Equal-sized joins convert all-or-nothing, and this pins that down.
+    /// Equal-sized joins are no longer all-or-nothing.
     ///
-    /// A single returned threshold cannot separate joins of identical size, so
-    /// three 100-byte joins under a 250-byte budget convert **all three** even
-    /// though two of them (200) would have fitted. Sort-merge is the slower
-    /// plan, so this over-converts: safe for memory, costly in time.
+    /// This is the regression test for a real limitation that was documented
+    /// and left in place for one revision: a single tightened threshold cannot
+    /// separate joins of identical size, so three equal joins under a budget
+    /// that fits two converted **all three** — over-converting to the slower
+    /// sort-merge plan. Ties are not exotic; sibling joins over similarly-sized
+    /// shuffle inputs estimate identically.
     ///
-    /// Documented as a test rather than a comment because it is a real
-    /// behavioural cliff on a plan shape that occurs naturally — sibling joins
-    /// over similarly-sized shuffle inputs estimate identically — and because
-    /// anyone who later gives the rule node identity should see this turn red.
+    /// Deciding per join by post-order position fixes it: exactly the one join
+    /// that does not fit converts.
     #[test]
-    fn joins_of_equal_size_convert_all_or_nothing() {
+    fn equal_sized_joins_are_decided_individually() {
         let plan = plan_with_build_sizes(&[100, 100, 100]);
-        let sizes = estimates(&plan);
-        let budget = sizes.iter().copied().fold(0, u64::saturating_add) - 100;
-        let effective = SpillableJoinSelection::effective_threshold(&plan, budget);
+        let facts = facts(&plan);
+        let sizes = sizes_of(&facts);
+        let one = sizes.first().copied().expect("fixture has joins");
+        // Room for exactly two of the three.
+        let budget = one * 2;
 
-        let retained: Vec<u64> = sizes.iter().copied().filter(|s| *s <= effective).collect();
-        assert!(
-            retained.is_empty(),
-            "equal sizes cannot be split by one threshold, so none are retained; \
-             got {retained:?} at effective threshold {effective} (sizes {sizes:?})"
+        let decisions = SpillableJoinSelection::conversion_decisions(&facts, budget);
+        assert_eq!(
+            decisions.iter().filter(|convert| **convert).count(),
+            1,
+            "exactly one of three equal joins should convert, not all of them: \
+             {decisions:?} (sizes {sizes:?}, budget {budget})"
         );
-        // The invariant that matters still holds: what is retained fits.
         assert!(
-            retained.iter().copied().fold(0, u64::saturating_add) <= budget,
-            "the retained set must never exceed the budget"
+            retained(&facts, &decisions) <= budget,
+            "the retained set must still fit the budget"
         );
+    }
+
+    /// A join the rule cannot convert must not be counted as spendable.
+    ///
+    /// Its build side is held whatever the budget decides, so charging it to
+    /// the budget first is the difference between converting the joins that
+    /// will actually free memory and converting smaller ones while the real
+    /// consumer stays put.
+    #[test]
+    fn unconvertible_joins_are_charged_to_the_budget_first() {
+        let big_unconvertible = JoinFacts { bytes: Some(100), convertible: false };
+        let small_candidate = JoinFacts { bytes: Some(30), convertible: true };
+        let facts = [big_unconvertible, small_candidate];
+
+        // 100 is already spent by the join that cannot convert, so the 30-byte
+        // candidate does not fit in the remaining 20 and must convert.
+        let decisions = SpillableJoinSelection::conversion_decisions(&facts, 120);
+        assert_eq!(
+            decisions,
+            vec![false, true],
+            "the unconvertible join stays (it must), and the candidate converts \
+             because the budget it draws on is what is left after it"
+        );
+    }
+
+    /// A join whose size is unknown keeps its hash join at the per-join gate, so
+    /// it is not a candidate and cannot be chosen for conversion.
+    #[test]
+    fn unmeasurable_joins_are_never_chosen() {
+        let facts = [
+            JoinFacts { bytes: None, convertible: true },
+            JoinFacts { bytes: Some(500), convertible: true },
+        ];
+        let decisions = SpillableJoinSelection::conversion_decisions(&facts, 10);
+        assert_eq!(decisions, vec![false, true]);
     }
 
     /// Build a plan whose hash joins report the given build-side byte sizes.
@@ -1303,7 +1421,7 @@ mod budget_tests {
     }
 
     /// A single-column source whose statistics report `bytes` total.
-    fn sized_source(bytes: u64) -> Arc<dyn ExecutionPlan> {
+    pub(super) fn sized_source(bytes: u64) -> Arc<dyn ExecutionPlan> {
         use arrow::array::Int32Array;
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
@@ -1785,10 +1903,27 @@ mod encodability_tests {
 mod budget_never_loosens_tests {
     use super::*;
 
-    /// A budget may only ever TIGHTEN the configured threshold.
+    use super::budget_tests::plan_with_build_sizes;
+
+    fn facts_of(plan: &Arc<dyn ExecutionPlan>) -> Vec<JoinFacts> {
+        let mut out = Vec::new();
+        collect_join_facts(plan, &mut out);
+        out
+    }
+
+    fn retained(facts: &[JoinFacts], decisions: &[bool]) -> u64 {
+        facts
+            .iter()
+            .zip(decisions)
+            .filter(|(_, convert)| !**convert)
+            .map(|(f, _)| f.retained_bytes())
+            .fold(0, u64::saturating_add)
+    }
+
+    /// The budget may only ever convert MORE, never fewer.
     ///
-    /// `effective_threshold` returns the largest join's size, and that is
-    /// routinely far above the configured threshold — so unclamped it converted
+    /// The first implementation returned the largest join's size as a new
+    /// threshold — routinely far above the configured one — so it converted
     /// only the single biggest join where the plain per-join rule would have
     /// converted every join over budget. Live on TPC-H q10:
     ///
@@ -1796,41 +1931,30 @@ mod budget_never_loosens_tests {
     /// threshold=974064839  configured_threshold=250000000  budget_tightened=false
     /// ```
     ///
-    /// The whole point of the budget is to convert MORE under aggregate
-    /// pressure. Returning a looser threshold inverted it, which is why the fix
-    /// never moved q10 or q11.
+    /// The budget exists to convert more under aggregate pressure; loosening
+    /// inverted it, and is why that fix never moved q10 or q11. Now that the
+    /// decision is per join there is no threshold to invert, but the property
+    /// it was protecting still has to hold.
     #[test]
-    fn the_effective_threshold_never_exceeds_the_configured_one() {
-        // One huge join plus small ones: the huge one alone blows the budget,
-        // which is the shape that produced the inverted threshold.
+    fn everything_over_the_configured_threshold_still_converts() {
         for configured in [1_u64, 1_000, 250_000_000] {
-            let plan = super::budget_tests::plan_with_build_sizes(&[900, 40, 30, 20]);
-            let effective = SpillableJoinSelection::effective_threshold(&plan, configured);
+            let plan = plan_with_build_sizes(&[900, 400, 300]);
+            let facts = facts_of(&plan);
+            let decisions = SpillableJoinSelection::conversion_decisions(&facts, configured);
+            let converted = decisions.iter().filter(|convert| **convert).count();
+            let would_have = facts
+                .iter()
+                .filter(|f| f.retained_bytes() > configured)
+                .count();
             assert!(
-                effective <= configured,
-                "effective threshold {effective} LOOSENED the configured {configured}"
+                converted >= would_have,
+                "the budget converted {converted} joins where the plain threshold \
+                 would have converted {would_have} (configured {configured})"
             );
         }
     }
 
-    /// And it still converts at least what the plain threshold would have.
-    #[test]
-    fn everything_over_the_configured_threshold_still_converts() {
-        let plan = super::budget_tests::plan_with_build_sizes(&[900, 400, 300]);
-        let mut sizes = Vec::new();
-        collect_build_estimates(&plan, &mut sizes);
-        let configured = *sizes.iter().min().expect("fixture has joins");
-        let effective = SpillableJoinSelection::effective_threshold(&plan, configured);
-        let converted = sizes.iter().filter(|s| **s > effective).count();
-        let would_have = sizes.iter().filter(|s| **s > configured).count();
-        assert!(
-            converted >= would_have,
-            "the budget converted {converted} joins where the plain threshold \
-             would have converted {would_have}"
-        );
-    }
-
-    /// The point of the budget: what is LEFT as hash joins must fit the budget.
+    /// The point of the budget: what is LEFT as hash joins must fit it.
     ///
     /// This is the property q10 needed and never had. Several joins that each
     /// sit under the threshold, whose sum does not — the retained set has to
@@ -1838,24 +1962,26 @@ mod budget_never_loosens_tests {
     /// before.
     #[test]
     fn the_joins_left_as_hash_joins_fit_the_budget() {
-        let plan = super::budget_tests::plan_with_build_sizes(&[200; 8]);
-        let mut sizes = Vec::new();
-        collect_build_estimates(&plan, &mut sizes);
-        let total: u64 = sizes.iter().copied().fold(0, u64::saturating_add);
+        let plan = plan_with_build_sizes(&[200; 8]);
+        let facts = facts_of(&plan);
+        let total: u64 = facts
+            .iter()
+            .map(|f| f.retained_bytes())
+            .fold(0, u64::saturating_add);
+        let largest = facts
+            .iter()
+            .map(|f| f.retained_bytes())
+            .max()
+            .expect("fixture has joins");
         // A budget every join clears individually, that the sum does not.
-        let budget = *sizes.iter().max().expect("fixture has joins") * 2;
+        let budget = largest * 2;
         assert!(total > budget, "fixture must create aggregate pressure");
 
-        let effective = SpillableJoinSelection::effective_threshold(&plan, budget);
-        let retained: u64 = sizes
-            .iter()
-            .copied()
-            .filter(|s| *s <= effective)
-            .fold(0, u64::saturating_add);
+        let decisions = SpillableJoinSelection::conversion_decisions(&facts, budget);
         assert!(
-            retained <= budget,
-            "un-converted joins sum to {retained}, over the {budget} budget \
-             (effective {effective}, sizes {sizes:?})"
+            retained(&facts, &decisions) <= budget,
+            "un-converted joins sum to {}, over the {budget} budget",
+            retained(&facts, &decisions)
         );
     }
 }
