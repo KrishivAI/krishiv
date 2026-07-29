@@ -236,22 +236,6 @@ pub enum NodeOp {
         output_column: String,
         with_ordinality: bool,
     },
-    /// E5.3: Recursive CTE — iterative fixpoint execution.
-    ///
-    /// Executes `base_query` once to seed the accumulator, then repeatedly
-    /// executes `recursive_query` (which may reference the CTE name) and unions
-    /// the new rows into the accumulator until either no new rows are produced
-    /// (fixpoint) or `max_iterations` is reached.
-    RecursiveCte {
-        /// CTE name visible inside `recursive_query`.
-        name: String,
-        /// The non-recursive seed query.
-        base_query: String,
-        /// The recursive query that may reference `name`.
-        recursive_query: String,
-        /// Hard cap on iterations to prevent infinite loops.
-        max_iterations: u32,
-    },
     /// CEP sequential pattern match on a keyed stream.
     ///
     /// `stage_column` names the column whose string value identifies which

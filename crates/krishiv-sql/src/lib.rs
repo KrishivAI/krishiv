@@ -110,7 +110,6 @@ pub mod object_store_registry;
 pub mod pipeline_ddl;
 pub mod pivot_sql;
 pub mod python_udf;
-pub mod recursive_cte;
 pub mod scalar_udf;
 pub mod semi_join_reduction;
 /// Spark SQL extensions: LATERAL VIEW, TABLESAMPLE, TRANSFORM, DESCRIBE EXTENDED, etc.
