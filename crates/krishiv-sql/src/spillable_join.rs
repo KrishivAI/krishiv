@@ -352,11 +352,33 @@ impl SpillableJoinSelection {
     /// 250 MB and together exhausted a 2.6 GB pool, after which the next join
     /// was refused 877 bytes and the query died.
     ///
-    /// So the budget applies to the sum. Largest joins convert first (they free
-    /// the most per conversion, and sort-merge suits a big side better) until
-    /// what remains fits. Returning a per-join threshold rather than a set of
-    /// nodes keeps the existing single-threshold mechanism and needs no node
-    /// identity, which `ExecutionPlan` does not offer.
+    /// So the budget applies to the sum. The **smallest** joins are retained as
+    /// hash joins and everything from the first join that breaks the budget
+    /// upward converts — the question is "which joins can we afford to leave
+    /// un-spillable", and the cheapest ones are the ones worth keeping.
+    ///
+    /// (This paragraph said "largest joins convert first" for one revision after
+    /// the code stopped doing that. The first implementation walked descending
+    /// and returned the largest join's size — routinely *above* the configured
+    /// threshold, so the "budget" loosened the rule instead of tightening it.
+    /// The walk was fixed to ascending; the prose was not, and described an
+    /// algorithm that no longer existed.)
+    ///
+    /// Returning a per-join threshold rather than a set of nodes keeps the
+    /// existing single-threshold mechanism and needs no node identity, which
+    /// `ExecutionPlan` does not offer. Two consequences worth knowing:
+    ///
+    /// - **Equal-sized joins are all-or-nothing.** No single threshold can
+    ///   retain two of three joins that are the same size, so a plan whose
+    ///   joins tie converts all of them once the sum breaks the budget. Since
+    ///   sort-merge is the slower plan, that over-converts — the safe direction
+    ///   for memory, the wrong one for time. Ties are not exotic: sibling joins
+    ///   over similarly-sized shuffle inputs estimate identically.
+    /// - **The budget counts joins `convert` will refuse.** Estimates are
+    ///   collected from every `HashJoinExec`, but a join whose mode is not
+    ///   convertible keeps its build side regardless. The threshold then
+    ///   tightens on account of memory that will not actually be freed,
+    ///   converting smaller joins while the real consumer stays.
     ///
     /// A strict generalisation: with no aggregate pressure this returns
     /// `threshold` unchanged, so a plan that was fine before still converts
@@ -1216,6 +1238,37 @@ mod budget_tests {
     fn a_plan_without_joins_is_left_alone() {
         let plan = plan_with_build_sizes(&[]);
         assert_eq!(SpillableJoinSelection::effective_threshold(&plan, 250), 250);
+    }
+
+    /// Equal-sized joins convert all-or-nothing, and this pins that down.
+    ///
+    /// A single returned threshold cannot separate joins of identical size, so
+    /// three 100-byte joins under a 250-byte budget convert **all three** even
+    /// though two of them (200) would have fitted. Sort-merge is the slower
+    /// plan, so this over-converts: safe for memory, costly in time.
+    ///
+    /// Documented as a test rather than a comment because it is a real
+    /// behavioural cliff on a plan shape that occurs naturally — sibling joins
+    /// over similarly-sized shuffle inputs estimate identically — and because
+    /// anyone who later gives the rule node identity should see this turn red.
+    #[test]
+    fn joins_of_equal_size_convert_all_or_nothing() {
+        let plan = plan_with_build_sizes(&[100, 100, 100]);
+        let sizes = estimates(&plan);
+        let budget = sizes.iter().copied().fold(0, u64::saturating_add) - 100;
+        let effective = SpillableJoinSelection::effective_threshold(&plan, budget);
+
+        let retained: Vec<u64> = sizes.iter().copied().filter(|s| *s <= effective).collect();
+        assert!(
+            retained.is_empty(),
+            "equal sizes cannot be split by one threshold, so none are retained; \
+             got {retained:?} at effective threshold {effective} (sizes {sizes:?})"
+        );
+        // The invariant that matters still holds: what is retained fits.
+        assert!(
+            retained.iter().copied().fold(0, u64::saturating_add) <= budget,
+            "the retained set must never exceed the budget"
+        );
     }
 
     /// Build a plan whose hash joins report the given build-side byte sizes.
