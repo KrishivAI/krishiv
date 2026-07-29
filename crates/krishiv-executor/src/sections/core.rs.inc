@@ -1835,4 +1835,3 @@ fn execution_model_streaming_exact_prefix() {
     );
 }
 
-use crate::barrier::{BarrierSimulator, BarrierSnapshot};

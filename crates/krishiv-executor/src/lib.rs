@@ -8,7 +8,6 @@
 // Root-level modules containing domain implementations.
 pub mod aligned_join;
 pub mod assignment_inbox;
-pub mod barrier;
 pub mod barrier_grpc;
 pub mod barrier_transport;
 pub mod cli;

@@ -220,61 +220,6 @@ async fn streaming_fragment_routes_data_through_operator_queue() {
     assert_eq!(output.batch_count(), 2);
 }
 
-#[test]
-fn barrier_simulator_accepts_increasing_epochs() {
-    let mut sim = BarrierSimulator::new();
-    sim.process_barrier(1, 1000, 0).unwrap();
-    sim.process_barrier(2, 2000, 1).unwrap();
-    sim.process_barrier(3, 3000, 0).unwrap();
-    assert_eq!(sim.last_committed_epoch(), 3);
-    assert_eq!(sim.snapshots().len(), 3);
-}
-
-#[test]
-fn barrier_simulator_rejects_stale_epoch() {
-    let mut sim = BarrierSimulator::new();
-    sim.process_barrier(1, 1000, 0).unwrap();
-    let err = sim.process_barrier(1, 2000, 0).unwrap_err();
-    assert!(
-        matches!(err, crate::ExecutorError::InvalidAssignment { .. }),
-        "expected InvalidAssignment for stale epoch, got {err}"
-    );
-    assert_eq!(sim.last_committed_epoch(), 1);
-}
-
-#[test]
-fn barrier_simulator_rejects_zero_epoch_after_commit() {
-    let mut sim = BarrierSimulator::new();
-    sim.process_barrier(5, 1000, 0).unwrap();
-    let err = sim.process_barrier(0, 2000, 0).unwrap_err();
-    assert!(matches!(
-        err,
-        crate::ExecutorError::InvalidAssignment { .. }
-    ));
-}
-
-#[test]
-fn barrier_snapshot_records_watermark_and_open_windows() {
-    let mut sim = BarrierSimulator::new();
-    sim.process_barrier(1, 5000, 3).unwrap();
-    assert_eq!(
-        sim.snapshots()[0],
-        BarrierSnapshot {
-            epoch: 1,
-            watermark_ms: 5000,
-            open_windows: 3,
-        }
-    );
-}
-
-#[test]
-fn barrier_watermark_monotonicity_enforced_by_operator_not_simulator() {
-    let mut sim = BarrierSimulator::new();
-    sim.process_barrier(1, 1000, 0).unwrap();
-    sim.process_barrier(2, 999, 0).unwrap();
-    assert_eq!(sim.snapshots()[1].watermark_ms, 999);
-}
-
 #[tokio::test]
 async fn deterministic_replay_end_to_end() {
     let fragment = "stream:tw:key=key:time=ts:win=1000:lag=0:agg=count";
