@@ -181,14 +181,32 @@ impl HudiSnapshotReader {
         Ok(out)
     }
 
-    /// Infer schema from the first readable batch.
+    /// Read the table's schema from Parquet metadata.
+    ///
+    /// This used to be `scan_batches()?.first().map(|b| b.schema())` — it
+    /// **decoded every row of every file in the table** to learn its column
+    /// names, and `register_hudi_uri` calls it at registration time, so merely
+    /// declaring a Hudi table read the whole thing into memory and threw all
+    /// of it away.
+    ///
+    /// A Parquet file carries its schema in the footer.
+    /// `ParquetRecordBatchReaderBuilder::try_new` reads that footer and nothing
+    /// else, so this is now O(one footer) instead of O(table). The
+    /// `parquet_files` helper immediately above already existed for exactly
+    /// this reason — "scan one file at a time instead of materializing the
+    /// whole table" — and this was the caller that ignored it.
+    ///
+    /// Files are enumerated in a `BTreeSet`, so "first" is deterministic rather
+    /// than whatever the directory happened to yield.
     pub fn schema(&self) -> LakehouseResult<SchemaRef> {
-        let batches = self.scan_batches()?;
-        let schema = batches
+        let files = self.parquet_files()?;
+        let first = files
             .first()
-            .map(|b| b.schema())
             .ok_or_else(|| LakehouseError::Io("hudi table has no readable data".into()))?;
-        Ok(schema)
+        let file = fs::File::open(first).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        Ok(builder.schema().clone())
     }
 }
 
@@ -1813,5 +1831,73 @@ mod tests {
         let removed =
             vacuum_hudi_table(Path::new("/tmp/krishiv_test_nonexistent_hudi_xyz"), 0).unwrap();
         assert_eq!(removed, 0);
+    }
+
+    /// The schema comes from Parquet metadata, not from decoding the table.
+    ///
+    /// `schema()` used to be `scan_batches()?.first().map(|b| b.schema())`, and
+    /// `register_hudi_uri` calls it at registration — so merely *declaring* a
+    /// Hudi table decoded every row of every file and threw all of it away.
+    ///
+    /// The test corrupts a file that is not the first one. Reading a footer
+    /// never touches it, so the schema still resolves; the old implementation
+    /// decoded every file and would fail here. That is what makes this test
+    /// able to tell the two apart rather than merely agreeing with both.
+    #[test]
+    fn schema_reads_one_footer_and_not_the_whole_table() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("hudi-schema");
+        let writer = HudiCowWriter::open(&root);
+        writer
+            .append_at("20240101120000123-0123456789abcdef", batch(&[(1, "a")]))
+            .unwrap();
+        writer
+            .append_at("20240102120000123-0123456789abcdef", batch(&[(2, "b")]))
+            .unwrap();
+        writer
+            .append_at("20240103120000123-0123456789abcdef", batch(&[(3, "c")]))
+            .unwrap();
+
+        let reader = HudiSnapshotReader::open(&root);
+        let files = reader.parquet_files().unwrap();
+        assert!(
+            files.len() >= 2,
+            "test needs more than one file to be meaningful, got {}",
+            files.len()
+        );
+
+        // Truncate every file after the first into unreadable garbage.
+        for path in files.iter().skip(1) {
+            fs::write(path, b"not parquet").unwrap();
+        }
+
+        let schema = reader
+            .schema()
+            .expect("schema must come from the first file's footer alone");
+        assert_eq!(
+            schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "name"]
+        );
+    }
+
+    /// A table with nothing in it has no footer to read, and must say so
+    /// rather than returning an empty schema that would silently type every
+    /// column away.
+    #[test]
+    fn a_table_with_no_files_has_no_schema() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("hudi-empty");
+        fs::create_dir_all(&root).unwrap();
+        let err = HudiSnapshotReader::open(&root)
+            .schema()
+            .expect_err("an empty table has no schema to infer");
+        // The timeline check fires before the footer read, which is the more
+        // useful message of the two — pinned so a refactor cannot quietly
+        // downgrade it to a bare "no data".
+        assert!(err.to_string().contains("Table not found"), "{err}");
     }
 }
