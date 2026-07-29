@@ -376,7 +376,22 @@ pub fn dfplan_task_body_for_spec(plan_bytes_b64: &str, spec: &DfplanTaskSpec) ->
 /// rewrites reuse the b64 payload untouched).
 pub fn dfplan_body_with_spec(body: &str, spec: &DfplanTaskSpec) -> SqlResult<String> {
     let (_, b64) = split_dfplan_body(body)?;
-    Ok(format!("{DFPLAN_BODY_PREFIX}{}:{b64}", spec.render()))
+    // Carry any leading Python-UDF directive(s) through to the rebuilt body.
+    //
+    // The parsers *skip* those directives; this function *re-emits* the body,
+    // and re-emitting from `DFPLAN_BODY_PREFIX` onward silently dropped them.
+    // AQE rewrites a reduce stage by rebuilding every task body through here, so
+    // an AQE-rewritten task shipped a plan that references the Python UDF with
+    // no directive telling the executor to reconstruct it — and the task died
+    // with "PhysicalExtensionCodec is not provided for scalar function <name>"
+    // while its sibling map tasks, whose bodies were never rebuilt, ran fine.
+    let trimmed = body.trim_start();
+    let rest = strip_leading_python_udf_directives(trimmed);
+    let directives = trimmed.get(..trimmed.len() - rest.len()).unwrap_or("");
+    Ok(format!(
+        "{directives}{DFPLAN_BODY_PREFIX}{}:{b64}",
+        spec.render()
+    ))
 }
 
 /// Strip the leading `/* krishiv-register-python-udf(a)f:… */` directive
@@ -945,6 +960,7 @@ pub async fn build_stages_for_parquet_query(
     // the executor reconstructs the worker-backed UDF before decoding the plan;
     // here the coordinator only needs the signature (the closure is never
     // invoked during planning — Volatile keeps it out of const-folding).
+    let udf_directive_source = query;
     let query = register_python_udf_signatures_and_strip(&ctx, query)?;
     let df = ctx.sql(&query).await.map_err(|e| SqlError::DataFusion {
         message: format!("staged planning: {e}"),
@@ -959,7 +975,7 @@ pub async fn build_stages_for_parquet_query(
         .map_err(|e| SqlError::DataFusion {
             message: format!("staged physical planning: {e}"),
         })?;
-    build_distributed_stages(plan)
+    build_distributed_stages_with_udf_directives(plan, udf_directive_source)
 }
 
 /// Evaluate **uncorrelated** scalar subqueries on the coordinator and replace
@@ -1738,6 +1754,15 @@ struct Unsupported(String);
 pub fn build_distributed_stages(
     plan: Arc<dyn ExecutionPlan>,
 ) -> SqlResult<Option<DistributedStagePlan>> {
+    build_distributed_stages_with_udf_directives(plan, "")
+}
+
+/// See `build_distributed_stages`; `udf_directive_source` supplies the query's
+/// inline Python-UDF directives so the decode rehearsal can resolve them.
+pub fn build_distributed_stages_with_udf_directives(
+    plan: Arc<dyn ExecutionPlan>,
+    udf_directive_source: &str,
+) -> SqlResult<Option<DistributedStagePlan>> {
     // Before cutting: a broadcast join whose unmatched build rows are emitted
     // only after the last probe partition cannot be split one-partition-per-task
     // without silently dropping those rows. Convert such joins to
@@ -1781,7 +1806,11 @@ pub fn build_distributed_stages(
     // One executor-equivalent decode context for the whole query: building a
     // `SqlEngine` registers the full UDF set, and every stage rehearses against
     // the same one the executor would use (A5).
-    let decode_ctx = fragment_decode_session_context().task_ctx();
+    let decode_session = fragment_decode_session_context();
+    if !udf_directive_source.is_empty() {
+        register_python_udf_signatures_and_strip(&decode_session, udf_directive_source)?;
+    }
+    let decode_ctx = decode_session.task_ctx();
     let mut stages = Vec::with_capacity(drafts.len());
     for draft in drafts {
         let partition_count = draft.plan.output_partitioning().partition_count();
@@ -4733,4 +4762,34 @@ mod codec_completeness_tests {
              post-decode and list it in EXECUTION_LOCAL."
         );
     }
-}
+}    /// An AQE rewrite rebuilds every reduce task body through
+    /// `dfplan_body_with_spec`. If that drops the Python-UDF directive prefix,
+    /// the rebuilt task ships a plan referencing a UDF the executor was never
+    /// told to reconstruct, and it dies with "PhysicalExtensionCodec is not
+    /// provided for scalar function <name>" — while its sibling map tasks,
+    /// whose bodies are never rebuilt, run fine.
+    #[test]
+    fn rebuilding_a_body_keeps_the_python_udf_directive() {
+        let directive = "/* krishiv-register-python-udf:addk:int64:int64:QUJD */";
+        let body = format!("{directive}\ndfplan:v1:0:QUJD");
+        let spec = DfplanTaskSpec {
+            partitions: vec![3, 4],
+            map_range: None,
+        };
+        let rebuilt = dfplan_body_with_spec(&body, &spec).expect("rebuild");
+        assert!(
+            rebuilt.starts_with(directive),
+            "the rebuilt body must still carry the UDF directive: {rebuilt}"
+        );
+        assert!(
+            is_dfplan_body(&rebuilt),
+            "and must still parse as a dfplan body: {rebuilt}"
+        );
+        assert_eq!(
+            dfplan_body_partition_spec(&rebuilt).expect("spec").partitions,
+            vec![3, 4],
+            "the new partition spec must be the one asked for"
+        );
+    }
+
+
