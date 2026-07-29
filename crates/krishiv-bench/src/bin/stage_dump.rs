@@ -30,6 +30,48 @@ use krishiv_sql::distributed_plan::{
 };
 use std::sync::Arc;
 
+/// Print every hash join with the statistics that decided its partition mode.
+///
+/// `CollectLeft` means "gather the build side into one partition and read it
+/// from every probe task". On the staged path that gather is a real shuffle to
+/// a single partition, so choosing it for a build side that is not actually
+/// small serialises everything above it. DataFusion makes that choice from
+/// `partition_statistics`, and an estimate carried up through joins is often
+/// wrong by orders of magnitude — so the estimate is the thing to print, not
+/// just the mode it produced.
+fn report_join_modes(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>, depth: usize) {
+    use datafusion::common::stats::Precision;
+    use datafusion::physical_plan::ExecutionPlanProperties;
+    use datafusion::physical_plan::joins::HashJoinExec;
+
+    fn show(p: Precision<usize>) -> String {
+        match p {
+            Precision::Exact(v) => format!("exact {v}"),
+            Precision::Inexact(v) => format!("~{v}"),
+            Precision::Absent => String::from("absent"),
+        }
+    }
+
+    if let Some(join) = (plan.as_ref() as &dyn std::any::Any).downcast_ref::<HashJoinExec>() {
+        let stats = join.left().partition_statistics(None).ok();
+        let (rows, bytes) = stats.map_or_else(
+            || (String::from("error"), String::from("error")),
+            |s| (show(s.num_rows), show(s.total_byte_size)),
+        );
+        println!(
+            "{:indent$}{:?} {:?}  build: rows={rows} bytes={bytes} parts={}",
+            "",
+            join.partition_mode(),
+            join.join_type(),
+            join.left().output_partitioning().partition_count(),
+            indent = depth * 2,
+        );
+    }
+    for child in plan.children() {
+        report_join_modes(child, depth + 1);
+    }
+}
+
 /// TPC-H generators emit either `<table>.parquet` or a `<table>/` directory of
 /// shards; accept both so one flag points at any scale factor.
 fn table_path(dir: &str, table: &str) -> String {
@@ -105,6 +147,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         println!("---- whole physical plan ----");
         println!("{}", displayable(plan.as_ref()).indent(false));
+        println!("---- hash joins: mode and the estimate that chose it ----");
+        report_join_modes(&plan, 0);
+
+        // `EXEC=1` runs the plan that was just dumped, in THIS process.
+        //
+        // The point is to separate two things the cluster conflates: the shape
+        // of the distributed plan, and the machinery that distributes it. The
+        // plan here is the staged one — every `RepartitionExec` the cluster
+        // would cut into a shuffle is present — but it executes in one process
+        // with no shuffle store, no task dispatch and no network. A query that
+        // is fast here and slow on the cluster is being killed by the
+        // machinery; one that is slow here is being killed by its own plan.
+        if std::env::var("EXEC").is_ok_and(|v| v != "0") {
+            let started = std::time::Instant::now();
+            match datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()).await {
+                Ok(batches) => {
+                    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    println!(
+                        "---- executed in-process: {rows} rows in {:.1} s ----",
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                Err(error) => println!(
+                    "---- executed in-process: FAILED after {:.1} s: {error} ----",
+                    started.elapsed().as_secs_f64()
+                ),
+            }
+        }
 
         match build_distributed_stages(Arc::clone(&plan)) {
             Ok(Some(staged)) => {

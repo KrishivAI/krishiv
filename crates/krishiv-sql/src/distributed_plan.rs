@@ -76,6 +76,16 @@ pub const STAGE_SPLIT_ENV: &str = "KRISHIV_STAGE_SPLIT";
 /// for why the distributed default differs from DataFusion's.
 pub const BROADCAST_JOIN_BYTES_ENV: &str = "KRISHIV_BROADCAST_JOIN_BYTES";
 
+/// Default build-side byte ceiling for broadcasting on the staged path.
+///
+/// DataFusion's own default is 1 MiB, tuned for a single process where a
+/// shuffle is a memcpy; here a shuffle is the pod network. See
+/// [`planning_session_context_with_options`] for the measurement behind 32 MiB.
+const DEFAULT_BROADCAST_JOIN_BYTES: usize = 32 * 1024 * 1024;
+
+/// Default build-side row ceiling, used only when a byte estimate is absent.
+const DEFAULT_BROADCAST_JOIN_ROWS: usize = 1_000_000;
+
 /// How many tasks to create per available slot.
 ///
 /// One task per slot fills the cluster in a single wave, but a single wave is
@@ -241,20 +251,22 @@ pub fn planning_session_context_with_options(
     //
     // Deliberately set only on the STAGED path — the embedded engine keeps
     // DataFusion's defaults, where they are correct.
-    let broadcast_bytes = broadcast_join_bytes.unwrap_or_else(|| {
-        std::env::var(BROADCAST_JOIN_BYTES_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(32 * 1024 * 1024)
-    });
+    //
+    // A build side that only *looks* small is caught afterwards by
+    // [`is_oversized_broadcast_join`], which re-checks the same ceilings and
+    // demands a positive estimate — DataFusion happily broadcasts on an
+    // estimate of zero rows, which is how q21 serialised.
+    let broadcast_bytes = broadcast_join_bytes.unwrap_or_else(|| broadcast_ceilings().0);
     let opts = config.options_mut();
     opts.optimizer.hash_join_single_partition_threshold = broadcast_bytes;
     // Both ceilings gate the same decision, so a caller asking for "never
     // broadcast" (0 bytes) must get the row ceiling zeroed too — otherwise a
     // small build side still collects and the request is silently ignored.
-    opts.optimizer.hash_join_single_partition_threshold_rows =
-        if broadcast_bytes == 0 { 0 } else { 1_000_000 };
+    opts.optimizer.hash_join_single_partition_threshold_rows = if broadcast_bytes == 0 {
+        0
+    } else {
+        DEFAULT_BROADCAST_JOIN_ROWS
+    };
 
     // A6: the rules. `planning_session_context` is where every distributed
     // query is planned, and it carried no engine rules at all — so
@@ -1258,6 +1270,41 @@ pub trait ShufflePartitionReader: fmt::Debug + Send + Sync {
     ) -> futures::future::BoxFuture<'static, Result<Vec<arrow::record_batch::RecordBatch>, String>>;
 }
 
+/// Env var overriding how many map fragments ONE reduce partition fetches at
+/// once. See the `buffered` call in [`ShuffleReadExec::execute`].
+///
+/// Deliberately **not** `KRISHIV_SHUFFLE_FETCH_CONCURRENCY`: that name is
+/// already taken by the executor-wide Flight semaphore
+/// (`fragment/common.rs`, default 8 in-flight requests per process). The two
+/// are different limits — this one is per reduce partition, that one is the
+/// process-wide ceiling every partition's fetches must also pass through — and
+/// giving them one name would mean a single number silently driving both.
+pub const SHUFFLE_FETCH_BUFFER_ENV: &str = "KRISHIV_SHUFFLE_FETCH_BUFFER";
+
+/// Map fragments in flight per reduce partition, by default.
+///
+/// The old behaviour was effectively 1 — strictly serial fetches — even though
+/// the executor was willing to run 8 at once. Every step up from there buys
+/// overlapped latency and costs resident bytes, because a fragment is
+/// materialised whole. Four is deliberately modest: it removes most of the
+/// serialisation (a task waits on the slowest of four round trips rather than
+/// the sum of eighteen), the executor semaphore still caps the process total,
+/// and this executor's memory has been the constraint on this benchmark more
+/// than once.
+const DEFAULT_SHUFFLE_FETCH_BUFFER: usize = 4;
+
+/// Resolve [`DEFAULT_SHUFFLE_FETCH_BUFFER`], honouring the env override.
+///
+/// Clamped to at least 1: a zero would make `buffered` yield nothing and hang
+/// the query, which is a worse failure than any concurrency choice.
+fn shuffle_fetch_buffer() -> usize {
+    std::env::var(SHUFFLE_FETCH_BUFFER_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SHUFFLE_FETCH_BUFFER)
+        .max(1)
+}
+
 // ── ShuffleReadExec ────────────────────────────────────────────────────────
 
 /// Leaf node that streams an upstream ShuffleMap stage's output partitions.
@@ -1439,7 +1486,7 @@ impl ExecutionPlan for ShuffleReadExec {
         let schema = Arc::clone(&self.schema);
         let expected = Arc::clone(&self.schema);
         let stream = futures::stream::iter(0..self.num_map_tasks)
-            .then(move |map_task| {
+            .map(move |map_task| {
                 let reader = Arc::clone(&reader);
                 async move {
                     reader
@@ -1454,6 +1501,22 @@ impl ExecutionPlan for ShuffleReadExec {
                         })
                 }
             })
+            // Fetch several map fragments at once instead of one at a time.
+            //
+            // This was `.then(..)`, which awaits each future before creating
+            // the next: a reduce task fetched its fragment from map task 0,
+            // waited for the whole round trip, then map task 1, and so on. With
+            // 18 map tasks that is 18 strictly serial network round trips per
+            // reduce partition, and a query with five shuffles pays it five
+            // times over — all of it latency, none of it overlapped, while the
+            // CPU that is meant to be joining sits idle.
+            //
+            // `buffered` keeps the output in map-task order (so the merge is
+            // still deterministic) and bounds how many fragments are in flight,
+            // which matters because `read_partition` materialises a whole
+            // fragment: concurrency here is paid for in resident bytes, and
+            // this executor has been OOM-killed before.
+            .buffered(shuffle_fetch_buffer())
             .map_ok(move |(map_task, batches)| {
                 let expected = Arc::clone(&expected);
                 futures::stream::iter(batches.into_iter().map(move |batch| {
@@ -2078,8 +2141,107 @@ fn is_unsplittable_broadcast_join(
         && join.right().output_partitioning().partition_count() > 1
 }
 
-/// Convert broadcast joins that cannot be split into hash-partitioned joins
-/// that can (see [`is_unsplittable_broadcast_join`]).
+/// Byte and row ceilings under which a build side may be broadcast.
+///
+/// Shared with [`planning_session_context_with_options`], which hands the same
+/// numbers to DataFusion, so the rule below cannot drift from the decision it
+/// is second-guessing.
+fn broadcast_ceilings() -> (usize, usize) {
+    let bytes = std::env::var(BROADCAST_JOIN_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_BROADCAST_JOIN_BYTES);
+    (bytes, DEFAULT_BROADCAST_JOIN_ROWS)
+}
+
+/// Is this build side **provably** small enough to broadcast?
+///
+/// "Provably" is the whole point. DataFusion's
+/// `supports_collect_by_thresholds` asks `estimate < ceiling`, which a
+/// degenerate estimate of **zero** passes more convincingly than any real
+/// small table — and a zero estimate is not a measurement, it is the
+/// estimator giving up.
+///
+/// TPC-H q21, at SF100, verbatim: its `NOT EXISTS` becomes a `LeftAnti` join
+/// whose two sides are both `lineitem` on `l_orderkey`, so DataFusion's
+/// `estimate_join_statistics` computes `outer_rows - semi_estimate` =
+/// `593462145 - 593462145` = **0** (`joins/utils.rs`, the semi/anti arm). The
+/// real output is tens of millions of rows. Three `CollectLeft` joins stacked
+/// above it each believed they were broadcasting nothing, so the stage cutter
+/// gathered that intermediate to ONE partition three times over
+/// (`shuffle=([], 1)` in the stage dump) and the whole top half of the query
+/// ran on a single task.
+///
+/// Requiring a *positive* estimate below the ceiling inverts the failure: a
+/// genuinely empty relation now costs one extra pair of hash exchanges over an
+/// empty stream, and a mis-estimated one no longer serialises the query.
+fn broadcast_build_is_provably_small(
+    join: &datafusion::physical_plan::joins::HashJoinExec,
+) -> bool {
+    use datafusion::common::stats::Precision;
+
+    let (ceiling_bytes, ceiling_rows) = broadcast_ceilings();
+    let Ok(stats) = join.left().partition_statistics(None) else {
+        // No statistics at all is not evidence of smallness either.
+        return false;
+    };
+    // Byte size first, exactly as DataFusion prefers it; rows only when bytes
+    // are absent, so the two agree on which number is authoritative.
+    match stats.total_byte_size {
+        Precision::Exact(bytes) | Precision::Inexact(bytes) => {
+            bytes > 0 && bytes <= ceiling_bytes
+        }
+        Precision::Absent => match stats.num_rows {
+            Precision::Exact(rows) | Precision::Inexact(rows) => {
+                rows > 0 && rows <= ceiling_rows
+            }
+            Precision::Absent => false,
+        },
+    }
+}
+
+/// Is this a broadcast join whose build side is too big — or too poorly
+/// estimated — to be worth gathering into one partition?
+///
+/// Distinct from [`is_unsplittable_broadcast_join`], which is a *correctness*
+/// test. This one is about throughput, and the two must stay separate: the
+/// correctness test also gates [`find_unsupported_stage_node`], which refuses
+/// to stage a plan rather than return wrong rows. Folding a performance
+/// heuristic into that gate would turn a merely slow plan into a query that
+/// declines to distribute at all.
+///
+/// Only fires where there is parallelism to lose: if both the probe side and
+/// the build side's own input are already single-partition, the gather costs
+/// nothing and the exchanges would be pure overhead.
+fn is_oversized_broadcast_join(join: &datafusion::physical_plan::joins::HashJoinExec) -> bool {
+    use datafusion::physical_plan::joins::PartitionMode;
+
+    if *join.partition_mode() != PartitionMode::CollectLeft {
+        return false;
+    }
+    // A null-aware anti join tracks probe-side state across the whole build and
+    // is only correct as `CollectLeft` (DataFusion rejects any other mode for
+    // it at construction). Never convert one.
+    if join.null_aware {
+        return false;
+    }
+    if broadcast_build_is_provably_small(join) {
+        return false;
+    }
+    let build_input_partitions = match join
+        .left()
+        .downcast_ref::<CoalescePartitionsExec>()
+    {
+        Some(coalesce) => coalesce.input().output_partitioning().partition_count(),
+        None => join.left().output_partitioning().partition_count(),
+    };
+    join.right().output_partitioning().partition_count() > 1 || build_input_partitions > 1
+}
+
+/// Convert broadcast joins that cannot be split — or that should not have been
+/// broadcast at all — into hash-partitioned joins
+/// (see [`is_unsplittable_broadcast_join`] and [`is_oversized_broadcast_join`]).
 ///
 /// Both sides gain a hash exchange on the join keys, which the stage cutter
 /// then turns into ordinary map stages — so the join keeps running across the
@@ -2120,7 +2282,8 @@ fn redistribute_unsplittable_broadcast_joins(
     let Some(join) = plan.downcast_ref::<HashJoinExec>() else {
         return Ok(plan);
     };
-    if !is_unsplittable_broadcast_join(join) {
+    let unsplittable = is_unsplittable_broadcast_join(join);
+    if !unsplittable && !is_oversized_broadcast_join(join) {
         return Ok(plan);
     }
 
@@ -2166,7 +2329,8 @@ fn redistribute_unsplittable_broadcast_joins(
     tracing::debug!(
         join_type = ?join.join_type(),
         partitions,
-        "converted an unsplittable broadcast join to a hash-partitioned join"
+        reason = if unsplittable { "unsplittable" } else { "oversized" },
+        "converted a broadcast join to a hash-partitioned join"
     );
     Ok(converted)
 }
@@ -4331,6 +4495,195 @@ mod staged_tpch_tests {
             converted.schema(),
             unsafe_join.schema(),
             "conversion must preserve the join's output schema"
+        );
+    }
+
+    /// Hand-build a `CollectLeft` join over `build`, coalesced as the planner
+    /// would coalesce it, probing a multi-partition `orders` scan.
+    ///
+    /// Shared by the broadcast-policy tests below so they differ only in the
+    /// build side, which is the variable under test.
+    async fn collect_left_over(
+        ctx: &SessionContext,
+        build_sql: &str,
+        build_key: &str,
+        null_aware: bool,
+        join_type: datafusion::logical_expr::JoinType,
+    ) -> Arc<dyn ExecutionPlan> {
+        use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+
+        let plan = |sql: String| {
+            let ctx = ctx.clone();
+            async move {
+                ctx.sql(&sql)
+                    .await
+                    .expect("sql")
+                    .create_physical_plan()
+                    .await
+                    .expect("physical plan")
+            }
+        };
+        let build = plan(build_sql.to_owned()).await;
+        let probe = plan(String::from("SELECT o_custkey FROM orders")).await;
+        let on = vec![(
+            datafusion::physical_plan::expressions::col(build_key, &build.schema())
+                .expect("build key"),
+            datafusion::physical_plan::expressions::col("o_custkey", &probe.schema())
+                .expect("probe key"),
+        )];
+        Arc::new(
+            HashJoinExec::try_new(
+                Arc::new(CoalescePartitionsExec::new(build)),
+                probe,
+                on,
+                None,
+                &join_type,
+                None,
+                PartitionMode::CollectLeft,
+                datafusion::common::NullEquality::NullEqualsNothing,
+                null_aware,
+            )
+            .expect("hand-built broadcast join"),
+        )
+    }
+
+    /// The q21 defect: an estimate of ZERO must not read as "small enough to
+    /// broadcast".
+    ///
+    /// At SF100 DataFusion estimates q21's `LeftAnti` self-join at
+    /// `593462145 - 593462145 = 0` rows, and three `CollectLeft` joins stacked
+    /// above it each broadcast on the strength of that — gathering tens of
+    /// millions of rows to ONE partition three times over. `0 < ceiling` is the
+    /// most convincing "broadcast me" a build side can produce, which is
+    /// exactly backwards.
+    #[tokio::test]
+    async fn a_zero_estimate_is_not_proof_that_a_build_side_is_small() {
+        use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = q22_context(tmp.path()).await;
+        // `WHERE false` gives the planner an exact zero — the same input the
+        // anti-join's arithmetic produces, without needing SF100 to reach it.
+        let join = collect_left_over(
+            &ctx,
+            "SELECT c_custkey FROM customer WHERE 1 = 0",
+            "c_custkey",
+            false,
+            datafusion::logical_expr::JoinType::Inner,
+        )
+        .await;
+        let join_ref = join.downcast_ref::<HashJoinExec>().expect("hash join");
+
+        assert!(
+            !broadcast_build_is_provably_small(join_ref),
+            "a zero estimate is the estimator giving up, not a measurement"
+        );
+        assert!(
+            is_oversized_broadcast_join(join_ref),
+            "so the join must be recognised as one that should not broadcast"
+        );
+        // The correctness gate must stay untouched: an Inner join drops no
+        // unmatched build rows, so refusing to STAGE it would turn a merely
+        // slow plan into one that declines to distribute at all.
+        assert!(
+            !is_unsplittable_broadcast_join(join_ref),
+            "this is a throughput problem, not a correctness one"
+        );
+        assert!(
+            find_unsupported_stage_node(&join).is_none(),
+            "and the stage guard must not refuse it"
+        );
+
+        let converted =
+            redistribute_unsplittable_broadcast_joins(Arc::clone(&join)).expect("conversion");
+        let converted_join = converted
+            .downcast_ref::<HashJoinExec>()
+            .expect("still a hash join");
+        assert_eq!(
+            *converted_join.partition_mode(),
+            PartitionMode::Partitioned,
+            "the build side must be hash-partitioned instead of gathered"
+        );
+        assert_eq!(
+            converted.schema(),
+            join.schema(),
+            "conversion must preserve the join's output schema"
+        );
+    }
+
+    /// The opposite regression, and the reason this rule is not simply "never
+    /// broadcast".
+    ///
+    /// Broadcasting a genuinely small dimension side is what keeps q8/q9 from
+    /// hash-partitioning the raw 600M-row `lineitem` scan across a ~11 MiB/s
+    /// pod network. A scan of a small table has EXACT parquet statistics, so it
+    /// is provably small and must survive this rule untouched.
+    #[tokio::test]
+    async fn a_provably_small_build_side_is_still_broadcast() {
+        use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = q22_context(tmp.path()).await;
+        let join = collect_left_over(
+            &ctx,
+            "SELECT c_custkey FROM customer",
+            "c_custkey",
+            false,
+            datafusion::logical_expr::JoinType::Inner,
+        )
+        .await;
+        let join_ref = join.downcast_ref::<HashJoinExec>().expect("hash join");
+
+        assert!(
+            broadcast_build_is_provably_small(join_ref),
+            "a small parquet scan has exact statistics and is provably small"
+        );
+        assert!(
+            !is_oversized_broadcast_join(join_ref),
+            "so it must keep its broadcast"
+        );
+        let after =
+            redistribute_unsplittable_broadcast_joins(Arc::clone(&join)).expect("conversion");
+        assert_eq!(
+            *after
+                .downcast_ref::<HashJoinExec>()
+                .expect("still a hash join")
+                .partition_mode(),
+            PartitionMode::CollectLeft,
+            "the rule must leave a legitimately small broadcast alone"
+        );
+    }
+
+    /// A null-aware anti join is only correct as `CollectLeft`.
+    ///
+    /// It tracks probe-side state across the whole build side, and DataFusion
+    /// rejects any other partition mode for it at construction — so however
+    /// badly estimated its build side is, converting it would trade a slow
+    /// query for one that does not run.
+    #[tokio::test]
+    async fn a_null_aware_anti_join_is_never_converted() {
+        use datafusion::physical_plan::joins::HashJoinExec;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = q22_context(tmp.path()).await;
+        let join = collect_left_over(
+            &ctx,
+            "SELECT c_custkey FROM customer WHERE 1 = 0",
+            "c_custkey",
+            true,
+            datafusion::logical_expr::JoinType::LeftAnti,
+        )
+        .await;
+        let join_ref = join.downcast_ref::<HashJoinExec>().expect("hash join");
+
+        assert!(
+            !broadcast_build_is_provably_small(join_ref),
+            "precondition: its build side looks oversized, so only the \
+             null-aware check can be what spares it"
+        );
+        assert!(
+            !is_oversized_broadcast_join(join_ref),
+            "a null-aware anti join must never be converted for throughput"
         );
     }
 

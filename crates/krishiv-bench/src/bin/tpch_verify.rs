@@ -13,12 +13,29 @@
 //!   KRISHIV_TPCH_DATA_DIR_SF1=/path/to/sf1 \
 //!     cargo run -p krishiv-bench --bin tpch_verify --release
 //!
+//! `KRISHIV_TPCH_ONLY=q10,q21` restricts the run to named queries. Diagnosing
+//! one slow query should not cost a full 22-query sweep, and at SF100 that
+//! difference is hours.
+//!
 //! Exit code is the number of queries that failed (0 = all ran).
 
 use std::collections::BTreeSet;
 use std::time::Instant;
 
 use krishiv_bench::tpch_queries::TPCH_QUERIES;
+
+/// TPC-H generators emit either `<table>.parquet` or a `<table>/` directory of
+/// shards. Only the first was accepted here, so this binary — the gate that is
+/// supposed to run before any measurement — could not read the sharded layout
+/// every scale factor above SF1 is generated in.
+fn table_path(dir: &str, table: &str) -> String {
+    let nested = format!("{dir}/{table}");
+    if std::path::Path::new(&nested).is_dir() {
+        format!("{nested}/")
+    } else {
+        format!("{dir}/{table}.parquet")
+    }
+}
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> std::process::ExitCode {
@@ -38,18 +55,30 @@ async fn main() -> std::process::ExitCode {
         .filter(|v: &f64| v.is_finite() && *v > 0.0)
         .unwrap_or(1.0);
 
+    // An explicit allow-list, so "verify everything" stays the default and
+    // narrowing is always a visible choice in the command line.
+    let only: BTreeSet<String> = std::env::var("KRISHIV_TPCH_ONLY")
+        .unwrap_or_default()
+        .split(',')
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+        .collect();
+
     let mut failures = 0usize;
     let mut failed_ids: BTreeSet<&str> = BTreeSet::new();
+    let mut ran = 0usize;
 
     for query in TPCH_QUERIES {
+        if !only.is_empty() && !only.contains(query.id) {
+            continue;
+        }
+        ran += 1;
         // A fresh engine per query so one query's registrations cannot mask a
         // missing declaration in the next.
         let engine = krishiv_sql::SqlEngine::new();
         let mut setup_failed = None;
         for table in query.tables {
-            if let Err(error) = engine
-                .register_parquet(*table, format!("{dir}/{table}.parquet"))
-                .await
+            if let Err(error) = engine.register_parquet(*table, table_path(&dir, table)).await
             {
                 setup_failed = Some(format!("register {table}: {error}"));
                 break;
@@ -88,11 +117,7 @@ async fn main() -> std::process::ExitCode {
         }
     }
 
-    println!(
-        "\n{} / {} queries executed",
-        TPCH_QUERIES.len() - failures,
-        TPCH_QUERIES.len()
-    );
+    println!("\n{} / {ran} queries executed", ran - failures);
     if failures > 0 {
         println!("failed: {failed_ids:?}");
     }
