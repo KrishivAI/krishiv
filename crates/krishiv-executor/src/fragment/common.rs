@@ -219,13 +219,6 @@ pub(crate) async fn read_object_parquet_partitions(
     Ok(result)
 }
 
-#[derive(Debug)]
-pub(crate) struct RegistryPartitionRead {
-    pub table_name: String,
-    pub batches: Vec<arrow::record_batch::RecordBatch>,
-    pub source_offset: Option<CheckpointSourceOffset>,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct RegistryPartitionSpec {
     pub partition_id: String,
@@ -435,11 +428,24 @@ pub(crate) fn coerce_batch_for_window(
 /// This is the CO5 execution path that allows any registered connector (including
 /// the new `ParquetDirectorySource` and `S3PrefixSource`) to be used as an input
 /// partition source from fragment assignments.
-pub(crate) async fn read_registry_partition_outputs(
+///
+/// # Offsets are read, not written, here
+///
+/// This path deliberately does **not** ask the source for a checkpoint offset
+/// after reading. It used to: an inner function computed one per partition and
+/// its only caller discarded it with `let _ = &read.source_offset;`. That cost
+/// a real connector call per partition for a value nobody consumed — and worse,
+/// the call is fallible and propagated with `?`, so a batch fragment could fail
+/// on a checkpoint-encoding error from a feature it does not use.
+///
+/// The streaming loop, which genuinely needs offsets, captures them itself from
+/// the source it owns (`run_loop.rs`, via [`checkpoint_offset_from_dyn_source`])
+/// — a batch fragment is one-shot and has nowhere to put one.
+pub(crate) async fn read_registry_partitions(
     registry: &krishiv_connectors::ConnectorRegistry,
     partitions: &[krishiv_proto::InputPartition],
     restored_offsets: Option<&[RestoredSourceOffset]>,
-) -> ExecutorResult<Vec<RegistryPartitionRead>> {
+) -> ExecutorResult<Vec<(String, Vec<arrow::record_batch::RecordBatch>)>> {
     let mut result = Vec::new();
     for spec in parse_registry_partition_specs(partitions)? {
         let mut source = registry
@@ -479,31 +485,9 @@ pub(crate) async fn read_registry_partition_outputs(
         {
             batches.push(batch);
         }
-        let source_offset = checkpoint_offset_from_dyn_source(&spec, source.as_ref())?;
-        result.push(RegistryPartitionRead {
-            table_name: spec.table_name,
-            batches,
-            source_offset,
-        });
+        result.push((spec.table_name, batches));
     }
     Ok(result)
-}
-
-pub(crate) async fn read_registry_partitions(
-    registry: &krishiv_connectors::ConnectorRegistry,
-    partitions: &[krishiv_proto::InputPartition],
-    restored_offsets: Option<&[RestoredSourceOffset]>,
-) -> ExecutorResult<Vec<(String, Vec<arrow::record_batch::RecordBatch>)>> {
-    Ok(
-        read_registry_partition_outputs(registry, partitions, restored_offsets)
-            .await?
-            .into_iter()
-            .map(|read| {
-                let _ = &read.source_offset;
-                (read.table_name, read.batches)
-            })
-            .collect(),
-    )
 }
 
 pub(crate) fn checkpoint_offset_from_dyn_source(
@@ -995,20 +979,20 @@ pub const EXECUTOR_MEMORY_LIMIT_ENV: &str = "KRISHIV_EXECUTOR_MEMORY_LIMIT_BYTES
 /// bounds over-commit at `concurrent_slots × 32 MiB`.
 const MIN_TASK_ENGINE_MEMORY_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Process-wide memory budget shared by every task slot in this executor.
+/// The whole-process memory limit, parsed once.
 ///
-/// `KRISHIV_EXECUTOR_MEMORY_LIMIT_BYTES` unset or unparseable → unlimited.
-/// Per-task engine limits still apply individually — and their fallback
-/// (`query_memory_limit_from_env`) is cgroup-derived, so task-level spill is
-/// armed in containers even without this process-wide layer.
-static EXECUTOR_PROCESS_BUDGET: std::sync::LazyLock<Arc<krishiv_common::MemoryBudget>> =
-    std::sync::LazyLock::new(|| {
-        let limit = std::env::var(EXECUTOR_MEMORY_LIMIT_ENV)
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&n| n > 0);
-        krishiv_common::MemoryBudget::from_limit(limit)
-    });
+/// One static rather than two. The unified arbiter and the (now removed) flat
+/// process budget each parsed `KRISHIV_EXECUTOR_MEMORY_LIMIT_BYTES` with the
+/// *same* predicate, so they were always both present or both absent — which
+/// made the flat budget's entire reservation ladder unreachable: the unified
+/// branch above it returned in every case that reached either. Deriving both
+/// from one parse removes the possibility of them disagreeing at all.
+static EXECUTOR_MEMORY_LIMIT: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| {
+    std::env::var(EXECUTOR_MEMORY_LIMIT_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+});
 
 /// Phase 56 (SH7): the executor-wide unified memory arbiter — one pool with
 /// Shuffle/Execution/State soft regions (Spark's model) instead of
@@ -1018,11 +1002,7 @@ static EXECUTOR_PROCESS_BUDGET: std::sync::LazyLock<Arc<krishiv_common::MemoryBu
 static EXECUTOR_UNIFIED_MEMORY: std::sync::LazyLock<
     Option<Arc<krishiv_common::UnifiedMemoryManager>>,
 > = std::sync::LazyLock::new(|| {
-    std::env::var(EXECUTOR_MEMORY_LIMIT_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .map(krishiv_common::UnifiedMemoryManager::with_total)
+    (*EXECUTOR_MEMORY_LIMIT).map(krishiv_common::UnifiedMemoryManager::with_total)
 });
 
 /// The executor-wide unified memory arbiter, when the process is bounded.
@@ -1037,21 +1017,14 @@ pub(crate) fn executor_unified_memory() -> Option<&'static Arc<krishiv_common::U
 /// slots see freed capacity immediately.
 pub(crate) struct ProcessMemoryReservation {
     bytes: u64,
-    /// Reserved through the unified arbiter's Execution region (Phase 56)
-    /// rather than the legacy flat process budget.
-    unified: bool,
 }
 
 impl Drop for ProcessMemoryReservation {
     fn drop(&mut self) {
-        if self.bytes > 0 {
-            if self.unified {
-                if let Some(manager) = executor_unified_memory() {
-                    manager.release(krishiv_common::MemoryRegion::Execution, self.bytes);
-                }
-            } else {
-                EXECUTOR_PROCESS_BUDGET.release(self.bytes);
-            }
+        if self.bytes > 0
+            && let Some(manager) = executor_unified_memory()
+        {
+            manager.release(krishiv_common::MemoryRegion::Execution, self.bytes);
         }
     }
 }
@@ -1073,9 +1046,11 @@ impl Drop for ProcessMemoryReservation {
 pub(crate) fn reserve_task_engine_memory(
     memory_budget: &krishiv_common::MemoryBudget,
 ) -> (krishiv_sql::EngineMemory, Option<ProcessMemoryReservation>) {
+    use krishiv_common::MemoryRegion;
+
     let desired = task_engine_memory_limit(memory_budget);
-    let process = &*EXECUTOR_PROCESS_BUDGET;
-    let Some(process_limit) = process.limit() else {
+    let (Some(process_limit), Some(manager)) = (*EXECUTOR_MEMORY_LIMIT, executor_unified_memory())
+    else {
         // No explicit process partitioning: a per-task limit stays private,
         // everything else shares the executor pool.
         return (
@@ -1095,88 +1070,41 @@ pub(crate) fn reserve_task_engine_memory(
     // Phase 56 (SH7): task engine pools draw from the unified arbiter's
     // Execution region — shuffle buffers created inside task execution ride
     // this reservation; state backends reserve from the State region at
-    // checkpoint time. `try_reserve` failure drives the same shrink-then-
-    // minimum-grant ladder as the legacy flat budget.
-    if let Some(manager) = executor_unified_memory() {
-        use krishiv_common::MemoryRegion;
-        if manager.try_reserve(MemoryRegion::Execution, want) {
-            let granted = usize::try_from(want).unwrap_or(usize::MAX);
-            return (
-                krishiv_sql::EngineMemory::Private(granted),
-                Some(ProcessMemoryReservation {
-                    bytes: want,
-                    unified: true,
-                }),
-            );
-        }
-        let remaining = manager
-            .available_for_region(MemoryRegion::Execution)
-            .min(want);
-        if remaining >= MIN_TASK_ENGINE_MEMORY_BYTES
-            && manager.try_reserve(MemoryRegion::Execution, remaining)
-        {
-            tracing::warn!(
-                requested = want,
-                granted = remaining,
-                "unified executor memory under pressure; task granted reduced engine limit"
-            );
-            let granted = usize::try_from(remaining).unwrap_or(usize::MAX);
-            return (
-                krishiv_sql::EngineMemory::Private(granted),
-                Some(ProcessMemoryReservation {
-                    bytes: remaining,
-                    unified: true,
-                }),
-            );
-        }
-        tracing::warn!(
-            requested = want,
-            granted = MIN_TASK_ENGINE_MEMORY_BYTES,
-            "unified executor memory exhausted; task granted minimum engine limit"
-        );
-        return (
-            krishiv_sql::EngineMemory::Private(
-                usize::try_from(MIN_TASK_ENGINE_MEMORY_BYTES).unwrap_or(usize::MAX),
-            ),
-            None,
-        );
-    }
-
-    if process.try_reserve(want) {
+    // checkpoint time. `try_reserve` failure drives a shrink-then-minimum-grant
+    // ladder.
+    if manager.try_reserve(MemoryRegion::Execution, want) {
         let granted = usize::try_from(want).unwrap_or(usize::MAX);
         return (
             krishiv_sql::EngineMemory::Private(granted),
-            Some(ProcessMemoryReservation {
-                bytes: want,
-                unified: false,
-            }),
+            Some(ProcessMemoryReservation { bytes: want }),
         );
     }
 
     // Full amount unavailable: take whatever remains, if meaningful.
-    let remaining = process.remaining().unwrap_or(0);
-    if remaining >= MIN_TASK_ENGINE_MEMORY_BYTES && process.try_reserve(remaining) {
+    let remaining = manager
+        .available_for_region(MemoryRegion::Execution)
+        .min(want);
+    if remaining >= MIN_TASK_ENGINE_MEMORY_BYTES
+        && manager.try_reserve(MemoryRegion::Execution, remaining)
+    {
         tracing::warn!(
             requested = want,
             granted = remaining,
-            "executor process memory budget under pressure; task granted reduced engine limit"
+            "unified executor memory under pressure; task granted reduced engine limit"
         );
         let granted = usize::try_from(remaining).unwrap_or(usize::MAX);
         return (
             krishiv_sql::EngineMemory::Private(granted),
-            Some(ProcessMemoryReservation {
-                bytes: remaining,
-                unified: false,
-            }),
+            Some(ProcessMemoryReservation { bytes: remaining }),
         );
     }
 
-    // Budget exhausted: minimum grant without reservation (bounded over-commit)
-    // so the task spills aggressively instead of failing outright.
+    // Exhausted: minimum grant without reservation (bounded over-commit) so the
+    // task spills aggressively instead of failing outright.
     tracing::warn!(
         requested = want,
         granted = MIN_TASK_ENGINE_MEMORY_BYTES,
-        "executor process memory budget exhausted; task granted minimum engine limit"
+        "unified executor memory exhausted; task granted minimum engine limit"
     );
     (
         krishiv_sql::EngineMemory::Private(
@@ -1607,18 +1535,32 @@ mod tests {
     #[test]
     fn process_memory_reservation_releases_on_drop() {
         // Exercise the guard against a locally constructed budget through the
-        // same release path the global budget uses.
+        // same release path the arbiter uses.
         let process = MemoryBudget::limited(100);
         assert!(process.try_reserve(80));
         process.release(80);
         assert_eq!(process.used_bytes(), 0);
-        // The Drop impl on ProcessMemoryReservation calls release on the
-        // global EXECUTOR_PROCESS_BUDGET, which is unlimited in tests; verify
-        // dropping a guard with zero bytes is a no-op and does not panic.
-        drop(super::ProcessMemoryReservation {
-            bytes: 0,
-            unified: false,
-        });
+        // The Drop impl releases into the unified arbiter, which is absent in
+        // tests; verify dropping a zero-byte guard is a no-op and does not panic.
+        drop(super::ProcessMemoryReservation { bytes: 0 });
+    }
+
+    /// The process limit and the arbiter must be the same decision.
+    ///
+    /// They were two `LazyLock`s parsing the same env var with the same
+    /// predicate, which made them always agree — and therefore made the flat
+    /// budget's whole reservation ladder unreachable, because the unified
+    /// branch ahead of it returned in every case that got that far. Deriving
+    /// the arbiter from the parsed limit is what makes "present together or
+    /// absent together" a property of the code rather than a coincidence of two
+    /// copies of one expression.
+    #[test]
+    fn the_memory_limit_and_the_arbiter_are_present_together_or_not_at_all() {
+        assert_eq!(
+            super::EXECUTOR_MEMORY_LIMIT.is_some(),
+            super::executor_unified_memory().is_some(),
+            "a bounded process must have an arbiter, and an unbounded one must not"
+        );
     }
 
     #[derive(Clone)]
