@@ -368,11 +368,9 @@ pub async fn spawn_coordinator_sidecars(
                 )
             })?);
         let gc_coordinator = coordinator.clone();
-        let orphan_store = Arc::clone(&store);
         let orphan_shuffle_dir = shuffle_dir.clone();
         handles.push(tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(5));
-            let mut orphan_tick_count: u64 = 0;
             loop {
                 ticker.tick().await;
                 let job_ids = gc_coordinator.write().await.take_gc_ready_jobs();
@@ -386,27 +384,68 @@ pub async fn spawn_coordinator_sidecars(
                         tracing::error!(job_id = %job_id, error = %e, "shuffle GC failed");
                     }
                 }
-                // Orphan scan every 60 s (every 12th 5-second tick) — removes
-                // partition files for jobs that crashed before reaching terminal
-                // state and were never added to gc_ready_jobs (C4).
-                orphan_tick_count += 1;
-                if orphan_tick_count.is_multiple_of(12) {
-                    let active = gc_coordinator.read().await.active_job_ids();
-                    let dir = orphan_shuffle_dir.clone();
-                    let store2 = Arc::clone(&orphan_store);
-                    tokio::task::spawn_blocking(move || {
-                        match krishiv_shuffle::orphan::cleanup_orphans(&dir, &active) {
-                            Ok(n) if n > 0 => {
-                                tracing::info!(
-                                    removed = n,
-                                    "shuffle orphan GC: removed orphaned partition files"
-                                );
-                            }
+            }
+        }));
+
+        // Orphan sweep — partition files for jobs that crashed before reaching a
+        // terminal state, so were never added to gc_ready_jobs (C4).
+        //
+        // A8, and the reason this is an `OrphanReclaimTracker` rather than a
+        // bare `cleanup_orphans`: the live-job set here is
+        // `job_coordinators.keys()`, which is exactly the set
+        // `OrphanReclaimTracker` was written to defend against. It is *present
+        // but incomplete* in two windows this daemon owns — a leadership
+        // failover, where the new leader rebuilds its job map from durable
+        // state, and any moment between a job being admitted and its
+        // coordinator being inserted. Reclaiming on the first such observation
+        // deletes a live job's committed shuffle output; the consumer then
+        // reports it missing, the producer regenerates it, and the next sweep
+        // deletes it again. The executor's sweep was given this protection; the
+        // coordinator's — the one that reads the very map the hazard is about —
+        // was not.
+        //
+        // Its own task, not a counter inside the GC loop above: the tracker has
+        // to be handed into `spawn_blocking` and handed back to keep its
+        // history, which means awaiting the walk. Awaiting it in the 5 s loop
+        // would stall `take_gc_ready_jobs` behind a filesystem traversal.
+        let orphan_coordinator = coordinator.clone();
+        handles.push(tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Held across ticks: "consecutive" is only meaningful with history.
+            let mut tracker = krishiv_shuffle::OrphanReclaimTracker::new(
+                krishiv_shuffle::OrphanReclaimPolicy::default(),
+            );
+            loop {
+                ticker.tick().await;
+                let active = orphan_coordinator.read().await.active_job_ids();
+                let dir = orphan_shuffle_dir.clone();
+                let joined = tokio::task::spawn_blocking(move || {
+                    let result = tracker.observe_and_cleanup(&dir, &active);
+                    (tracker, result)
+                })
+                .await;
+                // The tracker moves into the blocking task and comes back with
+                // it; a panicked sweep loses its history, which only costs the
+                // affected jobs another grace period.
+                match joined {
+                    Ok((returned, result)) => {
+                        tracker = returned;
+                        match result {
+                            Ok(n) if n > 0 => tracing::info!(
+                                removed = n,
+                                "shuffle orphan GC: reclaimed orphaned partition files"
+                            ),
                             Ok(_) => {}
                             Err(e) => tracing::error!(error = %e, "shuffle orphan GC failed"),
                         }
-                        drop(store2); // keep Arc alive
-                    });
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "shuffle orphan GC task panicked");
+                        tracker = krishiv_shuffle::OrphanReclaimTracker::new(
+                            krishiv_shuffle::OrphanReclaimPolicy::default(),
+                        );
+                    }
                 }
             }
         }));
