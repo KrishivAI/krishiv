@@ -345,6 +345,47 @@ async fn tiered_store_remote_write_failure_is_returned_to_caller() {
     );
 }
 
+/// Both tiers must end up holding the lease the tiered store accepted.
+///
+/// Lease tokens are what fence a stale writer. `read_partition` falls back
+/// from local to remote, so if the two tiers disagree about the current token
+/// a read can be served by whichever tier has the weaker fence.
+///
+/// Scope, stated honestly: this covers the success path — that registration
+/// reaches *both* stores rather than one. It does **not** reproduce the
+/// cancellation window that motivated the fix (`try_join!` dropping the
+/// remote future when the local one errors), because both concrete stores can
+/// complete their registration on the first poll, so whether the cancel is
+/// observed is a race. Proving that leg needs a store with an injectable
+/// await point; until then the guarantee rests on `join!` driving both to
+/// completion by construction.
+#[tokio::test]
+async fn tiered_lease_registration_reaches_both_tiers() {
+    let local_dir = tempfile::tempdir().unwrap();
+    let local = Arc::new(LocalDiskShuffleStore::new(local_dir.path()).unwrap());
+    let remote = Arc::new(ObjectStoreShuffleStore::new(
+        Arc::new(InMemory::new()),
+        "tiered-lease-parity",
+    ));
+    let store = TieredShuffleStore::new(Arc::clone(&local), Arc::clone(&remote));
+
+    let partition = make_object_store_partition("job-tiered-lease", "s0", 0);
+    let id = partition.id.clone();
+    store.register_partition_lease(id.clone(), 5).await.unwrap();
+
+    // Each tier, asked directly, must now refuse an older token.
+    let stale_local = local.write_partition(partition.clone(), 4).await;
+    assert!(
+        matches!(stale_local, Err(ShuffleError::StaleLeaseToken { .. })),
+        "local tier did not receive the lease: {stale_local:?}"
+    );
+    let stale_remote = remote.write_partition(partition, 4).await;
+    assert!(
+        matches!(stale_remote, Err(ShuffleError::StaleLeaseToken { .. })),
+        "remote tier did not receive the lease: {stale_remote:?}"
+    );
+}
+
 #[tokio::test]
 async fn tiered_store_reads_remote_copy_after_local_loss() {
     let first_local_dir = tempfile::tempdir().unwrap();

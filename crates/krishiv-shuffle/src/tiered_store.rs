@@ -33,11 +33,25 @@ impl ShuffleStore for TieredShuffleStore {
         id: PartitionId,
         lease_token: u64,
     ) -> ShuffleResult<()> {
-        tokio::try_join!(
+        // `join!`, not `try_join!` — for the same reason `write_partition`
+        // gives below, which this call used to contradict.
+        //
+        // `try_join!` returns on the first error and *drops the other future*,
+        // cancelling it wherever it had got to. For lease registration that
+        // leaves the two tiers holding different fencing tokens: one advanced,
+        // the other cancelled mid-update. Lease tokens are what fences a stale
+        // writer, so tiers that disagree about the current token disagree about
+        // which writer is stale — and `read_partition` falls back from local to
+        // remote, so a read can be served by the tier with the weaker fence.
+        //
+        // Driving both to completion and reporting afterwards keeps the two
+        // sides in step whatever happens.
+        let (local_result, remote_result) = tokio::join!(
             self.local.register_partition_lease(id.clone(), lease_token),
             self.remote.register_partition_lease(id, lease_token),
-        )?;
-        Ok(())
+        );
+        local_result?;
+        remote_result
     }
 
     async fn write_partition(
