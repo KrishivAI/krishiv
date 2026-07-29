@@ -171,4 +171,93 @@ mod tests {
         assert_eq!(rendered(&plan), rendered(&out));
         assert_eq!(rendered(&out).matches("Cooperative").count(), 0);
     }
+
+    /// Plan `sql` against two small tables and return the physical plan.
+    ///
+    /// Built through the planner rather than by calling operator constructors
+    /// directly: the point is that the shape DataFusion actually emits for
+    /// these queries is matched, which a hand-built node cannot tell us.
+    async fn physical(sql: &str) -> Arc<dyn ExecutionPlan> {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        for name in ["t1", "t2"] {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))],
+            )
+            .unwrap();
+            let table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).unwrap();
+            ctx.register_table(name, Arc::new(table)).unwrap();
+        }
+        let logical = ctx.sql(sql).await.unwrap().into_optimized_plan().unwrap();
+        ctx.state().create_physical_plan(&logical).await.unwrap()
+    }
+
+    /// A nested-loop join is named in `is_amplifier` and was never tested.
+    ///
+    /// It is the *other* operator the module was written for — a non-equi join
+    /// whose output dwarfs its input — and until now only the cross join had a
+    /// test, so this arm could have been deleted without anything failing.
+    #[tokio::test]
+    async fn a_nested_loop_join_is_wrapped() {
+        let plan = physical("SELECT t1.a FROM t1, t2 WHERE t1.a < t2.a").await;
+        assert!(
+            rendered(&plan).contains("NestedLoopJoin"),
+            "fixture stopped producing a nested-loop join:\n{}",
+            rendered(&plan)
+        );
+        let out = optimize(plan);
+        assert!(
+            rendered(&out).contains("Cooperative"),
+            "a nested-loop join must be made preemptible:\n{}",
+            rendered(&out)
+        );
+    }
+
+    /// Unnest is the arm that already regressed once.
+    ///
+    /// The module docs "have always named unnest as a member of this class and
+    /// it was never actually matched" — a silent gap that survived because no
+    /// test covered it. This is that test.
+    #[tokio::test]
+    async fn an_unnest_is_wrapped() {
+        let plan = physical("SELECT unnest([1, 2, 3]) AS u FROM t1").await;
+        assert!(
+            rendered(&plan).contains("Unnest"),
+            "fixture stopped producing an unnest:\n{}",
+            rendered(&plan)
+        );
+        let out = optimize(plan);
+        assert!(
+            rendered(&out).contains("Cooperative"),
+            "an unnest must be made preemptible:\n{}",
+            rendered(&out)
+        );
+    }
+
+    /// Idempotence must hold for every amplifier, not just the cross join.
+    ///
+    /// The collapse only inspects `children().first()`, so an operator whose
+    /// wrapped form sits differently in the tree would grow a layer per pass —
+    /// invisible until a plan had been optimized twice in production.
+    #[tokio::test]
+    async fn every_amplifier_is_idempotent_under_a_second_pass() {
+        for sql in [
+            "SELECT t1.a FROM t1, t2 WHERE t1.a < t2.a",
+            "SELECT unnest([1, 2, 3]) AS u FROM t1",
+        ] {
+            let once = optimize(physical(sql).await);
+            let twice = optimize(Arc::clone(&once));
+            assert_eq!(
+                rendered(&once),
+                rendered(&twice),
+                "a second pass changed the plan for:\n{sql}"
+            );
+        }
+    }
 }
