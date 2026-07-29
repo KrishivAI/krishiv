@@ -41,8 +41,27 @@ TARGET_DIR="$REPO/target/prod-image"
 # check `/proc/cpuinfo` before widening the fleet.
 RUSTFLAGS_BENCH="${RUSTFLAGS:-} -C target-cpu=x86-64-v3"
 
+# `-mpclmul` for the C/C++ dependencies, which is not cosmetic: it is required
+# by the line above.
+#
+# `librocksdb-sys` reads `CARGO_CFG_TARGET_FEATURE` — which `-C target-cpu`
+# changes — to decide the `-m` flags it hands its C++ compiler. Under
+# `x86-64-v3` it sees avx2/bmi/lzcnt, enables rocksdb's hardware-CRC path, and
+# that path uses `_mm_clmulepi64_si128`. PCLMULQDQ is in *neither* x86-64-v2
+# nor v3, so clang refuses the intrinsic and the whole image build dies in
+# `crc32c.cc` — a C++ error with no obvious connection to a Rust flag.
+#
+# Every AVX2 machine in this fleet has PCLMULQDQ (it shipped with Westmere,
+# 2010, and universally alongside AES-NI), so naming it costs nothing and the
+# v3 floor already assumes far newer silicon. Kept as a bare `-mpclmul` rather
+# than `-march=x86-64-v3` so this changes exactly one thing about the C/C++
+# builds and does not silently re-baseline every other native dependency.
+CFLAGS_BENCH="${CFLAGS:-} -mpclmul"
+CXXFLAGS_BENCH="${CXXFLAGS:-} -mpclmul"
+
 echo "== cargo build (prod preset; isolated target dir; target-cpu=x86-64-v3)"
 (cd "$REPO" && CARGO_TARGET_DIR="$TARGET_DIR" RUSTFLAGS="$RUSTFLAGS_BENCH" \
+    CFLAGS="$CFLAGS_BENCH" CXXFLAGS="$CXXFLAGS_BENCH" \
     cargo build --locked --release -p krishiv --no-default-features --features prod)
 
 BIN="$TARGET_DIR/release/krishiv"
