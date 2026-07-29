@@ -209,6 +209,25 @@ Measured: **81.07% regions, 68.67% functions, 78.07% lines** (11,475 regions,
 
 ## 2. krishiv-executor — in progress
 
+Measured **2026-07-29**: **75.34% regions, 62.44% functions, 73.96% lines**
+(27,312 regions, 6,736 uncovered).
+
+| file | uncov | cover |
+|---|---|---|
+| cli.rs | **1400** | 39.13% |
+| fragment/batch.rs | 709 | 68.92% |
+| fragment/streaming.rs | 683 | 53.09% |
+| runner/executor_task_runner.rs | 622 | 61.44% |
+| fragment/run_loop.rs | 471 | 69.79% |
+| fragment/common.rs | 470 | 79.15% |
+| transport.rs | 368 | **46.90%** |
+| runner/task_output.rs | 220 | 59.56% |
+| grpc.rs | 194 | 58.01% |
+| barrier_grpc.rs | 145 | **33.18%** |
+
+Already strong: `assignment_inbox.rs` 96.19%, `runner/partition.rs` 94.99%,
+`fragment/shuffle_write_buffer.rs` 85.04%.
+
 ### Map of the crate
 
 The distributed-batch critical path is `fragment/` + `runner/`. **Which
