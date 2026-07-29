@@ -22,12 +22,22 @@ use crate::kafka_table::{KafkaPartitionStream, kafka_auto_commit_interval_ms, pr
 /// run through local-filesystem canonicalization, and `STORED AS PARQUET`
 /// against one is a native DataFusion ListingTable read, not a connector source.
 fn is_object_store_url(location: &str) -> bool {
+    // URI schemes are case-insensitive (RFC 3986 §3.1), and this check decides
+    // whether a `LOCATION` is object storage or a path under the warehouse
+    // root. A case-sensitive match sent `LOCATION 'S3://bucket/x'` down the
+    // *filesystem* branch, where `validate_path_under_warehouse` tried to
+    // canonicalise it as a relative path and failed with "path not accessible"
+    // — an error about the local disk for a bucket that was perfectly fine.
     let l = location.trim_start();
+    let scheme = match l.split_once("://") {
+        Some((scheme, _)) => scheme,
+        None => return false,
+    };
     [
-        "s3://", "s3a://", "gs://", "gcs://", "az://", "azure://", "abfs://", "abfss://",
+        "s3", "s3a", "gs", "gcs", "az", "azure", "abfs", "abfss",
     ]
     .iter()
-    .any(|scheme| l.starts_with(scheme))
+    .any(|known| scheme.eq_ignore_ascii_case(known))
 }
 
 /// Reject paths that escape the warehouse root via traversal or absolutes.
@@ -507,5 +517,46 @@ mod tests {
             ),
             Some("orders".to_string())
         );
+    }
+
+    /// URI schemes are case-insensitive (RFC 3986 §3.1).
+    ///
+    /// A case-sensitive match sent `LOCATION 'S3://bucket/x'` down the
+    /// *filesystem* branch, where the warehouse-root validator tried to
+    /// canonicalise it as a relative path and reported "path not accessible" —
+    /// an error about the local disk for a bucket that was fine.
+    #[test]
+    fn object_store_schemes_are_recognised_regardless_of_case() {
+        for uri in [
+            "s3://bucket/k", "S3://bucket/k", "S3A://bucket/k", "Gs://b/k",
+            "GCS://b/k", "AZ://b/k", "Azure://b/k", "ABFS://b/k", "AbFsS://b/k",
+        ] {
+            assert!(is_object_store_url(uri), "{uri} must be object storage");
+        }
+    }
+
+    /// Leading whitespace is tolerated because `LOCATION` values arrive
+    /// straight from SQL.
+    #[test]
+    fn leading_whitespace_does_not_hide_the_scheme() {
+        assert!(is_object_store_url("   s3://bucket/k"));
+    }
+
+    /// Everything else is a warehouse path and must stay on the local branch —
+    /// including schemes that merely *start* like a known one.
+    #[test]
+    fn non_object_store_locations_are_not_claimed() {
+        for uri in [
+            "/var/data/orders",
+            "orders/",
+            "file:///var/data",
+            "s3",
+            "s3:/bucket/k",
+            "s3x://bucket/k",
+            "https://example.com/x",
+            "",
+        ] {
+            assert!(!is_object_store_url(uri), "{uri} must not be object storage");
+        }
     }
 }

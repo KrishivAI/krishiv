@@ -373,3 +373,74 @@ fn referenced_tables_subquery_in_from() {
     let tables = referenced_table_names(sql).unwrap();
     assert!(tables.contains(&"raw_events".to_string()));
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Streaming-source registration lifecycle
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// `deregister_table` must clear the streaming-source registration too.
+///
+/// It used to drop the table from DataFusion and leave the name in
+/// `streaming_sources` with `has_streaming_sources` latched true, so a name
+/// re-registered as an ordinary batch table stayed classified as streaming —
+/// and `is_streaming_query` decides execution mode purely from that set. The
+/// sequence below is the one that matters: drop a streaming table, put a plain
+/// batch table back under the same name, then run a plain SELECT.
+#[tokio::test]
+async fn dropping_a_streaming_table_stops_it_being_a_streaming_source() {
+    let engine = krishiv_sql::SqlEngine::new();
+    engine
+        .register_streaming_source_name("events")
+        .expect("register");
+    assert!(engine.is_streaming_source("events"));
+    assert!(
+        engine
+            .is_streaming_query("SELECT * FROM events")
+            .expect("classify"),
+        "precondition: the name must classify as streaming while registered"
+    );
+
+    engine.deregister_table("events").expect("drop");
+
+    assert!(
+        !engine.is_streaming_source("events"),
+        "the streaming registration must not outlive the table"
+    );
+    assert!(
+        !engine
+            .is_streaming_query("SELECT * FROM events")
+            .expect("classify"),
+        "a re-created batch table under the same name would be routed down the \
+         streaming path"
+    );
+}
+
+/// The dedicated remover keeps working, and dropping one source must not
+/// declassify the others.
+#[tokio::test]
+async fn dropping_one_streaming_source_leaves_the_others_registered() {
+    let engine = krishiv_sql::SqlEngine::new();
+    engine.register_streaming_source_name("a").expect("a");
+    engine.register_streaming_source_name("b").expect("b");
+
+    engine.deregister_table("a").expect("drop a");
+
+    assert!(!engine.is_streaming_source("a"));
+    assert!(engine.is_streaming_source("b"));
+    assert!(
+        engine
+            .is_streaming_query("SELECT * FROM b")
+            .expect("classify"),
+        "the fast-path latch must stay armed while any source remains"
+    );
+}
+
+/// Dropping a name that was never registered is not an error, and must not
+/// disturb the latch.
+#[tokio::test]
+async fn dropping_an_unregistered_name_is_idempotent() {
+    let engine = krishiv_sql::SqlEngine::new();
+    engine.register_streaming_source_name("kept").expect("kept");
+    engine.deregister_table("never-registered").expect("drop");
+    assert!(engine.is_streaming_source("kept"));
+}

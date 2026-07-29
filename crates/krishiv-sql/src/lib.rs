@@ -1657,6 +1657,21 @@ impl SqlEngine {
     /// Drop a named table from the session context.
     ///
     /// Idempotent — dropping a name that was never registered is not an error.
+    ///
+    /// Also clears any streaming-source registration for `name`. This function
+    /// used to drop the table from DataFusion and leave the name in
+    /// `streaming_sources` forever, with `has_streaming_sources` latched true.
+    /// Two consequences, and the second is the bad one:
+    ///
+    /// * the set grew without bound for the life of the engine, and
+    /// * a name **re-registered as an ordinary batch table** stayed classified
+    ///   as streaming. `DROP TABLE events; CREATE TABLE events AS SELECT …`
+    ///   followed by a plain `SELECT` over `events` would be routed down the
+    ///   streaming path by [`is_streaming_query`], which decides execution mode
+    ///   purely from this set.
+    ///
+    /// `deregister_streaming_source` always did this cleanup; the two paths
+    /// simply disagreed, and the generic one is the one most callers reach for.
     pub fn deregister_table(&self, name: &str) -> SqlResult<()> {
         if name.trim().is_empty() {
             return Err(SqlError::EmptyTableName);
@@ -1665,7 +1680,21 @@ impl SqlEngine {
             .context
             .deregister_table(name)
             .map_err(SqlError::from)?;
-        self.invalidate_plan_cache();
+        {
+            let mut sources = self
+                .streaming_sources
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            sources.remove(name);
+            if sources.is_empty() {
+                self.has_streaming_sources.store(false, Ordering::Release);
+            }
+            // Invalidated under the write lock, as in
+            // `deregister_streaming_source`: otherwise there is a window where
+            // a concurrent `is_streaming_query` sees the name gone but still
+            // serves a stale cached plan built for the streaming shape (N5).
+            self.invalidate_plan_cache();
+        }
         Ok(())
     }
 
