@@ -327,19 +327,26 @@ impl ExecutorRuntime {
             .unwrap_or_default();
         let active_count = attempts.len() as u32;
 
-        // Drain streaming progress snapshots (GAP-OB-04). Runner tasks write
-        // into the buffer via ProgressBufferCallback; we drain here so each
-        // heartbeat reports the latest progress for every actively-streaming
-        // task.  The buffer is cleared after reading so stale entries from
-        // completed tasks do not accumulate.
-        let progress: Vec<krishiv_proto::StreamingProgressReport> =
-            if let Some(buf) = &self.config.progress_buffer {
-                let reports: Vec<_> = buf.iter().map(|e| e.value().clone()).collect();
-                buf.clear();
-                reports
-            } else {
-                Vec::new()
-            };
+        // Read streaming progress snapshots (GAP-OB-04). Runner tasks write
+        // into the buffer via ProgressBufferCallback; each heartbeat reports the
+        // latest progress for every actively-streaming task.
+        //
+        // Reading does NOT clear. This used to `buf.clear()` right here, which
+        // made *building* a request destroy state: if the heartbeat that
+        // followed then failed, those reports were gone — and a coordinator
+        // outage is exactly when every heartbeat fails and exactly when someone
+        // is watching the freshness numbers. It also meant any caller who built
+        // a request to inspect it silently drained the buffer.
+        //
+        // The buffer is cleared by [`clear_reported_progress`] once a heartbeat
+        // has actually been accepted, which is also what keeps entries from
+        // completed tasks from accumulating.
+        let progress: Vec<krishiv_proto::StreamingProgressReport> = self
+            .config
+            .progress_buffer
+            .as_ref()
+            .map(|buf| buf.iter().map(|e| e.value().clone()).collect())
+            .unwrap_or_default();
 
         let mut req = ExecutorHeartbeatRequest::new(
             self.config.executor_id.clone(),
@@ -372,15 +379,29 @@ impl ExecutorRuntime {
         req
     }
 
+    /// Drop the streaming progress snapshots a delivered heartbeat carried.
+    ///
+    /// Called only after the coordinator has the reports, so a failed heartbeat
+    /// leaves them for the next one. Reports written *during* the RPC are also
+    /// cleared, which is a much smaller window than the previous behaviour of
+    /// discarding on every failure — and the next heartbeat is moments away.
+    fn clear_reported_progress(&self) {
+        if let Some(buf) = &self.config.progress_buffer {
+            buf.clear();
+        }
+    }
+
     /// Send a heartbeat through a tonic-shaped coordinator service.
     pub async fn heartbeat_with(
         &self,
         service: &dyn CoordinatorExecutorService,
     ) -> Result<ExecutorHeartbeatResponse, tonic::Status> {
-        service
+        let response = service
             .executor_heartbeat(tonic::Request::new(self.heartbeat_request()))
             .await
-            .map(tonic::Response::into_inner)
+            .map(tonic::Response::into_inner)?;
+        self.clear_reported_progress();
+        Ok(response)
     }
 
     /// Build an intercepted coordinator gRPC client from the pooled client connection.
@@ -441,6 +462,7 @@ impl ExecutorRuntime {
         let mut client = self.connect_coordinator_client().await?;
         let request = wire::executor_heartbeat_request_to_wire(self.heartbeat_request());
         let response = client.executor_heartbeat(request).await?.into_inner();
+        self.clear_reported_progress();
         Ok(wire::executor_heartbeat_response_from_wire(response)?)
     }
 
@@ -476,6 +498,7 @@ impl ExecutorRuntime {
             ))
             .await?
             .into_inner();
+        self.clear_reported_progress();
         let heartbeat = wire::executor_heartbeat_response_from_wire(heartbeat)?;
         if heartbeat.disposition() == TransportDisposition::Accepted {
             self.apply_lease_generation(heartbeat.lease_generation());
@@ -798,30 +821,40 @@ pub async fn serve_executor_task_grpc_with_run_loop(
         .await
 }
 
-/// Read process RSS (resident set size) in bytes from `/proc/self/status`.
-/// Returns `None` if the file cannot be read or parsed (e.g. non-Linux).
-fn read_proc_rss_bytes() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
-            let kb: u64 = rest.trim().strip_suffix(" kB")?.trim().parse().ok()?;
-            return Some(kb * 1024);
+/// Pull a `kB`-suffixed value out of a `/proc` key/value file.
+///
+/// `/proc/self/status` and `/proc/meminfo` share this shape, and both parsers
+/// had their own copy of it. Split out so the parsing is testable without a
+/// `/proc` to read: these run on every heartbeat and their output is what an
+/// operator sees as an executor's memory, but nothing exercised them, because
+/// the file path was baked into the function.
+fn proc_kb_value(contents: &str, key: &str) -> Option<u64> {
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix(key) {
+            let rest = rest.trim();
+            // The unit is conventionally `kB` but the kernel has used `KB`, and
+            // a bare number is not worth discarding either.
+            let digits = rest
+                .strip_suffix("kB")
+                .or_else(|| rest.strip_suffix("KB"))
+                .unwrap_or(rest)
+                .trim();
+            return digits.parse::<u64>().ok().map(|kb| kb * 1024);
         }
     }
     None
 }
 
+/// Read process RSS (resident set size) in bytes from `/proc/self/status`.
+/// Returns `None` if the file cannot be read or parsed (e.g. non-Linux).
+fn read_proc_rss_bytes() -> Option<u64> {
+    proc_kb_value(&std::fs::read_to_string("/proc/self/status").ok()?, "VmRSS:")
+}
+
 /// Read total system memory in bytes from `/proc/meminfo`.
 /// Returns `None` if the file cannot be read or parsed.
 fn read_proc_mem_total_bytes() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let kb: u64 = rest.trim().strip_suffix(" kB")?.trim().parse().ok()?;
-            return Some(kb * 1024);
-        }
-    }
-    None
+    proc_kb_value(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal:")
 }
 
 /// Read the number of available CPU cores.
@@ -836,15 +869,39 @@ fn available_cpu_cores() -> u32 {
 /// Read total network bytes sent and received from `/proc/net/dev`.
 /// Returns `(sent, recv)` or `None` on non-Linux or parse failure.
 fn read_proc_net_bytes() -> Option<(u64, u64)> {
-    let dev = std::fs::read_to_string("/proc/net/dev").ok()?;
+    Some(parse_proc_net_dev(
+        &std::fs::read_to_string("/proc/net/dev").ok()?,
+    ))
+}
+
+/// Sum `(sent, recv)` bytes across real interfaces in `/proc/net/dev`.
+///
+/// Loopback is excluded. Every loopback byte is counted once as sent and once
+/// as received, so including `lo` both double-counts and reports traffic that
+/// never touched a wire — and an executor pod talks to its own sidecars and
+/// local services over loopback constantly. The number this feeds is the
+/// heartbeat's network counter, which exists to say how much of the cluster
+/// interconnect a node is using; loopback is exactly the traffic that does not.
+///
+/// Format after the two header lines:
+///
+/// ```text
+///     lo: 1234 10 0 0 0 0 0 0  1234 10 0 0 0 0 0 0
+///   eth0: <recv bytes> ... <8 recv fields> <sent bytes> ...
+/// ```
+///
+/// The interface name carries its colon, so `split_whitespace` puts recv bytes
+/// at index 1 and sent bytes at index 9.
+fn parse_proc_net_dev(contents: &str) -> (u64, u64) {
     let mut total_sent: u64 = 0;
     let mut total_recv: u64 = 0;
-    // Lines after the header look like:
-    //   "  eth0: 1234  ...  5678 ..."
-    // Fields: recv_bytes (col 1), sent_bytes (col 9)
-    for line in dev.lines().skip(2) {
+    for line in contents.lines().skip(2) {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 10 {
+            continue;
+        }
+        let name = parts.first().copied().unwrap_or("").trim_end_matches(':');
+        if name == "lo" {
             continue;
         }
         let recv: u64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -852,5 +909,81 @@ fn read_proc_net_bytes() -> Option<(u64, u64)> {
         total_recv = total_recv.saturating_add(recv);
         total_sent = total_sent.saturating_add(sent);
     }
-    Some((total_sent, total_recv))
+    (total_sent, total_recv)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod proc_parsing_tests {
+    use super::*;
+
+    /// Real `/proc/self/status` shape: tab-indented values, `kB` unit,
+    /// `VmRSS` sitting among many similarly-prefixed keys.
+    #[test]
+    fn rss_is_read_from_the_right_line_and_scaled_to_bytes() {
+        let status = "Name:\tkrishiv\nVmPeak:\t 9999999 kB\nVmSize:\t 8888888 kB\n\
+                      VmRSS:\t 4194304 kB\nVmData:\t 123 kB\n";
+        assert_eq!(proc_kb_value(status, "VmRSS:"), Some(4_194_304 * 1024));
+        assert_eq!(proc_kb_value(status, "VmPeak:"), Some(9_999_999 * 1024));
+    }
+
+    #[test]
+    fn meminfo_total_is_read_and_scaled() {
+        let meminfo = "MemTotal:       65805312 kB\nMemFree:         1234 kB\n";
+        assert_eq!(
+            proc_kb_value(meminfo, "MemTotal:"),
+            Some(65_805_312 * 1024)
+        );
+    }
+
+    /// A missing key, or a value that is not a number, must read as "unknown"
+    /// rather than as zero. The heartbeat omits the field when this is `None`;
+    /// reporting 0 bytes of RSS would look like a healthy idle executor.
+    #[test]
+    fn an_absent_or_unparseable_value_is_unknown_not_zero() {
+        assert_eq!(proc_kb_value("MemFree: 1 kB\n", "VmRSS:"), None);
+        assert_eq!(proc_kb_value("VmRSS:\t not-a-number kB\n", "VmRSS:"), None);
+    }
+
+    /// Loopback must not be counted.
+    ///
+    /// Every loopback byte appears once as sent and once as received, and an
+    /// executor pod uses loopback heavily, so including `lo` both double-counts
+    /// and reports traffic that never crossed the interconnect this counter
+    /// exists to measure.
+    #[test]
+    fn loopback_is_excluded_from_the_network_counters() {
+        let dev = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 1000000000 10 0 0 0 0 0 0 1000000000 10 0 0 0 0 0 0
+  eth0:       7000 20 0 0 0 0 0 0       3000 20 0 0 0 0 0 0
+";
+        assert_eq!(
+            parse_proc_net_dev(dev),
+            (3000, 7000),
+            "only eth0 should be counted, and (sent, recv) must not be swapped"
+        );
+    }
+
+    /// Several real interfaces sum; short or malformed lines are skipped
+    /// rather than poisoning the total.
+    #[test]
+    fn real_interfaces_sum_and_malformed_lines_are_skipped() {
+        let dev = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+  eth0: 100 1 0 0 0 0 0 0 200 1 0 0 0 0 0 0
+ truncated: 1 2 3
+  eth1: 300 1 0 0 0 0 0 0 400 1 0 0 0 0 0 0
+";
+        assert_eq!(parse_proc_net_dev(dev), (600, 400));
+    }
+
+    /// An empty or non-Linux file yields zeros, not a panic on `skip(2)`.
+    #[test]
+    fn an_empty_file_is_zero_not_a_panic() {
+        assert_eq!(parse_proc_net_dev(""), (0, 0));
+        assert_eq!(parse_proc_net_dev("only one line\n"), (0, 0));
+    }
 }
