@@ -677,16 +677,12 @@ impl ComputeEngine for StreamingEngine {
 /// `SourceReader` impls that haven't been instrumented yet.
 const STREAMING_IDLE_TICK_MS: u64 = 5;
 
-/// How often the continuous loop advances the watermark during source idle
-/// periods so session windows whose inactivity gap has elapsed can close.
-/// Configurable via `KRISHIV_IDLE_TICK_MS` (milliseconds, default 500).
-fn idle_tick_interval() -> std::time::Duration {
-    let ms = std::env::var("KRISHIV_IDLE_TICK_MS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(500);
-    std::time::Duration::from_millis(ms)
-}
+// The idle tick (`KRISHIV_IDLE_TICK_MS`) and the streaming profile
+// (`KRISHIV_STREAM_PROFILE`) come from `krishiv_common::streaming_dials`, so
+// the embedded loop and the distributed run-loop cannot disagree about what
+// they mean. Each crate used to carry its own copy — same default, same
+// `"throughput"` comparison, written out twice.
+use krishiv_common::streaming_dials::{StreamProfile, idle_tick_interval};
 
 /// Interval (milliseconds) between speculative early-fire emissions of
 /// currently-open tumbling windows. Set `KRISHIV_STREAM_EARLY_FIRE_MS=0`
@@ -729,33 +725,15 @@ const STREAMING_CHECKPOINT_EVERY: u32 = 4;
 /// - `throughput`: checkpoint less often (the per-epoch fsync stall is then
 ///   amortized over more work), trading a higher recovery-replay bound and a
 ///   larger latency tail for sustained rows/sec.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamProfile {
-    LowLatency,
-    Throughput,
-}
-
-impl StreamProfile {
-    /// Resolve from `KRISHIV_STREAM_PROFILE` (`throughput` ⇒ throughput,
-    /// anything else or unset ⇒ low-latency).
-    fn from_env() -> Self {
-        Self::parse(std::env::var("KRISHIV_STREAM_PROFILE").ok().as_deref())
-    }
-
-    /// Pure parse of the profile string, factored out for testability.
-    fn parse(raw: Option<&str>) -> Self {
-        match raw {
-            Some(s) if s.trim().eq_ignore_ascii_case("throughput") => Self::Throughput,
-            _ => Self::LowLatency,
-        }
-    }
-
-    /// Batches processed between checkpoints under this profile.
-    fn checkpoint_every(self) -> u32 {
-        match self {
-            Self::LowLatency => STREAMING_CHECKPOINT_EVERY,
-            Self::Throughput => STREAMING_CHECKPOINT_EVERY.saturating_mul(8),
-        }
+/// Batches processed between checkpoints under `profile`.
+///
+/// The profile itself lives in `krishiv_common::streaming_dials`; the cadence
+/// is engine-specific, so it stays here rather than being pushed into a crate
+/// that has no checkpoints.
+fn checkpoint_every(profile: StreamProfile) -> u32 {
+    match profile {
+        StreamProfile::LowLatency => STREAMING_CHECKPOINT_EVERY,
+        StreamProfile::Throughput => STREAMING_CHECKPOINT_EVERY.saturating_mul(8),
     }
 }
 
@@ -1148,7 +1126,7 @@ async fn run_streaming_continuous(
     // microseconds of new data instead of within `STREAMING_IDLE_TICK_MS = 5ms`.
     let idle_floor = std::time::Duration::from_micros(STREAMING_IDLE_FLOOR_US);
     // Resolve the latency-vs-throughput profile once for this job's lifetime.
-    let checkpoint_every = StreamProfile::from_env().checkpoint_every();
+    let checkpoint_every = checkpoint_every(StreamProfile::from_env());
     let mut batches_since_checkpoint = 0u32;
     // S-3: at most one background checkpoint I/O task in flight at a time.
     // Tracks the JoinHandle and the epoch number it is persisting. Epoch is
@@ -2055,12 +2033,12 @@ mod tests {
         // Low-latency checkpoints more often (shorter recovery replay); the
         // throughput profile amortizes the per-epoch fsync over more batches.
         assert_eq!(
-            StreamProfile::LowLatency.checkpoint_every(),
+            checkpoint_every(StreamProfile::LowLatency),
             STREAMING_CHECKPOINT_EVERY
         );
         assert!(
-            StreamProfile::Throughput.checkpoint_every()
-                > StreamProfile::LowLatency.checkpoint_every()
+            checkpoint_every(StreamProfile::Throughput)
+                > checkpoint_every(StreamProfile::LowLatency)
         );
     }
 

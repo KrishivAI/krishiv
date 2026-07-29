@@ -21,6 +21,7 @@ async-trait = { workspace = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
+krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
 krishiv-dataflow = { path = "../krishiv-dataflow", version = "0.1.0" }
 krishiv-delta = { path = "../krishiv-delta", version = "0.1.0" }
 krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.0" }

@@ -28,6 +28,7 @@ pub mod executor_capacity;
 pub mod hash;
 pub mod memory_budget;
 pub mod page_cache;
+pub mod streaming_dials;
 pub mod panic_util;
 pub mod partition;
 pub mod production;

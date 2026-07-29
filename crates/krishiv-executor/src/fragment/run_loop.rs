@@ -76,34 +76,15 @@ fn watermark_idleness() -> Duration {
     Duration::from_millis(ms)
 }
 
-/// ST-4 idle-tick interval (`KRISHIV_IDLE_TICK_MS`, default 500) — the same
-/// dial the embedded loop reads, now honored distributed.
-fn idle_tick_interval() -> Duration {
-    let ms = std::env::var("KRISHIV_IDLE_TICK_MS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(500);
-    Duration::from_millis(ms)
-}
-
-/// Batch/linger dial: how long the loop accumulates input before draining.
-/// `KRISHIV_STREAM_LINGER_MS` wins when set; otherwise `KRISHIV_STREAM_PROFILE`
-/// (`throughput` ⇒ 5 ms micro-batching, anything else ⇒ 0 = emit immediately).
-/// This carries the embedded `StreamProfile` dial into the distributed loop.
-fn stream_linger() -> Duration {
-    if let Some(ms) = std::env::var("KRISHIV_STREAM_LINGER_MS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-    {
-        return Duration::from_millis(ms);
-    }
-    let profile = std::env::var("KRISHIV_STREAM_PROFILE").unwrap_or_default();
-    if profile.trim().eq_ignore_ascii_case("throughput") {
-        Duration::from_millis(5)
-    } else {
-        Duration::ZERO
-    }
-}
+// ST-4 idle-tick interval and the batch/linger dial, shared verbatim with the
+// embedded loop.
+//
+// These used to be a second implementation of each — same defaults, same
+// `"throughput"` comparison, written out again. They agreed, but nothing made
+// them agree, and a dial that means one thing embedded and another distributed
+// is invisible: both engines run, both look configured, and only a side-by-side
+// benchmark shows it. See `krishiv_common::streaming_dials`.
+use krishiv_common::streaming_dials::{idle_tick_interval, stream_linger};
 
 /// Parsed identity of one `stream:rloop:` fragment.
 #[derive(Debug, Clone, PartialEq, Eq)]
