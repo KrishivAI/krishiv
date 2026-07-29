@@ -20,10 +20,8 @@ pub mod orphan;
 pub mod partitioner;
 pub mod path;
 pub mod push_shuffle;
-pub mod range_partitioner;
 pub mod shuffle_svc;
 pub mod sort_shuffle_writer;
-pub mod spillable;
 pub mod storage_uri;
 pub mod store;
 pub mod tiered_store;
@@ -62,10 +60,8 @@ pub use orphan::{
 pub use partitioner::HashPartitioner;
 pub use path::ShufflePath;
 pub use push_shuffle::PushShuffleStore;
-pub use range_partitioner::{RangeBound, RangePartitioner, RangeSampler};
 pub use shuffle_svc::SortShuffleIndex;
 pub use sort_shuffle_writer::{SortShuffleFiles, SortShuffleWriter};
-pub use spillable::SpillableShuffleBackend;
 pub use storage_uri::{open_shuffle_backend_from_uri, open_tiered_shuffle_backend};
 pub use store::{
     PartitionId, ShuffleBackend, ShuffleBatchStream, ShufflePartition, ShuffleStore, ShuffleStream,

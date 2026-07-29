@@ -89,7 +89,7 @@ impl InMemoryShuffleStore {
 
     /// Returns `true` if the partition is currently in memory (not spilled).
     ///
-    /// Synchronous: callers (e.g. `SpillableShuffleBackend`) can call this
+    /// Synchronous: callers can call this
     /// without `.await` to decide whether to release budget after a write.
     pub fn is_partition_in_memory(&self, id: &PartitionId) -> bool {
         let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
