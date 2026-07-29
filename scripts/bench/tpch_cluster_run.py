@@ -76,8 +76,13 @@ def _abridge(message: str, head: int = 120, tail: int = 320) -> str:
     return f"{message[:head]} …[{elided} chars elided]… {message[-tail:]}"
 
 
-def load_corpus(corpus_json: str | None) -> list[dict]:
+def load_corpus(corpus_json: str | None, scale: int = 100) -> list[dict]:
     """Return the 22-query corpus, from a file or by running the Rust binary.
+
+    `scale` is passed through to `tpch_corpus --scale-factor`: TPC-H Q11's
+    threshold is `0.0001 / SF`, so a corpus built at the wrong scale silently
+    turns q11 into a query that returns zero rows on every engine — which
+    cannot distinguish a correct engine from one that dropped every row.
 
     The cargo path is silent and can take many minutes on a cold target dir —
     it compiles the workspace in release. That cost a benchmark run: a
@@ -100,6 +105,7 @@ def load_corpus(corpus_json: str | None) -> list[dict]:
             [
                 "cargo", "run", "-q", "-p", "krishiv-bench",
                 "--bin", "tpch_corpus", "--release",
+                "--", "--scale-factor", str(scale),
             ],
             capture_output=True,
             text=True,
@@ -493,7 +499,7 @@ def main() -> int:
     _install_cancel_handlers()
 
     token = os.environ.get("KRISHIV_COORDINATOR_BEARER_TOKEN")
-    corpus = load_corpus(args.corpus_json)
+    corpus = load_corpus(args.corpus_json, args.scale)
     if args.only:
         # Order matters, so `wanted` is a LIST and the corpus is rebuilt in its
         # order. This used to be a set intersection, which silently kept the
