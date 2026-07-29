@@ -12,7 +12,6 @@ mod shuffle_tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use crate::local_store::LocalShuffleStore;
     use crate::{
         CompressionCodec, HashPartitioner, InMemoryShuffleStore, LocalDiskShuffleStore,
         PartitionId, PartitionState, ShuffleCompression, ShuffleError,
@@ -25,7 +24,6 @@ mod shuffle_tests {
     // ── ShufflePath ───────────────────────────────────────────────────────
 
     include!("sections/path_metadata.rs.inc");
-    include!("sections/local_store.rs.inc");
     include!("sections/compression.rs.inc");
     include!("sections/orphans.rs.inc");
     include!("sections/partitioner.rs.inc");

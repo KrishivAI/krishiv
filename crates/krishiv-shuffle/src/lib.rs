@@ -11,8 +11,6 @@ pub mod disk_store;
 pub mod error;
 pub mod flight;
 pub mod lease_persistence;
-#[cfg(test)]
-pub(crate) mod local_store;
 pub mod memory_store;
 pub mod metadata;
 pub mod object_store;

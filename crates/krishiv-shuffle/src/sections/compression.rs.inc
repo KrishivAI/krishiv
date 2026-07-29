@@ -5,20 +5,6 @@ fn compression_codec_default_is_none() {
     assert_eq!(CompressionCodec::default(), CompressionCodec::None);
 }
 
-#[test]
-fn local_store_default_compression_is_none() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = LocalShuffleStore::new(dir.path());
-    assert_eq!(store.compression(), CompressionCodec::None);
-}
-
-#[test]
-fn local_store_with_compression_lz4() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = LocalShuffleStore::new(dir.path()).with_compression(CompressionCodec::Lz4);
-    assert_eq!(store.compression(), CompressionCodec::Lz4);
-}
-
 // ── Compression round-trip tests ──────────────────────────────────────
 
 #[test]
@@ -45,60 +31,57 @@ fn compression_codec_zstd_round_trip() {
     assert_eq!(decompressed, data, "Zstd round-trip must be byte-exact");
 }
 
-#[tokio::test]
-async fn local_store_lz4_write_read_round_trip() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = LocalShuffleStore::new(dir.path()).with_compression(CompressionCodec::Lz4);
-    let path = ShufflePath::new("job-1", "stage-1", 0);
-    let data: Vec<u8> = (0u8..=255).cycle().take(512).collect();
-    store.write_partition(&path, &data).await.unwrap();
-    let read_back = store.read_partition(&path).await.unwrap();
-    assert_eq!(
-        read_back, data,
-        "LZ4 write/read round-trip must be byte-exact"
-    );
-}
-
-#[tokio::test]
-async fn local_store_zstd_write_read_round_trip() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = LocalShuffleStore::new(dir.path()).with_compression(CompressionCodec::Zstd);
-    let path = ShufflePath::new("job-1", "stage-1", 0);
-    let data: Vec<u8> = (0u8..=255).cycle().take(512).collect();
-    store.write_partition(&path, &data).await.unwrap();
-    let read_back = store.read_partition(&path).await.unwrap();
-    assert_eq!(
-        read_back, data,
-        "Zstd write/read round-trip must be byte-exact"
-    );
-}
-
-/// GAP-SH-02: Verify that the header codec byte governs decompression even
-/// when the reader store has a different codec configured.
+/// GAP-SH-02: the codec recorded in the file governs decompression, not the
+/// codec the *reader* happens to be configured with.
 ///
-/// Write a partition with `CompressionCodec::None` (header byte = 0x00),
-/// then read it back through a store configured with `CompressionCodec::Lz4`.
-/// The reader must use the None codec recorded in the header and return the
-/// original uncompressed bytes without corruption.
+/// This assertion previously ran against `LocalShuffleStore`, a byte-store with
+/// its own "KSH" magic-header format that no production path ever wrote or
+/// read — so the property was proven for a phantom format and left unproven for
+/// the two that ship. It is restated here against `LocalDiskShuffleStore`,
+/// where Parquet carries the codec in file metadata. (`compression.rs` proves
+/// the same for the object store's Arrow IPC, where the codec rides in each
+/// record-batch message.)
+///
+/// This is the property that makes the storage-compression default safe to
+/// change under partitions already on disk: a reader never has to be told.
 #[tokio::test]
-async fn shuffle_codec_header_mismatch_detected() {
+async fn the_codec_in_the_file_governs_the_read_not_the_readers_config() {
     let dir = tempfile::tempdir().unwrap();
-    let write_store =
-        LocalShuffleStore::new(dir.path()).with_compression(CompressionCodec::None);
-    let read_store = LocalShuffleStore::new(dir.path()).with_compression(CompressionCodec::Lz4);
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let values: Vec<i64> = (0..4_000).map(|i| i % 64).collect();
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))]).unwrap();
+    let id = PartitionId {
+        job_id: "job-codec-header".to_owned(),
+        stage_id: "s0".to_owned(),
+        partition: 0,
+    };
 
-    let path = ShufflePath::new("job-mismatch", "stage-0", 0);
-    let data: Vec<u8> = (0u8..=127).cycle().take(256).collect();
+    let writer = LocalDiskShuffleStore::new(dir.path())
+        .unwrap()
+        .with_compression(ShuffleCompression::Zstd);
+    writer
+        .write_partition(
+            ShufflePartition {
+                id: id.clone(),
+                schema: schema.clone(),
+                batches: vec![batch.clone()],
+            },
+            1,
+        )
+        .await
+        .unwrap();
 
-    // Write with None codec — header byte 0x00 is embedded in the file.
-    write_store.write_partition(&path, &data).await.unwrap();
+    // A reader configured for a *different* codec must still read it.
+    let reader = LocalDiskShuffleStore::new(dir.path())
+        .unwrap()
+        .with_compression(ShuffleCompression::None);
+    let read = reader.read_partition(&id).await.unwrap().unwrap();
 
-    // Read with a store configured for Lz4 — must use the header's None codec,
-    // not Lz4, and return the original bytes without error or corruption.
-    let read_back = read_store.read_partition(&path).await.unwrap();
+    let actual = arrow::compute::concat_batches(&read.schema, &read.batches).unwrap();
     assert_eq!(
-        read_back, data,
-        "read_partition must use the codec from the file header, not the store config"
+        actual.column(0),
+        batch.column(0),
+        "the reader must decode using the file's codec, not its own configuration"
     );
 }
-
