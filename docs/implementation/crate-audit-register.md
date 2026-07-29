@@ -273,6 +273,26 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
       field, so it could not catch this. `fetch_merged` also ended in
       `bytes.to_vec()`, a second full copy of a merged partition.
 
+- [x] **`heartbeat_request` cleared the progress buffer while *building*
+      the request** (`684d4863`). A heartbeat that then failed lost those
+      reports — and a coordinator outage is exactly when every heartbeat fails
+      and exactly when someone is watching freshness. Any caller who built a
+      request to inspect it also drained the buffer. Now cleared only after a
+      delivered heartbeat, on all three send paths.
+
+- [x] **The heartbeat's network counter summed loopback** (`684d4863`). Every
+      loopback byte is counted once as sent and once as received, and an
+      executor pod uses loopback constantly, so the number both double-counted
+      and reported traffic that never crossed the interconnect it exists to
+      measure.
+
+- [x] **The three `/proc` parsers had their file path baked in**, so nothing
+      could exercise them (`684d4863`) — they run on every heartbeat and their
+      output is what an operator sees as an executor's memory and network.
+      Split over `&str` and covered, including that a missing or unparseable
+      value reads as *unknown*, not zero: the heartbeat omits the field on
+      `None`, and a reported 0 bytes of RSS looks like a healthy idle executor.
+
 - [x] **`LocalParquetPartition` parsing had no tests** (`26267f9d`), including
       the duplicate-table-name refusal — a second partition with the same name
       would silently shadow the first in the session context, so the task would
