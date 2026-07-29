@@ -94,6 +94,20 @@ impl TableProvider for DeltaScanProvider {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&datafusion::logical_expr::Expr],
+    ) -> DfResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        // Inexact: the Parquet reader prunes row groups by statistics, which
+        // discards non-matching data but does not guarantee every surviving row
+        // matches. DataFusion keeps its own filter above, so this is a pure
+        // reduction in bytes read.
+        Ok(vec![
+            datafusion::logical_expr::TableProviderFilterPushDown::Inexact;
+            filters.len()
+        ])
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
@@ -101,17 +115,68 @@ impl TableProvider for DeltaScanProvider {
         filters: &[datafusion::logical_expr::Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let schema = self.schema();
-        let batches = self
-            .handle
-            .scan_batches()
-            .await
-            .map_err(|e| DataFusionError::External(e.to_string().into()))?;
+        // Scan the snapshot's Parquet files directly instead of reading the
+        // whole table into a `MemTable` first.
+        //
+        // The old path called `scan_batches()` — which decodes **every file of
+        // every column** — and only then handed the result to `MemTable::scan`
+        // for projection, filtering and limiting. So `SELECT one_col FROM t
+        // LIMIT 10` read the entire table, and a Delta table larger than the
+        // executor's memory could not be queried at all regardless of how
+        // selective the query was.
+        //
+        // A Delta snapshot *is* a list of Parquet files, so handing that list
+        // to DataFusion's own Parquet scan gives projection pushdown,
+        // statistics-based row-group pruning, the limit, and per-file
+        // parallelism — none of which a `MemTable` can offer.
+        let files = krishiv_connectors::lakehouse::list_table_data_files(
+            self.handle.path(),
+            self.handle.version().map(|v| v as u64),
+        )
+        .map_err(|e| DataFusionError::External(e.to_string().into()))?;
 
-        let table = MemTable::try_new(schema, vec![batches])?;
-        let plan = table.scan(state, projection, filters, limit).await?;
-        Ok(plan)
+        let table = parquet_files_table(files, self.schema())?;
+        table.scan(state, projection, filters, limit).await
     }
+}
+
+/// A `TableProvider` over an explicit list of local Parquet files.
+///
+/// An empty list becomes an empty `MemTable` rather than a `ListingTable`:
+/// `ListingTable` with no paths cannot infer anything and errors, and "this
+/// version of the table has no data files" is a legitimate state (an empty
+/// table, or every file removed by a delete) that must scan to zero rows
+/// instead of failing the query.
+fn parquet_files_table(
+    files: Vec<std::path::PathBuf>,
+    schema: SchemaRef,
+) -> DfResult<Arc<dyn TableProvider>> {
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
+    use datafusion::datasource::listing::{
+        ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+    };
+
+    // `file.exists()` mirrors `local_delta::read_table`, which skips missing
+    // files rather than failing: a concurrent vacuum can remove a file between
+    // listing and reading it.
+    let urls: Vec<ListingTableUrl> = files
+        .iter()
+        .filter(|file| file.exists())
+        .map(|file| ListingTableUrl::parse(file.to_string_lossy().as_ref()))
+        .collect::<DfResult<Vec<_>>>()?;
+    if urls.is_empty() {
+        return Ok(Arc::new(MemTable::try_new(schema, vec![vec![]])?));
+    }
+
+    let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+        .with_file_extension(".parquet");
+    let config = ListingTableConfig::new_with_multi_paths(urls)
+        .with_listing_options(options)
+        // The table's declared schema, not one inferred per file: the Delta log
+        // is the authority on the snapshot's schema, and inferring would also
+        // cost a metadata read per file on every scan.
+        .with_schema(schema);
+    Ok(Arc::new(ListingTable::try_new(config)?))
 }
 
 #[derive(Debug)]
@@ -130,6 +195,16 @@ impl TableProvider for HudiScanProvider {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&datafusion::logical_expr::Expr],
+    ) -> DfResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        Ok(vec![
+            datafusion::logical_expr::TableProviderFilterPushDown::Inexact;
+            filters.len()
+        ])
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
@@ -137,15 +212,27 @@ impl TableProvider for HudiScanProvider {
         filters: &[datafusion::logical_expr::Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        // Same blocking-I/O concern as `register_hudi_uri`: offload to the
-        // blocking pool instead of running filesystem/Parquet decode inline
-        // on the async DataFusion worker thread.
+        // Resolve the query's files and let DataFusion's Parquet scan read
+        // them, rather than `scan_batches()` decoding every row of every file
+        // into a `MemTable` before projection, filtering or the limit apply.
+        //
+        // `parquet_files()` was written for exactly this — its own doc says
+        // readers use it "to scan one file at a time instead of materializing
+        // the whole table" — and this was a caller that ignored it, the same
+        // way `schema()` did until it was fixed to read a footer instead of the
+        // table. Commit selection (snapshot vs incremental, `begin_instant`)
+        // still happens in the reader, so the file list is the query's, not the
+        // whole table's.
+        //
+        // Listing is filesystem I/O, so it keeps the `spawn_blocking` the
+        // decode used to need.
         let reader = self.reader.clone();
-        let batches = tokio::task::spawn_blocking(move || reader.scan_batches())
+        let files = tokio::task::spawn_blocking(move || reader.parquet_files())
             .await
             .map_err(|e| DataFusionError::External(format!("hudi scan task panicked: {e}").into()))?
             .map_err(|e| DataFusionError::External(e.to_string().into()))?;
-        let table = MemTable::try_new(Arc::clone(&self.schema), vec![batches])?;
+
+        let table = parquet_files_table(files, Arc::clone(&self.schema))?;
         table.scan(state, projection, filters, limit).await
     }
 }
@@ -244,6 +331,127 @@ mod tests {
 
     fn ctx() -> SessionContext {
         SessionContext::new()
+    }
+
+    /// Write a two-file Delta table of `Int64` rows 1..=6 and return its path.
+    ///
+    /// Two appends, so the table has two data files — which is what makes
+    /// "did the scan read everything?" an answerable question.
+    async fn two_file_delta_table(dir: &std::path::Path) -> String {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let path = dir.join("delta_tbl").to_string_lossy().into_owned();
+        for chunk in [[1i64, 2, 3], [4, 5, 6]] {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(chunk.to_vec())),
+                    Arc::new(Int64Array::from(chunk.iter().map(|v| v * 10).collect::<Vec<_>>())),
+                ],
+            )
+            .unwrap();
+            krishiv_connectors::lakehouse::write_delta(
+                path.clone(),
+                vec![batch],
+                krishiv_connectors::lakehouse::DeltaWriteMode::Append,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        path
+    }
+
+    /// A Delta scan must be a Parquet scan, not a full read into memory.
+    ///
+    /// `DeltaScanProvider::scan` used to call `scan_batches()` — decoding every
+    /// file and every column — and only then hand the result to
+    /// `MemTable::scan` for projection, filtering and limiting. So
+    /// `SELECT one_col LIMIT 1` read the whole table, and a Delta table larger
+    /// than memory could not be queried however selective the query was.
+    ///
+    /// Asserting on the physical plan is the point: the *answers* were correct
+    /// the whole time, so only the plan shows the difference.
+    #[tokio::test]
+    async fn a_delta_scan_reads_parquet_rather_than_draining_the_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = two_file_delta_table(dir.path()).await;
+        let ctx = ctx();
+        register_delta_uri(&ctx, "d", &path, None).await.unwrap();
+
+        let logical = ctx
+            .sql("SELECT a FROM d LIMIT 1")
+            .await
+            .unwrap()
+            .into_optimized_plan()
+            .unwrap();
+        let physical = ctx.state().create_physical_plan(&logical).await.unwrap();
+        let plan = format!(
+            "{}",
+            datafusion::physical_plan::displayable(physical.as_ref()).indent(false)
+        );
+
+        assert!(
+            plan.contains("DataSourceExec") && plan.to_lowercase().contains("parquet"),
+            "the scan must reach the Parquet files:\n{plan}"
+        );
+        assert!(
+            !plan.contains("MemorySourceConfig") && !plan.contains("MemoryExec"),
+            "the table must not be drained into memory first:\n{plan}"
+        );
+    }
+
+    /// The rewrite must not change any answer.
+    #[tokio::test]
+    async fn a_delta_scan_still_returns_every_row_and_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = two_file_delta_table(dir.path()).await;
+        let ctx = ctx();
+        register_delta_uri(&ctx, "d", &path, None).await.unwrap();
+
+        let batches = ctx
+            .sql("SELECT a, b FROM d ORDER BY a")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 6, "both files must be scanned");
+
+        let total = ctx
+            .sql("SELECT sum(a) AS s, sum(b) AS t FROM d")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let sum_a = datafusion::common::cast::as_int64_array(total[0].column(0)).unwrap();
+        let sum_b = datafusion::common::cast::as_int64_array(total[0].column(1)).unwrap();
+        assert_eq!(sum_a.value(0), 21, "1+2+3+4+5+6");
+        assert_eq!(sum_b.value(0), 210, "each b is 10x its a");
+    }
+
+    /// A snapshot with no data files scans to zero rows instead of failing.
+    ///
+    /// `ListingTable` cannot be built from an empty path list, and "no data
+    /// files" is a legitimate state — an empty table, or every file removed —
+    /// so the provider falls back to an empty in-memory table there.
+    #[tokio::test]
+    async fn an_empty_delta_snapshot_scans_to_zero_rows() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let table = parquet_files_table(Vec::new(), schema).unwrap();
+        let ctx = ctx();
+        ctx.register_table("empty", table).unwrap();
+        let batches = ctx.sql("SELECT * FROM empty").await.unwrap().collect().await.unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
     }
 
     /// No qualifiers, nothing to do — the common path must stay quiet.
