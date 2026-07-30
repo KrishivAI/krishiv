@@ -1,0 +1,67 @@
+{
+  "label": "gate-fast-4323814b",
+  "scale_factor": 100,
+  "coordinator": "http://213.199.60.184:31902",
+  "data_root": "s3://krishiv-bench/tpch/sf100",
+  "generated_at": "2026-07-29T23:22:47Z",
+  "succeeded": 5,
+  "attempted": 5,
+  "total_elapsed_s": 1173.6615355860267,
+  "queries": [
+    {
+      "id": "q2",
+      "name": "minimum_cost_supplier",
+      "job_id": "batch-sql-1785366193830-0",
+      "status": "ok",
+      "elapsed_s": 79.67109302800964,
+      "result_batches": 1,
+      "stage_count": 11,
+      "task_count": 181,
+      "distributed": true
+    },
+    {
+      "id": "q8",
+      "name": "national_market_share",
+      "job_id": "batch-sql-1785366273494-1",
+      "status": "ok",
+      "elapsed_s": 91.61280773099861,
+      "result_batches": 1,
+      "stage_count": 8,
+      "task_count": 127,
+      "distributed": true
+    },
+    {
+      "id": "q9",
+      "name": "product_type_profit_measure",
+      "job_id": "batch-sql-1785366365208-2",
+      "status": "ok",
+      "elapsed_s": 253.2411067400244,
+      "result_batches": 1,
+      "stage_count": 8,
+      "task_count": 127,
+      "distributed": true
+    },
+    {
+      "id": "q17",
+      "name": "small_quantity_order_revenue",
+      "job_id": "batch-sql-1785366618341-3",
+      "status": "ok",
+      "elapsed_s": 60.18375062700943,
+      "result_batches": 1,
+      "stage_count": 6,
+      "task_count": 91,
+      "distributed": true
+    },
+    {
+      "id": "q21",
+      "name": "suppliers_who_kept_orders_waiting",
+      "job_id": "batch-sql-1785366678527-4",
+      "status": "ok",
+      "elapsed_s": 688.9527774599846,
+      "result_batches": 1,
+      "stage_count": 10,
+      "task_count": 146,
+      "distributed": true
+    }
+  ]
+}

@@ -637,6 +637,13 @@ fn attach_shuffle_auth<T>(request: &mut Request<T>) -> io::Result<()> {
 pub const DEFAULT_FETCH_MAX_ATTEMPTS: u32 = 4;
 /// Default base delay between fetch retries; doubles per attempt.
 pub const DEFAULT_FETCH_RETRY_BASE_MS: u64 = 100;
+/// Default wall-clock grace for transport failures — long enough to outlast a
+/// container restart. See [`FetchRetryPolicy::transport_grace`].
+///
+/// 90 s is chosen against what it is racing: a pod restart on a node that
+/// already has the image takes ~10-30 s, and regenerating a producer stage
+/// costs minutes. Waiting is the cheap side of that trade by a wide margin.
+pub const DEFAULT_FETCH_TRANSPORT_GRACE_SECS: u64 = 90;
 /// Upper bound on a single retry backoff delay.
 const FETCH_RETRY_MAX_DELAY_MS: u64 = 5_000;
 
@@ -653,6 +660,30 @@ pub struct FetchRetryPolicy {
     pub max_attempts: u32,
     /// Backoff before retry `n` is `base_delay_ms * 2^(n-1)`, capped at 5 s.
     pub base_delay_ms: u64,
+    /// How long to keep retrying a **transport** failure before concluding the
+    /// producing executor is gone for good.
+    ///
+    /// # Why an attempt count is not enough
+    ///
+    /// `max_attempts` with a 100 ms base spends about **0.7 s** of backoff. An
+    /// executor that is OOM-killed and restarted is unreachable for **10-30 s**
+    /// — so the attempt budget expires while the pod is still coming back, the
+    /// fetch is misclassified as permanent data loss, and the scheduler
+    /// regenerates producers that did not need regenerating.
+    ///
+    /// That mistake is expensive out of all proportion. Measured on the 3-node
+    /// cluster (2026-07-30, job `batch-sql-...-9`): TPC-H q10's shuffle scratch
+    /// lives on a **hostPath** volume, so every partition file survived the
+    /// restart and the pod came back on the same node — yet five reduce tasks
+    /// declared `producer executor gone`, three recompute rounds followed, and
+    /// q10 took **2921 s** against a ~200 s clean run. The data was on disk the
+    /// whole time.
+    ///
+    /// A genuine `NotFound` from a *live* server is unaffected: it is not a
+    /// retryable error (see `is_retryable_fetch_error`), so a partition that
+    /// really is missing still fails on the first attempt and regenerates
+    /// immediately. This grace only covers "cannot reach the server at all".
+    pub transport_grace: std::time::Duration,
 }
 
 impl Default for FetchRetryPolicy {
@@ -660,6 +691,9 @@ impl Default for FetchRetryPolicy {
         Self {
             max_attempts: DEFAULT_FETCH_MAX_ATTEMPTS,
             base_delay_ms: DEFAULT_FETCH_RETRY_BASE_MS,
+            transport_grace: std::time::Duration::from_secs(
+                DEFAULT_FETCH_TRANSPORT_GRACE_SECS,
+            ),
         }
     }
 }
@@ -668,7 +702,15 @@ impl FetchRetryPolicy {
     /// Resolve a policy from raw env-var values. `None`, unparseable, and
     /// zero attempt counts fall back to the defaults; `base_delay_ms` of 0 is
     /// allowed (retry without sleeping, useful in tests).
-    pub fn resolve(raw_max_attempts: Option<&str>, raw_base_delay_ms: Option<&str>) -> Self {
+    ///
+    /// `raw_transport_grace_secs` of `0` disables the grace entirely, which
+    /// restores pure attempt-count behaviour — the only way to ask for the old
+    /// fail-fast semantics.
+    pub fn resolve(
+        raw_max_attempts: Option<&str>,
+        raw_base_delay_ms: Option<&str>,
+        raw_transport_grace_secs: Option<&str>,
+    ) -> Self {
         let max_attempts = raw_max_attempts
             .and_then(|s| s.trim().parse::<u32>().ok())
             .filter(|n| *n > 0)
@@ -676,14 +718,21 @@ impl FetchRetryPolicy {
         let base_delay_ms = raw_base_delay_ms
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(DEFAULT_FETCH_RETRY_BASE_MS);
+        let transport_grace = std::time::Duration::from_secs(
+            raw_transport_grace_secs
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(DEFAULT_FETCH_TRANSPORT_GRACE_SECS),
+        );
         Self {
             max_attempts,
             base_delay_ms,
+            transport_grace,
         }
     }
 
     /// Resolve the policy from `KRISHIV_SHUFFLE_FETCH_RETRIES` (total
-    /// attempts) and `KRISHIV_SHUFFLE_FETCH_RETRY_BASE_MS`.
+    /// attempts), `KRISHIV_SHUFFLE_FETCH_RETRY_BASE_MS` and
+    /// `KRISHIV_SHUFFLE_FETCH_TRANSPORT_GRACE_SECS`.
     pub fn from_env() -> Self {
         Self::resolve(
             std::env::var("KRISHIV_SHUFFLE_FETCH_RETRIES")
@@ -692,7 +741,22 @@ impl FetchRetryPolicy {
             std::env::var("KRISHIV_SHUFFLE_FETCH_RETRY_BASE_MS")
                 .ok()
                 .as_deref(),
+            std::env::var("KRISHIV_SHUFFLE_FETCH_TRANSPORT_GRACE_SECS")
+                .ok()
+                .as_deref(),
         )
+    }
+
+    /// A policy that gives up as soon as `max_attempts` is spent, with no
+    /// wall-clock grace. Tests that assert on exhaustion need this: inheriting
+    /// the production grace would make them sit for 90 s.
+    #[must_use]
+    pub fn without_transport_grace(max_attempts: u32, base_delay_ms: u64) -> Self {
+        Self {
+            max_attempts,
+            base_delay_ms,
+            transport_grace: std::time::Duration::ZERO,
+        }
     }
 
     /// Backoff delay before retrying after failed attempt number `attempt`
@@ -704,6 +768,16 @@ impl FetchRetryPolicy {
                 .saturating_mul(factor)
                 .min(FETCH_RETRY_MAX_DELAY_MS),
         )
+    }
+
+    /// Should a transport failure be retried again, given how long the fetch
+    /// has been going and how many attempts it has spent?
+    ///
+    /// Either budget being unspent is enough. The attempt count keeps the
+    /// common case (a brief blip) responsive; the wall clock is what survives a
+    /// producer restart, which no small attempt count can.
+    fn should_retry_transport(&self, attempt: u32, elapsed: std::time::Duration) -> bool {
+        attempt < self.max_attempts.max(1) || elapsed < self.transport_grace
     }
 }
 
@@ -883,7 +957,10 @@ impl FlightShuffleClient {
                     }
                     return Ok(batches);
                 }
-                Err(error) if attempt < max_attempts && is_retryable_fetch_error(&error) => {
+                Err(error)
+                    if is_retryable_fetch_error(&error)
+                        && policy.should_retry_transport(attempt, fetch_started.elapsed()) =>
+                {
                     let delay = policy.delay_after_attempt(attempt);
                     tracing::warn!(
                         endpoint = %endpoint,
@@ -892,6 +969,8 @@ impl FlightShuffleClient {
                         partition_id,
                         attempt,
                         max_attempts,
+                        elapsed_ms = fetch_started.elapsed().as_millis() as u64,
+                        grace_ms = policy.transport_grace.as_millis() as u64,
                         delay_ms = delay.as_millis() as u64,
                         error = %error,
                         "transient shuffle fetch failure; retrying"
@@ -924,8 +1003,9 @@ impl FlightShuffleClient {
                             io::ErrorKind::NotFound,
                             format!(
                                 "shuffle partition {job_id}/{stage_id}/{partition_id} \
-                                 unreachable after {max_attempts} attempts (producer \
-                                 executor gone): {error}"
+                                 unreachable after {attempt} attempts over {:.1}s \
+                                 (producer executor gone): {error}",
+                                fetch_started.elapsed().as_secs_f64()
                             ),
                         ));
                     }
@@ -1318,31 +1398,76 @@ mod tests {
     #[test]
     fn fetch_retry_policy_resolves_defaults_and_overrides() {
         assert_eq!(
-            FetchRetryPolicy::resolve(None, None),
+            FetchRetryPolicy::resolve(None, None, None),
             FetchRetryPolicy::default()
         );
         assert_eq!(
-            FetchRetryPolicy::resolve(Some("garbage"), Some("garbage")),
+            FetchRetryPolicy::resolve(Some("garbage"), Some("garbage"), Some("garbage")),
             FetchRetryPolicy::default()
         );
         // Zero attempts is meaningless; falls back to the default.
         assert_eq!(
-            FetchRetryPolicy::resolve(Some("0"), None).max_attempts,
+            FetchRetryPolicy::resolve(Some("0"), None, None).max_attempts,
             DEFAULT_FETCH_MAX_ATTEMPTS
         );
-        let policy = FetchRetryPolicy::resolve(Some("7"), Some("250"));
+        let policy = FetchRetryPolicy::resolve(Some("7"), Some("250"), Some("30"));
         assert_eq!(policy.max_attempts, 7);
         assert_eq!(policy.base_delay_ms, 250);
+        assert_eq!(policy.transport_grace, std::time::Duration::from_secs(30));
         // Zero base delay is allowed (retry without sleeping).
-        assert_eq!(FetchRetryPolicy::resolve(None, Some("0")).base_delay_ms, 0);
+        assert_eq!(
+            FetchRetryPolicy::resolve(None, Some("0"), None).base_delay_ms,
+            0
+        );
+        // Zero grace is the documented way to ask for pure attempt-count
+        // behaviour — the only escape hatch back to fail-fast.
+        assert_eq!(
+            FetchRetryPolicy::resolve(None, None, Some("0")).transport_grace,
+            std::time::Duration::ZERO
+        );
+    }
+
+    /// The grace must outlast a producer restart, and must not delay a
+    /// partition that is genuinely absent.
+    ///
+    /// This is the whole bug in one test. TPC-H q10 lost 40 minutes to a
+    /// transport failure that lasted seconds: the attempt budget (4 tries,
+    /// ~0.7 s of backoff) expired while an OOM-killed executor was restarting,
+    /// the fetch was reported as `producer executor gone`, and the scheduler
+    /// recomputed producers whose files were sitting on a hostPath volume the
+    /// whole time.
+    #[test]
+    fn transport_grace_outlasts_a_restart_but_not_a_missing_partition() {
+        let policy = FetchRetryPolicy::default();
+        // Attempts exhausted, but well inside the grace: keep waiting.
+        assert!(
+            policy.should_retry_transport(
+                policy.max_attempts,
+                std::time::Duration::from_secs(20)
+            ),
+            "a 20 s outage is a restart, not data loss"
+        );
+        // Past the grace with attempts exhausted: give up and regenerate.
+        assert!(
+            !policy.should_retry_transport(
+                policy.max_attempts,
+                policy.transport_grace + std::time::Duration::from_secs(1)
+            ),
+            "past the grace the producer really is gone"
+        );
+        // Attempts remaining always retries, however early.
+        assert!(policy.should_retry_transport(1, std::time::Duration::ZERO));
+        // A `NotFound` never reaches this function — it is not retryable — so a
+        // genuinely missing partition still fails on the first attempt.
+        assert!(!is_retryable_fetch_error(&io::Error::new(
+            io::ErrorKind::NotFound,
+            "gone"
+        )));
     }
 
     #[test]
     fn fetch_retry_backoff_doubles_and_caps() {
-        let policy = FetchRetryPolicy {
-            max_attempts: 10,
-            base_delay_ms: 100,
-        };
+        let policy = FetchRetryPolicy::without_transport_grace(10, 100);
         assert_eq!(policy.delay_after_attempt(1).as_millis(), 100);
         assert_eq!(policy.delay_after_attempt(2).as_millis(), 200);
         assert_eq!(policy.delay_after_attempt(3).as_millis(), 400);
@@ -1431,10 +1556,7 @@ mod tests {
             serve(addr, server_store).await
         });
 
-        let policy = FetchRetryPolicy {
-            max_attempts: 10,
-            base_delay_ms: 100,
-        };
+        let policy = FetchRetryPolicy::without_transport_grace(10, 100);
         let result =
             FlightShuffleClient::fetch_with_retry(addr.to_string(), "job-retry-1", "s0", 0, policy)
                 .await;
@@ -1457,10 +1579,7 @@ mod tests {
         let (local_addr, server_handle) = serve(addr, Arc::clone(&store)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let policy = FetchRetryPolicy {
-            max_attempts: 5,
-            base_delay_ms: 200,
-        };
+        let policy = FetchRetryPolicy::without_transport_grace(5, 200);
         let started = std::time::Instant::now();
         let result = FlightShuffleClient::fetch_with_retry(
             local_addr.to_string(),
@@ -1492,10 +1611,10 @@ mod tests {
         let dead_addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let policy = FetchRetryPolicy {
-            max_attempts: 3,
-            base_delay_ms: 0, // retry without sleeping
-        };
+        // No transport grace: this test asserts on *exhaustion*, and with the
+        // production 90 s grace it would sit for a minute and a half before
+        // getting there.
+        let policy = FetchRetryPolicy::without_transport_grace(3, 0);
         let result =
             FlightShuffleClient::fetch_with_retry(dead_addr.to_string(), "job", "s0", 0, policy)
                 .await;
@@ -1521,10 +1640,7 @@ mod tests {
         // attempt falls straight through to the terminal arm. It must STILL be
         // converted to NotFound (producer gone) rather than leaking the raw
         // ConnectionRefused, which would trigger no shuffle regeneration.
-        let policy = FetchRetryPolicy {
-            max_attempts: 1,
-            base_delay_ms: 0,
-        };
+        let policy = FetchRetryPolicy::without_transport_grace(1, 0);
         let result =
             FlightShuffleClient::fetch_with_retry(dead_addr.to_string(), "j", "s0", 0, policy)
                 .await;
