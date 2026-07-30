@@ -954,6 +954,48 @@ pub fn clear_channel_pool() {
     CHANNEL_POOL.clear();
 }
 
+/// A stream that charges `shuffle_read_time_us` when it is dropped.
+///
+/// A streaming fetch has no single point at which "the fragment has arrived", so
+/// the elapsed time is closed out on drop. That covers both a stream run to
+/// completion and one abandoned part-way — the time was spent either way, and
+/// attributing only completed fragments would understate the cost of exactly the
+/// reads that went wrong.
+struct ReadTimedStream<S> {
+    inner: S,
+    started: std::time::Instant,
+}
+
+impl<S> Drop for ReadTimedStream<S> {
+    fn drop(&mut self) {
+        krishiv_metrics::global_metrics()
+            .add_shuffle_read_time_us(self.started.elapsed().as_micros() as u64);
+    }
+}
+
+impl<S: futures::Stream + Unpin> futures::Stream for ReadTimedStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+/// `.with_read_timer(started)` on any fragment stream.
+trait WithReadTimer: Sized {
+    fn with_read_timer(self, started: std::time::Instant) -> ReadTimedStream<Self> {
+        ReadTimedStream {
+            inner: self,
+            started,
+        }
+    }
+}
+
+impl<S: futures::Stream> WithReadTimer for S {}
+
 /// Client for fetching shuffle partitions over Arrow Flight.
 pub struct FlightShuffleClient;
 
@@ -1074,14 +1116,25 @@ impl FlightShuffleClient {
                         krishiv_metrics::global_metrics().add_shuffle_remote_blocks_fetched(1);
                     }
                     // Count rows and bytes as they flow past, rather than
-                    // summing a `Vec` that no longer exists.
-                    return Ok(stream.inspect(|batch| {
-                        if let Ok(batch) = batch {
-                            let metrics = krishiv_metrics::global_metrics();
-                            metrics.add_shuffle_read_bytes(batch.get_array_memory_size() as u64);
-                            metrics.add_shuffle_read_records(batch.num_rows() as u64);
-                        }
-                    }));
+                    // summing a `Vec` that no longer exists, and charge the read
+                    // time when the fragment finishes rather than when it opens.
+                    //
+                    // `add_shuffle_read_time_us` used to be recorded by
+                    // `fetch_with_retry` on collect, which was also the moment
+                    // the whole fragment had arrived. A streaming fetch has no
+                    // such moment inside the function, so the timer is closed by
+                    // `ReadTimerOnDrop` — which covers a stream run to
+                    // completion *and* one abandoned part-way, where the elapsed
+                    // time was spent either way.
+                    return Ok(stream
+                        .inspect(|batch| {
+                            if let Ok(batch) = batch {
+                                let metrics = krishiv_metrics::global_metrics();
+                                metrics.add_shuffle_read_bytes(batch.get_array_memory_size() as u64);
+                                metrics.add_shuffle_read_records(batch.num_rows() as u64);
+                            }
+                        })
+                        .with_read_timer(fetch_started));
                 }
                 Err(error)
                     if is_retryable_fetch_error(&error)
