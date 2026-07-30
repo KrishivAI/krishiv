@@ -670,6 +670,17 @@ pub struct LiveJobView {
     running_task_count: usize,
     succeeded_task_count: usize,
     failed_task_count: usize,
+    /// Bytes this job has committed to the shuffle store so far.
+    ///
+    /// The coordinator has always tracked this (`JobSnapshot`), but no endpoint
+    /// returned it, so the only way to ask "is this query slow because it is
+    /// moving too much data?" was to read per-pod network counters and subtract
+    /// object-store traffic by guessing. On a cluster whose pod network is the
+    /// binding constraint that is the first question worth asking, and it was
+    /// the one number not available.
+    shuffle_bytes_written: u64,
+    /// Shuffle partitions currently marked Available for this job.
+    shuffle_partitions_available: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -701,6 +712,8 @@ fn live_job_view(job: crate::JobSnapshot) -> LiveJobView {
         running_task_count: job.running_task_count(),
         succeeded_task_count: job.succeeded_task_count(),
         failed_task_count: job.failed_task_count(),
+        shuffle_bytes_written: job.shuffle_bytes_written(),
+        shuffle_partitions_available: job.shuffle_partitions_available(),
     }
 }
 
