@@ -60,6 +60,9 @@ pub use path::ShufflePath;
 pub use push_shuffle::PushShuffleStore;
 pub use shuffle_svc::SortShuffleIndex;
 pub use sort_shuffle_writer::{SortShuffleFiles, SortShuffleWriter};
+
+pub mod partition_size;
+pub use partition_size::{logical_batch_bytes, logical_partition_bytes};
 pub use storage_uri::{open_shuffle_backend_from_uri, open_tiered_shuffle_backend};
 pub use store::{
     PartitionId, ShuffleBackend, ShuffleBatchStream, ShufflePartition, ShuffleStore, ShuffleStream,

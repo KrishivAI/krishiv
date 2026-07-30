@@ -770,10 +770,11 @@ async fn execute_shuffle_write_fragment(
         let schema = observed_schema
             .clone()
             .unwrap_or_else(|| output_schema.clone());
-        let size_bytes: u64 = part_batches
-            .iter()
-            .map(|b| b.get_array_memory_size() as u64)
-            .sum();
+        // Not `get_array_memory_size()`: `take` on a Utf8View column leaves
+        // every partition pointing at the SAME shared data buffers, so that
+        // charges each one the whole buffer — measured 38.32x over 47 buckets.
+        // AQE sizes reduce parallelism from this number.
+        let size_bytes: u64 = krishiv_shuffle::logical_partition_bytes(&part_batches);
         let rows_written: u64 = part_batches.iter().map(|b| b.num_rows() as u64).sum();
 
         // DB-3: coalesce sub-batches into well-sized batches before writing to
@@ -1371,10 +1372,11 @@ async fn execute_inmem_shuffle_write(
         let schema = observed_schema
             .clone()
             .unwrap_or_else(|| output_schema.clone());
-        let size_bytes: u64 = part_batches
-            .iter()
-            .map(|b| b.get_array_memory_size() as u64)
-            .sum();
+        // Not `get_array_memory_size()`: `take` on a Utf8View column leaves
+        // every partition pointing at the SAME shared data buffers, so that
+        // charges each one the whole buffer — measured 38.32x over 47 buckets.
+        // AQE sizes reduce parallelism from this number.
+        let size_bytes: u64 = krishiv_shuffle::logical_partition_bytes(&part_batches);
         let part_batches =
             super::shuffle_write_buffer::coalesce_shuffle_batches(part_batches, &schema);
         let partition = ShufflePartition {

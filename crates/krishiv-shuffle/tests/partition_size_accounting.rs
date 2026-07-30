@@ -62,14 +62,22 @@ fn utf8view_partitions_each_report_the_whole_shared_data_buffer() {
     let rows = 10_000;
     let buckets = 47;
     let batch = customer_shaped_view_batch(rows);
-    let whole = batch.get_array_memory_size();
+    let whole = krishiv_shuffle::logical_batch_bytes(&batch);
 
     let parts = HashPartitioner::new("c_custkey", buckets)
         .partition(&batch)
         .expect("partition");
-    let summed: usize = parts.iter().map(RecordBatch::get_array_memory_size).sum();
+    let arrow_summed: usize = parts.iter().map(RecordBatch::get_array_memory_size).sum();
+    let summed: usize = parts
+        .iter()
+        .map(krishiv_shuffle::logical_batch_bytes)
+        .sum();
     let ratio = summed as f64 / whole as f64;
-    println!("UTF8VIEW whole={whole} summed={summed} ratio={ratio:.2}x over {buckets} buckets");
+    println!(
+        "UTF8VIEW whole={whole} arrow_summed={arrow_summed} ({:.2}x) fixed_summed={summed} \
+         ({ratio:.2}x) over {buckets} buckets",
+        arrow_summed as f64 / whole as f64
+    );
 
     assert!(
         ratio < 3.0,
