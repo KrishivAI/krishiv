@@ -48,6 +48,8 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::scalar_subquery::{ScalarSubqueryExec, ScalarSubqueryLink};
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties as _, Partitioning,
@@ -2207,6 +2209,17 @@ fn exchange_reuse_key(
     )
 }
 
+/// Largest `fetch` for which a `SortPreservingMergeExec` is worth turning into
+/// a gather + re-sort.
+///
+/// Cutting the merge buys distribution of everything beneath it, and costs
+/// buffering `partitions x fetch` rows in the stage that re-sorts them. At
+/// TPC-H's fetches (10-100) over 18 partitions that is under two thousand
+/// rows. A very large `LIMIT` inverts the trade: the merge would stream, the
+/// replacement would buffer, and the subtree below is usually cheap anyway —
+/// so those keep the streaming k-way merge they were planned with.
+const MAX_GATHERED_SORT_FETCH: usize = 10_000;
+
 fn cut_exchanges(
     plan: Arc<dyn ExecutionPlan>,
     stages: &mut Vec<StageDraft>,
@@ -2311,6 +2324,74 @@ fn cut_exchanges(
         return Ok(Arc::new(
             ShuffleReadExec::new(stage_index, map_task_count, 1, schema, None)
                 .with_upstream_estimate(estimate.0, estimate.1),
+        ));
+    }
+
+    // A `SortPreservingMergeExec` with a fetch is a **bounded** gather, and not
+    // cutting it is what leaves the whole query's real work in a one-task stage.
+    //
+    // TPC-H q3 at SF100, measured 2026-07-30: the plan is
+    //
+    //   SortPreservingMerge(fetch=10)          <- 1 partition
+    //     SortExec TopK(fetch=10)              <- 18 partitions
+    //       Aggregate(SinglePartitioned)       <- 18 partitions
+    //         HashJoin(Partitioned)            <- 18 partitions
+    //           ShuffleRead(stage 1) / ShuffleRead(stage 2)
+    //
+    // The only exchanges are the two `RepartitionExec`s *below* the join, so
+    // everything above them became one stage — and because the merge outputs a
+    // single partition, that stage got exactly **one task**. One executor then
+    // ran the entire 18-partition join and aggregate by itself and pulled both
+    // shuffles (13.2 GB) across an ~11 MiB/s pod network
+    // ([[bench-storage-longhorn-bottleneck]]): 13.2 GB / 11 MiB/s is ~20
+    // minutes, which is exactly what the live run showed, with 8 of 9 slots
+    // idle throughout.
+    //
+    // Cutting here puts the join, the aggregate and the per-partition TopK in a
+    // real 18-task stage; only each partition's `fetch` rows cross the wire.
+    //
+    // **Only when `fetch` is set.** `SortPreservingMerge` streams a k-way merge
+    // of already-sorted inputs; the replacement is a blocking `SortExec`, which
+    // buffers what it gathers. With a fetch that is bounded by
+    // `partitions x fetch` (180 rows at q3's shape) and the sort is trivial.
+    // Without one it would buffer the entire result to re-sort rows that were
+    // already sorted — trading a distribution win for an unbounded memory
+    // liability, so those merges are left exactly as they are.
+    if let Some(merge) = plan.downcast_ref::<SortPreservingMergeExec>()
+        && let Some(fetch) = merge.fetch()
+        && fetch <= MAX_GATHERED_SORT_FETCH
+    {
+        let input = cut_exchanges(Arc::clone(merge.input()), stages)?;
+        let map_task_count = input.output_partitioning().partition_count();
+        if map_task_count <= 1 {
+            // Already a single stream: a stage boundary here would add a
+            // shuffle round trip and buy no parallelism.
+            return plan
+                .with_new_children(vec![input])
+                .map_err(|e| Unsupported(format!("sort-merge gather rewrite: {e}")));
+        }
+        let schema = input.schema();
+        let estimate = ShuffleReadExec::estimate_of(&input);
+        let stage_index = stages.len();
+        stages.push(StageDraft {
+            plan: input,
+            shuffle: Some(StageShuffleOutput {
+                key_columns: Vec::new(),
+                num_output_partitions: 1,
+            }),
+            subqueries: None,
+        });
+        let read = Arc::new(
+            ShuffleReadExec::new(stage_index, map_task_count, 1, schema, None)
+                .with_upstream_estimate(estimate.0, estimate.1),
+        );
+        // The gather loses the cross-partition ordering the merge guaranteed,
+        // so re-establish it. Sorting the gathered rows is equivalent: each
+        // upstream partition already emitted its own sorted top-`fetch`, so a
+        // sort with the same expressions and the same fetch yields the same
+        // global top-`fetch` rows in the same order.
+        return Ok(Arc::new(
+            SortExec::new(merge.expr().clone(), read).with_fetch(Some(fetch)),
         ));
     }
 
