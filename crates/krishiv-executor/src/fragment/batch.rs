@@ -897,29 +897,6 @@ struct InmemDfplanShuffleReader {
     local_partitions: std::collections::HashSet<(String, u32)>,
 }
 
-/// A fragment stream that holds its shuffle-fetch permit until it is dropped.
-///
-/// The executor-wide `SHUFFLE_FETCH_SEMAPHORE` exists to bound how many shuffle
-/// fetches are decoding into memory at once. Now that a fetch *streams*, the
-/// bytes arrive while the stream is consumed, not while the `open` future is
-/// awaited — so a permit released when `open` returns would bound the number of
-/// concurrent handshakes and nothing that costs memory.
-struct PermitHeldStream {
-    inner: ShuffleFragmentStream,
-    _permit: tokio::sync::OwnedSemaphorePermit,
-}
-
-impl futures::Stream for PermitHeldStream {
-    type Item = Result<arrow::record_batch::RecordBatch, String>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        self.get_mut().inner.as_mut().poll_next(cx)
-    }
-}
-
 // Manual impl: `ShuffleBackend` itself does not derive Debug.
 impl std::fmt::Debug for InmemDfplanShuffleReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -953,14 +930,30 @@ impl krishiv_sql::distributed_plan::ShufflePartitionReader for InmemDfplanShuffl
             let endpoint = endpoint.clone();
             let job_id = self.job_id.clone();
             return Box::pin(async move {
-                // The permit must outlive the *stream*, not just the open: what
-                // it bounds is bytes in flight across the process, and those
-                // arrive while the stream is being consumed. Acquired owned and
-                // moved into the stream below for exactly that reason —
-                // releasing it here would cap the number of concurrent `open`
-                // calls, which costs nothing and bounds nothing.
-                let permit = std::sync::Arc::clone(&super::common::SHUFFLE_FETCH_SEMAPHORE)
-                    .acquire_owned()
+                // The permit covers the *open*, and is released when this future
+                // returns — deliberately NOT held for the stream's lifetime.
+                //
+                // Holding it for the stream deadlocks. `ShuffleReadExec` opens
+                // several fragments ahead (`buffered`) and consumes them in
+                // order, so an open-but-unconsumed stream would keep its permit
+                // until downstream consumption reached it. A plan with two
+                // shuffle reads feeding an operator that interleaves its inputs
+                // then hangs: side A opens enough fragments to take every permit,
+                // side B blocks forever waiting for one, and A's permits are only
+                // released by consumption that is now blocked on B. The
+                // collecting fetch this replaced could not deadlock, because its
+                // permit scope ended when the fetch returned regardless of what
+                // the consumer did.
+                //
+                // The looser bound is also sufficient now. What the semaphore was
+                // protecting against was concurrent *materialisation* — each
+                // fetch used to build a whole fragment in memory. A streaming
+                // fetch's open-but-unconsumed cost is an HTTP/2 flow-control
+                // window, tens of kilobytes, so resident bytes no longer scale
+                // with the number of open streams. A bound that can deadlock is
+                // worse than a bound that is merely loose.
+                let permit = super::common::SHUFFLE_FETCH_SEMAPHORE
+                    .acquire()
                     .await
                     .map_err(|_| String::from("shuffle fetch semaphore closed"))?;
                 let stream = krishiv_shuffle::flight::FlightShuffleClient::open_with_retry(
@@ -991,11 +984,9 @@ impl krishiv_sql::distributed_plan::ShufflePartitionReader for InmemDfplanShuffl
                         )
                     }
                 })?;
-                let held = PermitHeldStream {
-                    inner: Box::pin(stream.map(|b| b.map_err(|e| e.to_string()))),
-                    _permit: permit,
-                };
-                Ok(Box::pin(held) as ShuffleFragmentStream)
+                drop(permit);
+                Ok(Box::pin(stream.map(|b| b.map_err(|e| e.to_string())))
+                    as ShuffleFragmentStream)
             });
         }
 
@@ -2365,6 +2356,103 @@ mod tests {
     fn shuffle_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7, 8, 9]))]).unwrap()
+    }
+
+    /// More fragments may be OPEN at once than the executor-wide fetch
+    /// semaphore has permits.
+    ///
+    /// This pins the fix for a deadlock introduced when the read path started
+    /// streaming. `ShuffleReadExec` opens several fragments ahead and consumes
+    /// them in order, so if a permit were held for the *stream's* lifetime an
+    /// open-but-unconsumed fragment would keep it until downstream consumption
+    /// reached it. A plan with two shuffle reads feeding an operator that
+    /// interleaves its inputs then hangs forever: side A takes every permit,
+    /// side B blocks waiting for one, and A's permits are only released by
+    /// consumption that is now blocked on B.
+    ///
+    /// The semaphore here is deliberately smaller than the number of fragments
+    /// opened, which is the condition that would hang. If this test ever times
+    /// out, someone has re-tied the permit to the stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::unwrap_used)]
+    async fn more_fragments_can_be_open_than_the_fetch_semaphore_has_permits() {
+        use futures::TryStreamExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let remote_store = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+        let batch = shuffle_batch();
+        // Four map tasks, each with partition 0 written.
+        let map_tasks = 4usize;
+        for map_task in 0..map_tasks {
+            let id = PartitionId {
+                job_id: "job-permit".to_owned(),
+                stage_id: shuffle_stage_key(0, map_task),
+                partition: 0,
+            };
+            remote_store
+                .register_partition_lease(id.clone(), 1)
+                .await
+                .unwrap();
+            remote_store
+                .write_partition(
+                    ShufflePartition {
+                        id,
+                        schema: batch.schema(),
+                        batches: vec![batch.clone()],
+                    },
+                    1,
+                )
+                .await
+                .unwrap();
+        }
+        let (addr, server) = krishiv_shuffle::flight::serve(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&remote_store),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let endpoint = format!("127.0.0.1:{}", addr.port());
+        let reader = InmemDfplanShuffleReader {
+            store: Arc::new(ShuffleBackend::InMemory(Arc::new(
+                InMemoryShuffleStore::new(),
+            ))),
+            job_id: "job-permit".to_owned(),
+            remote_endpoints: (0..map_tasks)
+                .map(|m| ((shuffle_stage_key(0, m), 0u32), endpoint.clone()))
+                .collect(),
+            local_partitions: std::collections::HashSet::new(),
+        };
+
+        // Open every fragment BEFORE consuming any of them. With a permit held
+        // for the stream's lifetime this is the deadlock: the semaphore's
+        // default is 8, but the shape is what matters, so hold all four open at
+        // once and only then drain them.
+        let mut opened = Vec::new();
+        for map_task in 0..map_tasks {
+            opened.push(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    reader.open_partition(0, map_task, 0),
+                )
+                .await
+                .expect("opening a fragment must not block on unconsumed streams")
+                .unwrap(),
+            );
+        }
+        let mut rows = 0usize;
+        for stream in opened {
+            let batches: Vec<RecordBatch> = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                stream.try_collect(),
+            )
+            .await
+            .expect("draining an opened fragment must not block")
+            .unwrap();
+            rows += batches.iter().map(|b| b.num_rows()).sum::<usize>();
+        }
+        assert_eq!(rows, map_tasks * 3, "every opened fragment must deliver its rows");
+        server.abort();
     }
 
     /// Leg 3 residual: partitions whose map task ran on another executor
