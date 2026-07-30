@@ -124,36 +124,48 @@ impl SortShuffleWriter {
     pub fn new(
         job_id: impl Into<String>,
         stage_id: impl Into<String>,
-        key_column: impl Into<String>,
-        partition_count: u32,
+        partitioner: HashPartitioner,
+        sort_key: impl Into<String>,
         output_dir: impl AsRef<Path>,
     ) -> ShuffleResult<Self> {
         Self::new_with_spill_threshold(
             job_id,
             stage_id,
-            key_column,
-            partition_count,
+            partitioner,
+            sort_key,
             output_dir,
             spill_threshold_from_env(),
         )
     }
 
     /// Create a writer with an explicit `spill_threshold_bytes`.
+    ///
+    /// Takes the caller's [`HashPartitioner`] rather than building one, because
+    /// building one here silently produced a *different* partitioning than the
+    /// store path it runs alongside. This writer feeds the ESS index while the
+    /// same map task also writes the shuffle store; when the two disagree about
+    /// which partition a row belongs to, a reduce task reading one of them sees
+    /// rows for its key placed elsewhere — a wrong answer with no error.
+    ///
+    /// It diverged on both axes: the store path seeds from the job id
+    /// (`with_seed`) while this defaulted to seed 0, and the store path hashes
+    /// every declared key column while this hashed only the sort key. Neither is
+    /// expressible now — there is one partitioner and both writers share it.
     pub fn new_with_spill_threshold(
         job_id: impl Into<String>,
         stage_id: impl Into<String>,
-        key_column: impl Into<String>,
-        partition_count: u32,
+        partitioner: HashPartitioner,
+        sort_key: impl Into<String>,
         output_dir: impl AsRef<Path>,
         spill_threshold_bytes: u64,
     ) -> ShuffleResult<Self> {
+        let partition_count = partitioner.partition_count();
         if partition_count == 0 {
             return Err(ShuffleError::InvalidPartitionCount {
                 buckets: partition_count,
             });
         }
-        let sort_key = key_column.into();
-        let partitioner = HashPartitioner::new(sort_key.clone(), partition_count);
+        let sort_key = sort_key.into();
         let output_dir = output_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&output_dir).map_err(|e| {
             io_err(format!(
@@ -510,7 +522,9 @@ mod tests {
     #[test]
     fn sort_shuffle_writer_roundtrip_offsets() {
         let dir = tempfile::tempdir().unwrap();
-        let mut writer = SortShuffleWriter::new("job1", "stage1", "k", 4, dir.path()).unwrap();
+        let mut writer =
+            SortShuffleWriter::new("job1", "stage1", HashPartitioner::new("k", 4), "k", dir.path())
+                .unwrap();
 
         // Push rows across two batches so the concat+sort path is exercised.
         writer.push(make_batch(&[8, 1, 3, 0])).unwrap();
@@ -543,7 +557,9 @@ mod tests {
     #[test]
     fn sort_shuffle_writer_empty_push() {
         let dir = tempfile::tempdir().unwrap();
-        let mut writer = SortShuffleWriter::new("job2", "stage1", "k", 2, dir.path()).unwrap();
+        let mut writer =
+            SortShuffleWriter::new("job2", "stage1", HashPartitioner::new("k", 2), "k", dir.path())
+                .unwrap();
         // No rows pushed — flush should still produce valid (empty) files.
         writer.push(make_batch(&[])).unwrap();
         let files = writer.flush().unwrap();
@@ -556,7 +572,9 @@ mod tests {
     #[test]
     fn sort_shuffle_writer_rejects_zero_partitions() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(SortShuffleWriter::new("j", "s", "k", 0, dir.path()).is_err());
+        assert!(
+            SortShuffleWriter::new("j", "s", HashPartitioner::new("k", 0), "k", dir.path()).is_err()
+        );
     }
 
     #[test]
@@ -585,7 +603,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let threshold = 4096u64;
         let mut writer = SortShuffleWriter::new_with_spill_threshold(
-            "job-bound", "stage1", "k", 16, dir.path(), threshold,
+            "job-bound",
+            "stage1",
+            HashPartitioner::new("k", 16),
+            "k",
+            dir.path(),
+            threshold,
         )
         .unwrap();
 
@@ -631,12 +654,26 @@ mod tests {
     fn two_tasks_of_one_stage_overwrite_each_others_output() {
         let dir = tempfile::tempdir().unwrap();
 
-        let mut task_a = SortShuffleWriter::new("job-x", "stage-0", "k", 2, dir.path()).unwrap();
+        let mut task_a = SortShuffleWriter::new(
+            "job-x",
+            "stage-0",
+            HashPartitioner::new("k", 2),
+            "k",
+            dir.path(),
+        )
+        .unwrap();
         task_a.push(make_batch(&[1, 2, 3, 4])).unwrap();
         let files_a = task_a.flush().unwrap();
         assert_eq!(keys_in(&files_a), vec![1, 2, 3, 4], "task A wrote its rows");
 
-        let mut task_b = SortShuffleWriter::new("job-x", "stage-0", "k", 2, dir.path()).unwrap();
+        let mut task_b = SortShuffleWriter::new(
+            "job-x",
+            "stage-0",
+            HashPartitioner::new("k", 2),
+            "k",
+            dir.path(),
+        )
+        .unwrap();
         task_b.push(make_batch(&[5, 6, 7, 8])).unwrap();
         let files_b = task_b.flush().unwrap();
 
@@ -651,6 +688,102 @@ mod tests {
             vec![5, 6, 7, 8],
             "task B's rows replaced task A's in the shared file; A's rows are gone \
              and neither writer reported an error"
+        );
+    }
+
+    /// Keys per partition, in index order, read through the index offsets.
+    fn keys_by_partition(files: &SortShuffleFiles) -> Vec<Vec<i64>> {
+        use arrow::ipc::reader::StreamReader;
+        let data = std::fs::read(&files.data_path).unwrap();
+        let offsets = files.read_offsets().unwrap();
+        let mut out = Vec::new();
+        for w in offsets.windows(2) {
+            let (start, end) = (w[0] as usize, w[1] as usize);
+            let mut keys = Vec::new();
+            if end > start {
+                let reader = StreamReader::try_new(Cursor::new(&data[start..end]), None).unwrap();
+                for batch in reader {
+                    let batch = batch.unwrap();
+                    let arr = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    keys.extend((0..arr.len()).map(|i| arr.value(i)));
+                }
+            }
+            keys.sort_unstable();
+            out.push(keys);
+        }
+        out
+    }
+
+    /// The writer must place rows exactly where the partitioner it was given
+    /// places them.
+    ///
+    /// It used to build its own `HashPartitioner` from the key column, which
+    /// defaults to seed 0. The executor's store path seeds from the job id, so
+    /// the ESS index and the shuffle store — written from the *same* batches in
+    /// the same map task — disagreed about which partition a row belonged to.
+    /// A reduce task reading the ESS side then missed rows for its key and the
+    /// query still reported success.
+    ///
+    /// Asserting against a *seeded* partitioner is what makes this a guard: with
+    /// seed 0 the two agree by accident and any test would pass.
+    #[test]
+    fn writer_places_rows_where_the_given_partitioner_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let partitioner = HashPartitioner::new("k", 4).with_seed(0x5DEE_CE66_D125_1F13);
+        let batch = make_batch(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+        let expected: Vec<Vec<i64>> = partitioner
+            .partition(&batch)
+            .unwrap()
+            .iter()
+            .map(|b| {
+                let arr = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                let mut keys: Vec<i64> = (0..arr.len()).map(|i| arr.value(i)).collect();
+                keys.sort_unstable();
+                keys
+            })
+            .collect();
+
+        // Prove this assertion can actually fail: the partitioner the buggy
+        // version built for itself (same key, same bucket count, default seed)
+        // must disagree with the seeded one. Without this the test would still
+        // pass against the bug if seed 0 happened to agree.
+        let unseeded: Vec<Vec<i64>> = HashPartitioner::new("k", 4)
+            .partition(&batch)
+            .unwrap()
+            .iter()
+            .map(|b| {
+                let arr = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                let mut keys: Vec<i64> = (0..arr.len()).map(|i| arr.value(i)).collect();
+                keys.sort_unstable();
+                keys
+            })
+            .collect();
+        assert_ne!(
+            unseeded, expected,
+            "test is not discriminating: pick keys where seed 0 and the job seed differ"
+        );
+
+        let mut writer = SortShuffleWriter::new(
+            "job-seeded",
+            "stage-0",
+            partitioner.clone(),
+            "k",
+            dir.path(),
+        )
+        .unwrap();
+        writer.push(batch).unwrap();
+        let files = writer.flush().unwrap();
+
+        assert_eq!(
+            keys_by_partition(&files),
+            expected,
+            "the writer must not re-derive its own partitioner; an unseeded one sends \
+             the same key to a different partition than the store path does"
         );
     }
 
@@ -686,8 +819,15 @@ mod tests {
         // every push triggers a spill without touching process-global env state.
         let dir = tempfile::tempdir().unwrap();
         let mut writer =
-            SortShuffleWriter::new_with_spill_threshold("job3", "stage1", "k", 2, dir.path(), 1)
-                .unwrap();
+            SortShuffleWriter::new_with_spill_threshold(
+                "job3",
+                "stage1",
+                HashPartitioner::new("k", 2),
+                "k",
+                dir.path(),
+                1,
+            )
+            .unwrap();
 
         // Push two batches; each push will trigger a spill due to the tiny threshold.
         writer.push(make_batch(&[4, 2])).unwrap();

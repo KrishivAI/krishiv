@@ -696,11 +696,16 @@ async fn execute_shuffle_write_fragment(
     let mut hot_key_acc = HotKeyAccumulator::new();
     let mut ess_writer: Option<krishiv_shuffle::SortShuffleWriter> = if ctx.ess_index.is_some() {
         Some(
+            // The SAME partitioner the store path below uses. These two writers
+            // see identical batches and must agree on where each row goes; when
+            // the ESS writer built its own it used seed 0 against this path's
+            // job-derived seed, so the ESS index and the store placed the same
+            // row in different partitions.
             krishiv_shuffle::SortShuffleWriter::new(
                 job_id,
                 stage_id,
+                partitioner.clone(),
                 key_column,
-                num_partitions,
                 &ctx.local_dir,
             )
             .map_err(|e| ExecutorError::LocalExecution {
