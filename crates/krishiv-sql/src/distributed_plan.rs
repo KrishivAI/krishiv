@@ -2298,9 +2298,67 @@ fn is_degenerate_broadcast_join(join: &datafusion::physical_plan::joins::HashJoi
     join.right().output_partitioning().partition_count() > 1 || build_input_partitions > 1
 }
 
+/// The broadcast byte ceiling, resolved exactly as
+/// [`planning_session_context_with_options`] resolves it.
+///
+/// Read here rather than threaded through because this pass runs after
+/// planning, where the `SessionConfig` is gone. A caller that overrode the
+/// ceiling to 0 ("never broadcast") cannot be affected: DataFusion then never
+/// picks `CollectLeft`, so nothing downstream of this can fire.
+fn broadcast_byte_ceiling() -> usize {
+    std::env::var(BROADCAST_JOIN_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_BROADCAST_JOIN_BYTES)
+}
+
+/// Is this a broadcast whose build side is *wide* enough that the row ceiling
+/// admitted something the byte ceiling would have refused?
+///
+/// `supports_collect_by_thresholds` prefers `total_byte_size` and falls back to
+/// `num_rows`. Above a shuffle boundary the byte estimate is frequently absent —
+/// `ShuffleReadExec` reports what the cut subtree reported, and DataFusion loses
+/// `total_byte_size` through joins and aggregates — so the decision lands on the
+/// row ceiling, which cannot see how wide a row is. At q10's customer shape
+/// (~180 B/row) the 1,000,000-row ceiling admits ~155 MB, five times the 32 MiB
+/// byte ceiling it stands in for, and `CollectLeft` then copies that to *every*
+/// task of the stage. That is the shape of q10 moving ~63 GB in 13.5 minutes
+/// against a plan implying ~3.5 GB of shuffle.
+///
+/// Narrow on purpose, because widening it is what regressed four queries
+/// (see [`crate::join_estimates`]):
+///
+/// * Only fires where DataFusion *already chose* `CollectLeft`. A build side it
+///   left partitioned — q8/q9/q17, whose row counts are far over the ceiling —
+///   is never examined.
+/// * Only when the byte estimate is **absent**. A positive byte estimate means
+///   DataFusion decided on a real number with the same information, and
+///   overriding that is precisely the regression.
+fn broadcast_build_is_too_wide(join: &datafusion::physical_plan::joins::HashJoinExec) -> bool {
+    use datafusion::physical_plan::joins::PartitionMode;
+
+    if *join.partition_mode() != PartitionMode::CollectLeft {
+        return false;
+    }
+    // Null-aware anti joins are only correct as `CollectLeft` — never convert.
+    if join.null_aware {
+        return false;
+    }
+    let build = join.left();
+    let Some(implied) =
+        crate::join_estimates::BuildSideEstimate::of(build).bytes_implied_by_rows(&build.schema())
+    else {
+        return false;
+    };
+    implied > broadcast_byte_ceiling()
+}
+
 /// Convert broadcast joins that cannot be split — or that were chosen on an
-/// estimate claiming their build side is empty — into hash-partitioned joins
-/// (see [`is_unsplittable_broadcast_join`] and [`is_degenerate_broadcast_join`]).
+/// estimate claiming their build side is empty, or on a row ceiling blind to
+/// how wide those rows are — into hash-partitioned joins (see
+/// [`is_unsplittable_broadcast_join`], [`is_degenerate_broadcast_join`] and
+/// [`broadcast_build_is_too_wide`]).
 ///
 /// Both sides gain a hash exchange on the join keys, which the stage cutter
 /// then turns into ordinary map stages — so the join keeps running across the
@@ -2310,7 +2368,7 @@ fn is_degenerate_broadcast_join(join: &datafusion::physical_plan::joins::HashJoi
 /// only to satisfy `CollectLeft`'s `Distribution::SinglePartition` requirement,
 /// and keeping it would funnel the whole build side through one partition
 /// before re-splitting it.
-fn redistribute_unsplittable_broadcast_joins(
+pub fn redistribute_unsplittable_broadcast_joins(
     plan: Arc<dyn ExecutionPlan>,
 ) -> SqlResult<Arc<dyn ExecutionPlan>> {
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
@@ -2342,7 +2400,10 @@ fn redistribute_unsplittable_broadcast_joins(
         return Ok(plan);
     };
     let unsplittable = is_unsplittable_broadcast_join(join);
-    if !unsplittable && !is_degenerate_broadcast_join(join) {
+    if !unsplittable
+        && !is_degenerate_broadcast_join(join)
+        && !broadcast_build_is_too_wide(join)
+    {
         return Ok(plan);
     }
 

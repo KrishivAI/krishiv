@@ -92,12 +92,6 @@ const BUILD_FRACTION_OF_TASK_SHARE: f64 = 0.5;
 /// Bytes assumed for a column whose type carries no fixed width.
 ///
 /// Varlen columns (`Utf8`, `Binary`, and their `View`/`Large` forms) have no
-/// width until the data arrives. 32 bytes is deliberately modest: this
-/// estimate only ever *adds* conversions, so overestimating would convert
-/// joins that would have fitted, and sort-merge is the slower plan when hash
-/// join fits. Under-guessing costs nothing that is not already the status quo.
-const ASSUMED_VARLEN_COLUMN_BYTES: usize = 32;
-
 /// Build-side bytes derived from a row count when `total_byte_size` is absent.
 ///
 /// Returns `None` when the row count is absent too — the one case where the
@@ -110,16 +104,11 @@ fn estimated_build_bytes_from_rows(
         Precision::Exact(rows) | Precision::Inexact(rows) => rows,
         Precision::Absent => return None,
     };
-    let row_width: usize = build_schema
-        .fields()
-        .iter()
-        .map(|f| {
-            f.data_type()
-                .primitive_width()
-                .unwrap_or(ASSUMED_VARLEN_COLUMN_BYTES)
-        })
-        .sum();
-    u64::try_from(rows.saturating_mul(row_width.max(1))).ok()
+    // One reading of row width, shared with the broadcast rule — see
+    // `crate::join_estimates`. Two hand-rolled widths is how the two rules came
+    // to disagree about row *counts*, and there is no reason to repeat it.
+    let row_width = crate::join_estimates::estimated_row_width(build_schema);
+    u64::try_from(rows.saturating_mul(row_width)).ok()
 }
 
 /// This join's estimated build-side bytes, or `None` when the planner knows
@@ -1043,7 +1032,7 @@ mod row_count_fallback_tests {
             Field::new("k", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
         ]);
-        let want = 100 * (8 + ASSUMED_VARLEN_COLUMN_BYTES as u64);
+        let want = 100 * (8 + crate::join_estimates::ASSUMED_VARLEN_COLUMN_BYTES as u64);
         assert_eq!(
             estimated_build_bytes_from_rows(&stats_with(Precision::Exact(100), 2), &s),
             Some(want)

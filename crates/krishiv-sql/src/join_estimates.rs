@@ -113,6 +113,41 @@ impl BuildSideEstimate {
         let non_positive = |v: Option<usize>| !matches!(v, Some(n) if n > 0);
         non_positive(self.rows) && non_positive(self.bytes) && self.any_claims_empty()
     }
+
+    /// Bytes implied by the row count and the schema's width, when the planner
+    /// gave a row count but no byte size.
+    ///
+    /// `None` when a byte estimate exists (then there is nothing to derive and
+    /// deferring to DataFusion is the rule — see the module docs) or when the
+    /// row count is absent or zero.
+    pub(crate) fn bytes_implied_by_rows(&self, schema: &arrow::datatypes::Schema) -> Option<usize> {
+        if self.bytes.is_some() {
+            return None;
+        }
+        let rows = self.rows.filter(|r| *r > 0)?;
+        Some(rows.saturating_mul(estimated_row_width(schema)))
+    }
+}
+
+/// Assumed on-wire bytes for a variable-length column.
+///
+/// Deliberately modest, and shared with [`crate::spillable_join`] so the two
+/// rules cannot disagree about how wide a row is the way they once disagreed
+/// about how many rows there were.
+pub(crate) const ASSUMED_VARLEN_COLUMN_BYTES: usize = 32;
+
+/// Approximate bytes per row for `schema`.
+pub(crate) fn estimated_row_width(schema: &arrow::datatypes::Schema) -> usize {
+    schema
+        .fields()
+        .iter()
+        .map(|f| {
+            f.data_type()
+                .primitive_width()
+                .unwrap_or(ASSUMED_VARLEN_COLUMN_BYTES)
+        })
+        .sum::<usize>()
+        .max(1)
 }
 
 #[cfg(test)]
