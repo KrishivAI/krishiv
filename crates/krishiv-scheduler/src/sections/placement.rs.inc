@@ -2233,3 +2233,49 @@ fn missing_trip_timestamp_is_treated_as_expired_not_permanent() {
          unclearable ban"
     );
 }
+
+/// A restarted executor pod is a NEW process; it must not inherit the dead
+/// one's failure count. Without this a freshly started, perfectly healthy
+/// executor can come up already circuit-broken.
+#[test]
+fn reregistration_clears_the_failure_counter() {
+    let mut registry = ExecutorRegistry::new(64, None);
+    let id = ExecutorId::try_new("exec-restart").unwrap();
+    let other = ExecutorId::try_new("exec-restart-other").unwrap();
+    for (eid, host) in [(&id, "pod-r"), (&other, "pod-ro")] {
+        registry
+            .register(ExecutorDescriptor::new(eid.clone(), host, 4))
+            .unwrap();
+        registry
+            .heartbeat(ExecutorHeartbeat::new(eid.clone(), ExecutorState::Healthy))
+            .unwrap();
+    }
+    let threshold = 5u32;
+    for _ in 0..threshold {
+        registry.record_task_failure(&id, threshold, 1_000);
+    }
+    assert!(
+        registry
+            .circuit_broken_executors(threshold, 1_001, 60_000)
+            .contains(&id),
+        "precondition: broken before the restart"
+    );
+
+    // The pod restarts and re-registers.
+    registry
+        .register(ExecutorDescriptor::new(id.clone(), "pod-r", 4))
+        .unwrap();
+
+    assert_eq!(
+        registry.find_executor(&id).unwrap().consecutive_task_failures(),
+        0,
+        "a re-registered executor is a new process — the previous process's \
+         task-failure count must not carry over"
+    );
+    assert!(
+        !registry
+            .circuit_broken_executors(threshold, 1_002, 60_000)
+            .contains(&id),
+        "a restarted executor must not come up already circuit-broken"
+    );
+}

@@ -75,6 +75,16 @@ impl ExecutorRegistry {
             executor.last_heartbeat_tick = self.current_tick;
             executor.health_snapshot = None;
             executor.lease_generation = new_lease;
+            // A re-registration is a NEW executor process (a restarted pod, a
+            // reconnect after eviction). The consecutive-failure count belongs
+            // to the process that reported those failures, not to this one —
+            // carrying it over means a freshly started, perfectly healthy
+            // executor can begin life already circuit-broken, or one failure
+            // away from it. Note this cannot mask a crash-loop: the counter is
+            // only incremented by task-failure *reports* from a live executor
+            // (`apply_task_update`), never by the executor-loss path.
+            executor.consecutive_task_failures = 0;
+            executor.breaker_tripped_at_ms = None;
             return Ok(new_lease);
         }
 
