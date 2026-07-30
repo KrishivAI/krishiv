@@ -624,7 +624,7 @@ fn circuit_breaker_clears_assignments_synchronously() {
     let threshold = coordinator.config.circuit_breaker_failure_threshold();
     let mut exceeded = false;
     for _ in 0..threshold {
-        exceeded = coordinator.exec.executors.record_task_failure(&exec_id, threshold);
+        exceeded = coordinator.exec.executors.record_task_failure(&exec_id, threshold, 1);
     }
     assert!(exceeded, "circuit breaker must trip after threshold failures");
 

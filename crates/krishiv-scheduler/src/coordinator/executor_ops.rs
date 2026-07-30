@@ -992,7 +992,13 @@ impl Coordinator {
         jobs.retain(|j| j.pending > 0);
         if !jobs.is_empty() {
             let inflight = self.inflight_tasks_by_executor();
-            let mut placements = self.exec.executors.schedulable_executor_placements();
+            // Circuit-broken executors contribute no usable capacity: their
+            // slots can never be filled, so counting them inflates the pool
+            // quotas and hands out budget the cluster cannot spend.
+            let mut placements = self
+                .exec
+                .executors
+                .schedulable_executor_placements_excluding(&self.circuit_broken_executors(now_ms));
             for p in &mut placements {
                 if let Some(&n) = inflight.get(&p.executor_id) {
                     p.raise_active_tasks_to(n);
@@ -1074,7 +1080,15 @@ impl Coordinator {
         if total_pending == 0 {
             return;
         }
-        let available = self.exec.executors.schedulable_executor_placements().len();
+        // A circuit-broken executor is not available capacity — counting it
+        // here under-requests the replacement workers this autoscale exists
+        // to ask for.
+        let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+        let available = self
+            .exec
+            .executors
+            .schedulable_executor_placements_excluding(&self.circuit_broken_executors(now_ms))
+            .len();
         if total_pending > available {
             let deficit = total_pending - available;
             let granted = self.cluster_manager.request_workers(deficit);

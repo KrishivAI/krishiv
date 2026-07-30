@@ -46,6 +46,26 @@ pub struct CoordinatorConfig {
     /// basic circuit breaker (PRR Immediate + Short term).
     circuit_breaker_failure_threshold: u32,
 
+    /// How long an executor stays circuit-broken after crossing
+    /// `circuit_breaker_failure_threshold`.
+    ///
+    /// Without this the breaker is a one-way latch: the failure counter is
+    /// only cleared by a *successful* task, but a broken executor is filtered
+    /// out of launch candidates, so the success that would clear it can never
+    /// happen. One bad job poisons that executor for the lifetime of the
+    /// coordinator process — observed live on 2026-07-30, where five
+    /// `NoSuchBucket` failures from a mistyped data URI left `bench-s3`
+    /// permanently ineligible and wedged an unrelated TPC-H sweep submitted
+    /// 15 minutes later.
+    ///
+    /// With a cooldown the breaker becomes the standard closed → open →
+    /// half-open cycle: after the window the executor is admitted again, and
+    /// either succeeds (counter resets, fully closed) or fails once more
+    /// (re-stamped, open for another window). A genuinely sick node therefore
+    /// absorbs roughly one task per cooldown instead of being either
+    /// permanently banned or never banned.
+    circuit_breaker_cooldown_ms: u64,
+
     /// Maximum size in bytes for a single InlineIpc partition payload.
     ///
     /// Partitions larger than this limit are rejected with [`SchedulerError::InvalidJob`].
@@ -202,6 +222,7 @@ impl CoordinatorConfig {
             tick_period_ms: 5_000,
             checkpoint_ack_timeout_ms: 30_000,
             circuit_breaker_failure_threshold: 5,
+            circuit_breaker_cooldown_ms: 60_000,
             inline_partition_limit_bytes: 3 * 1024 * 1024,
             task_stall_timeout_ms: 30 * 60 * 1_000,
             stuck_assigned_reset_ms: 2 * 60 * 1_000,
@@ -292,6 +313,18 @@ impl CoordinatorConfig {
     /// Consecutive failures threshold for the basic circuit breaker.
     pub fn circuit_breaker_failure_threshold(&self) -> u32 {
         self.circuit_breaker_failure_threshold
+    }
+
+    /// How long an executor stays circuit-broken after crossing the threshold.
+    pub fn circuit_breaker_cooldown_ms(&self) -> u64 {
+        self.circuit_breaker_cooldown_ms
+    }
+
+    /// Override the per-executor circuit-breaker cooldown.
+    #[must_use]
+    pub fn with_circuit_breaker_cooldown_ms(mut self, ms: u64) -> Self {
+        self.circuit_breaker_cooldown_ms = ms;
+        self
     }
 
     /// Maximum size in bytes for a single InlineIpc partition payload.

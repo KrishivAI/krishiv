@@ -311,10 +311,25 @@ impl ExecutorRegistry {
     }
 
     pub(crate) fn schedulable_executor_placements(&self) -> Vec<ExecutorPlacement> {
+        self.schedulable_executor_placements_excluding(&std::collections::HashSet::new())
+    }
+
+    /// Placement candidates minus `excluded` — the circuit-broken set from
+    /// [`Self::circuit_broken_executors`].
+    ///
+    /// Placement must apply the same exclusion the launch path applies, or a
+    /// task is placed on an executor that will refuse to launch it and the two
+    /// loops fight forever. See `circuit_broken_executors` for the incident.
+    pub(crate) fn schedulable_executor_placements_excluding(
+        &self,
+        excluded: &std::collections::HashSet<ExecutorId>,
+    ) -> Vec<ExecutorPlacement> {
         let mut placements: Vec<_> = self
             .executors
             .values()
-            .filter(|executor| self.is_schedulable(executor))
+            .filter(|executor| {
+                self.is_schedulable(executor) && !excluded.contains(executor.executor_id())
+            })
             .map(|executor| {
                 let active_tasks = executor
                     .health_snapshot
@@ -443,6 +458,14 @@ pub struct ExecutorRecord {
     /// Simple consecutive task failure counter. Used as foundation for
     /// Phase 3 circuit breaker (executor-level load shedding).
     pub(crate) consecutive_task_failures: u32,
+    /// Wall-clock ms at which `consecutive_task_failures` last crossed the
+    /// breaker threshold, i.e. when this executor was most recently declared
+    /// bad. `None` means the breaker has never tripped (or was reset by a
+    /// success). Drives the cooldown in
+    /// [`ExecutorRegistry::circuit_broken_executors`] — without it the breaker
+    /// can never re-close, because only a successful task clears the counter
+    /// and a broken executor is never given one.
+    pub(crate) breaker_tripped_at_ms: Option<u64>,
 }
 
 impl ExecutorRecord {
@@ -459,6 +482,7 @@ impl ExecutorRecord {
             last_heartbeat_tick,
             health_snapshot: None,
             consecutive_task_failures: 0,
+            breaker_tripped_at_ms: None,
         }
     }
 
@@ -504,17 +528,27 @@ impl ExecutorRecord {
 
     /// Increment failure counter (called on task failure reports from this executor).
     /// Returns true if the executor has now exceeded the given threshold (circuit break candidate).
-    pub fn record_task_failure(&mut self, threshold: u32) -> bool {
+    ///
+    /// `now_ms` re-stamps the trip time on every failure at or over the
+    /// threshold, not just the first: a half-open probe that fails must open
+    /// the breaker for a fresh cooldown rather than inheriting the original
+    /// trip time and re-opening instantly on the next round.
+    pub fn record_task_failure(&mut self, threshold: u32, now_ms: u64) -> bool {
         if threshold == 0 {
             return false;
         }
         self.consecutive_task_failures = self.consecutive_task_failures.saturating_add(1);
-        self.consecutive_task_failures >= threshold
+        let tripped = self.consecutive_task_failures >= threshold;
+        if tripped {
+            self.breaker_tripped_at_ms = Some(now_ms);
+        }
+        tripped
     }
 
     /// Reset failure counter (called on successful task or healthy heartbeat).
     pub fn reset_task_failures(&mut self) {
         self.consecutive_task_failures = 0;
+        self.breaker_tripped_at_ms = None;
     }
 }
 
@@ -523,10 +557,15 @@ impl ExecutorRegistry {
     /// Record a task failure for a specific executor.
     /// Returns true if this executor has now crossed the given threshold
     /// and should be temporarily avoided for new assignments.
-    pub fn record_task_failure(&mut self, executor_id: &ExecutorId, threshold: u32) -> bool {
+    pub fn record_task_failure(
+        &mut self,
+        executor_id: &ExecutorId,
+        threshold: u32,
+        now_ms: u64,
+    ) -> bool {
         self.executors
             .get_mut(executor_id)
-            .is_some_and(|record| record.record_task_failure(threshold))
+            .is_some_and(|record| record.record_task_failure(threshold, now_ms))
     }
 
     /// Reset failure count for an executor (e.g. after it reports healthy progress).
@@ -537,6 +576,10 @@ impl ExecutorRegistry {
     }
 
     /// Return list of executors that currently exceed the failure threshold.
+    ///
+    /// Raw counter test with no cooldown and no starvation floor. Prefer
+    /// [`Self::circuit_broken_executors`] for any scheduling decision — this
+    /// one is for diagnostics and tests.
     pub fn executors_over_failure_threshold(&self, threshold: u32) -> Vec<ExecutorId> {
         if threshold == 0 {
             return Vec::new();
@@ -546,6 +589,77 @@ impl ExecutorRegistry {
             .filter(|e| e.consecutive_task_failures >= threshold)
             .map(|e| e.executor_id().clone())
             .collect()
+    }
+
+    /// The executors that must not receive new work right now.
+    ///
+    /// **This is the single definition of circuit-breaker ineligibility, and
+    /// every scheduling path must use it.** Task *assignment* (placement) and
+    /// task *launch* (lease filtering) used to decide this independently:
+    /// launch filtered on the failure counter, placement did not. A task
+    /// assigned to a broken executor was therefore refused at launch, reset to
+    /// `Pending`, and immediately re-placed on the same broken executor — a
+    /// livelock at the tick rate, with the job pinned Running and every
+    /// executor idle. The load balancer made it self-reinforcing: a broken
+    /// executor runs nothing, so it always looks like the *least loaded*
+    /// candidate and is always chosen. Observed live on 2026-07-30 (TPC-H
+    /// SF100 sweep, `dist-s0-t0` cycling Assigned→Pending for 17 minutes).
+    ///
+    /// Three rules, in order:
+    ///
+    /// 1. **Threshold** — at or over `threshold` consecutive failures.
+    /// 2. **Cooldown** — only for `cooldown_ms` after the trip. Past that the
+    ///    executor is admitted again as a half-open probe; it either succeeds
+    ///    (counter cleared) or fails and re-opens for a fresh window. Without
+    ///    this the breaker never re-closes: the counter is cleared only by a
+    ///    success, and a filtered executor is never given the chance to have
+    ///    one.
+    /// 3. **Starvation floor** — if excluding them would leave *no*
+    ///    schedulable executor, exclude none. The breaker exists to prefer
+    ///    healthy executors, not to halt the cluster; with every node over the
+    ///    threshold the retry and regeneration budgets should decide the job's
+    ///    fate, not an empty candidate list.
+    pub(crate) fn circuit_broken_executors(
+        &self,
+        threshold: u32,
+        now_ms: u64,
+        cooldown_ms: u64,
+    ) -> std::collections::HashSet<ExecutorId> {
+        if threshold == 0 {
+            return std::collections::HashSet::new();
+        }
+        let broken: std::collections::HashSet<ExecutorId> = self
+            .executors
+            .values()
+            .filter(|e| {
+                if e.consecutive_task_failures < threshold {
+                    return false;
+                }
+                match e.breaker_tripped_at_ms {
+                    // Still inside the cooldown window: stay open.
+                    Some(tripped_at) => now_ms.saturating_sub(tripped_at) < cooldown_ms,
+                    // Over the threshold with no trip timestamp — a record
+                    // restored from a durable snapshot written before the
+                    // timestamp existed. Treat it as expired rather than as
+                    // permanently broken: a stale counter must not outlive a
+                    // coordinator restart as an unclearable ban.
+                    None => false,
+                }
+            })
+            .map(|e| e.executor_id().clone())
+            .collect();
+        if broken.is_empty() {
+            return broken;
+        }
+        let any_healthy_remains = self
+            .executors
+            .values()
+            .any(|e| self.is_schedulable(e) && !broken.contains(e.executor_id()));
+        if any_healthy_remains {
+            broken
+        } else {
+            std::collections::HashSet::new()
+        }
     }
 }
 

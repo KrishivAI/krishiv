@@ -2147,7 +2147,7 @@ mod parse_tests {
                 .await
                 .exec
                 .executors
-                .record_task_failure(&exec_id, threshold);
+                .record_task_failure(&exec_id, threshold, 1);
         }
 
         let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DevLocal);

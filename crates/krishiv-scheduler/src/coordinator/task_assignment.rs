@@ -156,6 +156,23 @@ async fn assignment_retry_backoff(attempt_idx: usize) {
 }
 
 impl Coordinator {
+    /// Executors the circuit breaker currently bars from new work.
+    ///
+    /// One helper so the assignment and launch paths cannot drift apart on
+    /// what "eligible" means — the divergence that livelocked a TPC-H SF100
+    /// sweep on 2026-07-30. See
+    /// [`ExecutorRegistry::circuit_broken_executors`](crate::heartbeat::ExecutorRegistry::circuit_broken_executors).
+    pub(crate) fn circuit_broken_executors(
+        &self,
+        now_ms: u64,
+    ) -> std::collections::HashSet<krishiv_proto::ExecutorId> {
+        self.exec.executors.circuit_broken_executors(
+            self.config.circuit_breaker_failure_threshold(),
+            now_ms,
+            self.config.circuit_breaker_cooldown_ms(),
+        )
+    }
+
     /// Re-assign all `Pending` tasks in a job to available executors.
     ///
     /// Called after a stage retry (P1.24) to move tasks from `Pending` back to
@@ -205,6 +222,12 @@ impl Coordinator {
         let locality_wait_ms = self.config.locality_wait_ms();
         let executor_hosts = self.exec.executors.executor_hosts();
         let inflight = self.inflight_tasks_by_executor();
+        // Placement must exclude exactly what the launch path excludes. When
+        // it did not, a task placed on a circuit-broken executor was refused
+        // at launch, reset to Pending, and placed straight back on the same
+        // executor — forever, because a broken executor runs nothing and so
+        // always scores as the least-loaded candidate.
+        let circuit_broken = self.circuit_broken_executors(now_ms);
 
         // Collect (pending_task_ids, locality prefs) per stage. Also stamp
         // `pending_since_ms` on first consideration (delay-scheduling anchor)
@@ -281,7 +304,10 @@ impl Coordinator {
             if work.pending.is_empty() || total >= budget {
                 continue;
             }
-            let mut executors = self.exec.executors.schedulable_executor_placements();
+            let mut executors = self
+                .exec
+                .executors
+                .schedulable_executor_placements_excluding(&circuit_broken);
             if executors.is_empty() {
                 // Every executor went away between the fast-path check above
                 // and here; leave the tasks Pending for the next dispatch tick.
@@ -687,39 +713,20 @@ impl Coordinator {
         // PRR Parallel Execution - Circuit Breaker (IMM-1):
         // Filter out executors that have crossed the failure threshold before
         // even attempting to launch tasks to them.
-        let failure_threshold = self.config.circuit_breaker_failure_threshold();
-        let bad_executors: std::collections::HashSet<_> = self
-            .exec
-            .executors
-            .executors_over_failure_threshold(failure_threshold)
-            .into_iter()
-            .collect();
+        // The starvation floor and the cooldown both live in
+        // `circuit_broken_executors`, which the *assignment* path calls too —
+        // the two must agree on eligibility or they livelock against each
+        // other (see that function's docs).
+        let bad_executors = self.circuit_broken_executors(now_ms);
 
         let mut executor_leases = self.exec.executors.assignment_leases();
         if !bad_executors.is_empty() {
-            let before = executor_leases.len();
             executor_leases.retain(|(eid, _)| !bad_executors.contains(eid));
-            if executor_leases.is_empty() && before > 0 {
-                // Starvation floor: the breaker exists to PREFER healthy
-                // executors, not to halt the cluster. With every live executor
-                // over the threshold, filtering leaves pending tasks with zero
-                // candidates forever (no cooldown resets the counters — only a
-                // success does, which can never come). Bypass the filter and
-                // let the retry/regen budgets decide the job's fate instead.
-                executor_leases = self.exec.executors.assignment_leases();
-                tracing::warn!(
-                    job_id = %job_id,
-                    bad_executor_count = bad_executors.len(),
-                    "circuit breaker: ALL launch candidates over the failure \
-                     threshold — bypassing the breaker to avoid starvation"
-                );
-            } else {
-                tracing::warn!(
-                    job_id = %job_id,
-                    bad_executor_count = bad_executors.len(),
-                    "circuit breaker: filtered bad executors from launch candidates"
-                );
-            }
+            tracing::warn!(
+                job_id = %job_id,
+                bad_executor_count = bad_executors.len(),
+                "circuit breaker: filtered bad executors from launch candidates"
+            );
         }
 
         let batch_tables = self.batch_sql_job_tables.get(job_id).cloned();

@@ -394,7 +394,7 @@ fn circuit_breaker_actually_clears_assignments_from_bad_executor() {
     // Drive the failure counter directly (this is what apply_task_update does internally)
     // until the executor is marked bad.
     for _ in 0..6 {
-        coordinator.exec.executors.record_task_failure(&exec_id, 5);
+        coordinator.exec.executors.record_task_failure(&exec_id, 5, 1);
     }
 
     let bad = coordinator.exec.executors.executors_over_failure_threshold(5);
@@ -415,7 +415,7 @@ fn assignment_flood_protection_basic() {
         .unwrap();
 
     for _ in 0..10 {
-        let _ = coordinator.exec.executors.record_task_failure(&exec_id, 5);
+        let _ = coordinator.exec.executors.record_task_failure(&exec_id, 5, 1);
     }
 
     let broken = coordinator.exec.executors.executors_over_failure_threshold(5);

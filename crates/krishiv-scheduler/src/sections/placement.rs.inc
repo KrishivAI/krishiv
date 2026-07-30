@@ -1889,3 +1889,347 @@ fn scale_100_executors_10k_tasks_assignment() {
         "10k-task assignment must finish within budget, took {elapsed:?}"
     );
 }
+
+// ── Circuit breaker: assignment and launch must agree on eligibility ──────
+//
+// Regression cluster for the 2026-07-30 livelock. The launch path filtered
+// circuit-broken executors out of its lease list; the placement path did not.
+// A task placed on a broken executor was refused at launch, reset to Pending,
+// and immediately re-placed on the same broken executor — forever. The load
+// balancer made it self-reinforcing: a broken executor runs nothing, so it
+// always scored as the least-loaded candidate and was always chosen again.
+// Live symptom: a TPC-H SF100 sweep sat for 17 minutes with the job Running,
+// every executor idle, and `dist-s0-t0` cycling Assigned→Pending at ~1 Hz.
+
+/// Build a job with `n` tasks in one stage, so placement has to spread work
+/// across executors — one task cannot distinguish "avoided the bad executor"
+/// from "happened to pick the good one".
+fn multi_task_job(job_id: JobId, n: usize) -> JobSpec {
+    let mut stage = StageSpec::new(StageId::try_new("stage-1").unwrap(), "scan");
+    for i in 0..n {
+        stage = stage.with_task(TaskSpec::new(
+            TaskId::try_new(format!("task-{i}")).unwrap(),
+            "scan a",
+        ));
+    }
+    JobSpec::new(job_id, "multi task", JobKind::Batch).with_stage(stage)
+}
+
+/// Trip the per-executor breaker `threshold` times, stamped at `now_ms`.
+fn trip_breaker(coordinator: &mut Coordinator, exec_id: &ExecutorId, now_ms: u64) {
+    let threshold = coordinator.config().circuit_breaker_failure_threshold();
+    for _ in 0..threshold {
+        coordinator
+            .exec
+            .executors
+            .record_task_failure(exec_id, threshold, now_ms);
+    }
+}
+
+/// THE livelock regression: placement must not hand work to an executor that
+/// the launch path will refuse. Before the fix, some of these tasks landed on
+/// `exec-bad` and bounced between Assigned and Pending indefinitely.
+#[test]
+fn assignment_never_places_tasks_on_a_circuit_broken_executor() {
+    allow_anonymous_for_tests();
+    let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-cb-place").unwrap());
+    let good = ExecutorId::try_new("exec-good").unwrap();
+    let bad = ExecutorId::try_new("exec-bad").unwrap();
+    coordinator
+        .register_executor(ExecutorDescriptor::new(good.clone(), "pod-good", 8))
+        .unwrap();
+    coordinator
+        .register_executor(ExecutorDescriptor::new(bad.clone(), "pod-bad", 8))
+        .unwrap();
+
+    // Trip `exec-bad` now, so it is inside its cooldown window.
+    let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+    trip_breaker(&mut coordinator, &bad, now_ms);
+
+    let job_id = JobId::try_new("job-cb-place").unwrap();
+    coordinator
+        .submit_job(multi_task_job(job_id.clone(), 8))
+        .unwrap();
+    coordinator.assign_pending_tasks(&job_id).unwrap();
+
+    let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+    let on_bad: Vec<&str> = detail
+        .stages()
+        .iter()
+        .flat_map(|s| s.tasks())
+        .filter(|t| t.assigned_executor() == Some(&bad))
+        .map(|t| t.task_id().as_str())
+        .collect();
+    assert!(
+        on_bad.is_empty(),
+        "tasks {on_bad:?} were placed on a circuit-broken executor that the launch \
+         path will refuse — this is the Assigned→Pending livelock"
+    );
+    let assigned_count = detail
+        .stages()
+        .iter()
+        .flat_map(|s| s.tasks())
+        .filter(|t| t.assigned_executor().is_some())
+        .count();
+    assert!(
+        assigned_count > 0,
+        "the healthy executor must still receive work — excluding the broken one \
+         must not stall the job"
+    );
+}
+
+/// The end-to-end shape of the same bug: whatever assignment places must
+/// survive launch. If the two paths disagree, launch resets the task to
+/// Pending and the next assignment round re-places it identically.
+#[test]
+fn assigned_tasks_survive_launch_without_bouncing_to_pending() {
+    allow_anonymous_for_tests();
+    let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-cb-bounce").unwrap());
+    let good = ExecutorId::try_new("exec-good").unwrap();
+    let bad = ExecutorId::try_new("exec-bad").unwrap();
+    coordinator
+        .register_executor(ExecutorDescriptor::new(good.clone(), "pod-good", 4))
+        .unwrap();
+    coordinator
+        .register_executor(ExecutorDescriptor::new(bad.clone(), "pod-bad", 4))
+        .unwrap();
+    let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+    trip_breaker(&mut coordinator, &bad, now_ms);
+
+    let job_id = JobId::try_new("job-cb-bounce").unwrap();
+    coordinator
+        .submit_job(multi_task_job(job_id.clone(), 6))
+        .unwrap();
+    coordinator.assign_pending_tasks(&job_id).unwrap();
+
+    // Snapshot exactly what assignment placed. Tasks left Pending here are
+    // simply over capacity (the healthy executor has finite slots) — that is
+    // correct behaviour and must not be confused with a bounce.
+    let placed: std::collections::HashSet<String> = coordinator
+        .job_detail_snapshot(&job_id)
+        .unwrap()
+        .stages()
+        .iter()
+        .flat_map(|s| s.tasks())
+        .filter(|t| t.assigned_executor().is_some())
+        .map(|t| t.task_id().as_str().to_owned())
+        .collect();
+    assert!(
+        !placed.is_empty(),
+        "precondition: assignment must place something on the healthy executor"
+    );
+
+    coordinator.launch_assigned_tasks(&job_id).unwrap();
+
+    let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+    let bounced: Vec<&str> = detail
+        .stages()
+        .iter()
+        .flat_map(|s| s.tasks())
+        .filter(|t| {
+            placed.contains(t.task_id().as_str())
+                && t.state() == TaskState::Pending
+                && t.assigned_executor().is_none()
+        })
+        .map(|t| t.task_id().as_str())
+        .collect();
+    assert!(
+        bounced.is_empty(),
+        "tasks {bounced:?} were reset to Pending by the launch path after \
+         assignment placed them — assignment and launch disagree on eligibility"
+    );
+}
+
+/// The breaker must re-close. The failure counter is cleared only by a
+/// *successful* task, but a broken executor is filtered out of launch
+/// candidates, so without a cooldown the success that would clear it can never
+/// happen — one bad job poisons that executor for the life of the process.
+/// Live: five `NoSuchBucket` failures from a mistyped data URI left `bench-s3`
+/// permanently ineligible and wedged an unrelated sweep 15 minutes later.
+#[test]
+fn circuit_breaker_reopens_after_the_cooldown_expires() {
+    let mut registry = ExecutorRegistry::new(64, None);
+    let id = ExecutorId::try_new("exec-cooldown").unwrap();
+    registry
+        .register(ExecutorDescriptor::new(id.clone(), "pod-cd", 4))
+        .unwrap();
+    registry
+        .heartbeat(ExecutorHeartbeat::new(id.clone(), ExecutorState::Healthy))
+        .unwrap();
+    // A second healthy executor, so the starvation floor is not what clears it.
+    let other = ExecutorId::try_new("exec-other").unwrap();
+    registry
+        .register(ExecutorDescriptor::new(other.clone(), "pod-other", 4))
+        .unwrap();
+    registry
+        .heartbeat(ExecutorHeartbeat::new(other.clone(), ExecutorState::Healthy))
+        .unwrap();
+
+    let threshold = 5u32;
+    let cooldown_ms = 60_000u64;
+    for _ in 0..threshold {
+        registry.record_task_failure(&id, threshold, 1_000);
+    }
+
+    // Inside the window: broken.
+    assert!(
+        registry
+            .circuit_broken_executors(threshold, 1_000 + cooldown_ms - 1, cooldown_ms)
+            .contains(&id),
+        "executor must stay circuit-broken for the whole cooldown window"
+    );
+    // Past the window: eligible again (half-open probe).
+    assert!(
+        !registry
+            .circuit_broken_executors(threshold, 1_000 + cooldown_ms, cooldown_ms)
+            .contains(&id),
+        "executor must become eligible again once the cooldown expires, or the \
+         breaker is a one-way latch that only a success can clear — and a \
+         filtered executor is never given a task to succeed at"
+    );
+}
+
+/// A half-open probe that fails must re-open for a *fresh* window, not inherit
+/// the original trip time and fall straight back through the cooldown check.
+#[test]
+fn failed_half_open_probe_restamps_the_cooldown() {
+    let mut registry = ExecutorRegistry::new(64, None);
+    let id = ExecutorId::try_new("exec-probe").unwrap();
+    let other = ExecutorId::try_new("exec-probe-other").unwrap();
+    for (eid, host) in [(&id, "pod-p"), (&other, "pod-po")] {
+        registry
+            .register(ExecutorDescriptor::new(eid.clone(), host, 4))
+            .unwrap();
+        registry
+            .heartbeat(ExecutorHeartbeat::new(eid.clone(), ExecutorState::Healthy))
+            .unwrap();
+    }
+
+    let threshold = 5u32;
+    let cooldown_ms = 60_000u64;
+    for _ in 0..threshold {
+        registry.record_task_failure(&id, threshold, 1_000);
+    }
+    let after_cooldown = 1_000 + cooldown_ms;
+    assert!(
+        !registry
+            .circuit_broken_executors(threshold, after_cooldown, cooldown_ms)
+            .contains(&id),
+        "precondition: eligible again after the first cooldown"
+    );
+
+    // The probe fails.
+    registry.record_task_failure(&id, threshold, after_cooldown);
+    assert!(
+        registry
+            .circuit_broken_executors(threshold, after_cooldown + 1, cooldown_ms)
+            .contains(&id),
+        "a failed half-open probe must re-open the breaker for a fresh window"
+    );
+    assert!(
+        !registry
+            .circuit_broken_executors(threshold, after_cooldown + cooldown_ms, cooldown_ms)
+            .contains(&id),
+        "and that fresh window must itself expire"
+    );
+}
+
+/// A success fully closes the breaker: counter cleared AND trip timestamp
+/// cleared, so the next single failure does not instantly re-open it.
+#[test]
+fn success_fully_closes_the_breaker() {
+    let mut registry = ExecutorRegistry::new(64, None);
+    let id = ExecutorId::try_new("exec-success").unwrap();
+    let other = ExecutorId::try_new("exec-success-other").unwrap();
+    for (eid, host) in [(&id, "pod-s"), (&other, "pod-so")] {
+        registry
+            .register(ExecutorDescriptor::new(eid.clone(), host, 4))
+            .unwrap();
+        registry
+            .heartbeat(ExecutorHeartbeat::new(eid.clone(), ExecutorState::Healthy))
+            .unwrap();
+    }
+    let threshold = 5u32;
+    for _ in 0..threshold {
+        registry.record_task_failure(&id, threshold, 1_000);
+    }
+    registry.reset_task_failures(&id);
+
+    assert!(
+        !registry
+            .circuit_broken_executors(threshold, 1_001, 60_000)
+            .contains(&id),
+        "a successful task must clear the breaker immediately"
+    );
+    // One more failure must not re-trip on its own.
+    registry.record_task_failure(&id, threshold, 2_000);
+    assert!(
+        !registry
+            .circuit_broken_executors(threshold, 2_001, 60_000)
+            .contains(&id),
+        "after a success the executor needs a full fresh threshold to re-trip, \
+         not a single failure against a stale counter"
+    );
+}
+
+/// Starvation floor: the breaker prefers healthy executors, it does not halt
+/// the cluster. With every schedulable executor over the threshold, excluding
+/// them all would leave pending tasks with zero candidates forever.
+#[test]
+fn starvation_floor_admits_everyone_when_all_executors_are_broken() {
+    let mut registry = ExecutorRegistry::new(64, None);
+    let threshold = 5u32;
+    let ids: Vec<ExecutorId> = ["exec-a", "exec-b"]
+        .iter()
+        .map(|n| ExecutorId::try_new(*n).unwrap())
+        .collect();
+    for id in &ids {
+        registry
+            .register(ExecutorDescriptor::new(id.clone(), "pod", 4))
+            .unwrap();
+        registry
+            .heartbeat(ExecutorHeartbeat::new(id.clone(), ExecutorState::Healthy))
+            .unwrap();
+        for _ in 0..threshold {
+            registry.record_task_failure(id, threshold, 1_000);
+        }
+    }
+
+    assert!(
+        registry
+            .circuit_broken_executors(threshold, 1_001, 60_000)
+            .is_empty(),
+        "with no healthy executor left, the breaker must admit everyone and let \
+         the retry/regeneration budgets decide the job's fate"
+    );
+}
+
+/// A counter restored from a snapshot written before trip timestamps existed
+/// must not read as a permanent ban.
+#[test]
+fn missing_trip_timestamp_is_treated_as_expired_not_permanent() {
+    let mut registry = ExecutorRegistry::new(64, None);
+    let id = ExecutorId::try_new("exec-legacy").unwrap();
+    let other = ExecutorId::try_new("exec-legacy-other").unwrap();
+    for (eid, host) in [(&id, "pod-l"), (&other, "pod-lo")] {
+        registry
+            .register(ExecutorDescriptor::new(eid.clone(), host, 4))
+            .unwrap();
+        registry
+            .heartbeat(ExecutorHeartbeat::new(eid.clone(), ExecutorState::Healthy))
+            .unwrap();
+    }
+    // Simulate a restored record: over threshold, no trip timestamp.
+    if let Some(record) = registry.executors.get_mut(&id) {
+        record.consecutive_task_failures = 99;
+        record.breaker_tripped_at_ms = None;
+    }
+
+    assert!(
+        !registry
+            .circuit_broken_executors(5, 10_000, 60_000)
+            .contains(&id),
+        "a stale counter with no trip time must not outlive a restart as an \
+         unclearable ban"
+    );
+}

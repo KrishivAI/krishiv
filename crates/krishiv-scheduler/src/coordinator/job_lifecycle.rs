@@ -87,7 +87,17 @@ impl Coordinator {
         // (assign_pending_tasks_for_schedulable_jobs) will assign them as soon
         // as executors register or become healthy. This prevents submission
         // failures during rolling executor restarts.
-        let executors = self.exec.executors.schedulable_executor_placements();
+        // Submit-time placement must honour the circuit breaker for the same
+        // reason the orchestration-tick path does: a task placed here on a
+        // circuit-broken executor is refused by the launch path, reset to
+        // Pending, and re-placed identically — forever.
+        let submit_now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+        let executors = self
+            .exec
+            .executors
+            .schedulable_executor_placements_excluding(
+                &self.circuit_broken_executors(submit_now_ms),
+            );
         let job_id = spec.job_id().clone();
         let _job_name = spec.name().to_owned();
         let _namespace = spec
@@ -481,10 +491,11 @@ impl Coordinator {
         }
         if terminal_state == TaskState::Failed && missing_partitions.is_empty() {
             let threshold = self.config.circuit_breaker_failure_threshold();
-            let exceeded = self
-                .exec
-                .executors
-                .record_task_failure(&executor_id_for_circuit, threshold);
+            let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+            let exceeded =
+                self.exec
+                    .executors
+                    .record_task_failure(&executor_id_for_circuit, threshold, now_ms);
             if exceeded {
                 tracing::warn!(
                     executor_id = %executor_id_for_circuit,
