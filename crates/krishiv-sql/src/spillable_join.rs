@@ -157,19 +157,22 @@ fn estimated_build_bytes_from_rows(
 /// spillable algorithm. The cost of being wrong is a spillable join over an
 /// empty relation, which is free; the cost of trusting it is a failed query.
 fn build_bytes_estimate(hash_join: &HashJoinExec) -> Option<u64> {
-    // An error computing statistics is not evidence of a large build side, and
-    // this rule is an optimisation: declining is always a valid answer.
-    let stats = hash_join.left().partition_statistics(None).ok()?;
+    // One shared reading of the statistics; see `crate::join_estimates`.
+    //
     // An explicit zero is a *claim* that the relation is empty, and it is the
     // claim this function refuses to believe. `Absent` is different — an honest
     // "I do not know" — and keeps the existing policy of leaving the hash join
     // alone, which is what stops this rule from re-creating the q2 timeout.
-    let claims_empty = |p: Precision<usize>| {
-        matches!(p, Precision::Exact(0) | Precision::Inexact(0))
-    };
-    if claims_empty(stats.num_rows) || claims_empty(stats.total_byte_size) {
+    let estimate = crate::join_estimates::BuildSideEstimate::of(hash_join.left());
+    if estimate.is_unknown() {
+        return None;
+    }
+    if estimate.any_claims_empty() {
         return Some(u64::MAX);
     }
+    // An error computing statistics is not evidence of a large build side, and
+    // this rule is an optimisation: declining is always a valid answer.
+    let stats = hash_join.left().partition_statistics(None).ok()?;
     match stats.total_byte_size {
         Precision::Exact(bytes) | Precision::Inexact(bytes) => u64::try_from(bytes).ok(),
         Precision::Absent => {

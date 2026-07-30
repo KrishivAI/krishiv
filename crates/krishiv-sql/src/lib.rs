@@ -106,6 +106,9 @@ pub mod introspection_sql;
 pub mod kafka_table;
 pub mod lakehouse;
 pub mod live_table;
+/// One reading of a join build side's size estimate, shared by the broadcast
+/// override and the spillable-join choice so the two cannot disagree.
+pub(crate) mod join_estimates;
 pub mod object_store_registry;
 pub mod pipeline_ddl;
 pub mod pivot_sql;

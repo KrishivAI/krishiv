@@ -849,33 +849,129 @@ fn is_retryable_fetch_error(error: &io::Error) -> bool {
     )
 }
 
+/// T19: classify an endpoint as local (loopback) or remote, so the
+/// `local_blocks_fetched` / `remote_blocks_fetched` counters mean something.
+fn endpoint_is_local(endpoint: &str) -> bool {
+    endpoint.starts_with("http://localhost")
+        || endpoint.starts_with("http://127.0.0.1")
+        || endpoint.starts_with("http://[::1]")
+        || !endpoint.contains("://")
+}
+
+/// Convert a transport failure that outlasted every retry budget into the
+/// `NotFound` the recovery path keys on.
+///
+/// We arrive here in two ways: a genuinely permanent error (`NotFound` /
+/// `InvalidInput`), which passes through unchanged, and a *transport* error
+/// (connection refused, unavailable, deadline) that survived every attempt and
+/// the whole wall-clock grace. The second case means the producing executor's
+/// Flight server is unreachable for good — operationally the partition is gone
+/// — so it is reported as `NotFound`, which the task runner maps to
+/// `ShufflePartitionMissing` so the scheduler regenerates the producer.
+///
+/// Without that mapping the consumer returns an opaque transport error that
+/// triggers NO shuffle regeneration; it just burns the task's retry budget
+/// against a dead endpoint and the job fails unrecoverably (observed live on a
+/// 3-node cluster after a producer's pod was deleted mid-fetch).
+fn exhausted_transport_error(
+    error: io::Error,
+    job_id: &str,
+    stage_id: &str,
+    partition_id: u32,
+    attempt: u32,
+    elapsed: std::time::Duration,
+) -> io::Error {
+    if is_retryable_fetch_error(&error) {
+        return io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "shuffle partition {job_id}/{stage_id}/{partition_id} unreachable after \
+                 {attempt} attempts over {:.1}s (producer executor gone): {error}",
+                elapsed.as_secs_f64()
+            ),
+        );
+    }
+    error
+}
+
+/// Normalise a shuffle endpoint into a URL tonic will accept.
+fn endpoint_url(raw: &str) -> String {
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    }
+}
+
+/// Process-wide cache of one gRPC channel per shuffle endpoint.
+///
+/// # Why this exists
+///
+/// `fetch` used to call `Endpoint::connect()` on **every fragment fetch**. A
+/// reduce task fetches one fragment per upstream map task, so a stage with 18
+/// map tasks and 18 reduce partitions performs 324 fetches — and paid a fresh
+/// TCP handshake, HTTP/2 preface and settings exchange for each one. TPC-H q10
+/// has five shuffles and ~1600 fragments, so the query spent ~1600 connection
+/// setups against a pod network whose round trip dominates its 3.5 MB average
+/// payload.
+///
+/// A tonic [`Channel`](tonic::transport::Channel) multiplexes concurrent
+/// requests over one HTTP/2 connection and is cheap to clone, so one per
+/// endpoint is all that is wanted.
+///
+/// Built with `connect_lazy`, which is what makes caching safe across a
+/// producer restart: it returns immediately without a live socket, and tonic
+/// re-dials on demand, so a cached channel whose peer went away recovers by
+/// itself instead of pinning a dead connection forever. That is the same
+/// failure the transport grace covers, and the two now agree.
+static CHANNEL_POOL: std::sync::LazyLock<dashmap::DashMap<String, tonic::transport::Channel>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// The pooled channel for `url`, creating it on first use.
+fn pooled_channel(url: &str) -> io::Result<tonic::transport::Channel> {
+    if let Some(channel) = CHANNEL_POOL.get(url) {
+        return Ok(channel.clone());
+    }
+    let channel = tonic::transport::Endpoint::from_shared(url.to_string())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
+        // Keepalives stop an idle pooled channel from being reaped by a NAT or
+        // by the peer while a long stage runs with no fetches in flight.
+        .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+        .keep_alive_timeout(std::time::Duration::from_secs(20))
+        .keep_alive_while_idle(true)
+        .connect_lazy();
+    // A concurrent caller may have inserted first; either channel is equally
+    // good, so keep whichever is already published and drop ours.
+    Ok(CHANNEL_POOL
+        .entry(url.to_string())
+        .or_insert(channel)
+        .clone())
+}
+
+/// Drop every pooled channel. Tests that stand up and tear down servers on
+/// reused addresses need this so a stale channel cannot answer for a new one.
+pub fn clear_channel_pool() {
+    CHANNEL_POOL.clear();
+}
+
 /// Client for fetching shuffle partitions over Arrow Flight.
 pub struct FlightShuffleClient;
 
 impl FlightShuffleClient {
-    /// Fetch all [`RecordBatch`]es for one shuffle partition from a remote
-    /// shuffle Flight server.
+    /// Open one shuffle partition as a stream of [`RecordBatch`]es.
     ///
-    /// `endpoint` accepts either `<host>:<port>` or a full URL
-    /// (`http://<host>:<port>`).
-    pub async fn fetch(
+    /// Returns once the server has accepted the ticket, before any data is
+    /// decoded — so a missing partition or an unreachable producer is reported
+    /// here, and the caller can still retry without having emitted any rows.
+    /// Bytes are then decoded as the returned stream is polled.
+    pub async fn open(
         endpoint: impl Into<String>,
         job_id: &str,
         stage_id: &str,
         partition_id: u32,
-    ) -> io::Result<Vec<RecordBatch>> {
-        let raw = endpoint.into();
-        let url = if raw.starts_with("http://") || raw.starts_with("https://") {
-            raw
-        } else {
-            format!("http://{raw}")
-        };
-
-        let channel = tonic::transport::Endpoint::from_shared(url)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
-            .connect()
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
+    ) -> io::Result<impl futures::Stream<Item = io::Result<RecordBatch>> + Send + 'static> {
+        let url = endpoint_url(&endpoint.into());
+        let channel = pooled_channel(&url)?;
 
         let limit = shuffle_grpc_max_message_bytes();
         let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel)
@@ -905,11 +1001,114 @@ impl FlightShuffleClient {
             })?
             .into_inner();
 
-        let decoder = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
-            stream.map_err(arrow_flight::error::FlightError::from),
-        );
-        let batches: Vec<RecordBatch> = decoder.map_err(flight_stream_error).try_collect().await?;
-        Ok(batches)
+        Ok(
+            arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+                stream.map_err(arrow_flight::error::FlightError::from),
+            )
+            .map_err(flight_stream_error),
+        )
+    }
+
+    /// Fetch all [`RecordBatch`]es for one shuffle partition from a remote
+    /// shuffle Flight server.
+    ///
+    /// `endpoint` accepts either `<host>:<port>` or a full URL
+    /// (`http://<host>:<port>`).
+    ///
+    /// Prefer [`Self::open`] on the hot path: this collects the whole fragment
+    /// into memory, outside any budget.
+    pub async fn fetch(
+        endpoint: impl Into<String>,
+        job_id: &str,
+        stage_id: &str,
+        partition_id: u32,
+    ) -> io::Result<Vec<RecordBatch>> {
+        Self::open(endpoint, job_id, stage_id, partition_id)
+            .await?
+            .try_collect()
+            .await
+    }
+
+    /// Open one shuffle partition as a stream, retrying the *open* per `policy`.
+    ///
+    /// This is the streaming counterpart of [`Self::fetch_with_retry`] and the
+    /// one the reduce side should use: the fragment is decoded as it is consumed
+    /// rather than collected, so a reduce task's resident cost is a batch rather
+    /// than a whole fragment.
+    ///
+    /// # Why only the open is retried
+    ///
+    /// [`Self::fetch_with_retry`] can retry a mid-stream failure because it has
+    /// not handed anything to its caller yet — the batches are still inside its
+    /// `Vec`. A streaming fetch has no such freedom: once a batch has been
+    /// yielded downstream, re-opening the partition would replay rows the
+    /// consumer already has, and a shuffle read that silently duplicates rows is
+    /// a wrong answer reported as success. So a failure *after* the first batch
+    /// propagates, and the task-level retry re-runs the reduce task from
+    /// scratch.
+    ///
+    /// Nothing important is lost. The failure the grace exists for — a producer
+    /// that is OOM-killed and restarting — makes the *open* fail (connection
+    /// refused / unavailable), which is exactly what this still retries for the
+    /// full wall-clock grace.
+    pub async fn open_with_retry(
+        endpoint: impl Into<String>,
+        job_id: &str,
+        stage_id: &str,
+        partition_id: u32,
+        policy: FetchRetryPolicy,
+    ) -> io::Result<impl futures::Stream<Item = io::Result<RecordBatch>> + Send + 'static> {
+        let endpoint: String = endpoint.into();
+        let max_attempts = policy.max_attempts.max(1);
+        let mut attempt = 1u32;
+        let is_local = endpoint_is_local(&endpoint);
+        let fetch_started = std::time::Instant::now();
+        loop {
+            match Self::open(endpoint.clone(), job_id, stage_id, partition_id).await {
+                Ok(stream) => {
+                    let open_elapsed_us = fetch_started.elapsed().as_micros() as u64;
+                    krishiv_metrics::global_metrics().add_shuffle_fetch_wait_time_us(open_elapsed_us);
+                    if is_local {
+                        krishiv_metrics::global_metrics().add_shuffle_local_blocks_fetched(1);
+                    } else {
+                        krishiv_metrics::global_metrics().add_shuffle_remote_blocks_fetched(1);
+                    }
+                    // Count rows and bytes as they flow past, rather than
+                    // summing a `Vec` that no longer exists.
+                    return Ok(stream.inspect(|batch| {
+                        if let Ok(batch) = batch {
+                            let metrics = krishiv_metrics::global_metrics();
+                            metrics.add_shuffle_read_bytes(batch.get_array_memory_size() as u64);
+                            metrics.add_shuffle_read_records(batch.num_rows() as u64);
+                        }
+                    }));
+                }
+                Err(error)
+                    if is_retryable_fetch_error(&error)
+                        && policy.should_retry_transport(attempt, fetch_started.elapsed()) =>
+                {
+                    let delay = policy.delay_after_attempt(attempt);
+                    tracing::warn!(
+                        endpoint = %endpoint,
+                        job_id,
+                        stage_id,
+                        partition_id,
+                        attempt,
+                        max_attempts,
+                        elapsed_ms = fetch_started.elapsed().as_millis() as u64,
+                        grace_ms = policy.transport_grace.as_millis() as u64,
+                        delay_ms = delay.as_millis() as u64,
+                        error = %error,
+                        "transient shuffle open failure; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(exhausted_transport_error(
+                    error, job_id, stage_id, partition_id, attempt, fetch_started.elapsed(),
+                )),
+            }
+        }
     }
 
     /// Fetch one shuffle partition, retrying transient failures per `policy`.
@@ -928,13 +1127,7 @@ impl FlightShuffleClient {
         let endpoint: String = endpoint.into();
         let max_attempts = policy.max_attempts.max(1);
         let mut attempt = 1u32;
-        // T19: classify the endpoint as local (loopback) or remote so
-        // the `local_blocks_fetched` / `remote_blocks_fetched` counters
-        // are accurate.
-        let is_local = endpoint.starts_with("http://localhost")
-            || endpoint.starts_with("http://127.0.0.1")
-            || endpoint.starts_with("http://[::1]")
-            || !endpoint.contains("://");
+        let is_local = endpoint_is_local(&endpoint);
         let fetch_started = std::time::Instant::now();
         loop {
             match Self::fetch(endpoint.clone(), job_id, stage_id, partition_id).await {
@@ -978,38 +1171,17 @@ impl FlightShuffleClient {
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                 }
+                // See `exhausted_transport_error` for why an unreachable
+                // producer is reported as `NotFound`.
                 Err(error) => {
-                    // We fall here in two ways:
-                    //  * a genuinely permanent error (`NotFound` / `InvalidInput`)
-                    //    — pass it through unchanged, and
-                    //  * a *transport* error (connection refused, unavailable,
-                    //    deadline) that survived every retry attempt.
-                    //
-                    // The second case means the producing executor's Flight
-                    // server is unreachable after `max_attempts` — operationally
-                    // the partition is gone (the executor was killed / evicted).
-                    // Surface it as `NotFound` so the task runner maps it to
-                    // `ShufflePartitionMissing`, the consumer reports the
-                    // partition missing, and the scheduler regenerates the
-                    // producer on a healthy executor. Without this the consumer
-                    // returns an opaque transport error that triggers NO shuffle
-                    // regeneration; it just burns the task's retry budget against
-                    // the dead endpoint and the whole job fails unrecoverably
-                    // (observed live on a 3-node cluster: batch job "Failed",
-                    // one reduce task never recovered after its producer's pod
-                    // was deleted mid-fetch).
-                    if is_retryable_fetch_error(&error) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::NotFound,
-                            format!(
-                                "shuffle partition {job_id}/{stage_id}/{partition_id} \
-                                 unreachable after {attempt} attempts over {:.1}s \
-                                 (producer executor gone): {error}",
-                                fetch_started.elapsed().as_secs_f64()
-                            ),
-                        ));
-                    }
-                    return Err(error);
+                    return Err(exhausted_transport_error(
+                        error,
+                        job_id,
+                        stage_id,
+                        partition_id,
+                        attempt,
+                        fetch_started.elapsed(),
+                    ));
                 }
             }
         }

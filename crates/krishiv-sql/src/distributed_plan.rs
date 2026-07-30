@@ -846,20 +846,19 @@ struct MapRangeShuffleReader {
 }
 
 impl ShufflePartitionReader for MapRangeShuffleReader {
-    fn read_partition(
+    fn open_partition(
         &self,
         upstream_stage_index: usize,
         map_task_index: usize,
         partition: usize,
-    ) -> futures::future::BoxFuture<'static, Result<Vec<arrow::record_batch::RecordBatch>, String>>
-    {
+    ) -> futures::future::BoxFuture<'static, Result<ShuffleFragmentStream, String>> {
         if upstream_stage_index == self.range.upstream_stage_index
             && !(self.range.start..self.range.end).contains(&map_task_index)
         {
-            return Box::pin(async { Ok(Vec::new()) });
+            return Box::pin(async { Ok(Box::pin(futures::stream::empty()) as ShuffleFragmentStream) });
         }
         self.inner
-            .read_partition(upstream_stage_index, map_task_index, partition)
+            .open_partition(upstream_stage_index, map_task_index, partition)
     }
 }
 
@@ -1265,17 +1264,36 @@ pub fn register_python_udf_signatures_and_strip(
 /// the Flight endpoints delivered with the task assignment (remote reads);
 /// `krishiv-sql` stays free of shuffle/transport dependencies.
 pub trait ShufflePartitionReader: fmt::Debug + Send + Sync {
-    /// Read one map task's output for `partition` of `upstream_stage_index`.
+    /// Open one map task's output for `partition` of `upstream_stage_index`.
     ///
-    /// A missing partition (map task produced no rows for it) returns an
-    /// empty vec, not an error.
-    fn read_partition(
+    /// The returned future resolves once the fragment has been *located* — a
+    /// missing partition is an error here, before any rows are produced — and
+    /// the stream then yields its batches as they are decoded.
+    ///
+    /// # Why this streams
+    ///
+    /// This used to return `Vec<RecordBatch>`: a reduce task materialised each
+    /// upstream fragment whole, and neither the Flight decode buffers nor the
+    /// resulting batches passed through the DataFusion memory pool. With three
+    /// task slots and several fragments in flight per slot, that is hundreds of
+    /// megabytes the pool cannot see and therefore cannot make anyone spill for
+    /// — which is how an executor with a 2.6 GB pool reached 4.5 GiB of heap and
+    /// was OOM-killed on TPC-H q10. Streaming makes a reduce task's fragment
+    /// cost one batch instead of one fragment.
+    ///
+    /// A missing fragment (the map task produced no rows for this partition)
+    /// yields an empty stream, not an error.
+    fn open_partition(
         &self,
         upstream_stage_index: usize,
         map_task_index: usize,
         partition: usize,
-    ) -> futures::future::BoxFuture<'static, Result<Vec<arrow::record_batch::RecordBatch>, String>>;
+    ) -> futures::future::BoxFuture<'static, Result<ShuffleFragmentStream, String>>;
 }
+
+/// One upstream fragment's batches, in write order.
+pub type ShuffleFragmentStream =
+    futures::stream::BoxStream<'static, Result<arrow::record_batch::RecordBatch, String>>;
 
 /// Env var overriding how many map fragments ONE reduce partition fetches at
 /// once. See the `buffered` call in [`ShuffleReadExec::execute`].
@@ -1288,17 +1306,21 @@ pub trait ShufflePartitionReader: fmt::Debug + Send + Sync {
 /// giving them one name would mean a single number silently driving both.
 pub const SHUFFLE_FETCH_BUFFER_ENV: &str = "KRISHIV_SHUFFLE_FETCH_BUFFER";
 
-/// Map fragments in flight per reduce partition, by default.
+/// Map fragment *opens* in flight per reduce partition, by default.
 ///
-/// The old behaviour was effectively 1 — strictly serial fetches — even though
-/// the executor was willing to run 8 at once. Every step up from there buys
-/// overlapped latency and costs resident bytes, because a fragment is
-/// materialised whole. Four is deliberately modest: it removes most of the
-/// serialisation (a task waits on the slowest of four round trips rather than
-/// the sum of eighteen), the executor semaphore still caps the process total,
-/// and this executor's memory has been the constraint on this benchmark more
-/// than once.
-const DEFAULT_SHUFFLE_FETCH_BUFFER: usize = 4;
+/// The original behaviour was effectively 1 — strictly serial fetches — even
+/// though the executor was willing to run 8 at once, so a reduce task paid 18
+/// round trips end to end.
+///
+/// What this number buys changed when the read path started streaming. It now
+/// bounds how many fragments are **open** at once, not how many are resident:
+/// the opens overlap, so the task waits on the slowest of `n` round trips rather
+/// than their sum, while the batches themselves are still consumed one fragment
+/// at a time in map-task order. The bytes in flight for a not-yet-consumed open
+/// stream are whatever the HTTP/2 flow-control window holds — tens of kilobytes
+/// — instead of a whole materialised fragment, which is why this can be raised
+/// without re-creating the memory pressure it used to cost.
+const DEFAULT_SHUFFLE_FETCH_BUFFER: usize = 8;
 
 /// Resolve [`DEFAULT_SHUFFLE_FETCH_BUFFER`], honouring the env override.
 ///
@@ -1497,7 +1519,7 @@ impl ExecutionPlan for ShuffleReadExec {
                 let reader = Arc::clone(&reader);
                 async move {
                     reader
-                        .read_partition(stage, map_task, partition)
+                        .open_partition(stage, map_task, partition)
                         .await
                         .map(|batches| (map_task, batches))
                         .map_err(|e| {
@@ -1508,7 +1530,7 @@ impl ExecutionPlan for ShuffleReadExec {
                         })
                 }
             })
-            // Fetch several map fragments at once instead of one at a time.
+            // Open several map fragments at once instead of one at a time.
             //
             // This was `.then(..)`, which awaits each future before creating
             // the next: a reduce task fetched its fragment from map task 0,
@@ -1518,17 +1540,22 @@ impl ExecutionPlan for ShuffleReadExec {
             // times over — all of it latency, none of it overlapped, while the
             // CPU that is meant to be joining sits idle.
             //
-            // `buffered` keeps the output in map-task order (so the merge is
-            // still deterministic) and bounds how many fragments are in flight,
-            // which matters because `read_partition` materialises a whole
-            // fragment: concurrency here is paid for in resident bytes, and
-            // this executor has been OOM-killed before.
+            // `buffered` keeps the output in map-task order, so the merge stays
+            // deterministic, and bounds how many fragments are open. Because
+            // `open_partition` streams, an open-but-not-yet-consumed fragment
+            // costs a flow-control window rather than its full size.
             .buffered(shuffle_fetch_buffer())
             .map_ok(move |(map_task, batches)| {
                 let expected = Arc::clone(&expected);
-                futures::stream::iter(batches.into_iter().map(move |batch| {
+                batches.map(move |batch| {
+                    let batch = batch.map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "shuffle read (stage {stage}, map {map_task}, partition \
+                             {partition}): {e}"
+                        ))
+                    })?;
                     check_shuffle_batch_schema(&expected, batch, stage, map_task, partition)
-                }))
+                })
             })
             .try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
@@ -2207,20 +2234,11 @@ fn is_unsplittable_broadcast_join(
 fn broadcast_build_estimate_is_empty(
     join: &datafusion::physical_plan::joins::HashJoinExec,
 ) -> bool {
-    use datafusion::common::stats::Precision;
-
-    let Ok(stats) = join.left().partition_statistics(None) else {
-        // Statistics that will not compute are not evidence of anything; leave
-        // the plan alone rather than rewrite on no information.
-        return false;
-    };
-    let positive = |p: Precision<usize>| match p {
-        Precision::Exact(v) | Precision::Inexact(v) => v > 0,
-        Precision::Absent => false,
-    };
-    // Either number being positive is enough to believe the relation is real.
-    // Only when BOTH say zero-or-nothing is the estimate degenerate.
-    !positive(stats.num_rows) && !positive(stats.total_byte_size)
+    // One shared reading of the statistics — see `crate::join_estimates` for
+    // why this is not two hand-rolled matches any more, and for why the
+    // broadcast override and the spill choice are allowed to want different
+    // things from the same numbers.
+    crate::join_estimates::BuildSideEstimate::of(join.left()).is_wholly_degenerate()
 }
 
 /// Is this a broadcast join chosen on an estimate that says its build side is
@@ -3248,12 +3266,12 @@ mod tests {
     }
 
     impl ShufflePartitionReader for Arc<TestShuffleStore> {
-        fn read_partition(
+        fn open_partition(
             &self,
             upstream_stage_index: usize,
             map_task_index: usize,
             partition: usize,
-        ) -> futures::future::BoxFuture<'static, Result<Vec<RecordBatch>, String>> {
+        ) -> futures::future::BoxFuture<'static, Result<ShuffleFragmentStream, String>> {
             let batches = self
                 .partitions
                 .lock()
@@ -3261,7 +3279,10 @@ mod tests {
                 .get(&(upstream_stage_index, map_task_index, partition))
                 .cloned()
                 .unwrap_or_default();
-            Box::pin(async move { Ok(batches) })
+            Box::pin(async move {
+                Ok(Box::pin(futures::stream::iter(batches.into_iter().map(Ok)))
+                    as ShuffleFragmentStream)
+            })
         }
     }
 
@@ -4087,12 +4108,12 @@ mod staged_tpch_tests {
     }
 
     impl ShufflePartitionReader for Arc<StageStore> {
-        fn read_partition(
+        fn open_partition(
             &self,
             upstream_stage_index: usize,
             map_task_index: usize,
             partition: usize,
-        ) -> futures::future::BoxFuture<'static, Result<Vec<RecordBatch>, String>> {
+        ) -> futures::future::BoxFuture<'static, Result<ShuffleFragmentStream, String>> {
             let batches = self
                 .partitions
                 .lock()
@@ -4100,7 +4121,10 @@ mod staged_tpch_tests {
                 .get(&(upstream_stage_index, map_task_index, partition))
                 .cloned()
                 .unwrap_or_default();
-            Box::pin(async move { Ok(batches) })
+            Box::pin(async move {
+                Ok(Box::pin(futures::stream::iter(batches.into_iter().map(Ok)))
+                    as ShuffleFragmentStream)
+            })
         }
     }
 

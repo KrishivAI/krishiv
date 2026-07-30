@@ -30,6 +30,7 @@ use crate::runner::{
     ExecutorTaskOutput, ExecutorTaskRunner, OBJECT_PARQUET_SINK_PREFIX, RestoredSourceOffset,
     SHUFFLE_WRITE_PREFIX,
 };
+use krishiv_sql::distributed_plan::ShuffleFragmentStream;
 
 /// Register all input partitions from an assignment onto a SQL engine.
 ///
@@ -896,6 +897,29 @@ struct InmemDfplanShuffleReader {
     local_partitions: std::collections::HashSet<(String, u32)>,
 }
 
+/// A fragment stream that holds its shuffle-fetch permit until it is dropped.
+///
+/// The executor-wide `SHUFFLE_FETCH_SEMAPHORE` exists to bound how many shuffle
+/// fetches are decoding into memory at once. Now that a fetch *streams*, the
+/// bytes arrive while the stream is consumed, not while the `open` future is
+/// awaited — so a permit released when `open` returns would bound the number of
+/// concurrent handshakes and nothing that costs memory.
+struct PermitHeldStream {
+    inner: ShuffleFragmentStream,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl futures::Stream for PermitHeldStream {
+    type Item = Result<arrow::record_batch::RecordBatch, String>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.get_mut().inner.as_mut().poll_next(cx)
+    }
+}
+
 // Manual impl: `ShuffleBackend` itself does not derive Debug.
 impl std::fmt::Debug for InmemDfplanShuffleReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -906,13 +930,13 @@ impl std::fmt::Debug for InmemDfplanShuffleReader {
 }
 
 impl krishiv_sql::distributed_plan::ShufflePartitionReader for InmemDfplanShuffleReader {
-    fn read_partition(
+    fn open_partition(
         &self,
         upstream_stage_index: usize,
         map_task_index: usize,
         partition: usize,
-    ) -> futures::future::BoxFuture<'static, Result<Vec<arrow::record_batch::RecordBatch>, String>>
-    {
+    ) -> futures::future::BoxFuture<'static, Result<ShuffleFragmentStream, String>> {
+        use futures::StreamExt as _;
         use krishiv_shuffle::{PartitionId, ShuffleStore as _};
         let partition = match u32::try_from(partition) {
             Ok(p) => p,
@@ -929,11 +953,17 @@ impl krishiv_sql::distributed_plan::ShufflePartitionReader for InmemDfplanShuffl
             let endpoint = endpoint.clone();
             let job_id = self.job_id.clone();
             return Box::pin(async move {
-                let _permit = super::common::SHUFFLE_FETCH_SEMAPHORE
-                    .acquire()
+                // The permit must outlive the *stream*, not just the open: what
+                // it bounds is bytes in flight across the process, and those
+                // arrive while the stream is being consumed. Acquired owned and
+                // moved into the stream below for exactly that reason —
+                // releasing it here would cap the number of concurrent `open`
+                // calls, which costs nothing and bounds nothing.
+                let permit = std::sync::Arc::clone(&super::common::SHUFFLE_FETCH_SEMAPHORE)
+                    .acquire_owned()
                     .await
                     .map_err(|_| String::from("shuffle fetch semaphore closed"))?;
-                krishiv_shuffle::flight::FlightShuffleClient::fetch_with_retry(
+                let stream = krishiv_shuffle::flight::FlightShuffleClient::open_with_retry(
                     &endpoint,
                     &job_id,
                     &stage_key,
@@ -943,7 +973,7 @@ impl krishiv_sql::distributed_plan::ShufflePartitionReader for InmemDfplanShuffl
                 .await
                 .map_err(|e| {
                     // A NotFound here means the producer executor is gone (see
-                    // FlightShuffleClient::fetch_with_retry, which maps an
+                    // FlightShuffleClient::open_with_retry, which maps an
                     // exhausted transport retry to NotFound). The reader trait
                     // is String-typed, so embed the structured missing-partition
                     // marker the task runner recovers via
@@ -960,7 +990,12 @@ impl krishiv_sql::distributed_plan::ShufflePartitionReader for InmemDfplanShuffl
                              stage={stage_key} partition={partition}): {e}"
                         )
                     }
-                })
+                })?;
+                let held = PermitHeldStream {
+                    inner: Box::pin(stream.map(|b| b.map_err(|e| e.to_string()))),
+                    _permit: permit,
+                };
+                Ok(Box::pin(held) as ShuffleFragmentStream)
             });
         }
 
@@ -981,9 +1016,13 @@ impl krishiv_sql::distributed_plan::ShufflePartitionReader for InmemDfplanShuffl
         };
         let store = std::sync::Arc::clone(&self.store);
         Box::pin(async move {
-            let found = store.read_partition(&id).await.map_err(|e| e.to_string())?;
+            // A local read streams too: the file is on this node's disk, so
+            // there is no reason to build the whole fragment in anonymous
+            // memory before the first batch can be joined.
+            let found = store.stream_partition(&id).await.map_err(|e| e.to_string())?;
             match found {
-                Some(p) => Ok(p.batches),
+                Some(p) => Ok(Box::pin(p.batches.map(|b| b.map_err(|e| e.to_string())))
+                    as ShuffleFragmentStream),
                 None => {
                     let provenance = if attached_locally {
                         "the coordinator located it on THIS executor, so the local store lost it"
@@ -1107,9 +1146,13 @@ async fn execute_dfplan_fragment(
         // this task's sub-stage key (mirrors `execute_inmem_shuffle_write`,
         // which owns the `sql:`-body variant of the same protocol).
         let num_partitions = write_cfg.num_partitions.max(1) as u32;
-        let key_column = write_cfg.key_columns.first().map(String::as_str);
-        let partitioner = key_column.map(|col| {
-            HashPartitioner::new(col, num_partitions).with_seed(shuffle_seed_from_job_id(job_id))
+        // Every declared key column, in order — not just the first. Hashing
+        // `key_columns[0]` alone is co-location-correct but collapses a
+        // composite key onto its leading column's cardinality; see
+        // `HashPartitioner`.
+        let partitioner = (!write_cfg.key_columns.is_empty()).then(|| {
+            HashPartitioner::new_multi(write_cfg.key_columns.clone(), num_partitions)
+                .with_seed(shuffle_seed_from_job_id(job_id))
         });
         // Bounded, pool-accounted, spilling map-side buffer. The
         // `Vec<Vec<RecordBatch>>` this replaces held the task's ENTIRE map
@@ -1278,8 +1321,12 @@ async fn execute_inmem_shuffle_write(
                     message: e.to_string(),
                 })?;
 
-        let partitioner = key_column.map(|col| {
-            HashPartitioner::new(col, num_partitions).with_seed(shuffle_seed_from_job_id(job_id))
+        // All declared key columns, in order — see `HashPartitioner`. The
+        // hot-key accumulator below still observes only the leading column: it
+        // is a skew *detector*, and a single column is what it can summarise.
+        let partitioner = (!write_cfg.key_columns.is_empty()).then(|| {
+            HashPartitioner::new_multi(write_cfg.key_columns.clone(), num_partitions)
+                .with_seed(shuffle_seed_from_job_id(job_id))
         });
 
         while let Some(result) = sql_stream.next().await {
@@ -2295,6 +2342,26 @@ mod tests {
     };
     use krishiv_sql::distributed_plan::{ShufflePartitionReader as _, shuffle_stage_key};
 
+    /// Open a fragment and drain it, so tests can keep asserting on a
+    /// `Vec<RecordBatch>` now that the reader streams.
+    ///
+    /// Collecting here is exactly what the production path must NOT do, which is
+    /// the point: the test wants every batch in hand to assert on, and does not
+    /// care about residency.
+    async fn read_fragment(
+        reader: &InmemDfplanShuffleReader,
+        stage: usize,
+        map_task: usize,
+        partition: usize,
+    ) -> Result<Vec<RecordBatch>, String> {
+        use futures::TryStreamExt as _;
+        reader
+            .open_partition(stage, map_task, partition)
+            .await?
+            .try_collect()
+            .await
+    }
+
     fn shuffle_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7, 8, 9]))]).unwrap()
@@ -2353,7 +2420,7 @@ mod tests {
             )]),
             local_partitions: std::collections::HashSet::new(),
         };
-        let batches = reader.read_partition(0, 0, 3).await.unwrap();
+        let batches = read_fragment(&reader, 0, 0, 3).await.unwrap();
         server.abort();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
@@ -2380,8 +2447,7 @@ mod tests {
             remote_endpoints: std::collections::HashMap::new(),
             local_partitions: std::collections::HashSet::new(),
         };
-        let error = reader
-            .read_partition(0, 0, 0)
+        let error = read_fragment(&reader, 0, 0, 0)
             .await
             .expect_err("an unlocatable partition must not read as empty");
         for needle in [
@@ -2427,8 +2493,7 @@ mod tests {
             remote_endpoints: std::collections::HashMap::new(),
             local_partitions: std::collections::HashSet::from([(stage_key, 0u32)]),
         };
-        let batches = reader
-            .read_partition(0, 0, 0)
+        let batches = read_fragment(&reader, 0, 0, 0)
             .await
             .expect("a published-but-empty partition must still read locally");
         assert_eq!(
@@ -2572,7 +2637,7 @@ mod tests {
         let (reader, server) = remote_reader_for(&disk, "job-empty-partition", &stage_key, 4).await;
         let mut results = Vec::new();
         for partition in 0..4usize {
-            results.push(reader.read_partition(0, 0, partition).await);
+            results.push(read_fragment(&reader, 0, 0, partition).await);
         }
         server.abort();
 
@@ -2618,7 +2683,7 @@ mod tests {
             remote_reader_for(&disk, "job-spilled-partition", &stage_key, 4).await;
         let mut results = Vec::new();
         for partition in 0..4usize {
-            results.push(reader.read_partition(1, 2, partition).await);
+            results.push(read_fragment(&reader, 1, 2, partition).await);
         }
         server.abort();
 

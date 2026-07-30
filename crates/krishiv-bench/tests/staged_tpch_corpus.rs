@@ -36,7 +36,7 @@ use datafusion::prelude::SessionContext;
 use krishiv_bench::tpch_fixture::{fixture_ddl, row_producing_queries};
 use krishiv_bench::tpch_queries::TPCH_QUERIES;
 use krishiv_sql::distributed_plan::{
-    ShufflePartitionReader, build_distributed_stages, execute_dfplan_body,
+    ShuffleFragmentStream, ShufflePartitionReader, build_distributed_stages, execute_dfplan_body,
     fragment_decode_session_context, planning_session_context_with_options,
 };
 use std::collections::HashMap;
@@ -55,12 +55,12 @@ struct StageStore {
 struct StoreReader(Arc<StageStore>);
 
 impl ShufflePartitionReader for StoreReader {
-    fn read_partition(
+    fn open_partition(
         &self,
         upstream_stage_index: usize,
         map_task_index: usize,
         partition: usize,
-    ) -> futures::future::BoxFuture<'static, Result<Vec<RecordBatch>, String>> {
+    ) -> futures::future::BoxFuture<'static, Result<ShuffleFragmentStream, String>> {
         let found = self
             .0
             .partitions
@@ -71,7 +71,12 @@ impl ShufflePartitionReader for StoreReader {
                     .unwrap_or_default()
             })
             .map_err(|_| String::from("stage store poisoned"));
-        Box::pin(async move { found })
+        Box::pin(async move {
+            found.map(|batches| {
+                Box::pin(futures::stream::iter(batches.into_iter().map(Ok)))
+                    as ShuffleFragmentStream
+            })
+        })
     }
 }
 

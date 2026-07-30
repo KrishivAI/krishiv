@@ -27,7 +27,7 @@ use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Splits an Arrow `RecordBatch` into N buckets by hashing one key column.
+/// Splits an Arrow `RecordBatch` into N buckets by hashing its key columns.
 ///
 /// Supported key column types: `Int32`, `Int64`, `Utf8`, `Utf8View`, `LargeUtf8`.
 ///
@@ -35,9 +35,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// independent bucket distributions. This prevents both accidental and
 /// adversarial concentration caused by fixed-seed hash collisions.
 /// Use [`HashPartitioner::with_seed`] to set a per-job seed.
+///
+/// # Multi-column keys
+///
+/// A shuffle whose key is `(a, b)` must hash **both** columns. Hashing only the
+/// first is co-location-correct — equal keys still meet, because equal `(a, b)`
+/// implies equal `a` — so it produces right answers, which is why it survived
+/// unnoticed. What it costs is parallelism: a key like
+/// `(o_orderstatus, l_orderkey)` has three distinct values in its leading
+/// column, so every row lands in one of three buckets and the other fifteen
+/// reduce tasks get nothing.
+///
+/// TPC-H at SF100 does not expose it — a partial aggregate sits in front of the
+/// low-cardinality cases, so only a handful of pre-aggregated rows cross the
+/// wire and the bucket count is irrelevant. Do **not** attribute q5/q7/q16 to
+/// this.
 #[derive(Debug)]
 pub struct HashPartitioner {
-    key_column: String,
+    /// Key columns in declaration order. Order is part of the contract: both
+    /// sides of a join must hash the same columns in the same sequence, or equal
+    /// keys land in different buckets and rows silently fail to meet.
+    key_columns: Vec<String>,
     buckets: u32,
     /// XxHash64 seed. Defaults to 0; set per-job via `with_seed` to prevent
     /// pathological distributions from a fixed seed.
@@ -48,12 +66,24 @@ pub struct HashPartitioner {
 impl Clone for HashPartitioner {
     fn clone(&self) -> Self {
         Self {
-            key_column: self.key_column.clone(),
+            key_columns: self.key_columns.clone(),
             buckets: self.buckets,
             seed: self.seed,
             null_key_count: AtomicU64::new(0),
         }
     }
+}
+
+/// Odd 64-bit constant (the golden-ratio prime) used to mix a second and
+/// subsequent key column's hash into the running per-row accumulator.
+const KEY_MIX_PRIME: u64 = 0x9E37_79B1_85EB_CA87;
+
+/// Fold one more key column's hash into a running per-row accumulator.
+///
+/// Not commutative — `mix(mix(0,a),b) != mix(mix(0,b),a)` — which is what makes
+/// column *order* part of the partitioning contract rather than an accident.
+fn mix_key_hash(acc: u64, next: u64) -> u64 {
+    acc.rotate_left(31) ^ next.wrapping_mul(KEY_MIX_PRIME)
 }
 
 /// Sentinel bytes used to hash null keys.
@@ -71,12 +101,27 @@ const NULL_SENTINEL_STR: &[u8] = &[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF
 
 impl HashPartitioner {
     pub fn new(key_column: impl Into<String>, buckets: u32) -> Self {
+        Self::new_multi(vec![key_column.into()], buckets)
+    }
+
+    /// A partitioner over a composite key.
+    ///
+    /// `key_columns` order is significant — see [`HashPartitioner`]. An empty
+    /// list is accepted and routes every row to bucket 0, matching what callers
+    /// already do when a stage declares no key (they skip partitioning
+    /// entirely); erroring here would turn a keyless exchange into a failure.
+    pub fn new_multi(key_columns: Vec<String>, buckets: u32) -> Self {
         Self {
-            key_column: key_column.into(),
+            key_columns,
             buckets,
             seed: 0,
             null_key_count: AtomicU64::new(0),
         }
+    }
+
+    /// The key columns, in hashing order.
+    pub fn key_columns(&self) -> &[String] {
+        &self.key_columns
     }
 
     /// Set a per-job XxHash64 seed.
@@ -138,17 +183,35 @@ impl HashPartitioner {
             });
         }
         let schema = batch.schema();
-        let col_idx = schema
-            .index_of(&self.key_column)
-            .map_err(|e| crate::error::io_err(e.to_string()))?;
-        let key_col = batch.column(col_idx);
-
         let n = self.buckets as usize;
         let num_rows = batch.num_rows();
 
         // Collect row indices per bucket.
         // P3.8: use a generic helper closure to avoid five near-identical loop bodies.
         let mut bucket_indices: Vec<Vec<u32>> = vec![Vec::new(); n];
+
+        // A composite key needs each row's hashes from every key column combined
+        // before the modulo, which the single-column typed closures below cannot
+        // express. Kept as a separate branch on purpose: the one-column case is
+        // the hot path over hundreds of millions of rows at SF100, and it stays
+        // exactly as it was — same closures, same buckets, no per-row `Vec<u64>`.
+        if self.key_columns.len() != 1 {
+            let hashes = self.composite_row_hashes(batch)?;
+            fill_buckets(&mut bucket_indices, num_rows, |row| {
+                let hash = hashes.get(row).copied().unwrap_or(0);
+                ShuffleBucket((hash % self.buckets as u64) as u32)
+            })?;
+            return gather_buckets(batch, &bucket_indices);
+        }
+
+        let key_column = self
+            .key_columns
+            .first()
+            .ok_or_else(|| crate::error::io_err("partitioner has no key column".to_string()))?;
+        let col_idx = schema
+            .index_of(key_column)
+            .map_err(|e| crate::error::io_err(e.to_string()))?;
+        let key_col = batch.column(col_idx);
 
         match key_col.data_type() {
             DataType::Int32 => {
@@ -245,29 +308,130 @@ impl HashPartitioner {
             }
         }
 
-        // Build one RecordBatch per bucket.
-        let mut result = Vec::with_capacity(n);
-        for indices in &bucket_indices {
-            if indices.is_empty() {
-                result.push(RecordBatch::new_empty(schema.clone()));
-            } else {
-                let index_arr = UInt32Array::from_iter_values(indices.iter().copied());
-                let columns: Vec<Arc<dyn arrow::array::Array>> = batch
-                    .columns()
-                    .iter()
-                    .map(|col| {
-                        take(col.as_ref(), &index_arr, None)
-                            .map_err(|e| crate::error::io_err(e.to_string()))
-                    })
-                    .collect::<ShuffleResult<_>>()?;
-                let partition_batch = RecordBatch::try_new(schema.clone(), columns)
-                    .map_err(|e| crate::error::io_err(e.to_string()))?;
-                result.push(partition_batch);
-            }
-        }
-
-        Ok(result)
+        gather_buckets(batch, &bucket_indices)
     }
+
+    /// One combined hash per row across every key column, in declaration order.
+    ///
+    /// Nulls use the same type-tagged sentinels as the single-column path, so a
+    /// null in any key position still distributes rather than pinning to a
+    /// bucket. The null counter is incremented per null *value*, so a row with
+    /// two null key columns counts twice — the counter measures null keys seen,
+    /// not rows.
+    fn composite_row_hashes(&self, batch: &RecordBatch) -> ShuffleResult<Vec<u64>> {
+        let schema = batch.schema();
+        let mut acc = vec![0u64; batch.num_rows()];
+        for (position, name) in self.key_columns.iter().enumerate() {
+            let col_idx = schema
+                .index_of(name)
+                .map_err(|e| crate::error::io_err(e.to_string()))?;
+            let column = batch.column(col_idx);
+            let nulls = self.fold_column_into(&mut acc, column.as_ref(), position == 0)?;
+            self.count_nulls(nulls);
+        }
+        Ok(acc)
+    }
+
+    /// Fold one column's per-row hashes into `acc`, returning its null count.
+    ///
+    /// `is_first` writes the hash directly instead of mixing, which is what
+    /// keeps a one-column composite key bucket-identical to the single-column
+    /// fast path — the two must agree or the same logical shuffle key would
+    /// route differently depending on which branch ran.
+    fn fold_column_into(
+        &self,
+        acc: &mut [u64],
+        column: &dyn Array,
+        is_first: bool,
+    ) -> ShuffleResult<usize> {
+        let seed = self.seed;
+        let mut apply = |row: usize, hash: u64| {
+            if let Some(slot) = acc.get_mut(row) {
+                *slot = if is_first {
+                    hash
+                } else {
+                    mix_key_hash(*slot, hash)
+                };
+            }
+        };
+        macro_rules! fold {
+            ($ty:ty, $expected:literal, $sentinel:expr, $bytes:expr) => {{
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<$ty>()
+                    .ok_or_else(|| ShuffleError::TypeMismatch {
+                        expected: $expected.into(),
+                    })?;
+                let null_hash = twox_hash::XxHash64::oneshot(seed, $sentinel);
+                for row in 0..arr.len() {
+                    let hash = if arr.is_null(row) {
+                        null_hash
+                    } else {
+                        let value = arr.value(row);
+                        twox_hash::XxHash64::oneshot(seed, $bytes(value).as_ref())
+                    };
+                    apply(row, hash);
+                }
+                Ok(arr.null_count())
+            }};
+        }
+        match column.data_type() {
+            DataType::Int32 => fold!(Int32Array, "Int32", NULL_SENTINEL_INT, |v: i32| (v as i64)
+                .to_le_bytes()),
+            DataType::Int64 => {
+                fold!(Int64Array, "Int64", NULL_SENTINEL_INT, |v: i64| v.to_le_bytes())
+            }
+            DataType::Utf8 => fold!(StringArray, "Utf8", NULL_SENTINEL_STR, |v: &str| v
+                .as_bytes()
+                .to_vec()),
+            DataType::Utf8View => fold!(StringViewArray, "Utf8View", NULL_SENTINEL_STR, |v: &str| v
+                .as_bytes()
+                .to_vec()),
+            DataType::LargeUtf8 => fold!(
+                LargeStringArray,
+                "LargeUtf8",
+                NULL_SENTINEL_STR,
+                |v: &str| v.as_bytes().to_vec()
+            ),
+            other => Err(ShuffleError::TypeMismatch {
+                expected: format!(
+                    "supported partition key type (Int32, Int64, Utf8, Utf8View, LargeUtf8), got {other}"
+                ),
+            }),
+        }
+    }
+}
+
+/// Materialise one `RecordBatch` per bucket from per-bucket row indices.
+///
+/// Empty buckets become zero-row batches with the input schema, so the result
+/// always has exactly `bucket_indices.len()` entries and downstream index
+/// arithmetic stays valid.
+fn gather_buckets(
+    batch: &RecordBatch,
+    bucket_indices: &[Vec<u32>],
+) -> ShuffleResult<Vec<RecordBatch>> {
+    let schema = batch.schema();
+    let mut result = Vec::with_capacity(bucket_indices.len());
+    for indices in bucket_indices {
+        if indices.is_empty() {
+            result.push(RecordBatch::new_empty(schema.clone()));
+        } else {
+            let index_arr = UInt32Array::from_iter_values(indices.iter().copied());
+            let columns: Vec<Arc<dyn arrow::array::Array>> = batch
+                .columns()
+                .iter()
+                .map(|col| {
+                    take(col.as_ref(), &index_arr, None)
+                        .map_err(|e| crate::error::io_err(e.to_string()))
+                })
+                .collect::<ShuffleResult<_>>()?;
+            let partition_batch = RecordBatch::try_new(schema.clone(), columns)
+                .map_err(|e| crate::error::io_err(e.to_string()))?;
+            result.push(partition_batch);
+        }
+    }
+    Ok(result)
 }
 
 /// Hash an i64 value into a shuffle bucket using XxHash64 with the given seed.
@@ -410,6 +574,145 @@ mod tests {
         let total: usize = parts.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 5, "no rows dropped");
         assert_eq!(partitioner.null_key_count(), 3);
+    }
+
+    /// A two-column batch whose LEADING key has only two distinct values and
+    /// whose trailing key is unique per row.
+    fn low_then_high_cardinality(rows: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("status", DataType::Int64, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values((0..rows).map(|i| i % 2))),
+                Arc::new(Int64Array::from_iter_values(0..rows)),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The bottleneck this fixes: hashing only the leading key column collapses
+    /// a composite shuffle key onto that column's cardinality.
+    ///
+    /// With `(status, id)` where `status` has two values, the old single-column
+    /// behaviour could occupy at most two of eight buckets, leaving six reduce
+    /// tasks with nothing. Hashing both spreads the rows.
+    #[test]
+    fn a_composite_key_uses_every_bucket_not_just_the_leading_columns() {
+        let batch = low_then_high_cardinality(4096);
+
+        let leading_only = HashPartitioner::new("status", 8);
+        let occupied = |parts: &[RecordBatch]| parts.iter().filter(|b| b.num_rows() > 0).count();
+        let leading_buckets = occupied(&leading_only.partition(&batch).unwrap());
+        assert!(
+            leading_buckets <= 2,
+            "a two-valued key cannot reach more than two buckets; got {leading_buckets}"
+        );
+
+        let composite =
+            HashPartitioner::new_multi(vec!["status".into(), "id".into()], 8);
+        let parts = composite.partition(&batch).unwrap();
+        assert_eq!(parts.len(), 8);
+        assert_eq!(
+            parts.iter().map(|b| b.num_rows()).sum::<usize>(),
+            4096,
+            "no rows may be dropped"
+        );
+        assert_eq!(
+            occupied(&parts),
+            8,
+            "hashing both key columns must reach every bucket, not {leading_buckets}"
+        );
+    }
+
+    /// Co-location is the whole point of a shuffle: equal keys must land in the
+    /// same bucket regardless of which batch they arrived in, or a join silently
+    /// loses matches.
+    #[test]
+    fn equal_composite_keys_always_land_in_the_same_bucket() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let make = |a: Vec<i64>, b: Vec<i64>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(a)), Arc::new(Int64Array::from(b))],
+            )
+            .unwrap()
+        };
+        let partitioner = HashPartitioner::new_multi(vec!["a".into(), "b".into()], 7);
+        // The same logical key (5, 9) in two differently-shaped batches.
+        let left = partitioner.partition(&make(vec![5], vec![9])).unwrap();
+        let right = partitioner
+            .partition(&make(vec![1, 5, 3], vec![2, 9, 4]))
+            .unwrap();
+        let bucket_of = |parts: &[RecordBatch], want: (i64, i64)| -> Option<usize> {
+            parts.iter().position(|b| {
+                let a = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                let bb = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                (0..b.num_rows()).any(|r| (a.value(r), bb.value(r)) == want)
+            })
+        };
+        assert_eq!(
+            bucket_of(&left, (5, 9)),
+            bucket_of(&right, (5, 9)),
+            "equal composite keys must co-locate across batches"
+        );
+    }
+
+    /// Column order is part of the contract, so `(a, b)` and `(b, a)` are
+    /// different partitionings. This pins the mix as non-commutative — if it
+    /// ever became commutative, two sides of a join declared in different
+    /// orders would appear to agree while hashing different things.
+    #[test]
+    fn key_column_order_changes_the_partitioning() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..256)),
+                Arc::new(Int64Array::from_iter_values((0..256).map(|i| i * 7 + 1))),
+            ],
+        )
+        .unwrap();
+        let ab = HashPartitioner::new_multi(vec!["a".into(), "b".into()], 8)
+            .partition(&batch)
+            .unwrap();
+        let ba = HashPartitioner::new_multi(vec!["b".into(), "a".into()], 8)
+            .partition(&batch)
+            .unwrap();
+        let shape = |parts: &[RecordBatch]| parts.iter().map(|b| b.num_rows()).collect::<Vec<_>>();
+        assert_ne!(
+            shape(&ab),
+            shape(&ba),
+            "the key mix must not be commutative, or column order would be \
+             silently meaningless"
+        );
+    }
+
+    /// A one-column composite must route exactly like the single-column fast
+    /// path. The two are separate branches for performance, and a divergence
+    /// would mean the same logical key hashed differently depending on which
+    /// branch ran — the co-location bug, introduced by an optimisation.
+    #[test]
+    fn a_single_element_composite_matches_the_fast_path_exactly() {
+        let batch = low_then_high_cardinality(512);
+        let fast = HashPartitioner::new("id", 8).partition(&batch).unwrap();
+        let composite = HashPartitioner::new_multi(vec!["id".into()], 8)
+            .partition(&batch)
+            .unwrap();
+        let shape = |parts: &[RecordBatch]| parts.iter().map(|b| b.num_rows()).collect::<Vec<_>>();
+        assert_eq!(
+            shape(&fast),
+            shape(&composite),
+            "the composite path must agree with the single-column path on one column"
+        );
     }
 
     /// Regression (Wave 1 — Data Correctness): `Clone` must reset the
