@@ -34,6 +34,12 @@ datafusion-functions-nested = { workspace = true }
 krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["kafka", "lakehouse"] }
 krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
 krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
+# Cross-stage runtime filters (`runtime_filter_exec`) build on the split-block
+# bloom filter in this crate rather than re-deriving one. Note the direction:
+# krishiv-sql defines the `ShufflePartitionReader` trait itself and krishiv-shuffle
+# knows nothing of SQL, so this edge is acyclic — and it adds no new external
+# dependency, since the filter is `parquet::bloom_filter::Sbbf`, already in tree.
+krishiv-shuffle = { path = "../krishiv-shuffle", version = "0.1.0" }
 regex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

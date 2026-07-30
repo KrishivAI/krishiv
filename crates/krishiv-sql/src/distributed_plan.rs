@@ -1707,6 +1707,19 @@ struct ShuffleReadNodePayload {
     upstream_bytes: Option<usize>,
 }
 
+/// Serialized form of the runtime-filter nodes inside the plan proto.
+///
+/// Tagged on `node`, which [`ShuffleReadNodePayload`] does not carry — so the
+/// decoder can tell the two apart by whether this parse succeeds, without a
+/// version bump that would make new coordinators and old executors disagree
+/// about a field they both already understand.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "node")]
+enum KrishivNodePayload {
+    RuntimeFilterBuild { key_index: usize, filter_bytes: usize },
+    RuntimeFilterProbe { key_index: usize },
+}
+
 fn schema_to_ipc_bytes(schema: &arrow::datatypes::Schema) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
     let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, schema)
@@ -1748,9 +1761,45 @@ impl PhysicalExtensionCodec for KrishivPhysicalCodec {
     fn try_decode(
         &self,
         buf: &[u8],
-        _inputs: &[Arc<dyn ExecutionPlan>],
+        inputs: &[Arc<dyn ExecutionPlan>],
         _ctx: &TaskContext,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        use crate::runtime_filter_exec::{RuntimeFilterBuildExec, RuntimeFilterProbeExec};
+        // The runtime-filter nodes carry a `node` tag; a shuffle-read payload
+        // does not, so this parse is an unambiguous discriminator.
+        if let Ok(payload) = serde_json::from_slice::<KrishivNodePayload>(buf) {
+            return match payload {
+                KrishivNodePayload::RuntimeFilterBuild {
+                    key_index,
+                    filter_bytes,
+                } => {
+                    let [input] = inputs else {
+                        return Err(DataFusionError::Internal(format!(
+                            "RuntimeFilterBuildExec expects one input, got {}",
+                            inputs.len()
+                        )));
+                    };
+                    Ok(Arc::new(RuntimeFilterBuildExec::try_new(
+                        Arc::clone(input),
+                        key_index,
+                        filter_bytes,
+                    )?))
+                }
+                KrishivNodePayload::RuntimeFilterProbe { key_index } => {
+                    let [data, filter] = inputs else {
+                        return Err(DataFusionError::Internal(format!(
+                            "RuntimeFilterProbeExec expects two inputs, got {}",
+                            inputs.len()
+                        )));
+                    };
+                    Ok(Arc::new(RuntimeFilterProbeExec::try_new(
+                        Arc::clone(data),
+                        Arc::clone(filter),
+                        key_index,
+                    )?))
+                }
+            };
+        }
         let payload: ShuffleReadNodePayload = serde_json::from_slice(buf)
             .map_err(|e| DataFusionError::Internal(format!("shuffle-read node decode: {e}")))?;
         if payload.v != 1 {
@@ -1784,6 +1833,25 @@ impl PhysicalExtensionCodec for KrishivPhysicalCodec {
         node: Arc<dyn ExecutionPlan>,
         buf: &mut Vec<u8>,
     ) -> datafusion::error::Result<()> {
+        use crate::runtime_filter_exec::{RuntimeFilterBuildExec, RuntimeFilterProbeExec};
+        let filter_payload = if let Some(build) = node.downcast_ref::<RuntimeFilterBuildExec>() {
+            Some(KrishivNodePayload::RuntimeFilterBuild {
+                key_index: build.key_index(),
+                filter_bytes: build.filter_bytes(),
+            })
+        } else {
+            node.downcast_ref::<RuntimeFilterProbeExec>()
+                .map(|probe| KrishivNodePayload::RuntimeFilterProbe {
+                    key_index: probe.key_index(),
+                })
+        };
+        if let Some(payload) = filter_payload {
+            let json = serde_json::to_vec(&payload).map_err(|e| {
+                DataFusionError::Internal(format!("runtime filter node encode: {e}"))
+            })?;
+            buf.extend_from_slice(&json);
+            return Ok(());
+        }
         let read = node.downcast_ref::<ShuffleReadExec>().ok_or_else(|| {
             DataFusionError::NotImplemented(format!(
                 "KrishivPhysicalCodec cannot encode node {}",
@@ -1958,6 +2026,11 @@ pub fn build_distributed_stages_with_udf_directives(
             message: String::from("plan has no exchange to cut, so it cannot be split into stages"),
         });
     }
+    // Cross-stage runtime filters, before the root is pushed so the Result
+    // stage stays last. Appends filter stages and rewrites probe stages in
+    // place; a no-op unless `KRISHIV_RUNTIME_FILTER` is on.
+    inject_runtime_filters(&root, &mut drafts);
+
     drafts.push(StageDraft {
         plan: root,
         shuffle: None,
@@ -2623,6 +2696,311 @@ fn find_unsupported_stage_node(plan: &Arc<dyn ExecutionPlan>) -> Option<String> 
         }
     }
     None
+}
+
+// ── Cross-stage runtime filters ────────────────────────────────────────────
+
+/// How many times larger the probe side must be estimated before a filter is
+/// worth its stage.
+///
+/// The filter costs one extra scan of the build side plus a broadcast of a few
+/// MB to every probe task. Below this ratio that is not obviously repaid, and a
+/// rule that fires on marginal cases is exactly how the semi-join rule and the
+/// broadcast over-reach each cost more than they gained.
+const RUNTIME_FILTER_MIN_RATIO: usize = 8;
+
+/// A join that can carry a cross-stage runtime filter, with everything the
+/// rewrite needs already validated.
+#[derive(Debug, Clone, Copy)]
+struct RuntimeFilterCandidate {
+    build_stage: usize,
+    probe_stage: usize,
+    build_key_index: usize,
+    probe_key_index: usize,
+    filter_bytes: usize,
+}
+
+/// What a join child reads, when it reads one upstream stage with the column
+/// layout that stage's root emits.
+#[derive(Debug, Clone, Copy)]
+struct JoinSideRead {
+    stage: usize,
+    rows: Option<usize>,
+}
+
+/// Find the [`ShuffleReadExec`] under a join child, if the column indexes at the
+/// join are the same indexes the upstream stage's root emits.
+///
+/// The whole rewrite hinges on that equality: the key index comes from the
+/// join's `on` expressions, which are `Column`s into the join child's schema,
+/// and it is applied at the *root of the upstream stage*. So this descends only
+/// through single-child nodes that leave the field list untouched — a
+/// projection that reorders or renames stops the walk rather than silently
+/// shifting which column gets filtered.
+fn join_side_read(plan: &Arc<dyn ExecutionPlan>) -> Option<JoinSideRead> {
+    let mut current = Arc::clone(plan);
+    loop {
+        if let Some(read) = current.downcast_ref::<ShuffleReadExec>() {
+            return Some(JoinSideRead {
+                stage: read.upstream_stage_index(),
+                rows: read.upstream_estimate().0,
+            });
+        }
+        let next = {
+            let children = current.children();
+            let [child] = children.as_slice() else {
+                return None;
+            };
+            if current.schema().fields() != child.schema().fields() {
+                return None;
+            }
+            Arc::clone(child)
+        };
+        current = next;
+    }
+}
+
+/// Decide whether one join earns a runtime filter, and on which key.
+///
+/// Every guard here exists because a plan rule that fires too widely has
+/// already cost this engine more than it gained, twice.
+fn runtime_filter_candidate(
+    join: &datafusion::physical_plan::joins::HashJoinExec,
+) -> Option<RuntimeFilterCandidate> {
+    use datafusion::logical_expr::JoinType;
+    use datafusion::physical_expr::expressions::Column;
+    use krishiv_shuffle::{FilterKeyType, MAX_FILTER_BYTES, plan_filter_bytes};
+
+    // Guard — INNER only. A bloom drops probe rows that cannot match, which is
+    // invisible to an inner join and catastrophic to anything that preserves
+    // unmatched probe rows: RightAnti emits exactly the rows this removes, and
+    // Full/Right pad them with nulls. `RuntimeFilter::contains` also drops null
+    // keys, which is correct only where a null key cannot produce output.
+    if *join.join_type() != JoinType::Inner {
+        return None;
+    }
+    // Guard 1 — different stages. A same-stage join already gets DataFusion's
+    // own dynamic filter, so firing there duplicates work for nothing.
+    let build = join_side_read(join.left())?;
+    let probe = join_side_read(join.right())?;
+    if build.stage == probe.stage {
+        return None;
+    }
+
+    // Guard 2 — selectivity, on estimates that exist. `Precision::Absent`
+    // arrives here as `None` and means "no idea", never "small": guessing is
+    // the `SpillableJoinSelection` lesson, and guessing wrong here adds a stage
+    // and a broadcast to a query that gains nothing from either.
+    let (build_rows, probe_rows) = (build.rows?, probe.rows?);
+    if build_rows == 0 || probe_rows / RUNTIME_FILTER_MIN_RATIO < build_rows {
+        return None;
+    }
+
+    // Guard 3 — size cap. `plan_filter_bytes` clamps at the ceiling, and a
+    // clamped filter is one whose false-positive rate has quietly degraded
+    // towards "matches everything" — correct, but pure cost.
+    let filter_bytes = plan_filter_bytes(build_rows as u64);
+    if filter_bytes >= MAX_FILTER_BYTES {
+        return None;
+    }
+
+    // Guard 6 — read the join's own equijoin pairs rather than re-deriving
+    // them. Only plain columns of a type the filter can encode canonically;
+    // for a composite key the first usable column is enough, because a row that
+    // matches on every key column necessarily matches on one of them.
+    join.on().iter().find_map(|(left, right)| {
+        let build_column = (left.as_ref() as &dyn std::any::Any).downcast_ref::<Column>()?;
+        let probe_column = (right.as_ref() as &dyn std::any::Any).downcast_ref::<Column>()?;
+        let build_schema = join.left().schema();
+        let probe_schema = join.right().schema();
+        let build_type =
+            FilterKeyType::for_data_type(build_schema.field(build_column.index()).data_type())?;
+        let probe_type =
+            FilterKeyType::for_data_type(probe_schema.field(probe_column.index()).data_type())?;
+        // A disagreement fails open at runtime, but there is no reason to build
+        // a filter that will be ignored.
+        (build_type == probe_type).then_some(RuntimeFilterCandidate {
+            build_stage: build.stage,
+            probe_stage: probe.stage,
+            build_key_index: build_column.index(),
+            probe_key_index: probe_column.index(),
+            filter_bytes,
+        })
+    })
+}
+
+fn collect_runtime_filter_candidates(
+    plan: &Arc<dyn ExecutionPlan>,
+    out: &mut Vec<RuntimeFilterCandidate>,
+) {
+    if let Some(join) = plan.downcast_ref::<datafusion::physical_plan::joins::HashJoinExec>()
+        && let Some(candidate) = runtime_filter_candidate(join)
+    {
+        out.push(candidate);
+    }
+    for child in plan.children() {
+        collect_runtime_filter_candidates(child, out);
+    }
+}
+
+/// Does stage `from` depend, transitively, on stage `target`?
+///
+/// Guard 4. The filter stage inherits the build stage's upstreams, and the probe
+/// stage gains a dependency on the filter stage — so if the build side already
+/// depends on the probe side, that new edge closes a loop. The scheduler would
+/// catch it (Kahn's algorithm, `validate_job`) but only by rejecting the whole
+/// job, which turns an optimization into an outage.
+fn stage_depends_on(drafts: &[StageDraft], from: usize, target: usize) -> bool {
+    let mut seen = vec![false; drafts.len()];
+    let mut stack = vec![from];
+    while let Some(index) = stack.pop() {
+        if index == target {
+            return true;
+        }
+        match seen.get_mut(index) {
+            Some(flag) if !*flag => *flag = true,
+            _ => continue,
+        }
+        if let Some(draft) = drafts.get(index) {
+            stack.extend(collect_upstream_stage_indexes(&draft.plan));
+        }
+    }
+    false
+}
+
+/// Insert cross-stage runtime filters: for each qualifying join, add a stage
+/// that builds a bloom of the build-side key and make the probe stage filter
+/// its rows through it before shuffling them.
+///
+/// Returns the number of filters injected. Off unless
+/// [`crate::runtime_filter_exec::enabled`]; a failure to build any single
+/// filter skips that filter and leaves the plan untouched, because a
+/// throughput optimization must never be why a query fails.
+fn inject_runtime_filters(root: &Arc<dyn ExecutionPlan>, drafts: &mut Vec<StageDraft>) -> usize {
+    if !crate::runtime_filter_exec::enabled() {
+        return 0;
+    }
+    inject_runtime_filters_unconditionally(root, drafts)
+}
+
+/// [`inject_runtime_filters`] without the flag check.
+///
+/// Split out so the rewrite and every guard can be tested directly. Reading the
+/// flag inside the tested function would make the whole rule depend on process
+/// environment, and `set_var` across parallel test threads is a race, not a
+/// fixture.
+fn inject_runtime_filters_unconditionally(
+    root: &Arc<dyn ExecutionPlan>,
+    drafts: &mut Vec<StageDraft>,
+) -> usize {
+    use crate::runtime_filter_exec::{
+        RuntimeFilterBuildExec, RuntimeFilterProbeExec, filter_schema,
+    };
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion::physical_plan::projection::ProjectionExec;
+
+    let mut candidates = Vec::new();
+    collect_runtime_filter_candidates(root, &mut candidates);
+    for draft in drafts.iter() {
+        collect_runtime_filter_candidates(&draft.plan, &mut candidates);
+    }
+
+    let mut touched: Vec<usize> = Vec::new();
+    let mut injected = 0usize;
+    for candidate in candidates {
+        // One filter per stage, and never over a stage this pass has already
+        // rewritten: stacking rewrites would have each filter stage clone the
+        // previous one's probe node, which is correct but compounds cost for a
+        // shrinking return.
+        if touched.contains(&candidate.build_stage) || touched.contains(&candidate.probe_stage) {
+            continue;
+        }
+        let (Some(build), Some(probe)) = (
+            drafts.get(candidate.build_stage),
+            drafts.get(candidate.probe_stage),
+        ) else {
+            continue;
+        };
+        // A stage severed from a `ScalarSubqueryExec` is parameterised by a
+        // subquery result; cloning its subtree without the wrapper produces a
+        // fragment that cannot decode.
+        if build.subqueries.is_some() || probe.subqueries.is_some() {
+            continue;
+        }
+        if stage_depends_on(drafts, candidate.build_stage, candidate.probe_stage) {
+            continue;
+        }
+
+        let source = Arc::clone(&build.plan);
+        let probe_plan = Arc::clone(&probe.plan);
+        let schema = source.schema();
+        let Some(field) = schema.fields().get(candidate.build_key_index) else {
+            continue;
+        };
+        let name = field.name().clone();
+        // Project to the key column alone before coalescing: the filter stage
+        // needs one column, and carrying the rest through a single task is
+        // memory spent to be thrown away.
+        let projected = ProjectionExec::try_new(
+            vec![(
+                Arc::new(Column::new(&name, candidate.build_key_index)) as _,
+                name.clone(),
+            )],
+            source,
+        );
+        let filter_plan = projected.and_then(|projected| {
+            let coalesced = Arc::new(CoalescePartitionsExec::new(Arc::new(projected)));
+            RuntimeFilterBuildExec::try_new(coalesced, 0, candidate.filter_bytes)
+        });
+        let filter_plan = match filter_plan {
+            Ok(plan) => Arc::new(plan) as Arc<dyn ExecutionPlan>,
+            Err(error) => {
+                tracing::debug!(%error, "declined to build a runtime filter stage");
+                continue;
+            }
+        };
+
+        let filter_stage = drafts.len();
+        // A single map task (the coalesce above) writing one keyless partition:
+        // exactly the gather shape the cutter already emits for ungrouped
+        // aggregates, so the writer and reader need no special case.
+        let read = ShuffleReadExec::new(filter_stage, 1, 1, filter_schema(), None);
+        let rewritten = RuntimeFilterProbeExec::try_new(
+            probe_plan,
+            Arc::new(read),
+            candidate.probe_key_index,
+        );
+        let rewritten = match rewritten {
+            Ok(plan) => Arc::new(plan) as Arc<dyn ExecutionPlan>,
+            Err(error) => {
+                tracing::debug!(%error, "declined to apply a runtime filter to the probe stage");
+                continue;
+            }
+        };
+        let Some(probe_draft) = drafts.get_mut(candidate.probe_stage) else {
+            continue;
+        };
+        probe_draft.plan = rewritten;
+        drafts.push(StageDraft {
+            plan: filter_plan,
+            shuffle: Some(StageShuffleOutput {
+                key_columns: Vec::new(),
+                num_output_partitions: 1,
+            }),
+            subqueries: None,
+        });
+        touched.push(candidate.build_stage);
+        touched.push(candidate.probe_stage);
+        injected += 1;
+        tracing::info!(
+            build_stage = candidate.build_stage,
+            probe_stage = candidate.probe_stage,
+            filter_stage,
+            filter_bytes = candidate.filter_bytes,
+            "injected a cross-stage runtime filter"
+        );
+    }
+    injected
 }
 
 fn collect_upstream_stage_indexes(plan: &Arc<dyn ExecutionPlan>) -> Vec<usize> {
@@ -5486,7 +5864,14 @@ mod codec_completeness_tests {
     fn every_custom_execution_plan_is_encodable_or_declared_local() {
         // Nodes that may appear in a plan the coordinator encodes. Adding one
         // here without a `try_encode`/`try_decode` arm re-opens the bug.
-        const ENCODABLE: &[&str] = &["ShuffleReadExec"];
+        // `runtime_filters::the_injected_stages_round_trip_through_the_codec` is
+        // what makes listing the two filter nodes here a fact rather than a
+        // promise: it encodes and decodes a plan containing both.
+        const ENCODABLE: &[&str] = &[
+            "RuntimeFilterBuildExec",
+            "RuntimeFilterProbeExec",
+            "ShuffleReadExec",
+        ];
         // Nodes that are constructed only AFTER decode and never serialized.
         // `GraceHashJoinExec` is chosen per-executor from live memory pressure
         // (`apply_local_spill_strategy`); `OnceStreamExec` wraps an already-open
@@ -5536,7 +5921,7 @@ mod codec_completeness_tests {
              post-decode and list it in EXECUTION_LOCAL."
         );
     }
-}    /// An AQE rewrite rebuilds every reduce task body through
+    /// An AQE rewrite rebuilds every reduce task body through
     /// `dfplan_body_with_spec`. If that drops the Python-UDF directive prefix,
     /// the rebuilt task ships a plan referencing a UDF the executor was never
     /// told to reconstruct, and it dies with "PhysicalExtensionCodec is not
@@ -5544,6 +5929,9 @@ mod codec_completeness_tests {
     /// whose bodies are never rebuilt, run fine.
     #[test]
     fn rebuilding_a_body_keeps_the_python_udf_directive() {
+        use super::{
+            DfplanTaskSpec, dfplan_body_partition_spec, dfplan_body_with_spec, is_dfplan_body,
+        };
         let directive = "/* krishiv-register-python-udf:addk:int64:int64:QUJD */";
         let body = format!("{directive}\ndfplan:v1:0:QUJD");
         let spec = DfplanTaskSpec {
@@ -5566,4 +5954,344 @@ mod codec_completeness_tests {
         );
     }
 
+    // ── Cross-stage runtime filters ────────────────────────────────────────
 
+    mod runtime_filters {
+        use super::super::*;
+        use datafusion::common::{JoinType, NullEquality};
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+
+        fn schema(name: &str, key: arrow::datatypes::DataType) -> SchemaRef {
+            Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new(name, key, false),
+                arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Utf8, false),
+            ]))
+        }
+
+        /// A stage draft whose plan is a bare shuffle read of `stage`, standing
+        /// in for whatever subtree really produced it.
+        fn draft(stage: usize, rows: Option<usize>, key: &str) -> StageDraft {
+            StageDraft {
+                plan: Arc::new(
+                    ShuffleReadExec::new(
+                        stage,
+                        4,
+                        4,
+                        schema(key, arrow::datatypes::DataType::Int64),
+                        None,
+                    )
+                    .with_upstream_estimate(rows, None),
+                ),
+                shuffle: Some(StageShuffleOutput {
+                    key_columns: vec![String::from(key)],
+                    num_output_partitions: 4,
+                }),
+                subqueries: None,
+            }
+        }
+
+        fn read(
+            stage: usize,
+            rows: Option<usize>,
+            key: &str,
+            key_type: arrow::datatypes::DataType,
+        ) -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ShuffleReadExec::new(stage, 4, 4, schema(key, key_type), None)
+                    .with_upstream_estimate(rows, None),
+            )
+        }
+
+        fn join_of(
+            build: Arc<dyn ExecutionPlan>,
+            probe: Arc<dyn ExecutionPlan>,
+            join_type: JoinType,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(HashJoinExec::try_new(
+                build,
+                probe,
+                vec![(
+                    Arc::new(Column::new("bkey", 0)),
+                    Arc::new(Column::new("pkey", 0)),
+                )],
+                None,
+                &join_type,
+                None,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+                false,
+            )?))
+        }
+
+        /// The q10 shape: a small build stage, a probe stage 100x bigger, joined
+        /// across a stage boundary.
+        fn q10_shaped() -> datafusion::error::Result<(Arc<dyn ExecutionPlan>, Vec<StageDraft>)> {
+            let root = join_of(
+                read(0, Some(1_000_000), "bkey", arrow::datatypes::DataType::Int64),
+                read(1, Some(100_000_000), "pkey", arrow::datatypes::DataType::Int64),
+                JoinType::Inner,
+            )?;
+            Ok((root, vec![draft(0, Some(1_000_000), "bkey"), draft(1, Some(100_000_000), "pkey")]))
+        }
+
+        #[test]
+        fn a_filter_stage_is_injected_and_the_probe_stage_waits_on_it() {
+            let (root, mut drafts) = q10_shaped().expect("plan");
+            assert_eq!(inject_runtime_filters_unconditionally(&root, &mut drafts), 1);
+            assert_eq!(drafts.len(), 3, "one filter stage must have been appended");
+
+            let filter = &drafts[2];
+            let shuffle = filter.shuffle.as_ref().expect("filter stage shuffles");
+            assert!(
+                shuffle.key_columns.is_empty() && shuffle.num_output_partitions == 1,
+                "the filter must gather to ONE keyless partition; any other shape means \
+                 every probe task fetches N partials instead of one filter"
+            );
+            assert_eq!(
+                filter.plan.output_partitioning().partition_count(),
+                1,
+                "the filter stage must be a single task, or the broadcast it feeds \
+                 multiplies by the task count"
+            );
+
+            // The inverted edge: the PROBE stage now depends on the filter stage.
+            assert!(
+                collect_upstream_stage_indexes(&drafts[1].plan).contains(&2),
+                "the probe stage must declare the filter stage upstream, or the \
+                 scheduler will run it before the filter exists"
+            );
+        }
+
+        /// The probe stage's output schema is what its shuffle key columns are
+        /// resolved against by name. Changing it would misroute every row.
+        #[test]
+        fn the_probe_stages_output_schema_is_untouched() {
+            let (root, mut drafts) = q10_shaped().expect("plan");
+            let before = drafts[1].plan.schema();
+            inject_runtime_filters_unconditionally(&root, &mut drafts);
+            assert_eq!(
+                before.fields(),
+                drafts[1].plan.schema().fields(),
+                "wrapping the probe stage must not change its columns"
+            );
+        }
+
+        #[test]
+        fn the_filter_stage_emits_one_binary_column() {
+            let (root, mut drafts) = q10_shaped().expect("plan");
+            inject_runtime_filters_unconditionally(&root, &mut drafts);
+            assert_eq!(
+                drafts[2].plan.schema().fields().len(),
+                1,
+                "a filter stage carries only the serialized bloom"
+            );
+        }
+
+        #[test]
+        fn a_non_inner_join_gets_no_filter() {
+            for join_type in [
+                JoinType::Full,
+                JoinType::Right,
+                JoinType::RightAnti,
+                JoinType::LeftAnti,
+            ] {
+                let root = join_of(
+                    read(0, Some(1_000_000), "bkey", arrow::datatypes::DataType::Int64),
+                    read(1, Some(100_000_000), "pkey", arrow::datatypes::DataType::Int64),
+                    join_type,
+                )
+                .expect("join");
+                let mut drafts =
+                    vec![draft(0, Some(1_000_000), "bkey"), draft(1, Some(100_000_000), "pkey")];
+                assert_eq!(
+                    inject_runtime_filters_unconditionally(&root, &mut drafts),
+                    0,
+                    "{join_type:?} can preserve unmatched PROBE rows; dropping them is a \
+                     wrong answer, not a slow one"
+                );
+            }
+        }
+
+        #[test]
+        fn a_join_inside_one_stage_gets_no_filter() {
+            let root = join_of(
+                read(0, Some(1_000_000), "bkey", arrow::datatypes::DataType::Int64),
+                read(0, Some(100_000_000), "pkey", arrow::datatypes::DataType::Int64),
+                JoinType::Inner,
+            )
+            .expect("join");
+            let mut drafts = vec![draft(0, Some(1_000_000), "bkey")];
+            assert_eq!(
+                inject_runtime_filters_unconditionally(&root, &mut drafts),
+                0,
+                "a same-stage join already gets DataFusion's own dynamic filter"
+            );
+        }
+
+        #[test]
+        fn an_absent_estimate_refuses_rather_than_guesses() {
+            for (build_rows, probe_rows) in [(None, Some(100_000_000)), (Some(1_000_000), None)] {
+                let root = join_of(
+                    read(0, build_rows, "bkey", arrow::datatypes::DataType::Int64),
+                    read(1, probe_rows, "pkey", arrow::datatypes::DataType::Int64),
+                    JoinType::Inner,
+                )
+                .expect("join");
+                let mut drafts = vec![draft(0, build_rows, "bkey"), draft(1, probe_rows, "pkey")];
+                assert_eq!(
+                    inject_runtime_filters_unconditionally(&root, &mut drafts),
+                    0,
+                    "Precision::Absent means 'no idea', never 'small' — guessing here is \
+                     the SpillableJoinSelection lesson"
+                );
+            }
+        }
+
+        #[test]
+        fn a_probe_barely_bigger_than_the_build_is_not_worth_a_stage() {
+            let root = join_of(
+                read(0, Some(1_000_000), "bkey", arrow::datatypes::DataType::Int64),
+                read(1, Some(2_000_000), "pkey", arrow::datatypes::DataType::Int64),
+                JoinType::Inner,
+            )
+            .expect("join");
+            let mut drafts =
+                vec![draft(0, Some(1_000_000), "bkey"), draft(1, Some(2_000_000), "pkey")];
+            assert_eq!(
+                inject_runtime_filters_unconditionally(&root, &mut drafts),
+                0,
+                "2x is not enough to repay an extra scan plus a broadcast"
+            );
+        }
+
+        #[test]
+        fn an_oversized_filter_is_refused() {
+            // Enough distinct keys that the planned filter hits the 16 MB cap,
+            // where the false-positive rate has degraded towards "matches
+            // everything" and the broadcast costs more than the scan it saves.
+            let huge = 5_000_000_000usize;
+            let root = join_of(
+                read(0, Some(huge), "bkey", arrow::datatypes::DataType::Int64),
+                read(1, Some(huge * 8), "pkey", arrow::datatypes::DataType::Int64),
+                JoinType::Inner,
+            )
+            .expect("join");
+            let mut drafts = vec![draft(0, Some(huge), "bkey"), draft(1, Some(huge * 8), "pkey")];
+            assert_eq!(inject_runtime_filters_unconditionally(&root, &mut drafts), 0);
+        }
+
+        #[test]
+        fn an_unsupported_key_type_is_refused_not_guessed() {
+            let root = join_of(
+                read(0, Some(1_000_000), "bkey", arrow::datatypes::DataType::Float64),
+                read(1, Some(100_000_000), "pkey", arrow::datatypes::DataType::Float64),
+                JoinType::Inner,
+            )
+            .expect("join");
+            let mut drafts =
+                vec![draft(0, Some(1_000_000), "bkey"), draft(1, Some(100_000_000), "pkey")];
+            assert_eq!(
+                inject_runtime_filters_unconditionally(&root, &mut drafts),
+                0,
+                "-0.0 == 0.0 compares equal but encodes differently, so a float bloom \
+                 would produce false negatives"
+            );
+        }
+
+        /// Guard 4: the new edge must never close a loop. If the build stage
+        /// already reads the probe stage, `probe -> filter -> ... -> probe` is a
+        /// cycle, and the scheduler's answer to a cyclic job is to reject it.
+        #[test]
+        fn a_filter_that_would_close_a_cycle_is_not_injected() {
+            let root = join_of(
+                read(0, Some(1_000_000), "bkey", arrow::datatypes::DataType::Int64),
+                read(1, Some(100_000_000), "pkey", arrow::datatypes::DataType::Int64),
+                JoinType::Inner,
+            )
+            .expect("join");
+            let mut drafts =
+                vec![draft(0, Some(1_000_000), "bkey"), draft(1, Some(100_000_000), "pkey")];
+            // Make stage 0 (build) read stage 1 (probe).
+            drafts[0].plan = Arc::new(
+                ShuffleReadExec::new(
+                    1,
+                    4,
+                    4,
+                    schema("bkey", arrow::datatypes::DataType::Int64),
+                    None,
+                )
+                .with_upstream_estimate(Some(1_000_000), None),
+            );
+            assert!(stage_depends_on(&drafts, 0, 1), "precondition: build reads probe");
+            assert_eq!(inject_runtime_filters_unconditionally(&root, &mut drafts), 0);
+        }
+
+        #[test]
+        fn stage_dependency_reachability_is_transitive_and_terminates_on_cycles() {
+            let mut drafts =
+                vec![draft(0, Some(1), "a"), draft(1, Some(1), "b"), draft(2, Some(1), "c")];
+            // 2 -> 1 -> 0
+            drafts[1].plan = Arc::new(ShuffleReadExec::new(
+                0,
+                1,
+                1,
+                schema("b", arrow::datatypes::DataType::Int64),
+                None,
+            ));
+            drafts[2].plan = Arc::new(ShuffleReadExec::new(
+                1,
+                1,
+                1,
+                schema("c", arrow::datatypes::DataType::Int64),
+                None,
+            ));
+            assert!(stage_depends_on(&drafts, 2, 0), "reachability must be transitive");
+            assert!(!stage_depends_on(&drafts, 0, 2), "and directional");
+        }
+
+        /// A stage severed from a `ScalarSubqueryExec` is parameterised by a
+        /// subquery result; cloning its subtree without the wrapper yields a
+        /// fragment that cannot decode.
+        #[test]
+        fn a_subquery_parameterised_stage_is_never_cloned_into_a_filter() {
+            let (root, mut drafts) = q10_shaped().expect("plan");
+            drafts[0].subqueries = Some(StageSubqueryContext {
+                links: Vec::new(),
+                results: Default::default(),
+            });
+            assert_eq!(inject_runtime_filters_unconditionally(&root, &mut drafts), 0);
+        }
+
+        #[test]
+        fn the_feature_is_off_unless_the_flag_says_otherwise() {
+            let (root, mut drafts) = q10_shaped().expect("plan");
+            assert_eq!(
+                inject_runtime_filters(&root, &mut drafts),
+                0,
+                "the flag-checking entry point must decline by default: this rule \
+                 rewrites the stage DAG and ships dark until a clean 22-query sweep"
+            );
+            assert_eq!(drafts.len(), 2, "and it must not have touched the drafts");
+        }
+
+        /// Every node in an injected plan must survive the proto round trip.
+        /// A node the codec cannot encode does not fail loudly — the coordinator
+        /// silently runs the whole query as a SINGLE TASK.
+        #[test]
+        fn the_injected_stages_round_trip_through_the_codec() {
+            let (root, mut drafts) = q10_shaped().expect("plan");
+            assert_eq!(inject_runtime_filters_unconditionally(&root, &mut drafts), 1);
+
+            let codec = KrishivPhysicalCodec::coordinator();
+            let session = fragment_decode_session_context();
+            let ctx = session.task_ctx();
+            for (index, draft) in drafts.iter().enumerate() {
+                let bytes = encode_dfplan_bytes(Arc::clone(&draft.plan), &codec)
+                    .unwrap_or_else(|e| panic!("stage {index} did not encode: {e}"));
+                verify_dfplan_roundtrip(&bytes, &codec, &ctx, Some(&draft.plan))
+                    .unwrap_or_else(|e| panic!("stage {index} did not decode: {e}"));
+            }
+        }
+    }
+}

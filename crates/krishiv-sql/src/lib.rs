@@ -117,6 +117,7 @@ pub mod scalar_udf;
 pub mod semi_join_reduction;
 /// Spark SQL extensions: LATERAL VIEW, TABLESAMPLE, TRANSFORM, DESCRIBE EXTENDED, etc.
 pub mod spark_sql_ext;
+pub mod runtime_filter_exec;
 pub mod spillable_join;
 pub mod sqlstate;
 pub mod subquery;

@@ -684,8 +684,15 @@ pub(crate) fn validate_job(spec: &JobSpec) -> SchedulerResult<()> {
                     ),
                 }
             })?;
+            // Count DISTINCT upstreams. The drain loop below decrements once
+            // per processed upstream stage (`contains` is a boolean test), so
+            // counting a repeated dependency twice leaves an in-degree that can
+            // never reach zero — and a job with a duplicated edge is rejected
+            // as "cyclic" when its graph is a perfectly ordinary DAG.
+            let distinct: std::collections::HashSet<&StageId> =
+                stage.upstream_stage_ids().iter().collect();
             if let Some(d) = in_degree.get_mut(idx) {
-                *d = d.saturating_add(stage.upstream_stage_ids().len());
+                *d = d.saturating_add(distinct.len());
             }
         }
         let mut queue: std::collections::VecDeque<usize> = in_degree
@@ -1367,6 +1374,89 @@ mod fair_scheduler_tests {
             assignments.len(),
             3,
             "3 free slots → exactly 3 assignments, 7 stay Pending"
+        );
+    }
+
+
+    /// Kahn's algorithm counts in-degree from the upstream LIST but drains it
+    /// once per processed upstream STAGE. A repeated edge therefore inflated the
+    /// count past anything the drain could reach, and an ordinary DAG was
+    /// rejected as cyclic — a job that never starts, reported as a bad plan.
+    #[test]
+    fn a_duplicated_upstream_edge_is_not_a_cycle() {
+        let upstream = StageId::try_new("up").expect("stage id");
+        let spec = JobSpec::new(
+            JobId::try_new("dup-upstream").expect("job id"),
+            "dup",
+            JobKind::Batch,
+        )
+        .with_stage(
+            StageSpec::new(upstream.clone(), "up")
+                .with_task(TaskSpec::new(TaskId::try_new("t0").expect("task id"), "body")),
+        )
+        .with_stage(
+            StageSpec::new(StageId::try_new("down").expect("stage id"), "down")
+                .with_upstream_stage(upstream.clone())
+                .with_upstream_stage(upstream)
+                .with_task(TaskSpec::new(TaskId::try_new("t1").expect("task id"), "body")),
+        );
+        assert!(
+            validate_job(&spec).is_ok(),
+            "listing the same upstream twice describes one edge, not a loop"
+        );
+    }
+
+    /// The guard the fix must not weaken: a genuine loop still fails validation.
+    #[test]
+    fn a_genuine_cycle_is_still_rejected() {
+        let a = StageId::try_new("a").expect("stage id");
+        let b = StageId::try_new("b").expect("stage id");
+        let spec = JobSpec::new(
+            JobId::try_new("cyclic").expect("job id"),
+            "cyclic",
+            JobKind::Batch,
+        )
+        .with_stage(
+            StageSpec::new(a.clone(), "a")
+                .with_upstream_stage(b.clone())
+                .with_task(TaskSpec::new(TaskId::try_new("t0").expect("task id"), "body")),
+        )
+        .with_stage(
+            StageSpec::new(b, "b")
+                .with_upstream_stage(a)
+                .with_task(TaskSpec::new(TaskId::try_new("t1").expect("task id"), "body")),
+        );
+        assert!(validate_job(&spec).is_err(), "a -> b -> a is a real cycle");
+    }
+
+    /// The shape the runtime-filter rule produces: a probe stage depending on
+    /// BOTH its data producer and a filter stage that shares that producer's
+    /// upstreams. It is a diamond, not a loop, and must schedule.
+    #[test]
+    fn the_runtime_filter_diamond_validates() {
+        let build = StageId::try_new("dist-s0").expect("stage id");
+        let filter = StageId::try_new("dist-s2").expect("stage id");
+        let probe = StageId::try_new("dist-s1").expect("stage id");
+        let task = |name: &str| TaskSpec::new(TaskId::try_new(name).expect("task id"), "body");
+        let spec = JobSpec::new(
+            JobId::try_new("rf-diamond").expect("job id"),
+            "rf",
+            JobKind::Batch,
+        )
+        .with_stage(StageSpec::new(build.clone(), "build").with_task(task("t0")))
+        .with_stage(
+            StageSpec::new(filter.clone(), "filter")
+                .with_upstream_stage(build)
+                .with_task(task("t2")),
+        )
+        .with_stage(
+            StageSpec::new(probe, "probe")
+                .with_upstream_stage(filter)
+                .with_task(task("t1")),
+        );
+        assert!(
+            validate_job(&spec).is_ok(),
+            "a probe stage may depend on a filter stage built from a sibling's source"
         );
     }
 }

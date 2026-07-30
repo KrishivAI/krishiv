@@ -58,24 +58,32 @@ fn build_side(rows: usize) -> Arc<dyn ExecutionPlan> {
 }
 
 /// The probe side, multi-partition so there is parallelism to lose.
-fn probe_side() -> Arc<dyn ExecutionPlan> {
+///
+/// These helpers return `Result` rather than unwrapping internally: clippy's
+/// `allow-expect-in-tests` exempts `#[test]` bodies but not plain helper
+/// functions in the same file, and `unwrap`/`expect`/`panic!` are all denied
+/// here — so the fallible step belongs at the call sites, which are exempt.
+fn probe_side() -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
     let read: Arc<dyn ExecutionPlan> = Arc::new(
         ShuffleReadExec::new(1, 4, 4, narrow_schema(), None)
             .with_upstream_estimate(Some(5_000_000), Some(80_000_000)),
     );
-    Arc::new(RepartitionExec::try_new(read, Partitioning::RoundRobinBatch(4)).expect("repartition"))
+    Ok(Arc::new(RepartitionExec::try_new(
+        read,
+        Partitioning::RoundRobinBatch(4),
+    )?))
 }
 
 /// Ask DataFusion's own `JoinSelection` what mode it picks, under the exact
 /// config the distributed planner uses (32 MiB / 1,000,000 rows).
-fn chosen_mode(build_rows: usize) -> PartitionMode {
+fn chosen_mode(build_rows: usize) -> datafusion::error::Result<PartitionMode> {
     let ctx = planning_session_context_with_options(4, None, None);
     let state = ctx.state();
     let opts = state.config().options();
 
     let join = HashJoinExec::try_new(
         build_side(build_rows),
-        probe_side(),
+        probe_side()?,
         vec![(
             Arc::new(Column::new("c_custkey", 0)),
             Arc::new(Column::new("o_custkey", 0)),
@@ -88,17 +96,17 @@ fn chosen_mode(build_rows: usize) -> PartitionMode {
         PartitionMode::Auto,
         datafusion::common::NullEquality::NullEqualsNothing,
         false,
-    )
-    .expect("hash join");
+    )?;
 
     let optimized = datafusion::physical_optimizer::join_selection::JoinSelection::new()
-        .optimize(Arc::new(join), opts)
-        .expect("join selection");
+        .optimize(Arc::new(join), opts)?;
 
-    let hj = optimized
-        .downcast_ref::<HashJoinExec>()
-        .expect("still a hash join");
-    *hj.partition_mode()
+    let hj = optimized.downcast_ref::<HashJoinExec>().ok_or_else(|| {
+        datafusion::error::DataFusionError::Internal(String::from(
+            "JoinSelection replaced the hash join with another operator",
+        ))
+    })?;
+    Ok(*hj.partition_mode())
 }
 
 #[test]
@@ -106,7 +114,7 @@ fn a_wide_sub_ceiling_build_side_with_no_byte_estimate_is_broadcast() {
     // 900k rows: under the 1,000,000 row ceiling, so the row fallback admits it.
     // At ~180 B/row that is ~155 MB — far over the 32 MiB byte ceiling the row
     // number is standing in for.
-    let mode = chosen_mode(900_000);
+    let mode = chosen_mode(900_000).expect("join selection");
     assert_eq!(
         mode,
         PartitionMode::CollectLeft,
@@ -121,7 +129,7 @@ fn a_wide_sub_ceiling_build_side_with_no_byte_estimate_is_broadcast() {
 /// once instead of copied to every task.
 #[test]
 fn the_wide_broadcast_is_converted_to_a_partitioned_join() {
-    let join = wide_join(900_000);
+    let join = wide_join(900_000).expect("wide join");
     let converted = krishiv_sql::distributed_plan::redistribute_unsplittable_broadcast_joins(
         Arc::clone(&join),
     )
@@ -151,7 +159,7 @@ fn a_narrow_sub_ceiling_build_side_stays_broadcast() {
     let join: Arc<dyn ExecutionPlan> = Arc::new(
         HashJoinExec::try_new(
             build,
-            probe_side(),
+            probe_side().expect("probe side"),
             vec![(
                 Arc::new(Column::new("o_custkey", 0)),
                 Arc::new(Column::new("o_custkey", 0)),
@@ -180,11 +188,11 @@ fn a_narrow_sub_ceiling_build_side_stays_broadcast() {
 }
 
 /// Build the wide `CollectLeft` join the fix targets.
-fn wide_join(rows: usize) -> Arc<dyn ExecutionPlan> {
-    Arc::new(
+fn wide_join(rows: usize) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+    Ok(Arc::new(
         HashJoinExec::try_new(
             build_side(rows),
-            probe_side(),
+            probe_side()?,
             vec![(
                 Arc::new(Column::new("c_custkey", 0)),
                 Arc::new(Column::new("o_custkey", 0)),
@@ -195,9 +203,8 @@ fn wide_join(rows: usize) -> Arc<dyn ExecutionPlan> {
             PartitionMode::CollectLeft,
             datafusion::common::NullEquality::NullEqualsNothing,
             false,
-        )
-        .expect("hash join"),
-    )
+        )?,
+    ))
 }
 
 #[test]
@@ -205,7 +212,7 @@ fn the_q8_shape_stays_partitioned_and_must_keep_doing_so() {
     // The regression guard from `join_estimates`: rows well over the ceiling,
     // bytes absent. Converting these cost q8 4.1x, q9 2.5x and q17 4.8x. Any
     // width-aware rule must leave this exactly as it is.
-    let mode = chosen_mode(4_000_000);
+    let mode = chosen_mode(4_000_000).expect("join selection");
     assert_ne!(
         mode,
         PartitionMode::CollectLeft,
