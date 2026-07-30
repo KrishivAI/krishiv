@@ -191,9 +191,23 @@ pub struct TaskSnapshot {
     pub last_watermark_ms: Option<i64>,
     /// Last committed source offset reported by this streaming task's executor.
     pub last_source_offset: Option<Vec<u8>>,
+    /// Wall-clock ms from assignment to successful completion; `None` until the
+    /// task succeeds.
+    ///
+    /// The coordinator has always kept this (speculation needs a stage's median
+    /// task duration) and no snapshot carried it, so no endpoint could answer
+    /// "which stage costs the time, and is it one straggler or every task".
+    /// Diagnosing q10 burned a day and four falsified hypotheses on exactly
+    /// that blind spot.
+    pub(crate) completed_duration_ms: Option<u64>,
 }
 
 impl TaskSnapshot {
+    /// Wall-clock ms from assignment to successful completion.
+    pub fn completed_duration_ms(&self) -> Option<u64> {
+        self.completed_duration_ms
+    }
+
     /// Task id.
     pub fn task_id(&self) -> &TaskId {
         &self.task_id

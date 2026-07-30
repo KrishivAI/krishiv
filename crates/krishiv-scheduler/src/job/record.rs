@@ -1802,6 +1802,7 @@ impl TaskRecord {
             sink_capabilities: self.spec.sink_capabilities.clone(),
             last_watermark_ms: self.last_watermark_ms,
             last_source_offset: self.last_source_offset.clone(),
+            completed_duration_ms: self.completed_duration_ms,
         }
     }
 }

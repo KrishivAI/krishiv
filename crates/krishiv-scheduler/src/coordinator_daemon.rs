@@ -554,6 +554,7 @@ pub fn coordinator_http_router(
         .route("/api/v1/jobs", get(api_jobs))
         .route("/api/v1/jobs/{job_id}", get(api_job_by_id))
         .route("/api/v1/jobs/{job_id}/cancel", post(api_job_cancel))
+        .route("/api/v1/jobs/{job_id}/stages", get(api_job_stages))
         .route("/api/v1/executors", get(api_executors))
         .route(
             "/api/v1/executors/{executor_id}/reset",
@@ -748,6 +749,93 @@ async fn api_job_by_id(
             Json(serde_json::json!({"error": "job not found", "job_id": job_id_str})),
         ),
     }
+}
+
+
+/// One stage's cost and its task-duration spread.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StageTimingView {
+    stage_id: String,
+    state: String,
+    task_count: usize,
+    succeeded_task_count: usize,
+    /// Summed wall-clock ms over succeeded tasks. Identifies the expensive
+    /// stage in one read — the thing that previously had to be inferred from
+    /// gaps between coordinator log lines.
+    total_task_ms: u64,
+    /// A median near the max means *every* task is slow, which points at
+    /// bandwidth or compute. A max far above the median is a straggler, which
+    /// points at skew. Those need opposite fixes and this is the cheapest way
+    /// to tell them apart; without it, four q10 hypotheses were built and
+    /// falsified without ever knowing which of the two it was.
+    min_task_ms: Option<u64>,
+    median_task_ms: Option<u64>,
+    max_task_ms: Option<u64>,
+    /// Partition bytes this stage committed. Since `db34791c` this is the
+    /// partition's own bytes, not shared view buffers.
+    shuffle_bytes_written: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StageTimingResponse {
+    job_id: String,
+    stages: Vec<StageTimingView>,
+}
+
+async fn api_job_stages(
+    State(coordinator): State<SharedCoordinator>,
+    axum::extract::Path(job_id_str): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let detail = {
+        let coord = coordinator.read().await;
+        coord
+            .job_snapshots()
+            .into_iter()
+            .find(|j| j.job_id().as_str() == job_id_str)
+            .and_then(|j| coord.job_detail_snapshot(j.job_id()).ok())
+    };
+    let Some(detail) = detail else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown job", "job_id": job_id_str })),
+        );
+    };
+
+    let stages = detail
+        .stages()
+        .iter()
+        .map(|stage| {
+            let mut durations: Vec<u64> = stage
+                .tasks()
+                .iter()
+                .filter_map(krishiv_scheduler_snapshot_duration)
+                .collect();
+            durations.sort_unstable();
+            StageTimingView {
+                stage_id: stage.stage_id().to_string(),
+                state: format!("{:?}", stage.state()),
+                task_count: stage.task_count(),
+                succeeded_task_count: durations.len(),
+                total_task_ms: durations.iter().sum(),
+                min_task_ms: durations.first().copied(),
+                median_task_ms: durations.get(durations.len() / 2).copied(),
+                max_task_ms: durations.last().copied(),
+                shuffle_bytes_written: stage.shuffle_bytes_written(),
+            }
+        })
+        .collect();
+
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!(StageTimingResponse {
+            job_id: job_id_str,
+            stages,
+        })),
+    )
+}
+
+fn krishiv_scheduler_snapshot_duration(task: &crate::job::TaskSnapshot) -> Option<u64> {
+    task.completed_duration_ms()
 }
 
 async fn api_job_cancel(
