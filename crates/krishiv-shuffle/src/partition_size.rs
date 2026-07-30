@@ -42,8 +42,9 @@
 //! over-report after a slice. TPC-H does not exercise that shape; a nested
 //! schema would need this extended rather than trusted.
 
-use arrow::array::{Array, BinaryViewArray, RecordBatch, StringViewArray};
+use arrow::array::{Array, ArrayRef, BinaryViewArray, RecordBatch, StringViewArray};
 use arrow::datatypes::DataType;
+use std::sync::Arc;
 
 /// Bytes belonging to one array, not counting buffers it merely shares.
 pub fn logical_array_bytes(array: &dyn Array) -> usize {
@@ -120,6 +121,86 @@ fn views_bytes(views: &[u128]) -> usize {
     const VIEW_WIDTH: usize = std::mem::size_of::<u128>();
     let referenced: usize = views.iter().map(|v| (*v as u32) as usize).sum();
     views.len().saturating_mul(VIEW_WIDTH).saturating_add(referenced)
+}
+
+/// Make a `take`-produced array own its bytes instead of sharing the source's
+/// buffers.
+///
+/// # Why the shuffle cannot skip this
+///
+/// `take` on a `Utf8View`/`BinaryView` column copies the 16-byte views and
+/// leaves every output bucket referencing the **same** data buffers. Measured on
+/// a customer-shaped batch split into 18 buckets, the buckets together report
+/// **14.2x** the source batch's memory. Three separate consumers act on that
+/// number, and all three are wrong by the same factor:
+///
+///  * [`crate::ShuffleWriteBuffer`]'s spill decision (in `krishiv-executor`) —
+///    a wide-string map stage crosses its ceiling after ~1/N of the data it
+///    could hold and round-trips the rest through disk IPC. This is what made
+///    TPC-H q10's `dist-s1` cost 940 task-seconds.
+///  * `DrainTally` — reported as `ShufflePartitionOutput::size_bytes`, which is
+///    how that stage came to publish **1.74 TB** for a 100 GB dataset.
+///  * `krishiv-scheduler`'s `aqe.rs`, which sums those into reduce parallelism.
+///
+/// # It is not an accounting artefact
+///
+/// The decisive measurement, because it changes what this function is for.
+/// Arrow IPC serialises a view array's **data buffers**, so an un-compacted
+/// bucket writes the whole shared buffer. Same rows, same split, 18 buckets of
+/// a 9.73 MB batch, through the `StreamWriter` that both the spill path and the
+/// shuffle store use:
+///
+/// ```text
+/// shared buffers   133,839,504 B   13.76x
+/// compacted          9,735,184 B    1.00x
+/// ```
+///
+/// So the reported 1.74 TB was never a lie about bytes written — the executor
+/// really was writing ~13.8x too many, into every spill file and every shuffle
+/// fetch. Measuring around the sharing (which [`logical_array_bytes`] does)
+/// would have corrected the *number* while leaving the volume in place.
+///
+/// Compaction fixes the volume, the retention (spilling one bucket frees
+/// nothing while a sibling holds the shared buffer alive), and the reports at
+/// once — and it makes `get_array_memory_size()` and [`logical_array_bytes`]
+/// agree, so the accounting cannot silently drift apart again.
+///
+/// # Cost
+///
+/// `gc()` copies the bytes a bucket references — strictly fewer than the whole
+/// shared buffer it would otherwise carry into the writer, and bytes that are
+/// about to be serialised regardless. The guard below skips the copy entirely
+/// when the array already owns most of what it is charged for (an
+/// already-compact array, an all-inline view column), so that case pays one
+/// pass over the views and nothing else.
+///
+/// Offset-encoded `Utf8`/`Binary` need no compaction here: `take` allocates a
+/// fresh values buffer for them. Only the view encodings share.
+pub fn compact_shared_buffers(array: ArrayRef) -> ArrayRef {
+    if !matches!(
+        array.data_type(),
+        DataType::Utf8View | DataType::BinaryView
+    ) {
+        return array;
+    }
+    let charged = array.get_array_memory_size();
+    let owned = logical_array_bytes(array.as_ref());
+    // Compact only when it would release at least a quarter of what this array
+    // is charged for. An already-compact array has `owned == charged` and is
+    // skipped, so gc is never paid for nothing; a two-bucket split has
+    // `owned == charged / 2` and IS compacted, because the retention matters at
+    // any bucket count — one bucket holding the shared buffer keeps it alive
+    // after every sibling has spilled.
+    if owned.saturating_mul(4) >= charged.saturating_mul(3) {
+        return array;
+    }
+    if let Some(view) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Arc::new(view.gc());
+    }
+    if let Some(view) = array.as_any().downcast_ref::<BinaryViewArray>() {
+        return Arc::new(view.gc());
+    }
+    array
 }
 
 /// Bytes belonging to one record batch.

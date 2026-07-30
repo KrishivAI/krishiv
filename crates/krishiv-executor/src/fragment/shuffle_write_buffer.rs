@@ -253,10 +253,22 @@ impl DrainTally {
         self.bytes.load(Ordering::Relaxed)
     }
 
+    /// Measured with [`krishiv_shuffle::logical_batch_bytes`], not
+    /// `get_array_memory_size()`.
+    ///
+    /// `krishiv_shuffle`'s partitioner now compacts view buckets, so on the
+    /// production path the two agree. They must not be allowed to disagree
+    /// *here* regardless: this number is published as
+    /// `ShufflePartitionOutput::size_bytes` and summed by `aqe.rs` into reduce
+    /// parallelism, so a batch that reached this drain without compaction would
+    /// plan the next stage from a number inflated by the bucket count. That is
+    /// how TPC-H q10's `dist-s1` came to report 1.74 TB for a 100 GB dataset.
     fn observe(&self, batch: &RecordBatch) {
         self.rows.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
-        self.bytes
-            .fetch_add(batch.get_array_memory_size() as u64, Ordering::Relaxed);
+        self.bytes.fetch_add(
+            krishiv_shuffle::logical_batch_bytes(batch) as u64,
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -1808,5 +1820,86 @@ mod uniform_schema_tests {
         assert!(buffer.pushed_schema().is_none());
         buffer.push(0, batch(3)).await.unwrap();
         assert_eq!(buffer.pushed_schema(), Some(produced()));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod view_bucket_tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringViewArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    /// A `customer`-shaped batch: an integer key and a ~73-byte comment, held
+    /// as `Utf8View` because that is what DataFusion 54 produces from Parquet.
+    fn view_batch(rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("c_custkey", DataType::Int64, false),
+            Field::new("c_comment", DataType::Utf8View, false),
+        ]));
+        let keys = Int64Array::from_iter_values(0..rows as i64);
+        let comments =
+            StringViewArray::from_iter_values((0..rows).map(|i| format!("{i:0>73}")));
+        RecordBatch::try_new(schema, vec![Arc::new(keys), Arc::new(comments)]).unwrap()
+    }
+
+    /// The performance bug behind TPC-H q10's `dist-s1`, as a unit test.
+    ///
+    /// The map task hash-partitions each source batch and pushes the buckets
+    /// here. `push` sizes its spill decision with `get_array_memory_size()`, so
+    /// if a bucket still references the whole shared `Utf8View` data buffer,
+    /// 18 buckets of one 10 MB batch are charged ~150 MB. A wide-string map
+    /// stage then crosses a 512 MB ceiling after ~35 MB of real data and
+    /// round-trips essentially everything through disk IPC — for a stage that
+    /// fits in memory with room to spare.
+    ///
+    /// Asserting "does not spill" rather than "reports a smaller number",
+    /// because the number is not the cost; the disk round-trip is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wide_string_map_stage_that_fits_in_memory_does_not_spill() {
+        const BUCKETS: u32 = 18;
+        // ~8.9 MB of real Arrow data: 100k x (16 B view + 73 B value) plus keys.
+        let batch = view_batch(100_000);
+        let real_bytes = krishiv_shuffle::logical_batch_bytes(&batch);
+        const CEILING: u64 = 48 * 1024 * 1024;
+        assert!(
+            (real_bytes as u64) < CEILING / 4,
+            "precondition: the data must comfortably fit the ceiling \
+             ({real_bytes} B vs {CEILING} B)"
+        );
+
+        let buckets = krishiv_shuffle::HashPartitioner::new("c_custkey", BUCKETS)
+            .partition(&batch)
+            .expect("partition");
+
+        let mut buffer = ShuffleWriteBuffer::new(
+            BUCKETS as usize,
+            None,
+            CEILING,
+            temp_dir("view-spill"),
+        );
+        for (index, bucket) in buckets.into_iter().enumerate() {
+            buffer.push(index, bucket).await.unwrap();
+        }
+
+        assert_eq!(
+            buffer.spill_count(),
+            0,
+            "an {real_bytes}-byte map output spilled {} times under a {CEILING}-byte \
+             ceiling: each bucket is charged the whole shared Utf8View data buffer, so the \
+             buffer believes it is holding ~{}x what it holds. This is why q10's wide-string \
+             map stage writes everything to disk twice.",
+            buffer.spill_count(),
+            buffer.buffered_bytes().max(1) / real_bytes.max(1),
+        );
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "krishiv-shuffle-view-test-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
     }
 }

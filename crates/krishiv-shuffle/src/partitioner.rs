@@ -492,7 +492,14 @@ fn gather_buckets(
                 .columns()
                 .iter()
                 .map(|col| {
+                    // `take` on a view column copies the views and shares the
+                    // source's data buffers, so without compaction every bucket
+                    // is charged — and keeps alive — the whole buffer. See
+                    // `compact_shared_buffers`; this is the single place all
+                    // three map-write paths produce buckets, which is why the
+                    // invariant is established here rather than at each writer.
                     take(col.as_ref(), &index_arr, None)
+                        .map(crate::partition_size::compact_shared_buffers)
                         .map_err(|e| crate::error::io_err(e.to_string()))
                 })
                 .collect::<ShuffleResult<_>>()?;
