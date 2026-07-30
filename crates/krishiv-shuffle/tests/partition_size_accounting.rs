@@ -23,32 +23,35 @@ use arrow::datatypes::{DataType, Field, Schema};
 use krishiv_shuffle::HashPartitioner;
 use std::sync::Arc;
 
-fn customer_shaped_batch(rows: usize) -> RecordBatch {
+// These builders return `Result` rather than unwrapping internally. Clippy's
+// `allow-expect-in-tests` exempts `#[test]` bodies but not plain helper
+// functions in the same file, and `unwrap`/`expect`/`panic!` are all denied
+// here — so the fallible step belongs at the call sites, which are exempt.
+type BatchResult = Result<RecordBatch, arrow::error::ArrowError>;
+
+fn customer_shaped_batch(rows: usize) -> BatchResult {
     let schema = Arc::new(Schema::new(vec![
         Field::new("c_custkey", DataType::Int64, false),
         // c_comment averages ~73 bytes in TPC-H; this is the column that makes
         // q10's shuffle wide.
         Field::new("c_comment", DataType::Utf8, false),
     ]));
-    let keys = Int64Array::from_iter_values((0..rows as i64).map(|i| i));
-    let comments = StringArray::from_iter_values(
-        (0..rows).map(|i| format!("{:0>73}", i)),
-    );
-    RecordBatch::try_new(schema, vec![Arc::new(keys), Arc::new(comments)]).expect("batch")
+    let keys = Int64Array::from_iter_values(0..rows as i64);
+    let comments = StringArray::from_iter_values((0..rows).map(|i| format!("{i:0>73}")));
+    RecordBatch::try_new(schema, vec![Arc::new(keys), Arc::new(comments)])
 }
 
 /// The same batch, but with the string column as `Utf8View` — which is what
 /// DataFusion 54 actually produces when it reads Parquet.
-fn customer_shaped_view_batch(rows: usize) -> RecordBatch {
+fn customer_shaped_view_batch(rows: usize) -> BatchResult {
     use arrow::array::StringViewArray;
     let schema = Arc::new(Schema::new(vec![
         Field::new("c_custkey", DataType::Int64, false),
         Field::new("c_comment", DataType::Utf8View, false),
     ]));
     let keys = Int64Array::from_iter_values(0..rows as i64);
-    let comments =
-        StringViewArray::from_iter_values((0..rows).map(|i| format!("{:0>73}", i)));
-    RecordBatch::try_new(schema, vec![Arc::new(keys), Arc::new(comments)]).expect("batch")
+    let comments = StringViewArray::from_iter_values((0..rows).map(|i| format!("{i:0>73}")));
+    RecordBatch::try_new(schema, vec![Arc::new(keys), Arc::new(comments)])
 }
 
 /// `take` on a view array copies the 16-byte *views*, not the data buffers —
@@ -61,7 +64,7 @@ fn customer_shaped_view_batch(rows: usize) -> RecordBatch {
 fn utf8view_partitions_each_report_the_whole_shared_data_buffer() {
     let rows = 10_000;
     let buckets = 47;
-    let batch = customer_shaped_view_batch(rows);
+    let batch = customer_shaped_view_batch(rows).expect("batch");
     let whole = krishiv_shuffle::logical_batch_bytes(&batch);
 
     let parts = HashPartitioner::new("c_custkey", buckets)
@@ -91,7 +94,7 @@ fn utf8view_partitions_each_report_the_whole_shared_data_buffer() {
 fn summing_partition_memory_size_reports_the_partitioned_batch_faithfully() {
     let rows = 10_000;
     let buckets = 47; // q10's AQE-coalesced partition count.
-    let batch = customer_shaped_batch(rows);
+    let batch = customer_shaped_batch(rows).expect("batch");
     let whole = batch.get_array_memory_size();
 
     let parts = HashPartitioner::new("c_custkey", buckets)
@@ -141,7 +144,7 @@ fn summing_partition_memory_size_reports_the_partitioned_batch_faithfully() {
 fn a_utf8view_bucket_owns_its_bytes_rather_than_the_whole_source_buffer() {
     let rows = 100_000;
     let buckets = 18;
-    let batch = customer_shaped_view_batch(rows);
+    let batch = customer_shaped_view_batch(rows).expect("batch");
     let whole = batch.get_array_memory_size();
 
     let parts = HashPartitioner::new("c_custkey", buckets)
@@ -185,7 +188,7 @@ fn ipc_bytes_written_per_bucket_do_not_include_the_shared_buffer() {
 
     let rows = 100_000;
     let buckets = 18usize;
-    let batch = customer_shaped_view_batch(rows);
+    let batch = customer_shaped_view_batch(rows).expect("batch");
     let whole = ipc_len(&batch);
 
     // Both arms from the same row assignment, so the only variable is

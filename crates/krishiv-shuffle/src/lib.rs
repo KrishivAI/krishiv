@@ -18,6 +18,7 @@ pub mod orphan;
 pub mod partitioner;
 pub mod path;
 pub mod push_shuffle;
+pub mod runtime_filter;
 pub mod shuffle_svc;
 pub mod sort_shuffle_writer;
 pub mod storage_uri;
@@ -63,6 +64,10 @@ pub use sort_shuffle_writer::{SortShuffleFiles, SortShuffleWriter};
 
 pub mod partition_size;
 pub use partition_size::{compact_shared_buffers, logical_batch_bytes, logical_partition_bytes};
+pub use runtime_filter::{
+    DEFAULT_FPP, FilterKeyType, MAX_FILTER_BYTES, RuntimeFilter, RuntimeFilterBuilder,
+    plan_filter_bytes,
+};
 pub use storage_uri::{open_shuffle_backend_from_uri, open_tiered_shuffle_backend};
 pub use store::{
     PartitionId, ShuffleBackend, ShuffleBatchStream, ShufflePartition, ShuffleStore, ShuffleStream,
