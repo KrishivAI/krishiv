@@ -1333,13 +1333,49 @@ pub const SHUFFLE_FETCH_BUFFER_ENV: &str = "KRISHIV_SHUFFLE_FETCH_BUFFER";
 /// wedged permanently at 132/181 tasks with executors at 0-5% CPU and no errors
 /// logged. With it at 1, the identical image ran q2 in **104.3 s**.
 ///
-/// The latency this was meant to recover is largely recovered anyway by pooling
-/// the gRPC channel (see `flight::pooled_channel`): the dominant per-fragment
-/// cost was a fresh TCP + HTTP/2 handshake, not the round trip itself. A safe
-/// prefetch would require the server to bound *resident bytes* rather than open
-/// responses — i.e. release the permit once the inline buffer is handed to the
-/// encoder — and that is a change to `do_get`, not to this number.
-const DEFAULT_SHUFFLE_FETCH_BUFFER: usize = 1;
+/// # Why it is no longer 1
+///
+/// The precondition named above has been met: `ShuffleFlightService` now admits
+/// a `do_get` by the **bytes** it will hold resident (one `stat`, no read)
+/// rather than by counting open responses. A response-count cap had to price
+/// every response at `INLINE_READ_LIMIT`, so at SF100's ~3.5 MB average
+/// fragment it reserved ~9x the headroom each fetch actually needed — which is
+/// what made single-digit response caps the binding constraint.
+///
+/// What the pin cost, measured on q10 at SF100 (`fast-c91a7b26`):
+///
+/// ```text
+/// dist-s2  reads 3.49 GB  ->  11,304 task-seconds  (0.31 MB/s, CPU 0.3 of 3)
+/// dist-s4  reads 7.27 GB  ->   2,339 task-seconds
+/// ```
+///
+/// Twice the bytes, a fifth of the time: both stages make the same 36 round
+/// trips, so the stage with fewer bytes per fetch is the one the fixed per-fetch
+/// stall dominates. That is the signature of serialised latency, not bandwidth.
+/// The tail is worse — the final gather stage is a single task making
+/// 18 partitions x 18 map tasks = 324 strictly serial fetches.
+///
+/// # The bound that decides how high this may go
+///
+/// With prefetch `P`, a reduce stream may hold `P - 1` admitted-but-unconsumed
+/// responses while waiting for its head. Cluster-wide that is
+/// `executors x slots x reads_per_task x (P - 1)` responses pinned against each
+/// server's budget. The deadlock the old note describes is exactly the case
+/// where those pinned responses exhaust every server, so no head can be
+/// admitted and nothing can drain.
+///
+/// FIFO admission does *not* by itself rule this out, because a stream's head
+/// and its siblings can be queued on **different** executors' semaphores, so the
+/// head has no ordering guarantee relative to them. The safety margin is
+/// therefore quantitative, not structural: at `P = 2` each stream pins at most
+/// one response (3 x 3 x 2 = 18 cluster-wide, ~72 granules of a 256-granule
+/// budget at typical fragment sizes), which leaves the budget able to admit
+/// heads by a wide margin.
+///
+/// Raising this further is a measurement, not a judgement call: it needs a live
+/// SF100 run that both completes and shows the win, because the failure mode is
+/// a silent cluster-wide hang with no error logged.
+const DEFAULT_SHUFFLE_FETCH_BUFFER: usize = 2;
 
 /// Resolve [`DEFAULT_SHUFFLE_FETCH_BUFFER`], honouring the env override.
 ///

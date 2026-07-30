@@ -700,6 +700,22 @@ impl ShuffleStore for LocalDiskShuffleStore {
         }))
     }
 
+    /// One `stat`, no read — see [`ShuffleStore::partition_bytes`].
+    async fn partition_bytes(&self, id: &PartitionId) -> ShuffleResult<Option<u64>> {
+        let path = self.partition_path(id)?;
+        let result = tokio::task::spawn_blocking(move || match std::fs::metadata(&path) {
+            Ok(m) => Ok(Some(m.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            // A stat that fails for any other reason is not worth failing the
+            // fetch over: the caller only uses this to size an admission
+            // charge, and "unknown" already has a safe meaning there.
+            Err(_) => Ok(None),
+        })
+        .await
+        .map_err(|e| io_err(format!("partition stat join: {e}")))?;
+        result
+    }
+
     async fn stream_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShuffleStream>> {
         let path = self.partition_path(id)?;
         let hash_path = self.partition_hash_path(id)?;

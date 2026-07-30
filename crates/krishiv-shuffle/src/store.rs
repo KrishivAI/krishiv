@@ -109,6 +109,23 @@ pub trait ShuffleStore: Send + Sync {
     /// Read a partition. Returns `None` if not yet written.
     async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>>;
 
+    /// On-disk size of a partition, **without reading it**.
+    ///
+    /// Exists so the shuffle Flight server can admit a `do_get` by the bytes it
+    /// is about to hold resident rather than by counting open responses. Those
+    /// are not the same bound: a response-count cap has to assume every response
+    /// is the largest one allowed, so it admits a handful of 3 MB fragments as
+    /// though each were 32 MB. That over-charging is why the reduce side had to
+    /// be pinned at one fetch in flight (see `DEFAULT_SHUFFLE_FETCH_BUFFER`),
+    /// which serialises every reduce task's fetches end to end.
+    ///
+    /// `None` means "unknown" — the caller must fall back to the conservative
+    /// assumption, which is exactly the old behaviour. Implementations that
+    /// cannot answer cheaply should return `None` rather than read the data.
+    async fn partition_bytes(&self, _id: &PartitionId) -> ShuffleResult<Option<u64>> {
+        Ok(None)
+    }
+
     /// Stream a partition. Default implementation buffers via read_partition.
     async fn stream_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShuffleStream>> {
         let id = id.clone();

@@ -94,32 +94,73 @@ const MIN_SERVE_CONCURRENCY: usize = 2;
 /// same order as the reduce-side fetch semaphore's default.
 const DEFAULT_SERVE_CONCURRENCY: usize = 8;
 
-/// How many `do_get` responses this executor may have in flight at once.
+/// Unit the serve budget is counted in. One semaphore permit = one granule.
+///
+/// 1 MiB: fine enough that a 3 MB fragment is charged 3 rather than the 32 a
+/// response-count cap charged it, coarse enough that the permit count stays
+/// small.
+const SERVE_GRANULE_BYTES: u64 = 1024 * 1024;
+
+/// How many **bytes** of `do_get` response this executor may hold at once.
 ///
 /// B1: `SHUFFLE_FETCH_SEMAPHORE` on the executor bounds each **consumer**, not
 /// the aggregate arriving at one **producer**. On a 3-node cluster the ceiling
 /// was 3 × 8 = 24 concurrent `do_get` against a single executor, i.e. up to
 /// ~768 MiB of anonymous memory outside the DataFusion pool, in the same
-/// process that is also running map tasks — and it scales linearly with nodes
-/// or with `KRISHIV_SHUFFLE_FETCH_CONCURRENCY`. Compounding it, both
+/// process that is also running map tasks. Compounding it, both
 /// `write_partition` and `stream_partition` run in `spawn_blocking`, whose
 /// default pool is 512 threads.
 ///
-/// Sized in units of `INLINE_READ_LIMIT` out of the page-cache budget the same
-/// capacity derivation already carves for committed-but-unconsumed shuffle
-/// output, so the two numbers come from one decision rather than two.
-fn serve_concurrency_limit() -> usize {
+/// # Why bytes and not responses
+///
+/// Counting responses has to price every one of them at the largest a response
+/// may be ([`crate::disk_store::INLINE_READ_LIMIT`]), because admission happens
+/// before the size is known. SF100 shuffle fragments average ~3.5 MB, so the
+/// old cap admitted 8 of them while reserving headroom for 256 MB — a 9x
+/// over-charge on the common case. That is what forced the reduce side to be
+/// pinned at one fetch in flight (`DEFAULT_SHUFFLE_FETCH_BUFFER`), and that pin
+/// is what makes a reduce task fetch its map fragments strictly one at a time.
+///
+/// Measured cost of the pin, TPC-H q10 at SF100: `dist-s2` reads 3.49 GB and
+/// spends **11,304 task-seconds** doing it (0.31 MB/s) at 0.3 of 3 cores, while
+/// `dist-s4` reads twice as much in 2,339 task-seconds. Same 36 round trips,
+/// double the bytes to amortise them over — the signature of a per-fetch stall,
+/// not a bandwidth limit.
+///
+/// Charging actual bytes lets many small fragments be in flight and still
+/// admits one large one, so the consumer can prefetch without the producer
+/// having to guess.
+fn serve_budget_bytes() -> u64 {
     if let Some(explicit) = std::env::var(SHUFFLE_SERVE_CONCURRENCY_ENV)
         .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
     {
-        return explicit.max(1);
+        // Kept in its original units — "how many largest-allowed responses" —
+        // so an existing deployment override keeps meaning what it meant.
+        return explicit
+            .max(1)
+            .saturating_mul(crate::disk_store::INLINE_READ_LIMIT);
     }
     krishiv_common::ExecutorCapacity::detect()
         .page_cache_bytes
-        .map(|bytes| usize::try_from(bytes / crate::disk_store::INLINE_READ_LIMIT).unwrap_or(1))
-        .unwrap_or(DEFAULT_SERVE_CONCURRENCY)
-        .max(MIN_SERVE_CONCURRENCY)
+        .unwrap_or(DEFAULT_SERVE_CONCURRENCY as u64 * crate::disk_store::INLINE_READ_LIMIT)
+        // The floor must be at least one maximal response, or a partition at
+        // the inline limit could never be admitted and the fetch would wedge.
+        .max(MIN_SERVE_CONCURRENCY as u64 * crate::disk_store::INLINE_READ_LIMIT)
+}
+
+/// Granules to charge a response that will hold `size` bytes resident.
+///
+/// Above [`crate::disk_store::INLINE_READ_LIMIT`] the store streams the
+/// partition instead of buffering it, so residency stops growing with the file
+/// and the charge is capped there. An unknown size is charged the cap, which is
+/// exactly what the old response-count bound charged every response.
+fn response_granules(size: Option<u64>, total: u32) -> u32 {
+    let resident = size.map_or(crate::disk_store::INLINE_READ_LIMIT, |bytes| {
+        bytes.min(crate::disk_store::INLINE_READ_LIMIT)
+    });
+    let granules = resident.div_ceil(SERVE_GRANULE_BYTES).max(1);
+    u32::try_from(granules).unwrap_or(total).min(total.max(1))
 }
 
 /// Arrow Flight shuffle service backed by any [`ShuffleStore`] implementation.
@@ -132,20 +173,42 @@ pub struct ShuffleFlightService<S: ShuffleStore + Send + Sync + 'static> {
     /// B1: aggregate cap on in-flight `do_get` responses. A permit is held for
     /// the *response stream's* lifetime, not the handler future's, because that
     /// is how long the bytes it read stay resident.
+    ///
+    /// Counted in [`SERVE_GRANULE_BYTES`], not in responses — see
+    /// [`serve_budget_bytes`].
     serve_permits: Arc<tokio::sync::Semaphore>,
+    /// Total granules in the budget, so one oversized partition can be charged
+    /// the whole budget rather than more than exists (which would never be
+    /// grantable, and would wedge the fetch instead of serialising it).
+    serve_granules: u32,
 }
 
 impl<S: ShuffleStore + Send + Sync + 'static> ShuffleFlightService<S> {
     pub fn new(store: Arc<S>) -> Self {
-        Self::with_serve_limit(store, serve_concurrency_limit())
+        Self::with_serve_budget_bytes(store, serve_budget_bytes())
     }
 
-    /// [`Self::new`] with an explicit cap, so tests can drive the bound without
-    /// mutating process-global environment state.
+    /// [`Self::new`] with an explicit cap **in maximal responses**, so tests can
+    /// drive the bound without mutating process-global environment state.
+    ///
+    /// Kept in response units because that is what the tests assert about: a
+    /// limit of 1 must mean "one response at a time" whatever its size, and one
+    /// maximal response is [`crate::disk_store::INLINE_READ_LIMIT`] of budget.
     pub fn with_serve_limit(store: Arc<S>, limit: usize) -> Self {
+        let bytes = (limit.max(1) as u64).saturating_mul(crate::disk_store::INLINE_READ_LIMIT);
+        Self::with_serve_budget_bytes(store, bytes)
+    }
+
+    /// [`Self::new`] with an explicit byte budget.
+    pub fn with_serve_budget_bytes(store: Arc<S>, budget_bytes: u64) -> Self {
+        let granules = budget_bytes
+            .max(crate::disk_store::INLINE_READ_LIMIT)
+            .div_ceil(SERVE_GRANULE_BYTES);
+        let granules = u32::try_from(granules).unwrap_or(u32::MAX);
         Self {
             store,
-            serve_permits: Arc::new(tokio::sync::Semaphore::new(limit.max(1))),
+            serve_granules: granules,
+            serve_permits: Arc::new(tokio::sync::Semaphore::new(granules as usize)),
         }
     }
 
@@ -362,8 +425,17 @@ impl<S: ShuffleStore + Send + Sync + 'static> FlightService for ShuffleFlightSer
         // B1: take the permit BEFORE the store reads anything. The bound is on
         // resident bytes, and the store materialises the partition inside
         // `stream_partition` for anything at or below `INLINE_READ_LIMIT`.
+        //
+        // Charged by actual size (one `stat`, no read), not per response. A
+        // response-count cap has to price every response at the largest one
+        // allowed, so at SF100's ~3.5 MB average fragment it reserved ~9x the
+        // headroom each fetch needed — which is why the reduce side had to be
+        // pinned at one fetch in flight, and why q10's `dist-s2` spends 11,304
+        // task-seconds moving 3.49 GB.
+        let size = self.store.partition_bytes(&id).await.unwrap_or(None);
+        let granules = response_granules(size, self.serve_granules);
         let permit = Arc::clone(&self.serve_permits)
-            .acquire_owned()
+            .acquire_many_owned(granules)
             .await
             .map_err(|_| Status::unavailable("shuffle serve semaphore closed"))?;
 
@@ -555,7 +627,16 @@ pub(crate) async fn serve_with_token<S: ShuffleStore + Send + Sync + 'static>(
     store: Arc<S>,
     token: Option<String>,
 ) -> io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
-    serve_with_token_and_limit(addr, store, token, serve_concurrency_limit()).await
+    // Round the byte budget back into the response units this helper takes;
+    // `with_serve_limit` converts it straight back. Tests drive the same knob.
+    let responses = serve_budget_bytes().div_ceil(crate::disk_store::INLINE_READ_LIMIT);
+    serve_with_token_and_limit(
+        addr,
+        store,
+        token,
+        usize::try_from(responses).unwrap_or(DEFAULT_SERVE_CONCURRENCY).max(1),
+    )
+    .await
 }
 
 /// [`serve_with_token`] with an explicit serve-concurrency cap (B1), so tests
@@ -2014,5 +2095,68 @@ mod tests {
         assert_eq!(got, expected_rows, "streaming do_put lost rows");
 
         handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod serve_budget_tests {
+    use super::*;
+
+    /// The whole point of charging bytes: a typical SF100 fragment must not be
+    /// priced as though it were the largest response allowed.
+    ///
+    /// At SF100 shuffle fragments average ~3.5 MB against a 32 MiB inline
+    /// ceiling, so a response-count cap reserved ~9x the headroom each fetch
+    /// needed. That over-charge is what made single-digit response caps the
+    /// binding constraint and forced `DEFAULT_SHUFFLE_FETCH_BUFFER = 1`, which
+    /// serialises every reduce task's fetches end to end.
+    #[test]
+    fn a_typical_fragment_is_charged_its_own_size_not_the_inline_ceiling() {
+        let total = 256; // a 256 MiB budget in 1 MiB granules
+        let typical = response_granules(Some(3_500_000), total);
+        let ceiling = response_granules(None, total);
+        assert_eq!(typical, 4, "3.5 MB should cost 4 granules, got {typical}");
+        assert_eq!(
+            ceiling, 32,
+            "an unknown size must still be charged the inline ceiling"
+        );
+        assert!(
+            total / typical >= 60,
+            "a {total}-granule budget must admit many typical fragments at once, \
+             got {}",
+            total / typical
+        );
+    }
+
+    /// A partition at or above the inline ceiling is charged the ceiling, not
+    /// its file size: above that the store streams instead of buffering, so
+    /// residency stops growing with the file.
+    #[test]
+    fn an_oversized_partition_is_capped_at_the_inline_ceiling() {
+        let total = 256;
+        assert_eq!(response_granules(Some(4 * 1024 * 1024 * 1024), total), 32);
+    }
+
+    /// A charge can never exceed the budget, or the acquire could never be
+    /// granted and the fetch would wedge rather than queue — which is the
+    /// failure mode this whole area exists to avoid.
+    #[test]
+    fn a_charge_never_exceeds_the_budget_it_is_drawn_from() {
+        for total in [1u32, 2, 8, 31] {
+            let charged = response_granules(None, total);
+            assert!(
+                charged <= total,
+                "charged {charged} of a {total}-granule budget: unsatisfiable"
+            );
+            assert!(charged >= 1, "a response must cost at least one granule");
+        }
+    }
+
+    /// An existing `KRISHIV_SHUFFLE_SERVE_CONCURRENCY` override keeps meaning
+    /// what it meant: N maximal responses.
+    #[test]
+    fn the_legacy_override_still_means_n_maximal_responses() {
+        let service_budget = 8u64 * crate::disk_store::INLINE_READ_LIMIT;
+        assert_eq!(service_budget / SERVE_GRANULE_BYTES, 256);
     }
 }
