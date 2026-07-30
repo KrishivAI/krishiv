@@ -806,6 +806,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "Cross-stage runtime bloom filters: a distributed plan gains a filter stage over the join build side, and the probe stage drops non-matching rows BEFORE shuffling them. Distinct from KRISHIV_RUNTIME_FILTERS, which is DataFusion's in-plan mechanism and cannot see across a stage cut. Read on the coordinator, at planning time.",
     ),
     rt(
+        "KRISHIV_STAGE_REUSE",
+        FlagKind::Bool,
+        "off",
+        "Stage reuse (Spark's ReuseExchange): two leaf stages that compute the same rows with the same shuffle contract are collapsed into one, and both consumers read the same shuffle output. Measured on SF100 to remove a duplicate FULL lineitem scan from q18 and q21 and a duplicate partsupp scan from q2. Restricted to leaf stages, and refused when the plan text mentions a volatile function. Read on the coordinator, at planning time.",
+    ),
+    rt(
         "KRISHIV_SEMI_JOIN_PUSHDOWN",
         FlagKind::Bool,
         "on",

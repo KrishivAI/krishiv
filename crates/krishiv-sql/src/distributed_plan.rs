@@ -1489,6 +1489,25 @@ impl ShuffleReadExec {
         self.upstream_stage_index
     }
 
+    /// Copy of this read pointed at a different upstream stage.
+    ///
+    /// Used by stage reuse, which collapses identical stages and must then
+    /// repoint every reader at the surviving index. Everything else — map-task
+    /// count, partition count, schema, size estimates — is unchanged, because
+    /// the stage being pointed at computes exactly the same thing; that
+    /// identity is what made the collapse legal in the first place.
+    pub(crate) fn clone_with_upstream_stage_index(&self, upstream_stage_index: usize) -> Self {
+        Self {
+            upstream_stage_index,
+            num_map_tasks: self.num_map_tasks,
+            schema: Arc::clone(&self.schema),
+            properties: Arc::clone(&self.properties),
+            reader: self.reader.clone(),
+            upstream_rows: self.upstream_rows,
+            upstream_bytes: self.upstream_bytes,
+        }
+    }
+
     pub fn num_map_tasks(&self) -> usize {
         self.num_map_tasks
     }
@@ -2013,7 +2032,7 @@ pub fn build_distributed_stages_with_udf_directives(
         })?;
 
     let mut drafts: Vec<StageDraft> = Vec::new();
-    let root = match cut_exchanges(plan, &mut drafts) {
+    let mut root = match cut_exchanges(plan, &mut drafts) {
         Ok(root) => root,
         Err(Unsupported(reason)) => {
             return Err(SqlError::DataFusion {
@@ -2026,6 +2045,12 @@ pub fn build_distributed_stages_with_udf_directives(
             message: String::from("plan has no exchange to cut, so it cannot be split into stages"),
         });
     }
+    // Collapse identical leaf stages FIRST, so the runtime-filter rule sees the
+    // deduplicated stage list and cannot build a filter for a stage that is
+    // about to be removed (and thereby leave a dangling upstream index).
+    // A no-op unless `KRISHIV_STAGE_REUSE` is on.
+    dedupe_identical_stages(&mut root, &mut drafts);
+
     // Cross-stage runtime filters, before the root is pushed so the Result
     // stage stays last. Appends filter stages and rewrites probe stages in
     // place; a no-op unless `KRISHIV_CROSS_STAGE_RUNTIME_FILTER` is on.
@@ -2866,6 +2891,225 @@ fn stage_depends_on(drafts: &[StageDraft], from: usize, target: usize) -> bool {
         }
     }
     false
+}
+
+// ── Stage reuse (Spark's ReuseExchange) ────────────────────────────────────
+
+/// Env flag for cross-stage reuse of identical leaf stages. Default **off**.
+pub const STAGE_REUSE_ENV: &str = "KRISHIV_STAGE_REUSE";
+
+/// Whether identical leaf stages are collapsed into one.
+pub fn stage_reuse_enabled() -> bool {
+    std::env::var(STAGE_REUSE_ENV)
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false)
+}
+
+/// Function names whose presence makes a subtree non-reusable.
+///
+/// Reuse replaces two evaluations with one, which is only sound when the
+/// subtree is **deterministic**. `ExecutionPlan` exposes no expression
+/// accessor, so the rendered plan text is the only place a volatile call is
+/// visible — this matches on that text. Matching is deliberately over-eager: a
+/// column merely *named* `random_score` also blocks reuse. A false positive
+/// costs one missed optimization; a false negative would silently collapse two
+/// evaluations that were supposed to differ.
+const VOLATILE_MARKERS: &[&str] = &[
+    "random(",
+    "rand(",
+    "uuid(",
+    "now(",
+    "current_timestamp",
+    "current_date",
+    "current_time",
+    "nextval",
+];
+
+/// Rewrite every `ShuffleReadExec` in `plan`, remapping its upstream stage
+/// index through `remap`.
+fn remap_shuffle_reads(
+    plan: &Arc<dyn ExecutionPlan>,
+    remap: &std::collections::HashMap<usize, usize>,
+) -> Arc<dyn ExecutionPlan> {
+    if let Some(read) = plan.downcast_ref::<ShuffleReadExec>() {
+        let old = read.upstream_stage_index();
+        if let Some(&new) = remap.get(&old)
+            && new != old
+        {
+            return Arc::new(read.clone_with_upstream_stage_index(new));
+        }
+        return Arc::clone(plan);
+    }
+    let children = plan.children();
+    if children.is_empty() {
+        return Arc::clone(plan);
+    }
+    let new_children: Vec<_> = children
+        .iter()
+        .map(|child| remap_shuffle_reads(child, remap))
+        .collect();
+    let changed = new_children
+        .iter()
+        .zip(children.iter())
+        .any(|(new, old)| !Arc::ptr_eq(new, old));
+    if !changed {
+        return Arc::clone(plan);
+    }
+    Arc::clone(plan)
+        .with_new_children(new_children)
+        .unwrap_or_else(|_| Arc::clone(plan))
+}
+
+/// Collapse identical leaf stages into one, so a subtree computed twice is
+/// computed once and both consumers read the same shuffle output.
+///
+/// This is Spark's `ReuseExchange`, and it fits our model exactly: the cutter
+/// already materializes every stage boundary, so two stages that compute the
+/// same thing are two writes of the same bytes. Measured on the real SF100
+/// plans (2026-07-30):
+///
+/// | query | duplicated |
+/// |---|---|
+/// | q18 | `lineitem[l_orderkey, l_quantity]`, twice, **unfiltered** — 600M rows |
+/// | q21 | `lineitem[l_orderkey, l_suppkey, l_commitdate, l_receiptdate]` twice |
+/// | q2  | `partsupp[ps_partkey, ps_suppkey, ps_supplycost]` twice |
+///
+/// Each of those is a full scan of the largest table in the benchmark, done
+/// twice, on a cluster whose measured floor is the network
+/// (`bench-storage-longhorn-bottleneck`).
+///
+/// **Restricted to leaf stages** (no `ShuffleReadExec` inside, no severed
+/// scalar-subquery context). Two reasons, both load-bearing: a leaf stage
+/// contains no stage indexes, so collapsing it can never invalidate a
+/// reference *inside* it; and a leaf stage is a scan + row-wise work, the case
+/// where textual identity is most trustworthy. Non-leaf reuse (q17's
+/// projection-subsumed scan) needs a different, wider rule.
+///
+/// Returns the number of stages removed.
+fn dedupe_identical_stages(
+    root: &mut Arc<dyn ExecutionPlan>,
+    drafts: &mut Vec<StageDraft>,
+) -> usize {
+    if !stage_reuse_enabled() {
+        return 0;
+    }
+    dedupe_identical_stages_unconditionally(root, drafts)
+}
+
+/// [`dedupe_identical_stages`] without the flag check, so the rewrite and every
+/// guard are testable without `set_var` racing across test threads.
+fn dedupe_identical_stages_unconditionally(
+    root: &mut Arc<dyn ExecutionPlan>,
+    drafts: &mut Vec<StageDraft>,
+) -> usize {
+    use datafusion::physical_plan::displayable;
+
+    // The identity is the **encoded plan**, not the rendered plan text.
+    //
+    // Plan text is a display function, not a semantic identity: two
+    // `DataSourceExec`s over different in-memory data render identically,
+    // because the printer has nothing to show. Keying on text collapsed two
+    // stages producing different rows — a wrong answer, caught by
+    // `different_content_does_not_collapse`. The protobuf encoding is the
+    // bytes we actually ship to executors, so byte-identical encodings are the
+    // same computation by construction, and a plan that will not encode is
+    // simply not eligible (fails closed).
+    let codec = KrishivPhysicalCodec::coordinator();
+
+    // canonical key -> first draft index carrying it
+    let mut first_seen: std::collections::HashMap<Vec<u8>, usize> =
+        std::collections::HashMap::new();
+    // duplicate index -> index it is replaced by
+    let mut replaced_by: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+
+    for (index, draft) in drafts.iter().enumerate() {
+        if draft.subqueries.is_some() {
+            continue;
+        }
+        if !collect_upstream_stage_indexes(&draft.plan).is_empty() {
+            continue;
+        }
+        let Some(shuffle) = &draft.shuffle else {
+            continue;
+        };
+        let text = displayable(draft.plan.as_ref()).indent(true).to_string();
+        let lowered = text.to_ascii_lowercase();
+        if VOLATILE_MARKERS.iter().any(|m| lowered.contains(m)) {
+            continue;
+        }
+        // The shuffle contract is part of the identity: two stages computing
+        // the same rows but partitioning them differently are NOT
+        // interchangeable, because the consumer reads by partition index.
+        //
+        // `map_tasks` matters for a less obvious reason: a `ShuffleReadExec` is
+        // constructed with the producer's task count, so repointing a reader at
+        // a stage with a different task count would make it look for map
+        // outputs that do not exist.
+        let Ok(encoded) = encode_dfplan_bytes(Arc::clone(&draft.plan), &codec) else {
+            // Not shippable, so not reusable. The main loop has its own
+            // fallback for this; here it just means "skip".
+            continue;
+        };
+        let mut key = encoded;
+        key.extend_from_slice(
+            format!(
+                "|keys={:?}|parts={}|map_tasks={}|schema={:?}",
+                shuffle.key_columns,
+                shuffle.num_output_partitions,
+                draft.plan.output_partitioning().partition_count(),
+                draft.plan.schema()
+            )
+            .as_bytes(),
+        );
+        match first_seen.get(&key) {
+            Some(&canonical) => {
+                replaced_by.insert(index, canonical);
+            }
+            None => {
+                first_seen.insert(key, index);
+            }
+        }
+    }
+
+    if replaced_by.is_empty() {
+        return 0;
+    }
+
+    // Compact the draft list, building old -> new for the survivors.
+    let mut remap: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut survivors: Vec<StageDraft> = Vec::with_capacity(drafts.len() - replaced_by.len());
+    for (old_index, draft) in std::mem::take(drafts).into_iter().enumerate() {
+        if replaced_by.contains_key(&old_index) {
+            continue;
+        }
+        remap.insert(old_index, survivors.len());
+        survivors.push(draft);
+    }
+    // Duplicates point at their canonical stage's NEW index. The canonical is
+    // always a survivor (it is the first occurrence, and only later
+    // occurrences are removed), so this lookup cannot fail.
+    for (duplicate, canonical) in &replaced_by {
+        if let Some(&new_canonical) = remap.get(canonical) {
+            remap.insert(*duplicate, new_canonical);
+        }
+    }
+
+    let removed = replaced_by.len();
+    for draft in &mut survivors {
+        draft.plan = remap_shuffle_reads(&draft.plan, &remap);
+    }
+    *root = remap_shuffle_reads(root, &remap);
+    *drafts = survivors;
+
+    tracing::info!(
+        removed_stages = removed,
+        "collapsed identical leaf stages (stage reuse)"
+    );
+    removed
 }
 
 /// Insert cross-stage runtime filters: for each qualifying join, add a stage
@@ -5952,6 +6196,232 @@ mod codec_completeness_tests {
             vec![3, 4],
             "the new partition spec must be the one asked for"
         );
+    }
+
+    // ── Stage reuse (ReuseExchange) ────────────────────────────────────────
+
+    mod stage_reuse {
+        use super::super::*;
+
+        fn scan_schema() -> SchemaRef {
+            Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Int64, false),
+                arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, false),
+            ]))
+        }
+
+        /// A leaf stage: an in-memory scan, no shuffle read inside it.
+        fn leaf_draft(rows: usize, key: &str, parts: usize) -> StageDraft {
+            use datafusion::catalog::memory::MemorySourceConfig;
+            use datafusion::datasource::source::DataSourceExec;
+            let schema = scan_schema();
+            let batches: Vec<Vec<arrow::record_batch::RecordBatch>> = vec![vec![
+                arrow::record_batch::RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(arrow::array::Int64Array::from(
+                            (0..rows as i64).collect::<Vec<_>>(),
+                        )),
+                        Arc::new(arrow::array::Int64Array::from(
+                            (0..rows as i64).collect::<Vec<_>>(),
+                        )),
+                    ],
+                )
+                .expect("batch"),
+            ]];
+            let source = MemorySourceConfig::try_new(&batches, Arc::clone(&schema), None)
+                .expect("memory source");
+            StageDraft {
+                plan: Arc::new(DataSourceExec::new(Arc::new(source))),
+                shuffle: Some(StageShuffleOutput {
+                    key_columns: vec![String::from(key)],
+                    num_output_partitions: parts,
+                }),
+                subqueries: None,
+            }
+        }
+
+        fn reader(stage: usize) -> Arc<dyn ExecutionPlan> {
+            Arc::new(ShuffleReadExec::new(stage, 4, 4, scan_schema(), None))
+        }
+
+        /// Two identical leaf stages collapse into one, and the consumer that
+        /// pointed at the removed stage is repointed at the survivor. This is
+        /// q18: `lineitem[l_orderkey, l_quantity]` scanned twice, unfiltered.
+        #[test]
+        fn identical_leaf_stages_collapse_and_readers_are_repointed() {
+            let mut drafts = vec![leaf_draft(4, "k", 4), leaf_draft(4, "k", 4)];
+            // Root reads BOTH stages; after the collapse both reads must
+            // resolve to the surviving stage 0.
+            let mut root: Arc<dyn ExecutionPlan> =
+                datafusion::physical_plan::union::UnionExec::try_new(vec![reader(0), reader(1)])
+                    .expect("union");
+
+            let removed = dedupe_identical_stages_unconditionally(&mut root, &mut drafts);
+
+            assert_eq!(removed, 1, "one of the two identical stages must be removed");
+            assert_eq!(drafts.len(), 1, "one stage must survive");
+            let upstreams = collect_upstream_stage_indexes(&root);
+            assert_eq!(
+                upstreams,
+                vec![0],
+                "both readers must point at the surviving stage, got {upstreams:?}"
+            );
+        }
+
+        /// Stages that compute the same rows but partition them differently are
+        /// NOT interchangeable — the consumer reads by partition index.
+        #[test]
+        fn different_shuffle_contracts_do_not_collapse() {
+            let mut drafts = vec![leaf_draft(4, "k", 4), leaf_draft(4, "k", 8)];
+            let mut root: Arc<dyn ExecutionPlan> =
+                datafusion::physical_plan::union::UnionExec::try_new(vec![reader(0), reader(1)])
+                    .expect("union");
+            assert_eq!(
+                dedupe_identical_stages_unconditionally(&mut root, &mut drafts),
+                0,
+                "a different output-partition count is a different stage"
+            );
+            assert_eq!(drafts.len(), 2);
+        }
+
+        /// Same rows, different hash key: also not interchangeable.
+        #[test]
+        fn different_shuffle_keys_do_not_collapse() {
+            let mut drafts = vec![leaf_draft(4, "k", 4), leaf_draft(4, "v", 4)];
+            let mut root: Arc<dyn ExecutionPlan> =
+                datafusion::physical_plan::union::UnionExec::try_new(vec![reader(0), reader(1)])
+                    .expect("union");
+            assert_eq!(
+                dedupe_identical_stages_unconditionally(&mut root, &mut drafts),
+                0,
+                "a different partitioning key is a different stage"
+            );
+        }
+
+        /// Stages that differ in content must never be merged — the guard that
+        /// keeps this from silently returning wrong answers.
+        #[test]
+        fn different_content_does_not_collapse() {
+            let mut drafts = vec![leaf_draft(4, "k", 4), leaf_draft(9, "k", 4)];
+            let mut root: Arc<dyn ExecutionPlan> =
+                datafusion::physical_plan::union::UnionExec::try_new(vec![reader(0), reader(1)])
+                    .expect("union");
+            assert_eq!(
+                dedupe_identical_stages_unconditionally(&mut root, &mut drafts),
+                0,
+                "stages producing different rows must stay separate"
+            );
+            assert_eq!(drafts.len(), 2);
+        }
+
+        /// Non-leaf stages are out of scope: a stage containing a shuffle read
+        /// carries stage indexes of its own, and collapsing it could invalidate
+        /// a reference inside it.
+        #[test]
+        fn non_leaf_stages_are_left_alone() {
+            let mk = || StageDraft {
+                plan: reader(7),
+                shuffle: Some(StageShuffleOutput {
+                    key_columns: vec![String::from("k")],
+                    num_output_partitions: 4,
+                }),
+                subqueries: None,
+            };
+            let mut drafts = vec![mk(), mk()];
+            let mut root: Arc<dyn ExecutionPlan> =
+                datafusion::physical_plan::union::UnionExec::try_new(vec![reader(0), reader(1)])
+                    .expect("union");
+            assert_eq!(
+                dedupe_identical_stages_unconditionally(&mut root, &mut drafts),
+                0,
+                "stages that read a shuffle are not eligible for leaf reuse"
+            );
+        }
+
+        /// Three identical stages collapse to one, and every reader lands on it.
+        /// This is q21's shape, where lineitem is scanned three times.
+        #[test]
+        fn three_identical_stages_collapse_to_one() {
+            let mut drafts = vec![
+                leaf_draft(4, "k", 4),
+                leaf_draft(4, "k", 4),
+                leaf_draft(4, "k", 4),
+            ];
+            let mut root: Arc<dyn ExecutionPlan> =
+                datafusion::physical_plan::union::UnionExec::try_new(vec![
+                    reader(0),
+                    reader(1),
+                    reader(2),
+                ])
+                .expect("union");
+            assert_eq!(
+                dedupe_identical_stages_unconditionally(&mut root, &mut drafts),
+                2
+            );
+            assert_eq!(drafts.len(), 1);
+            assert_eq!(collect_upstream_stage_indexes(&root), vec![0]);
+        }
+
+        /// Surviving stages keep their relative order and their readers are
+        /// renumbered — an off-by-one here silently feeds a consumer the wrong
+        /// stage's data, which is a wrong answer, not a slow query.
+        #[test]
+        fn survivor_indexes_are_compacted_correctly() {
+            // 0: A, 1: B, 2: A(dup of 0), 3: C
+            let mut drafts = vec![
+                leaf_draft(4, "k", 4),
+                leaf_draft(7, "k", 4),
+                leaf_draft(4, "k", 4),
+                leaf_draft(9, "k", 4),
+            ];
+            let mut root: Arc<dyn ExecutionPlan> =
+                datafusion::physical_plan::union::UnionExec::try_new(vec![
+                    reader(1),
+                    reader(2),
+                    reader(3),
+                ])
+                .expect("union");
+            assert_eq!(
+                dedupe_identical_stages_unconditionally(&mut root, &mut drafts),
+                1
+            );
+            assert_eq!(drafts.len(), 3, "A, B, C survive");
+            // B was 1 -> 1, the dup of A was 2 -> 0, C was 3 -> 2.
+            assert_eq!(collect_upstream_stage_indexes(&root), vec![0, 1, 2]);
+        }
+
+        /// Reuse replaces two evaluations with one, which is only sound for a
+        /// deterministic subtree.
+        #[test]
+        fn volatile_markers_block_reuse() {
+            assert!(
+                VOLATILE_MARKERS.contains(&"random("),
+                "random() must block reuse"
+            );
+            assert!(VOLATILE_MARKERS.contains(&"now("), "now() must block reuse");
+            assert!(
+                VOLATILE_MARKERS.contains(&"uuid("),
+                "uuid() must block reuse"
+            );
+        }
+
+        /// The flag gates it: default off, so a plan is untouched until the
+        /// rule has been measured.
+        #[test]
+        fn reuse_is_off_by_default() {
+            let mut drafts = vec![leaf_draft(4, "k", 4), leaf_draft(4, "k", 4)];
+            let mut root: Arc<dyn ExecutionPlan> =
+                datafusion::physical_plan::union::UnionExec::try_new(vec![reader(0), reader(1)])
+                    .expect("union");
+            if std::env::var(STAGE_REUSE_ENV).is_err() {
+                assert_eq!(
+                    dedupe_identical_stages(&mut root, &mut drafts),
+                    0,
+                    "stage reuse must be off unless {STAGE_REUSE_ENV} is set"
+                );
+            }
+        }
     }
 
     // ── Cross-stage runtime filters ────────────────────────────────────────
