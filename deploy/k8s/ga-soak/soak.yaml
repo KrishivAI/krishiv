@@ -331,8 +331,17 @@ spec:
                     SEL="app=cert-v2-exec-a"
                     [ "$H" = "11" ] && SEL="app=cert-v2-exec-b"
                   fi
+                  # `{.items[*]...}` not `{.items[0]...}`: indexing an empty
+                  # list makes kubectl exit non-zero ("array index out of
+                  # bounds"), which under `set -e` kills this script before the
+                  # no-pod guard below can run. The star form yields an empty
+                  # string and exit 0, so "no target" logs SKIP as intended.
+                  # Restricted to Running pods so a kill is a real chaos event:
+                  # "killing" an already-terminating pod would still log
+                  # CHAOS KILL and overstate what the soak actually survived.
                   VICTIM=$(kubectl get pods -n krishiv-cert -l "$SEL" \
-                    -o jsonpath='{.items[0].metadata.name}')
+                    --field-selector status.phase=Running \
+                    -o jsonpath='{.items[*].metadata.name}' | awk '{print $1}')
                   if [ -z "$VICTIM" ]; then
                     echo "CHAOS SKIP $(date -u +%FT%TZ) selector=$SEL no-pod"
                     exit 0
