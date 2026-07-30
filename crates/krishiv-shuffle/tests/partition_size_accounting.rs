@@ -37,6 +37,48 @@ fn customer_shaped_batch(rows: usize) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(keys), Arc::new(comments)]).expect("batch")
 }
 
+/// The same batch, but with the string column as `Utf8View` — which is what
+/// DataFusion 54 actually produces when it reads Parquet.
+fn customer_shaped_view_batch(rows: usize) -> RecordBatch {
+    use arrow::array::StringViewArray;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("c_custkey", DataType::Int64, false),
+        Field::new("c_comment", DataType::Utf8View, false),
+    ]));
+    let keys = Int64Array::from_iter_values(0..rows as i64);
+    let comments =
+        StringViewArray::from_iter_values((0..rows).map(|i| format!("{:0>73}", i)));
+    RecordBatch::try_new(schema, vec![Arc::new(keys), Arc::new(comments)]).expect("batch")
+}
+
+/// `take` on a view array copies the 16-byte *views*, not the data buffers —
+/// every output partition keeps a reference to the SAME data buffers, and
+/// `get_array_memory_size()` charges each of them the full buffer.
+///
+/// This is the q10-shaped case: it is the only SF100 query whose shuffle
+/// carries wide strings, and it is AQE-coalesced to 47 partitions.
+#[test]
+fn utf8view_partitions_each_report_the_whole_shared_data_buffer() {
+    let rows = 10_000;
+    let buckets = 47;
+    let batch = customer_shaped_view_batch(rows);
+    let whole = batch.get_array_memory_size();
+
+    let parts = HashPartitioner::new("c_custkey", buckets)
+        .partition(&batch)
+        .expect("partition");
+    let summed: usize = parts.iter().map(RecordBatch::get_array_memory_size).sum();
+    let ratio = summed as f64 / whole as f64;
+    println!("UTF8VIEW whole={whole} summed={summed} ratio={ratio:.2}x over {buckets} buckets");
+
+    assert!(
+        ratio < 3.0,
+        "Utf8View partitions sum to {ratio:.2}x the original: every bucket is charged the \
+         whole shared data buffer. `size_bytes` feeds `aqe.rs` partition sizing, so this \
+         inflates what AQE thinks a partition weighs by ~the bucket count"
+    );
+}
+
 #[test]
 fn summing_partition_memory_size_reports_the_partitioned_batch_faithfully() {
     let rows = 10_000;

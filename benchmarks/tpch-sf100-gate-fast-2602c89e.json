@@ -1,0 +1,78 @@
+{
+  "label": "gate-fast-2602c89e",
+  "scale_factor": 100,
+  "coordinator": "http://213.199.60.184:31902",
+  "data_root": "s3://krishiv-bench/tpch/sf100",
+  "generated_at": "2026-07-30T06:20:43Z",
+  "succeeded": 6,
+  "attempted": 6,
+  "total_elapsed_s": 3475.4945753489737,
+  "queries": [
+    {
+      "id": "q2",
+      "name": "minimum_cost_supplier",
+      "job_id": "batch-sql-1785388967872-0",
+      "status": "ok",
+      "elapsed_s": 77.65358251798898,
+      "result_batches": 1,
+      "stage_count": 11,
+      "task_count": 181,
+      "distributed": true
+    },
+    {
+      "id": "q8",
+      "name": "national_market_share",
+      "job_id": "batch-sql-1785389045507-1",
+      "status": "ok",
+      "elapsed_s": 95.76047844399,
+      "result_batches": 1,
+      "stage_count": 8,
+      "task_count": 127,
+      "distributed": true
+    },
+    {
+      "id": "q9",
+      "name": "product_type_profit_measure",
+      "job_id": "batch-sql-1785389141264-2",
+      "status": "ok",
+      "elapsed_s": 221.72376724501373,
+      "result_batches": 1,
+      "stage_count": 8,
+      "task_count": 127,
+      "distributed": true
+    },
+    {
+      "id": "q10",
+      "name": "returned_item_reporting",
+      "job_id": "batch-sql-1785389362998-3",
+      "status": "ok",
+      "elapsed_s": 2348.9273963340092,
+      "result_batches": 1,
+      "stage_count": 6,
+      "task_count": 91,
+      "distributed": true
+    },
+    {
+      "id": "q17",
+      "name": "small_quantity_order_revenue",
+      "job_id": "batch-sql-1785391712566-4",
+      "status": "ok",
+      "elapsed_s": 52.81977260101121,
+      "result_batches": 1,
+      "stage_count": 6,
+      "task_count": 91,
+      "distributed": true
+    },
+    {
+      "id": "q21",
+      "name": "suppliers_who_kept_orders_waiting",
+      "job_id": "batch-sql-1785391765386-5",
+      "status": "ok",
+      "elapsed_s": 678.6095782069606,
+      "result_batches": 1,
+      "stage_count": 10,
+      "task_count": 146,
+      "distributed": true
+    }
+  ]
+}
