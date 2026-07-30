@@ -1306,21 +1306,40 @@ pub type ShuffleFragmentStream =
 /// giving them one name would mean a single number silently driving both.
 pub const SHUFFLE_FETCH_BUFFER_ENV: &str = "KRISHIV_SHUFFLE_FETCH_BUFFER";
 
-/// Map fragment *opens* in flight per reduce partition, by default.
+/// Map fragment opens in flight per reduce partition, by default.
 ///
-/// The original behaviour was effectively 1 — strictly serial fetches — even
-/// though the executor was willing to run 8 at once, so a reduce task paid 18
-/// round trips end to end.
+/// **Must be 1 unless the shuffle *server* is changed first.** Raising it hangs
+/// the cluster, and the hang is total rather than slow.
 ///
-/// What this number buys changed when the read path started streaming. It now
-/// bounds how many fragments are **open** at once, not how many are resident:
-/// the opens overlap, so the task waits on the slowest of `n` round trips rather
-/// than their sum, while the batches themselves are still consumed one fragment
-/// at a time in map-task order. The bytes in flight for a not-yet-consumed open
-/// stream are whatever the HTTP/2 flow-control window holds — tens of kilobytes
-/// — instead of a whole materialised fragment, which is why this can be raised
-/// without re-creating the memory pressure it used to cost.
-const DEFAULT_SHUFFLE_FETCH_BUFFER: usize = 8;
+/// # Why prefetching fragments deadlocks
+///
+/// `ShuffleFlightService::do_get` takes a permit from `serve_permits` *before*
+/// the store reads anything and holds it for the **response stream's lifetime**
+/// (`PermitHoldingStream`) — because for any partition at or below
+/// `INLINE_READ_LIMIT` the store has already read the whole file into memory,
+/// and that buffer lives as long as the response. So an open-but-undrained
+/// response occupies a server permit.
+///
+/// A collecting client could not expose that: it drained each fragment
+/// immediately, so permits were released promptly. A client that opens `n`
+/// fragments ahead and consumes them in order holds `n` server permits while
+/// draining one. Demand is then `executors x slots x n` against a per-server
+/// limit derived from its page-cache budget (`serve_concurrency_limit`, single
+/// digits on these 5 GiB nodes), and because every executor is both a client and
+/// a server the waits form cycles across nodes. Nothing times out; the job sits
+/// at 0% CPU forever.
+///
+/// Measured 2026-07-30 on the 3-node SF100 cluster: with this at 8, TPC-H q2
+/// wedged permanently at 132/181 tasks with executors at 0-5% CPU and no errors
+/// logged. With it at 1, the identical image ran q2 in **104.3 s**.
+///
+/// The latency this was meant to recover is largely recovered anyway by pooling
+/// the gRPC channel (see `flight::pooled_channel`): the dominant per-fragment
+/// cost was a fresh TCP + HTTP/2 handshake, not the round trip itself. A safe
+/// prefetch would require the server to bound *resident bytes* rather than open
+/// responses — i.e. release the permit once the inline buffer is handed to the
+/// encoder — and that is a change to `do_get`, not to this number.
+const DEFAULT_SHUFFLE_FETCH_BUFFER: usize = 1;
 
 /// Resolve [`DEFAULT_SHUFFLE_FETCH_BUFFER`], honouring the env override.
 ///
@@ -3284,6 +3303,133 @@ mod tests {
                     as ShuffleFragmentStream)
             })
         }
+    }
+
+    /// A reader that models the shuffle server's `serve_permits`: a permit is
+    /// taken before the fragment is served and released only when the response
+    /// stream is fully consumed.
+    ///
+    /// `reverse_open_order` makes the *last* map task acquire first and the
+    /// first acquire last. Without it the deadlock is not reproducible, because
+    /// `buffered` polls the futures in order, so map task 0 wins the permit race
+    /// by accident and the whole read drains sequentially. The production race is
+    /// decided by network timing, not poll order, so the ordering must be forced
+    /// to test the invariant rather than the scheduler's luck.
+    #[derive(Debug)]
+    struct ServeLimitedReader {
+        inner: Arc<TestShuffleStore>,
+        permits: Arc<tokio::sync::Semaphore>,
+        reverse_open_order: bool,
+        map_tasks: usize,
+    }
+
+    impl ShufflePartitionReader for ServeLimitedReader {
+        fn open_partition(
+            &self,
+            stage: usize,
+            map_task: usize,
+            partition: usize,
+        ) -> futures::future::BoxFuture<'static, Result<ShuffleFragmentStream, String>> {
+            let batches = self
+                .inner
+                .partitions
+                .lock()
+                .expect("store lock")
+                .get(&(stage, map_task, partition))
+                .cloned()
+                .unwrap_or_default();
+            let permits = Arc::clone(&self.permits);
+            let delay = if self.reverse_open_order {
+                // Later map tasks reach the semaphore first.
+                20 * (self.map_tasks.saturating_sub(map_task)) as u64
+            } else {
+                0
+            };
+            Box::pin(async move {
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                let permit = permits
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| String::from("serve semaphore closed"))?;
+                // The permit rides along with the stream, exactly as
+                // `PermitHoldingStream` does on the server.
+                let held = futures::stream::iter(batches.into_iter().map(Ok)).chain(
+                    futures::stream::unfold(Some(permit), |permit| async move {
+                        // Releasing the permit only when the stream is fully
+                        // consumed is the whole point: that is what the server's
+                        // `PermitHoldingStream` does.
+                        drop(permit?);
+                        None
+                    }),
+                );
+                Ok(Box::pin(held) as ShuffleFragmentStream)
+            })
+        }
+    }
+
+    /// A reduce read must complete when the producer serves fewer concurrent
+    /// responses than the reduce side has fragments to read.
+    ///
+    /// This pins the second deadlock found on 2026-07-30, and it is a *cluster*
+    /// hang rather than a slow query: `ShuffleFlightService::do_get` holds a
+    /// `serve_permits` permit for its response stream's lifetime, so a client
+    /// that opens `n` fragments ahead and drains them in order holds `n` server
+    /// permits while consuming one. With every executor acting as both client and
+    /// server the waits form cycles across nodes, nothing times out, and the job
+    /// sits at 0% CPU forever. Measured live: TPC-H q2 wedged at 132/181 tasks
+    /// with a prefetch of 8, and ran in 104.3 s on the identical image with a
+    /// prefetch of 1.
+    ///
+    /// Four fragments against one serve permit is the smallest case that
+    /// reproduces it. If `DEFAULT_SHUFFLE_FETCH_BUFFER` is ever raised without
+    /// first changing `do_get` to bound resident bytes instead of open
+    /// responses, this test hangs and the timeout fails it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reduce_read_completes_even_when_the_producer_serves_one_at_a_time() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let store = Arc::new(TestShuffleStore::default());
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let map_tasks = 4usize;
+        for map_task in 0..map_tasks {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![map_task as i64; 3]))],
+            )
+            .expect("batch");
+            store.write(0, map_task, 0, batch);
+        }
+
+        let reader: Arc<dyn ShufflePartitionReader> = Arc::new(ServeLimitedReader {
+            inner: Arc::clone(&store),
+            // One fewer permit than there are fragments, and the LAST map task
+            // reaches the semaphore first. With a prefetch of `map_tasks` the
+            // later fragments take every permit, map task 0 waits for one, and
+            // nothing releases because `buffered` cannot yield fragment 1 before
+            // fragment 0 has opened.
+            permits: Arc::new(tokio::sync::Semaphore::new(map_tasks - 1)),
+            reverse_open_order: true,
+            map_tasks,
+        });
+        let read = ShuffleReadExec::new(0, map_tasks, 1, Arc::clone(&schema), Some(reader));
+        let ctx = SessionContext::new();
+        let stream = read.execute(0, ctx.task_ctx()).expect("execute");
+
+        let batches = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            futures::TryStreamExt::try_collect::<Vec<_>>(stream),
+        )
+        .await
+        .expect(
+            "the reduce read deadlocked: it is holding more producer response \
+             streams open than the producer will serve, and only downstream \
+             consumption releases them",
+        )
+        .expect("read");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, map_tasks * 3, "every fragment's rows must arrive");
     }
 
     /// Consistent test-side hash partitioner (any consistent hash is
