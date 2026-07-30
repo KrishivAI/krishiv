@@ -190,12 +190,34 @@ impl HashPartitioner {
         // P3.8: use a generic helper closure to avoid five near-identical loop bodies.
         let mut bucket_indices: Vec<Vec<u32>> = vec![Vec::new(); n];
 
-        // A composite key needs each row's hashes from every key column combined
-        // before the modulo, which the single-column typed closures below cannot
-        // express. Kept as a separate branch on purpose: the one-column case is
-        // the hot path over hundreds of millions of rows at SF100, and it stays
-        // exactly as it was — same closures, same buckets, no per-row `Vec<u64>`.
-        if self.key_columns.len() != 1 {
+        // The single-column fast path below handles the five types that
+        // dominate TPC-H join keys with typed closures and no per-row
+        // `Vec<u64>` — it is the hot path over hundreds of millions of rows, so
+        // it stays exactly as it was. Everything else (composite keys, and the
+        // wider type set the composite path supports) goes through
+        // `composite_row_hashes`.
+        //
+        // Routing single-column keys of the wider types here rather than
+        // erroring keeps the two paths agreeing about what is hashable: it would
+        // be indefensible for a `(a, decimal)` key to route fine while a bare
+        // `decimal` key failed.
+        let single_fast = self.key_columns.len() == 1
+            && self
+                .key_columns
+                .first()
+                .and_then(|name| schema.index_of(name).ok())
+                .map(|idx| batch.column(idx).data_type())
+                .is_some_and(|t| {
+                    matches!(
+                        t,
+                        DataType::Int32
+                            | DataType::Int64
+                            | DataType::Utf8
+                            | DataType::Utf8View
+                            | DataType::LargeUtf8
+                    )
+                });
+        if !single_fast {
             let hashes = self.composite_row_hashes(batch)?;
             fill_buckets(&mut bucket_indices, num_rows, |row| {
                 let hash = hashes.get(row).copied().unwrap_or(0);
@@ -321,13 +343,48 @@ impl HashPartitioner {
     fn composite_row_hashes(&self, batch: &RecordBatch) -> ShuffleResult<Vec<u64>> {
         let schema = batch.schema();
         let mut acc = vec![0u64; batch.num_rows()];
-        for (position, name) in self.key_columns.iter().enumerate() {
+        let mut folded = 0usize;
+        let mut skipped: Vec<String> = Vec::new();
+        for name in &self.key_columns {
             let col_idx = schema
                 .index_of(name)
                 .map_err(|e| crate::error::io_err(e.to_string()))?;
             let column = batch.column(col_idx);
-            let nulls = self.fold_column_into(&mut acc, column.as_ref(), position == 0)?;
-            self.count_nulls(nulls);
+            match self.fold_column_into(&mut acc, column.as_ref(), folded == 0)? {
+                Some(nulls) => {
+                    self.count_nulls(nulls);
+                    folded += 1;
+                }
+                // A key column this partitioner cannot hash is *skipped*, not
+                // fatal. Hashing a subset of a composite key stays
+                // co-location-correct — equal full keys have equal subsets — and
+                // it is exactly what hashing `key_columns[0]` alone used to do.
+                //
+                // Failing instead would break queries that worked: TPC-H q10
+                // groups by `(c_custkey, c_name, c_acctbal, …)` where
+                // `c_acctbal` is `Decimal128(15, 2)`. Under the leading-column
+                // behaviour that column was never hashed; hashing every column
+                // and erroring on the first unsupported one turned a working
+                // query into `shuffle type mismatch: … got Decimal128(15, 2)`.
+                None => skipped.push(format!("{name}: {}", column.data_type())),
+            }
+        }
+        if folded == 0 {
+            return Err(ShuffleError::TypeMismatch {
+                expected: format!(
+                    "at least one hashable key column (Int8/16/32/64, UInt8/16/32/64, \
+                     Decimal128, Date32/64, Timestamp, Boolean, Utf8, Utf8View, LargeUtf8); \
+                     none of [{}] can be hashed",
+                    skipped.join(", ")
+                ),
+            });
+        }
+        if !skipped.is_empty() {
+            tracing::debug!(
+                skipped = %skipped.join(", "),
+                hashed = folded,
+                "shuffle key has columns this partitioner cannot hash; routing on the rest"
+            );
         }
         Ok(acc)
     }
@@ -338,12 +395,18 @@ impl HashPartitioner {
     /// keeps a one-column composite key bucket-identical to the single-column
     /// fast path — the two must agree or the same logical shuffle key would
     /// route differently depending on which branch ran.
+    /// `Ok(None)` means "this type is not hashable here" — the caller skips the
+    /// column rather than failing the query. See [`Self::composite_row_hashes`].
     fn fold_column_into(
         &self,
         acc: &mut [u64],
         column: &dyn Array,
         is_first: bool,
-    ) -> ShuffleResult<usize> {
+    ) -> ShuffleResult<Option<usize>> {
+        use arrow::array::{
+            BooleanArray, Date32Array, Date64Array, Decimal128Array, Int8Array, Int16Array,
+            UInt8Array, UInt16Array, UInt32Array as U32, UInt64Array,
+        };
         let seed = self.seed;
         let mut apply = |row: usize, hash: u64| {
             if let Some(slot) = acc.get_mut(row) {
@@ -354,6 +417,7 @@ impl HashPartitioner {
                 };
             }
         };
+        /// Fold a typed array, hashing each value's little-endian bytes.
         macro_rules! fold {
             ($ty:ty, $expected:literal, $sentinel:expr, $bytes:expr) => {{
                 let arr = column
@@ -372,32 +436,38 @@ impl HashPartitioner {
                     };
                     apply(row, hash);
                 }
-                Ok(arr.null_count())
+                Ok(Some(arr.null_count()))
             }};
         }
+        // Integers widen to i64 so the same logical value hashes identically
+        // whatever width it arrived in — otherwise an Int32 key on one side of a
+        // join and an Int64 key on the other would not co-locate.
         match column.data_type() {
-            DataType::Int32 => fold!(Int32Array, "Int32", NULL_SENTINEL_INT, |v: i32| (v as i64)
-                .to_le_bytes()),
-            DataType::Int64 => {
-                fold!(Int64Array, "Int64", NULL_SENTINEL_INT, |v: i64| v.to_le_bytes())
+            DataType::Int8 => fold!(Int8Array, "Int8", NULL_SENTINEL_INT, |v: i8| (v as i64).to_le_bytes()),
+            DataType::Int16 => fold!(Int16Array, "Int16", NULL_SENTINEL_INT, |v: i16| (v as i64).to_le_bytes()),
+            DataType::Int32 => fold!(Int32Array, "Int32", NULL_SENTINEL_INT, |v: i32| (v as i64).to_le_bytes()),
+            DataType::Int64 => fold!(Int64Array, "Int64", NULL_SENTINEL_INT, |v: i64| v.to_le_bytes()),
+            DataType::UInt8 => fold!(UInt8Array, "UInt8", NULL_SENTINEL_INT, |v: u8| (v as i64).to_le_bytes()),
+            DataType::UInt16 => fold!(UInt16Array, "UInt16", NULL_SENTINEL_INT, |v: u16| (v as i64).to_le_bytes()),
+            DataType::UInt32 => fold!(U32, "UInt32", NULL_SENTINEL_INT, |v: u32| (v as i64).to_le_bytes()),
+            DataType::UInt64 => fold!(UInt64Array, "UInt64", NULL_SENTINEL_INT, |v: u64| v.to_le_bytes()),
+            // Dates are day/millisecond counts; hash them as the integers they
+            // are. TPC-H shuffles on `o_orderdate` in several queries.
+            DataType::Date32 => fold!(Date32Array, "Date32", NULL_SENTINEL_INT, |v: i32| (v as i64).to_le_bytes()),
+            DataType::Date64 => fold!(Date64Array, "Date64", NULL_SENTINEL_INT, |v: i64| v.to_le_bytes()),
+            DataType::Boolean => fold!(BooleanArray, "Boolean", NULL_SENTINEL_INT, |v: bool| [u8::from(v)]),
+            // The unscaled i128. Two decimals with the same value but different
+            // scales hash differently, which is correct here: a shuffle key's
+            // scale is fixed by the plan, so both sides of an exchange always
+            // present the same one.
+            DataType::Decimal128(_, _) => {
+                fold!(Decimal128Array, "Decimal128", NULL_SENTINEL_INT, |v: i128| v.to_le_bytes())
             }
-            DataType::Utf8 => fold!(StringArray, "Utf8", NULL_SENTINEL_STR, |v: &str| v
-                .as_bytes()
-                .to_vec()),
-            DataType::Utf8View => fold!(StringViewArray, "Utf8View", NULL_SENTINEL_STR, |v: &str| v
-                .as_bytes()
-                .to_vec()),
-            DataType::LargeUtf8 => fold!(
-                LargeStringArray,
-                "LargeUtf8",
-                NULL_SENTINEL_STR,
-                |v: &str| v.as_bytes().to_vec()
-            ),
-            other => Err(ShuffleError::TypeMismatch {
-                expected: format!(
-                    "supported partition key type (Int32, Int64, Utf8, Utf8View, LargeUtf8), got {other}"
-                ),
-            }),
+            DataType::Utf8 => fold!(StringArray, "Utf8", NULL_SENTINEL_STR, |v: &str| v.as_bytes().to_vec()),
+            DataType::Utf8View => fold!(StringViewArray, "Utf8View", NULL_SENTINEL_STR, |v: &str| v.as_bytes().to_vec()),
+            DataType::LargeUtf8 => fold!(LargeStringArray, "LargeUtf8", NULL_SENTINEL_STR, |v: &str| v.as_bytes().to_vec()),
+            // Everything else is skipped, not fatal.
+            _ => Ok(None),
         }
     }
 }
@@ -624,6 +694,89 @@ mod tests {
             occupied(&parts),
             8,
             "hashing both key columns must reach every bucket, not {leading_buckets}"
+        );
+    }
+
+    /// TPC-H q10's exact shape: a composite key containing a `Decimal128`.
+    ///
+    /// Live regression, caught only on the cluster. q10 groups by
+    /// `(c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, c_comment)`
+    /// and `c_acctbal` is `Decimal128(15, 2)`. Hashing only the leading column
+    /// never touched it; hashing every column and erroring on the first
+    /// unsupported type turned a working query into
+    /// `shuffle type mismatch: … got Decimal128(15, 2)`.
+    ///
+    /// Decimal is now hashed on its unscaled `i128`. A type that still cannot be
+    /// hashed is *skipped* rather than fatal, because hashing a subset of a
+    /// composite key stays co-location-correct — which is exactly what the
+    /// leading-column behaviour was.
+    #[test]
+    fn a_composite_key_containing_a_decimal_routes_instead_of_failing() {
+        use arrow::array::Decimal128Array;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("c_custkey", DataType::Int64, false),
+            Field::new("c_acctbal", DataType::Decimal128(15, 2), false),
+        ]));
+        let acctbal = Decimal128Array::from_iter_values((0..256).map(|i| i as i128 * 137))
+            .with_precision_and_scale(15, 2)
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..256)),
+                Arc::new(acctbal),
+            ],
+        )
+        .unwrap();
+
+        let parts = HashPartitioner::new_multi(
+            vec!["c_custkey".into(), "c_acctbal".into()],
+            8,
+        )
+        .partition(&batch)
+        .expect("a Decimal key column must not fail the shuffle");
+        assert_eq!(
+            parts.iter().map(|b| b.num_rows()).sum::<usize>(),
+            256,
+            "no rows may be dropped"
+        );
+        assert_eq!(
+            parts.iter().filter(|b| b.num_rows() > 0).count(),
+            8,
+            "both key columns should contribute to the spread"
+        );
+
+        // And a bare Decimal key must work too, or the single-column and
+        // composite paths would disagree about what is hashable.
+        let solo = HashPartitioner::new("c_acctbal", 8)
+            .partition(&batch)
+            .expect("a single Decimal key column must not fail either");
+        assert_eq!(solo.iter().map(|b| b.num_rows()).sum::<usize>(), 256);
+    }
+
+    /// A key made only of types the partitioner cannot hash must fail loudly
+    /// rather than silently routing every row to bucket 0.
+    #[test]
+    fn a_wholly_unhashable_key_is_an_error_not_a_single_bucket() {
+        use arrow::array::Float64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "f",
+            DataType::Float64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Float64Array::from_iter_values(
+                (0..64).map(|i| i as f64),
+            ))],
+        )
+        .unwrap();
+        let err = HashPartitioner::new_multi(vec!["f".into()], 4)
+            .partition(&batch)
+            .expect_err("no hashable key column must be an error");
+        assert!(
+            err.to_string().contains("hashable key column"),
+            "the error must name the problem, got: {err}"
         );
     }
 
