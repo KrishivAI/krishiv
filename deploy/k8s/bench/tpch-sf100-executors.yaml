@@ -53,6 +53,11 @@ spec:
             - /scratch/shuffle
             - --shuffle-flight-addr
             - 0.0.0.0:2004
+            # Advertise the headless Service name, NOT POD_IP: a pod IP does not
+            # survive a restart, and the coordinator hands that string to every
+            # reduce task. See the Services at the end of this file.
+            - --host
+            - bench-exec-s1.krishiv-apitest.svc.cluster.local
           ports:
             - { containerPort: 2002, name: health }
             - { containerPort: 2004, name: shuffle-flight }
@@ -132,6 +137,11 @@ spec:
             - /scratch/shuffle
             - --shuffle-flight-addr
             - 0.0.0.0:2004
+            # Advertise the headless Service name, NOT POD_IP: a pod IP does not
+            # survive a restart, and the coordinator hands that string to every
+            # reduce task. See the Services at the end of this file.
+            - --host
+            - bench-exec-s2.krishiv-apitest.svc.cluster.local
           ports:
             - { containerPort: 2002, name: health }
             - { containerPort: 2004, name: shuffle-flight }
@@ -214,6 +224,11 @@ spec:
             - /scratch/shuffle
             - --shuffle-flight-addr
             - 0.0.0.0:2004
+            # Advertise the headless Service name, NOT POD_IP: a pod IP does not
+            # survive a restart, and the coordinator hands that string to every
+            # reduce task. See the Services at the end of this file.
+            - --host
+            - bench-exec-s3.krishiv-apitest.svc.cluster.local
           ports:
             - { containerPort: 2002, name: health }
             - { containerPort: 2004, name: shuffle-flight }
@@ -248,3 +263,75 @@ spec:
       volumes:
         - name: scratch
           hostPath: { path: /data/krishiv-bench-scratch, type: DirectoryOrCreate }
+---
+# Stable DNS identity for each executor.
+#
+# The executors used to advertise POD_IP (Kubernetes downward API) as their
+# shuffle Flight endpoint, and the coordinator attaches that string to every
+# reduce task's assignment. A pod IP does not survive a restart, so an
+# OOM-killed executor came back at a different address while every in-flight
+# assignment still pointed at the old one. Two things went wrong:
+#
+#  1. The 90 s shuffle transport grace (engine e62ae5a4) spent its entire budget
+#     retrying an address nothing answered on, then declared the partition
+#     missing and forced a producer-stage recompute — even though the shuffle
+#     files were on a hostPath volume and had survived the restart intact. TPC-H
+#     q10 spent ~40 minutes of a 2921 s run recomputing data that was on disk.
+#  2. The coordinator saw the address change as a new incarnation and fenced the
+#     old one. Observed live on 2026-07-30 02:04Z: bench-s1 flip-flopped between
+#     10.42.0.95 and 10.42.0.96, five losses inside the 30 s window tripped the
+#     SC11 cascade circuit breaker, and task assignment was suspended outright.
+#
+# A headless Service per executor gives each one a name that outlives its pod.
+# Combined with the pooled `connect_lazy` shuffle channel — which re-dials, and
+# therefore re-resolves DNS, on demand — a restarted executor becomes reachable
+# again as soon as it is ready and serves the shuffle output it still holds.
+#
+# `clusterIP: None` with a selector means DNS returns only *ready* pod IPs, so
+# the restart window surfaces as a resolution failure. That is a transport
+# error, which is exactly what the grace is for, rather than a connection
+# attempt against a stale address that will never answer.
+apiVersion: v1
+kind: Service
+metadata:
+  name: bench-exec-s1
+  namespace: krishiv-apitest
+  labels: { app: bench-exec, node: s1 }
+spec:
+  clusterIP: None
+  selector: { app: bench-exec, node: s1 }
+  ports:
+    - { name: health, port: 2002, targetPort: 2002 }
+    - { name: shuffle-flight, port: 2004, targetPort: 2004 }
+    - { name: task-grpc, port: 2005, targetPort: 2005 }
+    - { name: barrier-grpc, port: 2006, targetPort: 2006 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bench-exec-s2
+  namespace: krishiv-apitest
+  labels: { app: bench-exec, node: s2 }
+spec:
+  clusterIP: None
+  selector: { app: bench-exec, node: s2 }
+  ports:
+    - { name: health, port: 2002, targetPort: 2002 }
+    - { name: shuffle-flight, port: 2004, targetPort: 2004 }
+    - { name: task-grpc, port: 2005, targetPort: 2005 }
+    - { name: barrier-grpc, port: 2006, targetPort: 2006 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bench-exec-s3
+  namespace: krishiv-apitest
+  labels: { app: bench-exec, node: s3 }
+spec:
+  clusterIP: None
+  selector: { app: bench-exec, node: s3 }
+  ports:
+    - { name: health, port: 2002, targetPort: 2002 }
+    - { name: shuffle-flight, port: 2004, targetPort: 2004 }
+    - { name: task-grpc, port: 2005, targetPort: 2005 }
+    - { name: barrier-grpc, port: 2006, targetPort: 2006 }
