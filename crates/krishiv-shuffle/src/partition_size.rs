@@ -28,17 +28,19 @@
 //! the low 32 bits of the `u128`, so the sum costs one pass over the views with
 //! no string materialisation and no buffer walk.
 //!
-//! Every other array type keeps `get_array_memory_size()`: `take` allocates
-//! fresh buffers for them, so it is already faithful (0.74x above — under 1.0
-//! because splitting drops the parent's slack, not because anything is
-//! undercounted).
+//! Fixed-width and offset-encoded (Utf8/Binary) arrays are computed exactly
+//! from their own slice too. Deferring offset strings to Arrow is what left
+//! q10's `dist-s1` reporting **1.74 TB** in the first instrumented run *after*
+//! the view fix had landed: `take` allocates, but the map-side write buffer
+//! also *slices*, and a sliced offset array shares its values buffer exactly
+//! as a view array does.
 //!
 //! # Known limit
 //!
-//! A view array *nested* inside a struct/list is not descended into and falls
-//! back to `get_array_memory_size()`, so it can still over-report. TPC-H does
-//! not exercise that shape; a nested-view schema would need this extended
-//! rather than trusted.
+//! Nested types (struct/list) are not descended into and fall back to
+//! `get_array_memory_size()`, so a view or string nested inside one can still
+//! over-report after a slice. TPC-H does not exercise that shape; a nested
+//! schema would need this extended rather than trusted.
 
 use arrow::array::{Array, BinaryViewArray, RecordBatch, StringViewArray};
 use arrow::datatypes::DataType;
@@ -65,11 +67,43 @@ pub fn logical_array_bytes(array: &dyn Array) -> usize {
             let validity = array.nulls().map_or(0, |_| array.len().div_ceil(8));
             array.len().saturating_mul(width).saturating_add(validity)
         }
-        // Everything else (Utf8/Binary with offsets, nested types) keeps
-        // Arrow's answer, which is exact after `take` and an over-estimate
-        // after `slice`.
+        // Offset-encoded strings/binary: the slice's own bytes are the span
+        // between its first and last offset. `get_array_memory_size()` reports
+        // the whole shared values buffer here exactly as it does for views, so
+        // leaving this to Arrow left q10's `dist-s1` reporting **1.74 TB** even
+        // after the view fix landed.
+        DataType::Utf8 => offset_bytes::<i32>(array),
+        DataType::LargeUtf8 => offset_bytes::<i64>(array),
+        DataType::Binary => offset_bytes::<i32>(array),
+        DataType::LargeBinary => offset_bytes::<i64>(array),
+        // Nested types (struct/list) are not descended into and still defer to
+        // Arrow, so they remain exact-after-`take` and an over-estimate after
+        // `slice`. TPC-H does not exercise that shape.
         _ => array.get_array_memory_size(),
     }
+}
+
+/// Bytes an offset-encoded array's own slice references: the value span plus
+/// its offsets and validity.
+fn offset_bytes<O: arrow::array::OffsetSizeTrait>(array: &dyn Array) -> usize {
+    let data = array.to_data();
+    let Some(offsets) = data.buffers().first() else {
+        return array.get_array_memory_size();
+    };
+    let slice: &[O] = offsets.typed_data::<O>();
+    // `to_data` keeps the parent buffer, so index relative to this array's own
+    // offset rather than assuming the slice starts at zero.
+    let start = data.offset();
+    let end = start + data.len();
+    let (Some(first), Some(last)) = (slice.get(start), slice.get(end)) else {
+        return array.get_array_memory_size();
+    };
+    let values = last.as_usize().saturating_sub(first.as_usize());
+    let offset_width = std::mem::size_of::<O>();
+    let validity = data.nulls().map_or(0, |_| data.len().div_ceil(8));
+    values
+        .saturating_add(data.len().saturating_add(1).saturating_mul(offset_width))
+        .saturating_add(validity)
 }
 
 /// A `ByteView` is a `u128` whose low 32 bits are the value length, so the
@@ -138,6 +172,28 @@ mod tests {
             (0.9..1.1).contains(&ratio),
             "slicing into {pieces} pieces reported {ratio:.2}x the whole batch; the point of \
              this module is that a piece is charged only for what it references"
+        );
+    }
+
+    /// Offset strings must be slice-correct too: this is what left q10's
+    /// `dist-s1` reporting 1.74 TB after the view fix had already landed.
+    #[test]
+    fn slicing_a_utf8_batch_does_not_multiply_its_reported_size() {
+        use arrow::array::StringArray;
+        let rows = 4_000;
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let strings = StringArray::from_iter_values((0..rows).map(|i| format!("{i:0>73}")));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(strings)]).unwrap();
+        let whole = logical_batch_bytes(&batch);
+        let pieces = 16;
+        let per = rows / pieces;
+        let summed: usize = (0..pieces)
+            .map(|i| logical_batch_bytes(&batch.slice(i * per, per)))
+            .sum();
+        let ratio = summed as f64 / whole as f64;
+        assert!(
+            (0.9..1.15).contains(&ratio),
+            "Utf8 sliced into {pieces} pieces reported {ratio:.2}x the whole batch"
         );
     }
 
