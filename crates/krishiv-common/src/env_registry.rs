@@ -800,6 +800,30 @@ pub static FLAGS: &[FlagSpec] = &[
         "DataFusion dynamic (runtime) filters: TopK / join / aggregate predicates pushed into probe-side file scans at execution time (Phase 54). `off` disables all three via the DataFusion master switch.",
     ),
     rt(
+        "KRISHIV_CROSS_STAGE_RUNTIME_FILTER",
+        FlagKind::Bool,
+        "off",
+        "Cross-stage runtime bloom filters: a distributed plan gains a filter stage over the join build side, and the probe stage drops non-matching rows BEFORE shuffling them. Distinct from KRISHIV_RUNTIME_FILTERS, which is DataFusion's in-plan mechanism and cannot see across a stage cut. Read on the coordinator, at planning time.",
+    ),
+    rt(
+        "KRISHIV_SEMI_JOIN_PUSHDOWN",
+        FlagKind::Bool,
+        "on",
+        "Push a semi-join through an inner join. Gated by KRISHIV_SEMI_JOIN_REDUCTION as well, so turning that off disables both.",
+    ),
+    rt(
+        "KRISHIV_SHUFFLE_FETCH_BUFFER",
+        FlagKind::UInt,
+        "2",
+        "How many upstream map fragments a reduce partition opens concurrently. Raising this is NOT free: the shuffle server holds a do_get permit for the lifetime of each response, and a value of 4 wedged a 3-node cluster at 0% CPU.",
+    ),
+    rt(
+        "KRISHIV_SHUFFLE_FETCH_TRANSPORT_GRACE_SECS",
+        FlagKind::UInt,
+        "90",
+        "Wall-clock grace for retrying a shuffle fetch across a transport error, covering an executor restart. `0` disables the grace; NotFound still fails fast.",
+    ),
+    rt(
         "KRISHIV_BROADCAST_JOIN_BYTES",
         FlagKind::UInt,
         "33554432 (32 MiB), staged path only",
@@ -1223,6 +1247,18 @@ pub static FLAGS: &[FlagSpec] = &[
         FlagKind::Url,
         "unset",
         "Postgres URL for catalog integration tests.",
+    ),
+    test(
+        "KRISHIV_TPCH_ONLY",
+        FlagKind::Text,
+        "unset",
+        "Comma-separated TPC-H query names (e.g. `q10,q21`) restricting a verify/bench run; unset runs all 22.",
+    ),
+    test(
+        "KRISHIV_TPCH_SCALE_FACTOR",
+        FlagKind::Float,
+        "1.0",
+        "TPC-H scale factor the verifier assumes; q11's threshold is scale-dependent, so this must match the data being checked.",
     ),
     test(
         "KRISHIV_TEST_S3_BUCKET",

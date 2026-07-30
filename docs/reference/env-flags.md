@@ -118,6 +118,10 @@ Regenerate with:
 | `KRISHIV_ROCKSDB_MAX_OPEN_FILES` | int | `rocksdb default` | RocksDB max_open_files for state/metadata stores (-1 = unlimited). |
 | `KRISHIV_ROCKSDB_WRITE_BUFFER_MB` | uint | `rocksdb default` | RocksDB write-buffer (memtable) size in MiB. |
 | `KRISHIV_RUNTIME_FILTERS` | bool | `on` | DataFusion dynamic (runtime) filters: TopK / join / aggregate predicates pushed into probe-side file scans at execution time (Phase 54). `off` disables all three via the DataFusion master switch. |
+| `KRISHIV_CROSS_STAGE_RUNTIME_FILTER` | bool | `off` | Cross-stage runtime bloom filters: a distributed plan gains a filter stage over the join build side, and the probe stage drops non-matching rows BEFORE shuffling them. Distinct from KRISHIV_RUNTIME_FILTERS, which is DataFusion's in-plan mechanism and cannot see across a stage cut. Read on the coordinator, at planning time. |
+| `KRISHIV_SEMI_JOIN_PUSHDOWN` | bool | `on` | Push a semi-join through an inner join. Gated by KRISHIV_SEMI_JOIN_REDUCTION as well, so turning that off disables both. |
+| `KRISHIV_SHUFFLE_FETCH_BUFFER` | uint | `2` | How many upstream map fragments a reduce partition opens concurrently. Raising this is NOT free: the shuffle server holds a do_get permit for the lifetime of each response, and a value of 4 wedged a 3-node cluster at 0% CPU. |
+| `KRISHIV_SHUFFLE_FETCH_TRANSPORT_GRACE_SECS` | uint | `90` | Wall-clock grace for retrying a shuffle fetch across a transport error, covering an executor restart. `0` disables the grace; NotFound still fails fast. |
 | `KRISHIV_BROADCAST_JOIN_BYTES` | uint | `33554432 (32 MiB), staged path only` | Build-side byte ceiling under which a join is BROADCAST rather than hash-shuffled, on the distributed staged path only (embedded keeps DataFusion's 1 MiB default, which is right for a single process where a shuffle is a memcpy). Here a shuffle is the pod network, measured at ~11 MiB/s across separate hosts: TPC-H q8/q9 hash-partition the raw 600M-row lineitem scan — ~36 GiB on the wire — because the filtered dimension side lands just over 1 MiB and so is not eligible to broadcast. Bounded by the per-task memory share, since the build side is collected per task. |
 | `KRISHIV_SPILL_JOIN_BUILD_BYTES` | uint | `50% of the per-task memory share (disabled when uncapped)` | Hash-join build sides with a KNOWN size estimate above this many bytes are planned as sort-merge joins, which can spill, instead of hash joins, which cannot (TPC-H q18: 'Resources exhausted ... HashJoinInput[0] ... 732.4 MB'). Unknown estimates and uncapped engines keep hash join. |
 | `KRISHIV_SHUFFLE_GRPC_MAX_MESSAGE_BYTES` | uint | `268435456 (256 MiB)` | Maximum gRPC message the shuffle transport will send or decode. Must exceed the shuffle writer's coalesce target with room to spare, or a map task produces a partition the reduce side refuses to decode — tonic reports OutOfRange, the consumer retries forever and finally reports NotFound, which reads as a lost shuffle rather than an oversized message. TPC-H q10 at SF100 died this way on every sweep. |
@@ -181,6 +185,8 @@ Regenerate with:
 | `KRISHIV_KIND_SKIP_LOAD_IMAGE` | bool | `false` | Skip loading the engine image into kind. |
 | `KRISHIV_KIND_TIMEOUT_SECS` | uint | `300` | Timeout for kind e2e operations. |
 | `KRISHIV_TEST_DATABASE_URL` | url | `unset` | Postgres URL for catalog integration tests. |
+| `KRISHIV_TPCH_ONLY` | text | `unset` | Comma-separated TPC-H query names (e.g. `q10,q21`) restricting a verify/bench run; unset runs all 22. |
+| `KRISHIV_TPCH_SCALE_FACTOR` | float | `1.0` | TPC-H scale factor the verifier assumes; q11's threshold is scale-dependent, so this must match the data being checked. |
 | `KRISHIV_TEST_S3_BUCKET` | text | `unset` | S3 bucket for object-store integration tests. |
 
 ## Benchmark flags

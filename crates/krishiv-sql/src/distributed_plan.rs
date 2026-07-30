@@ -2028,7 +2028,7 @@ pub fn build_distributed_stages_with_udf_directives(
     }
     // Cross-stage runtime filters, before the root is pushed so the Result
     // stage stays last. Appends filter stages and rewrites probe stages in
-    // place; a no-op unless `KRISHIV_RUNTIME_FILTER` is on.
+    // place; a no-op unless `KRISHIV_CROSS_STAGE_RUNTIME_FILTER` is on.
     inject_runtime_filters(&root, &mut drafts);
 
     drafts.push(StageDraft {

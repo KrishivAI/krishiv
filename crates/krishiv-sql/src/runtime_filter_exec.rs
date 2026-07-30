@@ -81,12 +81,18 @@ use krishiv_shuffle::{FilterKeyType, RuntimeFilter, RuntimeFilterBuilder};
 
 /// Env flag gating the whole feature. Off by default.
 ///
+/// The name is long on purpose. `KRISHIV_RUNTIME_FILTERS` already exists — it is
+/// DataFusion's *in-plan* dynamic-filter master switch, and it defaults to on.
+/// Naming this one the singular of that would put two flags one letter apart,
+/// with opposite defaults and different mechanisms, in the same namespace: a
+/// trap an operator only discovers by setting one and measuring nothing change.
+///
 /// Guard 5 of the design register: two prior plan rules that fired too widely
 /// cost more than they gained (`semi-join-rule-was-the-pessimization` took q2
 /// from 189 s to a nested-loop join, and the broadcast over-reach regressed four
 /// queries). A rule that rewrites the stage DAG ships dark until a full 22-query
 /// sweep is clean against the queries we currently *win*, not only against q10.
-pub const RUNTIME_FILTER_ENV: &str = "KRISHIV_RUNTIME_FILTER";
+pub const RUNTIME_FILTER_ENV: &str = "KRISHIV_CROSS_STAGE_RUNTIME_FILTER";
 
 /// Is cross-stage runtime filtering enabled?
 #[must_use]
