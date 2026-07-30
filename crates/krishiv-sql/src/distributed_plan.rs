@@ -2025,6 +2025,54 @@ pub fn build_distributed_stages_with_udf_directives(
     Ok(Some(DistributedStagePlan { stages }))
 }
 
+/// Identity of a cut subtree, for deciding whether two exchanges can share one
+/// stage.
+///
+/// # Why reuse is worth having
+///
+/// The cutter gave every exchange its own stage, so a subtree feeding two
+/// consumers was scanned and shuffled twice. TPC-H q21 shuffles
+/// `["l_orderkey","l_suppkey"]` in **three** separate stages — one per
+/// EXISTS/NOT EXISTS self-join over `lineitem` — and q7 shuffles the **25-row**
+/// `nation` table in two. On a cluster whose pod network is the binding
+/// constraint, a redundant shuffle is redundant wire time. Spark calls this
+/// `ReusedExchange`.
+///
+/// # Why this key is the whole safety argument
+///
+/// A false match merges two stages that are *not* equivalent, and the consumers
+/// then read someone else's rows — a wrong answer with no error. So the key is
+/// the full indented physical plan of the subtree, which renders operators,
+/// projections, filter predicates and scanned file groups, plus the schema and
+/// the shuffle's own key columns and partition count (compared separately by
+/// the caller). Anything that changes what the stage *emits* changes this
+/// string.
+///
+/// Deliberately conservative in two ways:
+///
+/// * Stages carrying a [`StageSubqueryContext`] are never reused. Their tasks
+///   are parameterised by a subquery result, so identical plan text does not
+///   imply identical output.
+/// * It matches on rendered text rather than pointer identity, so it finds the
+///   real duplicates (separately-planned subqueries) rather than only shared
+///   `Arc`s — which is the case that actually occurs.
+///
+/// The empirical guard is `every_tpch_query_stages_to_the_same_answer_in_every_configuration`
+/// in krishiv-bench: all 22 queries, four join/broadcast configurations, staged
+/// through this cutter and compared against single-node execution.
+fn exchange_reuse_key(
+    plan: &Arc<dyn ExecutionPlan>,
+    key_columns: &[String],
+    num_partitions: usize,
+) -> String {
+    use datafusion::physical_plan::displayable;
+    format!(
+        "keys={key_columns:?}|parts={num_partitions}|schema={:?}|plan=\n{}",
+        plan.schema(),
+        displayable(plan.as_ref()).indent(true)
+    )
+}
+
 fn cut_exchanges(
     plan: Arc<dyn ExecutionPlan>,
     stages: &mut Vec<StageDraft>,
@@ -2050,15 +2098,32 @@ fn cut_exchanges(
         // D3(2): capture the estimate before `input` is moved into the stage —
         // this is the only point where the cut subtree is still in hand.
         let estimate = ShuffleReadExec::estimate_of(&input);
-        let stage_index = stages.len();
-        stages.push(StageDraft {
-            plan: input,
-            shuffle: Some(StageShuffleOutput {
-                key_columns,
-                num_output_partitions: *num_partitions,
-            }),
-            subqueries: None,
-        });
+
+        // Exchange reuse: an identical subtree shuffled on identical keys into
+        // identical partitions produces byte-identical output, so cut it once
+        // and let both consumers read the same stage.
+        let reuse_key = exchange_reuse_key(&input, &key_columns, *num_partitions);
+        let stage_index = match stages.iter().position(|draft| {
+            draft.subqueries.is_none()
+                && draft.shuffle.as_ref().is_some_and(|sh| {
+                    sh.key_columns == key_columns && sh.num_output_partitions == *num_partitions
+                })
+                && exchange_reuse_key(&draft.plan, &key_columns, *num_partitions) == reuse_key
+        }) {
+            Some(existing) => existing,
+            None => {
+                let index = stages.len();
+                stages.push(StageDraft {
+                    plan: input,
+                    shuffle: Some(StageShuffleOutput {
+                        key_columns,
+                        num_output_partitions: *num_partitions,
+                    }),
+                    subqueries: None,
+                });
+                index
+            }
+        };
         return Ok(Arc::new(
             ShuffleReadExec::new(
                 stage_index,
