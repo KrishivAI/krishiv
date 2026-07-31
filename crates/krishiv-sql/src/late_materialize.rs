@@ -614,12 +614,22 @@ impl InputFacts {
         None
     }
 
+    /// The columns of table `index`, or an empty slice if there is no such table.
+    ///
+    /// Every index here comes from [`Self::reach_one`], which produced it by
+    /// enumerating `self.tables` — but the workspace denies `indexing_slicing`
+    /// so that "obviously in range" never has to be re-derived by a later
+    /// reader, and an empty slice is the harmless reading of a bad index.
+    fn columns_of(&self, index: usize) -> &[Column] {
+        self.tables.get(index).map_or(&[], |t| t.columns.as_slice())
+    }
+
     /// Every column reachable from `seed`.
     fn closure(&self, seed: &[Column]) -> HashSet<String> {
         let mut available: HashSet<String> = seed.iter().map(Column::flat_name).collect();
         let mut used: Vec<usize> = Vec::new();
         while let Some((index, _)) = self.reach_one(&available, &used) {
-            for col in &self.tables[index].columns {
+            for col in self.columns_of(index) {
                 available.insert(col.flat_name());
             }
             used.push(index);
@@ -638,8 +648,7 @@ impl InputFacts {
     fn minimal_key(&self, group_cols: &[Column]) -> Vec<Column> {
         let mut retained: Vec<Column> = group_cols.to_vec();
         let mut index = 0;
-        while index < retained.len() {
-            let candidate = retained[index].clone();
+        while let Some(candidate) = retained.get(index).cloned() {
             let mut without = retained.clone();
             without.remove(index);
             if self.closure(&without).contains(&candidate.flat_name()) {
@@ -685,7 +694,7 @@ impl InputFacts {
                     );
                 }
             }
-            for col in &self.tables[index].columns {
+            for col in self.columns_of(index) {
                 available.insert(col.flat_name());
                 materialised.insert(col.flat_name());
             }
@@ -695,21 +704,28 @@ impl InputFacts {
 
         // Walk back from the links that supply a deferred column, keeping every
         // link whose columns another kept link probes into.
-        let mut keep = vec![false; links.len()];
         let mut wanted: HashSet<String> = deferred.iter().map(Column::flat_name).collect();
-        for position in (0..links.len()).rev() {
-            let (index, link) = &links[position];
-            let supplies = self.tables[*index]
-                .columns
-                .iter()
-                .any(|col| wanted.contains(&col.flat_name()));
-            if supplies {
-                keep[position] = true;
-                for probe in &link.probe_keys {
-                    wanted.insert(probe.flat_name());
+        // Reverse order matters: `links` is in dependency order, so by the time
+        // a link is examined every later link that could probe into it has
+        // already declared what it needs.
+        let mut keep: Vec<bool> = links
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(_, (index, link))| {
+                let supplies = self
+                    .columns_of(*index)
+                    .iter()
+                    .any(|col| wanted.contains(&col.flat_name()));
+                if supplies {
+                    for probe in &link.probe_keys {
+                        wanted.insert(probe.flat_name());
+                    }
                 }
-            }
-        }
+                supplies
+            })
+            .collect();
+        keep.reverse();
         let pruned: Vec<DimLink> = links
             .into_iter()
             .zip(keep)

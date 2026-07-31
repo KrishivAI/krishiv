@@ -2244,6 +2244,33 @@ impl SqlEngine {
         table_name: impl AsRef<str>,
         path: impl AsRef<Path>,
     ) -> SqlResult<()> {
+        self.register_parquet_with_primary_key(table_name, path, &[] as &[String])
+            .await
+    }
+
+    /// As [`Self::register_parquet`], declaring a primary key for the table.
+    ///
+    /// Parquet carries no key, so this declaration is the only way the optimizer
+    /// can learn that one column determines the others — which is what unlocks
+    /// functional-dependency group-by pruning and the late-materialisation
+    /// join-back (`crate::late_materialize`, measured at 14.8x on TPC-H q10 at
+    /// SF100).
+    ///
+    /// **Informational and unverified**, exactly as Spark/Databricks `RELY`:
+    /// nothing reads the data to check it, and a key that is not unique or not
+    /// non-null produces *wrong answers*, not slow ones.
+    ///
+    /// This exists so the embedded engine can be told the same thing the
+    /// distributed one is told through `BatchSqlTable::primary_key`. A
+    /// declaration that reached only one of the two would mean the two
+    /// topologies silently plan different queries — the hardest kind of
+    /// difference to notice, because both still return correct results.
+    pub async fn register_parquet_with_primary_key<S: AsRef<str>>(
+        &self,
+        table_name: impl AsRef<str>,
+        path: impl AsRef<Path>,
+        primary_key: &[S],
+    ) -> SqlResult<()> {
         let table_name = table_name.as_ref();
         if table_name.trim().is_empty() {
             return Err(SqlError::EmptyTableName);
@@ -2266,9 +2293,15 @@ impl SqlEngine {
                 .deregister_table(table_name)
                 .map_err(SqlError::from)?;
         }
-        self.context
-            .register_parquet(table_name, path, ParquetReadOptions::default())
-            .await?;
+        // One registration path, not two. `register_parquet_table` is what the
+        // coordinator uses for staged planning; routing the embedded engine
+        // through the same function is what keeps "declared key" from meaning
+        // two different things depending on where the query runs — including
+        // its error for a key column that is not in the file's schema, which
+        // would otherwise be a silent no-op here.
+        let spec = crate::distributed_plan::ParquetTableSpec::new(table_name, path)
+            .with_primary_key(primary_key.iter().map(|c| c.as_ref().to_owned()));
+        crate::distributed_plan::register_parquet_table(&self.context, &spec).await?;
         // Extract estimated row count from table provider statistics.
         if let Ok(provider) = self.context.table_provider(table_name).await
             && let Some(stats) = provider.statistics()

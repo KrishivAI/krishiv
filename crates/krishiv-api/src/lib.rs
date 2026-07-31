@@ -104,8 +104,8 @@ pub use process::{apply_async_io, apply_process_function};
 pub use query::{QueryCompletion, QueryHandle, QueryId, QueryProgress, QueryStatus};
 pub use session::{
     CompiledContinuousStreamJob, ContinuousStreamCheckpoint, ContinuousStreamStatus, Refresh,
-    RegisteredContinuousStreamJob, Session, SessionBuilder, SubmittedSqlJobState,
-    SubmittedSqlJobStatus,
+    RegisteredContinuousStreamJob, RegisteredParquet, Session, SessionBuilder,
+    SubmittedSqlJobState, SubmittedSqlJobStatus,
 };
 pub use sql_job::compile_sql_job;
 pub use stream::{KeyedStream, Stream};

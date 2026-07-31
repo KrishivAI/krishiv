@@ -3,7 +3,6 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::fmt;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -12,12 +11,11 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
 use krishiv_plan::{ExecutionKind, LogicalPlan, PhysicalPlan};
-use krishiv_runtime::{
-    BatchTableRegistration, ExecutionRuntime, JobId, JobState, JobStatus, LocalJobRegistry,
-};
+use krishiv_runtime::{ExecutionRuntime, JobId, JobState, JobStatus, LocalJobRegistry};
 use krishiv_sql::KrishivDataFrameOps;
 
 use crate::error::{KrishivError, Result};
+use crate::session::RegisteredParquet;
 use crate::expression::Expr;
 use crate::io::DataFrameWriter;
 use crate::types::{ExecutionMode, QueryResult};
@@ -218,7 +216,7 @@ pub struct DataFrame {
     /// cascades to it — the live view-DAG. `None` for a normal root DataFrame.
     ivm_parent: Option<crate::IvmJob>,
     runtime: Arc<dyn ExecutionRuntime>,
-    registered_parquet: Arc<DashMap<String, PathBuf>>,
+    registered_parquet: Arc<DashMap<String, RegisteredParquet>>,
     /// When set, this DataFrame was produced by `cache()` / `persist()` and
     /// the named in-memory table can be removed via `unpersist()`.
     _cache_name: Option<String>,
@@ -354,7 +352,7 @@ impl DataFrame {
         coordinator_url: Option<String>,
         coordinator_http_url: Option<String>,
         runtime: Arc<dyn ExecutionRuntime>,
-        registered_parquet: Arc<DashMap<String, PathBuf>>,
+        registered_parquet: Arc<DashMap<String, RegisteredParquet>>,
     ) -> Self {
         let logical_plan = sql_dataframe.krishiv_logical_plan();
         Self {
@@ -384,7 +382,7 @@ impl DataFrame {
         jobs: Arc<Mutex<LocalJobRegistry>>,
         next_job_id: Arc<AtomicU64>,
         runtime: Arc<dyn ExecutionRuntime>,
-        registered_parquet: Arc<DashMap<String, PathBuf>>,
+        registered_parquet: Arc<DashMap<String, RegisteredParquet>>,
     ) -> Self {
         let logical_plan = LogicalPlan::new("policy-enforced-query", ExecutionKind::Batch);
         Self {
@@ -703,9 +701,7 @@ Execution statistics:
                 let tables = self
                     .registered_parquet
                     .iter()
-                    .map(|entry| {
-                        BatchTableRegistration::new(entry.key().clone(), entry.value().clone())
-                    })
+                    .map(|entry| entry.value().to_registration(entry.key()))
                     .collect::<Vec<_>>();
                 crate::session::runtime_collect_batch_sql(
                     Arc::clone(&self.runtime),
@@ -758,9 +754,7 @@ Execution statistics:
                 let tables = self
                     .registered_parquet
                     .iter()
-                    .map(|entry| {
-                        BatchTableRegistration::new(entry.key().clone(), entry.value().clone())
-                    })
+                    .map(|entry| entry.value().to_registration(entry.key()))
                     .collect::<Vec<_>>();
                 let is_streaming = self.logical_plan.kind() == ExecutionKind::Streaming;
                 let batches = crate::session::runtime_collect_batch_sql(
@@ -1669,7 +1663,7 @@ Execution statistics:
         let tables = self
             .registered_parquet
             .iter()
-            .map(|entry| BatchTableRegistration::new(entry.key().clone(), entry.value().clone()))
+            .map(|entry| entry.value().to_registration(entry.key()))
             .collect::<Vec<_>>();
         Ok(self
             .runtime

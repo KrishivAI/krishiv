@@ -1013,7 +1013,7 @@ impl ParquetTableSpec {
 /// A declared column that is not in the file's schema is an error rather than
 /// a silent no-op: a typo would otherwise turn into "the optimization
 /// mysteriously does not apply", which is the least debuggable outcome.
-async fn register_parquet_table(
+pub async fn register_parquet_table(
     ctx: &SessionContext,
     spec: &ParquetTableSpec,
 ) -> SqlResult<()> {

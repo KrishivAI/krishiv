@@ -51,6 +51,94 @@ fn parquet_projection_filter_aggregate_limit_matches_golden_output() {
     );
 }
 
+/// `--primary-key` reaches the engine and does not change the answer.
+///
+/// The declaration licenses the optimizer to drop grouping columns and
+/// re-fetch them (`krishiv_sql::late_materialize`), so the property that
+/// matters is that a query returns the same rows either way. Without this the
+/// embedded path could declare a key and silently plan something wrong, which
+/// is exactly the failure the distributed side has a 22-query gate for.
+#[test]
+fn a_declared_primary_key_does_not_change_the_answer() {
+    let temp = tempdir().unwrap_or_else(|error| panic!("unexpected tempdir error: {error}"));
+    let parquet_path = temp.path().join("people.parquet");
+    write_people_parquet(&parquet_path);
+    let parquet_arg = format!("people={}", parquet_path.display());
+    let query = "select id, city, count(*) as n from people group by id, city \
+                 order by n desc, id limit 10";
+
+    let (plain_code, plain_out, plain_err) =
+        run(&["sql", "--parquet", &parquet_arg, "--query", query]);
+    let (keyed_code, keyed_out, keyed_err) = run(&[
+        "sql",
+        "--parquet",
+        &parquet_arg,
+        "--primary-key",
+        "people=id",
+        "--query",
+        query,
+    ]);
+
+    assert_eq!(plain_code, 0, "{plain_err}");
+    assert_eq!(keyed_code, 0, "{keyed_err}");
+    assert_eq!(
+        normalize(&plain_out),
+        normalize(&keyed_out),
+        "declaring a primary key changed the result"
+    );
+}
+
+/// A key naming a column the file does not have must fail loudly. A silent
+/// no-op would surface only as "the optimization mysteriously does nothing".
+#[test]
+fn an_unknown_primary_key_column_is_rejected() {
+    let temp = tempdir().unwrap_or_else(|error| panic!("unexpected tempdir error: {error}"));
+    let parquet_path = temp.path().join("people.parquet");
+    write_people_parquet(&parquet_path);
+    let parquet_arg = format!("people={}", parquet_path.display());
+    let (code, _stdout, stderr) = run(&[
+        "sql",
+        "--parquet",
+        &parquet_arg,
+        "--primary-key",
+        "people=not_a_column",
+        "--query",
+        "select * from people",
+    ]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("not_a_column"),
+        "the error must name the offending column: {stderr}"
+    );
+}
+
+/// A key for a table no `--parquet` registered is a typo, and one whose only
+/// symptom would otherwise be an optimization that never applies.
+#[test]
+fn a_primary_key_for_an_unregistered_table_is_rejected() {
+    let temp = tempdir().unwrap_or_else(|error| panic!("unexpected tempdir error: {error}"));
+    let parquet_path = temp.path().join("people.parquet");
+    write_people_parquet(&parquet_path);
+    let parquet_arg = format!("people={}", parquet_path.display());
+    let (code, _stdout, stderr) = run(&[
+        "sql",
+        "--parquet",
+        &parquet_arg,
+        "--primary-key",
+        "peple=id",
+        "--query",
+        "select * from people",
+    ]);
+    // 2, not 1: this is caught while parsing arguments, so it is a usage error
+    // rather than a query error — the same exit code any other malformed flag
+    // produces.
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("peple"),
+        "the error must name the unregistered table: {stderr}"
+    );
+}
+
 #[test]
 fn invalid_sql_returns_error() {
     let (code, _stdout, stderr) = run(&["sql", "--query", "select from"]);

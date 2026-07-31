@@ -1139,7 +1139,7 @@ fn arrow_array_value_to_string(array: &dyn arrow::array::Array, row: usize) -> S
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use crate::session::RegisteredParquet;
     use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
 
@@ -1198,7 +1198,7 @@ mod tests {
             Arc::new(Mutex::new(LocalJobRegistry::default())),
             Arc::new(AtomicU64::new(1)),
             shared_embedded_runtime().expect("embedded runtime for test"),
-            Arc::new(DashMap::<String, PathBuf>::new()),
+            Arc::new(DashMap::<String, RegisteredParquet>::new()),
         )
     }
 

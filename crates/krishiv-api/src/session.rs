@@ -1025,6 +1025,39 @@ impl SessionBuilder {
 /// `(pickle base64, input Arrow type names, output type name)`.
 type ShippedPythonUdf = (String, Vec<String>, String);
 
+/// A parquet table registered on a session, with whatever the caller declared
+/// about it.
+///
+/// This used to be a bare `PathBuf`. It is a struct so a declared primary key
+/// travels *with* the table rather than in a second map that a future
+/// registration site could forget to populate — the failure mode being an
+/// optimization that silently stops applying on one code path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredParquet {
+    /// Where the table's parquet lives (local path or object-store URI).
+    pub path: PathBuf,
+    /// Columns that jointly form the table's primary key, if declared.
+    ///
+    /// Informational and unverified — see
+    /// [`Session::register_parquet_with_primary_key`].
+    pub primary_key: Vec<String>,
+}
+
+impl RegisteredParquet {
+    fn new<S: AsRef<str>>(path: PathBuf, primary_key: &[S]) -> Self {
+        Self {
+            path,
+            primary_key: primary_key.iter().map(|c| c.as_ref().to_owned()).collect(),
+        }
+    }
+
+    /// The form the runtime hands to a coordinator for distributed planning.
+    pub(crate) fn to_registration(&self, table_name: &str) -> BatchTableRegistration {
+        BatchTableRegistration::new(table_name.to_owned(), self.path.clone())
+            .with_primary_key(self.primary_key.iter().cloned())
+    }
+}
+
 /// User-facing Krishiv session.
 #[derive(Clone)]
 pub struct Session {
@@ -1041,7 +1074,7 @@ pub struct Session {
     udf_registry: Arc<RwLock<UdfRegistry>>,
     local_cluster: Arc<InProcessCluster>,
     runtime: Arc<dyn ExecutionRuntime>,
-    registered_parquet: Arc<DashMap<String, PathBuf>>,
+    registered_parquet: Arc<DashMap<String, RegisteredParquet>>,
     /// Scalar SQL-expression user functions, inlined into native SQL before
     /// planning so they run anywhere the engine runs — including distributed
     /// execution on the Rust executors (no Python worker required).
@@ -2083,15 +2116,57 @@ impl Session {
         table_name: impl AsRef<str>,
         path: impl AsRef<Path>,
     ) -> Result<()> {
+        self.register_parquet_with_primary_key(table_name, path, &[] as &[String])
+    }
+
+    /// As [`Self::register_parquet`], declaring a primary key for the table.
+    ///
+    /// Parquet carries no key, so the declaration is the only way the optimizer
+    /// learns that one column determines the others. It is what enables
+    /// functional-dependency group-by pruning and the late-materialisation
+    /// join-back, and it is **informational and unverified** — the same
+    /// contract as Spark/Databricks `RELY`. A key that is not actually unique
+    /// and non-null yields wrong answers, not slow ones.
+    ///
+    /// The declaration is kept on the session so it also travels with the table
+    /// when the query is handed to a coordinator (`BatchSqlTable::primary_key`).
+    /// Without that, an embedded session and a distributed one would plan
+    /// different queries from the same code.
+    pub fn register_parquet_with_primary_key<S: AsRef<str>>(
+        &self,
+        table_name: impl AsRef<str>,
+        path: impl AsRef<Path>,
+        primary_key: &[S],
+    ) -> Result<()> {
         let table_name = table_name.as_ref().to_owned();
         let path = path.as_ref().to_path_buf();
-        block_on(async {
-            self.sql_engine
-                .register_parquet(&table_name, &path)
-                .await
-                .map_err(KrishivError::from)
+        // Own the key before the async block: `block_on` requires a `Send`
+        // future, and a borrowed `&[S]` is only `Send` when `S: Sync`. Cloning
+        // a handful of column names is cheaper than putting that bound on a
+        // public signature every caller would then have to satisfy.
+        let declared: Vec<String> = primary_key
+            .iter()
+            .map(|c| c.as_ref().to_owned())
+            .collect();
+        block_on({
+            let declared = declared.clone();
+            let table_name = table_name.clone();
+            let path = path.clone();
+            let engine = self.sql_engine.clone();
+            async move {
+                engine
+                    .register_parquet_with_primary_key(&table_name, &path, &declared)
+                    .await
+                    .map_err(KrishivError::from)
+            }
         })?;
-        self.registered_parquet.insert(table_name.clone(), path);
+        self.registered_parquet.insert(
+            table_name,
+            RegisteredParquet {
+                path,
+                primary_key: declared,
+            },
+        );
         Ok(())
     }
 
@@ -2232,7 +2307,8 @@ impl Session {
             .register_parquet(&table_name, &path)
             .await
             .map_err(KrishivError::from)?;
-        self.registered_parquet.insert(table_name, path);
+        self.registered_parquet
+            .insert(table_name, RegisteredParquet::new(path, &[] as &[String]));
         Ok(())
     }
 
@@ -2262,8 +2338,10 @@ impl Session {
                  use register_parquet for local reads",
             ));
         }
-        self.registered_parquet
-            .insert(table_name.as_ref().to_owned(), path.as_ref().to_path_buf());
+        self.registered_parquet.insert(
+            table_name.as_ref().to_owned(),
+            RegisteredParquet::new(path.as_ref().to_path_buf(), &[] as &[String]),
+        );
         Ok(())
     }
 
@@ -3116,7 +3194,7 @@ impl Session {
         let tables = self
             .registered_parquet
             .iter()
-            .map(|entry| BatchTableRegistration::new(entry.key().clone(), entry.value().clone()))
+            .map(|entry| entry.value().to_registration(entry.key()))
             .collect::<Vec<_>>();
         let is_streaming = self.sql_engine.is_streaming_query(query).unwrap_or(false);
         let batches =

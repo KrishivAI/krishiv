@@ -38,13 +38,28 @@ pub enum OutputFormat {
     Json,
 }
 
+/// A `--parquet` registration, plus anything `--primary-key` declared for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParquetTableArg {
+    pub name: String,
+    pub path: PathBuf,
+    /// Columns that jointly form the table's primary key, if declared.
+    ///
+    /// Informational and unverified, exactly as Spark/Databricks `RELY`.
+    /// Parquet carries no key, so declaring one is the only way the optimizer
+    /// can learn that a column determines the others — which is what enables
+    /// group-by pruning and the late-materialisation join-back. A key that is
+    /// not really unique and non-null gives *wrong answers*.
+    pub primary_key: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryCommand {
     pub query: String,
     /// Result rendering; `--format json` selects NDJSON.
     pub format: OutputFormat,
     pub mode: ExecutionMode,
-    pub parquet_tables: Vec<(String, PathBuf)>,
+    pub parquet_tables: Vec<ParquetTableArg>,
     pub execution: QueryExecution,
     pub api_key: Option<String>,
     /// Per-query session timeout, parsed from the CLI but not yet wired to
@@ -79,6 +94,9 @@ pub fn sql_help() -> String {
            --timeout <SECS>            Timeout in seconds for remote queries (default: 30)\n\
            --api-key <KEY>             Policy-enforced sql_as (requires KRISHIV_API_KEYS)\n\
            --parquet <table=path>      Register a Parquet table (repeatable)\n\
+           --primary-key <table=cols>  Declare a table's primary key, comma-separated\n\
+                                       (repeatable; informational and UNVERIFIED — a key\n\
+                                        that is not unique and non-null gives wrong answers)\n\
            --format <table|json>       Result format (default: table; json = NDJSON rows)\n\
            -h, --help                  Show help\n\
          \n\
@@ -111,7 +129,8 @@ pub fn explain_help() -> String {
 pub fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
     let mut query = None;
     let mut mode = ExecutionMode::Embedded;
-    let mut parquet_tables = Vec::new();
+    let mut parquet_tables: Vec<ParquetTableArg> = Vec::new();
+    let mut primary_keys: Vec<(String, Vec<String>)> = Vec::new();
     let mut format = OutputFormat::default();
     let mut analyze = false;
     let mut execution = QueryExecution::Default;
@@ -143,6 +162,13 @@ pub fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
                     .get(idx)
                     .ok_or_else(|| String::from("missing value for --parquet"))?;
                 parquet_tables.push(parse_parquet_spec(value)?);
+            }
+            "--primary-key" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| String::from("missing value for --primary-key"))?;
+                primary_keys.push(parse_primary_key_spec(value)?);
             }
             "--analyze" => {
                 analyze = true;
@@ -207,6 +233,19 @@ pub fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
     if query.trim().is_empty() {
         return Err(String::from("query cannot be empty"));
     }
+    // A key naming a table that was never registered is a typo, and a silent
+    // one: the declaration would simply not apply and the only symptom would be
+    // "the optimization mysteriously does nothing".
+    for (table, columns) in primary_keys {
+        match parquet_tables.iter_mut().find(|t| t.name == table) {
+            Some(entry) => entry.primary_key = columns,
+            None => {
+                return Err(format!(
+                    "--primary-key names table '{table}', which no --parquet registered"
+                ));
+            }
+        }
+    }
     Ok(QueryCommand {
         query,
         format,
@@ -249,15 +288,15 @@ pub fn build_session(command: &QueryCommand) -> Result<Session, String> {
             .with_policy(Arc::new(AllowAllPolicyHook));
     }
     let session = builder.build().map_err(|e| e.to_string())?;
-    for (table, path) in &command.parquet_tables {
-        if !path.exists() {
+    for table in &command.parquet_tables {
+        if !table.path.exists() {
             return Err(format!(
                 "DataFusion error: parquet file not found: {}",
-                path.display()
+                table.path.display()
             ));
         }
         session
-            .register_parquet(table, path)
+            .register_parquet_with_primary_key(&table.name, &table.path, &table.primary_key)
             .map_err(|e| e.to_string())?;
     }
     Ok(session)
@@ -399,7 +438,7 @@ fn parse_mode(value: &str) -> Result<ExecutionMode, String> {
     }
 }
 
-fn parse_parquet_spec(value: &str) -> Result<(String, PathBuf), String> {
+fn parse_parquet_spec(value: &str) -> Result<ParquetTableArg, String> {
     let (table, path) = value
         .split_once('=')
         .ok_or_else(|| String::from("--parquet must use table=path"))?;
@@ -409,5 +448,33 @@ fn parse_parquet_spec(value: &str) -> Result<(String, PathBuf), String> {
     if path.trim().is_empty() {
         return Err(String::from("parquet path cannot be empty"));
     }
-    Ok((table.to_owned(), PathBuf::from(path)))
+    Ok(ParquetTableArg {
+        name: table.to_owned(),
+        path: PathBuf::from(path),
+        primary_key: Vec::new(),
+    })
+}
+
+/// Parse `--primary-key table=col[,col…]`.
+///
+/// A separate flag rather than a suffix on `--parquet`, because a path may
+/// itself contain almost any separator (`s3://bucket/x:y`), and a delimiter
+/// that is ambiguous in a path is one that silently truncates it.
+fn parse_primary_key_spec(value: &str) -> Result<(String, Vec<String>), String> {
+    let (table, columns) = value
+        .split_once('=')
+        .ok_or_else(|| String::from("--primary-key must use table=col[,col...]"))?;
+    if table.trim().is_empty() {
+        return Err(String::from("primary-key table name cannot be empty"));
+    }
+    let columns: Vec<String> = columns
+        .split(',')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if columns.is_empty() {
+        return Err(format!("--primary-key for '{table}' names no columns"));
+    }
+    Ok((table.trim().to_owned(), columns))
 }

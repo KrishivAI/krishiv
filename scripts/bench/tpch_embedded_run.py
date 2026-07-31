@@ -43,11 +43,27 @@ def table_path(data_root: str, table: str) -> str:
     return os.path.join(data_root, table)
 
 
-def run_query(binary: str, data_root: str, query: dict, timeout_s: int) -> dict:
-    """Execute one query, returning its outcome and wall-clock elapsed time."""
+def run_query(
+    binary: str,
+    data_root: str,
+    query: dict,
+    timeout_s: int,
+    primary_keys: dict[str, list[str]] | None = None,
+) -> dict:
+    """Execute one query, returning its outcome and wall-clock elapsed time.
+
+    The declared primary keys are passed through for the same reason the
+    cluster runner passes them: they are part of the TPC-H schema, and an
+    embedded run that omits them plans a *different query* from the
+    distributed one. That difference would show up as an embedded-vs-cluster
+    performance gap and be misread as the cost of distribution.
+    """
+    keys = primary_keys or {}
     argv = [binary, "sql", "--local"]
     for table in query["tables"]:
         argv += ["--parquet", f"{table}={table_path(data_root, table)}"]
+        if keys.get(table):
+            argv += ["--primary-key", f"{table}={','.join(keys[table])}"]
     argv += ["--query", query["sql"]]
 
     started = time.monotonic()
@@ -83,7 +99,11 @@ def main() -> int:
     args = parser.parse_args()
 
     with open(args.corpus_json, encoding="utf-8") as handle:
-        queries = json.load(handle)["queries"]
+        corpus = json.load(handle)
+    queries = corpus["queries"]
+    # An older corpus file has no `primary_keys`; defaulting to {} keeps the
+    # previous behaviour rather than silently declaring an empty key.
+    primary_keys = corpus.get("primary_keys", {})
 
     print(
         f"# {args.label}: {len(queries)} queries at SF{args.scale} "
@@ -100,7 +120,7 @@ def main() -> int:
     with machine_lock(f"tpch_embedded_run {args.label}"):
         for index, query in enumerate(queries, start=1):
             name = f"q{index} {query['name']}"
-            outcome = run_query(args.binary, args.data, query, args.timeout)
+            outcome = run_query(args.binary, args.data, query, args.timeout, primary_keys)
             results.append({"id": index, "name": query["name"], **outcome})
             if outcome["status"] == "ok":
                 print(f"ok    {name:<45} {outcome['elapsed_s']:>8.2f} s", flush=True)

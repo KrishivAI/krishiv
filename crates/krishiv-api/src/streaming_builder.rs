@@ -1877,14 +1877,14 @@ mod tests {
     }
 
     fn dataframe_from_batches(batches: Vec<RecordBatch>) -> DataFrame {
-        use std::path::PathBuf;
+        use crate::session::RegisteredParquet;
         DataFrame::from_batches(
             ExecutionMode::Embedded,
             batches,
             Arc::new(Mutex::new(LocalJobRegistry::default())),
             Arc::new(AtomicU64::new(1)),
             shared_embedded_runtime().expect("embedded runtime"),
-            Arc::new(DashMap::<String, PathBuf>::new()),
+            Arc::new(DashMap::<String, RegisteredParquet>::new()),
         )
     }
 
@@ -2212,14 +2212,14 @@ mod listener_tests {
     }
 
     fn dataframe_from_batches(batches: Vec<RecordBatch>) -> DataFrame {
-        use std::path::PathBuf;
+        use crate::session::RegisteredParquet;
         DataFrame::from_batches(
             ExecutionMode::Embedded,
             batches,
             Arc::new(Mutex::new(LocalJobRegistry::default())),
             Arc::new(AtomicU64::new(1)),
             crate::session::shared_embedded_runtime().expect("embedded runtime"),
-            Arc::new(DashMap::<String, PathBuf>::new()),
+            Arc::new(DashMap::<String, RegisteredParquet>::new()),
         )
     }
 
