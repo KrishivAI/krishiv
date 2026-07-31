@@ -322,16 +322,29 @@ impl JoinFacts {
 
 /// Memory to assume for the joins whose build side cannot be estimated.
 ///
-/// # The hole this closes
+/// # What this does, and what it deliberately cannot do
 ///
-/// [`JoinFacts::retained_bytes`] reports **zero** for an unmeasurable join,
-/// and [`SpillableJoinSelection::conversion_decisions`] summed exactly that to
-/// decide whether there was aggregate pressure at all. So a fragment whose
-/// joins all have absent statistics summed to nothing, `total <= threshold`
-/// short-circuited, and the budget — whose entire purpose is to bound what the
-/// un-converted joins will hold — concluded there was nothing to bound.
+/// [`JoinFacts::retained_bytes`] reports **zero** for an unmeasurable join, so
+/// [`SpillableJoinSelection::conversion_decisions`] valued such joins at
+/// nothing when deciding whether aggregate pressure existed. This charges each
+/// one `threshold / joins` instead — a refusal to claim the join is free.
 ///
-/// That is TPC-H q21 at SF100, verbatim:
+/// **It only bites on a plan that MIXES measurable and unmeasurable joins**,
+/// where it makes the measurable ones convert sooner. Two boundaries make that
+/// exact, and both are intentional:
+///
+/// * With **every** join unmeasurable the term sums to `threshold` (n shares of
+///   `threshold / n`), so `total <= threshold` short-circuits and nothing
+///   converts. That is not a bug to route around: gate 2 keeps an unmeasurable
+///   join's hash join *unconditionally*, and [`JoinFacts::is_candidate`]
+///   requires `bytes.is_some()`, so there is no decision left for a budget to
+///   make. An all-unknown plan is beyond this rule's reach by construction.
+/// * A plan with no unmeasurable joins gets zero, so it behaves exactly as
+///   before.
+///
+/// # Correction: this was written for q21, and q21 was not this
+///
+/// This function was added believing q21's SF100 failure —
 ///
 /// ```text
 /// Resources exhausted: Failed to allocate additional 310.2 MB for
@@ -339,9 +352,19 @@ impl JoinFacts {
 /// 87.9 MB remain available for the total memory pool: fair(pool_size: 2.6 GB)
 /// ```
 ///
-/// The join asking for 310 MB had allocated **nothing** yet; ~2.5 GB of a
-/// 2.6 GB pool was already held by its siblings. Every one of them had passed
-/// a check that valued them at zero.
+/// — was siblings each valued at zero exhausting the pool. It was not. **Every
+/// join in every plan was unmeasurable**, because declaring a primary key had
+/// silently disabled the table's statistics (fixed in `register_parquet_table`;
+/// see its docs). Measured across coordinator and all three executors:
+/// `unmeasurable == hash_joins` in **all 414 passes**, **zero** conversions.
+/// q21 was therefore the all-unknown boundary above, which this term cannot
+/// help — and it duly did not. Restoring statistics fixed q21 and q17.
+///
+/// It is kept because the mixed case is real and reachable (a shuffle read
+/// whose upstream estimate is absent alongside measurable scans), and because
+/// valuing an unmeasurable join at zero is indefensible on its own terms. But
+/// it has **never been observed to change a decision on the SF100 corpus**, and
+/// nobody should cite it as the reason a query stopped failing.
 ///
 /// # Why an even split, and why this does not re-create the q2 regression
 ///
@@ -1455,6 +1478,37 @@ mod budget_tests {
         assert!(
             decisions.iter().all(|convert| !convert),
             "one unknown among ten small joins is not aggregate pressure: {decisions:?}"
+        );
+    }
+
+    /// The boundary the pressure term cannot cross, pinned so nobody "fixes"
+    /// it into converting joins the rest of the rule will refuse anyway.
+    ///
+    /// With every join unmeasurable the term sums to exactly `threshold`
+    /// (n shares of `threshold / n`), `total <= threshold` short-circuits, and
+    /// no join is chosen. That is correct: gate 2 keeps an unmeasurable join's
+    /// hash join unconditionally and `is_candidate` requires `bytes.is_some()`,
+    /// so a "convert" decision here would be silently ignored downstream.
+    ///
+    /// This is the shape TPC-H q21 was in when this term was written *for* it —
+    /// all 414 spillable-join passes at SF100 reported
+    /// `unmeasurable == hash_joins` because a declared primary key had disabled
+    /// the tables' statistics. The term could not have helped, and did not. The
+    /// fix belonged at the statistics layer.
+    #[test]
+    fn an_all_unknown_plan_is_beyond_the_budgets_reach() {
+        let facts: Vec<JoinFacts> = (0..4)
+            .map(|_| JoinFacts { bytes: None, convertible: true })
+            .collect();
+        assert_eq!(
+            super::unknown_build_pressure(&facts, 1000),
+            1000,
+            "four unknowns each charged threshold/4 sum to the whole threshold"
+        );
+        let decisions = SpillableJoinSelection::conversion_decisions(&facts, 1000);
+        assert!(
+            decisions.iter().all(|convert| !convert),
+            "an all-unknown plan has no candidate to convert: {decisions:?}"
         );
     }
 

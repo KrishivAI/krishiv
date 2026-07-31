@@ -3537,27 +3537,47 @@ fn inject_runtime_filters_unconditionally(
 
     let mut touched: Vec<usize> = Vec::new();
     let mut injected = 0usize;
+    // Why each candidate was turned away.
+    //
+    // Every rejection below was previously either `debug!` (invisible at the
+    // executors' and coordinator's `info` level) or a bare `continue`. So a run
+    // that found no candidates and a run that rejected all of them produced
+    // *identical* output: nothing. Turning the flag on for q18 changed the
+    // wall time by 2.4% and left 0 log lines, and there was no way to tell
+    // whether the rule had declined or was simply not installed.
+    //
+    // That is the exact failure that made `SpillableJoinSelection` cost hours
+    // of live investigation before its "pass complete" line existed. One
+    // counted summary, at info, is the whole fix.
+    let candidate_count = candidates.len();
+    let (mut already_touched, mut missing_stage, mut severed_subquery) = (0usize, 0usize, 0usize);
+    let (mut would_cycle, mut no_key_field, mut build_failed, mut probe_failed) =
+        (0usize, 0usize, 0usize, 0usize);
     for candidate in candidates {
         // One filter per stage, and never over a stage this pass has already
         // rewritten: stacking rewrites would have each filter stage clone the
         // previous one's probe node, which is correct but compounds cost for a
         // shrinking return.
         if touched.contains(&candidate.build_stage) || touched.contains(&candidate.probe_stage) {
+            already_touched += 1;
             continue;
         }
         let (Some(build), Some(probe)) = (
             drafts.get(candidate.build_stage),
             drafts.get(candidate.probe_stage),
         ) else {
+            missing_stage += 1;
             continue;
         };
         // A stage severed from a `ScalarSubqueryExec` is parameterised by a
         // subquery result; cloning its subtree without the wrapper produces a
         // fragment that cannot decode.
         if build.subqueries.is_some() || probe.subqueries.is_some() {
+            severed_subquery += 1;
             continue;
         }
         if stage_depends_on(drafts, candidate.build_stage, candidate.probe_stage) {
+            would_cycle += 1;
             continue;
         }
 
@@ -3565,6 +3585,7 @@ fn inject_runtime_filters_unconditionally(
         let probe_plan = Arc::clone(&probe.plan);
         let schema = source.schema();
         let Some(field) = schema.fields().get(candidate.build_key_index) else {
+            no_key_field += 1;
             continue;
         };
         let name = field.name().clone();
@@ -3585,6 +3606,7 @@ fn inject_runtime_filters_unconditionally(
         let filter_plan = match filter_plan {
             Ok(plan) => Arc::new(plan) as Arc<dyn ExecutionPlan>,
             Err(error) => {
+                build_failed += 1;
                 tracing::debug!(%error, "declined to build a runtime filter stage");
                 continue;
             }
@@ -3603,11 +3625,13 @@ fn inject_runtime_filters_unconditionally(
         let rewritten = match rewritten {
             Ok(plan) => Arc::new(plan) as Arc<dyn ExecutionPlan>,
             Err(error) => {
+                probe_failed += 1;
                 tracing::debug!(%error, "declined to apply a runtime filter to the probe stage");
                 continue;
             }
         };
         let Some(probe_draft) = drafts.get_mut(candidate.probe_stage) else {
+            missing_stage += 1;
             continue;
         };
         probe_draft.plan = rewritten;
@@ -3630,6 +3654,20 @@ fn inject_runtime_filters_unconditionally(
             "injected a cross-stage runtime filter"
         );
     }
+    // At info, unconditionally: "no candidates" and "rejected every candidate"
+    // must never again be indistinguishable from "rule not installed".
+    tracing::info!(
+        candidates = candidate_count,
+        injected,
+        already_touched,
+        missing_stage,
+        severed_subquery,
+        would_cycle,
+        no_key_field,
+        build_failed,
+        probe_failed,
+        "runtime-filter: pass complete"
+    );
     injected
 }
 
