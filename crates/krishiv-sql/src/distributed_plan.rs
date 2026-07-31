@@ -931,11 +931,169 @@ fn register_object_store_for_path(ctx: &SessionContext, path: &str) -> SqlResult
     Ok(())
 }
 
+/// A parquet table to plan against, and what is known to be true about it.
+///
+/// `primary_key` is an **informational constraint**, in the sense Spark and
+/// Databricks use the word (`RELY`): the engine does not verify it, it trusts
+/// it. Declaring a key that does not hold changes results, exactly as a wrong
+/// `RELY` constraint does there. It is empty by default, so a caller that says
+/// nothing gets the previous behaviour.
+///
+/// # Why the engine wants to be told
+///
+/// DataFusion already derives [`FunctionalDependencies`] from a provider's
+/// constraints, and `optimize_projections` already uses
+/// `get_required_group_by_exprs_indices` to shrink a `GROUP BY` to the minimal
+/// functionally-equivalent subset. All of that machinery is live and does
+/// nothing here, because a parquet file carries no key and every table we
+/// register declares none — so the dependency set is always empty.
+///
+/// # What this does and does NOT buy — read before assuming
+///
+/// DataFusion's rule keeps `(columns the parent requires) ∪ (minimal FD
+/// subset)`. So a declared key removes a column from a `GROUP BY` **only when
+/// nothing downstream selects it**. That is a real and common shape —
+/// `GROUP BY a, b` projecting only `a` — and it is what
+/// `a_declared_primary_key_shrinks_the_group_by` proves.
+///
+/// It is **not** TPC-H q10's shape. q10 selects all seven grouped columns, so
+/// the parent requires them and no key declaration can prune them. Measured
+/// 2026-07-31: rewriting q10 to carry only the key is worth **14.8x**
+/// (1784.6 s → 120.9 s; the `orders⋈customer` stage alone 8,968 → 38.9
+/// task-seconds), but capturing that needs **late materialisation** —
+/// aggregate on the key, take the top N, then re-join for the display columns.
+/// DataFusion has no such rule and neither do we. Declaring a key is a
+/// precondition for writing one, not a substitute.
+///
+/// The 230x on that stage is superlinear in the columns rather than the bytes:
+/// per-row string handling (hashing and copying ~227 B rows), which is why
+/// neither bandwidth nor fetch concurrency moved it
+/// (`q10-dist-s2-is-the-whole-query`).
+///
+/// [`FunctionalDependencies`]: datafusion::common::FunctionalDependencies
+#[derive(Debug, Clone)]
+pub struct ParquetTableSpec {
+    /// Name the query refers to the table by.
+    pub name: String,
+    /// Single parquet file or a directory dataset; local or object storage.
+    pub path: String,
+    /// Columns that jointly form a primary key, if the caller declares one.
+    pub primary_key: Vec<String>,
+}
+
+impl ParquetTableSpec {
+    /// A table with nothing declared about it.
+    pub fn new(name: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            path: path.into(),
+            primary_key: Vec::new(),
+        }
+    }
+
+    /// Declare a (possibly composite) primary key.
+    #[must_use]
+    pub fn with_primary_key<I, S>(mut self, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.primary_key = columns.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+/// Register one parquet table, attaching its declared key as a DataFusion
+/// constraint so the optimizer's functional-dependency machinery can see it.
+///
+/// With no declared key this is exactly `register_parquet`. With one, the
+/// table is built explicitly so [`ListingTable::with_constraints`] can be
+/// applied — `register_parquet` has no way to pass them.
+///
+/// A declared column that is not in the file's schema is an error rather than
+/// a silent no-op: a typo would otherwise turn into "the optimization
+/// mysteriously does not apply", which is the least debuggable outcome.
+async fn register_parquet_table(
+    ctx: &SessionContext,
+    spec: &ParquetTableSpec,
+) -> SqlResult<()> {
+    use datafusion::common::{Constraint, Constraints};
+    use datafusion::datasource::TableProvider as _;
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
+    use datafusion::datasource::listing::{
+        ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+    };
+
+    if spec.primary_key.is_empty() {
+        return ctx
+            .register_parquet(
+                &spec.name,
+                &spec.path,
+                datafusion::prelude::ParquetReadOptions::default(),
+            )
+            .await
+            .map_err(|e| SqlError::DataFusion {
+                message: format!("staged planning: register '{}': {e}", spec.name),
+            });
+    }
+
+    let url = ListingTableUrl::parse(&spec.path).map_err(|e| SqlError::DataFusion {
+        message: format!("staged planning: table url for '{}': {e}", spec.name),
+    })?;
+    let options = ListingOptions::new(Arc::new(ParquetFormat::default()));
+    let config = ListingTableConfig::new(url)
+        .with_listing_options(options)
+        .infer_schema(&ctx.state())
+        .await
+        .map_err(|e| SqlError::DataFusion {
+            message: format!("staged planning: infer schema for '{}': {e}", spec.name),
+        })?;
+    let table = ListingTable::try_new(config).map_err(|e| SqlError::DataFusion {
+        message: format!("staged planning: listing table '{}': {e}", spec.name),
+    })?;
+
+    let schema = table.schema();
+    let mut indices = Vec::with_capacity(spec.primary_key.len());
+    for column in &spec.primary_key {
+        let index = schema
+            .index_of(column)
+            .map_err(|_| SqlError::DataFusion {
+                message: format!(
+                    "declared primary key column '{column}' is not in table '{}' \
+                     (columns: {})",
+                    spec.name,
+                    schema
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().clone())
+                        .collect::<Vec<String>>()
+                        .join(", ")
+                ),
+            })?;
+        indices.push(index);
+    }
+
+    let table = table.with_constraints(Constraints::new_unverified(vec![
+        Constraint::PrimaryKey(indices),
+    ]));
+    ctx.register_table(spec.name.as_str(), Arc::new(table))
+        .map_err(|e| SqlError::DataFusion {
+            message: format!("staged planning: register '{}': {e}", spec.name),
+        })?;
+    tracing::debug!(
+        table = %spec.name,
+        primary_key = ?spec.primary_key,
+        "registered parquet table with a declared primary key"
+    );
+    Ok(())
+}
+
 /// Plan a query over parquet tables and cut it into stages
 /// (coordinator seam — keeps DataFusion types out of the scheduler crate).
 ///
 /// `tables` are `(table_name, path)` pairs; a path may be a single parquet
 /// file or a directory dataset, on the local filesystem or in object storage.
+/// To declare a primary key, use [`build_stages_for_parquet_tables`].
 /// Planning happens on a fresh [`planning_session_context`], so krishiv SQL
 /// extensions (streaming windows, catalog DML, UDFs) fail to plan here and
 /// surface as `Err` — callers treat any error as "fall back to the
@@ -947,6 +1105,23 @@ pub async fn build_stages_for_parquet_query(
     tables: &[(String, String)],
     cluster: Option<ClusterCapacity>,
 ) -> SqlResult<Option<DistributedStagePlan>> {
+    let specs: Vec<ParquetTableSpec> = tables
+        .iter()
+        .map(|(name, path)| ParquetTableSpec::new(name, path))
+        .collect();
+    build_stages_for_parquet_tables(query, &specs, cluster).await
+}
+
+/// As [`build_stages_for_parquet_query`], but each table may declare what is
+/// known about it — currently a primary key, which the optimizer turns into a
+/// functional dependency and uses to shrink `GROUP BY` lists.
+///
+/// See [`ParquetTableSpec`] for the semantics and for what it is worth.
+pub async fn build_stages_for_parquet_tables(
+    query: &str,
+    tables: &[ParquetTableSpec],
+    cluster: Option<ClusterCapacity>,
+) -> SqlResult<Option<DistributedStagePlan>> {
     let target_partitions = resolve_stage_target_partitions(cluster);
     tracing::debug!(
         target_partitions,
@@ -954,25 +1129,17 @@ pub async fn build_stages_for_parquet_query(
         "planning distributed stages"
     );
     let ctx = planning_session_context(target_partitions);
-    for (name, path) in tables {
+    for spec in tables {
         // An `s3://` table needs its object store on the planning context
-        // before `register_parquet` can infer a schema. Without this the
-        // registration errors, the caller swallows the error as "decline to
-        // stage", and the job silently runs as a SINGLE task — an entire
-        // object-store-backed dataset scanned by one executor while the rest
-        // of the cluster idles. That degradation is invisible: the query still
-        // returns correct rows, just without any distribution. Local paths are
-        // unaffected (the helper is a no-op for them).
-        register_object_store_for_path(&ctx, path)?;
-        ctx.register_parquet(
-            name,
-            path,
-            datafusion::prelude::ParquetReadOptions::default(),
-        )
-        .await
-        .map_err(|e| SqlError::DataFusion {
-            message: format!("staged planning: register '{name}': {e}"),
-        })?;
+        // before the schema can be inferred. Without this the registration
+        // errors, the caller swallows the error as "decline to stage", and the
+        // job silently runs as a SINGLE task — an entire object-store-backed
+        // dataset scanned by one executor while the rest of the cluster idles.
+        // That degradation is invisible: the query still returns correct rows,
+        // just without any distribution. Local paths are unaffected (the
+        // helper is a no-op for them).
+        register_object_store_for_path(&ctx, &spec.path)?;
+        register_parquet_table(&ctx, spec).await?;
     }
     // A Python scalar UDF shipped inline (`/* krishiv-register-python-udf */`)
     // must be known by name/signature for planning to resolve it, then stripped
@@ -3924,6 +4091,93 @@ mod tests {
             writer.close().expect("close writer");
         }
         table_dir
+    }
+
+    /// A declared primary key must actually shrink the GROUP BY.
+    ///
+    /// This is the whole point of `ParquetTableSpec::with_primary_key`:
+    /// DataFusion's `optimize_projections` already calls
+    /// `get_required_group_by_exprs_indices` to reduce a GROUP BY to the
+    /// minimal functionally-equivalent subset, but it can only do so when the
+    /// table declares a key. Without the declaration the rule is live and
+    /// inert.
+    ///
+    /// Measured stakes (TPC-H q10, SF100, 2026-07-31): grouping by seven
+    /// customer columns instead of the one key costs **14.8x** end to end —
+    /// 1784.6 s versus 120.9 s — because the six determined columns ride
+    /// through every join and shuffle.
+    #[tokio::test]
+    async fn a_declared_primary_key_shrinks_the_group_by() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let table_dir = write_test_parquet(tmp.path()).await;
+        let path = table_dir.to_string_lossy().to_string();
+        // `category` and `amount` are determined by `id`, so grouping by all
+        // three is equivalent to grouping by `id`.
+        //
+        // The two dependent columns are deliberately NOT selected. DataFusion's
+        // rule keeps `(what the parent requires) ∪ (minimal FD subset)`, so a
+        // column the output still needs stays in the GROUP BY no matter what
+        // the key says. Selecting them would test nothing.
+        let sql = "SELECT id, count(*) AS n FROM t GROUP BY id, category, amount";
+
+        let plan_text = |spec: ParquetTableSpec| async move {
+            let ctx = planning_session_context(4);
+            register_parquet_table(&ctx, &spec)
+                .await
+                .expect("register table");
+            let df = ctx.sql(sql).await.expect("plan sql");
+            // The OPTIMIZED plan: `optimize_projections` is where
+            // `get_required_group_by_exprs_indices` runs, so the unoptimized
+            // plan always shows the full GROUP BY and proves nothing.
+            let optimized = df.into_optimized_plan().expect("optimize");
+            format!("{}", optimized.display_indent())
+        };
+
+        let without = plan_text(ParquetTableSpec::new("t", &path)).await;
+        let with = plan_text(
+            ParquetTableSpec::new("t", &path).with_primary_key(["id"]),
+        )
+        .await;
+
+        // With the key declared, the aggregate groups by `id` alone.
+        let group_line = |text: &str| {
+            text.lines()
+                .find(|line| line.contains("Aggregate:"))
+                .unwrap_or("<no Aggregate>")
+                .to_owned()
+        };
+        let (g_without, g_with) = (group_line(&without), group_line(&with));
+        assert_ne!(
+            g_without, g_with,
+            "declaring a primary key changed nothing about the aggregate; \
+             the constraint is not reaching DataFusion's functional-dependency \
+             machinery.\n  without: {g_without}\n  with:    {g_with}"
+        );
+        assert!(
+            g_with.len() < g_without.len(),
+            "the declared key should SHRINK the grouping list, not grow it.\n\
+               without: {g_without}\n  with:    {g_with}"
+        );
+    }
+
+    /// A key naming a column the table does not have is an error, not a
+    /// silently ignored declaration — a typo would otherwise present as "the
+    /// optimization mysteriously never applies".
+    #[tokio::test]
+    async fn an_unknown_primary_key_column_is_rejected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let table_dir = write_test_parquet(tmp.path()).await;
+        let ctx = planning_session_context(4);
+        let spec = ParquetTableSpec::new("t", table_dir.to_string_lossy().as_ref())
+            .with_primary_key(["nonexistent_column"]);
+        let error = register_parquet_table(&ctx, &spec)
+            .await
+            .expect_err("an unknown key column must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("nonexistent_column") && message.contains("not in table"),
+            "the error must name the offending column and the table: {message}"
+        );
     }
 
     /// ADR-0003 risk gate: a scan→filter→hash-aggregate plan round-trips
