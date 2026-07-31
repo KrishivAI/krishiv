@@ -34,6 +34,7 @@ import atexit
 import json
 import os
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -493,6 +494,91 @@ def run_query(
         time.sleep(poll_interval_s)
 
 
+def _print_outcome(outcome: dict) -> None:
+    """One line per attempt, in the format every prior sweep log used."""
+    if outcome["status"] == "ok":
+        # A single-task pass gets its own marker. It is still a correct
+        # answer, so it stays in the ok column, but it must never look
+        # identical to a query that actually used the cluster.
+        marker = "ok  " if outcome.get("distributed") else "ok/1"
+        print(
+            f"{marker} {outcome['id']:>3} {outcome['name']:<34} "
+            f"{outcome['elapsed_s']:>9.2f} s  "
+            f"stages={outcome.get('stage_count')} tasks={outcome.get('task_count')}"
+            f"{'' if outcome.get('distributed') else '   << NOT DISTRIBUTED'}",
+            flush=True,
+        )
+    else:
+        print(
+            f"FAIL {outcome['id']:>3} {outcome['name']:<34} "
+            f"{outcome['status']}: {_abridge(outcome.get('error', ''))}",
+            flush=True,
+        )
+
+
+def _summarize(runs: list[dict], repeat: int) -> list[dict]:
+    """Collapse repeated attempts into one representative row per query.
+
+    The representative is the **median** attempt, not the fastest: reporting
+    the best of N is how a benchmark quietly becomes a best-case advertisement.
+    `elapsed_s` on the representative carries that median, so every existing
+    consumer of this file (`vs_spark.py`, the gate) keeps working unchanged and
+    silently gets the more honest number.
+
+    Fails closed on flakiness: if **any** attempt of a query failed, the
+    representative is that failure even when other attempts passed. An
+    intermittent failure is a defect, and averaging it away is how it survives
+    to the next release. Single-run sweeps could not see this at all.
+    """
+    order: list[str] = []
+    by_id: dict[str, list[dict]] = {}
+    for run in runs:
+        by_id.setdefault(run["id"], []).append(run)
+        if run["id"] not in order:
+            order.append(run["id"])
+
+    summary = []
+    for query_id in order:
+        attempts = by_id[query_id]
+        failures = [a for a in attempts if a["status"] != "ok"]
+        if failures:
+            row = dict(failures[0])
+            row["repeat_count"] = len(attempts)
+            row["failed_attempts"] = len(failures)
+            if len(failures) < len(attempts):
+                # Intermittent: say so loudly rather than burying it in a count.
+                row["error"] = (
+                    f"INTERMITTENT ({len(failures)}/{len(attempts)} attempts failed): "
+                    f"{row.get('error', '')}"
+                )
+            summary.append(row)
+            continue
+
+        times = sorted(a["elapsed_s"] for a in attempts)
+        median = statistics.median(times)
+        # The representative attempt is the one whose time is the median, so
+        # stage/task counts belong to a real run rather than a synthesised one.
+        representative = min(attempts, key=lambda a: abs(a["elapsed_s"] - median))
+        row = dict(representative)
+        row["repeat_count"] = len(attempts)
+        row["elapsed_s"] = median
+        row["elapsed_min_s"] = times[0]
+        row["elapsed_median_s"] = median
+        row["elapsed_max_s"] = times[-1]
+        row["spread_pct"] = (
+            0.0 if times[0] <= 0 else 100.0 * (times[-1] - times[0]) / times[0]
+        )
+        row["elapsed_all_s"] = times
+        summary.append(row)
+    if repeat == 1:
+        # Keep the single-run record byte-comparable with every earlier sweep:
+        # no repeat bookkeeping on a run that had nothing to repeat.
+        for row in summary:
+            for key in ("repeat_count", "elapsed_all_s"):
+                row.pop(key, None)
+    return summary
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--coordinator", required=True, help="coordinator HTTP base URL")
@@ -506,6 +592,19 @@ def main() -> int:
         "--timeout", type=float, default=DEFAULT_TIMEOUT_S, help="per-query seconds"
     )
     parser.add_argument("--poll-interval", type=float, default=1.0)
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help=(
+            "run the whole ordered corpus this many times and report per-query "
+            "min/median/spread. Default 1, which behaves exactly as before. "
+            "Without this every conclusion rests on a single sample of unknown "
+            "noise: q16 (which no declared key can affect) moved 48.6s -> 57.6s "
+            "between two runs, ~18%%, which is larger than several deltas that "
+            "were being read as real effects."
+        ),
+    )
     parser.add_argument(
         "--single-file-tables",
         default="nation,region",
@@ -544,37 +643,50 @@ def main() -> int:
         flush=True,
     )
 
-    results = []
-    for query in corpus:
-        outcome = run_query(
-            args.coordinator,
-            query,
-            args.data,
-            token,
-            args.timeout,
-            args.poll_interval,
-            single_file,
-            primary_keys,
+    if args.repeat < 1:
+        raise SystemExit("--repeat must be at least 1")
+
+    runs = []
+    # Round-robin, not N-in-a-row: repeating the whole ordered corpus spreads
+    # each query's samples across different cluster conditions. N consecutive
+    # runs of one query mostly measure how warm that one query's caches are.
+    for pass_index in range(args.repeat):
+        if args.repeat > 1:
+            print(f"\n# pass {pass_index + 1} of {args.repeat}", flush=True)
+        for query in corpus:
+            outcome = run_query(
+                args.coordinator,
+                query,
+                args.data,
+                token,
+                args.timeout,
+                args.poll_interval,
+                single_file,
+                primary_keys,
+            )
+            outcome["pass_index"] = pass_index
+            runs.append(outcome)
+            _print_outcome(outcome)
+
+    results = _summarize(runs, args.repeat)
+    if args.repeat > 1:
+        print("\n# per-query spread across passes")
+        print(
+            f"{'query':<5} {'n':>2} {'min':>9} {'median':>9} {'max':>9} {'spread':>8}"
         )
-        results.append(outcome)
-        if outcome["status"] == "ok":
-            # A single-task pass gets its own marker. It is still a correct
-            # answer, so it stays in the ok column, but it must never look
-            # identical to a query that actually used the cluster.
-            marker = "ok  " if outcome.get("distributed") else "ok/1"
+        for row in results:
+            if row["status"] != "ok":
+                print(f"{row['id']:<5} {'':>2} {row['status']}")
+                continue
             print(
-                f"{marker} {outcome['id']:>3} {outcome['name']:<34} "
-                f"{outcome['elapsed_s']:>9.2f} s  "
-                f"stages={outcome.get('stage_count')} tasks={outcome.get('task_count')}"
-                f"{'' if outcome.get('distributed') else '   << NOT DISTRIBUTED'}",
-                flush=True,
+                f"{row['id']:<5} {row['repeat_count']:>2} "
+                f"{row['elapsed_min_s']:>9.2f} {row['elapsed_median_s']:>9.2f} "
+                f"{row['elapsed_max_s']:>9.2f} {row['spread_pct']:>7.1f}%"
             )
-        else:
-            print(
-                f"FAIL {outcome['id']:>3} {outcome['name']:<34} "
-                f"{outcome['status']}: {_abridge(outcome.get('error', ''))}",
-                flush=True,
-            )
+        print(
+            "\nA delta smaller than a query's own spread is not a result. "
+            "Compare medians, and treat anything inside the spread as noise."
+        )
 
     ok = [r for r in results if r["status"] == "ok"]
     single_task = [r for r in ok if not r.get("distributed")]
