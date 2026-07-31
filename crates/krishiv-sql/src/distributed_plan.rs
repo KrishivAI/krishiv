@@ -3151,8 +3151,39 @@ fn join_side_read(plan: &Arc<dyn ExecutionPlan>) -> Option<JoinSideRead> {
 ///
 /// Every guard here exists because a plan rule that fires too widely has
 /// already cost this engine more than it gained, twice.
+/// Why joins were not even considered as runtime-filter candidates.
+///
+/// The guards inside [`runtime_filter_candidate`] all return `None`, so a join
+/// rejected there never reaches the injection loop and never appears in its
+/// counters. Instrumenting only the injection loop would have answered "how
+/// many candidates were rejected" while leaving "why were there no candidates"
+/// exactly as invisible as before — which is the half-fix that makes a rule
+/// look installed-but-idle.
+#[derive(Debug, Default, Clone, Copy)]
+struct RuntimeFilterRejects {
+    /// Joins inspected.
+    joins: usize,
+    /// Not an INNER join, so dropping probe rows would change the answer.
+    not_inner: usize,
+    /// A side does not resolve to a `ShuffleReadExec` through schema-preserving
+    /// parents — a projection between the join and the read stops the walk.
+    side_not_a_shuffle_read: usize,
+    /// Both sides read the same stage; DataFusion's own dynamic filter covers it.
+    same_stage: usize,
+    /// No row estimate on one of the sides.
+    no_row_estimate: usize,
+    /// The build side is not selective enough to be worth a stage.
+    not_selective: usize,
+    /// The bloom would be clamped at the size ceiling, degrading to
+    /// "matches everything".
+    filter_too_large: usize,
+    /// No equijoin pair of a type the filter can encode on both sides.
+    no_encodable_key: usize,
+}
+
 fn runtime_filter_candidate(
     join: &datafusion::physical_plan::joins::HashJoinExec,
+    rejects: &mut RuntimeFilterRejects,
 ) -> Option<RuntimeFilterCandidate> {
     use datafusion::logical_expr::JoinType;
     use datafusion::physical_expr::expressions::Column;
@@ -3163,14 +3194,20 @@ fn runtime_filter_candidate(
     // unmatched probe rows: RightAnti emits exactly the rows this removes, and
     // Full/Right pad them with nulls. `RuntimeFilter::contains` also drops null
     // keys, which is correct only where a null key cannot produce output.
+    rejects.joins += 1;
     if *join.join_type() != JoinType::Inner {
+        rejects.not_inner += 1;
         return None;
     }
     // Guard 1 — different stages. A same-stage join already gets DataFusion's
     // own dynamic filter, so firing there duplicates work for nothing.
-    let build = join_side_read(join.left())?;
-    let probe = join_side_read(join.right())?;
+    let (Some(build), Some(probe)) = (join_side_read(join.left()), join_side_read(join.right()))
+    else {
+        rejects.side_not_a_shuffle_read += 1;
+        return None;
+    };
     if build.stage == probe.stage {
+        rejects.same_stage += 1;
         return None;
     }
 
@@ -3178,8 +3215,12 @@ fn runtime_filter_candidate(
     // arrives here as `None` and means "no idea", never "small": guessing is
     // the `SpillableJoinSelection` lesson, and guessing wrong here adds a stage
     // and a broadcast to a query that gains nothing from either.
-    let (build_rows, probe_rows) = (build.rows?, probe.rows?);
+    let (Some(build_rows), Some(probe_rows)) = (build.rows, probe.rows) else {
+        rejects.no_row_estimate += 1;
+        return None;
+    };
     if build_rows == 0 || probe_rows / RUNTIME_FILTER_MIN_RATIO < build_rows {
+        rejects.not_selective += 1;
         return None;
     }
 
@@ -3188,6 +3229,7 @@ fn runtime_filter_candidate(
     // towards "matches everything" — correct, but pure cost.
     let filter_bytes = plan_filter_bytes(build_rows as u64);
     if filter_bytes >= MAX_FILTER_BYTES {
+        rejects.filter_too_large += 1;
         return None;
     }
 
@@ -3195,7 +3237,7 @@ fn runtime_filter_candidate(
     // them. Only plain columns of a type the filter can encode canonically;
     // for a composite key the first usable column is enough, because a row that
     // matches on every key column necessarily matches on one of them.
-    join.on().iter().find_map(|(left, right)| {
+    let found = join.on().iter().find_map(|(left, right)| {
         let build_column = (left.as_ref() as &dyn std::any::Any).downcast_ref::<Column>()?;
         let probe_column = (right.as_ref() as &dyn std::any::Any).downcast_ref::<Column>()?;
         let build_schema = join.left().schema();
@@ -3213,20 +3255,25 @@ fn runtime_filter_candidate(
             probe_key_index: probe_column.index(),
             filter_bytes,
         })
-    })
+    });
+    if found.is_none() {
+        rejects.no_encodable_key += 1;
+    }
+    found
 }
 
 fn collect_runtime_filter_candidates(
     plan: &Arc<dyn ExecutionPlan>,
     out: &mut Vec<RuntimeFilterCandidate>,
+    rejects: &mut RuntimeFilterRejects,
 ) {
     if let Some(join) = plan.downcast_ref::<datafusion::physical_plan::joins::HashJoinExec>()
-        && let Some(candidate) = runtime_filter_candidate(join)
+        && let Some(candidate) = runtime_filter_candidate(join, rejects)
     {
         out.push(candidate);
     }
     for child in plan.children() {
-        collect_runtime_filter_candidates(child, out);
+        collect_runtime_filter_candidates(child, out, rejects);
     }
 }
 
@@ -3530,9 +3577,10 @@ fn inject_runtime_filters_unconditionally(
     use datafusion::physical_plan::projection::ProjectionExec;
 
     let mut candidates = Vec::new();
-    collect_runtime_filter_candidates(root, &mut candidates);
+    let mut rejects = RuntimeFilterRejects::default();
+    collect_runtime_filter_candidates(root, &mut candidates, &mut rejects);
     for draft in drafts.iter() {
-        collect_runtime_filter_candidates(&draft.plan, &mut candidates);
+        collect_runtime_filter_candidates(&draft.plan, &mut candidates, &mut rejects);
     }
 
     let mut touched: Vec<usize> = Vec::new();
@@ -3657,6 +3705,14 @@ fn inject_runtime_filters_unconditionally(
     // At info, unconditionally: "no candidates" and "rejected every candidate"
     // must never again be indistinguishable from "rule not installed".
     tracing::info!(
+        joins_inspected = rejects.joins,
+        not_inner = rejects.not_inner,
+        side_not_a_shuffle_read = rejects.side_not_a_shuffle_read,
+        same_stage = rejects.same_stage,
+        no_row_estimate = rejects.no_row_estimate,
+        not_selective = rejects.not_selective,
+        filter_too_large = rejects.filter_too_large,
+        no_encodable_key = rejects.no_encodable_key,
         candidates = candidate_count,
         injected,
         already_touched,
