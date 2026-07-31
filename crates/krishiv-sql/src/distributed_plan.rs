@@ -2220,6 +2220,26 @@ fn exchange_reuse_key(
 /// so those keep the streaming k-way merge they were planned with.
 const MAX_GATHERED_SORT_FETCH: usize = 10_000;
 
+/// Does this subtree contain a hash-partitioned join?
+///
+/// The signal that a gather is stranding real distributed work. A
+/// `Partitioned` join exists *because* N tasks should each handle one
+/// partition; finding one below a gather means the plan paid for the shuffle
+/// and is about to throw the parallelism away. A `CollectLeft` join says
+/// nothing — its build side was chosen to be small and a single probe
+/// partition may be entirely correct.
+fn contains_partitioned_join(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+    if let Some(join) = plan.downcast_ref::<HashJoinExec>()
+        && *join.partition_mode() == PartitionMode::Partitioned
+    {
+        return true;
+    }
+    plan.children()
+        .iter()
+        .any(|child| contains_partitioned_join(child))
+}
+
 fn cut_exchanges(
     plan: Arc<dyn ExecutionPlan>,
     stages: &mut Vec<StageDraft>,
@@ -2357,11 +2377,31 @@ fn cut_exchanges(
     // Without one it would buffer the entire result to re-sort rows that were
     // already sorted — trading a distribution win for an unbounded memory
     // liability, so those merges are left exactly as they are.
-    if let Some(merge) = plan.downcast_ref::<SortPreservingMergeExec>()
-        && let Some(fetch) = merge.fetch()
-        && fetch <= MAX_GATHERED_SORT_FETCH
-    {
+    if let Some(merge) = plan.downcast_ref::<SortPreservingMergeExec>() {
         let input = cut_exchanges(Arc::clone(merge.input()), stages)?;
+        let fetch = merge.fetch();
+        // Two ways this merge is worth cutting:
+        //
+        //  * it has a small `fetch`, so the gather is bounded by
+        //    `partitions x fetch` and the re-sort is trivial; or
+        //  * there is no fetch, but a **hash-partitioned join** sits below it,
+        //    which is the q11/q15/q20 shape: without a cut, one task performs
+        //    that whole join. Buffering the gathered rows is worth it because
+        //    what reaches the final task is the join's *output*, while the
+        //    uncut plan drags the join's much larger *inputs* to a single node.
+        //
+        // Anything else keeps the streaming k-way merge it was planned with:
+        // an unbounded gather + blocking sort over a subtree that was never
+        // distributed in the first place buys nothing and risks a large spill.
+        let worth_cutting = match fetch {
+            Some(n) => n <= MAX_GATHERED_SORT_FETCH,
+            None => contains_partitioned_join(&input),
+        };
+        if !worth_cutting {
+            return plan
+                .with_new_children(vec![input])
+                .map_err(|e| Unsupported(format!("sort-merge passthrough: {e}")));
+        }
         let map_task_count = input.output_partitioning().partition_count();
         if map_task_count <= 1 {
             // Already a single stream: a stage boundary here would add a
@@ -2386,12 +2426,12 @@ fn cut_exchanges(
                 .with_upstream_estimate(estimate.0, estimate.1),
         );
         // The gather loses the cross-partition ordering the merge guaranteed,
-        // so re-establish it. Sorting the gathered rows is equivalent: each
-        // upstream partition already emitted its own sorted top-`fetch`, so a
-        // sort with the same expressions and the same fetch yields the same
-        // global top-`fetch` rows in the same order.
+        // so re-establish it. Sorting the gathered rows is equivalent: every
+        // upstream partition already emitted its own sorted run (its top-`fetch`
+        // when there is a fetch), so a sort with the same expressions and the
+        // same fetch yields the same rows in the same order.
         return Ok(Arc::new(
-            SortExec::new(merge.expr().clone(), read).with_fetch(Some(fetch)),
+            SortExec::new(merge.expr().clone(), read).with_fetch(fetch),
         ));
     }
 

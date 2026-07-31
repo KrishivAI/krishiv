@@ -117,19 +117,19 @@ async fn no_tpch_query_runs_a_join_inside_a_one_task_stage() {
     offenders.sort();
     offenders.dedup();
 
-    // The remaining four. Each is the *same* bug as q3 — a hash-partitioned
-    // join stranded in a one-task stage — but reached through a
-    // `SortPreservingMergeExec` with **no `fetch`**, which the cutter declines
-    // because the replacement would buffer an unbounded result where the merge
-    // streams. Cutting those needs a narrower trigger (only when a partitioned
-    // join sits below), which is not yet built.
+    // q15 and q20 were here until the cutter learned to cut a fetch-less
+    // `SortPreservingMergeExec` when a hash-partitioned join sits below it.
+    //
+    // q11's two are a different route to the same shape: they are the
+    // **scalar-subquery** stages, which the cutter treats as their own boundary
+    // (`ScalarSubqueryExec`), not as a gather — so no merge rule reaches them.
+    // Fixing those means giving the subquery cut the same partition-awareness,
+    // which is a separate change.
     //
     // Asserted as an exact set, not a floor: a NEW entry is a regression, and a
     // DISAPPEARING entry means someone fixed one and must delete it here. Both
     // directions should make a human look.
-    let known_gaps = [
-        "q11: stage 1", "q11: stage 3", "q15: stage 2", "q20: stage 8",
-    ];
+    let known_gaps = ["q11: stage 1", "q11: stage 3"];
     let unexpected: Vec<&String> = offenders
         .iter()
         .filter(|o| !known_gaps.iter().any(|k| o.starts_with(k)))
