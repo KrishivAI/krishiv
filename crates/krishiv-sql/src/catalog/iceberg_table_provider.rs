@@ -172,15 +172,25 @@ pub mod iceberg_scan {
             .collect::<DfResult<Vec<_>>>()?;
 
         let format = Arc::new(ParquetFormat::default().with_enable_pruning(true));
-        let listing_options = ListingOptions::new(format)
-            .with_file_extension(".parquet")
-            .with_collect_stat(true);
 
         // Build a temporary session state to infer the schema. For an object-store
         // data path, register the S3/MinIO store on this transient state's runtime
         // env — otherwise `infer_schema` fails with "no object store for s3://"
         // before the query's own (S3-registered) context ever scans the table.
         let state = SessionStateBuilder::new().with_default_features().build();
+
+        // `target_partitions` is set for the same reason `collect_stat` is:
+        // `ListingOptions::new` leaves it at **1**, which hands the snapshot's
+        // whole file list to the scan as a single group and reads a many-file
+        // Iceberg table serially.
+        //
+        // This provider is built at *registration* time, so there is no query
+        // session to ask; the default state's value (the machine's parallelism)
+        // is the best available answer and is strictly better than one.
+        let listing_options = ListingOptions::new(format)
+            .with_file_extension(".parquet")
+            .with_collect_stat(true)
+            .with_target_partitions(state.config().target_partitions().max(1));
         if (first_path.starts_with("s3://") || first_path.starts_with("s3a://"))
             && let Ok(url) = url::Url::parse(first_path)
         {

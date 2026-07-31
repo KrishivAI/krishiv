@@ -135,7 +135,7 @@ impl TableProvider for DeltaScanProvider {
         )
         .map_err(|e| DataFusionError::External(e.to_string().into()))?;
 
-        let table = parquet_files_table(files, self.schema())?;
+        let table = parquet_files_table(files, self.schema(), state.config().target_partitions())?;
         table.scan(state, projection, filters, limit).await
     }
 }
@@ -147,9 +147,32 @@ impl TableProvider for DeltaScanProvider {
 /// version of the table has no data files" is a legitimate state (an empty
 /// table, or every file removed by a delete) that must scan to zero rows
 /// instead of failing the query.
+///
+/// # Why the listing options are not left at their defaults
+///
+/// `ListingOptions::new` is not "defaults" in the usual sense — it sets
+/// `collect_stat: false` and `target_partitions: 1`, and DataFusion expects a
+/// caller to follow it with `.with_session_config_options(..)` (which is what
+/// `register_parquet` does). Left as constructed it undoes the two things this
+/// function exists to provide:
+///
+/// * **`collect_stat: false`** — no row counts and no byte sizes, so
+///   `SpillableJoinSelection` and broadcast selection cannot size a build side
+///   and every size-based decision defaults to "keep the hash join". Measured
+///   on the SF100 cluster when the same defect reached the parquet-registration
+///   path: `unmeasurable == hash_joins` in all 414 passes, **zero** conversions,
+///   and two queries dying on unspillable build sides.
+/// * **`target_partitions: 1`** — the file list is handed to the scan as a
+///   single group, so a Delta snapshot of a hundred files is read serially.
+///   The doc comment above promises "per-file parallelism"; that promise was
+///   this one line short of true.
+///
+/// `target_partitions` comes from the scanning session rather than a constant
+/// so a Delta scan splits exactly as wide as any other scan in the same query.
 fn parquet_files_table(
     files: Vec<std::path::PathBuf>,
     schema: SchemaRef,
+    target_partitions: usize,
 ) -> DfResult<Arc<dyn TableProvider>> {
     use datafusion::datasource::file_format::parquet::ParquetFormat;
     use datafusion::datasource::listing::{
@@ -169,7 +192,9 @@ fn parquet_files_table(
     }
 
     let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
-        .with_file_extension(".parquet");
+        .with_file_extension(".parquet")
+        .with_collect_stat(true)
+        .with_target_partitions(target_partitions.max(1));
     let config = ListingTableConfig::new_with_multi_paths(urls)
         .with_listing_options(options)
         // The table's declared schema, not one inferred per file: the Delta log
@@ -232,7 +257,11 @@ impl TableProvider for HudiScanProvider {
             .map_err(|e| DataFusionError::External(format!("hudi scan task panicked: {e}").into()))?
             .map_err(|e| DataFusionError::External(e.to_string().into()))?;
 
-        let table = parquet_files_table(files, Arc::clone(&self.schema))?;
+        let table = parquet_files_table(
+            files,
+            Arc::clone(&self.schema),
+            state.config().target_partitions(),
+        )?;
         table.scan(state, projection, filters, limit).await
     }
 }
@@ -447,7 +476,7 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
 
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
-        let table = parquet_files_table(Vec::new(), schema).unwrap();
+        let table = parquet_files_table(Vec::new(), schema, 4).unwrap();
         let ctx = ctx();
         ctx.register_table("empty", table).unwrap();
         let batches = ctx.sql("SELECT * FROM empty").await.unwrap().collect().await.unwrap();

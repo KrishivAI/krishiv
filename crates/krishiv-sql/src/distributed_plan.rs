@@ -1013,24 +1013,50 @@ impl ParquetTableSpec {
 /// A declared column that is not in the file's schema is an error rather than
 /// a silent no-op: a typo would otherwise turn into "the optimization
 /// mysteriously does not apply", which is the least debuggable outcome.
+///
+/// # Why the options come from `ParquetReadOptions` instead of `ListingOptions::new`
+///
+/// The two branches below must describe the *same table*; the only intended
+/// difference is the constraint. Building the keyed branch's options by hand
+/// silently made them differ, because `ListingOptions::new` does not mean
+/// "defaults" — it means:
+///
+/// ```text
+/// collect_stat:      false   // vs. session `collect_statistics`, default true
+/// target_partitions: 1       // vs. session `target_partitions`
+/// ```
+///
+/// `register_parquet` reaches `ListingOptions` through
+/// [`ReadOptions::to_listing_options`], which ends in
+/// `.with_session_config_options(config)` and sets both from the session. The
+/// hand-built branch never did, so **declaring a primary key turned that
+/// table's statistics off** and collapsed its scan to one partition.
+///
+/// Statistics off is not a slow path, it is a blind one. Every rule that keys
+/// on a known size stops seeing anything: measured on the SF100 cluster,
+/// `SpillableJoinSelection` reported `unmeasurable == hash_joins` in **all 414
+/// passes** across coordinator and executors and converted **zero** joins, so
+/// no oversized hash join could ever be made spillable and q21 died on a build
+/// side nothing was left to catch. It also blinds broadcast selection,
+/// `ShuffleReadExec`'s cut-subtree estimate, and join ordering.
+///
+/// So the options are produced by DataFusion's own conversion, from the same
+/// `ParquetReadOptions::default()` the unkeyed branch passes. The two paths
+/// cannot drift again without DataFusion changing under both at once.
 pub async fn register_parquet_table(
     ctx: &SessionContext,
     spec: &ParquetTableSpec,
 ) -> SqlResult<()> {
     use datafusion::common::{Constraint, Constraints};
     use datafusion::datasource::TableProvider as _;
-    use datafusion::datasource::file_format::parquet::ParquetFormat;
-    use datafusion::datasource::listing::{
-        ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
-    };
+    use datafusion::datasource::file_format::options::ReadOptions as _;
+    use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
+
+    let read_options = datafusion::prelude::ParquetReadOptions::default();
 
     if spec.primary_key.is_empty() {
         return ctx
-            .register_parquet(
-                &spec.name,
-                &spec.path,
-                datafusion::prelude::ParquetReadOptions::default(),
-            )
+            .register_parquet(&spec.name, &spec.path, read_options)
             .await
             .map_err(|e| SqlError::DataFusion {
                 message: format!("staged planning: register '{}': {e}", spec.name),
@@ -1040,7 +1066,8 @@ pub async fn register_parquet_table(
     let url = ListingTableUrl::parse(&spec.path).map_err(|e| SqlError::DataFusion {
         message: format!("staged planning: table url for '{}': {e}", spec.name),
     })?;
-    let options = ListingOptions::new(Arc::new(ParquetFormat::default()));
+    let options =
+        read_options.to_listing_options(&ctx.copied_config(), ctx.copied_table_options());
     let config = ListingTableConfig::new(url)
         .with_listing_options(options)
         .infer_schema(&ctx.state())
@@ -7185,5 +7212,133 @@ mod codec_completeness_tests {
                     .unwrap_or_else(|e| panic!("stage {index} did not decode: {e}"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod registration_parity_tests {
+    use super::*;
+
+    /// Write one small parquet file and return the path to register.
+    async fn parquet_at(dir: &std::path::Path) -> String {
+        let path = dir.join("t.parquet");
+        let path = path.to_str().expect("temp path is utf-8").to_owned();
+        let ctx = SessionContext::new();
+        ctx.sql(&format!(
+            "COPY (SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) t(k, v)) \
+             TO '{path}' STORED AS PARQUET"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        path
+    }
+
+    /// Register the same file both ways and hand back the two providers.
+    async fn both_ways(path: &str) -> (Arc<dyn datafusion::datasource::TableProvider>, Arc<dyn datafusion::datasource::TableProvider>) {
+        let ctx = planning_session_context(4);
+        register_parquet_table(&ctx, &ParquetTableSpec::new("plain", path))
+            .await
+            .unwrap();
+        register_parquet_table(
+            &ctx,
+            &ParquetTableSpec::new("keyed", path).with_primary_key(["k"]),
+        )
+        .await
+        .unwrap();
+        (
+            ctx.table_provider("plain").await.unwrap(),
+            ctx.table_provider("keyed").await.unwrap(),
+        )
+    }
+
+    fn listing_options(
+        provider: &Arc<dyn datafusion::datasource::TableProvider>,
+    ) -> datafusion::datasource::listing::ListingOptions {
+        // `TableProvider: Any` — upcast to downcast, as elsewhere in this file
+        // (DF 54 has no `as_any` on the trait).
+        let any = provider.as_ref() as &dyn std::any::Any;
+        any.downcast_ref::<datafusion::datasource::listing::ListingTable>()
+            .expect("parquet registration produces a ListingTable")
+            .options()
+            .clone()
+    }
+
+    /// The invariant the two branches of [`register_parquet_table`] exist under:
+    /// declaring a key changes the *constraints* and nothing else.
+    ///
+    /// It was violated silently. The keyed branch built its own
+    /// `ListingOptions::new(..)`, whose documented defaults are `collect_stat:
+    /// false` and `target_partitions: 1` — while `register_parquet` routes
+    /// through `ReadOptions::to_listing_options`, which ends in
+    /// `.with_session_config_options(config)` and takes both from the session.
+    ///
+    /// So every table with a declared primary key had **statistics collection
+    /// off**. On the SF100 cluster that made `SpillableJoinSelection` report
+    /// `unmeasurable == hash_joins` in all 414 passes and convert zero joins,
+    /// leaving q21's oversized build side with nothing to catch it.
+    ///
+    /// Comparing the whole `ListingOptions` rather than the two fields that
+    /// were wrong is deliberate: the next field DataFusion adds to
+    /// `with_session_config_options` fails this test instead of quietly
+    /// re-opening the same hole.
+    #[tokio::test]
+    async fn declaring_a_primary_key_changes_only_the_constraints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = parquet_at(dir.path()).await;
+        let (plain, keyed) = both_ways(&path).await;
+
+        let (plain_options, keyed_options) = (listing_options(&plain), listing_options(&keyed));
+        assert_eq!(
+            format!("{plain_options:?}"),
+            format!("{keyed_options:?}"),
+            "a declared key must not change how the table is read"
+        );
+        assert!(
+            keyed_options.collect_stat,
+            "statistics collection must stay on: every size-based rule goes \
+             blind without it"
+        );
+
+        // The one difference that is supposed to exist.
+        assert!(plain.constraints().is_none_or(|c| c.is_empty()));
+        assert!(
+            keyed.constraints().is_some_and(|c| !c.is_empty()),
+            "the declared key must reach the optimizer as a constraint"
+        );
+    }
+
+    /// The behavioural half: a keyed table must still report row counts.
+    ///
+    /// The options comparison above pins the mechanism; this pins the outcome
+    /// the mechanism exists for, so the test still fails if a future change
+    /// keeps `collect_stat` set but loses statistics some other way.
+    #[tokio::test]
+    async fn a_keyed_table_still_reports_row_counts() {
+        use datafusion::common::stats::Precision;
+        let dir = tempfile::tempdir().unwrap();
+        let path = parquet_at(dir.path()).await;
+        let (_, keyed) = both_ways(&path).await;
+
+        let ctx = planning_session_context(4);
+        ctx.register_table("keyed", Arc::clone(&keyed)).unwrap();
+        let stats = ctx
+            .sql("SELECT k, v FROM keyed")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap()
+            .partition_statistics(None)
+            .unwrap();
+        assert!(
+            matches!(stats.num_rows, Precision::Exact(3) | Precision::Inexact(3)),
+            "expected a row count for a keyed table, got {:?} — this is the \
+             shape that made every join unmeasurable at SF100",
+            stats.num_rows
+        );
     }
 }
