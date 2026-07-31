@@ -20,7 +20,7 @@ use crate::{
 };
 
 use super::partition::{
-    DEFAULT_BATCH_TASK_TIMEOUT_SECS, MAX_CHECKPOINT_ACK_RETRIES,
+    MAX_CHECKPOINT_ACK_RETRIES, default_batch_task_timeout_secs,
     collect_missing_shuffle_partitions, default_streaming_task_timeout_secs,
     format_failure_message,
 };
@@ -360,6 +360,27 @@ impl fmt::Debug for ExecutorTaskRunner {
             )
             .field("source_throttle_limits", &self.source_throttle_limits.len())
             .finish()
+    }
+}
+
+
+/// Removes a task's running-attempt entry on drop, so a slot cannot be leaked
+/// by an early return. See `ExecutorTaskRunner::running_attempt_guard` for the
+/// failure this closes.
+struct RunningAttemptGuard {
+    running_attempts: Option<std::sync::Arc<dashmap::DashMap<String, TaskAttemptRef>>>,
+    key_group_ranges: Option<SharedKeyGroupRanges>,
+    task_id: String,
+}
+
+impl Drop for RunningAttemptGuard {
+    fn drop(&mut self) {
+        if let Some(running) = &self.running_attempts {
+            running.remove(&self.task_id);
+        }
+        if let Some(ranges) = &self.key_group_ranges {
+            ranges.remove(&self.task_id);
+        }
     }
 }
 
@@ -775,6 +796,10 @@ impl ExecutorTaskRunner {
                 assignment.key_group_range(),
             );
         }
+        // Armed immediately after the insert, so that EVERY exit below —
+        // including the `?` operators that previously leaked the slot — takes
+        // the entry with it. See `running_attempt_guard`.
+        let _running_attempt_guard = self.running_attempt_guard(&assignment);
 
         // If a CancelTask RPC arrived while this task was queued, finish here
         // instead of starting execution.
@@ -863,7 +888,7 @@ impl ExecutorTaskRunner {
                 // hung tasks that would otherwise block the stage forever.
                 let timeout_secs = assignment
                     .task_timeout_secs()
-                    .unwrap_or(DEFAULT_BATCH_TASK_TIMEOUT_SECS);
+                    .unwrap_or_else(default_batch_task_timeout_secs);
                 // Mid-execution abort (#217): watch the inbox tombstone while
                 // the fragment runs. Without this, a batch fragment already
                 // inside the engine runs to its end (or the timeout) no
@@ -988,7 +1013,7 @@ impl ExecutorTaskRunner {
                 // deletion stops *future* ticks (see api_ivm_delete_job).
                 let timeout_secs = assignment
                     .task_timeout_secs()
-                    .unwrap_or(DEFAULT_BATCH_TASK_TIMEOUT_SECS);
+                    .unwrap_or_else(default_batch_task_timeout_secs);
                 let fragment_body = fragment_body.to_string();
                 let is_resident = crate::fragment::ivm::is_resident_ivm_fragment(&fragment_body);
                 let ivm_future = erased(async {
@@ -1309,6 +1334,43 @@ impl ExecutorTaskRunner {
                     return Err(error);
                 }
             }
+        }
+    }
+
+    /// Clear this task's running-attempt entry when the guard drops, however
+    /// the scope is left.
+    ///
+    /// # The leak this closes
+    ///
+    /// `run_assignment_with` inserts into `running_attempts` and then runs the
+    /// task through a long sequence of `?` operators. Only five of those exits
+    /// called `clear_running_attempt`; every other early return — a bad plan
+    /// fragment, an invalid-argument mapping, and crucially **a task that fails
+    /// during execution** — left the entry behind.
+    ///
+    /// The entry is not cosmetic. The executor reports `running_attempts` in
+    /// every heartbeat, the coordinator takes that list verbatim
+    /// (`heartbeat.rs`: `executor.running_tasks = heartbeat.running_tasks()`),
+    /// and it schedules against `slots - running_tasks.len()`. A leaked entry
+    /// therefore removes a slot **permanently** — no real task will ever
+    /// complete to decrement it.
+    ///
+    /// Observed on the SF100 sweep: TPC-H q21 failed with `Resources
+    /// exhausted: HashJoinInput`, and afterwards all three executors reported
+    /// 3 running tasks each — nine phantom tasks holding every slot — while
+    /// burning 24-43 millicores and 64-72 MiB, i.e. doing nothing. Every
+    /// subsequent query sat at 0 assigned tasks forever. The sweep was dead
+    /// and the cluster needed a restart.
+    ///
+    /// Enumerating exits is how the bug was introduced, so this does not add a
+    /// sixth call site: it makes the cleanup unconditional. The explicit
+    /// `clear_running_attempt` calls stay — freeing the slot early is still
+    /// worth doing, and a second removal is a no-op.
+    fn running_attempt_guard(&self, assignment: &ExecutorTaskAssignment) -> RunningAttemptGuard {
+        RunningAttemptGuard {
+            running_attempts: self.running_attempts.clone(),
+            key_group_ranges: self.key_group_ranges.clone(),
+            task_id: assignment.task_id().as_str().to_string(),
         }
     }
 
@@ -1988,5 +2050,60 @@ impl ExecutorTaskRunner {
             }
         }
         processed
+    }
+}
+
+#[cfg(test)]
+mod running_attempt_leak {
+    use super::*;
+
+    /// A slot must be released however the task's scope is left.
+    ///
+    /// This is the property the SF100 sweep proved was violated: after TPC-H
+    /// q21 failed with `Resources exhausted: HashJoinInput`, all three
+    /// executors reported three running tasks each — nine phantom slots — and
+    /// every later query sat at 0 assigned tasks forever, because the
+    /// coordinator schedules against `slots - running_tasks.len()`.
+    ///
+    /// The guard is tested directly rather than through `run_assignment_with`:
+    /// the whole point is that it does not matter *which* exit is taken, so
+    /// pinning the test to one of them would test the wrong thing.
+    #[test]
+    fn dropping_the_guard_releases_the_slot_on_every_exit_path() {
+        let running: std::sync::Arc<dashmap::DashMap<String, TaskAttemptRef>> =
+            std::sync::Arc::new(dashmap::DashMap::new());
+        let task_id = String::from("task-7");
+        running.insert(
+            task_id.clone(),
+            TaskAttemptRef::new(
+                krishiv_proto::JobId::try_new("job-1").expect("job id"),
+                krishiv_proto::StageId::try_new("stage-1").expect("stage id"),
+                krishiv_proto::TaskId::try_new(task_id.as_str()).expect("task id"),
+                krishiv_proto::AttemptId::try_new(1).expect("attempt id"),
+            ),
+        );
+        assert_eq!(running.len(), 1, "precondition: the slot is held");
+
+        // An early return — the `?` shape that leaked — is just a scope exit.
+        fn fails_early(
+            running: &std::sync::Arc<dashmap::DashMap<String, TaskAttemptRef>>,
+            task_id: &str,
+        ) -> Result<(), ()> {
+            let _guard = RunningAttemptGuard {
+                running_attempts: Some(std::sync::Arc::clone(running)),
+                key_group_ranges: None,
+                task_id: task_id.to_owned(),
+            };
+            Err(())
+        }
+        let leaked = fails_early(&running, &task_id);
+
+        assert!(leaked.is_err(), "the test must exercise the failing path");
+        assert_eq!(
+            running.len(),
+            0,
+            "the slot is still held after an early return — this is the leak \
+             that wedged the SF100 sweep"
+        );
     }
 }

@@ -1477,3 +1477,20 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod declared_default_guard {
+    /// See `krishiv_common::env_registry::declared_default_number`. This one
+    /// was documented as 16 against a real 128 — an 8x error in the number an
+    /// operator would use to reason about coordinator fan-out.
+    #[test]
+    fn the_documented_default_matches_the_compiled_in_one() {
+        assert_eq!(
+            krishiv_common::env_registry::declared_default_number(
+                super::MAX_CONCURRENT_ASSIGNMENT_RPCS_ENV
+            ),
+            Some(super::DEFAULT_MAX_CONCURRENT_ASSIGNMENT_RPCS as u64),
+            "KRISHIV_MAX_CONCURRENT_ASSIGNMENT_RPCS: docs and code disagree"
+        );
+    }
+}

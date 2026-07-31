@@ -57,8 +57,8 @@ Regenerate with:
 | `KRISHIV_FLIGHT_ADDR` | host:port | `127.0.0.1:50055` | Flight SQL service listen address. |
 | `KRISHIV_FLIGHT_ALLOW_ALL_AUTHENTICATED` | bool | `false` | Standalone Flight SQL: treat any authenticated subject as authorized (AllowAllPolicyHook) instead of SEC-2 default-deny. For deployments with no governance catalog; the API key is the authorization boundary. |
 | `KRISHIV_FLIGHT_API_KEY` | secret | `unset` | API key the Flight SQL client presents (takes precedence over KRISHIV_API_KEY). |
-| `KRISHIV_FLIGHT_MAX_CONCURRENT_QUERIES` | uint | `16` | Maximum concurrently executing Flight SQL queries. |
-| `KRISHIV_FLIGHT_MAX_RESULT_BYTES` | uint | `unset` | Per-query Flight SQL result-size cap; unset = unlimited. |
+| `KRISHIV_FLIGHT_MAX_CONCURRENT_QUERIES` | uint | `256` | Maximum concurrently executing Flight SQL queries. |
+| `KRISHIV_FLIGHT_MAX_RESULT_BYTES` | uint | `2147483648` | Per-query Flight SQL result-size cap. NOT unlimited when unset: the compiled-in default is 2 GiB. |
 | `KRISHIV_FLIGHT_PREPARED_STMT_CAPACITY` | uint | `128` | Maximum cached prepared statements per Flight SQL session. |
 | `KRISHIV_FLIGHT_REQUEST_TIMEOUT_SECS` | uint | `0` | Hard per-request deadline (seconds) on the client→coordinator Flight channel; 0 (default) disables it so long-running distributed queries are bounded by the coordinator's own statement timeout (KRISHIV_BATCH_SQL_TIMEOUT_SECS) rather than a premature transport cap. Dead peers are still detected via HTTP/2 keepalive. |
 | `KRISHIV_FULL_SNAPSHOT_EVERY` | uint | `8` | Every Nth checkpoint epoch takes a full portable snapshot in incremental mode (bounds the SST manifest chain). |
@@ -76,7 +76,7 @@ Regenerate with:
 | `KRISHIV_ICEBERG_REST_WAREHOUSE` | text | `empty` | Warehouse location/name passed to the Iceberg REST catalog. |
 | `KRISHIV_IDLE_TICK_MS` | uint | `engine default` | Continuous-engine idle tick interval in milliseconds. |
 | `KRISHIV_INCREMENTAL_CHECKPOINTS` | bool | `true` | RocksDB-backed window state checkpoints SST deltas instead of full snapshots (Phase 56). |
-| `KRISHIV_INLINE_IPC_MAX_BYTES` | uint | `4194304` | Maximum inline base64 Arrow IPC payload accepted in batch SQL requests. |
+| `KRISHIV_INLINE_IPC_MAX_BYTES` | uint | `67108864` | Maximum inline base64 Arrow IPC payload accepted in batch SQL requests. |
 | `KRISHIV_INLINE_RESULT_MAX_BYTES` | uint | `8388608` | Result size above which executor task output spools to disk instead of inlining. |
 | `KRISHIV_IVM_SHARDS` | uint | `1` | Shard count for coordinator-resident IVM flows. |
 | `KRISHIV_JCP_POLL_INTERVAL_SECS` | uint | `2` | Job-completion poll interval for job-mode coordinator runs. |
@@ -89,7 +89,7 @@ Regenerate with:
 | `KRISHIV_LOCAL_DATA_DIR` | path | `~/.krishiv/local` | Data directory for `krishiv local` single-node deployments. |
 | `KRISHIV_LOCAL_HTTP_ADDR` | host:port | `127.0.0.1:8080` | HTTP address for `krishiv local` status endpoints. |
 | `KRISHIV_MATCH_RECOGNIZE_STREAMING_LIMIT` | uint | `engine default` | Row cap for MATCH_RECOGNIZE evaluation over streaming inputs. |
-| `KRISHIV_MAX_CONCURRENT_ASSIGNMENT_RPCS` | uint | `16` | Coordinator-side concurrency cap for task assignment RPC fan-out. |
+| `KRISHIV_MAX_CONCURRENT_ASSIGNMENT_RPCS` | uint | `128` | Coordinator-side concurrency cap for task assignment RPC fan-out. |
 | `KRISHIV_MAX_SHUFFLE_REGEN` | uint | `8` | Maximum times a lost shuffle partition may be regenerated before the job fails terminally (consumer-driven FetchFailed recovery bound). |
 | `KRISHIV_MCP_ADDR` | host:port | `127.0.0.1:8811` | MCP server listen address (http transport). |
 | `KRISHIV_MCP_ALLOW_WRITE_SQL` | bool | `false` | Allow the MCP run_sql tool to execute write statements. |
@@ -113,7 +113,7 @@ Regenerate with:
 | `KRISHIV_REMOTE_EXEC` | bool | `mode-dependent` | Force remote (coordinator) execution on or off for API sessions. |
 | `KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH` | bool | `profile-dependent` | Require bearer auth on executor task gRPC even in dev profiles. |
 | `KRISHIV_RESULT_SPOOL_DIR` | path | `temp dir` | Directory for disk-spooled large query results. |
-| `KRISHIV_RESULT_SPOOL_MAX_BYTES` | uint | `1073741824` | Cap on total spooled result bytes per node. |
+| `KRISHIV_RESULT_SPOOL_MAX_BYTES` | uint | `8589934592` | Cap on total spooled result bytes per node. |
 | `KRISHIV_RESULT_SPOOL_SYNC_INTERVAL_BYTES` | uint | `67108864` | Bytes written between fsyncs of the disk-spooled result file; 0 or unset uses the 64 MiB default. |
 | `KRISHIV_ROCKSDB_MAX_OPEN_FILES` | int | `rocksdb default` | RocksDB max_open_files for state/metadata stores (-1 = unlimited). |
 | `KRISHIV_ROCKSDB_WRITE_BUFFER_MB` | uint | `rocksdb default` | RocksDB write-buffer (memtable) size in MiB. |
@@ -142,7 +142,7 @@ Regenerate with:
 | `KRISHIV_SHUFFLE_FETCH_RETRIES` | uint | `3` | Retry attempts per shuffle partition fetch. |
 | `KRISHIV_SHUFFLE_FETCH_RETRY_BASE_MS` | uint | `100` | Base backoff for shuffle fetch retries. |
 | `KRISHIV_SHUFFLE_FLIGHT_ADDR` | host:port | `unset` | Shuffle Flight transport listen address (executor). |
-| `KRISHIV_SHUFFLE_MEMORY_BYTES` | uint | `268435456` | In-memory shuffle store budget before spill/rejection. |
+| `KRISHIV_SHUFFLE_MEMORY_BYTES` | uint | `134217728` | In-memory shuffle store budget before spill/rejection. |
 | `KRISHIV_SHUFFLE_PARTITIONS` | uint | `target-parallelism` | Default shuffle partition count for distributed plans. |
 | `KRISHIV_SHUFFLE_SERVE_CONCURRENCY` | uint | `cgroup-derived` | Concurrent shuffle Flight `do_get` responses one executor will serve; bounds the aggregate bytes held for consumers across all peers. Derived from the page-cache budget in units of the 32 MiB inline-read limit, floor 2. |
 | `KRISHIV_SHUFFLE_SPILL_THRESHOLD_BYTES` | uint | `67108864` | Sort-shuffle writer in-memory buffer threshold before spilling a run. |
@@ -156,7 +156,8 @@ Regenerate with:
 | `KRISHIV_STATE_BACKEND` | rocksdb \| disaggregated | `rocksdb` | Executor generic state backend; disaggregated = DFS-primary with local cache (requires KRISHIV_STATE_DFS_ROOT). |
 | `KRISHIV_STATE_DFS_ROOT` | path | `unset` | DFS/object-store root for the disaggregated state backend. |
 | `KRISHIV_STATE_DIR` | path | `unset` | Executor state-backend directory (RocksDB window/operator state). |
-| `KRISHIV_STREAMING_TASK_TIMEOUT_SECS` | uint | `unset` | Watchdog timeout for streaming task cycles; unset = disabled. |
+| `KRISHIV_BATCH_TASK_TIMEOUT_SECS` | uint | `3600` | Watchdog timeout for batch task execution. A per-task task_timeout_secs still wins. Previously compile-time only, while the streaming watchdog was tunable — the asymmetry had no rationale and SF100 queries run within 2x of this ceiling. |
+| `KRISHIV_STREAMING_TASK_TIMEOUT_SECS` | uint | `300` | Watchdog timeout for streaming task cycles. NOT disabled when unset: the compiled-in default is 300 s. A per-task task_timeout_secs still wins. |
 | `KRISHIV_STREAM_EARLY_FIRE_MS` | uint | `unset` | Speculative early-fire interval for open windows (embedded loop only — the distributed stream:rloop: run-loop does not read this flag). |
 | `KRISHIV_STREAM_LINGER_MS` | uint | `profile` | Run-loop batch/linger before each drain in ms; overrides the KRISHIV_STREAM_PROFILE default (0 low-latency, 5 throughput). |
 | `KRISHIV_STREAM_PROFILE` | low-latency \| throughput | `low-latency` | Streaming loop profile: embedded checkpoint cadence and the distributed run-loop batch/linger dial (Phase 55). |

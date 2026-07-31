@@ -400,3 +400,21 @@ impl ShuffleStore for InMemoryShuffleStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod declared_default_guard {
+    /// The registry generates `docs/reference/env-flags.md` and the `krishiv
+    /// doctor` listing, so its declared default is what an operator sizing a
+    /// cluster reads — and nothing used to tie it to the constant the engine
+    /// actually uses. Seven flags had drifted, two of them describing
+    /// *behaviour* that did not exist ("unset = unlimited" against a hard cap).
+    /// Asserting it here means the check fires where the number is changed.
+    #[test]
+    fn the_documented_default_matches_the_compiled_in_one() {
+        assert_eq!(
+            krishiv_common::env_registry::declared_default_number("KRISHIV_SHUFFLE_MEMORY_BYTES"),
+            Some(super::DEFAULT_SHUFFLE_MEMORY_BYTES as u64),
+            "KRISHIV_SHUFFLE_MEMORY_BYTES: docs and code disagree"
+        );
+    }
+}

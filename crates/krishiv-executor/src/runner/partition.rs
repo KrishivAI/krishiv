@@ -10,6 +10,28 @@ use crate::{ExecutorError, ExecutorResult};
 /// blocking the stage indefinitely.
 pub(crate) const DEFAULT_BATCH_TASK_TIMEOUT_SECS: u64 = 3600;
 
+/// Return the effective batch task timeout, checking
+/// `KRISHIV_BATCH_TASK_TIMEOUT_SECS` before the compiled-in default.
+/// Per-task `task_timeout_secs` still takes precedence over both.
+///
+/// # Why this is not just a constant
+///
+/// The streaming watchdog below has been env-overridable since R6; the batch
+/// one was not, so an operator could tune one and not the other for no reason
+/// either could articulate. That asymmetry has teeth at scale: TPC-H q10 at
+/// SF100 takes ~1966 s unoptimised and the reference run 2280 s, both within
+/// 2x of this 3600 s ceiling. A cluster one size smaller, or a query one join
+/// heavier, hits a wall whose only escape is editing the per-task spec.
+///
+/// The default is unchanged — this adds a dial, it does not turn one.
+pub(crate) fn default_batch_task_timeout_secs() -> u64 {
+    std::env::var("KRISHIV_BATCH_TASK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_BATCH_TASK_TIMEOUT_SECS)
+}
+
 /// Default streaming task safety timeout in seconds (5 minutes).
 /// Streaming fragments run continuously, but a deadlocked window operator
 /// would block forever without this guard (R6). Operators that legitimately
@@ -483,5 +505,28 @@ mod local_parquet_tests {
         let parsed = parse_local_parquet_partitions(&partitions).expect("parse");
         let names: Vec<&str> = parsed.iter().map(|p| p.table_name()).collect();
         assert_eq!(names, vec!["orders", "lineitem"]);
+    }
+}
+
+#[cfg(test)]
+mod declared_default_guard {
+    /// The registry generates `docs/reference/env-flags.md` and the `krishiv
+    /// doctor` listing, so its declared default is what an operator sizing a
+    /// cluster reads — and nothing used to tie it to the constant the engine
+    /// actually uses. Seven flags had drifted, two of them describing
+    /// *behaviour* that did not exist ("unset = unlimited" against a hard cap).
+    /// Asserting it here means the check fires where the number is changed.
+    #[test]
+    fn the_documented_default_matches_the_compiled_in_one() {
+        assert_eq!(
+            krishiv_common::env_registry::declared_default_number("KRISHIV_STREAMING_TASK_TIMEOUT_SECS"),
+            Some(super::DEFAULT_STREAMING_TASK_TIMEOUT_SECS),
+            "KRISHIV_STREAMING_TASK_TIMEOUT_SECS: docs and code disagree"
+        );
+        assert_eq!(
+            krishiv_common::env_registry::declared_default_number("KRISHIV_BATCH_TASK_TIMEOUT_SECS"),
+            Some(super::DEFAULT_BATCH_TASK_TIMEOUT_SECS),
+            "KRISHIV_BATCH_TASK_TIMEOUT_SECS: docs and code disagree"
+        );
     }
 }

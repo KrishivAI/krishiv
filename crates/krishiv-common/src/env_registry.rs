@@ -423,14 +423,14 @@ pub static FLAGS: &[FlagSpec] = &[
     rt(
         "KRISHIV_FLIGHT_MAX_CONCURRENT_QUERIES",
         FlagKind::UInt,
-        "16",
+        "256",
         "Maximum concurrently executing Flight SQL queries.",
     ),
     rt(
         "KRISHIV_FLIGHT_MAX_RESULT_BYTES",
         FlagKind::UInt,
-        "unset",
-        "Per-query Flight SQL result-size cap; unset = unlimited.",
+        "2147483648",
+        "Per-query Flight SQL result-size cap. NOT unlimited when unset: the compiled-in default is 2 GiB.",
     ),
     rt(
         "KRISHIV_FLIGHT_PREPARED_STMT_CAPACITY",
@@ -541,7 +541,7 @@ pub static FLAGS: &[FlagSpec] = &[
     rt(
         "KRISHIV_INLINE_IPC_MAX_BYTES",
         FlagKind::UInt,
-        "4194304",
+        "67108864",
         "Maximum inline base64 Arrow IPC payload accepted in batch SQL requests.",
     ),
     rt(
@@ -620,7 +620,7 @@ pub static FLAGS: &[FlagSpec] = &[
     rt(
         "KRISHIV_MAX_CONCURRENT_ASSIGNMENT_RPCS",
         FlagKind::UInt,
-        "16",
+        "128",
         "Coordinator-side concurrency cap for task assignment RPC fan-out.",
     ),
     rt(
@@ -772,7 +772,7 @@ pub static FLAGS: &[FlagSpec] = &[
     rt(
         "KRISHIV_RESULT_SPOOL_MAX_BYTES",
         FlagKind::UInt,
-        "1073741824",
+        "8589934592",
         "Cap on total spooled result bytes per node.",
     ),
     rt(
@@ -1014,7 +1014,7 @@ pub static FLAGS: &[FlagSpec] = &[
     rt(
         "KRISHIV_SHUFFLE_MEMORY_BYTES",
         FlagKind::UInt,
-        "268435456",
+        "134217728",
         "In-memory shuffle store budget before spill/rejection.",
     ),
     rt(
@@ -1102,10 +1102,16 @@ pub static FLAGS: &[FlagSpec] = &[
         "Executor state-backend directory (RocksDB window/operator state).",
     ),
     rt(
+        "KRISHIV_BATCH_TASK_TIMEOUT_SECS",
+        FlagKind::UInt,
+        "3600",
+        "Watchdog timeout for batch task execution. A per-task task_timeout_secs still wins. Previously compile-time only, while the streaming watchdog was tunable — the asymmetry had no rationale and SF100 queries run within 2x of this ceiling.",
+    ),
+    rt(
         "KRISHIV_STREAMING_TASK_TIMEOUT_SECS",
         FlagKind::UInt,
-        "unset",
-        "Watchdog timeout for streaming task cycles; unset = disabled.",
+        "300",
+        "Watchdog timeout for streaming task cycles. NOT disabled when unset: the compiled-in default is 300 s. A per-task task_timeout_secs still wins.",
     ),
     rt(
         "KRISHIV_STREAM_EARLY_FIRE_MS",
@@ -1362,6 +1368,35 @@ pub fn env_u64(name: &str) -> Option<u64> {
 /// Parse an env var as `usize`; `None` when unset or unparseable.
 pub fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
+}
+
+/// The **declared** default for `name`, parsed as a number.
+///
+/// `None` when the flag is unknown or its documented default is prose
+/// (`"unset"`, `"derived from the cgroup limit"`) rather than a value.
+///
+/// # Why this exists
+///
+/// This registry generates `docs/reference/env-flags.md` and the `krishiv
+/// doctor` listing, so its `default` field is what an operator sizing a
+/// cluster reads. But the value the engine actually uses lives in a
+/// `DEFAULT_*` const next to the code that reads the variable, and **nothing
+/// connected the two**. They drifted, and an audit found seven flags whose
+/// published default was wrong — `KRISHIV_RESULT_SPOOL_MAX_BYTES` documented
+/// as 1 GiB against a real 8 GiB, `KRISHIV_MAX_CONCURRENT_ASSIGNMENT_RPCS` as
+/// 16 against 128 — plus two that misdescribed *behaviour*, promising
+/// "unset = unlimited" and "unset = disabled" where the code enforces a 2 GiB
+/// cap and a 300 s watchdog.
+///
+/// The registry test proves every flag that is *read* is *declared*. It could
+/// not prove the declaration is true. This accessor is what lets each owning
+/// crate assert that its compiled-in default matches what the docs promise,
+/// at the exact spot a developer would change the number.
+#[must_use]
+pub fn declared_default_number(name: &str) -> Option<u64> {
+    lookup(name)
+        .map(|spec| spec.default)
+        .and_then(|raw| raw.trim().replace('_', "").parse().ok())
 }
 
 // ── Coordinator endpoint aliasing ───────────────────────────────────────

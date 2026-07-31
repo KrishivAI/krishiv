@@ -2247,3 +2247,27 @@ mod prepared_statement_schema_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod declared_default_guard {
+    /// See `krishiv_common::env_registry::declared_default_number`. Both of
+    /// these were documented wrong: the concurrency cap as 16 against a real
+    /// 256, and the result cap as "unset = unlimited" against a hard 2 GiB.
+    #[test]
+    fn the_documented_default_matches_the_compiled_in_one() {
+        assert_eq!(
+            krishiv_common::env_registry::declared_default_number(
+                super::FLIGHT_MAX_CONCURRENT_QUERIES_ENV
+            ),
+            Some(super::DEFAULT_FLIGHT_MAX_CONCURRENT_QUERIES as u64),
+            "KRISHIV_FLIGHT_MAX_CONCURRENT_QUERIES: docs and code disagree"
+        );
+        assert_eq!(
+            krishiv_common::env_registry::declared_default_number(
+                super::FLIGHT_MAX_RESULT_BYTES_ENV
+            ),
+            Some(super::DEFAULT_FLIGHT_MAX_RESULT_BYTES as u64),
+            "KRISHIV_FLIGHT_MAX_RESULT_BYTES: docs and code disagree"
+        );
+    }
+}
