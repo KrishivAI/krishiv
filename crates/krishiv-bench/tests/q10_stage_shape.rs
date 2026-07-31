@@ -13,6 +13,18 @@
 //! This runs the real stage cutter offline against empty fixture tables, so it
 //! costs nothing and cannot perturb a running benchmark.
 
+// Integration-test crate: helpers run outside `#[test]` fns, so clippy.toml's
+// `allow-unwrap-in-tests` does not reach them (same as `staged_tpch_corpus.rs`).
+// A panic is the failure signal here, and the whole point of this file is to
+// print the per-stage byte breakdown.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+
 use datafusion::prelude::SessionContext;
 use krishiv_bench::tpch_fixture::fixture_ddl;
 use krishiv_sql::distributed_plan::{
