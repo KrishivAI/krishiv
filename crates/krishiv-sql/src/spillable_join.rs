@@ -320,6 +320,57 @@ impl JoinFacts {
     }
 }
 
+/// Memory to assume for the joins whose build side cannot be estimated.
+///
+/// # The hole this closes
+///
+/// [`JoinFacts::retained_bytes`] reports **zero** for an unmeasurable join,
+/// and [`SpillableJoinSelection::conversion_decisions`] summed exactly that to
+/// decide whether there was aggregate pressure at all. So a fragment whose
+/// joins all have absent statistics summed to nothing, `total <= threshold`
+/// short-circuited, and the budget — whose entire purpose is to bound what the
+/// un-converted joins will hold — concluded there was nothing to bound.
+///
+/// That is TPC-H q21 at SF100, verbatim:
+///
+/// ```text
+/// Resources exhausted: Failed to allocate additional 310.2 MB for
+/// HashJoinInput[0] with 0.0 B already allocated for this reservation -
+/// 87.9 MB remain available for the total memory pool: fair(pool_size: 2.6 GB)
+/// ```
+///
+/// The join asking for 310 MB had allocated **nothing** yet; ~2.5 GB of a
+/// 2.6 GB pool was already held by its siblings. Every one of them had passed
+/// a check that valued them at zero.
+///
+/// # Why an even split, and why this does not re-create the q2 regression
+///
+/// With no byte size and no row count there is genuinely nothing to measure,
+/// so any figure is an assumption; the only question is which assumption is
+/// defensible. Zero asserts the join is free, which is the assumption that
+/// just failed. Treating it as unbounded would convert every join in sight —
+/// that is the session-wide `prefer_hash_join = false` switch that took q2
+/// from 189 s past a 2400 s timeout.
+///
+/// The neutral assumption between them is that a shared pool divides evenly
+/// among the operators holding it: each unmeasurable join is charged
+/// `threshold / joins`. It is not a claim about the join's real size, it is a
+/// refusal to claim the join is free.
+///
+/// **Queries whose joins are all measurable are untouched**: this returns 0 for
+/// them, `total` is unchanged, and a plan with no aggregate pressure still
+/// short-circuits to the per-join gate exactly as before. The change can only
+/// bite where an unmeasurable join exists *and* the pool is under pressure —
+/// which is the case it was missing.
+fn unknown_build_pressure(facts: &[JoinFacts], threshold: u64) -> u64 {
+    let unknown = facts.iter().filter(|f| f.bytes.is_none()).count();
+    if unknown == 0 || facts.is_empty() {
+        return 0;
+    }
+    let share = threshold / facts.len() as u64;
+    share.saturating_mul(unknown as u64)
+}
+
 /// Facts for every hash join in `plan`, **in `transform_up` order**.
 ///
 /// Post-order (children before parent, children left to right) is exactly the
@@ -469,10 +520,12 @@ impl SpillableJoinSelection {
     /// that was fine before behaves identically — the q2 regression risk is
     /// unchanged.
     fn conversion_decisions(facts: &[JoinFacts], threshold: u64) -> Vec<bool> {
-        let total = facts
+        let measured = facts
             .iter()
             .map(|f| f.retained_bytes())
             .fold(0u64, u64::saturating_add);
+        let unknown_pressure = unknown_build_pressure(facts, threshold);
+        let total = measured.saturating_add(unknown_pressure);
         // No aggregate pressure: let the per-join gate decide, as before.
         if total <= threshold {
             return vec![false; facts.len()];
@@ -480,12 +533,15 @@ impl SpillableJoinSelection {
 
         // Joins the rule cannot convert are retained whatever we decide, so
         // their bytes come off the top rather than pretending they are
-        // available to spend.
+        // available to spend. An unmeasurable join is exactly that kind of
+        // join — the per-join gate always keeps it — so its assumed share is
+        // charged here too.
         let unavoidable = facts
             .iter()
             .filter(|f| !f.is_candidate())
             .map(|f| f.retained_bytes())
-            .fold(0u64, u64::saturating_add);
+            .fold(0u64, u64::saturating_add)
+            .saturating_add(unknown_pressure);
         let mut budget = threshold.saturating_sub(unavoidable);
 
         let mut candidates: Vec<(usize, u64)> = facts
@@ -1332,6 +1388,74 @@ mod budget_tests {
         let largest = *sizes_of(&facts).iter().max().expect("fixture has a join");
         let decisions = SpillableJoinSelection::conversion_decisions(&facts, largest - 1);
         assert_eq!(decisions, vec![true], "an over-budget join must convert");
+    }
+
+    /// **q21 at SF100.** Joins whose build side cannot be estimated used to sum
+    /// to zero, so the aggregate check concluded there was no pressure and
+    /// converted nothing — then the pool was exhausted at run time by the very
+    /// joins it had valued at nothing.
+    ///
+    /// The measured failure: a join asking for its FIRST 310.2 MB found 87.9 MB
+    /// left of a 2.6 GB pool, its siblings already holding the rest.
+    #[test]
+    fn unmeasurable_joins_still_create_aggregate_pressure() {
+        // Four joins whose size the planner cannot estimate at all.
+        let facts = vec![
+            JoinFacts { bytes: None, convertible: true },
+            JoinFacts { bytes: None, convertible: true },
+            JoinFacts { bytes: None, convertible: true },
+            JoinFacts { bytes: Some(900), convertible: true },
+        ];
+        let threshold = 1000;
+        // Before the fix `total` was 900, which fits 1000, so this returned all
+        // false and the query died. The unknowns are now charged a share each.
+        let decisions = SpillableJoinSelection::conversion_decisions(&facts, threshold);
+        assert!(
+            decisions.iter().any(|convert| *convert),
+            "unmeasurable joins must count as pressure, or the budget is blind \
+             to exactly the joins it exists to bound: {decisions:?}"
+        );
+    }
+
+    /// The other half of the tension, and the one that must not regress:
+    /// **a plan whose joins are all measurable is completely untouched.**
+    ///
+    /// Guessing "big" for every join is the session-wide `prefer_hash_join =
+    /// false` switch that took q2 from 189 s past a 2400 s timeout. The new
+    /// pressure term returns zero when nothing is unmeasurable, so such a plan
+    /// still short-circuits to the per-join gate exactly as before.
+    #[test]
+    fn measurable_plans_are_unaffected_by_the_unknown_pressure_term() {
+        let facts = vec![
+            JoinFacts { bytes: Some(50), convertible: true },
+            JoinFacts { bytes: Some(60), convertible: true },
+        ];
+        assert_eq!(
+            super::unknown_build_pressure(&facts, 1000),
+            0,
+            "no unknowns means no assumed pressure"
+        );
+        let decisions = SpillableJoinSelection::conversion_decisions(&facts, 1000);
+        assert!(
+            decisions.iter().all(|convert| !convert),
+            "a fully measurable plan under budget must convert nothing: {decisions:?}"
+        );
+    }
+
+    /// The assumed share is per join, not per plan: one unknown among many
+    /// small joins is not enough to force conversion on its own.
+    #[test]
+    fn a_single_unknown_among_many_does_not_force_conversion() {
+        let mut facts: Vec<JoinFacts> = (0..9)
+            .map(|_| JoinFacts { bytes: Some(1), convertible: true })
+            .collect();
+        facts.push(JoinFacts { bytes: None, convertible: true });
+        // 10 joins, threshold 1000 -> one unknown is charged 100; 9 + 100 fits.
+        let decisions = SpillableJoinSelection::conversion_decisions(&facts, 1000);
+        assert!(
+            decisions.iter().all(|convert| !convert),
+            "one unknown among ten small joins is not aggregate pressure: {decisions:?}"
+        );
     }
 
     /// A plan with no hash joins must decide nothing, and must not panic on the
