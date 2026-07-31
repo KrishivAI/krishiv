@@ -820,8 +820,8 @@ pub static FLAGS: &[FlagSpec] = &[
     rt(
         "KRISHIV_SHUFFLE_FETCH_BUFFER",
         FlagKind::UInt,
-        "2",
-        "How many upstream map fragments a reduce partition opens concurrently. Raising this is NOT free: the shuffle server holds a do_get permit for the lifetime of each response, and a value of 4 wedged a 3-node cluster at 0% CPU.",
+        "1",
+        "How many upstream map fragments a reduce partition opens concurrently. Raising this is NOT free: the shuffle server holds a do_get permit for the lifetime of each response. Measured on a 3-node SF100 cluster: 4 wedged it at 0% CPU, and 2 wedged TPC-H q10 for 40+ minutes moving ~2.5 KB of network in 45 s (1 moved 1.77 GB in the same window). Stays at 1 until the server stops holding a permit across the response.",
     ),
     rt(
         "KRISHIV_SHUFFLE_FETCH_TRANSPORT_GRACE_SECS",

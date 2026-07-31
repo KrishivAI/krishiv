@@ -1377,7 +1377,35 @@ pub const SHUFFLE_FETCH_BUFFER_ENV: &str = "KRISHIV_SHUFFLE_FETCH_BUFFER";
 /// Raising this further is a measurement, not a judgement call: it needs a live
 /// SF100 run that both completes and shows the win, because the failure mode is
 /// a silent cluster-wide hang with no error logged.
-const DEFAULT_SHUFFLE_FETCH_BUFFER: usize = 2;
+///
+/// # That measurement was taken, and `2` FAILED — back to 1
+///
+/// TPC-H q10 at SF100 on 2026-07-31, stage `dist-s2`: nine tasks reported
+/// `Running` for **40+ minutes** while the cluster did nothing at all.
+///
+/// ```text
+///                     network moved in 45 s (3 executors, eth0 rx)
+///   prefetch = 2      ~2.5 KB          <- heartbeats only
+///   prefetch = 1      1.77 GB          <- 39 MB/s aggregate
+/// ```
+///
+/// Executors sat at 10-20% CPU, `shuffle_bytes_written` did not advance across
+/// a 60 s window, no task completed, and **nothing was logged**. That is
+/// precisely the hang described above, and the quantitative safety margin
+/// argued for `P = 2` did not hold: it assumed a small `reads_per_task`, but
+/// the bound is `executors x slots x reads_per_task x (P - 1)`, and q10's
+/// reduce stage reads 18 map fragments per task, so the pinned-response count
+/// is an order of magnitude past the estimate.
+///
+/// The same change is the likeliest cause of q3 regressing from 505 s to over
+/// 3300 s on the preceding image.
+///
+/// So: **1 until the server stops holding a permit for the response's
+/// lifetime.** Byte-based admission was a necessary step, not a sufficient one
+/// — the permit is still held across the whole stream, so an
+/// admitted-but-undrained response still pins server capacity. Making the
+/// prefetch safe needs the *hold* removed, not the accounting improved.
+const DEFAULT_SHUFFLE_FETCH_BUFFER: usize = 1;
 
 /// Resolve [`DEFAULT_SHUFFLE_FETCH_BUFFER`], honouring the env override.
 ///
