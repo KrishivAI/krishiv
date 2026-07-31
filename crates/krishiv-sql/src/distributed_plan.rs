@@ -1368,11 +1368,30 @@ pub const SHUFFLE_FETCH_BUFFER_ENV: &str = "KRISHIV_SHUFFLE_FETCH_BUFFER";
 ///
 /// FIFO admission does *not* by itself rule this out, because a stream's head
 /// and its siblings can be queued on **different** executors' semaphores, so the
-/// head has no ordering guarantee relative to them. The safety margin is
-/// therefore quantitative, not structural: at `P = 2` each stream pins at most
-/// one response (3 x 3 x 2 = 18 cluster-wide, ~72 granules of a 256-granule
-/// budget at typical fragment sizes), which leaves the budget able to admit
-/// heads by a wide margin.
+/// head has no ordering guarantee relative to them.
+///
+/// That paragraph used to continue: "the safety margin is therefore
+/// quantitative, not structural … 3 x 3 x 2 = 18 cluster-wide, ~72 granules of
+/// a 256-granule budget". **Both halves of that were wrong, and were measured
+/// wrong on 2026-07-31.**
+///
+///  * The count omitted `reads_per_task`. q10's reduce stage reads 18 map
+///    fragments, so the real figure is 3 x 3 x **18** x (P-1), an order of
+///    magnitude larger.
+///  * The margin is **not** quantitative. Re-run with
+///    `KRISHIV_SHUFFLE_SERVE_CONCURRENCY=24` — a 768 MiB budget, 3x the
+///    default — and `P = 2` **still deadlocked**: q10's `dist-s2` stalled at
+///    15/18 tasks having moved 0.00 MB of network in 40 s. A cycle can form at
+///    any budget, because the head has no ordering guarantee relative to the
+///    siblings holding the capacity it needs.
+///
+/// It was also *slower* before it stalled: `dist-s2` median 497 s at P = 2
+/// versus 433 s at P = 1.
+///
+/// So there is no number to tune here. Prefetch above 1 requires the server to
+/// stop holding a permit for the response stream's lifetime — which means not
+/// buffering the whole fragment (`INLINE_READ_LIMIT`), not pricing the buffer
+/// more cleverly.
 ///
 /// Raising this further is a measurement, not a judgement call: it needs a live
 /// SF100 run that both completes and shows the win, because the failure mode is
