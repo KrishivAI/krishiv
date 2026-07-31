@@ -3330,18 +3330,42 @@ fn remap_shuffle_reads(
 ///
 /// This is Spark's `ReuseExchange`, and it fits our model exactly: the cutter
 /// already materializes every stage boundary, so two stages that compute the
-/// same thing are two writes of the same bytes. Measured on the real SF100
-/// plans (2026-07-30):
+/// same thing are two writes of the same bytes.
 ///
-/// | query | duplicated |
-/// |---|---|
-/// | q18 | `lineitem[l_orderkey, l_quantity]`, twice, **unfiltered** — 600M rows |
-/// | q21 | `lineitem[l_orderkey, l_suppkey, l_commitdate, l_receiptdate]` twice |
-/// | q2  | `partsupp[ps_partkey, ps_suppkey, ps_supplycost]` twice |
+/// # What it does NOT reach, measured
 ///
-/// Each of those is a full scan of the largest table in the benchmark, done
-/// twice, on a cluster whose measured floor is the network
-/// (`bench-storage-longhorn-bottleneck`).
+/// The three cases originally listed here (q18/q21 `lineitem`, q2 `partsupp`)
+/// were identified as duplicated **scans**, and this rule was written as if
+/// that made them duplicated **stages**. It does not. On the SF100 sweep of
+/// `fast-6f586954` the rule fired **twice across all 22 queries**, one stage
+/// each.
+///
+/// `tests/stage_reuse_duplicate_scan.rs` reproduces q18's shape over real
+/// parquet and shows why:
+///
+/// ```text
+/// stage A:  AggregateExec(Partial, gby=l_orderkey, sum(l_quantity))
+///             DataSourceExec lineitem[l_orderkey, l_quantity]  DynamicFilter [ empty ]
+/// stage B:  DataSourceExec lineitem[l_orderkey, l_quantity]    DynamicFilter [ empty ]
+/// ```
+///
+/// Identical scan, identical projection, identical predicate — and a partial
+/// aggregate fused onto one of them. They are not the same stage and never
+/// will be. (The `DynamicFilter` is *identical* on both sides and is not the
+/// blocker, which is what an earlier note here guessed.)
+///
+/// # And sharing the scan is probably the wrong trade here anyway
+///
+/// Both consumers want `lineitem` partitioned by `l_orderkey`, so one shuffle
+/// could serve both — but only by lifting the partial aggregate above the
+/// exchange, which puts ~600M raw rows on the wire in place of the partially
+/// aggregated ~150M. This cluster's floor is the network (pod-to-pod ~11 MiB/s
+/// VXLAN vs 150-286 MB/s node-local MinIO — `bench-storage-longhorn-bottleneck`,
+/// `bench-storage-locality-fix`), so converting a cheap local re-read into an
+/// expensive shuffle read is a loss, not a win.
+///
+/// The lever for q18 is not scanning `lineitem` once; it is not shipping 600M
+/// rows at all (`cross-stage-runtime-filter-design`).
 ///
 /// **Restricted to leaf stages** (no `ShuffleReadExec` inside, no severed
 /// scalar-subquery context). Two reasons, both load-bearing: a leaf stage
