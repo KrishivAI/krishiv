@@ -105,6 +105,7 @@ pub mod introspection_sql;
 
 pub mod kafka_table;
 pub mod lakehouse;
+pub mod late_materialize;
 pub mod live_table;
 /// One reading of a join build side's size estimate, shared by the broadcast
 /// override and the spillable-join choice so the two cannot disagree.
@@ -769,6 +770,20 @@ pub fn with_krishiv_optimizer_rules_with_join_threshold(
         // `SEMI_JOIN_PUSHDOWN_ENV`.
         .with_optimizer_rule(std::sync::Arc::new(
             crate::semi_join_reduction::SemiJoinPushdownThroughInnerJoin::default(),
+        ))
+        // q10: a `GROUP BY` that lists a key *and the columns that key
+        // determines* drags those columns through every join and shuffle to
+        // display twenty of them. Group on the key, take the top N, then
+        // re-fetch. Measured at 14.8x on q10 at SF100 — and measured *not* to
+        // be obtainable any cheaper; see `late_materialize` for the two local
+        // rewrites that were tried first and lost.
+        //
+        // Registered last on purpose: it rewrites what the projection and
+        // limit rules have already settled, and DataFusion's optimizer loops
+        // (`max_passes`), so `optimize_projections` runs again afterwards and
+        // is what actually prunes the deferred columns out of the scans.
+        .with_optimizer_rule(std::sync::Arc::new(
+            crate::late_materialize::LateMaterializeTopKAggregate::default(),
         ))
 }
 

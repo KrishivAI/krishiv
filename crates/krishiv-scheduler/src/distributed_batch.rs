@@ -13,9 +13,11 @@
 
 use krishiv_proto::{ShuffleWriteConfig, StageId, StageKind, StageSpec, TaskId, TaskSpec};
 use krishiv_sql::distributed_plan::{
-    ClusterCapacity, DistributedStagePlan, build_stages_for_parquet_query, shuffle_stage_key,
-    stage_split_enabled,
+    ClusterCapacity, DistributedStagePlan, ParquetTableSpec, build_stages_for_parquet_tables,
+    shuffle_stage_key, stage_split_enabled,
 };
+
+use crate::batch_sql::BatchSqlTable;
 
 /// Try to plan `query` over local parquet `tables` as shuffle-connected
 /// partition-parallel stages.
@@ -28,7 +30,7 @@ use krishiv_sql::distributed_plan::{
 /// stage last, ready for `JobSpec::with_stage`.
 pub async fn plan_staged_batch_stages(
     query: &str,
-    tables: &[(String, std::path::PathBuf)],
+    tables: &[BatchSqlTable],
     cluster: Option<ClusterCapacity>,
 ) -> Option<Vec<StageSpec>> {
     match plan_staged_batch_stages_verbose(query, tables, cluster).await {
@@ -57,7 +59,7 @@ pub async fn plan_staged_batch_stages(
 /// assert on it, and the caller decides how loudly to report it.
 pub async fn plan_staged_batch_stages_verbose(
     query: &str,
-    tables: &[(String, std::path::PathBuf)],
+    tables: &[BatchSqlTable],
     cluster: Option<ClusterCapacity>,
 ) -> Result<Vec<StageSpec>, String> {
     if !stage_split_enabled() {
@@ -88,14 +90,25 @@ pub async fn plan_staged_batch_stages_verbose(
         ));
     }
 
-    let mut table_paths: Vec<(String, String)> = Vec::with_capacity(tables.len());
-    for (name, path) in tables {
-        let Some(text) = path.to_str() else {
-            return Err(format!("table '{name}' has a non-UTF-8 path"));
+    // The declared primary key travels with the table, not beside it. Parquet
+    // carries no key, so this submission is the optimizer's only chance to
+    // learn one — and a key that reaches the planner is what makes
+    // `krishiv_sql::late_materialize` and the FD-based group-by pruning fire at
+    // all. Undeclared stays the default: nothing is inferred from column names.
+    let mut specs: Vec<ParquetTableSpec> = Vec::with_capacity(tables.len());
+    for table in tables {
+        let Some(text) = table.path.to_str() else {
+            return Err(format!(
+                "table '{}' has a non-UTF-8 path",
+                table.table_name
+            ));
         };
-        table_paths.push((name.clone(), text.to_owned()));
+        specs.push(
+            ParquetTableSpec::new(&table.table_name, text)
+                .with_primary_key(table.primary_key.iter().cloned()),
+        );
     }
-    let staged = match build_stages_for_parquet_query(query, &table_paths, cluster).await {
+    let staged = match build_stages_for_parquet_tables(query, &specs, cluster).await {
         Ok(Some(staged)) => staged,
         Ok(None) => return Err(String::from("planner produced no distributable stages")),
         Err(error) => return Err(error.to_string()),

@@ -168,3 +168,63 @@ pub fn row_producing_queries() -> &'static [&'static str] {
         "q1", "q3", "q4", "q5", "q6", "q7", "q10", "q11", "q12", "q13", "q14", "q16", "q19", "q22",
     ]
 }
+
+/// Re-register every fixture table carrying the primary key TPC-H declares for
+/// it, so key-dependent optimizations can be exercised offline.
+///
+/// # Why this is not part of [`fixture_ddl`]
+///
+/// `CREATE TABLE … AS VALUES` has nowhere to put a constraint, and the tables
+/// have to exist before their contents can be read back. So this is a second
+/// pass: read each table's batches, rebuild it as a `MemTable` carrying
+/// `Constraint::PrimaryKey`, and swap it in. The data is a few dozen rows, so
+/// the round trip costs nothing.
+///
+/// Without this, every functional-dependency optimization —
+/// `optimize_projections`' group-by pruning and
+/// `krishiv_sql::late_materialize`'s join-back — is **inert against the
+/// fixture**, and a test suite that never declares a key cannot tell a rewrite
+/// that is correct from one that never ran.
+///
+/// # Errors
+///
+/// Returns the first failure as a string: a missing table, a key column that is
+/// not in the schema, or a registration that the context rejects.
+pub async fn declare_fixture_primary_keys(
+    ctx: &datafusion::prelude::SessionContext,
+) -> Result<(), String> {
+    use datafusion::common::{Constraint, Constraints};
+    use datafusion::datasource::MemTable;
+    use std::sync::Arc;
+
+    for (table, key) in crate::tpch_queries::TPCH_PRIMARY_KEYS {
+        let df = ctx
+            .table(*table)
+            .await
+            .map_err(|e| format!("fixture table '{table}': {e}"))?;
+        let schema: datafusion::arrow::datatypes::SchemaRef =
+            Arc::new(df.schema().as_arrow().clone());
+        let mut indices = Vec::with_capacity(key.len());
+        for column in *key {
+            indices.push(
+                schema
+                    .index_of(column)
+                    .map_err(|_| format!("'{column}' is not a column of fixture '{table}'"))?,
+            );
+        }
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| format!("reading fixture '{table}': {e}"))?;
+        let provider = MemTable::try_new(Arc::clone(&schema), vec![batches])
+            .map_err(|e| format!("rebuilding fixture '{table}': {e}"))?
+            .with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                indices,
+            )]));
+        ctx.deregister_table(*table)
+            .map_err(|e| format!("deregistering fixture '{table}': {e}"))?;
+        ctx.register_table(*table, Arc::new(provider))
+            .map_err(|e| format!("re-registering fixture '{table}': {e}"))?;
+    }
+    Ok(())
+}

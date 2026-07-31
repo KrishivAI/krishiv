@@ -41,10 +41,26 @@ fn first_task_failure_reason(detail: &JobDetailSnapshot) -> Option<String> {
 ///
 /// For multi-node / distributed deployments use `BatchSqlInlineTable` instead,
 /// which delivers Arrow IPC bytes in-band so executors need no shared filesystem.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BatchSqlTable {
     pub table_name: String,
     pub path: PathBuf,
+    /// Columns that jointly form this table's primary key, if the submitter
+    /// declares one.
+    ///
+    /// **Informational and unverified**, exactly like Spark/Databricks `RELY`:
+    /// nothing reads the data to check it. Parquet carries no key, so a
+    /// declaration is the only way the optimizer can learn that one column
+    /// determines the others — which is what unlocks group-by pruning and the
+    /// late-materialisation rewrite (`krishiv_sql::late_materialize`, measured
+    /// at 14.8x on TPC-H q10 at SF100).
+    ///
+    /// Declaring a key that is not unique, or not non-null, produces **wrong
+    /// answers**, not slow ones. That is the same contract every engine with
+    /// informational constraints offers, and it is why this is opt-in per
+    /// submission rather than inferred.
+    #[serde(default)]
+    pub primary_key: Vec<String>,
 }
 
 /// Inline Arrow IPC table for distributed batch SQL.
@@ -439,10 +455,6 @@ async fn submit_batch_sql_job_inner(
     let staged_stages =
         if !is_streaming && sink_contract.is_none() && tables.is_empty() && !path_tables.is_empty()
         {
-            let table_refs: Vec<(String, std::path::PathBuf)> = path_tables
-                .iter()
-                .map(|t| (t.table_name.clone(), t.path.clone()))
-                .collect();
             // Plan against the capacity that will actually run the query. The
             // target partition count used to be a constant regardless of the
             // cluster, which left large clusters mostly idle and queued work on
@@ -455,7 +467,7 @@ async fn submit_batch_sql_job_inner(
                     krishiv_sql::distributed_plan::ClusterCapacity { total_slots },
                 )
             };
-            crate::distributed_batch::plan_staged_batch_stages(query, &table_refs, cluster).await
+            crate::distributed_batch::plan_staged_batch_stages(query, path_tables, cluster).await
         } else {
             None
         };
@@ -687,6 +699,7 @@ mod tests {
         let path_tables = vec![BatchSqlTable {
             table_name: "t".into(),
             path: table_dir,
+            ..Default::default()
         }];
 
         let job_id = submit_batch_sql_job_with_paths(
@@ -749,6 +762,7 @@ mod tests {
         let path_tables = vec![BatchSqlTable {
             table_name: "t".into(),
             path: table_dir,
+            ..Default::default()
         }];
         let job_id = submit_batch_sql_job_with_paths(
             &coordinator,
@@ -813,6 +827,7 @@ mod tests {
         let path_tables = vec![BatchSqlTable {
             table_name: "t".into(),
             path: table_dir,
+            ..Default::default()
         }];
 
         let job_id = submit_batch_sql_job_with_paths(
@@ -864,6 +879,7 @@ mod tests {
         let path_tables = vec![BatchSqlTable {
             table_name: "t".into(),
             path: table_dir,
+            ..Default::default()
         }];
         let job_id = submit_batch_sql_job_with_paths(
             &coordinator,
@@ -963,6 +979,7 @@ mod tests {
         let path_tables = vec![BatchSqlTable {
             table_name: "t".into(),
             path: table_dir,
+            ..Default::default()
         }];
         let job_id = submit_batch_sql_job_with_paths(
             &coordinator,

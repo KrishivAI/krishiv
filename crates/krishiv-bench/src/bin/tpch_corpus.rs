@@ -22,7 +22,7 @@
 //!
 //! Usage: cargo run -p krishiv-bench --bin tpch_corpus --release -- [--scale-factor 100]
 
-use krishiv_bench::tpch_queries::TPCH_QUERIES;
+use krishiv_bench::tpch_queries::{TPCH_PRIMARY_KEYS, TPCH_QUERIES};
 
 fn main() {
     // Default 1, the scale the spec's literal is written for: an unflagged
@@ -61,9 +61,18 @@ fn main() {
             })
         })
         .collect();
+    // The schema's primary keys travel with the queries for the same reason the
+    // SQL does: a runner that re-typed them would be running against a
+    // different schema than the one this corpus describes, and the difference
+    // would show up as a performance result rather than as an error.
+    let primary_keys: serde_json::Map<String, serde_json::Value> = TPCH_PRIMARY_KEYS
+        .iter()
+        .map(|(table, key)| ((*table).to_owned(), serde_json::json!(key)))
+        .collect();
     let out = serde_json::json!({
         "count": queries.len(),
         "scale_factor": scale_factor,
+        "primary_keys": primary_keys,
         "queries": queries,
     });
     // Serialisation of a `json!` tree cannot fail, but a panic here would

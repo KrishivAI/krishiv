@@ -63,6 +63,14 @@ pub struct BatchSqlTable {
     /// (shared-filesystem) resolution. Populated by the distributed remote path.
     #[serde(default)]
     pub ipc_b64: String,
+    /// Columns that jointly form this table's primary key, if declared.
+    ///
+    /// Informational and unverified — see
+    /// [`krishiv_scheduler::BatchSqlTable::primary_key`], which this forwards
+    /// to. Carried here so a declaration made by a Flight client survives to
+    /// the coordinator that plans the query.
+    #[serde(default)]
+    pub primary_key: Vec<String>,
 }
 
 struct RegistryDrainer(Arc<ContinuousStreamRegistry>);
@@ -593,9 +601,17 @@ impl InProcessStreamingRuntime {
         let staged_stages =
             if kind == JobKind::Batch && sink_contract.is_none() && stream_partitions.is_empty() {
                 fragment.strip_prefix("sql: ").and_then(|query| {
-                    let table_refs: Vec<(String, std::path::PathBuf)> = tables
+                    // The declared key rides along: without it the embedded
+                    // runtime plans a different query from the distributed one,
+                    // which is exactly how a rewrite ends up "working in tests
+                    // and not on the cluster" (or the reverse).
+                    let table_refs: Vec<krishiv_scheduler::BatchSqlTable> = tables
                         .iter()
-                        .map(|t| (t.table_name.clone(), t.path.clone()))
+                        .map(|t| krishiv_scheduler::BatchSqlTable {
+                            table_name: t.table_name.clone(),
+                            path: t.path.clone(),
+                            primary_key: t.primary_key.clone(),
+                        })
                         .collect();
                     // The embedded runtime's "cluster" is this process, so it
                     // plans against the same capacity derivation a standalone
@@ -1150,7 +1166,7 @@ mod tests {
         let tables = vec![BatchSqlTable {
             table_name: "nonexistent".into(),
             path: PathBuf::from("/no/such/file.parquet"),
-            ipc_b64: String::new(),
+            ..Default::default()
         }];
         // This may fail because file doesn't exist but the routing path is tested
         let result = runtime.execute_batch_sql("SELECT 1", &tables, false);
@@ -1268,7 +1284,7 @@ mod tests {
         let tables = vec![BatchSqlTable {
             table_name: "t".into(),
             path: table_dir,
-            ipc_b64: String::new(),
+            ..Default::default()
         }];
         let query = "SELECT category, COUNT(*) AS n, SUM(amount) AS total \
                      FROM t GROUP BY category";
@@ -1329,7 +1345,7 @@ mod tests {
         let tables = vec![BatchSqlTable {
             table_name: "t".into(),
             path: table_dir,
-            ipc_b64: String::new(),
+            ..Default::default()
         }];
 
         let directive = format!("/* krishiv-register-python-udf:addk:int64:int64:{pickle_b64} */");
@@ -1377,7 +1393,7 @@ mod tests {
         let tables = vec![BatchSqlTable {
             table_name: "t".into(),
             path: table_dir,
-            ipc_b64: String::new(),
+            ..Default::default()
         }];
 
         let directive = format!("/* krishiv-register-python-udaf:isum:int64:int64:{pickle_b64} */");
@@ -1417,7 +1433,7 @@ mod tests {
         let tables = vec![BatchSqlTable {
             table_name: "lineitem".into(),
             path: lineitem,
-            ipc_b64: String::new(),
+            ..Default::default()
         }];
         // TPC-H Q1 (pricing summary report), the classic aggregation gate.
         let query = "SELECT l_returnflag, l_linestatus, \
@@ -1463,7 +1479,7 @@ mod tests {
         let tables = vec![BatchSqlTable {
             table_name: "t".into(),
             path: table_dir,
-            ipc_b64: String::new(),
+            ..Default::default()
         }];
         // A query shape the stage builder declines (no exchange after
         // optimization): scan+filter only. Must run via the fallback.

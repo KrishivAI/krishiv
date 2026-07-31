@@ -382,9 +382,90 @@ pub fn all_tables() -> Vec<&'static str> {
     tables
 }
 
+/// The primary key of each TPC-H table, exactly as the spec declares it
+/// (§1.4, the "Primary Key" column of each table definition).
+///
+/// # Why the benchmark declares these
+///
+/// Parquet files carry no key, so an engine reading `customer/*.parquet` cannot
+/// know that `c_custkey` determines `c_name`. Two optimizations depend on
+/// knowing it — functional-dependency group-by pruning and the
+/// late-materialisation rewrite — and on TPC-H q10 at SF100 that difference was
+/// measured at **14.8x**.
+///
+/// **This is not benchmark tuning.** The keys below are part of the TPC-H
+/// schema definition, the same thing a `CREATE TABLE` would carry on any
+/// database the benchmark has ever been run against; declaring them is
+/// restoring information the parquet conversion threw away, not supplying a
+/// hint the query happens to like. Every engine in the comparison is free to
+/// read the same declaration, and Spark's own `RELY` constraints exist for
+/// precisely this. What *would* be tuning is declaring a key that is not in the
+/// spec, or declaring it for only the queries that benefit.
+///
+/// The engine treats a declaration as informational and unverified: nothing
+/// scans the data to confirm it. A wrong declaration produces wrong answers.
+pub static TPCH_PRIMARY_KEYS: &[(&str, &[&str])] = &[
+    ("region", &["r_regionkey"]),
+    ("nation", &["n_nationkey"]),
+    ("part", &["p_partkey"]),
+    ("supplier", &["s_suppkey"]),
+    ("partsupp", &["ps_partkey", "ps_suppkey"]),
+    ("customer", &["c_custkey"]),
+    ("orders", &["o_orderkey"]),
+    ("lineitem", &["l_orderkey", "l_linenumber"]),
+];
+
+/// The declared primary key of `table`, or an empty slice if it has none.
+#[must_use]
+pub fn primary_key_of(table: &str) -> &'static [&'static str] {
+    TPCH_PRIMARY_KEYS
+        .iter()
+        .find(|(name, _)| *name == table)
+        .map_or(&[], |(_, key)| *key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A table the corpus reads but the key map does not name would silently
+    /// lose every FD-based optimization for that table, with no error anywhere.
+    #[test]
+    fn every_corpus_table_declares_its_primary_key() {
+        for table in all_tables() {
+            assert!(
+                !primary_key_of(table).is_empty(),
+                "{table} is read by the corpus but declares no primary key"
+            );
+        }
+    }
+
+    /// Every key column must start with the table's own column prefix. TPC-H's
+    /// prefixes are per-table, so this catches a key copied from the row above
+    /// — the most likely way this table goes wrong, and one that produces
+    /// *wrong answers* rather than an error, since declarations are unverified.
+    #[test]
+    fn declared_key_columns_belong_to_their_table() {
+        let prefix = |table: &str| match table {
+            "region" => "r_",
+            "nation" => "n_",
+            "part" => "p_",
+            "supplier" => "s_",
+            "partsupp" => "ps_",
+            "customer" => "c_",
+            "orders" => "o_",
+            "lineitem" => "l_",
+            other => panic!("unknown TPC-H table {other}"),
+        };
+        for (table, key) in TPCH_PRIMARY_KEYS {
+            for column in *key {
+                assert!(
+                    column.starts_with(prefix(table)),
+                    "{table}'s key names {column}, which is not a {table} column"
+                );
+            }
+        }
+    }
 
     #[test]
     fn corpus_is_the_full_22_with_unique_ids() {

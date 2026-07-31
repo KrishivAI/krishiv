@@ -818,6 +818,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "Push a semi-join through an inner join. Gated by KRISHIV_SEMI_JOIN_REDUCTION as well, so turning that off disables both.",
     ),
     rt(
+        "KRISHIV_LATE_MATERIALIZATION",
+        FlagKind::Bool,
+        "on",
+        "Late materialisation of a bounded top-N aggregate: group on the declared key alone, take the top N, then re-join the base tables to fetch the columns the key determines, so those columns never enter the joins or the shuffle. Requires a declared PRIMARY KEY (see ParquetTableSpec::with_primary_key) and an ORDER BY ... LIMIT of at most 10000. On TPC-H q10 at SF100 the seven grouping columns are 14.8x of the query. Read wherever a query is planned.",
+    ),
+    rt(
         "KRISHIV_SHUFFLE_FETCH_BUFFER",
         FlagKind::UInt,
         "1",

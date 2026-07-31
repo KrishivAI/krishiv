@@ -80,6 +80,10 @@ fn split_batch_sql_wire_tables(
             path_tables.push(krishiv_scheduler::BatchSqlTable {
                 table_name: t.table_name.clone(),
                 path: t.path.clone(),
+                // The declaration has to survive the hop, or a Flight client's
+                // declared key is dropped at exactly the seam where the
+                // coordinator builds the plan that would have used it.
+                primary_key: t.primary_key.clone(),
             });
         } else {
             inline_tables.push(krishiv_scheduler::BatchSqlInlineTable {
@@ -1743,11 +1747,12 @@ mod batch_sql_wire_tests {
                 table_name: "small".into(),
                 path: std::path::PathBuf::from("/data/small.parquet"),
                 ipc_b64: "QVJ...".into(),
+                ..Default::default()
             },
             WireTable {
                 table_name: "big".into(),
                 path: std::path::PathBuf::from("/shared/big.parquet"),
-                ipc_b64: String::new(),
+                ..Default::default()
             },
         ];
         let (inline, path) = split_batch_sql_wire_tables(&tables);
@@ -1769,7 +1774,7 @@ mod batch_sql_wire_tests {
         let tables = vec![WireTable {
             table_name: "orphan".into(),
             path: std::path::PathBuf::new(),
-            ipc_b64: String::new(),
+            ..Default::default()
         }];
         let (inline, path) = split_batch_sql_wire_tables(&tables);
         assert_eq!(inline.len(), 1);

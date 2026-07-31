@@ -62,6 +62,14 @@ pub enum ExecutionPlacement {
 pub struct BatchTableRegistration {
     pub table_name: String,
     pub path: PathBuf,
+    /// Columns that jointly form this table's primary key, if declared.
+    ///
+    /// Informational and unverified — see
+    /// [`krishiv_scheduler::BatchSqlTable::primary_key`]. Declared here so the
+    /// embedded runtime plans the same query the distributed one does: a
+    /// rewrite that fires on only one of the two paths is the hardest kind of
+    /// difference to notice.
+    pub primary_key: Vec<String>,
 }
 
 impl BatchTableRegistration {
@@ -69,7 +77,19 @@ impl BatchTableRegistration {
         Self {
             table_name: table_name.into(),
             path,
+            primary_key: Vec::new(),
         }
+    }
+
+    /// Declare a (possibly composite) primary key for this table.
+    #[must_use]
+    pub fn with_primary_key<I, S>(mut self, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.primary_key = columns.into_iter().map(Into::into).collect();
+        self
     }
 }
 
@@ -289,6 +309,7 @@ fn tables_to_batch_sql(tables: &[BatchTableRegistration]) -> Vec<BatchSqlTable> 
             table_name: t.table_name.clone(),
             path: t.path.clone(),
             ipc_b64: String::new(),
+            primary_key: t.primary_key.clone(),
         })
         .collect()
 }
@@ -320,6 +341,7 @@ fn tables_to_batch_sql_inline(tables: &[BatchTableRegistration]) -> Vec<BatchSql
                 table_name: t.table_name.clone(),
                 path: t.path.clone(),
                 ipc_b64,
+                primary_key: t.primary_key.clone(),
             }
         })
         .collect()

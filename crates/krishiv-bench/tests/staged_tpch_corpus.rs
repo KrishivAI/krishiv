@@ -33,7 +33,7 @@
 )]
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
-use krishiv_bench::tpch_fixture::{fixture_ddl, row_producing_queries};
+use krishiv_bench::tpch_fixture::{declare_fixture_primary_keys, fixture_ddl, row_producing_queries};
 use krishiv_bench::tpch_queries::TPCH_QUERIES;
 use krishiv_sql::distributed_plan::{
     ShuffleFragmentStream, ShufflePartitionReader, build_distributed_stages, execute_dfplan_body,
@@ -205,6 +205,20 @@ fn cells(batches: &[RecordBatch]) -> Vec<String> {
 }
 
 async fn context(join_threshold: Option<u64>, broadcast_bytes: Option<usize>) -> SessionContext {
+    context_with_keys(join_threshold, broadcast_bytes, false).await
+}
+
+/// As [`context`], optionally declaring TPC-H's primary keys on the fixture.
+///
+/// The declaration is what turns on every functional-dependency optimization —
+/// group-by pruning and the late-materialisation join-back. Without it the
+/// fixture exercises neither, so a matrix run against an undeclared fixture
+/// cannot distinguish "the rewrite is correct" from "the rewrite never ran".
+async fn context_with_keys(
+    join_threshold: Option<u64>,
+    broadcast_bytes: Option<usize>,
+    declare_keys: bool,
+) -> SessionContext {
     let ctx = planning_session_context_with_options(4, join_threshold, broadcast_bytes);
     for ddl in fixture_ddl() {
         ctx.sql(ddl)
@@ -213,6 +227,11 @@ async fn context(join_threshold: Option<u64>, broadcast_bytes: Option<usize>) ->
             .collect()
             .await
             .unwrap_or_else(|e| panic!("fixture DDL execution failed: {e}\n{ddl}"));
+    }
+    if declare_keys {
+        declare_fixture_primary_keys(&ctx)
+            .await
+            .unwrap_or_else(|e| panic!("declaring fixture primary keys: {e}"));
     }
     ctx
 }
@@ -232,8 +251,16 @@ async fn every_tpch_query_stages_to_the_same_answer_in_every_configuration() {
     let mut failures: Vec<String> = Vec::new();
     let mut checked = 0usize;
 
-    for (label, threshold, broadcast) in MATRIX {
-        let ctx = context(*threshold, *broadcast).await;
+    for ((label, threshold, broadcast), keys) in MATRIX
+        .iter()
+        .flat_map(|cell| [(cell, false), (cell, true)])
+    {
+        let label = if keys {
+            format!("{label} + declared keys")
+        } else {
+            (*label).to_owned()
+        };
+        let ctx = context_with_keys(*threshold, *broadcast, keys).await;
         for query in TPCH_QUERIES {
             let expected = match ctx.sql(&query.sql_at_scale(1.0)).await {
                 Ok(df) => match df.collect().await {
@@ -276,8 +303,89 @@ async fn every_tpch_query_stages_to_the_same_answer_in_every_configuration() {
         failures.join("\n")
     );
     assert!(
-        checked >= 40,
+        checked >= 80,
         "only {checked} cases actually staged; the matrix has stopped covering anything"
+    );
+}
+
+/// **Declaring a primary key must not change a single answer.**
+///
+/// This is the one property that decides whether the FD optimizations are worth
+/// having at all. A declared key licenses the optimizer to drop grouping
+/// columns and to re-fetch them from the base table afterwards
+/// (`krishiv_sql::late_materialize`), and every one of those rewrites is a
+/// chance to return a *faster wrong answer* — the only outcome worse than the
+/// slow right one.
+///
+/// Deliberately compared **direct against direct**: the staged matrix above
+/// runs both sides on the same context, so it can only catch a rewrite that
+/// stages badly, never one that is uniformly wrong.
+#[tokio::test(flavor = "multi_thread")]
+async fn declaring_primary_keys_does_not_change_any_answer() {
+    let plain = context_with_keys(None, None, false).await;
+    let keyed = context_with_keys(None, None, true).await;
+    let mut failures = Vec::new();
+    let mut compared = 0usize;
+    for query in TPCH_QUERIES {
+        let sql = query.sql_at_scale(1.0);
+        let run = |ctx: &SessionContext, sql: String| {
+            let ctx = ctx.clone();
+            async move { ctx.sql(&sql).await?.collect().await }
+        };
+        let (before, after) = (
+            run(&plain, sql.clone()).await,
+            run(&keyed, sql.clone()).await,
+        );
+        match (before, after) {
+            (Ok(before), Ok(after)) => {
+                compared += 1;
+                if cells(&before) != cells(&after) {
+                    failures.push(format!(
+                        "{}: declaring keys changed the answer\n  undeclared: {:?}\n                           declared:   {:?}",
+                        query.id,
+                        cells(&before),
+                        cells(&after)
+                    ));
+                }
+            }
+            (Ok(_), Err(e)) => failures.push(format!("{}: fails only with keys: {e}", query.id)),
+            (Err(e), Ok(_)) => failures.push(format!("{}: fails only without keys: {e}", query.id)),
+            (Err(_), Err(_)) => {}
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_eq!(compared, 22, "every query must run in both configurations");
+}
+
+/// The test above is only worth anything if the rewrite actually fires against
+/// the fixture. q10 is the shape it was written for — seven grouping columns,
+/// six of them determined by `c_custkey` — so if the fixture stops triggering
+/// it, `declaring_primary_keys_does_not_change_any_answer` has quietly become
+/// twenty-two comparisons of a plan against itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_late_materialisation_rewrite_fires_on_the_fixture() {
+    let keyed = context_with_keys(None, None, true).await;
+    let q10 = TPCH_QUERIES
+        .iter()
+        .find(|q| q.id == "q10")
+        .expect("q10 is in the corpus");
+    let plan = format!(
+        "{}",
+        keyed
+            .sql(&q10.sql_at_scale(1.0))
+            .await
+            .expect("q10 plans")
+            .into_optimized_plan()
+            .expect("q10 optimizes")
+            .display_indent()
+    );
+    assert!(
+        plan.contains("__krishiv_lm"),
+        "q10 should take the late-materialisation join-back once its key is          declared; it did not:\n{plan}"
+    );
+    assert!(
+        plan.contains("groupBy=[[customer.c_custkey]]"),
+        "q10's group by should narrow to the declared key alone:\n{plan}"
     );
 }
 

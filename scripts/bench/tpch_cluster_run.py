@@ -76,8 +76,15 @@ def _abridge(message: str, head: int = 120, tail: int = 320) -> str:
     return f"{message[:head]} …[{elided} chars elided]… {message[-tail:]}"
 
 
-def load_corpus(corpus_json: str | None, scale: int = 100) -> list[dict]:
-    """Return the 22-query corpus, from a file or by running the Rust binary.
+def load_corpus(corpus_json: str | None, scale: int = 100) -> tuple[list[dict], dict[str, list[str]]]:
+    """Return the 22-query corpus and the schema's primary keys.
+
+    The keys come from the same Rust corpus as the SQL, and for the same
+    reason: they are part of the TPC-H schema definition, and a runner that
+    re-typed them would be benchmarking a different schema than the one the
+    corpus describes. They are forwarded to the coordinator per table, which is
+    the only way an engine reading bare parquet can learn that `c_custkey`
+    determines `c_name`.
 
     `scale` is passed through to `tpch_corpus --scale-factor`: TPC-H Q11's
     threshold is `0.0001 / SF`, so a corpus built at the wrong scale silently
@@ -93,7 +100,8 @@ def load_corpus(corpus_json: str | None, scale: int = 100) -> list[dict]:
     """
     if corpus_json:
         with open(corpus_json, encoding="utf-8") as handle:
-            return json.load(handle)["queries"]
+            corpus = json.load(handle)
+        return corpus["queries"], corpus.get("primary_keys", {})
     print(
         "# building tpch_corpus (cargo, release) — a cold target dir takes "
         "minutes; pass --corpus-json to skip this on repeat runs",
@@ -123,7 +131,8 @@ def load_corpus(corpus_json: str | None, scale: int = 100) -> list[dict]:
         raise SystemExit(
             f"cannot load the query corpus (cargo exit {proc.returncode}):\n{proc.stderr}"
         )
-    return json.loads(proc.stdout)["queries"]
+    corpus = json.loads(proc.stdout)
+    return corpus["queries"], corpus.get("primary_keys", {})
 
 
 # A coordinator restart, a rolling update, or a momentary connection refusal
@@ -364,11 +373,21 @@ def run_query(
     timeout_s: float,
     poll_interval_s: float,
     single_file: set[str],
+    primary_keys: dict[str, list[str]] | None = None,
 ) -> dict:
+    keys = primary_keys or {}
     body = {
         "query": query["sql"],
         "table_paths": [
-            {"table_name": table, "path": table_path(data_root, table, single_file)}
+            {
+                "table_name": table,
+                "path": table_path(data_root, table, single_file),
+                # Informational and unverified, like Spark/Databricks RELY.
+                # Omitted entirely when the corpus declares none, so an older
+                # corpus file keeps the previous behaviour rather than
+                # silently declaring an empty key.
+                "primary_key": keys.get(table, []),
+            }
             for table in query["tables"]
         ],
     }
@@ -499,7 +518,7 @@ def main() -> int:
     _install_cancel_handlers()
 
     token = os.environ.get("KRISHIV_COORDINATOR_BEARER_TOKEN")
-    corpus = load_corpus(args.corpus_json, args.scale)
+    corpus, primary_keys = load_corpus(args.corpus_json, args.scale)
     if args.only:
         # Order matters, so `wanted` is a LIST and the corpus is rebuilt in its
         # order. This used to be a set intersection, which silently kept the
@@ -535,6 +554,7 @@ def main() -> int:
             args.timeout,
             args.poll_interval,
             single_file,
+            primary_keys,
         )
         results.append(outcome)
         if outcome["status"] == "ok":
