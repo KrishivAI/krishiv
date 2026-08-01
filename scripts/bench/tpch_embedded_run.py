@@ -36,7 +36,25 @@ SINGLE_FILE_TABLES = {"nation", "region"}
 
 
 def table_path(data_root: str, table: str) -> str:
-    """Filesystem path for `table` under `data_root`."""
+    """Path for `table` under `data_root`, local or object store.
+
+    The `exists()` probe is a *local* disambiguation: on disk, a single-file
+    table may have been generated either as `nation.parquet` or as a directory,
+    so the layout is checked rather than assumed.
+
+    An object-store URI has no filesystem to probe — `os.path.exists` is always
+    False for `s3://...` — and taking the fallback there silently resolves
+    `nation` to a DIRECTORY that does not exist, for a table that is a single
+    file. So a URI root uses the same fixed convention `tpch_spark_run` and
+    `tpch_duckdb_run` use, which is what the generator actually writes.
+
+    (Identical in kind to the CLI's `--parquet` guard, where the same
+    `Path::exists` question about a URI produced "parquet file not found" for
+    data that was there.)
+    """
+    if "://" in data_root:
+        root = data_root.rstrip("/")
+        return f"{root}/{table}.parquet" if table in SINGLE_FILE_TABLES else f"{root}/{table}"
     if table in SINGLE_FILE_TABLES:
         single = os.path.join(data_root, f"{table}.parquet")
         if os.path.exists(single):
@@ -98,6 +116,14 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--out", help="write results JSON here")
     parser.add_argument(
+        "--only",
+        help=(
+            "comma-separated query ids, in the order given. Present on every "
+            "other runner; its absence here meant a targeted rerun or smoke "
+            "test had to run all 22."
+        ),
+    )
+    parser.add_argument(
         "--repeat",
         type=int,
         default=1,
@@ -111,6 +137,16 @@ def main() -> int:
     # An older corpus file has no `primary_keys`; defaulting to {} keeps the
     # previous behaviour rather than silently declaring an empty key.
     primary_keys = corpus.get("primary_keys", {})
+    if args.only:
+        # A LIST, not a set intersection: the requested order is the run order,
+        # which is how a sweep front-loads the queries under investigation.
+        wanted = [q.strip() for q in args.only.split(",") if q.strip()]
+        by_id = {q["id"]: q for q in queries}
+        missing = sorted({q for q in wanted if q not in by_id})
+        if missing:
+            raise SystemExit(f"unknown query ids: {missing}")
+        seen: set[str] = set()
+        queries = [by_id[q] for q in wanted if not (q in seen or seen.add(q))]
 
     print(
         f"# {args.label}: {len(queries)} queries at SF{args.scale} "

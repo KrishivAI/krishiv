@@ -1003,6 +1003,46 @@ impl ParquetTableSpec {
     }
 }
 
+/// Mark an extension-less object-store path as a directory so
+/// [`ListingTableUrl`] treats it as a prefix rather than a single file.
+///
+/// # The failure this fixes
+///
+/// `ListingTableUrl::parse` decides file-vs-directory by **statting the
+/// filesystem**. For a local path that works: `/data/sf100/lineitem` is seen to
+/// be a directory and gets a trailing slash added. For an object store there is
+/// nothing to stat, so `s3://bucket/sf100/lineitem` is taken to be a file, and
+/// the `.parquet` extension filter then rejects it:
+///
+/// ```text
+/// File path 's3://krishiv-bench/tpch/sf100/lineitem' does not match the
+/// expected extension '.parquet'
+/// ```
+///
+/// The message blames the extension, but the data is a directory of parts and
+/// nothing is wrong with it — so the reader goes looking for a naming problem
+/// that does not exist. The same registration works locally and fails remotely,
+/// which is the kind of asymmetry that reads as "object stores are broken".
+///
+/// The rule is the one a caller means: a final segment containing no `.` is a
+/// directory. `s3://b/data.parquet` keeps its file semantics; a path that
+/// already ends in `/` is left alone; local paths are untouched, because
+/// statting them is strictly better information than this heuristic.
+fn directory_aware_url(path: &str) -> String {
+    if !path.contains("://") || path.ends_with('/') {
+        return path.to_owned();
+    }
+    let looks_like_a_file = path
+        .rsplit('/')
+        .next()
+        .is_some_and(|segment| segment.contains('.'));
+    if looks_like_a_file {
+        path.to_owned()
+    } else {
+        format!("{path}/")
+    }
+}
+
 /// Register one parquet table, attaching its declared key as a DataFusion
 /// constraint so the optimizer's functional-dependency machinery can see it.
 ///
@@ -1063,9 +1103,12 @@ pub async fn register_parquet_table(
             });
     }
 
-    let url = ListingTableUrl::parse(&spec.path).map_err(|e| SqlError::DataFusion {
-        message: format!("staged planning: table url for '{}': {e}", spec.name),
-    })?;
+    let url =
+        ListingTableUrl::parse(directory_aware_url(&spec.path)).map_err(|e| {
+            SqlError::DataFusion {
+                message: format!("staged planning: table url for '{}': {e}", spec.name),
+            }
+        })?;
     let options =
         read_options.to_listing_options(&ctx.copied_config(), ctx.copied_table_options());
     let config = ListingTableConfig::new(url)
@@ -7383,6 +7426,32 @@ mod registration_parity_tests {
             .expect("parquet registration produces a ListingTable")
             .options()
             .clone()
+    }
+
+    /// An object-store directory must reach `ListingTableUrl` as a prefix.
+    ///
+    /// `ListingTableUrl::parse` decides file-vs-directory by statting, which an
+    /// object store cannot answer, so `s3://b/sf100/lineitem` was read as a
+    /// file and rejected for not ending in `.parquet` — a message that blames
+    /// the extension for a path that is simply a directory. The same
+    /// registration worked locally and failed remotely.
+    #[test]
+    fn an_extensionless_object_store_path_is_treated_as_a_directory() {
+        assert_eq!(
+            super::directory_aware_url("s3://b/sf100/lineitem"),
+            "s3://b/sf100/lineitem/"
+        );
+        // Already a prefix: unchanged, no doubled slash.
+        assert_eq!(super::directory_aware_url("s3://b/sf100/lineitem/"), "s3://b/sf100/lineitem/");
+        // A named file keeps file semantics.
+        assert_eq!(
+            super::directory_aware_url("s3://b/sf100/nation.parquet"),
+            "s3://b/sf100/nation.parquet"
+        );
+        // Local paths are untouched: statting them is better information than
+        // any guess this function could make.
+        assert_eq!(super::directory_aware_url("/data/sf100/lineitem"), "/data/sf100/lineitem");
+        assert_eq!(super::directory_aware_url("relative/dir"), "relative/dir");
     }
 
     /// The invariant the two branches of [`register_parquet_table`] exist under:
