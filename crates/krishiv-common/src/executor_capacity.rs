@@ -194,11 +194,34 @@ static SINGLE_QUERY_PROCESS: AtomicBool = AtomicBool::new(false);
 /// and every consumer of [`ExecutorCapacity::query_memory_share_bytes`] then
 /// planned against a third of the memory the query actually had.
 ///
-/// Measured on TPC-H q5 at SF100 (embedded, 4500 MiB container): the join rule
-/// saw a 418 MB allowance instead of 1254 MB and converted hash joins that fit
-/// comfortably into sort-merge joins. Declaring the truth takes q5 from
-/// **247.1 s to 116.6 s (2.12x)**. It is not a universal win — q7 over the same
-/// data is unchanged at ~175 s, because its cost is elsewhere.
+/// # Why nothing in this repository calls it
+///
+/// Because the arithmetic being corrected is right and the conclusion drawn
+/// from it was not. Measured on TPC-H at SF100 (embedded, 4500 MiB container,
+/// 2392 MiB pool), raising the join rule's allowance from 418 MB (`pool/6`) to
+/// the whole pool's half, 1254 MB:
+///
+/// | threshold | q5 | q8 | q18 | q21 |
+/// |---|---|---|---|---|
+/// | 418 MB (`pool/slots × 0.5`) | 247.1 s | 153.0 s | 436.4 s | **fails** |
+/// | 627 MB (`pool × 0.25`) | 124.8 s | 112.8 s | **fails** | **fails** |
+/// | 1254 MB (`pool × 0.5`) | 122.2 s | **fails** | **fails** | **fails** |
+///
+/// q5 really is ~2x faster with more headroom. But a *retained* hash join in
+/// q18 reserved 723.5 MB in a single partition against an estimate under
+/// 627 MB — the estimates under-predict by ~3.5x — so every byte of extra
+/// allowance is spent on joins the planner has already mis-sized, and the
+/// query dies instead of spilling. There is no fraction that buys q5 without
+/// losing q18: the safe ceiling lands back at roughly `pool/6`, which is what
+/// the per-slot division already produces.
+///
+/// (q21 fails embedded at every threshold including the original — a separate,
+/// pre-existing limit, not a consequence of this knob.)
+///
+/// The route to q5's win is a spillable join that is cheap when it is wrong
+/// (krishiv-sql's `grace_hash_join`), not a larger promise to an operator that
+/// cannot spill. Until then this stays uncalled and the conservative division
+/// stands.
 ///
 /// # Why this is opt-in rather than the default
 ///
@@ -584,14 +607,13 @@ mod tests {
         );
     }
 
-    /// A single-query process must plan against the whole pool, not a slice of
-    /// it that no scheduler is enforcing.
+    /// The two policies must actually differ, and the default must be the
+    /// dividing one.
     ///
-    /// The measured case: TPC-H q5 at SF100 embedded in a 4500 MiB container.
-    /// `slots` derived to 3 from the core count, so the join rule was told the
-    /// query had 418 MB when it had 1254 MB, and converted hash joins that fit
-    /// into sort-merge joins. Declaring the truth took q5 from 247.1 s to
-    /// 116.6 s.
+    /// This pins the arithmetic, not a recommendation to use it: see
+    /// [`declare_single_query_process`] for why nothing calls it — the whole
+    /// pool is the honest answer to "what does this process have" and the wrong
+    /// answer to "what may one join promise to hold".
     #[test]
     fn a_single_query_process_owns_the_whole_pool() {
         let cap = ExecutorCapacity::derive(3, Some(4500 * MIB), None, None, None, None, None);

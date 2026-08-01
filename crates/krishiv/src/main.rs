@@ -61,18 +61,12 @@ fn main() {
         process::exit(code);
     }
 
-    // Past the daemon dispatch this is a one-shot CLI invocation: it runs one
-    // command and exits. No coordinator schedules task fragments here, so the
-    // slot count that `ExecutorCapacity` derives from the core count is a
-    // fiction, and sizing decisions must not divide the query pool by it.
-    //
-    // Placed here rather than in `SessionBuilder::build` deliberately. Every
-    // daemon — including `mcp`, which *does* build a `Session` and can serve
-    // concurrent queries — has already exited through `try_run_daemon` above,
-    // so this cannot reach a process where several queries share the pool.
-    // A library embedder that knows it is single-query calls
-    // `declare_single_query_process` itself.
-    krishiv_common::executor_capacity::declare_single_query_process();
+    // NOT declared single-query here, though this is exactly the process that
+    // is one. See `declare_single_query_process`: giving an embedded query the
+    // whole pool to size joins against was measured *faster and wrong* — TPC-H
+    // q5 at SF100 went 247.1 s -> 122.2 s, and q8 and q18 stopped completing at
+    // all. The declaration stays available for a caller that has bounded its
+    // own join sizes; the CLI has not.
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let response = cli::dispatch(&arg_refs);
