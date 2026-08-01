@@ -209,6 +209,11 @@ static SINGLE_QUERY_PROCESS: AtomicBool = AtomicBool::new(false);
 /// dividing stays the default and the single-query case declares itself: a
 /// caller that forgets gets today's conservative behaviour, not a crash.
 ///
+/// Called by the `krishiv` binary once the daemon subcommands have been
+/// dispatched, so it can only ever describe a one-shot CLI process. It is
+/// deliberately *not* called from `SessionBuilder::build`: `krishiv mcp` builds
+/// a `Session` too, and serves concurrent queries from one pool.
+///
 /// Call before building an engine — capacity itself is cached on first use, and
 /// while this flag is read live, an engine built earlier has already sized its
 /// pool.

@@ -13,13 +13,34 @@ use krishiv_scheduler::{
 
 use crate::cli::CliResponse;
 
+/// Subcommands that run a long-lived process rather than a one-shot command.
+///
+/// One definition, because `main` relies on this list being exhaustive: past
+/// `try_run_daemon` it declares the process single-query, which is only true
+/// for a one-shot CLI invocation. `mcp` is the reason that matters — it builds
+/// a `Session` and serves concurrent queries from one memory pool.
+pub const DAEMON_SUBCOMMANDS: [&str; 8] = [
+    "coordinator",
+    "clusterd",
+    "executor",
+    "job-coordinator",
+    "flight-server",
+    "shuffle-svc",
+    "mcp",
+    "health",
+];
+
+/// Whether `sub` starts a daemon rather than a one-shot CLI command.
+#[must_use]
+pub fn is_daemon_subcommand(sub: &str) -> bool {
+    DAEMON_SUBCOMMANDS.contains(&sub)
+}
+
 /// If `args` starts with a daemon subcommand, run it and return `Some(exit_code)`.
 pub fn try_run_daemon(args: &[String]) -> Option<i32> {
     let sub = args.first()?.as_str();
-    match sub {
-        "coordinator" | "clusterd" | "executor" | "job-coordinator" | "flight-server"
-        | "shuffle-svc" | "mcp" | "health" => {}
-        _ => return None,
+    if !is_daemon_subcommand(sub) {
+        return None;
     }
     // Boot banner (flag-minimization plan): announce the compiled-in capability
     // set before the daemon starts, so a missing `kafka`/`cloud`/etc. is visible
