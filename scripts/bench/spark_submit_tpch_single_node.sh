@@ -54,19 +54,39 @@ exec /opt/spark/bin/spark-submit \
   --conf spark.kubernetes.authenticate.submission.oauthTokenFile="${KRISHIV_KUBE_PEMS:-/kube}/token" \
   \
   `# ── The single-node confinement, and the only deliberate difference ──` \
+  `# The key is passed unescaped. A quoted "kubernetes\.io/hostname" reaches` \
+  `# the API server with a literal backslash and the driver pod is rejected:` \
+  `#   spec.nodeSelector: Invalid value: "kubernetes\\.io/hostname"` \
+  `# Spark splits --conf on the FIRST '=', so dots in the key need no escaping.` \
   --conf spark.executor.instances=1 \
-  --conf "spark.kubernetes.node.selector.kubernetes\.io/hostname=$NODE" \
+  --conf spark.kubernetes.node.selector.kubernetes.io/hostname=$NODE \
   \
-  `# ── Per-executor resources: byte-identical to the 3-node submission ──` \
+  `# ── Memory: sized to the NODE, not copied from the 3-node run ────────` \
+  `#` \
+  `# The 3-node submission gives each executor 5000Mi and the driver 2048Mi.` \
+  `# That is fine when the driver lives on a different machine from most of` \
+  `# the executors. Co-locating them does not fit:` \
+  `#` \
+  `#   driver 2048Mi + executor 5000Mi + system/k3s/MinIO ~1400Mi = 8448Mi` \
+  `#   node total                                                  7936Mi` \
+  `#` \
+  `# Measured, not predicted: the first attempt drove s1 to 108Mi free and` \
+  `# load 14, kubelet went to "activating", and the API server was starved` \
+  `# for two hours. Spark reached 12 of 22 queries while swapping, which is a` \
+  `# measurement of an overcommitted node rather than of Spark.` \
+  `#` \
+  `# 4500 + 1500 = 6000Mi leaves ~1.9Gi for the system. This is NOT tuning:` \
+  `# it is the budget the hardware has, and the Krishiv single-node run is` \
+  `# given the SAME 6000Mi split the same way so the two remain comparable.` \
   --conf spark.executor.cores=3 \
-  --conf spark.executor.memory=3800m \
-  --conf spark.executor.memoryOverhead=1200m \
+  --conf spark.executor.memory=3500m \
+  --conf spark.executor.memoryOverhead=1000m \
   --conf spark.kubernetes.executor.request.cores=250m \
   --conf spark.kubernetes.executor.limit.cores=3800m \
   \
   --conf spark.driver.cores=1 \
-  --conf spark.driver.memory=1600m \
-  --conf spark.driver.memoryOverhead=448m \
+  --conf spark.driver.memory=1100m \
+  --conf spark.driver.memoryOverhead=400m \
   --conf spark.kubernetes.driver.request.cores=250m \
   --conf spark.kubernetes.driver.limit.cores=2 \
   \

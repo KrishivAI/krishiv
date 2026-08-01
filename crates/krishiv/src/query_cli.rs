@@ -4,7 +4,7 @@
 // block_on here bridges a synchronous public surface to the async core.
 #![allow(clippy::disallowed_methods)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use krishiv_api::{DataFrame, ExecutionMode, KrishivError, Session};
@@ -289,7 +289,24 @@ pub fn build_session(command: &QueryCommand) -> Result<Session, String> {
     }
     let session = builder.build().map_err(|e| e.to_string())?;
     for table in &command.parquet_tables {
-        if !table.path.exists() {
+        // `Path::exists` asks the *filesystem* whether something is there, and
+        // an object-store URI is not a filesystem path — `s3://bucket/t.parquet`
+        // is never "there", so this guard rejected every remote table before
+        // registration was even attempted, with the actively misleading
+        // "parquet file not found".
+        //
+        // The engine has supported remote paths the whole time:
+        // `SqlEngine::register_parquet_with_primary_key` calls
+        // `register_s3_object_store_for_warehouse`, which registers an S3 store
+        // for `s3://`/`s3a://`. Only this check stood in the way, which is why
+        // `krishiv sql --local --parquet t=s3://…` failed while the identical
+        // path worked through the coordinator.
+        //
+        // Local paths keep the friendly up-front error; anything carrying a
+        // scheme is handed to the engine, whose error names the real problem
+        // (unknown scheme, missing credentials, no such key) instead of
+        // claiming a file is absent.
+        if !is_object_store_uri(&table.path) && !table.path.exists() {
             return Err(format!(
                 "DataFusion error: parquet file not found: {}",
                 table.path.display()
@@ -438,6 +455,23 @@ fn parse_mode(value: &str) -> Result<ExecutionMode, String> {
     }
 }
 
+/// Does this `--parquet` path name an object store rather than a file?
+///
+/// The marker is a `scheme://` prefix. Deliberately not a list of known
+/// schemes: the engine decides what it can open, and enumerating them here
+/// would mean a second place to update whenever it learns a new one — the kind
+/// of duplication that leaves one copy quietly wrong.
+///
+/// Windows drive letters (`C:\data`) contain a colon but no `//`, so they stay
+/// local. A relative path containing `://` is not addressable as a file
+/// anyway.
+fn is_object_store_uri(path: &Path) -> bool {
+    path.to_str().is_some_and(|p| {
+        p.split_once("://")
+            .is_some_and(|(scheme, rest)| !scheme.is_empty() && !rest.is_empty())
+    })
+}
+
 fn parse_parquet_spec(value: &str) -> Result<ParquetTableArg, String> {
     let (table, path) = value
         .split_once('=')
@@ -477,4 +511,66 @@ fn parse_primary_key_spec(value: &str) -> Result<(String, Vec<String>), String> 
         return Err(format!("--primary-key for '{table}' names no columns"));
     }
     Ok((table.trim().to_owned(), columns))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod object_store_path_tests {
+    use super::*;
+
+    /// The bug: `krishiv sql --local --parquet t=s3://bucket/t.parquet` failed
+    /// with "parquet file not found" while the identical path worked through
+    /// the coordinator. `Path::exists` asks the filesystem, and an object-store
+    /// URI is never on the filesystem, so the guard rejected every remote table
+    /// before `register_parquet_with_primary_key` — which has registered an S3
+    /// store for these paths all along — could see it.
+    #[test]
+    fn object_store_uris_are_not_filesystem_paths() {
+        for uri in [
+            "s3://krishiv-bench/tpch/sf100/nation.parquet",
+            "s3a://bucket/dir",
+            "gs://bucket/x.parquet",
+            "file:///tmp/x.parquet",
+        ] {
+            assert!(
+                is_object_store_uri(Path::new(uri)),
+                "{uri} must be treated as an object-store URI"
+            );
+        }
+    }
+
+    /// Local paths keep the up-front existence check, which gives a far better
+    /// error for the common typo than anything the engine would produce.
+    #[test]
+    fn local_paths_stay_local() {
+        for path in [
+            "/data/tpch/sf100/nation.parquet",
+            "relative/dir",
+            "./x.parquet",
+            "C:\\data\\x.parquet",
+            "s3:/only-one-slash",
+            "://no-scheme",
+        ] {
+            assert!(
+                !is_object_store_uri(Path::new(path)),
+                "{path} must be treated as a local path"
+            );
+        }
+    }
+
+    /// A URI survives the `PathBuf` round-trip the CLI puts it through — the
+    /// engine receives `s3://bucket/key`, not a path-normalised `s3:/bucket/key`
+    /// that would fail to parse as a URL.
+    #[test]
+    fn a_uri_round_trips_through_the_parsed_argument() {
+        let arg = parse_parquet_spec("nation=s3://krishiv-bench/tpch/sf100/nation.parquet")
+            .expect("spec parses");
+        assert_eq!(arg.name, "nation");
+        assert_eq!(
+            arg.path.to_string_lossy(),
+            "s3://krishiv-bench/tpch/sf100/nation.parquet",
+            "the double slash must survive; the engine parses this as a URL"
+        );
+        assert!(is_object_store_uri(&arg.path));
+    }
 }
