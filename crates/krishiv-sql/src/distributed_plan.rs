@@ -1094,9 +1094,16 @@ pub async fn register_parquet_table(
 
     let read_options = datafusion::prelude::ParquetReadOptions::default();
 
+    // `directory_aware_url` on BOTH branches. Applying it only to the keyed one
+    // left the common case broken: with the minimal-key corpus (keys on
+    // customer and nation), `lineitem` takes this branch, so the very first
+    // query still failed with "does not match the expected extension" while the
+    // fix looked applied. The two branches must agree about what a path MEANS,
+    // exactly as they must agree about `ListingOptions` — this is the same
+    // divergence that turned statistics off for keyed tables.
     if spec.primary_key.is_empty() {
         return ctx
-            .register_parquet(&spec.name, &spec.path, read_options)
+            .register_parquet(&spec.name, &directory_aware_url(&spec.path), read_options)
             .await
             .map_err(|e| SqlError::DataFusion {
                 message: format!("staged planning: register '{}': {e}", spec.name),
