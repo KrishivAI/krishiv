@@ -909,6 +909,15 @@ impl SessionBuilder {
             }
         }
 
+        // A `Session` is the embedded engine surface — the CLI, the Python
+        // bindings, and the Rust API all reach DataFusion through here, and all
+        // of them run one query at a time in this process. Nothing schedules
+        // task fragments against a slot count, so the query owns the pool.
+        // Declared before the engine is built, because building it sizes the
+        // pool. The executor does not construct a `Session`; it drives
+        // `SqlEngine` directly and keeps the per-slot division it really has.
+        krishiv_common::executor_capacity::declare_single_query_process();
+
         let udf_registry = Arc::new(RwLock::new(UdfRegistry::new()));
         let parallelism = self.target_parallelism.unwrap_or_else(|| {
             std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::MIN)

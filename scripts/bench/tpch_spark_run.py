@@ -69,6 +69,12 @@ def main() -> int:
     ap.add_argument("--label", default="spark")
     ap.add_argument("--only", default="", help="comma-separated query ids")
     ap.add_argument("--timeout", type=float, default=7200.0)
+    ap.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="run the whole corpus N times; report per-query median and spread",
+    )
     args = ap.parse_args()
 
     from pyspark.sql import SparkSession

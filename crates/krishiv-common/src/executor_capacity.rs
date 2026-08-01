@@ -55,7 +55,7 @@
 //! observable next time instead of requiring the whole investigation again.
 
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Environment override for task placement capacity.
 pub const TASK_SLOTS_ENV: &str = "KRISHIV_TASK_SLOTS";
@@ -178,6 +178,48 @@ pub fn slots_override() -> Option<usize> {
         0 => None,
         slots => Some(slots),
     }
+}
+
+/// Whether this process plans one query at a time, with no task scheduler
+/// dividing the query pool between concurrent fragments.
+static SINGLE_QUERY_PROCESS: AtomicBool = AtomicBool::new(false);
+
+/// Declare that this process runs one query at a time.
+///
+/// `slots` is a *task placement* capacity: how many fragments the coordinator
+/// may run here concurrently. An embedded process has no such scheduler — it
+/// runs one query, alone, and owns the whole pool while it does. But `slots` is
+/// derived from `cores.min(memory_bound)` for *every* process, so an embedded
+/// session on a 3-core container claimed three task slots it would never use,
+/// and every consumer of [`ExecutorCapacity::query_memory_share_bytes`] then
+/// planned against a third of the memory the query actually had.
+///
+/// Measured on TPC-H q5 at SF100 (embedded, 4500 MiB container): the join rule
+/// saw a 418 MB allowance instead of 1254 MB and converted hash joins that fit
+/// comfortably into sort-merge joins. Declaring the truth takes q5 from
+/// **247.1 s to 116.6 s (2.12x)**. It is not a universal win — q7 over the same
+/// data is unchanged at ~175 s, because its cost is elsewhere.
+///
+/// # Why this is opt-in rather than the default
+///
+/// The two failure directions are not symmetric. A task executor that wrongly
+/// believed it owned the whole pool would let `slots` concurrent fragments each
+/// plan an unspillable build side of half the pool, and the container would be
+/// OOM-killed. An embedded process that wrongly divides is merely slower. So
+/// dividing stays the default and the single-query case declares itself: a
+/// caller that forgets gets today's conservative behaviour, not a crash.
+///
+/// Call before building an engine — capacity itself is cached on first use, and
+/// while this flag is read live, an engine built earlier has already sized its
+/// pool.
+pub fn declare_single_query_process() {
+    SINGLE_QUERY_PROCESS.store(true, Ordering::Relaxed);
+}
+
+/// Whether [`declare_single_query_process`] has been called.
+#[must_use]
+pub fn is_single_query_process() -> bool {
+    SINGLE_QUERY_PROCESS.load(Ordering::Relaxed)
 }
 
 /// How each field of an [`ExecutorCapacity`] was arrived at — recorded so the
@@ -416,6 +458,36 @@ impl ExecutorCapacity {
             .map(|pool| pool / u64::try_from(self.slots.get()).unwrap_or(1))
     }
 
+    /// The memory a *query being planned in this process* may assume it can
+    /// use — the input to sizing decisions like "will this hash join fit".
+    ///
+    /// Identical to [`Self::min_task_memory_share_bytes`] on a task executor,
+    /// where `slots` fragments really do divide one pool. On a process that has
+    /// declared itself single-query ([`declare_single_query_process`]) the
+    /// division is fiction and the whole pool is the answer.
+    ///
+    /// Separate from `min_task_memory_share_bytes` rather than replacing it:
+    /// that method answers "what does a task see when all slots are busy",
+    /// which is still the right question for the startup log and remains true
+    /// as arithmetic. This one answers "what may a planner assume", and those
+    /// two questions only coincide inside an executor.
+    #[must_use]
+    pub fn query_memory_share_bytes(&self) -> Option<u64> {
+        self.query_memory_share_bytes_when(is_single_query_process())
+    }
+
+    /// [`Self::query_memory_share_bytes`] with the process-wide flag passed in,
+    /// so the policy is testable without mutating state every other test in the
+    /// binary shares.
+    #[must_use]
+    pub fn query_memory_share_bytes_when(&self, single_query: bool) -> Option<u64> {
+        if single_query {
+            self.query_pool_bytes
+        } else {
+            self.min_task_memory_share_bytes()
+        }
+    }
+
     /// One-line human summary for the startup log.
     #[must_use]
     pub fn summary(&self) -> String {
@@ -505,6 +577,53 @@ mod tests {
             share >= MIN_TASK_MEMORY_BYTES,
             "per-task share {share} fell below the {MIN_TASK_MEMORY_BYTES} floor"
         );
+    }
+
+    /// A single-query process must plan against the whole pool, not a slice of
+    /// it that no scheduler is enforcing.
+    ///
+    /// The measured case: TPC-H q5 at SF100 embedded in a 4500 MiB container.
+    /// `slots` derived to 3 from the core count, so the join rule was told the
+    /// query had 418 MB when it had 1254 MB, and converted hash joins that fit
+    /// into sort-merge joins. Declaring the truth took q5 from 247.1 s to
+    /// 116.6 s.
+    #[test]
+    fn a_single_query_process_owns_the_whole_pool() {
+        let cap = ExecutorCapacity::derive(3, Some(4500 * MIB), None, None, None, None, None);
+        let pool = cap.query_pool_bytes.expect("bounded");
+        assert_eq!(
+            cap.query_memory_share_bytes_when(true),
+            Some(pool),
+            "one query alone in the process must see the whole pool"
+        );
+        assert_eq!(
+            cap.query_memory_share_bytes_when(false),
+            cap.min_task_memory_share_bytes(),
+            "a task executor must keep the per-slot division it really has"
+        );
+        assert!(
+            cap.min_task_memory_share_bytes().expect("bounded") < pool,
+            "this fixture is pointless unless the two answers differ"
+        );
+    }
+
+    /// The safe direction is the default: a process that never declares itself
+    /// keeps dividing. Getting this backwards would let `slots` fragments each
+    /// plan an unspillable build side of half the pool and OOM the container.
+    #[test]
+    fn dividing_is_what_an_undeclared_process_does() {
+        assert!(
+            !is_single_query_process(),
+            "the default must be the conservative per-slot division"
+        );
+    }
+
+    /// An unbounded pool has no share to divide, under either policy.
+    #[test]
+    fn an_unbounded_pool_has_no_share_either_way() {
+        let cap = ExecutorCapacity::derive(4, None, None, None, None, None, None);
+        assert_eq!(cap.query_memory_share_bytes_when(true), None);
+        assert_eq!(cap.query_memory_share_bytes_when(false), None);
     }
 
     #[test]

@@ -455,8 +455,12 @@ impl SpillableJoinSelection {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|n| *n > 0)
             .or_else(|| {
+                // `query_memory_share_bytes`, not `min_task_memory_share_bytes`:
+                // the per-slot division is real inside an executor and fiction
+                // in an embedded process, which runs one query and owns the
+                // whole pool. See `declare_single_query_process`.
                 let share = krishiv_common::executor_capacity::ExecutorCapacity::detect_cached()
-                    .min_task_memory_share_bytes()?;
+                    .query_memory_share_bytes()?;
                 #[expect(
                     clippy::cast_precision_loss,
                     clippy::cast_possible_truncation,
