@@ -34,12 +34,14 @@ import atexit
 import json
 import os
 import signal
-import statistics
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from repeat_stats import print_spread, summarize  # noqa: E402 - needs the path set above
 
 # Tables that live in a per-table subdirectory (generated with --parts). A
 # directory path registers as a multi-file dataset, which is what gives the
@@ -516,69 +518,6 @@ def _print_outcome(outcome: dict) -> None:
         )
 
 
-def _summarize(runs: list[dict], repeat: int) -> list[dict]:
-    """Collapse repeated attempts into one representative row per query.
-
-    The representative is the **median** attempt, not the fastest: reporting
-    the best of N is how a benchmark quietly becomes a best-case advertisement.
-    `elapsed_s` on the representative carries that median, so every existing
-    consumer of this file (`vs_spark.py`, the gate) keeps working unchanged and
-    silently gets the more honest number.
-
-    Fails closed on flakiness: if **any** attempt of a query failed, the
-    representative is that failure even when other attempts passed. An
-    intermittent failure is a defect, and averaging it away is how it survives
-    to the next release. Single-run sweeps could not see this at all.
-    """
-    order: list[str] = []
-    by_id: dict[str, list[dict]] = {}
-    for run in runs:
-        by_id.setdefault(run["id"], []).append(run)
-        if run["id"] not in order:
-            order.append(run["id"])
-
-    summary = []
-    for query_id in order:
-        attempts = by_id[query_id]
-        failures = [a for a in attempts if a["status"] != "ok"]
-        if failures:
-            row = dict(failures[0])
-            row["repeat_count"] = len(attempts)
-            row["failed_attempts"] = len(failures)
-            if len(failures) < len(attempts):
-                # Intermittent: say so loudly rather than burying it in a count.
-                row["error"] = (
-                    f"INTERMITTENT ({len(failures)}/{len(attempts)} attempts failed): "
-                    f"{row.get('error', '')}"
-                )
-            summary.append(row)
-            continue
-
-        times = sorted(a["elapsed_s"] for a in attempts)
-        median = statistics.median(times)
-        # The representative attempt is the one whose time is the median, so
-        # stage/task counts belong to a real run rather than a synthesised one.
-        representative = min(attempts, key=lambda a: abs(a["elapsed_s"] - median))
-        row = dict(representative)
-        row["repeat_count"] = len(attempts)
-        row["elapsed_s"] = median
-        row["elapsed_min_s"] = times[0]
-        row["elapsed_median_s"] = median
-        row["elapsed_max_s"] = times[-1]
-        row["spread_pct"] = (
-            0.0 if times[0] <= 0 else 100.0 * (times[-1] - times[0]) / times[0]
-        )
-        row["elapsed_all_s"] = times
-        summary.append(row)
-    if repeat == 1:
-        # Keep the single-run record byte-comparable with every earlier sweep:
-        # no repeat bookkeeping on a run that had nothing to repeat.
-        for row in summary:
-            for key in ("repeat_count", "elapsed_all_s"):
-                row.pop(key, None)
-    return summary
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--coordinator", required=True, help="coordinator HTTP base URL")
@@ -668,25 +607,10 @@ def main() -> int:
             runs.append(outcome)
             _print_outcome(outcome)
 
-    results = _summarize(runs, args.repeat)
+    results = summarize(runs, args.repeat)
     if args.repeat > 1:
         print("\n# per-query spread across passes")
-        print(
-            f"{'query':<5} {'n':>2} {'min':>9} {'median':>9} {'max':>9} {'spread':>8}"
-        )
-        for row in results:
-            if row["status"] != "ok":
-                print(f"{row['id']:<5} {'':>2} {row['status']}")
-                continue
-            print(
-                f"{row['id']:<5} {row['repeat_count']:>2} "
-                f"{row['elapsed_min_s']:>9.2f} {row['elapsed_median_s']:>9.2f} "
-                f"{row['elapsed_max_s']:>9.2f} {row['spread_pct']:>7.1f}%"
-            )
-        print(
-            "\nA delta smaller than a query's own spread is not a result. "
-            "Compare medians, and treat anything inside the spread as noise."
-        )
+        print_spread(results)
 
     ok = [r for r in results if r["status"] == "ok"]
     single_task = [r for r in ok if not r.get("distributed")]

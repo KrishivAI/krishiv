@@ -35,7 +35,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from repeat_stats import print_spread, summarize  # noqa: E402 - needs the path set above
 
 TABLES = [
     "customer",
@@ -108,41 +112,51 @@ def main() -> int:
     print(f"# registered {len(TABLES)} tables in {register_s:.1f}s", flush=True)
 
     results = []
-    for query in corpus:
-        started = time.monotonic()
-        try:
-            rows = spark.sql(query["sql"]).collect()
-            elapsed = time.monotonic() - started
-            results.append(
-                {
-                    "id": query["id"],
-                    "name": query["name"],
-                    "status": "ok",
-                    "elapsed_s": elapsed,
-                    "row_count": len(rows),
-                }
-            )
-            print(
-                f"ok   {query['id']:>4} {query['name']:<38} {elapsed:9.2f} s"
-                f"  rows={len(rows)}",
-                flush=True,
-            )
-        except Exception as error:  # noqa: BLE001 - the message is the finding
-            elapsed = time.monotonic() - started
-            results.append(
-                {
-                    "id": query["id"],
-                    "name": query["name"],
-                    "status": "failed",
-                    "elapsed_s": elapsed,
-                    "error": str(error)[:600],
-                }
-            )
-            print(
-                f"FAIL {query['id']:>4} {query['name']:<38} {elapsed:9.2f} s"
-                f"  {str(error)[:100]}",
-                flush=True,
-            )
+    runs: list[dict] = []
+    for pass_index in range(args.repeat):
+        if args.repeat > 1:
+            print(f"\n# pass {pass_index + 1} of {args.repeat}", flush=True)
+        for query in corpus:
+            started = time.monotonic()
+            try:
+                rows = spark.sql(query["sql"]).collect()
+                elapsed = time.monotonic() - started
+                runs.append(
+                    {
+                        "id": query["id"],
+                        "name": query["name"],
+                        "status": "ok",
+                        "elapsed_s": elapsed,
+                        "row_count": len(rows),
+                    }
+                )
+                print(
+                    f"ok   {query['id']:>4} {query['name']:<38} {elapsed:9.2f} s"
+                    f"  rows={len(rows)}",
+                    flush=True,
+                )
+            except Exception as error:  # noqa: BLE001 - the message is the finding
+                elapsed = time.monotonic() - started
+                runs.append(
+                    {
+                        "id": query["id"],
+                        "name": query["name"],
+                        "status": "failed",
+                        "elapsed_s": elapsed,
+                        "error": str(error)[:600],
+                    }
+                )
+                print(
+                    f"FAIL {query['id']:>4} {query['name']:<38} {elapsed:9.2f} s"
+                    f"  {str(error)[:100]}",
+                    flush=True,
+                )
+
+    for row in runs:
+        row.setdefault("pass_index", 0)
+    results = summarize(runs, args.repeat)
+    if args.repeat > 1:
+        print_spread(results)
 
     ok = [r for r in results if r["status"] == "ok"]
     total = sum(r["elapsed_s"] for r in ok)

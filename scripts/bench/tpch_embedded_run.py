@@ -28,6 +28,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchlock import machine_lock  # noqa: E402 - needs the path set above
+from repeat_stats import print_spread, summarize  # noqa: E402 - same
 
 # nation and region generate as a single file; the rest are directories of
 # parts. `--parquet name=path` accepts either, but the path has to be right.
@@ -96,6 +97,12 @@ def main() -> int:
     parser.add_argument("--label", default="embedded-local")
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--out", help="write results JSON here")
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="run the whole corpus N times; report per-query median and spread",
+    )
     args = parser.parse_args()
 
     with open(args.corpus_json, encoding="utf-8") as handle:
@@ -116,23 +123,42 @@ def main() -> int:
     # a three-engine comparison are equally capable of ruining each other's
     # numbers, and they are launched by different scripts that have no reason
     # to know about one another.
-    results = []
+    runs: list[dict] = []
     with machine_lock(f"tpch_embedded_run {args.label}"):
-        for index, query in enumerate(queries, start=1):
-            name = f"q{index} {query['name']}"
-            outcome = run_query(args.binary, args.data, query, args.timeout, primary_keys)
-            results.append({"id": index, "name": query["name"], **outcome})
-            if outcome["status"] == "ok":
-                print(f"ok    {name:<45} {outcome['elapsed_s']:>8.2f} s", flush=True)
-            else:
-                print(
-                    f"FAIL  {name:<45} {outcome['status']}: {outcome.get('error', '')}",
-                    flush=True,
+        for pass_index in range(args.repeat):
+            if args.repeat > 1:
+                print(f"\n# pass {pass_index + 1} of {args.repeat}", flush=True)
+            for query in queries:
+                # The corpus id (`q1`), NOT an enumeration index. This used to
+                # record `id: 1`, which meant an embedded result could not be
+                # joined to a cluster, Spark or DuckDB result by query — every
+                # cross-topology comparison would silently match nothing.
+                query_id = query["id"]
+                label = f"{query_id} {query['name']}"
+                outcome = run_query(
+                    args.binary, args.data, query, args.timeout, primary_keys
                 )
+                outcome = {
+                    "id": query_id,
+                    "name": query["name"],
+                    "pass_index": pass_index,
+                    **outcome,
+                }
+                runs.append(outcome)
+                if outcome["status"] == "ok":
+                    print(f"ok    {label:<45} {outcome['elapsed_s']:>8.2f} s", flush=True)
+                else:
+                    print(
+                        f"FAIL  {label:<45} {outcome['status']}: {outcome.get('error', '')}",
+                        flush=True,
+                    )
 
+    results = summarize(runs, args.repeat)
     ok = sum(1 for r in results if r["status"] == "ok")
     total = sum(r["elapsed_s"] for r in results if r["status"] == "ok")
     print(f"\n{ok}/{len(results)} queries ran; total {total:.1f} s", flush=True)
+    if args.repeat > 1:
+        print_spread(results)
 
     if args.out:
         with open(args.out, "w", encoding="utf-8") as handle:
