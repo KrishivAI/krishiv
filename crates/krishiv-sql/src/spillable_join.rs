@@ -73,8 +73,9 @@ use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::joins::utils::JoinFilter;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
+use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, Partitioning};
 use std::sync::Arc;
 
 /// Environment override for the build-size threshold, in bytes.
@@ -401,31 +402,84 @@ fn unknown_build_pressure(facts: &[JoinFacts], threshold: u64) -> u64 {
 /// pair the Nth fact with the Nth join it is asked to rewrite. `ExecutionPlan`
 /// offers no node identity and `transform_up` rebuilds parents as their
 /// children change — so pointers are useless here, but position is stable.
-fn collect_join_facts(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<JoinFacts>) {
+fn collect_join_facts(
+    plan: &Arc<dyn ExecutionPlan>,
+    target_partitions: usize,
+    out: &mut Vec<JoinFacts>,
+) {
     for child in plan.children() {
-        collect_join_facts(child, out);
+        collect_join_facts(child, target_partitions, out);
     }
     let any = plan.as_ref() as &dyn std::any::Any;
     if let Some(hash_join) = any.downcast_ref::<HashJoinExec>() {
         out.push(JoinFacts {
             bytes: build_bytes_estimate(hash_join),
-            convertible: convertible_mode(hash_join).is_some(),
+            convertible: convertible_mode(hash_join, target_partitions).is_some(),
         });
     }
 }
 
-/// Whether this join's mode can become sort-merge, and with what partitioning.
+/// How a convertible join reaches sort-merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Conversion {
+    /// The sides already share the distribution sort-merge needs: sort in
+    /// place. `preserve_partitioning` is false only for the single-partition
+    /// `CollectLeft` case, where there is no distribution to preserve.
+    InPlace { preserve_partitioning: bool },
+    /// A `CollectLeft` join whose sides have *different* partition counts.
+    /// Hash-partition both on the join keys first — which is precisely the plan
+    /// DataFusion would have produced as `Partitioned` had the build-side
+    /// estimate not claimed to be tiny.
+    Repartition { partitions: usize },
+}
+
+/// Whether this join's mode can become sort-merge, and how.
 ///
-/// `Some(preserve_partitioning)` when convertible, `None` when not. Split out
-/// of `convert` so the budget can ask the question without doing the work —
-/// counting a join the rule will refuse is how the budget ends up tightening
-/// against memory that never gets freed.
-fn convertible_mode(hash_join: &HashJoinExec) -> Option<bool> {
+/// Split out of `convert` so the budget can ask the question without doing the
+/// work — counting a join the rule will refuse is how the budget ends up
+/// tightening against memory that never gets freed.
+///
+/// # Why `CollectLeft` over an already-split probe side is convertible
+///
+/// It did not used to be, and TPC-H q21 at SF100 embedded died of it every
+/// time. `CollectLeft` is chosen from an *estimate*; q21's `NOT EXISTS` becomes
+/// a `LeftAnti` self-join over `lineitem` that DataFusion estimates at
+/// `outer_rows - semi_estimate` = `593462145 - 593462145` = **0 rows**, which
+/// is comfortably under any broadcast threshold. The real build side is
+/// 2003 MB, and it was buffered whole into a 2.3 GB pool:
+///
+/// ```text
+/// Resources exhausted: Failed to allocate additional 1151.2 KB for
+/// HashJoinInput with 2003.0 MB already allocated
+/// ```
+///
+/// The distributed planner already refuses to broadcast on a degenerate
+/// estimate (`distributed_plan::broadcast_build_estimate_is_empty`), but the
+/// embedded path never runs the distributed planner, so nothing caught it —
+/// and this rule, which *did* size the build side as unbounded, then had no
+/// mode it was allowed to rewrite. The join was un-spillable by construction.
+///
+/// Hash-partitioning both sides on the equijoin keys is the standard remedy
+/// and is what `PartitionMode::Partitioned` means; matching rows still land in
+/// the same partition, so it is correct for every join type here, including
+/// the `LeftAnti` that q21 needs.
+fn convertible_mode(hash_join: &HashJoinExec, target_partitions: usize) -> Option<Conversion> {
     let single_partition = hash_join.left().output_partitioning().partition_count() == 1
         && hash_join.right().output_partitioning().partition_count() == 1;
     match hash_join.partition_mode() {
-        PartitionMode::Partitioned => Some(true),
-        PartitionMode::CollectLeft if single_partition => Some(false),
+        PartitionMode::Partitioned => Some(Conversion::InPlace {
+            preserve_partitioning: true,
+        }),
+        PartitionMode::CollectLeft if single_partition => Some(Conversion::InPlace {
+            preserve_partitioning: false,
+        }),
+        // Repartitioning needs equijoin keys to hash on, and more than one
+        // partition to be worth planning.
+        PartitionMode::CollectLeft if target_partitions > 1 && !hash_join.on().is_empty() => {
+            Some(Conversion::Repartition {
+                partitions: target_partitions,
+            })
+        }
         _ => None,
     }
 }
@@ -684,6 +738,7 @@ impl SpillableJoinSelection {
         &self,
         hash_join: &HashJoinExec,
         threshold: u64,
+        target_partitions: usize,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         // Gate 3: the join mode must be convertible to sort-merge.
         // `CollectLeft` is convertible exactly when the plan has one partition
@@ -706,7 +761,7 @@ impl SpillableJoinSelection {
         // With one partition, "sorted" is the whole requirement — there is no
         // distribution to preserve — so the conversion is *simpler* here than
         // in the partitioned case, not riskier.
-        let Some(preserve_partitioning) = convertible_mode(hash_join) else {
+        let Some(conversion) = convertible_mode(hash_join, target_partitions) else {
             tracing::debug!(
                 mode = ?hash_join.partition_mode(),
                 threshold,
@@ -764,6 +819,45 @@ impl SpillableJoinSelection {
         // re-planned), drop it for single-partition `CollectLeft` (where there
         // is nothing to preserve).
         let on = hash_join.on();
+
+        // A degenerate broadcast join is given the distribution it should have
+        // had before anything is sorted — see `convertible_mode`. The sorts
+        // below then run per partition, exactly as in the `Partitioned` case.
+        let (build_input, probe_input, preserve_partitioning) = match conversion {
+            Conversion::InPlace {
+                preserve_partitioning,
+            } => (
+                Arc::clone(hash_join.left()),
+                Arc::clone(hash_join.right()),
+                preserve_partitioning,
+            ),
+            Conversion::Repartition { partitions } => {
+                let build_keys: Vec<_> = on.iter().map(|(l, _)| Arc::clone(l)).collect();
+                let probe_keys: Vec<_> = on.iter().map(|(_, r)| Arc::clone(r)).collect();
+                let build = RepartitionExec::try_new(
+                    Arc::clone(hash_join.left()),
+                    Partitioning::Hash(build_keys, partitions),
+                )?;
+                let probe = RepartitionExec::try_new(
+                    Arc::clone(hash_join.right()),
+                    Partitioning::Hash(probe_keys, partitions),
+                )?;
+                tracing::info!(
+                    partitions,
+                    build_bytes,
+                    threshold,
+                    join_type = ?hash_join.join_type(),
+                    "spillable-join: broadcast build side is too large to buffer; \
+                     hash-partitioning both sides so it can spill"
+                );
+                (
+                    Arc::new(build) as Arc<dyn ExecutionPlan>,
+                    Arc::new(probe) as Arc<dyn ExecutionPlan>,
+                    true,
+                )
+            }
+        };
+
         let left_keys: Vec<PhysicalSortExpr> = on
             .iter()
             .map(|(l, _)| PhysicalSortExpr::new_default(Arc::clone(l)))
@@ -784,11 +878,11 @@ impl SpillableJoinSelection {
             .collect();
 
         let sorted_left = Arc::new(
-            SortExec::new(left_ordering, Arc::clone(hash_join.left()))
+            SortExec::new(left_ordering, build_input)
                 .with_preserve_partitioning(preserve_partitioning),
         );
         let sorted_right = Arc::new(
-            SortExec::new(right_ordering, Arc::clone(hash_join.right()))
+            SortExec::new(right_ordering, probe_input)
                 .with_preserve_partitioning(preserve_partitioning),
         );
 
@@ -871,18 +965,22 @@ impl PhysicalOptimizerRule for SpillableJoinSelection {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Gate 1: no cap, no change.
         let Some(configured) = self.threshold_bytes else {
             tracing::debug!("spillable-join: no memory cap configured, rule inactive");
             return Ok(plan);
         };
+        // Needed to re-partition a degenerate broadcast join — see
+        // `convertible_mode`. Read from the session rather than from capacity:
+        // it is the number of partitions this plan is actually being built for.
+        let target_partitions = config.execution.target_partitions.max(1);
         // The budget is on the SUM of un-converted build sides, not on each one
         // separately — see `conversion_decisions`. Decisions are indexed by
         // position in `transform_up` order, which `collect_join_facts` mirrors.
         let mut facts = Vec::new();
-        collect_join_facts(&plan, &mut facts);
+        collect_join_facts(&plan, target_partitions, &mut facts);
         let decisions = Self::conversion_decisions(&facts, configured);
         let threshold = configured;
         let mut at = 0usize;
@@ -915,7 +1013,7 @@ impl PhysicalOptimizerRule for SpillableJoinSelection {
                 // out-of-memory error for a planning error — strictly worse,
                 // because the un-converted plan at least had a chance of
                 // fitting. Declining is always available; erroring is not.
-                match self.convert(hash_join, threshold) {
+                match self.convert(hash_join, threshold, target_partitions) {
                     Ok(Some(plan)) => {
                         converted += 1;
                         Ok(Transformed::yes(plan))
@@ -1251,6 +1349,211 @@ mod collect_left_tests {
     }
 }
 
+/// The shape that killed TPC-H q21 embedded: a broadcast join whose probe side
+/// is *already* split across partitions, so the old `convertible_mode` refused
+/// it and the oversized build side had nowhere to spill to.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod degenerate_broadcast_tests {
+    use super::*;
+    use datafusion::physical_plan::{collect, displayable};
+    use datafusion::prelude::{SessionConfig, SessionContext};
+
+    fn shows(plan: &Arc<dyn ExecutionPlan>, name: &str) -> bool {
+        displayable(plan.as_ref()).indent(true).to_string().contains(name)
+    }
+
+    /// Multi-partition, which is what an embedded session uses: an engine built
+    /// with `target_partitions = available_parallelism()`, not the task
+    /// engine's 1.
+    fn multi_partition_ctx() -> SessionContext {
+        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4))
+    }
+
+    /// The q21 shape: a `CollectLeft` join whose **probe side is already
+    /// split**. A tiny build side keeps DataFusion's broadcast choice, and a
+    /// probe registered with two partitions keeps the split — the combination
+    /// the old `convertible_mode` refused, leaving the build side nowhere to
+    /// spill to.
+    ///
+    /// Registered as a real multi-partition table rather than assembled by
+    /// hand: a `HashJoinExec` built directly over a `RepartitionExec` is not a
+    /// plan DataFusion would emit, and executing it panics partitions that
+    /// nothing polls. The bug is about a plan the planner really produces.
+    async fn broadcast_join_over_split_probe(ctx: &SessionContext) -> Arc<dyn ExecutionPlan> {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use datafusion::datasource::MemTable;
+
+        ctx.sql("CREATE TABLE l(k INT, v INT) AS VALUES (1, 10), (2, 20), (3, 30)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("w", DataType::Int32, false),
+        ]));
+        let partition = |k: i32, w: i32| {
+            vec![
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int32Array::from(vec![k])),
+                        Arc::new(Int32Array::from(vec![w])),
+                    ],
+                )
+                .unwrap(),
+            ]
+        };
+        // Two partitions, so the probe side arrives already split.
+        let split = MemTable::try_new(
+            Arc::clone(&schema),
+            vec![partition(1, 100), partition(2, 200)],
+        )
+        .unwrap();
+        ctx.register_table("r", Arc::new(split)).unwrap();
+
+        ctx.sql("SELECT l.v, r.w FROM l JOIN r ON l.k = r.k")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_premise_holds_a_collect_left_join_over_a_split_probe() {
+        // If either half of this stops being true the tests below stop testing
+        // anything, so assert the premise separately and first.
+        let ctx = multi_partition_ctx();
+        let plan = broadcast_join_over_split_probe(&ctx).await;
+        assert!(shows(&plan, "CollectLeft"), "fixture is not a broadcast join");
+        assert_eq!(
+            plan.children()[0].output_partitioning().partition_count(),
+            1,
+            "build side should be un-split"
+        );
+        assert!(
+            plan.children()[1].output_partitioning().partition_count() > 1,
+            "probe side must be split — that is the case the old rule refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_broadcast_join_is_repartitioned_so_it_can_spill() {
+        // q21 at SF100: `HashJoinInput` reached 2003.0 MB in a 2.3 GB pool
+        // because this join could be neither buffered nor converted. It must now
+        // convert, which means hash-partitioning both sides first.
+        let ctx = multi_partition_ctx();
+        let plan = broadcast_join_over_split_probe(&ctx).await;
+        let out = SpillableJoinSelection::with_threshold(Some(1))
+            .optimize(plan, ctx.copied_config().options())
+            .unwrap();
+        assert!(
+            shows(&out, "SortMergeJoin"),
+            "broadcast join over a split probe side was left un-spillable:\n{}",
+            displayable(out.as_ref()).indent(true)
+        );
+        assert!(
+            shows(&out, "RepartitionExec"),
+            "sort-merge needs both sides hash-partitioned on the join keys:\n{}",
+            displayable(out.as_ref()).indent(true)
+        );
+    }
+
+    /// Rows from every partition. Both the fixture and the converted plan have
+    /// four output partitions, and `collect` drives only partition 0 — which
+    /// does not merely under-count, it panics `RepartitionExec` for the
+    /// partitions nothing ever polled.
+    async fn all_rows(
+        plan: Arc<dyn ExecutionPlan>,
+        task_ctx: Arc<datafusion::execution::TaskContext>,
+    ) -> usize {
+        use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+        let merged = Arc::new(CoalescePartitionsExec::new(plan));
+        collect(merged, task_ctx)
+            .await
+            .unwrap()
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn repartitioning_does_not_change_the_answer() {
+        // Re-planning a join's distribution is only a fix if the rows survive it.
+        let ctx = multi_partition_ctx();
+        let plan = broadcast_join_over_split_probe(&ctx).await;
+        let task_ctx = ctx.task_ctx();
+        let before = all_rows(Arc::clone(&plan), Arc::clone(&task_ctx)).await;
+        let converted = SpillableJoinSelection::with_threshold(Some(1))
+            .optimize(plan, ctx.copied_config().options())
+            .unwrap();
+        let after = all_rows(converted, task_ctx).await;
+
+        assert_eq!(before, after, "row count changed");
+        assert_eq!(after, 2, "expected the two matching keys");
+    }
+
+    #[tokio::test]
+    async fn a_small_broadcast_join_keeps_its_hash_join() {
+        // The repartition is a rescue, not a policy: a build side that fits must
+        // still be broadcast, or every small dimension join pays for an exchange.
+        let ctx = multi_partition_ctx();
+        let plan = broadcast_join_over_split_probe(&ctx).await;
+        let out = SpillableJoinSelection::with_threshold(Some(1 << 30))
+            .optimize(Arc::clone(&plan), ctx.copied_config().options())
+            .unwrap();
+        assert!(
+            !shows(&out, "SortMergeJoin"),
+            "a build side well under the threshold was converted anyway:\n{}",
+            displayable(out.as_ref()).indent(true)
+        );
+    }
+
+    /// The executor task engine plans at `target_partitions = cores / slots`,
+    /// which is 1 on a saturated 3-core executor. Its broadcast joins have a
+    /// single-partition probe side and must keep taking the simpler in-place
+    /// conversion — this rescue must not plant an exchange there.
+    #[tokio::test]
+    async fn a_single_partition_broadcast_join_gains_no_exchange() {
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        ctx.sql("CREATE TABLE l(k INT, v INT) AS VALUES (1, 10), (2, 20), (3, 30)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        ctx.sql("CREATE TABLE r(k INT, w INT) AS VALUES (1, 100), (2, 200)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let plan = ctx
+            .sql("SELECT l.v, r.w FROM l JOIN r ON l.k = r.k")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        assert!(shows(&plan, "CollectLeft"), "premise: one partition broadcasts");
+        let out = SpillableJoinSelection::with_threshold(Some(1))
+            .optimize(plan, ctx.copied_config().options())
+            .unwrap();
+        assert!(shows(&out, "SortMergeJoin"));
+        assert!(
+            !shows(&out, "RepartitionExec"),
+            "a one-partition plan gained an exchange it cannot use:\n{}",
+            displayable(out.as_ref()).indent(true)
+        );
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod never_fails_the_query_tests {
@@ -1344,7 +1647,7 @@ mod budget_tests {
     /// these tests measure first and assert the *invariant*.
     fn facts(plan: &Arc<dyn ExecutionPlan>) -> Vec<JoinFacts> {
         let mut out = Vec::new();
-        collect_join_facts(plan, &mut out);
+        collect_join_facts(plan, 1, &mut out);
         out
     }
 
@@ -2112,7 +2415,7 @@ mod budget_never_loosens_tests {
 
     fn facts_of(plan: &Arc<dyn ExecutionPlan>) -> Vec<JoinFacts> {
         let mut out = Vec::new();
-        collect_join_facts(plan, &mut out);
+        collect_join_facts(plan, 1, &mut out);
         out
     }
 
