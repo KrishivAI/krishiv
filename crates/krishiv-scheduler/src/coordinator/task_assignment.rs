@@ -750,6 +750,23 @@ impl Coordinator {
         if let Some(parts) = task_window_parts {
             self.job_task_input_partitions.insert(job_id.clone(), parts);
         }
+        // The skew override is a one-shot consumed by the batch it corrects.
+        // If this launch produced no batch — it errored, or there was nothing
+        // launch-ready yet — no assignment carried the corrected partition
+        // count, so consuming it here silently discards the adaptive decision
+        // and the next batch launches with the same hot key it was meant to
+        // spread. Put it back for the batch that actually launches.
+        // (`task_window_parts` above is restored for exactly this reason.)
+        let nothing_launched = match assignment_result.as_ref() {
+            Ok(assignments) => assignments.is_empty(),
+            Err(_) => true,
+        };
+        if let Some(buckets) = skew_override
+            && nothing_launched
+        {
+            self.skew_repartition_overrides
+                .insert(job_id.clone(), buckets);
+        }
         let assignments = assignment_result?;
         if !assignments.is_empty() {
             self.persist_job_record(
@@ -1264,7 +1281,18 @@ impl Coordinator {
                 _ => self.clear_launch_in_flight_for_task(job_id, assignment.task_id()),
             }
         }
-        if accepted == responses.len() && self.continuous_input_cycles.contains(job_id) {
+        // `accepted == responses.len()` is vacuously true for an empty batch,
+        // so this used to consume the pending restore snapshot when nothing had
+        // been dispatched at all (no launch-ready task yet, or an all-in-process
+        // target set, both of which reach here with zero responses). If that
+        // cycle was then aborted, `abort_continuous_input_cycle` dropped
+        // `job_input_partitions` — the only other copy — and the restore was
+        // gone: the job resumed from empty state instead of its checkpoint.
+        // Only a batch that actually delivered something confirms the restore.
+        if !responses.is_empty()
+            && accepted == responses.len()
+            && self.continuous_input_cycles.contains(job_id)
+        {
             self.pending_continuous_restores.remove(job_id);
         }
         accepted
@@ -1418,6 +1446,75 @@ mod tests {
                 "http://exec-c",
                 "http://exec-a",
             ]
+        );
+    }
+
+    /// The skew override is a one-shot: it is removed at the top of the launch
+    /// path and handed to the batch it corrects. A launch round that produces
+    /// no batch (nothing launch-ready, or an error) therefore used to swallow
+    /// the adaptive decision — the hot key that triggered it stayed
+    /// unspread, and the next batch launched with the partitioning the
+    /// coordinator had already decided was wrong.
+    #[test]
+    fn a_launch_round_that_launches_nothing_keeps_the_skew_override() {
+        use krishiv_proto::{JobKind, JobSpec, StageSpec, TaskSpec};
+
+        let mut coord = Coordinator::new_active(None).unwrap();
+        let job_id = JobId::try_new("skew-oneshot").unwrap();
+        coord
+            .submit_job(
+                JobSpec::new(job_id.clone(), "skew", JobKind::Batch).with_stage(
+                    StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(
+                        TaskSpec::new(TaskId::try_new("t0").unwrap(), "sql: select 1"),
+                    ),
+                ),
+            )
+            .unwrap();
+        coord.skew_repartition_overrides.insert(job_id.clone(), 16);
+
+        // No executor is registered, so nothing is launch-ready.
+        let launched = coord.launch_assigned_task_assignments(&job_id);
+        assert!(
+            launched.as_ref().is_ok_and(Vec::is_empty),
+            "precondition: this round must launch nothing, got {launched:?}"
+        );
+
+        assert_eq!(
+            coord.skew_repartition_overrides.get(&job_id),
+            Some(&16),
+            "an override consumed by a batch that never launched is an \
+             adaptive decision silently thrown away"
+        );
+    }
+
+    /// An empty dispatch batch delivered nothing, so it cannot confirm that a
+    /// pending continuous restore snapshot reached its executor. The guard was
+    /// `accepted == responses.len()`, which is vacuously true for zero
+    /// responses — reachable whenever a launch round finds no launch-ready
+    /// task, or resolves only in-process targets. Consuming the snapshot there
+    /// leaves `job_input_partitions` holding the only copy, and
+    /// `abort_continuous_input_cycle` drops that: the job then resumes from
+    /// empty state instead of its checkpoint.
+    #[test]
+    fn an_empty_dispatch_batch_does_not_consume_a_pending_continuous_restore() {
+        let mut coord = Coordinator::new_active(None).unwrap();
+        let job_id = JobId::try_new("continuous-restore").unwrap();
+        coord.continuous_input_cycles.insert(job_id.clone());
+        coord.pending_continuous_restores.insert(
+            job_id.clone(),
+            crate::ContinuousSnapshot {
+                snapshot_bytes: vec![1, 2, 3],
+                watermark_ms: 42,
+            },
+        );
+
+        let accepted = coord.apply_assignment_dispatch_responses(&job_id, &[]);
+
+        assert_eq!(accepted, 0, "an empty batch accepts nothing");
+        assert!(
+            coord.pending_continuous_restores.contains_key(&job_id),
+            "a batch that delivered nothing must not mark the restore snapshot \
+             as consumed"
         );
     }
 
