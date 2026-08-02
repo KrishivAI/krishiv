@@ -587,11 +587,6 @@ pub(crate) async fn execute_run_loop_fragment(
         .map(|(_, spec)| spec)
         .collect();
 
-    let restored_source_offsets = runner
-        .source_restore_offsets
-        .get(job_id)
-        .map(|entry| entry.clone())
-        .unwrap_or_default();
     let source_cache = runner.shared_continuous_connector_sources();
 
     let idle_floor = Duration::from_micros(RLOOP_IDLE_FLOOR_US);
@@ -682,6 +677,23 @@ pub(crate) async fn execute_run_loop_fragment(
                             spec.kind, spec.table_name, spec.partition_id
                         ),
                     })?;
+                // Read the restore table HERE, not once before the loop.
+                //
+                // A `RestoreFromCheckpointCommand` arriving mid-run rewrites
+                // `runner.source_restore_offsets` and then calls
+                // `clear_continuous_connector_sources_for_job`, which evicts this
+                // subtask's cached sources (they key on `{job}#{subtask}`). The
+                // next iteration therefore lands right here and reopens them — so
+                // a snapshot taken at loop start would re-apply the *pre-restore*
+                // offsets and resume the subtask from the wrong position, quietly
+                // replaying or skipping records. The cycle model never had this:
+                // `read_continuous_registry_sources` is called per cycle and so
+                // reads the table fresh every time.
+                let restored_source_offsets = runner
+                    .source_restore_offsets
+                    .get(job_id)
+                    .map(|entry| entry.clone())
+                    .unwrap_or_default();
                 let restored = (!restored_source_offsets.is_empty())
                     .then_some(restored_source_offsets.as_slice());
                 if let Some(offset) = spec.restored_offset(restored) {
