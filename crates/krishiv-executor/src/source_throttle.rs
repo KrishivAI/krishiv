@@ -85,13 +85,10 @@ impl SourceThrottleTable {
         }
     }
 
-    /// Return the current rate limit for `source_id`, or `None` if no
-    /// limit has been applied.
-    pub fn limit_for(&self, source_id: &str) -> Option<u64> {
-        let mut bucket = self.inner.get_mut(source_id)?;
-        bucket.refill();
-        Some(bucket.rate)
-    }
+    // `limit_for` lived here with a body byte-identical to `active_limit` and
+    // no callers anywhere in the workspace. Two spellings of one accessor is
+    // how they drift: a future fix applied to whichever the author found first
+    // would silently leave the other reporting the old answer.
 
     /// Number of rows the source is allowed to emit right now.
     /// Returns the rate limit if throttled, or `None` if unlimited/unknown.
