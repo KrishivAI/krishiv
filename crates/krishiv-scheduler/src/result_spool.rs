@@ -144,17 +144,55 @@ fn result_spool_max_bytes() -> u64 {
         .unwrap_or(DEFAULT_RESULT_SPOOL_MAX_BYTES)
 }
 
+/// A spool file that is still being received. Deletes itself on drop unless
+/// [`Self::disarm`] hands the path to a finished [`TaskResultSpool`].
+///
+/// This used to be a `cleanup(&path)` closure called at each early return,
+/// which covers every error the function *returns* but nothing about the
+/// function not returning at all. A `PushTaskResult` handler whose future is
+/// dropped mid-stream — client disconnect, request cancellation, coordinator
+/// shutdown — ran no cleanup and left the partial file on disk forever, with
+/// nothing that ever sweeps the spool directory. The module header promises
+/// "results abandoned by a failed or cancelled job cannot leak disk"; that
+/// was only true once a spool had been fully received. A destructor is what
+/// makes the promise hold on the cancellation path too.
+struct PartialSpoolFile(Option<PathBuf>);
+
+impl PartialSpoolFile {
+    /// Give up ownership of the path: the caller now owns the finished file.
+    fn disarm(&mut self) -> Option<PathBuf> {
+        self.0.take()
+    }
+}
+
+impl Drop for PartialSpoolFile {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Drain a `PushTaskResult` chunk stream into a spool file.
 ///
 /// Every chunk must carry the same task-attempt identity; the final chunk
-/// must set `last` with a `total_bytes` matching the bytes received. On any
-/// error the partial file is removed.
+/// must set `last` with a `total_bytes` matching the bytes received. The
+/// partial file is removed on any error *and* if this future is dropped
+/// before it completes.
 pub async fn receive_task_result_spool(
+    stream: TaskResultChunkStream,
+) -> Result<(TaskResultKey, TaskResultSpool), tonic::Status> {
+    receive_task_result_spool_in(result_spool_dir(), stream).await
+}
+
+/// [`receive_task_result_spool`] against an explicit directory, so tests can
+/// use a tempdir instead of racing on the process-global env var.
+pub(crate) async fn receive_task_result_spool_in(
+    dir: PathBuf,
     mut stream: TaskResultChunkStream,
 ) -> Result<(TaskResultKey, TaskResultSpool), tonic::Status> {
     use tokio::io::AsyncWriteExt as _;
 
-    let dir = result_spool_dir();
     tokio::fs::create_dir_all(&dir).await.map_err(|e| {
         tonic::Status::internal(format!(
             "cannot create result spool dir {}: {e}",
@@ -164,7 +202,7 @@ pub async fn receive_task_result_spool(
 
     let max_bytes = result_spool_max_bytes();
     let mut key: Option<TaskResultKey> = None;
-    let mut path: Option<PathBuf> = None;
+    let mut partial = PartialSpoolFile(None);
     let mut file: Option<tokio::io::BufWriter<tokio::fs::File>> = None;
     let mut received: u64 = 0;
     let mut saw_last = false;
@@ -172,23 +210,9 @@ pub async fn receive_task_result_spool(
     let mut unsynced: u64 = 0;
     let sync_interval = result_spool_sync_interval_bytes();
 
-    // Remove the partial file on any early-return error.
-    let cleanup = |path: &Option<PathBuf>| {
-        if let Some(p) = path {
-            let _ = std::fs::remove_file(p);
-        }
-    };
-
     while let Some(chunk) = stream.next().await {
-        let chunk: TaskResultChunk = match chunk {
-            Ok(c) => c,
-            Err(status) => {
-                cleanup(&path);
-                return Err(status);
-            }
-        };
+        let chunk: TaskResultChunk = chunk?;
         if saw_last {
-            cleanup(&path);
             return Err(tonic::Status::invalid_argument(
                 "task result chunk received after the final chunk",
             ));
@@ -217,12 +241,11 @@ pub async fn receive_task_result_spool(
                         p.display()
                     ))
                 })?;
-                path = Some(p);
+                partial = PartialSpoolFile(Some(p));
                 file = Some(tokio::io::BufWriter::new(f));
                 key = Some(chunk_key);
             }
             Some(existing) if *existing != chunk_key => {
-                cleanup(&path);
                 return Err(tonic::Status::invalid_argument(
                     "task result chunks must all belong to one task attempt",
                 ));
@@ -232,7 +255,6 @@ pub async fn receive_task_result_spool(
 
         received = received.saturating_add(chunk.data().len() as u64);
         if received > max_bytes {
-            cleanup(&path);
             return Err(tonic::Status::resource_exhausted(format!(
                 "spooled task result exceeds {max_bytes} bytes ({RESULT_SPOOL_MAX_BYTES_ENV})"
             )));
@@ -247,10 +269,7 @@ pub async fn receive_task_result_spool(
         {
             write_and_maybe_sync(f, &data, &mut unsynced, sync_interval)
                 .await
-                .map_err(|e| {
-                    cleanup(&path);
-                    tonic::Status::internal(format!("result spool write failed: {e}"))
-                })?;
+                .map_err(|e| tonic::Status::internal(format!("result spool write failed: {e}")))?;
             // #222: a large transfer that stalls (network contention, or a
             // genuine hang) used to be a total black box until the caller's
             // own timeout fired minutes later, with no trace of how far it
@@ -271,36 +290,40 @@ pub async fn receive_task_result_spool(
         }
     }
 
-    let (Some(key), Some(path_buf), Some(mut writer)) = (key, path.clone(), file) else {
+    let (Some(key), Some(mut writer)) = (key, file) else {
         return Err(tonic::Status::invalid_argument(
             "task result stream carried no chunks",
         ));
     };
     if !saw_last {
-        cleanup(&Some(path_buf));
         return Err(tonic::Status::invalid_argument(
             "task result stream ended without a final chunk",
         ));
     }
     if declared_total != received {
-        cleanup(&Some(path_buf));
         return Err(tonic::Status::data_loss(format!(
             "task result spool incomplete: declared {declared_total} bytes, received {received}"
         )));
     }
-    writer.flush().await.map_err(|e| {
-        cleanup(&Some(path_buf.clone()));
-        tonic::Status::internal(format!("result spool flush failed: {e}"))
-    })?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| tonic::Status::internal(format!("result spool flush failed: {e}")))?;
     // Sync the tail too — a spool smaller than the sync interval (or the
     // last partial interval of a larger one) would otherwise never get an
     // fdatasync at all, sitting as dirty page cache until the kernel's own
     // background writeback gets to it.
-    writer.get_ref().sync_data().await.map_err(|e| {
-        cleanup(&Some(path_buf.clone()));
-        tonic::Status::internal(format!("result spool final sync failed: {e}"))
-    })?;
+    writer
+        .get_ref()
+        .sync_data()
+        .await
+        .map_err(|e| tonic::Status::internal(format!("result spool final sync failed: {e}")))?;
 
+    let Some(path_buf) = partial.disarm() else {
+        return Err(tonic::Status::internal(
+            "result spool completed with no file path",
+        ));
+    };
     Ok((
         key,
         TaskResultSpool {
@@ -384,6 +407,52 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// The module header promises abandoned results cannot leak disk. That
+    /// held for a fully-received spool (`TaskResultSpool: Drop`) and for every
+    /// error the receiver *returns*, but not for the receiver simply not
+    /// finishing — a client disconnect or request cancellation drops the
+    /// future mid-stream, and nothing sweeps the spool directory afterwards.
+    #[tokio::test]
+    async fn a_cancelled_receive_leaves_no_partial_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // One real chunk (so the file is created), then a stream that never
+        // yields again — the shape of a producer that stops mid-transfer.
+        let stalling = futures::stream::once(async { Ok(TaskResultChunk::new(ids(), vec![7; 64])) })
+            .chain(futures::stream::pending());
+        let receive =
+            receive_task_result_spool_in(dir.path().to_path_buf(), Box::pin(stalling));
+
+        let timed_out = tokio::time::timeout(std::time::Duration::from_millis(150), receive).await;
+        assert!(timed_out.is_err(), "the stalled receive must not complete");
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "dropping the receive future must delete the partial spool; found {leftovers:?}"
+        );
+    }
+
+    /// The successful path must NOT delete the file it just handed over.
+    #[tokio::test]
+    async fn a_completed_receive_keeps_its_file_until_the_spool_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let c1 = TaskResultChunk::new(ids(), vec![1, 2, 3]);
+        let c2 = TaskResultChunk::new(ids(), vec![4, 5]).with_last(5);
+        let (_key, spool) =
+            receive_task_result_spool_in(dir.path().to_path_buf(), chunk_stream(vec![c1, c2]))
+                .await
+                .unwrap();
+        assert!(spool.path().exists(), "the finished spool must survive");
+        let path = spool.path().to_path_buf();
+        drop(spool);
+        assert!(!path.exists(), "and delete on its own drop, as before");
     }
 
     #[tokio::test]
