@@ -867,12 +867,80 @@ mod tests {
         let composite = HashPartitioner::new_multi(vec!["id".into()], 8)
             .partition(&batch)
             .unwrap();
-        let shape = |parts: &[RecordBatch]| parts.iter().map(|b| b.num_rows()).collect::<Vec<_>>();
         assert_eq!(
-            shape(&fast),
-            shape(&composite),
+            bucket_contents(&fast, "id"),
+            bucket_contents(&composite, "id"),
             "the composite path must agree with the single-column path on one column"
         );
+    }
+
+    /// The keys each bucket received, so agreement is checked on *contents*
+    /// rather than on bucket sizes.
+    ///
+    /// Comparing `num_rows()` per bucket — which this file did — passes even
+    /// when two buckets swap equally-sized sets of rows, which is precisely the
+    /// co-location bug the comparison exists to catch. `None` is kept in the
+    /// vector so a null routed to a different bucket is a difference too.
+    fn bucket_contents(parts: &[RecordBatch], column: &str) -> Vec<Vec<Option<i64>>> {
+        parts
+            .iter()
+            .map(|b| {
+                let idx = b.schema().index_of(column).expect("column present");
+                let arr = b
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64 key");
+                (0..arr.len())
+                    .map(|r| (!arr.is_null(r)).then(|| arr.value(r)))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The two hashing paths must agree — asserted where they can actually be
+    /// compared.
+    ///
+    /// `partition()` cannot compare them. `new()` delegates to `new_multi()`,
+    /// and the fast path is selected by `key_columns.len() == 1` plus the column
+    /// type, *not* by which constructor was used — so for a single Int64 key
+    /// **both** constructors take the fast path and the composite branch never
+    /// runs. `a_single_element_composite_matches_the_fast_path_exactly` compares
+    /// the fast path against itself; it was verified vacuous by breaking the
+    /// composite path's null sentinel and watching it still pass.
+    ///
+    /// So drive `composite_row_hashes` directly, which is the only way to reach
+    /// the branch, and compare against `hash_i64`/`null_bucket` — the functions
+    /// the fast path uses. This one *does* fail when the sentinels diverge.
+    #[test]
+    fn the_composite_hash_agrees_with_the_fast_path_including_nulls() {
+        let batch = batch_with_nulls();
+        let buckets = 4;
+        let partitioner = HashPartitioner::new_multi(vec!["k".into()], buckets);
+        let hashes = partitioner.composite_row_hashes(&batch).unwrap();
+
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let null_bucket = partitioner.null_bucket(NULL_SENTINEL_INT);
+        let mut nulls_seen = 0;
+        for row in 0..arr.len() {
+            let composite_bucket = (hashes[row] % u64::from(buckets)) as u32;
+            let expected = if arr.is_null(row) {
+                nulls_seen += 1;
+                null_bucket
+            } else {
+                hash_i64(arr.value(row), buckets, partitioner.seed)
+            };
+            assert_eq!(
+                ShuffleBucket(composite_bucket),
+                expected,
+                "row {row} routes differently on the composite path than the fast path"
+            );
+        }
+        assert_eq!(nulls_seen, 3, "fixture must exercise the null sentinel");
     }
 
     /// Regression (Wave 1 — Data Correctness): `Clone` must reset the
