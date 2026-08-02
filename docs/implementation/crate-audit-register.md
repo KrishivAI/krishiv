@@ -303,12 +303,14 @@ Measured: **81.07% regions, 68.67% functions, 78.07% lines** (11,475 regions,
 
 ---
 
-## 2. krishiv-executor — 7 of 40 files read whole (in progress, 2026-08-02)
+## 2. krishiv-executor — 11 of 40 files read whole (in progress, 2026-08-02)
 
 Read whole: `fragment/shuffle_write_buffer.rs`, `runner/partition.rs`,
 `runner/result_spool.rs`, `transport.rs`, `ess_client.rs`, and — as of
 2026-08-02 — `fragment/batch.rs` (2,814) and `fragment/common.rs` (2,149),
-both of which had previously been read in regions only. 9,239 of 28,927 lines.
+both of which had previously been read in regions only, plus `cli.rs` (2,155),
+`runner/executor_task_runner.rs` (2,109) and `assignment_inbox.rs` (697).
+14,200 of 28,927 lines.
 
 Largest still unread: `cli.rs` (2,155),
 `runner/executor_task_runner.rs` (2,109), `sections/core.rs.inc` (1,837),
@@ -330,6 +332,39 @@ Largest still unread: `cli.rs` (2,155),
       and now rejects `num_partitions == 0` — and again in the executor, because
       `ShuffleWriteConfig` is also built in-process by
       `krishiv-scheduler/distributed_batch.rs`, which never crosses the decoder.
+
+### Found, NOT fixed — needs a decision first
+
+- [ ] **`cancelled_tasks` grows without bound for cancelled batch tasks.**
+      `ExecutorAssignmentInbox` bounds its `seen` set deliberately
+      (`MAX_SEEN_ENTRIES` = 10,000, FIFO eviction) and leaves its sibling
+      `cancelled_tasks` unbounded. The test
+      `forget_job_purges_its_own_cancel_tombstone` states the intent — "so a
+      long-lived executor process does not accumulate an unbounded
+      `cancelled_tasks` set" — but `forget_job` is called from exactly one
+      place, `grpc.rs:251`, **gated on `had_cycle_executor || had_rloop`**. That
+      is only true for continuous/streaming jobs with a registered loop
+      executor.
+
+      For a batch cancel: `cancel_task` removes the assignment from the queue
+      *and* plants the tombstone; the gate is false so neither `forget_job` nor
+      the eager `clear_cancelled_task` runs; and the runner's own
+      `clear_cancelled_task` (`executor_task_runner.rs:814`/`:936`) never fires
+      because the task was removed from the queue and will never be dequeued.
+      One leaked `(JobId, TaskId)` per batch task cancelled while queued.
+
+      **Why the obvious fix is wrong.** Clearing the tombstone when
+      `cancel_task` returns `removed == true` looks right — nothing can read it
+      if the assignment is gone. But tombstones are keyed `(job, task)` with no
+      attempt, so a *queued attempt 2* and a *running attempt 1* of the same
+      task share one entry. Clearing on removal of the queued attempt would let
+      the running attempt escape cancellation — trading a slow memory leak for
+      a correctness bug in the cancel path.
+
+      The real question is whether `cancelled_tasks` should be keyed by attempt.
+      That changes `is_task_cancelled`'s contract for the mid-execution cancel
+      watch (#217) and for run-loop tasks that poll it, so it wants deliberate
+      design rather than a patch. Recorded rather than guessed at.
 
 ### Read and found clean
 
