@@ -486,6 +486,25 @@ pub struct ShuffleContext {
     /// When the External Shuffle Service is running in-process, sort-shuffle
     /// writers register their output here so the ESS HTTP server can serve
     /// partition-level range reads without a separate registration RPC.
+    ///
+    /// # Must stay `None` — setting it silently loses rows
+    ///
+    /// This field is the switch that arms `SortShuffleWriter`
+    /// (`fragment/batch.rs` builds one iff this is `Some`), and that writer is
+    /// not safe to run yet: every path it emits is derived from `job_id` and
+    /// `stage_id` alone — `{job}_{stage}.data`, `.index`, and
+    /// `{job}_{stage}_{bucket}_spill{seq}.ipc` — with no map-task identity.
+    /// A stage has one task per partition and this engine runs three slots per
+    /// executor, so two tasks of the same stage on one executor overwrite each
+    /// other's data and index files, and the second `SortShuffleIndex::register`
+    /// (keyed `(job_id, stage_id)`) evicts the first. The reduce side reads one
+    /// task's output and the query reports success. Spark keys this per map task
+    /// (`shuffle_<shuffleId>_<mapId>_0.data`); `mapId` has no counterpart here.
+    ///
+    /// Every production construction site sets this to `None` deliberately.
+    /// `krishiv-shuffle`'s `two_tasks_of_one_stage_overwrite_each_others_output`
+    /// asserts the collision and will fail the moment task identity is added —
+    /// invert it into a correctness check then, and only then set this.
     pub ess_index: Option<krishiv_shuffle::SortShuffleIndex>,
     /// T12: optional push-shuffle store — when set, each partition's IPC bytes
     /// are also pushed here so reduce-side tasks can read without a Flight hop.

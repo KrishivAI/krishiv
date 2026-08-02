@@ -212,6 +212,22 @@ impl ShuffleCompression {
     }
 }
 
+/// Bytes a partition *retains*, used by [`crate::InMemoryShuffleStore`] for its
+/// byte cap and eviction.
+///
+/// Deliberately `get_array_memory_size()` and not
+/// [`crate::logical_partition_bytes`]. The two answer different questions: the
+/// logical figure is what a partition *references* (right for reporting and for
+/// AQE sizing, where counting a shared buffer once per bucket inflates the sum
+/// by the bucket count), while a memory cap needs what is actually *held* — a
+/// buffer one partition alone references is real resident memory.
+///
+/// They coincide here because every bucket is compacted at the moment it is
+/// produced, in `partitioner::partition_batch`: that is the single place all
+/// three map-write paths create buckets, so a partition reaching any store owns
+/// its buffers rather than sharing the source's. If a new writer ever produces
+/// buckets outside that path, this number reverts to Arrow's shared-buffer
+/// over-report and the cap starts spilling early.
 pub fn partition_memory_bytes(partition: &crate::store::ShufflePartition) -> usize {
     partition
         .batches

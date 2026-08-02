@@ -926,8 +926,9 @@ mod tests {
             .unwrap();
         let null_bucket = partitioner.null_bucket(NULL_SENTINEL_INT);
         let mut nulls_seen = 0;
-        for row in 0..arr.len() {
-            let composite_bucket = (hashes[row] % u64::from(buckets)) as u32;
+        assert_eq!(hashes.len(), arr.len(), "one composite hash per row");
+        for (row, hash) in hashes.iter().enumerate() {
+            let composite_bucket = (hash % u64::from(buckets)) as u32;
             let expected = if arr.is_null(row) {
                 nulls_seen += 1;
                 null_bucket

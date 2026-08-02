@@ -627,34 +627,51 @@ pub(crate) async fn serve_with_token<S: ShuffleStore + Send + Sync + 'static>(
     store: Arc<S>,
     token: Option<String>,
 ) -> io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
-    // Round the byte budget back into the response units this helper takes;
-    // `with_serve_limit` converts it straight back. Tests drive the same knob.
-    let responses = serve_budget_bytes().div_ceil(crate::disk_store::INLINE_READ_LIMIT);
-    serve_with_token_and_limit(
-        addr,
-        store,
-        token,
-        usize::try_from(responses).unwrap_or(DEFAULT_SERVE_CONCURRENCY).max(1),
-    )
-    .await
+    // Pass the budget through in bytes. It used to be rounded into response
+    // units here (`div_ceil` by `INLINE_READ_LIMIT`) and multiplied straight
+    // back by `with_serve_limit` — described as converting "straight back", but
+    // `div_ceil` rounds *up*, so the server enforced up to one whole
+    // `INLINE_READ_LIMIT` (32 MiB) MORE resident than `ExecutorCapacity` said
+    // was available. Overshooting is the one direction this bound must not err
+    // in: it exists because the untracked bytes live in the same process as the
+    // map tasks.
+    serve_with_token_and_budget_bytes(addr, store, token, serve_budget_bytes()).await
 }
 
-/// [`serve_with_token`] with an explicit serve-concurrency cap (B1), so tests
-/// can prove the bound without mutating process-global environment state.
+/// [`serve_with_token`] with an explicit serve cap in **maximal responses**, so
+/// tests can drive the bound without mutating process-global environment state.
+///
+/// Response units are the test-facing shape — "a limit of 1 must mean one
+/// response at a time" — so the conversion to bytes happens here, at the one
+/// seam that wants it, rather than on the production path. Test-only: since
+/// `serve_with_token` stopped routing through response units, nothing in a
+/// production build reaches this.
+#[cfg(test)]
 pub(crate) async fn serve_with_token_and_limit<S: ShuffleStore + Send + Sync + 'static>(
     addr: SocketAddr,
     store: Arc<S>,
     token: Option<String>,
     serve_limit: usize,
 ) -> io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    let budget = (serve_limit.max(1) as u64).saturating_mul(crate::disk_store::INLINE_READ_LIMIT);
+    serve_with_token_and_budget_bytes(addr, store, token, budget).await
+}
+
+/// [`serve_with_token`] with an explicit byte budget for the `do_get` bound.
+pub(crate) async fn serve_with_token_and_budget_bytes<S: ShuffleStore + Send + Sync + 'static>(
+    addr: SocketAddr,
+    store: Arc<S>,
+    token: Option<String>,
+    budget_bytes: u64,
+) -> io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
     tracing::debug!(
         %local_addr,
-        serve_limit,
+        budget_bytes,
         "shuffle flight server bounding concurrent do_get responses"
     );
-    let service = ShuffleFlightService::with_serve_limit(store, serve_limit);
+    let service = ShuffleFlightService::with_serve_budget_bytes(store, budget_bytes);
     let incoming = tonic::transport::server::TcpIncoming::from(listener);
     // One interceptor type for both auth-on and auth-off so `add_service`
     // receives a single concrete service type. When `token` is `None` the
@@ -2150,6 +2167,37 @@ mod serve_budget_tests {
             );
             assert!(charged >= 1, "a response must cost at least one granule");
         }
+    }
+
+    /// The budget must be enforced as given, never rounded up.
+    ///
+    /// `serve_with_token` used to convert bytes into response units with
+    /// `div_ceil` and let `with_serve_limit` multiply them back, described as
+    /// converting "straight back". Rounding up meant the server allowed up to
+    /// one whole `INLINE_READ_LIMIT` more resident than `ExecutorCapacity`
+    /// reported — and these bytes sit outside the DataFusion pool, in the
+    /// process running map tasks, which is the entire reason the bound exists.
+    #[test]
+    fn the_serve_budget_is_enforced_as_given_not_rounded_up() {
+        let budget = 100 * 1024 * 1024u64;
+        let inflated = budget
+            .div_ceil(crate::disk_store::INLINE_READ_LIMIT)
+            .saturating_mul(crate::disk_store::INLINE_READ_LIMIT);
+        assert!(
+            inflated > budget,
+            "test premise: {budget} must not already be a whole number of maximal responses"
+        );
+
+        let svc = ShuffleFlightService::with_serve_budget_bytes(
+            Arc::new(crate::InMemoryShuffleStore::new_unbounded()),
+            budget,
+        );
+        assert_eq!(
+            u64::from(svc.serve_granules),
+            budget / SERVE_GRANULE_BYTES,
+            "the budget must be granted in granules of itself; routing it through \
+             response units enforces {inflated} bytes instead of {budget}"
+        );
     }
 
     /// An existing `KRISHIV_SHUFFLE_SERVE_CONCURRENCY` override keeps meaning
