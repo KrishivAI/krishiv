@@ -303,13 +303,47 @@ Measured: **81.07% regions, 68.67% functions, 78.07% lines** (11,475 regions,
 
 ---
 
-## 2. krishiv-executor — 5 of 32 files read whole
+## 2. krishiv-executor — 7 of 40 files read whole (in progress, 2026-08-02)
 
 Read whole: `fragment/shuffle_write_buffer.rs`, `runner/partition.rs`,
-`runner/result_spool.rs`, `transport.rs`, `ess_client.rs`. `fragment/batch.rs`
-and `fragment/common.rs` read in regions only. Everything else unread —
-`cli.rs` (2154), `runner/executor_task_runner.rs` (1992),
-`fragment/run_loop.rs` (1480), `fragment/streaming.rs` (1358) are the largest.
+`runner/result_spool.rs`, `transport.rs`, `ess_client.rs`, and — as of
+2026-08-02 — `fragment/batch.rs` (2,814) and `fragment/common.rs` (2,149),
+both of which had previously been read in regions only. 9,239 of 28,927 lines.
+
+Largest still unread: `cli.rs` (2,155),
+`runner/executor_task_runner.rs` (2,109), `sections/core.rs.inc` (1,837),
+`fragment/run_loop.rs` (1,461), `fragment/streaming.rs` (1,358),
+`sections/gap6.rs.inc` (1,250).
+
+### Fixed reading it
+
+- [x] **A zero-partition shuffle write reported success with no output**
+      (`dca44555`). `execute_inmem_shuffle_write` — the `sql:`-body map path —
+      took `write_cfg.num_partitions` unguarded and counted rows *before* the
+      skip, so with 0 partitions it counted every row, wrote none (`for p in
+      0..0`) and returned `shuffle_write(total_rows, vec![])`: task green, rows
+      reported, nothing stored, and nothing could have read it anyway. Its
+      sibling `execute_dfplan_fragment` applies `.max(1)` and so does
+      `job/record.rs` on dispatch, which is exactly why this path's omission was
+      invisible. Fixed at the protocol boundary —
+      `shuffle_write_config_from_wire` validated `stage_id` and nothing else,
+      and now rejects `num_partitions == 0` — and again in the executor, because
+      `ShuffleWriteConfig` is also built in-process by
+      `krishiv-scheduler/distributed_batch.rs`, which never crosses the decoder.
+
+### Read and found clean
+
+`fragment/common.rs`: the one known issue is B3 (the shuffle read materialises
+a whole fragment outside every budget, `read_shuffle_flight_partitions`), which
+is already instrumented in place and carries its own explanation of why a
+`MemTable` cannot simply become a stream — a fragment's SQL may scan the same
+shuffle table twice. No new defect.
+
+`execute_shuffle_write_fragment` in `batch.rs` remains dead (nothing constructs
+a `shuffle-write:` fragment) and is marked as such at the function; its
+leftover `if output_schema.fields().is_empty()` fallback is unreachable now
+that the schema comes from the stream, and was left alone rather than tidied
+inside a dead path.
 
 Measured **2026-07-29**: **75.34% regions, 62.44% functions, 73.96% lines**
 (27,312 regions, 6,736 uncovered).
