@@ -303,7 +303,7 @@ Measured: **81.07% regions, 68.67% functions, 78.07% lines** (11,475 regions,
 
 ---
 
-## 2. krishiv-executor — 11 of 40 files read whole (in progress, 2026-08-02)
+## 2. krishiv-executor — 35 of 40 files read whole (in progress, 2026-08-02)
 
 Read whole: `fragment/shuffle_write_buffer.rs`, `runner/partition.rs`,
 `runner/result_spool.rs`, `transport.rs`, `ess_client.rs`, and — as of
@@ -312,10 +312,11 @@ both of which had previously been read in regions only, plus `cli.rs` (2,155),
 `runner/executor_task_runner.rs` (2,109) and `assignment_inbox.rs` (697).
 14,200 of 28,927 lines.
 
-Largest still unread: `cli.rs` (2,155),
-`runner/executor_task_runner.rs` (2,109), `sections/core.rs.inc` (1,837),
-`fragment/run_loop.rs` (1,461), `fragment/streaming.rs` (1,358),
-`sections/gap6.rs.inc` (1,250).
+**Every production `.rs` file is read except `fragment/run_loop.rs`**, which is
+read to line 560 of 1,461. Still unread: `fragment/run_loop.rs` (901 lines
+remaining), and four test sections — `sections/core.rs.inc` (1,837),
+`sections/gap6.rs.inc` (1,250), `sections/stream_loop.rs.inc` (835),
+`sections/recovery.rs.inc` (797). ~5,620 of 28,927 lines outstanding.
 
 ### Fixed reading it
 
