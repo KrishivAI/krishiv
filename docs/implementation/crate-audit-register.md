@@ -102,21 +102,29 @@ Uncovered-region concentration (this decides what to test next):
       `delta.<path>` refs were honoured; a timestamp mapped to `None`, which
       means "latest". Both now error. `69bfc86d`
 
+### Closed since, verified against the tree 2026-08-02
+
+Four of the five items below were carried as open while already being fixed.
+That is not free: a stale "Open" list sends the next session to re-derive work
+that is done, and on 2026-08-02 it cost a wasted change to a dead code path
+(see krishiv-executor). **Re-verify an item against the tree before working
+it** — this section is a record of what was found, not a queue.
+
+- [x] `connector_table.rs` — `streaming_sources` insert-only: fixed `1d98f9b6`.
+- [x] `connector_table.rs` — `is_object_store_url` case-sensitivity: fixed in
+      the same commit; `eq_ignore_ascii_case` over the scheme, with a test at
+      `connector_table.rs:524` covering `S3://`, `S3A://`, `Gs://`.
+- [x] `lakehouse/providers.rs` — Delta **and** Hudi scans no longer build a
+      `MemTable`. Both resolve the snapshot's Parquet file list and hand it to
+      DataFusion's Parquet scan, so projection pushdown, row-group pruning, the
+      limit and per-file parallelism all apply.
+- [x] `recursive_cte` — resolved by deletion (`f0742b30`): DataFusion already
+      implements it. The file no longer exists.
+
 ### Open
 
-- [ ] `lib.rs` — 2540 uncovered regions, the single largest target anywhere
-- [ ] `connector_table.rs` — `streaming_sources` set and the
-      `has_streaming_sources` latch look **insert-only** (lib.rs 1329/1357/
-      1497/1578, no removes): a dropped Kafka table may stay "streaming"
-      forever. Unconfirmed.
-- [ ] `connector_table.rs` — `is_object_store_url` is case-sensitive, so
-      `LOCATION 'S3://…'` misroutes to the local-filesystem path
-- [ ] `lakehouse/providers.rs` — `DeltaScanProvider::scan` and
-      `HudiScanProvider::scan` drain the **whole table** into a `MemTable`
-      before projection/limit apply. This is the exact pattern
-      `connector_table.rs` already retired (Phase 52 #194); the streaming
-      replacement pattern is next door in `BoundedConnectorPartitionStream`.
-- [ ] `recursive_cte` — unreachable; wire it or delete it
+- [ ] `lib.rs` — the single largest target anywhere. A coverage target, not a
+      known defect: nothing here claims `lib.rs` is wrong, only untested.
 
 ---
 
