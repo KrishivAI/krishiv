@@ -22,39 +22,47 @@ cluster. This audit runs between cluster runs, not instead of them.
 Ranked by (1) on the distributed TPC-H critical path, (2) blast radius of a
 silent wrong answer, (3) size × test-thinness.
 
-| # | crate | LOC | files | test files | why here |
+**LOC and file counts corrected 2026-08-02.** Every figure below previously came
+from a `*.rs`-only walk, which cannot see `src/sections/*.rs.inc` — this repo
+keeps 441 tests in those. The old numbers understated the workspace by ~55 files
+and ~30k lines, and they are what ranked this table. The worst offender was
+krishiv-scheduler: **78 files / 51,438 lines**, not 56 / 39,142 — it is the
+largest crate in the workspace, not the second. Counts are `find src tests -name
+'*.rs' -o -name '*.rs.inc'`.
+
+| # | crate | LOC | files | read whole | why here |
 |---|---|---|---|---|---|
 | **Tier 1 — critical path** |
-| 1 | krishiv-sql | 38,727 | 54 | 49 | first slice done; `lib.rs` alone holds 37% of the crate's uncovered regions |
-| 2 | krishiv-executor | 21,867 | 32 | 27 | shuffle write/drain (D7), task running, the memory pool |
-| 3 | krishiv-shuffle | 14,241 | 35 | **35 — COMPLETE 2026-08-02** | first crate fully read; 4 defects fixed. Counts now include `sections/*.rs.inc` and `tests/`, which the old figures omitted |
-| 4 | krishiv-scheduler | 39,142 | 56 | 56 | stage cutting, dispatch, the single-task fallback, SC11 breaker |
+| 1 | krishiv-sql | 46,632 | 61 | 7 | first slice done; `lib.rs` alone holds 37% of the crate's uncovered regions |
+| 2 | krishiv-executor | 28,927 | 40 | 5 | shuffle write/drain (D7), task running, the memory pool |
+| 3 | krishiv-shuffle | 14,329 | 36 | **36 — COMPLETE 2026-08-02** | first crate fully read; 4 defects fixed |
+| 4 | krishiv-scheduler | **51,438** | **78** | 0 | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
 | **Tier 2 — correctness blast radius** |
-| 5 | krishiv-plan | 14,385 | 25 | 19 | plan IR every surface depends on |
-| 6 | krishiv-common | 7,525 | 22 | 19 | env registry, durability profiles, memory budget |
-| 7 | krishiv-connectors | 39,088 | 95 | 53 | ingest correctness; 42 files with no tests |
-| 8 | krishiv-state | 11,980 | 34 | 16 | checkpoints/restore; fewer than half the files tested |
+| 5 | krishiv-plan | 14,371 | 25 | 0 | plan IR every surface depends on |
+| 6 | krishiv-common | 7,966 | 23 | 0 | env registry, durability profiles, memory budget |
+| 7 | krishiv-connectors | 39,930 | 97 | 0 | ingest correctness; 42 files with no tests |
+| 8 | krishiv-state | 12,357 | 37 | 0 | checkpoints/restore; fewer than half the files tested |
 | **Tier 3 — runtime & surfaces** |
-| 9 | krishiv-api | 25,039 | 38 | 25 | |
-| 10 | krishiv-runtime | 12,978 | 15 | 13 | |
-| 11 | krishiv-dataflow | 18,016 | 37 | 32 | |
-| 12 | krishiv-ivm | 6,387 | 8 | 5 | |
-| 13 | krishiv-delta | 6,880 | 19 | 16 | |
-| 14 | krishiv-flight-sql | 5,170 | 6 | 4 | |
-| 15 | krishiv-proto | 8,130 | 12 | **3** | 8k LOC, 3 test files |
-| 16 | krishiv-metrics | 3,731 | 6 | 5 | |
-| 17 | krishiv-engine-core | 3,146 | 11 | 8 | |
+| 9 | krishiv-api | 25,111 | 38 | 0 | |
+| 10 | krishiv-runtime | 13,648 | 17 | 0 | |
+| 11 | krishiv-dataflow | 18,107 | 38 | 0 | |
+| 12 | krishiv-ivm | 7,019 | 10 | 0 | |
+| 13 | krishiv-delta | 7,098 | 20 | 0 | |
+| 14 | krishiv-flight-sql | 5,199 | 6 | 0 | |
+| 15 | krishiv-proto | 8,130 | 12 | 0 | 8k LOC, 3 test files |
+| 16 | krishiv-metrics | 3,731 | 6 | 0 | |
+| 17 | krishiv-engine-core | 3,146 | 11 | 0 | |
 | **Tier 4 — thin, tooling, structural smells** |
-| 18 | krishiv-python | 12,892 | 35 | **8** | excluded from CI clippy — breakage is invisible |
-| 19 | krishiv-operator | 4,878 | 19 | 5 | |
-| 20 | krishiv-mcp | 3,296 | **1** | 1 | one 3,296-line file |
-| 21 | krishiv | 6,194 | 19 | 9 | binary/CLI |
-| 22 | krishiv-engines | 2,216 | **1** | 1 | one file |
-| 23 | krishiv-ui | 2,384 | 4 | 1 | |
-| 24 | krishiv-bench | 1,947 | 9 | 4 | |
-| 25 | krishiv-sql-gateway | 541 | 3 | 1 | |
-| 26 | krishiv-conformance | 209 | 1 | **0** | no tests at all |
-| 27 | krishiv-chaos | **0** | 0 | 0 | empty crate — delete or fill |
+| 18 | krishiv-python | 12,892 | 35 | 0 | excluded from CI clippy — breakage is invisible |
+| 19 | krishiv-operator | 5,128 | 20 | 0 | |
+| 20 | krishiv-mcp | 3,296 | **1** | 0 | one 3,296-line file |
+| 21 | krishiv | 8,257 | 24 | 0 | binary/CLI |
+| 22 | krishiv-engines | 2,192 | **1** | 0 | one file |
+| 23 | krishiv-ui | 2,384 | 4 | 0 | |
+| 24 | krishiv-bench | 3,362 | 14 | 0 | |
+| 25 | krishiv-sql-gateway | 541 | 3 | 0 | |
+| 26 | krishiv-conformance | 353 | 3 | 0 | no tests at all |
+| 27 | krishiv-chaos | **0** | 0 | — | empty crate — delete or fill |
 
 ---
 
@@ -128,10 +136,10 @@ it** — this section is a record of what was found, not a queue.
 
 ---
 
-## 3. krishiv-shuffle — COMPLETE, 35 of 35 files read whole (2026-08-02)
+## 3. krishiv-shuffle — COMPLETE, 36 of 36 files read whole (2026-08-02)
 
 **A crate is "covered" only when every file has been read end to end.** This is
-the first crate to reach it: all 35 files, **14,241 lines**, including the 11
+the first crate to reach it: all 36 files, **14,329 lines**, including the 11
 `src/sections/*.rs.inc` test sections and both files under `tests/`.
 
 **Methodology correction that this crate forced.** `grep --include=*.rs` cannot
