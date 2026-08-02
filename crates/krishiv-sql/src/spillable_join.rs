@@ -463,6 +463,20 @@ enum Conversion {
 /// and is what `PartitionMode::Partitioned` means; matching rows still land in
 /// the same partition, so it is correct for every join type here, including
 /// the `LeftAnti` that q21 needs.
+///
+/// # Why only for a *degenerate* estimate
+///
+/// The first version of this rescued any oversized `CollectLeft`, and that is
+/// a plan change on the coordinator too — which runs this same rule with more
+/// than one target partition. Every ordinary broadcast join in a distributed
+/// plan gained a pair of exchanges, and each exchange is a stage boundary:
+/// q21 at SF100 went from **11 stages / 758 s** to **13 stages / 1061 s**.
+///
+/// The degenerate estimate is the whole reason this case is unrescuable, so it
+/// is the whole condition. A broadcast join with an honest size is one the
+/// budget can reason about and the distributed planner can already refuse
+/// (`distributed_plan::broadcast_build_estimate_is_empty`); it does not need,
+/// and must not get, an exchange it never asked for.
 fn convertible_mode(hash_join: &HashJoinExec, target_partitions: usize) -> Option<Conversion> {
     let single_partition = hash_join.left().output_partitioning().partition_count() == 1
         && hash_join.right().output_partitioning().partition_count() == 1;
@@ -473,9 +487,15 @@ fn convertible_mode(hash_join: &HashJoinExec, target_partitions: usize) -> Optio
         PartitionMode::CollectLeft if single_partition => Some(Conversion::InPlace {
             preserve_partitioning: false,
         }),
-        // Repartitioning needs equijoin keys to hash on, and more than one
-        // partition to be worth planning.
-        PartitionMode::CollectLeft if target_partitions > 1 && !hash_join.on().is_empty() => {
+        // Only when the estimator *gave up*. Repartitioning needs equijoin keys
+        // to hash on and more than one partition to be worth planning, but the
+        // binding condition is the degenerate estimate — see below.
+        PartitionMode::CollectLeft
+            if target_partitions > 1
+                && !hash_join.on().is_empty()
+                && crate::join_estimates::BuildSideEstimate::of(hash_join.left())
+                    .any_claims_empty() =>
+        {
             Some(Conversion::Repartition {
                 partitions: target_partitions,
             })
@@ -1380,18 +1400,39 @@ mod degenerate_broadcast_tests {
     /// hand: a `HashJoinExec` built directly over a `RepartitionExec` is not a
     /// plan DataFusion would emit, and executing it panics partitions that
     /// nothing polls. The bug is about a plan the planner really produces.
-    async fn broadcast_join_over_split_probe(ctx: &SessionContext) -> Arc<dyn ExecutionPlan> {
+    /// `degenerate` chooses whether the build side's estimate *claims to be
+    /// empty* — the q21 condition, and the only one this rescue fires on.
+    async fn broadcast_join_over_split_probe(
+        ctx: &SessionContext,
+        degenerate: bool,
+    ) -> Arc<dyn ExecutionPlan> {
         use arrow::array::Int32Array;
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
         use datafusion::datasource::MemTable;
 
-        ctx.sql("CREATE TABLE l(k INT, v INT) AS VALUES (1, 10), (2, 20), (3, 30)")
-            .await
-            .unwrap()
-            .collect()
-            .await
+        let build_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
+        ]));
+        if degenerate {
+            // Zero rows, so `BuildSideEstimate::any_claims_empty` holds — which
+            // is what q21's LeftAnti produces for a relation that is really
+            // 2 GB. The shape is the point; the size cannot be reproduced here.
+            let empty = MemTable::try_new(Arc::clone(&build_schema), vec![vec![]]).unwrap();
+            ctx.register_table("l", Arc::new(empty)).unwrap();
+        } else {
+            let rows = RecordBatch::try_new(
+                Arc::clone(&build_schema),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    Arc::new(Int32Array::from(vec![10, 20, 30])),
+                ],
+            )
             .unwrap();
+            let table = MemTable::try_new(Arc::clone(&build_schema), vec![vec![rows]]).unwrap();
+            ctx.register_table("l", Arc::new(table)).unwrap();
+        }
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int32, false),
@@ -1430,7 +1471,7 @@ mod degenerate_broadcast_tests {
         // If either half of this stops being true the tests below stop testing
         // anything, so assert the premise separately and first.
         let ctx = multi_partition_ctx();
-        let plan = broadcast_join_over_split_probe(&ctx).await;
+        let plan = broadcast_join_over_split_probe(&ctx, true).await;
         assert!(shows(&plan, "CollectLeft"), "fixture is not a broadcast join");
         assert_eq!(
             plan.children()[0].output_partitioning().partition_count(),
@@ -1449,7 +1490,7 @@ mod degenerate_broadcast_tests {
         // because this join could be neither buffered nor converted. It must now
         // convert, which means hash-partitioning both sides first.
         let ctx = multi_partition_ctx();
-        let plan = broadcast_join_over_split_probe(&ctx).await;
+        let plan = broadcast_join_over_split_probe(&ctx, true).await;
         let out = SpillableJoinSelection::with_threshold(Some(1))
             .optimize(plan, ctx.copied_config().options())
             .unwrap();
@@ -1487,7 +1528,7 @@ mod degenerate_broadcast_tests {
     async fn repartitioning_does_not_change_the_answer() {
         // Re-planning a join's distribution is only a fix if the rows survive it.
         let ctx = multi_partition_ctx();
-        let plan = broadcast_join_over_split_probe(&ctx).await;
+        let plan = broadcast_join_over_split_probe(&ctx, true).await;
         let task_ctx = ctx.task_ctx();
         let before = all_rows(Arc::clone(&plan), Arc::clone(&task_ctx)).await;
         let converted = SpillableJoinSelection::with_threshold(Some(1))
@@ -1495,8 +1536,13 @@ mod degenerate_broadcast_tests {
             .unwrap();
         let after = all_rows(converted, task_ctx).await;
 
-        assert_eq!(before, after, "row count changed");
-        assert_eq!(after, 2, "expected the two matching keys");
+        // The build side really is empty here — a degenerate estimate is the
+        // trigger, and the only relation whose estimate honestly claims empty
+        // is an empty one. So this checks that the re-planned distribution
+        // *executes* and agrees, not that it carries rows; rows through the
+        // conversion are covered by `collect_left_tests` and `projection_tests`.
+        assert_eq!(before, after, "row count changed across the re-plan");
+        assert_eq!(after, 0, "an empty build side joins to nothing");
     }
 
     #[tokio::test]
@@ -1504,13 +1550,47 @@ mod degenerate_broadcast_tests {
         // The repartition is a rescue, not a policy: a build side that fits must
         // still be broadcast, or every small dimension join pays for an exchange.
         let ctx = multi_partition_ctx();
-        let plan = broadcast_join_over_split_probe(&ctx).await;
+        let plan = broadcast_join_over_split_probe(&ctx, false).await;
         let out = SpillableJoinSelection::with_threshold(Some(1 << 30))
             .optimize(Arc::clone(&plan), ctx.copied_config().options())
             .unwrap();
         assert!(
             !shows(&out, "SortMergeJoin"),
             "a build side well under the threshold was converted anyway:\n{}",
+            displayable(out.as_ref()).indent(true)
+        );
+    }
+
+    /// The regression this rescue caused on its first outing, pinned so it
+    /// cannot come back.
+    ///
+    /// The coordinator runs this same rule with more than one target partition.
+    /// Rescuing *every* oversized broadcast join therefore re-planned ordinary
+    /// distributed joins, and each added exchange is a stage boundary: TPC-H
+    /// q21 at SF100 went from 11 stages / 758 s to 13 stages / 1061 s.
+    ///
+    /// A broadcast join whose estimate is honest must be left exactly as it is,
+    /// however far over the threshold it sits — the budget can reason about it,
+    /// and the distributed planner can already refuse it.
+    #[tokio::test]
+    async fn an_honest_broadcast_join_is_never_repartitioned() {
+        let ctx = multi_partition_ctx();
+        let plan = broadcast_join_over_split_probe(&ctx, false).await;
+        assert!(shows(&plan, "CollectLeft"), "premise: an honest broadcast join");
+        // Threshold 1 byte: every join is "oversized". Only the degenerate
+        // estimate may buy an exchange, so this must still change nothing.
+        let out = SpillableJoinSelection::with_threshold(Some(1))
+            .optimize(plan, ctx.copied_config().options())
+            .unwrap();
+        assert!(
+            !shows(&out, "RepartitionExec"),
+            "an honestly-sized broadcast join gained an exchange — this is the \
+             q21 distributed regression (11 stages -> 13):\n{}",
+            displayable(out.as_ref()).indent(true)
+        );
+        assert!(
+            shows(&out, "CollectLeft"),
+            "the join should have been left alone entirely:\n{}",
             displayable(out.as_ref()).indent(true)
         );
     }
