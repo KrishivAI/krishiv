@@ -1212,7 +1212,9 @@ fn job_gc_grace() -> std::time::Duration {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(std::time::Duration::from_secs)
-        .unwrap_or_else(|| std::time::Duration::from_secs(30))
+        .unwrap_or_else(|| {
+            std::time::Duration::from_secs(super::DEFAULT_JOB_GC_GRACE_SECS)
+        })
 }
 
 #[cfg(test)]

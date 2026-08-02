@@ -46,6 +46,11 @@ use crate::store::{EventLogEvent, MetadataStore, NonBlockingStoreHandle};
 
 static COORDINATOR_NEXT_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Compiled-in default for `KRISHIV_JOB_GC_GRACE_SECS` (see `job_gc_grace`).
+/// Named so `config::declared_default_guard` can pin it against the value the
+/// env-flag registry publishes to operators.
+pub(crate) const DEFAULT_JOB_GC_GRACE_SECS: u64 = 30;
+
 /// Generate a cluster-unique coordinator identifier using hostname + PID + tick.
 /// Collision-resistant across coordinator restarts, multi-process deployments,
 /// and cross-host scenarios. For deterministic IDs deployments should set

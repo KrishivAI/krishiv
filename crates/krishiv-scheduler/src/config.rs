@@ -179,6 +179,18 @@ pub struct CoordinatorConfig {
     aqe_skew_min_bytes: u64,
 }
 
+/// Compiled-in defaults for the env-tunable knobs.
+///
+/// Named consts rather than literals inside `new()` so
+/// `declared_default_guard` below can assert each against the value
+/// `krishiv_common::env_registry` publishes to operators — see
+/// [`krishiv_common::env_registry::declared_default_number`] for why that
+/// check exists.
+pub(crate) const DEFAULT_MAX_SHUFFLE_REGEN: u64 = 8;
+pub(crate) const DEFAULT_AQE_TARGET_PARTITION_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const DEFAULT_AQE_SKEW_MIN_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const DEFAULT_AQE_SKEW_FACTOR: f64 = 4.0;
+
 fn env_flag_enabled(name: &str) -> bool {
     !matches!(
         std::env::var(name)
@@ -210,7 +222,10 @@ impl CoordinatorConfig {
     pub fn new(max_stage_retries: u32, heartbeat_timeout_ticks: u64) -> Self {
         Self {
             max_stage_retries,
-            max_shuffle_regen_attempts: env_u64("KRISHIV_MAX_SHUFFLE_REGEN", 8) as u32,
+            max_shuffle_regen_attempts: env_u64(
+                "KRISHIV_MAX_SHUFFLE_REGEN",
+                DEFAULT_MAX_SHUFFLE_REGEN,
+            ) as u32,
             heartbeat_timeout_ticks: heartbeat_timeout_ticks.max(1),
             memory_threshold_bytes: None,
             streaming_reattach_grace_ticks: 5,
@@ -240,10 +255,10 @@ impl CoordinatorConfig {
             aqe_skew_split_enabled: env_flag_enabled("KRISHIV_AQE_SKEW_SPLIT"),
             aqe_target_partition_bytes: env_u64(
                 "KRISHIV_AQE_TARGET_PARTITION_BYTES",
-                64 * 1024 * 1024,
+                DEFAULT_AQE_TARGET_PARTITION_BYTES,
             ),
-            aqe_skew_factor: env_f64("KRISHIV_AQE_SKEW_FACTOR", 4.0),
-            aqe_skew_min_bytes: env_u64("KRISHIV_AQE_SKEW_MIN_BYTES", 128 * 1024 * 1024),
+            aqe_skew_factor: env_f64("KRISHIV_AQE_SKEW_FACTOR", DEFAULT_AQE_SKEW_FACTOR),
+            aqe_skew_min_bytes: env_u64("KRISHIV_AQE_SKEW_MIN_BYTES", DEFAULT_AQE_SKEW_MIN_BYTES),
         }
     }
 
@@ -575,5 +590,58 @@ impl TlsConfig {
     pub fn with_ca(mut self, ca_pem: impl Into<Vec<u8>>) -> Self {
         self.ca_pem = Some(ca_pem.into());
         self
+    }
+}
+
+#[cfg(test)]
+mod declared_default_guard {
+    use super::*;
+
+    /// Every numeric knob an operator can tune must publish the default the
+    /// code actually compiles in. The registry generates
+    /// `docs/reference/env-flags.md` and the `krishiv doctor` listing, and it
+    /// used to drift silently — an audit found seven flags whose published
+    /// default was wrong, one of them by 8x. `declared_default_number` exists
+    /// so each owning crate can pin its own; `KRISHIV_MAX_CONCURRENT_ASSIGNMENT_RPCS`
+    /// was pinned in `task_assignment.rs`, and these were not.
+    ///
+    /// Extend this list as the audit reaches the remaining scheduler files.
+    #[test]
+    fn documented_defaults_match_the_compiled_in_ones() {
+        use krishiv_common::env_registry::declared_default_number;
+
+        for (flag, compiled) in [
+            ("KRISHIV_MAX_SHUFFLE_REGEN", DEFAULT_MAX_SHUFFLE_REGEN),
+            (
+                "KRISHIV_AQE_TARGET_PARTITION_BYTES",
+                DEFAULT_AQE_TARGET_PARTITION_BYTES,
+            ),
+            ("KRISHIV_AQE_SKEW_MIN_BYTES", DEFAULT_AQE_SKEW_MIN_BYTES),
+            (
+                "KRISHIV_JOB_GC_GRACE_SECS",
+                crate::coordinator::DEFAULT_JOB_GC_GRACE_SECS,
+            ),
+        ] {
+            assert_eq!(
+                declared_default_number(flag),
+                Some(compiled),
+                "{flag}: docs and code disagree"
+            );
+        }
+    }
+
+    /// `KRISHIV_AQE_SKEW_FACTOR` is a ratio, not a byte/count, so the registry
+    /// declares it as prose-free text `declared_default_number` cannot parse
+    /// as an integer. Pin it against the declared string instead so it is not
+    /// silently exempt from the same check.
+    #[test]
+    fn the_skew_factor_default_is_documented_as_compiled() {
+        let declared = krishiv_common::env_registry::lookup("KRISHIV_AQE_SKEW_FACTOR")
+            .map(|spec| spec.default);
+        assert_eq!(
+            declared.map(str::trim),
+            Some(format!("{DEFAULT_AQE_SKEW_FACTOR:.1}").as_str()),
+            "KRISHIV_AQE_SKEW_FACTOR: docs and code disagree"
+        );
     }
 }
