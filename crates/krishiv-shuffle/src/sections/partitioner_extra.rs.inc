@@ -333,4 +333,22 @@ async fn http_shuffle_svc_token_auth_enforced() {
         "expected 401, got: {}",
         resp
     );
+
+    // 3. The configured token must be ACCEPTED.
+    //
+    // Without this case the test asserts only that requests are rejected, so it
+    // passes just as happily against a handler that rejects *everything* — which
+    // would break every shuffle read in the cluster while the auth test stayed
+    // green. The partition does not exist, so the honest response is a 404; what
+    // this pins is that it is not a 401. The Flight-side equivalent
+    // (`sec3_flight_shuffle_enforces_bearer_token`) has always covered all three.
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let req = "GET /shuffle/job1/stage1/0 HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secure-api-key\r\nConnection: close\r\n\r\n";
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).await.unwrap();
+    assert!(
+        !resp.contains("HTTP/1.1 401 Unauthorized"),
+        "the configured token must be accepted, not rejected; got: {resp}"
+    );
 }

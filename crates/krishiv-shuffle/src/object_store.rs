@@ -13,6 +13,27 @@ use std::sync::Arc;
 ///
 /// Assignment lease tokens are tracked in memory so zombie writers cannot
 /// overwrite committed partitions after a task retry.
+///
+/// # A missing hash sidecar fails CLOSED here and OPEN on local disk
+///
+/// `write_partition` puts the data object and then the `.blake3` sidecar, so a
+/// hard crash between the two leaves data with no sidecar. This store treats
+/// that as [`ShuffleError::ContentHashMismatch`] — the partition is unreadable,
+/// which the consumer reports as missing and the coordinator answers by
+/// regenerating the producing stage.
+///
+/// `LocalDiskShuffleStore` has the identical window (its data-then-hash *rename*
+/// order) and makes the opposite choice: it warns and serves the partition. See
+/// `object_store_shuffle_data_without_hash_sidecar_fails_closed` against
+/// `disk_store_data_without_hash_sidecar_warns_not_fails_after_restart` — both
+/// deliberate, both tested, and neither states why they differ.
+///
+/// The divergence is recorded rather than resolved because either direction
+/// trades a real guarantee: fail-open weakens integrity on the tier whose bytes
+/// travel furthest, fail-closed converts a recoverable crash into a full stage
+/// recompute. Deciding it needs a measurement of how often the window is
+/// actually hit, which nothing here has. Do not "align" them on the assumption
+/// that one is simply a bug.
 pub struct ObjectStoreShuffleStore {
     store: Arc<dyn object_store::ObjectStore>,
     prefix: object_store::path::Path,
