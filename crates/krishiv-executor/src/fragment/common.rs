@@ -913,6 +913,41 @@ pub(crate) async fn read_shuffle_flight_partitions(
         table_batches.entry(table_name).or_default().extend(batches);
     }
 
+    // Say how much was materialised.
+    //
+    // This function holds a task's ENTIRE shuffle input resident, and does it
+    // outside every budget: the batches go on to `register_record_batches`,
+    // which builds a `MemTable` that lives for the whole fragment. The map side
+    // (`execute_shuffle_write_fragment`) streams and costs a batch; this path —
+    // the final stage of every distributed query — costs the fragment.
+    //
+    // It is not simply an oversight. A `MemTable` can be scanned repeatedly and
+    // a stream cannot, and a fragment's SQL may reference the same shuffle table
+    // more than once, so converting needs either a proof of single use or a
+    // spillable buffering provider. Until then the least this can do is not be
+    // invisible: an unaccounted allocation that nothing reports is how the
+    // executor OOM investigation lost weeks to shuffle page cache
+    // (`executor_capacity`'s module docs).
+    let bytes: usize = table_batches
+        .values()
+        .flat_map(|batches| batches.iter())
+        .map(arrow::record_batch::RecordBatch::get_array_memory_size)
+        .sum();
+    let rows: usize = table_batches
+        .values()
+        .flat_map(|batches| batches.iter())
+        .map(arrow::record_batch::RecordBatch::num_rows)
+        .sum();
+    if bytes > 0 {
+        tracing::info!(
+            tables = table_batches.len(),
+            rows,
+            bytes,
+            mib = bytes / (1024 * 1024),
+            "shuffle read: whole fragment materialised, outside any memory budget"
+        );
+    }
+
     Ok(table_batches.into_iter().collect())
 }
 
