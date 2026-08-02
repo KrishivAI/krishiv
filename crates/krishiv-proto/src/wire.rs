@@ -1130,10 +1130,22 @@ fn shuffle_write_config_from_wire(
     value: v1::ShuffleWriteConfigWire,
 ) -> WireResult<crate::io::ShuffleWriteConfig> {
     require_non_empty(&value.stage_id, "shuffle write stage id")?;
-    let num_partitions = value
+    let num_partitions: usize = value
         .num_partitions
         .try_into()
         .map_err(|_| WireError::new("shuffle write num_partitions overflows usize"))?;
+    // A shuffle write with zero output partitions cannot be read by anything,
+    // and the executor's `sql:`-body map path answers it by counting every row
+    // and writing none — `for p in 0..0` — then reporting success with an empty
+    // outputs vector. Rows reported, nothing stored, task green. The dfplan path
+    // and the scheduler's own dispatch both apply `.max(1)`, which is why this
+    // never surfaced; the decoder is the boundary that should have made it
+    // impossible.
+    if num_partitions == 0 {
+        return Err(WireError::new(
+            "shuffle write num_partitions must be at least 1",
+        ));
+    }
     Ok(crate::io::ShuffleWriteConfig {
         stage_id: StageId::try_new(value.stage_id).map_err(WireError::from_id)?,
         num_partitions,

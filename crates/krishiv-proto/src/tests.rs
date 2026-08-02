@@ -687,6 +687,53 @@ mod proto_tests {
         assert_eq!(cfg, &read_cfg);
     }
 
+    /// A shuffle write declaring zero output partitions must not decode.
+    ///
+    /// Nothing can read such a partition set, and the executor's `sql:`-body map
+    /// path answers it by counting every row, writing none (`for p in 0..0`) and
+    /// returning success with an empty outputs vector — rows reported, nothing
+    /// stored, task green. The dfplan path and the scheduler's dispatch both
+    /// apply `.max(1)`, so the decoder is the only boundary that can make it
+    /// impossible rather than merely unlikely.
+    #[test]
+    fn shuffle_write_config_with_zero_partitions_is_rejected_on_the_wire() {
+        let assignment = ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                JobId::try_new("job-zero-parts").unwrap(),
+                StageId::try_new("stage-1").unwrap(),
+                TaskId::try_new("task-1").unwrap(),
+                AttemptId::initial(),
+            ),
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new("sql: select 1"),
+            OutputContract::new(OutputContractKind::InlineRecordBatches, "return result"),
+        )
+        .with_shuffle_write(ShuffleWriteConfig {
+            stage_id: StageId::try_new("stage-write").unwrap(),
+            num_partitions: 1,
+            key_columns: vec![String::from("k")],
+            lease_token: 1,
+        });
+
+        let mut wire = crate::wire::executor_task_assignment_to_wire(assignment).unwrap();
+        assert!(
+            crate::wire::executor_task_assignment_from_wire(wire.clone()).is_ok(),
+            "test premise: the same message with 1 partition must decode"
+        );
+
+        wire.shuffle_write
+            .as_mut()
+            .expect("shuffle_write present")
+            .num_partitions = 0;
+        let error = crate::wire::executor_task_assignment_from_wire(wire)
+            .expect_err("zero partitions must not decode");
+        assert!(
+            error.to_string().contains("num_partitions"),
+            "the error must name the field; got: {error}"
+        );
+    }
+
     #[test]
     fn task_spec_with_no_shuffle_configs_has_none() {
         let task = TaskSpec::new(TaskId::try_new("task-plain").unwrap(), "sql: select 1");

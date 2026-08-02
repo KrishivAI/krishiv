@@ -1287,6 +1287,23 @@ async fn execute_inmem_shuffle_write(
     {
         tracing::warn!(%error, "iceberg REST catalog registration from env failed");
     }
+    // A shuffle write with zero output partitions cannot be read by anything.
+    // Without this the drain loop below is `for p in 0..0` — it writes nothing
+    // — while `total_rows` has already counted every row, so the task returns
+    // `shuffle_write(total_rows, vec![])`: success, rows reported, no output
+    // stored. `execute_dfplan_fragment` never had the hole because it applies
+    // `.max(1)`, and the scheduler's own dispatch applies `.max(1)` too, which
+    // is why this path's omission stayed invisible. The wire decoder now
+    // rejects it as well, but `ShuffleWriteConfig` is also constructed
+    // in-process (krishiv-scheduler `distributed_batch.rs`) and never crosses
+    // that boundary.
+    if write_cfg.num_partitions == 0 {
+        return Err(ExecutorError::InvalidAssignment {
+            message: String::from(
+                "shuffle_write config declares 0 output partitions; no reduce task could read them",
+            ),
+        });
+    }
     let num_partitions = write_cfg.num_partitions as u32;
     let lease_token = write_cfg.lease_token;
     let job_id = assignment.job_id().as_str();
@@ -1347,10 +1364,13 @@ async fn execute_inmem_shuffle_write(
             let batch = result.map_err(|e| ExecutorError::LocalExecution {
                 message: e.to_string(),
             })?;
-            total_rows += batch.num_rows();
-            if num_partitions == 0 || batch.num_rows() == 0 {
+            // Count only rows this task goes on to write, matching
+            // `execute_dfplan_fragment`. Counting before the skip is what made
+            // the zero-partition case report rows it never stored.
+            if batch.num_rows() == 0 {
                 continue;
             }
+            total_rows += batch.num_rows();
             if output_schema.fields().is_empty() {
                 output_schema = batch.schema();
             }
