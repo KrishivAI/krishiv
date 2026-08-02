@@ -61,12 +61,22 @@ fn main() {
         process::exit(code);
     }
 
-    // NOT declared single-query here, though this is exactly the process that
-    // is one. See `declare_single_query_process`: giving an embedded query the
-    // whole pool to size joins against was measured *faster and wrong* — TPC-H
-    // q5 at SF100 went 247.1 s -> 122.2 s, and q8 and q18 stopped completing at
-    // all. The declaration stays available for a caller that has bounded its
-    // own join sizes; the CLI has not.
+    // Past the daemon dispatch this is a one-shot CLI invocation: one query,
+    // then exit. Every daemon — including `mcp`, which builds a `Session` too —
+    // has already exited through `try_run_daemon` above.
+    //
+    // This gates exactly one behaviour: the degenerate-broadcast rescue in
+    // `spillable_join::convertible_mode`, which TPC-H q21 needs embedded and
+    // which must never fire on a coordinator, where each exchange it adds
+    // becomes a stage boundary (q21: 11 stages -> 13, 758 s -> 1061 s). Scoping
+    // it by call site does not work — the embedded session and the coordinator's
+    // planning session install the same rule through the same constructor — so
+    // the process itself is the discriminator.
+    //
+    // It does NOT change the join-size threshold. That was tried and reverted:
+    // giving an embedded query the whole pool made q5 2x faster and stopped q8
+    // and q18 completing at all. See `declare_single_query_process`.
+    krishiv_common::executor_capacity::declare_single_query_process();
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let response = cli::dispatch(&arg_refs);

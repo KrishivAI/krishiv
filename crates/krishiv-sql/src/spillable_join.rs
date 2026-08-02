@@ -546,12 +546,13 @@ impl SpillableJoinSelection {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|n| *n > 0)
             .or_else(|| {
-                // `query_memory_share_bytes`, not `min_task_memory_share_bytes`:
-                // the per-slot division is real inside an executor and fiction
-                // in an embedded process, which runs one query and owns the
-                // whole pool. See `declare_single_query_process`.
+                // Deliberately the per-slot share, in every process. Giving an
+                // embedded query the whole pool to size joins against was
+                // measured faster and wrong — see
+                // `executor_capacity::declare_single_query_process`. The flag
+                // below controls the broadcast rescue and nothing else.
                 let share = krishiv_common::executor_capacity::ExecutorCapacity::detect_cached()
-                    .query_memory_share_bytes()?;
+                    .min_task_memory_share_bytes()?;
                 #[expect(
                     clippy::cast_precision_loss,
                     clippy::cast_possible_truncation,
@@ -569,7 +570,12 @@ impl SpillableJoinSelection {
             // `for_local_execution`, which only the post-decode executor path
             // calls.
             grace: false,
-            rescue_degenerate_broadcast: true,
+            // Only a one-shot CLI process rescues a degenerate broadcast join.
+            // A coordinator installs this same rule in its planning session, and
+            // there an added exchange is an added stage boundary: scoping by
+            // call site does not work, because both reach `from_capacity`.
+            rescue_degenerate_broadcast:
+                krishiv_common::executor_capacity::is_single_query_process(),
         }
     }
 
@@ -700,6 +706,10 @@ impl SpillableJoinSelection {
         Self {
             threshold_bytes,
             grace: false,
+            // Enabled, unlike `from_capacity`: a test binary is not a
+            // single-query CLI process, and gating on that here would make
+            // every rescue test silently vacuous. Tests that need it off call
+            // `without_broadcast_rescue`.
             rescue_degenerate_broadcast: true,
         }
     }

@@ -489,12 +489,9 @@ fn guarded_fair_pool(bytes: usize) -> Arc<dyn MemoryPool> {
 /// One engine's expected share of [`process_query_pool`] when every slot is
 /// busy. Sizes spill reservations only; the pool itself is shared.
 ///
-/// In a single-query process there are no other slots to be busy, so the share
-/// is the whole pool — see
-/// [`krishiv_common::executor_capacity::declare_single_query_process`].
 fn process_query_pool_fair_share_bytes() -> usize {
     krishiv_common::ExecutorCapacity::detect()
-        .query_memory_share_bytes()
+        .min_task_memory_share_bytes()
         .map_or(usize::MAX, |bytes| {
             usize::try_from(bytes).unwrap_or(usize::MAX)
         })
