@@ -1172,6 +1172,13 @@ impl ExecutorTaskRunner {
             terminal_state,
         )?;
 
+        // Frees the slot a moment earlier than the guard would. It does NOT
+        // mean a `Running` terminal state retains the entry: `_running_attempt_guard`
+        // drops when this function returns and removes it either way. That is
+        // the intended behaviour — the only way to reach `Running` here is a
+        // `stream:rloop:` task that returned *without* being cancelled, and a
+        // run-loop that has returned is not running, whatever it just reported.
+        // Read this as an early release, never as a retention policy.
         if matches!(terminal_state, TaskState::Succeeded | TaskState::Cancelled) {
             self.clear_running_attempt(&assignment);
         }
