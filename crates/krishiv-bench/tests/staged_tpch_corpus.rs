@@ -341,7 +341,7 @@ async fn declaring_primary_keys_does_not_change_any_answer() {
                 compared += 1;
                 if cells(&before) != cells(&after) {
                     failures.push(format!(
-                        "{}: declaring keys changed the answer\n  undeclared: {:?}\n                           declared:   {:?}",
+                        "{}: declaring keys changed the answer\n  undeclared: {:?}\n declared:   {:?}",
                         query.id,
                         cells(&before),
                         cells(&after)
@@ -381,7 +381,7 @@ async fn the_late_materialisation_rewrite_fires_on_the_fixture() {
     );
     assert!(
         plan.contains("__krishiv_lm"),
-        "q10 should take the late-materialisation join-back once its key is          declared; it did not:\n{plan}"
+        "q10 should take the late-materialisation join-back once its key is declared; it did not:\n{plan}"
     );
     assert!(
         plan.contains("groupBy=[[customer.c_custkey]]"),

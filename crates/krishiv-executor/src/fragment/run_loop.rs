@@ -1136,7 +1136,7 @@ impl ExecutorTaskRunner {
     ) -> ExecutorResult<()> {
         Err(ExecutorError::InvalidAssignment {
             message: format!(
-                "job {job_id} requests an Iceberg sink but this executor was built                  without the `iceberg` feature"
+                "job {job_id} requests an Iceberg sink but this executor was built without the `iceberg` feature"
             ),
         })
     }
@@ -1214,7 +1214,7 @@ impl ExecutorTaskRunner {
     ) -> ExecutorResult<()> {
         Err(ExecutorError::InvalidAssignment {
             message: format!(
-                "job {job_id} requests a Kafka sink but this executor was built                  without the `kafka` feature"
+                "job {job_id} requests a Kafka sink but this executor was built without the `kafka` feature"
             ),
         })
     }

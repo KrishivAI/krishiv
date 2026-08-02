@@ -34,7 +34,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 |---|---|---|---|---|---|
 | **Tier 1 — critical path** |
 | 1 | krishiv-sql | 46,632 | 61 | 7 | first slice done; `lib.rs` alone holds 37% of the crate's uncovered regions |
-| 2 | krishiv-executor | 28,927 | 40 | 5 | shuffle write/drain (D7), task running, the memory pool |
+| 2 | krishiv-executor | 28,927 | 40 | **40 — COMPLETE 2026-08-02** | second crate fully read; 3 defects fixed |
 | 3 | krishiv-shuffle | 14,329 | 36 | **36 — COMPLETE 2026-08-02** | first crate fully read; 4 defects fixed |
 | 4 | krishiv-scheduler | **51,438** | **78** | 0 | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
 | **Tier 2 — correctness blast radius** |
@@ -303,22 +303,40 @@ Measured: **81.07% regions, 68.67% functions, 78.07% lines** (11,475 regions,
 
 ---
 
-## 2. krishiv-executor — 35 of 40 files read whole (in progress, 2026-08-02)
+## 2. krishiv-executor — COMPLETE, 40 of 40 files read whole (2026-08-02)
 
-Read whole: `fragment/shuffle_write_buffer.rs`, `runner/partition.rs`,
-`runner/result_spool.rs`, `transport.rs`, `ess_client.rs`, and — as of
-2026-08-02 — `fragment/batch.rs` (2,814) and `fragment/common.rs` (2,149),
-both of which had previously been read in regions only, plus `cli.rs` (2,155),
-`runner/executor_task_runner.rs` (2,109) and `assignment_inbox.rs` (697).
-14,200 of 28,927 lines.
+**Second crate fully read.** 28,927 lines: every production `.rs` file and all
+four `.rs.inc` test sections (`core` 1,838, `gap6` 1,250, `stream_loop` 835,
+`recovery` 797). The last files read were `fragment/run_loop.rs` (1,461) and
+those four sections.
 
-**Every production `.rs` file is read except `fragment/run_loop.rs`**, which is
-read to line 560 of 1,461. Still unread: `fragment/run_loop.rs` (901 lines
-remaining), and four test sections — `sections/core.rs.inc` (1,837),
-`sections/gap6.rs.inc` (1,250), `sections/stream_loop.rs.inc` (835),
-`sections/recovery.rs.inc` (797). ~5,620 of 28,927 lines outstanding.
+Three defects fixed, two recorded with reasons (below).
 
 ### Fixed reading it
+
+- [x] **A run-loop resumed from pre-restore offsets after a checkpoint
+      restore** (`6eeea3c4`). `execute_run_loop_fragment` snapshotted
+      `runner.source_restore_offsets` once, *before* the loop, and used that
+      copy at every source open inside it. A `RestoreFromCheckpointCommand`
+      arriving mid-run rewrites that table and then calls
+      `clear_continuous_connector_sources_for_job`, which evicts this subtask's
+      cached sources — they key on `{job}#{subtask}`, which the eviction prefix
+      matches. The next iteration therefore reopened them and re-applied the
+      loop-start offsets: the subtask resumed from its *pre-restore* position,
+      replaying or skipping records depending on which way the checkpoint moved.
+
+      The cycle model never had this — `read_continuous_registry_sources` is
+      called once per cycle and so reads the table fresh every time. Promoting
+      the loop (Phase 55) hoisted the lookup out and froze it. Fixed by reading
+      the table at the point of use.
+
+      **Why it survived**: `sections/stream_loop.rs.inc:573` is exactly the
+      missing test, one model over — it seeds `source_restore_offsets` and
+      proves a *cycle* applies them, across all three durability profiles.
+      There is no `stream:rloop:` equivalent. Likewise
+      `sections/recovery.rs.inc:463` asserts the source cache is evicted on
+      restore *"so restored offsets apply"* — true of the eviction, false of
+      the run-loop that consumes it.
 
 - [x] **A zero-partition shuffle write reported success with no output**
       (`dca44555`). `execute_inmem_shuffle_write` — the `sql:`-body map path —

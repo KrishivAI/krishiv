@@ -774,7 +774,7 @@ mod phase3_recovery {
 
         assert_eq!(
             victim_emitted, control_emitted,
-            "after {iterations} kill/restore cycles the emitted windows must                  match an executor that never died"
+            "after {iterations} kill/restore cycles the emitted windows must match an executor that never died"
         );
         assert!(
             !control_emitted.is_empty(),

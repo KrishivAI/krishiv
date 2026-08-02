@@ -1337,7 +1337,7 @@ pub async fn register_continuous_stream_with_options(
         && options.checkpoint_interval_ms.is_some() != options.checkpoint_storage_path.is_some()
     {
         return Err(invalid_registration(
-            "run-loop checkpointing requires BOTH checkpoint_interval_ms and              checkpoint_storage_path (or neither)",
+            "run-loop checkpointing requires BOTH checkpoint_interval_ms and checkpoint_storage_path (or neither)",
         ));
     }
     let job_id_typed = JobId::try_new(job_id).map_err(|e| invalid_registration(e.to_string()))?;
@@ -1419,7 +1419,7 @@ async fn launch_run_loop_job(
                         .find_executor_endpoint(&executor_id)
                         .ok_or_else(|| {
                             ContinuousStreamError::Unavailable(format!(
-                                "run-loop job {job_id}: executor {executor_id} has no                                  task endpoint"
+                                "run-loop job {job_id}: executor {executor_id} has no task endpoint"
                             ))
                         })?;
                     peers.push((index, task.task_id().as_str().to_owned(), endpoint));
