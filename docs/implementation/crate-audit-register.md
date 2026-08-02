@@ -36,7 +36,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 1 | krishiv-sql | 46,632 | 61 | 7 | first slice done; `lib.rs` alone holds 37% of the crate's uncovered regions |
 | 2 | krishiv-executor | 28,927 | 40 | **40 — COMPLETE 2026-08-02** | second crate fully read; 3 defects fixed |
 | 3 | krishiv-shuffle | 14,329 | 36 | **36 — COMPLETE 2026-08-02** | first crate fully read; 4 defects fixed |
-| 4 | krishiv-scheduler | **51,438** | **78** | 12 (in progress) | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
+| 4 | krishiv-scheduler | **51,438** | **78** | 22 (in progress) | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
 | **Tier 2 — correctness blast radius** |
 | 5 | krishiv-plan | 14,371 | 25 | 0 | plan IR every surface depends on |
 | 6 | krishiv-common | 7,966 | 23 | 0 | env registry, durability profiles, memory budget |
@@ -554,7 +554,7 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
 
 ---
 
-## 4. krishiv-scheduler — 12 of 78 files read whole (in progress, 2026-08-02)
+## 4. krishiv-scheduler — 22 of 78 files read whole (in progress, 2026-08-02)
 
 Third crate. The largest in the workspace: 51,438 lines. Working down the
 distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198),
@@ -562,7 +562,16 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
 `job/snapshot.rs` (302), `coordinator/mod.rs` (2,384),
 `coordinator/job_lifecycle.rs` (1,475), `coordinator/task_assignment.rs`
 (1,496), `coordinator/executor_ops.rs` (1,341), `heartbeat.rs` (881),
-`cluster_control.rs` (462). 12,726 of 51,438 lines.
+`cluster_control.rs` (462), `config.rs` (579), `admission.rs` (280),
+`coordinator/aqe.rs` (501), `coordinator/recovery.rs` (565),
+`coordinator/streaming.rs` (279), `coordinator/snapshots.rs` (200),
+`coordinator/observability.rs` (182), `metrics.rs` (201), `result_spool.rs`
+(550), `coordinator_sharded.rs` (752). 16,815 of 51,438 lines.
+
+**The recurring shape in this crate**: *state removed at the head of a path as
+"consumed by this batch", never restored when the batch turns out to be empty
+— and cleanup that covers every `return` but not the function failing to
+return at all.* Six of the nine defects below are one of those two.
 
 ### Fixed reading it
 
@@ -632,6 +641,52 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
       restarted its pods twice sized the override at 9 and shredded the stage
       into partitions no executor existed to run.
 
+- [x] **Promotion left every per-job map behind** (`ce415a3a`).
+      `recover_from_store` runs on every standby→active promotion, not only at
+      process start, and cleared two maps out of twenty. A job absent from the
+      store afterwards kept its inline results, spools, input partitions,
+      checkpoint coordinator, adaptive log, skew override and GC entry — and
+      its `continuous_input_cycles` fence, which makes every later push to a
+      job of that id 409 forever. Fixed by extracting `purge_job_scoped_state`
+      from `evict_completed_job` and running it for the ids that did not
+      return.
+
+- [x] **Eviction dropped the forward streaming index, not the reverse one**
+      (`ce415a3a`). `streaming_job_task_index` leaked a `Vec<TaskId>` per
+      evicted streaming job. Not only a leak: the forward index is keyed by
+      bare `TaskId` (task ids like `t0` repeat across jobs), so a stale reverse
+      entry lets a later `remove_streaming_task_index` for the dead job delete
+      a **live** job's entry — after which its watermark and source-offset
+      reports are silently dropped, because `apply_streaming_task_state`
+      returns early on an unindexed task.
+
+- [x] **The observability report measured heartbeat age off the wrong clock**
+      (`ac79403d`). `heartbeat_age_ticks` used `exec.ticks_since_restart`,
+      which is initialised to `u64::MAX` (so a never-recovered coordinator is
+      never inside the streaming re-attach grace window) and only resets to 0
+      in `recover_from_store`. `last_heartbeat_tick` is stamped from
+      `ExecutorRegistry::current_tick`. Every executor in the report therefore
+      showed ~1.8e19 ticks of staleness on any fresh process — in the one
+      report an operator reads to decide whether an executor is alive. Also
+      populated `upstream_stage_ids`, which was hard-coded empty in a report
+      whose purpose is "why has this stage not started".
+
+- [x] **A cancelled result-spool receive leaked its partial file**
+      (`2c09c31f`). `receive_task_result_spool` cleaned up at every early
+      return via a `cleanup(&path)` closure, which says nothing about the
+      future being dropped — the normal outcome when a `PushTaskResult` client
+      disconnects mid-transfer or the request is cancelled. Multi-GiB partial
+      files stayed on disk with nothing sweeping the spool directory. Replaced
+      with a `PartialSpoolFile` destructor disarmed only after the final
+      fsync, so cancellation and every error path share one mechanism.
+
+- [x] **Env-flag defaults pinned to the registry** (`d9c4e93e`) — a guard, not
+      a fix; all five were correct. `declared_default_number` exists because
+      seven flags had drifted (one by 8x) and the registry generates
+      `docs/reference/env-flags.md`. `KRISHIV_AQE_SKEW_FACTOR` is a ratio the
+      accessor cannot parse as an integer, so it was pinned against the
+      declared string rather than left silently exempt.
+
 ### Recorded, not fixed — needs a decision
 
 - **`advance_heartbeat_clock` does not `release_workers` on eviction.** The
@@ -649,6 +704,38 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
   stated intent for `ClusterManager` semantics — "release on any Lost
   transition" vs "release only on deliberate teardown" — before either side
   is changed.
+
+- **`streaming_task_index` is keyed by bare `TaskId`, not `(JobId, TaskId)`.**
+  Two live streaming jobs with a task id in common collide: the second
+  `index_streaming_tasks` overwrites the first, and the first job's watermark
+  reports then update the wrong record. Not fixable here —
+  `StreamingTaskState` carries no job id on the wire, so the heartbeat itself
+  cannot disambiguate. Protocol change, not an audit edit.
+
+- **`CheckpointInner::pending_checkpoint_complete_for_executor` and
+  `pending_restore_commands_for_executor` have no callers outside their own
+  tests.** The live path is `Coordinator::pending_*` on the *outer* copy
+  (`checkpoint_ops.rs`), and `prune_sent_set` is duplicated verbatim in both
+  files. Concrete hazard if the inner ones are ever wired: the inner lock
+  would record delivery in `checkpoint_complete_sent`, and the next periodic
+  `apply_monotonic_from` full-replaces that field from the outer copy, which
+  never saw the insert — so every commit signal is re-delivered. Either
+  delete the inner pair or make `apply_monotonic_from` union the
+  delivery-tracking sets; both are decisions about which copy owns delivery.
+
+- **`shuffle_bytes_written` (stage and job) has no task-state filter** while
+  the `shuffle_partitions_available` count two lines above filters on
+  `Succeeded`. A task reset to Pending by shuffle invalidation keeps its old
+  `output_metadata`, so its bytes keep counting until it re-succeeds. Whether
+  the metric means cumulative I/O or currently-fetchable output is a
+  reporting-semantics decision. **Not established** as the explanation for the
+  q10 `dist-s1` 1.74 TB observation, which stays open.
+
+- **Nothing sweeps the result-spool directory at startup**, so files orphaned
+  by a coordinator *crash* (as opposed to a dropped future, now handled)
+  persist. A sweep must distinguish a previous incarnation's files from a
+  co-located coordinator's live ones; the filename carries a pid, but pids are
+  reused. Needs a decision on spool-dir ownership.
 
 ### Noted, no defect
 
@@ -691,6 +778,23 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
   tasks that *were* delivered and re-dispatches them. Not a defect today: the
   executor inbox dedupes and answers `Duplicate`, which the response handler
   counts as accepted. It does cost redundant RPCs and under-reports `launched`.
+
+- `KRISHIV_AQE_TARGET_PARTITION_BYTES=0` is accepted by the env reader while
+  the `with_aqe_target_partition_bytes` setter applies `.max(1)`. It cannot
+  divide by zero: the skew-split sizing already guards with `.max(1)`, and the
+  coalescing loop degenerates to one group per partition, which returns "no
+  rewrite". Behaviourally identical to the setter's floor.
+
+- `reset_running_tasks_for_lost_executor` sets `job_affected` after the
+  `if job_affected { refresh_state() }` line when only its shuffle-invalidation
+  half fires. `invalidate_executor_shuffle_partitions` calls
+  `self.refresh_state()` itself, so job state is refreshed either way.
+
+- The cascade breaker's window (30 s) is shorter than its cooldown (60 s), so
+  by the time it re-closes the losses that tripped it have aged out of
+  `cascade_loss_timestamps` and the next single loss cannot re-trip it. An
+  operator who configures `cascade_window_ms > cascade_cooldown_ms` gets
+  immediate re-tripping, which is arguably what that configuration asks for.
 
 ---
 
