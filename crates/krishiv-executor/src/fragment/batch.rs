@@ -551,6 +551,23 @@ async fn execute_window_fragment(
 }
 
 /// Execute a `shuffle-write:hash:<key_column>:<num_partitions>` fragment.
+///
+/// # Not reached in production — check before optimising this
+///
+/// Nothing constructs a `shuffle-write:` fragment. [`SHUFFLE_WRITE_PREFIX`]
+/// appears only in its own definition, two `runner::partition` unit tests, and
+/// the dispatch above: no scheduler path, no coordinator path. The live
+/// map-write path is [`execute_dfplan_fragment`], which drains through
+/// `shuffle_write_buffer::drain_into_store` and therefore *streams* — its peak
+/// is one coalesce group, not one partition.
+///
+/// This is recorded here, and not only in
+/// `docs/implementation/crate-audit-register.md`, because the register has now
+/// caught two separate attempts to "fix" the materialisation below: the memory
+/// characteristics look alarming (a whole partition as Arrow batches, plus a
+/// second full copy as IPC bytes when a push store is wired) and nothing in the
+/// code said the branch was dead. Confirm reachability before spending effort
+/// here — or wire it up, or delete it.
 async fn execute_shuffle_write_fragment(
     assignment: &ExecutorTaskAssignment,
     spec: &str,
