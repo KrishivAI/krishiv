@@ -159,7 +159,14 @@ pub enum ShuffleCompression {
     /// No compression (default).
     #[default]
     None,
-    /// LZ4 frame compression via `lz4_flex`.
+    /// LZ4 **block** format with a little-endian u32 length prefix
+    /// (`lz4_flex::compress_prepend_size`) — not an LZ4 *frame*.
+    ///
+    /// The distinction matters if these bytes ever leave the crate: a standard
+    /// `lz4` frame tool cannot read them, and `lz4_flex`'s own frame encoder is
+    /// a different module. It round-trips correctly because `compress` and
+    /// `decompress` are the matching pair; the doc used to say "frame", which
+    /// would have sent someone looking for a framing bug that does not exist.
     Lz4,
     /// Zstandard compression via `zstd`.
     Zstd,
@@ -170,6 +177,18 @@ pub type CompressionCodec = ShuffleCompression;
 
 impl ShuffleCompression {
     /// Compress `data` using this codec. Returns the compressed bytes.
+    ///
+    /// # Not on the shuffle path
+    ///
+    /// Nothing in production calls this or [`Self::decompress`] — only
+    /// `tests/integration_shuffle_pipeline.rs`. The *enum* is live, as the codec
+    /// selector threaded into [`parquet_writer_properties`] and the stores'
+    /// `with_compression`, but shuffle bytes are compressed by Parquet (at rest)
+    /// and by Arrow IPC body compression (on the wire), never by these methods.
+    ///
+    /// Recorded because the crate has already cost two sessions to a plausible
+    /// but unreachable code path: check that a caller exists before tuning the
+    /// codec here, and note that changing it would not move a shuffle byte.
     pub fn compress(self, data: &[u8]) -> ShuffleResult<Vec<u8>> {
         match self {
             ShuffleCompression::None => Ok(data.to_vec()),
