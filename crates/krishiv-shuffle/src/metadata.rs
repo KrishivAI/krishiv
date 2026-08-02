@@ -1,4 +1,4 @@
-use crate::{ShuffleError, ShufflePath, ShuffleResult};
+use crate::ShufflePath;
 use std::collections::HashMap;
 
 /// Lifecycle state of a single shuffle partition.
@@ -16,19 +16,27 @@ pub enum PartitionState {
 }
 
 /// In-memory registry tracking the state of shuffle partitions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # There is deliberately no partition cap
+///
+/// This map used to carry a `max_partitions` bound (65536) that only
+/// `mark_pending` enforced. Nothing ever called `mark_pending`: production
+/// reaches this type exclusively through [`mark_available`](Self::mark_available)
+/// and [`mark_failed`](Self::mark_failed), from `krishiv-scheduler`'s
+/// `job/record.rs` and `store.rs`. The bound was therefore never once
+/// evaluated, and `with_max_partitions` configured a limit that could not fire.
+///
+/// It was removed rather than extended to the two completion paths, because
+/// refusing to record a partition that has *already been written to disk*
+/// would make the consumer stage treat live data as missing and recompute its
+/// producer — a strictly worse failure than the unbounded map it was meant to
+/// guard. A cap belongs at admission, and there is no admission call site.
+///
+/// The real bound on this map is the shuffle partition count the physical plan
+/// declares for the job, fixed by the planner before any task is dispatched.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShuffleMetadata {
     states: HashMap<ShufflePath, PartitionState>,
-    max_partitions: usize,
-}
-
-impl Default for ShuffleMetadata {
-    fn default() -> Self {
-        Self {
-            states: HashMap::new(),
-            max_partitions: 65_536,
-        }
-    }
 }
 
 impl ShuffleMetadata {
@@ -37,24 +45,15 @@ impl ShuffleMetadata {
         Self::default()
     }
 
-    /// Set the maximum number of tracked partitions (default 65536).
-    #[must_use]
-    pub fn with_max_partitions(mut self, n: usize) -> Self {
-        self.max_partitions = n;
-        self
-    }
-
     /// Record that a partition write has been started.
     ///
-    /// Returns `TooManyPartitions` when the cap is already reached.
-    pub fn mark_pending(&mut self, path: &ShufflePath) -> ShuffleResult<()> {
-        if self.states.len() >= self.max_partitions && !self.states.contains_key(path) {
-            return Err(ShuffleError::TooManyPartitions {
-                limit: self.max_partitions,
-            });
-        }
+    /// # Not reached in production — check before relying on `Pending`
+    ///
+    /// No production caller invokes this, so [`state`](Self::state) never
+    /// returns [`PartitionState::Pending`] in a running cluster. Treat a match
+    /// arm for `Pending` as dead until this gains a caller.
+    pub fn mark_pending(&mut self, path: &ShufflePath) {
         self.states.insert(path.clone(), PartitionState::Pending);
-        Ok(())
     }
 
     /// Record that a partition is fully written and available.

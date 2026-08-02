@@ -21,10 +21,6 @@ pub enum ShuffleError {
     #[error("shuffle path not found: {path}")]
     NotFound { path: String },
 
-    /// The shuffle partition cap was exceeded; no new partitions may be registered.
-    #[error("shuffle partition limit exceeded: max {limit} partitions")]
-    TooManyPartitions { limit: usize },
-
     /// The in-memory shuffle byte cap was exceeded and no safe spill/admission path exists.
     #[error(
         "shuffle memory limit exceeded: max {max_bytes} bytes, current {current_bytes} bytes, incoming {incoming_bytes} bytes"

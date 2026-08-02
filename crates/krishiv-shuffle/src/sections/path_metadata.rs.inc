@@ -32,7 +32,7 @@ fn make_path(partition_id: u32) -> ShufflePath {
 fn metadata_pending_to_available() {
     let mut meta = ShuffleMetadata::new();
     let p = make_path(0);
-    meta.mark_pending(&p).unwrap();
+    meta.mark_pending(&p);
     assert_eq!(meta.state(&p), Some(&PartitionState::Pending));
     meta.mark_available(&p);
     assert_eq!(meta.state(&p), Some(&PartitionState::Available));
@@ -42,7 +42,7 @@ fn metadata_pending_to_available() {
 fn metadata_pending_to_failed() {
     let mut meta = ShuffleMetadata::new();
     let p = make_path(1);
-    meta.mark_pending(&p).unwrap();
+    meta.mark_pending(&p);
     meta.mark_failed(&p, "disk full".into());
     assert_eq!(
         meta.state(&p),
@@ -58,7 +58,7 @@ fn metadata_all_available_requires_every_path() {
     let p0 = make_path(0);
     let p1 = make_path(1);
     meta.mark_available(&p0);
-    meta.mark_pending(&p1).unwrap();
+    meta.mark_pending(&p1);
 
     assert!(!meta.all_available(&[p0.clone(), p1.clone()]));
 
@@ -72,26 +72,10 @@ fn metadata_all_available_empty_slice() {
     assert!(meta.all_available(&[]));
 }
 
-#[test]
-fn metadata_partition_cap_enforced() {
-    let mut meta = ShuffleMetadata::new().with_max_partitions(2);
-    meta.mark_pending(&make_path(0)).unwrap();
-    meta.mark_pending(&make_path(1)).unwrap();
-    let err = meta.mark_pending(&make_path(2)).unwrap_err();
-    assert!(
-        matches!(err, ShuffleError::TooManyPartitions { limit: 2 }),
-        "expected TooManyPartitions(2), got: {err}"
-    );
-}
-
-#[test]
-fn metadata_cap_allows_update_of_existing_partition() {
-    let mut meta = ShuffleMetadata::new().with_max_partitions(1);
-    let p = make_path(0);
-    meta.mark_pending(&p).unwrap();
-    // Re-marking an existing key must succeed even at cap.
-    meta.mark_pending(&p).unwrap();
-}
+// `metadata_partition_cap_enforced` and
+// `metadata_cap_allows_update_of_existing_partition` lived here, covering a
+// `max_partitions` cap that no production caller could reach. See
+// `ShuffleMetadata`'s type docs.
 
 #[test]
 fn hash_partitioner_rejects_zero_buckets() {
