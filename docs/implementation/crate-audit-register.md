@@ -36,7 +36,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 1 | krishiv-sql | 46,632 | 61 | 7 | first slice done; `lib.rs` alone holds 37% of the crate's uncovered regions |
 | 2 | krishiv-executor | 28,927 | 40 | **40 — COMPLETE 2026-08-02** | second crate fully read; 3 defects fixed |
 | 3 | krishiv-shuffle | 14,329 | 36 | **36 — COMPLETE 2026-08-02** | first crate fully read; 4 defects fixed |
-| 4 | krishiv-scheduler | **51,438** | **78** | 4 (in progress) | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
+| 4 | krishiv-scheduler | **51,438** | **78** | 12 (in progress) | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
 | **Tier 2 — correctness blast radius** |
 | 5 | krishiv-plan | 14,371 | 25 | 0 | plan IR every surface depends on |
 | 6 | krishiv-common | 7,966 | 23 | 0 | env registry, durability profiles, memory budget |
@@ -554,11 +554,15 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
 
 ---
 
-## 4. krishiv-scheduler — 4 of 78 files read whole (in progress, 2026-08-02)
+## 4. krishiv-scheduler — 12 of 78 files read whole (in progress, 2026-08-02)
 
-Third crate. The largest in the workspace: 51,438 lines. Started on the
+Third crate. The largest in the workspace: 51,438 lines. Working down the
 distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198),
-`job/mod.rs` (199), `job/record.rs` (2,282). 2,824 of 51,438 lines.
+`job/mod.rs` (199), `job/record.rs` (2,381), `job/scheduler.rs` (1,462),
+`job/snapshot.rs` (302), `coordinator/mod.rs` (2,384),
+`coordinator/job_lifecycle.rs` (1,475), `coordinator/task_assignment.rs`
+(1,496), `coordinator/executor_ops.rs` (1,341), `heartbeat.rs` (881),
+`cluster_control.rs` (462). 12,726 of 51,438 lines.
 
 ### Fixed reading it
 
@@ -586,6 +590,66 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
       the coordinator form. **A comment describing an invariant the code does
       not have is how this survived review.**
 
+- [x] **The gc-ready cap dropped jobs without collecting them** (`6ad38e30`).
+      `on_job_terminal`'s `MAX_GC_JOBS` cap pops the oldest id off
+      `gc_ready_jobs` to make room, but `take_gc_ready_jobs` is the only caller
+      of `evict_completed_job` — so a dropped id was never evicted. Its
+      JobRecord, inline results, result spools, input partitions, checkpoint
+      coordinator and index entries stayed in memory forever, **and** because
+      `active_job_ids()` (the shuffle orphan sweep's live set) is exactly
+      `job_coordinators.keys()`, the sweep kept treating it as a running job
+      and never reclaimed its partition files either. The cap bounds only the
+      queue. Reachable whenever >1000 jobs go terminal inside the 30 s GC
+      grace window — one IVM flow ticking at 100 ms is 300, ten flows is 3000.
+
+- [x] **`validate_job` reported a duplicate stage id as a cycle** (`6ad38e30`).
+      Cycle detection indexes stages by id; with a duplicate the Kahn drain
+      decrements one index twice and re-queues a stage already at in-degree
+      zero, so `processed` overshoots `n`. Duplicate *task* ids were already
+      rejected by name ten lines below.
+
+- [x] **The stall watchdog reported the wrong duration** (`6ad38e30`). It
+      triggers on `last_progress_ms` but reported time since `assigned_at_ms`.
+      Not confined to a log line — `apply_stall_resets` bakes the number into
+      the task's `last_failure_reason`, so a task that worked nine hours and
+      then went quiet for one was recorded as "no progress for 10 hours".
+
+- [x] **Two one-shots consumed by batches that never launched** (`a2f615c3`).
+      (a) `apply_assignment_dispatch_responses` gated on
+      `accepted == responses.len()`, vacuously true for an empty batch, and so
+      marked a pending continuous restore snapshot consumed when nothing had
+      been dispatched; `job_input_partitions` held the only other copy and
+      `abort_continuous_input_cycle` drops that, losing the checkpoint.
+      (b) `launch_assigned_task_assignments` removed the hot-key skew override
+      as a one-shot even when the launch errored or produced no assignments.
+      The sibling `task_window_parts` on the same path was already restored for
+      exactly this reason.
+
+- [x] **Hot-key repartitioning counted dead executors** (`274125d8`).
+      `process_hot_key_reports` sized the override with `executors.list()`,
+      which retains Lost/Removed records for 40x the heartbeat timeout (~30
+      min) so zombie leases still validate. A 3-executor cluster that had
+      restarted its pods twice sized the override at 9 and shredded the stage
+      into partitions no executor existed to run.
+
+### Recorded, not fixed — needs a decision
+
+- **`advance_heartbeat_clock` does not `release_workers` on eviction.** The
+  heartbeat-timeout path inlines `mark_executor_lost`'s cleanup (its comments
+  enumerate the parity list twice) but omits
+  `cluster_manager.release_workers(1)`, which `mark_executor_lost` and
+  `drain_executor` both call. Two paths to the same `Lost` state with
+  different dynamic-allocation accounting.
+
+  Not fixed because both patterns are defensible and the choice changes live
+  cluster scaling: a timed-out pod is usually one Kubernetes will restart
+  under the existing replica count (so releasing would scale down work that is
+  coming back), while conversely `register_executor` currently releases a
+  worker for an executor that is re-registering in that same call. Needs a
+  stated intent for `ClusterManager` semantics — "release on any Lost
+  transition" vs "release only on deliberate teardown" — before either side
+  is changed.
+
 ### Noted, no defect
 
 - `stage_specs_from_plan` (`distributed_batch.rs`) passes
@@ -602,6 +666,31 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
   which regeneration does reset, so it was the more accurate of the two even
   before the fix above. Left as-is — unifying them is a reporting-semantics
   decision, not a bug fix.
+
+- `reset_running_tasks_for_lost_executor` appears to skip `refresh_state` when
+  only its shuffle-invalidation half fires (`job_affected` is set after the
+  `if job_affected { job.refresh_state() }` line).
+  `invalidate_executor_shuffle_partitions` calls `self.refresh_state()` itself,
+  so the job state is refreshed either way.
+
+- `deregister_executor` prunes the gRPC channel *after* calling
+  `executors.deregister`, the opposite order from `mark_executor_lost`. Not a
+  leak: `ExecutorRegistry::deregister` only sets state `Removed` and keeps the
+  record (pruning happens later in `advance_clock_excluding`'s retention
+  sweep), so the endpoint lookup still resolves.
+
+- `AssignmentRejected` classifies `FailedPrecondition` and `Unimplemented` as
+  permanent and cancels the whole job. That would be over-broad if an executor
+  returned either transiently from `assign_task` — it does not: the executor's
+  only `failed_precondition` sites are the checkpoint-fanout path, and its
+  `unimplemented` sites are on `stream_exchange`. Re-check if `assign_task`
+  ever grows a drain/backpressure rejection.
+
+- `collect_bounded_assignment_futures` discards every successful response when
+  any one future fails, so the launch loop's error branch clears in-flight for
+  tasks that *were* delivered and re-dispatches them. Not a defect today: the
+  executor inbox dedupes and answers `Duplicate`, which the response handler
+  counts as accepted. It does cost redundant RPCs and under-reports `launched`.
 
 ---
 
