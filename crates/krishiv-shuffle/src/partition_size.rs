@@ -23,10 +23,12 @@
 //! # What this computes instead
 //!
 //! The partition's *own* bytes. For a view array that is
-//! `16 * len` (the views this partition owns) plus the sum of the value
-//! lengths it actually references — and arrow encodes a `ByteView`'s length in
-//! the low 32 bits of the `u128`, so the sum costs one pass over the views with
-//! no string materialisation and no buffer walk.
+//! `16 * len` (the views this partition owns) plus the lengths of the values
+//! long enough to live in a data buffer — arrow encodes a `ByteView`'s length
+//! in the low 32 bits of the `u128`, so the sum costs one pass over the views
+//! with no string materialisation and no buffer walk. Values of 12 bytes or
+//! fewer are stored *inside* the view and are deliberately not added again;
+//! counting them twice reported a 1000-row 8-byte column at 1.49x its size.
 //!
 //! Fixed-width and offset-encoded (Utf8/Binary) arrays are computed exactly
 //! from their own slice too. Deferring offset strings to Arrow is what left
@@ -119,7 +121,17 @@ fn binary_view_bytes_of(array: &BinaryViewArray) -> usize {
 
 fn views_bytes(views: &[u128]) -> usize {
     const VIEW_WIDTH: usize = std::mem::size_of::<u128>();
-    let referenced: usize = views.iter().map(|v| (*v as u32) as usize).sum();
+    // A `ByteView` of 12 bytes or fewer stores its value in the view's own 12
+    // trailing bytes — there is no data buffer to reference, so adding the
+    // length would charge those bytes a second time. Measured on a 1000-row
+    // 8-byte column: 24000 B reported against 16112 B actually held, 1.49x.
+    const INLINE_MAX_LEN: u32 = 12;
+    let referenced: usize = views
+        .iter()
+        .map(|v| *v as u32)
+        .filter(|len| *len > INLINE_MAX_LEN)
+        .map(|len| len as usize)
+        .sum();
     views.len().saturating_mul(VIEW_WIDTH).saturating_add(referenced)
 }
 
@@ -275,6 +287,27 @@ mod tests {
         assert!(
             (0.9..1.15).contains(&ratio),
             "Utf8 sliced into {pieces} pieces reported {ratio:.2}x the whole batch"
+        );
+    }
+
+    /// A `ByteView` whose value is 12 bytes or shorter stores that value
+    /// *inside* the 16-byte view — there is no data buffer to reference.
+    /// Charging it `16 + length` counts those bytes twice.
+    #[test]
+    fn inline_view_values_are_not_charged_twice() {
+        let inline =
+            StringViewArray::from_iter_values((0..1_000).map(|i| format!("{i:0>8}")));
+        assert!(
+            inline.data_buffers().is_empty(),
+            "test premise: 8-byte values must live inline, not in a data buffer"
+        );
+        let logical = logical_array_bytes(&inline);
+        let arrow = inline.get_array_memory_size();
+        assert!(
+            logical <= arrow,
+            "an array that owns every byte it references cannot logically hold more than \
+             Arrow charges it (logical={logical}, arrow={arrow}) — inline view values are \
+             being counted once in the 16-byte view and again as referenced bytes"
         );
     }
 
