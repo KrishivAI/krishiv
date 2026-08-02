@@ -36,7 +36,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 1 | krishiv-sql | 46,632 | 61 | 7 | first slice done; `lib.rs` alone holds 37% of the crate's uncovered regions |
 | 2 | krishiv-executor | 28,927 | 40 | **40 — COMPLETE 2026-08-02** | second crate fully read; 3 defects fixed |
 | 3 | krishiv-shuffle | 14,329 | 36 | **36 — COMPLETE 2026-08-02** | first crate fully read; 4 defects fixed |
-| 4 | krishiv-scheduler | **51,438** | **78** | 0 | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
+| 4 | krishiv-scheduler | **51,438** | **78** | 4 (in progress) | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
 | **Tier 2 — correctness blast radius** |
 | 5 | krishiv-plan | 14,371 | 25 | 0 | plan IR every surface depends on |
 | 6 | krishiv-common | 7,966 | 23 | 0 | env registry, durability profiles, memory budget |
@@ -66,7 +66,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 
 ---
 
-## 1. krishiv-sql — 7 of 54 files read whole ("first slice")
+## 1. krishiv-sql — 7 of 61 files read whole ("first slice")
 
 Measured coverage: **78.01% regions, 70.84% functions, 76.87% lines.**
 
@@ -554,7 +554,58 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
 
 ---
 
-## 4–27. Not yet started
+## 4. krishiv-scheduler — 4 of 78 files read whole (in progress, 2026-08-02)
+
+Third crate. The largest in the workspace: 51,438 lines. Started on the
+distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198),
+`job/mod.rs` (199), `job/record.rs` (2,282). 2,824 of 51,438 lines.
+
+### Fixed reading it
+
+- [x] **Invalidated shuffle partitions stayed "available" on every dfplan job**
+      (`e8fed5cf`). `invalidate_specific_shuffle_partitions` built its
+      `ShufflePath` from `m.stage_id()` — the key the *consumer* reported —
+      while `apply_task_update` records availability from `update.stage_id()`,
+      the coordinator stage id, which is also the map key and the form
+      `store.rs` rebuilds from. `ShuffleMetadata` keys on the whole
+      `ShufflePath`, so a dfplan consumer's `sN.mM` sub-stage key (never equal
+      to `dist-sN`) inserted a second entry and left the Available one standing.
+
+      **Scope, stated precisely**: nothing gates scheduling on this map —
+      regeneration is driven by task state and `missing_report_addresses_task` —
+      so no job was mis-scheduled. It corrupts what the coordinator *reports*
+      and *persists*: `shuffle_partitions_available`, the
+      `krishiv_shuffle_partitions_available` gauge, and
+      `PersistedJobRecord::from`, which serialises exactly the Available paths.
+      A partition known to be lost was persisted and restored as available.
+
+      The comment at the site asserted the opposite rationale — that the
+      consumer's key marks "the entry that served the fetch" and the re-run
+      producer "re-registers under the same key". Neither holds;
+      `apply_task_update` is the only writer of availability and only ever uses
+      the coordinator form. **A comment describing an invariant the code does
+      not have is how this survived review.**
+
+### Noted, no defect
+
+- `stage_specs_from_plan` (`distributed_batch.rs`) passes
+  `shuffle.num_output_partitions` into `ShuffleWriteConfig` with no floor, and
+  this path builds the config in-process — it never crosses the
+  `shuffle_write_config_from_wire` zero-guard added in `dca44555`. Not a defect:
+  `launch_assigned_task_assignments` applies `.max(1)` when copying the config
+  onto the assignment (`record.rs:644`), so the executor never receives 0.
+
+- Job-level and stage-level availability come from *different sources*:
+  `JobRecord::shuffle_partitions_available_count` reads the `shuffle_output`
+  map, `StageRecord::snapshot` counts succeeded tasks' metadata lengths
+  (`record.rs:1545`). They can disagree. The stage-level one tracks task state,
+  which regeneration does reset, so it was the more accurate of the two even
+  before the fix above. Left as-is — unifying them is a reporting-semantics
+  decision, not a bug fix.
+
+---
+
+## 5–27. Not yet started
 
 Each crate gets the same treatment and its own section here: measured
 coverage, a table of uncovered-region concentration, a fixed list with commit
