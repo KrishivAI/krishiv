@@ -405,16 +405,18 @@ fn unknown_build_pressure(facts: &[JoinFacts], threshold: u64) -> u64 {
 fn collect_join_facts(
     plan: &Arc<dyn ExecutionPlan>,
     target_partitions: usize,
+    rescue_degenerate_broadcast: bool,
     out: &mut Vec<JoinFacts>,
 ) {
     for child in plan.children() {
-        collect_join_facts(child, target_partitions, out);
+        collect_join_facts(child, target_partitions, rescue_degenerate_broadcast, out);
     }
     let any = plan.as_ref() as &dyn std::any::Any;
     if let Some(hash_join) = any.downcast_ref::<HashJoinExec>() {
         out.push(JoinFacts {
             bytes: build_bytes_estimate(hash_join),
-            convertible: convertible_mode(hash_join, target_partitions).is_some(),
+            convertible: convertible_mode(hash_join, target_partitions, rescue_degenerate_broadcast)
+                .is_some(),
         });
     }
 }
@@ -477,7 +479,11 @@ enum Conversion {
 /// budget can reason about and the distributed planner can already refuse
 /// (`distributed_plan::broadcast_build_estimate_is_empty`); it does not need,
 /// and must not get, an exchange it never asked for.
-fn convertible_mode(hash_join: &HashJoinExec, target_partitions: usize) -> Option<Conversion> {
+fn convertible_mode(
+    hash_join: &HashJoinExec,
+    target_partitions: usize,
+    rescue_degenerate_broadcast: bool,
+) -> Option<Conversion> {
     let single_partition = hash_join.left().output_partitioning().partition_count() == 1
         && hash_join.right().output_partitioning().partition_count() == 1;
     match hash_join.partition_mode() {
@@ -491,7 +497,8 @@ fn convertible_mode(hash_join: &HashJoinExec, target_partitions: usize) -> Optio
         // to hash on and more than one partition to be worth planning, but the
         // binding condition is the degenerate estimate — see below.
         PartitionMode::CollectLeft
-            if target_partitions > 1
+            if rescue_degenerate_broadcast
+                && target_partitions > 1
                 && !hash_join.on().is_empty()
                 && crate::join_estimates::BuildSideEstimate::of(hash_join.left())
                     .any_claims_empty() =>
@@ -518,6 +525,16 @@ pub struct SpillableJoinSelection {
     /// paths without mutating process-wide environment that every other test in
     /// the binary shares.
     grace: bool,
+    /// Allow the degenerate-broadcast rescue in `convertible_mode` to
+    /// hash-partition a join's inputs.
+    ///
+    /// Off for the coordinator. The rescue is a *distribution* change, and in a
+    /// plan that is about to be cut into stages every exchange becomes a stage
+    /// boundary: q21 at SF100 went from 11 stages / 758 s to 13 / 1061 s when
+    /// this fired during distributed planning. The coordinator does not need it
+    /// either — q21 completes distributed; it is the embedded path, which has
+    /// no stages to add and no other guard, that cannot survive without it.
+    rescue_degenerate_broadcast: bool,
 }
 
 impl SpillableJoinSelection {
@@ -552,6 +569,17 @@ impl SpillableJoinSelection {
             // `for_local_execution`, which only the post-decode executor path
             // calls.
             grace: false,
+            rescue_degenerate_broadcast: true,
+        }
+    }
+
+    /// Forbid the degenerate-broadcast rescue — for a plan that is about to be
+    /// cut into stages, where an added exchange is an added stage boundary.
+    #[must_use]
+    pub fn without_broadcast_rescue(self) -> Self {
+        Self {
+            rescue_degenerate_broadcast: false,
+            ..self
         }
     }
 
@@ -672,6 +700,7 @@ impl SpillableJoinSelection {
         Self {
             threshold_bytes,
             grace: false,
+            rescue_degenerate_broadcast: true,
         }
     }
 
@@ -681,6 +710,7 @@ impl SpillableJoinSelection {
         Self {
             threshold_bytes,
             grace,
+            rescue_degenerate_broadcast: true,
         }
     }
 
@@ -781,7 +811,9 @@ impl SpillableJoinSelection {
         // With one partition, "sorted" is the whole requirement — there is no
         // distribution to preserve — so the conversion is *simpler* here than
         // in the partitioned case, not riskier.
-        let Some(conversion) = convertible_mode(hash_join, target_partitions) else {
+        let Some(conversion) =
+            convertible_mode(hash_join, target_partitions, self.rescue_degenerate_broadcast)
+        else {
             tracing::debug!(
                 mode = ?hash_join.partition_mode(),
                 threshold,
@@ -1000,7 +1032,12 @@ impl PhysicalOptimizerRule for SpillableJoinSelection {
         // separately — see `conversion_decisions`. Decisions are indexed by
         // position in `transform_up` order, which `collect_join_facts` mirrors.
         let mut facts = Vec::new();
-        collect_join_facts(&plan, target_partitions, &mut facts);
+        collect_join_facts(
+            &plan,
+            target_partitions,
+            self.rescue_degenerate_broadcast,
+            &mut facts,
+        );
         let decisions = Self::conversion_decisions(&facts, configured);
         let threshold = configured;
         let mut at = 0usize;
@@ -1595,6 +1632,30 @@ mod degenerate_broadcast_tests {
         );
     }
 
+    /// The coordinator opts out entirely, and must get the plan back untouched
+    /// even for the degenerate shape the rescue exists to handle.
+    ///
+    /// Narrowing the rescue to degenerate estimates was *not* enough on its
+    /// own: q21's degenerate `LeftAnti` is present in the distributed plan too,
+    /// so the coordinator kept re-planning it and q21 stayed at 13 stages
+    /// (888 s) instead of the baseline's 11 (758 s). What separates the two is
+    /// not the estimate but who is planning — a plan about to be cut into
+    /// stages cannot afford an exchange, and does not need one.
+    #[tokio::test]
+    async fn the_coordinator_never_repartitions_even_a_degenerate_broadcast() {
+        let ctx = multi_partition_ctx();
+        let plan = broadcast_join_over_split_probe(&ctx, true).await;
+        let out = SpillableJoinSelection::with_threshold(Some(1))
+            .without_broadcast_rescue()
+            .optimize(plan, ctx.copied_config().options())
+            .unwrap();
+        assert!(
+            !shows(&out, "RepartitionExec"),
+            "a plan bound for stage-cutting gained an exchange:\n{}",
+            displayable(out.as_ref()).indent(true)
+        );
+    }
+
     /// The executor task engine plans at `target_partitions = cores / slots`,
     /// which is 1 on a saturated 3-core executor. Its broadcast joins have a
     /// single-partition probe side and must keep taking the simpler in-place
@@ -1727,7 +1788,7 @@ mod budget_tests {
     /// these tests measure first and assert the *invariant*.
     fn facts(plan: &Arc<dyn ExecutionPlan>) -> Vec<JoinFacts> {
         let mut out = Vec::new();
-        collect_join_facts(plan, 1, &mut out);
+        collect_join_facts(plan, 1, true, &mut out);
         out
     }
 
@@ -2495,7 +2556,7 @@ mod budget_never_loosens_tests {
 
     fn facts_of(plan: &Arc<dyn ExecutionPlan>) -> Vec<JoinFacts> {
         let mut out = Vec::new();
-        collect_join_facts(plan, 1, &mut out);
+        collect_join_facts(plan, 1, true, &mut out);
         out
     }
 

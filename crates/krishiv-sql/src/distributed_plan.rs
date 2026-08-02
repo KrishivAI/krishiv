@@ -2318,6 +2318,9 @@ pub fn build_distributed_stages_with_udf_directives(
     let plan = {
         use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
         crate::spillable_join::SpillableJoinSelection::from_capacity()
+            // This plan is about to be cut into stages, so an added exchange is
+            // an added stage boundary — see `without_broadcast_rescue`.
+            .without_broadcast_rescue()
             .optimize(plan, &datafusion::common::config::ConfigOptions::default())
     }
         .map_err(|e| SqlError::DataFusion {
