@@ -25,6 +25,28 @@ pub fn build_observability_report(
         .map(|r| r.spec.name().to_owned())
         .unwrap_or_else(|| job.job_id().as_str().to_owned());
 
+    // Upstream edges are not carried on `StageSnapshot`, but this report is
+    // read to answer "why is this stage not starting" — a DAG report with no
+    // edges cannot answer it. Take them from the record we already hold.
+    let upstreams_by_stage: BTreeMap<String, Vec<String>> = record
+        .as_ref()
+        .map(|r| {
+            r.stages()
+                .iter()
+                .map(|s| {
+                    (
+                        s.stage_id().as_str().to_owned(),
+                        s.spec
+                            .upstream_stage_ids()
+                            .iter()
+                            .map(|id| id.as_str().to_owned())
+                            .collect(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut stages = Vec::new();
     for stage in detail.stages() {
         let mut task_counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -51,7 +73,10 @@ pub fn build_observability_report(
             stage_name: stage.stage_id().as_str().to_owned(),
             state: stage.state().to_string(),
             task_counts,
-            upstream_stage_ids: Vec::new(),
+            upstream_stage_ids: upstreams_by_stage
+                .get(stage.stage_id().as_str())
+                .cloned()
+                .unwrap_or_default(),
             output_partition_count: None,
             task_details,
         });
@@ -82,9 +107,19 @@ pub fn build_observability_report(
             state: record.state().to_string(),
             slots: record.descriptor().slots(),
             active_tasks: record.running_tasks().len(),
+            // The registry's own clock — the one `last_heartbeat_tick` is
+            // stamped from. This read `exec.ticks_since_restart`, which is a
+            // different counter entirely: it starts at `u64::MAX` (so that a
+            // coordinator that never recovered is never inside the streaming
+            // re-attach grace window) and only resets to 0 in
+            // `recover_from_store`. Every executor in this report therefore
+            // showed a heartbeat age of ~1.8e19 ticks on any coordinator that
+            // had not recovered from a store — in the one report an operator
+            // reads to decide whether an executor is alive.
             heartbeat_age_ticks: coordinator
                 .exec
-                .ticks_since_restart
+                .executors
+                .current_tick()
                 .saturating_sub(record.last_heartbeat_tick()),
             task_endpoint: record.descriptor().task_endpoint().map(str::to_owned),
             memory_used_bytes: record.health_snapshot().and_then(|h| h.memory_used_bytes),
@@ -177,6 +212,93 @@ mod tests {
         assert!(
             report.checkpoint.is_none(),
             "a job without checkpoint config must report no checkpoint block"
+        );
+    }
+
+    /// The report's executor liveness column must be a real heartbeat age.
+    /// It was computed against `exec.ticks_since_restart`, which starts at
+    /// `u64::MAX` and is only reset by `recover_from_store` — so on any
+    /// coordinator that had not recovered from a store (every fresh process)
+    /// it reported ~1.8e19 ticks for a healthy executor that had just
+    /// heartbeated.
+    #[test]
+    fn heartbeat_age_is_measured_against_the_registry_clock() {
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("obs-age").unwrap());
+        let exec_id = krishiv_proto::ExecutorId::try_new("exec-age").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(exec_id.clone(), "10.0.0.9", 2))
+            .unwrap();
+        coordinator
+            .executor_heartbeat(ExecutorHeartbeat::new(
+                exec_id.clone(),
+                ExecutorState::Healthy,
+            ))
+            .unwrap();
+
+        let job_id = JobId::try_new("obs-age-job").unwrap();
+        coordinator
+            .submit_job(
+                JobSpec::new(job_id.clone(), "obs-age-job", JobKind::Batch).with_stage(
+                    StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(
+                        TaskSpec::new(TaskId::try_new("t0").unwrap(), "sql: select 1"),
+                    ),
+                ),
+            )
+            .unwrap();
+
+        let report = build_observability_report(&coordinator, &job_id).unwrap();
+        assert_eq!(
+            report.executors[0].heartbeat_age_ticks, 0,
+            "an executor that just heartbeated is zero ticks stale"
+        );
+
+        coordinator.advance_heartbeat_clock(2).unwrap();
+        let report = build_observability_report(&coordinator, &job_id).unwrap();
+        assert_eq!(
+            report.executors[0].heartbeat_age_ticks, 2,
+            "the age must track the registry clock the heartbeat is stamped from"
+        );
+    }
+
+    /// A DAG report with no edges cannot answer the question it exists for
+    /// ("why has this stage not started"). The upstream ids are on the job
+    /// record the builder already holds; they were being emitted as empty.
+    #[test]
+    fn stage_upstream_edges_are_reported() {
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("obs-dag").unwrap());
+        let job_id = JobId::try_new("obs-dag-job").unwrap();
+        let up = StageId::try_new("dist-s0").unwrap();
+        let down = StageId::try_new("dist-s1").unwrap();
+        coordinator
+            .submit_job(
+                JobSpec::new(job_id.clone(), "dag", JobKind::Batch)
+                    .with_stage(
+                        StageSpec::new(up.clone(), "map").with_task(TaskSpec::new(
+                            TaskId::try_new("m0").unwrap(),
+                            "sql: select 1",
+                        )),
+                    )
+                    .with_stage(
+                        StageSpec::new(down, "reduce")
+                            .with_upstream_stage(up)
+                            .with_task(TaskSpec::new(
+                                TaskId::try_new("r0").unwrap(),
+                                "sql: select 1",
+                            )),
+                    ),
+            )
+            .unwrap();
+
+        let report = build_observability_report(&coordinator, &job_id).unwrap();
+        let reduce = report
+            .stages
+            .iter()
+            .find(|s| s.stage_id == "dist-s1")
+            .expect("reduce stage in report");
+        assert_eq!(
+            reduce.upstream_stage_ids,
+            vec!["dist-s0".to_string()],
+            "the reduce stage's dependency must appear in the report"
         );
     }
 }
