@@ -32,8 +32,20 @@ impl Coordinator {
     pub fn recover_from_store(&mut self, store: &mut dyn MetadataStore) -> SchedulerResult<()> {
         // P1.23: Clear in-memory state first so stale phantom jobs cannot survive.
         // Always prefer the persisted store as the authoritative source of truth.
+        //
+        // Clearing the two job maps is not enough. This runs on every
+        // standby→active promotion, not only at process start, so a
+        // coordinator that was previously active carries per-job state for
+        // every job it was running. Those maps were left untouched: a job
+        // absent from the store afterwards leaked its inline results, spools,
+        // input partitions, checkpoint coordinator, indexes and adaptive
+        // state — and kept its `continuous_input_cycles` fence, which makes
+        // every later push to a job of that id 409 forever. Purge state for
+        // exactly the ids that did not come back.
+        let previous_job_ids: Vec<JobId> = self.job_coordinators.keys().cloned().collect();
         self.job_coordinators.clear();
         self.streaming_task_index.clear();
+        self.streaming_job_task_index.clear();
         self.exec.executors.reset_for_recovery();
         for record in store.jobs() {
             let job_id = record.job_id().clone();
@@ -41,6 +53,11 @@ impl Coordinator {
                 job_id.clone(),
                 Arc::new(JobCoordinator::new(job_id, record.clone())),
             );
+        }
+        for job_id in previous_job_ids {
+            if !self.job_coordinators.contains_key(&job_id) {
+                self.purge_job_scoped_state(&job_id);
+            }
         }
         let normalized = self.normalize_recovered_launch_state();
         if normalized > 0 {
@@ -431,6 +448,89 @@ impl Coordinator {
         open_checkpoint_storage_from_uri(path).map_err(|e| SchedulerError::InvalidJob {
             message: format!("failed to open checkpoint storage at {path}: {e}"),
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod stale_job_state_tests {
+    use super::*;
+    use crate::InMemoryMetadataStore;
+    use krishiv_proto::{CoordinatorId, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
+
+    fn streaming_job(job_id: &JobId) -> JobSpec {
+        JobSpec::new(job_id.clone(), "stale-state", JobKind::Streaming).with_stage(
+            StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage")
+                .with_task(TaskSpec::new(TaskId::try_new("t0").unwrap(), "stream:tw")),
+        )
+    }
+
+    /// `recover_from_store` runs on every standby→active promotion, not only
+    /// at process start. It cleared the two job maps and left every other
+    /// per-job map behind, so a job that did not come back from the store
+    /// leaked all of its state — including its `continuous_input_cycles`
+    /// fence, which makes every later push to a job of that id 409 forever.
+    #[test]
+    fn promotion_purges_state_for_jobs_that_did_not_come_back_from_the_store() {
+        let mut coord = Coordinator::active(CoordinatorId::try_new("stale-purge").unwrap());
+        let gone = JobId::try_new("job-gone").unwrap();
+        coord.submit_job(streaming_job(&gone)).unwrap();
+
+        // The kind of per-job state a live streaming job accumulates.
+        coord.continuous_input_cycles.insert(gone.clone());
+        coord
+            .job_inline_results
+            .insert(gone.clone(), vec![vec![1, 2, 3]]);
+        coord.skew_repartition_overrides.insert(gone.clone(), 8);
+        assert!(coord.streaming_job_task_index.contains_key(&gone));
+
+        // Promote against a store that knows nothing about this job.
+        let mut store = InMemoryMetadataStore::default();
+        coord.recover_from_store(&mut store).unwrap();
+
+        assert!(
+            !coord.job_coordinators.contains_key(&gone),
+            "precondition: the job must not have come back"
+        );
+        assert!(
+            !coord.continuous_input_cycles.contains(&gone),
+            "a stale cycle fence makes every future push to this id 409 forever"
+        );
+        assert!(!coord.job_inline_results.contains_key(&gone));
+        assert!(!coord.skew_repartition_overrides.contains_key(&gone));
+        assert!(!coord.streaming_job_task_index.contains_key(&gone));
+    }
+
+    /// `evict_completed_job` dropped the forward streaming index but not the
+    /// reverse one. The forward index is keyed by bare `TaskId`, so the stale
+    /// reverse entry is not merely a leak: a later
+    /// `remove_streaming_task_index` for the dead job deletes a *live* job's
+    /// identically-named task entry and silently stops its watermark updates.
+    #[test]
+    fn evicting_a_job_drops_both_streaming_indexes() {
+        let mut coord = Coordinator::active(CoordinatorId::try_new("stream-idx-leak").unwrap());
+        let dead = JobId::try_new("job-dead").unwrap();
+        coord.submit_job(streaming_job(&dead)).unwrap();
+        coord.cancel_job(&dead).unwrap();
+        assert!(coord.streaming_job_task_index.contains_key(&dead));
+
+        coord.evict_completed_job(&dead);
+
+        assert!(
+            !coord.streaming_job_task_index.contains_key(&dead),
+            "the reverse index must not outlive the job it describes"
+        );
+
+        // The hazard the leak creates: a live job whose task shares the id.
+        let live = JobId::try_new("job-live").unwrap();
+        coord.submit_job(streaming_job(&live)).unwrap();
+        coord.remove_streaming_task_index(&dead);
+        assert!(
+            coord
+                .streaming_task_index
+                .contains_key(&TaskId::try_new("t0").unwrap()),
+            "tearing down the dead job must not unindex the live job's task"
+        );
     }
 }
 

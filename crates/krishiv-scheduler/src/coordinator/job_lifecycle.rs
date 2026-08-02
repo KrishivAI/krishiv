@@ -1131,6 +1131,24 @@ impl Coordinator {
             return;
         }
         self.job_coordinators.remove(job_id);
+        self.purge_job_scoped_state(job_id);
+    }
+
+    /// Drop every piece of coordinator state keyed by `job_id`, *except* the
+    /// `job_coordinators` entry itself.
+    ///
+    /// Split out of [`Self::evict_completed_job`] so recovery can reuse it:
+    /// `recover_from_store` rebuilds `job_coordinators` from the durable store
+    /// and runs on every standby→active promotion, not only at process start.
+    /// Any job that was live before the promotion but is absent from the store
+    /// afterwards used to leave all of this behind — most damagingly a
+    /// `continuous_input_cycles` fence, which makes every later push to a job
+    /// of that id 409 forever.
+    ///
+    /// Keep this the single place that enumerates the per-job maps: the
+    /// forward/reverse streaming indexes drifted apart precisely because two
+    /// call sites maintained them separately.
+    pub(crate) fn purge_job_scoped_state(&mut self, job_id: &JobId) {
         self.job_inline_results.remove(job_id);
         self.job_result_spools.remove(job_id);
         self.pending_task_result_spools
@@ -1143,8 +1161,17 @@ impl Coordinator {
         self.ckpt.coordinators.remove(job_id);
         self.gc_ready_jobs.retain(|id| id != job_id);
         self.gc_ready_at.remove(job_id);
+        self.pending_backlog_jobs.remove(job_id);
+        self.launch_dirty_jobs.remove(job_id);
         self.streaming_task_index
             .retain(|_, (jid, _)| jid != job_id);
+        // The reverse index was NOT dropped here, only the forward one. That
+        // leaks a `Vec<TaskId>` per streaming job forever — and worse, the
+        // forward index is keyed by bare `TaskId`, so a stale reverse entry
+        // naming `t0` lets a later `remove_streaming_task_index` for this dead
+        // job delete a *live* job's `t0` entry and silently stop its watermark
+        // updates.
+        self.streaming_job_task_index.remove(job_id);
         // S4: Evict adaptive decision log entries for the completed job to
         // prevent unbounded HashMap growth on long-running coordinators.
         self.adaptive_decision_log.remove(job_id);
