@@ -3608,9 +3608,51 @@ fn dedupe_identical_stages_unconditionally(
 /// throughput optimization must never be why a query fails.
 fn inject_runtime_filters(root: &Arc<dyn ExecutionPlan>, drafts: &mut Vec<StageDraft>) -> usize {
     if !crate::runtime_filter_exec::enabled() {
+        // Count and report anyway, then change nothing.
+        //
+        // The early return used to happen here, *before* the pass computed its
+        // rejection breakdown — so the one diagnostic that would tell an
+        // operator whether enabling the flag is worth trying was available only
+        // after enabling it. Every run since the counters landed in `59243a94`
+        // has therefore produced zero `runtime-filter: pass complete` lines, and
+        // the note-to-self to "read that line before theorising" was unsatisfiable
+        // by construction.
+        //
+        // A dry run costs one read-only walk of a plan that has just been built
+        // and cut, and it makes "would this fire?" answerable from an ordinary
+        // benchmark log.
+        report_runtime_filter_candidates(root, drafts);
         return 0;
     }
     inject_runtime_filters_unconditionally(root, drafts)
+}
+
+/// Walk the plan exactly as the injector would and log the same
+/// `runtime-filter: pass complete` breakdown, without rewriting anything.
+///
+/// Deliberately shares [`collect_runtime_filter_candidates`] with the real pass:
+/// a dry run that used its own traversal would answer a question nobody asked.
+fn report_runtime_filter_candidates(root: &Arc<dyn ExecutionPlan>, drafts: &[StageDraft]) {
+    let mut candidates = Vec::new();
+    let mut rejects = RuntimeFilterRejects::default();
+    collect_runtime_filter_candidates(root, &mut candidates, &mut rejects);
+    for draft in drafts {
+        collect_runtime_filter_candidates(&draft.plan, &mut candidates, &mut rejects);
+    }
+    tracing::info!(
+        joins_inspected = rejects.joins,
+        not_inner = rejects.not_inner,
+        side_not_a_shuffle_read = rejects.side_not_a_shuffle_read,
+        same_stage = rejects.same_stage,
+        no_row_estimate = rejects.no_row_estimate,
+        not_selective = rejects.not_selective,
+        filter_too_large = rejects.filter_too_large,
+        no_encodable_key = rejects.no_encodable_key,
+        candidates = candidates.len(),
+        injected = 0,
+        enabled = false,
+        "runtime-filter: pass complete"
+    );
 }
 
 /// [`inject_runtime_filters`] without the flag check.
@@ -7315,6 +7357,44 @@ mod codec_completeness_tests {
             );
             assert!(stage_depends_on(&drafts, 0, 1), "precondition: build reads probe");
             assert_eq!(inject_runtime_filters_unconditionally(&root, &mut drafts), 0);
+        }
+
+        /// With the feature off, the pass must still change nothing *and* still
+        /// be able to count — the diagnostic is what tells an operator whether
+        /// turning the flag on is worth trying.
+        ///
+        /// Before the dry run existed, `inject_runtime_filters` returned before
+        /// computing its rejection breakdown, so every run since the counters
+        /// landed produced zero `runtime-filter: pass complete` lines and the
+        /// question stayed unanswerable without first enabling the thing being
+        /// evaluated.
+        #[test]
+        fn the_dry_run_reports_without_rewriting_when_the_flag_is_off() {
+            let root: Arc<dyn ExecutionPlan> = Arc::new(ShuffleReadExec::new(
+                0,
+                1,
+                1,
+                schema("k", arrow::datatypes::DataType::Int64),
+                None,
+            ));
+            let mut drafts = vec![draft(0, Some(1), "a"), draft(1, Some(1), "b")];
+            let before = drafts.len();
+            // `enabled()` reads the environment, which this test does not touch:
+            // the default is off, which is the case under audit.
+            assert!(
+                !crate::runtime_filter_exec::enabled(),
+                "precondition: the feature ships dark"
+            );
+            assert_eq!(
+                inject_runtime_filters(&root, &mut drafts),
+                0,
+                "a disabled pass must inject nothing"
+            );
+            assert_eq!(
+                drafts.len(),
+                before,
+                "a disabled pass must not add a stage"
+            );
         }
 
         #[test]
