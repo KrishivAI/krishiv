@@ -27,7 +27,7 @@ silent wrong answer, (3) size × test-thinness.
 | **Tier 1 — critical path** |
 | 1 | krishiv-sql | 38,727 | 54 | 49 | first slice done; `lib.rs` alone holds 37% of the crate's uncovered regions |
 | 2 | krishiv-executor | 21,867 | 32 | 27 | shuffle write/drain (D7), task running, the memory pool |
-| 3 | krishiv-shuffle | 8,153 | 24 | 22 | the disk story lives here; no streaming write path |
+| 3 | krishiv-shuffle | 14,241 | 35 | **35 — COMPLETE 2026-08-02** | first crate fully read; 4 defects fixed. Counts now include `sections/*.rs.inc` and `tests/`, which the old figures omitted |
 | 4 | krishiv-scheduler | 39,142 | 56 | 56 | stage cutting, dispatch, the single-task fallback, SC11 breaker |
 | **Tier 2 — correctness blast radius** |
 | 5 | krishiv-plan | 14,385 | 25 | 19 | plan IR every surface depends on |
@@ -128,18 +128,87 @@ it** — this section is a record of what was found, not a queue.
 
 ---
 
-## 3. krishiv-shuffle — 7 of 24 files read whole
+## 3. krishiv-shuffle — COMPLETE, 35 of 35 files read whole (2026-08-02)
 
-**A crate is "covered" only when every file has been read end to end.** This
-section previously implied more than was done: the open-item list was closed,
-which is not the same thing. Read whole so far — `store.rs`, `local_store.rs`,
-`disk_store.rs`, `shuffle_svc.rs`, `push_shuffle.rs`, `storage_uri.rs`,
-`orphan.rs` (3,956 of 9,269 lines). Remaining, largest first: `flight.rs`
-(1486), `partitioner.rs` (743), `sort_shuffle_writer.rs` (584),
-`range_partitioner.rs` (536), `object_store.rs` (520), `memory_store.rs` (382),
-`spillable.rs` (308), `tiered_store.rs` (125), `token_auth.rs` (123),
-`metadata.rs` (104), `error.rs` (94), `compression.rs` (67),
-`lease_persistence.rs` (50), `path.rs` (36).
+**A crate is "covered" only when every file has been read end to end.** This is
+the first crate to reach it: all 35 files, **14,241 lines**, including the 11
+`src/sections/*.rs.inc` test sections and both files under `tests/`.
+
+**Methodology correction that this crate forced.** `grep --include=*.rs` cannot
+see `*.rs.inc`, and this repo keeps 441 tests in them (krishiv-scheduler 266,
+krishiv-executor 80, krishiv-shuffle 95). A "no callers anywhere" conclusion
+about `ShuffleMetadata::mark_pending` survived review and then failed `cargo
+test` with 16 errors from two `.rs.inc` files holding three dedicated tests of
+exactly that API. **Every reachability grep in this repo must pass both
+`--include='*.rs'` and `--include='*.rs.inc'`.** Earlier sections of this
+register were written under the narrower grep and their "uncalled" claims should
+be re-checked before being relied on.
+
+The inverse trap matters just as much: a guard can be *fully unit-tested inside
+`.rs.inc` and still be unreachable from production*. Green tests prove
+behaviour, not reachability. Two of the four defects below were of exactly that
+shape.
+
+### Defects found and fixed reading it (2026-08-02)
+
+- [x] **`ShuffleMetadata`'s partition cap was enforced by nothing** (`c6581a4d`).
+      `max_partitions` (65536) was checked only in `mark_pending`, which no
+      production caller invokes — the scheduler reaches this type solely through
+      `mark_available` / `mark_failed`, both of which insert unconditionally. So
+      `with_max_partitions` configured a bound that could not fire, while three
+      unit tests asserted it firing at limits 2 and 3 and passed. Removed rather
+      than extended to the live paths: refusing to record a partition already
+      written to disk would make the consumer treat live data as missing and
+      recompute its producer, which is worse than the unbounded map. A cap
+      belongs at admission and there is no admission call site.
+
+- [x] **Inline view values were charged twice in partition accounting**
+      (`723986c9`). `views_bytes` charged every `ByteView` `16 + length`, but a
+      value of ≤12 bytes lives *inside* the view — no data buffer holds it.
+      Measured 24000 B reported against 16112 B held on a 1000-row 8-byte
+      column, **1.49x**. The figure feeds `ShufflePartitionOutput::size_bytes`,
+      `aqe.rs` reduce parallelism and `ShuffleWriteBuffer`'s spill decision, so
+      any stage keyed on short strings — TPC-H's `l_returnflag`,
+      `l_linestatus`, `c_mktsegment`, `l_shipmode` are all inline — was sized
+      from an inflated number. Same class as the shared-buffer over-report this
+      module was written to fix, in the opposite direction.
+
+- [x] **The Flight serve budget was rounded up past the capacity limit**
+      (`333906a4`). `serve_with_token` converted bytes to response units with
+      `div_ceil(INLINE_READ_LIMIT)` and `with_serve_limit` multiplied back,
+      commented as converting "straight back". Rounding up meant the server
+      allowed up to one whole 32 MiB `INLINE_READ_LIMIT` MORE resident than
+      `ExecutorCapacity` reported — the one direction a bound guarding
+      out-of-pool memory in the map-task process must not err in.
+
+- [x] **The HTTP shuffle auth test only proved rejection** (`79ec9cf9`).
+      `http_shuffle_svc_token_auth_enforced` covered no-token → 401 and
+      wrong-token → 401 but never that the configured token is *accepted*, so it
+      passed identically against a handler that rejected everything and broke
+      every shuffle read. Its Flight counterpart always had all three cases.
+
+### Recorded, deliberately not "fixed"
+
+- **A missing `.blake3` sidecar fails CLOSED on the object store and OPEN on
+  local disk.** Identical crash window (data written, sidecar not), opposite
+  dispositions, both deliberately tested, neither stating why. Documented at
+  `ObjectStoreShuffleStore` instead of aligned: fail-open weakens integrity on
+  the tier whose bytes travel furthest, fail-closed converts a recoverable crash
+  into a stage recompute, and choosing needs a measurement of how often the
+  window is hit. Do not assume one is simply a bug.
+
+- **`partition_memory_bytes` uses `get_array_memory_size()` on purpose**, not
+  `logical_partition_bytes`. A memory cap needs bytes *held*, not *referenced*.
+  The two agree only because `partitioner::partition_batch` compacts every
+  bucket at the moment it is produced; a reader in `compression.rs` had no way
+  to see that invariant, so it is now stated there.
+
+- **`SortShuffleWriter` is wired but correctly dead.** `fragment/batch.rs`
+  builds one iff `ShuffleContext::ess_index` is `Some`, and every production
+  site sets `None`. Its output paths carry no map-task identity, so arming it
+  would let two tasks of one stage overwrite each other's data and index files
+  with the query still reporting success. The warning lived in krishiv-shuffle
+  while the switch lives in krishiv-executor; it is now recorded at the field.
 
 Measured: **81.07% regions, 68.67% functions, 78.07% lines** (11,475 regions,
 2,172 uncovered).
