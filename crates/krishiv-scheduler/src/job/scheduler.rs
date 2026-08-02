@@ -652,6 +652,28 @@ pub(crate) fn validate_job(spec: &JobSpec) -> SchedulerResult<()> {
     }
     let stage_ids: std::collections::HashSet<&StageId> =
         spec.stages().iter().map(|s| s.stage_id()).collect();
+    // Stage ids must be unique for the same reason task ids must be: they are
+    // the identity every later lookup keys on. Cycle detection below indexes
+    // stages by id, so with a duplicate the drain decrements one index twice
+    // and re-queues a stage whose in-degree already reached zero — `processed`
+    // overshoots `n` and a perfectly ordinary DAG is rejected as "cyclic".
+    // Diagnosing that from the error text is impossible; reject the real
+    // problem by name instead.
+    if stage_ids.len() != spec.stages().len() {
+        let mut seen: std::collections::HashSet<&StageId> =
+            std::collections::HashSet::with_capacity(spec.stages().len());
+        let duplicate = spec
+            .stages()
+            .iter()
+            .map(krishiv_proto::StageSpec::stage_id)
+            .find(|id| !seen.insert(id));
+        return Err(SchedulerError::InvalidJob {
+            message: match duplicate {
+                Some(id) => format!("duplicate stage id {} in job {}", id, spec.job_id()),
+                None => format!("duplicate stage id in job {}", spec.job_id()),
+            },
+        });
+    }
     for stage in spec.stages() {
         for upstream_id in stage.upstream_stage_ids() {
             if !stage_ids.contains(upstream_id) {
@@ -1403,6 +1425,45 @@ mod fair_scheduler_tests {
         assert!(
             validate_job(&spec).is_ok(),
             "listing the same upstream twice describes one edge, not a loop"
+        );
+    }
+
+    /// Two stages sharing an id is not a cycle, and must not be reported as
+    /// one. Cycle detection indexes stages by id, so the duplicate made the
+    /// drain decrement one index twice and re-queue a stage already at
+    /// in-degree zero; `processed` overshot `n` and the job was rejected as
+    /// "stage dependency graph is cyclic" — an error naming the one thing that
+    /// was not wrong with the plan.
+    #[test]
+    fn duplicate_stage_ids_are_rejected_by_name_not_as_a_cycle() {
+        let dup = StageId::try_new("same").expect("stage id");
+        let spec = JobSpec::new(
+            JobId::try_new("dup-stage").expect("job id"),
+            "dup",
+            JobKind::Batch,
+        )
+        .with_stage(
+            StageSpec::new(dup.clone(), "first")
+                .with_task(TaskSpec::new(TaskId::try_new("t0").expect("task id"), "body")),
+        )
+        .with_stage(
+            StageSpec::new(dup, "second")
+                .with_task(TaskSpec::new(TaskId::try_new("t1").expect("task id"), "body")),
+        )
+        .with_stage(
+            StageSpec::new(StageId::try_new("down").expect("stage id"), "down")
+                .with_upstream_stage(StageId::try_new("same").expect("stage id"))
+                .with_task(TaskSpec::new(TaskId::try_new("t2").expect("task id"), "body")),
+        );
+        let error = validate_job(&spec).expect_err("duplicate stage ids must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("duplicate stage id"),
+            "the error must name the duplicate, got: {message}"
+        );
+        assert!(
+            !message.contains("cyclic"),
+            "a duplicated id is not a cycle; got: {message}"
         );
     }
 

@@ -967,7 +967,30 @@ impl Coordinator {
         if self.gc_ready_jobs.len() >= MAX_GC_JOBS
             && let Some(evicted) = self.gc_ready_jobs.pop_front()
         {
+            // Dropping the id out of the queue is not the same as collecting
+            // it. `take_gc_ready_jobs` is the ONLY caller of
+            // `evict_completed_job`, and the orphan sweep's live set is
+            // exactly `active_job_ids()` == `job_coordinators.keys()`. So a
+            // job dropped here without being evicted leaks its whole
+            // in-memory footprint (record, inline results, result spools,
+            // input partitions, checkpoint coordinator, indexes) *and* pins
+            // its shuffle directory on disk forever, because the sweep keeps
+            // seeing it as a live job. Both leaks are silent and unbounded:
+            // the cap only bounds the queue.
+            //
+            // Evicting here reclaims the memory and lets the orphan sweep
+            // reclaim the partitions once the id leaves the live set. The
+            // only thing genuinely lost is the targeted
+            // `delete_job_partitions` call, which the sweep subsumes.
             self.gc_ready_at.remove(&evicted);
+            tracing::warn!(
+                evicted_job_id = %evicted,
+                queue_len = MAX_GC_JOBS,
+                "gc-ready queue is full; evicting the oldest terminal job \
+                 without its targeted shuffle GC (the orphan sweep reclaims \
+                 its partitions once it leaves the live-job set)"
+            );
+            self.evict_completed_job(&evicted);
         }
         self.gc_ready_jobs.push_back(job_id.clone());
         self.gc_ready_at
@@ -1234,6 +1257,71 @@ mod gc_grace_tests {
         assert!(
             !coord.gc_ready_at.contains_key(&aged),
             "an evicted job's timestamp must not leak in gc_ready_at"
+        );
+    }
+
+    /// The `MAX_GC_JOBS` cap bounds the *queue*, not the state the queue
+    /// exists to release. `take_gc_ready_jobs` is the only caller of
+    /// `evict_completed_job`, so a job dropped off the front by the cap used
+    /// to keep its whole in-memory footprint forever — and, because the shuffle
+    /// orphan sweep's live set is exactly `active_job_ids()`
+    /// (`job_coordinators.keys()`), keep its shuffle directory on disk forever
+    /// too. Both leaks are silent and unbounded.
+    #[test]
+    fn overflowing_the_gc_queue_evicts_the_dropped_job_instead_of_leaking_it() {
+        use krishiv_proto::{StageId, StageSpec, TaskId, TaskSpec};
+
+        fn job(job_id: &JobId) -> JobSpec {
+            JobSpec::new(job_id.clone(), "gc-cap", JobKind::Batch).with_stage(
+                StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(
+                    TaskSpec::new(TaskId::try_new("t0").unwrap(), "sql: select 1"),
+                ),
+            )
+        }
+
+        let mut coord = Coordinator::new_active(None).unwrap();
+        let victim = JobId::try_new("gc-cap-victim").unwrap();
+        coord.submit_job(job(&victim)).unwrap();
+        coord.cancel_job(&victim).unwrap();
+        assert_eq!(
+            coord.gc_ready_jobs.front(),
+            Some(&victim),
+            "the victim must be the oldest entry, i.e. the one the cap drops"
+        );
+
+        // Fill the queue to the cap behind the victim.
+        for i in 0..999 {
+            coord
+                .gc_ready_jobs
+                .push_back(JobId::try_new(format!("gc-cap-filler-{i}")).unwrap());
+        }
+
+        // One more terminal job forces the cap to drop the victim.
+        let newcomer = JobId::try_new("gc-cap-newcomer").unwrap();
+        coord.submit_job(job(&newcomer)).unwrap();
+        coord.cancel_job(&newcomer).unwrap();
+
+        assert!(
+            !coord.gc_ready_jobs.contains(&victim),
+            "the cap must have dropped the victim from the queue"
+        );
+        assert!(
+            !coord.job_coordinators.contains_key(&victim),
+            "a job dropped by the cap must be evicted, not left in \
+             job_coordinators where it leaks memory and pins its shuffle \
+             directory against the orphan sweep forever"
+        );
+        assert!(
+            !coord.active_job_ids().contains(victim.as_str()),
+            "the orphan sweep's live set must no longer claim the dropped job"
+        );
+        assert!(
+            !coord.gc_ready_at.contains_key(&victim),
+            "the dropped job's queued-at timestamp must not leak"
+        );
+        assert!(
+            coord.job_coordinators.contains_key(&newcomer),
+            "the job that triggered the overflow must still be tracked"
         );
     }
 }

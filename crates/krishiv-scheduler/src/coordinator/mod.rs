@@ -1706,10 +1706,17 @@ impl Coordinator {
                     if task.state() != krishiv_proto::TaskState::Running {
                         continue;
                     }
-                    if let Some(assigned_ms) = task.assigned_at_ms
-                        && now_ms.saturating_sub(task.last_progress_ms.unwrap_or(assigned_ms))
-                            > stall_timeout_ms
-                    {
+                    let Some(assigned_ms) = task.assigned_at_ms else {
+                        continue;
+                    };
+                    // Stall is measured from the last sign of life, so report
+                    // it from the same instant the trigger uses. Reporting
+                    // time-since-*assignment* instead overstated every stall
+                    // by however long the task ran healthily first, and that
+                    // number is not just a log line — `apply_stall_resets`
+                    // bakes it into the task's `last_failure_reason`.
+                    let since_ms = task.last_progress_ms.unwrap_or(assigned_ms);
+                    if now_ms.saturating_sub(since_ms) > stall_timeout_ms {
                         let executor_endpoint = task
                             .assigned_executor()
                             .and_then(|eid| self.exec.executors.find_executor(eid).ok())
@@ -1720,7 +1727,7 @@ impl Coordinator {
                             task_id: task.task_id().clone(),
                             attempt: task.attempt(),
                             executor_endpoint,
-                            stall_secs: now_ms.saturating_sub(assigned_ms) / 1000,
+                            stall_secs: now_ms.saturating_sub(since_ms) / 1000,
                         });
                     }
                 }
@@ -2366,6 +2373,58 @@ impl Coordinator {
             .ok_or_else(|| SchedulerError::UnknownJob {
                 job_id: job_id.clone(),
             })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod stall_reporting_tests {
+    use super::*;
+    use krishiv_proto::{StageSpec, TaskSpec};
+
+    /// The stall watchdog triggers on time since the last sign of life, so the
+    /// duration it reports must come from the same instant. It used to report
+    /// time since *assignment*, which overstates every stall by however long
+    /// the task ran healthily first — and that number is not confined to a log
+    /// line: `apply_stall_resets` bakes it into the task's recorded
+    /// `last_failure_reason`, so an operator reading back the failure sees a
+    /// task that "made no progress for 10 hours" when it in fact worked for
+    /// nine of them.
+    #[test]
+    fn reported_stall_duration_is_measured_from_last_progress_not_assignment() {
+        let mut coord = Coordinator::new_active(None).unwrap();
+        let job_id = JobId::try_new("stall-report").unwrap();
+        coord
+            .submit_job(
+                JobSpec::new(job_id.clone(), "stall", JobKind::Batch).with_stage(
+                    StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(
+                        TaskSpec::new(TaskId::try_new("t0").unwrap(), "sql: select 1"),
+                    ),
+                ),
+            )
+            .unwrap();
+
+        let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap();
+        const HOUR_MS: u64 = 60 * 60 * 1000;
+        {
+            let jc = coord.job_coordinators.get(&job_id).unwrap();
+            let mut record = jc.write_record();
+            let stage = record.stages_mut().first_mut().unwrap();
+            let task = stage.tasks_mut().first_mut().unwrap();
+            task.state = TaskState::Running;
+            // Ran healthily for nine hours, then went quiet one hour ago.
+            task.assigned_at_ms = Some(now_ms - 10 * HOUR_MS);
+            task.last_progress_ms = Some(now_ms - HOUR_MS);
+        }
+
+        let work = coord.collect_stall_cancel_work();
+        assert_eq!(work.len(), 1, "the quiet task must be detected as stalled");
+        let stall_secs = work[0].stall_secs;
+        assert!(
+            (3000..=4500).contains(&stall_secs),
+            "stall must be reported as the ~1h of silence, not the 10h since \
+             assignment; got {stall_secs}s"
+        );
     }
 }
 
