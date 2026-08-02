@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use krishiv_connectors::vector::{EmbeddingBatch, PayloadValue, VectorSink};
-use krishiv_ivm::{IvmResult, VectorFuture};
+use krishiv_ivm::VectorFuture;
 
 /// Wraps a `krishiv-connectors::VectorSink` and implements `IvmVectorSink`.
 pub struct VectorSinkBridge {
