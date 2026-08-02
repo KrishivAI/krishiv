@@ -577,6 +577,17 @@ async fn heartbeat_loop(
     // and misses the write ("partition not found"). The unconditional in-memory
     // fallback below is therefore gated on neither being set.
     let has_configured_shuffle_store = shuffle_uri.is_some() || shuffle_dir.is_some();
+    // The directory the executor-local shuffle GC must sweep — the one partitions
+    // are actually written to, which is NOT always `shuffle_dir`.
+    //
+    // `--shuffle-uri file://<path>` with no `--shuffle-dir` is a supported
+    // configuration (`apply_shuffle_defaults` returns `(None, Some(uri))`, and
+    // `dev_local_allows_object_store_only_shuffle` asserts it): the local dir is
+    // then derived from the URI below. Keying the GC on `shuffle_dir` left that
+    // configuration writing shuffle output to disk and never reclaiming it —
+    // exactly the failure the GC exists for, and invisible because the sweep was
+    // simply never spawned.
+    let mut gc_shuffle_dir: Option<std::path::PathBuf> = shuffle_dir.clone();
     if let Some(uri) = shuffle_uri {
         // When both a local shuffle-dir and an s3:// URI are set, build a tiered
         // backend: local disk for fast P2P reads, object store for durability.
@@ -603,13 +614,10 @@ async fn heartbeat_loop(
                 println!(
                     "Krishiv executor shuffle flight listening on {local_addr} (advertised {endpoint})"
                 );
-                let local_dir = shuffle_dir.clone().unwrap_or_else(|| {
-                    std::path::PathBuf::from(if uri.starts_with("file://") {
-                        uri.strip_prefix("file://").unwrap_or(&uri)
-                    } else {
-                        "/var/lib/krishiv/shuffle"
-                    })
-                });
+                let local_dir = local_shuffle_dir(shuffle_dir.as_deref(), &uri);
+                // Sweep the directory this store actually writes to, derived or
+                // explicit — see `gc_shuffle_dir`.
+                gc_shuffle_dir = Some(local_dir.clone());
                 runner_builder = runner_builder
                     .with_shuffle(ShuffleContext {
                         store: Arc::clone(&backend),
@@ -877,7 +885,7 @@ async fn heartbeat_loop(
     // consistent evidence.
     let (live_jobs_tx, live_jobs_rx) =
         tokio::sync::watch::channel::<Option<std::collections::HashSet<String>>>(None);
-    if let Some(gc_dir) = shuffle_dir.clone() {
+    if let Some(gc_dir) = gc_shuffle_dir {
         let mut rx = live_jobs_rx;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
@@ -1467,6 +1475,24 @@ fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
     args.next()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| format!("missing value for {flag}"))
+}
+
+/// The on-disk directory a local shuffle backend writes to.
+///
+/// An explicit `--shuffle-dir` wins; otherwise a `file://` URI supplies the
+/// path and anything else falls back to the packaged default. Named rather than
+/// inlined because two things must agree on it — the `ShuffleContext` handed to
+/// the runner, and the executor-local shuffle GC. They did not: the GC was keyed
+/// on `shuffle_dir`, so a `--shuffle-uri file://…` executor with no
+/// `--shuffle-dir` swept nothing and grew without bound.
+fn local_shuffle_dir(explicit_dir: Option<&std::path::Path>, uri: &str) -> std::path::PathBuf {
+    if let Some(dir) = explicit_dir {
+        return dir.to_path_buf();
+    }
+    std::path::PathBuf::from(
+        uri.strip_prefix("file://")
+            .unwrap_or("/var/lib/krishiv/shuffle"),
+    )
 }
 
 /// Apply shuffle backend defaults driven by the durability profile.
@@ -2125,6 +2151,40 @@ mod tests {
         .unwrap();
         assert!(dir.is_none());
         assert_eq!(uri.as_deref(), Some("s3://bucket/shuffle"));
+    }
+
+    /// The GC must sweep the directory the shuffle store actually writes to.
+    ///
+    /// `--shuffle-uri file://<path>` with no `--shuffle-dir` is a supported
+    /// configuration — `dev_local_allows_object_store_only_shuffle` above pins
+    /// that `apply_shuffle_defaults` returns `(None, Some(uri))`. The local
+    /// backend then derives its directory from the URI, but the executor-local
+    /// shuffle GC was keyed on `shuffle_dir`, so for that configuration the
+    /// sweep was never spawned and partitions accumulated until the node hit
+    /// DiskPressure and the kubelet evicted the executor.
+    #[test]
+    fn the_gc_directory_follows_the_uri_when_no_shuffle_dir_is_given() {
+        use std::path::{Path, PathBuf};
+
+        // No explicit dir: a file:// URI supplies the path the store writes to,
+        // so that is what must be swept.
+        assert_eq!(
+            super::local_shuffle_dir(None, "file:///var/lib/krishiv/shuffle"),
+            PathBuf::from("/var/lib/krishiv/shuffle"),
+        );
+        // An explicit dir always wins, whatever the URI says.
+        assert_eq!(
+            super::local_shuffle_dir(
+                Some(Path::new("/mnt/scratch")),
+                "file:///var/lib/krishiv/shuffle"
+            ),
+            PathBuf::from("/mnt/scratch"),
+        );
+        // A non-file URI has no path to take, so the packaged default stands.
+        assert_eq!(
+            super::local_shuffle_dir(None, "memory://"),
+            PathBuf::from("/var/lib/krishiv/shuffle"),
+        );
     }
 
     #[test]
