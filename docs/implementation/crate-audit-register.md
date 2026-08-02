@@ -377,7 +377,13 @@ hashes, and an open list. Sections are appended as the audit reaches them.
 
 Things that are not one crate's problem.
 
-- [ ] **The streaming dials exist twice, byte-identically.**
+- [x] **The streaming dials exist twice, byte-identically.** Consolidated
+      `76f3fbba` into `krishiv_common::streaming_dials`; both
+      `krishiv-executor/src/fragment/run_loop.rs` and `krishiv-engines` now
+      import `idle_tick_interval`/`stream_linger`/`StreamProfile` from it. The
+      deliberate decision this asked for was taken. Original note follows.
+
+- [ ] ~~**The streaming dials exist twice, byte-identically.**~~
       `idle_tick_interval()` (`KRISHIV_IDLE_TICK_MS`, default 500) is duplicated
       between `krishiv-executor/src/fragment/run_loop.rs` and
       `krishiv-engines/src/lib.rs`, and the `KRISHIV_STREAM_PROFILE`
@@ -417,15 +423,25 @@ Things that are not one crate's problem.
       the pool's arithmetic. Also explains why `UnspillableHeadroomPool` never
       logged its ceiling: it bounds spillable consumers and delegates
       unspillable ones straight through.
-- [ ] **D7 remainder — `ShuffleWriteBuffer::drain_partition` reads every spilled run of
-      a partition back into memory at once**, held by a `can_spill(false)`
-      consumer, and `account_unavoidable` grows it past the pool
-      unconditionally. In `FairSpillPool` an oversized *unspillable* total
-      saturates `pool_size - unspillable` to zero, which zeroes **every**
-      consumer's share. `ShuffleStore::write_partition` takes a whole
-      partition and has no append — but `LocalDiskShuffleStore` uses
-      `ArrowWriter`, which accepts batches incrementally, so a streaming write
-      is buildable.
+- [x] **D7 remainder — re-verified 2026-08-02, and mostly stale.** Two of the
+      three claims no longer hold:
+
+      * "`account_unavoidable` grows it past the pool unconditionally" — no.
+        `c8736a52` (the item above) changed it to `try_grow` and, on failure,
+        *log without growing*. The two bullets described the same mechanism,
+        one as fixed and one as broken.
+      * "the drain reads every spilled run back at once" — true of
+        `drain_partition`, but the **live** map-write path does not call it.
+        A TPC-H map task carries a `dfplan:` body, and
+        `execute_batch_fragment` dispatches dfplan *before* the generic
+        `shuffle_write` branch (the code says so, at the branch). That reaches
+        `drain_into_store` -> `drain_partition_stream`, whose peak is the
+        in-memory tail plus a window.
+
+      What remains is genuinely narrow: `drain_partition` is still used by
+      `execute_inmem_shuffle_write` (non-dfplan `sql:` fragments) and by
+      `execute_shuffle_write_fragment`, which is **unreachable** — see the
+      krishiv-executor section, and the warning now carried at that function.
 - [x] **Abandoning a benchmark query left it running on the cluster.** The
       coordinator has no notion of a client going away; the harness never
       cancelled. Every killed sweep left its query executing, holding slots
