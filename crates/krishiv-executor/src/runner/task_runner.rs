@@ -256,28 +256,12 @@ impl TaskRunner {
         // checkpoint wire shape; Kafka offsets are appended through the legacy
         // compatibility cache until Kafka source execution moves fully to the
         // generic path.
+        // Through the same helper the incremental path uses. This block was a
+        // byte-identical second copy of it; two spellings of one encoding is
+        // how the `kafka-{topic}-{partition}` key drifts, and that key is what
+        // `kafka_offsets_from_source_records` parses back on restore.
         let mut source_offsets = self.source_offsets.clone();
-        let kafka_source_offsets: Vec<CheckpointSourceOffset> = self
-            .kafka_source_offsets
-            .iter()
-            .map(|ko| {
-                Ok(CheckpointSourceOffset {
-                    partition_id: krishiv_proto::PartitionId::try_new(format!(
-                        "kafka-{}-{}",
-                        ko.topic, ko.partition
-                    ))
-                    .map_err(|_| ExecutorError::LocalExecution {
-                        message: format!(
-                            "partition_id is empty for topic={} partition={}",
-                            ko.topic, ko.partition
-                        ),
-                    })?,
-                    offset: ko.offset,
-                    encoded_offset: ko.encode(),
-                })
-            })
-            .collect::<Result<Vec<_>, ExecutorError>>()?;
-        source_offsets.extend(kafka_source_offsets);
+        source_offsets.extend(self.kafka_checkpoint_offsets()?);
 
         self.last_acked_epoch = req.epoch;
         self.record_state_region_usage(snapshot_bytes.len() as u64);

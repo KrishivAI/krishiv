@@ -408,13 +408,18 @@ impl ExecutorTaskOutput {
         meta
     }
 
-    /// Attach serialized continuous operator state from this cycle (G5).
-    #[must_use]
     /// G5: the post-cycle stateful-operator snapshot, when one was captured.
+    ///
+    /// The setter's doc line ("Attach serialized continuous operator state…")
+    /// was left on this getter when the two were reordered, sandwiching the
+    /// attribute between two doc comments that rustc concatenates — so the
+    /// rendered docs described this accessor as if it mutated.
+    #[must_use]
     pub fn state_snapshot(&self) -> Option<&[u8]> {
         self.state_snapshot.as_deref()
     }
 
+    /// Attach serialized continuous operator state from this cycle (G5).
     pub(crate) fn with_state_snapshot(mut self, bytes: Vec<u8>) -> Self {
         self.state_snapshot = Some(bytes);
         self
