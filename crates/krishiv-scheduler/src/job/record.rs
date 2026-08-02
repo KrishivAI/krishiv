@@ -1091,14 +1091,33 @@ impl JobRecord {
                     continue;
                 }
 
-                // Record failed paths under the addressing key the consumer
-                // used (coordinator stage id or sub-stage key), so the entry
-                // that served the fetch is the one marked. The re-run producer
-                // re-registers under the same key (replace-on-write) either way.
+                // Invalidate under the COORDINATOR stage id.
+                //
+                // That is the only form availability is ever recorded under:
+                // `apply_task_update` builds its `mark_available` path from
+                // `update.stage_id()`, the map entry is keyed by it, and the
+                // restore path in `store.rs` rebuilds from it. `ShuffleMetadata`
+                // keys on the whole `ShufflePath`, so marking a *different* path
+                // failed does not transition the Available entry — it inserts a
+                // second, unrelated one.
+                //
+                // This used to use `m.stage_id()`, the consumer's addressing
+                // key, on the stated rationale that it marks "the entry that
+                // served the fetch". There is no such entry. A dfplan consumer
+                // always reports the `sN.mM` sub-stage key, which by
+                // construction never equals the coordinator stage id — so on
+                // every dfplan job (all of TPC-H) the invalidated partition
+                // stayed Available and a junk Failed entry accumulated beside it
+                // per regeneration. Nothing gates scheduling on this map, so it
+                // never mis-scheduled; but it is what `shuffle_partitions_available`
+                // and the `krishiv_shuffle_partitions_available` gauge report,
+                // and `PersistedJobRecord::from` serialises exactly the Available
+                // paths — so a partition known to be lost was persisted, and
+                // restored after a coordinator restart, as available.
                 for m in &addressed {
                     paths_to_invalidate.push(ShufflePath {
                         job_id: job_id_str.clone(),
-                        stage_id: m.stage_id().as_str().to_owned(),
+                        stage_id: stage_id.as_str().to_owned(),
                         partition_id: m.partition_id(),
                     });
                 }
@@ -2216,6 +2235,86 @@ mod shuffle_regen_tests {
             "the sub-stage-keyed producer must be reset for re-execution"
         );
         assert!(job.stages[0].tasks[0].assigned_executor.is_none());
+    }
+
+    /// Invalidating a partition must actually drop its availability.
+    ///
+    /// `apply_task_update` records availability under the COORDINATOR stage id
+    /// (`dist-s0`); a dfplan consumer reports the `sN.mM` sub-stage key.
+    /// `ShuffleMetadata` keys on the whole `ShufflePath`, so invalidating under
+    /// the *reported* key left the Available entry standing and inserted a junk
+    /// Failed one beside it. `PersistedJobRecord::from` serialises exactly the
+    /// Available paths, so the coordinator persisted — and after a restart
+    /// restored — a partition it had just been told was gone.
+    ///
+    /// Deliberately drives the REAL update path rather than stamping
+    /// `output_metadata` like `succeed_producer` does: `shuffle_output` is only
+    /// ever populated by `apply_task_update`, so a fixture that bypasses it
+    /// cannot observe this at all.
+    #[test]
+    fn invalidating_a_substage_keyed_partition_clears_its_availability() {
+        use krishiv_proto::{ExecutorId, ShuffleWriteConfig, TaskStatusUpdate};
+
+        let coordinator_stage = StageId::try_new("dist-s0").unwrap();
+        let substage = StageId::try_new("s0.m0").unwrap();
+        let task_id = TaskId::try_new("dist-s0-t0").unwrap();
+        let job_id = JobId::try_new("availability-job").unwrap();
+        let exec = ExecutorId::try_new("exec-p0").unwrap();
+
+        let spec = JobSpec::new(job_id.clone(), "availability", JobKind::Batch).with_stage(
+            StageSpec::new(coordinator_stage.clone(), "map").with_task(
+                TaskSpec::new(task_id.clone(), "dfplan:v1:body").with_shuffle_write(
+                    ShuffleWriteConfig {
+                        stage_id: substage.clone(),
+                        num_partitions: 4,
+                        key_columns: Vec::new(),
+                        lease_token: 0,
+                    },
+                ),
+            ),
+        );
+        let mut job = JobRecord::from_spec(spec, 4);
+        {
+            let task = &mut job.stages[0].tasks[0];
+            task.attempt = 1;
+            task.state = TaskState::Assigned;
+            task.assigned_executor = Some(exec.clone());
+        }
+        let update = TaskStatusUpdate::new(
+            job_id,
+            coordinator_stage,
+            task_id,
+            exec,
+            TaskState::Succeeded,
+            1,
+        )
+        .with_output_metadata(
+            TaskOutputMetadata::new("shuffle", 10, 1, 1).with_shuffle_partitions(vec![
+                ShufflePartitionOutput::new(0, 1024, "http://producer:9000"),
+            ]),
+        );
+        job.apply_task_update(update).unwrap();
+        assert_eq!(
+            job.shuffle_partitions_available_count(),
+            1,
+            "the succeeded producer must register its partition as available"
+        );
+
+        // The dfplan consumer reports it missing by SUB-STAGE key — the only
+        // form it ever uses.
+        assert_eq!(
+            job.invalidate_specific_shuffle_partitions(
+                &[MissingShufflePartition::new(substage, 0)],
+                8
+            ),
+            ShuffleRegenOutcome::Regenerated
+        );
+        assert_eq!(
+            job.shuffle_partitions_available_count(),
+            0,
+            "an invalidated partition must not still count as available: it is \
+             what the availability gauge reports and what the coordinator persists"
+        );
     }
 
     /// Phase 58 (FetchFailed semantics): a consumer that fails on a *missing
