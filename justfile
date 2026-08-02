@@ -297,6 +297,18 @@ lint:
         -p krishiv-sql \
         --features iceberg-datafusion,local-catalog \
         -- -D warnings
+    # Same blindspot, different crate: `etcd` is off by default, so the
+    # --workspace pass above never compiles `etcd_metadata.rs`, the etcd arm of
+    # `coordinator_daemon.rs`, or `bin/krishiv_clusterd.rs` at all. They had
+    # accumulated 8 denials (3 slicing, 3 indexing, an unwrap, an expect) plus a
+    # disallowed `block_on` and two print macros — none of them a rule anyone
+    # broke, all of them code CI never looked at. etcd is a supported metadata
+    # backend; lint it like one.
+    {{ cargo }} clippy \
+        -p krishiv-scheduler \
+        --features etcd \
+        --all-targets \
+        -- -D warnings
 
 # Verify each optional feature compiles on its own — catches forwarding-flag
 # rot and "doesn't build with --no-default-features" breakage in the crates

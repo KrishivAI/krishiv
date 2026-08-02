@@ -153,8 +153,16 @@ where
         let _ = tx.send(outcome);
     });
     let recv = move || -> Result<F::Output, SchedulerError> {
+        // A recv error means the etcd runtime dropped the task without sending
+        // — runtime shutdown, or a panic inside the spawned future. That is a
+        // transport failure the caller can report and retry, not a reason to
+        // abort the coordinator, which is what the `expect` here did.
         rx.recv()
-            .expect("etcd runtime dropped the task before sending a result")
+            .map_err(|_| SchedulerError::Transport {
+                message: String::from(
+                    "etcd runtime dropped the operation before it returned a result",
+                ),
+            })?
             .map_err(|_elapsed| SchedulerError::Transport {
                 message: format!(
                     "etcd operation did not complete within {}s",
@@ -626,7 +634,13 @@ fn prefix_range_end(prefix: &str) -> Vec<u8> {
     let mut end = prefix.as_bytes().to_vec();
     while let Some(&last) = end.last() {
         if last < 0xff {
-            *end.last_mut().unwrap() = last + 1;
+            // `last_mut` cannot be None here — `last()` just matched — but the
+            // crate denies `unwrap`, and a loop that silently stops incrementing
+            // would produce a range end that quietly scans the wrong keyspace.
+            let Some(slot) = end.last_mut() else {
+                return Vec::new();
+            };
+            *slot = last + 1;
             return end;
         }
         end.pop();
@@ -655,7 +669,10 @@ async fn get_prefix_paged(client: &mut KvClient, prefix: &str) -> Result<Vec<Key
             break;
         }
         let page_len = kvs.len();
-        let last_key = kvs[page_len - 1].key().to_vec();
+        // `kvs` is non-empty (checked above), so `last()` is the same element
+        // as `kvs[page_len - 1]` without the panicking index.
+        let Some(last_kv) = kvs.last() else { break };
+        let last_key = last_kv.key().to_vec();
         out.extend(kvs.iter().cloned());
         if (page_len as i64) < ETCD_PAGE_LIMIT {
             break;
@@ -793,16 +810,21 @@ fn parse_ivm_manifest_header(value: &[u8]) -> Option<IvmManifestHeader> {
     if value.len() < IVM_HEADER_LEN || !value.starts_with(IVM_MANIFEST_MAGIC) {
         return None;
     }
+    // Read by `get`, not by index. The length check above establishes
+    // `IVM_HEADER_LEN`, but every offset below is computed, so an index would
+    // be trusting arithmetic to stay inside a constant that a later format
+    // change could move. `?` on a short read is exactly the "truncated header"
+    // case this function already promises to report as `None`.
     let mut p = IVM_MANIFEST_MAGIC.len();
-    if value[p] != IVM_MANIFEST_VERSION {
+    if *value.get(p)? != IVM_MANIFEST_VERSION {
         return None;
     }
     p += 1;
-    let codec = value[p];
+    let codec = *value.get(p)?;
     p += 2; // skip codec + flags
-    let chunk_count = u32::from_le_bytes(value[p..p + 4].try_into().ok()?);
+    let chunk_count = u32::from_le_bytes(value.get(p..p + 4)?.try_into().ok()?);
     p += 4;
-    let raw_len = u64::from_le_bytes(value[p..p + 8].try_into().ok()?);
+    let raw_len = u64::from_le_bytes(value.get(p..p + 8)?.try_into().ok()?);
     Some(IvmManifestHeader {
         codec,
         chunk_count,
@@ -827,7 +849,14 @@ fn reassemble_ivm_snapshot(
         .ok_or_else(|| "corrupt or unsupported IVM manifest header".to_string())?;
 
     let payload = if header.chunk_count == 0 {
-        manifest_value[IVM_HEADER_LEN..].to_vec()
+        // `parse_ivm_manifest_header` succeeded, so the value is at least
+        // `IVM_HEADER_LEN`; `get` states that rather than assuming it, and an
+        // inconsistency becomes the `Err` this function already contracts to
+        // return instead of a panic in a recovery path.
+        manifest_value
+            .get(IVM_HEADER_LEN..)
+            .ok_or_else(|| "IVM manifest shorter than its own header".to_string())?
+            .to_vec()
     } else {
         let chunks = chunks.ok_or_else(|| {
             format!(

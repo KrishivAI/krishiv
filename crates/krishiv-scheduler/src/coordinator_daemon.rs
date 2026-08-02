@@ -1,5 +1,16 @@
 //! Shared coordinator / clusterd startup (bare metal + VM).
 
+// Deliberate sync-over-async boundary, same as `krishiv::daemon_cmd`: daemon
+// startup is a synchronous function that must connect to the metadata store
+// before the runtime it will later serve on exists. The single `block_on` below
+// is the etcd connect during construction, not a call on a hot path.
+//
+// Scoped to the module rather than the call site so it is stated once, with the
+// reason. Note it was only ever *invisible* before: `just lint` runs
+// `--workspace` without `--all-features`, so the `etcd` feature — and this
+// warning with it — was never compiled by CI at all.
+#![allow(clippy::disallowed_methods)]
+
 use std::env;
 use std::error::Error;
 use std::net::SocketAddr;

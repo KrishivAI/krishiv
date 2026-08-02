@@ -1,4 +1,12 @@
 #![forbid(unsafe_code)]
+// A daemon entry point writes `--help` to stdout and, as its last act, why it
+// could not start to stderr — and at that point there is no logger to route
+// either through. Same allows as `krishiv_flight_server`,
+// `krishiv_shuffle_svc` and `krishiv_job_coordinator`, which do the same.
+//
+// It compiles only under `--features etcd`, which `just lint` never passed, so
+// this was not a rule being broken — it was a file CI never looked at.
+#![allow(clippy::print_stderr, clippy::print_stdout)]
 
 //! Cluster control plane daemon (`krishiv-clusterd` / `krishiv clusterd`).
 
