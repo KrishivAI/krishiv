@@ -335,6 +335,30 @@ Largest still unread: `cli.rs` (2,155),
 
 ### Found, NOT fixed — needs a decision first
 
+- [ ] **GAP-WATERMARK is open, and three places say it is closed.** The
+      coordinator injects a `WatermarkHint` input partition for downstream
+      stages; `fragment/streaming.rs` decodes it, logs it, and **discards it**.
+      The comment above that block described applying it as the initial
+      `prev_watermark_ms`, and `WatermarkHint`'s own doc in
+      `krishiv-proto/src/task.rs:952` says the same. Neither happens.
+
+      It is not a dropped variable: `WindowExecutionSpec` has no
+      `prev_watermark_ms` field to carry the value. It lives inside
+      krishiv-dataflow's operators, initialised to `i64::MIN`
+      (`window/session.rs:95`), with no path in from the spec.
+
+      **Consequence.** A downstream stage starts its watermark at `i64::MIN`,
+      so every event from the upstream stage scores as in-order however late it
+      actually is — the stage reports "no late events" by construction, and
+      `allowed_lateness_ms` / late-firing never engage on any stage but the
+      first.
+
+      Closing it needs a field in krishiv-plan, threading through
+      `execute_bounded_window` into each window operator, and a re-baseline of
+      late-event counts across the streaming corpus — three crates and a change
+      to lateness semantics. The misleading comment is corrected in place so the
+      code no longer claims the fix; the work itself is scoped, not done.
+
 - [ ] **`cancelled_tasks` grows without bound for cancelled batch tasks.**
       `ExecutorAssignmentInbox` bounds its `seen` set deliberately
       (`MAX_SEEN_ENTRIES` = 10,000, FIFO eviction) and leaves its sibling

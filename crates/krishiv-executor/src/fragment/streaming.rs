@@ -1097,19 +1097,29 @@ pub(crate) async fn execute_streaming_fragment(
             message: e.to_string(),
         })?;
 
-    // GAP-WATERMARK: Apply the upstream stage's output watermark as the initial
-    // prev_watermark_ms for this stage's window operators. Without this, stage 2
-    // starts from i64::MIN and incorrectly treats all stage-1 output events as
-    // in-order even when the actual watermark is much higher, causing false
-    // "no late events" reports.
-    // The WatermarkHint partition is injected by the coordinator when emitting
-    // task assignments for downstream stages.
+    // GAP-WATERMARK is NOT closed: the hint is decoded and logged, never applied.
+    //
+    // The intent — carried in this comment, and in `WatermarkHint`'s own doc at
+    // `krishiv-proto/src/task.rs` — is to seed this stage's window operators
+    // with the upstream stage's output watermark, so stage 2 does not start from
+    // `i64::MIN` and score every stage-1 event as in-order (a false "no late
+    // events" report). Nothing does that. `WindowExecutionSpec` has no
+    // `prev_watermark_ms` field to carry it; the value lives inside
+    // krishiv-dataflow's operators, initialised to `i64::MIN` (`window/session.rs`),
+    // with no path in from the spec.
+    //
+    // Closing it means adding the field in krishiv-plan, threading it through
+    // `execute_bounded_window` into each window operator, and re-baselining
+    // late-event counts — a three-crate change that alters lateness semantics,
+    // not a line here. Logged rather than silently dropped so the gap is at
+    // least visible in a trace; do not read this block as the fix.
     if let Some(upstream_wm) =
         crate::fragment::common::read_watermark_hint(assignment.input_partitions())
     {
         tracing::debug!(
             upstream_watermark_ms = upstream_wm,
-            "applied upstream watermark hint to downstream stage window spec"
+            "upstream watermark hint received but NOT applied (GAP-WATERMARK open); \
+             this stage's operators still start from i64::MIN"
         );
     }
 
