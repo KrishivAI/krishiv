@@ -787,7 +787,22 @@ async fn execute_shuffle_write_fragment(
         // before transferring ownership to write_partition.
         if let Some(ps) = ctx.push_store.as_ref() {
             use arrow::ipc::writer::StreamWriter;
-            let mut ipc_bytes: Vec<u8> = Vec::new();
+            // Sized up front, and deliberately.
+            //
+            // This buffer is a *second* full copy of the partition, living
+            // alongside the Arrow batches until `ps.push` takes it — so this
+            // loop's true peak is roughly twice a partition, and only the Arrow
+            // half is covered by `_reservation`. A default `Vec` reaches its
+            // final size by repeated doubling, and each growth copies, so the
+            // unaccounted half briefly costs more than the copy itself.
+            //
+            // `size_bytes` is the partition's logical size, which is the right
+            // order of magnitude for its IPC encoding: this removes the realloc
+            // churn without pretending to be exact. Capped so a bad estimate
+            // cannot turn a hint into a huge speculative allocation.
+            const IPC_RESERVE_CAP_BYTES: u64 = 256 * 1024 * 1024;
+            let mut ipc_bytes: Vec<u8> =
+                Vec::with_capacity(usize::try_from(size_bytes.min(IPC_RESERVE_CAP_BYTES)).unwrap_or(0));
             if !part_batches.is_empty() {
                 let mut w = StreamWriter::try_new(&mut ipc_bytes, &schema).map_err(|e| {
                     ExecutorError::LocalExecution {
@@ -802,6 +817,18 @@ async fn execute_shuffle_write_fragment(
                 w.finish().map_err(|e| ExecutorError::LocalExecution {
                     message: format!("push-shuffle ipc finish failed: {e}"),
                 })?;
+            }
+            // The one moment both copies are live, reported because nothing
+            // else can see it: `_reservation` covers the Arrow batches, and an
+            // IPC `Vec<u8>` is invisible to the pool.
+            if !ipc_bytes.is_empty() {
+                tracing::debug!(
+                    partition = p,
+                    arrow_bytes = size_bytes,
+                    ipc_bytes = ipc_bytes.len(),
+                    "shuffle write: partition held as Arrow and IPC simultaneously; \
+                     only the Arrow half is pool-accounted"
+                );
             }
             if !ipc_bytes.is_empty()
                 && let Err(e) = ps.push(job_id, stage_id, p, ipc_bytes)
