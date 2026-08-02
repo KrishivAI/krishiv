@@ -436,7 +436,16 @@ impl Coordinator {
                         );
                     }
                     Some(_) => {
-                        let buckets = self.exec.executors.list().len().max(2) as u32;
+                        // Count executors that can actually take the spread
+                        // work. `list()` returns every record, and Lost/Removed
+                        // ones are kept for a ~30-minute fencing-retention
+                        // window (see `advance_clock_excluding`) — so under pod
+                        // churn this counted corpses and produced a bucket
+                        // count several times the live cluster width. The
+                        // override exists to spread a hot key across available
+                        // slots; a dead executor has none.
+                        let buckets =
+                            self.exec.executors.schedulable_executors().len().max(2) as u32;
                         self.skew_repartition_overrides
                             .insert(job_id.clone(), buckets);
                     }
@@ -1122,6 +1131,72 @@ impl Coordinator {
             }
         }
         global
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod skew_override_tests {
+    use super::*;
+    use krishiv_proto::{
+        ExecutorDescriptor, ExecutorId, HeartbeatHotKeyReport, JobSpec, StageSpec, TaskSpec,
+    };
+
+    /// The hot-key repartition override spreads a skewed key across the
+    /// executors that can take the work. It counted `list()`, which retains
+    /// Lost/Removed records for a ~30-minute fencing window — so after a few
+    /// pod restarts the bucket count was several times the live cluster width,
+    /// shredding the stage into partitions no executor exists to run.
+    #[test]
+    fn skew_override_bucket_count_ignores_dead_executors() {
+        let mut coord = Coordinator::new_active(None).unwrap();
+        for i in 0..3 {
+            coord
+                .register_executor(ExecutorDescriptor::new(
+                    ExecutorId::try_new(format!("exec-{i}")).unwrap(),
+                    format!("host-{i}"),
+                    4,
+                ))
+                .unwrap();
+        }
+        // Two of the three are gone but still retained for lease fencing.
+        for i in 0..2 {
+            coord
+                .mark_executor_lost(&ExecutorId::try_new(format!("exec-{i}")).unwrap())
+                .unwrap();
+        }
+        assert_eq!(
+            coord.exec.executors.list().len(),
+            3,
+            "precondition: dead records are still retained for fencing"
+        );
+
+        let job_id = JobId::try_new("skew-job").unwrap();
+        coord
+            .submit_job(
+                JobSpec::new(job_id.clone(), "skew", JobKind::Batch).with_stage(
+                    StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(
+                        TaskSpec::new(TaskId::try_new("t0").unwrap(), "sql: select 1"),
+                    ),
+                ),
+            )
+            .unwrap();
+
+        coord.process_hot_key_reports(&[HeartbeatHotKeyReport {
+            job_id: job_id.clone(),
+            source_id: String::from("src"),
+            key: String::from("hot"),
+            heat_score: 0.9,
+            estimated_count: 1_000,
+            max_error: 0,
+        }]);
+
+        assert_eq!(
+            coord.skew_repartition_overrides.get(&job_id),
+            Some(&2),
+            "only the one live executor may count (floored at 2); counting the \
+             two retained corpses would have produced 3"
+        );
     }
 }
 
