@@ -554,7 +554,7 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
 
 ---
 
-## 4. krishiv-scheduler — 38 of 78 files read whole (in progress, 2026-08-03)
+## 4. krishiv-scheduler — 39 of 78 files read whole (in progress, 2026-08-03)
 
 Third crate. The largest in the workspace: 51,438 lines. Working down the
 distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198),
@@ -573,11 +573,11 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
 `rpc_drain.rs` (223), `leadership.rs` (71), `http_auth.rs` (224),
 `queryable_state_http.rs` (262), `bounded_window_http.rs` (83),
 `coordinator_daemon.rs` (2,518), `continuous_stream_http.rs` (3,041),
-`sections/placement.rs.inc` (2,281).
-**29,590 of 51,438 lines.**
+`sections/placement.rs.inc` (2,281), `ivm_http.rs` (2,273).
+**31,863 of 51,438 lines.**
 
-**Remaining, in intended order** (40 files, ~21,850 lines):
-`ivm_http.rs` (2,273), `store.rs` (1,996), `sections/core.rs.inc` (1,772),
+**Remaining, in intended order** (39 files, ~19,580 lines):
+`store.rs` (1,996), `sections/core.rs.inc` (1,772),
 `sections/chaos_jcp.rs.inc` (1,407), `etcd_metadata.rs` (1,250), `ivm.rs`
 (1,107), `batch_sql.rs` (1,065), `grpc.rs` (1,041), `auth.rs` (1,029), then
 the remaining `sections/*.rs.inc` and the sub-500-line files.
@@ -806,6 +806,42 @@ return at all.* Six of the nine defects below are one of those two.
       the query. `planning_width_keeps_everyone_when_the_starvation_floor_admits_them`
       pins that boundary; it is the test that discriminates against the
       *wrong* fix rather than against the bug.
+
+- [x] **Ten IVM endpoints 404'd on jobs that were durably stored**
+      (`d51c3f83`). `ensure_ivm_job` rehydrates a job from the coordinator's
+      durable snapshot when this process has never seen it. It exists because
+      the IVM registry is process-local and **nothing repopulates it at
+      startup** — `restore_durable_snapshot` is reachable only from
+      `ensure_ivm_job` and `api_ivm_create_job` — so after a coordinator
+      restart or a standby failover, rehydration is entirely lazy. Six
+      handlers called it; ten called `registry.get` and 404'd.
+
+      The read side was the visible half. `/stats` exists to be polled ("the
+      platform freshness sampler can hit it every few seconds", per its own
+      doc comment) and answered 404 — a live table reported as missing —
+      until an unrelated `/feed` or `/step` happened to resurrect the job.
+      `/checkpoint`, the backup path, failed the same way. `/stream-bridge`
+      is the sharpest case: its two sibling ingest routes, `/feed` and
+      `/stream-delta`, both rehydrate. Instance five of *fix the call sites
+      that hurt, then leave*.
+
+      **Second defect, same file: `/restore` never persisted.**
+      `register_view`, `drop_view` and `step` all call `persist_ivm_job`
+      after changing authoritative state. `/restore` answered
+      `{"success": true}` and left the store holding the pre-restore
+      snapshot, so a restart before the next `/step` silently undid the
+      rewind. Reverting only that line reads 1000.0 (advanced) where 100.0
+      (restored) is correct.
+
+      Why the existing test missed it: `evicted_job_is_restored_from_the_durable_snapshot`
+      resurrects the job with `/feed` before reading, so its snapshot
+      assertion never exercised the read path's own rehydration. The new test
+      evicts again between every handler.
+
+      One correction made while writing it: `/output` returns 200-with-null
+      after a restart, not a delta — the durable snapshot carries source and
+      view state, not the last tick's emitted delta. That is the true answer;
+      the point is that it is distinguishable from "no such job".
 
 ### Recorded, not fixed — needs a decision
 
