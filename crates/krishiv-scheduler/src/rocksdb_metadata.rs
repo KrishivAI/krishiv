@@ -277,6 +277,21 @@ impl MetadataStore for RocksDbMetadataStore {
         &self.jobs
     }
 
+    fn remove_job(&mut self, job_id: &str) -> SchedulerResult<()> {
+        let cf = self
+            .db
+            .cf_handle(CF_JOBS)
+            .ok_or_else(|| Self::store_err("missing jobs CF"))?;
+        // DUR-6: sync, like every other structural delete here. The cached
+        // vector is only updated once the delete is on disk, so a failure
+        // leaves both views agreeing that the record still exists.
+        self.db
+            .delete_cf_opt(&cf, job_id, &self.write_opts())
+            .map_err(Self::store_err)?;
+        self.jobs.retain(|j| j.job_id().as_str() != job_id);
+        Ok(())
+    }
+
     fn save_executor(&mut self, descriptor: &ExecutorDescriptor) -> SchedulerResult<()> {
         let pe = PersistedExecutorDescriptor::from(descriptor);
         let bytes = serde_json::to_vec(&pe).map_err(Self::store_err)?;
@@ -539,6 +554,59 @@ mod tests {
 
         let reopened = RocksDbMetadataStore::open(&path).unwrap();
         assert_eq!(reopened.jobs(), &[job]);
+    }
+
+    /// Retiring a concluded job must reach disk, not just the in-memory
+    /// cache: the whole point is that a later process — the one that runs
+    /// `recover_from_store` — does not rebuild the job. A cache-only removal
+    /// would look correct in-process and leak on every restart.
+    #[test]
+    fn rocksdb_metadata_remove_job_persists_and_leaves_history_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scheduler.rocksdb");
+        let live = job_record("job-live");
+        let retired = job_record("job-retired");
+
+        {
+            let mut store = RocksDbMetadataStore::open(&path).unwrap();
+            store.save_job(&live).unwrap();
+            store.save_job(&retired).unwrap();
+            store
+                .save_job_history(crate::store::JobHistoryRecord {
+                    job_id: "job-retired".to_owned(),
+                    job_kind: "batch".to_owned(),
+                    final_state: "succeeded".to_owned(),
+                    completed_at_ms: 1,
+                    stage_count: 0,
+                    task_count: 0,
+                    succeeded_task_count: 0,
+                    failed_task_count: 0,
+                    cpu_nanos: 0,
+                    memory_peak_task_bytes: 0,
+                    namespace_id: None,
+                    priority: 0,
+                })
+                .unwrap();
+            store.remove_job("job-retired").unwrap();
+            assert_eq!(
+                store.jobs(),
+                std::slice::from_ref(&live),
+                "cache updated in-process"
+            );
+            // Removing an absent id is not an error.
+            store.remove_job("job-never-existed").unwrap();
+        }
+
+        let reopened = RocksDbMetadataStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.jobs(),
+            &[live],
+            "the retired record must be gone from disk, not just the cache"
+        );
+        assert!(
+            reopened.get_job_history("job-retired").is_some(),
+            "and its outcome must survive in the history archive"
+        );
     }
 
     #[test]

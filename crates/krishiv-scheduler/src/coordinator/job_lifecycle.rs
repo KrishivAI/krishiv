@@ -1133,6 +1133,29 @@ impl Coordinator {
         }
         self.job_coordinators.remove(job_id);
         self.purge_job_scoped_state(job_id);
+
+        // Retire the durable record too, so the store's live-job set tracks
+        // this map instead of accumulating forever. `on_job_terminal` already
+        // archived the outcome in the history log, which is what `/ui/history`
+        // and the terminal-jobs latch read; the `jobs` record only exists so a
+        // restart can resume work, and there is none left to resume.
+        //
+        // Gated on that archive actually being present. If the history write
+        // failed (it logs and continues by design — a failed archive must not
+        // block the job from concluding), removing here would erase the last
+        // trace of the outcome. Leaking one record is the cheaper error.
+        if let Some(store) = &self.store {
+            let archived = store.inner().get_job_history(job_id.as_str()).is_some();
+            if archived {
+                store.remove_job(job_id.as_str());
+            } else {
+                tracing::warn!(
+                    job_id = %job_id,
+                    "evicting a terminal job with no history record; keeping its durable \
+                     job record so the outcome is not lost entirely"
+                );
+            }
+        }
     }
 
     /// Drop every piece of coordinator state keyed by `job_id`, *except* the
@@ -1586,6 +1609,154 @@ mod terminal_id_reuse_tests {
                 .state()
                 .is_terminal(),
             "the store must be converged back to terminal too, not left stale"
+        );
+    }
+}
+
+#[cfg(test)]
+mod durable_job_retirement_tests {
+    use super::*;
+    use crate::store::{InMemoryMetadataStore, MetadataStore};
+    use krishiv_proto::{StageId, StageSpec, TaskId, TaskSpec};
+
+    fn single_task_job(job_id: &JobId, task_id: &str) -> JobSpec {
+        JobSpec::new(job_id.clone(), "retirement-test", JobKind::Batch).with_stage(
+            StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(TaskSpec::new(
+                TaskId::try_new(task_id).unwrap(),
+                "sql: select 1",
+            )),
+        )
+    }
+
+    /// `jobs` is the live-job set; `job_history` is the archive. Before
+    /// `remove_job` existed, `save_job` was the only writer of `jobs`, so a
+    /// coordinator's live-job set was really "every job this cluster has ever
+    /// run" — unbounded on disk, and reloaded in full into `job_coordinators`
+    /// by `recover_from_store` on every standby→active promotion.
+    ///
+    /// Eviction is the right retirement point: it is exactly when the live
+    /// coordinator itself stops answering for the job, so durable state now
+    /// tracks the in-memory map instead of diverging from it.
+    #[test]
+    fn evicting_a_terminal_job_retires_its_durable_record_and_keeps_the_history() {
+        let mut coordinator = Coordinator::new_active(None)
+            .unwrap()
+            .with_store(InMemoryMetadataStore::default());
+
+        let job_id = JobId::try_new("job-retired").unwrap();
+        coordinator
+            .submit_job(single_task_job(&job_id, "t0"))
+            .unwrap();
+        coordinator.cancel_job(&job_id).unwrap();
+
+        assert_eq!(
+            coordinator.store.as_ref().unwrap().inner().jobs().len(),
+            1,
+            "precondition: the terminal job is still a live record before eviction"
+        );
+
+        coordinator.evict_completed_job(&job_id);
+
+        let store = coordinator.store.as_ref().unwrap().inner();
+        assert!(
+            store.jobs().is_empty(),
+            "an evicted terminal job must not stay in the live-job set forever"
+        );
+        assert_eq!(
+            store
+                .get_job_history(job_id.as_str())
+                .expect("the outcome must survive in the history archive")
+                .final_state,
+            JobState::Cancelled.to_string(),
+            "retirement must not cost the recorded outcome"
+        );
+    }
+
+    /// The point of the retirement: a promotion rebuilds `job_coordinators`
+    /// from the store, so what the store keeps is what every future
+    /// coordinator carries. Only live jobs should come back.
+    #[test]
+    fn recovery_loads_only_live_jobs() {
+        let mut store = InMemoryMetadataStore::default();
+
+        let live = JobId::try_new("job-live").unwrap();
+        let retired = JobId::try_new("job-retired").unwrap();
+        for job_id in [&live, &retired] {
+            let mut record = JobRecord::from_spec(single_task_job(job_id, "t0"), 0);
+            if job_id == &retired {
+                record.state = JobState::Succeeded;
+            }
+            store.save_job(&record).unwrap();
+        }
+        // The retired job concluded: archived first, then retired — the
+        // ordering `MetadataStore::remove_job` documents.
+        store
+            .save_job_history(crate::store::JobHistoryRecord {
+                job_id: retired.as_str().to_owned(),
+                job_kind: "batch".to_owned(),
+                final_state: "succeeded".to_owned(),
+                completed_at_ms: 1,
+                stage_count: 1,
+                task_count: 1,
+                succeeded_task_count: 1,
+                failed_task_count: 0,
+                cpu_nanos: 0,
+                memory_peak_task_bytes: 0,
+                namespace_id: None,
+                priority: 0,
+            })
+            .unwrap();
+        store.remove_job(retired.as_str()).unwrap();
+
+        let mut coordinator = Coordinator::new_active(None).unwrap();
+        coordinator.recover_from_store(&mut store).unwrap();
+
+        assert!(
+            coordinator.job_coordinators.contains_key(&live),
+            "a live job must still be recovered"
+        );
+        assert!(
+            !coordinator.job_coordinators.contains_key(&retired),
+            "a retired job must not be rebuilt into the live registry on promotion"
+        );
+    }
+
+    /// A failed history write is logged and the job still concludes — that is
+    /// deliberate, a broken archive must not wedge the lifecycle. But it means
+    /// eviction can reach a job whose outcome exists *only* in its live
+    /// record, and removing that would erase the outcome entirely. Leaking one
+    /// record is the cheaper error, so retirement is gated on the archive.
+    #[test]
+    fn a_terminal_job_with_no_history_record_keeps_its_durable_record() {
+        let job_id = JobId::try_new("job-unarchived").unwrap();
+        let mut record = JobRecord::from_spec(single_task_job(&job_id, "t0"), 0);
+        record.state = JobState::Failed;
+
+        // A store holding a terminal job with no archive alongside it — what a
+        // failed `save_job_history` leaves behind.
+        let mut store = InMemoryMetadataStore::default();
+        store.save_job(&record).unwrap();
+        assert!(store.list_job_history().is_empty());
+
+        let mut coordinator = Coordinator::new_active(None).unwrap().with_store(store);
+        coordinator.job_coordinators.insert(
+            job_id.clone(),
+            Arc::new(crate::job_coordinator::JobCoordinator::new(
+                job_id.clone(),
+                record,
+            )),
+        );
+
+        coordinator.evict_completed_job(&job_id);
+
+        assert!(
+            !coordinator.job_coordinators.contains_key(&job_id),
+            "eviction from the live registry still happens"
+        );
+        assert_eq!(
+            coordinator.store.as_ref().unwrap().inner().jobs().len(),
+            1,
+            "without an archive, the live record is the only trace of the outcome"
         );
     }
 }

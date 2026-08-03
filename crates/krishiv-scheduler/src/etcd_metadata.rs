@@ -417,6 +417,17 @@ impl MetadataStore for EtcdMetadataStore {
         &self.startup_jobs
     }
 
+    fn remove_job(&mut self, job_id: &str) -> SchedulerResult<()> {
+        let key = format!("{JOB_KEY_PREFIX}{job_id}");
+        self.delete_key(key)?;
+        // `jobs()` serves the startup snapshot, so drop it there too or a
+        // promotion later in this same process would recover a job this
+        // coordinator has already retired.
+        self.startup_jobs
+            .retain(|record| record.job_id().as_str() != job_id);
+        Ok(())
+    }
+
     fn save_executor(
         &mut self,
         descriptor: &krishiv_proto::ExecutorDescriptor,

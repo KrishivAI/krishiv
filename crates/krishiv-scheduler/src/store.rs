@@ -255,6 +255,26 @@ pub trait MetadataStore: Send + Sync {
     fn save_job(&mut self, record: &JobRecord) -> SchedulerResult<()>;
     fn jobs(&self) -> &[JobRecord];
 
+    /// Drop the live record for `job_id`.
+    ///
+    /// `jobs` and `job_history` own different halves of a job's lifetime, and
+    /// before this existed the first half had no end: `save_job` was the only
+    /// writer, so every job a coordinator ever ran stayed in `jobs` for the
+    /// life of the store. That is not merely disk — `recover_from_store`
+    /// reloads *every* record into `job_coordinators`, and it runs on each
+    /// standby→active promotion, so a long-lived cluster rebuilt an
+    /// ever-larger map of long-dead jobs on every failover.
+    ///
+    /// **Ordering contract: the terminal outcome must already be durable in
+    /// the history log ([`Self::save_job_history`]) before this is called.**
+    /// History-then-remove loses nothing if the process dies between the two;
+    /// remove-then-history loses the outcome entirely. Callers should treat a
+    /// missing history record as "not safe to remove yet" rather than pressing
+    /// on — see `Coordinator::evict_completed_job`.
+    ///
+    /// Removing an id that is not present is not an error.
+    fn remove_job(&mut self, job_id: &str) -> SchedulerResult<()>;
+
     /// Append an immutable terminal-job record to the history log.
     fn save_job_history(&mut self, record: JobHistoryRecord) -> SchedulerResult<()>;
 
@@ -413,6 +433,10 @@ impl MetadataStore for InMemoryMetadataStore {
     }
     fn jobs(&self) -> &[JobRecord] {
         &self.jobs
+    }
+    fn remove_job(&mut self, job_id: &str) -> SchedulerResult<()> {
+        self.jobs.retain(|j| j.job_id().as_str() != job_id);
+        Ok(())
     }
     fn save_executor(&mut self, descriptor: &ExecutorDescriptor) -> SchedulerResult<()> {
         let id = descriptor.executor_id();
@@ -1238,6 +1262,7 @@ pub(crate) fn parse_task_state(value: &str) -> SchedulerResult<TaskState> {
 enum StoreCommand {
     AppendEvent(EventLogEvent),
     SaveJob(Box<JobRecord>),
+    RemoveJob(String),
     SaveContinuousSnapshot {
         job_id: String,
         snapshot: ContinuousSnapshot,
@@ -1333,13 +1358,28 @@ impl NonBlockingStoreHandle {
         // disk (e.g. a warm reconnect) before `store` is moved into the Mutex
         // below, so a write racing in immediately after construction is
         // protected too, not just ones persisted during this process's life.
+        //
+        // The history log is the primary source: it is the purpose-built,
+        // bounded record of which jobs concluded, and since terminal records
+        // are now removed from `jobs` at eviction (see
+        // `MetadataStore::remove_job`) it is the only source that still knows
+        // about a job reaped before this process started. Terminal records
+        // still sitting in `jobs` are unioned in as well — a store written by
+        // an older build, or a job that turned terminal but has not yet been
+        // evicted, must latch exactly as before.
         let terminal_jobs: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> = {
-            let initial: std::collections::HashSet<String> = store
-                .jobs()
-                .iter()
-                .filter(|record| record.state().is_terminal())
-                .map(|record| record.job_id().as_str().to_owned())
+            let mut initial: std::collections::HashSet<String> = store
+                .list_job_history()
+                .into_iter()
+                .map(|record| record.job_id)
                 .collect();
+            initial.extend(
+                store
+                    .jobs()
+                    .iter()
+                    .filter(|record| record.state().is_terminal())
+                    .map(|record| record.job_id().as_str().to_owned()),
+            );
             std::sync::Arc::new(std::sync::Mutex::new(initial))
         };
         let inner: std::sync::Arc<std::sync::Mutex<dyn MetadataStore + 'static>> =
@@ -1394,6 +1434,33 @@ impl NonBlockingStoreHandle {
                                     tracing::error!(
                                         error = %e,
                                         "NonBlockingStoreHandle: save_job failed"
+                                    );
+                                }
+                                in_flight_done.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                notify_done.notify_one();
+                            })
+                            .await
+                            .ok();
+                        }
+                        StoreCommand::RemoveJob(job_id) => {
+                            // Deliberately *not* latch-checked, and deliberately
+                            // routed through this channel rather than written
+                            // inline: the channel is FIFO, so every `SaveJob`
+                            // enqueued before the removal is applied before it.
+                            // A removal written inline could be overtaken by an
+                            // older queued `SaveJob` and resurrect the record it
+                            // just deleted.
+                            in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let bg = std::sync::Arc::clone(&bg_store);
+                            let in_flight_done = std::sync::Arc::clone(&in_flight);
+                            let notify_done = std::sync::Arc::clone(&notify);
+                            tokio::task::spawn_blocking(move || {
+                                let mut guard = bg.lock().unwrap_or_else(|p| p.into_inner());
+                                if let Err(e) = guard.remove_job(&job_id) {
+                                    tracing::error!(
+                                        error = %e,
+                                        job_id = %job_id,
+                                        "NonBlockingStoreHandle: remove_job failed"
                                     );
                                 }
                                 in_flight_done.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -1473,6 +1540,54 @@ impl NonBlockingStoreHandle {
         let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Err(e) = guard.save_job(record) {
             tracing::error!(error = %e, "NonBlockingStoreHandle: save_job failed (sync fallback)");
+        }
+    }
+
+    /// Drop the durable live-job record for `job_id`.
+    ///
+    /// Enqueued behind any pending `SaveJob` when a runtime is available (the
+    /// channel is FIFO, so a stale queued write cannot land *after* the
+    /// removal and resurrect the record); written inline otherwise.
+    ///
+    /// The terminal-job latch is deliberately left set: removing the record
+    /// does not make the job's id reusable, and clearing the latch here would
+    /// reopen the resurrection race for exactly the ids most likely to have a
+    /// stale write in flight. `forget_terminal_job` remains the only way to
+    /// release an id, at the one point that is legitimate.
+    ///
+    /// Callers must have durably archived the outcome first — see the
+    /// ordering contract on [`MetadataStore::remove_job`].
+    pub fn remove_job(&self, job_id: &str) {
+        match &self.tx {
+            Some(tx) => match tx.try_send(StoreCommand::RemoveJob(job_id.to_owned())) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // Never dropped regardless of `fail_closed_writes`: a lost
+                    // removal is a record that leaks for the life of the store,
+                    // and unlike an event it will never be re-attempted.
+                    tracing::warn!(
+                        job_id = %job_id,
+                        "NonBlockingStoreHandle: channel full; removing job record synchronously"
+                    );
+                    self.remove_job_sync(job_id);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::error!("NonBlockingStoreHandle: store background task dropped");
+                    self.remove_job_sync(job_id);
+                }
+            },
+            None => self.remove_job_sync(job_id),
+        }
+    }
+
+    fn remove_job_sync(&self, job_id: &str) {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(e) = guard.remove_job(job_id) {
+            tracing::error!(
+                error = %e,
+                job_id = %job_id,
+                "NonBlockingStoreHandle: remove_job failed (sync fallback)"
+            );
         }
     }
 
@@ -2123,5 +2238,75 @@ mod terminal_job_latch_tests {
 
         handle.forget_terminal_job("job-a");
         assert!(!handle.is_terminal_latched("job-a"));
+    }
+
+    /// The latch is seeded at construction so a write racing in right after a
+    /// restart is guarded too. It used to be seeded from terminal records in
+    /// `jobs` — which stops working the moment those records are retired
+    /// (`MetadataStore::remove_job`), since a job reaped before this process
+    /// started leaves nothing there. The history log is the purpose-built,
+    /// bounded record of exactly which jobs concluded, so seed from it.
+    #[test]
+    fn the_latch_is_seeded_from_history_for_jobs_already_retired_from_the_live_set() {
+        let mut store = InMemoryMetadataStore::default();
+        let mut concluded = job_record("job-retired");
+        concluded.state = JobState::Succeeded;
+        store.save_job(&concluded).unwrap();
+        store
+            .save_job_history(JobHistoryRecord {
+                job_id: "job-retired".to_owned(),
+                job_kind: "batch".to_owned(),
+                final_state: "succeeded".to_owned(),
+                completed_at_ms: 1,
+                stage_count: 0,
+                task_count: 0,
+                succeeded_task_count: 0,
+                failed_task_count: 0,
+                cpu_nanos: 0,
+                memory_peak_task_bytes: 0,
+                namespace_id: None,
+                priority: 0,
+            })
+            .unwrap();
+        store.remove_job("job-retired").unwrap();
+        assert!(
+            store.jobs().is_empty(),
+            "precondition: nothing is left in the live-job set to seed from"
+        );
+
+        let handle = NonBlockingStoreHandle::new(store);
+        assert!(
+            handle.is_terminal_latched("job-retired"),
+            "a job whose live record was retired must still be latched terminal, \
+             or a stale in-flight write could resurrect it after a restart"
+        );
+
+        let mut stale = job_record("job-retired");
+        stale.state = JobState::Running;
+        assert!(
+            !handle.save_job_checked(&stale).unwrap(),
+            "and that latch must actually reject the stale write"
+        );
+    }
+
+    /// Retiring a record must not release the id: `forget_terminal_job` is the
+    /// only legitimate way to do that, at the one point a reuse is deliberate.
+    #[test]
+    fn removing_a_job_record_leaves_its_terminal_latch_set() {
+        let handle = NonBlockingStoreHandle::new(InMemoryMetadataStore::default());
+        let mut concluded = job_record("job-b");
+        concluded.state = JobState::Succeeded;
+        handle.save_job_checked(&concluded).unwrap();
+
+        handle.remove_job("job-b");
+
+        assert!(
+            handle.inner().jobs().is_empty(),
+            "the record itself is gone"
+        );
+        assert!(
+            handle.is_terminal_latched("job-b"),
+            "but the id stays latched — removal is retirement, not id release"
+        );
     }
 }
