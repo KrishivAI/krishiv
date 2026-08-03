@@ -668,6 +668,29 @@ async fn tonic_service_register_executor_persists_descriptor() {
     if let Some(store) = &shared.read().await.store {
         store.flush().await;
     }
+
+    // Read the STORE, not the in-memory registry. This test flushed the store
+    // and then asserted on `executors().list()` — the registry — which
+    // `register_executor` populates whether or not it persists anything, so
+    // deleting the `save_executor` call left it green. R10 exists so a
+    // re-attaching executor is recognised after a coordinator restart, and
+    // only the durable copy can do that. `cancel_job_marks_active_tasks_cancelled`
+    // in this same file already reads through `store.inner()`; this call site
+    // just never adopted it.
+    let persisted = shared
+        .read()
+        .await
+        .store
+        .as_ref()
+        .expect("store configured")
+        .inner()
+        .executors();
+    assert_eq!(persisted.len(), 1, "descriptor must be in the metadata store");
+    assert_eq!(persisted[0].executor_id(), &executor_id);
+    assert_eq!(persisted[0].host(), "pod-persist");
+    assert_eq!(persisted[0].slots(), 2);
+
+    // …and the live registry agrees.
     let executors = shared.read().await.executors().list();
     assert_eq!(executors.len(), 1);
     assert_eq!(executors[0].descriptor.executor_id(), &executor_id);
