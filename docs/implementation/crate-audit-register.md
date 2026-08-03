@@ -554,7 +554,7 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
 
 ---
 
-## 4. krishiv-scheduler — 41 of 78 files read whole (in progress, 2026-08-03)
+## 4. krishiv-scheduler — 42 of 78 files read whole (in progress, 2026-08-03)
 
 Third crate. The largest in the workspace: 51,438 lines. Working down the
 distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198),
@@ -574,13 +574,15 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
 `queryable_state_http.rs` (262), `bounded_window_http.rs` (83),
 `coordinator_daemon.rs` (2,518), `continuous_stream_http.rs` (3,041),
 `sections/placement.rs.inc` (2,281), `ivm_http.rs` (2,273), `store.rs`
-(1,996), `sections/core.rs.inc` (1,772).
-**35,631 of 51,438 lines.**
+(1,996), `sections/core.rs.inc` (1,772), `sections/chaos_jcp.rs.inc`
+(1,407).
+**37,038 of 51,438 lines.**
 
-**Remaining, in intended order** (37 files, ~15,810 lines):
-`sections/chaos_jcp.rs.inc` (1,407), `etcd_metadata.rs` (1,250), `ivm.rs`
+**Remaining, in intended order** (36 files, ~14,400 lines):
+`etcd_metadata.rs` (1,250), `ivm.rs`
 (1,107), `batch_sql.rs` (1,065), `grpc.rs` (1,041), `auth.rs` (1,029), then
-the remaining `sections/*.rs.inc` and the sub-500-line files.
+the remaining `sections/*.rs.inc` (start with `prr_parallel.rs.inc` — see
+the note below) and the sub-500-line files.
 
 **The recurring shape in this crate**: *state removed at the head of a path as
 "consumed by this batch", never restored when the batch turns out to be empty
@@ -893,7 +895,54 @@ return at all.* Six of the nine defects below are one of those two.
       file already used that idiom — this call site never adopted it.
       Verified: 0 descriptors where 1 is required.
 
+- [x] **A chaos suite that could not fail** (`4f871420`).
+      `sections/chaos_jcp.rs.inc` held ~72 tests. Almost all exercised only
+      `MiniSimulationHarness` — a test double — and never reached production
+      code; their own comments said so ("In real flow this would be…").
+      Four defects, each the founding failure mode of this register:
+
+      * **Tautologies.** The dominant assertion,
+        `assert!(!h.is_partitioned(&x) || h.current_tick() > 10)`, ran after
+        a `simulate_partition_and_recovery` (which un-partitions) and 14
+        ticks. Both disjuncts true by construction.
+      * **Assertions on the double's own setters** — `h.partition(x)` then
+        `assert!(h.is_partitioned(&x))`.
+      * **Twelve verbatim duplicates** of one body, identical down to the
+        executor-id string, named `_stress` and `_stress_v2` … `_v12`.
+      * **Names that promised what the body never did.**
+        `..._clear_assignments_for_bad_executor_works` never called it;
+        `chaos_jcp_running_task_count_under_failure` asserted a string
+        contained a substring of itself; `prr_new_surfaces_all_green_…` had
+        an empty body; `..._exposes_raw_udf_limits_…` had no assertion, its
+        comment claiming compilation was the assertion.
+
+      They also hid **un-awaited futures**: every JCP accessor is `async`, so
+      `let _eligible = jc.has_tasks_eligible_for_launch();` in a sync
+      `#[test]` builds a future and drops it unpolled. The file already
+      documented that bug being found and fixed in *one* place and left seven
+      more — they survived `clippy::let_underscore_future` because a **named**
+      `_eligible` binding does not trip a lint that only fires on the bare `_`
+      pattern. The lint was satisfied by renaming, not by awaiting. Instance
+      six of *fixed where it hurt, then left*.
+
+      Replaced with six tests that call those surfaces and assert what they
+      do (detach-vs-requeue semantics, the heartbeat-forget half of
+      `handle_executor_loss` observed through the staleness seam, the
+      threshold in both directions including a backwards clock jump, launch
+      eligibility across assignment/guard/Running, the work summary, the UDF
+      budget). **Test count 595 → 530 — that is the point.**
+
 ### Recorded, not fixed — needs a decision
+
+- **`MiniSimulationHarness` is now a closed loop.** It lives in
+  `sections/prr_parallel.rs.inc`, and after the deletion above its only
+  remaining consumers are its own self-tests (`richer_simulation_harness_…`,
+  `simulation_harness_advanced_failure_modes`, `…_concurrent_partitions`,
+  `…_timeout_detection`, `…_frozen_executor_progress_stall`) — a test double
+  tested by tests of itself, with no production coverage. That file also
+  holds `real_job_coordinator_extraction`, which asserts a string equals
+  itself. Read `prr_parallel.rs.inc` next and decide whether the harness
+  earns its keep or follows the chaos suite.
 
 - **`MetadataStore` has no `remove_job`.** Events are byte-bounded, history
   is capped at `MAX_JOB_HISTORY`, executors / continuous snapshots / IVM
