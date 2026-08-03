@@ -539,13 +539,20 @@ fn continuous_job_view(
 pub async fn api_continuous_register(
     State(coordinator): State<SharedCoordinator>,
     Json(body): Json<ContinuousRegisterRequest>,
-) -> Result<Json<ContinuousRegisterResponse>, StatusCode> {
+) -> Result<Json<ContinuousRegisterResponse>, (StatusCode, String)> {
     // Encode/spec errors are a client fault -> 400 (unlike the SQL entrypoint,
     // whose caller already compiled a valid spec).
-    if JobId::try_new(&body.job_id).is_err()
-        || krishiv_plan::window::encode_window_execution_spec(&body.spec).is_err()
-    {
-        return Err(StatusCode::BAD_REQUEST);
+    if let Err(error) = JobId::try_new(&body.job_id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("invalid job_id '{}': {error}", body.job_id),
+        ));
+    }
+    if let Err(error) = krishiv_plan::window::encode_window_execution_spec(&body.spec) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("window spec is not encodable: {error}"),
+        ));
     }
     let options = ContinuousRegistrationOptions {
         sink: body.sink.clone(),
@@ -558,9 +565,11 @@ pub async fn api_continuous_register(
     register_continuous_stream_with_options(&coordinator, &body.job_id, &body.spec, &options)
         .await
         .map_err(|error| match error {
-            ContinuousStreamError::Scheduler(e) => scheduler_status(&e),
-            ContinuousStreamError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
+            ContinuousStreamError::Scheduler(e) => scheduler_error_response(&e),
+            other @ ContinuousStreamError::Unavailable(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, other.to_string())
+            }
+            other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(Json(ContinuousRegisterResponse { success: true }))
 }
@@ -603,11 +612,14 @@ pub struct ContinuousRegisterSqlResponse {
 pub async fn api_continuous_register_sql(
     State(coordinator): State<SharedCoordinator>,
     Json(body): Json<ContinuousRegisterSqlRequest>,
-) -> Result<Json<ContinuousRegisterSqlResponse>, StatusCode> {
+) -> Result<Json<ContinuousRegisterSqlResponse>, (StatusCode, String)> {
     let plan = krishiv_sql::streaming_window_plan::compile_streaming_window_sql(&body.sql)
         .map_err(|error| {
             tracing::warn!(error = %error, "continuous-register-sql: compile failed");
-            StatusCode::BAD_REQUEST
+            (
+                StatusCode::BAD_REQUEST,
+                format!("streaming window SQL failed to compile: {error}"),
+            )
         })?;
     let options = ContinuousRegistrationOptions {
         sink: body.sink.clone(),
@@ -620,9 +632,11 @@ pub async fn api_continuous_register_sql(
     register_continuous_stream_with_options(&coordinator, &body.job_id, &plan.spec, &options)
         .await
         .map_err(|error| match error {
-            ContinuousStreamError::Scheduler(e) => scheduler_status(&e),
-            ContinuousStreamError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
+            ContinuousStreamError::Scheduler(e) => scheduler_error_response(&e),
+            other @ ContinuousStreamError::Unavailable(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, other.to_string())
+            }
+            other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(Json(ContinuousRegisterSqlResponse {
         success: true,
@@ -650,11 +664,12 @@ pub async fn api_continuous_list(
 pub async fn api_continuous_get(
     State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
-) -> Result<Json<ContinuousJobView>, StatusCode> {
-    let job_id = JobId::try_new(&job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+) -> Result<Json<ContinuousJobView>, (StatusCode, String)> {
+    let job_id = JobId::try_new(&job_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("invalid job id: {error}")))?;
     let view = {
         let coord = coordinator.read().await;
-        continuous_job_view(&coord, &job_id).map_err(|error| scheduler_status(&error))?
+        continuous_job_view(&coord, &job_id).map_err(|error| scheduler_error_response(&error))?
     };
     Ok(Json(view))
 }
@@ -674,11 +689,12 @@ pub struct ContinuousDeregisterResponse {
 pub async fn api_continuous_deregister(
     State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
-) -> Result<Json<ContinuousDeregisterResponse>, StatusCode> {
-    let job_id = JobId::try_new(&job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+) -> Result<Json<ContinuousDeregisterResponse>, (StatusCode, String)> {
+    let job_id = JobId::try_new(&job_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("invalid job id: {error}")))?;
     let mut coord = coordinator.write().await;
     // Confirm it exists and is a streaming job (404 if unknown, 409 otherwise).
-    continuous_job_view(&coord, &job_id).map_err(|error| scheduler_status(&error))?;
+    continuous_job_view(&coord, &job_id).map_err(|error| scheduler_error_response(&error))?;
     // push_cancel_job (not plain cancel_job): the assigned executor must hear
     // about the teardown so it retires the job identity — drops the stateful
     // `stream:loop` executor and the inbox dedupe entries. Without the RPC, a
@@ -687,7 +703,7 @@ pub async fn api_continuous_deregister(
     coord
         .push_cancel_job(&job_id)
         .await
-        .map_err(|error| scheduler_status(&error))?;
+        .map_err(|error| scheduler_error_response(&error))?;
     // Cancel is terminal → evict removes it from `job_coordinators`, freeing the id.
     coord.evict_completed_job(&job_id);
     // A job id can be reused (a fresh `continuous-register-sql` with the same
@@ -701,14 +717,15 @@ pub async fn api_continuous_deregister(
 pub async fn api_continuous_checkpoint(
     State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
-) -> Result<Json<ContinuousCheckpointResponse>, StatusCode> {
+) -> Result<Json<ContinuousCheckpointResponse>, (StatusCode, String)> {
     use base64::Engine as _;
 
-    let job_id = JobId::try_new(&job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let job_id = JobId::try_new(&job_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("invalid job id: {error}")))?;
     let response = {
         let coord = coordinator.read().await;
-        let view =
-            continuous_job_view(&coord, &job_id).map_err(|error| scheduler_status(&error))?;
+        let view = continuous_job_view(&coord, &job_id)
+            .map_err(|error| scheduler_error_response(&error))?;
         let persisted = coord.load_continuous_snapshot(job_id.as_str());
         ContinuousCheckpointResponse {
             job_id: view.job_id,
@@ -727,20 +744,29 @@ pub async fn api_continuous_restore(
     State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
     Json(body): Json<ContinuousRestoreRequest>,
-) -> Result<Json<ContinuousRestoreResponse>, StatusCode> {
+) -> Result<Json<ContinuousRestoreResponse>, (StatusCode, String)> {
     use base64::Engine as _;
 
-    let job_id = JobId::try_new(&job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let job_id = JobId::try_new(&job_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("invalid job id: {error}")))?;
     let snapshot_bytes = base64::engine::general_purpose::STANDARD
         .decode(body.snapshot_b64.as_bytes())
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("snapshot_b64 is not valid base64: {error}"),
+            )
+        })?;
     if snapshot_bytes.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            String::from("restore snapshot must not be empty"),
+        ));
     }
     let watermark_ms = {
         let mut coord = coordinator.write().await;
-        let view =
-            continuous_job_view(&coord, &job_id).map_err(|error| scheduler_status(&error))?;
+        let view = continuous_job_view(&coord, &job_id)
+            .map_err(|error| scheduler_error_response(&error))?;
         let watermark_ms = view
             .persisted_watermark_ms
             .or(view.last_watermark_ms)
@@ -952,14 +978,15 @@ pub struct ContinuousStopWithSavepointResponse {
 pub async fn api_continuous_stop_with_savepoint(
     State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
-) -> Result<Json<ContinuousStopWithSavepointResponse>, StatusCode> {
-    let job_id = JobId::try_new(&job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+) -> Result<Json<ContinuousStopWithSavepointResponse>, (StatusCode, String)> {
+    let job_id = JobId::try_new(&job_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("invalid job id: {error}")))?;
     let mut coord = coordinator.write().await;
     // 404 unknown / 409 non-streaming, matching the other continuous routes.
-    continuous_job_view(&coord, &job_id).map_err(|error| scheduler_status(&error))?;
+    continuous_job_view(&coord, &job_id).map_err(|error| scheduler_error_response(&error))?;
     let epoch = coord
         .stop_job_with_savepoint(&job_id, Some(String::from("continuous-stop")))
-        .map_err(|error| scheduler_status(&error))?;
+        .map_err(|error| scheduler_error_response(&error))?;
     Ok(Json(ContinuousStopWithSavepointResponse {
         job_id: job_id.to_string(),
         savepoint_epoch: epoch,
@@ -1120,21 +1147,25 @@ pub struct ContinuousDrainResponse {
 pub async fn api_continuous_drain(
     State(coordinator): State<SharedCoordinator>,
     Json(body): Json<ContinuousDrainRequest>,
-) -> Result<Json<ContinuousDrainResponse>, StatusCode> {
-    let job_id =
-        krishiv_proto::JobId::try_new(&body.job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+) -> Result<Json<ContinuousDrainResponse>, (StatusCode, String)> {
+    let job_id = krishiv_proto::JobId::try_new(&body.job_id).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid job_id '{}': {error}", body.job_id),
+        )
+    })?;
 
     // Phase 55: run-loop jobs serve their egress buffers from the executors.
     let run_loop = {
         let coord = coordinator.read().await;
-        run_loop_targets(&coord, &job_id).map_err(|error| scheduler_status(&error))?
+        run_loop_targets(&coord, &job_id).map_err(|error| scheduler_error_response(&error))?
     };
     if let Some(targets) = run_loop {
         let payloads = drain_run_loop_output(&coordinator, &job_id, targets)
             .await
             .map_err(|error| match error {
-                ContinuousStreamError::Scheduler(e) => scheduler_status(&e),
-                _ => StatusCode::SERVICE_UNAVAILABLE,
+                ContinuousStreamError::Scheduler(e) => scheduler_error_response(&e),
+                other => (StatusCode::SERVICE_UNAVAILABLE, other.to_string()),
             })?;
         return Ok(Json(ContinuousDrainResponse {
             inline_record_batch_ipc: payloads,
@@ -1145,9 +1176,12 @@ pub async fn api_continuous_drain(
         let mut coord = coordinator.write().await;
         let snapshot = coord
             .job_snapshot(&job_id)
-            .map_err(|error| scheduler_status(&error))?;
+            .map_err(|error| scheduler_error_response(&error))?;
         if snapshot.kind() != krishiv_proto::JobKind::Streaming {
-            return Err(StatusCode::CONFLICT);
+            return Err((
+                StatusCode::CONFLICT,
+                format!("job {job_id} is not a streaming job"),
+            ));
         }
         coord.take_job_inline_results(&job_id).unwrap_or_default()
     };
@@ -2446,7 +2480,7 @@ mod tests {
         .await
         .expect_err("invalid window spec must fail registration");
 
-        assert_eq!(error, StatusCode::BAD_REQUEST);
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
         let job_id = krishiv_proto::JobId::try_new("cs-invalid-window").unwrap();
         assert!(matches!(
             coordinator.read().await.job_snapshot(&job_id),
@@ -2573,7 +2607,7 @@ mod tests {
         )
         .await
         .expect_err("continuous register over a batch id must conflict");
-        assert_eq!(error, StatusCode::CONFLICT);
+        assert_eq!(error.0, StatusCode::CONFLICT);
     }
 
     /// Deregistering a registered-but-never-pushed streaming job must free the
@@ -2637,7 +2671,7 @@ mod tests {
         )
         .await
         .expect_err("unknown drain must fail");
-        assert_eq!(drain, StatusCode::NOT_FOUND);
+        assert_eq!(drain.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -3034,6 +3068,138 @@ mod tests {
             "the task must be reassigned to the already-registered healthy \
              executor immediately on eviction, not left unassigned forever \
              waiting for a registration event that already happened"
+        );
+    }
+
+    /// Every rejection on this surface must say why, not just how.
+    ///
+    /// `scheduler_error_response` was introduced because a bare status code
+    /// with an empty body "cost a full bisection" during the Phase 62 soak —
+    /// but only `api_continuous_push` was converted. Its siblings kept
+    /// returning `StatusCode` alone, so a caller driving register/get/drain
+    /// against a mistyped id, a non-streaming job, or a bad snapshot got a
+    /// number and nothing else. `drain` is the sharpest case: it is driven in
+    /// the same loop as `push`, whose message was already fixed.
+    ///
+    /// Asserts the status (the contract) AND a non-empty body (the
+    /// explanation) so the explanation cannot be dropped again one handler at
+    /// a time.
+    #[tokio::test]
+    async fn every_continuous_rejection_explains_itself() {
+        let coordinator = make_coordinator_with_executor("explains").await;
+
+        // Unknown job: drain, get, checkpoint, deregister, stop-with-savepoint.
+        let drain = api_continuous_drain(
+            State(coordinator.clone()),
+            Json(ContinuousDrainRequest {
+                job_id: "cs-explains-missing".into(),
+            }),
+        )
+        .await
+        .expect_err("unknown drain must fail");
+        assert_eq!(drain.0, StatusCode::NOT_FOUND);
+        assert!(!drain.1.trim().is_empty(), "drain 404 must say which job");
+
+        for (label, result) in [
+            (
+                "get",
+                api_continuous_get(
+                    State(coordinator.clone()),
+                    Path(String::from("cs-explains-missing")),
+                )
+                .await
+                .err()
+                .map(|e| (e.0, e.1)),
+            ),
+            (
+                "checkpoint",
+                api_continuous_checkpoint(
+                    State(coordinator.clone()),
+                    Path(String::from("cs-explains-missing")),
+                )
+                .await
+                .err()
+                .map(|e| (e.0, e.1)),
+            ),
+            (
+                "deregister",
+                api_continuous_deregister(
+                    State(coordinator.clone()),
+                    Path(String::from("cs-explains-missing")),
+                )
+                .await
+                .err()
+                .map(|e| (e.0, e.1)),
+            ),
+            (
+                "stop-with-savepoint",
+                api_continuous_stop_with_savepoint(
+                    State(coordinator.clone()),
+                    Path(String::from("cs-explains-missing")),
+                )
+                .await
+                .err()
+                .map(|e| (e.0, e.1)),
+            ),
+        ] {
+            let (status, message) = result.unwrap_or_else(|| panic!("{label} must reject"));
+            assert_eq!(status, StatusCode::NOT_FOUND, "{label} status");
+            assert!(!message.trim().is_empty(), "{label} must explain itself");
+        }
+
+        // Client faults on register: bad id, unencodable spec, and a restore
+        // whose snapshot is not base64.
+        let bad_id = api_continuous_register(
+            State(coordinator.clone()),
+            Json(ContinuousRegisterRequest {
+                job_id: String::new(),
+                spec: tumbling_spec(),
+                sink: None,
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
+            }),
+        )
+        .await
+        .expect_err("empty job id must be rejected");
+        assert_eq!(bad_id.0, StatusCode::BAD_REQUEST);
+        assert!(
+            bad_id.1.contains("job_id"),
+            "the 400 must name the offending field, got {:?}",
+            bad_id.1
+        );
+
+        let _ = api_continuous_register(
+            State(coordinator.clone()),
+            Json(ContinuousRegisterRequest {
+                job_id: "cs-explains-job".into(),
+                spec: tumbling_spec(),
+                sink: None,
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let bad_snapshot = api_continuous_restore(
+            State(coordinator),
+            Path(String::from("cs-explains-job")),
+            Json(ContinuousRestoreRequest {
+                snapshot_b64: String::from("!!! not base64 !!!"),
+            }),
+        )
+        .await
+        .expect_err("malformed snapshot must be rejected");
+        assert_eq!(bad_snapshot.0, StatusCode::BAD_REQUEST);
+        assert!(
+            bad_snapshot.1.contains("base64"),
+            "the 400 must say the snapshot was not decodable, got {:?}",
+            bad_snapshot.1
         );
     }
 }
