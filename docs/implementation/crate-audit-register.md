@@ -554,7 +554,7 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
 
 ---
 
-## 4. krishiv-scheduler — 45 of 78 files read whole (in progress, 2026-08-03)
+## 4. krishiv-scheduler — 46 of 78 files read whole (in progress, 2026-08-03)
 
 Third crate. The largest in the workspace: 51,438 lines. Working down the
 distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198),
@@ -576,12 +576,14 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
 `sections/placement.rs.inc` (2,281), `ivm_http.rs` (2,273), `store.rs`
 (1,996), `sections/core.rs.inc` (1,772), `sections/chaos_jcp.rs.inc`
 (1,407), `sections/prr_parallel.rs.inc` (276), `etcd_metadata.rs` (1,250), `ivm.rs`
-(1,107).
-**39,671 of 51,438 lines.**
+(1,107), `batch_sql.rs` (1,065).
+**40,736 of 51,438 lines.**
 
-**Remaining, in intended order** (33 files, ~11,770 lines):
-`batch_sql.rs` (1,065), `grpc.rs` (1,041), `auth.rs`
-(1,029), then the remaining `sections/*.rs.inc` and the sub-500-line files.
+**Remaining, in intended order** (32 files, ~10,700 lines):
+`grpc.rs` (1,041), `auth.rs` (1,029), then the remaining
+`sections/*.rs.inc` and the sub-500-line files. (`bounded_window.rs` was
+partly read while sweeping the notify bug — its wait loop is fixed, but the
+file has not been read whole and still counts as remaining.)
 
 **The recurring shape in this crate**: *state removed at the head of a path as
 "consumed by this batch", never restored when the batch turns out to be empty
@@ -1019,6 +1021,41 @@ return at all.* Six of the nine defects below are one of those two.
       job unloadable on upgrade. Three tests: the pin survives; an ordinary
       job still auto-partitions (so the fix is not "pin everything"); a
       field-stripped snapshot still loads.
+
+- [x] **A finished batch-SQL query could hang for its full 300s timeout**
+      (`d3836145`, `29fec838`). Both batch-SQL wait loops used
+      `sleep_until(deadline)` as the `select!` fallback, so the only early
+      exit was a change notification — and `Coordinator::notify` is fired with
+      `Notify::notify_waiters()`, which wakes only waiters **already parked**
+      and stores no permit. The recheck-before-park dance was written to close
+      that window and cannot: `Notified` does not register until first polled,
+      which happens inside the `select!`, *after* the recheck released the
+      lock. A job terminating in that window notified nobody, so the caller
+      slept the whole `KRISHIV_BATCH_SQL_TIMEOUT_SECS` and then reported a
+      timeout — and cancelled the job on the way out — for a query that had
+      already finished.
+
+      **Four copies of this wait loop exist.** `run_ivm_fragment_job` had it
+      right (100 ms tick); `batch_sql.rs` ×2 and `bounded_window.rs` did not.
+      Fixed by sharing one `await_job_change` helper rather than patching a
+      third copy. Same root cause as `5caadb7c`, where it was only a test
+      defect — here it is production behaviour on the coordinated-query path.
+
+- [x] **Two terminal branches reported a caller's query error as an internal
+      fault** (`d3836145`, `29fec838`). The batch-SQL *sink* path and
+      `bounded_window` both returned `SchedulerError::Transport` on
+      Failed/Cancelled, which the interface layer classifies Retryable/opaque
+      ("internal error; contact the operator"), discarding the reason the
+      coordinator had already recorded. `poll_batch_sql_outcome` does the
+      opposite and says why (Phase 63 / audit §11), and
+      `first_task_failure_reason` sat right there serving only that one
+      caller. The sink path's *timeout* branch already carried the matching
+      #222 fix and points at the sibling — only the terminal branches were
+      left behind. Both now share `first_task_failure_reason`.
+
+      One test covers both defects; each was reverted alone to prove it
+      discriminates (taxonomy → `Transport` in 0.06 s; tick → `Elapsed` after
+      the full timeout).
 
 ### Recorded, not fixed — needs a decision
 
