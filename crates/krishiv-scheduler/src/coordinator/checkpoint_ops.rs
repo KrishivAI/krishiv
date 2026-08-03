@@ -1001,5 +1001,65 @@ impl Coordinator {
         self.ckpt
             .notify_sent
             .retain(|(jid, _, ep)| jid != job_id || ep != &epoch);
+        // `barrier_sent` tracks the same epoch's delivery and must be dropped
+        // with it. It was not, and unlike `notify_sent` nothing else prunes it:
+        // it is a `HashSet`, so the insertion-ordered `prune_sent_set` cap does
+        // not apply, and the per-epoch abort cleanup only fires on epochs that
+        // *fail*. A healthy streaming job therefore accumulated one permanent
+        // entry per committed epoch — 8,640/day at a 10 s checkpoint interval,
+        // for the lifetime of the job. The sibling implementation
+        // (`CheckpointInner::clear_notify_for_epoch`) always cleared both.
+        //
+        // Safe to clear: `pending_barrier_dispatch_plans` only dispatches for
+        // coordinators sitting in `AwaitingAcks`, and this runs on the commit
+        // path (the epoch is now `Committed`), so nothing can re-dispatch it.
+        // Epoch numbers are never reused, so the key cannot recur either.
+        self.ckpt
+            .barrier_sent
+            .retain(|(jid, ep)| jid != job_id || ep != &epoch);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod barrier_sent_lifetime_tests {
+    use super::*;
+
+    /// Committing an epoch must retire *both* of its delivery-tracking
+    /// entries. `barrier_sent` is a `HashSet`, so the insertion-ordered
+    /// `prune_sent_set` cap cannot touch it, and the per-epoch abort cleanup
+    /// only fires for epochs that fail — so a healthy long-running streaming
+    /// job accumulated one entry per committed epoch forever (8,640/day at a
+    /// 10 s interval). The sibling `CheckpointInner::clear_notify_for_epoch`
+    /// always cleared both; this one cleared only `notify_sent`.
+    #[test]
+    fn committing_an_epoch_retires_its_barrier_dispatch_marker() {
+        let mut coord = Coordinator::new_active(None).unwrap();
+        let job_id = JobId::try_new("barrier-sent-lifetime").unwrap();
+        let executor_id = ExecutorId::try_new("exec-0").unwrap();
+
+        coord.mark_barrier_dispatched(&job_id, 7);
+        coord
+            .ckpt
+            .notify_sent
+            .insert((job_id.clone(), executor_id, 7));
+        // A later epoch's markers must survive — this clears one epoch, not
+        // the whole job.
+        coord.mark_barrier_dispatched(&job_id, 8);
+
+        coord.clear_checkpoint_notify_for_epoch(&job_id, 7);
+
+        assert!(
+            !coord.ckpt.barrier_sent.contains(&(job_id.clone(), 7)),
+            "the committed epoch's barrier marker must not outlive it"
+        );
+        assert!(
+            coord.ckpt.notify_sent.is_empty(),
+            "the notify marker was already cleared and must stay cleared"
+        );
+        assert!(
+            coord.ckpt.barrier_sent.contains(&(job_id, 8)),
+            "clearing one epoch must not disturb another"
+        );
     }
 }
