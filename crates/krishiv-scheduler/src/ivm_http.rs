@@ -72,6 +72,21 @@ fn ivm_not_found(job_id: &str) -> StatusCode {
     StatusCode::NOT_FOUND
 }
 
+/// Resolve a job, transparently rehydrating it from the coordinator's durable
+/// snapshot when this process has never seen it.
+///
+/// **Every handler that names a job must go through here.** The registry is
+/// process-local and nothing repopulates it at startup — `restore_durable_snapshot`
+/// is reachable only from this function and `api_ivm_create_job`. So after a
+/// coordinator restart or a failover to a standby, a job whose state is sitting
+/// in the metadata store is simply absent until some handler rehydrates it.
+///
+/// Ten handlers used `registry.get` directly and 404'd instead. The read side
+/// was the visible half: `/stats` exists to be polled "every few seconds" by
+/// the platform freshness sampler, and it answered 404 — a live table reported
+/// as missing — until an unrelated `/feed` or `/step` happened to resurrect the
+/// job. `/checkpoint`, the backup path, failed the same way, and `/restore`
+/// refused to restore into a job that demonstrably existed.
 async fn ensure_ivm_job(
     registry: &SharedIvmJobRegistry,
     coordinator: &SharedCoordinator,
@@ -740,11 +755,15 @@ pub struct DispatchStateResponse {
 
 pub async fn api_ivm_dispatch_state(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
 ) -> Result<Json<DispatchStateResponse>, StatusCode> {
-    registry
-        .get(&job_id)
-        .ok_or_else(|| ivm_not_found(&job_id))?;
+    // Rehydrates like every other job-scoped handler. The *record* it returns
+    // is process-local by nature — `attached` and `fence` describe a resident
+    // flow this coordinator attached — so after a restart the honest answer is
+    // a freshly-defaulted "not attached", which is exactly what rehydration
+    // produces. 404 would instead claim the job does not exist.
+    ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     let d = registry.dispatch_state(&job_id);
     Ok(Json(DispatchStateResponse {
         attached: d.attached,
@@ -773,11 +792,10 @@ pub struct SnapshotResponse {
 
 pub async fn api_ivm_snapshot(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Path((job_id, view_name)): Path<(String, String)>,
 ) -> Result<Json<SnapshotResponse>, StatusCode> {
-    let flow = registry
-        .get(&job_id)
-        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     let materialized = flow.view_is_materialized(&view_name);
     let rb_opt = flow.snapshot(&view_name).map_err(ivm_err)?;
     match rb_opt {
@@ -811,11 +829,10 @@ pub struct ViewOutputResponse {
 
 pub async fn api_ivm_view_output(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Path((job_id, view_name)): Path<(String, String)>,
 ) -> Result<Json<ViewOutputResponse>, StatusCode> {
-    let job = registry
-        .get(&job_id)
-        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let job = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     // Peek the latest output delta (merged across shards for partitioned jobs).
     match job.view_output_peek(&view_name).map_err(ivm_err)? {
         None => Ok(Json(ViewOutputResponse {
@@ -853,11 +870,10 @@ pub struct ViewStatsResponse {
 
 pub async fn api_ivm_view_stats(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Path((job_id, view_name)): Path<(String, String)>,
 ) -> Result<Json<ViewStatsResponse>, StatusCode> {
-    let job = registry
-        .get(&job_id)
-        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let job = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     // 404 for a view that isn't registered (matches /debug-info semantics).
     job.view_spec(&view_name)
         .map_err(ivm_err)?
@@ -899,11 +915,10 @@ pub struct ViewDebugInfo {
 
 pub async fn api_ivm_view_debug_info(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Path((job_id, view_name)): Path<(String, String)>,
 ) -> Result<Json<ViewDebugInfo>, StatusCode> {
-    let job = registry
-        .get(&job_id)
-        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let job = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     // is_materialized from spec
     let is_materialized = job
         .view_spec(&view_name)
@@ -941,11 +956,10 @@ pub struct CheckpointResponse {
 
 pub async fn api_ivm_checkpoint(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
 ) -> Result<Json<CheckpointResponse>, StatusCode> {
-    let flow = registry
-        .get(&job_id)
-        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     // Full checkpoint (sources + view baselines): the source-only `checkpoint`
     // loses view state across a restart, which broke IVM recovery (G6/F4).
     let bytes = flow.checkpoint_full().map_err(ivm_err)?;
@@ -969,12 +983,11 @@ pub struct RestoreResponse {
 
 pub async fn api_ivm_restore(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
     Json(body): Json<RestoreRequest>,
 ) -> Result<Json<RestoreResponse>, StatusCode> {
-    let flow = registry
-        .get(&job_id)
-        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     let bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         &body.checkpoint_b64,
@@ -982,6 +995,12 @@ pub async fn api_ivm_restore(
     .map_err(|e| ivm_err(format!("base64 decode: {e}")))?;
     // Matches `api_ivm_checkpoint`'s full checkpoint (sources + view baselines).
     flow.restore_full(&bytes).map_err(ivm_err)?;
+    // Persist, like every other handler that changes authoritative state
+    // (`register_view`, `drop_view`, `step`). Without this a restore lived only
+    // in memory: answer `{"success": true}`, restart before the next `/step`,
+    // and `ensure_ivm_job` rehydrates the *pre-restore* snapshot — silently
+    // undoing the rewind the operator was told had happened.
+    persist_ivm_job(&registry, &coordinator, &job_id).await?;
     Ok(Json(RestoreResponse { success: true }))
 }
 
@@ -995,11 +1014,10 @@ pub struct CheckpointDeltaResponse {
 
 pub async fn api_ivm_checkpoint_delta(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
 ) -> Result<Json<CheckpointDeltaResponse>, StatusCode> {
-    let flow = registry
-        .get(&job_id)
-        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     let bytes = flow.checkpoint_delta().map_err(ivm_err)?;
     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
     Ok(Json(CheckpointDeltaResponse {
@@ -1021,18 +1039,19 @@ pub struct RestoreDeltaResponse {
 
 pub async fn api_ivm_restore_delta(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
     Json(body): Json<RestoreDeltaRequest>,
 ) -> Result<Json<RestoreDeltaResponse>, StatusCode> {
-    let flow = registry
-        .get(&job_id)
-        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     let bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         &body.checkpoint_delta_b64,
     )
     .map_err(|e| ivm_err(format!("base64 decode: {e}")))?;
     flow.restore_delta(&bytes).map_err(ivm_err)?;
+    // Same reason as `api_ivm_restore`.
+    persist_ivm_job(&registry, &coordinator, &job_id).await?;
     Ok(Json(RestoreDeltaResponse { success: true }))
 }
 
@@ -1051,12 +1070,11 @@ pub struct StreamBridgeResponse {
 
 pub async fn api_ivm_stream_bridge(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Path((job_id, source_name)): Path<(String, String)>,
     Json(body): Json<StreamBridgeRequest>,
 ) -> Result<Json<StreamBridgeResponse>, StatusCode> {
-    let flow = registry
-        .get(&job_id)
-        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     let ipc_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         &body.snapshot_ipc_b64,
@@ -1103,14 +1121,13 @@ pub struct RegisterVectorViewResponse {
 
 pub async fn api_ivm_register_vector_view(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
     Json(body): Json<RegisterVectorViewRequest>,
 ) -> Result<Json<RegisterVectorViewResponse>, StatusCode> {
     use krishiv_ivm::VectorViewSpec;
 
-    let job = registry
-        .get(&job_id)
-        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let job = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
 
     if body.sink_type != "in_memory" {
         return Err(ivm_err(format!(
@@ -1375,7 +1392,7 @@ mod tests {
         .expect("create");
         assert!(!resp.job_id.is_empty(), "generated id must be non-empty");
 
-        let listed = api_ivm_list_jobs(State(registry), State(coordinator)).await;
+        let listed = api_ivm_list_jobs(State(registry.clone()), State(coordinator.clone())).await;
         assert!(listed.job_ids.contains(&resp.job_id));
     }
 
@@ -1395,7 +1412,7 @@ mod tests {
             .expect("create");
             assert_eq!(resp.job_id, "job-a");
         }
-        let listed = api_ivm_list_jobs(State(registry), State(coordinator)).await;
+        let listed = api_ivm_list_jobs(State(registry.clone()), State(coordinator.clone())).await;
         assert_eq!(
             listed.job_ids.iter().filter(|j| *j == "job-a").count(),
             1,
@@ -1418,7 +1435,7 @@ mod tests {
 
         let second = api_ivm_delete_job(
             State(registry.clone()),
-            State(coordinator),
+            State(coordinator.clone()),
             Path("gone".into()),
         )
         .await;
@@ -1432,8 +1449,8 @@ mod tests {
     async fn register_view_404s_on_missing_job() {
         let (registry, coordinator) = test_deps_with_shards(1);
         let err = api_ivm_register_view(
-            State(registry),
-            State(coordinator),
+            State(registry.clone()),
+            State(coordinator.clone()),
             Path("nope".into()),
             Json(revenue_view_request()),
         )
@@ -1449,8 +1466,8 @@ mod tests {
         let mut req = revenue_view_request();
         req.output_schema.fields[1].data_type = "Decimal999".into();
         let err = api_ivm_register_view(
-            State(registry),
-            State(coordinator),
+            State(registry.clone()),
+            State(coordinator.clone()),
             Path("j".into()),
             Json(req),
         )
@@ -1470,8 +1487,8 @@ mod tests {
         let mut req = revenue_view_request();
         req.output_schema.fields[0].data_type = "Utf8View".into();
         let resp = api_ivm_register_view(
-            State(registry),
-            State(coordinator),
+            State(registry.clone()),
+            State(coordinator.clone()),
             Path("j".into()),
             Json(req),
         )
@@ -1495,8 +1512,8 @@ mod tests {
         assert!(dropped.dropped);
 
         let again = api_ivm_drop_view(
-            State(registry),
-            State(coordinator),
+            State(registry.clone()),
+            State(coordinator.clone()),
             Path(("j".into(), "revenue".into())),
         )
         .await
@@ -1524,8 +1541,8 @@ mod tests {
         assert_eq!(err, StatusCode::BAD_REQUEST);
 
         let err = api_ivm_feed_source(
-            State(registry),
-            State(coordinator),
+            State(registry.clone()),
+            State(coordinator.clone()),
             Path(("j".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: base64::Engine::encode(
@@ -1569,9 +1586,13 @@ mod tests {
         assert_eq!(step.tick, 1);
         assert!(step.total_output_rows > 0);
 
-        let snap = api_ivm_snapshot(State(registry), Path(("j".into(), "revenue".into())))
-            .await
-            .expect("snapshot");
+        let snap = api_ivm_snapshot(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("snapshot");
         assert_eq!(snap.num_rows, 3, "one aggregate row per region");
         let rows = decode_delta_rows(snap.snapshot_ipc_b64.as_deref().unwrap());
         assert_eq!(
@@ -1602,14 +1623,18 @@ mod tests {
 
         let _ = api_ivm_step(
             State(registry.clone()),
-            State(coordinator),
+            State(coordinator.clone()),
             Path("j".into()),
         )
         .await
         .expect("step");
-        let snap = api_ivm_snapshot(State(registry), Path(("j".into(), "revenue".into())))
-            .await
-            .expect("snapshot");
+        let snap = api_ivm_snapshot(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("snapshot");
         assert_eq!(
             decode_delta_rows(snap.snapshot_ipc_b64.as_deref().unwrap()),
             vec![("US".to_owned(), 42.0)]
@@ -1624,6 +1649,7 @@ mod tests {
         let batch = orders(&["US", "EU"], &[7, 3]);
         let _ = api_ivm_stream_bridge(
             State(registry.clone()),
+            State(coordinator.clone()),
             Path(("j".into(), "orders".into())),
             Json(StreamBridgeRequest {
                 snapshot_ipc_b64: ipc_stream_b64(&batch),
@@ -1634,14 +1660,18 @@ mod tests {
 
         let _ = api_ivm_step(
             State(registry.clone()),
-            State(coordinator),
+            State(coordinator.clone()),
             Path("j".into()),
         )
         .await
         .expect("step");
-        let snap = api_ivm_snapshot(State(registry), Path(("j".into(), "revenue".into())))
-            .await
-            .expect("snapshot");
+        let snap = api_ivm_snapshot(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("snapshot");
         assert_eq!(
             decode_delta_rows(snap.snapshot_ipc_b64.as_deref().unwrap()),
             vec![("EU".to_owned(), 3.0), ("US".to_owned(), 7.0)]
@@ -1653,7 +1683,8 @@ mod tests {
         let (registry, coordinator) = test_deps_with_shards(1);
         create_revenue_job(&registry, &coordinator, "j").await;
         let err = api_ivm_stream_bridge(
-            State(registry),
+            State(registry.clone()),
+            State(coordinator.clone()),
             Path(("j".into(), "orders".into())),
             Json(StreamBridgeRequest {
                 snapshot_ipc_b64: base64::Engine::encode(
@@ -1675,16 +1706,20 @@ mod tests {
         create_revenue_job(&registry, &coordinator, "j").await;
         let _ = api_ivm_step(
             State(registry.clone()),
-            State(coordinator),
+            State(coordinator.clone()),
             Path("j".into()),
         )
         .await
         .expect("step");
 
-        let disp = api_ivm_dispatch_state(State(registry), Path("j".into()))
-            .await
-            .expect("dispatch state")
-            .0;
+        let disp = api_ivm_dispatch_state(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("dispatch state")
+        .0;
         assert!(!disp.attached);
         let last = disp.last.expect("a dispatch record must be recorded");
         assert_eq!(last.mode, "central-no-executors");
@@ -1711,25 +1746,33 @@ mod tests {
         .expect("feed");
         let _ = api_ivm_step(
             State(registry.clone()),
-            State(coordinator),
+            State(coordinator.clone()),
             Path("j".into()),
         )
         .await
         .expect("step");
 
-        let disp = api_ivm_dispatch_state(State(registry), Path("j".into()))
-            .await
-            .expect("dispatch state")
-            .0;
+        let disp = api_ivm_dispatch_state(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("dispatch state")
+        .0;
         assert_eq!(disp.last.unwrap().mode, "central-partitioned");
     }
 
     #[tokio::test]
     async fn dispatch_state_404s_on_missing_job() {
-        let (registry, _) = test_deps_with_shards(1);
-        let err = api_ivm_dispatch_state(State(registry), Path("nope".into()))
-            .await
-            .expect_err("must 404");
+        let (registry, coordinator) = test_deps_with_shards(1);
+        let err = api_ivm_dispatch_state(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("nope".into()),
+        )
+        .await
+        .expect_err("must 404");
         assert_eq!(err, StatusCode::NOT_FOUND);
     }
 
@@ -1780,12 +1823,14 @@ mod tests {
 
         let plain_snap = api_ivm_snapshot(
             State(registry.clone()),
+            State(coordinator.clone()),
             Path(("mat-flag".to_string(), "plain".to_string())),
         )
         .await
         .unwrap();
         let mat_snap = api_ivm_snapshot(
             State(registry.clone()),
+            State(coordinator.clone()),
             Path(("mat-flag".to_string(), "mat".to_string())),
         )
         .await
@@ -1809,6 +1854,7 @@ mod tests {
 
         let snap = api_ivm_snapshot(
             State(registry.clone()),
+            State(coordinator.clone()),
             Path(("j".into(), "revenue".into())),
         )
         .await
@@ -1816,9 +1862,13 @@ mod tests {
         assert_eq!(snap.num_rows, 0);
         assert!(snap.snapshot_ipc_b64.is_none());
 
-        let out = api_ivm_view_output(State(registry), Path(("j".into(), "revenue".into())))
-            .await
-            .expect("output");
+        let out = api_ivm_view_output(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("output");
         assert_eq!(out.num_rows, 0);
         assert!(out.delta_ipc_b64.is_none());
     }
@@ -1839,15 +1889,19 @@ mod tests {
         .expect("feed");
         let _ = api_ivm_step(
             State(registry.clone()),
-            State(coordinator),
+            State(coordinator.clone()),
             Path("j".into()),
         )
         .await
         .expect("step");
 
-        let out = api_ivm_view_output(State(registry), Path(("j".into(), "revenue".into())))
-            .await
-            .expect("output");
+        let out = api_ivm_view_output(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("output");
         assert!(out.delta_ipc_b64.is_some());
         assert!(out.num_rows > 0);
     }
@@ -1859,6 +1913,7 @@ mod tests {
 
         let err = api_ivm_view_stats(
             State(registry.clone()),
+            State(coordinator.clone()),
             Path(("j".into(), "no-such-view".into())),
         )
         .await
@@ -1877,15 +1932,19 @@ mod tests {
         .expect("feed");
         let _ = api_ivm_step(
             State(registry.clone()),
-            State(coordinator),
+            State(coordinator.clone()),
             Path("j".into()),
         )
         .await
         .expect("step");
 
-        let stats = api_ivm_view_stats(State(registry), Path(("j".into(), "revenue".into())))
-            .await
-            .expect("stats");
+        let stats = api_ivm_view_stats(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("stats");
         assert_eq!(stats.num_rows, 2);
         assert!(stats.rows_inserted_total >= 2);
         assert!(stats.last_tick_inserts >= 2);
@@ -1908,7 +1967,7 @@ mod tests {
         .expect("feed");
         let _ = api_ivm_step(
             State(registry.clone()),
-            State(coordinator),
+            State(coordinator.clone()),
             Path("j".into()),
         )
         .await
@@ -1916,6 +1975,7 @@ mod tests {
 
         let info = api_ivm_view_debug_info(
             State(registry.clone()),
+            State(coordinator.clone()),
             Path(("j".into(), "revenue".into())),
         )
         .await
@@ -1929,9 +1989,13 @@ mod tests {
             "plan choice must always carry a reason (AUD-9 loud degradation)"
         );
 
-        let err = api_ivm_view_debug_info(State(registry), Path(("j".into(), "ghost".into())))
-            .await
-            .expect_err("unknown view");
+        let err = api_ivm_view_debug_info(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "ghost".into())),
+        )
+        .await
+        .expect_err("unknown view");
         assert_eq!(err, StatusCode::BAD_REQUEST);
     }
 
@@ -1959,10 +2023,14 @@ mod tests {
         .await
         .expect("step 1");
 
-        let ckpt = api_ivm_checkpoint(State(registry.clone()), Path("j".into()))
-            .await
-            .expect("checkpoint")
-            .0;
+        let ckpt = api_ivm_checkpoint(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("checkpoint")
+        .0;
         assert!(!ckpt.checkpoint_b64.is_empty());
 
         // Advance the state past the checkpoint…
@@ -1985,6 +2053,7 @@ mod tests {
         .expect("step 2");
         let advanced = api_ivm_snapshot(
             State(registry.clone()),
+            State(coordinator.clone()),
             Path(("j".into(), "revenue".into())),
         )
         .await
@@ -1997,6 +2066,7 @@ mod tests {
         // …then restore back to the checkpointed state.
         let _ = api_ivm_restore(
             State(registry.clone()),
+            State(coordinator.clone()),
             Path("j".into()),
             Json(RestoreRequest {
                 checkpoint_b64: ckpt.checkpoint_b64,
@@ -2004,9 +2074,13 @@ mod tests {
         )
         .await
         .expect("restore");
-        let restored = api_ivm_snapshot(State(registry), Path(("j".into(), "revenue".into())))
-            .await
-            .expect("snapshot");
+        let restored = api_ivm_snapshot(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("snapshot");
         assert_eq!(
             decode_delta_rows(restored.snapshot_ipc_b64.as_deref().unwrap()),
             vec![("US".to_owned(), 100.0)],
@@ -2030,18 +2104,23 @@ mod tests {
         .expect("feed");
         let _ = api_ivm_step(
             State(registry.clone()),
-            State(coordinator),
+            State(coordinator.clone()),
             Path("j".into()),
         )
         .await
         .expect("step");
 
-        let delta_ckpt = api_ivm_checkpoint_delta(State(registry.clone()), Path("j".into()))
-            .await
-            .expect("checkpoint-delta")
-            .0;
+        let delta_ckpt = api_ivm_checkpoint_delta(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("checkpoint-delta")
+        .0;
         let _ = api_ivm_restore_delta(
-            State(registry),
+            State(registry.clone()),
+            State(coordinator.clone()),
             Path("j".into()),
             Json(RestoreDeltaRequest {
                 checkpoint_delta_b64: delta_ckpt.checkpoint_delta_b64,
@@ -2058,6 +2137,7 @@ mod tests {
 
         let err = api_ivm_restore(
             State(registry.clone()),
+            State(coordinator.clone()),
             Path("j".into()),
             Json(RestoreRequest {
                 checkpoint_b64: "!!!".into(),
@@ -2068,7 +2148,8 @@ mod tests {
         assert_eq!(err, StatusCode::BAD_REQUEST);
 
         let err = api_ivm_restore(
-            State(registry),
+            State(registry.clone()),
+            State(coordinator.clone()),
             Path("j".into()),
             Json(RestoreRequest {
                 checkpoint_b64: base64::Engine::encode(
@@ -2133,18 +2214,202 @@ mod tests {
         .expect("feed after restore");
         let _ = api_ivm_step(
             State(registry.clone()),
-            State(coordinator),
+            State(coordinator.clone()),
             Path("j".into()),
         )
         .await
         .expect("step after restore");
-        let snap = api_ivm_snapshot(State(registry), Path(("j".into(), "revenue".into())))
-            .await
-            .expect("snapshot");
+        let snap = api_ivm_snapshot(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("snapshot");
         assert_eq!(
             decode_delta_rows(snap.snapshot_ipc_b64.as_deref().unwrap()),
             vec![("EU".to_owned(), 50.0), ("US".to_owned(), 100.0)],
             "restored job must keep its pre-eviction materialized state"
+        );
+    }
+
+    /// Build a store-backed coordinator + a job with 100 US revenue already
+    /// stepped and persisted, then evict the registry entry to model a
+    /// coordinator restart / standby failover: the durable snapshot survives,
+    /// the in-memory registry does not.
+    async fn evicted_but_durable_job() -> (SharedIvmJobRegistry, SharedCoordinator) {
+        let (registry, _) = test_deps_with_shards(1);
+        let coordinator = SharedCoordinator::new(
+            Coordinator::active(CoordinatorId::try_new("test-coord").unwrap())
+                .with_store(crate::store::InMemoryMetadataStore::default()),
+        );
+        create_revenue_job(&registry, &coordinator, "j").await;
+        let _ = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(&["US"], &[100])),
+            }),
+        )
+        .await
+        .expect("feed");
+        let _ = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("step persists the snapshot");
+        assert!(registry.delete("j"), "evict the in-memory entry");
+        (registry, coordinator)
+    }
+
+    /// Reads must rehydrate too. Nothing repopulates the registry at startup,
+    /// so a coordinator restart left `/snap`, `/output`, `/stats`,
+    /// `/debug-info` and `/checkpoint` answering 404 for a job whose state was
+    /// sitting in the store — a live table reported as missing — until an
+    /// unrelated `/feed` or `/step` happened to resurrect it. `/stats` is the
+    /// one the platform freshness sampler polls every few seconds.
+    #[tokio::test]
+    async fn read_handlers_rehydrate_an_evicted_job_instead_of_404ing() {
+        let (registry, coordinator) = evicted_but_durable_job().await;
+
+        let stats = api_ivm_view_stats(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("/stats must rehydrate, not 404");
+        assert_eq!(stats.num_rows, 1);
+
+        // Evict again so each handler is proven to rehydrate on its own rather
+        // than riding on the previous one's restore.
+        assert!(registry.delete("j"));
+        let snap = api_ivm_snapshot(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("/snap must rehydrate, not 404");
+        assert_eq!(
+            decode_delta_rows(snap.snapshot_ipc_b64.as_deref().unwrap()),
+            vec![("US".to_owned(), 100.0)],
+            "the rehydrated view must carry its pre-eviction state"
+        );
+
+        assert!(registry.delete("j"));
+        let ckpt = api_ivm_checkpoint(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("/checkpoint — the backup path — must rehydrate, not 404");
+        assert!(!ckpt.checkpoint_b64.is_empty());
+
+        assert!(registry.delete("j"));
+        let info = api_ivm_view_debug_info(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("/debug-info must rehydrate, not 404");
+        assert!(info.has_snapshot);
+
+        assert!(registry.delete("j"));
+        let out = api_ivm_view_output(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("/output must rehydrate, not 404");
+        // 200 with a null delta, not 404: the durable snapshot carries source
+        // and view state, not the last tick's emitted delta, so after a restart
+        // there genuinely is no last output to report. "No delta since the
+        // restart" and "no such job" are different answers and the caller must
+        // be able to tell them apart.
+        assert!(out.delta_ipc_b64.is_none());
+        assert_eq!(out.num_rows, 0);
+    }
+
+    /// A restore that is not persisted is a restore that did not happen. The
+    /// handler changes authoritative state exactly as `register_view`,
+    /// `drop_view` and `step` do, all of which persist; this one answered
+    /// `{"success": true}` and left the store holding the pre-restore
+    /// snapshot, so the next rehydration silently undid the rewind.
+    #[tokio::test]
+    async fn restore_is_durable_without_waiting_for_the_next_step() {
+        let (registry, _) = test_deps_with_shards(1);
+        let coordinator = SharedCoordinator::new(
+            Coordinator::active(CoordinatorId::try_new("test-coord").unwrap())
+                .with_store(crate::store::InMemoryMetadataStore::default()),
+        );
+        create_revenue_job(&registry, &coordinator, "j").await;
+
+        let feed_and_step = async |amount: i64| {
+            let _ = api_ivm_feed_source(
+                State(registry.clone()),
+                State(coordinator.clone()),
+                Path(("j".into(), "orders".into())),
+                Json(FeedSourceRequest {
+                    delta_ipc_b64: delta_b64(orders(&["US"], &[amount])),
+                }),
+            )
+            .await
+            .expect("feed");
+            let _ = api_ivm_step(
+                State(registry.clone()),
+                State(coordinator.clone()),
+                Path("j".into()),
+            )
+            .await
+            .expect("step");
+        };
+
+        feed_and_step(100).await;
+        let ckpt = api_ivm_checkpoint(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("checkpoint")
+        .0;
+
+        // Advance past the checkpoint and persist that advanced state.
+        feed_and_step(900).await;
+
+        let _ = api_ivm_restore(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+            Json(RestoreRequest {
+                checkpoint_b64: ckpt.checkpoint_b64,
+            }),
+        )
+        .await
+        .expect("restore");
+
+        // Restart before any further step. The durable snapshot must already
+        // be the restored one.
+        assert!(registry.delete("j"), "evict the in-memory entry");
+        let snap = api_ivm_snapshot(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("snapshot");
+        assert_eq!(
+            decode_delta_rows(snap.snapshot_ipc_b64.as_deref().unwrap()),
+            vec![("US".to_owned(), 100.0)],
+            "a restore reported successful must survive a restart; the store \
+             still held the pre-restore (advanced) snapshot"
         );
     }
 
@@ -2156,6 +2421,7 @@ mod tests {
 
         let err = api_ivm_register_vector_view(
             State(registry.clone()),
+            State(coordinator.clone()),
             Path("nope".into()),
             Json(RegisterVectorViewRequest {
                 view_name: "v".into(),
@@ -2170,7 +2436,8 @@ mod tests {
 
         create_revenue_job(&registry, &coordinator, "j").await;
         let err = api_ivm_register_vector_view(
-            State(registry),
+            State(registry.clone()),
+            State(coordinator.clone()),
             Path("j".into()),
             Json(RegisterVectorViewRequest {
                 view_name: "v".into(),
@@ -2252,7 +2519,14 @@ mod tests {
         let delete = tokio::spawn({
             let (registry, coordinator, job_id) =
                 (registry.clone(), coordinator.clone(), job_id.clone());
-            async move { api_ivm_delete_job(State(registry), State(coordinator), Path(job_id)).await }
+            async move {
+                api_ivm_delete_job(
+                    State(registry.clone()),
+                    State(coordinator.clone()),
+                    Path(job_id),
+                )
+                .await
+            }
         });
 
         // While the lock is held, deletion must not complete.
