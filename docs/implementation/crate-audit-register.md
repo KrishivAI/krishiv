@@ -554,7 +554,7 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
 
 ---
 
-## 4. krishiv-scheduler — 39 of 78 files read whole (in progress, 2026-08-03)
+## 4. krishiv-scheduler — 40 of 78 files read whole (in progress, 2026-08-03)
 
 Third crate. The largest in the workspace: 51,438 lines. Working down the
 distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198),
@@ -573,11 +573,12 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
 `rpc_drain.rs` (223), `leadership.rs` (71), `http_auth.rs` (224),
 `queryable_state_http.rs` (262), `bounded_window_http.rs` (83),
 `coordinator_daemon.rs` (2,518), `continuous_stream_http.rs` (3,041),
-`sections/placement.rs.inc` (2,281), `ivm_http.rs` (2,273).
-**31,863 of 51,438 lines.**
+`sections/placement.rs.inc` (2,281), `ivm_http.rs` (2,273), `store.rs`
+(1,996).
+**33,859 of 51,438 lines.**
 
-**Remaining, in intended order** (39 files, ~19,580 lines):
-`store.rs` (1,996), `sections/core.rs.inc` (1,772),
+**Remaining, in intended order** (38 files, ~17,580 lines):
+`sections/core.rs.inc` (1,772),
 `sections/chaos_jcp.rs.inc` (1,407), `etcd_metadata.rs` (1,250), `ivm.rs`
 (1,107), `batch_sql.rs` (1,065), `grpc.rs` (1,041), `auth.rs` (1,029), then
 the remaining `sections/*.rs.inc` and the sub-500-line files.
@@ -843,7 +844,54 @@ return at all.* Six of the nine defects below are one of those two.
       view state, not the last tick's emitted delta. That is the true answer;
       the point is that it is distinguishable from "no such job".
 
+- [x] **The bounded events log memmoved its whole buffer on every append**
+      (`cf0163d7`). `InMemoryMetadataStore::evict_until_fits` looped
+      `Vec::remove(0)` until the incoming event fit. `remove(0)` shifts the
+      entire tail, and each append frees roughly its own size, so exactly one
+      removal ran per append once the log was full — the *steady* state for a
+      long-running streaming coordinator, not a rare one. At the 64 MiB cap
+      that is a memmove of ~280k elements (~36 MB) per task-state change.
+      The comment above it claimed "amortized O(1) per appended event because
+      it only fires when the buffer is full", which inverts the truth: full is
+      exactly when it fires on every append. One `drain` now frees a slab
+      (1/8 of the cap). Measured: reverting only the headroom term gives
+      **15,585 eviction passes in 15,585 appends**; with it, ≤32.
+
+      The ring buffer had **no test at all** — `evicted_event_count` and
+      `events_byte_size` are `pub` and documented "for tests and metrics",
+      and nothing read either. Added cap + FIFO coverage.
+
+- [x] **The SC3 stall-tracking tick fields were dead** (`cf0163d7`).
+      `PersistedTaskRecord::assigned_at_tick` / `last_progress_tick` were
+      documented as carrying a stalled task's timeout window across a
+      coordinator restart. `From<&TaskRecord>` hardcoded both to `None`,
+      `TryFrom` ignored them, and no other file in the workspace referenced
+      either name — while two doc comments and two tests asserted the
+      round-trip worked. **The tests passed because they built a
+      `PersistedTaskRecord` by hand and checked serde carried its fields;
+      neither went through the conversions that were broken.** Replaced with
+      one that runs the real path and asserts what must survive (attempt,
+      failure_count, executor_loss_count — the retry budgets) and what must
+      not (stall clocks, launch guard).
+
+      **Removed, not wired**, same disposition as the unreachable
+      `ShuffleMetadata` cap: a tick is meaningless across a restart because
+      the tick clock is rewound, and persisting the wall-clock variant would
+      reintroduce the failure that killed SF100 q5 — a healthy long-running
+      task failed for "no progress" it was in fact making. The heartbeat
+      refresh path is authoritative. If cross-restart stall budgets are ever
+      wanted, persist `last_progress_ms` and keep that path in charge.
+
 ### Recorded, not fixed — needs a decision
+
+- **`MetadataStore` has no `remove_job`.** Events are byte-bounded, history
+  is capped at `MAX_JOB_HISTORY`, executors / continuous snapshots / IVM
+  snapshots all have removers — but `jobs` grows for the life of the
+  process, one full `JobRecord` (specs, stages, every task description) per
+  distinct job id, and the coordinator's own GC eviction never reaches the
+  store. Not fixed here because it is a trait change across four backends
+  (in-memory, JSON file, RocksDB, etcd) plus a GC wiring decision about when
+  a durable job record may be forgotten — a feature, not a defect fix.
 
 - **The JCP never exits when its job is gone.** `run_job_coordinator_daemon`
   treats a 404 from `/federation/v1/jobs/{id}` exactly like a transient
