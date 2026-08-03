@@ -554,7 +554,7 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
 
 ---
 
-## 4. krishiv-scheduler — 42 of 78 files read whole (in progress, 2026-08-03)
+## 4. krishiv-scheduler — 43 of 78 files read whole (in progress, 2026-08-03)
 
 Third crate. The largest in the workspace: 51,438 lines. Working down the
 distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198),
@@ -575,14 +575,13 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
 `coordinator_daemon.rs` (2,518), `continuous_stream_http.rs` (3,041),
 `sections/placement.rs.inc` (2,281), `ivm_http.rs` (2,273), `store.rs`
 (1,996), `sections/core.rs.inc` (1,772), `sections/chaos_jcp.rs.inc`
-(1,407).
-**37,038 of 51,438 lines.**
+(1,407), `sections/prr_parallel.rs.inc` (276).
+**37,314 of 51,438 lines.**
 
-**Remaining, in intended order** (36 files, ~14,400 lines):
+**Remaining, in intended order** (35 files, ~14,120 lines):
 `etcd_metadata.rs` (1,250), `ivm.rs`
 (1,107), `batch_sql.rs` (1,065), `grpc.rs` (1,041), `auth.rs` (1,029), then
-the remaining `sections/*.rs.inc` (start with `prr_parallel.rs.inc` — see
-the note below) and the sub-500-line files.
+the remaining `sections/*.rs.inc` and the sub-500-line files.
 
 **The recurring shape in this crate**: *state removed at the head of a path as
 "consumed by this batch", never restored when the batch turns out to be empty
@@ -932,9 +931,44 @@ return at all.* Six of the nine defects below are one of those two.
       eligibility across assignment/guard/Running, the work summary, the UDF
       budget). **Test count 595 → 530 — that is the point.**
 
+- [x] **The notify test always timed out and discarded the result**
+      (`5caadb7c`). `notify_wakes_on_executor_registration_and_deregistration`
+      registered an executor, *then* built the wait future, then wrote
+      `let _ = timeout(100ms, wait).await`. Tokio's
+      `Notify::notify_waiters()` wakes only waiters **already registered** and
+      stores no permit — unlike `notify_one()`. Every producer in this crate
+      uses `notify_waiters()` and `wait_for_change` consumes it with
+      `notified().await`, so a notification fired before anyone is parked is
+      dropped. The test's own comment asserted the opposite of what the API
+      guarantees; it always timed out and `let _ =` swallowed the
+      `Err(Elapsed)`. Deleting `notify_waiters()` from `register_executor`
+      left it green.
+
+      Rewritten so the waiter parks first, with `tokio::select! { biased; … }`
+      making the ordering deterministic rather than timing-dependent, and split
+      per notifier. Verified: removing that one line fails the registration
+      test after the full timeout and leaves the deregistration test green.
+
+      **Worth carrying forward:** because `notify_waiters()` stores no permit,
+      the coordinator's Notify is a latency optimisation, not a delivery
+      guarantee — a state change landing between a daemon's work pass and its
+      next park is simply missed, and the daemon waits out its timer. That is
+      why the live loops pair the wait with a sleep in `select!`. Do not treat
+      a `notify_waiters()` call as "the daemon will definitely see this".
+
+      Also deleted from that file: two pairs of duplicate tests that only
+      registered an executor and asserted it was registered / its lease bumped
+      (both facts already covered properly in `core.rs.inc`),
+      `real_job_coordinator_extraction` (asserted a string equalled itself),
+      and `MiniSimulationHarness` with its five self-tests — the closed loop
+      recorded below, now closed. Test count 530 → 521.
+
 ### Recorded, not fixed — needs a decision
 
-- **`MiniSimulationHarness` is now a closed loop.** It lives in
+- ~~**`MiniSimulationHarness` is now a closed loop.**~~ **RESOLVED** in
+  `5caadb7c` — deleted with its self-tests.
+
+  Original note kept for the reasoning: **`MiniSimulationHarness` is now a closed loop.** It lives in
   `sections/prr_parallel.rs.inc`, and after the deletion above its only
   remaining consumers are its own self-tests (`richer_simulation_harness_…`,
   `simulation_harness_advanced_failure_modes`, `…_concurrent_partitions`,
