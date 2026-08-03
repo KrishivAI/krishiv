@@ -554,7 +554,7 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
 
 ---
 
-## 4. krishiv-scheduler — 43 of 78 files read whole (in progress, 2026-08-03)
+## 4. krishiv-scheduler — 44 of 78 files read whole (in progress, 2026-08-03)
 
 Third crate. The largest in the workspace: 51,438 lines. Working down the
 distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198),
@@ -575,13 +575,12 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
 `coordinator_daemon.rs` (2,518), `continuous_stream_http.rs` (3,041),
 `sections/placement.rs.inc` (2,281), `ivm_http.rs` (2,273), `store.rs`
 (1,996), `sections/core.rs.inc` (1,772), `sections/chaos_jcp.rs.inc`
-(1,407), `sections/prr_parallel.rs.inc` (276).
-**37,314 of 51,438 lines.**
+(1,407), `sections/prr_parallel.rs.inc` (276), `etcd_metadata.rs` (1,250).
+**38,564 of 51,438 lines.**
 
-**Remaining, in intended order** (35 files, ~14,120 lines):
-`etcd_metadata.rs` (1,250), `ivm.rs`
-(1,107), `batch_sql.rs` (1,065), `grpc.rs` (1,041), `auth.rs` (1,029), then
-the remaining `sections/*.rs.inc` and the sub-500-line files.
+**Remaining, in intended order** (34 files, ~12,870 lines):
+`ivm.rs` (1,107), `batch_sql.rs` (1,065), `grpc.rs` (1,041), `auth.rs`
+(1,029), then the remaining `sections/*.rs.inc` and the sub-500-line files.
 
 **The recurring shape in this crate**: *state removed at the head of a path as
 "consumed by this batch", never restored when the batch turns out to be empty
@@ -963,7 +962,52 @@ return at all.* Six of the nine defects below are one of those two.
       and `MiniSimulationHarness` with its five self-tests — the closed loop
       recorded below, now closed. Test count 530 → 521.
 
+- [x] **The etcd backend's tests never ran anywhere** (`da425ce3`). `etcd` is
+      a non-default feature, so `just test` (`--workspace --lib`, default
+      features) compiles none of `etcd_metadata.rs` and runs not one of its
+      tests. `lint-features` already compiles it with `--features etcd` and
+      its own comment argues the case — *"etcd is a supported metadata
+      backend; lint it like one"* — reasoning never extended from clippy to
+      tests. Instance seven of *fixed where it hurt, then left*.
+
+      Unrun: the regression guards for three production incidents recorded in
+      that file — the unbounded-RPC-under-lock wedge (Phase 58, `/leaderz`
+      dead 10+ min), the dedicated-runtime deadlock, and the IVM snapshot size
+      cliffs. `--features etcd` yields **547 tests against the default 521**.
+      `ci-tiers.md` opens with "the split is a committed decision, not an
+      accident of one cargo flag", and etcd appears nowhere in its exclusions
+      table — so this was exactly that accident. Added `just test-etcd`, wired
+      it into the required CI job, documented it in the required-tier table.
+
+- [x] **The Phase 58 wedge guard did not guard the constant that wedged**
+      (`da425ce3`). Found by checking that the new gate actually catches
+      something: regressing `ETCD_RPC_TIMEOUT` to 24 h (the pre-fix
+      "effectively unbounded" state) left **both** tiers green.
+      `etcd_block_on_bounded_times_out_a_hung_future_instead_of_blocking_forever`
+      passes its *own* 200 ms bound, so it proves the helper honours what it is
+      handed — never that the production entry point hands it anything sane.
+      Added a constant guard pinning `ETCD_RPC_TIMEOUT` (≤30 s, non-zero) and
+      its ordering against `ETCD_REFRESH_TIMEOUT`, with the incident in the
+      failure message. It is a constant guard, not a runtime proof, and says
+      so — same shape as the env-registry default pinning already in this
+      crate.
+
+      **General lesson:** a test that takes the bound as a parameter tests the
+      mechanism, not the policy. When a regression test exists for an incident
+      caused by a *value*, check that the value itself is pinned.
+
 ### Recorded, not fixed — needs a decision
+
+- **`load_prefix` fails the whole load on one bad record.** `connect` /
+  `refresh` return `Err` on the first job, executor, or history value that
+  will not decode, so a single corrupt or schema-incompatible record in etcd
+  fails every coordinator's startup and every standby promotion —
+  cluster-wide. `load_ivm_snapshots`, in the same file, deliberately logs and
+  skips ("so one bad record never blocks the coordinator from loading the
+  rest"). The IVM path learned the lesson; the other three did not. Not fixed
+  here because skip-vs-fail for a *job* record is a durability policy call
+  (silently dropping a job vs refusing to start), not an obvious defect —
+  but the asymmetry is unintended and worth a decision.
 
 - ~~**`MiniSimulationHarness` is now a closed loop.**~~ **RESOLVED** in
   `5caadb7c` — deleted with its self-tests.
