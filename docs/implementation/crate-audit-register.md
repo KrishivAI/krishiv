@@ -554,7 +554,7 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
 
 ---
 
-## 4. krishiv-scheduler — 44 of 78 files read whole (in progress, 2026-08-03)
+## 4. krishiv-scheduler — 45 of 78 files read whole (in progress, 2026-08-03)
 
 Third crate. The largest in the workspace: 51,438 lines. Working down the
 distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198),
@@ -575,11 +575,12 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
 `coordinator_daemon.rs` (2,518), `continuous_stream_http.rs` (3,041),
 `sections/placement.rs.inc` (2,281), `ivm_http.rs` (2,273), `store.rs`
 (1,996), `sections/core.rs.inc` (1,772), `sections/chaos_jcp.rs.inc`
-(1,407), `sections/prr_parallel.rs.inc` (276), `etcd_metadata.rs` (1,250).
-**38,564 of 51,438 lines.**
+(1,407), `sections/prr_parallel.rs.inc` (276), `etcd_metadata.rs` (1,250), `ivm.rs`
+(1,107).
+**39,671 of 51,438 lines.**
 
-**Remaining, in intended order** (34 files, ~12,870 lines):
-`ivm.rs` (1,107), `batch_sql.rs` (1,065), `grpc.rs` (1,041), `auth.rs`
+**Remaining, in intended order** (33 files, ~11,770 lines):
+`batch_sql.rs` (1,065), `grpc.rs` (1,041), `auth.rs`
 (1,029), then the remaining `sections/*.rs.inc` and the sub-500-line files.
 
 **The recurring shape in this crate**: *state removed at the head of a path as
@@ -995,6 +996,29 @@ return at all.* Six of the nine defects below are one of those two.
       **General lesson:** a test that takes the bound as a parameter tests the
       mechanism, not the policy. When a regression test exists for an incident
       caused by a *value*, check that the value itself is pinned.
+
+- [x] **The single-flow pin did not survive rehydration** (`ab4a48d4`).
+      `create_unpartitioned` pins a job to a single flow so a view-DAG can
+      cascade off it; the pin lived only in the process-local `pinned_single`
+      set, and neither `durable_snapshot` nor `restore_durable_snapshot`
+      carried it. `shape` cannot stand in: `api_ivm_create_job` persists at
+      create time, so a `partitioned: false` job reaches the store as
+      `Single` with **no views** — byte-identical to an ordinary job that has
+      not registered one yet. After a restart the first `GROUP BY` view
+      auto-partitions a job that explicitly asked to stay single, and the
+      composition is silently impossible.
+
+      **Self-inflicted reachability:** `d51c3f83` (this session) taught ten
+      more handlers to rehydrate, so far more paths now reach
+      `restore_durable_snapshot` before a view exists. Worth remembering that
+      widening a recovery path can promote a latent bug to a live one.
+
+      Persisted with `serde(default)` under an **unchanged version 1** —
+      deliberately not a bump, because `restore_durable_snapshot` rejects
+      unrecognised versions and a bump would make every already-persisted IVM
+      job unloadable on upgrade. Three tests: the pin survives; an ordinary
+      job still auto-partitions (so the fix is not "pin everything"); a
+      field-stripped snapshot still loads.
 
 ### Recorded, not fixed — needs a decision
 
