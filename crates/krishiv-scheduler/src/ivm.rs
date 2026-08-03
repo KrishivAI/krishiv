@@ -53,6 +53,23 @@ struct PersistedIvmJob {
     shape: PersistedIvmShape,
     views: Vec<PersistedIvmViewSpec>,
     checkpoint_full: Vec<u8>,
+    /// Whether the job was created pinned to a single flow
+    /// ([`IvmJobRegistry::create_unpartitioned`]).
+    ///
+    /// `shape` alone cannot carry this. A job created unpartitioned but with no
+    /// views yet persists as `Single` — indistinguishable from an ordinary job
+    /// that simply has not registered a view. Rehydrate that without the pin
+    /// and the client's first `GROUP BY` view auto-partitions a job it
+    /// explicitly asked to keep single, silently breaking the view-DAG
+    /// composition the pin exists for.
+    ///
+    /// Added under **version 1 with `serde(default)`**, deliberately not a
+    /// version bump: `restore_durable_snapshot` rejects any version it does not
+    /// recognise, so bumping would make every already-persisted IVM job
+    /// unloadable on upgrade. Old snapshots default to `false`, which is
+    /// exactly the behaviour they have today.
+    #[serde(default)]
+    pinned_single: bool,
 }
 
 /// A coordinator-hosted IVM job: a single flow, or one auto-partitioned by key.
@@ -567,6 +584,11 @@ impl IvmJobRegistry {
             shape,
             views,
             checkpoint_full: job.checkpoint_full()?,
+            pinned_single: self
+                .pinned_single
+                .lock()
+                .map(|p| p.contains(job_id))
+                .unwrap_or(false),
         };
         serde_json::to_vec(&persisted).map_err(|e| IvmError::execution(e.to_string()))
     }
@@ -604,6 +626,14 @@ impl IvmJobRegistry {
             .lock()
             .map_err(|_| IvmError::execution("registry lock poisoned"))?
             .insert(job_id.to_owned(), job);
+        // Restore the single-flow pin before the job becomes visible for view
+        // registration; without it a rehydrated view-DAG job auto-partitions on
+        // its first GROUP BY view.
+        if persisted.pinned_single
+            && let Ok(mut pinned) = self.pinned_single.lock()
+        {
+            pinned.insert(job_id.to_owned());
+        }
         self.update_dispatch(job_id, |dispatch| *dispatch = IvmDispatchState::default());
         Ok(())
     }
@@ -817,6 +847,88 @@ mod tests {
                 .num_rows(),
             3
         );
+    }
+
+    /// The single-flow pin must survive rehydration.
+    ///
+    /// `api_ivm_create_job` persists immediately at create time, so a job
+    /// created with `partitioned: false` reaches the store as `shape: Single`
+    /// with **no views** — indistinguishable from an ordinary job that has not
+    /// registered one yet. Nothing repopulates the IVM registry at startup, so
+    /// after a coordinator restart the client's first `GROUP BY` view lands on
+    /// a rehydrated job whose pin was lost, and auto-partitions a job that
+    /// explicitly asked to stay single. The composition it was pinned for — a
+    /// derived view reading the base view's full output — is then impossible,
+    /// with no error anywhere.
+    #[tokio::test]
+    async fn a_pinned_single_job_keeps_its_pin_across_a_durable_round_trip() {
+        let reg = IvmJobRegistry::with_default_shards(3);
+        reg.create_unpartitioned("dag".into()).unwrap();
+        // Snapshot taken before any view exists — what api_ivm_create_job does.
+        let snapshot = reg.durable_snapshot("dag").unwrap();
+
+        // A fresh process rehydrates it, then the client registers its first
+        // view, which is shardable.
+        let restored = IvmJobRegistry::with_default_shards(3);
+        restored.restore_durable_snapshot("dag", &snapshot).unwrap();
+        restored.register_view("dag", revenue_spec()).unwrap();
+
+        assert!(
+            matches!(restored.get("dag").unwrap(), IvmJob::Single(_)),
+            "a job created unpartitioned must still be unpartitioned after \
+             rehydration; auto-partitioning it here silently breaks the \
+             view-DAG cascade the pin exists to protect"
+        );
+    }
+
+    /// The counterweight: restoring must not pin *everything*. An ordinary job
+    /// round-tripped the same way must still auto-partition on a shardable
+    /// first view, or the fix above has simply disabled partitioning.
+    #[tokio::test]
+    async fn an_ordinary_job_still_auto_partitions_after_a_durable_round_trip() {
+        let reg = IvmJobRegistry::with_default_shards(3);
+        reg.create("plain".into()).unwrap();
+        let snapshot = reg.durable_snapshot("plain").unwrap();
+
+        let restored = IvmJobRegistry::with_default_shards(3);
+        restored
+            .restore_durable_snapshot("plain", &snapshot)
+            .unwrap();
+        restored.register_view("plain", revenue_spec()).unwrap();
+
+        assert!(
+            restored.get("plain").unwrap().is_partitioned(),
+            "an unpinned job must still auto-partition after rehydration"
+        );
+    }
+
+    /// A snapshot written before the pin field existed must still load — the
+    /// field is `serde(default)` under an unchanged version precisely so
+    /// `restore_durable_snapshot`'s version check does not reject every
+    /// already-persisted job on upgrade.
+    #[tokio::test]
+    async fn a_snapshot_without_the_pin_field_still_restores() {
+        let reg = IvmJobRegistry::with_default_shards(3);
+        reg.create("legacy".into()).unwrap();
+        let snapshot = reg.durable_snapshot("legacy").unwrap();
+
+        // Strip the field, exactly as a pre-upgrade writer would have left it.
+        let mut value: serde_json::Value = serde_json::from_slice(&snapshot).unwrap();
+        assert!(
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("pinned_single")
+                .is_some(),
+            "precondition: the field is present in a current snapshot"
+        );
+        let legacy_bytes = serde_json::to_vec(&value).unwrap();
+
+        let restored = IvmJobRegistry::with_default_shards(3);
+        restored
+            .restore_durable_snapshot("legacy", &legacy_bytes)
+            .expect("a snapshot without the pin field must still load");
+        assert!(restored.get("legacy").is_some());
     }
 
     // ── shard-count policy (escape hatch) ─────────────────────────────────────
