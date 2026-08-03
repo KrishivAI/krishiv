@@ -1399,7 +1399,6 @@ mod fair_scheduler_tests {
         );
     }
 
-
     /// Kahn's algorithm counts in-degree from the upstream LIST but drains it
     /// once per processed upstream STAGE. A repeated edge therefore inflated the
     /// count past anything the drain could reach, and an ordinary DAG was
@@ -1413,14 +1412,19 @@ mod fair_scheduler_tests {
             JobKind::Batch,
         )
         .with_stage(
-            StageSpec::new(upstream.clone(), "up")
-                .with_task(TaskSpec::new(TaskId::try_new("t0").expect("task id"), "body")),
+            StageSpec::new(upstream.clone(), "up").with_task(TaskSpec::new(
+                TaskId::try_new("t0").expect("task id"),
+                "body",
+            )),
         )
         .with_stage(
             StageSpec::new(StageId::try_new("down").expect("stage id"), "down")
                 .with_upstream_stage(upstream.clone())
                 .with_upstream_stage(upstream)
-                .with_task(TaskSpec::new(TaskId::try_new("t1").expect("task id"), "body")),
+                .with_task(TaskSpec::new(
+                    TaskId::try_new("t1").expect("task id"),
+                    "body",
+                )),
         );
         assert!(
             validate_job(&spec).is_ok(),
@@ -1443,17 +1447,22 @@ mod fair_scheduler_tests {
             JobKind::Batch,
         )
         .with_stage(
-            StageSpec::new(dup.clone(), "first")
-                .with_task(TaskSpec::new(TaskId::try_new("t0").expect("task id"), "body")),
+            StageSpec::new(dup.clone(), "first").with_task(TaskSpec::new(
+                TaskId::try_new("t0").expect("task id"),
+                "body",
+            )),
         )
-        .with_stage(
-            StageSpec::new(dup, "second")
-                .with_task(TaskSpec::new(TaskId::try_new("t1").expect("task id"), "body")),
-        )
+        .with_stage(StageSpec::new(dup, "second").with_task(TaskSpec::new(
+            TaskId::try_new("t1").expect("task id"),
+            "body",
+        )))
         .with_stage(
             StageSpec::new(StageId::try_new("down").expect("stage id"), "down")
                 .with_upstream_stage(StageId::try_new("same").expect("stage id"))
-                .with_task(TaskSpec::new(TaskId::try_new("t2").expect("task id"), "body")),
+                .with_task(TaskSpec::new(
+                    TaskId::try_new("t2").expect("task id"),
+                    "body",
+                )),
         );
         let error = validate_job(&spec).expect_err("duplicate stage ids must be rejected");
         let message = error.to_string();
@@ -1480,12 +1489,18 @@ mod fair_scheduler_tests {
         .with_stage(
             StageSpec::new(a.clone(), "a")
                 .with_upstream_stage(b.clone())
-                .with_task(TaskSpec::new(TaskId::try_new("t0").expect("task id"), "body")),
+                .with_task(TaskSpec::new(
+                    TaskId::try_new("t0").expect("task id"),
+                    "body",
+                )),
         )
         .with_stage(
             StageSpec::new(b, "b")
                 .with_upstream_stage(a)
-                .with_task(TaskSpec::new(TaskId::try_new("t1").expect("task id"), "body")),
+                .with_task(TaskSpec::new(
+                    TaskId::try_new("t1").expect("task id"),
+                    "body",
+                )),
         );
         assert!(validate_job(&spec).is_err(), "a -> b -> a is a real cycle");
     }

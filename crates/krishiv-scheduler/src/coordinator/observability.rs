@@ -272,12 +272,10 @@ mod tests {
         coordinator
             .submit_job(
                 JobSpec::new(job_id.clone(), "dag", JobKind::Batch)
-                    .with_stage(
-                        StageSpec::new(up.clone(), "map").with_task(TaskSpec::new(
-                            TaskId::try_new("m0").unwrap(),
-                            "sql: select 1",
-                        )),
-                    )
+                    .with_stage(StageSpec::new(up.clone(), "map").with_task(TaskSpec::new(
+                        TaskId::try_new("m0").unwrap(),
+                        "sql: select 1",
+                    )))
                     .with_stage(
                         StageSpec::new(down, "reduce")
                             .with_upstream_stage(up)

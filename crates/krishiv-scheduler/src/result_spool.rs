@@ -420,10 +420,10 @@ mod tests {
 
         // One real chunk (so the file is created), then a stream that never
         // yields again — the shape of a producer that stops mid-transfer.
-        let stalling = futures::stream::once(async { Ok(TaskResultChunk::new(ids(), vec![7; 64])) })
-            .chain(futures::stream::pending());
-        let receive =
-            receive_task_result_spool_in(dir.path().to_path_buf(), Box::pin(stalling));
+        let stalling =
+            futures::stream::once(async { Ok(TaskResultChunk::new(ids(), vec![7; 64])) })
+                .chain(futures::stream::pending());
+        let receive = receive_task_result_spool_in(dir.path().to_path_buf(), Box::pin(stalling));
 
         let timed_out = tokio::time::timeout(std::time::Duration::from_millis(150), receive).await;
         assert!(timed_out.is_err(), "the stalled receive must not complete");
@@ -611,7 +611,9 @@ mod declared_default_guard {
             "KRISHIV_RESULT_SPOOL_MAX_BYTES: docs and code disagree"
         );
         assert_eq!(
-            krishiv_common::env_registry::declared_default_number("KRISHIV_RESULT_SPOOL_SYNC_INTERVAL_BYTES"),
+            krishiv_common::env_registry::declared_default_number(
+                "KRISHIV_RESULT_SPOOL_SYNC_INTERVAL_BYTES"
+            ),
             Some(super::DEFAULT_RESULT_SPOOL_SYNC_INTERVAL_BYTES),
             "KRISHIV_RESULT_SPOOL_SYNC_INTERVAL_BYTES: docs and code disagree"
         );

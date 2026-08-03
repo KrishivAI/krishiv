@@ -492,10 +492,11 @@ impl Coordinator {
         if terminal_state == TaskState::Failed && missing_partitions.is_empty() {
             let threshold = self.config.circuit_breaker_failure_threshold();
             let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
-            let exceeded =
-                self.exec
-                    .executors
-                    .record_task_failure(&executor_id_for_circuit, threshold, now_ms);
+            let exceeded = self.exec.executors.record_task_failure(
+                &executor_id_for_circuit,
+                threshold,
+                now_ms,
+            );
             if exceeded {
                 tracing::warn!(
                     executor_id = %executor_id_for_circuit,
@@ -1239,9 +1240,7 @@ fn job_gc_grace() -> std::time::Duration {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(std::time::Duration::from_secs)
-        .unwrap_or_else(|| {
-            std::time::Duration::from_secs(super::DEFAULT_JOB_GC_GRACE_SECS)
-        })
+        .unwrap_or_else(|| std::time::Duration::from_secs(super::DEFAULT_JOB_GC_GRACE_SECS))
 }
 
 #[cfg(test)]

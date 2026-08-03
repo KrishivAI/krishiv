@@ -133,7 +133,10 @@ pub async fn api_batch_sql_submit(
     })?;
     let key = job_id.as_str().to_owned();
     let response_id = key.clone();
-    PLANNING.insert(key.clone(), (Planning::InProgress, std::time::Instant::now()));
+    PLANNING.insert(
+        key.clone(),
+        (Planning::InProgress, std::time::Instant::now()),
+    );
 
     tokio::spawn(async move {
         let started = std::time::Instant::now();
@@ -187,12 +190,17 @@ pub async fn api_batch_sql_submit(
                     error = ?e,
                     "batch SQL planning failed"
                 );
-                PLANNING.insert(key, (Planning::Failed(e.to_string()), std::time::Instant::now()));
+                PLANNING.insert(
+                    key,
+                    (Planning::Failed(e.to_string()), std::time::Instant::now()),
+                );
             }
         }
     });
 
-    Ok(Json(BatchSqlSubmitResponse { job_id: response_id }))
+    Ok(Json(BatchSqlSubmitResponse {
+        job_id: response_id,
+    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -431,12 +439,16 @@ mod planning_tests {
     fn abandoned_planning_entries_are_pruned_by_age() {
         let fresh = key("prune-fresh");
         let stale = key("prune-stale");
-        PLANNING.insert(fresh.clone(), (Planning::InProgress, std::time::Instant::now()));
+        PLANNING.insert(
+            fresh.clone(),
+            (Planning::InProgress, std::time::Instant::now()),
+        );
         PLANNING.insert(
             stale.clone(),
             (
                 Planning::Failed("old".into()),
-                std::time::Instant::now() - (PLANNING_ENTRY_TTL + std::time::Duration::from_secs(1)),
+                std::time::Instant::now()
+                    - (PLANNING_ENTRY_TTL + std::time::Duration::from_secs(1)),
             ),
         );
 

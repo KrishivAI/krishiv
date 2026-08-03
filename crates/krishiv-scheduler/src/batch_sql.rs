@@ -463,9 +463,8 @@ async fn submit_batch_sql_job_inner(
             // planner falls back to the local machine.
             let cluster = {
                 let total_slots = coordinator.read().await.total_schedulable_slots();
-                (total_slots > 0).then_some(
-                    krishiv_sql::distributed_plan::ClusterCapacity { total_slots },
-                )
+                (total_slots > 0)
+                    .then_some(krishiv_sql::distributed_plan::ClusterCapacity { total_slots })
             };
             crate::distributed_batch::plan_staged_batch_stages(query, path_tables, cluster).await
         } else {

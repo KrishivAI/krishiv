@@ -990,7 +990,6 @@ fn status_from_wire_error(error: wire::WireError) -> tonic::Status {
     tonic::Status::invalid_argument(error.to_string())
 }
 
-
 pub(crate) fn status_from_scheduler_error(error: SchedulerError) -> tonic::Status {
     match error {
         SchedulerError::InactiveCoordinator { .. } => {

@@ -1415,13 +1415,11 @@ async fn launch_run_loop_job(
                             "run-loop job {job_id} subtask {index} has no executor                              (register more executors and retry)"
                         )));
                     };
-                    let endpoint = coord
-                        .find_executor_endpoint(&executor_id)
-                        .ok_or_else(|| {
-                            ContinuousStreamError::Unavailable(format!(
-                                "run-loop job {job_id}: executor {executor_id} has no task endpoint"
-                            ))
-                        })?;
+                    let endpoint = coord.find_executor_endpoint(&executor_id).ok_or_else(|| {
+                        ContinuousStreamError::Unavailable(format!(
+                            "run-loop job {job_id}: executor {executor_id} has no task endpoint"
+                        ))
+                    })?;
                     peers.push((index, task.task_id().as_str().to_owned(), endpoint));
                 }
             }

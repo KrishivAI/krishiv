@@ -98,10 +98,7 @@ pub async fn plan_staged_batch_stages_verbose(
     let mut specs: Vec<ParquetTableSpec> = Vec::with_capacity(tables.len());
     for table in tables {
         let Some(text) = table.path.to_str() else {
-            return Err(format!(
-                "table '{}' has a non-UTF-8 path",
-                table.table_name
-            ));
+            return Err(format!("table '{}' has a non-UTF-8 path", table.table_name));
         };
         specs.push(
             ParquetTableSpec::new(&table.table_name, text)
