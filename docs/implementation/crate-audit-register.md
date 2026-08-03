@@ -554,7 +554,7 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
 
 ---
 
-## 4. krishiv-scheduler — 35 of 78 files read whole (in progress, 2026-08-03)
+## 4. krishiv-scheduler — 36 of 78 files read whole (in progress, 2026-08-03)
 
 Third crate. The largest in the workspace: 51,438 lines. Working down the
 distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198),
@@ -571,18 +571,11 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
 `job_coordinator.rs` (419), `adaptive.rs` (101), `error.rs` (189),
 `coordinator/heartbeat_mapping.rs` (87), `barrier_tracker.rs` (108),
 `rpc_drain.rs` (223), `leadership.rs` (71), `http_auth.rs` (224),
-`queryable_state_http.rs` (262), `bounded_window_http.rs` (83).
-**21,750 of 51,438 lines.**
+`queryable_state_http.rs` (262), `bounded_window_http.rs` (83),
+`coordinator_daemon.rs` (2,518). **24,268 of 51,438 lines.**
 
-**Partially read**: `coordinator_daemon.rs` — lines 1–840 (config/store
-selection, CCP run loop, sidecar spawn, `coordinator_http_router`, the live
-job/stage views). The routing and auth surface is fully checked (see the
-SEC-1 entry below); the remaining ~1,700 lines (handlers, arg parsing,
-standalone/job-coordinator entry points, tests) are **not** read. Do not
-count this file complete.
-
-**Remaining, in intended order** (43 files, ~29,700 lines):
-`continuous_stream_http.rs` (3,041), `coordinator_daemon.rs` (2,518, partial),
+**Remaining, in intended order** (42 files, ~27,200 lines):
+`continuous_stream_http.rs` (3,041),
 `sections/placement.rs.inc` (2,281), `ivm_http.rs` (2,273), `store.rs`
 (1,996), `sections/core.rs.inc` (1,772), `sections/chaos_jcp.rs.inc`
 (1,407), `etcd_metadata.rs` (1,250), `ivm.rs` (1,107), `batch_sql.rs`
@@ -729,7 +722,58 @@ return at all.* Six of the nine defects below are one of those two.
       rather than retrying), fixed because it is the same two-implementations
       shape as the entry above.
 
+- [x] **`KRISHIV_JCP_POLL_INTERVAL_SECS=0` busy-polls the coordinator**
+      (`2d3f4582`). `--poll-interval-secs` clamped with `.max(1)`; its env twin
+      did not. `run_job_coordinator_daemon`'s watch loop has no delay other
+      than this interval, so zero turns the status poll into an unbounded
+      request flood against the CCP's HTTP surface — the same surface that
+      serves `/readyz`, so one misconfigured JCP pod degrades the
+      coordinator's Kubernetes probes cluster-wide. The env path is the one
+      Kubernetes actually takes (the operator sets env, not argv), so the
+      *unvalidated* path was the deployed one. Both now route through
+      `jcp_poll_interval`.
+
+- [x] **Circuit-breaker reset reported success for an unknown executor**
+      (`2d3f4582`). `ExecutorRegistry::reset_task_failures` no-ops silently on
+      an unknown id and `api_executor_reset` answered `{"reset": true}`
+      regardless. An operator calls that endpoint precisely because an
+      executor is pinned at the failure threshold and is being skipped for
+      assignment; a typo'd or already-removed id reported the one signal they
+      have as "fixed" while the cluster stayed degraded. Now 404 +
+      `reset: false`; `reset_task_failures` returns bool so the distinction
+      exists. Same shape as the cancel 404-vs-409 bug already fixed in this
+      file — the sibling test only ever reset an executor that exists, which
+      is why the false success survived.
+
+- [x] **JCP help text named a port nothing serves** (`2d3f4582`). It
+      advertised `http://127.0.0.1:2002` — the *daemon's* default HTTP port —
+      while the code defaults to 18080, the port `krishiv local start`
+      publishes and `docs/running-examples.md` uses.
+
+- [x] **The crate was failing CI's fmt gate** (`033d3f38`). `cargo fmt
+      --check` reported 21 diffs across 10 files, and
+      `.github/workflows/ci.yml` runs `just fmt` (a workspace-wide
+      `cargo fmt --check`) — so main was red on that job. Four of the ten
+      (`job_lifecycle.rs`, `observability.rs`, `job/scheduler.rs`,
+      `result_spool.rs`) were introduced by this audit session; six predate
+      it. Committed separately from the fixes so the audit diff stays
+      reviewable. **Run `cargo fmt -p krishiv-scheduler` before each audit
+      commit.**
+
 ### Recorded, not fixed — needs a decision
+
+- **The JCP never exits when its job is gone.** `run_job_coordinator_daemon`
+  treats a 404 from `/federation/v1/jobs/{id}` exactly like a transient
+  network error: log a warning, sleep, retry, forever. Terminal states are the
+  only exit. So a JCP pod that restarts *after* its job finished — or whose
+  job has aged past the 30 s `KRISHIV_JOB_GC_GRACE_SECS` window and been
+  evicted, or been dropped by the `MAX_GC_JOBS` cap — polls a job that will
+  never come back and the Kubernetes Job never completes. Not fixed because
+  the threshold is a judgement call and 404 is genuinely ambiguous: a CCP that
+  has just failed over and not yet finished `recover_from_store` also answers
+  404 for a job that is alive. Wants either a bounded consecutive-404 budget
+  distinct from the transient-error path, or a CCP response that distinguishes
+  "never heard of this job" from "not ready yet".
 
 - **`advance_heartbeat_clock` does not `release_workers` on eviction.** The
   heartbeat-timeout path inlines `mark_executor_lost`'s cleanup (its comments
