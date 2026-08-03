@@ -18,6 +18,30 @@ fn standby_coordinator_rejects_savepoint_mutation() {
     assert!(matches!(error, SchedulerError::InactiveCoordinator { .. }));
 }
 
+/// The sibling of the test above, for the mutation that did not have the
+/// guard. `CoordinatorManagement::restore_job` has two branches:
+/// `activate_job_restore_from_checkpoint_with_fencing` calls `ensure_active`,
+/// `restore_job_from_savepoint` did not — so a standby accepted a savepoint
+/// restore, copied the epoch back into the active chain, and the handler then
+/// did `checkpoint_inner.replace_data_from(&coordinator.ckpt)`, replacing the
+/// shard's checkpoint state on a non-leader. The fencing token does not cover
+/// this: it guards storage against a stale *leader*, and on a standby it falls
+/// back to the job's own coordinator token and proceeds.
+#[test]
+fn standby_coordinator_rejects_savepoint_restore() {
+    let mut coordinator = Coordinator::standby(CoordinatorId::try_new("coord-standby-restore").unwrap());
+    let job_id = JobId::try_new("job-standby-restore").unwrap();
+
+    let error = coordinator
+        .restore_job_from_savepoint(&job_id, 1, "/tmp/does-not-matter", None)
+        .unwrap_err();
+
+    assert!(
+        matches!(error, SchedulerError::InactiveCoordinator { .. }),
+        "a standby must refuse to rewrite a job's checkpoint chain, got {error:?}"
+    );
+}
+
 #[test]
 fn executor_registry_accepts_registration_and_heartbeat() {
     let executor_id = ExecutorId::try_new("exec-1").unwrap();

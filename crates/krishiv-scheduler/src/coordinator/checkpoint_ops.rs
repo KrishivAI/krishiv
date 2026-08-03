@@ -292,6 +292,20 @@ impl Coordinator {
         storage_path: &str,
         leader_fencing_token: Option<u64>,
     ) -> SchedulerResult<CheckpointMetadata> {
+        // Only the leader may rewrite a job's checkpoint chain. Every sibling
+        // mutation has this — `savepoint_job` (and `stop_job_with_savepoint`
+        // through it), and `activate_job_restore_from_checkpoint_with_fencing`,
+        // which is the *other branch of the same gRPC handler*. This one did
+        // not, so `CoordinatorManagement::restore_job` with `from_savepoint`
+        // was accepted on a standby: it copies the savepoint epoch back into
+        // the active chain and the caller then does
+        // `checkpoint_inner.replace_data_from(&coordinator.ckpt)` — a full
+        // replace of the shard's checkpoint state on a non-leader.
+        //
+        // The fencing token is not a substitute: it guards storage against a
+        // stale *leader*, and on a standby it falls back to the job's own
+        // coordinator token and proceeds.
+        self.ensure_active()?;
         let storage = Self::open_checkpoint_storage(storage_path)?;
         let current_token = leader_fencing_token
             .or_else(|| {

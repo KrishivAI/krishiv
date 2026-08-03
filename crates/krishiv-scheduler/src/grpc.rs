@@ -42,7 +42,9 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<RegisterExecutorRequest>,
     ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status> {
-        // GAP-CP-08: Extract auth context for every handler.
+        // GAP-CP-08: extract auth context for every handler. The server-level
+        // interceptor only enforces Role::Reader, so this Writer check is the
+        // sole authorization gate on a mutating RPC — not defence in depth.
         let auth = extract_auth_context(request.metadata());
         validate_grpc_writer(&auth)?;
         tracing::debug!(subject = %auth.subject(), "register_executor");
@@ -88,7 +90,9 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<DeregisterExecutorRequest>,
     ) -> Result<tonic::Response<DeregisterExecutorResponse>, tonic::Status> {
-        // defense-in-depth: redundant when server-level interceptor is active
+        // NOT redundant with the server-level interceptor: that only
+        // enforces Role::Reader (`auth_interceptor` -> `validate_grpc_auth`).
+        // This is the sole enforcement of Role::Writer on a mutating RPC.
         let auth = extract_auth_context(request.metadata());
         validate_grpc_writer(&auth)?;
         tracing::debug!(subject = %auth.subject(), "deregister_executor");
@@ -130,7 +134,9 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<ExecutorHeartbeatRequest>,
     ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
-        // defense-in-depth: redundant when server-level interceptor is active
+        // NOT redundant with the server-level interceptor: that only
+        // enforces Role::Reader (`auth_interceptor` -> `validate_grpc_auth`).
+        // This is the sole enforcement of Role::Writer on a mutating RPC.
         let auth = extract_auth_context(request.metadata());
         validate_grpc_writer(&auth)?;
         tracing::debug!(subject = %auth.subject(), "executor_heartbeat");
@@ -162,7 +168,9 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<krishiv_proto::services::TaskResultChunkStream>,
     ) -> Result<tonic::Response<krishiv_proto::PushTaskResultResponse>, tonic::Status> {
-        // defense-in-depth: redundant when server-level interceptor is active
+        // NOT redundant with the server-level interceptor: that only
+        // enforces Role::Reader (`auth_interceptor` -> `validate_grpc_auth`).
+        // This is the sole enforcement of Role::Writer on a mutating RPC.
         let auth = extract_auth_context(request.metadata());
         validate_grpc_writer(&auth)?;
         tracing::debug!(subject = %auth.subject(), "push_task_result");
@@ -192,7 +200,9 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<TaskStatusRequest>,
     ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
-        // defense-in-depth: redundant when server-level interceptor is active
+        // NOT redundant with the server-level interceptor: that only
+        // enforces Role::Reader (`auth_interceptor` -> `validate_grpc_auth`).
+        // This is the sole enforcement of Role::Writer on a mutating RPC.
         let auth = extract_auth_context(request.metadata());
         validate_grpc_writer(&auth)?;
         tracing::debug!(subject = %auth.subject(), "task_status");
@@ -285,7 +295,9 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<CheckpointAckRequest>,
     ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
-        // defense-in-depth: redundant when server-level interceptor is active
+        // NOT redundant with the server-level interceptor: that only
+        // enforces Role::Reader (`auth_interceptor` -> `validate_grpc_auth`).
+        // This is the sole enforcement of Role::Writer on a mutating RPC.
         let auth = extract_auth_context(request.metadata());
         validate_grpc_writer(&auth)?;
         tracing::debug!(subject = %auth.subject(), "checkpoint_ack");

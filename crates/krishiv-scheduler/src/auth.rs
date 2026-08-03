@@ -438,14 +438,35 @@ pub enum GrpcAuthSetupError {
 /// control-plane RPCs.  Set `KRISHIV_PRODUCTION=0` AND keep the default
 /// `dev-local` profile to allow anonymous access for local development.
 pub fn set_allow_anonymous() -> Result<(), GrpcAuthSetupError> {
-    if krishiv_common::is_production_mode() {
-        return Err(GrpcAuthSetupError::AnonymousForbiddenInProduction);
-    }
-    let profile = krishiv_common::resolve_durability_profile();
-    if krishiv_common::requires_http_auth(profile) {
-        return Err(GrpcAuthSetupError::AnonymousForbiddenInProduction);
-    }
+    anonymous_allowed_for(
+        krishiv_common::is_production_mode(),
+        krishiv_common::resolve_durability_profile(),
+    )?;
     set_allow_anonymous_when(true)
+}
+
+/// The SEC-7 policy itself, without the environment lookups: anonymous gRPC is
+/// permitted only outside production mode **and** only on the `dev-local`
+/// profile.
+///
+/// Split out so the decision is testable, the same way `resolve_ivm_shards` is
+/// split from `default_ivm_shards`. It had no real coverage: the only test that
+/// named it, `set_allow_anonymous_rejected_in_production_mode`, called
+/// `set_allow_anonymous_when(false)` — which returns `Err` on its first line
+/// without consulting production mode or the profile at all. Both guards could
+/// have been deleted and every test stayed green.
+///
+/// Equivalent to the previous `is_production_mode() || requires_http_auth(p)`
+/// pair: `requires_http_auth` is `p != DevLocal || is_production_mode()`, so the
+/// second guard already subsumed the first.
+fn anonymous_allowed_for(
+    production_mode: bool,
+    profile: krishiv_common::DurabilityProfile,
+) -> Result<(), GrpcAuthSetupError> {
+    if production_mode || profile != krishiv_common::DurabilityProfile::DevLocal {
+        return Err(GrpcAuthSetupError::AnonymousForbiddenInProduction);
+    }
+    Ok(())
 }
 
 fn set_allow_anonymous_when(allowed: bool) -> Result<(), GrpcAuthSetupError> {
@@ -1019,11 +1040,40 @@ mod tests {
     }
 
     #[test]
-    fn set_allow_anonymous_rejected_in_production_mode() {
+    fn set_allow_anonymous_when_false_is_always_an_error() {
+        // Renamed: this asserts the trivial guard on `set_allow_anonymous_when`
+        // and nothing about production mode — the policy it used to claim to
+        // cover is exercised by the matrix below.
         let result = set_allow_anonymous_when(false);
         assert!(matches!(
             result,
             Err(GrpcAuthSetupError::AnonymousForbiddenInProduction)
         ));
+    }
+
+    /// SEC-7: the full anonymous-access policy. Exactly one combination may
+    /// enable an unauthenticated control plane — dev-local, outside production.
+    #[test]
+    fn anonymous_is_permitted_only_on_dev_local_outside_production() {
+        use krishiv_common::DurabilityProfile::{DevLocal, DistributedDurable, SingleNodeDurable};
+
+        assert!(
+            anonymous_allowed_for(false, DevLocal).is_ok(),
+            "dev-local outside production is the one permitted combination"
+        );
+
+        assert!(
+            anonymous_allowed_for(true, DevLocal).is_err(),
+            "production mode forbids anonymous even on dev-local"
+        );
+        for profile in [SingleNodeDurable, DistributedDurable] {
+            assert!(
+                anonymous_allowed_for(false, profile).is_err(),
+                "{profile:?} must forbid anonymous even outside production — a \
+                 real cluster never silently accepts unauthenticated \
+                 control-plane RPCs"
+            );
+            assert!(anonymous_allowed_for(true, profile).is_err());
+        }
     }
 }
