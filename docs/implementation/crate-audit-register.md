@@ -36,7 +36,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 1 | krishiv-sql | 46,632 | 61 | 7 | first slice done; `lib.rs` alone holds 37% of the crate's uncovered regions |
 | 2 | krishiv-executor | 28,927 | 40 | **40 — COMPLETE 2026-08-02** | second crate fully read; 3 defects fixed |
 | 3 | krishiv-shuffle | 14,329 | 36 | **36 — COMPLETE 2026-08-02** | first crate fully read; 4 defects fixed |
-| 4 | krishiv-scheduler | **51,438** | **78** | 22 (in progress) | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
+| 4 | krishiv-scheduler | **51,438** | **78** | 35 (in progress) | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
 | **Tier 2 — correctness blast radius** |
 | 5 | krishiv-plan | 14,371 | 25 | 0 | plan IR every surface depends on |
 | 6 | krishiv-common | 7,966 | 23 | 0 | env registry, durability profiles, memory budget |
@@ -554,7 +554,7 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
 
 ---
 
-## 4. krishiv-scheduler — 22 of 78 files read whole (in progress, 2026-08-02)
+## 4. krishiv-scheduler — 35 of 78 files read whole (in progress, 2026-08-03)
 
 Third crate. The largest in the workspace: 51,438 lines. Working down the
 distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198),
@@ -566,7 +566,21 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
 `coordinator/aqe.rs` (501), `coordinator/recovery.rs` (565),
 `coordinator/streaming.rs` (279), `coordinator/snapshots.rs` (200),
 `coordinator/observability.rs` (182), `metrics.rs` (201), `result_spool.rs`
-(550), `coordinator_sharded.rs` (752). 16,815 of 51,438 lines.
+(550), `coordinator_sharded.rs` (752), `coordinator/checkpoint_ops.rs`
+(1,005), `barrier_dispatch.rs` (826), `checkpoint.rs` (1,337),
+`job_coordinator.rs` (419), `adaptive.rs` (101), `error.rs` (189),
+`coordinator/heartbeat_mapping.rs` (87), `barrier_tracker.rs` (108),
+`rpc_drain.rs` (223), `leadership.rs` (71), `http_auth.rs` (224),
+`queryable_state_http.rs` (262), `bounded_window_http.rs` (83).
+**21,750 of 51,438 lines.**
+
+**Remaining, in intended order** (43 files, ~29,700 lines):
+`continuous_stream_http.rs` (3,041), `coordinator_daemon.rs` (2,518),
+`sections/placement.rs.inc` (2,281), `ivm_http.rs` (2,273), `store.rs`
+(1,996), `sections/core.rs.inc` (1,772), `sections/chaos_jcp.rs.inc`
+(1,407), `etcd_metadata.rs` (1,250), `ivm.rs` (1,107), `batch_sql.rs`
+(1,065), `grpc.rs` (1,041), `auth.rs` (1,029), then the remaining
+`sections/*.rs.inc` and the sub-500-line files.
 
 **The recurring shape in this crate**: *state removed at the head of a path as
 "consumed by this batch", never restored when the batch turns out to be empty
@@ -687,6 +701,27 @@ return at all.* Six of the nine defects below are one of those two.
       accessor cannot parse as an integer, so it was pinned against the
       declared string rather than left silently exempt.
 
+- [x] **`barrier_sent` grew one entry per committed epoch, forever**
+      (`016fa2f5`). `clear_checkpoint_notify_for_epoch` runs on the commit path
+      and dropped the epoch's `notify_sent` entry but not its `barrier_sent`
+      one. Nothing else reclaims it on a healthy job: it is a `HashSet`, so the
+      insertion-ordered `prune_sent_set` cap cannot apply, and the per-epoch
+      cleanup in `advance_heartbeat_clock` only fires for epochs that *abort*.
+      A job checkpointing every 10 s accumulated 8,640 permanent entries a day
+      for its whole lifetime — on exactly the long-running streaming workload
+      the feature exists for. `CheckpointInner::clear_notify_for_epoch` has
+      always cleared both; this is the outer copy drifting from it.
+
+- [x] **A failed savepoint commit lost the operator's label** (`00c60e70`).
+      `commit_epoch` read the label with `.take()` before the fallible manifest
+      read and the three storage writes, while `pending_is_savepoint` is
+      cleared only on success — so a retry after a storage failure sealed an
+      unnamed savepoint. `extract_commit_data`, the async sibling, already
+      clones, and the success path clears both fields anyway. Narrow in
+      practice (quorum is already reached, so the epoch usually times out
+      rather than retrying), fixed because it is the same two-implementations
+      shape as the entry above.
+
 ### Recorded, not fixed — needs a decision
 
 - **`advance_heartbeat_clock` does not `release_workers` on eviction.** The
@@ -789,6 +824,32 @@ return at all.* Six of the nine defects below are one of those two.
   `if job_affected { refresh_state() }` line when only its shuffle-invalidation
   half fires. `invalidate_executor_shuffle_partitions` calls
   `self.refresh_state()` itself, so job state is refreshed either way.
+
+- `try_tick` guards `expected_task_count == 0` before initiating, so the
+  checkpoint interval timer cannot open an epoch nobody will ack.
+  `trigger_checkpoint_for_job` omits `savepoint_job`'s `.max(1)` on the
+  expected count, but a zero-count epoch still cannot false-commit: the quorum
+  test lives inside `receive_ack`, which needs at least one ack to run.
+
+- `recover_from_storage` does not reset the `pending_*` fields the way
+  `activate_restored_epoch` does. Only ever called on a freshly-constructed
+  coordinator where they are already default.
+
+- `CheckpointBarrierTracker::timed_out` is never called — `dispatch_barrier_plan`
+  enforces the deadline per target inside `inject_barrier` instead. Dead
+  accessor, not a missing timeout.
+
+- `InFlightTracker::drain` registers its `Notify` waiter *after* checking the
+  count, so a `notify_waiters` in that window is missed (`Notify` stores no
+  permit for future waiters). Correctness is unaffected — the loop re-checks
+  the count at the top after the timeout elapses and returns `true` — but a
+  demotion can wait the full drain timeout instead of returning as soon as the
+  last call finishes, widening the split-brain window it exists to close.
+
+- `JobCoordinator::has_in_flight_tasks` counts *failed* tasks as in-flight, and
+  `has_tasks_eligible_for_launch` uses a different terminal-state predicate
+  from `should_consider_for_launch`. Both are only consumed by `debug!`-gated
+  logging, so neither drives a scheduling decision.
 
 - The cascade breaker's window (30 s) is shorter than its cooldown (60 s), so
   by the time it re-closes the losses that tripped it have aged out of
