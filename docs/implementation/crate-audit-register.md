@@ -554,7 +554,7 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
 
 ---
 
-## 4. krishiv-scheduler — 46 of 78 files read whole (in progress, 2026-08-03)
+## 4. krishiv-scheduler — 53 of 78 files read whole (in progress, 2026-08-03)
 
 Third crate. The largest in the workspace: 51,438 lines. Working down the
 distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198),
@@ -576,14 +576,25 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
 `sections/placement.rs.inc` (2,281), `ivm_http.rs` (2,273), `store.rs`
 (1,996), `sections/core.rs.inc` (1,772), `sections/chaos_jcp.rs.inc`
 (1,407), `sections/prr_parallel.rs.inc` (276), `etcd_metadata.rs` (1,250), `ivm.rs`
-(1,107), `batch_sql.rs` (1,065).
-**40,736 of 51,438 lines.**
+(1,107), `batch_sql.rs` (1,065), `grpc.rs` (1,040), `auth.rs` (1,029),
+`rocksdb_metadata.rs` (531), `etcd_lease.rs` (501), `batch_sql_http.rs` (467),
+`bounded_window.rs` (395).
+**44,699 of 51,438 lines.**
 
-**Remaining, in intended order** (32 files, ~10,700 lines):
-`grpc.rs` (1,041), `auth.rs` (1,029), then the remaining
-`sections/*.rs.inc` and the sub-500-line files. (`bounded_window.rs` was
-partly read while sweeping the notify bug — its wait loop is fixed, but the
-file has not been read whole and still counts as remaining.)
+**Remaining, in intended order** (25 files, ~6,740 lines):
+`sections/checkpoint.rs.inc` (865), `sections/adaptive.rs.inc` (717),
+`sections/retry_streaming.rs.inc` (612), `sections/streaming_recovery.rs.inc`
+(586), `sections/recovery.rs.inc` (544), `unified_jobs_http.rs` (377),
+`tests/r2_k8s_manifests.rs` (376), `sections/savepoint.rs.inc` (367),
+`in_process.rs` (353), `sections/chaos_basic.rs.inc` (285),
+`sections/dur1.rs.inc` (213), `barrier_client.rs` (204),
+`sections/validation.rs.inc` (180), `sections/queue_manager.rs.inc` (162),
+`sections/checkpoint_timer.rs.inc` (160), `sections/barrier_oob.rs.inc` (141),
+`sections/chaos_restart.rs.inc` (128), `tests.rs` (124),
+`sections/failover.rs.inc` (86), `tests/distributed_e2e.rs` (71),
+`bin/krishiv_coordinator.rs` (58), `bin/krishiv_clusterd.rs` (56),
+`bin/krishiv_job_coordinator.rs` (55), `sections/etcd_sim.rs.inc` (53),
+`tests/coordinator_executor_integration.rs` (40), `transport.rs` (38).
 
 **The recurring shape in this crate**: *state removed at the head of a path as
 "consumed by this batch", never restored when the batch turns out to be empty
@@ -1057,7 +1068,51 @@ return at all.* Six of the nine defects below are one of those two.
       discriminates (taxonomy → `Transport` in 0.06 s; tick → `Elapsed` after
       the full timeout).
 
+- [x] **A standby accepted savepoint restores** (`ddc642a3`).
+      `restore_job_from_savepoint` had no `ensure_active`, unlike every sibling
+      mutation including `activate_job_restore_from_checkpoint_with_fencing` —
+      the *other branch of the same gRPC handler*. A standby therefore copied a
+      savepoint epoch into the active chain and the handler then did
+      `checkpoint_inner.replace_data_from(...)`, a full replace on a non-leader.
+      The fencing token guards storage against a stale *leader*, not this.
+
+- [x] **The SEC-7 anonymous-access policy had no real test** (`ddc642a3`). The
+      only test that named it called `set_allow_anonymous_when(false)`, which
+      returns `Err` on its first line without consulting production mode or the
+      durability profile — both guards could have been deleted and stayed
+      green. Extracted `anonymous_allowed_for(production, profile)` and tested
+      the matrix. Also corrected six `grpc.rs` comments calling the per-handler
+      auth check "redundant when server-level interceptor is active": the
+      interceptor enforces only `Role::Reader`, so those checks are the **sole**
+      enforcement of `Role::Writer` on every mutating RPC.
+
+- [x] **The ephemeral RocksDB store deleted its own directory** (`a0082f52`).
+      `in_memory` passed its `TempDir` to `open_at` as `_tempdir`, which nothing
+      stored, so the guard dropped and removed the directory under the open
+      `DB`. Linux keeps the open descriptors working, which is why every test
+      passed; RocksDB fails the moment it needs a new file. Also: three of four
+      deleters ignored the DUR-6 sync policy that `remove_ivm_snapshot` already
+      honoured.
+
+- [x] **Bounded-window jobs were rejected on every durable profile**
+      (`a2abcef8`). `prepare_bounded_window_job` emitted a raw
+      `window:{topic}:{spec}` fragment; the executor rejects untyped fragments
+      unless `dev-local` outside production. `batch_sql.rs` claims its own fix
+      covered "the last untyped batch-SQL emitter" — true, but
+      `bounded_window.rs` was the last untyped emitter in the crate. Instance
+      eight of *fixed where it hurt, then left*.
+
 ### Recorded, not fixed — needs a decision
+
+- **`EtcdLeaseElection::last_renewed_at` is written and never read.** Three
+  writes, zero reads — dead state shaped exactly like a liveness guard.
+  `is_leader()` has no staleness check, so if the renew loop stalls the node
+  keeps reporting itself leader while its etcd lease expires and another node
+  legitimately acquires. The fencing token still prevents split-brain *writes*,
+  but `is_leader()` also gates `/leaderz` and Service routing. Not fixed here
+  because self-demotion on renew staleness changes HA behaviour under GC pauses
+  (leadership flapping) — a design call, not an obvious defect. Either wire it
+  or delete it.
 
 - **`load_prefix` fails the whole load on one bad record.** `connect` /
   `refresh` return `Err` on the first job, executor, or history value that
