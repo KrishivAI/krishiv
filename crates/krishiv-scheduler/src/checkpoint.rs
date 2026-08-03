@@ -623,7 +623,17 @@ impl CheckpointCoordinator {
         let sink_transactions = collect_sink_transactions(self.pending_acks.values());
 
         let is_savepoint = self.pending_is_savepoint;
-        let savepoint_label = self.pending_savepoint_label.take();
+        // Clone, do not take. Everything below this line can fail — the
+        // manifest build reads each snapshot back, and all three storage
+        // writes are fallible — and a failure leaves the coordinator in
+        // `AwaitingAcks` for a retry. Taking the label consumed it before that
+        // could happen, while `pending_is_savepoint` (cleared only on success,
+        // below) stayed set: the retry would then seal an *unlabelled*
+        // savepoint, silently losing the name the operator asked for.
+        // `extract_commit_data`, the async sibling, already clones; the
+        // success path at the end of this function clears both fields anyway,
+        // so taking here bought nothing.
+        let savepoint_label = self.pending_savepoint_label.clone();
         let metadata = CheckpointMetadata {
             version: CheckpointMetadata::VERSION,
             epoch,
@@ -1287,6 +1297,46 @@ mod tests {
             .await,
             Err(krishiv_state::checkpoint::CheckpointError::NoValidEpoch)
         ));
+    }
+
+    /// A savepoint commit that fails at storage must leave the operator's
+    /// label intact for the retry. `commit_epoch` took the label before the
+    /// fallible manifest read and the three storage writes, while
+    /// `pending_is_savepoint` was cleared only on success — so a retry after a
+    /// storage failure sealed a savepoint with no name.
+    #[test]
+    fn a_failed_savepoint_commit_keeps_its_label_for_the_retry() {
+        let storage: Arc<dyn krishiv_state::checkpoint::CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("job-savepoint-label").unwrap();
+        let mut coord =
+            CheckpointCoordinator::new_for_test(job_id.clone(), storage.clone(), 1000, 1);
+        coord
+            .initiate_savepoint(Some("nightly-2026-08-03".to_owned()))
+            .unwrap();
+
+        // Reference a snapshot that was never written: the manifest build
+        // fails, so the commit errors out after the label was read.
+        let mut ack = make_ack(&job_id, "task-1", 1, coord.fencing_token());
+        ack.snapshot_path = Some(krishiv_state::checkpoint::snapshot_path(
+            "job-savepoint-label",
+            1,
+            "op-task-1",
+            "task-1",
+        ));
+        coord
+            .receive_ack(ack)
+            .expect_err("missing snapshot must fail the commit");
+
+        assert!(
+            coord.pending_is_savepoint,
+            "precondition: the savepoint intent survives a failed commit"
+        );
+        assert_eq!(
+            coord.pending_savepoint_label.as_deref(),
+            Some("nightly-2026-08-03"),
+            "the label must survive with it, or the retry seals an unnamed savepoint"
+        );
     }
 
     #[test]
