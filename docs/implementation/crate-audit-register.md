@@ -554,7 +554,7 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
 
 ---
 
-## 4. krishiv-scheduler — 37 of 78 files read whole (in progress, 2026-08-03)
+## 4. krishiv-scheduler — 38 of 78 files read whole (in progress, 2026-08-03)
 
 Third crate. The largest in the workspace: 51,438 lines. Working down the
 distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198),
@@ -572,15 +572,15 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
 `coordinator/heartbeat_mapping.rs` (87), `barrier_tracker.rs` (108),
 `rpc_drain.rs` (223), `leadership.rs` (71), `http_auth.rs` (224),
 `queryable_state_http.rs` (262), `bounded_window_http.rs` (83),
-`coordinator_daemon.rs` (2,518), `continuous_stream_http.rs` (3,041).
-**27,309 of 51,438 lines.**
+`coordinator_daemon.rs` (2,518), `continuous_stream_http.rs` (3,041),
+`sections/placement.rs.inc` (2,281).
+**29,590 of 51,438 lines.**
 
-**Remaining, in intended order** (41 files, ~24,100 lines):
-`sections/placement.rs.inc` (2,281), `ivm_http.rs` (2,273), `store.rs`
-(1,996), `sections/core.rs.inc` (1,772), `sections/chaos_jcp.rs.inc`
-(1,407), `etcd_metadata.rs` (1,250), `ivm.rs` (1,107), `batch_sql.rs`
-(1,065), `grpc.rs` (1,041), `auth.rs` (1,029), then the remaining
-`sections/*.rs.inc` and the sub-500-line files.
+**Remaining, in intended order** (40 files, ~21,850 lines):
+`ivm_http.rs` (2,273), `store.rs` (1,996), `sections/core.rs.inc` (1,772),
+`sections/chaos_jcp.rs.inc` (1,407), `etcd_metadata.rs` (1,250), `ivm.rs`
+(1,107), `batch_sql.rs` (1,065), `grpc.rs` (1,041), `auth.rs` (1,029), then
+the remaining `sections/*.rs.inc` and the sub-500-line files.
 
 **The recurring shape in this crate**: *state removed at the head of a path as
 "consumed by this batch", never restored when the batch turns out to be empty
@@ -776,6 +776,36 @@ return at all.* Six of the nine defects below are one of those two.
       `job_snapshot` call) did **not** fail the test, because an unknown job
       fails earlier at `run_loop_targets`. A discrimination check that passes
       means the wrong line was reverted, not that the test is weak.
+
+- [x] **Planning width counted slots on circuit-broken executors**
+      (`ee118c60`). `total_schedulable_slots` is the width a query is planned
+      to: it feeds the AQE coalesce floor (`job_lifecycle.rs:740`, "coalescing
+      must not shrink a stage below the cluster's schedulable width") and the
+      staged-batch target partition count (`batch_sql.rs:465`, "plan against
+      the capacity that will actually run the query"). It filtered on
+      `is_schedulable` alone. A circuit-broken executor passes that test but
+      is excluded from both paths that could give it a task —
+      `assign_pending_tasks_capped` and `launch_assigned_task_assignments` —
+      so the planner sized stages against slots that would never be offered.
+      On a 3×3 cluster with one node broken (five consecutive failures: the
+      `bench-s3` NoSuchBucket shape), stages were still cut 9 wide and the 3
+      tasks with nowhere to run queued behind a half-empty second wave.
+
+      **This is the 2026-07-30 livelock's rule applied to the third consumer
+      of "eligible".** That incident was diagnosed as launch and placement
+      disagreeing; both were fixed and `circuit_broken_executors` was written
+      so they could not drift again. Planning was the consumer nobody looked
+      at — instance four of the *fix the call site that hurt, then leave*
+      shape.
+
+      Routing through the same helper inherits the starvation floor for free:
+      when every executor is broken the breaker admits them all and so does
+      the count. A hand-rolled `consecutive_task_failures >= threshold` filter
+      would instead report width 0, which callers read as "capacity unknown"
+      and collapse onto the local machine — while the cluster is about to run
+      the query. `planning_width_keeps_everyone_when_the_starvation_floor_admits_them`
+      pins that boundary; it is the test that discriminates against the
+      *wrong* fix rather than against the bug.
 
 ### Recorded, not fixed — needs a decision
 
