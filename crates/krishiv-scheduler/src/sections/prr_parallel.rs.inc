@@ -1,276 +1,110 @@
-// ── Additional PRR Parallel Failure-Mode Tests ────────────────────────
+// ── Coordinator change notification ──────────────────────────────────────────
+//
+// This file used to hold four "PRR failure-mode" tests, a `MiniSimulationHarness`
+// with five self-tests, and `real_job_coordinator_extraction`. None of them
+// reached a behaviour worth asserting:
+//
+//   * `frozen_executor_detected_via_missing_progress` and
+//     `slow_frozen_executor_detected_by_progress_stall` were the same test
+//     twice — register an executor, assert it is registered. Both comments
+//     conceded the point ("In a real system we would check
+//     StreamingProgressSnapshot staleness"; "this test documents the scenario").
+//   * `duplicate_task_assignment_after_partition_is_limited` and
+//     `network_partition_causes_lease_bump_and_task_replay` were also the same
+//     test twice — register twice, assert the lease bumped. Neither assigned a
+//     task, so neither could observe a duplicate assignment or a replay.
+//     `lost_executor_can_reregister_with_next_lease_generation` in
+//     `core.rs.inc` already covers the lease bump properly.
+//   * `real_job_coordinator_extraction` asserted that a string it had just
+//     built equalled itself.
+//   * `MiniSimulationHarness` was a test double whose only remaining consumers,
+//     once the `chaos_jcp` suite was deleted, were its own five self-tests — a
+//     closed loop with no production coverage.
+//
+// What survives is the one test that drove real code, with the assertion it
+// was missing.
 
-#[test]
-fn frozen_executor_detected_via_missing_progress() {
-    // Simulates an executor that heartbeats but provides no streaming progress.
-    // This is one of the high-priority missing failure scenarios.
-    let mut coordinator = Coordinator::active(CoordinatorId::try_new("frozen-test").unwrap());
-    let exec_id = ExecutorId::try_new("frozen-exec").unwrap();
-
-    coordinator
-        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-frozen", 4))
-        .unwrap();
-
-    // In a real system we would check StreamingProgressSnapshot staleness.
-    // For this durable slice we at least verify the executor stays registered
-    // while we have the infrastructure (progress snapshots) to detect it later.
-    assert!(
-        coordinator
-            .executor_snapshots()
-            .iter()
-            .any(|e| e.executor_id() == &exec_id)
-    );
-}
-
-#[test]
-fn duplicate_task_assignment_after_partition_is_limited() {
-    // After a network partition, an executor may re-register with a new lease.
-    // We should not keep sending the same task to multiple generations.
-    let mut coordinator = Coordinator::active(CoordinatorId::try_new("dup-test").unwrap());
-    let exec_id = ExecutorId::try_new("dup-exec").unwrap();
-
-    let lease1 = coordinator
-        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-dup", 2))
-        .unwrap();
-
-    // Simulate re-registration (common after partition)
-    let lease2 = coordinator
-        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-dup", 2))
-        .unwrap();
-
-    assert_ne!(
-        lease1.as_u64(),
-        lease2.as_u64(),
-        "re-registration must bump lease"
-    );
-}
-
-#[test]
-fn slow_frozen_executor_detected_by_progress_stall() {
-    // High-priority missing test: Executor heartbeats but makes no progress.
-    // Infrastructure (StreamingProgressSnapshot) exists; this test documents the scenario.
-    let mut coordinator = Coordinator::active(CoordinatorId::try_new("stall-test").unwrap());
-    let exec_id = ExecutorId::try_new("stall-exec").unwrap();
-    coordinator
-        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-stall", 2))
-        .unwrap();
-
-    // In production the coordinator would monitor progress snapshots over time.
-    // This test ensures the executor registration path remains stable under stall conditions.
-    assert!(
-        coordinator
-            .executor_snapshots()
-            .iter()
-            .any(|e| e.executor_id() == &exec_id)
-    );
-}
-
-#[test]
-fn network_partition_causes_lease_bump_and_task_replay() {
-    // Classic partition + recovery scenario.
-    let mut coordinator =
-        Coordinator::active(CoordinatorId::try_new("partition-test").unwrap());
-    let exec_id = ExecutorId::try_new("part-exec").unwrap();
-
-    let initial = coordinator
-        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-part", 1))
-        .unwrap();
-
-    // Simulate partition + reconnect (new lease)
-    let after_partition = coordinator
-        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-part", 1))
-        .unwrap();
-
-    assert!(
-        after_partition.as_u64() > initial.as_u64(),
-        "partition recovery must produce higher lease"
-    );
-}
-
-// Simulation harness for failure injection testing
-/// Expanded deterministic simulation harness for partition, delay, and lease
-/// replay testing. This is the foundation for full chaos/simulation testing.
-#[derive(Debug, Default)]
-pub struct MiniSimulationHarness {
-    tick: u64,
-    partitions: Vec<(ExecutorId, u64)>, // simulated network partitions
-    delays: std::collections::HashMap<String, u64>,
-}
-
-impl MiniSimulationHarness {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn tick(&mut self) {
-        self.tick += 1;
-    }
-
-    pub fn partition(&mut self, executor: ExecutorId) {
-        self.partitions.push((executor, self.tick));
-    }
-
-    pub fn delay(&mut self, msg_id: &str, ticks: u64) {
-        self.delays.insert(msg_id.to_string(), self.tick + ticks);
-    }
-
-    pub fn is_partitioned(&self, executor: &ExecutorId) -> bool {
-        self.partitions.iter().any(|(e, _)| e == executor)
-    }
-
-    // Additional failure injection for simulation testing.
-    pub fn simulate_lease_bump(&mut self) -> u64 {
-        self.tick += 1;
-        self.tick
-    }
-
-    /// Simulate a full partition + recovery cycle with lease invalidation.
-    pub fn simulate_partition_and_recovery(&mut self, executor: ExecutorId) -> u64 {
-        self.partition(executor.clone());
-        self.tick += 10; // simulate downtime
-        self.partitions.retain(|(e, _)| e != &executor); // recovery
-        self.simulate_lease_bump()
-    }
-
-    pub fn advance_clock_with_skew(&mut self, ticks: u64, skew_on: Option<ExecutorId>) {
-        self.tick += ticks;
-        if let Some(exec) = skew_on {
-            self.delays.insert(format!("skew-{}", exec), self.tick);
-        }
-    }
-
-    /// Simulate concurrent partitions + partial recovery (useful for complex failure testing).
-    pub fn simulate_concurrent_partitions(&mut self, executors: &[ExecutorId]) {
-        for exec in executors {
-            self.partitions.push((exec.clone(), self.tick));
-        }
-    }
-
-    pub fn executors_timed_out(&self, timeout_ticks: u64) -> Vec<ExecutorId> {
-        self.partitions
-            .iter()
-            .filter(|(_, t)| self.tick.saturating_sub(*t) > timeout_ticks)
-            .map(|(e, _)| e.clone())
-            .collect()
-    }
-
-    /// Simulate message loss for a specific message type (for chaos testing).
-    pub fn simulate_message_loss(&mut self, msg_type: &str) {
-        self.delays.insert(format!("lost-{}", msg_type), u64::MAX);
-    }
-}
-
-#[test]
-fn richer_simulation_harness_partition_and_delay() {
-    let mut h = MiniSimulationHarness::new();
-    let exec = ExecutorId::try_new("sim-exec").unwrap();
-
-    h.partition(exec.clone());
-    h.delay("heartbeat-1", 5);
-
-    assert!(h.is_partitioned(&exec));
-    assert_eq!(h.delays.get("heartbeat-1"), Some(&(5)));
-}
-
-#[test]
-fn simulation_harness_advanced_failure_modes() {
-    let mut h = MiniSimulationHarness::new();
-    let exec = ExecutorId::try_new("chaos-exec").unwrap();
-
-    h.simulate_partition_and_recovery(exec.clone());
-    h.simulate_message_loss("task-status");
-    h.advance_clock_with_skew(3, Some(exec.clone()));
-
-    assert!(!h.is_partitioned(&exec));
-    assert!(h.delays.contains_key("lost-task-status"));
-}
-
-#[test]
-fn simulation_harness_concurrent_partitions() {
-    let mut h = MiniSimulationHarness::new();
-    let e1 = ExecutorId::try_new("e1").unwrap();
-    let e2 = ExecutorId::try_new("e2").unwrap();
-
-    h.simulate_concurrent_partitions(&[e1.clone(), e2.clone()]);
-    assert!(h.is_partitioned(&e1) && h.is_partitioned(&e2));
-}
-
-#[test]
-fn simulation_harness_timeout_detection() {
-    let mut h = MiniSimulationHarness::new();
-    let exec = ExecutorId::try_new("timeout-exec").unwrap();
-
-    h.partition(exec.clone());
-    h.tick();
-    h.tick();
-    h.tick();
-
-    let timed_out = h.executors_timed_out(2);
-    assert!(timed_out.contains(&exec));
-}
-
-#[test]
-fn real_job_coordinator_extraction() {
-    // Verifies the two-tier JobCoordinator type and API surface exist and
-    // are ready for deeper delegation (per-job state ownership).
-    let _ = std::any::type_name::<crate::job_coordinator::JobCoordinator>();
-    let job_id = JobId::try_new("job-two-tier").unwrap();
-    assert_eq!(job_id.as_str(), "job-two-tier");
-}
-
-#[test]
-fn simulation_harness_frozen_executor_progress_stall() {
-    // Covers PRR missing scenario: executor alive (heartbeats) but no progress
-    // (no watermark/row updates). Harness can drive stall detection in full loop.
-    let mut h = MiniSimulationHarness::new();
-    let exec = ExecutorId::try_new("frozen-exec-01").unwrap();
-
-    h.partition(exec.clone());
-    // Simulate 20 ticks of "alive but zero progress" (no state change, no watermark advance)
-    for _ in 0..20 {
-        h.tick();
-        h.delay(&format!("progress-snapshot-{}", exec), 0); // no real progress injected
-    }
-
-    let timed = h.executors_timed_out(5);
-    assert!(
-        timed.contains(&exec) || h.is_partitioned(&exec),
-        "harness must surface frozen executor for stall detection"
-    );
-}
-
+/// `notify_waiters()` must wake a waiter that is already parked.
+///
+/// **The waiter is registered first, and that ordering is the whole test.**
+/// Tokio's `Notify::notify_waiters()` wakes only waiters already registered and
+/// stores no permit — unlike `notify_one()` — so a notification fired before
+/// anyone is waiting is dropped on the floor. Every producer in this crate uses
+/// `notify_waiters()`, and `SharedCoordinator::wait_for_change` consumes it with
+/// `notified().await`.
+///
+/// The version that shipped had the ordering backwards: it registered the
+/// executor, *then* built the wait future, then wrote
+/// `let _ = timeout(100ms, wait).await`. Its comment claimed "the wait helper
+/// should return promptly because a notification was already sent" — which is
+/// the opposite of what `notify_waiters()` guarantees. So it always timed out,
+/// and `let _ =` swallowed the `Err(Elapsed)`. Deleting the `notify_waiters()`
+/// call from `register_executor` outright left it green.
+///
+/// `biased` makes this deterministic rather than timing-dependent: select polls
+/// the wait arm first, so the waiter is parked before the trigger arm starts.
 #[tokio::test]
-async fn notify_wakes_on_executor_registration_and_deregistration() {
+async fn notify_wakes_a_parked_waiter_on_executor_registration() {
     use std::time::Duration;
 
-    // Exercises the real Notify producer (register/deregister paths through
-    // SharedCoordinator's RwLock) + consumer helpers added for Track A async
-    // safety work.
-    let coord = Coordinator::active(CoordinatorId::try_new("notify-coord").unwrap());
-    let coordinator = SharedCoordinator::new(coord);
-
+    let coordinator = SharedCoordinator::new(Coordinator::active(
+        CoordinatorId::try_new("notify-coord").unwrap(),
+    ));
     let exec_id = ExecutorId::try_new("notify-test-exec").unwrap();
     let desc = ExecutorDescriptor::new(exec_id.clone(), "pod-notify", 2);
 
-    // Registration should have notified
+    let mut woken = false;
+    tokio::select! {
+        biased;
+        () = coordinator.wait_for_change() => woken = true,
+        () = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            coordinator
+                .write()
+                .await
+                .register_executor(desc)
+                .expect("register should succeed");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        } => {}
+    }
+    assert!(
+        woken,
+        "registering an executor must wake a parked `wait_for_change` waiter, \
+         or the daemon sleeps through the state change until its next timer tick"
+    );
+}
+
+/// Same contract for the departure half of the executor lifecycle.
+#[tokio::test]
+async fn notify_wakes_a_parked_waiter_on_executor_deregistration() {
+    use std::time::Duration;
+
+    let coordinator = SharedCoordinator::new(Coordinator::active(
+        CoordinatorId::try_new("notify-coord-dereg").unwrap(),
+    ));
+    let exec_id = ExecutorId::try_new("notify-dereg-exec").unwrap();
     let lease = coordinator
         .write()
         .await
-        .register_executor(desc)
+        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-notify", 2))
         .expect("register should succeed");
 
-    // The wait helper should return promptly because a notification was already sent.
-    // We use a short timeout to prove it doesn't block forever.
-    let wait = coordinator.wait_for_change();
-    let _ = tokio::time::timeout(Duration::from_millis(100), wait).await;
-
-    // Deregistration should also notify
-    let _ = coordinator
-        .write()
-        .await
-        .deregister_executor(&exec_id, lease);
-
-    let wait2 = coordinator.wait_for_change();
-    let _ = tokio::time::timeout(Duration::from_millis(100), wait2).await;
+    let mut woken = false;
+    tokio::select! {
+        biased;
+        () = coordinator.wait_for_change() => woken = true,
+        () = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            coordinator
+                .write()
+                .await
+                .deregister_executor(&exec_id, lease)
+                .expect("deregister should succeed");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        } => {}
+    }
+    assert!(
+        woken,
+        "deregistering an executor must wake a parked `wait_for_change` waiter"
+    );
 }
-
