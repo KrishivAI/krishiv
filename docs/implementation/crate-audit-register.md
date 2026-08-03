@@ -574,8 +574,15 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
 `queryable_state_http.rs` (262), `bounded_window_http.rs` (83).
 **21,750 of 51,438 lines.**
 
+**Partially read**: `coordinator_daemon.rs` — lines 1–840 (config/store
+selection, CCP run loop, sidecar spawn, `coordinator_http_router`, the live
+job/stage views). The routing and auth surface is fully checked (see the
+SEC-1 entry below); the remaining ~1,700 lines (handlers, arg parsing,
+standalone/job-coordinator entry points, tests) are **not** read. Do not
+count this file complete.
+
 **Remaining, in intended order** (43 files, ~29,700 lines):
-`continuous_stream_http.rs` (3,041), `coordinator_daemon.rs` (2,518),
+`continuous_stream_http.rs` (3,041), `coordinator_daemon.rs` (2,518, partial),
 `sections/placement.rs.inc` (2,281), `ivm_http.rs` (2,273), `store.rs`
 (1,996), `sections/core.rs.inc` (1,772), `sections/chaos_jcp.rs.inc`
 (1,407), `etcd_metadata.rs` (1,250), `ivm.rs` (1,107), `batch_sql.rs`
@@ -824,6 +831,33 @@ return at all.* Six of the nine defects below are one of those two.
   `if job_affected { refresh_state() }` line when only its shuffle-invalidation
   half fires. `invalidate_executor_shuffle_partitions` calls
   `self.refresh_state()` itself, so job state is refreshed either way.
+
+- **SEC-1 re-verified end to end, including the seam above it.**
+  `coordinator_http_router` folds `ivm_routes` and `qs_routes` into `protected`
+  *before* `require_coordinator_bearer` is layered — the fix holds.
+
+  But `spawn_coordinator_sidecars` then does
+  `coordinator_http_router(..).merge(factory(coordinator))`, i.e. it merges the
+  `extra_http_factory` routes **after** that layer. That is the same shape as
+  the original SEC-1 bug one level up, and the only supplier is
+  `krishiv_ui::embedded_router`, whose protected group includes
+  `POST /api/v1/sql` (arbitrary SQL execution).
+
+  Not a bypass: the UI router applies **its own** bearer layer, and
+  `resolve_ui_token` is fail-closed — with no token configured under a profile
+  that needs one it returns `Some("")`, a token nothing can match, denying the
+  whole group. The two predicates cannot drift because
+  `profile_requires_authenticated_ui(p)` is defined as `requires_http_auth(p)`.
+
+  One asymmetry, deliberate-looking and left alone: the coordinator's
+  `http_auth_required` honours `allow_anonymous_http_override()` while the UI's
+  token resolution does not, so the dev escape hatch opens the coordinator API
+  but not the UI. That errs strict, which is the right direction.
+
+  **This is why the merge-after-layer must not be "tidied" without care**: it is
+  safe only because every current supplier self-protects. A future
+  `extra_http_factory` that does not would be unauthenticated with nothing in
+  the type system to catch it.
 
 - `try_tick` guards `expected_task_count == 0` before initiating, so the
   checkpoint interval timer cannot open an epoch nobody will ack.
