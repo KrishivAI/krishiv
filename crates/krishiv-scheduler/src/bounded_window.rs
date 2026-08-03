@@ -220,7 +220,23 @@ fn prepare_bounded_window_job(
         message: format!("window spec json: {error}"),
     })?;
     let spec_b64 = base64::engine::general_purpose::STANDARD.encode(spec_json.as_bytes());
-    let fragment = format!("window:{topic}:{spec_b64}");
+    // Wrap in the Phase-52 typed envelope. The executor validates every
+    // fragment with `TypedTaskFragment::decode_for_profile`, and
+    // `allow_legacy_task_fragments` is true only on `dev-local` outside
+    // production — so a raw `window:…` string is *rejected outright* on any
+    // durable profile, exactly the failure `batch_sql.rs` documents fixing for
+    // its own single-task path ("legacy untyped task fragment rejected", job
+    // hangs). `distributed_batch.rs` and `continuous_stream_http.rs` were both
+    // converted; this was the last untyped emitter in the crate. The body is
+    // unchanged — only the envelope is added.
+    let fragment = krishiv_plan::TypedTaskFragment::new(
+        krishiv_plan::ExecutionKind::Batch,
+        format!("window:{topic}:{spec_b64}"),
+    )
+    .encode()
+    .map_err(|error| SchedulerError::InvalidJob {
+        message: format!("encode bounded window task fragment: {error}"),
+    })?;
 
     let mut stage = StageSpec::new(stage_id, "bounded-window");
     let mut task_inputs = HashMap::with_capacity(shards.len());
@@ -365,6 +381,52 @@ mod tests {
             }
         }
         assert_eq!(total_rows, 4);
+    }
+
+    /// The emitted fragment must be accepted under a durable profile.
+    ///
+    /// The executor validates every fragment with `decode_for_profile`, and
+    /// legacy untyped strings are permitted only on `dev-local` outside
+    /// production. A raw `window:…` fragment therefore failed validation on
+    /// every durable deployment — the job was rejected, not slowed. Asserting
+    /// the task count (which the sibling test does) cannot see this; only
+    /// decoding the fragment the way the executor does can.
+    #[test]
+    fn emitted_fragment_is_typed_and_accepted_under_a_durable_profile() {
+        use krishiv_common::DurabilityProfile;
+
+        let prepared = prepare_bounded_window_job(
+            JobId::try_new("bounded-window-typed").unwrap(),
+            "events",
+            &WindowExecutionSpec::tumbling("key", "ts", 1_000),
+            vec![vec![input_batch()]],
+        )
+        .unwrap();
+        let fragment = prepared.job_spec.stages()[0].tasks()[0]
+            .description()
+            .to_owned();
+
+        let decoded = krishiv_plan::TypedTaskFragment::decode_for_profile(
+            &fragment,
+            DurabilityProfile::DistributedDurable,
+        )
+        .expect("the bounded-window fragment must be accepted under a durable profile");
+        assert!(
+            decoded.body.starts_with("window:events:"),
+            "the envelope must carry the original body verbatim, got {}",
+            decoded.body
+        );
+
+        // And the pre-fix raw form is genuinely rejected there — proving the
+        // envelope is load-bearing rather than decoration.
+        assert!(
+            krishiv_plan::TypedTaskFragment::decode_for_profile(
+                &decoded.body,
+                DurabilityProfile::DistributedDurable,
+            )
+            .is_err(),
+            "a raw untyped window fragment must be rejected under a durable profile"
+        );
     }
 
     #[test]
