@@ -14,6 +14,7 @@ a named rationale.
 | Lib tests | `just test` | all `--lib` unit tests |
 | Integration tests | `just test-integration` | all `crates/*/tests/*.rs` suites (134+ fns, incl. the proptest suites below) |
 | Doctests | `just test-doc` | documentation examples compile and run |
+| etcd backend tests | `just test-etcd` | `krishiv-scheduler --features etcd` unit tests. `etcd` is off by default, so `just test` runs none of them; `lint-features` already compiles this code but cannot catch a behavioural regression. Guards the Phase 58 wedge fixes (bounded etcd RPC, dedicated runtime) and the IVM snapshot compression/chunking codec. No live etcd required — the one test that needs a server stays `#[ignore]`d. |
 | External-service tests | `just test-external` job | the `#[ignore = "requires …"]` tests against real provisioned Postgres/MinIO/OTLP (audit §14 TEST-6) |
 | Python bindings | `test-python` job | maturin build + pytest — a non-compiling binding fails CI (the `1694143` class) |
 | Security | `security.yml` cargo-deny | advisories/licenses/bans |

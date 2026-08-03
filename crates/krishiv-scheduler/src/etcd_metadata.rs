@@ -1020,6 +1020,44 @@ mod tests {
         assert_eq!(result.unwrap(), 7);
     }
 
+    /// Pin the bounds themselves.
+    ///
+    /// The timeout test above passes its **own** 200 ms bound, so it proves
+    /// `etcd_block_on_bounded` honours whatever it is handed — not that the
+    /// production entry point hands it anything sane. Widening
+    /// `ETCD_RPC_TIMEOUT` back toward "effectively unbounded" (or routing
+    /// `etcd_block_on` to a huge literal) reproduces the Phase 58 wedge exactly
+    /// and leaves every other test in this file green; verified by doing it.
+    ///
+    /// This cannot prove runtime behaviour — it is a constant guard, the same
+    /// shape as the env-registry default pinning elsewhere in this crate. What
+    /// it does prevent is the specific regression that took the coordinator
+    /// down: a per-key etcd RPC allowed to hold `NonBlockingStoreHandle`'s
+    /// coordinator-wide store mutex for longer than an operator would ever
+    /// wait before assuming the process is dead.
+    #[test]
+    fn the_etcd_rpc_bound_stays_small_enough_to_not_wedge_the_coordinator() {
+        assert!(
+            ETCD_RPC_TIMEOUT <= std::time::Duration::from_secs(30),
+            "ETCD_RPC_TIMEOUT is {ETCD_RPC_TIMEOUT:?}. This bound is held under \
+             the coordinator-wide store mutex, so it caps how long ONE hung etcd \
+             key write can freeze every other metadata write in the process — \
+             task launches, heartbeats, IVM dispatch, cancellation. Phase 58 \
+             (2026-07-20) had no bound here and lost /leaderz for 10+ minutes \
+             with zero self-recovery."
+        );
+        assert!(
+            !ETCD_RPC_TIMEOUT.is_zero(),
+            "a zero bound would fail every etcd write immediately"
+        );
+        assert!(
+            ETCD_REFRESH_TIMEOUT >= ETCD_RPC_TIMEOUT,
+            "refresh loads five prefixes and legitimately costs more than one \
+             key's RPC; a refresh bound below the per-key bound would fail \
+             recovery on clusters the hot path handles fine"
+        );
+    }
+
     #[test]
     fn prefix_range_end_increments_the_last_byte() {
         // The last byte is incremented (0xff never appears in a &str prefix,

@@ -108,6 +108,11 @@ jobs:
       # rationale per exclusion: docs/implementation/ci-tiers.md
       - run: just test-integration
       - run: just test-doc
+      # `etcd` is a non-default feature, so `just test` compiles none of
+      # etcd_metadata.rs and runs none of its tests — including the regression
+      # guards for the Phase 58 coordinator wedge and the IVM snapshot size
+      # cliffs. No live etcd needed (docs/implementation/ci-tiers.md).
+      - run: just test-etcd
 
   # ── External-service tests (audit §14 TEST-6) ────────────────────────────────
   # Runs the `#[ignore = "requires …"]` tests against real provisioned services

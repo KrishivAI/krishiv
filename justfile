@@ -227,6 +227,21 @@ test-external:
         {{ sccache_env }} {{ cargo }} test -p krishiv-metrics --lib -- --ignored otlp_integration
     {{ sccache_env }} {{ cargo }} test -p krishiv-runtime --lib -- --ignored do_action_
 
+# etcd metadata-backend unit tests. `etcd` is off by default, so the
+# `--workspace` pass in `test` never *runs* a single one of them — the same
+# blindspot `lint-features` already fixed for clippy ("etcd is a supported
+# metadata backend; lint it like one"), left un-extended to tests.
+#
+# What was going unrun: the regression guards for three separate production
+# incidents recorded in `etcd_metadata.rs` — the unbounded-RPC-under-lock wedge
+# (Phase 58, 2026-07-20: `/leaderz` dead 10+ minutes, zero self-recovery), the
+# dedicated-runtime deadlock that froze every coordinator, and the IVM snapshot
+# size cliffs (1.5 MiB write rejection, 4 MiB decode limit). None need a live
+# etcd; all 19 run in ~0.2s. The one test that does need a server stays
+# `#[ignore]`d.
+test-etcd:
+    {{ sccache_env }} {{ cargo }} test -p krishiv-scheduler --lib --features etcd
+
 # Tests that must pass with only embedded features enabled
 test-embedded:
     {{ sccache_env }} {{ cargo }} test -p krishiv --no-default-features --features embedded --lib
