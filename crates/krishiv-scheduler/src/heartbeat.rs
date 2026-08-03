@@ -304,7 +304,9 @@ impl ExecutorRegistry {
             .collect()
     }
 
-    /// Total task slots across every executor that can currently accept work.
+    /// Total task slots across every executor that can currently accept work,
+    /// minus `excluded` — the circuit-broken set from
+    /// [`Self::circuit_broken_executors`].
     ///
     /// This is the number a query should be planned against: it is what the
     /// cluster can run at once, so it sets how wide a stage is worth cutting.
@@ -312,10 +314,24 @@ impl ExecutorRegistry {
     /// "capacity unknown" rather than "capacity none" — a query submitted
     /// microseconds before the first executor registers should not be planned
     /// as if the cluster were empty forever.
-    pub(crate) fn total_schedulable_slots(&self) -> usize {
+    ///
+    /// Planning takes `excluded` because it must apply the same exclusion
+    /// placement and launch apply. A circuit-broken executor is filtered out of
+    /// both, so counting its slots plans the query against capacity that will
+    /// never be offered: the AQE coalesce floor and the staged-batch target
+    /// partition count both cut the stage wider than the cluster can run, and
+    /// the overflow queues behind a second wave. Same principle as
+    /// [`Self::schedulable_executor_placements_excluding`] — one notion of
+    /// "eligible" shared by every consumer, so they cannot drift.
+    pub(crate) fn total_schedulable_slots_excluding(
+        &self,
+        excluded: &std::collections::HashSet<ExecutorId>,
+    ) -> usize {
         self.executors
             .values()
-            .filter(|executor| self.is_schedulable(executor))
+            .filter(|executor| {
+                self.is_schedulable(executor) && !excluded.contains(executor.executor_id())
+            })
             .map(|executor| executor.descriptor().slots())
             .sum()
     }

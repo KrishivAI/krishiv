@@ -1190,7 +1190,10 @@ fn cascade_circuit_breaker_trips_and_auto_resets() {
     let coord_id = CoordinatorId::try_new("coord-cascade").unwrap();
     let mut coordinator = Coordinator::active_with_config(coord_id, config);
 
-    // Register some executors so the coordinator is in a valid state.
+    // No executors: the cascade breaker is a cluster-wide gate driven purely by
+    // the loss timestamps fed to it, so it is exercised directly here. Its
+    // interaction with per-executor eligibility is covered by the circuit
+    // breaker tests below.
     let base_t: u64 = 1_000_000;
 
     // Breaker is open=false initially.
@@ -2037,6 +2040,73 @@ fn assigned_tasks_survive_launch_without_bouncing_to_pending() {
         bounced.is_empty(),
         "tasks {bounced:?} were reset to Pending by the launch path after \
          assignment placed them — assignment and launch disagree on eligibility"
+    );
+}
+
+/// The third consumer of "eligible": planning width. `total_schedulable_slots`
+/// is the AQE coalesce floor (`job_lifecycle.rs`) and the staged-batch target
+/// partition count (`batch_sql.rs`, "plan against the capacity that will
+/// actually run the query"). Placement and launch were both taught to skip
+/// circuit-broken executors after the 2026-07-30 livelock; this count was not,
+/// so it kept planning against slots that would never be offered — a 3×3
+/// cluster with one broken node still cut stages 9 wide, and the 3 tasks with
+/// nowhere to run queued behind a half-empty second wave.
+#[test]
+fn planning_width_excludes_circuit_broken_executors() {
+    allow_anonymous_for_tests();
+    let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-cb-width").unwrap());
+    let good = ExecutorId::try_new("exec-width-good").unwrap();
+    let bad = ExecutorId::try_new("exec-width-bad").unwrap();
+    coordinator
+        .register_executor(ExecutorDescriptor::new(good.clone(), "pod-wg", 4))
+        .unwrap();
+    coordinator
+        .register_executor(ExecutorDescriptor::new(bad.clone(), "pod-wb", 4))
+        .unwrap();
+    assert_eq!(
+        coordinator.total_schedulable_slots(),
+        8,
+        "precondition: both executors count toward the planning width"
+    );
+
+    let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+    trip_breaker(&mut coordinator, &bad, now_ms);
+
+    assert_eq!(
+        coordinator.total_schedulable_slots(),
+        4,
+        "a circuit-broken executor's slots must leave the planning width — \
+         neither placement nor launch will give it a task, so planning a stage \
+         against them cuts it wider than the cluster can run"
+    );
+}
+
+/// And the starvation floor must carry through to planning. When every
+/// executor is broken the breaker admits them all rather than halting the
+/// cluster; a planning width of 0 would then report "capacity unknown" and
+/// collapse the query onto the local machine while the cluster is in fact
+/// about to run it. Sharing `circuit_broken_executors` is what keeps the two
+/// consistent — a second, hand-rolled filter here would not.
+#[test]
+fn planning_width_keeps_everyone_when_the_starvation_floor_admits_them() {
+    allow_anonymous_for_tests();
+    let mut coordinator =
+        Coordinator::active(CoordinatorId::try_new("coord-cb-width-floor").unwrap());
+    let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+    for name in ["exec-floor-a", "exec-floor-b"] {
+        let id = ExecutorId::try_new(name).unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(id.clone(), "pod-floor", 4))
+            .unwrap();
+        trip_breaker(&mut coordinator, &id, now_ms);
+    }
+
+    assert_eq!(
+        coordinator.total_schedulable_slots(),
+        8,
+        "with no healthy executor left the breaker admits everyone, so planning \
+         must count everyone too — planning 0 would report the cluster as \
+         capacity-unknown while it is still running work"
     );
 }
 

@@ -1606,8 +1606,21 @@ impl Coordinator {
     /// run at once. `0` means no executor is schedulable — callers must treat
     /// that as "capacity unknown", since a job submitted before the first
     /// executor registers is not a job for an empty cluster.
+    ///
+    /// Circuit-broken executors are excluded, because neither
+    /// `assign_pending_tasks_capped` nor `launch_assigned_task_assignments`
+    /// will give them a task. Counting them here planned the query against
+    /// capacity that will never be offered — the same "the paths must agree on
+    /// eligibility" rule that the 2026-07-30 livelock established for
+    /// placement and launch, extended to the third consumer. The starvation
+    /// floor inside `circuit_broken_executors` keeps the two consistent for
+    /// free: when every executor is broken the breaker admits them all, and so
+    /// does this count.
     pub fn total_schedulable_slots(&self) -> usize {
-        self.exec.executors.total_schedulable_slots()
+        let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+        self.exec
+            .executors
+            .total_schedulable_slots_excluding(&self.circuit_broken_executors(now_ms))
     }
 
     /// Heartbeat ticks since coordinator restart.
