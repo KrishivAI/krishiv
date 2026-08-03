@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
-// CLI binary intentionally writes help text to stdout.
-#![allow(clippy::print_stdout)]
+// A daemon entry point writes `--help` to stdout and, as its last act, why it
+// could not start to stderr — and at that point there is no logger to route
+// either through. `krishiv_clusterd` already says exactly this; these two
+// still used `tracing::error!`, so a config-parse failure (which happens
+// before any logging is initialised) exited 2 with no output at all.
+#![allow(clippy::print_stderr, clippy::print_stdout)]
 
 //! Standalone `krishiv-coordinator` binary (alias for `krishiv coordinator`).
 
@@ -51,7 +55,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     match result {
         Ok(()) => Ok(()),
         Err(error) => {
-            tracing::error!(error = %error, "coordinator exited with error");
+            eprintln!("{error}");
             process::exit(2);
         }
     }
