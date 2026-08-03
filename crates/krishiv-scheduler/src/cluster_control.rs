@@ -115,6 +115,10 @@ impl ClusterControlPlane {
         shared: SharedCoordinator,
         leader: SharedLeader,
     ) -> Self {
+        // Publish the election to the shared handle so the HTTP health surface
+        // can observe lease staleness (the router only ever sees
+        // `SharedCoordinator`, never the CCP).
+        let shared = shared.with_leader_election(Arc::clone(&leader));
         Self {
             coordinator_id,
             shared,

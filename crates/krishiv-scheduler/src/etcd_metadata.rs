@@ -684,6 +684,46 @@ async fn get_prefix_paged(client: &mut KvClient, prefix: &str) -> Result<Vec<Key
     Ok(out)
 }
 
+/// Decide whether a partially-decoded prefix load may proceed.
+///
+/// Two different failures were previously conflated by failing the whole load
+/// on the first bad record:
+///
+/// * **Single-record corruption.** One key will not decode. Failing the load
+///   fails `connect`/`refresh`, so *every* coordinator in the cluster
+///   crash-loops on one bad key — a total outage that needs manual etcd
+///   surgery to clear. Skipping it costs one job.
+/// * **A schema break.** A field added without `serde(default)`, or a version
+///   bump: *every* record fails. Skipping silently would start the coordinator
+///   with zero jobs and no error at all — total, silent state loss, which is
+///   far worse than refusing to start.
+///
+/// The two are distinguishable by exactly one thing: whether anything decoded.
+/// So skip per record, and fail only when nothing survived. `load_ivm_snapshots`
+/// already skipped-and-logged; it was missing this half.
+fn admit_partial_prefix_load(prefix: &str, decoded: usize, skipped: usize) -> Result<(), String> {
+    if skipped == 0 {
+        return Ok(());
+    }
+    if decoded == 0 {
+        return Err(format!(
+            "every one of {skipped} record(s) under {prefix} failed to decode; \
+             that is a schema/format break rather than corruption, and starting \
+             with an empty view of this prefix would silently discard all of it"
+        ));
+    }
+    // Loud on purpose: a skipped record is durable state this coordinator will
+    // never act on again. `warn` is where that goes to die in a busy log.
+    tracing::error!(
+        prefix,
+        decoded,
+        skipped,
+        "skipped undecodable etcd records during load; the affected state is \
+         lost to this coordinator — inspect the keys logged above"
+    );
+    Ok(())
+}
+
 async fn load_prefix<P, T>(client: &mut KvClient, prefix: &str) -> Result<Vec<T>, String>
 where
     P: serde::de::DeserializeOwned,
@@ -693,21 +733,21 @@ where
     let kvs = get_prefix_paged(client, prefix).await?;
 
     let mut results = Vec::with_capacity(kvs.len());
+    let mut skipped = 0usize;
     for kv in &kvs {
-        let persisted: P = serde_json::from_slice(kv.value()).map_err(|e| {
-            format!(
-                "etcd decode failed for key {}: {e}",
-                kv.key_str().unwrap_or("?")
-            )
-        })?;
-        let record = T::try_from(persisted).map_err(|e| {
-            format!(
-                "etcd record convert failed for key {}: {e}",
-                kv.key_str().unwrap_or("?")
-            )
-        })?;
-        results.push(record);
+        let key = kv.key_str().unwrap_or("?");
+        let decoded = serde_json::from_slice::<P>(kv.value())
+            .map_err(|e| format!("decode: {e}"))
+            .and_then(|persisted| T::try_from(persisted).map_err(|e| format!("convert: {e}")));
+        match decoded {
+            Ok(record) => results.push(record),
+            Err(error) => {
+                skipped += 1;
+                tracing::error!(key, %error, "skipping undecodable etcd record");
+            }
+        }
     }
+    admit_partial_prefix_load(prefix, results.len(), skipped)?;
     Ok(results)
 }
 
@@ -718,15 +758,18 @@ where
     let kvs = get_prefix_paged(client, prefix).await?;
 
     let mut results = Vec::with_capacity(kvs.len());
+    let mut skipped = 0usize;
     for kv in &kvs {
-        let record: T = serde_json::from_slice(kv.value()).map_err(|e| {
-            format!(
-                "etcd decode failed for key {}: {e}",
-                kv.key_str().unwrap_or("?")
-            )
-        })?;
-        results.push(record);
+        let key = kv.key_str().unwrap_or("?");
+        match serde_json::from_slice::<T>(kv.value()) {
+            Ok(record) => results.push(record),
+            Err(error) => {
+                skipped += 1;
+                tracing::error!(key, %error, "skipping undecodable etcd record");
+            }
+        }
     }
+    admit_partial_prefix_load(prefix, results.len(), skipped)?;
     Ok(results)
 }
 
@@ -736,15 +779,28 @@ async fn load_continuous_snapshots(
     let kvs = get_prefix_paged(client, CONTINUOUS_KEY_PREFIX).await?;
 
     let mut snapshots = std::collections::HashMap::with_capacity(kvs.len());
+    let mut skipped = 0usize;
     for kv in &kvs {
         let key = kv.key_str().unwrap_or("?");
-        let job_id = key
+        let decoded = key
             .strip_prefix(CONTINUOUS_KEY_PREFIX)
-            .ok_or_else(|| format!("etcd continuous snapshot key has wrong prefix: {key}"))?;
-        let snapshot = ContinuousSnapshot::decode(kv.value())
-            .map_err(|e| format!("etcd continuous snapshot decode failed for {key}: {e}"))?;
-        snapshots.insert(job_id.to_owned(), snapshot);
+            .ok_or_else(|| String::from("key has the wrong prefix"))
+            .and_then(|job_id| {
+                ContinuousSnapshot::decode(kv.value())
+                    .map(|snapshot| (job_id.to_owned(), snapshot))
+                    .map_err(|e| format!("decode: {e}"))
+            });
+        match decoded {
+            Ok((job_id, snapshot)) => {
+                snapshots.insert(job_id, snapshot);
+            }
+            Err(error) => {
+                skipped += 1;
+                tracing::error!(key, %error, "skipping undecodable continuous snapshot");
+            }
+        }
     }
+    admit_partial_prefix_load(CONTINUOUS_KEY_PREFIX, snapshots.len(), skipped)?;
     Ok(snapshots)
 }
 
@@ -923,14 +979,15 @@ async fn load_ivm_snapshots(
         }
     }
 
-    let mut snapshots = HashMap::with_capacity(manifests.len());
+    let manifest_count = manifests.len();
+    let mut snapshots = HashMap::with_capacity(manifest_count);
     for (job_id, manifest_value) in manifests {
         match reassemble_ivm_snapshot(&manifest_value, chunks.get(&job_id)) {
             Ok(raw) => {
                 snapshots.insert(job_id, raw);
             }
             Err(error) => {
-                tracing::warn!(
+                tracing::error!(
                     job_id = %job_id,
                     %error,
                     "skipping unrecoverable IVM snapshot during etcd load"
@@ -938,6 +995,12 @@ async fn load_ivm_snapshots(
             }
         }
     }
+    // This loader already skipped-and-logged; it was missing the other half.
+    admit_partial_prefix_load(
+        IVM_KEY_PREFIX,
+        snapshots.len(),
+        manifest_count - snapshots.len(),
+    )?;
     Ok(snapshots)
 }
 
@@ -1093,6 +1156,41 @@ mod tests {
         assert_eq!(sorted.len(), MAX_JOB_HISTORY);
         assert_eq!(sorted[0].completed_at_ms, (MAX_JOB_HISTORY + 1) as u64);
         assert_eq!(sorted[MAX_JOB_HISTORY - 1].completed_at_ms, 2);
+    }
+
+    // ── partial prefix loads ─────────────────────────────────────────────
+
+    /// One unreadable record must not fail the load — failing `connect` /
+    /// `refresh` crash-loops **every** coordinator in the cluster over a single
+    /// bad key, which needs manual etcd surgery to clear.
+    #[test]
+    fn a_single_undecodable_record_does_not_fail_the_whole_load() {
+        assert!(admit_partial_prefix_load(JOB_KEY_PREFIX, 9, 1).is_ok());
+    }
+
+    /// But if *nothing* decoded, that is a schema/format break rather than
+    /// corruption, and proceeding would start the coordinator with an empty
+    /// view of the prefix — silent total state loss, which is strictly worse
+    /// than refusing to start.
+    #[test]
+    fn a_prefix_where_nothing_decoded_is_a_schema_break_and_must_fail() {
+        let error = admit_partial_prefix_load(JOB_KEY_PREFIX, 0, 7)
+            .expect_err("zero decoded of seven must fail the load");
+        assert!(
+            error.contains("schema/format break"),
+            "the error must name the distinction, got: {error}"
+        );
+    }
+
+    /// A clean load is not a partial load — no warning, no error, regardless
+    /// of how many records there were.
+    #[test]
+    fn a_clean_load_is_admitted_including_an_empty_prefix() {
+        assert!(admit_partial_prefix_load(JOB_KEY_PREFIX, 12, 0).is_ok());
+        // An empty prefix decodes nothing but skips nothing: a fresh cluster,
+        // not a schema break. This is the boundary the zero-decoded rule must
+        // not swallow.
+        assert!(admit_partial_prefix_load(JOB_KEY_PREFIX, 0, 0).is_ok());
     }
 
     #[test]

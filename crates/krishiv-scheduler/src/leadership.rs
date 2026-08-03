@@ -36,6 +36,30 @@ pub trait LeaderElection: Send + Sync {
     /// Default: no-op.
     async fn release(&self) {}
 
+    /// How long since this node last successfully renewed its lease, if it
+    /// believes it holds one.
+    ///
+    /// **This is a health signal, not a leadership predicate.** `is_leader()`
+    /// deliberately stays a plain flag: safety comes from the fencing token,
+    /// which every checkpoint ack validates and which etcd revisions make
+    /// monotonic across restarts — not from a clock. Making `is_leader()`
+    /// time-aware would buy no safety and would self-demote a healthy leader
+    /// through an ordinary GC pause, flapping the cluster.
+    ///
+    /// What it does catch is the renew loop *not running at all* — task
+    /// panicked, starved, or wedged — which this codebase has seen: a
+    /// coordinator frozen for minutes while `/healthz` on a dedicated liveness
+    /// thread kept answering. Wire this to readiness so the orchestrator
+    /// restarts the pod. Same split as Kubernetes' own `leaderelection`:
+    /// `IsLeader()` is a flag, and a separate `Check(maxTolerableExpiredLease)`
+    /// drives the probe.
+    ///
+    /// `None` means "not leader, or no renewal recorded" — never a staleness
+    /// claim. Default: `None` (single-node has no lease to go stale).
+    fn renewal_age(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Monotonically increasing fencing token for this lease holder.
     ///
     /// Must be stored in every `CheckpointMetadata` committed by this

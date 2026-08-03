@@ -1002,6 +1002,34 @@ async fn readyz(
     State(coordinator): State<SharedCoordinator>,
 ) -> Result<&'static str, (axum::http::StatusCode, String)> {
     leaderz(State(coordinator.clone())).await?;
+
+    // A leader whose lease has not been renewed within its own TTL is not
+    // ready, even though it still reports itself leader.
+    //
+    // `is_leader()` deliberately stays a plain flag — safety comes from the
+    // fencing token, and self-demoting on a clock would flap the cluster
+    // through an ordinary GC pause. What this catches is the renew loop *not
+    // running at all* (panicked, starved, wedged), which this codebase has
+    // seen: a coordinator frozen for minutes while `/healthz` on its dedicated
+    // liveness thread kept answering. Failing readiness drops the pod from
+    // Service routing and lets the orchestrator restart it, which is the
+    // correct response to a stuck supervisor loop.
+    if let (Some(age), Some(ttl)) = (
+        coordinator.leader_renewal_age(),
+        coordinator.leader_lease_duration(),
+    ) && age > ttl
+    {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "leader lease last renewed {}s ago, past its {}s TTL — the \
+                 renewal loop is not running\n",
+                age.as_secs(),
+                ttl.as_secs()
+            ),
+        ));
+    }
+
     let c = coordinator.read().await;
     let has_schedulable_executor = c
         .executor_snapshots()
@@ -2460,6 +2488,90 @@ mod parse_tests {
         assert_eq!(
             json["executors"][0]["executor_id"],
             serde_json::json!(exec_id.to_string())
+        );
+    }
+
+    /// A leader whose lease went stale is not ready, even while it still
+    /// reports itself leader — that is the renew loop being wedged, and the
+    /// correct response is to leave Service routing and be restarted.
+    ///
+    /// `is_leader()` stays true throughout on purpose: safety is the fencing
+    /// token's job, and self-demoting on a clock flaps the cluster (see
+    /// `LeaderElection::renewal_age`). Readiness is where staleness belongs.
+    #[tokio::test]
+    async fn readyz_fails_when_the_leader_lease_has_gone_stale() {
+        use crate::CoordinatorDaemonConfig;
+        use crate::coordinator_http_router;
+        use crate::leadership::LeaderElection;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use krishiv_proto::{ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState};
+        use tower::ServiceExt;
+
+        /// Election stub whose renewal age is controllable. Always leader.
+        #[derive(Debug)]
+        struct StaleLeaseElection {
+            renewal_age: std::sync::Mutex<std::time::Duration>,
+        }
+
+        impl crate::LeaderElection for StaleLeaseElection {
+            fn is_leader(&self) -> bool {
+                true
+            }
+            fn lease_duration_s(&self) -> u64 {
+                15
+            }
+            fn renewal_age(&self) -> Option<std::time::Duration> {
+                Some(*self.renewal_age.lock().unwrap_or_else(|p| p.into_inner()))
+            }
+        }
+
+        let _ = crate::auth::set_allow_anonymous();
+
+        let election = std::sync::Arc::new(StaleLeaseElection {
+            renewal_age: std::sync::Mutex::new(std::time::Duration::from_secs(1)),
+        });
+        let mut inner = Coordinator::active(CoordinatorId::try_new("coord-stale-lease").unwrap());
+        let exec_id = ExecutorId::try_new("exec-stale-lease").unwrap();
+        inner
+            .register_executor(ExecutorDescriptor::new(exec_id.clone(), "localhost", 4))
+            .unwrap();
+        inner
+            .executor_heartbeat(ExecutorHeartbeat::new(exec_id, ExecutorState::Healthy))
+            .unwrap();
+        let coordinator = SharedCoordinator::new(inner)
+            .with_leader_election(election.clone() as crate::cluster_control::SharedLeader);
+        let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DevLocal);
+
+        let readyz = async |coordinator: SharedCoordinator, config: &CoordinatorDaemonConfig| {
+            coordinator_http_router(coordinator, config)
+                .oneshot(
+                    Request::builder()
+                        .uri("/readyz")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        };
+
+        assert_eq!(
+            readyz(coordinator.clone(), &config).await,
+            StatusCode::OK,
+            "a freshly renewed lease with a healthy executor must be ready"
+        );
+
+        // The renewal loop wedges: age passes the TTL while leadership still reads true.
+        *election.renewal_age.lock().unwrap() = std::time::Duration::from_secs(60);
+        assert!(
+            election.is_leader(),
+            "precondition: the node must still consider itself leader"
+        );
+        assert_eq!(
+            readyz(coordinator, &config).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a lease past its TTL must fail readiness so the pod is restarted"
         );
     }
 

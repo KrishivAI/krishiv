@@ -449,6 +449,19 @@ impl LeaderElection for EtcdLeaseElection {
     fn lease_duration_s(&self) -> u64 {
         self.lease_duration_s
     }
+
+    /// Age of the last successful renewal, for the readiness probe.
+    ///
+    /// `last_renewed_at` was written in three places and read in none — dead
+    /// state shaped exactly like a liveness guard. This is the read side, and
+    /// it is deliberately NOT consulted by `is_leader()`; see the trait doc.
+    fn renewal_age(&self) -> Option<std::time::Duration> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.is_leader {
+            return None;
+        }
+        state.last_renewed_at.map(|at| at.elapsed())
+    }
 }
 
 impl fmt::Display for EtcdLeaseElection {
@@ -485,6 +498,49 @@ mod tests {
         election.release().await;
         assert!(election.try_acquire().await);
         assert_eq!(election.fencing_token(), 2);
+    }
+
+    #[tokio::test]
+    async fn renewal_age_tracks_renewals_and_is_none_when_not_leader() {
+        let election = EtcdLeaseElection::new(DEFAULT_CCP_LEADER_KEY, "node-a", 15);
+        assert!(
+            election.renewal_age().is_none(),
+            "a node that holds no lease makes no staleness claim"
+        );
+
+        assert!(election.try_acquire().await);
+        let after_acquire = election
+            .renewal_age()
+            .expect("a leader has a renewal timestamp");
+        assert!(after_acquire < std::time::Duration::from_secs(1));
+
+        election.release().await;
+        assert!(
+            election.renewal_age().is_none(),
+            "releasing the lease must stop reporting an age, not report a stale one"
+        );
+    }
+
+    /// The point of the split: leadership is a flag, staleness is a probe.
+    /// `is_leader()` must not consult the clock — a GC pause is not a demotion.
+    #[tokio::test]
+    async fn is_leader_does_not_depend_on_renewal_age() {
+        let election = EtcdLeaseElection::new(DEFAULT_CCP_LEADER_KEY, "node-b", 1);
+        assert!(election.try_acquire().await);
+        // Backdate the renewal well past the 1s lease duration.
+        {
+            let mut s = election.state.lock().unwrap();
+            s.last_renewed_at = Some(Instant::now() - std::time::Duration::from_secs(3600));
+        }
+        assert!(
+            election.is_leader(),
+            "is_leader must stay a plain flag; safety comes from the fencing \
+             token, and self-demoting on a stale clock flaps the cluster"
+        );
+        assert!(
+            election.renewal_age().unwrap() > std::time::Duration::from_secs(60),
+            "but the probe must see the staleness"
+        );
     }
 
     #[test]

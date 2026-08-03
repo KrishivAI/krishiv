@@ -407,7 +407,7 @@ impl fmt::Debug for Coordinator {
 ///
 /// Any code that acquires locks in a different order risks a deadlock.  If you add a new
 /// synchronization primitive, place it in this ordering and update this comment.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SharedCoordinator {
     inner: Arc<RwLock<Coordinator>>,
     /// Dedicated lock for executor registry state — avoids serialising
@@ -423,6 +423,36 @@ pub struct SharedCoordinator {
     /// E4.4: Live operator state registry for queryable-state REST API.
     /// Operator backends register here; deregistered on job eviction.
     pub queryable_state: Arc<QueryableStateStore>,
+    /// Leader-election backend, when one is attached (clusterd HA). Mirrored
+    /// here beside `leader_fencing_token` — which the election already
+    /// publishes — so the HTTP health surface can ask the lease how stale it
+    /// is without the CCP being reachable from the router state.
+    ///
+    /// Used **only** for readiness. Leadership itself is
+    /// `Coordinator::state()`; see `LeaderElection::renewal_age`.
+    ///
+    /// `LeaderElection` is an erased trait object over backends holding live
+    /// clients and is not `Debug`, so `SharedCoordinator` implements `Debug`
+    /// by hand rather than deriving it.
+    pub leader: Option<crate::cluster_control::SharedLeader>,
+}
+
+impl std::fmt::Debug for SharedCoordinator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedCoordinator")
+            .field("durability_profile", &self.durability_profile)
+            .field(
+                "leader_fencing_token",
+                &self
+                    .leader_fencing_token
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .field(
+                "leader_election",
+                &self.leader.as_ref().map(|_| "<attached>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl SharedCoordinator {
@@ -440,7 +470,31 @@ impl SharedCoordinator {
             durability_profile,
             leader_fencing_token: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             queryable_state: Arc::new(QueryableStateStore::new()),
+            leader: None,
         }
+    }
+
+    /// Attach the leader-election backend so `/readyz` can observe lease
+    /// staleness. Set by `ClusterControlPlane::from_shared_with_leader`.
+    #[must_use]
+    pub fn with_leader_election(mut self, leader: crate::cluster_control::SharedLeader) -> Self {
+        self.leader = Some(leader);
+        self
+    }
+
+    /// How stale this node's leader lease is, when it holds one.
+    ///
+    /// `None` for single-node/embedded (no election attached) and for a node
+    /// that is not leader — neither makes a staleness claim.
+    pub fn leader_renewal_age(&self) -> Option<std::time::Duration> {
+        self.leader.as_ref().and_then(|l| l.renewal_age())
+    }
+
+    /// The lease TTL this node is holding to, when an election is attached.
+    pub fn leader_lease_duration(&self) -> Option<std::time::Duration> {
+        self.leader
+            .as_ref()
+            .map(|l| std::time::Duration::from_secs(l.lease_duration_s()))
     }
 
     /// Attach the daemon durability profile to this shared handle.
