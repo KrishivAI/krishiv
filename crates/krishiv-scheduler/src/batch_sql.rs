@@ -45,7 +45,11 @@ const BATCH_SQL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Park until the job may have changed state: whichever comes first of a change
 /// notification, one [`BATCH_SQL_POLL_INTERVAL`] tick, or the deadline.
-async fn await_job_change(
+///
+/// Shared with `bounded_window.rs`, which had a fourth copy of this same wait
+/// loop carrying the same deadline-as-fallback bug. One implementation so the
+/// copies cannot drift apart again.
+pub(crate) async fn await_job_change(
     state_changed: impl std::future::Future<Output = ()>,
     deadline: tokio::time::Instant,
 ) {
@@ -63,7 +67,7 @@ async fn await_job_change(
 /// table/column, type mismatch, arithmetic overflow, …). Returns `None` when no
 /// task recorded a reason (e.g. an external cancellation), letting the caller
 /// fall back to a generic terminal-state message.
-fn first_task_failure_reason(detail: &JobDetailSnapshot) -> Option<String> {
+pub(crate) fn first_task_failure_reason(detail: &JobDetailSnapshot) -> Option<String> {
     detail
         .stages()
         .iter()

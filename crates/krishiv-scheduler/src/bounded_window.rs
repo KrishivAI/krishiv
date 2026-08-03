@@ -156,9 +156,19 @@ pub async fn execute_bounded_window_coordinated(
                 });
             }
             JobState::Failed | JobState::Cancelled => {
-                return Err(SchedulerError::Transport {
-                    message: format!("bounded window job {job_id} finished in state {state:?}"),
-                });
+                // Same reasoning as the batch-SQL paths: `Transport` is
+                // classified Retryable/opaque by the interface layer, so a
+                // window job that failed on a caller's query error was reported
+                // as an internal fault with the recorded reason discarded.
+                let reason = {
+                    let coord = coordinator.read().await;
+                    coord
+                        .job_detail_snapshot(&job_id)
+                        .ok()
+                        .and_then(|detail| crate::batch_sql::first_task_failure_reason(&detail))
+                        .unwrap_or_else(|| format!("job finished in state {state:?}"))
+                };
+                return Err(SchedulerError::JobFailed { job_id, reason });
             }
             JobState::Queued
             | JobState::Accepted
@@ -178,10 +188,11 @@ pub async fn execute_bounded_window_coordinated(
                         | JobState::Running
                         | JobState::Committing
                 ) {
-                    tokio::select! {
-                        _ = state_changed => {}
-                        _ = tokio::time::sleep_until(deadline) => {}
-                    }
+                    // Was `sleep_until(deadline)`: a missed `notify_waiters`
+                    // notification parked this caller for the full 120s window
+                    // timeout on a job that had already finished. See
+                    // `batch_sql::BATCH_SQL_POLL_INTERVAL`.
+                    crate::batch_sql::await_job_change(state_changed, deadline).await;
                 }
             }
         }
