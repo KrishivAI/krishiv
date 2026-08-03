@@ -24,6 +24,12 @@ pub const MAX_EVENTS_LOG_BYTES: u64 = 64 * 1024 * 1024;
 /// is counted separately via [`EventLogEvent::approx_heap_bytes`].
 const EVENT_BASE_BYTES: u64 = 96;
 
+/// Fraction of [`MAX_EVENTS_LOG_BYTES`] freed in one eviction pass, so the
+/// buffer's tail is shifted once per slab instead of once per append. Larger =
+/// cheaper appends, smaller = tighter adherence to the cap; 1/8 keeps the log
+/// between 87.5% and 100% of the cap.
+const EVICT_SLAB_FRACTION: u64 = 8;
+
 impl EventLogEvent {
     /// Approximate heap-allocated bytes owned by this event.
     ///
@@ -312,9 +318,9 @@ pub trait MetadataStore: Send + Sync {
 /// (`save_job`/`save_executor`) is unaffected because those are kept in
 /// separate fields and are never evicted.
 ///
-/// Eviction is O(n) per removed event (`Vec::remove(0)` shifts the tail) but
-/// is amortized O(1) per appended event because it only fires when the buffer
-/// is full (every ~[`MAX_EVENTS_LOG_BYTES`] / avg_event_size appends).
+/// Eviction frees a whole slab ([`EVICT_SLAB_FRACTION`] of the cap) in one
+/// `drain`, so the tail is shifted once per slab rather than once per append.
+/// See [`InMemoryMetadataStore::evict_until_fits`] for why that matters.
 #[derive(Debug, Default)]
 pub struct InMemoryMetadataStore {
     events: Vec<EventLogEvent>,
@@ -342,16 +348,47 @@ impl InMemoryMetadataStore {
         self.events_byte_size
     }
 
+    /// Evict oldest events until `incoming_bytes` fits, freeing a slab at a
+    /// time rather than one event at a time.
+    ///
+    /// The previous version looped `Vec::remove(0)` until the incoming event
+    /// fit. `remove(0)` shifts the entire tail, and once the log is full —
+    /// which for a long-running streaming coordinator is the *steady* state,
+    /// not a rare one — each append frees roughly its own size, so exactly one
+    /// removal ran per append. That is one memmove of the whole buffer per
+    /// appended event: at 64 MiB and ~130 B per `EventLogEvent` slot, ~280k
+    /// elements, ~36 MB moved for every task-state change. The comment above
+    /// it claimed "amortized O(1) per appended event because it only fires
+    /// when the buffer is full", which inverts the truth — full is precisely
+    /// when it fires on *every* append.
+    ///
+    /// Freeing [`EVICT_SLAB_FRACTION`] of the cap in a single `drain` restores
+    /// the intended amortization: one tail shift per slab, and the next
+    /// slab-worth of appends evict nothing at all.
     fn evict_until_fits(&mut self, incoming_bytes: u64) {
-        while self.events_byte_size + incoming_bytes > MAX_EVENTS_LOG_BYTES
-            && !self.events.is_empty()
-        {
-            let oldest = self.events.remove(0);
-            self.events_byte_size = self
-                .events_byte_size
-                .saturating_sub(EVENT_BASE_BYTES + oldest.approx_heap_bytes());
-            self.evicted_event_count = self.evicted_event_count.saturating_add(1);
+        if self.events_byte_size + incoming_bytes <= MAX_EVENTS_LOG_BYTES {
+            return;
         }
+        // Leave room for this event *plus* a slab of headroom.
+        let target = MAX_EVENTS_LOG_BYTES
+            .saturating_sub(incoming_bytes)
+            .saturating_sub(MAX_EVENTS_LOG_BYTES / EVICT_SLAB_FRACTION);
+
+        let mut freed = 0u64;
+        let mut drop_count = 0usize;
+        for event in &self.events {
+            if self.events_byte_size.saturating_sub(freed) <= target {
+                break;
+            }
+            freed = freed.saturating_add(EVENT_BASE_BYTES + event.approx_heap_bytes());
+            drop_count += 1;
+        }
+        if drop_count == 0 {
+            return;
+        }
+        self.events.drain(..drop_count);
+        self.events_byte_size = self.events_byte_size.saturating_sub(freed);
+        self.evicted_event_count = self.evicted_event_count.saturating_add(drop_count as u64);
     }
 }
 
@@ -748,19 +785,21 @@ pub(crate) struct PersistedTaskRecord {
     /// Defaults to 0 for records written before this field was added.
     #[serde(default)]
     pub(crate) executor_loss_count: u32,
-    /// SC3: deterministic coordinator tick at which the task was last
-    /// assigned to an executor. Restored on coordinator restart so a
-    /// stalled-task timeout window does not reset across a leader
-    /// failover. Defaults to `None` for records written before this
-    /// field was added (backward compatible).
-    #[serde(default)]
-    pub(crate) assigned_at_tick: Option<u64>,
-    /// SC3: deterministic coordinator tick of the last progress event
-    /// reported by the executor. Used by the heartbeat-driven stall
-    /// detector. Defaults to `None` for records written before this
-    /// field was added.
-    #[serde(default)]
-    pub(crate) last_progress_tick: Option<u64>,
+    //
+    // There were once `assigned_at_tick` / `last_progress_tick` fields here,
+    // documented as carrying SC3's stall-timeout window across a coordinator
+    // restart. They were never wired: `From<&TaskRecord>` hardcoded both to
+    // `None`, `TryFrom` ignored them, and nothing else in the workspace ever
+    // referenced either name — while two doc comments and two tests asserted
+    // the round-trip worked. The tests passed because they serialised a
+    // hand-built `PersistedTaskRecord` and never went through the real
+    // conversions. Removed rather than wired, because a tick is meaningless
+    // across a restart (the tick clock is rewound) and the wall-clock variant
+    // would reintroduce the failure mode that killed TPC-H SF100 q5: a
+    // healthy, long-running task failed for "no progress". If cross-restart
+    // stall budgets are wanted, persist `last_progress_ms` and keep the
+    // heartbeat refresh path authoritative. Old JSON carrying the two keys
+    // still loads — serde ignores unknown fields.
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -936,12 +975,6 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             last_failure_reason: value.last_failure_reason.clone(),
             failure_count: value.failure_count,
             executor_loss_count: value.executor_loss_count,
-            // SC3: round-trip the stall-tracking timestamps so a coordinator
-            // restart does not reset the timeout window. `assigned_at_ms`
-            // and `last_progress_ms` on `TaskRecord` are populated by the
-            // scheduler's task-assignment / progress paths.
-            assigned_at_tick: None,
-            last_progress_tick: None,
         }
     }
 }
@@ -967,10 +1000,11 @@ impl TryFrom<PersistedTaskRecord> for TaskRecord {
             // Streaming state is not persisted in R5.1; executors re-report it on re-attach.
             last_watermark_ms: None,
             last_source_offset: None,
-            // SC3: restore the stall-tracking timestamps so a stalled task
-            // that survived a coordinator restart keeps its elapsed time
-            // budget. The wall-clock variants are derived from the tick
-            // values when the coordinator's tick clock is rewound.
+            // Stall clocks are deliberately transient: a restarted coordinator
+            // has observed no progress yet, and the first heartbeat listing the
+            // task as running re-establishes `last_progress_ms`. See the note
+            // on `PersistedTaskRecord` for why the persisted tick variants were
+            // removed rather than wired.
             assigned_at_ms: None,
             last_progress_ms: None,
             completed_duration_ms: None,
@@ -1741,49 +1775,61 @@ mod tests {
         assert_eq!(legacy.incarnation_id(), None);
     }
 
-    /// SC3: `PersistedTaskRecord` round-trips the new
-    /// `assigned_at_tick` / `last_progress_tick` fields through JSON.
+    /// Round-trip a `TaskRecord` through the **real** conversions
+    /// (`From<&TaskRecord>` → JSON → `TryFrom` → `TaskRecord`), which is what
+    /// a coordinator restart actually runs.
+    ///
+    /// The two tests this replaces built a `PersistedTaskRecord` by hand and
+    /// asserted serde carried its fields — so they passed while
+    /// `From<&TaskRecord>` hardcoded the SC3 tick fields to `None` and
+    /// `TryFrom` ignored them. A conversion test has to go through the
+    /// conversion.
     #[test]
-    fn persisted_task_record_round_trips_stall_tracking_ticks() {
-        let rec = PersistedTaskRecord {
-            spec: PersistedTaskSpec {
-                task_id: String::from("task-1"),
-                description: String::from("desc"),
-                task_timeout_secs: Some(0),
-                source_capabilities: None,
-                sink_capabilities: None,
-                sink_contract: None,
-            },
-            state: String::from("Running"),
-            assigned_executor: Some(String::from("executor-1")),
-            attempt: 1,
-            output_metadata: None,
-            last_failure_reason: None,
-            failure_count: 0,
-            executor_loss_count: 0,
-            assigned_at_tick: Some(42),
-            last_progress_tick: Some(47),
-        };
-        let json = serde_json::to_string(&rec).expect("serialise");
-        // Both fields must be present in the JSON output.
-        assert!(
-            json.contains("\"assigned_at_tick\":42"),
-            "missing field in {json}"
+    fn task_record_round_trips_its_retry_budget_and_drops_only_transient_state() {
+        let mut task = TaskRecord::from_spec(TaskSpec::new(
+            TaskId::try_new("task-1").expect("task id"),
+            "scan a",
+        ));
+        task.state = TaskState::Running;
+        task.assigned_executor = Some(ExecutorId::try_new("executor-1").expect("executor id"));
+        task.attempt = 3;
+        task.failure_count = 2;
+        task.executor_loss_count = 1;
+        task.last_failure_reason = Some("executor lost".to_owned());
+        // Transient in-memory state that must NOT survive.
+        task.assigned_at_ms = Some(1_000);
+        task.last_progress_ms = Some(2_000);
+        task.launch_in_flight = true;
+
+        let json = serde_json::to_string(&PersistedTaskRecord::from(&task)).expect("serialise");
+        let persisted: PersistedTaskRecord = serde_json::from_str(&json).expect("deserialise");
+        let round = TaskRecord::try_from(persisted).expect("convert back");
+
+        // Durable: the retry/loss budgets are exactly what a restart must not
+        // reset, or a task that has already burned its attempts gets a fresh
+        // set and can retry forever.
+        assert_eq!(round.state(), TaskState::Running);
+        assert_eq!(round.attempt, 3);
+        assert_eq!(round.failure_count, 2);
+        assert_eq!(round.executor_loss_count, 1);
+        assert_eq!(round.last_failure_reason.as_deref(), Some("executor lost"));
+        assert_eq!(
+            round.assigned_executor.as_ref().map(|e| e.as_str()),
+            Some("executor-1")
         );
-        assert!(
-            json.contains("\"last_progress_tick\":47"),
-            "missing field in {json}"
-        );
-        let round: PersistedTaskRecord = serde_json::from_str(&json).expect("deserialise");
-        assert_eq!(round.assigned_at_tick, Some(42));
-        assert_eq!(round.last_progress_tick, Some(47));
+
+        // Transient by design: the stall clocks are re-established by the first
+        // heartbeat that lists the task as running, and the launch guard must
+        // reopen so a restart can re-dispatch.
+        assert_eq!(round.assigned_at_ms, None);
+        assert_eq!(round.last_progress_ms, None);
+        assert!(!round.launch_in_flight);
     }
 
-    /// SC3: a `PersistedTaskRecord` written before this field existed
-    /// (no `assigned_at_tick` / `last_progress_tick` in the JSON) must
-    /// still deserialise with `None` for both fields.
+    /// A record written before the SC3 tick fields were removed still loads:
+    /// serde ignores unknown keys, so old stores are readable.
     #[test]
-    fn persisted_task_record_back_compat_with_legacy_payload() {
+    fn persisted_task_record_loads_a_payload_carrying_the_removed_tick_fields() {
         let legacy = r#"{
             "spec": {
                 "task_id": "task-1",
@@ -1792,18 +1838,103 @@ mod tests {
                 "source_capabilities": null,
                 "sink_capabilities": null
             },
-            "state": "Running",
+            "state": "running",
             "assigned_executor": "executor-1",
             "attempt": 1,
             "output_metadata": null,
             "last_failure_reason": null,
             "failure_count": 0,
-            "executor_loss_count": 0
+            "executor_loss_count": 0,
+            "assigned_at_tick": 42,
+            "last_progress_tick": 47
         }"#;
-        let round: PersistedTaskRecord =
-            serde_json::from_str(legacy).expect("legacy payload must deserialise");
-        assert_eq!(round.assigned_at_tick, None);
-        assert_eq!(round.last_progress_tick, None);
+        let persisted: PersistedTaskRecord =
+            serde_json::from_str(legacy).expect("legacy payload must still deserialise");
+        let round = TaskRecord::try_from(persisted).expect("convert");
+        assert_eq!(round.state(), TaskState::Running);
+        assert_eq!(round.assigned_at_ms, None);
+    }
+
+    // ── bounded events ring buffer ───────────────────────────────────────────
+
+    fn filler_event(i: usize) -> EventLogEvent {
+        EventLogEvent::TaskFailed {
+            job_id: JobId::try_new(format!("job-{i}")).expect("job id"),
+            stage_id: StageId::try_new("stage-0").expect("stage id"),
+            task_id: TaskId::try_new(format!("task-{i}")).expect("task id"),
+            attempt: AttemptId::try_new(1).expect("attempt"),
+            // Pad so the cap is reached in a manageable number of appends.
+            reason: "x".repeat(4096),
+        }
+    }
+
+    /// The cap is enforced and eviction is FIFO. The whole ring buffer had no
+    /// test at all — `evicted_event_count` and `events_byte_size` are `pub`
+    /// and documented "for tests and metrics", and nothing read either.
+    #[test]
+    fn events_log_stays_under_the_cap_and_evicts_oldest_first() {
+        let mut store = InMemoryMetadataStore::default();
+        let per_event = EVENT_BASE_BYTES + filler_event(0).approx_heap_bytes();
+        // Enough to overflow the cap twice over.
+        let appends = (MAX_EVENTS_LOG_BYTES / per_event) as usize * 2;
+        for i in 0..appends {
+            store.append_event(filler_event(i)).expect("append");
+            assert!(
+                store.events_byte_size() <= MAX_EVENTS_LOG_BYTES,
+                "cap exceeded after {i} appends: {} > {MAX_EVENTS_LOG_BYTES}",
+                store.events_byte_size()
+            );
+        }
+        assert!(
+            store.evicted_event_count() > 0,
+            "the cap must actually have been hit"
+        );
+        // FIFO: the newest event is still present, the very first is gone.
+        let newest = filler_event(appends - 1);
+        assert_eq!(store.events().last(), Some(&newest));
+        assert!(
+            !store.events().contains(&filler_event(0)),
+            "the oldest event must have been evicted first"
+        );
+    }
+
+    /// Eviction must free a slab, not one event per append. Before this, the
+    /// full-buffer steady state ran one `Vec::remove(0)` — a memmove of the
+    /// entire buffer — for *every* appended event. Counting eviction passes
+    /// rather than evicted events is what distinguishes the two: with
+    /// slab eviction, appends-after-full vastly outnumber passes.
+    #[test]
+    fn eviction_frees_a_slab_so_most_appends_shift_nothing() {
+        let mut store = InMemoryMetadataStore::default();
+        let per_event = EVENT_BASE_BYTES + filler_event(0).approx_heap_bytes();
+        let to_fill = (MAX_EVENTS_LOG_BYTES / per_event) as usize + 1;
+        for i in 0..to_fill {
+            store.append_event(filler_event(i)).expect("append");
+        }
+        assert!(store.evicted_event_count() > 0, "buffer must be full");
+
+        // Now measure passes over a further full buffer's worth of appends.
+        let mut passes = 0usize;
+        let mut last_evicted = store.evicted_event_count();
+        for i in 0..to_fill {
+            store
+                .append_event(filler_event(to_fill + i))
+                .expect("append");
+            if store.evicted_event_count() != last_evicted {
+                passes += 1;
+                last_evicted = store.evicted_event_count();
+            }
+        }
+        // One pass per slab: ~EVICT_SLAB_FRACTION passes per full buffer, with
+        // slack for the byte-size estimate. The pre-fix behaviour is one pass
+        // per append — `to_fill` of them.
+        assert!(
+            passes <= (EVICT_SLAB_FRACTION as usize) * 4,
+            "expected ~{EVICT_SLAB_FRACTION} slab evictions over a full buffer of \
+             appends, got {passes} passes in {to_fill} appends — that is \
+             per-append eviction, which memmoves the whole buffer every time"
+        );
+        assert!(passes > 0, "the cap must still be enforced");
     }
 }
 
