@@ -391,7 +391,6 @@ impl ExecutorRegistry {
         true
     }
 
-
     /// Sum of available memory across schedulable executors that report
     /// memory capacity in their heartbeats.
     ///
@@ -579,9 +578,18 @@ impl ExecutorRegistry {
     }
 
     /// Reset failure count for an executor (e.g. after it reports healthy progress).
-    pub fn reset_task_failures(&mut self, executor_id: &ExecutorId) {
-        if let Some(record) = self.executors.get_mut(executor_id) {
-            record.reset_task_failures();
+    ///
+    /// Returns `false` when the id is unknown. Operator-facing callers need to
+    /// tell "cleared" apart from "there was nothing to clear"; reporting a
+    /// silent no-op as success is how the admin endpoint below came to answer
+    /// `{"reset": true}` for executors that do not exist.
+    pub fn reset_task_failures(&mut self, executor_id: &ExecutorId) -> bool {
+        match self.executors.get_mut(executor_id) {
+            Some(record) => {
+                record.reset_task_failures();
+                true
+            }
+            None => false,
         }
     }
 

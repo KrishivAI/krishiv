@@ -762,7 +762,6 @@ async fn api_job_by_id(
     }
 }
 
-
 /// One stage's cost and its task-duration spread.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StageTimingView {
@@ -956,12 +955,30 @@ async fn api_executor_reset(
             );
         }
     };
-    coordinator
+    let reset = coordinator
         .write()
         .await
         .exec
         .executors
         .reset_task_failures(&executor_id);
+    if !reset {
+        // `reset_task_failures` no-ops silently on an unknown id, so this
+        // answered `{"reset": true}` for an executor that does not exist. An
+        // operator calls this endpoint precisely because an executor is
+        // pinned at the failure threshold and is being skipped for
+        // assignment; a typo'd or already-removed id then reports the one
+        // signal they have as "fixed" while the cluster stays degraded.
+        // Same shape as the cancel 404-vs-409 bug above: report what
+        // happened, not what was asked for.
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "reset": false,
+                "executor_id": executor_id_str,
+                "error": "unknown executor",
+            })),
+        );
+    }
     (
         axum::http::StatusCode::OK,
         Json(serde_json::json!({"reset": true, "executor_id": executor_id_str})),
@@ -1099,7 +1116,7 @@ pub fn parse_coordinator_daemon_config(
         leader_lease_duration_s: env::var("KRISHIV_LEADER_LEASE_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(15),
+            .unwrap_or(DEFAULT_LEADER_LEASE_SECS),
         insecure: krishiv_common::truthy_env("KRISHIV_ALLOW_ANONYMOUS"),
         flight_addr: env::var("KRISHIV_FLIGHT_ADDR")
             .ok()
@@ -1637,6 +1654,28 @@ pub struct JobCoordinatorDaemonConfig {
     pub help: bool,
 }
 
+/// Default JCP status-poll interval, pinned to the env registry's declared
+/// default for `KRISHIV_JCP_POLL_INTERVAL_SECS`.
+pub(crate) const DEFAULT_JCP_POLL_INTERVAL_SECS: u64 = 2;
+
+/// Default etcd leader-lease TTL, pinned to the env registry's declared
+/// default for `KRISHIV_LEADER_LEASE_SECS`.
+pub(crate) const DEFAULT_LEADER_LEASE_SECS: u64 = 15;
+
+/// Clamp a JCP status-poll interval to at least one second.
+///
+/// `run_job_coordinator_daemon`'s watch loop has no delay other than this
+/// interval, so a zero turns the status poll into an unbounded request flood
+/// against the CCP's HTTP surface — the same surface that serves `/readyz`, so
+/// one misconfigured JCP pod degrades the coordinator's Kubernetes probes for
+/// the whole cluster. `--poll-interval-secs` already clamped with `.max(1)`;
+/// the env var did not, and the env var is the path Kubernetes pods actually
+/// take (the operator sets env, not argv). The clamp lives here so the flag
+/// and its env twin cannot drift apart again.
+fn jcp_poll_interval(secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(secs.max(1))
+}
+
 /// Parse `krishiv job-coordinator` flags.
 pub fn parse_job_coordinator_daemon_config(
     args: impl IntoIterator<Item = String>,
@@ -1645,11 +1684,11 @@ pub fn parse_job_coordinator_daemon_config(
         job_id: env::var("KRISHIV_JOB_ID").unwrap_or_default(),
         coordinator_http: env::var("KRISHIV_COORDINATOR_HTTP")
             .unwrap_or_else(|_| String::from("http://127.0.0.1:18080")),
-        poll_interval: std::time::Duration::from_secs(
+        poll_interval: jcp_poll_interval(
             env::var("KRISHIV_JCP_POLL_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(2),
+                .unwrap_or(DEFAULT_JCP_POLL_INTERVAL_SECS),
         ),
         help: false,
     };
@@ -1663,7 +1702,7 @@ pub fn parse_job_coordinator_daemon_config(
             "--poll-interval-secs" => {
                 let v = next_daemon_arg(&mut args, "--poll-interval-secs")?;
                 let secs: u64 = v.parse().map_err(|_| "--poll-interval-secs must be u64")?;
-                config.poll_interval = std::time::Duration::from_secs(secs.max(1));
+                config.poll_interval = jcp_poll_interval(secs);
             }
             "--help" | "-h" => config.help = true,
             unknown => {
@@ -1686,7 +1725,7 @@ pub fn job_coordinator_daemon_help() -> &'static str {
      \n\
      Options:\n\
        --job-id <ID>              Job id to watch (also KRISHIV_JOB_ID)\n\
-       --coordinator-http <URL>   CCP federation HTTP endpoint (also KRISHIV_COORDINATOR_HTTP, default http://127.0.0.1:2002)\n\
+       --coordinator-http <URL>   CCP federation HTTP endpoint (also KRISHIV_COORDINATOR_HTTP, default http://127.0.0.1:18080)\n\
        --poll-interval-secs <N>   Status poll interval (also KRISHIV_JCP_POLL_INTERVAL_SECS, default 2)\n\
      \n\
      Optional env KRISHIV_JOB_SPEC_JSON to submit the job on first connect.\n"
@@ -1789,9 +1828,11 @@ pub async fn run_job_coordinator_daemon(
 #[cfg(test)]
 mod parse_tests {
     use super::{
-        CoordinatorDaemonConfig, CoordinatorSecurityPosture, build_shared_coordinator_sync,
-        classify_coordinator_security_posture, coordinator_daemon_help,
-        parse_coordinator_daemon_config, render_metrics_body, validate_runtime_security_config,
+        CoordinatorDaemonConfig, CoordinatorSecurityPosture, DEFAULT_JCP_POLL_INTERVAL_SECS,
+        DEFAULT_LEADER_LEASE_SECS, build_shared_coordinator_sync,
+        classify_coordinator_security_posture, coordinator_daemon_help, jcp_poll_interval,
+        parse_coordinator_daemon_config, parse_job_coordinator_daemon_config, render_metrics_body,
+        validate_runtime_security_config,
     };
     use crate::{Coordinator, SharedCoordinator};
     use krishiv_common::durability::DurabilityProfile;
@@ -2514,5 +2555,123 @@ mod parse_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A zero poll interval must never reach the JCP watch loop.
+    ///
+    /// That loop has no delay other than this interval, so zero turns the
+    /// status poll into an unbounded request flood against the CCP's HTTP
+    /// surface — which also serves `/readyz`, so one misconfigured JCP pod
+    /// degrades the coordinator's Kubernetes probes cluster-wide.
+    /// `--poll-interval-secs` clamped with `.max(1)`; the
+    /// `KRISHIV_JCP_POLL_INTERVAL_SECS` twin did not, and env is the path
+    /// Kubernetes pods take. Both now route through `jcp_poll_interval`.
+    #[test]
+    fn jcp_poll_interval_is_never_zero() {
+        assert_eq!(
+            jcp_poll_interval(0),
+            std::time::Duration::from_secs(1),
+            "a zero interval would busy-poll the coordinator's HTTP surface"
+        );
+        assert_eq!(jcp_poll_interval(7), std::time::Duration::from_secs(7));
+
+        let config = parse_job_coordinator_daemon_config([
+            String::from("--poll-interval-secs"),
+            String::from("0"),
+        ])
+        .unwrap();
+        assert_eq!(config.poll_interval, std::time::Duration::from_secs(1));
+    }
+
+    /// The JCP help text must name the default the code actually compiles in.
+    ///
+    /// It advertised `http://127.0.0.1:2002` — the *daemon's* default HTTP
+    /// port — while the code defaults to `18080`, the port `krishiv local
+    /// start` publishes. An operator following the help would point the JCP at
+    /// a port nothing serves.
+    #[test]
+    fn jcp_help_states_the_compiled_in_coordinator_http_default() {
+        let config = parse_job_coordinator_daemon_config(std::iter::empty::<String>()).unwrap();
+        // Only meaningful when the env override is absent.
+        if std::env::var("KRISHIV_COORDINATOR_HTTP").is_err() {
+            assert_eq!(config.coordinator_http, "http://127.0.0.1:18080");
+            assert!(
+                super::job_coordinator_daemon_help().contains(&config.coordinator_http),
+                "help text must name the compiled-in default"
+            );
+        }
+    }
+
+    /// Same pinning as `config.rs`'s `declared_default_guard`: the registry
+    /// generates the operator-facing flag reference, and it has drifted from
+    /// the compiled-in defaults before.
+    #[test]
+    fn documented_daemon_defaults_match_the_compiled_in_ones() {
+        use krishiv_common::env_registry::declared_default_number;
+
+        for (flag, compiled) in [
+            (
+                "KRISHIV_JCP_POLL_INTERVAL_SECS",
+                DEFAULT_JCP_POLL_INTERVAL_SECS,
+            ),
+            ("KRISHIV_LEADER_LEASE_SECS", DEFAULT_LEADER_LEASE_SECS),
+        ] {
+            assert_eq!(
+                declared_default_number(flag),
+                Some(compiled),
+                "{flag}: env registry default disagrees with the compiled-in one"
+            );
+        }
+    }
+
+    /// Resetting the circuit breaker on an executor that does not exist is 404,
+    /// not a success.
+    ///
+    /// `ExecutorRegistry::reset_task_failures` no-ops silently on an unknown
+    /// id, and this handler answered `{"reset": true}` regardless. An operator
+    /// calls this endpoint precisely because an executor is pinned at the
+    /// failure threshold and is being skipped for assignment; a typo'd or
+    /// already-removed id then reported "fixed" while the cluster stayed
+    /// degraded. The sibling test above only ever resets an executor that
+    /// exists, which is why the false success survived.
+    #[tokio::test]
+    async fn resetting_an_unknown_executor_is_not_found() {
+        use crate::CoordinatorDaemonConfig;
+        use crate::coordinator_http_router;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let _ = crate::auth::set_allow_anonymous();
+
+        let coordinator = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-reset-unknown").unwrap(),
+        ));
+        let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DevLocal);
+        let router = coordinator_http_router(coordinator, &config);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/executors/exec-never-registered/reset")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "there is no breaker to clear on an executor the coordinator has \
+             never seen; reporting success hides that the cluster is still degraded"
+        );
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["reset"], serde_json::json!(false));
     }
 }
