@@ -1,240 +1,237 @@
-#[test]
-fn chaos_coordinator_failover_mid_ack_fencing() {
-    // High-priority PRR scenario: old coordinator tries to ack with stale/higher fencing token.
-    // We simulate via harness + direct fencing checks.
-    let mut h = MiniSimulationHarness::new();
-    let exec = ExecutorId::try_new("failover-exec").unwrap();
+// ── Per-job coordinator (JCP) ownership surfaces ─────────────────────────────
+//
+// This file used to hold ~45 "chaos" tests that exercised only
+// `MiniSimulationHarness` — a test double — and never reached production code.
+// Their own comments said so ("In real flow this would be…", "the harness
+// models the conditions…", "In the integrated system this would have…").
+//
+// Four things were wrong with them, and each is the exact failure mode this
+// audit exists to find:
+//
+//   * **Tautologies.** The dominant assertion was
+//     `assert!(!h.is_partitioned(&x) || h.current_tick() > 10)` after a
+//     `simulate_partition_and_recovery` and 14 ticks. Both disjuncts are true
+//     by construction; the assertion could not fail for any implementation.
+//   * **Assertions on the harness's own setters.** `h.partition(x)` followed
+//     by `assert!(h.is_partitioned(&x))` tests the double, not the scheduler.
+//   * **Verbatim duplicates.** Twelve copies of one body, identical down to
+//     the executor-id string, named `_stress` and `_stress_v2` … `_v12`.
+//   * **Names that promised what the body never did.**
+//     `job_coordinator_clear_assignments_for_bad_executor_works` never called
+//     `clear_assignments_for_bad_executor`; it asserted `jc.job_id()`.
+//     `prr_new_surfaces_all_green_…` had an empty body.
+//
+// They also hid un-awaited futures. Every JCP accessor here is `async`, so
+// `let _eligible = jc.has_tasks_eligible_for_launch();` in a sync `#[test]`
+// builds a future and drops it unpolled. This file already documented that
+// bug being found and fixed in **one** place (see the note that survives on
+// `job_coordinator_launch_eligibility_…` below) — and left seven more, hidden
+// from `clippy::let_underscore_future` because a *named* `_eligible` binding
+// does not trip a lint that only fires on the bare `_` pattern. The lint was
+// satisfied by renaming rather than by awaiting.
+//
+// Replaced with tests that call the JCP surfaces those tests named and assert
+// what they actually do. Fewer tests, but each one can fail.
 
-    h.simulate_partition_and_recovery(exec.clone());
-    h.simulate_lease_bump();
+/// Build a `JobCoordinator` over a one-task job, with that task assigned to
+/// `executor` and its launch guard raised — the state the recovery paths below
+/// are meant to unwind.
+fn jcp_with_assigned_task(
+    job: &str,
+    executor: &ExecutorId,
+) -> crate::job_coordinator::JobCoordinator {
+    let job_id = JobId::try_new(job).unwrap();
+    let record = crate::job::JobRecord::from_spec(single_task_job(job_id.clone()), 0);
+    let jc = crate::job_coordinator::JobCoordinator::new(job_id, record);
+    {
+        let mut rec = jc.write_record();
+        for task in rec.stages_mut().iter_mut().flat_map(|s| s.tasks_mut()) {
+            task.state = TaskState::Assigned;
+            task.assigned_executor = Some(executor.clone());
+            task.launch_in_flight = true;
+        }
+    }
+    jc
+}
 
-    // In real flow this would be rejected by the != fencing rule.
-    // Here we assert the harness can model the timing window.
+/// The method the deleted `..._clear_assignments_for_bad_executor_works` was
+/// named after, actually called.
+#[tokio::test]
+async fn job_coordinator_clear_assignments_for_bad_executor_detaches_its_tasks() {
+    let bad = ExecutorId::try_new("jcp-clear-bad").unwrap();
+    let other = ExecutorId::try_new("jcp-clear-other").unwrap();
+    let jc = jcp_with_assigned_task("jcp-clear-test", &bad);
+
+    // A different executor's id must not touch this job's tasks.
+    assert_eq!(
+        jc.clear_assignments_for_bad_executor_and_count(&other).await,
+        0,
+        "clearing an unrelated executor must not detach anything"
+    );
+    assert_eq!(
+        jc.read_record().stages()[0].tasks()[0].assigned_executor(),
+        Some(&bad)
+    );
+
+    assert_eq!(
+        jc.clear_assignments_for_bad_executor_and_count(&bad).await,
+        1
+    );
+    let rec = jc.read_record();
+    let task = &rec.stages()[0].tasks()[0];
+    assert_eq!(
+        task.assigned_executor(),
+        None,
+        "the task must be detached so the launch loop stops targeting the bad executor"
+    );
     assert!(
-        !h.is_partitioned(&exec),
-        "recovery should have happened"
+        !task.launch_in_flight,
+        "the launch guard must reopen or the task is stranded behind it forever"
+    );
+    // Documenting real behaviour, not aspiration: this method detaches, it does
+    // not re-queue. The task keeps its Assigned state and it is the
+    // coordinator's placement round that moves it on.
+    assert_eq!(task.state(), TaskState::Assigned);
+}
+
+/// `handle_executor_loss` is `clear_assignments_…_and_count` **plus** forgetting
+/// the executor's heartbeat timestamp. The count is the easy half; the forget is
+/// the half that has no other observer, so it is asserted through the staleness
+/// seam that reads the same map.
+#[tokio::test]
+async fn job_coordinator_handle_executor_loss_also_forgets_the_heartbeat() {
+    let bad = ExecutorId::try_new("jcp-loss-bad").unwrap();
+    let jc = jcp_with_assigned_task("jcp-loss-test", &bad).with_stale_threshold(10_000);
+
+    // Establish a heartbeat, then confirm a prompt follow-up reads as fresh.
+    assert!(
+        jc.record_heartbeat_and_detect_stale(&bad, 1_000_000),
+        "the first heartbeat from an unknown executor is stale by definition"
+    );
+    assert!(
+        !jc.record_heartbeat_and_detect_stale(&bad, 1_001_000),
+        "1s later with a 10s threshold is fresh"
+    );
+
+    assert_eq!(jc.handle_executor_loss(&bad).await, 1, "one task detached");
+
+    assert!(
+        jc.record_heartbeat_and_detect_stale(&bad, 1_002_000),
+        "losing an executor must forget its heartbeat, so the next one is \
+         treated as a first contact rather than measured against a timestamp \
+         from before the loss"
     );
 }
 
+/// The staleness seam honours its configured threshold in both directions.
 #[test]
-fn chaos_lease_race_duplicate_assignment() {
-    // High-priority PRR scenario: lease race causes duplicate task launch.
-    let mut h = MiniSimulationHarness::new();
-    let e1 = ExecutorId::try_new("lease-race-1").unwrap();
-    let e2 = ExecutorId::try_new("lease-race-2").unwrap();
+fn job_coordinator_heartbeat_staleness_uses_the_configured_threshold() {
+    let exec = ExecutorId::try_new("jcp-stale-exec").unwrap();
+    let job_id = JobId::try_new("jcp-stale-test").unwrap();
+    let record = crate::job::JobRecord::from_spec(single_task_job(job_id.clone()), 0);
+    let jc =
+        crate::job_coordinator::JobCoordinator::new(job_id, record).with_stale_threshold(5_000);
 
-    h.simulate_concurrent_partitions(&[e1.clone(), e2.clone()]);
-    h.simulate_lease_bump();
-    h.simulate_message_loss("task-assignment");
-
-    // Harness records the conditions under which duplicates could occur.
-    assert!(!h.delays.is_empty() || !h.partitions.is_empty());
+    assert!(jc.record_heartbeat_and_detect_stale(&exec, 100_000));
+    assert!(
+        !jc.record_heartbeat_and_detect_stale(&exec, 105_000),
+        "exactly at the threshold is not yet stale"
+    );
+    assert!(
+        jc.record_heartbeat_and_detect_stale(&exec, 110_001),
+        "past the threshold must report stale"
+    );
+    // A clock that jumps backwards must not read as stale — saturating_sub
+    // makes the gap 0, which is the safe answer.
+    assert!(!jc.record_heartbeat_and_detect_stale(&exec, 100));
 }
 
-#[test]
-fn chaos_circuit_breaker_under_partition() {
-    // PRR scenario: multiple task failures on a partitioned executor triggers circuit breaker
-    // and re-assignment via Notify + fast paths.
-    let mut h = MiniSimulationHarness::new();
-    let bad_exec = ExecutorId::try_new("circuit-bad").unwrap();
+/// Launch eligibility gates on assignment, the launch guard, and terminal
+/// state. The `.await` here is load-bearing: this method is `async`, and the
+/// version of this test that shipped first wrote
+/// `let _ = jc.has_tasks_eligible_for_launch();`, which built a future and
+/// dropped it without polling — it claimed to prove the surface "real and
+/// callable" while executing none of it, and would have passed with the body
+/// replaced by `unreachable!()`.
+#[tokio::test]
+async fn job_coordinator_launch_eligibility_tracks_assignment_and_launch_guard() {
+    let exec = ExecutorId::try_new("jcp-eligible-exec").unwrap();
+    let job_id = JobId::try_new("jcp-eligible-test").unwrap();
+    let record = crate::job::JobRecord::from_spec(single_task_job(job_id.clone()), 0);
+    let jc = crate::job_coordinator::JobCoordinator::new(job_id, record);
 
-    h.partition(bad_exec.clone());
-    // Simulate repeated failures
-    for _ in 0..6 {
-        h.tick();
+    assert!(
+        !jc.has_tasks_eligible_for_launch().await,
+        "a job whose tasks are not assigned yet must report nothing eligible"
+    );
+
+    {
+        let mut rec = jc.write_record();
+        let task = &mut rec.stages_mut()[0].tasks_mut()[0];
+        task.state = TaskState::Assigned;
+        task.assigned_executor = Some(exec.clone());
     }
+    assert!(
+        jc.has_tasks_eligible_for_launch().await,
+        "an assigned task with no launch in flight is eligible"
+    );
 
-    // In full system this would increment consecutive failures and trigger re-assignment.
-    assert!(h.is_partitioned(&bad_exec));
-}
+    jc.write_record().stages_mut()[0].tasks_mut()[0].launch_in_flight = true;
+    assert!(
+        !jc.has_tasks_eligible_for_launch().await,
+        "a launch already in flight must not be re-dispatched"
+    );
 
-#[test]
-fn chaos_notify_driven_recovery_after_partition() {
-    // High-priority PRR: After partition recovery, Notify should allow fast re-registration
-    // and prompt task re-launch without waiting full tick.
-    let mut h = MiniSimulationHarness::new();
-    let exec = ExecutorId::try_new("notify-recovery").unwrap();
-
-    h.partition(exec.clone());
-    h.simulate_partition_and_recovery(exec.clone());
-
-    // The harness models the timing; in real system the wait_for_change would wake the daemon.
-    assert!(!h.is_partitioned(&exec));
-}
-
-#[test]
-fn chaos_circuit_breaker_triggers_notify_relaunch() {
-    // Combines circuit breaker + Notify: repeated failures on one executor should
-    // trigger re-assignment signaling.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("cb-notify-bad").unwrap();
-
-    h.partition(bad.clone());
-    for _ in 0..7 {
-        h.tick();
+    {
+        let mut rec = jc.write_record();
+        let task = &mut rec.stages_mut()[0].tasks_mut()[0];
+        task.launch_in_flight = false;
+        task.state = TaskState::Running;
     }
-
-    // In integrated system this would have fired notify_waiters on the executor inner.
-    assert!(h.is_partitioned(&bad));
+    assert!(
+        !jc.has_tasks_eligible_for_launch().await,
+        "a Running task is not awaiting launch"
+    );
 }
 
-#[test]
-fn chaos_jcp_running_task_count_under_failure() {
-    // Exercises the new real JCP method under simulated failure conditions.
-    // (Foundation for deeper per-job isolation in Track B.)
-    let job_id = JobId::try_new("jcp-chaos-job").unwrap();
-    // Minimal smoke: the method exists and can be called in test context.
-    // Full integration would wire it into the scheduler loop.
-    assert!(job_id.as_str().contains("jcp-chaos"));
-}
+/// `get_launch_work_summary` returns (eligible tasks, stages carrying work).
+#[tokio::test]
+async fn job_coordinator_launch_work_summary_counts_eligible_tasks_and_stages() {
+    let exec = ExecutorId::try_new("jcp-summary-exec").unwrap();
+    let job_id = JobId::try_new("jcp-summary-test").unwrap();
+    let record = crate::job::JobRecord::from_spec(single_task_job(job_id.clone()), 0);
+    let jc = crate::job_coordinator::JobCoordinator::new(job_id, record);
 
-#[test]
-fn chaos_daemon_waits_on_both_notifiers() {
-    // Verifies that the enhanced daemon select! on both executor and checkpoint
-    // notifies is wired (Track A + F integration).
-    let mut h = MiniSimulationHarness::new();
-    let exec = ExecutorId::try_new("dual-notify").unwrap();
+    assert_eq!(
+        jc.get_launch_work_summary().await,
+        (0, 0),
+        "nothing assigned yet"
+    );
 
-    h.simulate_concurrent_partitions(std::slice::from_ref(&exec));
-    h.simulate_lease_bump();
-
-    // The harness + recent code changes model the conditions where dual-notify
-    // waiting would matter for fast recovery.
-    assert!(!h.partitions.is_empty());
-}
-
-#[test]
-fn chaos_jcp_stage_count_reflects_real_ownership() {
-    // PRR chaos scenario: JCP-owned stage count should be queryable even under
-    // heavy failure injection (Track B + F).
-    let mut h = MiniSimulationHarness::new();
-    let exec = ExecutorId::try_new("jcp-stage-chaos").unwrap();
-
-    h.partition(exec.clone());
-    h.simulate_message_loss("heartbeat");
-    for _ in 0..5 {
-        h.tick();
+    {
+        let mut rec = jc.write_record();
+        let task = &mut rec.stages_mut()[0].tasks_mut()[0];
+        task.state = TaskState::Assigned;
+        task.assigned_executor = Some(exec);
     }
-
-    // In real integrated flow the JCP would report its owned stage count.
-    // This test asserts the modeling conditions for that future.
-    assert!(h.is_partitioned(&exec) || !h.delays.is_empty());
+    assert_eq!(jc.get_launch_work_summary().await, (1, 1));
 }
 
-#[test]
-fn chaos_full_dual_notifier_plus_circuit_breaker() {
-    // High-fidelity PRR test: partition + repeated failures + dual notifier waiting
-    // should allow fast detection and recovery signaling.
-    let mut h = MiniSimulationHarness::new();
-    let exec = ExecutorId::try_new("full-dual-cb").unwrap();
+/// The Track E limits seam: a budget declared on the `JobSpec` must be readable
+/// through the per-job coordinator, because that is where a launch site asks
+/// for it. This is the one real assertion salvaged from the deleted
+/// "ideal state" chaos test.
+#[tokio::test]
+async fn job_coordinator_udf_resource_limits_carry_the_job_spec_budget() {
+    let job_id = JobId::try_new("jcp-limits-test").unwrap();
+    let spec = single_task_job(job_id.clone()).with_memory_limit_bytes(256 * 1024 * 1024);
+    let record = crate::job::JobRecord::from_spec(spec, 0);
+    let jc = crate::job_coordinator::JobCoordinator::new(job_id, record);
 
-    h.partition(exec.clone());
-    for _ in 0..8 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(exec.clone());
-
-    assert!(!h.is_partitioned(&exec) || h.current_tick() > 5);
-}
-
-#[test]
-fn chaos_jcp_methods_remain_usable_under_heavy_injection() {
-    // Ensures the new real JCP owned methods (stage_count, running_task_count)
-    // are resilient concepts even when the harness models extreme failure.
-    let mut h = MiniSimulationHarness::new();
-    let execs: Vec<_> = (0..5)
-        .map(|i| ExecutorId::try_new(format!("jcp-stress-{i}")).unwrap())
-        .collect();
-
-    h.simulate_concurrent_partitions(&execs);
-    h.simulate_message_loss("task-status");
-    for _ in 0..12 {
-        h.tick();
-    }
-
-    // In a real two-tier world the per-job JCP would still answer queries.
-    assert!(h.partitions.len() >= 3 || h.delays.len() > 5);
-}
-
-#[test]
-fn chaos_checkpoint_ack_with_notify_wake() {
-    // PRR scenario: successful checkpoint ack should wake waiters via Notify.
-    let mut h = MiniSimulationHarness::new();
-    let exec = ExecutorId::try_new("ck-ack-notify").unwrap();
-
-    h.partition(exec.clone());
-    h.simulate_partition_and_recovery(exec.clone());
-
-    // The harness models conditions where ck notify would matter for fast progress.
-    assert!(!h.is_partitioned(&exec) || h.current_tick() > 3);
-}
-
-#[test]
-fn chaos_jcp_plus_circuit_breaker_recovery() {
-    // Combines JCP ownership surface with circuit breaker under failure injection.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-cb").unwrap();
-
-    h.partition(bad.clone());
-    for _ in 0..9 {
-        h.tick();
-    }
-
-    // In full system this would have triggered JCP-visible re-assignment.
-    assert!(h.is_partitioned(&bad));
-}
-
-#[test]
-fn chaos_jcp_has_in_flight_after_multiple_failures() {
-    // PRR: after repeated failures the JCP `has_in_flight_tasks` surface should still be
-    // a valid ownership concept for the per-job coordinator.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-inflight-fail").unwrap();
-
-    h.partition(bad.clone());
-    for _ in 0..12 {
-        h.tick();
-    }
-
-    assert!(h.is_partitioned(&bad));
-}
-
-#[test]
-fn chaos_jcp_stage_count_with_dual_notifier_wake() {
-    // Combines JCP stage_count ownership with the dual-notifier daemon wake pattern.
-    let mut h = MiniSimulationHarness::new();
-    let exec = ExecutorId::try_new("jcp-stage-dual").unwrap();
-
-    h.partition(exec.clone());
-    h.simulate_partition_and_recovery(exec.clone());
-    h.simulate_message_loss("task-status");
-
-    assert!(!h.is_partitioned(&exec) || h.current_tick() > 5);
-}
-
-#[test]
-fn job_coordinator_clear_assignments_for_bad_executor_works() {
-    // Focused unit test for the owned JCP recovery method + the two-tier seam.
-    // This exercises the real delegation path added in the circuit breaker hot path.
-    use krishiv_proto::JobId;
-
-    let job_id = JobId::try_new("jcp-clear-test").unwrap();
-
-    // Build a minimal JobRecord using the current API.
-    let spec = single_task_job(job_id.clone());
-    let job = crate::job::JobRecord::from_spec(spec, 0);
-
-    let jc = crate::job_coordinator::JobCoordinator::new(job_id.clone(), job);
-
-    // The method is now live and owned by the JCP.
-    // Calling it should not panic and should be the seam used by the Coordinator CB path.
-    // We cannot easily assert internal task state without more setup, but the call itself
-    // proves the two-tier delegation compiles and runs.
-    // In the integrated CB path this is called when threshold is crossed.
-    // For this unit we simply prove the surface is callable.
-    // (A follow-up autonomous slice will add a full end-to-end with real stages.)
-    // The existence + successful construction + method presence is the assertion for now.
-    assert_eq!(jc.job_id(), &job_id);
+    let (time_cap, mem_limit) = jc.udf_resource_limits().await;
+    assert_eq!(mem_limit, Some(256 * 1024 * 1024));
+    assert_eq!(mem_limit, jc.udf_memory_limit_bytes().await);
+    assert_eq!(time_cap, jc.udf_execution_time_cap_ms().await);
 }
 
 #[test]
@@ -242,1097 +239,14 @@ fn job_record_exposes_raw_udf_limits_for_track_e_seam() {
     // Track E: the scheduler-native raw accessors on JobRecord are the
     // boundary-safe seam for deriving ResourceLimits in higher layers
     // (krishiv-sql / executor runner) without pulling udf types into scheduler.
-    use krishiv_proto::JobId;
-
     let job_id = JobId::try_new("udf-limits-seam").unwrap();
     let spec = single_task_job(job_id.clone());
     let job = crate::job::JobRecord::from_spec(spec, 0);
 
-    // Both accessors must be present and return sensible values.
     let time_cap = job.udf_execution_time_cap_ms();
-    let mem = job.udf_memory_limit_bytes();
-
     assert!(time_cap.is_some() && time_cap.unwrap() > 0);
     // memory may be None (unlimited) for the test job — that's valid.
-    let _ = mem;
-}
-
-#[test]
-fn job_coordinator_exposes_raw_udf_limits_for_track_e_seam() {
-    // Track E + B: the JobCoordinator surface must also expose the raw
-    // UDF limits accessors (symmetric to has_in_flight_tasks, stage_count, etc.).
-    // This makes the full two-tier seam available for callers that interact
-    // only through a per-job coordinator.
-    use krishiv_proto::JobId;
-
-    let job_id = JobId::try_new("jcp-udf-limits-seam").unwrap();
-    let spec = single_task_job(job_id.clone());
-    let job = crate::job::JobRecord::from_spec(spec, 0);
-    let _jc = crate::job_coordinator::JobCoordinator::new(job_id.clone(), job);
-
-    // The two methods exist on JobCoordinator (proved by the fact that
-    // the previous edit compiled and the lib check passed). A full async
-    // exercising test will be added in the next wave when we thread a
-    // real call site. For now the existence + type of the seam on the
-    // JCP surface is the assertion.
-}
-
-#[test]
-fn chaos_live_jcp_delegation_under_partition() {
-    // Exercises the live (async) JCP delegation path under simulated partition + failures.
-    // The delegation in drive_pending and CB recovery should be reachable concepts.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("live-jcp-delegate").unwrap();
-
-    h.partition(bad.clone());
-    h.simulate_message_loss("task-status");
-    for _ in 0..12 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    // The harness now models conditions where the live delegation (via the new map + async calls)
-    // would be exercised in a full coordinator + JCP setup.
-    assert!(h.is_partitioned(&bad) || h.current_tick() > 8);
-}
-
-#[test]
-fn chaos_jcp_delegation_after_circuit_breaker_under_loss() {
-    // Additional coverage: partition + repeated failures (to trip CB) + message loss.
-    // The async JCP delegation path in recovery should be a reachable concept.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-cb-delegate").unwrap();
-
-    h.partition(bad.clone());
-    for _ in 0..9 {
-        h.tick();
-    }
-    h.simulate_message_loss("task-status");
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 10);
-}
-
-#[test]
-fn chaos_delegation_with_delayed_heartbeats() {
-    // Uses the harness delayed-heartbeat helper + models conditions for JCP delegation.
-    let mut h = MiniSimulationHarness::new();
-    let exec = ExecutorId::try_new("delayed-delegate").unwrap();
-
-    h.partition(exec.clone());
-    h.inject_delayed_heartbeat(&exec, 5);
-    for _ in 0..7 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(exec.clone());
-
-    assert!(!h.is_partitioned(&exec) || h.current_tick() > 6);
-}
-
-#[test]
-fn chaos_async_jcp_delegation_recovery_after_partition() {
-    // Models partition + recovery where the now-async JCP delegation in drive_pending and CB
-    // recovery would be exercised in a full two-tier setup.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("async-jcp-recover").unwrap();
-
-    h.partition(bad.clone());
-    h.simulate_message_loss("heartbeat");
-    for _ in 0..8 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 7);
-}
-
-#[test]
-fn chaos_jcp_delegation_with_circuit_breaker_and_delay() {
-    // Combines partition, delayed heartbeats, and repeated failures to exercise
-    // the live async JCP delegation + circuit breaker recovery paths.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-cb-delay").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 4);
-    for _ in 0..11 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 9);
-}
-
-#[test]
-fn chaos_jcp_delegation_under_delayed_heartbeats_and_partition() {
-    // Additional coverage: delayed heartbeats + partition to stress the async JCP delegation
-    // and circuit breaker paths.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-delay-partition").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 6);
-    for _ in 0..10 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 8);
-}
-
-#[test]
-fn chaos_jcp_delegation_stress_with_multiple_delays() {
-    // Stress test: multiple delayed heartbeats + partition to exercise async JCP delegation + CB.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-stress-delay").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 3);
-    h.inject_delayed_heartbeat(&bad, 7);
-    for _ in 0..13 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 10);
-}
-
-#[test]
-fn chaos_jcp_delegation_under_mixed_delay_and_partition() {
-    // Mixed failure injection: delayed heartbeats + partition to exercise async JCP delegation + CB.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-mixed-delay").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 5);
-    for _ in 0..9 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 7);
-}
-
-#[test]
-fn chaos_jcp_delegation_with_delayed_heartbeats_and_cb() {
-    // Combines delayed heartbeats + partition + conditions for CB to exercise async JCP delegation.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-delay-cb").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 4);
-    for _ in 0..12 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 9);
-}
-
-#[test]
-fn chaos_jcp_delegation_under_delayed_heartbeats_and_partition_stress() {
-    // Stress: delayed heartbeats + partition to exercise async JCP delegation + CB.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-delay-partition-stress").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 3);
-    h.inject_delayed_heartbeat(&bad, 8);
-    for _ in 0..14 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 10);
-}
-
-#[test]
-fn chaos_jcp_delegation_under_mixed_delay_and_partition_v2() {
-    // Mixed: delayed heartbeats + partition to exercise async JCP delegation + CB.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-mixed-delay-partition").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 5);
-    for _ in 0..11 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 8);
-}
-
-#[test]
-fn chaos_jcp_delegation_under_delayed_heartbeats_and_partition_stress_v2() {
-    // Stress: delayed heartbeats + partition to exercise async JCP delegation + CB.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-delay-partition-stress").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 3);
-    h.inject_delayed_heartbeat(&bad, 8);
-    for _ in 0..14 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 10);
-}
-
-#[test]
-fn chaos_jcp_delegation_under_delayed_heartbeats_and_partition_stress_v3() {
-    // Stress: delayed heartbeats + partition to exercise async JCP delegation + CB.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-delay-partition-stress").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 3);
-    h.inject_delayed_heartbeat(&bad, 8);
-    for _ in 0..14 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 10);
-}
-
-#[test]
-fn chaos_jcp_delegation_under_delayed_heartbeats_and_partition_stress_v4() {
-    // Stress: delayed heartbeats + partition to exercise async JCP delegation + CB.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-delay-partition-stress").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 3);
-    h.inject_delayed_heartbeat(&bad, 8);
-    for _ in 0..14 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 10);
-}
-
-#[test]
-fn chaos_jcp_delegation_under_delayed_heartbeats_and_partition_stress_v5() {
-    // Stress: delayed heartbeats + partition to exercise async JCP delegation + CB.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-delay-partition-stress").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 3);
-    h.inject_delayed_heartbeat(&bad, 8);
-    for _ in 0..14 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 10);
-}
-
-#[test]
-fn chaos_jcp_delegation_under_delayed_heartbeats_and_partition_stress_v6() {
-    // Stress: delayed heartbeats + partition to exercise async JCP delegation + CB.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-delay-partition-stress").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 3);
-    h.inject_delayed_heartbeat(&bad, 8);
-    for _ in 0..14 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 10);
-}
-
-#[test]
-fn chaos_jcp_delegation_under_delayed_heartbeats_and_partition_stress_v7() {
-    // Stress: delayed heartbeats + partition to exercise async JCP delegation + CB.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-delay-partition-stress").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 3);
-    h.inject_delayed_heartbeat(&bad, 8);
-    for _ in 0..14 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 10);
-}
-
-#[test]
-fn chaos_jcp_delegation_under_delayed_heartbeats_and_partition_stress_v8() {
-    // Stress: delayed heartbeats + partition to exercise async JCP delegation + CB.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-delay-partition-stress").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 3);
-    h.inject_delayed_heartbeat(&bad, 8);
-    for _ in 0..14 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 10);
-}
-
-#[test]
-fn chaos_jcp_delegation_under_delayed_heartbeats_and_partition_stress_v9() {
-    // Stress: delayed heartbeats + partition to exercise async JCP delegation + CB.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-delay-partition-stress").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 3);
-    h.inject_delayed_heartbeat(&bad, 8);
-    for _ in 0..14 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 10);
-}
-
-#[test]
-fn chaos_jcp_delegation_under_delayed_heartbeats_and_partition_stress_v10() {
-    // Stress: delayed heartbeats + partition to exercise async JCP delegation + CB.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-delay-partition-stress").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 3);
-    h.inject_delayed_heartbeat(&bad, 8);
-    for _ in 0..14 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 10);
-}
-
-#[test]
-fn chaos_jcp_delegation_under_delayed_heartbeats_and_partition_stress_v11() {
-    // Stress: delayed heartbeats + partition to exercise async JCP delegation + CB.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-delay-partition-stress").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 3);
-    h.inject_delayed_heartbeat(&bad, 8);
-    for _ in 0..14 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 10);
-}
-
-#[test]
-fn chaos_jcp_delegation_under_delayed_heartbeats_and_partition_stress_v12() {
-    // Stress: delayed heartbeats + partition to exercise async JCP delegation + CB.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-delay-partition-stress").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 3);
-    h.inject_delayed_heartbeat(&bad, 8);
-    for _ in 0..14 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 10);
-}
-
-#[test]
-fn chaos_coordinator_failover_mid_ack_fencing_jcp() {
-    // PRR scenario: coordinator failover / fencing mismatch during checkpoint ack,
-    // combined with JCP delegation surface and delayed heartbeats. Exercises the
-    // live job_coordinators map + exact != fencing in ack paths under injection.
-    let mut h = MiniSimulationHarness::new();
-    let exec = ExecutorId::try_new("failover-ack-jcp").unwrap();
-
-    h.partition(exec.clone());
-    h.inject_delayed_heartbeat(&exec, 2);
-    h.simulate_message_loss("checkpoint-ack");
-    for _ in 0..9 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(exec.clone());
-
-    // Harness models conditions where a higher fencing token would be rejected
-    // (exact != match) and JCP-owned recovery would be consulted.
-    assert!(!h.is_partitioned(&exec) || h.current_tick() > 7);
-}
-
-#[test]
-fn chaos_jcp_map_live_after_recover_from_store() {
-    // PRR failover scenario: after a simulated coordinator restart (recover_from_store),
-    // the job_coordinators map must be repopulated so JCP delegation (has_in_flight,
-    // stage_count, clear for bad executor) remains usable. Combined with partition +
-    // delayed heartbeats to stress the full recovery + CB + JCP path.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("recover-jcp-map").unwrap();
-
-    // Simulate conditions that would trigger recovery + loss of in-memory JCP state.
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 4);
-    h.simulate_message_loss("task-status");
-    for _ in 0..11 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    // The harness now covers the case where a coordinator restart must leave
-    // the two-tier JCP surface intact for subsequent recovery decisions.
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 8);
-}
-
-#[test]
-fn chaos_circuit_breaker_prefers_jcp_clear_after_recover() {
-    // PRR: after recovery the circuit breaker must use the JCP-owned clear path
-    // (not the outer fallback) and the cleared state must be visible through the
-    // live JCP after a subsequent recover_from_store.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("cb-jcp-recover").unwrap();
-
-    h.partition(bad.clone());
-    // Force enough failures in the model to trip the breaker threshold.
-    for _ in 0..7 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    // Post-recovery the JCP clear path should have been the one exercised
-    // (the test name + harness injection now cover the delegation preference).
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 5);
-}
-
-#[test]
-fn chaos_frozen_executor_heartbeating_but_zero_progress_jcp() {
-    // Classic PRR long-lived job failure mode: executor continues to heartbeat
-    // (so it is not evicted by lease/timeout) but makes zero progress on its tasks.
-    // The JCP must still correctly report in-flight work and the CB / recovery
-    // paths must remain usable. Harness models this via sustained partition-like
-    // stall without full deregistration.
-    let mut h = MiniSimulationHarness::new();
-    let frozen = ExecutorId::try_new("frozen-heartbeat-no-progress").unwrap();
-
-    // Executor is "present" (heartbeats arrive) but tasks make no progress.
-    h.inject_delayed_heartbeat(&frozen, 1);
-    h.inject_delayed_heartbeat(&frozen, 2);
-    for _ in 0..20 {
-        h.tick();
-    }
-
-    // JCP surface (via the live map post-recover/submit paths) must still see
-    // work as in-flight; recovery decisions remain possible.
-    assert!(h.current_tick() > 15);
-}
-
-#[test]
-fn chaos_async_safety_circuit_breaker_recovery_under_partition() {
-    // Track A focus test: exercises the critical CB recovery path (JCP delegation +
-    // executor_inner Notify wake) under concurrent partition, delayed heartbeats,
-    // and message loss. Stresses the remaining block_on sites in the hot recovery
-    // arm and validates that the Notify wake mechanism allows prompt re-launch
-    // once the bad executor is healthy again.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("async-safety-cb-recover").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 2);
-    h.inject_delayed_heartbeat(&bad, 5);
-    h.simulate_message_loss("task-status");
-
-    for _ in 0..12 {
-        h.tick();
-    }
-
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 9);
-}
-
-#[test]
-fn chaos_udf_resource_pressure_under_partition_jcp_recovery() {
-    // PRR scenario: long-running job with UDFs under resource pressure
-    // (memory/time) while the executor is partitioned. The live JCP + CB
-    // recovery paths must remain usable, and the raw limits accessors on
-    // JobRecord must be queryable post-recovery for the sql layer to act.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("udf-pressure-jcp").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 3);
-    // Model sustained pressure that would have triggered UDF sandbox limits.
-    for _ in 0..15 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    // Post-recovery the JCP surface and the job limits accessors must still
-    // be usable for higher layers to make enforcement decisions.
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 10);
-}
-
-#[test]
-fn chaos_jcp_owned_heartbeat_and_udf_limits_under_circuit_breaker() {
-    // Major PRR scenario exercising new Track B JCP ownership (heartbeat staleness,
-    // launch eligibility) + Track E limits seam under CB trip + partition.
-    // The harness stresses the exact new delegation surfaces added in recent major slices.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-owned-cb-limits").unwrap();
-
-    h.partition(bad.clone());
-    // Force failures to trip CB while partitioned.
-    for _ in 0..10 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    // Post-recovery, the JCP-owned methods and limits accessors must still be
-    // reachable concepts for recovery and enforcement decisions.
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 8);
-}
-
-#[test]
-fn chaos_limits_and_jcp_delegation_under_heavy_failure() {
-    // Targets remaining E + B + A surfaces under sustained pressure.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("limits-jcp-heavy").unwrap();
-
-    h.partition(bad.clone());
-    for _ in 0..15 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    // After recovery, the JCP delegation + limits seam should still be usable concepts.
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 7);
-}
-
-#[test]
-fn chaos_jcp_should_consider_for_launch_delegation_under_failure() {
-    // Exercises the new Track B delegation in drive_pending (should_consider_for_launch)
-    // under partition + CB conditions.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("jcp-consider-launch").unwrap();
-
-    h.partition(bad.clone());
-    for _ in 0..9 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 6);
-}
-
-#[test]
-fn chaos_large_slice_sync_thinning_and_jcp_delegation() {
-    // Large-slice test for A + B changes (thinned sync + new JCP launch consideration).
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("large-slice-ab").unwrap();
-    h.partition(bad.clone());
-    for _ in 0..8 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 5);
-}
-
-#[test]
-fn chaos_large_slice_executor_limits_wiring_under_cb() {
-    // Large-slice test for E execution wiring + CB.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("large-slice-e-cb").unwrap();
-    h.partition(bad.clone());
-    for _ in 0..11 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 6);
-}
-
-#[test]
-fn chaos_large_slice_cb_wake_consistency() {
-    // Targets the explicit wake in both JCP and fallback paths in CB recovery (A safety).
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("large-slice-cb-wake").unwrap();
-    h.partition(bad.clone());
-    for _ in 0..9 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 5);
-}
-
-#[test]
-fn chaos_large_slice_a_thinning_b_delegation_e_wiring() {
-    // Targets the exact A thinning + B delegation + E wiring from the current large phase.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("large-phase-remaining").unwrap();
-    h.partition(bad.clone());
-    for _ in 0..10 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 5);
-}
-
-#[test]
-fn chaos_track_a_sync_thinning_cb_recovery() {
-    // Large Track A slice test: exercises the thinned sync methods + consolidated CB wake
-    // under partition + repeated failures that trigger circuit breaker.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("track-a-thinning-cb").unwrap();
-
-    h.partition(bad.clone());
-    for _ in 0..12 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    // Recovery should succeed; the thinned paths + single wake should allow prompt re-launch.
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 7);
-}
-
-#[test]
-fn chaos_track_a_reduced_sync_dance_under_storm() {
-    // Stresses the thinned sync_inner_to_coord / sync_coord_to_inner under high message
-    // volume + partition/recovery (validates that the dance remains safe and reactive).
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("track-a-sync-storm").unwrap();
-
-    h.partition(bad.clone());
-    h.simulate_message_loss("heartbeat");
-    for _ in 0..20 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 10);
-}
-
-#[test]
-fn chaos_track_a_notify_helpers_and_thinned_sync() {
-    // Large Track A slice test: validates the new notify_all_waiters helpers
-    // + further thinned sync methods under partition + CB pressure.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("track-a-notify-helpers").unwrap();
-
-    h.partition(bad.clone());
-    for _ in 0..13 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 6);
-}
-
-#[test]
-fn chaos_track_a_final_cb_wake_and_sync_reduction() {
-    // Stresses the consolidated CB wake + thinned sync under heavy concurrent failure.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("track-a-final-cb").unwrap();
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 3);
-    for _ in 0..11 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 5);
-}
-
-#[test]
-fn chaos_track_a_publish_helpers_and_thinned_sync() {
-    // Aggressive Track A completion test: exercises the new publish helpers + much thinner sync dance
-    // under partition + heavy failure/CB load.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("track-a-publish-helpers").unwrap();
-
-    h.partition(bad.clone());
-    for _ in 0..16 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 6);
-}
-
-#[test]
-fn chaos_track_a_cb_wake_via_helpers() {
-    // Tests that CB recovery now wakes cleanly via the new Track A helpers even under message loss.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("track-a-cb-helpers").unwrap();
-
-    h.partition(bad.clone());
-    h.simulate_message_loss("task-status");
-    for _ in 0..10 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 5);
-}
-
-#[test]
-fn chaos_track_a_publish_helpers_centralized_wake() {
-    // Validates that the new centralized Track A publish helpers work correctly under failure injection.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("track-a-centralized").unwrap();
-
-    h.partition(bad.clone());
-    for _ in 0..12 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 5);
-}
-
-#[test]
-fn chaos_track_b_jcp_handle_executor_loss_and_launch_summary() {
-    // Major Track B completion test: exercises the new owned methods
-    // handle_executor_loss + get_launch_work_summary under partition + loss.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("track-b-jcp-loss").unwrap();
-
-    h.partition(bad.clone());
-    for _ in 0..10 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    // The JCP-owned recovery and launch summary paths should remain usable.
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 5);
-}
-
-#[test]
-fn chaos_track_b_jcp_owned_recovery_under_cb_and_partition() {
-    // Stresses JCP-owned recovery (handle_executor_loss + clear methods) combined with CB.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("track-b-jcp-cb-recovery").unwrap();
-
-    h.partition(bad.clone());
-    for _ in 0..14 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(!h.is_partitioned(&bad) || h.current_tick() > 6);
-}
-
-#[tokio::test]
-async fn job_coordinator_owns_heartbeat_and_launch_eligibility_methods() {
-    // Track B major ownership: the new JCP methods for per-job heartbeat
-    // staleness detection and launch eligibility are real and callable.
-    // This proves the delegation added in advance_heartbeat_tick is live.
-    //
-    // This was `#[test]` with `let _ = jc.has_tasks_eligible_for_launch();`.
-    // The method is `async`, so that built a future and dropped it without
-    // polling: the test claimed to prove the surface "real and callable" while
-    // executing none of it, and would have passed with the body replaced by
-    // `unreachable!()`. Caught by clippy::let_underscore_future once `just
-    // lint` began covering test targets.
-    use krishiv_proto::JobId;
-
-    let job_id = JobId::try_new("jcp-heartbeat-launch-ownership").unwrap();
-    let spec = single_task_job(job_id.clone());
-    let job = crate::job::JobRecord::from_spec(spec, 0);
-    let jc = crate::job_coordinator::JobCoordinator::new(job_id.clone(), job);
-
-    // A freshly-built job has no assigned task, so nothing is launch-eligible.
-    assert!(
-        !jc.has_tasks_eligible_for_launch().await,
-        "a job whose tasks are not assigned yet must report nothing eligible"
-    );
-}
-
-#[test]
-fn chaos_track_af_publish_helpers_centralized_wake_under_injection() {
-    // Exercises the Track A publish/notify helpers under simulated partition
-    // and executor loss — the exact surfaces centralized in the A completion slice.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("af-publish-helper-wake").unwrap();
-
-    h.partition(bad.clone());
-    for _ in 0..8 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    // The centralized wake path (notify_all_waiters via helpers) must not
-    // have regressed the recovery visibility.
-    assert!(h.current_tick() > 4);
-}
-
-#[test]
-fn chaos_track_af_jcp_loss_and_launch_summary_during_partition() {
-    // Stresses the Track B owned methods (handle_executor_loss + get_launch_work_summary)
-    // under concurrent partition + recovery + circuit-breaker style loss.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("af-jcp-loss-summary").unwrap();
-
-    h.partition(bad.clone());
-    for _ in 0..12 {
-        h.tick();
-    }
-    let bads = [bad.clone()];
-    h.simulate_concurrent_partitions(&bads);
-    h.simulate_partition_and_recovery(bad.clone());
-
-    // JCP-owned recovery and launch summary paths remain usable after injection.
-    assert!(h.current_tick() > 8);
-}
-
-#[test]
-fn chaos_track_af_circuit_breaker_wake_via_canonical_helper() {
-    // Verifies that circuit-breaker recovery continues to wake waiters
-    // exclusively through the Track A centralized notify helper even under
-    // heavy failure injection.
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("af-cb-wake-helper").unwrap();
-
-    h.partition(bad.clone());
-    for _ in 0..20 {
-        h.tick();
-    }
-    // Force a simulated loss that would trigger CB path in real coordinator.
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(h.current_tick() > 10);
-}
-
-#[test]
-fn job_coordinator_record_heartbeat_detects_staleness_real() {
-    // Proves the now-real per-job heartbeat staleness detection in JCP
-    // (Track B completion surface) produces a detectable signal on backward jump.
-    use krishiv_proto::JobId;
-
-    let job_id = JobId::try_new("jcp-real-heartbeat-stale").unwrap();
-    let spec = single_task_job(job_id.clone());
-    let job = crate::job::JobRecord::from_spec(spec, 0);
-    let jc = crate::job_coordinator::JobCoordinator::new(job_id.clone(), job);
-
-    let exec = ExecutorId::try_new("hb-exec-1").unwrap();
-    // First heartbeat advances the window.
-    let _ = jc.record_heartbeat_and_detect_stale(&exec, 1_000_000);
-    // Large backward jump exercises the live seam (current impl returns false
-    // until JobRecord grows per-executor last-seen; the call itself is the proof).
-    let stale = jc.record_heartbeat_and_detect_stale(&exec, 900_000);
-    let _ = stale;
-}
-
-#[test]
-fn chaos_track_af_jcp_udf_limits_accessible_under_failure_injection() {
-    // Exercises the Track E JCP limits accessors (udf_execution_time_cap_ms /
-    // udf_memory_limit_bytes) under simulated partition + loss + recovery.
-    // Proves the per-job limits seam remains usable for executor launch
-    // decision making even when the cluster is under heavy failure.
-    use krishiv_proto::JobId;
-
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("af-jcp-limits-under-chaos").unwrap();
-
-    // The harness does not yet carry full JobSpec limits, but constructing
-    // a JCP directly and calling the accessors (which delegate to the
-    // underlying JobRecord) proves the surface is live and does not panic
-    // even when the broader simulation is injecting partitions.
-    let job_id = JobId::try_new("limits-chaos-job").unwrap();
-    let spec = single_task_job(job_id.clone());
-    let job = crate::job::JobRecord::from_spec(spec, 0);
-    let jc = crate::job_coordinator::JobCoordinator::new(job_id.clone(), job);
-
-    h.partition(bad.clone());
-    for _ in 0..6 {
-        h.tick();
-    }
-    h.simulate_partition_and_recovery(bad.clone());
-
-    // The accessors are callable and return Option values (real seam).
-    let _time_cap = jc.udf_execution_time_cap_ms(); // may be None for this synthetic job
-    let _mem = jc.udf_memory_limit_bytes();
-    assert!(h.current_tick() > 4);
-}
-
-#[test]
-fn prr_new_surfaces_all_green_when_known_env_failures_excluded() {
-    // Dedicated smoke that the exact new surfaces from the A-F one-phase
-    // completion + ideal-state continuation (publish helpers, JCP ownership,
-    // limits accessors, CB wake centralization, real heartbeat seam) are
-    // fully green when the 4 long-standing env-sensitive tests are excluded.
-    // This is the filter that will be used in CI for the PRR remediation
-    // until the 4 known cases are stabilized.
-    // The test itself is a no-op marker; the real proof is that
-    // `cargo test -p krishiv-scheduler --lib -- --skip cancel_job_pushes...`
-    // (and the other 3) passes cleanly with all new chaos_track_af_* and
-    // JCP method tests included.
-}
-
-#[test]
-fn chaos_track_continuation_jcp_with_nondefault_limits_under_launch_and_loss() {
-    // Continuation ideal-state test: constructs a JCP with explicit non-default
-    // UDF limits on the underlying JobRecord, exercises the accessor seam,
-    // then subjects the harness to partition + loss + recovery while the
-    // JCP-owned launch eligibility and loss recovery paths remain live.
-    use krishiv_proto::JobId;
-
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("continuation-jcp-limits-launch-loss").unwrap();
-
-    let job_id = JobId::try_new("limits-launch-loss-job").unwrap();
-    let spec = single_task_job(job_id.clone());
-    // Simulate a JobSpec that carried non-default UDF budgets (the real path
-    // comes from JobSpec in production; here we just ensure the JCP surface
-    // that will be queried at launch time is exercised under injection).
-    // The JobRecord created below will have the default (None) caps; the
-    // accessor path is what matters for the seam.
-    let job = crate::job::JobRecord::from_spec(spec, 0);
-    let jc = crate::job_coordinator::JobCoordinator::new(job_id.clone(), job);
-
-    h.partition(bad.clone());
-    for _ in 0..9 {
-        h.tick();
-    }
-    // Exercise the limits accessor while the cluster is under failure.
-    let _cap = jc.udf_execution_time_cap_ms();
-    let _mem = jc.udf_memory_limit_bytes();
-    // Also exercise a launch eligibility query (JCP-owned).
-    let _eligible = jc.has_tasks_eligible_for_launch();
-    h.simulate_partition_and_recovery(bad.clone());
-
-    assert!(h.current_tick() > 7);
-}
-
-#[test]
-fn chaos_track_continuation_jcp_limits_in_launch_decision_under_failure() {
-    // Stronger continuation test: a JCP with non-default UDF limits is
-    // consulted for launch eligibility and loss recovery while the harness
-    // injects partition + loss + recovery. This simulates the exact path
-    // a real executor launch site will take when pulling per-job budgets
-    // from the JCP before dispatching tasks under failure conditions.
-    use krishiv_proto::JobId;
-
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("continuation-limits-launch-decision").unwrap();
-
-    let job_id = JobId::try_new("limits-launch-decision-job").unwrap();
-    let spec = single_task_job(job_id.clone());
-    let job = crate::job::JobRecord::from_spec(spec, 0);
-    let jc = crate::job_coordinator::JobCoordinator::new(job_id.clone(), job);
-
-    h.partition(bad.clone());
-    for _ in 0..11 {
-        h.tick();
-    }
-    // The launch decision surface (which will read limits in the real path)
-    // must remain usable while the executor is lost.
-    let _eligible = jc.has_tasks_eligible_for_launch();
-    let _summary = jc.get_launch_work_summary();
-    let _affected = jc.handle_executor_loss(&bad);
-    h.simulate_partition_and_recovery(bad.clone());
-
-    // Re-query after recovery — the JCP surfaces must still be live.
-    let _post = jc.has_tasks_eligible_for_launch();
-    assert!(h.current_tick() > 9);
-}
-
-#[tokio::test]
-async fn chaos_track_continuation_full_jcp_limits_launch_decision_under_heavy_injection() {
-    // Deep continuation test: constructs a JCP with non-default UDF limits,
-    // exercises the accessor + launch eligibility + loss recovery surfaces
-    // while the harness injects concurrent partitions, delayed heartbeats,
-    // and recovery. This is the closest simulation yet of a real executor
-    // launch site pulling per-job budgets from the JCP before dispatching
-    // tasks under sustained failure conditions.
-    use krishiv_proto::JobId;
-
-    let mut h = MiniSimulationHarness::new();
-    let bad1 = ExecutorId::try_new("cont-full-limits-bad1").unwrap();
-    let bad2 = ExecutorId::try_new("cont-full-limits-bad2").unwrap();
-
-    let job_id = JobId::try_new("full-limits-launch-job").unwrap();
-    let spec = single_task_job(job_id.clone());
-    let job = crate::job::JobRecord::from_spec(spec, 0);
-    let jc = crate::job_coordinator::JobCoordinator::new(job_id.clone(), job);
-
-    h.partition(bad1.clone());
-    h.partition(bad2.clone());
-    for _ in 0..14 {
-        h.tick();
-    }
-    // inject_delayed_heartbeat temporarily disabled in this deep test to keep
-    // compilation clean in the current harness state (the surface remains
-    // exercised by other continuation tests). The JCP limits + launch decision
-    // paths under concurrent partition + recovery are still fully covered.
-    // h.inject_delayed_heartbeat(&bad1, 4);
-    let _cap = jc.udf_execution_time_cap_ms();
-    let _mem = jc.udf_memory_limit_bytes();
-    let _eligible = jc.has_tasks_eligible_for_launch();
-    let (_eligible_count, _stages_with_work) = jc.get_launch_work_summary().await;
-    let _affected1 = jc.handle_executor_loss(&bad1);
-    let _affected2 = jc.handle_executor_loss(&bad2);
-    h.simulate_partition_and_recovery(bad1.clone());
-    h.simulate_partition_and_recovery(bad2.clone());
-
-    // Final queries after heavy injection + recovery.
-    let _final_eligible = jc.has_tasks_eligible_for_launch();
-    let _final_summary = jc.get_launch_work_summary().await;
-    assert!(h.current_tick() > 12);
-}
-
-#[tokio::test]
-async fn chaos_ideal_state_jcp_nondefault_limits_with_delayed_heartbeat_and_partition() {
-    // Ideal-state continuation: JCP with non-default UDF memory limits,
-    // exercised under combined delayed heartbeat + partition + message loss
-    // injection. Verifies the launch decision, loss recovery, and limits
-    // accessor surfaces survive sustained failure conditions.
-    use krishiv_proto::JobId;
-
-    let mut h = MiniSimulationHarness::new();
-    let bad = ExecutorId::try_new("ideal-limits-bad").unwrap();
-
-    let job_id = JobId::try_new("ideal-limits-job").unwrap();
-    let spec = single_task_job(job_id.clone()).with_memory_limit_bytes(256 * 1024 * 1024); // 256 MB non-default limit
-    let job = crate::job::JobRecord::from_spec(spec, 0);
-    let jc = crate::job_coordinator::JobCoordinator::new(job_id.clone(), job);
-
-    // Non-default limits must be accessible before failure injection.
-    let (_time_cap, mem_limit) = jc.udf_resource_limits().await;
-    assert_eq!(mem_limit, Some(256 * 1024 * 1024));
-
-    h.partition(bad.clone());
-    h.inject_delayed_heartbeat(&bad, 5);
-    h.simulate_message_loss("checkpoint-ack");
-    for _ in 0..10 {
-        h.tick();
-    }
-
-    // During partition + delayed heartbeat + message loss:
-    let _eligible = jc.has_tasks_eligible_for_launch();
-    let _summary = jc.get_launch_work_summary().await;
-    let _affected = jc.handle_executor_loss(&bad).await;
-
-    // After loss recovery:
-    h.simulate_partition_and_recovery(bad.clone());
-    for _ in 0..3 {
-        h.tick();
-    }
-
-    // Limits must still be accessible after full failure cycle.
-    let (_time_cap2, mem_limit2) = jc.udf_resource_limits().await;
-    assert_eq!(mem_limit2, Some(256 * 1024 * 1024));
-    let _post_eligible = jc.has_tasks_eligible_for_launch();
-    let _post_summary = jc.get_launch_work_summary().await;
-    assert!(h.current_tick() > 10);
+    let _ = job.udf_memory_limit_bytes();
 }
 
 #[test]
@@ -1404,4 +318,3 @@ fn chaos_speculative_execution_stale_lease_rejected() {
     let valid_outcome = coordinator.apply_task_update(valid_update).unwrap();
     assert_eq!(valid_outcome, TaskUpdateOutcome::Applied);
 }
-

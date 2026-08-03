@@ -105,9 +105,6 @@ impl MiniSimulationHarness {
     pub fn tick(&mut self) {
         self.tick += 1;
     }
-    pub fn current_tick(&self) -> u64 {
-        self.tick
-    }
 
     pub fn partition(&mut self, executor: ExecutorId) {
         self.partitions.push((executor, self.tick));
@@ -133,11 +130,6 @@ impl MiniSimulationHarness {
         self.tick += 10; // simulate downtime
         self.partitions.retain(|(e, _)| e != &executor); // recovery
         self.simulate_lease_bump()
-    }
-
-    /// Inject a delayed heartbeat (useful for timeout testing).
-    pub fn inject_delayed_heartbeat(&mut self, executor: &ExecutorId, delay_ticks: u64) {
-        self.delay(&format!("hb-{}", executor), delay_ticks);
     }
 
     pub fn advance_clock_with_skew(&mut self, ticks: u64, skew_on: Option<ExecutorId>) {
