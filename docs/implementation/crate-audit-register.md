@@ -554,7 +554,7 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
 
 ---
 
-## 4. krishiv-scheduler — 40 of 78 files read whole (in progress, 2026-08-03)
+## 4. krishiv-scheduler — 41 of 78 files read whole (in progress, 2026-08-03)
 
 Third crate. The largest in the workspace: 51,438 lines. Working down the
 distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198),
@@ -574,11 +574,10 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
 `queryable_state_http.rs` (262), `bounded_window_http.rs` (83),
 `coordinator_daemon.rs` (2,518), `continuous_stream_http.rs` (3,041),
 `sections/placement.rs.inc` (2,281), `ivm_http.rs` (2,273), `store.rs`
-(1,996).
-**33,859 of 51,438 lines.**
+(1,996), `sections/core.rs.inc` (1,772).
+**35,631 of 51,438 lines.**
 
-**Remaining, in intended order** (38 files, ~17,580 lines):
-`sections/core.rs.inc` (1,772),
+**Remaining, in intended order** (37 files, ~15,810 lines):
 `sections/chaos_jcp.rs.inc` (1,407), `etcd_metadata.rs` (1,250), `ivm.rs`
 (1,107), `batch_sql.rs` (1,065), `grpc.rs` (1,041), `auth.rs` (1,029), then
 the remaining `sections/*.rs.inc` and the sub-500-line files.
@@ -881,6 +880,18 @@ return at all.* Six of the nine defects below are one of those two.
       task failed for "no progress" it was in fact making. The heartbeat
       refresh path is authoritative. If cross-restart stall budgets are ever
       wanted, persist `last_progress_ms` and keep that path in charge.
+
+- [x] **The executor-persistence test asserted on memory, not the store**
+      (`a129c0fa`). `tonic_service_register_executor_persists_descriptor` set
+      up a RocksDB store, registered through the tonic service, awaited
+      `store.flush()` — then asserted on `executors().list()`, the in-memory
+      registry, which `register_executor` populates whether or not it
+      persists anything. Deleting the `save_executor` call left it green.
+      R10 exists so a re-attaching executor is recognised after a restart,
+      and only the durable copy can do that. Now reads through
+      `store.inner()`. `cancel_job_marks_active_tasks_cancelled` in the same
+      file already used that idiom — this call site never adopted it.
+      Verified: 0 descriptors where 1 is required.
 
 ### Recorded, not fixed — needs a decision
 
