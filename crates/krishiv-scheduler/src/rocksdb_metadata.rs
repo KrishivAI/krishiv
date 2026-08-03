@@ -49,6 +49,18 @@ pub struct RocksDbMetadataStore {
     /// metadata write survives host/power loss (default `put_cf` only survives a
     /// process crash, not a machine crash).
     sync_writes: bool,
+    /// Keeps an [`Self::in_memory`] store's backing directory alive for as long
+    /// as the `DB` is open.
+    ///
+    /// `in_memory` used to hand its `TempDir` to `open_at` as `_tempdir` and
+    /// nothing stored it, so the guard dropped at the end of that call and
+    /// **deleted the directory out from under the still-open database**. On
+    /// Linux the open descriptors keep working, which is why every test passed;
+    /// but the moment RocksDB needs a *new* file — a WAL rotation, a memtable
+    /// flush, any compaction — it writes into a directory that no longer
+    /// exists, and the store can never be reopened. Holding the guard here is
+    /// the whole point of having passed it.
+    _tempdir: Option<tempfile::TempDir>,
 }
 
 impl RocksDbMetadataStore {
@@ -71,7 +83,7 @@ impl RocksDbMetadataStore {
         Self::open_at(p, None)
     }
 
-    fn open_at(path: &Path, _tempdir: Option<tempfile::TempDir>) -> SchedulerResult<Self> {
+    fn open_at(path: &Path, tempdir: Option<tempfile::TempDir>) -> SchedulerResult<Self> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
@@ -196,6 +208,7 @@ impl RocksDbMetadataStore {
             next_event_id,
             history,
             sync_writes: false,
+            _tempdir: tempdir,
         })
     }
 
@@ -300,8 +313,12 @@ impl MetadataStore for RocksDbMetadataStore {
             .db
             .cf_handle(CF_EXECUTORS)
             .ok_or_else(|| Self::store_err("missing executors CF"))?;
+        // DUR-6 applies to deletes too: a clean deregister that is not fsync'd
+        // can come back after host loss, so a removed executor reappears on
+        // restart. `remove_ivm_snapshot` already used the sync options; these
+        // three deleters did not.
         self.db
-            .delete_cf(&cf, executor_id.as_str())
+            .delete_cf_opt(&cf, executor_id.as_str(), &self.write_opts())
             .map_err(Self::store_err)?;
         self.executors.retain(|e| e.executor_id() != executor_id);
         Ok(())
@@ -334,7 +351,9 @@ impl MetadataStore for RocksDbMetadataStore {
             .db
             .cf_handle(CF_CONTINUOUS)
             .ok_or_else(|| Self::store_err("missing continuous_snapshots CF"))?;
-        self.db.delete_cf(&cf, job_id).map_err(Self::store_err)?;
+        self.db
+            .delete_cf_opt(&cf, job_id, &self.write_opts())
+            .map_err(Self::store_err)?;
         self.continuous_snapshots.remove(job_id);
         Ok(())
     }
@@ -392,7 +411,9 @@ impl MetadataStore for RocksDbMetadataStore {
         // in-memory view and the column family so disk usage stays bounded.
         while self.history.len() > crate::store::MAX_JOB_HISTORY {
             if let Some(evicted) = self.history.pop() {
-                let _ = self.db.delete_cf(&cf, evicted.job_id.as_str());
+                let _ = self
+                    .db
+                    .delete_cf_opt(&cf, evicted.job_id.as_str(), &self.write_opts());
             }
         }
         Ok(())
@@ -444,6 +465,35 @@ mod tests {
         assert_eq!(store.events(), &[event]);
         assert_eq!(store.jobs(), &[job]);
         assert_eq!(store.executors(), vec![exec]);
+    }
+
+    /// The ephemeral store must still own its directory once constructed.
+    ///
+    /// `in_memory` passed its `TempDir` into `open_at`, which bound it to
+    /// `_tempdir` and dropped it — deleting the directory while the `DB` was
+    /// still open on it. On Linux the already-open descriptors keep serving
+    /// reads and writes, so every existing test passed; the damage only shows
+    /// when RocksDB needs a new file (WAL rotation, flush, compaction) or when
+    /// anything tries to reopen the path. Asserting the directory exists is
+    /// what falsifies it — asserting a read-back does not.
+    #[test]
+    fn in_memory_store_keeps_its_backing_directory_alive() {
+        let mut store = RocksDbMetadataStore::in_memory().unwrap();
+        let path = store.db.path().to_path_buf();
+        assert!(
+            path.exists(),
+            "the ephemeral store's directory {} was deleted while its DB is \
+             still open; RocksDB will fail the moment it needs a new file",
+            path.display()
+        );
+
+        // And it survives real work, including a flush that must create files.
+        store.save_job(&job_record("job-live")).unwrap();
+        store
+            .db
+            .flush()
+            .expect("flush must succeed on a live directory");
+        assert!(path.exists());
     }
 
     #[test]
