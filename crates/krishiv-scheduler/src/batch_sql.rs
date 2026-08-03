@@ -22,6 +22,40 @@ use crate::{JobDetailSnapshot, SchedulerError, SchedulerResult, SharedCoordinato
 
 const BATCH_SQL_JOB_PREFIX: &str = "batch-sql-";
 
+/// How long a batch-SQL waiter parks before re-reading job state, when no
+/// change notification arrives first.
+///
+/// **This must not be the job deadline.** Both wait loops below used
+/// `sleep_until(deadline)` as the `select!` fallback, so the only thing that
+/// could end a wait early was a notification — and
+/// `Coordinator::notify` is fired with `Notify::notify_waiters()`, which wakes
+/// only waiters **already parked** and stores no permit. The recheck-before-park
+/// dance in those loops was written to close that window but cannot: the
+/// `Notified` future does not register until it is first polled, which happens
+/// inside the `select!`, *after* the recheck released the lock. A job reaching a
+/// terminal state in that window notified nobody, so the caller slept the full
+/// `KRISHIV_BATCH_SQL_TIMEOUT_SECS` (300s default) and then reported a timeout
+/// for a query that had already finished.
+///
+/// Ticking instead makes the notification a latency optimisation — which is all
+/// `notify_waiters` can honestly be — and caps the cost of a missed one at one
+/// interval. `run_ivm_fragment_job` already pairs its wait with a 100 ms sleep
+/// for exactly this reason; these two loops were the ones that did not.
+const BATCH_SQL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Park until the job may have changed state: whichever comes first of a change
+/// notification, one [`BATCH_SQL_POLL_INTERVAL`] tick, or the deadline.
+async fn await_job_change(
+    state_changed: impl std::future::Future<Output = ()>,
+    deadline: tokio::time::Instant,
+) {
+    let tick = (tokio::time::Instant::now() + BATCH_SQL_POLL_INTERVAL).min(deadline);
+    tokio::select! {
+        () = state_changed => {}
+        _ = tokio::time::sleep_until(tick) => {}
+    }
+}
+
 /// Extract the terminal failure reason from a failed job's detail snapshot.
 ///
 /// Scans stages in order and returns the first task-level `last_failure_reason`
@@ -210,10 +244,7 @@ async fn poll_batch_sql_outcome(
                         | JobState::Running
                         | JobState::Committing
                 ) {
-                    tokio::select! {
-                        _ = state_changed => {}
-                        _ = tokio::time::sleep_until(deadline) => {}
-                    }
+                    await_job_change(state_changed, deadline).await;
                 }
             }
         }
@@ -289,9 +320,26 @@ pub async fn execute_batch_sql_sink_coordinated(
                 return Ok(job_id);
             }
             JobState::Failed | JobState::Cancelled => {
-                return Err(SchedulerError::Transport {
-                    message: format!("batch SQL sink job {job_id} finished in state {state:?}"),
-                });
+                // Same reasoning as `poll_batch_sql_outcome`'s terminal branch,
+                // which this path had not adopted: `Transport` is classified
+                // Retryable/opaque by the interface layer — the "internal
+                // error; contact the operator" wrapping — so a distributed
+                // write that failed for a *caller's* reason (unknown column,
+                // type mismatch, permission denied on the destination) was
+                // reported as an internal fault, and the reason the coordinator
+                // had already recorded was thrown away entirely.
+                //
+                // The timeout branch above carries the #222 fix and says so;
+                // only this one was left behind.
+                let reason = {
+                    let coord = coordinator.read().await;
+                    coord
+                        .job_detail_snapshot(&job_id)
+                        .ok()
+                        .and_then(|detail| first_task_failure_reason(&detail))
+                        .unwrap_or_else(|| format!("job finished in state {state:?}"))
+                };
+                return Err(SchedulerError::JobFailed { job_id, reason });
             }
             JobState::Queued
             | JobState::Accepted
@@ -311,10 +359,7 @@ pub async fn execute_batch_sql_sink_coordinated(
                         | JobState::Running
                         | JobState::Committing
                 ) {
-                    tokio::select! {
-                        _ = state_changed => {}
-                        _ = tokio::time::sleep_until(deadline) => {}
-                    }
+                    await_job_change(state_changed, deadline).await;
                 }
             }
         }
@@ -685,6 +730,107 @@ mod tests {
             .is_err(),
             "raw untyped batch SQL fragment must be rejected under a durable profile"
         );
+    }
+
+    /// A failed distributed **write** must surface the query error, not an
+    /// opaque transport fault.
+    ///
+    /// `poll_batch_sql_outcome` returns `JobFailed` carrying the reason the
+    /// coordinator recorded, precisely so the interface layer can classify it
+    /// as a caller-facing query error (Phase 63 / audit §11). The sink path
+    /// returned `Transport` — which that layer classifies Retryable/opaque, the
+    /// "internal error; contact the operator" wrapping — and discarded the
+    /// reason. Its *timeout* branch already carried the matching #222 fix and
+    /// pointed at the sibling; only the terminal branch was left behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_sink_job_surfaces_the_recorded_query_error() {
+        use krishiv_proto::{
+            CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState,
+            LeaseGeneration, TaskState, TaskStatusUpdate,
+        };
+
+        // Zero stage retries so the first task failure is terminal for the job.
+        let mut coord = Coordinator::active_with_config(
+            CoordinatorId::try_new("coord-sink-err").unwrap(),
+            crate::CoordinatorConfig::new(0, 3),
+        );
+        let exec_id = ExecutorId::try_new("sink-exec").unwrap();
+        coord
+            .register_executor(ExecutorDescriptor::new(exec_id.clone(), "localhost", 4))
+            .unwrap();
+        coord
+            .executor_heartbeat(
+                ExecutorHeartbeat::new(exec_id, ExecutorState::Healthy)
+                    .with_lease_generation(LeaseGeneration::initial()),
+            )
+            .unwrap();
+        let coordinator = SharedCoordinator::new(coord);
+
+        let submitted = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                execute_batch_sql_sink_coordinated(
+                    &coordinator,
+                    "SELECT nope FROM t",
+                    &[],
+                    "object-parquet-sink:/tmp/base:/tmp/dest:mode=overwrite",
+                )
+                .await
+            }
+        });
+
+        // Wait for the spawned submission to register the job, then drive its
+        // single task to Failed with the error a real executor would report.
+        let assignment = loop {
+            {
+                let mut coord = coordinator.write().await;
+                if let Some(job_id) = coord.job_snapshots().first().map(|s| s.job_id().clone()) {
+                    let _ = coord.assign_pending_tasks(&job_id);
+                    if let Ok(mut a) = coord.launch_assigned_task_assignments(&job_id)
+                        && !a.is_empty()
+                    {
+                        break a.remove(0);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        {
+            let mut coord = coordinator.write().await;
+            coord
+                .apply_task_update(
+                    TaskStatusUpdate::new(
+                        assignment.job_id().clone(),
+                        assignment.stage_id().clone(),
+                        assignment.task_id().clone(),
+                        assignment.executor_id().clone(),
+                        TaskState::Failed,
+                        assignment.attempt_id().as_u32(),
+                    )
+                    .with_lease_generation(assignment.lease_generation())
+                    .with_message("No field named nope. Valid fields are t.id, t.category."),
+                )
+                .unwrap();
+        }
+
+        let error = tokio::time::timeout(Duration::from_secs(10), submitted)
+            .await
+            .expect("the sink call must return once the job is terminal")
+            .expect("task panicked")
+            .expect_err("a failed sink job must be an error");
+
+        match error {
+            SchedulerError::JobFailed { reason, .. } => assert!(
+                reason.contains("No field named nope"),
+                "the recorded query error must reach the caller, got: {reason}"
+            ),
+            other => panic!(
+                "a failed sink job must be JobFailed (a caller-facing query \
+                 error), not {other:?} — Transport is classified as an opaque \
+                 internal fault"
+            ),
+        }
     }
 
     /// Phase 52 Leg 7: the daemon submission path stage-splits plain
