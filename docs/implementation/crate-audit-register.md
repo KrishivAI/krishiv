@@ -554,7 +554,7 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
 
 ---
 
-## 4. krishiv-scheduler — 36 of 78 files read whole (in progress, 2026-08-03)
+## 4. krishiv-scheduler — 37 of 78 files read whole (in progress, 2026-08-03)
 
 Third crate. The largest in the workspace: 51,438 lines. Working down the
 distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198),
@@ -572,10 +572,10 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
 `coordinator/heartbeat_mapping.rs` (87), `barrier_tracker.rs` (108),
 `rpc_drain.rs` (223), `leadership.rs` (71), `http_auth.rs` (224),
 `queryable_state_http.rs` (262), `bounded_window_http.rs` (83),
-`coordinator_daemon.rs` (2,518). **24,268 of 51,438 lines.**
+`coordinator_daemon.rs` (2,518), `continuous_stream_http.rs` (3,041).
+**27,309 of 51,438 lines.**
 
-**Remaining, in intended order** (42 files, ~27,200 lines):
-`continuous_stream_http.rs` (3,041),
+**Remaining, in intended order** (41 files, ~24,100 lines):
 `sections/placement.rs.inc` (2,281), `ivm_http.rs` (2,273), `store.rs`
 (1,996), `sections/core.rs.inc` (1,772), `sections/chaos_jcp.rs.inc`
 (1,407), `etcd_metadata.rs` (1,250), `ivm.rs` (1,107), `batch_sql.rs`
@@ -759,6 +759,23 @@ return at all.* Six of the nine defects below are one of those two.
       it. Committed separately from the fixes so the audit diff stays
       reviewable. **Run `cargo fmt -p krishiv-scheduler` before each audit
       commit.**
+
+- [x] **The continuous surface explained one of its nine rejections**
+      (`85d7b0d8`). `scheduler_error_response` exists in
+      `continuous_stream_http.rs` because a bare status code with an empty body
+      "cost a full bisection" during the Phase 62 soak — its own doc comment
+      says so — but only `api_continuous_push` was converted. The eight
+      siblings still returned `StatusCode` alone. `drain` was the sharpest
+      case (callers drive push and drain in the same loop, and push's message
+      was already fixed); `register_sql` discarded the SQL compiler's
+      diagnostic entirely behind a bare 400. Converted all eight to
+      `(StatusCode, String)`; statuses unchanged. `api_continuous_list` left
+      alone — no error path.
+
+      Verification note worth keeping: the first revert I tried (drain's
+      `job_snapshot` call) did **not** fail the test, because an unknown job
+      fails earlier at `run_loop_targets`. A discrimination check that passes
+      means the wrong line was reverted, not that the test is weak.
 
 ### Recorded, not fixed — needs a decision
 
