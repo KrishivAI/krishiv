@@ -3243,8 +3243,28 @@ struct RuntimeFilterRejects {
     joins_of_unsupported_kind: usize,
 }
 
+/// The four things a runtime filter needs from a join, independent of which
+/// algorithm executes it.
+///
+/// A bloom filter is a statement about the join's *keys*: probe rows whose key
+/// cannot appear on the build side cannot join, whichever way the rows are
+/// matched. Hash, sort-merge and grace joins all answer the same four
+/// questions, so the rule reads them through this view instead of being
+/// hard-wired to one node type — which is what left it inspecting zero joins on
+/// q21 (see `joins_of_unsupported_kind`).
+struct JoinView<'a> {
+    /// By value: `HashJoinExec` hands back a reference and
+    /// `SortMergeJoinExec` a copy, and `JoinType` is `Copy`.
+    join_type: datafusion::logical_expr::JoinType,
+    left: &'a Arc<dyn ExecutionPlan>,
+    right: &'a Arc<dyn ExecutionPlan>,
+    /// DataFusion's own name for the equijoin-pair slice, so this reads the
+    /// same shape both join nodes expose rather than restating it.
+    on: datafusion::physical_plan::joins::utils::JoinOnRef<'a>,
+}
+
 fn runtime_filter_candidate(
-    join: &datafusion::physical_plan::joins::HashJoinExec,
+    join: &JoinView<'_>,
     rejects: &mut RuntimeFilterRejects,
 ) -> Option<RuntimeFilterCandidate> {
     use datafusion::logical_expr::JoinType;
@@ -3257,14 +3277,13 @@ fn runtime_filter_candidate(
     // Full/Right pad them with nulls. `RuntimeFilter::contains` also drops null
     // keys, which is correct only where a null key cannot produce output.
     rejects.joins += 1;
-    if *join.join_type() != JoinType::Inner {
+    if join.join_type != JoinType::Inner {
         rejects.not_inner += 1;
         return None;
     }
     // Guard 1 — different stages. A same-stage join already gets DataFusion's
     // own dynamic filter, so firing there duplicates work for nothing.
-    let (Some(build), Some(probe)) = (join_side_read(join.left()), join_side_read(join.right()))
-    else {
+    let (Some(build), Some(probe)) = (join_side_read(join.left), join_side_read(join.right)) else {
         rejects.side_not_a_shuffle_read += 1;
         return None;
     };
@@ -3299,11 +3318,11 @@ fn runtime_filter_candidate(
     // them. Only plain columns of a type the filter can encode canonically;
     // for a composite key the first usable column is enough, because a row that
     // matches on every key column necessarily matches on one of them.
-    let found = join.on().iter().find_map(|(left, right)| {
+    let found = join.on.iter().find_map(|(left, right)| {
         let build_column = (left.as_ref() as &dyn std::any::Any).downcast_ref::<Column>()?;
         let probe_column = (right.as_ref() as &dyn std::any::Any).downcast_ref::<Column>()?;
-        let build_schema = join.left().schema();
-        let probe_schema = join.right().schema();
+        let build_schema = join.left.schema();
+        let probe_schema = join.right.schema();
         let build_type =
             FilterKeyType::for_data_type(build_schema.field(build_column.index()).data_type())?;
         let probe_type =
@@ -3329,24 +3348,49 @@ fn collect_runtime_filter_candidates(
     out: &mut Vec<RuntimeFilterCandidate>,
     rejects: &mut RuntimeFilterRejects,
 ) {
+    // Both equijoin algorithms are read through the same view. Which one the
+    // planner picked is not a property of the filter: `SpillableJoinSelection`
+    // converts an oversized hash join to sort-merge *before* stage cutting, and
+    // on q21 at SF100 it converted all five — so keying on `HashJoinExec` alone
+    // meant the rule saw nothing at all on the query it was written for.
     if let Some(join) = plan.downcast_ref::<datafusion::physical_plan::joins::HashJoinExec>() {
-        if let Some(candidate) = runtime_filter_candidate(join, rejects) {
+        let view = JoinView {
+            join_type: *join.join_type(),
+            left: join.left(),
+            right: join.right(),
+            on: join.on(),
+        };
+        if let Some(candidate) = runtime_filter_candidate(&view, rejects) {
+            out.push(candidate);
+        }
+    } else if let Some(join) =
+        plan.downcast_ref::<datafusion::physical_plan::joins::SortMergeJoinExec>()
+    {
+        let view = JoinView {
+            join_type: join.join_type(),
+            left: join.left(),
+            right: join.right(),
+            on: join.on(),
+        };
+        if let Some(candidate) = runtime_filter_candidate(&view, rejects) {
             out.push(candidate);
         }
     } else if plan
-        .downcast_ref::<datafusion::physical_plan::joins::SortMergeJoinExec>()
+        .downcast_ref::<datafusion::physical_plan::joins::NestedLoopJoinExec>()
         .is_some()
-        || plan
-            .downcast_ref::<datafusion::physical_plan::joins::NestedLoopJoinExec>()
-            .is_some()
         || plan
             .downcast_ref::<crate::grace_hash_join::GraceHashJoinExec>()
             .is_some()
     {
-        // Seen but unreachable — see `joins_of_unsupported_kind`. Counted so a
-        // log line can say "there were joins, this pass just cannot read them"
-        // instead of reporting the same `joins_inspected: 0` a join-free query
-        // would.
+        // Still unreachable, for different reasons, and both honest:
+        //
+        // * `NestedLoopJoinExec` has no equijoin pairs at all — it is the node
+        //   DataFusion picks when there is no equality to key on, so there is
+        //   no key to build a filter over. Not a gap; a category error.
+        // * `GraceHashJoinExec` is ours and does carry equi keys, but it
+        //   partitions its build side into buckets on disk, and whether a probe
+        //   filter composes with that spill protocol is a question this pass
+        //   should not answer by assumption. Left counted until it is measured.
         rejects.joins_of_unsupported_kind += 1;
     }
     for child in plan.children() {
@@ -7152,39 +7196,39 @@ mod codec_completeness_tests {
         use datafusion::physical_expr::expressions::Column;
         use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 
-        /// A sort-merge join between two shuffle reads is invisible to this
-        /// pass, and the breakdown must say so rather than report the same
-        /// `joins_inspected: 0` a join-free plan would.
+        /// A sort-merge join across two stages now yields a candidate, exactly
+        /// as the equivalent hash join does.
         ///
-        /// This is the shape TPC-H q21 actually reaches the cutter in:
-        /// `SpillableJoinSelection` runs before stage cutting and converted all
-        /// five of q21's hash joins to sort-merge (measured on the live cluster
-        /// 2026-08-04, `fast-4c122b5f` — `hash_joins: 5, converted: 3`, the
-        /// other two already sort-merge). The runtime-filter pass then logged
-        /// `joins_inspected: 0`, which read as "no joins here" when the truth
-        /// was "five joins this pass cannot look at".
+        /// This is the shape TPC-H q21 reaches the cutter in — see
+        /// `a_sort_merge_join_is_counted_as_unreadable_not_as_no_join` for the
+        /// measurement that produced it. Which algorithm the planner picked is
+        /// not a property of the filter: a bloom over the join keys drops probe
+        /// rows that cannot match either way.
         #[test]
-        fn a_sort_merge_join_is_counted_as_unreadable_not_as_no_join() {
+        fn a_sort_merge_join_across_stages_is_a_candidate() {
+            use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
             use datafusion::physical_plan::joins::SortMergeJoinExec;
 
             let build = read(0, Some(1_000), "k", arrow::datatypes::DataType::Int64);
             let probe = read(1, Some(10_000_000), "k", arrow::datatypes::DataType::Int64);
-            let on = vec![(
-                Arc::new(Column::new("k", 0)) as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-                Arc::new(Column::new("k", 0)) as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-            )];
+            let on: Vec<(
+                Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+                Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+            )> = vec![(Arc::new(Column::new("k", 0)), Arc::new(Column::new("k", 0)))];
+            let sort_options = LexOrdering::new(vec![PhysicalSortExpr::new_default(Arc::new(
+                Column::new("k", 0),
+            ))])
+            .expect("ordering")
+            .iter()
+            .map(|e| e.options)
+            .collect();
             let smj = SortMergeJoinExec::try_new(
                 build,
                 probe,
                 on,
                 None,
                 JoinType::Inner,
-                vec![
-                    datafusion::physical_expr::PhysicalSortExpr::new_default(Arc::new(
-                        Column::new("k", 0),
-                    ))
-                    .options,
-                ],
+                sort_options,
                 NullEquality::NullEqualsNothing,
             )
             .expect("sort-merge join over two shuffle reads");
@@ -7195,14 +7239,41 @@ mod codec_completeness_tests {
             collect_runtime_filter_candidates(&plan, &mut candidates, &mut rejects);
 
             assert_eq!(
-                rejects.joins_of_unsupported_kind, 1,
-                "the sort-merge join must be counted as seen-but-unreadable"
+                rejects.joins, 1,
+                "the sort-merge join must now be inspected like any other equijoin"
             );
             assert_eq!(
-                rejects.joins, 0,
-                "and must not be counted as an inspected join, which would \
-                 imply a gate turned it away"
+                rejects.joins_of_unsupported_kind, 0,
+                "and must no longer be written off as unreadable"
             );
+            assert_eq!(
+                candidates.len(),
+                1,
+                "a selective cross-stage join is a candidate"
+            );
+            assert_eq!(candidates[0].build_stage, 0);
+            assert_eq!(candidates[0].probe_stage, 1);
+        }
+
+        /// A nested-loop join stays uncounted-as-inspected: it has no equijoin
+        /// pairs at all, so there is no key to build a filter over. That is a
+        /// category error, not a gap to close.
+        #[test]
+        fn a_nested_loop_join_remains_unreadable() {
+            use datafusion::physical_plan::joins::NestedLoopJoinExec;
+
+            let left = read(0, Some(1_000), "k", arrow::datatypes::DataType::Int64);
+            let right = read(1, Some(10_000_000), "k", arrow::datatypes::DataType::Int64);
+            let nlj = NestedLoopJoinExec::try_new(left, right, None, &JoinType::Inner, None)
+                .expect("nested-loop join");
+
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(nlj);
+            let mut candidates = Vec::new();
+            let mut rejects = RuntimeFilterRejects::default();
+            collect_runtime_filter_candidates(&plan, &mut candidates, &mut rejects);
+
+            assert_eq!(rejects.joins_of_unsupported_kind, 1);
+            assert_eq!(rejects.joins, 0);
             assert!(candidates.is_empty());
         }
 
