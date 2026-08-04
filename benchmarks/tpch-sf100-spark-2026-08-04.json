@@ -1,0 +1,99 @@
+{
+  "label": "spark-3.5.3-sf100-2026-08-04",
+  "engine": "spark-3.5.3",
+  "scale_factor": 100,
+  "data_root": "s3a://krishiv-bench/tpch/sf100",
+  "succeeded": 22,
+  "attempted": 22,
+  "total_elapsed_s": 5053.88,
+  "queries": [
+    {
+      "id": "q1",
+      "elapsed_s": 240.98
+    },
+    {
+      "id": "q2",
+      "elapsed_s": 104.78
+    },
+    {
+      "id": "q3",
+      "elapsed_s": 250.61
+    },
+    {
+      "id": "q4",
+      "elapsed_s": 112.8
+    },
+    {
+      "id": "q5",
+      "elapsed_s": 418.91
+    },
+    {
+      "id": "q6",
+      "elapsed_s": 78.7
+    },
+    {
+      "id": "q7",
+      "elapsed_s": 230.04
+    },
+    {
+      "id": "q8",
+      "elapsed_s": 281.39
+    },
+    {
+      "id": "q9",
+      "elapsed_s": 658.69
+    },
+    {
+      "id": "q10",
+      "elapsed_s": 233.54
+    },
+    {
+      "id": "q11",
+      "elapsed_s": 124.86
+    },
+    {
+      "id": "q12",
+      "elapsed_s": 142.5
+    },
+    {
+      "id": "q13",
+      "elapsed_s": 108.65
+    },
+    {
+      "id": "q14",
+      "elapsed_s": 99.14
+    },
+    {
+      "id": "q15",
+      "elapsed_s": 168.32
+    },
+    {
+      "id": "q16",
+      "elapsed_s": 47.9
+    },
+    {
+      "id": "q17",
+      "elapsed_s": 575.96
+    },
+    {
+      "id": "q18",
+      "elapsed_s": 372.46
+    },
+    {
+      "id": "q19",
+      "elapsed_s": 118.35
+    },
+    {
+      "id": "q20",
+      "elapsed_s": 135.53
+    },
+    {
+      "id": "q21",
+      "elapsed_s": 497.09
+    },
+    {
+      "id": "q22",
+      "elapsed_s": 52.68
+    }
+  ]
+}

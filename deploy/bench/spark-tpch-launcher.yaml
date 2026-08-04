@@ -1,0 +1,68 @@
+# Launcher for the distributed Spark-on-k8s TPC-H baseline.
+#
+# `scripts/bench/spark_submit_tpch.sh` runs *inside* the Spark image (it needs
+# spark-submit), so something has to put it there. That something used to be an
+# ad-hoc pod typed at a shell, which meant the committed script could not
+# actually be run from a clean checkout — the two assets it needs, a kube
+# credentials mount and this pod, existed only in one operator's history.
+#
+# Before applying, create the credentials the submitter needs:
+#
+#   kubectl -n krishiv-apitest get cm kube-root-ca.crt -o jsonpath='{.data.ca\.crt}' > ca.pem
+#   kubectl -n krishiv-apitest create token spark-bench --duration=24h > token
+#   kubectl -n krishiv-apitest create secret generic spark-kube-creds \
+#       --from-file=ca.pem --from-file=token
+#
+# and the job ConfigMap (corpus + runner + driver template + this script):
+#
+#   kubectl -n krishiv-apitest create cm spark-tpch-job \
+#     --from-file=corpus.json=<corpus> \
+#     --from-file=tpch_spark_run.py=scripts/bench/tpch_spark_run.py \
+#     --from-file=repeat_stats.py=scripts/bench/repeat_stats.py \
+#     --from-file=spark-driver-pod-template.yaml=deploy/bench/spark-driver-pod-template.yaml \
+#     --from-file=spark_submit_tpch.sh=scripts/bench/spark_submit_tpch.sh \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+# Set KRISHIV_APISERVER below from:
+#   kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'
+#
+# CAPACITY, and this is the part that silently corrupts the result: a Spark
+# executor requests 3800m + 1200m overhead = 5000Mi, and the driver requests
+# 2048Mi. Three nodes at ~7936Mi allocatable fit exactly one executor each —
+# so whichever node hosts the driver has no room left, and the third executor
+# sits Pending while the run completes on two. It still reports 22/22. Scale
+# *both* the Krishiv executors and the coordinator to zero first; the engine is
+# idle during the Spark run anyway, and its coordinator alone is the 512Mi that
+# decides whether the third executor schedules.
+#
+#   kubectl -n krishiv-apitest scale deploy/bench-exec-s1 --replicas=0   # and s2, s3
+#   kubectl -n krishiv-apitest scale deploy/apitest-coordinator --replicas=0
+#
+# Then verify THREE executors reach Running before trusting the numbers:
+#   kubectl -n krishiv-apitest get pods | grep spark-3-5-3
+apiVersion: v1
+kind: Pod
+metadata:
+  name: spark-tpch-launcher
+  namespace: krishiv-apitest
+spec:
+  restartPolicy: Never
+  serviceAccountName: spark-bench
+  containers:
+    - name: submit
+      image: localhost/krishiv-spark:3.5.3
+      imagePullPolicy: Never
+      command: ["/bin/bash", "/opt/job/spark_submit_tpch.sh"]
+      env:
+        - name: KRISHIV_APISERVER
+          value: "https://213.199.60.184:6443"
+        - name: KRISHIV_KUBE_PEMS
+          value: /kube
+      volumeMounts:
+        - {name: job, mountPath: /opt/job}
+        - {name: kube, mountPath: /kube, readOnly: true}
+  volumes:
+    - name: job
+      configMap: {name: spark-tpch-job, defaultMode: 0555}
+    - name: kube
+      secret: {secretName: spark-kube-creds, defaultMode: 0444}
