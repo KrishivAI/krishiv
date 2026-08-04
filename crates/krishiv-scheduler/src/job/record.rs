@@ -1744,6 +1744,7 @@ impl TaskRecord {
                 task_id: self.task_id().clone(),
                 expected: self.attempt,
                 received: update.attempt(),
+                reason: crate::error::StaleTaskReason::AttemptMismatch,
             });
         }
 
@@ -1752,6 +1753,7 @@ impl TaskRecord {
                 task_id: self.task_id().clone(),
                 expected: self.attempt,
                 received: update.attempt(),
+                reason: crate::error::StaleTaskReason::NotTheAssignee,
             });
         }
 
@@ -1768,6 +1770,7 @@ impl TaskRecord {
                 task_id: self.task_id().clone(),
                 expected: self.attempt,
                 received: update.attempt(),
+                reason: crate::error::StaleTaskReason::StateCannotAcceptUpdate,
             });
         }
 

@@ -3,10 +3,25 @@ use super::{
 };
 
 impl Coordinator {
-    /// Update a task record's last-known watermark and source offset from executor-reported state.
+    /// Update a task record's last-known watermark and source offset from
+    /// executor-reported state, resolved through `streaming_task_index` for
+    /// O(1) lookup instead of an O(jobs x stages x tasks) scan (P1.1).
     ///
-    /// P1.1: Uses `streaming_task_index` for O(1) lookup instead of O(jobs×stages×tasks) scan.
-    pub(crate) fn apply_streaming_task_state(&mut self, state: &StreamingTaskState) {
+    /// `reporter` is the executor whose heartbeat carried this state, and the
+    /// resolved task must actually be assigned to it. `StreamingTaskState`
+    /// carries only a bare `TaskId`, and `streaming_task_index` is keyed by
+    /// that bare id — but task ids are only unique *within* a job, and the
+    /// distributed planner names them positionally (`dist-s0-t0`), so two
+    /// concurrent jobs collide on the same key as a matter of course. Without
+    /// the ownership check, one job's report silently lands on another job's
+    /// task: `apply_streaming_state` refreshes `last_progress_ms`, which the
+    /// stall watchdog reads, so a genuinely hung task could be kept alive
+    /// indefinitely by an unrelated executor's heartbeat.
+    pub(crate) fn apply_streaming_task_state(
+        &mut self,
+        reporter: &ExecutorId,
+        state: &StreamingTaskState,
+    ) {
         let (job_id, stage_id) = match self.streaming_task_index.get(&state.task_id) {
             Some(entry) => (entry.0.clone(), entry.1.clone()),
             None => return,
@@ -18,10 +33,21 @@ impl Coordinator {
             && let Some(stage) = job.stages.iter_mut().find(|s| s.stage_id() == &stage_id)
         {
             for task in stage.tasks_mut() {
-                if task.task_id() == &state.task_id {
-                    task.apply_streaming_state(state);
+                if task.task_id() != &state.task_id {
+                    continue;
+                }
+                if task.assigned_executor() != Some(reporter) {
+                    tracing::debug!(
+                        task_id = %state.task_id,
+                        job_id = %job_id,
+                        reporter = %reporter,
+                        "dropping streaming task state from an executor that does not own \
+                         the task this id resolves to (colliding task id across jobs)"
+                    );
                     return;
                 }
+                task.apply_streaming_state(state);
+                return;
             }
         }
     }
@@ -65,6 +91,16 @@ impl Coordinator {
             Some(j) => j,
             None => return,
         };
+        // Streaming jobs only — the index exists to route streaming heartbeat
+        // state, and nothing else reads it. `submit_job` used to index every
+        // kind while `recover_from_store` filtered to streaming, so the index
+        // held different contents before and after a restart; and since the
+        // key is a bare `TaskId`, every batch job in it was another chance for
+        // a cross-job id collision. Batch tasks have no streaming state to
+        // route, so indexing them bought nothing and cost that.
+        if job.spec.kind() != krishiv_proto::JobKind::Streaming {
+            return;
+        }
         let mut job_task_ids = Vec::new();
         for stage in &job.stages {
             let stage_id = stage.stage_id().clone();
@@ -180,16 +216,23 @@ mod tests {
     #[test]
     fn apply_streaming_task_state_updates_the_indexed_task() {
         let mut coord = Coordinator::active(CoordinatorId::try_new("stream-apply").unwrap());
+        let exec_id = krishiv_proto::ExecutorId::try_new("exec-apply").unwrap();
+        coord
+            .register_executor(krishiv_proto::ExecutorDescriptor::new(
+                exec_id.clone(),
+                "pod-apply",
+                2,
+            ))
+            .unwrap();
         let job_id = JobId::try_new("job-apply").unwrap();
         coord.submit_job(two_task_streaming_job(&job_id)).unwrap();
         coord.index_streaming_tasks(&job_id);
 
         let task_id = TaskId::try_new("t0").unwrap();
-        coord.apply_streaming_task_state(&StreamingTaskState::new(
-            task_id.clone(),
-            42_000,
-            b"offset-7".to_vec(),
-        ));
+        coord.apply_streaming_task_state(
+            &exec_id,
+            &StreamingTaskState::new(task_id.clone(), 42_000, b"offset-7".to_vec()),
+        );
 
         let record = coord.job_coordinators.get(&job_id).unwrap().read_record();
         let task = record
@@ -204,21 +247,27 @@ mod tests {
 
     #[test]
     fn apply_streaming_task_state_is_a_noop_for_an_unindexed_task() {
-        // `submit_job` always indexes its own tasks (job_lifecycle.rs calls
-        // `index_streaming_tasks` unconditionally), so the only way to
-        // observe a genuinely unindexed task is one that was never
-        // submitted at all — a stale/unknown report arriving after the
-        // index believes nothing about this id.
+        // `submit_job` indexes a streaming job's own tasks, so the only way to
+        // observe a genuinely unindexed task is one that was never submitted
+        // at all — a stale/unknown report arriving after the index believes
+        // nothing about this id.
         let mut coord = Coordinator::active(CoordinatorId::try_new("stream-noop").unwrap());
+        let exec_id = krishiv_proto::ExecutorId::try_new("exec-noop").unwrap();
+        coord
+            .register_executor(krishiv_proto::ExecutorDescriptor::new(
+                exec_id.clone(),
+                "pod-noop",
+                2,
+            ))
+            .unwrap();
         let job_id = JobId::try_new("job-noop").unwrap();
         coord.submit_job(two_task_streaming_job(&job_id)).unwrap();
 
         // Must not panic even though "no-such-task" is not in any job.
-        coord.apply_streaming_task_state(&StreamingTaskState::new(
-            TaskId::try_new("no-such-task").unwrap(),
-            1,
-            Vec::new(),
-        ));
+        coord.apply_streaming_task_state(
+            &exec_id,
+            &StreamingTaskState::new(TaskId::try_new("no-such-task").unwrap(), 1, Vec::new()),
+        );
 
         // And the real, indexed tasks must be completely unaffected.
         let record = coord.job_coordinators.get(&job_id).unwrap().read_record();

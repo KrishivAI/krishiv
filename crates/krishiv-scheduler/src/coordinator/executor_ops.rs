@@ -286,7 +286,7 @@ impl Coordinator {
 
         self.assign_pending_tasks_for_schedulable_jobs();
         for state in &streaming_states {
-            self.apply_streaming_task_state(state);
+            self.apply_streaming_task_state(&executor_id, state);
         }
         // R7.2 Group D: process hot-key reports and record adaptive decisions.
         let mut source_throttles = self.process_hot_key_reports(&hot_key_reports);

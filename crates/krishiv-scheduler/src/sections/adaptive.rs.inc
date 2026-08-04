@@ -383,46 +383,51 @@ fn batch_sql_decode_inline_ipc_roundtrip() {
 // PRR Parallel Execution: High-priority failure-mode tests (Track B)
 // ─────────────────────────────────────────────────────────────────────
 
+/// `record_task_failure` counts consecutive failures per executor and
+/// `executors_over_failure_threshold` reports who is past the bar — that, and
+/// only that, is what this level tests.
+///
+/// It replaces two tests that each claimed more than they asserted:
+/// `circuit_breaker_actually_clears_assignments_from_bad_executor` never
+/// looked at a single assignment, and `assignment_flood_protection_basic` was
+/// the same loop again with a weaker assertion (`!is_empty()` instead of
+/// naming the executor). Neither touched flood protection or assignment
+/// clearing. Those behaviours are real and are tested where they live:
+/// assignment clearing in `circuit_breaker_clears_assignments_synchronously`,
+/// the cooldown and re-close in `circuit_breaker_reopens_after_the_cooldown_expires`
+/// and `success_fully_closes_the_breaker`, and the effect on planning width in
+/// `planning_width_excludes_circuit_broken_executors`. No coverage was lost by
+/// collapsing the pair; two misleading names were.
 #[test]
-fn circuit_breaker_actually_clears_assignments_from_bad_executor() {
-    let mut coordinator = Coordinator::active(CoordinatorId::try_new("cb-reassign").unwrap());
-    let exec_id = ExecutorId::try_new("bad-exec").unwrap();
-    let executor = ExecutorDescriptor::new(exec_id.clone(), "pod-bad", 2);
-
-    coordinator.register_executor(executor).unwrap();
-
-    // Drive the failure counter directly (this is what apply_task_update does internally)
-    // until the executor is marked bad.
-    for _ in 0..6 {
-        coordinator.exec.executors.record_task_failure(&exec_id, 5, 1);
+fn repeated_task_failures_put_an_executor_over_the_failure_threshold() {
+    let mut coordinator = Coordinator::active(CoordinatorId::try_new("cb-threshold").unwrap());
+    let bad = ExecutorId::try_new("bad-exec").unwrap();
+    let good = ExecutorId::try_new("good-exec").unwrap();
+    for id in [&bad, &good] {
+        coordinator
+            .register_executor(ExecutorDescriptor::new(id.clone(), "pod", 2))
+            .unwrap();
     }
 
-    let bad = coordinator.exec.executors.executors_over_failure_threshold(5);
+    const THRESHOLD: u32 = 5;
+    for _ in 0..THRESHOLD {
+        coordinator
+            .exec
+            .executors
+            .record_task_failure(&bad, THRESHOLD, 1);
+    }
+
+    let over = coordinator
+        .exec
+        .executors
+        .executors_over_failure_threshold(THRESHOLD);
     assert!(
-        bad.contains(&exec_id),
-        "executor must be in bad set after repeated failures"
+        over.contains(&bad),
+        "an executor at the threshold must be reported over it"
     );
-}
-
-#[test]
-fn assignment_flood_protection_basic() {
-    // Validates the registry side of flood/circuit breaker protection.
-    let mut coordinator = Coordinator::active(CoordinatorId::try_new("flood-test").unwrap());
-    let exec_id = ExecutorId::try_new("flood-exec").unwrap();
-
-    coordinator
-        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-flood", 1))
-        .unwrap();
-
-    for _ in 0..10 {
-        let _ = coordinator.exec.executors.record_task_failure(&exec_id, 5, 1);
-    }
-
-    let broken = coordinator.exec.executors.executors_over_failure_threshold(5);
-
     assert!(
-        !broken.is_empty(),
-        "flood protection machinery should detect bad executor"
+        !over.contains(&good),
+        "an executor with no failures must not be swept up with it"
     );
 }
 

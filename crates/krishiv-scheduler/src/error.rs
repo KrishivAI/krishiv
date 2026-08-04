@@ -27,6 +27,37 @@ pub enum TaskUpdateOutcome {
     /// The update was already reflected in scheduler state.
     Duplicate,
 }
+/// Why a task status update was fenced off as stale.
+///
+/// All three are fenced identically; they are separated so an operator
+/// reading a log line can tell which one happened without inspecting
+/// coordinator state after the fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleTaskReason {
+    /// The reported attempt is not the task's current attempt — genuine
+    /// attempt fencing, e.g. a speculative duplicate losing the race.
+    AttemptMismatch,
+    /// The attempt matches, but this executor is not the task's current
+    /// assignee: the assignment was cleared or re-placed underneath it.
+    NotTheAssignee,
+    /// The attempt and assignee match, but the task's state cannot accept
+    /// this transition — it already reached a terminal state, or the update
+    /// would move it out of a non-running state without going through
+    /// `Running`.
+    StateCannotAcceptUpdate,
+}
+
+impl std::fmt::Display for StaleTaskReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::AttemptMismatch => "reported attempt is not the current attempt",
+            Self::NotTheAssignee => "reporter is no longer the assigned executor",
+            Self::StateCannotAcceptUpdate => "task state cannot accept this transition",
+        };
+        f.write_str(s)
+    }
+}
+
 /// Scheduler and coordinator errors.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum SchedulerError {
@@ -68,12 +99,25 @@ pub enum SchedulerError {
     /// Task was not found.
     #[error("unknown task: {task_id}")]
     UnknownTask { task_id: TaskId },
-    /// Task status referenced an attempt that is no longer current.
-    #[error("stale task attempt for {task_id}: expected attempt {expected}, received {received}")]
+    /// A task status update was fenced off: the reporter is no longer the
+    /// authority for this task's current attempt.
+    ///
+    /// Three distinct conditions land here (see [`StaleTaskReason`]) and they
+    /// are handled identically — the update is dropped and the reporter should
+    /// stop — but they are not the same thing. Reporting all three as an
+    /// attempt mismatch produced log lines reading "expected attempt 1,
+    /// received 1", which sends whoever is debugging after an
+    /// attempt-numbering bug that does not exist; the real cause is usually
+    /// that the assignment was cleared out from under the reporter (a stall
+    /// reset, an executor eviction) or that the task already concluded.
+    #[error(
+        "stale task update for {task_id} ({reason}): current attempt {expected}, reported {received}"
+    )]
     StaleTaskAttempt {
         task_id: TaskId,
         expected: u32,
         received: u32,
+        reason: StaleTaskReason,
     },
     /// Job submission was invalid.
     #[error("invalid job: {message}")]

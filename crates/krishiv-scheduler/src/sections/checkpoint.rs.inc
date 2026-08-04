@@ -331,8 +331,17 @@ async fn async_checkpoint_ack_quorum_increments_committed_metric() {
     );
 }
 
+/// A non-quorum ack is `Accepted` — the ack is recorded and quorum is still
+/// pending — and it must leave `checkpoint_notify_sent` alone, because the
+/// remaining tasks have not acked yet and still need their notifications.
+///
+/// This was named `..._rejects_non_quorum_ack_as_stale_epoch`, which asserted
+/// the opposite of its own body: the semantics were corrected to match the
+/// async sharded path (`StaleEpoch` is for actual `Err` results) and the name
+/// was left behind. A test whose name contradicts its assertions is worse
+/// than no test — it is what someone greps for when checking this behaviour.
 #[test]
-fn checkpoint_coordinator_rejects_non_quorum_ack_as_stale_epoch() {
+fn non_quorum_ack_is_accepted_and_does_not_clear_checkpoint_notify_state() {
     let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
     let storage_path = storage.base_dir().to_string_lossy().to_string();
 
@@ -684,7 +693,7 @@ fn stall_detection_respects_progress_updates() {
                 task.assigned_executor = Some(exec_id.clone());
                 task.state = TaskState::Running;
                 task.launch_in_flight = false;
-                let two_min_ago = u64::try_from(unix_now_ms()).unwrap_or(0) - 120_000;
+                let two_min_ago = u64::try_from(unix_now_ms()).unwrap_or(0).saturating_sub(120_000);
                 task.assigned_at_ms = Some(two_min_ago);
                 // last_progress_ms is None — no progress reported.
                 task.last_progress_ms = None;
@@ -757,7 +766,7 @@ fn stalled_task_is_retried_instead_of_failing_the_job() {
                 task.state = TaskState::Running;
                 task.attempt = 1;
                 task.launch_in_flight = false;
-                task.assigned_at_ms = Some(u64::try_from(unix_now_ms()).unwrap_or(0) - 120_000);
+                task.assigned_at_ms = Some(u64::try_from(unix_now_ms()).unwrap_or(0).saturating_sub(120_000));
                 task.last_progress_ms = None;
             }
         }
@@ -826,7 +835,7 @@ fn late_executor_report_for_a_stalled_attempt_does_not_fail_the_stage() {
                 task.assigned_executor = Some(exec_id.clone());
                 task.state = TaskState::Running;
                 task.attempt = 1;
-                task.assigned_at_ms = Some(u64::try_from(unix_now_ms()).unwrap_or(0) - 120_000);
+                task.assigned_at_ms = Some(u64::try_from(unix_now_ms()).unwrap_or(0).saturating_sub(120_000));
                 task.last_progress_ms = None;
             }
         }
@@ -844,10 +853,22 @@ fn late_executor_report_for_a_stalled_attempt_does_not_fail_the_stage() {
         TaskState::Failed,
         1,
     );
+    // Pinned to the exact rejection, not "an error or a duplicate": the
+    // assignment was cleared by the stall reset, so the reporter is no longer
+    // the assignee. Accepting any error here would also pass if the update
+    // were rejected for an unrelated reason — an unknown task, a lease
+    // mismatch — which is a different bug wearing this test's green tick.
     let outcome = coordinator.apply_task_update(late);
     assert!(
-        outcome.is_err() || outcome.as_ref().is_ok_and(|o| *o == TaskUpdateOutcome::Duplicate),
-        "a report for the cancelled attempt must be rejected as stale, not applied"
+        matches!(
+            outcome,
+            Err(SchedulerError::StaleTaskAttempt {
+                reason: crate::error::StaleTaskReason::NotTheAssignee,
+                ..
+            })
+        ),
+        "a report for the cancelled attempt must be fenced as no-longer-the-assignee, \
+         got: {outcome:?}"
     );
 
     let jc = coordinator.job_coordinator(&job_id).unwrap();

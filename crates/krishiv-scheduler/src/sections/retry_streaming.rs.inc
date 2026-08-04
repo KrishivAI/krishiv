@@ -455,10 +455,23 @@ fn streaming_reattach_updates_task_watermark_and_offset() {
     );
 }
 
+/// A batch job's tasks must not be touched by `streaming_task_states`, and
+/// this used to assert the opposite of its own name: the batch task's
+/// watermark *was* updated, with a message explaining that
+/// `apply_streaming_state` is task-kind-agnostic.
+///
+/// That was not a harmless quirk. `submit_job` indexed every job kind into
+/// `streaming_task_index`, which is keyed by a bare `TaskId` — and task ids
+/// are unique only within a job, with the distributed planner naming them
+/// positionally (`dist-s0-t0`), so batch jobs collided with each other and
+/// with streaming jobs as a matter of course. `apply_streaming_state` also
+/// refreshes `last_progress_ms`, which the stall watchdog reads, so an
+/// unrelated executor's heartbeat could hold a genuinely hung task's progress
+/// clock open indefinitely. `recover_from_store` had always filtered to
+/// streaming jobs, so the index even held different contents before and after
+/// a restart.
 #[test]
-fn streaming_reattach_does_not_affect_batch_tasks() {
-    // A batch job's tasks must not be disturbed by streaming_task_states
-    // arriving from an unrelated executor heartbeat.
+fn a_streaming_heartbeat_does_not_touch_a_batch_task() {
     let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-bt").unwrap());
 
     let executor_id = ExecutorId::try_new("exec-bt-1").unwrap();
@@ -478,7 +491,6 @@ fn streaming_reattach_does_not_affect_batch_tasks() {
     let task_id = detail.stages()[0].tasks()[0].task_id().clone();
     let lease = coordinator.executor_snapshots()[0].lease_generation();
 
-    // Heartbeat with a streaming_task_state referencing the batch task id.
     let heartbeat = ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy)
         .with_lease_generation(lease)
         .with_streaming_task_states(vec![StreamingTaskState::new(
@@ -488,17 +500,75 @@ fn streaming_reattach_does_not_affect_batch_tasks() {
         )]);
     coordinator.executor_heartbeat(heartbeat).unwrap();
 
-    // The watermark is applied (apply_streaming_state is task-kind-agnostic).
     let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
     let task = &detail.stages()[0].tasks()[0];
     assert_eq!(
         task.last_watermark_ms(),
-        Some(9999),
-        "apply_streaming_state is task-agnostic; the coordinator applies it if IDs match"
+        None,
+        "a batch task is not in the streaming index and must not take a watermark"
     );
-    // Task state must be unchanged by the heartbeat (still Assigned until an
-    // executor status update transitions it to Running).
     assert_eq!(task.state(), TaskState::Assigned);
+}
+
+/// The ownership half of the same defect: even between two *streaming* jobs,
+/// where filtering the index by job kind does not help, colliding task ids
+/// must not let one executor's report land on another's task. The report is
+/// resolved through a bare-id index, so the reporter must own what it names.
+#[test]
+fn a_streaming_report_from_a_non_owning_executor_is_dropped() {
+    let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-collide").unwrap());
+    let owner = ExecutorId::try_new("exec-owner").unwrap();
+    let stranger = ExecutorId::try_new("exec-stranger").unwrap();
+    for id in [&owner, &stranger] {
+        coordinator
+            .register_executor(ExecutorDescriptor::new(id.clone(), "pod", 2))
+            .unwrap();
+    }
+
+    let job_id = JobId::try_new("job-collide").unwrap();
+    coordinator
+        .submit_job(single_task_streaming_job(job_id.clone()))
+        .unwrap();
+    coordinator.launch_assigned_tasks(&job_id).unwrap();
+
+    let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+    let task_id = detail.stages()[0].tasks()[0].task_id().clone();
+    let assignee = detail.stages()[0].tasks()[0]
+        .assigned_executor()
+        .expect("the task must be assigned")
+        .clone();
+    let reporter = if assignee == owner { stranger } else { owner };
+    let lease = coordinator
+        .executor_snapshots()
+        .iter()
+        .find(|e| e.executor_id() == &reporter)
+        .unwrap()
+        .lease_generation();
+
+    coordinator
+        .executor_heartbeat(
+            ExecutorHeartbeat::new(reporter, ExecutorState::Healthy)
+                .with_lease_generation(lease)
+                .with_streaming_task_states(vec![StreamingTaskState::new(
+                    task_id,
+                    7777,
+                    b"not-mine".to_vec(),
+                )]),
+        )
+        .unwrap();
+
+    let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+    let task = &detail.stages()[0].tasks()[0];
+    assert_eq!(
+        task.last_watermark_ms(),
+        None,
+        "an executor that does not own the task must not move its watermark"
+    );
+    assert_eq!(
+        task.last_source_offset(),
+        None,
+        "nor its source offset — that would corrupt the restart position"
+    );
 }
 
 #[test]
