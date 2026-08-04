@@ -158,10 +158,27 @@ async fn handle_ivm(
         .job_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    state
-        .registry
-        .create(job_id.clone())
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Must go through the same path as `POST /api/v1/ivm/jobs`. This used to
+    // call `registry.create` directly, which skips both halves of that path:
+    // it never rehydrates a durable snapshot, so submitting an existing job id
+    // here after a coordinator restart produced a live-but-empty job that the
+    // next step or restore would persist over the real state; and it never
+    // persisted the new job, so a job created through this endpoint did not
+    // survive a restart at all. Two endpoints for the same resource must not
+    // disagree about what creating it means.
+    crate::ivm_http::create_or_rehydrate_ivm_job(
+        &state.registry,
+        &state.coordinator,
+        &job_id,
+        None,
+    )
+    .await
+    .map_err(|status| {
+        (
+            status,
+            format!("failed to create or rehydrate IVM job '{job_id}'"),
+        )
+    })?;
 
     Ok((
         StatusCode::CREATED,
@@ -342,6 +359,38 @@ mod tests {
                 .expect("both submissions must succeed");
             assert_eq!(status, StatusCode::CREATED);
         }
+    }
+
+    /// The unified endpoint used to call `registry.create` directly instead
+    /// of the IVM create path, so a job created here was never persisted: it
+    /// vanished on the next restart while the identical request to
+    /// `/api/v1/ivm/jobs` survived it. (The other half of that divergence —
+    /// recreating an existing job *empty* instead of rehydrating it — is
+    /// covered in `ivm_http`, where the durable-job fixture lives.)
+    #[tokio::test]
+    async fn ivm_submission_persists_the_new_job() {
+        let state = IvmRouterState {
+            registry: Arc::new(IvmJobRegistry::new()),
+            coordinator: SharedCoordinator::new(
+                Coordinator::active(CoordinatorId::try_new("test-coord-durable").unwrap())
+                    .with_store(crate::store::InMemoryMetadataStore::default()),
+            ),
+        };
+
+        let mut body = request("ivm");
+        body.job_id = Some("revenue".to_owned());
+        let _ = api_unified_submit(State(state.clone()), Json(body))
+            .await
+            .expect("submission must succeed");
+
+        assert!(
+            state
+                .coordinator
+                .load_ivm_snapshot("revenue")
+                .await
+                .is_some(),
+            "a job created through this endpoint must be recoverable after a restart"
+        );
     }
 
     #[test]

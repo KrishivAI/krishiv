@@ -34,6 +34,25 @@ pub struct InProcessCoordinatorBridge {
     pub(crate) executor_inner: Arc<RwLock<ExecutorInner>>,
     /// Dedicated lock for checkpoint coordinator state.
     pub(crate) checkpoint_inner: Arc<RwLock<CheckpointInner>>,
+    /// Serialises "snapshot an inner state, then publish it into the outer
+    /// coordinator".
+    ///
+    /// Both sharded paths below must drop their async guard *before* taking
+    /// the coordinator's sync `Mutex`, or an async task holding the guard and
+    /// blocking on the `Mutex` deadlocks against a sync task holding the
+    /// `Mutex` and waiting on the `RwLock`. That is correct, but it leaves a
+    /// gap between the snapshot and its publish — and the publish assigns the
+    /// *whole* collection, not one entry. Two concurrent heartbeats therefore
+    /// raced: A snapshots, B snapshots, B publishes, B's full heartbeat runs,
+    /// then A publishes its older clone and silently reverts every effect B
+    /// just had on `coord.exec` — B's `last_heartbeat_ms` moves backwards and
+    /// any recovery state B cleared comes back until its next heartbeat.
+    ///
+    /// Holding this across snapshot-and-publish makes the pair atomic without
+    /// reintroducing the deadlock: the ordering is always this lock, then the
+    /// inner `RwLock` (released), then the coordinator `Mutex`, and nothing
+    /// ever acquires this lock while holding the coordinator `Mutex`.
+    state_publish: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl InProcessCoordinatorBridge {
@@ -48,6 +67,7 @@ impl InProcessCoordinatorBridge {
             coordinator,
             executor_inner,
             checkpoint_inner,
+            state_publish: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -134,6 +154,12 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
                 .map_err(status_from_scheduler_error)?;
         }
 
+        // Held until the full heartbeat below has been applied: the publish
+        // overwrites the whole registry, so it must not be able to land after
+        // a concurrent heartbeat's own publish *and* full-heartbeat effects.
+        // See the `state_publish` field doc.
+        let publish = self.state_publish.lock().await;
+
         let lease_generation = {
             // Snapshot executor state while holding the async write guard, then
             // drop it before acquiring the sync Mutex — holding both simultaneously
@@ -177,6 +203,7 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
                 Err(error) => return Err(status_from_scheduler_error(error)),
             }
         };
+        drop(publish);
 
         Ok(tonic::Response::new(response))
     }
@@ -324,6 +351,13 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
         // Clone inner state while holding the async lock, then drop the guard
         // before acquiring the sync Mutex (prevents L1 deadlock: T1 holds async
         // write guard and blocks on Mutex; T2 holds Mutex and waits for RwLock).
+        // Same snapshot-then-publish pair as the heartbeat path, and the same
+        // hazard: `apply_checkpoint_inner_sync` mirrors *all* of the
+        // checkpoint-control state, so an ack for job A publishing a clone
+        // taken before job B's ack landed would roll B's back. Held across
+        // both halves; deliberately not across the storage I/O above, which
+        // must stay concurrent across jobs.
+        let publish = self.state_publish.lock().await;
         let (inner_snap, finalize_result) = {
             let mut inner = self.checkpoint_inner.write().await;
             let result = if require_finalize {
@@ -348,6 +382,113 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
                 coord.on_checkpoint_epoch_committed(&job_id, ack_epoch);
             }
         }
+        drop(publish);
         Ok(tonic::Response::new(response))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use krishiv_proto::{
+        AttemptId, CoordinatorExecutorService, CoordinatorId, ExecutorDescriptor,
+        ExecutorHeartbeatRequest, ExecutorId, ExecutorState, JobId, LeaseGeneration, StageId,
+        TaskAttemptRef, TaskId,
+    };
+
+    use super::*;
+
+    /// A bridge whose inner registry and outer coordinator both know about
+    /// `count` executors — the state a running in-process cluster is in when
+    /// heartbeats start flowing.
+    fn bridge_with_executors(count: usize) -> (InProcessCoordinatorBridge, Vec<ExecutorId>) {
+        let mut coordinator =
+            Coordinator::active(CoordinatorId::try_new("in-process-coord").unwrap());
+        let mut ids = Vec::new();
+        for i in 0..count {
+            let id = ExecutorId::try_new(format!("exec-{i}")).unwrap();
+            coordinator
+                .register_executor(ExecutorDescriptor::new(id.clone(), "localhost", 2))
+                .unwrap();
+            ids.push(id);
+        }
+        let inner = coordinator.exec_inner_snapshot();
+        let bridge = InProcessCoordinatorBridge::new(
+            Arc::new(Mutex::new(coordinator)),
+            Arc::new(RwLock::new(inner)),
+            Arc::new(RwLock::new(CheckpointInner::default())),
+        );
+        (bridge, ids)
+    }
+
+    fn heartbeat_with_running_task(id: &ExecutorId, task: &TaskId) -> ExecutorHeartbeatRequest {
+        ExecutorHeartbeatRequest::new(
+            id.clone(),
+            LeaseGeneration::initial(),
+            ExecutorState::Healthy,
+        )
+        .with_running_attempts(vec![TaskAttemptRef::new(
+            JobId::try_new("job-1").unwrap(),
+            StageId::try_new("stage-0").unwrap(),
+            task.clone(),
+            AttemptId::initial(),
+        )])
+    }
+
+    /// Regression: the executor-registry publish assigns the *whole* registry
+    /// from a clone taken earlier, with the async guard released in between.
+    /// Two concurrent heartbeats therefore raced — A snapshots, B snapshots, B
+    /// publishes and applies its full heartbeat, then A publishes its older
+    /// clone and reverts every effect B just had on `coord.exec`.
+    ///
+    /// Running tasks make that visible: only the *full* heartbeat carries them
+    /// (the registry heartbeat is built without `with_running_tasks`), so the
+    /// inner clone always has an empty list for every executor. A stale
+    /// publish therefore erases whichever executors' running tasks the outer
+    /// coordinator had just learned — and `coord.exec` is what scheduling and
+    /// task-ownership reclaim read.
+    ///
+    /// Run over many rounds: the losing interleaving is a race, not a
+    /// certainty. With the serialization removed this fails within a few
+    /// rounds; the assertion itself is exact, not statistical.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_heartbeats_do_not_publish_a_stale_registry_over_a_newer_one() {
+        for round in 0..64 {
+            let (bridge, ids) = bridge_with_executors(4);
+            let tasks: Vec<TaskId> = (0..ids.len())
+                .map(|i| TaskId::try_new(format!("task-{i}")).unwrap())
+                .collect();
+
+            let mut handles = Vec::new();
+            for (id, task) in ids.iter().zip(&tasks) {
+                let bridge = bridge.clone();
+                let request = heartbeat_with_running_task(id, task);
+                handles.push(tokio::spawn(async move {
+                    bridge
+                        .executor_heartbeat(tonic::Request::new(request))
+                        .await
+                }));
+            }
+            for handle in handles {
+                handle
+                    .await
+                    .unwrap()
+                    .expect("every heartbeat must be accepted");
+            }
+
+            let coord = bridge.coordinator.lock().unwrap();
+            for (id, task) in ids.iter().zip(&tasks) {
+                let record = coord
+                    .exec
+                    .executors
+                    .find_executor(id)
+                    .expect("outer coordinator must know the executor");
+                assert_eq!(
+                    record.running_tasks(),
+                    std::slice::from_ref(task),
+                    "round {round}: {id}'s running tasks were erased from the outer \
+                     coordinator by a concurrent heartbeat publishing a stale registry"
+                );
+            }
+        }
     }
 }

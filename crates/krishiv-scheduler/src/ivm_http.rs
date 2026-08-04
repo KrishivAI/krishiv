@@ -193,6 +193,42 @@ pub struct CreateJobResponse {
     pub job_id: String,
 }
 
+/// Bring `job_id` into the live registry and make it durable.
+///
+/// Every entry point that creates an IVM job must go through this. The order
+/// matters and is not obvious: a job absent from the registry may still have a
+/// durable snapshot (coordinator restart, standby promotion, eviction), so
+/// **rehydrate before creating**. Creating first yields an empty job under a
+/// live id, which the next `/step` or `/restore` then persists straight over
+/// the real state — the read handlers' own `ensure_ivm_job` rehydration cannot
+/// save it either, because the id *is* present, just empty.
+///
+/// `partitioned == Some(false)` pins the job to a single flow so it can host a
+/// view-DAG; absent / `Some(true)` keeps the default auto-partitioning. Only
+/// consulted when the job is genuinely new — a rehydrated job keeps whatever
+/// shape its snapshot recorded.
+pub(crate) async fn create_or_rehydrate_ivm_job(
+    registry: &SharedIvmJobRegistry,
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+    partitioned: Option<bool>,
+) -> Result<(), StatusCode> {
+    if registry.get(job_id).is_none() {
+        if let Some(snapshot) = coordinator.load_ivm_snapshot(job_id).await {
+            registry
+                .restore_durable_snapshot(job_id, &snapshot)
+                .map_err(ivm_err)?;
+        } else if partitioned == Some(false) {
+            registry
+                .create_unpartitioned(job_id.to_owned())
+                .map_err(ivm_err)?;
+        } else {
+            registry.create(job_id.to_owned()).map_err(ivm_err)?;
+        }
+    }
+    persist_ivm_job(registry, coordinator, job_id).await
+}
+
 pub async fn api_ivm_create_job(
     State(registry): State<SharedIvmJobRegistry>,
     State(coordinator): State<SharedCoordinator>,
@@ -201,20 +237,7 @@ pub async fn api_ivm_create_job(
     let job_id = body
         .job_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    if registry.get(&job_id).is_none() {
-        if let Some(snapshot) = coordinator.load_ivm_snapshot(&job_id).await {
-            registry
-                .restore_durable_snapshot(&job_id, &snapshot)
-                .map_err(ivm_err)?;
-        } else if body.partitioned == Some(false) {
-            registry
-                .create_unpartitioned(job_id.clone())
-                .map_err(ivm_err)?;
-        } else {
-            registry.create(job_id.clone()).map_err(ivm_err)?;
-        }
-    }
-    persist_ivm_job(&registry, &coordinator, &job_id).await?;
+    create_or_rehydrate_ivm_job(&registry, &coordinator, &job_id, body.partitioned).await?;
     Ok(Json(CreateJobResponse { job_id }))
 }
 
@@ -2263,6 +2286,43 @@ mod tests {
         .expect("step persists the snapshot");
         assert!(registry.delete("j"), "evict the in-memory entry");
         (registry, coordinator)
+    }
+
+    /// `POST /api/v1/jobs {"kind":"ivm"}` is a second front door to the same
+    /// resource, and it used to call `registry.create` directly rather than
+    /// the create path above. For an id whose state is durable but whose
+    /// registry entry is gone — restart, promotion, eviction — that produced a
+    /// live *empty* job under the same id, which the next step or restore
+    /// would then persist straight over the real state. The read handlers'
+    /// own rehydration cannot catch it either: the id is present, just empty.
+    #[tokio::test]
+    async fn unified_ivm_submission_rehydrates_an_evicted_job_rather_than_recreating_it_empty() {
+        let (registry, coordinator) = evicted_but_durable_job().await;
+        let state = crate::ivm_http::IvmRouterState {
+            registry: registry.clone(),
+            coordinator: coordinator.clone(),
+        };
+
+        let _ = crate::unified_jobs_http::api_unified_submit(
+            State(state),
+            Json(
+                serde_json::from_value(serde_json::json!({"kind": "ivm", "job_id": "j"}))
+                    .expect("well-formed unified request"),
+            ),
+        )
+        .await
+        .expect("unified submit must succeed");
+
+        let job = registry.get("j").expect("the job must be live again");
+        let snapshot = job
+            .snapshot("revenue")
+            .expect("snapshot lookup must succeed")
+            .expect("the rehydrated job must still have its view");
+        assert_eq!(
+            snapshot.num_rows(),
+            1,
+            "resubmitting an existing id must restore its state, not blank it"
+        );
     }
 
     /// Reads must rehydrate too. Nothing repopulates the registry at startup,
