@@ -36,7 +36,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 1 | krishiv-sql | 46,632 | 61 | 7 | first slice done; `lib.rs` alone holds 37% of the crate's uncovered regions |
 | 2 | krishiv-executor | 28,927 | 40 | **40 — COMPLETE 2026-08-02** | second crate fully read; 3 defects fixed |
 | 3 | krishiv-shuffle | 14,329 | 36 | **36 — COMPLETE 2026-08-02** | first crate fully read; 4 defects fixed |
-| 4 | krishiv-scheduler | **51,438** | **78** | 35 (in progress) | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
+| 4 | krishiv-scheduler | **51,438** | **78** | **78 (COMPLETE)** | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
 | **Tier 2 — correctness blast radius** |
 | 5 | krishiv-plan | 14,371 | 25 | 0 | plan IR every surface depends on |
 | 6 | krishiv-common | 7,966 | 23 | 0 | env registry, durability profiles, memory budget |
@@ -554,7 +554,7 @@ That is `drain_into_store` (batch.rs ~1156) — **not** `execute_shuffle_write`
 
 ---
 
-## 4. krishiv-scheduler — 53 of 78 files read whole (in progress, 2026-08-03)
+## 4. krishiv-scheduler — 78 of 78 files read whole (COMPLETE, 2026-08-04)
 
 Third crate. The largest in the workspace: 51,438 lines. Working down the
 distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198),
@@ -581,20 +581,54 @@ distributed-batch critical path — `lib.rs` (145), `distributed_batch.rs` (198)
 `bounded_window.rs` (395).
 **44,699 of 51,438 lines.**
 
-**Remaining, in intended order** (25 files, ~6,740 lines):
+**All 78 files / 51,438 lines read.** The final pass covered
+`unified_jobs_http.rs` (377), `in_process.rs` (353), `barrier_client.rs` (204),
+`transport.rs` (38), the three `bin/` entry points (169), and every remaining
+`sections/*.rs.inc` plus `tests/` file:
 `sections/checkpoint.rs.inc` (865), `sections/adaptive.rs.inc` (717),
 `sections/retry_streaming.rs.inc` (612), `sections/streaming_recovery.rs.inc`
-(586), `sections/recovery.rs.inc` (544), `unified_jobs_http.rs` (377),
-`tests/r2_k8s_manifests.rs` (376), `sections/savepoint.rs.inc` (367),
-`in_process.rs` (353), `sections/chaos_basic.rs.inc` (285),
-`sections/dur1.rs.inc` (213), `barrier_client.rs` (204),
-`sections/validation.rs.inc` (180), `sections/queue_manager.rs.inc` (162),
-`sections/checkpoint_timer.rs.inc` (160), `sections/barrier_oob.rs.inc` (141),
-`sections/chaos_restart.rs.inc` (128), `tests.rs` (124),
-`sections/failover.rs.inc` (86), `tests/distributed_e2e.rs` (71),
-`bin/krishiv_coordinator.rs` (58), `bin/krishiv_clusterd.rs` (56),
-`bin/krishiv_job_coordinator.rs` (55), `sections/etcd_sim.rs.inc` (53),
-`tests/coordinator_executor_integration.rs` (40), `transport.rs` (38).
+(586), `sections/recovery.rs.inc` (544), `tests/r2_k8s_manifests.rs` (376),
+`sections/savepoint.rs.inc` (367), `sections/chaos_basic.rs.inc` (285),
+`sections/dur1.rs.inc` (213), `sections/validation.rs.inc` (180),
+`sections/queue_manager.rs.inc` (162), `sections/checkpoint_timer.rs.inc` (160),
+`sections/barrier_oob.rs.inc` (141), `sections/chaos_restart.rs.inc` (128),
+`tests.rs` (124), `sections/failover.rs.inc` (86),
+`tests/distributed_e2e.rs` (71), `sections/etcd_sim.rs.inc` (53),
+`tests/coordinator_executor_integration.rs` (40).
+
+### The shape the test files taught (new to this crate)
+
+*A test name is an assertion nobody checks.* Eight tests in this crate claimed
+behaviour their bodies did not test, and three of them were documenting a live
+defect as intended behaviour:
+
+- `streaming_reattach_does_not_affect_batch_tasks` asserted that a streaming
+  heartbeat **did** update a batch task's watermark. That was the visible edge
+  of a real bug: `streaming_task_index` is keyed by a bare `TaskId`, task ids
+  are unique only within a job, and the distributed planner names them
+  positionally — so jobs collided, and `apply_streaming_state` refreshes
+  `last_progress_ms`, which the stall watchdog reads. Fixed by indexing only
+  streaming jobs (matching what `recover_from_store` always did) *and*
+  requiring the reporting executor to own the task.
+- `metadata_store_persists_job_on_submit` / `..._task_state_on_update` asserted
+  the in-memory registry, never the store; one built a store handle and dropped
+  it unused.
+- `checkpoint_coordinator_rejects_non_quorum_ack_as_stale_epoch` asserts
+  `Accepted`.
+- `circuit_breaker_actually_clears_assignments_from_bad_executor` never looked
+  at an assignment; `assignment_flood_protection_basic` was the same loop with a
+  weaker assertion.
+- `executor_failover_reassigns_task_to_surviving_executor` accepted either
+  executor and either state — and tightening it revealed the setup never made
+  the task Running or the executor lost, so no failover was being exercised.
+- `executor_max_losses_permanently_fails_task` hardcoded the threshold and could
+  pass after a single loss.
+
+**The generalisable check**: for every test, ask what single line of production
+code you would delete to make it fail. If the answer is "none", or "a line
+unrelated to the name", it is not a regression test. Two discrimination checks
+in this session initially passed because they targeted the wrong function —
+that is the check failing, not the fix.
 
 **The recurring shape in this crate**: *state removed at the head of a path as
 "consumed by this batch", never restored when the batch turns out to be empty
