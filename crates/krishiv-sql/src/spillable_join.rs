@@ -733,15 +733,40 @@ impl SpillableJoinSelection {
     /// whole reason to prefer it — `reapply_projection` exists only because
     /// `SortMergeJoinExec` drops the projection, and getting those indices wrong
     /// is what broke live q7/q8/q9.
+    /// `build_input`/`probe_input` are the sides *after* `conversion` has been
+    /// applied, not the join's original children. That distinction is the whole
+    /// fix: `GraceHashJoinExec::try_new` rejects exactly one thing — sides with
+    /// different partition counts — and a degenerate broadcast is defined by
+    /// having them. Offered the raw children, grace declined every rescued join
+    /// and the rule then hash-partitioned both sides itself for sort-merge,
+    /// producing the alignment grace had just been refused for lacking. The
+    /// better algorithm was unreachable on the one shape this rescue exists for.
     fn grace_join(
         &self,
         hash_join: &HashJoinExec,
+        conversion: Conversion,
+        build_input: &Arc<dyn ExecutionPlan>,
+        probe_input: &Arc<dyn ExecutionPlan>,
         build_bytes: u64,
         threshold: u64,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // `builder()` clones the node; `reset_state()` drops the original's
         // collected build side and dynamic filter so the copy starts clean.
-        let template = Arc::new(hash_join.builder().reset_state().build()?);
+        let mut builder = hash_join.builder().reset_state().with_new_children(vec![
+            Arc::clone(build_input),
+            Arc::clone(probe_input),
+        ])?;
+        // Both sides are now hash-partitioned on the join keys, so the mode has
+        // to say so. `CollectLeft` over partitioned children is not merely
+        // mislabelled: grace runs `left().execute(partition)` for each output
+        // partition, which on a one-partition build side would be out of range.
+        if matches!(conversion, Conversion::Repartition { .. }) {
+            builder = builder
+                .with_partition_mode(PartitionMode::Partitioned)
+                .recompute_properties();
+        }
+        let template = Arc::new(builder.build()?);
+        let mode = *template.partition_mode();
         let buckets = crate::grace_hash_join::bucket_count(build_bytes, threshold);
         let budget = usize::try_from(threshold).unwrap_or(usize::MAX);
         let grace = crate::grace_hash_join::GraceHashJoinExec::try_new(template, buckets, budget)?;
@@ -749,7 +774,7 @@ impl SpillableJoinSelection {
             build_bytes,
             threshold,
             buckets,
-            mode = ?hash_join.partition_mode(),
+            ?mode,
             join_type = ?hash_join.join_type(),
             "hash join build side exceeds per-task memory share; using grace hash join"
         );
@@ -853,29 +878,6 @@ impl SpillableJoinSelection {
         // per join is what let seven joins each sit under the threshold and
         // together exhaust the pool.
 
-        // The build side is too big. Two ways to make it spill:
-        //
-        //   grace hash join — partition both sides by key and join bucket by
-        //     bucket, each bucket an ordinary in-memory hash join. Nothing is
-        //     sorted, and the buckets that would have fitted never touch disk.
-        //   sort-merge — sort *both* sides in full, always. Correct, spillable,
-        //     and the reason q2 went from 208 s to 1317 s.
-        //
-        // Grace is strictly the better trade when it applies, so it is tried
-        // first; sort-merge remains the fallback for the shapes it refuses
-        // (today: a broadcast join, whose sides have different partition
-        // counts). Off by default — see `grace_hash_join::enabled`.
-        if self.grace {
-            match self.grace_join(hash_join, build_bytes, threshold) {
-                Ok(converted) => return Ok(Some(converted)),
-                Err(error) => tracing::debug!(
-                    %error,
-                    build_bytes,
-                    "spillable-join: grace hash join declined; trying sort-merge"
-                ),
-            }
-        }
-
         // Sort both sides on the join keys. Partition preservation follows the
         // mode decided above: keep it for `Partitioned` (so no exchange is
         // re-planned), drop it for single-partition `CollectLeft` (where there
@@ -885,6 +887,11 @@ impl SpillableJoinSelection {
         // A degenerate broadcast join is given the distribution it should have
         // had before anything is sorted — see `convertible_mode`. The sorts
         // below then run per partition, exactly as in the `Partitioned` case.
+        //
+        // This runs *before* the choice of algorithm, not just before the sorts:
+        // both candidates want these inputs, and computing them here is what
+        // lets grace be judged on the sides the rule actually produces. It used
+        // to be judged on the raw children and declined every rescued join.
         let (build_input, probe_input, preserve_partitioning) = match conversion {
             Conversion::InPlace {
                 preserve_partitioning,
@@ -919,6 +926,41 @@ impl SpillableJoinSelection {
                 )
             }
         };
+
+        // The build side is too big. Two ways to make it spill:
+        //
+        //   grace hash join — partition both sides by key and join bucket by
+        //     bucket, each bucket an ordinary in-memory hash join. Nothing is
+        //     sorted, and the buckets that would have fitted never touch disk.
+        //   sort-merge — sort *both* sides in full, always. Correct, spillable,
+        //     and the reason q2 went from 208 s to 1317 s.
+        //
+        // Grace is strictly the better trade when it applies, so it is tried
+        // first; sort-merge remains the fallback for the shapes it refuses.
+        // Off by default — see `grace_hash_join::enabled`.
+        if self.grace {
+            match self.grace_join(
+                hash_join,
+                conversion,
+                &build_input,
+                &probe_input,
+                build_bytes,
+                threshold,
+            ) {
+                // Returned as-is: grace keeps the join whole, projection
+                // included, so `reapply_projection` here would project twice.
+                Ok(converted) => return Ok(Some(converted)),
+                // At info, not debug. A declining rule is indistinguishable from
+                // an absent one, and this decline sends the query to the
+                // operator that cost q2 1109 s — on an executor at
+                // `RUST_LOG=info` the old `debug!` left no trace whatsoever.
+                Err(error) => tracing::info!(
+                    %error,
+                    build_bytes,
+                    "spillable-join: grace hash join declined; trying sort-merge"
+                ),
+            }
+        }
 
         let left_keys: Vec<PhysicalSortExpr> = on
             .iter()
@@ -1192,6 +1234,66 @@ mod tests {
             bs.iter().map(|b| b.num_rows()).sum()
         };
         assert_eq!(count(&baseline), count(&converted));
+    }
+
+    /// Grace over a genuinely partitioned join, with rows, answers correctly.
+    ///
+    /// `grace_tests` runs everything at one partition, where `execute(0)` is the
+    /// only call there is. Grace actually runs `left().execute(partition)` and
+    /// `right().execute(partition)` for *each* output partition and joins them
+    /// pairwise, which is only sound because both sides are hash-partitioned on
+    /// the join keys. Nothing tested that pairing carried the right rows, and
+    /// the rescue path now sends production traffic through it.
+    #[tokio::test]
+    async fn grace_over_partitioned_inputs_answers_correctly() {
+        let ctx = partitioned_join_ctx();
+        let plan = joined_plan(&ctx).await;
+        assert!(
+            contains(&plan, "mode=Partitioned"),
+            "precondition: the join must be Partitioned or this tests nothing:\n{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+
+        let optimized = SpillableJoinSelection::with_threshold_and_grace(Some(1), true)
+            .optimize(Arc::clone(&plan), &ConfigOptions::default())
+            .unwrap();
+        assert!(
+            contains(&optimized, "GraceHashJoin"),
+            "grace must be what ran, or the answer proves nothing about it:\n{}",
+            datafusion::physical_plan::displayable(optimized.as_ref()).indent(true)
+        );
+
+        // Planned afresh — the optimized tree shares untransformed Arc subtrees
+        // with `plan`, and RepartitionExec panics if one instance runs twice.
+        let baseline_plan = ctx
+            .sql("SELECT b.k, count(*) FROM big b JOIN small s ON b.k = s.k GROUP BY b.k")
+            .await.unwrap().create_physical_plan().await.unwrap();
+        let baseline =
+            datafusion::physical_plan::collect(baseline_plan, ctx.task_ctx()).await.unwrap();
+        let converted =
+            datafusion::physical_plan::collect(optimized, ctx.task_ctx()).await.unwrap();
+
+        // Values, not row counts: a mispaired partition would drop some groups
+        // and keep the total plausible. `k` is the group key, so sorting the
+        // rendered pairs makes the comparison order-independent.
+        let cells = |bs: &[arrow::record_batch::RecordBatch]| -> Vec<String> {
+            let mut out = Vec::new();
+            for b in bs {
+                for row in 0..b.num_rows() {
+                    let cols: Vec<String> = (0..b.num_columns())
+                        .map(|c| {
+                            arrow::util::display::array_value_to_string(b.column(c), row).unwrap()
+                        })
+                        .collect();
+                    out.push(cols.join("|"));
+                }
+            }
+            out.sort();
+            out
+        };
+        let expected = cells(&baseline);
+        assert_eq!(expected.len(), 100, "fixture should produce one group per key");
+        assert_eq!(cells(&converted), expected, "grace changed the answer");
     }
 
     /// A build side comfortably under the threshold keeps its hash join. This
@@ -1551,6 +1653,68 @@ mod degenerate_broadcast_tests {
             "sort-merge needs both sides hash-partitioned on the join keys:\n{}",
             displayable(out.as_ref()).indent(true)
         );
+    }
+
+    /// The rescued join must be offered to grace, not handed straight to
+    /// sort-merge.
+    ///
+    /// `GraceHashJoinExec::try_new`'s only rejection is a partition-count
+    /// mismatch, and a degenerate broadcast is *defined* by having one — a
+    /// 1-partition build side against a split probe. `convert` tried grace on
+    /// those raw inputs, watched it decline, and then hash-partitioned both
+    /// sides itself twenty lines further down. So on the one shape this rescue
+    /// exists for, the better algorithm was unreachable by construction: grace
+    /// was judged on inputs the rule was already about to replace.
+    ///
+    /// This is q21 at SF100 — five oversized joins, five sort-merges, and the
+    /// sort-merge fallback is the operator that took q2 from 208 s to 1317 s.
+    /// The decline was logged at `debug!`, so on an executor running
+    /// `RUST_LOG=info` it left no trace at all.
+    #[tokio::test]
+    async fn a_rescued_broadcast_join_is_offered_to_grace() {
+        let ctx = multi_partition_ctx();
+        let plan = broadcast_join_over_split_probe(&ctx, true).await;
+        let out = SpillableJoinSelection::with_threshold_and_grace(Some(1), true)
+            .optimize(plan, ctx.copied_config().options())
+            .unwrap();
+
+        assert!(
+            shows(&out, "GraceHashJoin"),
+            "grace declined a join whose sides this rule then repartitioned itself:\n{}",
+            displayable(out.as_ref()).indent(true)
+        );
+        assert!(
+            !shows(&out, "SortMergeJoin"),
+            "grace applies here, so sort-merge should not have been reached:\n{}",
+            displayable(out.as_ref()).indent(true)
+        );
+    }
+
+    /// The rescued grace plan executes, across every partition.
+    ///
+    /// Not a row-carrying test — the trigger is a degenerate estimate, and the
+    /// only relation whose estimate honestly claims empty is an empty one, so
+    /// this asserts 0 == 0 on the data. What it does exercise is the specific
+    /// hazard of the new path: grace calls `left().execute(i)` and
+    /// `right().execute(i)` per output partition, directly against the
+    /// `RepartitionExec`s this rule inserts, and a `RepartitionExec` whose
+    /// partitions are not all polled panics rather than under-counting. Rows
+    /// through grace on partitioned inputs are covered by
+    /// `tests::grace_over_partitioned_inputs_answers_correctly`.
+    #[tokio::test]
+    async fn the_rescued_grace_plan_executes_on_every_partition() {
+        let ctx = multi_partition_ctx();
+        let plan = broadcast_join_over_split_probe(&ctx, true).await;
+        let task_ctx = ctx.task_ctx();
+        let before = all_rows(Arc::clone(&plan), Arc::clone(&task_ctx)).await;
+        let converted = SpillableJoinSelection::with_threshold_and_grace(Some(1), true)
+            .optimize(plan, ctx.copied_config().options())
+            .unwrap();
+        assert!(shows(&converted, "GraceHashJoin"), "precondition: grace must have applied");
+        let after = all_rows(converted, task_ctx).await;
+
+        assert_eq!(before, after, "row count changed across the re-plan");
+        assert_eq!(after, 0, "an empty build side joins to nothing");
     }
 
     /// Rows from every partition. Both the fixture and the converted plan have
