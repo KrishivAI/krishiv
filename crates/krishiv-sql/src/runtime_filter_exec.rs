@@ -70,12 +70,12 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     SendableRecordBatchStream,
 };
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use futures::{StreamExt, TryStreamExt};
 use krishiv_shuffle::{FilterKeyType, RuntimeFilter, RuntimeFilterBuilder};
 
@@ -317,8 +317,26 @@ impl RuntimeFilterProbeExec {
         // Row count changes, so equivalences and ordering are the input's but
         // statistics are not: report the input's partitioning verbatim, which is
         // what keeps the stage's task count unchanged.
+        //
+        // The equivalence properties are **cloned from the input**, not rebuilt
+        // from the schema. This node drops rows and touches nothing else — same
+        // schema, same column values, same relative order — so every ordering
+        // and equivalence class the input advertised still holds.
+        //
+        // It used to construct `EquivalenceProperties::new(schema)`, which is
+        // empty: no orderings, no equivalence classes. That contradicted the
+        // sentence above it, and it was harmless only by accident — this node is
+        // injected solely beneath a hash join, which imposes no ordering
+        // requirement on its inputs, so nothing ever read the field.
+        //
+        // It stops being harmless the moment the runtime-filter rule reaches a
+        // `SortMergeJoinExec`, which *requires* its inputs sorted on the join
+        // keys. Declaring "no ordering" there would at best provoke a redundant
+        // `SortExec` over the probe side and at worst feed unsorted input to a
+        // merge join. Propagating the truth costs nothing and removes the trap
+        // before the rule is generalised.
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&schema)),
+            input.equivalence_properties().clone(),
             input.output_partitioning().clone(),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -405,7 +423,11 @@ impl ExecutionPlan for RuntimeFilterProbeExec {
                     c.len()
                 ))
             })?;
-        Ok(Arc::new(Self::try_new(input, filter_source, self.key_index)?))
+        Ok(Arc::new(Self::try_new(
+            input,
+            filter_source,
+            self.key_index,
+        )?))
     }
 
     /// Row counts shrink by an unknown amount, so the row estimate becomes
@@ -486,6 +508,46 @@ mod tests {
         Arc::new(DataSourceExec::new(Arc::new(config)))
     }
 
+    /// The probe node drops rows and changes nothing else, so every ordering
+    /// its input advertised still holds — and it must say so.
+    ///
+    /// It used to build `EquivalenceProperties::new(schema)`, which advertises
+    /// no ordering at all. That was invisible while this node only ever sat
+    /// beneath a hash join (no ordering requirement on its inputs), and becomes
+    /// a correctness hazard under a `SortMergeJoinExec`, which requires its
+    /// inputs sorted on the join keys: an input claiming "unordered" either
+    /// provokes a redundant sort or feeds a merge join something it cannot
+    /// merge.
+    #[test]
+    fn probe_preserves_its_input_ordering() {
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+        use datafusion::physical_plan::sorts::sort::SortExec;
+
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new_default(Arc::new(
+            Column::new("k", 0),
+        ))])
+        .expect("a single-column ordering");
+        let sorted: Arc<dyn ExecutionPlan> =
+            Arc::new(SortExec::new(ordering, source(keys(&[3, 1, 2]))));
+        let input_ordering = sorted.output_ordering().cloned();
+        assert!(
+            input_ordering.is_some(),
+            "precondition: the input must advertise an ordering"
+        );
+
+        let probe: Arc<dyn ExecutionPlan> = Arc::new(
+            RuntimeFilterProbeExec::try_new(sorted, source(keys(&[1])), 0)
+                .expect("probe over a sorted input"),
+        );
+
+        assert_eq!(
+            probe.output_ordering().cloned(),
+            input_ordering,
+            "a row-dropping filter must carry its input's ordering through"
+        );
+    }
+
     async fn collect(plan: Arc<dyn ExecutionPlan>) -> Vec<RecordBatch> {
         let ctx = SessionContext::new();
         datafusion::physical_plan::collect(plan, ctx.task_ctx())
@@ -498,16 +560,14 @@ mod tests {
     #[tokio::test]
     async fn probe_keeps_every_row_that_could_join_and_drops_most_that_cannot() {
         let build = source(keys(&(0..1000).map(|i| i * 2).collect::<Vec<_>>()));
-        let filter = Arc::new(
-            RuntimeFilterBuildExec::try_new(build, 0, 4096).expect("build node"),
-        ) as Arc<dyn ExecutionPlan>;
+        let filter = Arc::new(RuntimeFilterBuildExec::try_new(build, 0, 4096).expect("build node"))
+            as Arc<dyn ExecutionPlan>;
 
         // Probe carries the 1000 matching evens and 1000 non-matching odds.
         let probe_keys: Vec<i64> = (0..2000).collect();
         let probe = source(keys(&probe_keys));
-        let node = Arc::new(
-            RuntimeFilterProbeExec::try_new(probe, filter, 0).expect("probe node"),
-        ) as Arc<dyn ExecutionPlan>;
+        let node = Arc::new(RuntimeFilterProbeExec::try_new(probe, filter, 0).expect("probe node"))
+            as Arc<dyn ExecutionPlan>;
 
         let out = collect(node).await;
         let kept: Vec<i64> = out
@@ -543,9 +603,8 @@ mod tests {
         let empty = MemorySourceConfig::try_new(&[vec![]], filter_schema(), None).expect("source");
         let empty = Arc::new(DataSourceExec::new(Arc::new(empty))) as Arc<dyn ExecutionPlan>;
         let probe = source(keys(&[1, 2, 3, 4, 5]));
-        let node = Arc::new(
-            RuntimeFilterProbeExec::try_new(probe, empty, 0).expect("probe node"),
-        ) as Arc<dyn ExecutionPlan>;
+        let node = Arc::new(RuntimeFilterProbeExec::try_new(probe, empty, 0).expect("probe node"))
+            as Arc<dyn ExecutionPlan>;
 
         let rows: usize = collect(node).await.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(
@@ -569,9 +628,8 @@ mod tests {
         let filter = Arc::new(RuntimeFilterBuildExec::try_new(build, 0, 4096).expect("build"))
             as Arc<dyn ExecutionPlan>;
         let probe = source(keys(&[1, 2, 3, 4, 5]));
-        let node = Arc::new(
-            RuntimeFilterProbeExec::try_new(probe, filter, 0).expect("probe node"),
-        ) as Arc<dyn ExecutionPlan>;
+        let node = Arc::new(RuntimeFilterProbeExec::try_new(probe, filter, 0).expect("probe node"))
+            as Arc<dyn ExecutionPlan>;
 
         let rows: usize = collect(node).await.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(rows, 0, "nothing on the build side can join anything");
@@ -597,7 +655,6 @@ mod tests {
         assert!(RuntimeFilterProbeExec::try_new(input, filter, 7).is_err());
     }
 
-
     /// String keys are the other half of the corpus (q17/q20 filter `part` by
     /// brand and container), and they take a different encoding path from
     /// integers — raw bytes rather than a widened little-endian word.
@@ -615,9 +672,8 @@ mod tests {
         let probe = source(names(&[
             "BRAND#11", "BRAND#99", "BRAND#23", "BRAND#77", "BRAND#42",
         ]));
-        let node = Arc::new(
-            RuntimeFilterProbeExec::try_new(probe, filter, 0).expect("probe node"),
-        ) as Arc<dyn ExecutionPlan>;
+        let node = Arc::new(RuntimeFilterProbeExec::try_new(probe, filter, 0).expect("probe node"))
+            as Arc<dyn ExecutionPlan>;
 
         let kept: Vec<String> = collect(node)
             .await
@@ -660,7 +716,11 @@ mod tests {
             .expect("batch")
         };
         let probe = MemorySourceConfig::try_new(
-            &[vec![part(vec![10, 11])], vec![part(vec![20, 21])], vec![part(vec![30, 31])]],
+            &[
+                vec![part(vec![10, 11])],
+                vec![part(vec![20, 21])],
+                vec![part(vec![30, 31])],
+            ],
             Arc::clone(&schema),
             None,
         )
@@ -672,9 +732,8 @@ mod tests {
             "precondition: the probe must actually be multi-partition"
         );
 
-        let node = Arc::new(
-            RuntimeFilterProbeExec::try_new(probe, filter, 0).expect("probe node"),
-        ) as Arc<dyn ExecutionPlan>;
+        let node = Arc::new(RuntimeFilterProbeExec::try_new(probe, filter, 0).expect("probe node"))
+            as Arc<dyn ExecutionPlan>;
         let kept: Vec<i64> = collect(node)
             .await
             .iter()
@@ -708,19 +767,17 @@ mod tests {
             RuntimeFilterProbeExec::try_new(Arc::clone(&data), Arc::clone(&filter), 0)
                 .expect("probe"),
         );
-        let rebuilt = ExecutionPlan::with_new_children(node, vec![data, filter])
-            .expect("rebuild");
+        let rebuilt = ExecutionPlan::with_new_children(node, vec![data, filter]).expect("rebuild");
         let rebuilt = rebuilt
             .downcast_ref::<RuntimeFilterProbeExec>()
             .expect("still a probe node");
         assert_eq!(rebuilt.key_index(), 0);
         assert_eq!(rebuilt.children().len(), 2);
 
-        let build = Arc::new(
-            RuntimeFilterBuildExec::try_new(source(keys(&[1])), 0, 8192).expect("build"),
-        );
-        let rebuilt = ExecutionPlan::with_new_children(build, vec![source(keys(&[1]))])
-            .expect("rebuild");
+        let build =
+            Arc::new(RuntimeFilterBuildExec::try_new(source(keys(&[1])), 0, 8192).expect("build"));
+        let rebuilt =
+            ExecutionPlan::with_new_children(build, vec![source(keys(&[1]))]).expect("rebuild");
         let rebuilt = rebuilt
             .downcast_ref::<RuntimeFilterBuildExec>()
             .expect("still a build node");
