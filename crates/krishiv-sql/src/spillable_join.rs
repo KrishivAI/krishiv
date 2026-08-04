@@ -602,6 +602,54 @@ impl SpillableJoinSelection {
         }
     }
 
+    /// Allow grace **only** in a process that never encodes a stage plan.
+    ///
+    /// `with_krishiv_optimizer_rules` is shared by two callers with opposite
+    /// requirements: the coordinator's staging planner, whose output must
+    /// survive `datafusion-proto` (a `GraceHashJoinExec` there fails to encode
+    /// and the scheduler's response is to run the whole query as a SINGLE
+    /// TASK), and the one-shot CLI, whose plans never leave the process.
+    ///
+    /// `is_single_query_process()` separates them exactly: stage building
+    /// happens only in `build_stages_for_parquet_tables`, reached solely from
+    /// `krishiv-scheduler`'s `distributed_batch`, i.e. the coordinator daemon,
+    /// which never declares itself single-query. It is also the same predicate
+    /// that gates `rescue_degenerate_broadcast`, which is the point: the rescue
+    /// exists to make a degenerate broadcast spillable, and grace is the better
+    /// way to spill one. Enabling them apart is what left the rescue handing
+    /// every join to sort-merge while grace sat unreachable.
+    ///
+    /// This does **not** turn grace on — `grace_hash_join::enabled()` still
+    /// defaults off. It stops `KRISHIV_GRACE_HASH_JOIN` from being silently
+    /// inert in the tier that has the rescue.
+    #[must_use]
+    pub fn with_grace_where_plans_are_never_encoded(self) -> Self {
+        self.with_grace_gated(
+            krishiv_common::executor_capacity::is_single_query_process(),
+            crate::grace_hash_join::enabled(),
+        )
+    }
+
+    /// The gate above with both inputs passed in.
+    ///
+    /// Split out purely so the *closed* direction can be tested with the flag
+    /// **on** — the only version of that test worth having. Reading the real
+    /// inputs would make it assert nothing: grace is false when the flag is
+    /// unset, so a passing test could not tell a shut gate from an absent
+    /// flag. The env cannot be set in the test either (`forbid(unsafe_code)`),
+    /// and `declare_single_query_process()` is a latch with no reset.
+    ///
+    /// Only ever *enables*: a caller that already chose grace
+    /// (`for_local_execution`) keeps it.
+    #[must_use]
+    fn with_grace_gated(self, single_query_process: bool, flag: bool) -> Self {
+        if single_query_process && flag {
+            Self { grace: true, ..self }
+        } else {
+            self
+        }
+    }
+
     /// The per-join threshold to actually apply, once the **total** unspillable
     /// build footprint of the plan is taken into account.
     ///
@@ -2699,6 +2747,45 @@ mod encodability_tests {
     /// (`distributed_plan::apply_local_spill_strategy`). This pins the
     /// separation: whatever the environment says, the path that plans stages
     /// stays encodable.
+    /// The gate that lets the CLI have grace must not open for the coordinator.
+    ///
+    /// `with_grace_where_plans_are_never_encoded` is applied by
+    /// `with_krishiv_optimizer_rules_with_join_threshold`, which the staging
+    /// planner also calls — so the *only* thing standing between a grace join
+    /// and an unencodable stage plan is `is_single_query_process()`. This pins
+    /// the closed direction, with the environment variable deliberately set:
+    /// a reader should not have to trust that the env is unset to believe the
+    /// coordinator is safe.
+    ///
+    /// Both directions are asserted **with the flag on**, which is what makes
+    /// the closed case mean anything: read from the real environment, grace is
+    /// false when the flag is unset, so the test would pass against a gate that
+    /// was wired backwards.
+    #[test]
+    fn grace_opens_only_where_plans_are_never_encoded() {
+        let coordinator = SpillableJoinSelection::with_threshold(Some(1))
+            .with_grace_gated(false, true);
+        assert!(
+            !coordinator.grace,
+            "the flag opened grace on a process whose plans get encoded — a \
+             grace join in a stage plan runs the whole query as a SINGLE TASK"
+        );
+
+        let one_shot_cli = SpillableJoinSelection::with_threshold(Some(1))
+            .with_grace_gated(true, true);
+        assert!(
+            one_shot_cli.grace,
+            "grace stayed shut in a process that never encodes a plan, which \
+             is the whole point of the gate"
+        );
+
+        // And the flag still governs: a single-query process without it opted
+        // in gets today's behaviour, not grace by default.
+        let flag_off = SpillableJoinSelection::with_threshold(Some(1))
+            .with_grace_gated(true, false);
+        assert!(!flag_off.grace, "the gate turned grace on by itself");
+    }
+
     #[tokio::test]
     async fn the_staging_planner_never_emits_an_unencodable_grace_join() {
         // Exactly how `planning_session_context_with_options` builds its rules.

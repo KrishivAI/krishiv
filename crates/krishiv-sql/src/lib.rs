@@ -745,7 +745,15 @@ pub fn with_krishiv_optimizer_rules_with_join_threshold(
         // business on the wire.
         Some(bytes) => crate::spillable_join::SpillableJoinSelection::with_threshold(Some(bytes)),
         None => crate::spillable_join::SpillableJoinSelection::from_capacity(),
-    };
+    }
+    // ...except in a process that never encodes a stage plan. The paragraph
+    // above is about the *coordinator*, and this builder serves the one-shot
+    // CLI too, where the encodability argument simply does not apply — nothing
+    // it plans goes on the wire. Gated on `is_single_query_process()`, the same
+    // predicate that enables the degenerate-broadcast rescue, so the rescue and
+    // the algorithm it wants stop being enabled in different processes. Still
+    // off unless `KRISHIV_GRACE_HASH_JOIN` says otherwise.
+    .with_grace_where_plans_are_never_encoded();
     builder
         .with_physical_optimizer_rule(std::sync::Arc::new(
             crate::coop_amplifiers::CooperativeAmplifiers::new(),
