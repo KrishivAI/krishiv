@@ -59,17 +59,21 @@ fn recover_from_store_removes_phantom_stale_jobs() {
 
 // --- Slice 1: MetadataStore write-through tests ---
 
+/// Submitting a job must write it through to the attached `MetadataStore`,
+/// because that record is what a restart recovers from.
+///
+/// This asserted `coordinator.job_snapshot(...)` — the *in-memory* registry —
+/// and never looked at the store at all. It even built an `Arc<Mutex<Store>>`
+/// and dropped it unused, with a comment conceding "not used; we verify
+/// indirectly". It passed identically with `with_store` deleted, so it tested
+/// nothing its name claims.
 #[test]
 fn metadata_store_persists_job_on_submit() {
     let coord_id = CoordinatorId::try_new("coord-ms1").unwrap();
     let job_id = JobId::try_new("job-1").unwrap();
-    let store = crate::store::InMemoryMetadataStore::default();
-    let store_arc = std::sync::Arc::new(std::sync::Mutex::new(store));
 
-    let mut coordinator = Coordinator::active(coord_id)
-        .with_store(crate::store::InMemoryMetadataStore::default());
-    // Attach our observable arc separately via explicit field — use with_store builder path.
-    // We use a fresh store here and verify via the coordinator's write-through.
+    let mut coordinator =
+        Coordinator::active(coord_id).with_store(crate::store::InMemoryMetadataStore::default());
     coordinator
         .register_executor(ExecutorDescriptor::new(
             ExecutorId::try_new("exec-1").unwrap(),
@@ -81,21 +85,31 @@ fn metadata_store_persists_job_on_submit() {
         .submit_job(single_task_job(job_id.clone()))
         .unwrap();
 
-    // The write-through happened into the internal store.
-    drop(store_arc); // not used; we verify indirectly
-
-    // Direct verification: job should be visible on the original coordinator.
-    let snap = coordinator.job_snapshot(&job_id).unwrap();
-    assert_eq!(snap.job_id(), &job_id);
+    let store = coordinator
+        .store
+        .as_ref()
+        .expect("a store is attached")
+        .inner();
+    let persisted = store
+        .jobs()
+        .iter()
+        .find(|record| record.job_id() == &job_id)
+        .expect("submit must write the job through to the store, not only in-memory");
+    assert_eq!(persisted.stages().len(), 1);
+    assert_eq!(persisted.stages()[0].tasks().len(), 1);
 }
 
+/// The same gap on the update path: a task reaching a terminal state must be
+/// visible in the store, or a restart recovers a job that looks unfinished and
+/// re-runs work that already completed. This also asserted only the in-memory
+/// snapshot.
 #[test]
 fn metadata_store_persists_task_state_on_update() {
     let coord_id = CoordinatorId::try_new("coord-ms2").unwrap();
     let job_id = JobId::try_new("job-ms2").unwrap();
 
-    let mut coordinator = Coordinator::active(coord_id)
-        .with_store(crate::store::InMemoryMetadataStore::default());
+    let mut coordinator =
+        Coordinator::active(coord_id).with_store(crate::store::InMemoryMetadataStore::default());
     let executor_id = ExecutorId::try_new("exec-1").unwrap();
     let lease = coordinator
         .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 1))
@@ -108,36 +122,47 @@ fn metadata_store_persists_task_state_on_update() {
         .unwrap();
     let assignment = &assignments[0];
 
-    coordinator
-        .apply_task_update(
-            TaskStatusUpdate::new(
-                job_id.clone(),
-                assignment.stage_id().clone(),
-                assignment.task_id().clone(),
-                executor_id.clone(),
-                TaskState::Running,
-                assignment.attempt_id().as_u32(),
+    for state in [TaskState::Running, TaskState::Succeeded] {
+        coordinator
+            .apply_task_update(
+                TaskStatusUpdate::new(
+                    job_id.clone(),
+                    assignment.stage_id().clone(),
+                    assignment.task_id().clone(),
+                    executor_id.clone(),
+                    state,
+                    assignment.attempt_id().as_u32(),
+                )
+                .with_lease_generation(lease),
             )
-            .with_lease_generation(lease),
-        )
-        .unwrap();
-    coordinator
-        .apply_task_update(
-            TaskStatusUpdate::new(
-                job_id.clone(),
-                assignment.stage_id().clone(),
-                assignment.task_id().clone(),
-                executor_id,
-                TaskState::Succeeded,
-                assignment.attempt_id().as_u32(),
-            )
-            .with_lease_generation(lease),
-        )
-        .unwrap();
+            .unwrap();
+    }
 
-    let snap = coordinator.job_snapshot(&job_id).unwrap();
-    assert_eq!(snap.state(), JobState::Succeeded);
-    assert_eq!(snap.succeeded_task_count(), 1);
+    assert_eq!(
+        coordinator.job_snapshot(&job_id).unwrap().state(),
+        JobState::Succeeded
+    );
+
+    let store = coordinator
+        .store
+        .as_ref()
+        .expect("a store is attached")
+        .inner();
+    let persisted = store
+        .jobs()
+        .iter()
+        .find(|record| record.job_id() == &job_id)
+        .expect("the job record must be in the store");
+    assert_eq!(
+        persisted.state(),
+        JobState::Succeeded,
+        "the terminal state must be durable, not only in-memory"
+    );
+    assert_eq!(
+        persisted.stages()[0].tasks()[0].state(),
+        TaskState::Succeeded,
+        "and so must the task's own terminal state"
+    );
 }
 
 #[test]

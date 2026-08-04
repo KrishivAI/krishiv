@@ -339,7 +339,9 @@ fn deployment_conformance_k8s_kind_and_bare_metal_process_modes_are_declared() {
     assert_contains_all(
         K8S_README,
         &[
-            "kind",
+            // (a bare "kind" needle was dropped here: it matches every
+            // `kind: Deployment` line in any k8s README, so it could not fail.
+            // The two needles below pin the KinD path specifically.)
             "KRISHIV_KIND_E2E=1",
             "cargo test -p krishiv-operator --test r2_kind_smoke",
             "kubectl apply -k k8s/operator",

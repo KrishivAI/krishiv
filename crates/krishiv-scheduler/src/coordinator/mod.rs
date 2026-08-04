@@ -2502,7 +2502,7 @@ mod stall_reporting_tests {
 
 pub(crate) mod aqe;
 mod checkpoint_ops;
-mod executor_ops;
+pub(crate) mod executor_ops;
 mod heartbeat_mapping;
 pub(crate) use heartbeat_mapping::{
     executor_heartbeat_from_request, executor_heartbeat_response_from_effects,

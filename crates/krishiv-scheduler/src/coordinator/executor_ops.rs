@@ -1,5 +1,14 @@
 use super::*;
 
+/// How many consecutive executor losses a single task absorbs before it is
+/// failed permanently instead of re-queued.
+///
+/// Module-scoped so tests bind to the real threshold rather than a copy of the
+/// number: a test that hardcodes its own `5` keeps passing after this is
+/// lowered (it breaks out of its loop early) and fails for the wrong reason
+/// after it is raised.
+pub(crate) const MAX_EXECUTOR_LOSSES_BEFORE_FAIL: u32 = 5;
+
 impl Coordinator {
     /// Register an executor with the active coordinator.
     #[tracing::instrument(
@@ -831,7 +840,6 @@ impl Coordinator {
     }
 
     pub(crate) fn reset_running_tasks_for_lost_executor(&mut self, lost_id: &ExecutorId) {
-        const MAX_EXECUTOR_LOSSES_BEFORE_FAIL: u32 = 5;
         let profile = self.durability_profile;
 
         let mut jobs_to_reassign = Vec::new();
