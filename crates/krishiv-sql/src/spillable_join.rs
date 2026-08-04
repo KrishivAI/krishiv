@@ -741,6 +741,24 @@ impl SpillableJoinSelection {
     /// and the rule then hash-partitioned both sides itself for sort-merge,
     /// producing the alignment grace had just been refused for lacking. The
     /// better algorithm was unreachable on the one shape this rescue exists for.
+    ///
+    /// # No configuration reaches this combination today
+    ///
+    /// Measured on SF100 q21, 2026-08-04: the rescue fires (three
+    /// `Repartition`s, five conversions) and grace is never *consulted* —
+    /// `self.grace` is false. `for_local_execution` is the only constructor
+    /// that enables grace and it is reached only from
+    /// `distributed_plan::apply_local_spill_strategy`, i.e. the post-decode
+    /// **executor**, where `is_single_query_process()` is false and so the
+    /// rescue is off. The embedded CLI is the mirror image: rescue on, grace
+    /// hard-off, because its session comes from `from_capacity` /
+    /// `with_threshold`.
+    ///
+    /// So this repairs a latent contradiction rather than a live regression.
+    /// It becomes load-bearing the moment grace is allowed anywhere the rescue
+    /// runs — the obvious candidate being the embedded session, which plans
+    /// locally, never encodes, and is exactly where a degenerate broadcast
+    /// exhausted the pool in the first place.
     fn grace_join(
         &self,
         hash_join: &HashJoinExec,
