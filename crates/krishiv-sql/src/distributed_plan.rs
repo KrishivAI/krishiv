@@ -42,8 +42,8 @@ use arrow::datatypes::SchemaRef;
 use base64::Engine as _;
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::logical_expr::execution_props::ScalarSubqueryResults;
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::repartition::RepartitionExec;
@@ -558,8 +558,8 @@ fn verify_dfplan_roundtrip(
     let decoded =
         datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec(bytes, ctx, codec)
             .map_err(|e| SqlError::DataFusion {
-                message: format!("physical plan proto decode: {e}"),
-            })?;
+            message: format!("physical plan proto decode: {e}"),
+        })?;
     // Decoding is not the same as reconstructing. A fragment can decode into a
     // plan whose *output type* differs from the one the coordinator encoded —
     // `datafusion-proto` re-resolves aggregate UDFs by name, and a decimal
@@ -775,7 +775,10 @@ fn apply_local_spill_strategy(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn Execution
         return plan;
     }
     let rule = crate::spillable_join::SpillableJoinSelection::for_local_execution();
-    match rule.optimize(Arc::clone(&plan), &datafusion::common::config::ConfigOptions::default()) {
+    match rule.optimize(
+        Arc::clone(&plan),
+        &datafusion::common::config::ConfigOptions::default(),
+    ) {
         Ok(rewritten) => rewritten,
         Err(error) => {
             tracing::warn!(%error, "local spill strategy declined; running the decoded plan as-is");
@@ -857,7 +860,9 @@ impl ShufflePartitionReader for MapRangeShuffleReader {
         if upstream_stage_index == self.range.upstream_stage_index
             && !(self.range.start..self.range.end).contains(&map_task_index)
         {
-            return Box::pin(async { Ok(Box::pin(futures::stream::empty()) as ShuffleFragmentStream) });
+            return Box::pin(async {
+                Ok(Box::pin(futures::stream::empty()) as ShuffleFragmentStream)
+            });
         }
         self.inner
             .open_partition(upstream_stage_index, map_task_index, partition)
@@ -1110,14 +1115,12 @@ pub async fn register_parquet_table(
             });
     }
 
-    let url =
-        ListingTableUrl::parse(directory_aware_url(&spec.path)).map_err(|e| {
-            SqlError::DataFusion {
-                message: format!("staged planning: table url for '{}': {e}", spec.name),
-            }
-        })?;
-    let options =
-        read_options.to_listing_options(&ctx.copied_config(), ctx.copied_table_options());
+    let url = ListingTableUrl::parse(directory_aware_url(&spec.path)).map_err(|e| {
+        SqlError::DataFusion {
+            message: format!("staged planning: table url for '{}': {e}", spec.name),
+        }
+    })?;
+    let options = read_options.to_listing_options(&ctx.copied_config(), ctx.copied_table_options());
     let config = ListingTableConfig::new(url)
         .with_listing_options(options)
         .infer_schema(&ctx.state())
@@ -1132,27 +1135,25 @@ pub async fn register_parquet_table(
     let schema = table.schema();
     let mut indices = Vec::with_capacity(spec.primary_key.len());
     for column in &spec.primary_key {
-        let index = schema
-            .index_of(column)
-            .map_err(|_| SqlError::DataFusion {
-                message: format!(
-                    "declared primary key column '{column}' is not in table '{}' \
+        let index = schema.index_of(column).map_err(|_| SqlError::DataFusion {
+            message: format!(
+                "declared primary key column '{column}' is not in table '{}' \
                      (columns: {})",
-                    spec.name,
-                    schema
-                        .fields()
-                        .iter()
-                        .map(|field| field.name().clone())
-                        .collect::<Vec<String>>()
-                        .join(", ")
-                ),
-            })?;
+                spec.name,
+                schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().clone())
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            ),
+        })?;
         indices.push(index);
     }
 
-    let table = table.with_constraints(Constraints::new_unverified(vec![
-        Constraint::PrimaryKey(indices),
-    ]));
+    let table = table.with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+        indices,
+    )]));
     ctx.register_table(spec.name.as_str(), Arc::new(table))
         .map_err(|e| SqlError::DataFusion {
             message: format!("staged planning: register '{}': {e}", spec.name),
@@ -1360,7 +1361,10 @@ async fn inline_uncorrelated_scalar_subqueries(
         let Ok(batches) = sub_df.collect().await else {
             continue;
         };
-        let rows: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
+        let rows: usize = batches
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum();
         // Zero rows is SQL NULL; more than one row is a runtime error that the
         // normal path must keep raising, so leave it alone.
         if rows > 1 {
@@ -1742,11 +1746,7 @@ impl ShuffleReadExec {
 
     /// Attach the cut subtree's estimated size. See [`Self::upstream_rows`].
     #[must_use]
-    pub fn with_upstream_estimate(
-        mut self,
-        rows: Option<usize>,
-        bytes: Option<usize>,
-    ) -> Self {
+    pub fn with_upstream_estimate(mut self, rows: Option<usize>, bytes: Option<usize>) -> Self {
         self.upstream_rows = rows;
         self.upstream_bytes = bytes;
         self
@@ -2028,8 +2028,13 @@ struct ShuffleReadNodePayload {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "node")]
 enum KrishivNodePayload {
-    RuntimeFilterBuild { key_index: usize, filter_bytes: usize },
-    RuntimeFilterProbe { key_index: usize },
+    RuntimeFilterBuild {
+        key_index: usize,
+        filter_bytes: usize,
+    },
+    RuntimeFilterProbe {
+        key_index: usize,
+    },
 }
 
 fn schema_to_ipc_bytes(schema: &arrow::datatypes::Schema) -> Result<Vec<u8>, String> {
@@ -2152,10 +2157,11 @@ impl PhysicalExtensionCodec for KrishivPhysicalCodec {
                 filter_bytes: build.filter_bytes(),
             })
         } else {
-            node.downcast_ref::<RuntimeFilterProbeExec>()
-                .map(|probe| KrishivNodePayload::RuntimeFilterProbe {
+            node.downcast_ref::<RuntimeFilterProbeExec>().map(|probe| {
+                KrishivNodePayload::RuntimeFilterProbe {
                     key_index: probe.key_index(),
-                })
+                }
+            })
         };
         if let Some(payload) = filter_payload {
             let json = serde_json::to_vec(&payload).map_err(|e| {
@@ -2323,9 +2329,9 @@ pub fn build_distributed_stages_with_udf_directives(
             .without_broadcast_rescue()
             .optimize(plan, &datafusion::common::config::ConfigOptions::default())
     }
-        .map_err(|e| SqlError::DataFusion {
-            message: format!("spillable-join pass over the redistributed plan: {e}"),
-        })?;
+    .map_err(|e| SqlError::DataFusion {
+        message: format!("spillable-join pass over the redistributed plan: {e}"),
+    })?;
 
     let mut drafts: Vec<StageDraft> = Vec::new();
     let mut root = match cut_exchanges(plan, &mut drafts) {
@@ -2586,14 +2592,8 @@ fn cut_exchanges(
             }
         };
         return Ok(Arc::new(
-            ShuffleReadExec::new(
-                stage_index,
-                map_task_count,
-                *num_partitions,
-                schema,
-                None,
-            )
-            .with_upstream_estimate(estimate.0, estimate.1),
+            ShuffleReadExec::new(stage_index, map_task_count, *num_partitions, schema, None)
+                .with_upstream_estimate(estimate.0, estimate.1),
         ));
     }
 
@@ -2822,9 +2822,7 @@ fn emits_unmatched_build_rows(join_type: datafusion::logical_expr::JoinType) -> 
 /// which is why the fix is to convert rather than to decline.
 ///
 /// A single-partition probe side is safe as it stands: the count is already 1.
-fn is_unsplittable_broadcast_join(
-    join: &datafusion::physical_plan::joins::HashJoinExec,
-) -> bool {
+fn is_unsplittable_broadcast_join(join: &datafusion::physical_plan::joins::HashJoinExec) -> bool {
     use datafusion::physical_plan::joins::PartitionMode;
     *join.partition_mode() == PartitionMode::CollectLeft
         && emits_unmatched_build_rows(*join.join_type())
@@ -2902,10 +2900,7 @@ fn is_degenerate_broadcast_join(join: &datafusion::physical_plan::joins::HashJoi
     if !broadcast_build_estimate_is_empty(join) {
         return false;
     }
-    let build_input_partitions = match join
-        .left()
-        .downcast_ref::<CoalescePartitionsExec>()
-    {
+    let build_input_partitions = match join.left().downcast_ref::<CoalescePartitionsExec>() {
         Some(coalesce) => coalesce.input().output_partitioning().partition_count(),
         None => join.left().output_partitioning().partition_count(),
     };
@@ -3014,10 +3009,7 @@ pub fn redistribute_unsplittable_broadcast_joins(
         return Ok(plan);
     };
     let unsplittable = is_unsplittable_broadcast_join(join);
-    if !unsplittable
-        && !is_degenerate_broadcast_join(join)
-        && !broadcast_build_is_too_wide(join)
-    {
+    if !unsplittable && !is_degenerate_broadcast_join(join) && !broadcast_build_is_too_wide(join) {
         return Ok(plan);
     }
 
@@ -3028,10 +3020,7 @@ pub fn redistribute_unsplittable_broadcast_joins(
         .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
         .unzip();
 
-    let build_side = match join
-        .left()
-        .downcast_ref::<CoalescePartitionsExec>()
-    {
+    let build_side = match join.left().downcast_ref::<CoalescePartitionsExec>() {
         Some(coalesce) => Arc::clone(coalesce.input()),
         None => Arc::clone(join.left()),
     };
@@ -3232,6 +3221,26 @@ struct RuntimeFilterRejects {
     filter_too_large: usize,
     /// No equijoin pair of a type the filter can encode on both sides.
     no_encodable_key: usize,
+    /// A join node this pass cannot even look at, because it is not a
+    /// `HashJoinExec`.
+    ///
+    /// This is not a rejection — it is the pass being structurally blind, and
+    /// it is why every other counter here read zero on the query this feature
+    /// was built for. `SpillableJoinSelection` runs *before* stage cutting and
+    /// converts an oversized hash join into a sort-merge join; on TPC-H q21 at
+    /// SF100 it converted all five (`hash_joins: 5, converted: 3`, plus two it
+    /// declined that were already sort-merge). By the time this pass walks the
+    /// plan there is no `HashJoinExec` left to inspect, so it logged
+    /// `joins_inspected: 0` — indistinguishable, in a log, from a query with no
+    /// joins at all.
+    ///
+    /// Counting them separately makes "the rule declined" and "the rule could
+    /// not see it" different observations. Generalising the rule to sort-merge
+    /// (and grace) joins is the actual fix: a runtime filter is a semantic
+    /// operation on the join's keys and does not care which algorithm executes
+    /// it, and `runtime_filter_candidate` only needs `join_type`, `left`,
+    /// `right` and the equijoin keys, all of which those nodes also have.
+    joins_of_unsupported_kind: usize,
 }
 
 fn runtime_filter_candidate(
@@ -3320,10 +3329,25 @@ fn collect_runtime_filter_candidates(
     out: &mut Vec<RuntimeFilterCandidate>,
     rejects: &mut RuntimeFilterRejects,
 ) {
-    if let Some(join) = plan.downcast_ref::<datafusion::physical_plan::joins::HashJoinExec>()
-        && let Some(candidate) = runtime_filter_candidate(join, rejects)
+    if let Some(join) = plan.downcast_ref::<datafusion::physical_plan::joins::HashJoinExec>() {
+        if let Some(candidate) = runtime_filter_candidate(join, rejects) {
+            out.push(candidate);
+        }
+    } else if plan
+        .downcast_ref::<datafusion::physical_plan::joins::SortMergeJoinExec>()
+        .is_some()
+        || plan
+            .downcast_ref::<datafusion::physical_plan::joins::NestedLoopJoinExec>()
+            .is_some()
+        || plan
+            .downcast_ref::<crate::grace_hash_join::GraceHashJoinExec>()
+            .is_some()
     {
-        out.push(candidate);
+        // Seen but unreachable — see `joins_of_unsupported_kind`. Counted so a
+        // log line can say "there were joins, this pass just cannot read them"
+        // instead of reporting the same `joins_inspected: 0` a join-free query
+        // would.
+        rejects.joins_of_unsupported_kind += 1;
     }
     for child in plan.children() {
         collect_runtime_filter_candidates(child, out, rejects);
@@ -3509,8 +3533,7 @@ fn dedupe_identical_stages_unconditionally(
     let mut first_seen: std::collections::HashMap<Vec<u8>, usize> =
         std::collections::HashMap::new();
     // duplicate index -> index it is replaced by
-    let mut replaced_by: std::collections::HashMap<usize, usize> =
-        std::collections::HashMap::new();
+    let mut replaced_by: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
 
     for (index, draft) in drafts.iter().enumerate() {
         if draft.subqueries.is_some() {
@@ -3648,6 +3671,7 @@ fn report_runtime_filter_candidates(root: &Arc<dyn ExecutionPlan>, drafts: &[Sta
         not_selective = rejects.not_selective,
         filter_too_large = rejects.filter_too_large,
         no_encodable_key = rejects.no_encodable_key,
+        joins_of_unsupported_kind = rejects.joins_of_unsupported_kind,
         candidates = candidates.len(),
         injected = 0,
         enabled = false,
@@ -3760,11 +3784,8 @@ fn inject_runtime_filters_unconditionally(
         // exactly the gather shape the cutter already emits for ungrouped
         // aggregates, so the writer and reader need no special case.
         let read = ShuffleReadExec::new(filter_stage, 1, 1, filter_schema(), None);
-        let rewritten = RuntimeFilterProbeExec::try_new(
-            probe_plan,
-            Arc::new(read),
-            candidate.probe_key_index,
-        );
+        let rewritten =
+            RuntimeFilterProbeExec::try_new(probe_plan, Arc::new(read), candidate.probe_key_index);
         let rewritten = match rewritten {
             Ok(plan) => Arc::new(plan) as Arc<dyn ExecutionPlan>,
             Err(error) => {
@@ -3808,6 +3829,7 @@ fn inject_runtime_filters_unconditionally(
         not_selective = rejects.not_selective,
         filter_too_large = rejects.filter_too_large,
         no_encodable_key = rejects.no_encodable_key,
+        joins_of_unsupported_kind = rejects.joins_of_unsupported_kind,
         candidates = candidate_count,
         injected,
         already_touched,
@@ -3854,7 +3876,11 @@ mod tests {
         use datafusion::logical_expr::Expr;
         let mut found = false;
         let _ = plan.apply(|node| {
-            if node.expressions().iter().any(Expr::contains_scalar_subquery) {
+            if node
+                .expressions()
+                .iter()
+                .any(Expr::contains_scalar_subquery)
+            {
                 found = true;
                 return Ok(TreeNodeRecursion::Stop);
             }
@@ -3875,12 +3901,14 @@ mod tests {
     #[tokio::test]
     async fn an_uncorrelated_scalar_subquery_is_folded_so_the_query_can_stage() {
         let ctx = planning_session_context(4);
-        ctx.sql("CREATE TABLE acct(id BIGINT, bal DOUBLE) AS VALUES (1, 10.0), (2, 30.0), (3, 50.0)")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
+        ctx.sql(
+            "CREATE TABLE acct(id BIGINT, bal DOUBLE) AS VALUES (1, 10.0), (2, 30.0), (3, 50.0)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
 
         let sql = "SELECT id FROM acct WHERE bal > (SELECT avg(bal) FROM acct)";
         let before = ctx.sql(sql).await.unwrap();
@@ -3901,7 +3929,10 @@ mod tests {
         // And the fold must not change the answer: avg is 30.0, so only id=3.
         let rows = after.collect().await.unwrap();
         let total: usize = rows.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total, 1, "folding a constant must not change the result set");
+        assert_eq!(
+            total, 1,
+            "folding a constant must not change the result set"
+        );
     }
 
     /// A CORRELATED subquery references the outer row, so it is not a constant
@@ -4062,7 +4093,10 @@ mod tests {
 
         // A bare context cannot resolve the bucket — the first guard's bug.
         assert!(
-            SessionContext::new().runtime_env().object_store(url.clone()).is_err(),
+            SessionContext::new()
+                .runtime_env()
+                .object_store(url.clone())
+                .is_err(),
             "precondition: a bare context must NOT resolve s3, or this test proves nothing"
         );
 
@@ -4231,10 +4265,18 @@ mod tests {
     async fn the_roundtrip_guard_accepts_an_ordinary_plan() {
         let ctx = SessionContext::new();
         ctx.sql("CREATE TABLE t AS VALUES (1, 'a'), (2, 'b')")
-            .await.unwrap().collect().await.unwrap();
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         let plan = ctx
             .sql("SELECT column1 FROM t WHERE column1 > 1")
-            .await.unwrap().create_physical_plan().await.unwrap();
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
         let codec = DefaultPhysicalExtensionCodec {};
         let bytes = encode_dfplan_bytes(plan, &codec).expect("encode");
         verify_dfplan_roundtrip(
@@ -4374,10 +4416,7 @@ mod tests {
         };
 
         let without = plan_text(ParquetTableSpec::new("t", &path)).await;
-        let with = plan_text(
-            ParquetTableSpec::new("t", &path).with_primary_key(["id"]),
-        )
-        .await;
+        let with = plan_text(ParquetTableSpec::new("t", &path).with_primary_key(["id"])).await;
 
         // With the key declared, the aggregate groups by `id` alone.
         let group_line = |text: &str| {
@@ -4507,7 +4546,7 @@ mod tests {
         let staged = build_stages_for_parquet_query(
             "SELECT SUM(amount) AS total, COUNT(*) AS n FROM t WHERE id >= 100",
             &tables,
-                    Some(ClusterCapacity { total_slots: 4 }),
+            Some(ClusterCapacity { total_slots: 4 }),
         )
         .await
         .expect("planning must not error")
@@ -4552,7 +4591,7 @@ mod tests {
         let staged = build_stages_for_parquet_query(
             "SELECT category, SUM(amount) AS total FROM t GROUP BY category",
             &tables,
-                    Some(ClusterCapacity { total_slots: 4 }),
+            Some(ClusterCapacity { total_slots: 4 }),
         )
         .await
         .expect("planning must not error")
@@ -4682,7 +4721,9 @@ mod tests {
         let error = check_shuffle_batch_schema(&declared, two_col, 0, 0, 0)
             .expect_err("column-count disagreement must not be passed on");
         assert!(
-            error.to_string().contains("2 columns but the plan declares 1"),
+            error
+                .to_string()
+                .contains("2 columns but the plan declares 1"),
             "got: {error}"
         );
     }
@@ -5536,7 +5577,11 @@ mod roundtrip_schema_guard_tests {
 
     /// A schema deliberately unlike anything the encoded plan produces.
     fn alien_schema() -> Schema {
-        Schema::new(vec![Field::new("not_a_real_column", DataType::Boolean, true)])
+        Schema::new(vec![Field::new(
+            "not_a_real_column",
+            DataType::Boolean,
+            true,
+        )])
     }
 
     #[tokio::test]
@@ -5598,15 +5643,14 @@ mod roundtrip_schema_guard_tests {
 
         let same_root = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
         // Two plans with identical root schemas and different interiors.
-        let original: Arc<dyn ExecutionPlan> = Arc::new(
-            datafusion::physical_plan::limit::GlobalLimitExec::new(
+        let original: Arc<dyn ExecutionPlan> =
+            Arc::new(datafusion::physical_plan::limit::GlobalLimitExec::new(
                 Arc::new(EmptyExec::new(Arc::clone(&same_root))),
                 0,
                 None,
-            ),
-        );
-        let decoded: Arc<dyn ExecutionPlan> = Arc::new(
-            datafusion::physical_plan::limit::GlobalLimitExec::new(
+            ));
+        let decoded: Arc<dyn ExecutionPlan> =
+            Arc::new(datafusion::physical_plan::limit::GlobalLimitExec::new(
                 Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![Field::new(
                     "a",
                     DataType::Int64,
@@ -5614,8 +5658,7 @@ mod roundtrip_schema_guard_tests {
                 )])))),
                 0,
                 None,
-            ),
-        );
+            ));
         // Roots agree only if the interiors do for CoalesceBatchesExec, so
         // assert on the child directly: the walk must reach it and name it.
         let difference = first_schema_difference(&original, &decoded, "root")
@@ -5789,7 +5832,10 @@ mod staged_tpch_tests {
                 ],
             )
             .expect("lineitem batch");
-            write_parquet(&lineitem_dir.join(format!("l-{file_index}.parquet")), &batch);
+            write_parquet(
+                &lineitem_dir.join(format!("l-{file_index}.parquet")),
+                &batch,
+            );
         }
 
         let part_dir = dir.join("part");
@@ -5867,14 +5913,14 @@ mod staged_tpch_tests {
                     Arc::new(Int64Array::from(keys.clone())),
                     Arc::new(StringArray::from(
                         keys.iter()
-                            .map(|k| {
-                                format!("{}-555-0100", codes[(*k as usize) % codes.len()])
-                            })
+                            .map(|k| format!("{}-555-0100", codes[(*k as usize) % codes.len()]))
                             .collect::<Vec<_>>(),
                     )),
                     Arc::new(
                         Decimal128Array::from(
-                            keys.iter().map(|k| i128::from(k % 900) * 100).collect::<Vec<_>>(),
+                            keys.iter()
+                                .map(|k| i128::from(k % 900) * 100)
+                                .collect::<Vec<_>>(),
                         )
                         .with_precision_and_scale(15, 2)
                         .expect("decimal(15,2)"),
@@ -5882,7 +5928,10 @@ mod staged_tpch_tests {
                 ],
             )
             .expect("customer batch");
-            write_parquet(&customer_dir.join(format!("c-{file_index}.parquet")), &batch);
+            write_parquet(
+                &customer_dir.join(format!("c-{file_index}.parquet")),
+                &batch,
+            );
         }
 
         let orders_dir = dir.join("orders");
@@ -5974,7 +6023,8 @@ mod staged_tpch_tests {
             };
             let bytes =
                 encode_dfplan_bytes(Arc::clone(&draft.plan), &codec).expect("q22 stage encodes");
-            let Err(error) = verify_dfplan_roundtrip(&bytes, &codec, &decode_ctx, Some(&draft.plan))
+            let Err(error) =
+                verify_dfplan_roundtrip(&bytes, &codec, &decode_ctx, Some(&draft.plan))
             else {
                 // This stage carried no `ScalarSubqueryExpr`; nothing severed.
                 continue;
@@ -6475,8 +6525,8 @@ mod staged_tpch_tests {
                 let (declared, mut stream) = execute_dfplan_body(body, &exec_ctx, Some(reader))
                     .map_err(|e| format!("stage {stage_index} task {task_index} start: {e}"))?;
                 while let Some(batch) = futures::StreamExt::next(&mut stream).await {
-                    let batch = batch
-                        .map_err(|e| format!("stage {stage_index} task {task_index}: {e}"))?;
+                    let batch =
+                        batch.map_err(|e| format!("stage {stage_index} task {task_index}: {e}"))?;
                     // The invariant the cluster depends on and this harness
                     // would otherwise hide: the store here hands the *same*
                     // batches back, so a stage whose declared schema disagrees
@@ -6813,7 +6863,10 @@ mod codec_completeness_tests {
         }
         found.sort();
         found.dedup();
-        assert!(!found.is_empty(), "the scan found no ExecutionPlan impls at all");
+        assert!(
+            !found.is_empty(),
+            "the scan found no ExecutionPlan impls at all"
+        );
 
         let undeclared: Vec<&String> = found
             .iter()
@@ -6854,7 +6907,9 @@ mod codec_completeness_tests {
             "and must still parse as a dfplan body: {rebuilt}"
         );
         assert_eq!(
-            dfplan_body_partition_spec(&rebuilt).expect("spec").partitions,
+            dfplan_body_partition_spec(&rebuilt)
+                .expect("spec")
+                .partitions,
             vec![3, 4],
             "the new partition spec must be the one asked for"
         );
@@ -6921,7 +6976,10 @@ mod codec_completeness_tests {
 
             let removed = dedupe_identical_stages_unconditionally(&mut root, &mut drafts);
 
-            assert_eq!(removed, 1, "one of the two identical stages must be removed");
+            assert_eq!(
+                removed, 1,
+                "one of the two identical stages must be removed"
+            );
             assert_eq!(drafts.len(), 1, "one stage must survive");
             let upstreams = collect_upstream_stage_indexes(&root);
             assert_eq!(
@@ -7094,6 +7152,60 @@ mod codec_completeness_tests {
         use datafusion::physical_expr::expressions::Column;
         use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 
+        /// A sort-merge join between two shuffle reads is invisible to this
+        /// pass, and the breakdown must say so rather than report the same
+        /// `joins_inspected: 0` a join-free plan would.
+        ///
+        /// This is the shape TPC-H q21 actually reaches the cutter in:
+        /// `SpillableJoinSelection` runs before stage cutting and converted all
+        /// five of q21's hash joins to sort-merge (measured on the live cluster
+        /// 2026-08-04, `fast-4c122b5f` — `hash_joins: 5, converted: 3`, the
+        /// other two already sort-merge). The runtime-filter pass then logged
+        /// `joins_inspected: 0`, which read as "no joins here" when the truth
+        /// was "five joins this pass cannot look at".
+        #[test]
+        fn a_sort_merge_join_is_counted_as_unreadable_not_as_no_join() {
+            use datafusion::physical_plan::joins::SortMergeJoinExec;
+
+            let build = read(0, Some(1_000), "k", arrow::datatypes::DataType::Int64);
+            let probe = read(1, Some(10_000_000), "k", arrow::datatypes::DataType::Int64);
+            let on = vec![(
+                Arc::new(Column::new("k", 0)) as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+                Arc::new(Column::new("k", 0)) as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+            )];
+            let smj = SortMergeJoinExec::try_new(
+                build,
+                probe,
+                on,
+                None,
+                JoinType::Inner,
+                vec![
+                    datafusion::physical_expr::PhysicalSortExpr::new_default(Arc::new(
+                        Column::new("k", 0),
+                    ))
+                    .options,
+                ],
+                NullEquality::NullEqualsNothing,
+            )
+            .expect("sort-merge join over two shuffle reads");
+
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(smj);
+            let mut candidates = Vec::new();
+            let mut rejects = RuntimeFilterRejects::default();
+            collect_runtime_filter_candidates(&plan, &mut candidates, &mut rejects);
+
+            assert_eq!(
+                rejects.joins_of_unsupported_kind, 1,
+                "the sort-merge join must be counted as seen-but-unreadable"
+            );
+            assert_eq!(
+                rejects.joins, 0,
+                "and must not be counted as an inspected join, which would \
+                 imply a gate turned it away"
+            );
+            assert!(candidates.is_empty());
+        }
+
         fn schema(name: &str, key: arrow::datatypes::DataType) -> SchemaRef {
             Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new(name, key, false),
@@ -7160,17 +7272,36 @@ mod codec_completeness_tests {
         /// across a stage boundary.
         fn q10_shaped() -> datafusion::error::Result<(Arc<dyn ExecutionPlan>, Vec<StageDraft>)> {
             let root = join_of(
-                read(0, Some(1_000_000), "bkey", arrow::datatypes::DataType::Int64),
-                read(1, Some(100_000_000), "pkey", arrow::datatypes::DataType::Int64),
+                read(
+                    0,
+                    Some(1_000_000),
+                    "bkey",
+                    arrow::datatypes::DataType::Int64,
+                ),
+                read(
+                    1,
+                    Some(100_000_000),
+                    "pkey",
+                    arrow::datatypes::DataType::Int64,
+                ),
                 JoinType::Inner,
             )?;
-            Ok((root, vec![draft(0, Some(1_000_000), "bkey"), draft(1, Some(100_000_000), "pkey")]))
+            Ok((
+                root,
+                vec![
+                    draft(0, Some(1_000_000), "bkey"),
+                    draft(1, Some(100_000_000), "pkey"),
+                ],
+            ))
         }
 
         #[test]
         fn a_filter_stage_is_injected_and_the_probe_stage_waits_on_it() {
             let (root, mut drafts) = q10_shaped().expect("plan");
-            assert_eq!(inject_runtime_filters_unconditionally(&root, &mut drafts), 1);
+            assert_eq!(
+                inject_runtime_filters_unconditionally(&root, &mut drafts),
+                1
+            );
             assert_eq!(drafts.len(), 3, "one filter stage must have been appended");
 
             let filter = &drafts[2];
@@ -7229,13 +7360,25 @@ mod codec_completeness_tests {
                 JoinType::LeftAnti,
             ] {
                 let root = join_of(
-                    read(0, Some(1_000_000), "bkey", arrow::datatypes::DataType::Int64),
-                    read(1, Some(100_000_000), "pkey", arrow::datatypes::DataType::Int64),
+                    read(
+                        0,
+                        Some(1_000_000),
+                        "bkey",
+                        arrow::datatypes::DataType::Int64,
+                    ),
+                    read(
+                        1,
+                        Some(100_000_000),
+                        "pkey",
+                        arrow::datatypes::DataType::Int64,
+                    ),
                     join_type,
                 )
                 .expect("join");
-                let mut drafts =
-                    vec![draft(0, Some(1_000_000), "bkey"), draft(1, Some(100_000_000), "pkey")];
+                let mut drafts = vec![
+                    draft(0, Some(1_000_000), "bkey"),
+                    draft(1, Some(100_000_000), "pkey"),
+                ];
                 assert_eq!(
                     inject_runtime_filters_unconditionally(&root, &mut drafts),
                     0,
@@ -7248,8 +7391,18 @@ mod codec_completeness_tests {
         #[test]
         fn a_join_inside_one_stage_gets_no_filter() {
             let root = join_of(
-                read(0, Some(1_000_000), "bkey", arrow::datatypes::DataType::Int64),
-                read(0, Some(100_000_000), "pkey", arrow::datatypes::DataType::Int64),
+                read(
+                    0,
+                    Some(1_000_000),
+                    "bkey",
+                    arrow::datatypes::DataType::Int64,
+                ),
+                read(
+                    0,
+                    Some(100_000_000),
+                    "pkey",
+                    arrow::datatypes::DataType::Int64,
+                ),
                 JoinType::Inner,
             )
             .expect("join");
@@ -7283,13 +7436,25 @@ mod codec_completeness_tests {
         #[test]
         fn a_probe_barely_bigger_than_the_build_is_not_worth_a_stage() {
             let root = join_of(
-                read(0, Some(1_000_000), "bkey", arrow::datatypes::DataType::Int64),
-                read(1, Some(2_000_000), "pkey", arrow::datatypes::DataType::Int64),
+                read(
+                    0,
+                    Some(1_000_000),
+                    "bkey",
+                    arrow::datatypes::DataType::Int64,
+                ),
+                read(
+                    1,
+                    Some(2_000_000),
+                    "pkey",
+                    arrow::datatypes::DataType::Int64,
+                ),
                 JoinType::Inner,
             )
             .expect("join");
-            let mut drafts =
-                vec![draft(0, Some(1_000_000), "bkey"), draft(1, Some(2_000_000), "pkey")];
+            let mut drafts = vec![
+                draft(0, Some(1_000_000), "bkey"),
+                draft(1, Some(2_000_000), "pkey"),
+            ];
             assert_eq!(
                 inject_runtime_filters_unconditionally(&root, &mut drafts),
                 0,
@@ -7309,20 +7474,38 @@ mod codec_completeness_tests {
                 JoinType::Inner,
             )
             .expect("join");
-            let mut drafts = vec![draft(0, Some(huge), "bkey"), draft(1, Some(huge * 8), "pkey")];
-            assert_eq!(inject_runtime_filters_unconditionally(&root, &mut drafts), 0);
+            let mut drafts = vec![
+                draft(0, Some(huge), "bkey"),
+                draft(1, Some(huge * 8), "pkey"),
+            ];
+            assert_eq!(
+                inject_runtime_filters_unconditionally(&root, &mut drafts),
+                0
+            );
         }
 
         #[test]
         fn an_unsupported_key_type_is_refused_not_guessed() {
             let root = join_of(
-                read(0, Some(1_000_000), "bkey", arrow::datatypes::DataType::Float64),
-                read(1, Some(100_000_000), "pkey", arrow::datatypes::DataType::Float64),
+                read(
+                    0,
+                    Some(1_000_000),
+                    "bkey",
+                    arrow::datatypes::DataType::Float64,
+                ),
+                read(
+                    1,
+                    Some(100_000_000),
+                    "pkey",
+                    arrow::datatypes::DataType::Float64,
+                ),
                 JoinType::Inner,
             )
             .expect("join");
-            let mut drafts =
-                vec![draft(0, Some(1_000_000), "bkey"), draft(1, Some(100_000_000), "pkey")];
+            let mut drafts = vec![
+                draft(0, Some(1_000_000), "bkey"),
+                draft(1, Some(100_000_000), "pkey"),
+            ];
             assert_eq!(
                 inject_runtime_filters_unconditionally(&root, &mut drafts),
                 0,
@@ -7337,13 +7520,25 @@ mod codec_completeness_tests {
         #[test]
         fn a_filter_that_would_close_a_cycle_is_not_injected() {
             let root = join_of(
-                read(0, Some(1_000_000), "bkey", arrow::datatypes::DataType::Int64),
-                read(1, Some(100_000_000), "pkey", arrow::datatypes::DataType::Int64),
+                read(
+                    0,
+                    Some(1_000_000),
+                    "bkey",
+                    arrow::datatypes::DataType::Int64,
+                ),
+                read(
+                    1,
+                    Some(100_000_000),
+                    "pkey",
+                    arrow::datatypes::DataType::Int64,
+                ),
                 JoinType::Inner,
             )
             .expect("join");
-            let mut drafts =
-                vec![draft(0, Some(1_000_000), "bkey"), draft(1, Some(100_000_000), "pkey")];
+            let mut drafts = vec![
+                draft(0, Some(1_000_000), "bkey"),
+                draft(1, Some(100_000_000), "pkey"),
+            ];
             // Make stage 0 (build) read stage 1 (probe).
             drafts[0].plan = Arc::new(
                 ShuffleReadExec::new(
@@ -7355,8 +7550,14 @@ mod codec_completeness_tests {
                 )
                 .with_upstream_estimate(Some(1_000_000), None),
             );
-            assert!(stage_depends_on(&drafts, 0, 1), "precondition: build reads probe");
-            assert_eq!(inject_runtime_filters_unconditionally(&root, &mut drafts), 0);
+            assert!(
+                stage_depends_on(&drafts, 0, 1),
+                "precondition: build reads probe"
+            );
+            assert_eq!(
+                inject_runtime_filters_unconditionally(&root, &mut drafts),
+                0
+            );
         }
 
         /// With the feature off, the pass must still change nothing *and* still
@@ -7390,17 +7591,16 @@ mod codec_completeness_tests {
                 0,
                 "a disabled pass must inject nothing"
             );
-            assert_eq!(
-                drafts.len(),
-                before,
-                "a disabled pass must not add a stage"
-            );
+            assert_eq!(drafts.len(), before, "a disabled pass must not add a stage");
         }
 
         #[test]
         fn stage_dependency_reachability_is_transitive_and_terminates_on_cycles() {
-            let mut drafts =
-                vec![draft(0, Some(1), "a"), draft(1, Some(1), "b"), draft(2, Some(1), "c")];
+            let mut drafts = vec![
+                draft(0, Some(1), "a"),
+                draft(1, Some(1), "b"),
+                draft(2, Some(1), "c"),
+            ];
             // 2 -> 1 -> 0
             drafts[1].plan = Arc::new(ShuffleReadExec::new(
                 0,
@@ -7416,7 +7616,10 @@ mod codec_completeness_tests {
                 schema("c", arrow::datatypes::DataType::Int64),
                 None,
             ));
-            assert!(stage_depends_on(&drafts, 2, 0), "reachability must be transitive");
+            assert!(
+                stage_depends_on(&drafts, 2, 0),
+                "reachability must be transitive"
+            );
             assert!(!stage_depends_on(&drafts, 0, 2), "and directional");
         }
 
@@ -7430,7 +7633,10 @@ mod codec_completeness_tests {
                 links: Vec::new(),
                 results: Default::default(),
             });
-            assert_eq!(inject_runtime_filters_unconditionally(&root, &mut drafts), 0);
+            assert_eq!(
+                inject_runtime_filters_unconditionally(&root, &mut drafts),
+                0
+            );
         }
 
         #[test]
@@ -7451,7 +7657,10 @@ mod codec_completeness_tests {
         #[test]
         fn the_injected_stages_round_trip_through_the_codec() {
             let (root, mut drafts) = q10_shaped().expect("plan");
-            assert_eq!(inject_runtime_filters_unconditionally(&root, &mut drafts), 1);
+            assert_eq!(
+                inject_runtime_filters_unconditionally(&root, &mut drafts),
+                1
+            );
 
             let codec = KrishivPhysicalCodec::coordinator();
             let session = fragment_decode_session_context();
@@ -7489,7 +7698,12 @@ mod registration_parity_tests {
     }
 
     /// Register the same file both ways and hand back the two providers.
-    async fn both_ways(path: &str) -> (Arc<dyn datafusion::datasource::TableProvider>, Arc<dyn datafusion::datasource::TableProvider>) {
+    async fn both_ways(
+        path: &str,
+    ) -> (
+        Arc<dyn datafusion::datasource::TableProvider>,
+        Arc<dyn datafusion::datasource::TableProvider>,
+    ) {
         let ctx = planning_session_context(4);
         register_parquet_table(&ctx, &ParquetTableSpec::new("plain", path))
             .await
@@ -7532,7 +7746,10 @@ mod registration_parity_tests {
             "s3://b/sf100/lineitem/"
         );
         // Already a prefix: unchanged, no doubled slash.
-        assert_eq!(super::directory_aware_url("s3://b/sf100/lineitem/"), "s3://b/sf100/lineitem/");
+        assert_eq!(
+            super::directory_aware_url("s3://b/sf100/lineitem/"),
+            "s3://b/sf100/lineitem/"
+        );
         // A named file keeps file semantics.
         assert_eq!(
             super::directory_aware_url("s3://b/sf100/nation.parquet"),
@@ -7540,7 +7757,10 @@ mod registration_parity_tests {
         );
         // Local paths are untouched: statting them is better information than
         // any guess this function could make.
-        assert_eq!(super::directory_aware_url("/data/sf100/lineitem"), "/data/sf100/lineitem");
+        assert_eq!(
+            super::directory_aware_url("/data/sf100/lineitem"),
+            "/data/sf100/lineitem"
+        );
         assert_eq!(super::directory_aware_url("relative/dir"), "relative/dir");
     }
 
