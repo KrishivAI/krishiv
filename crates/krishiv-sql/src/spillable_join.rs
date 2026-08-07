@@ -1047,14 +1047,10 @@ impl SpillableJoinSelection {
             .map(|sort_expr| sort_expr.options)
             .collect();
 
-        let sorted_left = Arc::new(
-            SortExec::new(left_ordering, build_input)
-                .with_preserve_partitioning(preserve_partitioning),
-        );
-        let sorted_right = Arc::new(
-            SortExec::new(right_ordering, probe_input)
-                .with_preserve_partitioning(preserve_partitioning),
-        );
+        let sorted_left =
+            sort_unless_already_sorted(build_input, left_ordering, preserve_partitioning);
+        let sorted_right =
+            sort_unless_already_sorted(probe_input, right_ordering, preserve_partitioning);
 
         // Sort-merge materialises the filter's columns left-side-first
         // regardless of the order `column_indices` declares, so a filter that
@@ -1119,6 +1115,66 @@ impl SpillableJoinSelection {
             }
         }
     }
+}
+
+/// Sort `input` on `ordering` — unless it is already sorted that way.
+///
+/// # Why this is not premature cleverness
+///
+/// This rule runs *after* `EnforceSorting`, so every `SortExec` it inserts is
+/// final: nothing downstream ever revisits the plan to notice that one of them
+/// is redundant. And converting a join to sort-merge makes its output ordered,
+/// which is exactly the input a *stacked* join is then handed.
+///
+/// TPC-H q21 at SF100 is that shape verbatim. Its `NOT EXISTS` and `EXISTS`
+/// become two joins on the same key, one feeding the other, and both convert:
+///
+/// ```text
+/// SortMergeJoinExec LeftAnti  on l_orderkey
+///   SortExec [l_orderkey]                    <- re-sorts an already-sorted input
+///     SortMergeJoinExec LeftSemi  on l_orderkey
+///       SortExec [l_orderkey] ...            <- genuine
+///       SortExec [l_orderkey] ...            <- genuine
+///   SortExec [l_orderkey] ...                <- genuine
+/// ```
+///
+/// `SortMergeJoinExec::maintains_input_order` is `[true, false]` for every
+/// `Left*` join type, so DataFusion already reports the LeftSemi's output as
+/// ordered on `l_orderkey`. The middle sort therefore re-sorted several GB per
+/// task — spilling, because the whole reason the join converted is that its
+/// build side does not fit — to reach an order it was already in. Measured:
+/// that one stage is 73% of q21's task time.
+///
+/// The check is DataFusion's own `ordering_satisfy`, not a hand-rolled
+/// comparison, so an input sorted on a *superset* prefix or on an equivalent
+/// column also counts.
+///
+/// # Partitioning is part of the contract
+///
+/// A `SortExec` with `preserve_partitioning(false)` outputs ONE partition
+/// whatever it was given, so skipping it would silently change the plan's
+/// partitioning. Dropping it is only safe when the input already has the
+/// partition count the sort would have produced.
+fn sort_unless_already_sorted(
+    input: Arc<dyn ExecutionPlan>,
+    ordering: LexOrdering,
+    preserve_partitioning: bool,
+) -> Arc<dyn ExecutionPlan> {
+    let partitions_match =
+        preserve_partitioning || input.output_partitioning().partition_count() == 1;
+    if partitions_match
+        && input
+            .equivalence_properties()
+            .ordering_satisfy(ordering.clone())
+            .unwrap_or(false)
+    {
+        tracing::debug!(
+            ordering = %ordering,
+            "spillable-join: input already sorted on the join keys; skipping the sort"
+        );
+        return input;
+    }
+    Arc::new(SortExec::new(ordering, input).with_preserve_partitioning(preserve_partitioning))
 }
 
 impl PhysicalOptimizerRule for SpillableJoinSelection {
@@ -1373,6 +1429,84 @@ mod tests {
         let optimized = rule.optimize(Arc::clone(&plan), &ConfigOptions::default()).unwrap();
         assert!(contains(&optimized, "HashJoinExec"), "under-threshold joins stay hash");
         assert!(!contains(&optimized, "SortMergeJoin"));
+    }
+
+    /// Two joins on the same key, stacked: the upper one must not re-sort the
+    /// lower one's already-sorted output.
+    ///
+    /// This is TPC-H q21's shape — `EXISTS` and `NOT EXISTS` over the same
+    /// table on the same key — and on the SF100 cluster that one stage is
+    /// **64% of the whole query's task time**. Three of its four sorts are
+    /// genuine; the fourth re-sorted the semi-join's output into the order the
+    /// semi-join had already produced it in.
+    ///
+    /// Counting sorts is the assertion because it is the thing that regressed:
+    /// a version that only checked "the answer is right" passed against the
+    /// redundant sort, which is correct and merely slow.
+    #[tokio::test]
+    async fn a_stacked_join_on_the_same_key_does_not_re_sort() {
+        let ctx = partitioned_join_ctx();
+        ctx.sql("CREATE TABLE l1 AS SELECT v % 1000 AS k FROM (VALUES (1)) t(x), UNNEST(range(0, 20000)) AS u(v)")
+            .await.unwrap().collect().await.unwrap();
+        ctx.sql("CREATE TABLE l2 AS SELECT v % 700 AS k FROM (VALUES (1)) t(x), UNNEST(range(0, 20000)) AS u(v)")
+            .await.unwrap().collect().await.unwrap();
+        ctx.sql("CREATE TABLE l3 AS SELECT v % 300 AS k FROM (VALUES (1)) t(x), UNNEST(range(0, 20000)) AS u(v)")
+            .await.unwrap().collect().await.unwrap();
+        let sql = "SELECT l1.k FROM l1 \
+                   WHERE EXISTS (SELECT 1 FROM l2 WHERE l2.k = l1.k) \
+                     AND NOT EXISTS (SELECT 1 FROM l3 WHERE l3.k = l1.k)";
+        let plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
+
+        let joins = |plan: &Arc<dyn ExecutionPlan>| -> usize {
+            datafusion::physical_plan::displayable(plan.as_ref())
+                .indent(true)
+                .to_string()
+                .matches("HashJoinExec")
+                .count()
+        };
+        assert_eq!(
+            joins(&plan),
+            2,
+            "precondition: both subqueries must plan as hash joins:\n{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            contains(&plan, "mode=Partitioned"),
+            "precondition: partitioned, or the rule declines and this tests nothing:\n{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+
+        let optimized = SpillableJoinSelection::with_threshold(Some(1))
+            .optimize(Arc::clone(&plan), &ConfigOptions::default())
+            .unwrap();
+        let rendered = datafusion::physical_plan::displayable(optimized.as_ref())
+            .indent(true)
+            .to_string();
+        assert_eq!(
+            rendered.matches("SortMergeJoin").count(),
+            2,
+            "precondition: both joins convert, or there is no stacking to test:\n{rendered}"
+        );
+        // Four inputs feed two joins; one of them — the lower join's output —
+        // arrives sorted. Three sorts, not four.
+        assert_eq!(
+            rendered.matches("SortExec").count(),
+            3,
+            "the upper join must reuse the lower join's ordering:\n{rendered}"
+        );
+
+        // Skipping a sort must not change what comes out. Planned afresh: the
+        // optimized tree shares untransformed Arc subtrees with `plan`.
+        let baseline_plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
+        let baseline =
+            datafusion::physical_plan::collect(baseline_plan, ctx.task_ctx()).await.unwrap();
+        let converted =
+            datafusion::physical_plan::collect(optimized, ctx.task_ctx()).await.unwrap();
+        let rows = |bs: &[arrow::record_batch::RecordBatch]| -> usize {
+            bs.iter().map(|b| b.num_rows()).sum()
+        };
+        assert!(rows(&baseline) > 0, "fixture must produce rows");
+        assert_eq!(rows(&converted), rows(&baseline), "skipping the sort changed the answer");
     }
 
     /// No memory cap means no threshold means no change — the embedded engine
