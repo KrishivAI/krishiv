@@ -158,7 +158,7 @@ fn build_bytes_estimate(hash_join: &HashJoinExec) -> Option<u64> {
         return None;
     }
     if estimate.any_claims_empty() {
-        return Some(u64::MAX);
+        return Some(DEGENERATE_BUILD_BYTES);
     }
     // An error computing statistics is not evidence of a large build side, and
     // this rule is an optimisation: declining is always a valid answer.
@@ -292,6 +292,16 @@ fn left_first_filter(filter: &JoinFilter) -> Option<JoinFilter> {
     Some(JoinFilter::new(expression, column_indices, schema))
 }
 
+/// What [`build_bytes_estimate`] reports when the planner's estimate is
+/// degenerate — an explicit claim of zero rows and zero bytes on a relation
+/// that is being asked to build a hash table.
+///
+/// **A sentinel, not a size.** It means "the estimator gave up; do not read
+/// this as small". Anywhere it is treated as a number it will dominate, which
+/// is the point when choosing whether to convert *this* join, and a bug when
+/// summing what a *plan* costs — see [`JoinFacts::budget_bytes`].
+const DEGENERATE_BUILD_BYTES: u64 = u64::MAX;
+
 /// What the budget needs to know about one hash join in the plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct JoinFacts {
@@ -310,6 +320,26 @@ impl JoinFacts {
     /// size it cannot estimate.
     fn retained_bytes(self) -> u64 {
         self.bytes.unwrap_or(0)
+    }
+
+    /// What this join costs the **plan's** budget.
+    ///
+    /// [`DEGENERATE_BUILD_BYTES`] is a sentinel, not a measurement, and the two
+    /// must not be added together. Charged as an assumption — the same share an
+    /// unmeasurable join gets from [`unknown_build_pressure`] — because that is
+    /// honestly what is known about it.
+    ///
+    /// Deliberately NOT used for the candidate ordering or the fit test below:
+    /// there the sentinel still means "assume it does not fit", so a degenerate
+    /// join stays first in line to convert. Costing the plan and choosing what
+    /// to convert are different questions and this join answers them
+    /// differently.
+    fn budget_bytes(self, assumed_share: u64) -> u64 {
+        if self.bytes == Some(DEGENERATE_BUILD_BYTES) {
+            assumed_share
+        } else {
+            self.retained_bytes()
+        }
     }
 
     /// Whether the budget is free to choose for this join.
@@ -703,14 +733,32 @@ impl SpillableJoinSelection {
     /// that was fine before behaves identically — the q2 regression risk is
     /// unchanged.
     fn conversion_decisions(facts: &[JoinFacts], threshold: u64) -> Vec<bool> {
+        // The share an *unknown* build side is assumed to hold. Shared with
+        // `unknown_build_pressure`, and used for the degenerate sentinel too —
+        // see `JoinFacts::budget_bytes` for why one sentinel must not be
+        // allowed to saturate a whole plan's arithmetic.
+        let assumed_share = if facts.is_empty() {
+            0
+        } else {
+            threshold / facts.len() as u64
+        };
         let measured = facts
             .iter()
-            .map(|f| f.retained_bytes())
+            .map(|f| f.budget_bytes(assumed_share))
             .fold(0u64, u64::saturating_add);
         let unknown_pressure = unknown_build_pressure(facts, threshold);
         let total = measured.saturating_add(unknown_pressure);
+        // A degenerate estimate IS aggregate pressure — that is the whole
+        // meaning of the sentinel — so it must not be able to short-circuit its
+        // way out. Charging it an assumed share (above) fixed the budget it was
+        // saturating, but with a single degenerate join that share is the whole
+        // threshold and `total <= threshold` held by equality, retaining exactly
+        // the join the sentinel exists to convert. Both halves are needed.
+        let degenerate = facts
+            .iter()
+            .any(|f| f.bytes == Some(DEGENERATE_BUILD_BYTES));
         // No aggregate pressure: let the per-join gate decide, as before.
-        if total <= threshold {
+        if !degenerate && total <= threshold {
             return vec![false; facts.len()];
         }
 
@@ -722,7 +770,7 @@ impl SpillableJoinSelection {
         let unavoidable = facts
             .iter()
             .filter(|f| !f.is_candidate())
-            .map(|f| f.retained_bytes())
+            .map(|f| f.budget_bytes(assumed_share))
             .fold(0u64, u64::saturating_add)
             .saturating_add(unknown_pressure);
         let mut budget = threshold.saturating_sub(unavoidable);
@@ -3044,6 +3092,84 @@ mod budget_never_loosens_tests {
             retained(&facts, &decisions) <= budget,
             "un-converted joins sum to {}, over the {budget} budget",
             retained(&facts, &decisions)
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod degenerate_sentinel_budget_tests {
+    use super::*;
+
+    fn fact(bytes: Option<u64>, convertible: bool) -> JoinFacts {
+        JoinFacts { bytes, convertible }
+    }
+
+    /// One degenerate estimate must not make the configured threshold
+    /// meaningless for every other join in the plan.
+    ///
+    /// `DEGENERATE_BUILD_BYTES` is `u64::MAX`, and the budget summed it. A
+    /// degenerate join that the rule cannot convert therefore saturated
+    /// `unavoidable`, `budget` became `threshold - u64::MAX` = **0**, and every
+    /// candidate converted to sort-merge no matter how much build memory the
+    /// operator said a task had.
+    ///
+    /// Measured live on the SF100 cluster 2026-08-07: raising
+    /// `KRISHIV_SPILL_JOIN_BUILD_BYTES` from 250 MB to 900 TB changed q21's
+    /// plan by exactly nothing — `configured_threshold: 900000000000000`,
+    /// `hash_joins: 5, converted: 3`, the same three joins. The knob was
+    /// inoperative for any plan containing a degenerate estimate, which is
+    /// every plan with a self anti-join.
+    #[test]
+    fn a_degenerate_estimate_does_not_zero_the_budget_for_everyone_else() {
+        let facts = vec![
+            // Unconvertible and degenerate — the q21 shape.
+            fact(Some(DEGENERATE_BUILD_BYTES), false),
+            fact(Some(100), true),
+            fact(Some(200), true),
+        ];
+        // Comfortably fits the two measurable joins plus an assumed share for
+        // the third.
+        let decisions = SpillableJoinSelection::conversion_decisions(&facts, 10_000);
+        assert_eq!(
+            decisions,
+            vec![false, false, false],
+            "a threshold that fits the measurable joins must retain them"
+        );
+    }
+
+    /// ...and the sentinel must still do its job.
+    ///
+    /// The correction above is only safe if a degenerate join remains the
+    /// FIRST thing to convert under real pressure. It is the join whose size
+    /// nothing can bound, and leaving it as an un-spillable hash join is what
+    /// killed q21 with `HashJoinInput[4] with 806.0 MB already allocated`.
+    #[test]
+    fn under_pressure_the_degenerate_join_is_the_one_that_converts() {
+        let facts = vec![
+            fact(Some(DEGENERATE_BUILD_BYTES), true),
+            fact(Some(200), true),
+        ];
+        let decisions = SpillableJoinSelection::conversion_decisions(&facts, 250);
+        assert_eq!(
+            decisions,
+            vec![true, false],
+            "the unbounded join converts and the measurable one that fits is kept"
+        );
+    }
+
+    /// The budget still binds when the measurable joins genuinely do not fit.
+    #[test]
+    fn a_degenerate_join_does_not_buy_the_others_a_free_pass() {
+        let facts = vec![
+            fact(Some(DEGENERATE_BUILD_BYTES), false),
+            fact(Some(900), true),
+            fact(Some(800), true),
+        ];
+        let decisions = SpillableJoinSelection::conversion_decisions(&facts, 1_000);
+        assert!(
+            decisions[1] || decisions[2],
+            "900 + 800 cannot both be retained under a 1000 budget: {decisions:?}"
         );
     }
 }
