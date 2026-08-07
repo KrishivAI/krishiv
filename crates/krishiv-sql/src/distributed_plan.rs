@@ -3013,7 +3013,6 @@ pub fn redistribute_unsplittable_broadcast_joins(
         return Ok(plan);
     }
 
-    let partitions = join.right().output_partitioning().partition_count();
     let (left_keys, right_keys): (Vec<_>, Vec<_>) = join
         .on()
         .iter()
@@ -3024,6 +3023,24 @@ pub fn redistribute_unsplittable_broadcast_joins(
         Some(coalesce) => Arc::clone(coalesce.input()),
         None => Arc::clone(join.left()),
     };
+    // The wider of the two sides, not simply the probe's count.
+    //
+    // Taking the probe side's alone is a rescue that does not rescue when the
+    // probe is a small single-file table. TPC-H q21's last join is against
+    // `nation` — 25 rows in one parquet file, so one partition — with a build
+    // side of everything above `lineitem ⋈ supplier ⋈ orders`. Sizing from the
+    // probe hash-partitioned that whole intermediate into **one** partition:
+    // exactly as serial as the broadcast being replaced, plus two exchanges
+    // and a stage boundary to pay for it.
+    //
+    // `max` can only ever raise the count, so no shape that works today loses
+    // parallelism; both sides are repartitioned to it regardless, which is what
+    // `PartitionMode::Partitioned` requires.
+    let partitions = join
+        .right()
+        .output_partitioning()
+        .partition_count()
+        .max(build_side.output_partitioning().partition_count());
     let exchange = |input: Arc<dyn ExecutionPlan>,
                     keys: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>>|
      -> SqlResult<Arc<dyn ExecutionPlan>> {
@@ -6335,6 +6352,111 @@ mod staged_tpch_tests {
             *converted_join.partition_mode(),
             PartitionMode::Partitioned,
             "the build side must be hash-partitioned instead of gathered"
+        );
+        assert_eq!(
+            converted.schema(),
+            join.schema(),
+            "conversion must preserve the join's output schema"
+        );
+    }
+
+    /// A rescue sized from a **single-partition probe** is not a rescue.
+    ///
+    /// TPC-H q21's last join is against `nation`: 25 rows in one parquet file,
+    /// so one output partition. Sizing the replacement exchange from the probe
+    /// alone hash-partitioned the entire `lineitem ⋈ supplier ⋈ orders`
+    /// intermediate into ONE partition — as serial as the broadcast it replaced,
+    /// with two exchanges and a stage boundary added for nothing. The count has
+    /// to be the wider of the two sides.
+    ///
+    /// Asserting the partition count, not just the mode: the mode flipped to
+    /// `Partitioned` in the broken version too, which is why the existing
+    /// conversion tests could not see this.
+    #[tokio::test]
+    async fn a_rescue_never_narrows_to_the_probe_sides_partition_count() {
+        use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = q22_context(tmp.path()).await;
+        let scan = ctx
+            .sql("SELECT c_custkey FROM customer WHERE 1 = 0")
+            .await
+            .expect("sql")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        // Explicitly hash-partitioned, because that is what the build side of
+        // this join is in the real plan: the output of the shuffle-connected
+        // stage below it. The fixture's own scan is one file group.
+        let build_key =
+            datafusion::physical_plan::expressions::col("c_custkey", &scan.schema()).expect("col");
+        let build: Arc<dyn ExecutionPlan> = Arc::new(
+            RepartitionExec::try_new(scan, Partitioning::Hash(vec![build_key], 4))
+                .expect("hash exchange"),
+        );
+        // One partition, like `nation` — a whole table small enough to land in
+        // a single file group.
+        let probe = ctx
+            .sql("SELECT o_custkey FROM orders LIMIT 5")
+            .await
+            .expect("sql")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let build_partitions = build.output_partitioning().partition_count();
+        assert_eq!(
+            probe.output_partitioning().partition_count(),
+            1,
+            "precondition: the probe must be single-partition or this tests nothing"
+        );
+        assert!(
+            build_partitions > 1,
+            "precondition: the build side must have parallelism to lose, got {build_partitions}"
+        );
+
+        let on = vec![(
+            datafusion::physical_plan::expressions::col("c_custkey", &build.schema())
+                .expect("build key"),
+            datafusion::physical_plan::expressions::col("o_custkey", &probe.schema())
+                .expect("probe key"),
+        )];
+        let join: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                Arc::new(CoalescePartitionsExec::new(build)),
+                probe,
+                on,
+                None,
+                &datafusion::logical_expr::JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                datafusion::common::NullEquality::NullEqualsNothing,
+                false,
+            )
+            .expect("hand-built broadcast join"),
+        );
+        assert!(
+            is_degenerate_broadcast_join(join.downcast_ref::<HashJoinExec>().expect("hash join")),
+            "precondition: the zero estimate must make this a rescue candidate"
+        );
+
+        let converted =
+            redistribute_unsplittable_broadcast_joins(Arc::clone(&join)).expect("conversion");
+        let converted_join = converted
+            .downcast_ref::<HashJoinExec>()
+            .expect("still a hash join");
+        assert_eq!(*converted_join.partition_mode(), PartitionMode::Partitioned);
+        assert_eq!(
+            converted_join.left().output_partitioning().partition_count(),
+            build_partitions,
+            "the rescue must keep the build side's parallelism, not collapse to the probe's 1"
+        );
+        assert_eq!(
+            converted_join
+                .right()
+                .output_partitioning()
+                .partition_count(),
+            build_partitions,
+            "and both sides must agree, as PartitionMode::Partitioned requires"
         );
         assert_eq!(
             converted.schema(),
