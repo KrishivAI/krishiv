@@ -72,3 +72,27 @@ For rollback, restore the previous image on every node, replace the two
 standbys, then replace the active. etcd keys are per-record and forward reads
 fail closed; take an etcd snapshot before any release that changes persisted
 schema versions.
+
+## 2026-08-08 — gate re-run: coordinator-kill REGRESSED (KRV_SHUFFLE_MISSING)
+
+First gate run since the 2026-07-20 clean pass, on a kind cluster (topology
+adapted: executor/driver `nodeName` pins repointed from the CI rig's s1–s3,
+`phase58-tokens`/`minio-s3-creds` recreated, events/changes datasets
+reseeded, image built from `--features prod`).
+
+- PASS: batch, streaming, and ivm through executor-kill (iterations 0–2),
+  leader election <30s, one active endpoint, two-executor re-registration.
+- **FAIL, twice, from a clean 3-coordinator topology: batch ×
+  coordinator-kill.** After the standby promotes, reduce tasks retry into
+  `KRV_SHUFFLE_MISSING(stage=s0.mN)` — "the coordinator attached no location
+  for this stage key at all" — because the map-output locations lived only
+  in the dead leader's memory. The producer stage is never regenerated, so
+  the job lands `failed` with 1 failed task (of 9–16). Steady-state
+  submit→Succeeded on the same topology works (9/9 tasks).
+- Reading: in-flight jobs' shuffle-location registry is not part of the
+  durable state the promoted coordinator recovers, and there is no
+  fetch-failed → regenerate-producer-stage path. One of the two must exist
+  for the failover story to hold for running batch jobs. The 2026-07-20 run
+  passed this cell; the regression window is the three weeks of scheduler /
+  shuffle / runtime-filter work since — the gate simply did not run across
+  it. Bisect before fixing forward.
