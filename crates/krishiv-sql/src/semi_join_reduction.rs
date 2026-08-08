@@ -125,19 +125,63 @@ pub const SEMI_JOIN_PUSHDOWN_ENV: &str = "KRISHIV_SEMI_JOIN_PUSHDOWN";
 
 /// Environment switch for reduction *from a selective dimension* (the q7 rule).
 ///
-/// Its own switch, like the other two, so it can be A/B'd alone. This rule
-/// family has regressed unrelated queries twice — the pushdown rule turned q2
-/// into a nested-loop join (18.4x), and an earlier broadcast fix cost q8/q9 —
-/// so being able to isolate one rule is not a nicety here.
+/// # OFF by default, and the measurement that made it so
 ///
-/// `KRISHIV_SEMI_JOIN_DIMENSION=off` disables it.
+/// It shipped on, was measured across all 22 SF100 queries, and is a large win
+/// on the query it was written for and a **much larger loss on two others**:
+///
+/// ```text
+///        rule on     rule off
+///   q7    118.6 s     ~340 s      2.9x FASTER   (paired A/B median 0.498)
+///   q8    422.6 s      95.4 s     4.4x slower
+///   q10  1997.1 s     110.7 s    18.1x SLOWER
+/// ```
+///
+/// The A/B that cleared it covered q2, q17 and q18 — chosen because *those*
+/// were the queries this rule family had regressed before. It missed q8 and
+/// q10, and only the full sweep caught them. **Picking a regression set from
+/// the last incident is picking the queries you already know about.**
+///
+/// # Why, and why the fix is not a tweak here
+///
+/// The guard asks only whether the dimension side carries a `Filter` — never
+/// whether it is *small*. In q7 that filter sits on `nation`, 25 rows. In q10
+/// the same test passes for `orders` filtered to a 3-month window (~11M rows)
+/// and `lineitem` filtered by `l_returnflag` (~150M), so the rule attaches a
+/// whole extra join instead of a cheap reducer.
+///
+/// The missing discriminator is dimension size, and **it is not available
+/// where this rule lives**: `TableSource` in DF 54 exposes `schema`,
+/// `constraints`, `table_type` and pushdown support — no `statistics()`. A
+/// logical rule cannot tell 25 rows from 150 million.
+///
+/// So the rule belongs at the *physical* level, beside
+/// `distributed_plan::redistribute_unsplittable_broadcast_joins`, where
+/// `partition_statistics()` is what `broadcast_build_estimate_is_empty` and
+/// `broadcast_build_is_too_wide` already read. Until it is moved there this
+/// stays off, and the q7 win stays available to anyone who opts in knowing the
+/// shape their queries have.
+///
+/// `KRISHIV_SEMI_JOIN_DIMENSION=on` enables it.
 pub const SEMI_JOIN_DIMENSION_ENV: &str = "KRISHIV_SEMI_JOIN_DIMENSION";
 
-/// Whether reduction from a selective dimension is enabled (default: yes).
+/// Whether reduction from a selective dimension is enabled (default: **no**).
 pub fn semi_join_dimension_reduction_enabled() -> bool {
     // Still under the umbrella switch, so turning that off disables all three.
     semi_join_reduction_enabled()
-        && enabled_from(&std::env::var(SEMI_JOIN_DIMENSION_ENV).unwrap_or_default())
+        && opt_in_from(&std::env::var(SEMI_JOIN_DIMENSION_ENV).unwrap_or_default())
+}
+
+/// Opt-*in* parsing: anything but an explicit yes is off.
+///
+/// The mirror of [`enabled_from`], kept separate rather than parameterised so
+/// that reading either call site tells you the default without following a
+/// boolean argument.
+fn opt_in_from(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "on" | "true" | "yes"
+    )
 }
 
 /// Whether semi-join reduction through aggregates is enabled (default: yes).
@@ -1247,6 +1291,24 @@ mod tests {
         let expected = rows(&dimension_context(false), Q7_SHAPE).await;
         assert!(!expected.is_empty(), "fixture must produce rows");
         assert_eq!(rows(&dimension_context(true), Q7_SHAPE).await, expected);
+    }
+
+    /// The switch is opt-in: unset means off.
+    ///
+    /// Pinned because the default is the whole safety story here — the rule is
+    /// a measured 18x regression on q10 — and because a default that flips back
+    /// silently is exactly how the sibling rule's own default drifted once.
+    #[test]
+    fn the_dimension_rule_is_off_unless_explicitly_asked_for() {
+        for unset_or_no in ["", "  ", "off", "0", "false", "no", "maybe"] {
+            assert!(
+                !opt_in_from(unset_or_no),
+                "{unset_or_no:?} must not enable the rule"
+            );
+        }
+        for yes in ["1", "on", "true", "yes", "ON", " On "] {
+            assert!(opt_in_from(yes), "{yes:?} must enable the rule");
+        }
     }
 
     /// An unfiltered dimension is left alone: the reducer would remove nothing
