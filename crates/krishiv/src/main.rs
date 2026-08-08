@@ -90,6 +90,28 @@ fn main() {
     process::exit(response.exit_code);
 }
 
+/// Detect symlink invocation and return the equivalent `krishiv` subcommand.
+///
+/// Enables the multi-call binary pattern: deploy-time symlinks like
+/// `krishiv-coordinator → krishiv` cause the binary to dispatch as
+/// `krishiv coordinator` with zero runtime overhead.
+fn multipass_subcommand() -> Option<&'static str> {
+    let prog = env::args().next()?;
+    let name = Path::new(&prog).file_name()?.to_str()?;
+    match name {
+        "krishiv-coordinator" => Some("coordinator"),
+        "krishiv-clusterd" => Some("clusterd"),
+        "krishiv-executor" => Some("executor"),
+        "krishiv-job-coordinator" => Some("job-coordinator"),
+        "krishiv-flight-server" => Some("flight-server"),
+        "krishiv-shuffle-svc" => Some("shuffle-svc"),
+        "krishiv-mcp" => Some("mcp"),
+        _ => None,
+    }
+}
+
+// Keep the test module last: clippy::items_after_test_module (denied by
+// `just lint`) rejects any item declared below it.
 #[cfg(test)]
 mod single_query_declaration_tests {
     /// Every process that shares one memory pool between concurrent queries
@@ -134,25 +156,5 @@ mod single_query_declaration_tests {
         ] {
             assert!(crate::daemon_cmd::is_daemon_subcommand(sub));
         }
-    }
-}
-
-/// Detect symlink invocation and return the equivalent `krishiv` subcommand.
-///
-/// Enables the multi-call binary pattern: deploy-time symlinks like
-/// `krishiv-coordinator → krishiv` cause the binary to dispatch as
-/// `krishiv coordinator` with zero runtime overhead.
-fn multipass_subcommand() -> Option<&'static str> {
-    let prog = env::args().next()?;
-    let name = Path::new(&prog).file_name()?.to_str()?;
-    match name {
-        "krishiv-coordinator" => Some("coordinator"),
-        "krishiv-clusterd" => Some("clusterd"),
-        "krishiv-executor" => Some("executor"),
-        "krishiv-job-coordinator" => Some("job-coordinator"),
-        "krishiv-flight-server" => Some("flight-server"),
-        "krishiv-shuffle-svc" => Some("shuffle-svc"),
-        "krishiv-mcp" => Some("mcp"),
-        _ => None,
     }
 }
