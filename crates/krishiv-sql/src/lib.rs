@@ -780,6 +780,18 @@ pub fn with_krishiv_optimizer_rules_with_join_threshold(
         .with_optimizer_rule(std::sync::Arc::new(
             crate::semi_join_reduction::SemiJoinPushdownThroughInnerJoin::default(),
         ))
+        // q7: the two 25-row `nation` tables are last in the FROM clause, so a
+        // left-deep plan applies `n_name IN (FRANCE, GERMANY)` above every big
+        // join — after `s_nationkey` has ridden two 9.48 GB shuffles that were
+        // measured at 81% of the query. Reduce the fact stream by the filtered
+        // dimension first; the pushdown rule above then carries that reducer
+        // down onto the `supplier` scan.
+        //
+        // Registered *after* the pushdown rule so the reducer it introduces is
+        // picked up on the following pass rather than sitting at the top.
+        .with_optimizer_rule(std::sync::Arc::new(
+            crate::semi_join_reduction::SemiJoinReductionFromSelectiveDimension::default(),
+        ))
         // q10: a `GROUP BY` that lists a key *and the columns that key
         // determines* drags those columns through every join and shuffle to
         // display twenty of them. Group on the key, take the top N, then

@@ -123,6 +123,23 @@ pub const SEMI_JOIN_REDUCTION_ENV: &str = "KRISHIV_SEMI_JOIN_REDUCTION";
 /// So: on by default. `KRISHIV_SEMI_JOIN_PUSHDOWN=off` disables it.
 pub const SEMI_JOIN_PUSHDOWN_ENV: &str = "KRISHIV_SEMI_JOIN_PUSHDOWN";
 
+/// Environment switch for reduction *from a selective dimension* (the q7 rule).
+///
+/// Its own switch, like the other two, so it can be A/B'd alone. This rule
+/// family has regressed unrelated queries twice — the pushdown rule turned q2
+/// into a nested-loop join (18.4x), and an earlier broadcast fix cost q8/q9 —
+/// so being able to isolate one rule is not a nicety here.
+///
+/// `KRISHIV_SEMI_JOIN_DIMENSION=off` disables it.
+pub const SEMI_JOIN_DIMENSION_ENV: &str = "KRISHIV_SEMI_JOIN_DIMENSION";
+
+/// Whether reduction from a selective dimension is enabled (default: yes).
+pub fn semi_join_dimension_reduction_enabled() -> bool {
+    // Still under the umbrella switch, so turning that off disables all three.
+    semi_join_reduction_enabled()
+        && enabled_from(&std::env::var(SEMI_JOIN_DIMENSION_ENV).unwrap_or_default())
+}
+
 /// Whether semi-join reduction through aggregates is enabled (default: yes).
 pub fn semi_join_reduction_enabled() -> bool {
     enabled_from(&std::env::var(SEMI_JOIN_REDUCTION_ENV).unwrap_or_default())
@@ -544,6 +561,193 @@ fn push_semi_below(
         }
         _ => Ok(None),
     }
+}
+
+/// Reduce a fact stream by a *selective dimension* it is inner-joined to,
+/// before the join that needs it.
+///
+/// # The query that motivated this
+///
+/// TPC-H q7's FROM clause is
+/// `supplier, lineitem, orders, customer, nation n1, nation n2`, and the plan
+/// is left-deep in that order — so the two 25-row `nation` tables land at the
+/// very TOP, above every big join:
+///
+/// ```text
+/// Inner Join: n2.n_nationkey = customer.c_nationkey     <- n_name IN (FRANCE, GERMANY)
+///   Inner Join: n1.n_nationkey = supplier.s_nationkey   <- n_name IN (FRANCE, GERMANY)
+///     Inner Join: customer.c_custkey = orders.o_custkey
+///       Inner Join: orders.o_orderkey = lineitem.l_orderkey
+///         Inner Join: supplier.s_suppkey = lineitem.l_suppkey   <- ALL 1M suppliers
+/// ```
+///
+/// `s_nationkey` is carried as payload from the bottom join all the way up,
+/// through **two** shuffles measured at 9.48 GB each, before the nation filter
+/// is ever applied. TPC-H spreads supplier nations uniformly over 25, so
+/// **~8% of suppliers qualify**: the bottom join emits about twelve times more
+/// rows than any of them can survive.
+///
+/// Measured at SF100 on 2026-08-08, those two shuffles and the stage that
+/// consumes them are **81% of q7** (s4 43.4%, s5 37.7%).
+///
+/// # The rewrite
+///
+/// ```text
+///   Inner(N, Big)  on N.k = Big.k    ==>    Inner(N, LeftSemi(Big, N') on Big.k)
+/// ```
+///
+/// where `N'` is `N` descended to its nearest `Filter` and projected to the key
+/// — the same `selective_key_source` the aggregate rule uses.
+///
+/// The reducer is introduced at the TOP of the big side and deliberately left
+/// there: [`SemiJoinPushdownThroughInnerJoin`] already carries a `LeftSemi`
+/// down through inner joins, one level per optimizer pass, and the optimizer
+/// runs to a fixed point. So this rule does not need its own descent, and the
+/// reducer ends up landing directly on the `supplier` scan.
+///
+/// # Why it is safe
+///
+/// - **The join must be Inner.** Under an outer join the unmatched rows are
+///   preserved, so removing them early changes the result.
+/// - **Removing exactly what the join would remove.** A `Big` row whose key has
+///   no match in `N` cannot appear in `Inner(N, Big)`. The reducer removes
+///   precisely those rows and no others, so the output is identical.
+/// - **No duplication.** `LeftSemi` emits each left row at most once however
+///   many `N` rows match, so multiplicity — and every count and sum above — is
+///   unchanged.
+/// - **Nulls agree.** A null key satisfies neither the reducer nor the join.
+/// - **The schema is untouched.** `LeftSemi` projects only its left side, so
+///   the parent join's `on` columns resolve exactly as before.
+///
+/// # Why it is guarded
+///
+/// - **The dimension must carry a `Filter`.** Without one the reducer removes
+///   nothing and costs an extra pass — the same guard, and the same reason, as
+///   the aggregate rule.
+/// - **The big side must contain an inner join.** If it is a bare scan there is
+///   nothing to push past: the reducer would sit directly beneath the join that
+///   already does that work.
+/// - **Idempotence is structural, not shallow.** The pushdown rule moves the
+///   reducer down, so after one pass the big side's top node is an inner join
+///   again and a shallow `already_reduced` check would let this rule add a
+///   second reducer on every pass, forever. `carries_reducer` searches the
+///   whole subtree for this exact probe instead.
+#[derive(Debug, Default)]
+pub struct SemiJoinReductionFromSelectiveDimension {
+    /// Bypass the env gate and always apply — see
+    /// [`SemiJoinPushdownThroughInnerJoin::forced`] for why this exists.
+    forced: bool,
+}
+
+impl SemiJoinReductionFromSelectiveDimension {
+    /// The rule with its env gate bypassed, for tests and explicit opt-in.
+    pub fn forced() -> Self {
+        Self { forced: true }
+    }
+}
+
+impl OptimizerRule for SemiJoinReductionFromSelectiveDimension {
+    fn name(&self) -> &str {
+        "semi_join_reduction_from_selective_dimension"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        // Bottom-up, so the join tree below is already in its final shape when
+        // a join is examined and `carries_reducer` sees the finished subtree.
+        Some(ApplyOrder::BottomUp)
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>> {
+        if !self.forced && !semi_join_dimension_reduction_enabled() {
+            return Ok(Transformed::no(plan));
+        }
+        let LogicalPlan::Join(join) = &plan else {
+            return Ok(Transformed::no(plan));
+        };
+        if join.join_type != JoinType::Inner || join.on.is_empty() {
+            return Ok(Transformed::no(plan));
+        }
+
+        for (left_key, right_key) in &join.on {
+            let (Expr::Column(left_col), Expr::Column(right_col)) = (left_key, right_key) else {
+                continue;
+            };
+            // Either side may be the dimension; try both orientations. Which
+            // side is which is carried explicitly rather than recovered by
+            // pointer comparison — a self-join whose children are the same
+            // `Arc` makes `Arc::ptr_eq` true for both, and the rewrite would go
+            // into the wrong child (the `4e9203e9` bug).
+            for (dimension_is_right, dimension, dimension_key, big, big_key) in [
+                (true, &join.right, right_col, &join.left, left_col),
+                (false, &join.left, left_col, &join.right, right_col),
+            ] {
+                let Some((probe, probe_col)) = selective_key_source(dimension, dimension_key)?
+                else {
+                    continue;
+                };
+                if !contains_inner_join(big) || carries_reducer(big, &probe) {
+                    continue;
+                }
+                // Equijoin keys, not a predicate expression. `join_on` parks
+                // equalities in the join's `filter`, and by the time this rule
+                // runs nothing hoists them into `on`, so the physical planner
+                // picks a nested-loop join — which is how the sibling rule once
+                // made q2 eighteen times slower.
+                let reduced = LogicalPlanBuilder::from(big.as_ref().clone())
+                    .join_detailed(
+                        probe,
+                        JoinType::LeftSemi,
+                        (vec![big_key.clone()], vec![probe_col]),
+                        None,
+                        NullEquality::NullEqualsNothing,
+                    )?
+                    .build()?;
+                let rebuilt = if dimension_is_right {
+                    Join {
+                        left: Arc::new(reduced),
+                        ..join.clone()
+                    }
+                } else {
+                    Join {
+                        right: Arc::new(reduced),
+                        ..join.clone()
+                    }
+                };
+                return Ok(Transformed::yes(LogicalPlan::Join(rebuilt)));
+            }
+        }
+        Ok(Transformed::no(plan))
+    }
+}
+
+/// Is there an inner join anywhere beneath here for a reducer to be pushed past?
+fn contains_inner_join(plan: &LogicalPlan) -> bool {
+    if matches!(plan, LogicalPlan::Join(j) if j.join_type == JoinType::Inner) {
+        return true;
+    }
+    plan.inputs().iter().any(|child| contains_inner_join(child))
+}
+
+/// Does this subtree already carry a reducer against exactly this probe?
+///
+/// Structural, and searching the *whole* subtree, because
+/// [`SemiJoinPushdownThroughInnerJoin`] relocates the reducer on later passes:
+/// a check that only looked at the top node would see an inner join again and
+/// add another reducer every pass, without ever converging.
+fn carries_reducer(plan: &LogicalPlan, probe: &LogicalPlan) -> bool {
+    if let LogicalPlan::Join(join) = plan
+        && join.join_type == JoinType::LeftSemi
+        && join.right.as_ref() == probe
+    {
+        return true;
+    }
+    plan.inputs()
+        .iter()
+        .any(|child| carries_reducer(child, probe))
 }
 
 /// Push a semi-join built from an inner join's other side into the input of a
@@ -970,6 +1174,110 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    /// As [`context`], plus the selective-dimension rule (the q7 rule).
+    ///
+    /// The pushdown rule comes with it deliberately: this rule only *introduces*
+    /// the reducer, and the pushdown rule is what carries it down onto the
+    /// dimension-keyed scan. Testing them apart would test half a mechanism.
+    fn dimension_context(with_rule: bool) -> SessionContext {
+        let mut builder = SessionStateBuilder::new().with_default_features();
+        if with_rule {
+            builder = builder
+                .with_optimizer_rule(Arc::new(SemiJoinPushdownThroughInnerJoin::forced()))
+                .with_optimizer_rule(Arc::new(SemiJoinReductionFromSelectiveDimension::forced()));
+        }
+        let ctx = SessionContext::new_with_state(builder.build());
+        ctx.register_table("lineitem", line_table()).unwrap();
+        ctx.register_table("supplier", supplier_table()).unwrap();
+        ctx.register_table("nation", nation_table()).unwrap();
+        ctx
+    }
+
+    /// The q7 shape: a fact stream joined to a *filtered* dimension, where the
+    /// dimension's key enters at the deepest join and the filter is applied at
+    /// the top.
+    const Q7_SHAPE: &str = "SELECT n.n_name, sum(l.l_quantity) AS q \
+        FROM supplier s, lineitem l, nation n \
+        WHERE s.s_suppkey = l.l_suppkey AND s.s_nationkey = n.n_nationkey \
+          AND n.n_name = 'SAUDI ARABIA' \
+        GROUP BY n.n_name";
+
+    /// The reducer must land on the `supplier` scan, not merely exist.
+    ///
+    /// Inserting a `LeftSemi` somewhere in the plan is not the win; q7's cost is
+    /// that all 1M suppliers reach the `lineitem` join, so the reducer has to
+    /// end up *below* that join. Asserting only "a LeftSemi appears" would pass
+    /// on a plan that still broadcasts every supplier.
+    #[tokio::test]
+    async fn the_reducer_lands_on_the_dimension_keyed_scan() {
+        let plan = plan_of(&dimension_context(true), Q7_SHAPE).await;
+        let semi = plan
+            .lines()
+            .position(|l| l.contains("LeftSemi"))
+            .unwrap_or_else(|| panic!("no reducer was introduced:\n{plan}"));
+        let supplier = plan
+            .lines()
+            .position(|l| l.contains("TableScan: supplier"))
+            .unwrap_or_else(|| panic!("no supplier scan:\n{plan}"));
+        let lineitem = plan
+            .lines()
+            .position(|l| l.contains("TableScan: lineitem"))
+            .unwrap_or_else(|| panic!("no lineitem scan:\n{plan}"));
+        // `display_indent` is pre-order, so a node's subtree is the contiguous
+        // block after it. The reducer is on the supplier side exactly when the
+        // supplier scan falls inside it and the lineitem scan does not.
+        assert!(
+            semi < supplier,
+            "the reducer must sit above the supplier scan, not below it:\n{plan}"
+        );
+        assert!(
+            semi > lineitem || supplier < lineitem,
+            "the reducer swallowed the lineitem scan, so it did not land on \
+             supplier alone:\n{plan}"
+        );
+    }
+
+    /// Reducing must not change the answer, and the fixture must have an answer
+    /// to change: `nation` here is 2 rows of which the filter keeps 1, so the
+    /// suppliers that survive are a strict subset.
+    #[tokio::test]
+    async fn reducing_by_the_dimension_keeps_the_same_rows() {
+        let expected = rows(&dimension_context(false), Q7_SHAPE).await;
+        assert!(!expected.is_empty(), "fixture must produce rows");
+        assert_eq!(rows(&dimension_context(true), Q7_SHAPE).await, expected);
+    }
+
+    /// An unfiltered dimension is left alone: the reducer would remove nothing
+    /// and cost an extra pass over the dimension.
+    #[tokio::test]
+    async fn an_unfiltered_dimension_does_not_get_a_reducer() {
+        let sql = "SELECT n.n_name, sum(l.l_quantity) AS q \
+            FROM supplier s, lineitem l, nation n \
+            WHERE s.s_suppkey = l.l_suppkey AND s.s_nationkey = n.n_nationkey \
+            GROUP BY n.n_name";
+        let plan = plan_of(&dimension_context(true), sql).await;
+        assert!(
+            !plan.contains("LeftSemi"),
+            "no filter on the dimension means nothing to reduce by:\n{plan}"
+        );
+    }
+
+    /// The rule must converge.
+    ///
+    /// The pushdown rule relocates the reducer, so after one pass the fact
+    /// side's top node is an inner join again. A shallow "already reduced"
+    /// check would then add another reducer every pass. One is the right
+    /// number.
+    #[tokio::test]
+    async fn the_reducer_is_introduced_exactly_once() {
+        let plan = plan_of(&dimension_context(true), Q7_SHAPE).await;
+        assert_eq!(
+            plan.matches("LeftSemi").count(),
+            1,
+            "the rule stacked reducers instead of converging:\n{plan}"
+        );
     }
 
     async fn plan_of(ctx: &SessionContext, sql: &str) -> String {
