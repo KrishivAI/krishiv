@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use krishiv_proto::{
     AttemptId, ConnectorCapabilityFlags, ExecutorDescriptor, ExecutorId, JobId, JobKind, JobSpec,
-    JobState, StageId, StageSpec, StageState, TaskId, TaskOutputMetadata, TaskSpec, TaskState,
+    JobState, ShufflePartitionOutput, ShuffleWriteConfig, StageId, StageSpec, StageState, TaskId,
+    TaskOutputMetadata, TaskSpec, TaskState,
 };
 use serde::{Deserialize, Serialize};
 
@@ -861,6 +862,25 @@ pub(crate) struct PersistedTaskSpec {
     /// Absent in records written before this field was added.
     #[serde(default)]
     pub(crate) sink_contract: Option<String>,
+    /// Shuffle-write identity of a map task. Without it, a promoted
+    /// coordinator cannot tell which restored task produced a stage's
+    /// shuffle output: both guards in `missing_report_addresses_task` and
+    /// the producer scan in `shuffle_location_inputs` read
+    /// `spec.shuffle_write()`, so reduce tasks of an in-flight job died
+    /// `KRV_SHUFFLE_MISSING` after every failover (phase58 gate,
+    /// 2026-08-08). Absent in records written before this field was added.
+    #[serde(default)]
+    pub(crate) shuffle_write: Option<PersistedShuffleWrite>,
+}
+
+/// `ShuffleWriteConfig`, persisted. `stage_id` is the stage key the
+/// consumers' missing-shuffle reports name.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct PersistedShuffleWrite {
+    pub(crate) stage_id: String,
+    pub(crate) num_partitions: usize,
+    pub(crate) key_columns: Vec<String>,
+    pub(crate) lease_token: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -878,6 +898,25 @@ pub(crate) struct PersistedTaskOutputMetadata {
     pub(crate) row_count: u64,
     pub(crate) batch_count: u64,
     pub(crate) column_count: u64,
+    /// Where each shuffle partition this task produced is served from.
+    /// The data plane survives a coordinator kill (executors keep serving);
+    /// this is the only durable copy of WHERE, and until it existed the
+    /// promoted coordinator attached no locations to reduce tasks and
+    /// `audit_shuffle_availability` was dead on the failover path. Absent
+    /// in records written before this field was added.
+    #[serde(default)]
+    pub(crate) shuffle_partitions: Vec<PersistedShuffleOutputPartition>,
+}
+
+/// `ShufflePartitionOutput`, persisted with exactly the fields location
+/// attachment needs. An empty `flight_endpoint` means in-process
+/// (single-node mode) — preserved as-is; recovery treats it the same way
+/// the live path does.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct PersistedShuffleOutputPartition {
+    pub(crate) partition_id: u32,
+    pub(crate) size_bytes: u64,
+    pub(crate) flight_endpoint: String,
 }
 
 impl From<&JobRecord> for PersistedJobRecord {
@@ -1128,6 +1167,12 @@ impl From<&TaskSpec> for PersistedTaskSpec {
                 .as_ref()
                 .map(PersistedConnectorCapabilities::from),
             sink_contract: value.sink_contract().map(str::to_owned),
+            shuffle_write: value.shuffle_write().map(|sw| PersistedShuffleWrite {
+                stage_id: sw.stage_id.to_string(),
+                num_partitions: sw.num_partitions,
+                key_columns: sw.key_columns.clone(),
+                lease_token: sw.lease_token,
+            }),
         }
     }
 }
@@ -1151,6 +1196,14 @@ impl TryFrom<PersistedTaskSpec> for TaskSpec {
         }
         if let Some(contract) = value.sink_contract {
             spec = spec.with_sink_contract(contract);
+        }
+        if let Some(sw) = value.shuffle_write {
+            spec = spec.with_shuffle_write(ShuffleWriteConfig {
+                stage_id: StageId::try_new(sw.stage_id).map_err(invalid_metadata_id)?,
+                num_partitions: sw.num_partitions,
+                key_columns: sw.key_columns,
+                lease_token: sw.lease_token,
+            });
         }
         Ok(spec)
     }
@@ -1187,6 +1240,15 @@ impl From<&TaskOutputMetadata> for PersistedTaskOutputMetadata {
             row_count: value.row_count(),
             batch_count: value.batch_count(),
             column_count: value.column_count(),
+            shuffle_partitions: value
+                .shuffle_partitions()
+                .iter()
+                .map(|p| PersistedShuffleOutputPartition {
+                    partition_id: p.partition_id,
+                    size_bytes: p.size_bytes,
+                    flight_endpoint: p.flight_endpoint.clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -1198,6 +1260,15 @@ impl From<PersistedTaskOutputMetadata> for TaskOutputMetadata {
             value.row_count,
             value.batch_count,
             value.column_count,
+        )
+        .with_shuffle_partitions(
+            value
+                .shuffle_partitions
+                .into_iter()
+                .map(|p| {
+                    ShufflePartitionOutput::new(p.partition_id, p.size_bytes, p.flight_endpoint)
+                })
+                .collect(),
         )
     }
 }
@@ -1939,6 +2010,75 @@ mod tests {
         assert_eq!(round.assigned_at_ms, None);
         assert_eq!(round.last_progress_ms, None);
         assert!(!round.launch_in_flight);
+    }
+
+    /// The shuffle identity and map-output locations must survive the
+    /// persist/restore cycle: they are what a PROMOTED coordinator has —
+    /// the executors still hold and serve the partitions, but the only
+    /// durable copy of which task produced which stage's output, and where
+    /// each partition is served from, is this record. Before these fields
+    /// existed, every in-flight batch job died `KRV_SHUFFLE_MISSING` after
+    /// a coordinator failover (phase58 gate, 2026-08-08): reduce specs got
+    /// no locations attached and `missing_report_addresses_task` could not
+    /// name the producer, so regeneration diagnosed `NoneAffected`.
+    #[test]
+    fn task_record_round_trips_shuffle_write_identity_and_output_locations() {
+        let spec = TaskSpec::new(TaskId::try_new("map-1").expect("task id"), "map stage 0")
+            .with_shuffle_write(ShuffleWriteConfig {
+                stage_id: StageId::try_new("s0.m0").expect("stage id"),
+                num_partitions: 4,
+                key_columns: vec!["region".to_owned()],
+                lease_token: 42,
+            });
+        let mut task = TaskRecord::from_spec(spec);
+        task.state = TaskState::Succeeded;
+        task.output_metadata = Some(
+            TaskOutputMetadata::new("shuffle", 100, 2, 3).with_shuffle_partitions(vec![
+                ShufflePartitionOutput::new(0, 1_024, "http://10.244.1.7:2004"),
+                ShufflePartitionOutput::new(1, 2_048, "http://10.244.2.9:2004"),
+            ]),
+        );
+
+        let json = serde_json::to_string(&PersistedTaskRecord::from(&task)).expect("serialise");
+        let persisted: PersistedTaskRecord = serde_json::from_str(&json).expect("deserialise");
+        let round = TaskRecord::try_from(persisted).expect("convert back");
+
+        let sw = round.spec.shuffle_write().expect("shuffle_write survives");
+        assert_eq!(sw.stage_id.as_str(), "s0.m0");
+        assert_eq!(sw.num_partitions, 4);
+        assert_eq!(sw.key_columns, vec!["region".to_owned()]);
+        assert_eq!(sw.lease_token, 42);
+
+        let meta = round.output_metadata.as_ref().expect("output metadata");
+        let parts = meta.shuffle_partitions();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].partition_id, 0);
+        assert_eq!(parts[0].flight_endpoint, "http://10.244.1.7:2004");
+        assert_eq!(parts[1].size_bytes, 2_048);
+    }
+
+    /// A record written before the shuffle fields existed still loads, with
+    /// the new fields empty — the partial-load rule, not a hard error.
+    #[test]
+    fn persisted_task_record_loads_a_payload_without_shuffle_fields() {
+        let legacy = r#"{
+            "spec": {"task_id": "t-1", "description": "d",
+                     "task_timeout_secs": null,
+                     "source_capabilities": null, "sink_capabilities": null},
+            "state": "succeeded",
+            "assigned_executor": null,
+            "attempt": 1,
+            "output_metadata": {"output_kind": "rows", "row_count": 1,
+                                 "batch_count": 1, "column_count": 1},
+            "last_failure_reason": null,
+            "failure_count": 0,
+            "executor_loss_count": 0
+        }"#;
+        let persisted: PersistedTaskRecord = serde_json::from_str(legacy).expect("deserialise");
+        let round = TaskRecord::try_from(persisted).expect("convert back");
+        assert!(round.spec.shuffle_write().is_none());
+        let meta = round.output_metadata.as_ref().expect("output metadata");
+        assert!(meta.shuffle_partitions().is_empty());
     }
 
     /// A record written before the SC3 tick fields were removed still loads:

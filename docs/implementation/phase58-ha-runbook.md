@@ -96,3 +96,56 @@ reseeded, image built from `--features prod`).
   passed this cell; the regression window is the three weeks of scheduler /
   shuffle / runtime-filter work since — the gate simply did not run across
   it. Bisect before fixing forward.
+
+### Correction, same day: NOT a regression — the 2026-07-20 pass was false
+
+Code archaeology (full `-S` history over `store.rs`): shuffle map-output
+locations have NEVER been part of the etcd-persisted job state.
+`PersistedShufflePartition` is `{stage_id, partition_id}` only;
+`PersistedTaskOutputMetadata` drops `shuffle_partitions` (and their
+`flight_endpoint`s) on the floor (`store.rs:876-882`, `:1183-1192`), and
+`PersistedTaskSpec` does not carry `shuffle_write` (`store.rs:854-865`).
+After promotion, both guards in `missing_report_addresses_task`
+(`job/record.rs:218-233`) read exactly those absent fields, so the
+regenerate-producer path — which exists and works for executor-kill —
+diagnoses `NoneAffected` and does nothing.
+
+What changed in the window is DETECTION: before `74fcae1` (2026-07-27,
+"an unlocatable shuffle partition is an error, not empty"), this same
+promotion scenario read the missing partitions as EMPTY and completed
+`Succeeded` with silently short results. The gate asserts only
+`"state":"Succeeded"` — no row count, no digest — so 2026-07-20 scored
+silent data loss as a pass.
+
+Do NOT bisect (it lands on `74fcae1`, which is a fix, not a fault) and do
+not revert it. Fix options, either sufficient:
+  a) persist `(stage_key, partition, flight_endpoint, executor_id,
+     size_bytes)` in `PersistedTaskOutputMetadata` + `shuffle_write` in
+     `PersistedTaskSpec`, so recovery rebuilds the location registry; or
+  b) have executors re-advertise their held shuffle output on
+     re-registration (`executor_ops.rs:19-88`) — the data plane still has
+     the partitions; only the coordinator's map of them died.
+Also: the gate needs a row-count/digest assertion so an empty-read bug can
+never score PASS again.
+
+### 2026-08-08 — FIXED (option a: persist the locations)
+
+`PersistedTaskOutputMetadata` now carries `shuffle_partitions`
+(partition_id, size_bytes, flight_endpoint) and `PersistedTaskSpec` carries
+`shuffle_write` (stage_id, num_partitions, key_columns, lease_token), both
+`#[serde(default)]` so pre-fix stores still load with the fields empty. The
+four store.rs conversions round-trip them; recovery reconstructs the
+location registry, so `shuffle_location_inputs` attaches locations to reduce
+specs and `missing_report_addresses_task` can name the producer again.
+Round-trip + legacy-load unit tests in store.rs; `cargo clippy
+-p krishiv-scheduler -D warnings` clean.
+
+**Verified live**: rebuilt the phase58-ha image on the fix, brought the
+control plane fully onto it, re-ran `scripts/phase58_chaos.sh` — the
+`batch × coordinator-kill` cell (iteration 3), which failed twice before,
+PASSES, along with `streaming` and `ivm × coordinator-kill` (iterations
+4–5). The whole coordinator-kill fault class recovers.
+
+Still owed (unchanged): the gate's own missing correctness assertion — it
+asserts `Succeeded`, never a row count or digest, which is exactly why the
+pre-`74fcae1` empty-read scored PASS. Add one before trusting a green run.
