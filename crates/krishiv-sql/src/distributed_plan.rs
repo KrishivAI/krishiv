@@ -2301,6 +2301,12 @@ pub fn build_distributed_stages_with_udf_directives(
     plan: Arc<dyn ExecutionPlan>,
     udf_directive_source: &str,
 ) -> SqlResult<Option<DistributedStagePlan>> {
+    // First: reduce a fact stream by a dimension the planner has already decided
+    // to broadcast, before that stream is carried through the big joins. Runs
+    // ahead of the redistribution below so the rows it removes are removed
+    // before any decision is made about how to distribute what remains.
+    let plan = reduce_by_broadcast_dimension(plan)?;
+
     // Before cutting: a broadcast join whose unmatched build rows are emitted
     // only after the last probe partition cannot be split one-partition-per-task
     // without silently dropping those rows. Convert such joins to
@@ -2961,6 +2967,311 @@ fn broadcast_build_is_too_wide(join: &datafusion::physical_plan::joins::HashJoin
         return false;
     };
     implied > broadcast_byte_ceiling()
+}
+
+/// Environment switch for the broadcast-dimension reducer. Default **off**.
+pub const DIMENSION_REDUCTION_ENV: &str = "KRISHIV_DIMENSION_REDUCTION";
+
+/// Whether the broadcast-dimension reducer runs (default: no).
+///
+/// Opt-in, because being right about the architecture is not evidence about
+/// the behaviour. The logical version of this idea was cleared by an A/B over
+/// three queries, shipped on, and cost q10 18x.
+fn dimension_reduction_enabled() -> bool {
+    matches!(
+        std::env::var(DIMENSION_REDUCTION_ENV)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "on" | "true" | "yes"
+    )
+}
+
+/// [`reduce_by_broadcast_dimension`] with its env gate bypassed.
+///
+/// The gate cannot be flipped from a test — `set_var` is unsafe since edition
+/// 2024 and this workspace forbids it — so without this the rule's own tests
+/// would assert nothing at all now that the default is off. That is precisely
+/// the failure mode this codebase keeps finding in its own suite.
+#[cfg(test)]
+fn reduce_by_broadcast_dimension_for_test(
+    plan: Arc<dyn ExecutionPlan>,
+) -> SqlResult<Arc<dyn ExecutionPlan>> {
+    reduce_by_broadcast_dimension_inner(plan)
+}
+
+/// Reduce a fact stream by a dimension the planner already chose to broadcast.
+///
+/// # The query
+///
+/// TPC-H q7's FROM clause ends `… nation n1, nation n2`, so a left-deep plan
+/// puts both 25-row dimensions above every big join. `s_nationkey` is carried
+/// as payload from the bottom join upward through two shuffles measured at
+/// **9.48 GB each**, and only then is `n_name IN (FRANCE, GERMANY)` applied.
+/// TPC-H spreads supplier nations uniformly over 25, so ~8% of suppliers can
+/// survive: the bottom join emits about twelve times more rows than are
+/// reachable. Those two shuffles and the stage consuming them were measured at
+/// **81% of q7**.
+///
+/// Reducing `supplier` by the filtered `nation` before it is broadcast into
+/// `lineitem` took q7 from 296.8 s to 118.6 s and collapsed both 9.48 GB
+/// shuffles to 760 MB.
+///
+/// # Why this is a PHYSICAL rule, which is the whole point
+///
+/// This shipped first as a logical rule (`semi_join_reduction`), where the only
+/// available test for "is this a dimension" was "does that side carry a
+/// `Filter`". That is true of `nation` filtered to 2 rows and equally true of
+/// `orders` filtered to a three-month window (~11M rows) and `lineitem`
+/// filtered by `l_returnflag` (~150M) — so on q10 it attached a whole extra
+/// join and cost **18.1x**. It was defaulted off in `72d0dad0`.
+///
+/// The missing discriminator is size, and it is **not obtainable at the logical
+/// level**: `TableProvider::statistics()` defaults to `None` and `ListingTable`
+/// does not override it, so for the parquet tables this engine actually reads,
+/// a logical rule cannot tell 25 rows from 150 million.
+///
+/// Here it can. `partition_statistics()` is populated — it is what
+/// [`broadcast_build_estimate_is_empty`] and [`broadcast_build_is_too_wide`]
+/// already read — and better still, **the planner has already made the
+/// judgement for us**: a `CollectLeft` join whose build side is provably small
+/// is the definition of a dimension it is willing to broadcast. q7's nation
+/// joins are `CollectLeft` with `build: rows=~5`; nothing in q10 that the
+/// logical rule mistook for a dimension is.
+///
+/// # Why it is safe
+///
+/// - **Inner only.** An outer join preserves unmatched rows, so removing them
+///   early changes the result.
+/// - **Removes exactly what the join above removes.** A fact row whose key has
+///   no match in the dimension cannot survive `Inner(dim, fact)`. `RightSemi`
+///   removes precisely those and no others.
+/// - **No duplication.** A semi join emits each surviving row once however many
+///   dimension rows match, so counts and sums above are unchanged.
+/// - **The schema is untouched.** `RightSemi` projects only its right side, so
+///   the node it replaces keeps its exact schema and every parent's positional
+///   column references stay valid.
+///
+/// # The guard that makes column matching sound
+///
+/// Physical columns are positional, and following one down through joins and
+/// projections means remapping indices at every level — the kind of arithmetic
+/// that pairs the wrong two columns and returns wrong rows silently.
+///
+/// So this does not track indices. It requires the key's name to occur in
+/// **exactly one** leaf scan of the fact subtree, which makes the match
+/// unambiguous by construction, and resolves the column against the target's
+/// own schema with `Column::new_with_schema`. A self-join — q21 reads
+/// `l_suppkey` from three separate `lineitem` scans — fails that test and is
+/// declined rather than guessed at.
+fn reduce_by_broadcast_dimension(
+    plan: Arc<dyn ExecutionPlan>,
+) -> SqlResult<Arc<dyn ExecutionPlan>> {
+    // OFF by default until it has a measured cluster A/B of its own. The
+    // logical version of this idea was cleared by an A/B over three queries,
+    // shipped on, and cost q10 **18x** — caught only by the full 22-query
+    // sweep. Being right about the architecture is not evidence about the
+    // behaviour, and this rewrite has not been measured at SF100 yet.
+    if !dimension_reduction_enabled() {
+        return Ok(plan);
+    }
+    reduce_by_broadcast_dimension_inner(plan)
+}
+
+/// The rewrite itself, past the gate — see `reduce_by_broadcast_dimension`.
+fn reduce_by_broadcast_dimension_inner(
+    plan: Arc<dyn ExecutionPlan>,
+) -> SqlResult<Arc<dyn ExecutionPlan>> {
+    use datafusion::logical_expr::JoinType;
+    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+
+    // Bottom-up, so a rewritten child is what the parent above sees.
+    let children = plan.children();
+    let plan = if children.is_empty() {
+        plan
+    } else {
+        let mut rebuilt = Vec::with_capacity(children.len());
+        let mut changed = false;
+        for child in children {
+            let new_child = reduce_by_broadcast_dimension_inner(Arc::clone(child))?;
+            changed = changed || !Arc::ptr_eq(&new_child, child);
+            rebuilt.push(new_child);
+        }
+        if changed {
+            plan.with_new_children(rebuilt)
+                .map_err(|e| SqlError::DataFusion {
+                    message: format!("dimension-reduction rewrite: {e}"),
+                })?
+        } else {
+            plan
+        }
+    };
+
+    let Some(join) = plan.downcast_ref::<HashJoinExec>() else {
+        return Ok(plan);
+    };
+    if *join.join_type() != JoinType::Inner
+        || *join.partition_mode() != PartitionMode::CollectLeft
+        || join.null_aware
+    {
+        return Ok(plan);
+    }
+    // The dimension is the build side, and it must be provably small — a
+    // positive estimate under the same ceiling the broadcast decision uses.
+    // `Absent` is an honest "I do not know" and declines, exactly as the
+    // sibling rules treat it.
+    if !is_broadcastable_dimension(join.left()) {
+        return Ok(plan);
+    }
+
+    let fact = join.right();
+    for (dim_key, fact_key) in join.on() {
+        let (Some(dim_col), Some(fact_col)) = (
+            (dim_key.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<datafusion::physical_plan::expressions::Column>(),
+            (fact_key.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<datafusion::physical_plan::expressions::Column>(),
+        ) else {
+            continue;
+        };
+        // Unambiguous by name across the fact subtree's leaves, or decline.
+        if leaf_scans_naming(fact, fact_col.name()) != 1 {
+            continue;
+        }
+        let Some(reduced_fact) =
+            attach_reducer(fact, fact_col.name(), join.left(), dim_col.name())?
+        else {
+            continue;
+        };
+        let rebuilt = join
+            .builder()
+            .reset_state()
+            .with_new_children(vec![Arc::clone(join.left()), reduced_fact])
+            .and_then(|b| b.recompute_properties().build_exec())
+            .map_err(|e| SqlError::DataFusion {
+                message: format!("dimension-reduction rebuild: {e}"),
+            })?;
+        tracing::debug!(
+            key = fact_col.name(),
+            "reduced a fact stream by a broadcast dimension before its joins"
+        );
+        return Ok(rebuilt);
+    }
+    Ok(plan)
+}
+
+/// Is this a relation small enough that the planner would broadcast it?
+///
+/// A positive estimate under [`broadcast_byte_ceiling`]. A degenerate zero is
+/// refused for the same reason [`broadcast_build_estimate_is_empty`] refuses
+/// it: zero is the estimator giving up, and reducing by a relation we believe
+/// is empty would be reducing by nothing.
+fn is_broadcastable_dimension(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    use datafusion::common::stats::Precision;
+
+    let estimate = crate::join_estimates::BuildSideEstimate::of(plan);
+    if estimate.is_wholly_degenerate() {
+        return false;
+    }
+    let Ok(stats) = plan.partition_statistics(None) else {
+        return false;
+    };
+    let bytes = match stats.total_byte_size {
+        Precision::Exact(b) | Precision::Inexact(b) => Some(b),
+        Precision::Absent => estimate.bytes_implied_by_rows(&plan.schema()),
+    };
+    matches!(bytes, Some(b) if b > 0 && b <= broadcast_byte_ceiling())
+}
+
+/// How many leaf scans beneath `plan` have a field of this name?
+///
+/// The soundness test for matching the key by name — see the guard note on
+/// [`reduce_by_broadcast_dimension`]. More than one means the name is
+/// ambiguous (a self-join) and the rewrite is refused.
+fn leaf_scans_naming(plan: &Arc<dyn ExecutionPlan>, name: &str) -> usize {
+    if plan.children().is_empty() {
+        return usize::from(plan.schema().index_of(name).is_ok());
+    }
+    plan.children()
+        .iter()
+        .map(|child| leaf_scans_naming(child, name))
+        .sum()
+}
+
+/// Attach a `RightSemi` reducer at the deepest node that still carries `name`.
+///
+/// `RightSemi` with the dimension on the left and `CollectLeft` mode is the
+/// shape the physical planner itself produces for this: it buffers the tiny
+/// dimension and probes with the fact side, and its output schema is the
+/// right side's — so the node being replaced keeps its exact schema.
+fn attach_reducer(
+    plan: &Arc<dyn ExecutionPlan>,
+    name: &str,
+    dimension: &Arc<dyn ExecutionPlan>,
+    dimension_key: &str,
+) -> SqlResult<Option<Arc<dyn ExecutionPlan>>> {
+    use datafusion::logical_expr::JoinType;
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_plan::expressions::Column;
+    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+
+    // Already reduced by this dimension: the rewrite is idempotent by refusing
+    // to stack, not by hoping the traversal only runs once.
+    if let Some(existing) = plan.downcast_ref::<HashJoinExec>()
+        && *existing.join_type() == JoinType::RightSemi
+    {
+        return Ok(None);
+    }
+
+    // Deepest first: reducing as early as possible is the entire point, so
+    // recurse before considering this node.
+    for (at, child) in plan.children().iter().enumerate() {
+        if child.schema().index_of(name).is_err() {
+            continue;
+        }
+        if let Some(new_child) = attach_reducer(child, name, dimension, dimension_key)? {
+            let mut children: Vec<Arc<dyn ExecutionPlan>> =
+                plan.children().into_iter().map(Arc::clone).collect();
+            let Some(slot) = children.get_mut(at) else {
+                return Ok(None);
+            };
+            *slot = new_child;
+            return Arc::clone(plan)
+                .with_new_children(children)
+                .map(Some)
+                .map_err(|e| SqlError::DataFusion {
+                    message: format!("dimension-reduction splice: {e}"),
+                });
+        }
+    }
+
+    // No child could take it; land it here if this node actually has the column.
+    let Ok(fact_index) = plan.schema().index_of(name) else {
+        return Ok(None);
+    };
+    let Ok(dim_index) = dimension.schema().index_of(dimension_key) else {
+        return Ok(None);
+    };
+    let on = vec![(
+        Arc::new(Column::new(dimension_key, dim_index)) as Arc<dyn PhysicalExpr>,
+        Arc::new(Column::new(name, fact_index)) as Arc<dyn PhysicalExpr>,
+    )];
+    let reducer = HashJoinExec::try_new(
+        Arc::clone(dimension),
+        Arc::clone(plan),
+        on,
+        None,
+        &JoinType::RightSemi,
+        None,
+        PartitionMode::CollectLeft,
+        datafusion::common::NullEquality::NullEqualsNothing,
+        false,
+    )
+    .map_err(|e| SqlError::DataFusion {
+        message: format!("dimension reducer: {e}"),
+    })?;
+    Ok(Some(Arc::new(reducer)))
 }
 
 /// Convert broadcast joins that cannot be split — or that were chosen on an
@@ -6357,6 +6668,125 @@ mod staged_tpch_tests {
             converted.schema(),
             join.schema(),
             "conversion must preserve the join's output schema"
+        );
+    }
+
+    /// The q7 shape: the reducer must land on the scan that owns the key.
+    ///
+    /// Calls the rewrite directly rather than going through `stage_dump`,
+    /// which prints the plan *before* staging and initialises no tracing
+    /// subscriber — so neither its output nor its logs can show whether this
+    /// fired. Reading "0 occurrences" off a binary that cannot print them is
+    /// how this rule was almost declared inert.
+    #[tokio::test]
+    async fn the_reducer_lands_on_the_scan_that_owns_the_key() {
+        use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = q22_context(tmp.path()).await;
+        let plan = |sql: String| {
+            let ctx = ctx.clone();
+            async move {
+                ctx.sql(&sql)
+                    .await
+                    .expect("sql")
+                    .create_physical_plan()
+                    .await
+                    .expect("plan")
+            }
+        };
+        // `customer` carries the key (`c_phone`); `orders` is the rest of the
+        // fact stream. The q7 shape: the key enters at the deepest join and the
+        // dimension that filters it sits at the top.
+        let customer = plan(String::from("SELECT c_custkey, c_phone FROM customer")).await;
+        let orders = plan(String::from("SELECT o_custkey FROM orders")).await;
+        let on_fact = vec![(
+            datafusion::physical_plan::expressions::col("c_custkey", &customer.schema())
+                .expect("c_custkey"),
+            datafusion::physical_plan::expressions::col("o_custkey", &orders.schema())
+                .expect("o_custkey"),
+        )];
+        let fact: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                Arc::new(CoalescePartitionsExec::new(customer)),
+                orders,
+                on_fact,
+                None,
+                &datafusion::logical_expr::JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                datafusion::common::NullEquality::NullEqualsNothing,
+                false,
+            )
+            .expect("fact join"),
+        );
+
+        // A small, filtered dimension keyed on the column `customer` supplies.
+        let dimension = plan(String::from(
+            "SELECT c_phone FROM customer WHERE c_custkey = 1",
+        ))
+        .await;
+        let on_top = vec![(
+            datafusion::physical_plan::expressions::col("c_phone", &dimension.schema())
+                .expect("dim key"),
+            datafusion::physical_plan::expressions::col("c_phone", &fact.schema())
+                .expect("fact key"),
+        )];
+        let top: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                Arc::clone(&dimension),
+                Arc::clone(&fact),
+                on_top,
+                None,
+                &datafusion::logical_expr::JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                datafusion::common::NullEquality::NullEqualsNothing,
+                false,
+            )
+            .expect("top join"),
+        );
+
+        let before = datafusion::physical_plan::displayable(top.as_ref())
+            .indent(true)
+            .to_string();
+        assert_eq!(
+            before.matches("RightSemi").count(),
+            0,
+            "precondition: nothing reduced yet"
+        );
+
+        // The rule is opt-in, so drive the rewrite directly — the env cannot be
+        // set from a test under `forbid(unsafe_code)`.
+        let after_plan = reduce_by_broadcast_dimension_for_test(Arc::clone(&top))
+            .expect("rewrite must not fail");
+        let after = datafusion::physical_plan::displayable(after_plan.as_ref())
+            .indent(true)
+            .to_string();
+
+        assert_eq!(
+            after.matches("RightSemi").count(),
+            1,
+            "exactly one reducer, attached once:\n{after}"
+        );
+        // It has to sit BELOW the fact join, not above it — a reducer that
+        // lands at the top removes the same rows far too late to matter.
+        let semi = after
+            .lines()
+            .position(|l| l.contains("RightSemi"))
+            .expect("reducer");
+        let fact_join = after
+            .lines()
+            .position(|l| l.contains("on=[(c_custkey"))
+            .expect("fact join");
+        assert!(
+            semi > fact_join,
+            "the reducer must be below the fact join, not above it:\n{after}"
+        );
+        assert_eq!(
+            after_plan.schema(),
+            top.schema(),
+            "the rewrite must preserve the plan's schema exactly"
         );
     }
 
