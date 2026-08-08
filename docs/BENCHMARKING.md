@@ -493,3 +493,45 @@ the previous one:
 The first is the one worth remembering: **a distributed engine silently
 degrading to single-node execution, with correct output and a debug-level log
 line as the only evidence.** A benchmark is what caught it.
+
+### 2026-08-08 — #179 residual: crossover pinned to (5M, 7.5M] (provisional)
+
+- **Why**: the 2026-07-21 entry left the IVM-vs-full-recompute crossover
+  "somewhere in (1M, 10M]" and asked for intermediate samples. This run adds
+  them: 1M / 2M / 3.5M / 5M / 7.5M / 10M, via the new
+  `KRISHIV_BENCH_IVM_ROWS` override on `ivm_vs_full_recompute` (comma list,
+  committed with this entry).
+- **Method caveat, stated up front**: same shared box as always, and this
+  run had *substantial* concurrent load (a k8s chaos topology, an e2e
+  harness, and a cargo build ran alongside). The 2026-07-21 entry measured a
+  ~1.7× back-to-back spread on this box when otherwise idle; treat these
+  numbers as ordering evidence, not magnitudes.
+
+| Accumulated rows | IVM tick (median ms) | full recompute (median ms) | winner |
+|---:|---:|---:|---|
+| 1 M   | 8.4  | 5.5  | full |
+| 2 M   | 16.8 | 8.6  | full |
+| 3.5 M | 16.8 | 12.7 | full |
+| 5 M   | 48.9 | 21.6 | full |
+| 7.5 M | 20.1 | 42.0 | IVM  |
+| 10 M  | 63.2 | 40.0 | full (inversion — see below) |
+
+Findings:
+
+1. **The crossover sits in (5M, 7.5M] on this run** — full recompute wins
+   every sampled point through 5M, IVM wins at 7.5M. This sharpens
+   2026-07-21's "(1M, 10M]" but is provisional until a quiet-box rerun:
+   two points are visibly load-corrupted (IVM@5M > IVM@7.5M is
+   non-monotonic; full@10M < full@7.5M likewise), and the 10M row
+   contradicts both July runs (which had IVM winning 64.6 vs 93.7). The
+   ordering at 1M–5M vs 7.5M held consistently, the corrupted points bound
+   it from both sides.
+2. **Phase 57's exit number (crossover ≤ 1M rows) remains unmet** — full
+   recompute at 1M is ~1.5× faster than the IVM tick here, same direction
+   as both July runs. `full_recompute` keeps getting faster
+   (11.9 ms → 5.5 ms at 1M since 2026-07-21), consistent with the July
+   hypothesis that #194's batch-hot-path work moved the baseline rather
+   than IVM regressing. Whether #194 touched this exact path is still
+   unverified — that inspection stays open on #179.
+3. Next step for a non-provisional pin: rerun
+   `KRISHIV_BENCH_IVM_ROWS=5000000,6000000,7000000,7500000` on an idle box.

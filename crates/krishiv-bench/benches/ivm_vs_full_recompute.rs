@@ -67,7 +67,20 @@ const BATCH_SIZE: i64 = 5_000;
 const TOTAL_ROWS: &[i64] = &[50_000, 200_000, 500_000, 1_000_000, 10_000_000];
 
 /// The `TOTAL_ROWS` ladder truncated to `KRISHIV_BENCH_IVM_MAX_ROWS` (if set).
+/// `KRISHIV_BENCH_IVM_ROWS` (comma-separated row counts) replaces the ladder
+/// outright — the #179 crossover residual needs samples between 1M and 10M,
+/// and pinning a crossover means choosing points a fixed ladder doesn't have.
 fn total_rows_ladder() -> Vec<i64> {
+    if let Ok(list) = std::env::var("KRISHIV_BENCH_IVM_ROWS") {
+        let rows: Vec<i64> = list
+            .split(',')
+            .filter_map(|v| v.trim().parse::<i64>().ok())
+            .filter(|&n| n > 0)
+            .collect();
+        if !rows.is_empty() {
+            return rows;
+        }
+    }
     let cap = std::env::var("KRISHIV_BENCH_IVM_MAX_ROWS")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
