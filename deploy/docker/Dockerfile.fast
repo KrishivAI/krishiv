@@ -2,8 +2,15 @@
 # Use when the multi-stage Dockerfile.build times out on constrained VMs.
 # Binaries are staged into dist/docker/ by: just docker-fast
 #
-# Base: debian:trixie-slim — matches the builder's glibc.
-FROM debian:trixie-slim
+# The binaries are built on the HOST and only copied in, so this base must ship
+# a glibc at least as new as the build machine's — otherwise the image builds
+# clean and then dies at exec with "version `GLIBC_2.xx' not found".
+# debian:trixie-slim (2.41) matches the CI runner. A newer host overrides it:
+#   RUNTIME_BASE=ubuntu:26.04 just docker-fast   # Ubuntu 26.04 → GLIBC_2.43
+# `just docker-fast` smoke-runs the binary afterwards so a mismatch fails there
+# rather than in the cluster.
+ARG RUNTIME_BASE=debian:trixie-slim
+FROM ${RUNTIME_BASE}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \

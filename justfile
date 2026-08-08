@@ -1,9 +1,13 @@
 set shell := ["bash", "-cu"]
 set dotenv-load := true   # picks up .env for IMAGE, BOOTSTRAP, etc.
 
-# Rust toolchain (override: RUST_TOOLCHAIN=nightly just check-k8s)
-rust_toolchain := env_var_or_default("RUST_TOOLCHAIN", "stable")
-cargo := "cargo +" + rust_toolchain
+# Rust toolchain. Default empty = honour rust-toolchain.toml (1.92.0), so a
+# local `just` and CI compile with the same compiler. `+stable` used to be the
+# default, which silently overrode that pin — whatever `stable` happened to be
+# on the machine, currently 1.97.1.
+# Override for a one-off: RUST_TOOLCHAIN=nightly just check-k8s
+rust_toolchain := env_var_or_default("RUST_TOOLCHAIN", "")
+cargo := if rust_toolchain == "" { "cargo" } else { "cargo +" + rust_toolchain }
 
 # Optional build accelerators — used automatically if installed.
 #   sccache:  cargo binstall sccache   (caches across branches and CI runs)
@@ -18,6 +22,17 @@ target := env_var_or_default("TARGET", "x86_64-unknown-linux-musl")
 # Docker image coordinates
 image          := env_var_or_default("IMAGE", "localhost/krishiv:local")
 registry_image := env_var_or_default("REGISTRY_IMAGE", "ghcr.io/yourorg/krishiv:dev")
+
+# Runtime base for Dockerfile.fast. `docker-fast` copies HOST-built glibc
+# binaries in, so this base needs a glibc at least as new as this machine's.
+# trixie (2.41) matches the CI runner; a newer host needs its own, e.g.
+#   RUNTIME_BASE=ubuntu:26.04 just docker-fast    # Ubuntu 26.04 → GLIBC_2.43
+runtime_base := env_var_or_default("RUNTIME_BASE", "debian:trixie-slim")
+
+# Strip the staged binaries before imaging (STRIP=1). The debug `krishiv` is
+# ~700 MB and ~250 MB stripped, and that size is paid again by every
+# `kind load` / registry push. Costs backtrace symbols, so it stays opt-in.
+strip_binaries := env_var_or_default("STRIP", "")
 
 # Executor slots for the bare-metal cluster
 slots := env_var_or_default("SLOTS", "4")
@@ -103,9 +118,22 @@ docker-fast:
     @mkdir -p dist/docker
     cp target/debug/krishiv dist/docker/krishiv
     cp target/debug/krishiv-operator dist/docker/krishiv-operator 2>/dev/null || true
+    @if [ -n "{{ strip_binaries }}" ]; then \
+        strip dist/docker/krishiv dist/docker/krishiv-operator 2>/dev/null || true; \
+        echo "✓ stripped staged binaries (STRIP=1)"; \
+    fi
     docker buildx build --load \
         -f deploy/docker/Dockerfile.fast \
+        --build-arg RUNTIME_BASE={{ runtime_base }} \
         -t {{ image }} .
+    @# These binaries were linked against the HOST's glibc. A base with an older
+    @# one still builds a perfectly good-looking image that then dies at exec
+    @# with "version GLIBC_2.xx not found" — in the cluster, not here. Same
+    @# smoke check `docker-local` runs, for the same reason.
+    @docker run --rm --entrypoint /usr/local/bin/krishiv {{ image }} capabilities >/dev/null \
+        || { echo "✗ {{ image }} cannot run its own binary on {{ runtime_base }}."; \
+             echo "  Set a base matching this host's glibc, e.g.:"; \
+             echo "      RUNTIME_BASE=ubuntu:26.04 just docker-fast"; exit 1; }
     @echo "✓ loaded {{ image }} into local docker (use k3s ctr images import for k3s)"
 
 # Prod fast image: release binary in an isolated target dir, verified before
@@ -278,9 +306,9 @@ coverage:
 
 # ── Quality ───────────────────────────────────────────────────────────────────
 
-# Check code formatting (run `cargo fmt` to fix)
+# Check code formatting (run `cargo fmt --all` to fix)
 fmt:
-    {{ cargo }} fmt --check
+    {{ cargo }} fmt --all --check
 
 # Run clippy across the workspace
 #

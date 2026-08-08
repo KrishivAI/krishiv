@@ -7,6 +7,10 @@ scripts/
 deploy/
 examples/
 dist/
+# ...except the staged binaries Dockerfile.fast COPYs. `just docker-fast` and
+# `just stage` both write here; without this negation both COPY lines miss the
+# build context and the image fails on "dist/docker/krishiv: not found".
+!dist/docker/
 .bench-baselines/
 venv/
 tpch*
