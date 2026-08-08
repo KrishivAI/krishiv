@@ -149,3 +149,23 @@ PASSES, along with `streaming` and `ivm × coordinator-kill` (iterations
 Still owed (unchanged): the gate's own missing correctness assertion — it
 asserts `Succeeded`, never a row count or digest, which is exactly why the
 pre-`74fcae1` empty-read scored PASS. Add one before trusting a green run.
+
+### 2026-08-08 — separately surfaced: streaming × shuffle-kill is FLAKY
+
+The post-fix full 2×25 ran 44 consecutive PASS (all of run 1, 19 of run 2)
+— every coordinator-kill cell green, confirming the shuffle-location fix —
+then failed at run 2 iteration 19 on `streaming × shuffle-kill`:
+`do_action ... unknown job: phase58-...-streaming`. This cell PASSED three
+other times the same run (run1 i7, run1 i19, run2 i7), so it is
+**intermittent, not deterministic** — a distinct pre-existing streaming
+recovery bug, NOT the shuffle-location regression (which never flaked).
+
+Signature: after a shuffle-write executor is killed, the continuous job's
+registration intermittently vanishes from the coordinator (`unknown job`),
+where a batch job in the same slot recovers. Likely the run-loop
+peer-table refresh residual already filed on Phase 55
+(`parse_stream_peers` is start-of-task only) surfacing as lost
+registration under executor loss. Needs its own investigation; it blocks
+the *twice-consecutive* 2×25 that Phase 58's exit gate wants, but does not
+reopen the coordinator-kill fix. Filed here so the next chaos run does not
+mistake it for a durability regression.
