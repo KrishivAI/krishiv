@@ -82,12 +82,27 @@ nothing to do with performance. Those stay manual (`just bench-tpch`,
 When comparing Krishiv with Spark, Flink, or another engine, publish all engine
 versions, equivalent semantics, configuration files, queries, raw output, and
 reproduction commands. Clearly separate batch latency, streaming throughput,
-checkpoint cost, recovery time, and resource consumption. No such comparison
-exists yet — `crates/krishiv-bench/src/comparison.rs` models cross-engine
-runs but nothing populates it with real Spark/DuckDB/Sail numbers measured
-on identical hardware and data; every existing "vs Spark" reference in this
-repo's docs cites the other project's own published numbers, not something
-Krishiv ran. Recorded as a Phase 66 residual, not attempted this pass.
+checkpoint cost, recovery time, and resource consumption.
+
+**Status 2026-08-08**: real same-hardware comparisons now exist (they were run
+2026-07-26 and 2026-08-04 but this section kept claiming they didn't — that
+stale claim cost nothing except making the numbers below invisible). Raw
+per-query output lives in `benchmarks/`:
+
+| Setup (TPC-H SF100, 22 queries) | Krishiv | DuckDB | Spark 3.5.3 |
+|---|---:|---:|---:|
+| Single box, 8 cores (2026-07-26, `tpch-sf100-engine-comparison.json`) | 855.5 s (22/22) | **552.9 s** (22/22) | 1221.0 s (9/22 — not comparable) |
+| 3-node k3s cluster (2026-08-04, `tpch-sf100-ab-B-4c122b5f.json` vs `tpch-sf100-spark-2026-08-04.json`) | **4274.8 s** (22/22) | — | 5053.9 s (22/22) |
+
+Read it honestly: on the cluster Krishiv is **1.18×** faster than Spark
+(commit `9dbfff0` — the previously-quoted 1.29× rested on a stale Krishiv
+number and was corrected the day both sides were re-run together). On a
+single box DuckDB is ~1.5× faster than Krishiv; that gap is real and is
+what Phase 65/66's kernel work is aimed at. The single-box Spark column is
+not a comparison — 13 of 22 queries failed in that harness configuration
+and no effort was spent tuning it. Still missing (Phase 66 residuals):
+DataFusion-CLI and Sail baselines, ClickBench, and per-engine config files
+published alongside the raw JSON.
 
 ## Recorded baselines
 
