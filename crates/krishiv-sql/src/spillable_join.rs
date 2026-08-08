@@ -1073,9 +1073,35 @@ impl SpillableJoinSelection {
         //   sort-merge — sort *both* sides in full, always. Correct, spillable,
         //     and the reason q2 went from 208 s to 1317 s.
         //
-        // Grace is strictly the better trade when it applies, so it is tried
-        // first; sort-merge remains the fallback for the shapes it refuses.
-        // Off by default — see `grace_hash_join::enabled`.
+        // Grace is tried first; sort-merge remains the fallback for the shapes
+        // it refuses. Off by default — see `grace_hash_join::enabled`.
+        //
+        // # "Grace is strictly the better trade" — measured, and it is not
+        //
+        // That claim stood here unmeasured for weeks. TPC-H q21 at SF100,
+        // 3 nodes, three interleaved A/B pairs on one image, 2026-08-08:
+        //
+        // | buckets | q21 wall (median of 3) | vs sort-merge |
+        // |---|---|---|
+        // | sort-merge | **632.8 s** | — |
+        // | grace, 32 (the floor) | 1075.9 s | **1.70x slower** |
+        // | grace, 114 (before the per-task bucket fix) | 2257.3 s | 3.43x slower |
+        // | grace, 8 (`KRISHIV_GRACE_HASH_JOIN_BUCKETS`) | — | **OOM** |
+        //
+        // Arm A's spread across the three passes was 4%, so 1.70x is a result
+        // and not drift. Fewer buckets is not the answer either: at 8 the query
+        // dies with `Failed to allocate additional 39.4 MB for HashJoinInput
+        // with 2.6 GB already allocated`, which is what `DEFAULT_BUCKETS = 32`
+        // is protecting against.
+        //
+        // So on this shape — two stacked self-joins over `lineitem` on
+        // `l_orderkey`, ~1.2 GB of shuffle read per task — sort-merge wins at
+        // every bucket count that survives. The sorts amortise; per-bucket
+        // spill files do not, on nodes whose disk is shared with MinIO.
+        //
+        // This is one query on one cluster, so it is not a reason to delete
+        // grace. It IS a reason not to reach for it as an obvious win, and the
+        // flag stays off by default.
         if self.grace {
             match self.grace_join(
                 hash_join,
