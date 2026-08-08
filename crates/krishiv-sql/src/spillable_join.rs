@@ -881,11 +881,35 @@ impl SpillableJoinSelection {
         }
         let template = Arc::new(builder.build()?);
         let mode = *template.partition_mode();
-        let buckets = crate::grace_hash_join::bucket_count(build_bytes, threshold);
+        // Bucket for what ONE TASK builds, not for the whole relation.
+        //
+        // `build_bytes` describes every partition of the build side, but
+        // `threshold` is a per-task memory share, and a task executes exactly
+        // one partition of a `Partitioned` join. Feeding the whole-relation
+        // figure to a per-task budget over-partitions by the partition count.
+        //
+        // Measured on the SF100 cluster 2026-08-08. q21's LeftSemi build side
+        // estimates 14.2 GB across 18 partitions — 790 MB per task, which wants
+        // ~7 buckets against a 250 MB share. It asked for **114**, and the
+        // LeftAnti for 76. Each bucket is its own spill file and its own hash
+        // join pass, so stage 3's median task went from 180 s under sort-merge
+        // to **500 s** under grace: the operator that is supposed to be the
+        // better trade lost 2.8x, on bookkeeping rather than on the join.
+        let per_task_build_bytes = match mode {
+            PartitionMode::Partitioned => {
+                let partitions = template.left().output_partitioning().partition_count().max(1);
+                build_bytes / partitions as u64
+            }
+            // `CollectLeft` buffers the entire build side in every task, so the
+            // whole-relation figure is the right one there.
+            _ => build_bytes,
+        };
+        let buckets = crate::grace_hash_join::bucket_count(per_task_build_bytes, threshold);
         let budget = usize::try_from(threshold).unwrap_or(usize::MAX);
         let grace = crate::grace_hash_join::GraceHashJoinExec::try_new(template, buckets, budget)?;
         tracing::info!(
             build_bytes,
+            per_task_build_bytes,
             threshold,
             buckets,
             ?mode,
@@ -2678,6 +2702,88 @@ mod grace_tests {
         let any = plan.as_ref() as &dyn std::any::Any;
         usize::from(any.downcast_ref::<GraceHashJoinExec>().is_some())
             + plan.children().iter().map(|c| grace_joins(c)).sum::<usize>()
+    }
+
+    /// A partitioned grace join buckets for what ONE TASK builds.
+    ///
+    /// `build_bytes` covers every partition; `threshold` is a per-task share.
+    /// Feeding one to the other over-partitions by the partition count, and
+    /// each extra bucket is its own spill file and its own hash-join pass.
+    ///
+    /// Live on SF100 2026-08-08: q21's LeftSemi asked for **114** buckets on a
+    /// build side that is 790 MB per task against a 250 MB share — about 7 are
+    /// wanted. Stage 3's median task went 180 s (sort-merge) to 500 s (grace),
+    /// losing 2.8x on bookkeeping rather than on the join.
+    ///
+    /// Asserts the bucket count, because that is the number that was wrong;
+    /// every existing grace test asserts only that grace was chosen.
+    #[tokio::test]
+    async fn a_partitioned_grace_join_buckets_per_task_not_per_relation() {
+        let mut config = SessionConfig::new().with_target_partitions(4);
+        config.options_mut().optimizer.hash_join_single_partition_threshold = 0;
+        config.options_mut().optimizer.hash_join_single_partition_threshold_rows = 0;
+        let ctx = SessionContext::new_with_config(config);
+        ctx.sql("CREATE TABLE big AS SELECT v % 1000 AS k, v AS payload FROM (VALUES (1)) t(x), UNNEST(range(0, 20000)) AS u(v)")
+            .await.unwrap().collect().await.unwrap();
+        ctx.sql("CREATE TABLE small AS SELECT v AS k FROM (VALUES (1)) t(x), UNNEST(range(0, 100)) AS u(v)")
+            .await.unwrap().collect().await.unwrap();
+        let plan = ctx
+            .sql("SELECT b.k, count(*) FROM big b JOIN small s ON b.k = s.k GROUP BY b.k")
+            .await.unwrap().create_physical_plan().await.unwrap();
+        assert!(
+            displayable(plan.as_ref()).indent(true).to_string().contains("mode=Partitioned"),
+            "precondition: a partitioned join, or per-task and per-relation agree"
+        );
+
+        // Threshold 1 byte, so the bucket count is driven entirely by the build
+        // size and the difference between the two readings is maximal.
+        let out = SpillableJoinSelection::with_threshold_and_grace(Some(1), true)
+            .optimize(plan, ctx.copied_config().options())
+            .unwrap();
+
+        fn grace_of(plan: &Arc<dyn ExecutionPlan>) -> Option<&GraceHashJoinExec> {
+            let any = plan.as_ref() as &dyn std::any::Any;
+            any.downcast_ref::<GraceHashJoinExec>()
+                .or_else(|| plan.children().iter().find_map(|c| grace_of(c)))
+        }
+        let grace = grace_of(&out).expect("grace join");
+        let partitions = grace.children()[0].output_partitioning().partition_count();
+        assert!(partitions > 1, "precondition: more than one partition to divide by");
+
+        let whole_relation =
+            crate::grace_hash_join::bucket_count(build_bytes_of(&out).unwrap_or(0), 1);
+        let per_task = crate::grace_hash_join::bucket_count(
+            build_bytes_of(&out).unwrap_or(0) / partitions as u64,
+            1,
+        );
+        // The fixture only proves something if the two readings differ.
+        if whole_relation != per_task {
+            assert_eq!(
+                grace.buckets(),
+                per_task,
+                "grace bucketed for the whole relation ({whole_relation}) instead of \
+                 for one task ({per_task}) across {partitions} partitions"
+            );
+        }
+    }
+
+    /// The build-side estimate the rule saw, read back off the converted plan.
+    fn build_bytes_of(plan: &Arc<dyn ExecutionPlan>) -> Option<u64> {
+        fn walk(plan: &Arc<dyn ExecutionPlan>) -> Option<u64> {
+            let any = plan.as_ref() as &dyn std::any::Any;
+            if let Some(grace) = any.downcast_ref::<GraceHashJoinExec>() {
+                let build = &grace.children()[0];
+                let stats = build.partition_statistics(None).ok()?;
+                return match stats.total_byte_size {
+                    Precision::Exact(b) | Precision::Inexact(b) => u64::try_from(b).ok(),
+                    Precision::Absent => {
+                        estimated_build_bytes_from_rows(&stats, &build.schema())
+                    }
+                };
+            }
+            plan.children().iter().find_map(|c| walk(c))
+        }
+        walk(plan)
     }
 
     /// With the flag on, an oversized build side becomes a grace hash join
