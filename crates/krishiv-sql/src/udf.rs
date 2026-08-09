@@ -59,6 +59,30 @@ pub(crate) fn sync_scalar_udfs_with_limits_for_policy(
             "scalar UDF name must not be empty".into(),
         ));
     }
+    // Reject zero-argument scalar UDFs up front, before anything is registered.
+    //
+    // `create_udf` takes a `Fn(&[ColumnarValue])`, which drops the
+    // `number_rows` that `ScalarFunctionArgs` carries. With no arguments there
+    // is nothing left to infer the row count from, so
+    // `columnar_values_to_record_batch` builds a 0-row batch and the UDF returns
+    // a 0-length array for a projection over N rows — an opaque Arrow
+    // "all columns must have the same length" failure deep in execution. Fail at
+    // registration with a message that names the actual problem instead.
+    for name in &scalar_names {
+        let Some(udf) = registry.get_scalar(name) else {
+            continue;
+        };
+        if udf.input_schema().fields().is_empty() {
+            return Err(DataFusionError::External(
+                format!(
+                    "scalar UDF '{name}' declares no input columns; zero-argument \
+                     scalar UDFs are not supported because the row count cannot be \
+                     recovered at the DataFusion boundary"
+                )
+                .into(),
+            ));
+        }
+    }
     if policy.is_forbidden() && !scalar_names.is_empty() {
         return Err(DataFusionError::External(
             format!(
@@ -237,11 +261,30 @@ impl Accumulator for KrishivAggregateAccumulator {
         Ok(())
     }
 
+    /// Finalise **without consuming** the accumulated state.
+    ///
+    /// DataFusion's `Accumulator::evaluate` contract is explicit: "This function
+    /// must not consume the internal state, as it is also used in window
+    /// aggregate functions where it can be executed multiple times depending on
+    /// the current window frame. Consuming the internal state can cause the next
+    /// invocation to have incorrect results."
+    ///
+    /// This used to `std::mem::take` the state. Two reachable consequences:
+    ///
+    /// * a window frame — `udaf(x) OVER (ORDER BY t ROWS BETWEEN UNBOUNDED
+    ///   PRECEDING AND CURRENT ROW)` — calls `evaluate` once per row, so every
+    ///   row after the first aggregated only the rows since the previous call;
+    /// * `AggregateStream::maybe_update_dyn_filter` calls `evaluate` *mid-stream*
+    ///   to refresh a dynamic filter bound, selecting accumulators by function
+    ///   name alone (`eq_ignore_ascii_case("min"|"max")`, flagged as a HACK in
+    ///   datafusion#18643) — so a UDAF registered as `min`/`max` was hit too.
+    ///
+    /// Both produced silently wrong numbers rather than an error. Cloning is
+    /// cheap: `AggState` is a `Vec<u8>` the UDF owns the format of.
     fn evaluate(&mut self) -> datafusion::error::Result<datafusion::scalar::ScalarValue> {
-        let state = std::mem::take(&mut self.state);
         let result = self
             .udf
-            .finalize(state)
+            .finalize(self.state.clone())
             .map_err(|e| DataFusionError::External(e.to_string().into()))?;
         krishiv_scalar_to_datafusion(&result)
     }
@@ -289,6 +332,27 @@ pub fn register_single_table_udf(
 }
 
 /// Register table UDFs from `registry` with DataFusion (P1-21).
+///
+/// # Why there is no durability-profile gate here
+///
+/// Scalar and aggregate sync both refuse to register under a durable or
+/// production profile unless `KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS=1`. Table UDFs
+/// are deliberately exempt, and the asymmetry is documented here so it is not
+/// "fixed" by adding an over-broad gate.
+///
+/// The policy exists to keep *arbitrary native code* out of a durable engine.
+/// Only two things put a `TableUdf` in the registry, and neither is that:
+///
+/// * `SqlEngine::register_table_udf_fn` takes a Rust closure — a caller who can
+///   reach it is already executing native code in this process, so the gate
+///   would deny nothing;
+/// * `CREATE FUNCTION … RETURNS TABLE … LANGUAGE SQL` is a SQL body run through
+///   the session, with no native code at all. Gating it would break a supported
+///   SQL feature under the production profile for no security gain.
+///
+/// The remote vector the gate does close — `register_python_udf`/`_udaf`
+/// accepting cloudpickled bytes over the wire — lands in the scalar and
+/// aggregate registries, both of which are gated.
 pub fn sync_table_udfs(
     ctx: &datafusion::prelude::SessionContext,
     registry: &krishiv_plan::udf::UdfRegistry,
@@ -297,16 +361,13 @@ pub fn sync_table_udfs(
         let Some(udf) = registry.get_table(name) else {
             continue;
         };
-        let udf = Arc::clone(udf);
         let udf_name = udf.name().to_string();
-        let output_schema = udf.output_schema().clone();
-        let inner_udf = Arc::clone(&udf);
-
+        let schema = udf.output_schema().clone();
         ctx.register_udtf(
             &udf_name,
             Arc::new(KrishivTableFunctionImpl {
-                inner: Arc::clone(&inner_udf),
-                schema: output_schema.clone(),
+                inner: Arc::clone(udf),
+                schema,
             }),
         );
     }
@@ -521,5 +582,158 @@ mod tests {
         .expect_err("empty scalar UDF names must be rejected");
 
         assert!(error.to_string().contains("must not be empty"));
+    }
+
+    /// A zero-argument scalar UDF cannot work: `create_udf` erases
+    /// `number_rows`, so the bridge has no way to size the output array. Reject
+    /// at registration rather than failing with an Arrow length mismatch inside
+    /// the query.
+    #[test]
+    fn zero_argument_scalar_udfs_are_rejected_at_registration() {
+        #[derive(Debug)]
+        struct NoArgUdf {
+            input: Schema,
+            output: arrow::datatypes::Field,
+        }
+        impl krishiv_plan::udf::ScalarUdf for NoArgUdf {
+            fn name(&self) -> &str {
+                "no_args"
+            }
+            fn input_schema(&self) -> &Schema {
+                &self.input
+            }
+            fn output_field(&self) -> &arrow::datatypes::Field {
+                &self.output
+            }
+            fn call(
+                &self,
+                _batch: &RecordBatch,
+            ) -> Result<arrow::array::ArrayRef, krishiv_plan::udf::UdfError> {
+                unreachable!("registration must fail before the UDF is ever called")
+            }
+        }
+
+        let ctx = SessionContext::new();
+        let mut registry = UdfRegistry::new();
+        registry.register_scalar(Arc::new(NoArgUdf {
+            input: Schema::empty(),
+            output: arrow::datatypes::Field::new("out", DataType::Int64, true),
+        }));
+
+        let error = sync_scalar_udfs_with_limits_for_policy(
+            &ctx,
+            &registry,
+            ResourceLimits::default(),
+            krishiv_common::NativeScalarUdfPolicy::from_decision(
+                krishiv_common::DurabilityProfile::DevLocal,
+                false,
+            ),
+        )
+        .expect_err("zero-argument scalar UDFs must be rejected");
+
+        assert!(
+            error.to_string().contains("declares no input columns"),
+            "{error}"
+        );
+    }
+
+    /// A counting UDAF whose state is the running total, little-endian.
+    #[derive(Debug)]
+    struct CountingUdf {
+        input: Schema,
+        output: arrow::datatypes::Field,
+    }
+
+    impl CountingUdf {
+        fn new() -> Self {
+            Self {
+                input: Schema::new(vec![arrow::datatypes::Field::new(
+                    "x",
+                    DataType::Int64,
+                    true,
+                )]),
+                output: arrow::datatypes::Field::new("out", DataType::Int64, true),
+            }
+        }
+
+        fn total(state: &krishiv_plan::udf::AggState) -> i64 {
+            let mut buf = [0u8; 8];
+            let n = state.data.len().min(8);
+            buf[..n].copy_from_slice(&state.data[..n]);
+            i64::from_le_bytes(buf)
+        }
+    }
+
+    impl krishiv_plan::udf::AggregateUdf for CountingUdf {
+        fn name(&self) -> &str {
+            "counting"
+        }
+        fn input_schema(&self) -> &Schema {
+            &self.input
+        }
+        fn output_field(&self) -> &arrow::datatypes::Field {
+            &self.output
+        }
+        fn accumulate(
+            &self,
+            state: &mut krishiv_plan::udf::AggState,
+            batch: &RecordBatch,
+        ) -> Result<(), krishiv_plan::udf::UdfError> {
+            let next = Self::total(state) + batch.num_rows() as i64;
+            state.data = next.to_le_bytes().to_vec();
+            Ok(())
+        }
+        fn finalize(
+            &self,
+            state: krishiv_plan::udf::AggState,
+        ) -> Result<krishiv_plan::udf::ScalarValue, krishiv_plan::udf::UdfError> {
+            Ok(krishiv_plan::udf::ScalarValue::Int64(Self::total(&state)))
+        }
+        fn merge(
+            &self,
+            a: krishiv_plan::udf::AggState,
+            b: krishiv_plan::udf::AggState,
+        ) -> Result<krishiv_plan::udf::AggState, krishiv_plan::udf::UdfError> {
+            let sum = Self::total(&a) + Self::total(&b);
+            Ok(krishiv_plan::udf::AggState {
+                data: sum.to_le_bytes().to_vec(),
+            })
+        }
+    }
+
+    /// `Accumulator::evaluate` must not consume the state — DataFusion calls it
+    /// repeatedly for window frames, and mid-stream to refresh dynamic filter
+    /// bounds. Consuming it made every call after the first see an empty state.
+    #[test]
+    fn evaluate_does_not_consume_the_accumulator_state() {
+        use arrow::array::Int64Array;
+        use datafusion::logical_expr::Accumulator as _;
+
+        let udf = Arc::new(CountingUdf::new());
+        let mut acc = KrishivAggregateAccumulator {
+            udf: udf.clone(),
+            state: krishiv_plan::udf::AggState::default(),
+        };
+
+        let values: Vec<arrow::array::ArrayRef> =
+            vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))];
+        acc.update_batch(&values).expect("update should succeed");
+
+        let first = acc.evaluate().expect("first evaluate");
+        let second = acc.evaluate().expect("second evaluate");
+        assert_eq!(
+            first, second,
+            "evaluate must be repeatable; a differing second call means the \
+             state was consumed (window frames call this once per row)"
+        );
+
+        // And accumulation must continue correctly afterwards.
+        acc.update_batch(&values).expect("second update");
+        let third = acc.evaluate().expect("third evaluate");
+        assert_eq!(
+            third,
+            datafusion::scalar::ScalarValue::Int64(Some(6)),
+            "3 rows + 3 rows = 6; a smaller number means evaluate reset the state"
+        );
     }
 }
