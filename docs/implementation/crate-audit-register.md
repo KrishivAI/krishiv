@@ -33,7 +33,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | # | crate | LOC | files | read whole | why here |
 |---|---|---|---|---|---|
 | **Tier 1 — critical path** |
-| 1 | krishiv-sql | 46,632 | 61 | 15 | 8 files read whole 2026-08-09 — **14 live defects fixed**, incl. MERGE INTO never working and silent time-travel-to-present |
+| 1 | krishiv-sql | 46,632 | 61 | 24 | 17 files read whole 2026-08-09 — **18 live defects fixed**, incl. MERGE INTO never working, silent time-travel-to-present, and an orphan (never-compiled) feature file |
 | 2 | krishiv-executor | 28,927 | 40 | **40 — COMPLETE 2026-08-02** | second crate fully read; 3 defects fixed |
 | 3 | krishiv-shuffle | 14,329 | 36 | **36 — COMPLETE 2026-08-02** | first crate fully read; 4 defects fixed |
 | 4 | krishiv-scheduler | **51,438** | **78** | **78 (COMPLETE)** | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
@@ -66,7 +66,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 
 ---
 
-## 1. krishiv-sql — 15 of 61 files read whole (2026-08-09)
+## 1. krishiv-sql — 24 of 61 files read whole (2026-08-09)
 
 Measured coverage: **78.01% regions, 70.84% functions, 76.87% lines.**
 
@@ -244,7 +244,39 @@ Uncovered-region concentration (this decides what to test next):
       constructors removed so a half-wired (uncancellable) pair cannot be
       built. `b6d28985`
 
-Four lessons from these files, all about *my own* method:
+#### Batch 4 — small modules (read whole, 2026-08-09)
+
+- [x] **`sqlstate.rs`: every DataFusion error was `XX000` "engine fault".** That
+      variant carries syntax errors, unknown tables, column typos, failed casts
+      and object-store timeouts, and JDBC/ODBC clients key on SQLSTATE — so a
+      user typo was reported as an engine bug. Classified by DataFusion's own
+      `error_prefix()` literals (one match in datafusion-common/src/error.rs),
+      verified by round-tripping real `DataFusionError` variants. Also puts
+      `UNDEFINED_TABLE`/`DATA_EXCEPTION`/`SYSTEM_ERROR`/`GENERAL_ERROR` to work
+      — all four were defined and referenced only by the "codes are 5 chars"
+      test. `190b92ea`
+- [x] **`unnest_sql.rs`: the `",LATERAL UNNEST("` pattern was unreachable.**
+      `contains_lateral` requires `" LATERAL "` *with a leading space*, so
+      `FROM t,LATERAL …` returned early — the pattern written for exactly that
+      form could never run. `3b6d924f`
+- [x] **`pipe_syntax.rs` was an orphan file: no `mod` declaration anywhere.**
+      Never compiled, so the documented "P10: SQL Pipe Syntax" feature did not
+      exist and its six tests ran zero times (`running 0 tests`). Wired in, but
+      only after fixing what the dead code hid: repeated stages silently
+      overwrote (`|> WHERE a |> WHERE b` dropped `a`), and a filter after a
+      `GROUP BY` was emitted as a `WHERE` instead of a `HAVING`. `7cf02964`
+- [x] Read and found clean: `lakehouse/mod.rs`, `catalog/object_store_io.rs`,
+      `catalog/rest_catalog_wrapper.rs`, `object_store_registry.rs`,
+      `streaming_table_ddl.rs`, `scalar_udf.rs`, `join_estimates.rs`
+      (the last is exemplary — it documents *why* two rules must read the same
+      statistics differently), `introspection_sql.rs`.
+
+**Orphan-file sweep**: after wiring `pipe_syntax`, no source file in
+krishiv-sql lacks a `mod` declaration. Repeated across the whole workspace, the
+only hits are eight `src/bin/*.rs` — Cargo auto-discovers binary targets, so
+those are false positives, not findings.
+
+Five lessons from these files, all about *my own* method:
 
 1. `register_parquet` looked like a missing-invalidation site to a
    grep-for-`invalidate_plan_cache`-in-body heuristic. Reading the body showed
