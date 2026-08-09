@@ -44,7 +44,15 @@ pub fn contains_lateral(sql: &str) -> bool {
 /// (multiple LATERAL joins, LATERAL subqueries) are passed through to DataFusion
 /// which will either handle them or return a clear error.
 pub fn rewrite_lateral_unnest(sql: &str) -> String {
-    if !contains_lateral(sql) || !contains_unnest(sql) {
+    // Gate on UNNEST alone, not on `contains_lateral`.
+    //
+    // `contains_lateral` looks for `" LATERAL "` with a *leading* space, so
+    // `FROM t,LATERAL UNNEST(…)` — no space after the comma — returned early
+    // and was never rewritten. That made the `",LATERAL UNNEST("` pattern
+    // below unreachable: it exists precisely for the form the guard rejected.
+    // The patterns are specific enough to decide for themselves; a query with
+    // no LATERAL simply matches none of them and is returned unchanged.
+    if !contains_unnest(sql) {
         return sql.to_owned();
     }
 
@@ -57,8 +65,10 @@ pub fn rewrite_lateral_unnest(sql: &str) -> String {
     let mut result = sql.to_owned();
     for (from, to) in patterns {
         let upper_from = from.to_ascii_uppercase();
-        // Compute the uppercase view once per pattern pass; track the search
-        // position to avoid re-scanning the prefix on each replacement.
+        // The uppercase view is recomputed per replacement because a match
+        // shifts every later byte offset (the replacement is not the same
+        // length as the pattern); `search_start` at least keeps the prefix out
+        // of each rescan.
         let mut search_start = 0;
         loop {
             let upper_result = result[search_start..].to_ascii_uppercase();
@@ -136,6 +146,26 @@ mod tests {
             rewritten.contains("tag(value)"),
             "alias preserved: {rewritten}"
         );
+    }
+
+    /// `FROM t,LATERAL UNNEST(…)` — no space after the comma — must rewrite.
+    ///
+    /// The `",LATERAL UNNEST("` pattern was written for exactly this form but
+    /// could never run: the old `contains_lateral(sql)` guard looks for
+    /// `" LATERAL "` with a leading space and returned early.
+    #[test]
+    fn rewrites_lateral_unnest_without_space_after_comma() {
+        let sql = "SELECT * FROM t,LATERAL UNNEST(t.tags) AS tag(value)";
+        let rewritten = rewrite_lateral_unnest(sql);
+        assert!(
+            rewritten.to_ascii_uppercase().contains("CROSS JOIN UNNEST"),
+            "must be rewritten: {rewritten}"
+        );
+        assert!(
+            !rewritten.to_ascii_uppercase().contains("LATERAL"),
+            "no LATERAL should survive: {rewritten}"
+        );
+        assert!(rewritten.contains("tag(value)"), "alias preserved");
     }
 
     #[test]
