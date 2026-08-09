@@ -998,6 +998,70 @@ mod udtf_ddl_tests {
         assert!(error.to_string().contains("returned schema"));
     }
 
+    /// `CREATE OR REPLACE FUNCTION` must not be defeated by the plan cache.
+    ///
+    /// A cached `LogicalPlan` pins whatever the planner resolved: for a table
+    /// function that is the `TableProvider` the *previous* definition returned.
+    /// Without invalidation the second `SELECT` below hits the cache and still
+    /// answers 1 — redefinition being the whole point of `OR REPLACE`, that is
+    /// a silently wrong answer rather than a stale-cache annoyance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replacing_a_table_function_is_not_served_the_old_definition() {
+        let engine = SqlEngine::new();
+
+        let value_of = |batches: Vec<arrow::record_batch::RecordBatch>| -> i64 {
+            let batch = batches.first().expect("one batch").clone();
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value should be Int64")
+                .value(0)
+        };
+
+        engine
+            .sql(
+                "CREATE OR REPLACE FUNCTION versioned() \
+                 RETURNS TABLE (value BIGINT) \
+                 LANGUAGE SQL AS 'SELECT 1 AS value'",
+            )
+            .await
+            .expect("first definition should register");
+
+        // Populate the plan cache under this exact query text.
+        let first = engine
+            .sql("SELECT value FROM versioned()")
+            .await
+            .expect("planning should succeed")
+            .collect()
+            .await
+            .expect("execution should succeed");
+        assert_eq!(value_of(first), 1);
+
+        engine
+            .sql(
+                "CREATE OR REPLACE FUNCTION versioned() \
+                 RETURNS TABLE (value BIGINT) \
+                 LANGUAGE SQL AS 'SELECT 2 AS value'",
+            )
+            .await
+            .expect("redefinition should register");
+
+        // Byte-identical query text: only invalidation can produce the new answer.
+        let second = engine
+            .sql("SELECT value FROM versioned()")
+            .await
+            .expect("planning should succeed after replacement")
+            .collect()
+            .await
+            .expect("execution should succeed after replacement");
+        assert_eq!(
+            value_of(second),
+            2,
+            "the replaced definition must win; 1 means the cached plan pinned the old UDF"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sql_body_udtf_binds_literal_arguments() {
         let engine = SqlEngine::new();

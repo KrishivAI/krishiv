@@ -1805,7 +1805,9 @@ impl SqlEngine {
             guard.register_table(std::sync::Arc::new(udf.clone()));
         }
         udf::register_single_table_udf(&self.context, std::sync::Arc::new(udf))
-            .map_err(SqlError::from)
+            .map_err(SqlError::from)?;
+        self.bump_udf_version();
+        Ok(())
     }
 
     /// Returns `true` if any table referenced in `sql` is a registered streaming source.
@@ -1962,10 +1964,26 @@ impl SqlEngine {
         self
     }
 
-    /// Increment the UDF version counter to signal that `sync_all_udfs()` is
-    /// needed on the next `sql()` call.
+    /// Signal that the UDF set has changed: `sync_all_udfs()` is needed on the
+    /// next `sql()` call, **and** the plan cache is now stale.
+    ///
+    /// Both consequences belong to the one event, which is why they live in one
+    /// place. A cached [`LogicalPlan`](datafusion::logical_expr::LogicalPlan)
+    /// pins the UDF it resolved at plan time — `Expr::ScalarFunction` holds an
+    /// `Arc<ScalarUDF>`, and a table function is resolved all the way to the
+    /// `TableProvider` it returned. So after `CREATE OR REPLACE FUNCTION f …`,
+    /// re-running an identical query text would hit the cache and execute the
+    /// *old* `f`. Redefinition is the entire point of `OR REPLACE`, so this is
+    /// reachable from ordinary SQL.
+    ///
+    /// Deliberately not placed in the `sync_*_udfs` methods: those are public
+    /// and are called when the UDF set has *not* changed (krishiv-api calls
+    /// them directly; the `_with_limits` variants re-sync the same set under
+    /// different resource limits), and invalidating there would drop the cache
+    /// on non-changes.
     pub(crate) fn bump_udf_version(&self) {
         self.udf_registry_version.fetch_add(1, Ordering::Release);
+        self.invalidate_plan_cache();
     }
 
     /// Invalidate the plan cache after any schema change. Call this whenever a
@@ -1985,8 +2003,6 @@ impl SqlEngine {
         self.invalidate_plan_cache();
     }
 
-    /// Register all scalar UDFs from the attached registry with DataFusion.
-    /// Uses unlimited defaults (backward compat).
     /// Extract Python UDF/UDAF directive comments from `sql`, register each on
     /// this engine, and return `sql` with the directives removed. Handles both
     /// `/* krishiv-register-python-udf:name:in,…:out:pickle_b64 */` (scalar, via
@@ -2108,8 +2124,7 @@ impl SqlEngine {
                 message: e.to_string(),
             })?
             .register_scalar(udf);
-        self.udf_registry_version
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.bump_udf_version();
         self.sync_scalar_udfs().await
     }
 
@@ -2155,8 +2170,7 @@ impl SqlEngine {
                 message: e.to_string(),
             })?
             .register_aggregate(udf);
-        self.udf_registry_version
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.bump_udf_version();
         self.sync_aggregate_udfs().await
     }
 
@@ -2764,6 +2778,9 @@ impl SqlEngine {
             }
             udf::register_single_table_udf(&self.context, std::sync::Arc::clone(&udf))
                 .map_err(SqlError::from)?;
+            // `OR REPLACE` redefines an existing function: drop any cached plan
+            // that resolved the previous definition.
+            self.bump_udf_version();
             let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
             return Ok(
                 self.attach_query_metadata(self.make_sql_df("create-function", empty), query)
