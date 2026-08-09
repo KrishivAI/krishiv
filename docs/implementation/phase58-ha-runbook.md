@@ -177,12 +177,33 @@ and cost the leader its 9s lease) fell into `run_loop_targets`'
 `retry_engine` treats as terminal — instead of a retryable `Unavailable`
 whose retry the client's Service routes to the real leader.
 
-**Fixed 2026-08-09**: both push entry points (`push_continuous_input_coordinated`
-and `api_continuous_push`) now `ensure_active()` before the existence
-check; a non-leader push is a retryable 503, and `UnknownJob` past the
-fence means the ACTIVE leader genuinely lacks the job. Unit-tested
-(`continuous_push_to_a_standby_is_retryable_not_unknown_job`). The 1-in-4
-flake could not be reproduced deterministically to prove full resolution
-live, but the fix removes the exact mechanism by which the transient
-became a hard failure. It blocked the *twice-consecutive* 2×25 exit gate;
-re-run to confirm.
+**Partial fix 2026-08-09** (leader-fence): both push entry points now
+`ensure_active()` before the existence check, so a push to a NON-leader is
+a retryable 503. Unit-tested
+(`continuous_push_to_a_standby_is_retryable_not_unknown_job`). Correct, but
+**the gate re-run (2×25, fixed image) STILL FAILED** the same cell — so
+this was NOT the operative cause. The failing push's `unknown job` came
+*past* the fence (`ensure_active` passed → the coordinator WAS active),
+proving the active leader genuinely lacked the job.
+
+**Actual mechanism, from the failing iteration's coordinator logs
+(2026-08-09, job `…-r1-i19-streaming` on pod `657458454-7tqnx`):**
+the coordinator that owned the job was **freshly created at 18:00:03** (a
+promotion — the executor-kill churn cost the prior leader its 9s lease).
+The job was submitted to it at 18:00:17 and registered; its task went
+`Running` on `exec-s3` at 18:00:18.073, then **`Failed` at 18:00:18.098**
+when the shuffle-kill killed `exec-s3`. **The streaming task terminated
+`Failed` instead of being reset-to-`Pending` and reassigned to a survivor**
+— which is what `reset_running_tasks_for_lost_executor` does for a
+continuous task under normal conditions. The job then evicts on the
+terminal failure, and the next push reports `unknown job`.
+
+So the real bug is in the executor-loss handling for a streaming task on a
+freshly-promoted coordinator: a `Running` continuous task whose executor
+dies is failed terminally rather than reset+reassigned. NOT root-caused to
+the exact code branch yet (candidates: the reset-eligibility check treating
+a `Running` (not idle-`Succeeded`) continuous task as non-resettable, or
+fresh-promotion executor-membership not yet established so the loss is
+mis-handled). The leader-fence fix stays (it closes a real, separate
+non-leader window); this remains OPEN and still blocks the twice-consecutive
+2×25 exit gate.
