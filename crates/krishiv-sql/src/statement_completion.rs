@@ -28,6 +28,14 @@ pub struct UseTarget {
     pub schema: Option<String>,
 }
 
+/// Whether `ident` is wrapped in a matching pair of backticks or double quotes.
+fn is_quoted(ident: &str) -> bool {
+    let t = ident.trim();
+    ['`', '"']
+        .iter()
+        .any(|q| t.len() >= 2 && t.starts_with(*q) && t.ends_with(*q))
+}
+
 fn unquote(ident: &str) -> String {
     let t = ident.trim();
     for q in ['`', '"'] {
@@ -70,6 +78,10 @@ pub fn parse_use(query: &str) -> Option<UseTarget> {
         }
         _ => (false, remainder),
     };
+    // A quoted identifier is one name even when it contains a dot: ``USE
+    // `my.schema` `` asks for the schema literally called `my.schema`, not for
+    // catalog `my` / schema `schema`. Only an *unquoted* name is qualified.
+    let was_quoted = is_quoted(name_part);
     let name = unquote(name_part);
     if name.is_empty() {
         return None;
@@ -81,7 +93,7 @@ pub fn parse_use(query: &str) -> Option<UseTarget> {
         });
     }
     // Schema form: allow a qualified `catalog.schema`.
-    if let Some((cat, sch)) = name.split_once('.') {
+    if let Some((cat, sch)) = name.split_once('.').filter(|_| !was_quoted) {
         return Some(UseTarget {
             catalog: Some(unquote(cat)),
             schema: Some(unquote(sch)),
@@ -120,17 +132,59 @@ pub fn rewrite_show_databases(query: &str) -> Option<String> {
     if !is_show {
         return None;
     }
-    // Optional `LIKE 'pattern'` filter.
-    let like_clause = if let Some(idx) = upper.find(" LIKE ") {
-        let pat = q[idx + 6..].trim().trim_end_matches(';').trim();
-        Some(format!(" WHERE schema_name LIKE {pat}"))
+
+    // Split the tail into the optional `{FROM|IN} <catalog>` qualifier and the
+    // optional `LIKE 'pattern'` filter.
+    //
+    // The catalog qualifier used to be ignored outright: `SHOW SCHEMAS IN prod`
+    // listed the schemas of *every* catalog, silently answering a broader
+    // question than the one asked. Spark's grammar is
+    // `SHOW SCHEMAS [ { FROM | IN } catalog ] [ LIKE pattern ]`.
+    let (before_like, like_pattern) = match upper.find(" LIKE ") {
+        Some(idx) => (
+            q.get(..idx).unwrap_or_default(),
+            q.get(idx + " LIKE ".len()..).map(str::trim),
+        ),
+        None => (q, None),
+    };
+
+    let mut predicates: Vec<String> = Vec::new();
+    if let Some(catalog) = catalog_qualifier(before_like) {
+        // Single-quote escaping so a catalog name containing `'` cannot end the
+        // literal early.
+        predicates.push(format!(
+            "catalog_name = '{}'",
+            catalog.replace('\'', "''")
+        ));
+    }
+    if let Some(pattern) = like_pattern.filter(|p| !p.is_empty()) {
+        predicates.push(format!("schema_name LIKE {pattern}"));
+    }
+
+    let where_clause = if predicates.is_empty() {
+        String::new()
     } else {
-        None
+        format!(" WHERE {}", predicates.join(" AND "))
     };
     Some(format!(
-        "SELECT schema_name AS namespace FROM information_schema.schemata{} ORDER BY namespace",
-        like_clause.unwrap_or_default()
+        "SELECT schema_name AS namespace FROM information_schema.schemata{where_clause} \
+         ORDER BY namespace"
     ))
+}
+
+/// The catalog named by a trailing `{FROM|IN} <catalog>`, if present.
+///
+/// `head` is the statement up to any `LIKE`, e.g. `SHOW SCHEMAS IN prod`.
+fn catalog_qualifier(head: &str) -> Option<String> {
+    let mut tokens = head.split_whitespace().collect::<Vec<_>>();
+    let catalog = tokens.pop()?;
+    let keyword = tokens.pop()?;
+    if keyword.eq_ignore_ascii_case("FROM") || keyword.eq_ignore_ascii_case("IN") {
+        let name = unquote(catalog);
+        (!name.is_empty()).then_some(name)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -196,6 +250,60 @@ mod tests {
         let with_like = rewrite_show_databases("SHOW DATABASES LIKE 'sal%'").unwrap();
         assert!(with_like.contains("LIKE 'sal%'"));
         assert_eq!(rewrite_show_databases("SHOW TABLES"), None);
+    }
+
+    /// `SHOW SCHEMAS { FROM | IN } <catalog>` must scope to that catalog.
+    ///
+    /// The qualifier used to be ignored outright, so the statement listed the
+    /// schemas of *every* catalog — a silently broader answer than the one
+    /// asked for.
+    #[test]
+    fn show_databases_honours_the_catalog_qualifier() {
+        for sql in ["SHOW SCHEMAS IN prod", "SHOW DATABASES FROM prod"] {
+            let rewritten = rewrite_show_databases(sql).expect("recognised");
+            assert!(
+                rewritten.contains("catalog_name = 'prod'"),
+                "{sql} must filter by catalog: {rewritten}"
+            );
+        }
+    }
+
+    /// Both filters compose rather than one displacing the other.
+    #[test]
+    fn catalog_qualifier_and_like_compose() {
+        let rewritten =
+            rewrite_show_databases("SHOW SCHEMAS IN prod LIKE 'sal%'").expect("recognised");
+        assert!(rewritten.contains("catalog_name = 'prod'"), "{rewritten}");
+        assert!(rewritten.contains("schema_name LIKE 'sal%'"), "{rewritten}");
+        assert!(rewritten.contains(" AND "), "{rewritten}");
+    }
+
+    /// A bare `SHOW DATABASES` still has no WHERE at all.
+    #[test]
+    fn bare_show_databases_is_unfiltered() {
+        let rewritten = rewrite_show_databases("SHOW DATABASES").expect("recognised");
+        assert!(!rewritten.contains("WHERE"), "{rewritten}");
+    }
+
+    /// A quoted identifier is one name even when it contains a dot.
+    #[test]
+    fn a_quoted_use_target_is_not_split_on_its_dot() {
+        assert_eq!(
+            parse_use("USE `my.schema`"),
+            Some(UseTarget {
+                catalog: None,
+                schema: Some("my.schema".into())
+            }),
+            "a back-quoted name is a single identifier, not catalog.schema"
+        );
+        // ...while an unquoted one still qualifies.
+        assert_eq!(
+            parse_use("USE lake.sales"),
+            Some(UseTarget {
+                catalog: Some("lake".into()),
+                schema: Some("sales".into())
+            })
+        );
     }
 
     #[tokio::test]
