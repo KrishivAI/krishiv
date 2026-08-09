@@ -33,7 +33,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | # | crate | LOC | files | read whole | why here |
 |---|---|---|---|---|---|
 | **Tier 1 — critical path** |
-| 1 | krishiv-sql | 46,632 | 61 | 8 | `lib.rs` read whole 2026-08-09 — 2 live defects fixed (`62f357c2`, `f92f690e`) |
+| 1 | krishiv-sql | 46,632 | 61 | 10 | `lib.rs`, `connector_table.rs`, `kafka_table.rs` read whole 2026-08-09 — 3 live defects fixed (`62f357c2`, `f92f690e`, `2b8bddaa`) |
 | 2 | krishiv-executor | 28,927 | 40 | **40 — COMPLETE 2026-08-02** | second crate fully read; 3 defects fixed |
 | 3 | krishiv-shuffle | 14,329 | 36 | **36 — COMPLETE 2026-08-02** | first crate fully read; 4 defects fixed |
 | 4 | krishiv-scheduler | **51,438** | **78** | **78 (COMPLETE)** | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
@@ -66,7 +66,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 
 ---
 
-## 1. krishiv-sql — 8 of 61 files read whole (`lib.rs` done 2026-08-09)
+## 1. krishiv-sql — 10 of 61 files read whole (2026-08-09)
 
 Measured coverage: **78.01% regions, 70.84% functions, 76.87% lines.**
 
@@ -134,7 +134,27 @@ Uncovered-region concentration (this decides what to test next):
 - [x] `query_memory_limit_from_env` — recorded as having zero callers and
       being the third copy of the same parse. `93d1c0c3`
 
-Two lessons from this file, both about *my own* method:
+#### `connector_table.rs` + `kafka_table.rs` (read whole, 2026-08-09)
+
+- [x] **Kafka tables declared themselves bounded to the optimizer.**
+      `KafkaPartitionStream::execute` never ends a stream — `Ok(None)` is a poll
+      gap, so it flushes, sleeps 20 ms and retries; its own comment says "the
+      polling loop can run indefinitely". Both `StreamingTable` construction
+      sites omitted `.with_infinite_table(true)`, and DataFusion's default
+      `infinite: false` maps to `Boundedness::Bounded`
+      (datafusion-physical-plan-54/src/streaming.rs:158). A pipeline-breaking
+      operator over a Kafka table was therefore *accepted* and then blocked
+      forever — no output, no error. Now a plan-time error. `2b8bddaa`
+      **Still owed: a live-broker exercise confirming the error surfaces where
+      the hang was.** No Kafka available in this environment.
+- [x] Verified NOT defects while reading: `BoundedConnectorProvider` is
+      genuinely finite and `create_continuous_table` terminates on sender close,
+      so both are correctly left bounded; `deregister_table` already clears
+      `streaming_sources` (fixed earlier, documented in place); the `kafka`
+      DDL branch accepting arbitrary options is deliberate (librdkafka surface)
+      where the `jdbc` branch's closed option set is also deliberate.
+
+Two lessons from `lib.rs`, both about *my own* method:
 
 1. `register_parquet` looked like a missing-invalidation site to a
    grep-for-`invalidate_plan_cache`-in-body heuristic. Reading the body showed
