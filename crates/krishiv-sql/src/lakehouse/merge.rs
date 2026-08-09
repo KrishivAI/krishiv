@@ -21,9 +21,19 @@ static KEY_COL_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     .ok()
 });
 
+/// Groups: 1 target, 2 source table, 3 ON clause, 4 WHEN MATCHED arm,
+/// 5 WHEN NOT MATCHED arm.
+///
+/// Groups 4 and 5 **must stay capturing**. They were written `(?:…)` — the
+/// regex then defined only three groups, `caps.get(4)`/`get(5)` were always
+/// `None`, so `has_matched`/`has_not_matched` were always false and
+/// `execute_merge_sql` rejected *every* MERGE with "requires at least one WHEN
+/// MATCHED or WHEN NOT MATCHED clause". No test caught it because they all
+/// asserted on `MERGE_RE.is_match` or called `dry_run_merge` directly, never
+/// the entry point `SqlEngine::sql` actually invokes.
 static MERGE_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(
-        r"(?is)^\s*MERGE\s+INTO\s+([`\w.:/-]+)\s+USING\s+([`\w.]+)\s+ON\s+(.+?)(?:\s+WHEN\s+MATCHED\s+THEN\s+UPDATE\s+SET\s+.+?)?(?:\s+WHEN\s+NOT\s+MATCHED\s+THEN\s+INSERT\s*(?:\([^)]*\))?\s*(?:VALUES\s*\([^)]*\)|\*)?)?\s*$",
+        r"(?is)^\s*MERGE\s+INTO\s+([`\w.:/-]+)\s+USING\s+([`\w.]+)\s+ON\s+(.+?)(\s+WHEN\s+MATCHED\s+THEN\s+UPDATE\s+SET\s+.+?)?(\s+WHEN\s+NOT\s+MATCHED\s+THEN\s+INSERT\s*(?:\([^)]*\))?\s*(?:VALUES\s*\([^)]*\)|\*)?)?\s*$",
     )
     .ok()
 });
@@ -115,28 +125,54 @@ pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec
             message: e.to_string(),
         })?;
 
+    // Pass the clauses the statement actually carried. These were parsed and
+    // then discarded in favour of hardcoded `true, true`, so
+    // `WHEN NOT MATCHED THEN INSERT *` — an insert-only merge — also updated
+    // every matched row.
     let metrics = if let Some(path) = target
         .strip_prefix("delta:`")
         .and_then(|p| p.strip_suffix('`'))
     {
-        krishiv_connectors::lakehouse::merge_delta(path, source_batches, merge_key, true, true)
-            .await
-            .map_err(|e| SqlError::DataFusion {
-                message: e.to_string(),
-            })?
+        krishiv_connectors::lakehouse::merge_delta(
+            path,
+            source_batches,
+            merge_key,
+            has_matched,
+            has_not_matched,
+        )
+        .await
+        .map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })?
     } else if let Some(path) = target.strip_prefix("delta.") {
-        krishiv_connectors::lakehouse::merge_delta(path, source_batches, merge_key, true, true)
-            .await
-            .map_err(|e| SqlError::DataFusion {
-                message: e.to_string(),
-            })?
+        krishiv_connectors::lakehouse::merge_delta(
+            path,
+            source_batches,
+            merge_key,
+            has_matched,
+            has_not_matched,
+        )
+        .await
+        .map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })?
     } else if target.starts_with("iceberg:") {
-        let r = dry_run_merge(ctx, &target, source_batches, merge_key).await?;
-        krishiv_connectors::lakehouse::MergeDeltaResult {
-            rows_inserted: r.rows_inserted,
-            rows_updated: r.rows_updated,
-            rows_deleted: r.rows_deleted,
-        }
+        // Refuse rather than report a merge that did not happen.
+        //
+        // This branch used to call a *dry run* that counted how many rows would
+        // be inserted vs updated and returned those counts as the statement's
+        // result. Nothing was ever written back — the helper's own doc said so
+        // — but the caller received `rows_inserted`/`rows_updated` and a
+        // success, with no way to tell the table was untouched. That is the
+        // same false-success class as DUR-1; the engine's rule is that work not
+        // done is not reported as done.
+        return Err(SqlError::Unsupported {
+            feature: format!(
+                "MERGE INTO for Iceberg target '{target}': not implemented — the merged rows \
+                 are never written back. Only delta: targets have a real merge. Use \
+                 INSERT/UPDATE/DELETE or CREATE OR REPLACE TABLE ... AS SELECT instead."
+            ),
+        });
     } else {
         return Err(SqlError::DataFusion {
             message: MergeTargetUnsupportedError { target }.to_string(),
@@ -144,122 +180,6 @@ pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec
     };
 
     Ok(vec![merge_result_batch(metrics)?])
-}
-
-/// **Dry-run** merge for Iceberg in-memory tables.
-///
-/// This function simulates a MERGE INTO by computing how many rows would be
-/// inserted vs updated, but does **not** write the merged result back to the
-/// target table. It returns [`MergeResult`] metrics only.
-///
-/// A real MERGE INTO would need to join source + target on the key column,
-/// apply WHEN MATCHED / WHEN NOT MATCHED logic, and write the merged output
-/// back to the table. This is deferred to R2 when Iceberg write support lands.
-async fn dry_run_merge(
-    ctx: &SessionContext,
-    target: &str,
-    source_batches: Vec<RecordBatch>,
-    merge_key: &str,
-) -> SqlResult<MergeResult> {
-    use arrow::compute::concat_batches;
-    use arrow::util::display::{ArrayFormatter, FormatOptions};
-    use std::collections::HashSet;
-
-    if source_batches.is_empty() {
-        return Ok(MergeResult::default());
-    }
-
-    let source_schema = source_batches
-        .first()
-        .ok_or_else(|| SqlError::DataFusion {
-            message: "empty source batches".into(),
-        })?
-        .schema();
-    let source_batch =
-        concat_batches(&source_schema, &source_batches).map_err(|e| SqlError::DataFusion {
-            message: e.to_string(),
-        })?;
-
-    let inserted: u64 = source_batches.iter().map(|b| b.num_rows() as u64).sum();
-    let fmt_opts = FormatOptions::default();
-
-    // Extract source key values into a hash set.
-    let key_idx = source_schema
-        .index_of(merge_key)
-        .map_err(|_| SqlError::Unsupported {
-            feature: format!("merge key column '{merge_key}' not found in source schema"),
-        })?;
-    let source_keys: HashSet<String> = {
-        let f = ArrayFormatter::try_new(source_batch.column(key_idx), &fmt_opts).map_err(|e| {
-            SqlError::DataFusion {
-                message: e.to_string(),
-            }
-        })?;
-        (0..source_batch.num_rows())
-            .map(|i| f.value(i).to_string())
-            .collect()
-    };
-
-    // Only load the target table when we have source keys to match against.
-    let updated = if source_keys.is_empty() {
-        0
-    } else {
-        let table = target.trim_start_matches("iceberg:");
-        let existing = ctx
-            .table(table)
-            .await
-            .map_err(|e| SqlError::DataFusion {
-                message: e.to_string(),
-            })?
-            .collect()
-            .await
-            .map_err(|e| SqlError::DataFusion {
-                message: e.to_string(),
-            })?;
-
-        if existing.is_empty() {
-            0
-        } else {
-            let existing_schema = existing
-                .first()
-                .ok_or_else(|| SqlError::DataFusion {
-                    message: "empty existing batches".into(),
-                })?
-                .schema();
-            let tb =
-                concat_batches(&existing_schema, &existing).map_err(|e| SqlError::DataFusion {
-                    message: e.to_string(),
-                })?;
-            let target_key_idx =
-                tb.schema()
-                    .index_of(merge_key)
-                    .map_err(|_| SqlError::Unsupported {
-                        feature: format!(
-                            "merge key column '{merge_key}' not found in target schema"
-                        ),
-                    })?;
-            let target_keys: Vec<String> = {
-                let f =
-                    ArrayFormatter::try_new(tb.column(target_key_idx), &fmt_opts).map_err(|e| {
-                        SqlError::DataFusion {
-                            message: e.to_string(),
-                        }
-                    })?;
-                (0..tb.num_rows()).map(|i| f.value(i).to_string()).collect()
-            };
-            target_keys
-                .iter()
-                .filter(|k| source_keys.contains(*k))
-                .count() as u64
-        }
-    };
-    // ---- end !Send scope ----
-
-    Ok(MergeResult {
-        rows_inserted: inserted.saturating_sub(updated),
-        rows_updated: updated,
-        rows_deleted: 0,
-    })
 }
 
 fn merge_result_batch(
@@ -346,19 +266,18 @@ mod tests {
         assert_eq!(caps.get(2).map(|m| m.as_str()), Some("id"));
     }
 
-    /// C9 regression: iceberg in-memory merge must return correct metrics
-    /// (updated for matching keys, inserted for new keys) and must NOT
-    /// report all rows as inserted (the full-table-replace bug).
+    /// The entry point must actually accept a well-formed MERGE.
+    ///
+    /// Every existing test here checks `MERGE_RE.is_match` or calls
+    /// `dry_run_merge` directly — none goes through `execute_merge_sql`, which
+    /// is the only thing `SqlEngine::sql` calls.
     #[tokio::test]
-    async fn iceberg_merge_returns_correct_row_counts() {
+    async fn execute_merge_sql_accepts_a_statement_with_both_when_clauses() {
         let ctx = SessionContext::new();
-
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
         ]));
-
-        // Target: (1, "alice"), (2, "bob")
         ctx.register_batch(
             "target_t",
             RecordBatch::try_new(
@@ -371,23 +290,84 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-
-        // Source: (1, "alice-updated"), (3, "charlie") — id=1 matches, id=3 is new
-        let source = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 3])),
-                Arc::new(StringArray::from(vec!["alice-updated", "charlie"])),
-            ],
+        ctx.register_batch(
+            "staging",
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 3])),
+                    Arc::new(StringArray::from(vec!["alice-updated", "charlie"])),
+                ],
+            )
+            .unwrap(),
         )
         .unwrap();
 
-        let result = dry_run_merge(&ctx, "iceberg:target_t", vec![source], "id")
-            .await
-            .unwrap();
+        let error = execute_merge_sql(
+            &ctx,
+            "MERGE INTO iceberg:target_t USING staging ON target_t.id = staging.id \
+             WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *",
+        )
+        .await
+        .expect_err("Iceberg MERGE is not implemented and must say so");
 
-        assert_eq!(result.rows_updated, 1, "id=1 matches target → updated");
-        assert_eq!(result.rows_inserted, 1, "id=3 is new → inserted");
-        assert_eq!(result.rows_deleted, 0);
+        // The point of the test: it must get *past* the clause check. Before the
+        // capture-group fix every MERGE died here regardless of its clauses.
+        let message = error.to_string();
+        assert!(
+            !message.contains("requires at least one WHEN"),
+            "the WHEN clauses were parsed but not seen: {message}"
+        );
+        assert!(
+            message.contains("not implemented"),
+            "Iceberg MERGE must fail honestly rather than report a merge that did not happen: \
+             {message}"
+        );
+    }
+
+    /// Both WHEN arms must be recognised independently, and must reach
+    /// `merge_delta` as its `when_matched_update` / `when_not_matched_insert`
+    /// arguments — they were parsed and then thrown away for hardcoded
+    /// `true, true`, so an insert-only MERGE also updated every matched row.
+    #[test]
+    fn when_clauses_are_captured_independently() {
+        let re = MERGE_RE.as_ref().unwrap();
+
+        let both = re
+            .captures(
+                "MERGE INTO delta.`/tmp/t` USING staging ON t.id = staging.id \
+                 WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *",
+            )
+            .unwrap();
+        assert!(both.get(4).is_some(), "WHEN MATCHED arm must be captured");
+        assert!(
+            both.get(5).is_some(),
+            "WHEN NOT MATCHED arm must be captured"
+        );
+
+        let insert_only = re
+            .captures(
+                "MERGE INTO delta.`/tmp/t` USING staging ON t.id = staging.id \
+                 WHEN NOT MATCHED THEN INSERT *",
+            )
+            .unwrap();
+        assert!(
+            insert_only.get(4).is_none(),
+            "an insert-only MERGE must not report a WHEN MATCHED arm — that is what made it \
+             update matched rows"
+        );
+        assert!(insert_only.get(5).is_some());
+
+        let update_only = re
+            .captures(
+                "MERGE INTO delta.`/tmp/t` USING staging ON t.id = staging.id \
+                 WHEN MATCHED THEN UPDATE SET *",
+            )
+            .unwrap();
+        assert!(update_only.get(4).is_some());
+        assert!(
+            update_only.get(5).is_none(),
+            "an update-only MERGE must not report a WHEN NOT MATCHED arm"
+        );
     }
 }
