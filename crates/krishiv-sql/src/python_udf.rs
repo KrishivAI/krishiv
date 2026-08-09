@@ -284,7 +284,7 @@ use krishiv_plan::udf::{AggState, AggregateUdf, ScalarValue};
 /// the aggregate trivially mergeable across partitions and executors — `merge`
 /// is byte concatenation of two partial buffers — so it works in distributed
 /// two-phase aggregation (partial per map task, final after the shuffle) through
-/// the existing [`crate::udf`] `KrishivAggregateAccumulator` bridge.
+/// the existing `crate::udf` `KrishivAggregateAccumulator` bridge.
 ///
 /// The callable receives each input column of the group as a numpy array (one
 /// positional argument per input column) and returns a Python scalar; a callable

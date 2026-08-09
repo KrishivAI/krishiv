@@ -11,7 +11,7 @@
 //!    runtime) point at where they are proven instead.
 //! 2. **The matrix-to-test CI rule**: every non-`n/a`, non-`planned` **batch**
 //!    cell must have a checklist case — enforced by
-//!    [`tests::every_claimed_batch_feature_has_a_checklist_case`].
+//!    `tests::every_claimed_batch_feature_has_a_checklist_case`.
 //! 3. **The published KPI + generated pages**: [`coverage_report`] computes the
 //!    pass-rate, and the reference / honesty markdown pages are regenerated from
 //!    the matrix and drift-guarded against the checked-in copies.

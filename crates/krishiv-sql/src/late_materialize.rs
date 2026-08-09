@@ -132,7 +132,7 @@
 //!   a sort on a deferred column would need the column it is deferring. Group
 //!   columns the sort names are added back to the key rather than refused.
 //! - **Bounded output only.** Without a `fetch` the join-back re-joins every
-//!   group and the rewrite is a pure loss. See [`MAX_LATE_MATERIALIZE_FETCH`].
+//!   group and the rewrite is a pure loss. See `MAX_LATE_MATERIALIZE_FETCH`.
 //! - **Names cannot be crossed.** Columns are matched by fully-qualified name,
 //!   and a projection that *reuses* an input's qualified name for a different
 //!   expression makes the rule decline; duplicate qualified names across the

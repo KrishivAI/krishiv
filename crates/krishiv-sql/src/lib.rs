@@ -1372,7 +1372,7 @@ impl SqlEngine {
     /// `ContinuousTableInput::send(...).await` backpressures the producer,
     /// and `ContinuousTableInput::try_send(...)` returns a resource error
     /// rather than growing memory without limit. Use
-    /// [`register_streaming_table_with_capacity`] for a non-default
+    /// [`Self::register_streaming_table_with_capacity`] for a non-default
     /// capacity.
     pub fn register_streaming_table(
         &self,
@@ -1567,11 +1567,11 @@ impl SqlEngine {
     /// Execute a SQL query and write every result row to a Kafka/Redpanda topic.
     ///
     /// Each row is serialised as a JSON object using the same format as
-    /// [`KafkaSink`].  The method blocks until the query stream ends and the
+    /// `KafkaSink` (krishiv-proto).  The method blocks until the query stream ends and the
     /// producer queue is flushed, then returns the total number of rows written.
     ///
     /// **Note**: If `sql` targets an unbounded streaming table (e.g. one
-    /// registered via [`register_kafka_source`]) this call will never return.
+    /// registered via [`Self::register_kafka_source`]) this call will never return.
     /// Use it with batch sources or add a `LIMIT` clause.
     pub async fn sql_to_kafka(
         &self,
@@ -1644,7 +1644,7 @@ impl SqlEngine {
 
     /// Register a table name as a streaming source without creating a live connector.
     ///
-    /// This is the test-safe alternative to [`register_kafka_source`]: it marks
+    /// This is the test-safe alternative to [`Self::register_kafka_source`]: it marks
     /// `table_name` in the `streaming_sources` set so that `is_streaming_query`
     /// returns `true` for queries that reference it, without constructing any
     /// broker connection. Useful for unit tests where a live Kafka broker is not
@@ -1728,7 +1728,7 @@ impl SqlEngine {
     /// * a name **re-registered as an ordinary batch table** stayed classified
     ///   as streaming. `DROP TABLE events; CREATE TABLE events AS SELECT …`
     ///   followed by a plain `SELECT` over `events` would be routed down the
-    ///   streaming path by [`is_streaming_query`], which decides execution mode
+    ///   streaming path by [`Self::is_streaming_query`], which decides execution mode
     ///   purely from this set.
     ///
     /// `deregister_streaming_source` always did this cleanup; the two paths

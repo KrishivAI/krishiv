@@ -374,8 +374,9 @@ impl ColumnStatistics {
     }
 
     /// Stamp the wall-clock timestamp (seconds) at which these stats
-    /// were collected. Stamped by [`analyze_table`][crate::analyze::analyze_table]
-    /// so the CBO can detect stale stats.
+    /// were collected. Stamped by [`crate::analyze::analyze_record_batches`] and
+    /// [`crate::analyze::analyze_batch_per_column`] so the CBO can detect stale
+    /// stats. (This said `analyze_table`, which has never existed at that path.)
     #[must_use]
     pub fn with_collected_at_secs(mut self, secs: u64) -> Self {
         self.collected_at_secs = Some(secs);

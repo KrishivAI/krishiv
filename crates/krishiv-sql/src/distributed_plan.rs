@@ -255,7 +255,7 @@ pub fn planning_session_context_with_options(
     // DataFusion's defaults, where they are correct.
     //
     // A build side that only *looks* small is caught afterwards by
-    // [`is_degenerate_broadcast_join`], but only for the one case DataFusion
+    // `is_degenerate_broadcast_join`, but only for the one case DataFusion
     // gets wrong: it happily broadcasts on an estimate of ZERO rows, which is
     // how q21 serialised. The ceiling itself is left entirely to DataFusion —
     // overriding it cost q8 4x and q9 2.5x on the cluster.
@@ -1052,7 +1052,7 @@ fn directory_aware_url(path: &str) -> String {
 /// constraint so the optimizer's functional-dependency machinery can see it.
 ///
 /// With no declared key this is exactly `register_parquet`. With one, the
-/// table is built explicitly so [`ListingTable::with_constraints`] can be
+/// table is built explicitly so `ListingTable::with_constraints` can be
 /// applied — `register_parquet` has no way to pass them.
 ///
 /// A declared column that is not in the file's schema is an error rather than
@@ -1072,7 +1072,7 @@ fn directory_aware_url(path: &str) -> String {
 /// ```
 ///
 /// `register_parquet` reaches `ListingOptions` through
-/// [`ReadOptions::to_listing_options`], which ends in
+/// `ReadOptions::to_listing_options`, which ends in
 /// `.with_session_config_options(config)` and sets both from the session. The
 /// hand-built branch never did, so **declaring a primary key turned that
 /// table's statistics off** and collapsed its scan to one partition.
@@ -1744,7 +1744,7 @@ impl ShuffleReadExec {
         }
     }
 
-    /// Attach the cut subtree's estimated size. See [`Self::upstream_rows`].
+    /// Attach the cut subtree's estimated size. See `Self::upstream_rows`.
     #[must_use]
     pub fn with_upstream_estimate(mut self, rows: Option<usize>, bytes: Option<usize>) -> Self {
         self.upstream_rows = rows;
@@ -2881,7 +2881,7 @@ fn broadcast_build_estimate_is_empty(
 /// Is this a broadcast join chosen on an estimate that says its build side is
 /// empty when it is not?
 ///
-/// Distinct from [`is_unsplittable_broadcast_join`], which is a *correctness*
+/// Distinct from `is_unsplittable_broadcast_join`, which is a *correctness*
 /// test. This one is about throughput, and the two must stay separate: the
 /// correctness test also gates [`find_unsupported_stage_node`], which refuses
 /// to stage a plan rather than return wrong rows. Folding a performance
@@ -3033,7 +3033,7 @@ fn reduce_by_broadcast_dimension_for_test(
 /// a logical rule cannot tell 25 rows from 150 million.
 ///
 /// Here it can. `partition_statistics()` is populated — it is what
-/// [`broadcast_build_estimate_is_empty`] and [`broadcast_build_is_too_wide`]
+/// [`broadcast_build_estimate_is_empty`] and `broadcast_build_is_too_wide`
 /// already read — and better still, **the planner has already made the
 /// judgement for us**: a `CollectLeft` join whose build side is provably small
 /// is the definition of a dimension it is willing to broadcast. q7's nation
@@ -3277,8 +3277,8 @@ fn attach_reducer(
 /// Convert broadcast joins that cannot be split — or that were chosen on an
 /// estimate claiming their build side is empty, or on a row ceiling blind to
 /// how wide those rows are — into hash-partitioned joins (see
-/// [`is_unsplittable_broadcast_join`], [`is_degenerate_broadcast_join`] and
-/// [`broadcast_build_is_too_wide`]).
+/// `is_unsplittable_broadcast_join`, `is_degenerate_broadcast_join` and
+/// `broadcast_build_is_too_wide`).
 ///
 /// Both sides gain a hash exchange on the join keys, which the stage cutter
 /// then turns into ordinary map stages — so the join keeps running across the

@@ -8,8 +8,8 @@
 //!   exact when the input is small)
 //!
 //! The driver calls
-//! [`analyze_batch`][analyze_batch] over a single `RecordBatch` or
-//! [`analyze_record_batches`][analyze_record_batches] for an aggregate
+//! [`analyze_batch`] over a single `RecordBatch` or
+//! [`analyze_record_batches`] for an aggregate
 //! over many batches (e.g. every file behind a table). The result is a
 //! [`ColumnStatistics`] ready to attach to
 //! [`TableMetadata`][crate::catalog::TableMetadata] via

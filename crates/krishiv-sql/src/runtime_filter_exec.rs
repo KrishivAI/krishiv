@@ -48,7 +48,7 @@
 //!
 //! It is a one-row `RecordBatch` with a single `Binary` column, written through
 //! the same keyless single-partition gather the stage cutter already emits for
-//! ungrouped aggregates, and read back through an ordinary [`ShuffleReadExec`].
+//! ungrouped aggregates, and read back through an ordinary [`crate::distributed_plan::ShuffleReadExec`].
 //! So there is no new RPC, no new store key, no new transport, and the stage DAG
 //! edge `P → F` is an edge the scheduler already knows how to order and
 //! cycle-check.
