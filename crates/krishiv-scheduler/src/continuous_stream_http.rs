@@ -1026,6 +1026,20 @@ pub async fn api_continuous_push(
     let job_id = krishiv_proto::JobId::try_new(&body.job_id)
         .map_err(|error| bad(&format!("invalid job_id '{}': {error}", body.job_id)))?;
 
+    // Leader-fence before the existence check (see
+    // `push_continuous_input_coordinated`): a push to a non-active replica
+    // during a leadership transition must be a retryable 503, not a 404
+    // "unknown job" for a job that is durably registered elsewhere.
+    {
+        let coord = coordinator.read().await;
+        if let Err(e) = coord.ensure_active() {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("continuous push not served here: {e}; retry (routes to the active leader)"),
+            ));
+        }
+    }
+
     // Phase 55: run-loop jobs receive pushes directly on their executors —
     // no coordinator fencing, no coordinator-buffered data (control-plane-
     // only invariant). The push is ingest API, never the execution driver.
@@ -1621,6 +1635,25 @@ pub async fn push_continuous_input_coordinated(
             message: e.to_string(),
         })
     })?;
+
+    // Leader-fence BEFORE the existence check, mirroring register
+    // (`ensure_active` up front). Registration is durable and recovered on
+    // promotion, so a job unknown to the ACTIVE leader is a genuine error;
+    // but a push landing on a demoted/standby/not-yet-recovered replica
+    // during a leadership transition would otherwise fall straight into
+    // `run_loop_targets`' `UnknownJob` and surface as a hard, non-retryable
+    // `scheduler error: unknown job` — the phase58 gate's intermittent
+    // streaming failure. Fenced, that transient becomes a retryable
+    // `Unavailable` (the client's Service routing then reaches the real
+    // leader), and `UnknownJob` past this point means what it says.
+    {
+        let coord = coordinator.read().await;
+        if let Err(e) = coord.ensure_active() {
+            return Err(ContinuousStreamError::Unavailable(format!(
+                "continuous push not served here: {e}; retry (routes to the active leader)"
+            )));
+        }
+    }
 
     // Phase 55: run-loop jobs receive pushes directly on their executors.
     let run_loop = {
@@ -3201,5 +3234,36 @@ mod tests {
             "the 400 must say the snapshot was not decodable, got {:?}",
             bad_snapshot.1
         );
+    }
+
+    /// A continuous push to a NON-active coordinator must be a retryable
+    /// `Unavailable`, never `UnknownJob`. Registration is durable and
+    /// recovered on promotion, so a push that lands on a standby during a
+    /// leadership transition is a routing blip the client should retry (its
+    /// Service reaches the real leader) — not a hard "unknown job" the
+    /// phase58 gate's `retry_engine` treats as a permanent failure. Without
+    /// the leader fence the standby falls straight into the existence check
+    /// and returns `Scheduler(UnknownJob)`, the intermittent gate failure.
+    #[tokio::test]
+    async fn continuous_push_to_a_standby_is_retryable_not_unknown_job() {
+        let coord_id = CoordinatorId::try_new("coord-cs-standby-push").unwrap();
+        let coordinator = SharedCoordinator::new(Coordinator::standby(coord_id));
+
+        let err = push_continuous_input_coordinated(&coordinator, "any-job", vec![1, 2, 3])
+            .await
+            .expect_err("a standby must not serve a continuous push");
+
+        match err {
+            ContinuousStreamError::Unavailable(msg) => {
+                assert!(
+                    msg.contains("active leader"),
+                    "the 503 must tell the caller to retry against the leader, got {msg:?}"
+                );
+            }
+            other => panic!(
+                "a standby push must be retryable Unavailable, not {other:?} \
+                 (an UnknownJob here is the unfenced bug)"
+            ),
+        }
     }
 }

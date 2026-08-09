@@ -160,12 +160,29 @@ other times the same run (run1 i7, run1 i19, run2 i7), so it is
 **intermittent, not deterministic** — a distinct pre-existing streaming
 recovery bug, NOT the shuffle-location regression (which never flaked).
 
-Signature: after a shuffle-write executor is killed, the continuous job's
-registration intermittently vanishes from the coordinator (`unknown job`),
-where a batch job in the same slot recovers. Likely the run-loop
-peer-table refresh residual already filed on Phase 55
-(`parse_stream_peers` is start-of-task only) surfacing as lost
-registration under executor loss. Needs its own investigation; it blocks
-the *twice-consecutive* 2×25 that Phase 58's exit gate wants, but does not
-reopen the coordinator-kill fix. Filed here so the next chaos run does not
-mistake it for a durability regression.
+Signature: after a shuffle-write executor is killed, `stream push` returns
+`scheduler error: unknown job` where a batch job in the same slot recovers.
+
+**Root-caused 2026-08-09 (code analysis, not the runbook's earlier
+peer-table guess).** Registration IS durable — `submit_job` persists to
+etcd synchronously before the in-memory insert, and `recover_from_store`
+rebuilds it on every promotion — and executor loss never drops a job from
+the registry (that needs 5 consecutive losses). The defect is an
+asymmetry: `register` leader-fences up front (`ensure_active()`), but the
+**push path checked job existence BEFORE leadership**. So a push landing
+on a demoted/standby/not-yet-recovered replica during a leadership
+transition (executor churn can park the etcd bridge on `block_in_place`
+and cost the leader its 9s lease) fell into `run_loop_targets`'
+`UnknownJob` and surfaced as a hard, non-retryable `unknown job` — which
+`retry_engine` treats as terminal — instead of a retryable `Unavailable`
+whose retry the client's Service routes to the real leader.
+
+**Fixed 2026-08-09**: both push entry points (`push_continuous_input_coordinated`
+and `api_continuous_push`) now `ensure_active()` before the existence
+check; a non-leader push is a retryable 503, and `UnknownJob` past the
+fence means the ACTIVE leader genuinely lacks the job. Unit-tested
+(`continuous_push_to_a_standby_is_retryable_not_unknown_job`). The 1-in-4
+flake could not be reproduced deterministically to prove full resolution
+live, but the fix removes the exact mechanism by which the transient
+became a hard failure. It blocked the *twice-consecutive* 2×25 exit gate;
+re-run to confirm.
