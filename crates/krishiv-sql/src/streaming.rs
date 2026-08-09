@@ -8,6 +8,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream;
 use futures::StreamExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -43,6 +44,10 @@ pub enum ContinuousInputError {
 pub struct ChannelPartitionStream {
     schema: SchemaRef,
     receiver: AsyncMutex<Option<mpsc::Receiver<RecordBatch>>>,
+    /// Set by [`ContinuousTableInput::cancel`]. Checked before each batch is
+    /// yielded, which is what makes cancellation *hard* — dropping the sender
+    /// alone does not discard what is already queued.
+    cancelled: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for ChannelPartitionStream {
@@ -54,10 +59,20 @@ impl fmt::Debug for ChannelPartitionStream {
 }
 
 impl ChannelPartitionStream {
-    pub fn new(schema: SchemaRef, receiver: mpsc::Receiver<RecordBatch>) -> Self {
+    /// Build a stream sharing `cancelled` with its [`ContinuousTableInput`].
+    ///
+    /// This is the only constructor on purpose. A stream built with its own
+    /// fresh flag could never be cancelled by any producer, and the resulting
+    /// half-wired pair would look correct at every call site.
+    fn with_cancel_flag(
+        schema: SchemaRef,
+        receiver: mpsc::Receiver<RecordBatch>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             schema,
             receiver: AsyncMutex::new(Some(receiver)),
+            cancelled,
         }
     }
 
@@ -88,7 +103,16 @@ impl PartitionStream for ChannelPartitionStream {
             );
         };
 
-        let stream = ReceiverStream::new(rx).map(Ok::<RecordBatch, DataFusionError>);
+        // Stop yielding as soon as the producer cancels, even if the channel
+        // still holds buffered batches. Dropping the sender is not enough: a
+        // tokio mpsc receiver drains its buffer before reporting end-of-stream.
+        let cancelled = Arc::clone(&self.cancelled);
+        let stream = ReceiverStream::new(rx)
+            .take_while(move |_| {
+                let stop = cancelled.load(Ordering::Acquire);
+                futures::future::ready(!stop)
+            })
+            .map(Ok::<RecordBatch, DataFusionError>);
         Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), stream))
     }
 }
@@ -97,6 +121,10 @@ impl PartitionStream for ChannelPartitionStream {
 pub struct ContinuousTableInput {
     schema: SchemaRef,
     sender: StdMutex<Option<mpsc::Sender<RecordBatch>>>,
+    /// Shared with the [`ChannelPartitionStream`] this input feeds, so
+    /// [`Self::cancel`] can stop the consumer rather than only closing the
+    /// producer.
+    cancelled: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for ContinuousTableInput {
@@ -109,10 +137,17 @@ impl fmt::Debug for ContinuousTableInput {
 }
 
 impl ContinuousTableInput {
-    fn new(schema: SchemaRef, sender: mpsc::Sender<RecordBatch>) -> Self {
+    /// Build an input sharing `cancelled` with the stream it feeds. Sole
+    /// constructor for the same reason as [`ChannelPartitionStream`]'s.
+    fn with_cancel_flag(
+        schema: SchemaRef,
+        sender: mpsc::Sender<RecordBatch>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             schema,
             sender: StdMutex::new(Some(sender)),
+            cancelled,
         }
     }
 
@@ -152,14 +187,19 @@ impl ContinuousTableInput {
         Ok(sender.take().is_some())
     }
 
-    /// A-8: hard-cancel the stream. Drops any queued batches in the channel
-    /// before closing it, so the consumer sees an immediate end-of-stream
-    /// without flushing. Idempotent.
+    /// A-8: hard-cancel the stream. Queued batches are discarded and the
+    /// consumer sees an immediate end-of-stream without flushing. Idempotent.
+    ///
+    /// Use [`Self::close`] instead to end the stream *after* what is already
+    /// queued has been delivered.
+    ///
+    /// Dropping the sender is not sufficient on its own, which is what this
+    /// used to do: a tokio mpsc receiver drains everything still buffered
+    /// before it reports `None`, so a "cancelled" stream went on delivering
+    /// every queued row and `cancel` was indistinguishable from `close`. The
+    /// flag is what the consumer actually stops on.
     pub fn cancel(&self) {
-        // Take the sender and drop it; the receiver end of an mpsc channel
-        // returns `None` once all senders are gone, which our SQL consumer
-        // surfaces as end-of-stream. Dropping the sender also drops any
-        // batches still buffered in the channel — they are lost.
+        self.cancelled.store(true, Ordering::Release);
         if let Ok(mut sender) = self.sender.lock() {
             sender.take();
         }
@@ -211,12 +251,96 @@ pub fn create_continuous_table_with_capacity(
     capacity: usize,
 ) -> datafusion::error::Result<(Arc<dyn TableProvider>, Arc<ContinuousTableInput>)> {
     let (tx, rx) = mpsc::channel(capacity.max(1));
-    let partition = Arc::new(ChannelPartitionStream::new(schema.clone(), rx));
+    // One flag shared by both ends: the producer sets it, the consumer stops on it.
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let partition = Arc::new(ChannelPartitionStream::with_cancel_flag(
+        schema.clone(),
+        rx,
+        Arc::clone(&cancelled),
+    ));
     let table = StreamingTable::try_new(schema.clone(), vec![partition])?;
     Ok((
         Arc::new(table),
-        Arc::new(ContinuousTableInput::new(schema, tx)),
+        Arc::new(ContinuousTableInput::with_cancel_flag(schema, tx, cancelled)),
     ))
+}
+
+#[cfg(test)]
+mod cancel_semantics_tests {
+    use super::*;
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    /// Build a producer/consumer pair sharing one cancellation flag, exactly as
+    /// `create_continuous_table_with_capacity` does.
+    fn linked_pair(capacity: usize) -> (SchemaRef, ChannelPartitionStream, ContinuousTableInput) {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let (tx, rx) = mpsc::channel(capacity);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        (
+            Arc::clone(&schema),
+            ChannelPartitionStream::with_cancel_flag(
+                Arc::clone(&schema),
+                rx,
+                Arc::clone(&cancelled),
+            ),
+            ContinuousTableInput::with_cancel_flag(schema, tx, cancelled),
+        )
+    }
+
+    fn queue(input: &ContinuousTableInput, schema: &SchemaRef, values: [i32; 3]) {
+        for value in values {
+            let batch = RecordBatch::try_new(
+                Arc::clone(schema),
+                vec![Arc::new(Int32Array::from(vec![value]))],
+            )
+            .unwrap();
+            input.try_send(batch).expect("queue has capacity");
+        }
+    }
+
+    async fn drain(partition: ChannelPartitionStream) -> usize {
+        let mut stream = partition.execute(Arc::new(TaskContext::default()));
+        let mut rows = 0;
+        while let Some(batch) = stream.next().await {
+            rows += batch.expect("no error expected").num_rows();
+        }
+        rows
+    }
+
+    /// `cancel()` must discard what is already queued.
+    ///
+    /// It used to only drop the sender, and a tokio mpsc receiver drains its
+    /// buffer before reporting end-of-stream — so every queued row was still
+    /// delivered and `cancel` was indistinguishable from `close`.
+    #[tokio::test]
+    async fn cancel_discards_already_queued_batches() {
+        let (schema, partition, input) = linked_pair(8);
+        queue(&input, &schema, [1, 2, 3]);
+
+        input.cancel();
+
+        assert_eq!(
+            drain(partition).await,
+            0,
+            "a hard cancel must not deliver queued rows"
+        );
+    }
+
+    /// ...and `close()` must still flush them, or the graceful path is gone.
+    #[tokio::test]
+    async fn close_still_delivers_already_queued_batches() {
+        let (schema, partition, input) = linked_pair(8);
+        queue(&input, &schema, [1, 2, 3]);
+
+        input.close().expect("close should succeed");
+
+        assert_eq!(
+            drain(partition).await,
+            3,
+            "close() ends the stream after queued data, unlike cancel()"
+        );
+    }
 }
 
 #[cfg(test)]
