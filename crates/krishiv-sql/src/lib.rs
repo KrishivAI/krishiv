@@ -112,6 +112,7 @@ pub mod live_table;
 pub(crate) mod join_estimates;
 pub mod object_store_registry;
 pub mod pipeline_ddl;
+pub mod pipe_syntax;
 pub mod pivot_sql;
 pub mod python_udf;
 pub mod scalar_udf;
@@ -3075,6 +3076,19 @@ impl SqlEngine {
 
         // Rewrite PIVOT / UNPIVOT into equivalent CASE WHEN / UNION ALL SQL —
         // DataFusion does not parse either construct natively.
+        // Pipe syntax (`FROM t |> WHERE x |> SELECT y`) lowers to standard SQL
+        // before every other rewrite, since those all expect standard SQL.
+        // Gated on a leading `FROM ` *and* a `|>`, so no ordinary statement
+        // reaches it. This module existed but was never declared as a module —
+        // it was not compiled, its tests never ran, and the documented feature
+        // was silently absent.
+        let piped = pipe_syntax::process_pipe_syntax(query).map_err(|error| {
+            SqlError::Unsupported {
+                feature: error.to_string(),
+            }
+        })?;
+        let query: &str = &piped;
+
         let query = &pivot_sql::rewrite_pivot_unpivot(query)?;
 
         // Rewrite TUMBLE/HOP/SESSION TVFs before other preprocessing.
