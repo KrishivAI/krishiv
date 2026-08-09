@@ -256,7 +256,13 @@ pub fn create_kafka_streaming_table(
     };
     let source = KafkaSource::new(config).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let partition = Arc::new(KafkaPartitionStream::new(schema.clone(), source));
-    let table = StreamingTable::try_new(schema, vec![partition])?;
+    // A Kafka topic never ends: `KafkaPartitionStream::execute` treats a poll
+    // gap as "retry", never as end-of-stream. Left at DataFusion's default
+    // (`infinite: false`) the plan claims `Boundedness::Bounded`, so a
+    // pipeline-breaking operator — `ORDER BY`, an unwindowed aggregate — is
+    // accepted and then blocks forever waiting for an end that never comes.
+    // Declaring it unbounded turns that silent hang into a plan-time error.
+    let table = StreamingTable::try_new(schema, vec![partition])?.with_infinite_table(true);
     Ok(Arc::new(table))
 }
 

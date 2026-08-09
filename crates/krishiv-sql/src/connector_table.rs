@@ -289,7 +289,10 @@ async fn create_kafka_table_provider(
     let schema: SchemaRef = cmd.schema.as_ref().inner().clone();
     let source = KafkaSource::new(kafka_config).map_err(connector_error)?;
     let partition = Arc::new(KafkaPartitionStream::new(schema.clone(), source));
-    let table = StreamingTable::try_new(schema, vec![partition])?;
+    // Unbounded, for the reason spelled out in `create_kafka_streaming_table`:
+    // the topic stream never returns end-of-input, so a `Bounded` claim lets
+    // DataFusion accept a pipeline-breaking operator that then hangs forever.
+    let table = StreamingTable::try_new(schema, vec![partition])?.with_infinite_table(true);
 
     if let Some(streaming_sources) = streaming_sources {
         let table_name = cmd.name.table().to_string();
