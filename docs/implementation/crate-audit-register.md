@@ -33,7 +33,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | # | crate | LOC | files | read whole | why here |
 |---|---|---|---|---|---|
 | **Tier 1 — critical path** |
-| 1 | krishiv-sql | 46,632 | 61 | 11 | `lib.rs`, `connector_table.rs`, `kafka_table.rs`, `udf.rs` read whole 2026-08-09 — 5 live defects fixed |
+| 1 | krishiv-sql | 46,632 | 61 | 12 | `lib.rs`, `connector_table.rs`, `kafka_table.rs`, `udf.rs`, `cep_sql.rs` read whole 2026-08-09 — 8 live defects fixed |
 | 2 | krishiv-executor | 28,927 | 40 | **40 — COMPLETE 2026-08-02** | second crate fully read; 3 defects fixed |
 | 3 | krishiv-shuffle | 14,329 | 36 | **36 — COMPLETE 2026-08-02** | first crate fully read; 4 defects fixed |
 | 4 | krishiv-scheduler | **51,438** | **78** | **78 (COMPLETE)** | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
@@ -66,7 +66,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 
 ---
 
-## 1. krishiv-sql — 11 of 61 files read whole (2026-08-09)
+## 1. krishiv-sql — 12 of 61 files read whole (2026-08-09)
 
 Measured coverage: **78.01% regions, 70.84% functions, 76.87% lines.**
 
@@ -181,6 +181,38 @@ Uncovered-region concentration (this decides what to test next):
       Both bottom out in `profile_forbids_native_scalar_udfs`, which honours
       `KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS` and is `OnceLock`-cached — they cannot
       disagree.
+
+#### `cep_sql.rs` (read whole, 2026-08-09)
+
+- [x] **Streaming `MATCH_RECOGNIZE` fabricated a match from every event.** A row
+      carries no stage label, so both executors offer it to each stage name in
+      turn; `SequentialPatternMatcher` starts a partial at stage 0 then accepts
+      `stage_index + 1`, so one row was started at A, advanced to B, then C —
+      returning a "match" of that row repeated N times. The **batch** path
+      guards this by diffing `(stage_index, start_time_ms)` around each
+      `process_event`; the **streaming** path never got the same guard. Fixed by
+      adding `PartitionedCepMatcher::partial_signature` (the streaming path owns
+      state through the wrapper and could not observe the partial) and applying
+      the identical check. `eebe037b`
+- [x] **Two reachable parser panics**, both reversed-range slices on ordinary
+      SQL: `find(" FROM ")` scanned the whole statement so `FROM` could follow
+      the match position (`SELECT ' MATCH_RECOGNIZE ' FROM t` — keyword in a
+      string literal); `rfind(')')` likewise, so `SELECT (1) FROM t
+      MATCH_RECOGNIZE (` gave `body_end < body_start`. Both now search only the
+      correct sub-range. `eebe037b`
+- [x] Checked, NOT defects: `window_ms` defaults to `60_000` when `WITHIN` is
+      omitted, so the streaming TTL eviction `max_ts - 2 * window_ms` cannot
+      collapse to "evict every key"; and byte offsets taken from `upper` are
+      safe to slice `trimmed` with, because `to_ascii_uppercase` remaps only
+      ASCII `a-z` and never changes length.
+- [ ] **Open, deliberately not fixed:** `extract_parenthesized_after` takes the
+      *first* `)` after the keyword, so `PATTERN ((A B) C)` silently truncates
+      instead of erroring, and `parse_within_ms` matches `WITHIN` as a bare
+      substring (a column named `within_x` would be misread). Both are
+      limitations of a hand-rolled parser for a subset that does not support
+      nesting; fixing them properly means parsing the body rather than
+      string-scanning it, which is a larger change than this audit should make
+      unannounced.
 
 Three lessons from these files, all about *my own* method:
 
