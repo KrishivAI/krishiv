@@ -25,15 +25,6 @@ use object_store::aws::AmazonS3Builder;
 use krishiv_plan::optimizer::{CostModel, Optimizer};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
-/// Build an `object_store` S3 client for `bucket` from the ambient AWS
-/// environment (`AWS_ENDPOINT_URL` for MinIO, credentials, region).
-///
-/// Shared by the Iceberg FileIO [`catalog::object_store_io::KrishivStorage`]
-/// (metadata reads/writes) *and* DataFusion's object-store registry (Parquet
-/// data scans via `ListingTable`) so both hit the *same* S3/MinIO backend.
-/// Reading `AWS_ENDPOINT_URL` here — the AWS-SDK convention prod sets — is what
-/// makes MinIO reachable; `AmazonS3Builder::from_env` alone honours only
-/// `AWS_ENDPOINT` and would silently target real AWS.
 /// Map an Arrow type name (as shipped in a Python-UDF directive) to a DataType.
 /// Unknown names fall back to Utf8 (the safest catch-all for a scalar result).
 fn python_udf_arrow_type(name: &str) -> arrow::datatypes::DataType {
@@ -49,6 +40,15 @@ fn python_udf_arrow_type(name: &str) -> arrow::datatypes::DataType {
     }
 }
 
+/// Build an `object_store` S3 client for `bucket` from the ambient AWS
+/// environment (`AWS_ENDPOINT_URL` for MinIO, credentials, region).
+///
+/// Shared by the Iceberg FileIO [`catalog::object_store_io::KrishivStorage`]
+/// (metadata reads/writes) *and* DataFusion's object-store registry (Parquet
+/// data scans via `ListingTable`) so both hit the *same* S3/MinIO backend.
+/// Reading `AWS_ENDPOINT_URL` here — the AWS-SDK convention prod sets — is what
+/// makes MinIO reachable; `AmazonS3Builder::from_env` alone honours only
+/// `AWS_ENDPOINT` and would silently target real AWS.
 pub(crate) fn build_s3_object_store(
     bucket: &str,
 ) -> object_store::Result<std::sync::Arc<dyn object_store::ObjectStore>> {
@@ -341,17 +341,7 @@ impl SqlPlan {
     }
 }
 
-/// Local SQL engine backed by DataFusion.
-///
-/// **Local-only**: All SQL execution is in-process via DataFusion. No distributed SQL
-/// execution path is available in this crate.
-/// This crate is scoped to R1 — DataFusion will be abstracted behind
-/// the `KrishivDataFrameOps` trait in future releases.
-///
-/// Methods like `register_parquet`, `read_delta`, and `read_hudi` treat
-/// path arguments as local filesystem paths. S3/GCS paths require the
-/// object-store connector layer.
-/// Maximum number of query plans stored in the plan cache before random eviction.
+/// Maximum number of query plans stored in the plan cache before LRU eviction.
 const PLAN_CACHE_MAX_ENTRIES: usize = 256;
 
 fn resolve_plan_cache_max_entries() -> usize {
@@ -400,6 +390,21 @@ pub fn resolve_query_memory_limit_bytes(raw: Option<&str>) -> Option<usize> {
 /// engine's pool must not claim the whole container. Explicit `0` disables
 /// the limit entirely (DataFusion's default unbounded pool); an unlimited
 /// cgroup (no limit / `max`) also yields `None`.
+///
+/// # This is the third copy of this decision, and it has no callers
+///
+/// Audited 2026-08-09: **zero references** across the workspace (both `*.rs`
+/// and `*.rs.inc`). The live sizing path is
+/// `krishiv_common::ExecutorCapacity`, which every engine constructor uses,
+/// and `krishiv_ivm::spill::ivm_memory_limit_bytes` carries a byte-identical
+/// third copy for the IVM tick.
+///
+/// Kept rather than deleted because it is `pub` and this crate's API is
+/// consumed outside the workspace, but **do not add callers**: reach for
+/// `ExecutorCapacity`, which also knows the slot count and so can answer
+/// "this engine's share" rather than only "the process's ceiling". Three
+/// independent readings of one env var is exactly how the spill threshold
+/// and the bucket count came to disagree about what a byte count meant.
 pub fn query_memory_limit_from_env() -> Option<usize> {
     match std::env::var("KRISHIV_QUERY_MEMORY_LIMIT_BYTES").ok() {
         // Set (including "0" and garbage): explicit-config semantics — no
@@ -675,19 +680,6 @@ const DEFAULT_SORT_SPILL_RESERVATION_BYTES: usize = 10 * 1024 * 1024;
 /// has too little room to make forward progress.
 const MIN_SORT_SPILL_RESERVATION_BYTES: usize = 64 * 1024;
 
-/// Build the DataFusion session config with a configurable parallelism level.
-///
-/// When `target_partitions > 1`, round-robin repartitioning is enabled so
-/// DataFusion can balance work across threads for hash-join build,
-/// aggregation spill, and parquet scan parallelism.
-///
-/// `execution.batch_size` is set from `KRISHIV_BATCH_SIZE` (default: 8192).
-///
-/// `memory_limit_bytes`, when `Some`, scales `sort_spill_reservation_bytes`
-/// down proportionally so a tight memory pool can still spill instead of
-/// failing outright because the reservation itself doesn't fit. Pools at or
-/// above `4 * DEFAULT_SORT_SPILL_RESERVATION_BYTES` (40MB) are unaffected —
-/// this only kicks in for genuinely memory-constrained deployments.
 /// Install Krishiv's optimizer rules on a session-state builder.
 ///
 /// **A6 (review 2026-07-27).** These rules used to be written out at each
@@ -808,6 +800,19 @@ pub fn with_krishiv_optimizer_rules_with_join_threshold(
         ))
 }
 
+/// Build the DataFusion session config with a configurable parallelism level.
+///
+/// When `target_partitions > 1`, round-robin repartitioning is enabled so
+/// DataFusion can balance work across threads for hash-join build,
+/// aggregation spill, and parquet scan parallelism.
+///
+/// `execution.batch_size` is set from `KRISHIV_BATCH_SIZE` (default: 8192).
+///
+/// `memory_limit_bytes`, when `Some`, scales `sort_spill_reservation_bytes`
+/// down proportionally so a tight memory pool can still spill instead of
+/// failing outright because the reservation itself doesn't fit. Pools at or
+/// above `4 * DEFAULT_SORT_SPILL_RESERVATION_BYTES` (40MB) are unaffected —
+/// this only kicks in for genuinely memory-constrained deployments.
 pub(crate) fn build_single_node_session_config(
     target_partitions: NonZeroUsize,
     memory_limit_bytes: Option<usize>,
@@ -873,6 +878,18 @@ pub(crate) fn build_single_node_session_config(
 type IcebergCatalogRegistry =
     Arc<std::sync::RwLock<Vec<(Arc<catalog::unified::KrishivCatalog>, String)>>>;
 
+/// Local SQL engine backed by DataFusion.
+///
+/// **Local-only**: all SQL execution is in-process via DataFusion. This crate
+/// exposes no distributed execution path of its own — the distributed batch
+/// runtime consumes [`distributed_plan`] instead.
+///
+/// Scoped to R1: DataFusion is expected to move behind the `KrishivDataFrameOps`
+/// trait in a later release.
+///
+/// `register_parquet`, `read_delta` and `read_hudi` treat their path arguments
+/// as local filesystem paths; S3/GCS URIs go through the object-store
+/// connector layer (see [`object_store_registry`]).
 #[derive(Clone)]
 pub struct SqlEngine {
     context: SessionContext,

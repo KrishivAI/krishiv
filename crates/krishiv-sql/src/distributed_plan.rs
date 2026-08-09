@@ -736,14 +736,6 @@ pub fn is_dfplan_body(body: &str) -> bool {
     strip_leading_python_udf_directives(body).starts_with(DFPLAN_BODY_PREFIX)
 }
 
-/// Decode a dfplan body and execute its assigned partition (executor seam).
-///
-/// Keeps DataFusion types out of the executor crate: the result streams as
-/// the crate-level [`crate::SqlStream`]. `session` supplies the runtime
-/// environment (memory pool, object stores); the decoded plan needs no
-/// tables registered on it. Map-stage plans read upstream shuffle data
-/// through `reader`; passing `None` leaves any [`ShuffleReadExec`] leaves
-/// unexecutable (coordinator-side decode).
 /// Convert over-budget hash joins in a decoded fragment to the grace hash join.
 ///
 /// # Why this runs after decode, and not during planning
@@ -787,6 +779,14 @@ fn apply_local_spill_strategy(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn Execution
     }
 }
 
+/// Decode a dfplan body and execute its assigned partition (executor seam).
+///
+/// Keeps DataFusion types out of the executor crate: the result streams as
+/// the crate-level [`crate::SqlStream`]. `session` supplies the runtime
+/// environment (memory pool, object stores); the decoded plan needs no
+/// tables registered on it. Map-stage plans read upstream shuffle data
+/// through `reader`; passing `None` leaves any [`ShuffleReadExec`] leaves
+/// unexecutable (coordinator-side decode).
 pub fn execute_dfplan_body(
     body: &str,
     session: &SessionContext,
