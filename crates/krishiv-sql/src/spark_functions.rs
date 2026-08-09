@@ -72,13 +72,27 @@ fn make_date_format() -> ScalarUDF {
                     DataFusionError::Internal("date_format: arg 1 (format) must be Utf8".into())
                 })?;
             let mut out = StringBuilder::new();
+            // Translate each distinct pattern once, not once per row.
+            //
+            // The format argument is almost always a literal, and
+            // `values_to_arrays` expands a scalar to one entry per row — so
+            // translating inside the loop re-parsed the same string and
+            // allocated a fresh `String` for every row in the table. Caching the
+            // last pattern collapses the usual case to a single translation and
+            // still handles a genuinely per-row format column correctly.
+            let mut cached_pattern: Option<String> = None;
+            let mut chrono_fmt = String::new();
             for i in 0..ts.len() {
                 if ts.is_null(i) || fmt.is_null(i) {
                     out.append_null();
                     continue;
                 }
-                let chrono_fmt =
-                    spark_pattern_to_chrono(fmt.value(i)).map_err(DataFusionError::Execution)?;
+                let pattern = fmt.value(i);
+                if cached_pattern.as_deref() != Some(pattern) {
+                    chrono_fmt =
+                        spark_pattern_to_chrono(pattern).map_err(DataFusionError::Execution)?;
+                    cached_pattern = Some(pattern.to_string());
+                }
                 let dt = DateTime::from_timestamp_nanos(ts.value(i)).naive_utc();
                 out.append_value(dt.format(&chrono_fmt).to_string());
             }
@@ -271,6 +285,75 @@ mod tests {
         assert_eq!(spark_pattern_to_chrono("HH'%'").unwrap(), "%H%%");
         // Non-letter separators pass through literally.
         assert_eq!(spark_pattern_to_chrono("yyyy/MM").unwrap(), "%Y/%m");
+    }
+
+    /// Sub-second precision was translated but never asserted. `%3f`/`%6f`/`%9f`
+    /// are chrono's dot-less fractional forms, which is what Spark's `S` run
+    /// means; getting the dotted `%.3f` here would emit a stray separator.
+    #[test]
+    fn spark_pattern_subsecond_precision() {
+        assert_eq!(spark_pattern_to_chrono("SSS").unwrap(), "%3f");
+        assert_eq!(spark_pattern_to_chrono("SSSSSS").unwrap(), "%6f");
+        assert_eq!(spark_pattern_to_chrono("SSSSSSSSS").unwrap(), "%9f");
+        // And it renders: 123 ms with no leading dot.
+        let dt = DateTime::from_timestamp_nanos(1_709_802_300_123_000_000).naive_utc();
+        let rendered = dt
+            .format(&spark_pattern_to_chrono("HH:mm:ss.SSS").unwrap())
+            .to_string();
+        assert_eq!(rendered, "09:05:00.123", "one dot, from the literal");
+    }
+
+    /// A per-row format column must still be honoured — the pattern cache keys
+    /// on the pattern text, so a changing format cannot reuse a stale one.
+    #[tokio::test]
+    async fn date_format_honours_a_varying_format_column() {
+        use arrow::array::{StringArray, TimestampNanosecondArray};
+        use arrow::datatypes::{Field, Schema};
+
+        let engine = crate::SqlEngine::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("f", DataType::Utf8, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_709_802_300_000_000_000_i64,
+                    1_709_802_300_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec!["yyyy-MM-dd", "HH:mm"])),
+            ],
+        )
+        .unwrap();
+        engine
+            .register_record_batches("events", vec![batch])
+            .await
+            .unwrap();
+
+        let batches = engine
+            .sql("SELECT date_format(ts, f) AS d FROM events ORDER BY d")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("collect");
+        let d = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut got: Vec<&str> = (0..d.len()).map(|i| d.value(i)).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec!["09:05", "2024-03-07"],
+            "each row must use its own format"
+        );
     }
 
     #[test]
