@@ -33,7 +33,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | # | crate | LOC | files | read whole | why here |
 |---|---|---|---|---|---|
 | **Tier 1 — critical path** |
-| 1 | krishiv-sql | 46,632 | 61 | 7 | first slice done; `lib.rs` alone holds 37% of the crate's uncovered regions |
+| 1 | krishiv-sql | 46,632 | 61 | 8 | `lib.rs` read whole 2026-08-09 — 2 live defects fixed (`62f357c2`, `f92f690e`) |
 | 2 | krishiv-executor | 28,927 | 40 | **40 — COMPLETE 2026-08-02** | second crate fully read; 3 defects fixed |
 | 3 | krishiv-shuffle | 14,329 | 36 | **36 — COMPLETE 2026-08-02** | first crate fully read; 4 defects fixed |
 | 4 | krishiv-scheduler | **51,438** | **78** | **78 (COMPLETE)** | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
@@ -66,7 +66,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 
 ---
 
-## 1. krishiv-sql — 7 of 61 files read whole ("first slice")
+## 1. krishiv-sql — 8 of 61 files read whole (`lib.rs` done 2026-08-09)
 
 Measured coverage: **78.01% regions, 70.84% functions, 76.87% lines.**
 
@@ -109,6 +109,42 @@ Uncovered-region concentration (this decides what to test next):
       clause is stripped from the SQL before DataFusion sees it, and only
       `delta.<path>` refs were honoured; a timestamp mapped to `None`, which
       means "latest". Both now error. `69bfc86d`
+
+#### `lib.rs` (read whole, 2026-08-08/09)
+
+- [x] Four detached doc comments reattached; `SqlEngine` itself had none.
+      19 rustdoc warnings → 0. `1c6f7056`, `93d1c0c3`
+- [x] **`CREATE OR REPLACE FUNCTION` returned the old function's results.**
+      Nothing invalidated the plan cache on UDF registration, and a cached
+      `LogicalPlan` pins what the planner resolved — `Expr::ScalarFunction`
+      holds an `Arc<ScalarUDF>`, a table function is resolved all the way to
+      the `TableProvider` the *previous* definition returned. Re-running
+      identical query text within the 30 s TTL executed the old body. A wrong
+      answer, not a stale-cache annoyance. Fixed by making `bump_udf_version()`
+      — already the canonical "UDF set changed" signal — carry the whole
+      invariant; deliberately *not* placed in `sync_*_udfs`, which are called
+      when the set has not changed. `62f357c2`
+- [x] **Plan cache evicted FIFO while documenting LRU.** `get(&self)` could not
+      touch `order`, so `order` only recorded insertion. Under FIFO a burst of
+      distinct query texts evicts precisely the hot repeated query the cache
+      exists for. Made the code match the documented intent rather than
+      downgrading the doc; `get` now also drops an entry it finds expired
+      instead of holding a dead `LogicalPlan` until eviction reaches it.
+      `f92f690e`
+- [x] `query_memory_limit_from_env` — recorded as having zero callers and
+      being the third copy of the same parse. `93d1c0c3`
+
+Two lessons from this file, both about *my own* method:
+
+1. `register_parquet` looked like a missing-invalidation site to a
+   grep-for-`invalidate_plan_cache`-in-body heuristic. Reading the body showed
+   it delegates to `register_parquet_with_primary_key`, which does invalidate.
+   **A body-scanning heuristic cannot see through a delegation** — every hit it
+   produces has to be read before it is believed.
+2. The LRU doc I "corrected" earlier in this same audit (from "random
+   eviction" to "LRU") was still wrong: the code was FIFO. **Correcting a
+   comment against the name of a field rather than the behaviour of the code
+   just relocates the error.**
 
 ### Closed since, verified against the tree 2026-08-02
 
