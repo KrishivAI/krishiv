@@ -215,11 +215,30 @@ impl PlanCache {
         }
     }
 
-    fn get(&self, key: &str) -> Option<&datafusion::logical_expr::LogicalPlan> {
-        self.map
-            .get(key)
-            .filter(|(_, at)| at.elapsed() < PLAN_CACHE_TTL)
-            .map(|(plan, _)| plan)
+    /// Look up a plan, promoting it to most-recently-used on a hit.
+    ///
+    /// The promotion is what makes eviction LRU. Without it — `get(&self)` —
+    /// `order` only ever reflects insertion, so eviction is FIFO and a burst of
+    /// distinct query texts evicts the hot repeated ones that are the entire
+    /// reason the cache exists. An expired entry is dropped here rather than
+    /// left to age out, so a dead `LogicalPlan` is not held until eviction.
+    fn get(&mut self, key: &str) -> Option<&datafusion::logical_expr::LogicalPlan> {
+        match self.map.get(key).map(|(_, at)| at.elapsed() < PLAN_CACHE_TTL) {
+            None => None,
+            Some(false) => {
+                self.map.remove(key);
+                self.order.retain(|k| k != key);
+                None
+            }
+            Some(true) => {
+                if let Some(pos) = self.order.iter().position(|k| k == key)
+                    && let Some(promoted) = self.order.remove(pos)
+                {
+                    self.order.push_back(promoted);
+                }
+                self.map.get(key).map(|(plan, _)| plan)
+            }
+        }
     }
 
     fn insert(&mut self, key: String, plan: datafusion::logical_expr::LogicalPlan) {

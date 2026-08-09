@@ -1328,6 +1328,43 @@ mod udtf_ddl_tests {
             "cache must refill after re-query"
         );
     }
+
+    /// Eviction must be LRU, not insertion-order FIFO.
+    ///
+    /// The distinction is the whole value of the cache: a burst of distinct
+    /// query texts must not evict the hot repeated one. Under FIFO this test
+    /// evicts "a" — the entry that was just read.
+    #[test]
+    fn plan_cache_eviction_is_lru_not_fifo() {
+        let plan = || {
+            datafusion::logical_expr::LogicalPlan::EmptyRelation(
+                datafusion::logical_expr::EmptyRelation {
+                    produce_one_row: false,
+                    schema: std::sync::Arc::new(datafusion::common::DFSchema::empty()),
+                },
+            )
+        };
+
+        let mut cache = crate::PlanCache::new(2);
+        cache.insert("a".to_string(), plan());
+        cache.insert("b".to_string(), plan());
+
+        // Read "a", making it the most recently used.
+        assert!(cache.get("a").is_some(), "a was just inserted");
+
+        // The third insert must evict "b", the least recently used.
+        cache.insert("c".to_string(), plan());
+
+        assert!(
+            cache.map.contains_key("a"),
+            "LRU must keep the entry that was just read; FIFO would evict it"
+        );
+        assert!(
+            !cache.map.contains_key("b"),
+            "the least recently used entry must be the one evicted"
+        );
+        assert!(cache.map.contains_key("c"), "the new entry must be present");
+    }
 }
 
 #[cfg(test)]
