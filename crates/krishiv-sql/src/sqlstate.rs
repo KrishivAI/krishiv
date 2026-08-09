@@ -47,12 +47,77 @@ pub fn sqlstate_for(error: &SqlError) -> &'static str {
         SqlError::EmptyTableName => SYNTAX_ERROR,
         SqlError::Unsupported { .. } => FEATURE_NOT_SUPPORTED,
         SqlError::InvalidTableFunction { .. } => SYNTAX_ERROR,
-        SqlError::DataFusion { .. } => INTERNAL_ERROR,
+        SqlError::DataFusion { message } => datafusion_sqlstate(message),
         SqlError::Optimizer(_) => INTERNAL_ERROR,
         SqlError::AccessDenied { .. } => INSUFFICIENT_PRIVILEGE,
         SqlError::OperationCancelled { .. } => QUERY_CANCELLED,
         SqlError::Timeout { .. } => QUERY_TIMEOUT,
     }
+}
+
+/// Classify a `SqlError::DataFusion` message into a SQLSTATE.
+///
+/// Every DataFusion error used to map to `XX000` — "internal error (engine
+/// fault)". Most of them are nothing of the sort: an unknown table, a column
+/// typo, a type mismatch and a plain syntax error all arrive here, because
+/// `impl From<DataFusionError> for SqlError` keeps the rendered string and
+/// discards the variant. JDBC/ODBC clients key on SQLSTATE, so a user typo was
+/// reported to them as an engine bug.
+///
+/// The variant is recoverable from the message: DataFusion renders every error
+/// as `error_prefix() + message`, and those prefixes are fixed string literals
+/// in one `match` (`datafusion-common/src/error.rs`). Matching them is stable
+/// in a way that matching arbitrary message text would not be.
+///
+/// Anything unrecognised keeps `XX000`, so this can only ever be an
+/// improvement on the previous blanket mapping.
+fn datafusion_sqlstate(message: &str) -> &'static str {
+    // User errors in the statement itself.
+    if message.starts_with("SQL error: ") {
+        return SYNTAX_ERROR;
+    }
+    if message.starts_with("Error during planning: ") {
+        // `table '<ref>' not found` is the one planning failure with a
+        // dedicated code that clients act on differently.
+        return if message.contains("not found") || message.contains("No table named") {
+            UNDEFINED_TABLE
+        } else {
+            SYNTAX_ERROR
+        };
+    }
+    // "Schema error: No field named x" — an undefined column, i.e. the
+    // statement refers to something that does not exist.
+    if message.starts_with("Schema error: ") {
+        return SYNTAX_ERROR;
+    }
+    if message.starts_with("This feature is not implemented: ") {
+        return FEATURE_NOT_SUPPORTED;
+    }
+    // Bad data or a failed cast, not a broken engine.
+    if message.starts_with("Arrow error: ") {
+        return DATA_EXCEPTION;
+    }
+    // An external component failed: storage, network, a foreign library.
+    if message.starts_with("Parquet error: ")
+        || message.starts_with("Object Store error: ")
+        || message.starts_with("IO error: ")
+        || message.starts_with("External error: ")
+        || message.starts_with("FFI error: ")
+        || message.starts_with("Substrait error: ")
+    {
+        return SYSTEM_ERROR;
+    }
+    // Runtime conditions that are neither the statement's fault nor an engine
+    // defect — resource limits, misconfiguration, execution-time failures.
+    if message.starts_with("Resources exhausted: ")
+        || message.starts_with("Invalid or Unsupported Configuration: ")
+        || message.starts_with("Execution error: ")
+        || message.starts_with("ExecutionJoin error: ")
+    {
+        return GENERAL_ERROR;
+    }
+    // "Internal error: " and anything else: an engine fault.
+    INTERNAL_ERROR
 }
 
 /// A structured error envelope carrying the SQLSTATE code alongside the
@@ -103,11 +168,61 @@ mod tests {
     }
 
     #[test]
-    fn datafusion_maps_to_internal_error() {
+    fn unrecognised_datafusion_message_keeps_internal_error() {
         let e = SqlError::DataFusion {
             message: "panic in executor".into(),
         };
         assert_eq!(sqlstate_for(&e), INTERNAL_ERROR);
+    }
+
+    /// A user's mistake must not be reported to a JDBC/ODBC client as an
+    /// engine fault. Every one of these used to map to `XX000`.
+    #[test]
+    fn datafusion_user_errors_do_not_map_to_internal_error() {
+        let cases: &[(&str, &str)] = &[
+            ("SQL error: ParserError(\"Expected: ...\")", SYNTAX_ERROR),
+            ("Error during planning: table 'orders' not found", UNDEFINED_TABLE),
+            ("Error during planning: No table named foo", UNDEFINED_TABLE),
+            ("Error during planning: Coercion from [Utf8] to ... failed", SYNTAX_ERROR),
+            ("Schema error: No field named custkey.", SYNTAX_ERROR),
+            ("This feature is not implemented: GROUPING SETS", FEATURE_NOT_SUPPORTED),
+            ("Arrow error: Cast error: Cannot cast 'x' to Int64", DATA_EXCEPTION),
+            ("Object Store error: Generic S3 error", SYSTEM_ERROR),
+            ("Parquet error: EOF", SYSTEM_ERROR),
+            ("IO error: broken pipe", SYSTEM_ERROR),
+            ("External error: connector failed", SYSTEM_ERROR),
+            ("Resources exhausted: memory limit", GENERAL_ERROR),
+            ("Execution error: divide by zero", GENERAL_ERROR),
+            ("Internal error: this is a bug", INTERNAL_ERROR),
+        ];
+        for (message, expected) in cases {
+            let error = SqlError::DataFusion {
+                message: (*message).to_string(),
+            };
+            assert_eq!(
+                sqlstate_for(&error),
+                *expected,
+                "wrong SQLSTATE for {message:?}"
+            );
+        }
+    }
+
+    /// The prefixes matched above are DataFusion's own, so they must survive a
+    /// real error round-tripping through `From<DataFusionError>`.
+    #[test]
+    fn prefixes_match_real_datafusion_errors() {
+        use datafusion::error::DataFusionError;
+
+        let planning: SqlError =
+            DataFusionError::Plan("table 'nope' not found".to_string()).into();
+        assert_eq!(sqlstate_for(&planning), UNDEFINED_TABLE);
+
+        let internal: SqlError = DataFusionError::Internal("bug".to_string()).into();
+        assert_eq!(sqlstate_for(&internal), INTERNAL_ERROR);
+
+        let exhausted: SqlError =
+            DataFusionError::ResourcesExhausted("pool".to_string()).into();
+        assert_eq!(sqlstate_for(&exhausted), GENERAL_ERROR);
     }
 
     #[test]
