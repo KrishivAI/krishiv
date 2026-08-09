@@ -33,7 +33,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | # | crate | LOC | files | read whole | why here |
 |---|---|---|---|---|---|
 | **Tier 1 — critical path** |
-| 1 | krishiv-sql | 46,632 | 61 | 12 | `lib.rs`, `connector_table.rs`, `kafka_table.rs`, `udf.rs`, `cep_sql.rs` read whole 2026-08-09 — 8 live defects fixed |
+| 1 | krishiv-sql | 46,632 | 61 | 15 | 8 files read whole 2026-08-09 — **14 live defects fixed**, incl. MERGE INTO never working and silent time-travel-to-present |
 | 2 | krishiv-executor | 28,927 | 40 | **40 — COMPLETE 2026-08-02** | second crate fully read; 3 defects fixed |
 | 3 | krishiv-shuffle | 14,329 | 36 | **36 — COMPLETE 2026-08-02** | first crate fully read; 4 defects fixed |
 | 4 | krishiv-scheduler | **51,438** | **78** | **78 (COMPLETE)** | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
@@ -66,7 +66,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 
 ---
 
-## 1. krishiv-sql — 12 of 61 files read whole (2026-08-09)
+## 1. krishiv-sql — 15 of 61 files read whole (2026-08-09)
 
 Measured coverage: **78.01% regions, 70.84% functions, 76.87% lines.**
 
@@ -214,7 +214,37 @@ Uncovered-region concentration (this decides what to test next):
       string-scanning it, which is a larger change than this audit should make
       unannounced.
 
-Three lessons from these files, all about *my own* method:
+#### `lakehouse/merge.rs`, `lakehouse/as_of.rs`, `streaming.rs` (read whole, 2026-08-09)
+
+- [x] **`MERGE INTO` never worked at all.** `MERGE_RE`'s two `WHEN` arms were
+      `(?:…)` — non-capturing — so the regex defined three groups and
+      `caps.get(4)`/`get(5)` were always `None`. Every statement was rejected
+      with "requires at least one WHEN MATCHED or WHEN NOT MATCHED clause".
+      **Zero tests touched the entry point**: three asserted on
+      `MERGE_RE.is_match`, three on `KEY_COL_RE`, and the one end-to-end test
+      called a private helper. `3200c987`
+- [x] Same file: `merge_delta(…, true, true)` hardcoded both arms while the
+      parsed flags went unused, so `WHEN NOT MATCHED THEN INSERT *` also updated
+      every matched row. And the `iceberg:` branch ran a **dry run** and
+      returned its counts as the statement's result — a merge that never
+      happened, reported as success (DUR-1 class). Now refuses. `3200c987`
+- [x] **An `AS OF` qualifier the mapper could not read was silently dropped.**
+      `version.take()` removed the clause unconditionally but only recorded a
+      ref when the mapping succeeded — so a time-travel query ran against the
+      *current* version. This is the same "time travel returned the present"
+      bug fixed earlier in `lakehouse/providers`; that fix made the provider
+      refuse an unpinnable ref, but the clause was discarded before a ref was
+      ever built, so the provider never saw it. Also added the
+      `TIMESTAMP AS OF TIMESTAMP '…'` spelling, which was handled for
+      `FOR SYSTEM_TIME AS OF` but not here. `51f66bd1`
+- [x] **`ContinuousTableInput::cancel()` was a graceful close.** Documented as
+      an A-8 hard cancel that discards queued batches; it only dropped the
+      sender, and a tokio mpsc receiver drains its buffer before reporting
+      end-of-stream. Now shares an `AtomicBool` with the consumer. Both `new()`
+      constructors removed so a half-wired (uncancellable) pair cannot be
+      built. `b6d28985`
+
+Four lessons from these files, all about *my own* method:
 
 1. `register_parquet` looked like a missing-invalidation site to a
    grep-for-`invalidate_plan_cache`-in-body heuristic. Reading the body showed
