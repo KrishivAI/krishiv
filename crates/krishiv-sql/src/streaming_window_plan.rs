@@ -157,14 +157,61 @@ fn extract_window(select: &Select) -> SqlResult<(WindowParams, String)> {
     };
     let boundary = projection_alias_expr(inner, "window_start")
         .ok_or_else(|| unsupported("windowed source is missing its window_start boundary"))?;
-    let Expr::Function(func) = boundary else {
-        return Err(unsupported(
-            "window_start must be produced by a window boundary function",
-        ));
+    // TUMBLE and SESSION project the boundary function directly. HOP cannot:
+    // one event belongs to `size / slide` overlapping windows, so its rewrite
+    // fans the row out through an inner `_tvf_hop` derived table and
+    // `window_start` is an alias of the unnested column. Resolve that alias back
+    // to the `hop_start(…)` call that bounds the series, which still carries the
+    // slide and size this compiler needs.
+    let (func, inner) = match boundary {
+        Expr::Function(func) => (func, inner.as_ref()),
+        Expr::Identifier(ident) => resolve_through_fanout(inner, &ident.value).ok_or_else(|| {
+            unsupported("window_start must be produced by a window boundary function")
+        })?,
+        _ => {
+            return Err(unsupported(
+                "window_start must be produced by a window boundary function",
+            ));
+        }
     };
     let params = window_params_from_udf(func)?;
     let source = single_source_name(inner)?;
     Ok((params, source))
+}
+
+/// Resolve a `window_start` that is a column alias produced by the HOP fan-out.
+///
+/// Given the outer `SELECT *, _ws AS window_start, … FROM (SELECT *,
+/// unnest(generate_series(hop_first_start(…), hop_start(…), slide)) AS _ws FROM
+/// src) AS _tvf_hop`, returns the `hop_start(…)` call and the *inner* select, so
+/// the caller reads the source table from the right level.
+fn resolve_through_fanout<'a>(outer: &'a Select, column: &str) -> Option<(&'a Function, &'a Select)> {
+    let fanout = outer.from.iter().find_map(|twj| match &twj.relation {
+        TableFactor::Derived {
+            subquery, alias, ..
+        } if alias.as_ref().map(|a| a.name.value.as_str()) == Some("_tvf_hop") => {
+            match subquery.body.as_ref() {
+                SetExpr::Select(select) => Some(select.as_ref()),
+                _ => None,
+            }
+        }
+        _ => None,
+    })?;
+    // `_ws` is defined as `unnest(generate_series(first, last, step))`; the
+    // bounding `hop_start(...)` is the one call carrying both slide and size.
+    let defining = projection_alias_expr(fanout, column)?;
+    Some((find_hop_start(defining)?, fanout))
+}
+
+/// Find the `hop_start(…)` call nested anywhere inside `expr`.
+fn find_hop_start(expr: &Expr) -> Option<&Function> {
+    if let Expr::Function(func) = expr {
+        if func.name.to_string().eq_ignore_ascii_case("hop_start") {
+            return Some(func);
+        }
+        return function_arg_exprs(func).into_iter().find_map(find_hop_start);
+    }
+    None
 }
 
 /// Find the `_tvf_window` derived table emitted by the TVF rewrite.
@@ -715,6 +762,11 @@ mod tests {
         assert_eq!(plan.spec.window_size_ms, 60000);
         assert_eq!(plan.spec.slide_ms, Some(30000));
         assert_eq!(plan.spec.agg_exprs[0].kind, WindowAggKind::Count);
+        // HOP resolves its boundary through the `_tvf_hop` fan-out layer, so the
+        // source has to be read from the inner select — not the derived table
+        // that wraps it.
+        assert_eq!(plan.source, "clicks", "source must be the base table");
+        assert_eq!(plan.spec.event_time_column, "ts");
     }
 
     #[test]

@@ -27,6 +27,7 @@ pub fn register_window_functions(ctx: &SessionContext) -> Result<(), DataFusionE
     ctx.register_udf(make_tumble_start());
     ctx.register_udf(make_tumble_end());
     ctx.register_udf(make_hop_start());
+    ctx.register_udf(make_hop_first_start());
     ctx.register_udf(make_hop_end());
     ctx.register_udf(make_session_start());
     ctx.register_udf(make_session_end());
@@ -109,6 +110,54 @@ fn make_hop_start() -> datafusion::logical_expr::ScalarUDF {
                     if sl != 0 { t - t.rem_euclid(sl) } else { t }
                 },
             )
+        }),
+    )
+}
+
+/// HOP_FIRST_START(ts_ms, slide_ms, window_size_ms) → the *earliest* hop window
+/// start whose window still contains `ts`.
+///
+/// A hopping window of `size` sliding by `slide` places each event in
+/// `ceil(size / slide)` overlapping windows, not one. Window `[s, s + size)`
+/// contains `ts` exactly when `ts - size < s <= ts`, so the earliest qualifying
+/// start is the smallest multiple of `slide` strictly greater than `ts - size`:
+///
+/// ```text
+/// first = (floor_div(ts - size, slide) + 1) * slide
+/// last  = HOP_START(ts, slide, size)
+/// ```
+///
+/// Together with [`make_hop_start`] this bounds the series of window starts an
+/// event belongs to, which is what `streaming_tvf` expands with
+/// `generate_series` + `unnest`. Without it a HOP TVF could only ever emit one
+/// row per event, silently undercounting every grouped aggregate by
+/// `size / slide`.
+///
+/// Euclidean division is used so negative timestamps floor toward `-inf` rather
+/// than truncating toward zero.
+fn make_hop_first_start() -> datafusion::logical_expr::ScalarUDF {
+    create_udf(
+        "hop_first_start",
+        vec![DataType::Int64, DataType::Int64, DataType::Int64],
+        DataType::Int64,
+        Volatility::Immutable,
+        Arc::new(|args: &[ColumnarValue]| {
+            let a0 = args.first().ok_or_else(|| {
+                DataFusionError::Internal("hop_first_start: missing arg 0".into())
+            })?;
+            let a1 = args.get(1).ok_or_else(|| {
+                DataFusionError::Internal("hop_first_start: missing arg 1".into())
+            })?;
+            let a2 = args.get(2).ok_or_else(|| {
+                DataFusionError::Internal("hop_first_start: missing arg 2".into())
+            })?;
+            apply3(a0, a1, a2, |t, sl, sz| {
+                if sl != 0 {
+                    (t.saturating_sub(sz).div_euclid(sl) + 1).saturating_mul(sl)
+                } else {
+                    t
+                }
+            })
         }),
     )
 }
@@ -403,6 +452,71 @@ mod tests {
         let ctx = make_ctx();
         let val = query_i64(&ctx, "SELECT hop_end(65000, 30000, 60000) AS he").await;
         assert_eq!(val, 120000, "hop end = 60000 + 60000");
+    }
+
+    /// `hop_first_start` must bound the series of windows containing `ts`.
+    #[tokio::test]
+    async fn hop_first_start_is_the_earliest_window_still_containing_ts() {
+        let ctx = make_ctx();
+        // size 60s sliding by 30s: t=65s sits in [30s,90s) and [60s,120s).
+        let first = query_i64(&ctx, "SELECT hop_first_start(65000, 30000, 60000)").await;
+        let last = query_i64(&ctx, "SELECT hop_start(65000, 30000, 60000)").await;
+        assert_eq!(first, 30000, "earliest window start still covering 65s");
+        assert_eq!(last, 60000, "latest window start at or before 65s");
+
+        // t=95s: [60s,120s) and [90s,150s) — but NOT [30s,90s).
+        assert_eq!(
+            query_i64(&ctx, "SELECT hop_first_start(95000, 30000, 60000)").await,
+            60000
+        );
+
+        // slide == size degenerates to tumbling: exactly one window.
+        assert_eq!(
+            query_i64(&ctx, "SELECT hop_first_start(65000, 60000, 60000)").await,
+            60000
+        );
+    }
+
+    /// A HOP TVF must emit `size / slide` rows per event, not one.
+    ///
+    /// The rewrite was a scalar projection, which can only ever produce one row
+    /// per input row — so every grouped aggregate over a HOP undercounted by
+    /// exactly this factor while the docs promised overlapping windows.
+    #[tokio::test]
+    async fn hop_tvf_fans_one_event_into_every_window_containing_it() {
+        let engine = crate::SqlEngine::new();
+        engine
+            .sql("CREATE TABLE ev (ts BIGINT, k VARCHAR) AS VALUES (65000, 'a')")
+            .await
+            .expect("create")
+            .collect()
+            .await
+            .expect("collect");
+
+        let batches = engine
+            .sql(
+                "SELECT window_start, window_end FROM \
+                 HOP(TABLE ev, DESCRIPTOR(ts), 30000, 60000) ORDER BY window_start",
+            )
+            .await
+            .expect("plan HOP")
+            .collect()
+            .await
+            .expect("execute HOP");
+
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            rows, 2,
+            "60s window sliding by 30s puts one event in 2 windows, got {rows}"
+        );
+
+        let starts = batches
+            .first()
+            .expect("a batch")
+            .column(0)
+            .as_primitive::<Int64Type>();
+        assert_eq!(starts.value(0), 30000);
+        assert_eq!(starts.value(1), 60000);
     }
 
     #[tokio::test]

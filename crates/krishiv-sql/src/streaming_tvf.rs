@@ -316,8 +316,20 @@ fn emit_tvf_subquery(tvf: &WindowTvf<'_>) -> String {
             slide_ms,
             size_ms,
         } => format!(
-            "(SELECT *, hop_start({ts_col}, {slide_ms}, {size_ms}) AS window_start, \
-             hop_end({ts_col}, {slide_ms}, {size_ms}) AS window_end FROM {source}) AS _tvf_window"
+            // A hop window places each event in ceil(size/slide) *overlapping*
+            // windows. A scalar projection can only ever emit one row per event,
+            // so this used to assign each event to a single slide-aligned slot —
+            // every grouped aggregate over a HOP undercounted by size/slide,
+            // while the module docs promised the opposite.
+            //
+            // `generate_series(first_start, last_start, slide)` enumerates the
+            // window starts that actually contain the event, and `unnest` fans
+            // the row out across them.
+            "(SELECT *, _ws AS window_start, _ws + {size_ms} AS window_end FROM \
+             (SELECT *, unnest(generate_series(\
+             hop_first_start({ts_col}, {slide_ms}, {size_ms}), \
+             hop_start({ts_col}, {slide_ms}, {size_ms}), \
+             {slide_ms})) AS _ws FROM {source}) AS _tvf_hop) AS _tvf_window"
         ),
         WindowTvf::Session {
             source,
@@ -387,12 +399,16 @@ mod tests {
     fn hop_rewrite() {
         let sql = "SELECT key FROM HOP(TABLE events, DESCRIPTOR(ts), 30000, 60000) GROUP BY key, window_start, window_end";
         let out = rewrite_window_tvfs(sql);
+        // HOP fans each event across the windows containing it, so the shape is
+        // an inner `_tvf_hop` unnest rather than a scalar projection.
         assert!(
-            out.contains("hop_start(ts, 30000, 60000) AS window_start"),
+            out.contains("hop_first_start(ts, 30000, 60000)")
+                && out.contains("hop_start(ts, 30000, 60000)")
+                && out.contains("unnest(generate_series("),
             "{out}"
         );
         assert!(
-            out.contains("hop_end(ts, 30000, 60000) AS window_end"),
+            out.contains("_ws + 60000 AS window_end"),
             "{out}"
         );
     }
