@@ -206,6 +206,25 @@ where
     pub fn partition_count(&self) -> usize {
         self.states.len()
     }
+
+    /// `(stage_index, start_time_ms)` of this key's live partial match, if any.
+    ///
+    /// Callers that do not know which pattern stage an incoming row represents
+    /// feed the row to each stage name in order, and must stop as soon as the
+    /// row has been consumed. Comparing this signature before and after
+    /// [`Self::process_event`] is how they detect consumption — it changes when
+    /// a partial starts, advances, or restarts after expiry (where
+    /// `stage_index` stays 0 but `start_time_ms` moves).
+    ///
+    /// Without that check the same row starts a partial at stage 0 and is then
+    /// advanced through every remaining stage, fabricating a complete match out
+    /// of a single event.
+    pub fn partial_signature(&self, key: &K) -> Option<(usize, i64)> {
+        self.states
+            .get(key)
+            .and_then(|(_, state)| state.partial.as_ref())
+            .map(|partial| (partial.stage_index, partial.start_time_ms))
+    }
 }
 
 #[cfg(test)]

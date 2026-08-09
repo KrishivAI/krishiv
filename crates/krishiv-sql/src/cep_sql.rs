@@ -41,9 +41,19 @@ pub fn parse_match_recognize(sql: &str) -> SqlResult<Option<MatchRecognizeStatem
     let Some(mr_pos) = upper.find(" MATCH_RECOGNIZE ") else {
         return Ok(None);
     };
-    let from_pos = upper.find(" FROM ").ok_or_else(|| SqlError::Unsupported {
-        feature: "MATCH_RECOGNIZE requires SELECT ... FROM <table>".into(),
-    })?;
+    // Search only the region *before* the match position, and take the nearest
+    // preceding `FROM`. Scanning the whole string let `FROM` land after
+    // `MATCH_RECOGNIZE` — e.g. `SELECT ' MATCH_RECOGNIZE ' FROM t`, where the
+    // keyword sits inside a string literal — and `trimmed[from_pos + 6..mr_pos]`
+    // then panicked on a reversed range. Ordinary user SQL must not panic here.
+    //
+    // Byte indices from `upper` are used to slice `trimmed`: safe because
+    // `to_ascii_uppercase` only remaps ASCII `a-z` and never changes length.
+    let from_pos = upper[..mr_pos]
+        .rfind(" FROM ")
+        .ok_or_else(|| SqlError::Unsupported {
+            feature: "MATCH_RECOGNIZE requires SELECT ... FROM <table>".into(),
+        })?;
     let source_table = trimmed[from_pos + 6..mr_pos].trim().to_string();
     if source_table.is_empty() {
         return Err(SqlError::EmptyTableName);
@@ -56,9 +66,16 @@ pub fn parse_match_recognize(sql: &str) -> SqlResult<Option<MatchRecognizeStatem
         })?
         + mr_pos
         + 1;
-    let body_end = trimmed.rfind(')').ok_or_else(|| SqlError::Unsupported {
-        feature: "MATCH_RECOGNIZE requires closing ')'".into(),
-    })?;
+    // Look for the closing paren only at or after the body's opening paren.
+    // `trimmed.rfind(')')` scanned the whole statement, so a query whose only
+    // parens precede the body — `SELECT (1) FROM t MATCH_RECOGNIZE (` — yielded
+    // `body_end < body_start` and panicked on the reversed range below.
+    let body_end = trimmed[body_start..]
+        .rfind(')')
+        .map(|offset| offset + body_start)
+        .ok_or_else(|| SqlError::Unsupported {
+            feature: "MATCH_RECOGNIZE requires closing ')'".into(),
+        })?;
     let body = &trimmed[body_start..body_end];
     let body_upper = body.to_ascii_uppercase();
 
@@ -364,6 +381,17 @@ pub fn execute_streaming_match_recognize(
             continue;
         };
         let row = batch.slice(*row_idx, 1);
+        // Same "consume once" guard as `execute_match_recognize`.
+        //
+        // A source row carries no stage label, so it is offered to each stage
+        // name in turn. `SequentialPatternMatcher` starts a partial at stage 0
+        // and thereafter accepts `stage_index + 1` — so without stopping at the
+        // first stage that takes the row, the *same* row was started at A, then
+        // advanced to B, then to C, completing the whole pattern by itself.
+        // Every single event fabricated a match. Tracking `(stage_index,
+        // start_time_ms)` also catches restart-after-expiry, where the index
+        // stays 0 but the start time moves.
+        let partial_before = state.partial_signature(key);
         for &stage in &stage_names {
             let completed = state.process_event(key.clone(), stage, row.clone(), *event_time);
             if !completed.is_empty() {
@@ -372,6 +400,9 @@ pub fn execute_streaming_match_recognize(
                         output.push(concat);
                     }
                 }
+                break;
+            }
+            if state.partial_signature(key) != partial_before {
                 break;
             }
         }
@@ -716,6 +747,125 @@ mod tests {
             !engine.is_streaming_source("batch_table"),
             "batch_table must not be streaming"
         );
+    }
+
+    /// `" MATCH_RECOGNIZE "` inside a string literal puts `FROM` *after* the
+    /// match position, so `trimmed[from_pos + 6..mr_pos]` is a reversed range.
+    /// Reachable from ordinary user SQL — must be an error, never a panic.
+    #[test]
+    fn match_recognize_inside_a_string_literal_does_not_panic() {
+        let result = parse_match_recognize("SELECT ' MATCH_RECOGNIZE ' FROM t");
+        assert!(
+            result.is_err() || matches!(result, Ok(None)),
+            "must report an error rather than panicking"
+        );
+    }
+
+    /// When every `)` precedes the `MATCH_RECOGNIZE` body, `rfind(')')` lands
+    /// before `body_start` and `trimmed[body_start..body_end]` is reversed.
+    #[test]
+    fn unclosed_match_recognize_body_does_not_panic() {
+        let result = parse_match_recognize("SELECT (1) FROM t MATCH_RECOGNIZE (");
+        assert!(
+            result.is_err() || matches!(result, Ok(None)),
+            "must report an error rather than panicking"
+        );
+    }
+
+    /// One event cannot satisfy a two-stage pattern.
+    ///
+    /// The streaming loop feeds each event to every stage name in turn. Because
+    /// `SequentialPatternMatcher` starts a partial at stage 0 and then accepts
+    /// `stage_index + 1`, the *same row* was advanced through the whole stage
+    /// list — so every single event fabricated a complete match. The batch path
+    /// guards this by breaking once the partial state changes.
+    #[test]
+    fn streaming_match_recognize_cannot_complete_a_pattern_from_one_event() {
+        use krishiv_plan::cep::{PartitionedCepMatcher, Pattern};
+        use std::time::Duration;
+
+        let pattern = Pattern::begin("A")
+            .followed_by("B")
+            .within(Duration::from_secs(60))
+            .compile()
+            .unwrap();
+        let stmt = MatchRecognizeStatement {
+            source_table: "events".to_string(),
+            key_column: "user_id".to_string(),
+            event_time_column: "ts".to_string(),
+            pattern: pattern.clone(),
+        };
+        let mut state = PartitionedCepMatcher::<String>::new(pattern);
+
+        let batch = make_batch_with_key_ts(&["u1"], &[1_000]);
+        let out = execute_streaming_match_recognize(&stmt, &[batch], &mut state).unwrap();
+        assert!(
+            out.is_empty(),
+            "a single event must not complete a two-stage A→B pattern; got {} match(es)",
+            out.len()
+        );
+    }
+
+    /// ...but two events in order still must complete it — the guard must not
+    /// over-correct into never matching.
+    #[test]
+    fn streaming_match_recognize_still_completes_across_two_events() {
+        use krishiv_plan::cep::{PartitionedCepMatcher, Pattern};
+        use std::time::Duration;
+
+        let pattern = Pattern::begin("A")
+            .followed_by("B")
+            .within(Duration::from_secs(60))
+            .compile()
+            .unwrap();
+        let stmt = MatchRecognizeStatement {
+            source_table: "events".to_string(),
+            key_column: "user_id".to_string(),
+            event_time_column: "ts".to_string(),
+            pattern: pattern.clone(),
+        };
+        let mut state = PartitionedCepMatcher::<String>::new(pattern);
+
+        let batch = make_batch_with_key_ts(&["u1", "u1"], &[1_000, 2_000]);
+        let out = execute_streaming_match_recognize(&stmt, &[batch], &mut state).unwrap();
+        assert_eq!(out.len(), 1, "two ordered events must complete A→B");
+        assert_eq!(out[0].num_rows(), 2, "the match spans both stage events");
+    }
+
+    /// State must carry across calls: A in the first batch, B in the second.
+    #[test]
+    fn streaming_match_recognize_completes_across_two_batches() {
+        use krishiv_plan::cep::{PartitionedCepMatcher, Pattern};
+        use std::time::Duration;
+
+        let pattern = Pattern::begin("A")
+            .followed_by("B")
+            .within(Duration::from_secs(60))
+            .compile()
+            .unwrap();
+        let stmt = MatchRecognizeStatement {
+            source_table: "events".to_string(),
+            key_column: "user_id".to_string(),
+            event_time_column: "ts".to_string(),
+            pattern: pattern.clone(),
+        };
+        let mut state = PartitionedCepMatcher::<String>::new(pattern);
+
+        let first = execute_streaming_match_recognize(
+            &stmt,
+            &[make_batch_with_key_ts(&["u1"], &[1_000])],
+            &mut state,
+        )
+        .unwrap();
+        assert!(first.is_empty(), "one event is only the start of the pattern");
+
+        let second = execute_streaming_match_recognize(
+            &stmt,
+            &[make_batch_with_key_ts(&["u1"], &[2_000])],
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(second.len(), 1, "the second batch completes A→B");
     }
 
     #[test]
