@@ -949,6 +949,79 @@ impl Coordinator {
             }
         }
     }
+
+    /// Rescue a continuous (`stream:loop`) task that reported `Failed`
+    /// because its executor went away, instead of letting that one failure
+    /// terminate the whole streaming job.
+    ///
+    /// `reset_running_tasks_for_lost_executor` above only runs on the slow
+    /// heartbeat-timeout / re-registration paths and only matches
+    /// `Running`/`Assigned`/idle-`Succeeded` tasks. But a task whose executor
+    /// is gracefully shut down (a chaos `shuffle-kill` is `kubectl delete pod`
+    /// = SIGTERM) SELF-reports `Failed` in milliseconds — far ahead of the
+    /// 9-tick heartbeat timeout — and `refresh_state` turns any `Failed`
+    /// stage into a `Failed` job with no streaming exception, so the job is
+    /// terminal and evicted before the reset can act; the next push then gets
+    /// `unknown job` (the phase58 gate's intermittent streaming×executor/
+    /// shuffle-kill failure). This resets the failed continuous task to
+    /// `Pending` within the same loss budget and reassigns it, keeping the
+    /// job `Running`. Bounded: after `MAX_EXECUTOR_LOSSES_BEFORE_FAIL`
+    /// consecutive failures the task stays `Failed` and the job terminates —
+    /// so a genuinely broken streaming task still fails, just not on the
+    /// first transient executor loss. Returns whether the task was rescued.
+    pub(crate) fn rescue_failed_continuous_task(
+        &mut self,
+        job_id: &JobId,
+        task_id: &TaskId,
+    ) -> bool {
+        let Some(job_arc) = self.job_coordinators.get(job_id) else {
+            return false;
+        };
+        let mut rescued = false;
+        {
+            let mut job = job_arc.write_record();
+            job.bump_recovery_epoch();
+            'search: for stage in &mut job.stages {
+                for task in &mut stage.tasks {
+                    if task.task_id() == task_id && task.state == TaskState::Failed {
+                        task.executor_loss_count = task.executor_loss_count.saturating_add(1);
+                        if task.executor_loss_count >= MAX_EXECUTOR_LOSSES_BEFORE_FAIL {
+                            // Budget exhausted: leave it Failed so the job
+                            // terminates — a genuine, repeating failure.
+                            break 'search;
+                        }
+                        task.state = TaskState::Pending;
+                        task.assigned_executor = None;
+                        task.clear_launch_in_flight();
+                        task.last_failure_reason = None;
+                        rescued = true;
+                        break 'search;
+                    }
+                }
+            }
+            if rescued {
+                for stage in &mut job.stages {
+                    stage.refresh_state();
+                }
+                // The failed stage is now Pending → the job leaves Failed and
+                // returns to Running.
+                job.refresh_state();
+            }
+        }
+        if rescued {
+            // Seed an automatic restore from the last checkpoint, exactly as
+            // the executor-loss reset does, so the reassigned task resumes
+            // with accumulated state rather than an empty window.
+            if let Some(snapshot) = self.load_continuous_snapshot(job_id.as_str()) {
+                self.pending_continuous_restores
+                    .insert(job_id.clone(), snapshot);
+            }
+            if let Err(error) = self.assign_pending_tasks(job_id) {
+                tracing::warn!(job_id = %job_id, error = %error, "failed to reassign after continuous rescue");
+            }
+        }
+        rescued
+    }
 }
 
 impl Coordinator {

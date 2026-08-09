@@ -198,12 +198,24 @@ when the shuffle-kill killed `exec-s3`. **The streaming task terminated
 continuous task under normal conditions. The job then evicts on the
 terminal failure, and the next push reports `unknown job`.
 
-So the real bug is in the executor-loss handling for a streaming task on a
-freshly-promoted coordinator: a `Running` continuous task whose executor
-dies is failed terminally rather than reset+reassigned. NOT root-caused to
-the exact code branch yet (candidates: the reset-eligibility check treating
-a `Running` (not idle-`Succeeded`) continuous task as non-resettable, or
-fresh-promotion executor-membership not yet established so the loss is
-mis-handled). The leader-fence fix stays (it closes a real, separate
-non-leader window); this remains OPEN and still blocks the twice-consecutive
-2×25 exit gate.
+The bug: `refresh_state` (job/record.rs) marks a job `Failed` on ANY
+`Failed` stage with no streaming exception, while the executor-loss reset
+(`reset_running_tasks_for_lost_executor`) only runs on the SLOW
+heartbeat-timeout path and only matches `Running`/`Assigned`/idle-`Succeeded`
+tasks. A streaming task whose executor is SIGTERM'd (chaos `shuffle-kill`
+= `kubectl delete pod`) SELF-reports `Failed` in ~25 ms — far ahead of the
+9-tick heartbeat — so the fast failure drives the job terminal and evicts
+it before recovery can act; the next push gets `unknown job`.
+
+**FIXED + CONFIRMED 2026-08-09.** `rescue_failed_continuous_task`
+(`coordinator/executor_ops.rs`, called from `apply_task_update`) resets a
+continuous task's fast `Failed` back to `Pending` and reassigns it — within
+the same `MAX_EXECUTOR_LOSSES_BEFORE_FAIL = 5` budget, seeding the
+checkpoint restore — keeping the streaming job `Running`. A genuinely
+broken task still fails after 5 consecutive failures. All 543 scheduler
+tests pass; clippy clean. **The full 2×25 gate now PASSES on the fixed
+image: 51/51, 0 failures, all 16 streaming cells green across both runs
+(including every streaming×shuffle-kill and ×executor-kill), plus the
+final failover-≤30s / one-leader / durable-history check.** Phase 58's
+twice-consecutive exit gate is met. The leader-fence fix stays too (it
+closes a real, separate non-leader push window).

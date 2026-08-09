@@ -831,6 +831,26 @@ impl Coordinator {
             self.job_input_partitions.remove(&job_id);
         }
 
+        // A continuous task reporting `Failed` because its executor went away
+        // must not terminate the whole streaming job: the executor-loss reset
+        // runs only on the slow heartbeat path, so this fast self-reported
+        // failure otherwise drives the job terminal (via `refresh_state`,
+        // which has no streaming exception) before recovery can act — and the
+        // next push gets `unknown job`. Rescue it here, on the fast path,
+        // bounded by the same loss budget. The shuffle-regen case
+        // (`!missing_partitions.is_empty()`) is handled above and left alone.
+        if is_continuous_cycle
+            && terminal_state == TaskState::Failed
+            && missing_partitions.is_empty()
+            && self.rescue_failed_continuous_task(&job_id, &task_id)
+        {
+            tracing::info!(
+                job_id = %job_id,
+                task_id = %task_id,
+                "continuous task failure rescued (executor loss); job kept Running for reassignment"
+            );
+        }
+
         // Phase 2.3 distributed write commit: when this update drove the job
         // to a terminal state, publish staged sink outputs (job success) or
         // clean up staging (failure/cancel). Runs before the state snapshot
