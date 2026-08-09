@@ -33,7 +33,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | # | crate | LOC | files | read whole | why here |
 |---|---|---|---|---|---|
 | **Tier 1 — critical path** |
-| 1 | krishiv-sql | 46,632 | 61 | 10 | `lib.rs`, `connector_table.rs`, `kafka_table.rs` read whole 2026-08-09 — 3 live defects fixed (`62f357c2`, `f92f690e`, `2b8bddaa`) |
+| 1 | krishiv-sql | 46,632 | 61 | 11 | `lib.rs`, `connector_table.rs`, `kafka_table.rs`, `udf.rs` read whole 2026-08-09 — 5 live defects fixed |
 | 2 | krishiv-executor | 28,927 | 40 | **40 — COMPLETE 2026-08-02** | second crate fully read; 3 defects fixed |
 | 3 | krishiv-shuffle | 14,329 | 36 | **36 — COMPLETE 2026-08-02** | first crate fully read; 4 defects fixed |
 | 4 | krishiv-scheduler | **51,438** | **78** | **78 (COMPLETE)** | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
@@ -66,7 +66,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 
 ---
 
-## 1. krishiv-sql — 10 of 61 files read whole (2026-08-09)
+## 1. krishiv-sql — 11 of 61 files read whole (2026-08-09)
 
 Measured coverage: **78.01% regions, 70.84% functions, 76.87% lines.**
 
@@ -154,7 +154,35 @@ Uncovered-region concentration (this decides what to test next):
       DDL branch accepting arbitrary options is deliberate (librdkafka surface)
       where the `jdbc` branch's closed option set is also deliberate.
 
-Two lessons from `lib.rs`, both about *my own* method:
+#### `udf.rs` (read whole, 2026-08-09)
+
+- [x] **Aggregate UDF `evaluate()` consumed its state.** DataFusion's
+      `Accumulator::evaluate` contract (datafusion-expr-common-54) is explicit:
+      "must not consume the internal state … Consuming the internal state can
+      cause the next invocation to have incorrect results."
+      `KrishivAggregateAccumulator` did `std::mem::take`. Reachable two ways,
+      both silently wrong numbers: a **window frame** calls `evaluate` once per
+      row, and `AggregateStream::maybe_update_dyn_filter` calls it *mid-stream*,
+      selecting accumulators **by function name alone**
+      (`eq_ignore_ascii_case("min"|"max")` — flagged as a HACK in
+      datafusion#18643), so a UDAF named `min`/`max` was hit too. `b0eabb9e`
+- [x] **Zero-argument scalar UDFs now rejected at registration.** `create_udf`
+      takes a `Fn(&[ColumnarValue])`, erasing the `number_rows` that
+      `ScalarFunctionArgs` carries — with no args the bridge built a 0-row batch
+      and returned a 0-length array for a projection over N rows. `b0eabb9e`
+- [x] **Documented why `sync_table_udfs` has no durability gate** where scalar
+      and aggregate do, so it is not later "fixed" with an over-broad one. The
+      gate keeps arbitrary *native* code out of a durable engine; the only two
+      producers of a `TableUdf` are a Rust closure (caller already runs native
+      code in-process) and a `LANGUAGE SQL` body (no native code). The remote
+      cloudpickle vector lands in the gated scalar/aggregate registries.
+- [x] Checked, NOT a defect: the aggregate path re-resolves the durability
+      profile while the scalar path takes a snapshotted `NativeScalarUdfPolicy`.
+      Both bottom out in `profile_forbids_native_scalar_udfs`, which honours
+      `KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS` and is `OnceLock`-cached — they cannot
+      disagree.
+
+Three lessons from these files, all about *my own* method:
 
 1. `register_parquet` looked like a missing-invalidation site to a
    grep-for-`invalidate_plan_cache`-in-body heuristic. Reading the body showed
