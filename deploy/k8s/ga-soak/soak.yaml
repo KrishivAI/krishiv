@@ -72,7 +72,7 @@ spec:
       # something the soak hides from itself.
       containers:
         - name: driver
-          image: localhost/krishiv:fast-b907ae23
+          image: localhost/krishiv:phase58-ha
           imagePullPolicy: Never
           env:
             # cert-v2 runs SEC-7 hardened, so the driver is a real authenticated
@@ -99,7 +99,7 @@ spec:
           args:
             - |
               COORD="${KRISHIV_COORD:-http://cert-v2-coordinator:2003}"
-              echo "GA-SOAK START $(date -u +%FT%TZ) coord=$COORD image=fast-b907ae23"
+              echo "GA-SOAK START $(date -u +%FT%TZ) coord=$COORD image=phase58-ha"
               n=0; ok=0; avail_fail=0; correct_fail=0
               while true; do
                 n=$((n+1))
@@ -324,12 +324,14 @@ spec:
                   # Rotate victims by hour so executors are hit more often than
                   # the coordinator: coordinator loss is the rarer, heavier
                   # event and hammering it would mask executor-recovery bugs.
+                  # Selectors match the helm chart's labels (the old
+                  # cert-v2-exec-a/-b names selected nothing after the rig
+                  # moved to the chart — every kill logged SKIP no-pod).
                   H=$(date -u +%H)
                   if [ "$H" = "05" ]; then
-                    SEL="app=cert-v2-coordinator"
+                    SEL="app.kubernetes.io/instance=cert-v2,app.kubernetes.io/component=coordinator"
                   else
-                    SEL="app=cert-v2-exec-a"
-                    [ "$H" = "11" ] && SEL="app=cert-v2-exec-b"
+                    SEL="app.kubernetes.io/instance=cert-v2,app.kubernetes.io/component=executor"
                   fi
                   # `{.items[*]...}` not `{.items[0]...}`: indexing an empty
                   # list makes kubectl exit non-zero ("array index out of
