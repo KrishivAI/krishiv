@@ -1098,6 +1098,12 @@ krishiv_scheduler_tasks_assigned_total {tasks}
         tasks = scheduler.tasks_assigned_total,
     );
     body.push_str(&scheduler_body);
+    // The full scheduler counter set — locality placement tiers
+    // (krishiv_placements_total{tier=…}, the Phase 53 NODE_LOCAL-majority
+    // measurement instrument), speculation, retries. This existed since
+    // Phase 53 but was never appended here, so the exit-gate measurement
+    // had no live surface to read.
+    body.push_str(&crate::metrics::render_prometheus_metrics());
     body.push_str(&krishiv_metrics::global_metrics().render_prometheus());
     body.push('\n');
     body.push_str(&krishiv_metrics::system::system_metrics().render_prometheus());
@@ -2189,6 +2195,12 @@ mod parse_tests {
         assert!(body.contains("krishiv_scheduler_jobs_submitted_total"));
         assert!(body.contains("krishiv_scheduler_checkpoint_epochs_total"));
         assert!(body.contains("krishiv_scheduler_tasks_assigned_total"));
+        // The Phase 53 locality tiers must be readable here — this is the
+        // exit-gate's NODE_LOCAL-majority measurement instrument, and it was
+        // rendered by `render_prometheus_metrics` but never appended to this
+        // body, so the live measurement had no surface to read.
+        assert!(body.contains("krishiv_placements_total{tier=\"node_local\"}"));
+        assert!(body.contains("krishiv_placements_total{tier=\"any\"}"));
     }
 
     #[tokio::test]
