@@ -286,13 +286,21 @@ impl TumblingWindowOperator {
         // Deterministic output order.
         closed.sort_by(|(ka, wa), (kb, wb)| wa.cmp(wb).then(ka.cmp(kb)));
 
-        let mut output = Vec::with_capacity(closed.len());
-        for bucket in closed {
-            if let Some(state) = self.accumulators.remove(&bucket) {
-                output.push(self.build_output_batch(&bucket.0, bucket.1, &state)?);
-            }
-        }
-        Ok(output)
+        // Phase 65: build the per-window output batches on the shared
+        // compute pool. Order-preserving by construction — `par_map` keeps
+        // input order and the bucket list is sorted BEFORE the parallel
+        // region, so output is byte-identical to the serial loop. State
+        // removal stays serial (it mutates the map); batch building is
+        // `&self`-only and independent per bucket.
+        let drained: Vec<((String, i64), AggState)> = closed
+            .into_iter()
+            .filter_map(|bucket| self.accumulators.remove(&bucket).map(|state| (bucket, state)))
+            .collect();
+        krishiv_common::compute_pool::par_map(drained, |(bucket, state)| {
+            self.build_output_batch(&bucket.0, bucket.1, &state)
+        })
+        .into_iter()
+        .collect()
     }
 
     /// Early-fire: emit the **current** aggregate of every still-open window
@@ -311,13 +319,18 @@ impl TumblingWindowOperator {
         let mut open: Vec<(String, i64)> = self.accumulators.keys().cloned().collect();
         // Deterministic output order, matching `flush_closed_windows`.
         open.sort_by(|(ka, wa), (kb, wb)| wa.cmp(wb).then(ka.cmp(kb)));
-        let mut output = Vec::with_capacity(open.len());
-        for bucket in open {
-            if let Some(state) = self.accumulators.get(&bucket) {
-                output.push(self.build_output_batch(&bucket.0, bucket.1, state)?);
+        // Phase 65: same order-preserving pool fan-out as the close path;
+        // read-only over `&self`, state untouched (early fires must never
+        // mutate).
+        krishiv_common::compute_pool::par_map(open, |bucket| {
+            match self.accumulators.get(&bucket) {
+                Some(state) => self.build_output_batch(&bucket.0, bucket.1, state).map(Some),
+                None => Ok(None),
             }
-        }
-        Ok(output)
+        })
+        .into_iter()
+        .filter_map(Result::transpose)
+        .collect()
     }
 
     fn build_output_batch(
@@ -674,6 +687,64 @@ mod aggregation_proptests {
             ],
         )
         .expect("schema and array lengths match")
+    }
+
+    /// Phase 65: the pooled flush must be byte-order-identical to the serial
+    /// contract — one batch per closed window, sorted by
+    /// `(window_start_ms, key)` — across many keys and windows. `par_map`
+    /// preserves input order and the sort happens before the parallel
+    /// region, so any reordering here is a real regression.
+    #[test]
+    fn parallel_flush_keeps_deterministic_order() {
+        let mut op = TumblingWindowOperator::new(spec());
+        // 40 keys × 5 windows, inserted in scrambled order.
+        let mut rows: Vec<(String, i64, i64)> = Vec::new();
+        for k in 0..40 {
+            for w in 0..5 {
+                rows.push((format!("key-{:02}", (k * 7) % 40), w * 1000 + 17, 1));
+            }
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(k, _, _)| k.clone()).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, ts, _)| *ts).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, _, v)| *v).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        // Watermark past every window end closes all 5 windows per key.
+        let out = op.process_batch(&batch, 10_000).unwrap();
+        let mut seen: Vec<(i64, String)> = Vec::new();
+        for b in &out {
+            assert_eq!(b.num_rows(), 1, "one batch per (key, window) bucket");
+            let start = b
+                .column_by_name("window_start_ms")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .map(|a| a.value(0))
+                .unwrap();
+            let key = b
+                .column_by_name("k")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .map(|a| a.value(0).to_string())
+                .unwrap();
+            seen.push((start, key));
+        }
+        let mut expected = seen.clone();
+        expected.sort();
+        assert_eq!(seen, expected, "flush output must stay (window_start, key)-sorted");
+        assert_eq!(seen.len(), 40 * 5);
     }
 
     fn spec() -> TumblingWindowSpec {
