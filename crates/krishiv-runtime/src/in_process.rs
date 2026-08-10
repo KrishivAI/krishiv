@@ -736,12 +736,21 @@ impl InProcessStreamingRuntime {
                 };
                 // Dispatch assignments the previous tick launched (they are
                 // already launch-in-flight, so the call above cannot return
-                // them again).
-                assignments.extend(
-                    std::mem::take(&mut tick_assignments)
-                        .into_iter()
-                        .filter(|a| a.job_id() == &job_id),
-                );
+                // them again). Assignments for OTHER jobs — a concurrent
+                // driver's stage the tick just made eligible — go straight to
+                // the shared inbox: they were marked launch-in-flight by OUR
+                // tick, so dropping them would strand that job's stage
+                // forever (its own driver's launch call can't return them
+                // again).
+                for a in std::mem::take(&mut tick_assignments) {
+                    if a.job_id() == &job_id {
+                        assignments.push(a);
+                    } else {
+                        self.inbox
+                            .push(a)
+                            .map_err(|e| RuntimeError::transport(e.to_string()))?;
+                    }
+                }
 
                 if assignments.is_empty() {
                     if let Some(state) = job_state
@@ -828,18 +837,20 @@ impl InProcessStreamingRuntime {
                     .await
                     .map_err(|e| RuntimeError::transport(e.message()))?
                 {
-                    // Only collect terminal-stage outputs (SQL, connector pipeline,
-                    // streaming window).  Intermediate shuffle-write reports must
-                    // not be concatenated into the final result set.
-                    let kind = report.output().kind();
-                    if matches!(
-                        kind,
-                        ExecutorTaskOutputKind::Sql
-                            | ExecutorTaskOutputKind::ConnectorPipeline
-                            | ExecutorTaskOutputKind::StreamingWindow
-                    ) {
-                        output_batches.extend(report.output().record_batches().to_vec());
+                    // The inbox is SHARED across concurrent drivers, so this
+                    // report may belong to ANOTHER driver's job — we executed
+                    // its task; its rows are routed per-job through the
+                    // coordinator's inline-result store by the status report.
+                    // Rows are NEVER collected from the report stream (before
+                    // this filter existed, 12 concurrent queries received
+                    // each other's rows or none — found by the all-slots-busy
+                    // bench); every driver drains its OWN job's rows from the
+                    // store after the loop. Per-report side effects apply
+                    // only to this driver's job.
+                    if report.assignment().job_id() != &job_id {
+                        continue;
                     }
+                    let kind = report.output().kind();
                     // G1: Collect watermark from streaming stages for the next stage.
                     // Skip i64::MIN (WATERMARK_UNSET) — it is the uninitialized sentinel
                     // returned by windows that have not yet processed any events (B3/A4).
@@ -884,6 +895,28 @@ impl InProcessStreamingRuntime {
                 }
             }
         })?;
+
+        // The job's rows: drained from the coordinator's per-job inline-result
+        // store — the one place they are correctly routed regardless of WHICH
+        // concurrent driver's thread executed the terminal task (every
+        // Succeeded report deposits its inline IPC there, keyed by job).
+        {
+            let inline = {
+                let mut coord = self
+                    .coordinator
+                    .lock()
+                    .map_err(|_| RuntimeError::InvalidState {
+                        message: "coordinator lock poisoned during result claim".into(),
+                    })?;
+                coord.take_job_inline_results(&job_id).unwrap_or_default()
+            };
+            if !inline.is_empty() {
+                output_batches.extend(
+                    krishiv_scheduler::decode_inline_record_batches(&inline)
+                        .map_err(|e| RuntimeError::transport(format!("decode results: {e}")))?,
+                );
+            }
+        }
 
         // Phase 2.10: results that exceeded the inline threshold were spooled
         // to disk and pushed through the coordinator bridge instead of riding
@@ -1637,6 +1670,51 @@ mod tests {
             rt2.continuous_registry.has_job("job-a"),
             "restored job must appear in the registry"
         );
+    }
+
+    /// Concurrent drivers share one inbox, so any thread can execute any
+    /// job's task — before results were routed through the coordinator's
+    /// per-job store, a driver collected WHATEVER rows the report it popped
+    /// carried: 12 concurrent queries received each other's rows or none
+    /// (found live by the all-slots-busy bench). Every query must get
+    /// exactly its own answer, every time.
+    #[test]
+    fn concurrent_queries_each_get_their_own_rows() {
+        use arrow::array::Int64Array;
+        let runtime = std::sync::Arc::new(InProcessStreamingRuntime::new().unwrap());
+        for round in 0..3 {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|i| {
+                        let runtime = std::sync::Arc::clone(&runtime);
+                        scope.spawn(move || {
+                            let tag = round * 100 + i;
+                            let batches = runtime
+                                .execute_batch_sql_via_coordinator(
+                                    &format!("SELECT {tag} AS tag"),
+                                    &[],
+                                )
+                                .expect("concurrent query failed");
+                            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                            assert_eq!(rows, 1, "query {tag} must get exactly one row");
+                            let got = batches
+                                .iter()
+                                .find(|b| b.num_rows() > 0)
+                                .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
+                                .map(|a| a.value(0))
+                                .expect("tag column");
+                            assert_eq!(
+                                got, tag,
+                                "query {tag} received ANOTHER query's rows (got {got})"
+                            );
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    h.join().expect("worker panicked");
+                }
+            });
+        }
     }
 
     #[test]
