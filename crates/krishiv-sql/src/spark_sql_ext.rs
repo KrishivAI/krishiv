@@ -39,7 +39,7 @@ use crate::{SqlError, SqlResult};
 
 /// Detects `LATERAL VIEW` in SQL.
 pub fn contains_lateral_view(sql: &str) -> bool {
-    let upper = sql.to_uppercase();
+    let upper = sql.to_ascii_uppercase();
     upper.contains("LATERAL VIEW") || upper.contains("LATERAL VIEW OUTER")
 }
 
@@ -103,7 +103,11 @@ fn rewrite_lateral_view_at(sql: &str, pos: usize, keyword: &str, is_outer: bool)
     let keyword_offset = after_keyword.len() - trimmed.len();
 
     // Find " AS " keyword in the remaining text
-    let upper_trimmed = trimmed.to_uppercase();
+    // ASCII folding: `as_pos` below indexes `trimmed`, not this copy, so the
+    // two must have identical byte lengths. Unicode folding does not preserve
+    // length (U+FB01 folds to "FI", 3 bytes to 2), which shifts the split and
+    // can slice a multi-byte character in half.
+    let upper_trimmed = trimmed.to_ascii_uppercase();
     let as_pos = upper_trimmed.find(" AS ")?;
     let func_call = trimmed[..as_pos].trim();
 
@@ -208,8 +212,9 @@ fn find_alias_length(text: &str) -> usize {
 }
 
 fn find_keyword_boundary(sql: &str, keyword: &str) -> Option<usize> {
-    let upper = sql.to_uppercase();
-    let keyword_upper = keyword.to_uppercase();
+    // ASCII folding: `abs_pos` is applied to `sql`.
+    let upper = sql.to_ascii_uppercase();
+    let keyword_upper = keyword.to_ascii_uppercase();
 
     let mut search_start = 0;
     while let Some(pos) = upper[search_start..].find(&keyword_upper) {
@@ -388,7 +393,8 @@ fn regex_replace(input: &str, pattern: &str, replacement: &str) -> SqlResult<Str
     if pattern == r"(?i)\bEXTENDED\b\s*" {
         // Remove EXTENDED and surrounding whitespace
         let mut result = input.to_string();
-        while let Some(pos) = result.to_uppercase().find("EXTENDED") {
+        // ASCII folding: `pos` indexes `result`.
+        while let Some(pos) = result.to_ascii_uppercase().find("EXTENDED") {
             // Check word boundaries
             let bytes = result.as_bytes();
             let before_ok =

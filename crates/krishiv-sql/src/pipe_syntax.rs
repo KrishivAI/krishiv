@@ -116,7 +116,8 @@ pub fn process_pipe_syntax(sql: &str) -> Result<String, PipeSyntaxError> {
 
     for part in stages {
         let part = part.trim();
-        let upper = part.to_uppercase();
+        // ASCII folding so `strip_kw`'s byte offsets into `part` are valid.
+        let upper = part.to_ascii_uppercase();
 
         if let Some(rest) = strip_kw(part, &upper, "WHERE ") {
             // Grouped already? Then this filters groups, i.e. HAVING.

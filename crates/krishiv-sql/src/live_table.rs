@@ -83,7 +83,13 @@ impl LiveTableRegistry {
 /// Parse `CREATE|REFRESH|DROP LIVE TABLE` statements.
 pub fn parse_live_table_statement(sql: &str) -> SqlResult<Option<LiveTableStatement>> {
     let trimmed = sql.trim().trim_end_matches(';');
-    let upper = trimmed.to_uppercase();
+    // `to_ascii_uppercase`, not `to_uppercase`: offsets found in the uppercased
+    // copy are applied to the original, so the two must have identical byte
+    // lengths. Unicode case folding does not preserve length — `ﬁ` (U+FB01,
+    // 3 bytes) uppercases to `FI` (2) — which truncated names and, when the
+    // shifted offset landed inside a multi-byte character, panicked outright.
+    // Every keyword matched here is ASCII, so ASCII folding is sufficient.
+    let upper = trimmed.to_ascii_uppercase();
 
     if upper.starts_with("CREATE LIVE TABLE ") {
         let rest =
@@ -128,7 +134,9 @@ pub fn parse_live_table_statement(sql: &str) -> SqlResult<Option<LiveTableStatem
 }
 
 fn split_name_and_query(rest: &str) -> SqlResult<(String, String)> {
-    let upper = rest.to_uppercase();
+    // Length-preserving folding — see the note in `parse_live_table_statement`.
+    // `as_pos` below indexes `rest`, not `upper`.
+    let upper = rest.to_ascii_uppercase();
     let as_pos = upper.find(" AS ").ok_or_else(|| SqlError::Unsupported {
         feature: "CREATE LIVE TABLE requires AS <query>".into(),
     })?;
@@ -240,6 +248,39 @@ mod tests {
                 assert!(query.contains("SUM(amount)"));
             }
             _ => panic!("expected create"),
+        }
+    }
+
+    /// The name offset is found in the uppercased copy and applied to the
+    /// original, so the two must have identical byte lengths. Unicode
+    /// `to_uppercase` does not guarantee that: `ﬁ` (U+FB01, 3 bytes) becomes
+    /// `FI` (2 bytes), shifting every later offset.
+    #[test]
+    fn a_name_whose_uppercase_is_shorter_is_not_truncated() {
+        let stmt = parse_live_table_statement("CREATE LIVE TABLE \u{FB01}x AS SELECT 1")
+            .unwrap()
+            .unwrap();
+        match stmt {
+            LiveTableStatement::Create { name, query } => {
+                assert_eq!(name, "\u{FB01}x", "the whole name must survive");
+                assert_eq!(query, "SELECT 1");
+            }
+            other => panic!("expected create, got {other:?}"),
+        }
+    }
+
+    /// ...and when the shifted offset lands inside a multi-byte character,
+    /// slicing the original panics outright.
+    #[test]
+    fn a_shifted_offset_landing_mid_character_does_not_panic() {
+        let stmt = parse_live_table_statement("CREATE LIVE TABLE \u{FB01}\u{E9} AS SELECT 1")
+            .unwrap()
+            .unwrap();
+        match stmt {
+            LiveTableStatement::Create { name, .. } => {
+                assert_eq!(name, "\u{FB01}\u{E9}");
+            }
+            other => panic!("expected create, got {other:?}"),
         }
     }
 
