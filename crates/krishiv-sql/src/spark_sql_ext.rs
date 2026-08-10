@@ -6,9 +6,32 @@
 //! - **LATERAL VIEW**: `SELECT ... FROM t LATERAL VIEW explode(arr) AS col`
 //! - **LATERAL VIEW OUTER**: `SELECT ... FROM t LATERAL VIEW OUTER explode(arr) AS col`
 //! - **TABLESAMPLE**: `SELECT ... FROM t TABLESAMPLE (10 PERCENT)`
-//! - **TRANSFORM**: `SELECT TRANSFORM(...) FROM t`
 //! - **DESCRIBE TABLE EXTENDED**: `DESCRIBE TABLE EXTENDED t`
-//! - **SHOW TABLE PROPERTIES**: `SHOW TBLPROPERTIES t`
+//!
+//! # Status: not wired into the query path
+//!
+//! Nothing calls this module. Every one of its public functions, including the
+//! aggregate [`preprocess_spark_sql`], has zero callers in the workspace, so no
+//! query reaches any of these rewrites. The module is compiled and its tests
+//! run, which is why that was not obvious.
+//!
+//! Whether to wire it or delete it is a product decision about how much Spark
+//! surface the SQL front door should carry, so it is recorded in
+//! `docs/implementation/crate-audit-register.md` rather than decided here. What
+//! *is* fixed here is everything that would have been wrong the moment it was
+//! wired — the rewrites used to emit SQL naming functions and relations that do
+//! not exist:
+//!
+//! - `LATERAL VIEW explode(x)` produced `explode(x)`, which is neither a
+//!   DataFusion function nor registered by this engine. It now emits `UNNEST`,
+//!   matching what [`crate::unnest_sql`] produces for the same shape.
+//! - `SHOW TBLPROPERTIES` produced a query against
+//!   `information_schema.table_properties`, which DataFusion does not define,
+//!   and interpolated the table name unescaped. It now reports the feature as
+//!   unsupported.
+//! - `TRANSFORM` was a documented "rewrite" that returned its input untouched,
+//!   so a `TRANSFORM` query would have been passed to DataFusion verbatim. It
+//!   now reports the feature as unsupported.
 
 use crate::{SqlError, SqlResult};
 
@@ -29,7 +52,7 @@ pub fn contains_lateral_view(sql: &str) -> bool {
 /// SELECT id, val FROM t LATERAL VIEW explode(tags) AS tag
 ///
 /// -- Output
-/// SELECT id, val FROM t CROSS JOIN LATERAL explode(tags) AS tag
+/// SELECT id, val FROM t CROSS JOIN LATERAL UNNEST(tags) AS tag
 /// ```
 ///
 /// Also handles `LATERAL VIEW OUTER`:
@@ -38,7 +61,7 @@ pub fn contains_lateral_view(sql: &str) -> bool {
 /// SELECT id, val FROM t LATERAL VIEW OUTER explode(tags) AS tag
 ///
 /// -- Output
-/// SELECT id, val FROM t LEFT JOIN LATERAL explode(tags) AS tag ON TRUE
+/// SELECT id, val FROM t LEFT JOIN LATERAL UNNEST(tags) AS tag ON TRUE
 /// ```
 pub fn rewrite_lateral_view(sql: &str) -> SqlResult<String> {
     if !contains_lateral_view(sql) {
@@ -96,6 +119,12 @@ fn rewrite_lateral_view_at(sql: &str, pos: usize, keyword: &str, is_outer: bool)
     let consumed = keyword.len() + keyword_offset + as_pos + 4 + alias_len;
     let rest = &sql[pos + consumed..];
 
+    // Spark's generator functions are spelled `explode`/`posexplode`; neither
+    // exists in DataFusion. `UNNEST` is the equivalent and is what
+    // `unnest_sql::rewrite_lateral_unnest` emits for the same shape, so the two
+    // Spark-compat paths agree on one target.
+    let func_call = &spark_generator_to_unnest(func_call);
+
     let join_type = if is_outer {
         "LEFT JOIN LATERAL"
     } else {
@@ -108,6 +137,27 @@ fn rewrite_lateral_view_at(sql: &str, pos: usize, keyword: &str, is_outer: bool)
         "{} {} {} AS {}{}{}",
         before, join_type, func_call, alias_part, on_clause, rest
     ))
+}
+
+/// Rewrite a Spark generator call to the equivalent `UNNEST`.
+///
+/// `explode(arr)` and `posexplode(arr)` both become `UNNEST(arr)`. Anything else
+/// is left alone — a user-defined generator may well exist.
+fn spark_generator_to_unnest(func_call: &str) -> String {
+    let trimmed = func_call.trim();
+    for generator in ["explode_outer", "posexplode_outer", "explode", "posexplode"] {
+        let prefix_len = generator.len();
+        if trimmed.len() > prefix_len
+            && trimmed
+                .get(..prefix_len)
+                .is_some_and(|head| head.eq_ignore_ascii_case(generator))
+            && trimmed.get(prefix_len..).is_some_and(|r| r.starts_with('('))
+        {
+            let args = trimmed.get(prefix_len..).unwrap_or("");
+            return format!("UNNEST{args}");
+        }
+    }
+    trimmed.to_string()
 }
 
 /// Find the length of an alias in the text like "tag" or "tag(col1, col2)".
@@ -250,8 +300,18 @@ pub fn contains_transform(sql: &str) -> bool {
 /// Spark's `TRANSFORM` is an alias for `SELECT TRANSFORM(...)`. This rewrites
 /// it to a DataFusion-compatible form.
 pub fn rewrite_transform(sql: &str) -> SqlResult<String> {
-    // TRANSFORM is complex and Spark-specific; for now pass through with a note
-    Ok(sql.to_string())
+    if !contains_transform(sql) {
+        return Ok(sql.to_string());
+    }
+    // This used to return `sql` untouched while documenting itself as a
+    // rewrite, so a TRANSFORM query would have reached DataFusion verbatim and
+    // failed there with a parse error naming nothing useful. Spark's TRANSFORM
+    // pipes rows through an external process; there is no SQL-level equivalent
+    // to rewrite it into.
+    Err(SqlError::Unsupported {
+        feature: "Spark TRANSFORM (rows piped through an external script) has no SQL equivalent"
+            .into(),
+    })
 }
 
 // ── DESCRIBE TABLE EXTENDED ─────────────────────────────────────────────────
@@ -303,10 +363,15 @@ pub fn rewrite_show_tblproperties(sql: &str) -> SqlResult<String> {
                 message: "SHOW TBLPROPERTIES requires a table name".into(),
             });
         }
-        // Rewrite to a standard query against table_properties metadata
-        return Ok(format!(
-            "SELECT key, value FROM information_schema.table_properties WHERE table_name = '{table_name}'"
-        ));
+        // `information_schema.table_properties` is not a relation DataFusion
+        // defines, so the generated query could only ever fail with "table not
+        // found" — and the name was interpolated unescaped on the way there.
+        return Err(SqlError::Unsupported {
+            feature: format!(
+                "SHOW TBLPROPERTIES {table_name}: no table-properties relation is exposed by the \
+                 catalog yet"
+            ),
+        });
     }
 
     Ok(sql.to_string())
@@ -378,7 +443,10 @@ mod tests {
     fn lateral_view_basic() {
         let sql = "SELECT id, val FROM t LATERAL VIEW explode(tags) AS tag";
         let result = rewrite_lateral_view(sql).unwrap();
-        assert!(result.contains("CROSS JOIN LATERAL explode(tags) AS tag"));
+        assert!(
+            result.contains("CROSS JOIN LATERAL UNNEST(tags) AS tag"),
+            "explode must become UNNEST, which DataFusion actually has: {result}"
+        );
         assert!(!result.contains("LATERAL VIEW"));
     }
 
@@ -386,8 +454,44 @@ mod tests {
     fn lateral_view_outer() {
         let sql = "SELECT id, val FROM t LATERAL VIEW OUTER explode(tags) AS tag";
         let result = rewrite_lateral_view(sql).unwrap();
-        assert!(result.contains("LEFT JOIN LATERAL explode(tags) AS tag ON TRUE"));
+        assert!(
+            result.contains("LEFT JOIN LATERAL UNNEST(tags) AS tag ON TRUE"),
+            "{result}"
+        );
         assert!(!result.contains("LATERAL VIEW"));
+    }
+
+    /// `posexplode` maps too, and a non-Spark generator is left alone.
+    #[test]
+    fn only_spark_generators_are_mapped_to_unnest() {
+        let mapped = rewrite_lateral_view("SELECT a FROM t LATERAL VIEW posexplode(arr) AS p").unwrap();
+        assert!(mapped.contains("UNNEST(arr)"), "{mapped}");
+        let untouched =
+            rewrite_lateral_view("SELECT a FROM t LATERAL VIEW my_gen(arr) AS p").unwrap();
+        assert!(
+            untouched.contains("my_gen(arr)"),
+            "a user-defined generator must survive: {untouched}"
+        );
+    }
+
+    /// TRANSFORM used to return its input unchanged while documenting itself as
+    /// a rewrite, so the query reached DataFusion verbatim.
+    #[test]
+    fn transform_reports_unsupported_instead_of_passing_through() {
+        let sql = "SELECT TRANSFORM(a, b) USING 'script' AS (x, y) FROM t";
+        let err = rewrite_transform(sql).expect_err("TRANSFORM has no SQL equivalent");
+        assert!(matches!(err, SqlError::Unsupported { .. }), "{err}");
+        // A query without TRANSFORM is still untouched.
+        assert_eq!(rewrite_transform("SELECT 1").unwrap(), "SELECT 1");
+    }
+
+    /// SHOW TBLPROPERTIES targeted `information_schema.table_properties`, which
+    /// DataFusion does not define, and interpolated the name unescaped.
+    #[test]
+    fn show_tblproperties_reports_unsupported() {
+        let err = rewrite_show_tblproperties("SHOW TBLPROPERTIES my_table")
+            .expect_err("no table-properties relation exists");
+        assert!(matches!(err, SqlError::Unsupported { .. }), "{err}");
     }
 
     #[test]
@@ -474,17 +578,23 @@ mod tests {
 
     #[test]
     fn show_tblproperties_rewrite() {
-        let sql = "SHOW TBLPROPERTIES my_table";
-        let result = rewrite_show_tblproperties(sql).unwrap();
-        assert!(result.contains("my_table"));
-        assert!(result.contains("information_schema"));
+        // This asserted that the output referenced `information_schema` — i.e.
+        // it pinned a rewrite to `information_schema.table_properties`, a
+        // relation DataFusion does not define. The generated query could only
+        // ever fail with "table not found", so the test was pinning the bug.
+        let err = rewrite_show_tblproperties("SHOW TBLPROPERTIES my_table")
+            .expect_err("no table-properties relation is exposed");
+        assert!(err.to_string().contains("my_table"), "{err}");
     }
 
     #[test]
     fn show_tblproperties_with_semicolon() {
-        let sql = "SHOW TBLPROPERTIES my_table;";
-        let result = rewrite_show_tblproperties(sql).unwrap();
-        assert!(result.contains("my_table"));
+        // The trailing semicolon must still be stripped from the reported name.
+        let err = rewrite_show_tblproperties("SHOW TBLPROPERTIES my_table;")
+            .expect_err("no table-properties relation is exposed");
+        let message = err.to_string();
+        assert!(message.contains("my_table"), "{message}");
+        assert!(!message.contains("my_table;"), "semicolon not stripped: {message}");
     }
 
     #[test]
