@@ -1,0 +1,71 @@
+# Continuous engine image for cross-repo CI (Phase 63 SEC-7).
+#
+# The platform repo's certified-profile-live gate needs a pullable engine
+# image; release.yml only publishes on published releases, which are
+# maintainer-gated — so the SEC-7 CI gate sat blocked on "an engine image
+# reachable from platform CI". This closes that structurally: every push to
+# main publishes ghcr.io/<owner>/krishiv:main (prod feature set — the exact
+# set the gate's input demands: rest-catalog, distributed, cloud, kafka,
+# iceberg) plus an immutable :main-<sha> tag for pinning.
+#
+# Auth is the workflow's own GITHUB_TOKEN (packages: write) — no new
+# secrets. If the org keeps the package private, grant the krishiv-platform
+# repo read access on the package once (package settings → manage Actions
+# access); a public package needs nothing.
+name: publish-main-image
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deploy/docker/**"
+      - ".github/workflows/publish-main-image.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: publish-main-image
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/krishiv
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=main
+            type=raw,value=main-{{sha}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.build
+          # amd64 only: this is the CI-consumption image, not the release
+          # matrix — release.yml keeps the multi-platform publishes.
+          platforms: linux/amd64
+          push: true
+          build-args: FEATURES=prod
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=docker-main
+          cache-to: type=gha,scope=docker-main,mode=max
