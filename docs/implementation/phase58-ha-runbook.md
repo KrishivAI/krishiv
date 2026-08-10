@@ -219,3 +219,45 @@ image: 51/51, 0 failures, all 16 streaming cells green across both runs
 final failover-≤30s / one-leader / durable-history check.** Phase 58's
 twice-consecutive exit gate is met. The leader-fence fix stays too (it
 closes a real, separate non-leader push window).
+
+### 2026-08-10 — digest assertions land; they immediately kill two hollow cells
+
+The gate's owed correctness assertion is now built in
+(`scripts/phase58_chaos.sh`): before the matrix, every workload runs twice
+in steady state — capture + determinism check — and each fault iteration
+must then reproduce the baseline content digest to PASS. `Succeeded` alone
+no longer scores. Batch verifies the fault-surviving job's OWN result rows
+(`GET /api/v1/batch-sql/{id}`, sha256 over sorted rows); streaming digests
+the poll's windowed rows (main push, then an `advance.parquet` push that
+closes the tail window); IVM asserts the post-fault re-run is EXACTLY 2×
+the pre-fault view per key (incremental semantics: 1× = state lost,
+3× = double-applied) plus a baseline digest on the pre-fault view.
+Loud, bounded carve-outs where delivery is best-effort by design
+(coordinator-kill: batch inline results and undrained stream output live
+in leader RAM — DUR-5).
+
+Two findings the first baseline run surfaced immediately, before any fault:
+
+1. **Every prior streaming cell was hollow.** The gate submitted
+   `--event-time-column ts` against a dataset whose column is
+   `event_time`; every poll returned 0 rows and exit-code-only scoring
+   called that PASS — including all 16 "green" streaming cells of the
+   2026-08-09 51/51 run. The fixed workload digests 87,623 windowed rows.
+2. **The Flight drain path silently lost oversized cycle output** (engine
+   fix, same day). `ContinuousDrain` consumed the store, THEN size-checked:
+   a >64 MiB response was rejected client-side and the client's streaming
+   fallback re-drained an EMPTY store — 87k rows reported as "0 rows", no
+   error anywhere. Fixed server-side: the action now measures the encoded
+   response against a 48 MiB budget (`KRISHIV_FLIGHT_DRAIN_ACTION_MAX_BYTES`)
+   and, when oversized, PUTS THE PAYLOAD BACK
+   (`Coordinator::unshift_job_inline_results`, order-preserving; host-level
+   buffer for the in-process backend) before returning
+   `resource_exhausted` — so the existing streaming fallback then delivers
+   it. Regression tests: scheduler unshift ordering; flight-sql
+   end-to-end oversize→retry-delivers-all-rows.
+
+The rescue fix (`4f20d74`) also gained its missing unit test
+(`fast_failed_continuous_task_is_rescued_not_terminal`: rescued below the
+loss budget, terminal at it). Rig standup for kind is now scripted:
+`scripts/phase58_kind_up.sh` (fresh secrets, MinIO + DUR-2 bucket,
+deterministic datasets incl. `advance.parquet`, nodeName repoints).
