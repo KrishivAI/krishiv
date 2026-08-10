@@ -41,6 +41,13 @@ static CLUSTER_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// `drain_continuous_job`).
 const MAX_STAGE_ITERATIONS: usize = 1024;
 
+/// Maximum consecutive no-progress wait iterations (5ms sleep each, so ~60s)
+/// a driver tolerates while its job's tasks run on other concurrent drivers'
+/// threads before declaring the job wedged. Reset whenever the unfinished
+/// task count changes or an assignment arrives, so it bounds a genuinely
+/// lost task — not a long-running query.
+const MAX_WAIT_ITERATIONS: usize = 12_000;
+
 /// Sentinel returned by uninitialized streaming windows (`i64::MIN`).
 /// Watermarks equal to this value are never propagated to downstream stages.
 pub(crate) const WATERMARK_UNSET: i64 = i64::MIN;
@@ -717,20 +724,19 @@ impl InProcessStreamingRuntime {
         // hang: the tick already consumed their one launch.
         let mut tick_assignments: Vec<krishiv_proto::ExecutorTaskAssignment> = Vec::new();
 
+        // Consecutive no-progress wait iterations (assignments empty, unfinished
+        // tasks unchanged). Bounds a genuine wedge — a task lost with no
+        // executor ever picking it up — without burning MAX_STAGE_ITERATIONS
+        // on legitimate waiting while another driver runs this job's tasks.
+        let mut wait_iters = 0usize;
+        let mut last_unfinished = usize::MAX;
+
         block_on(async {
             loop {
-                if iter_count >= MAX_STAGE_ITERATIONS {
-                    return Err(RuntimeError::transport(format!(
-                        "in-process runtime exceeded {MAX_STAGE_ITERATIONS} stage iterations \
-                         for job {job_id}; for unbounded queries use the streaming API"
-                    )));
-                }
-                iter_count += 1;
-
                 // O4: Merge launch_assigned_task_assignments + job_snapshot into
                 // one lock acquisition (previously two separate locks per iteration).
                 // coordinator_tick is kept after task execution below.
-                let (mut assignments, job_state, tasks_unfinished) = {
+                let (mut assignments, job_state, task_count, tasks_unfinished) = {
                     let mut coord = self.coordinator.lock().map_err(|_| {
                         RuntimeError::transport(
                             "coordinator lock poisoned during task assignment launch",
@@ -741,22 +747,22 @@ impl InProcessStreamingRuntime {
                         .map_err(|e| RuntimeError::transport(e.to_string()))?;
                     let snapshot = coord.job_snapshot(&job_id).ok();
                     let job_state = snapshot.as_ref().map(|s| s.state());
-                    // Unfinished = total − succeeded − failed, NOT
-                    // assigned + running: during a stage transition the next
-                    // stage's tasks are PENDING (eligible but not yet assigned
-                    // by a tick), and counting only assigned/running here made
-                    // the quiescent exit below fire mid-job — the driver
-                    // returned zero rows while its reduce stage had not even
-                    // been assigned yet (third concurrency hole found by the
-                    // all-slots-busy bench).
+                    let task_count = snapshot.as_ref().map(|s| s.task_count()).unwrap_or(0);
+                    // Unfinished = total − succeeded, NOT assigned + running:
+                    // during a stage transition the next stage's tasks are
+                    // PENDING (eligible but not yet assigned by a tick), and
+                    // counting only assigned/running here made the quiescent
+                    // exit below fire mid-job — the driver returned zero rows
+                    // while its reduce stage had not even been assigned yet
+                    // (third concurrency hole found by the all-slots-busy
+                    // bench). Failed tasks also count as unfinished: either
+                    // the retry machinery resets them to Pending or the job
+                    // flips Failed, and the terminal branch below is the one
+                    // that must classify that — never the quiescent exit.
                     let tasks_unfinished = snapshot
-                        .map(|s| {
-                            s.task_count()
-                                .saturating_sub(s.succeeded_task_count())
-                                .saturating_sub(s.failed_task_count())
-                        })
+                        .map(|s| s.task_count().saturating_sub(s.succeeded_task_count()))
                         .unwrap_or(0);
-                    (assignments, job_state, tasks_unfinished)
+                    (assignments, job_state, task_count, tasks_unfinished)
                 };
                 // Dispatch assignments the previous tick launched (they are
                 // already launch-in-flight, so the call above cannot return
@@ -793,48 +799,73 @@ impl InProcessStreamingRuntime {
                             Ok(())
                         };
                     }
-                    // Tasks still Pending/Assigned/Running with nothing for
-                    // US to launch: either a CONCURRENT driver popped this
-                    // job's work from the shared inbox and is executing it
-                    // (holds even on OUR first iteration — another driver's
-                    // coordinator tick can launch this job's tasks before we
-                    // ever loop), or the next stage's tasks are awaiting
-                    // assignment by a tick. Returning here (the old behavior)
-                    // declared the job "effectively done" and handed back an
-                    // EMPTY result while work remained — the second and third
-                    // concurrency holes the all-slots-busy bench exposed.
-                    // Tick to advance assignment, then wait for reports;
-                    // MAX_STAGE_ITERATIONS still bounds a wedge.
                     if tasks_unfinished > 0 {
-                        // `continue` skips the tick at the bottom of the loop,
-                        // so tick HERE too: with no other driver ticking (they
-                        // all finished), a Pending next-stage task would
-                        // otherwise never be assigned and this loop would spin
-                        // to MAX_STAGE_ITERATIONS. The next iteration's
-                        // dispatch routes anything this tick launches.
-                        {
-                            let mut coord = self.coordinator.lock().map_err(|_| {
-                                RuntimeError::InvalidState {
-                                    message: "coordinator lock poisoned during wait tick".into(),
-                                }
-                            })?;
-                            let _ = coord.touch_executor(&self.executor_id);
-                            tick_assignments = coord.coordinator_tick().unwrap_or_default();
+                        // Tasks still Pending/Assigned/Running with nothing
+                        // for US to launch: either a CONCURRENT driver popped
+                        // this job's work from the shared inbox and is
+                        // executing it (holds even on OUR first iteration —
+                        // another driver's tick can launch this job's tasks
+                        // before we ever loop), or the next stage's tasks are
+                        // awaiting assignment by a tick. Returning here (the
+                        // old behavior) declared the job "effectively done"
+                        // and handed back an EMPTY result while work remained.
+                        //
+                        // Do NOT `continue` here: this job's task may be
+                        // sitting in the SHARED inbox — launched by another
+                        // driver's tick right before that driver finished and
+                        // went away — and the runner drain below is the only
+                        // thing that will ever execute it. Fall through to
+                        // the drain + tick; sleep briefly so an inbox-empty
+                        // wait (task running on another thread) doesn't spin
+                        // hot.
+                        if tasks_unfinished == last_unfinished {
+                            wait_iters += 1;
+                            if wait_iters >= MAX_WAIT_ITERATIONS {
+                                return Err(RuntimeError::transport(format!(
+                                    "in-process driver made no progress on job {job_id} for \
+                                     {MAX_WAIT_ITERATIONS} consecutive wait iterations \
+                                     ({tasks_unfinished} task(s) unfinished, none completing); \
+                                     a task was lost without any executor picking it up"
+                                )));
+                            }
+                        } else {
+                            wait_iters = 0;
+                            last_unfinished = tasks_unfinished;
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                        continue;
+                    } else {
+                        // Every task Succeeded (or the job never had any),
+                        // job not terminal.
+                        if task_count == 0 {
+                            // The coordinator genuinely produced no work.
+                            return Err(RuntimeError::transport(
+                                "in-process coordinator produced no task assignments",
+                            ));
+                        }
+                        // All tasks done, results already deposited in the
+                        // per-job stores. Reached by a streaming one-shot
+                        // whose job record legitimately never reaches
+                        // Succeeded, and by a driver whose ENTIRE job was
+                        // launched and executed by concurrent drivers before
+                        // its own first launch call (iter_count may still be
+                        // 0 here — that is not an error).
+                        return Ok(());
                     }
-                    // First iteration, nothing launched, nothing in flight:
-                    // the coordinator genuinely produced no work.
-                    if iter_count == 1 {
-                        return Err(RuntimeError::transport(
-                            "in-process coordinator produced no task assignments",
-                        ));
+                } else {
+                    // A real stage dispatch: only these iterations count
+                    // toward the stage budget — wait iterations above are
+                    // time-bounded separately, so waiting on a slow
+                    // concurrent driver can't exhaust a STAGE budget.
+                    wait_iters = 0;
+                    last_unfinished = usize::MAX;
+                    iter_count += 1;
+                    if iter_count > MAX_STAGE_ITERATIONS {
+                        return Err(RuntimeError::transport(format!(
+                            "in-process runtime exceeded {MAX_STAGE_ITERATIONS} stage \
+                             iterations for job {job_id}; for unbounded queries use the \
+                             streaming API"
+                        )));
                     }
-                    // No assignments, nothing in flight, not terminal: the
-                    // single-driver quiescent exit (a streaming one-shot's job
-                    // record legitimately never reaches Succeeded).
-                    return Ok(());
                 }
 
                 // G1: Inject the upstream stage's watermark as a WatermarkHint
