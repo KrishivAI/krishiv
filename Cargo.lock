@@ -5609,6 +5609,7 @@ dependencies = [
  "datafusion 54.0.0",
  "futures",
  "krishiv-api",
+ "krishiv-common",
  "krishiv-dataflow",
  "krishiv-delta",
  "krishiv-engine-core",
