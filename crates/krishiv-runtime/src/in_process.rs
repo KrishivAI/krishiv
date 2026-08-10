@@ -722,7 +722,7 @@ impl InProcessStreamingRuntime {
                 // O4: Merge launch_assigned_task_assignments + job_snapshot into
                 // one lock acquisition (previously two separate locks per iteration).
                 // coordinator_tick is kept after task execution below.
-                let (mut assignments, job_state) = {
+                let (mut assignments, job_state, tasks_in_flight) = {
                     let mut coord = self.coordinator.lock().map_err(|_| {
                         RuntimeError::transport(
                             "coordinator lock poisoned during task assignment launch",
@@ -731,8 +731,12 @@ impl InProcessStreamingRuntime {
                     let assignments = coord
                         .launch_assigned_task_assignments(&job_id)
                         .map_err(|e| RuntimeError::transport(e.to_string()))?;
-                    let job_state = coord.job_snapshot(&job_id).map(|s| s.state()).ok();
-                    (assignments, job_state)
+                    let snapshot = coord.job_snapshot(&job_id).ok();
+                    let job_state = snapshot.as_ref().map(|s| s.state());
+                    let tasks_in_flight = snapshot
+                        .map(|s| s.assigned_task_count() + s.running_task_count())
+                        .unwrap_or(0);
+                    (assignments, job_state, tasks_in_flight)
                 };
                 // Dispatch assignments the previous tick launched (they are
                 // already launch-in-flight, so the call above cannot return
@@ -769,16 +773,31 @@ impl InProcessStreamingRuntime {
                             Ok(())
                         };
                     }
-                    // First iteration: coordinator never produced assignments.
+                    // Tasks still Assigned/Running with nothing for US to
+                    // launch: a CONCURRENT driver popped this job's work from
+                    // the shared inbox and is executing it — this holds even
+                    // on OUR first iteration (another driver's coordinator
+                    // tick can launch this job's tasks before we ever loop).
+                    // Returning here (the old behavior) declared the job
+                    // "effectively done" and handed back an EMPTY result
+                    // while the terminal task ran on another thread — the
+                    // second concurrency hole the all-slots-busy bench
+                    // exposed. Wait for the report to land instead;
+                    // MAX_STAGE_ITERATIONS still bounds a wedge.
+                    if tasks_in_flight > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        continue;
+                    }
+                    // First iteration, nothing launched, nothing in flight:
+                    // the coordinator genuinely produced no work.
                     if iter_count == 1 {
                         return Err(RuntimeError::transport(
                             "in-process coordinator produced no task assignments",
                         ));
                     }
-                    // Subsequent iterations with no new assignments but job not
-                    // yet terminal: all tasks in the previous stage completed and
-                    // the coordinator bridge already updated state — the job is
-                    // effectively done from the in-process executor's perspective.
+                    // No assignments, nothing in flight, not terminal: the
+                    // single-driver quiescent exit (a streaming one-shot's job
+                    // record legitimately never reaches Succeeded).
                     return Ok(());
                 }
 
