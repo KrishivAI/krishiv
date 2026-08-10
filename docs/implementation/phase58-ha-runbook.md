@@ -261,3 +261,40 @@ The rescue fix (`4f20d74`) also gained its missing unit test
 loss budget, terminal at it). Rig standup for kind is now scripted:
 `scripts/phase58_kind_up.sh` (fresh secrets, MinIO + DUR-2 bucket,
 deterministic datasets incl. `advance.parquet`, nodeName repoints).
+
+### 2026-08-10 — TWICE-CONSECUTIVE 2×25 PASS on the digest-hardened gate
+
+Both invocations ran on the same image (pushed HEAD + this session's fixes)
+on the kind rig stood up by `scripts/phase58_kind_up.sh`:
+
+- **Invocation 1: exit 0 — 50/50 iterations PASS**, final failover-≤30s /
+  one-leader / durable-history check green.
+- **Invocation 2 (immediately after, fresh MATRIX_ID): exit 0 — 50/50
+  PASS**, same final check green.
+- **Zero digest downgrades and zero carve-out skips across both runs**:
+  every one of the 100 fault iterations reproduced its steady-state
+  content digest exactly (batch rows=1000, streaming rows=8750, ivm
+  rows=500 with the 2× incremental check) — including every
+  coordinator-kill cell, where the loud DUR-5 carve-outs never even fired.
+  Baselines were bit-identical across both invocations and across a full
+  rig rebuild.
+
+En route, the digest gate forced two more engine fixes that are part of
+this certification: the oversized-drain put-back (a >64 MiB cycle output
+was silently lost as "0 rows") and the shuffle open-attempt bound (a
+black-holed producer IP cost 405 s of kernel connect timeout before
+regeneration; now ≤15 s per attempt, recovery well inside the workload
+budget — batch × executor/shuffle-kill cells pass with the fetch retry
+loop in charge of its own schedule).
+
+Known residual, deliberately out of this gate's scope: the drain's
+streaming SQL/do_get fallback still consumes before delivery completes, so
+a client killed mid-transfer of a >48 MiB drain loses that payload —
+structural fix tracked as Phase 55 streamed-results / drain-ack. The
+gate's streaming workload rides the bounded atomic path
+(`events_stream.parquet`), and the oversized path is pinned by engine
+unit/service tests.
+
+**Phase 58's twice-consecutive 2×25 exit gate: met, this time on a gate
+that verifies content.** (The 2026-08-09 "51/51" run predates the digest
+assertions; its streaming cells were vacuous — see above.)
