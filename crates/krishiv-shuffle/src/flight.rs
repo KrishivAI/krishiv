@@ -742,6 +742,11 @@ pub const DEFAULT_FETCH_RETRY_BASE_MS: u64 = 100;
 /// already has the image takes ~10-30 s, and regenerating a producer stage
 /// costs minutes. Waiting is the cheap side of that trade by a wide margin.
 pub const DEFAULT_FETCH_TRANSPORT_GRACE_SECS: u64 = 90;
+
+/// Default per-attempt bound on a shuffle `open` (connect + do_get header).
+/// Generous against a slow-but-alive producer, tiny against the ~130 s OS
+/// connect timeout a black-holed pod IP otherwise costs per attempt.
+pub const DEFAULT_FETCH_OPEN_TIMEOUT_SECS: u64 = 15;
 /// Upper bound on a single retry backoff delay.
 const FETCH_RETRY_MAX_DELAY_MS: u64 = 5_000;
 
@@ -782,6 +787,18 @@ pub struct FetchRetryPolicy {
     /// really is missing still fails on the first attempt and regenerates
     /// immediately. This grace only covers "cannot reach the server at all".
     pub transport_grace: std::time::Duration,
+    /// Upper bound on ONE `open` attempt (connect + do_get header).
+    ///
+    /// Without it, an attempt against a **black-holed** address — a killed
+    /// Kubernetes pod whose IP simply drops SYNs — burns the OS TCP connect
+    /// timeout (~130 s with default `tcp_syn_retries`) per attempt, and the
+    /// 4-attempt policy spends **405 s** before declaring the partition
+    /// missing (live, Phase 58 gate 2026-08-10: batch × executor-kill blew
+    /// the workload budget while every retry sat in `connect`). The grace
+    /// exists to ride out a 10–30 s producer restart; one bounded attempt
+    /// per backoff step keeps the retry LOOP in charge of the schedule
+    /// instead of the kernel. `ZERO` disables the bound.
+    pub open_attempt_timeout: std::time::Duration,
 }
 
 impl Default for FetchRetryPolicy {
@@ -791,6 +808,9 @@ impl Default for FetchRetryPolicy {
             base_delay_ms: DEFAULT_FETCH_RETRY_BASE_MS,
             transport_grace: std::time::Duration::from_secs(
                 DEFAULT_FETCH_TRANSPORT_GRACE_SECS,
+            ),
+            open_attempt_timeout: std::time::Duration::from_secs(
+                DEFAULT_FETCH_OPEN_TIMEOUT_SECS,
             ),
         }
     }
@@ -825,6 +845,9 @@ impl FetchRetryPolicy {
             max_attempts,
             base_delay_ms,
             transport_grace,
+            open_attempt_timeout: std::time::Duration::from_secs(
+                DEFAULT_FETCH_OPEN_TIMEOUT_SECS,
+            ),
         }
     }
 
@@ -832,7 +855,7 @@ impl FetchRetryPolicy {
     /// attempts), `KRISHIV_SHUFFLE_FETCH_RETRY_BASE_MS` and
     /// `KRISHIV_SHUFFLE_FETCH_TRANSPORT_GRACE_SECS`.
     pub fn from_env() -> Self {
-        Self::resolve(
+        let mut policy = Self::resolve(
             std::env::var("KRISHIV_SHUFFLE_FETCH_RETRIES")
                 .ok()
                 .as_deref(),
@@ -842,7 +865,14 @@ impl FetchRetryPolicy {
             std::env::var("KRISHIV_SHUFFLE_FETCH_TRANSPORT_GRACE_SECS")
                 .ok()
                 .as_deref(),
-        )
+        );
+        if let Some(secs) = std::env::var("KRISHIV_SHUFFLE_FETCH_OPEN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            policy.open_attempt_timeout = std::time::Duration::from_secs(secs);
+        }
+        policy
     }
 
     /// A policy that gives up as soon as `max_attempts` is spent, with no
@@ -854,6 +884,9 @@ impl FetchRetryPolicy {
             max_attempts,
             base_delay_ms,
             transport_grace: std::time::Duration::ZERO,
+            open_attempt_timeout: std::time::Duration::from_secs(
+                DEFAULT_FETCH_OPEN_TIMEOUT_SECS,
+            ),
         }
     }
 
@@ -1037,6 +1070,12 @@ fn pooled_channel(url: &str) -> io::Result<tonic::transport::Channel> {
         .http2_keep_alive_interval(std::time::Duration::from_secs(30))
         .keep_alive_timeout(std::time::Duration::from_secs(20))
         .keep_alive_while_idle(true)
+        // Bound connection establishment: a black-holed peer (killed pod IP)
+        // otherwise costs the kernel's ~130 s SYN-retry timeout on every RPC
+        // this lazy channel tries. The per-attempt fetch bound
+        // (`FetchRetryPolicy::open_attempt_timeout`) backstops this; both
+        // exist so neither layer's default regresses silently.
+        .connect_timeout(std::time::Duration::from_secs(5))
         .connect_lazy();
     // A concurrent caller may have inserted first; either channel is equally
     // good, so keep whichever is already published and drop ours.
@@ -1204,7 +1243,30 @@ impl FlightShuffleClient {
         let is_local = endpoint_is_local(&endpoint);
         let fetch_started = std::time::Instant::now();
         loop {
-            match Self::open(endpoint.clone(), job_id, stage_id, partition_id).await {
+            // Bound the attempt itself: a black-holed producer IP otherwise
+            // parks this await in the kernel's ~130 s connect timeout and the
+            // retry schedule below never gets a say (see
+            // `FetchRetryPolicy::open_attempt_timeout`).
+            let attempt_result = if policy.open_attempt_timeout.is_zero() {
+                Self::open(endpoint.clone(), job_id, stage_id, partition_id).await
+            } else {
+                match tokio::time::timeout(
+                    policy.open_attempt_timeout,
+                    Self::open(endpoint.clone(), job_id, stage_id, partition_id),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "shuffle open attempt timed out after {} ms (endpoint {endpoint})",
+                            policy.open_attempt_timeout.as_millis(),
+                        ),
+                    )),
+                }
+            };
+            match attempt_result {
                 Ok(stream) => {
                     let open_elapsed_us = fetch_started.elapsed().as_micros() as u64;
                     krishiv_metrics::global_metrics().add_shuffle_fetch_wait_time_us(open_elapsed_us);
@@ -1716,6 +1778,38 @@ mod tests {
         let ok = client.do_get(req).await;
         server_handle.abort();
         assert!(ok.is_ok(), "valid token must be accepted: {ok:?}");
+    }
+
+    /// Phase 58 live regression (2026-08-10): an open attempt against a
+    /// black-holed producer IP (killed pod) parked in the kernel's ~130 s
+    /// connect timeout, so the 4-attempt policy burned 405 s before the
+    /// partition was declared missing. Each attempt must be bounded by
+    /// `open_attempt_timeout` so the retry loop — not the kernel — owns the
+    /// schedule. 192.0.2.1 (TEST-NET-1) either black-holes (the bound fires)
+    /// or refuses fast (also under the bound); both must finish promptly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_attempt_against_unreachable_endpoint_is_bounded() {
+        clear_channel_pool();
+        let policy = FetchRetryPolicy {
+            open_attempt_timeout: std::time::Duration::from_millis(300),
+            ..FetchRetryPolicy::without_transport_grace(2, 1)
+        };
+        let started = std::time::Instant::now();
+        let result = FlightShuffleClient::open_with_retry(
+            "192.0.2.1:19999",
+            "job-open-bound",
+            "s0.m0",
+            0,
+            policy,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(result.is_err(), "an unreachable endpoint must fail");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "2 bounded attempts must not take {elapsed:?} — the kernel connect \
+             timeout is running the schedule again"
+        );
     }
 
     #[test]
