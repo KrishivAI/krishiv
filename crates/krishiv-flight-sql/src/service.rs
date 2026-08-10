@@ -171,6 +171,9 @@ pub struct KrishivFlightSqlService {
     /// eviction, and session metrics. Complements the *global* `inflight_queries`
     /// semaphore with a *per-subject* dimension.
     session_limits: Arc<crate::session_limits::SessionRegistry>,
+    /// Response budget for the `ContinuousDrain` do_action; oversized drains
+    /// put their data back and error retryably instead of losing it.
+    drain_action_budget: usize,
 }
 
 const FLIGHT_PREPARED_STMT_CAPACITY_ENV: &str = "KRISHIV_FLIGHT_PREPARED_STMT_CAPACITY";
@@ -198,6 +201,34 @@ fn read_max_result_bytes() -> usize {
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_FLIGHT_MAX_RESULT_BYTES)
+}
+
+/// Env override for the `ContinuousDrain` do_action response budget (tests
+/// shrink it to exercise the put-back path without multi-MB fixtures).
+const DRAIN_ACTION_BUDGET_ENV: &str = "KRISHIV_FLIGHT_DRAIN_ACTION_MAX_BYTES";
+/// Default `ContinuousDrain` do_action response budget.
+///
+/// Must stay comfortably under the CLIENT's 64 MiB `do_action` response cap
+/// (`DO_ACTION_MAX_RESPONSE_BYTES` in krishiv-runtime): a response over that
+/// cap is rejected client-side after the server already consumed the drain,
+/// which is exactly the loss the put-back guards against. Responses over this
+/// budget error with the data returned to the store, and the client's
+/// streaming SQL drain delivers them instead.
+const DEFAULT_DRAIN_ACTION_BUDGET_BYTES: usize = 48 * 1024 * 1024;
+
+/// Response budget for the `ContinuousDrain` action: the env override or
+/// default, further clamped by `max_result_bytes` when that is configured.
+fn drain_action_response_budget(max_result_bytes: usize) -> usize {
+    let budget = std::env::var(DRAIN_ACTION_BUDGET_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_DRAIN_ACTION_BUDGET_BYTES);
+    if max_result_bytes > 0 {
+        budget.min(max_result_bytes)
+    } else {
+        budget
+    }
 }
 
 impl std::fmt::Debug for KrishivFlightSqlService {
@@ -233,6 +264,7 @@ impl KrishivFlightSqlService {
             inflight_queries: limit.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
             max_result_bytes: read_max_result_bytes(),
             session_limits: crate::session_limits::SessionRegistry::from_env(),
+            drain_action_budget: drain_action_response_budget(read_max_result_bytes()),
         })
     }
 
@@ -249,6 +281,7 @@ impl KrishivFlightSqlService {
             inflight_queries: limit.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
             max_result_bytes: read_max_result_bytes(),
             session_limits: crate::session_limits::SessionRegistry::from_env(),
+            drain_action_budget: drain_action_response_budget(read_max_result_bytes()),
         }
     }
 
@@ -259,6 +292,15 @@ impl KrishivFlightSqlService {
         registry: Arc<crate::session_limits::SessionRegistry>,
     ) -> Self {
         self.session_limits = registry;
+        self
+    }
+
+    /// Override the `ContinuousDrain` do_action response budget (tests use a
+    /// tiny budget to exercise the oversized-drain put-back path without
+    /// multi-MB fixtures).
+    #[cfg(test)]
+    pub(crate) fn with_drain_action_budget(mut self, n: usize) -> Self {
+        self.drain_action_budget = n;
         self
     }
 
@@ -1587,8 +1629,29 @@ impl KrishivFlightSqlService {
                     .drain_continuous_stream(&body.job_id)
                     .await
                     .map_err(KrishivActionError::Status)?;
-                check_batch_result_size(&batches, self.max_result_bytes)?;
-                encode_batches_ipc(&batches)
+                let encoded = encode_batches_ipc(&batches)?;
+                let budget = self.drain_action_budget;
+                if encoded.len() > budget {
+                    // The drain take is consume-once and this response cannot
+                    // be delivered through do_action (the client rejects
+                    // oversized action responses and retries via the
+                    // streaming SQL drain). Hand the batches back FIRST:
+                    // erroring without the put-back made that retry re-drain
+                    // an empty store — a full cycle's output (87k windowed
+                    // rows, live 2026-08-10) reported as "0 rows" with no
+                    // error anywhere.
+                    let batch_count = batches.len();
+                    self.host.return_drained_batches(&body.job_id, batches).await;
+                    return Err(KrishivActionError::Status(Status::resource_exhausted(
+                        format!(
+                            "continuous drain response ({} bytes across {batch_count} batches) \
+                             exceeds the do_action budget ({budget} bytes); the data is intact — \
+                             retry via the streaming drain",
+                            encoded.len(),
+                        ),
+                    )));
+                }
+                Ok(encoded)
             }
             A::BoundedWindow(body) => {
                 let input_batches = krishiv_runtime::decode_batches(&body.batches_b64)
@@ -1779,6 +1842,97 @@ mod batch_sql_wire_tests {
         let (inline, path) = split_batch_sql_wire_tables(&tables);
         assert_eq!(inline.len(), 1);
         assert!(path.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod continuous_drain_tests {
+    use super::*;
+
+    /// Live regression, 2026-08-10 (Phase 58 gate): the `ContinuousDrain`
+    /// action drained the consume-once store FIRST and size-checked SECOND,
+    /// so an oversized cycle output was consumed, rejected, and the client's
+    /// streaming fallback re-drained an EMPTY store — a full cycle (87k
+    /// windowed rows) reported as "0 rows" with no error anywhere. The
+    /// oversized rejection must put the data back: same drain, retried with
+    /// a deliverable budget, must return every row.
+    #[tokio::test]
+    async fn oversized_drain_errors_retryably_with_data_intact() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use krishiv_runtime::KrishivFlightAction as A;
+        use krishiv_runtime::flight_action::ContinuousDrainBody;
+
+        let host = FlightExecutionHost::embedded().expect("embedded host");
+        let spec = krishiv_plan::window::WindowExecutionSpec::tumbling("k", "t", 1_000);
+        host.register_continuous_stream("drain-putback", &spec)
+            .await
+            .expect("register");
+
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("t", DataType::Int64, false),
+        ]));
+        let events = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(StringArray::from(vec!["a", "b", "a", "b"])),
+                std::sync::Arc::new(Int64Array::from(vec![100, 200, 1_100, 1_200])),
+            ],
+        )
+        .expect("events batch");
+        // A far-future event advances the watermark past every earlier
+        // window so the drain below has closed windows to return.
+        let advance = RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(StringArray::from(vec!["a"])),
+                std::sync::Arc::new(Int64Array::from(vec![10_000])),
+            ],
+        )
+        .expect("advance batch");
+        host.push_continuous_input("drain-putback", vec![events])
+            .await
+            .expect("push events");
+        host.push_continuous_input("drain-putback", vec![advance])
+            .await
+            .expect("push advance");
+
+        let drain = A::ContinuousDrain(ContinuousDrainBody {
+            job_id: "drain-putback".to_string(),
+        });
+
+        // 1 byte of budget: the drain must reject as oversized...
+        let strict = KrishivFlightSqlService::with_host(host.clone()).with_drain_action_budget(1);
+        let err = match strict.handle_krishiv_action(drain.clone()).await {
+            Err(KrishivActionError::Status(status)) => status,
+            Err(KrishivActionError::Other(other)) => {
+                panic!("expected a typed Status rejection, got: {other}")
+            }
+            Ok(_) => panic!("a drain over the response budget must be rejected"),
+        };
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            err.message().contains("intact"),
+            "the rejection must tell the caller the data survived: {}",
+            err.message()
+        );
+
+        // ...and the SAME drain against the SAME host must then deliver every
+        // window — nothing was lost to the rejected attempt.
+        let generous = KrishivFlightSqlService::with_host(host);
+        let body = generous
+            .handle_krishiv_action(drain)
+            .await
+            .expect("retry drain");
+        let batches =
+            krishiv_scheduler::decode_inline_record_batches(&[body]).expect("decode drain");
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert!(
+            rows >= 4,
+            "the retried drain must return the windows the rejected attempt consumed; got {rows} rows"
+        );
     }
 }
 

@@ -130,6 +130,35 @@ impl Coordinator {
         self.job_inline_results.remove(job_id)
     }
 
+    /// Put previously taken inline result payloads back at the FRONT of a
+    /// job's inline result queue.
+    ///
+    /// `take_job_inline_results` is consume-once, which is correct only when
+    /// the taker actually delivers the payloads. The Flight `ContinuousDrain`
+    /// action used to take first and size-check second: an oversized cycle
+    /// output was consumed, then rejected, and the client's streaming
+    /// fallback re-drained an EMPTY store — 87k windowed rows reported as
+    /// "0 rows" with no error (found live on the Phase 58 gate, 2026-08-10).
+    /// A taker that cannot deliver must return what it took through here
+    /// before surfacing its error, so the retry finds the data.
+    ///
+    /// Prepending (not appending) preserves emission order when new cycle
+    /// output landed between the take and the return.
+    pub fn unshift_job_inline_results(&mut self, job_id: &JobId, mut payloads: Vec<Vec<u8>>) {
+        if payloads.is_empty() {
+            return;
+        }
+        match self.job_inline_results.entry(job_id.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                payloads.append(entry.get_mut());
+                *entry.get_mut() = payloads;
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(payloads);
+            }
+        }
+    }
+
     /// Take disk-backed result spools for a completed job (large terminal
     /// SQL results delivered via `PushTaskResult`). Spool files delete
     /// themselves when the returned handles drop.

@@ -107,6 +107,7 @@ pub use continuous_stream_http::{
     ContinuousSinkSpec, ContinuousStreamError, drain_continuous_stream_coordinated,
     push_continuous_input_coordinated, register_continuous_stream_coordinated,
     register_continuous_stream_with_sink, restore_continuous_stream_coordinated,
+    return_continuous_stream_payloads,
 };
 pub use grpc::{
     CoordinatorExecutorGrpcService, CoordinatorExecutorTonicService,

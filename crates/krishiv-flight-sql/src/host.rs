@@ -18,6 +18,24 @@ use krishiv_scheduler::{
 use krishiv_sql::explain_sql;
 use tonic::Status;
 
+/// Encode record batches into one Arrow IPC stream (single-schema payload),
+/// the shape the coordinator's inline-result store holds.
+fn encode_record_batches_single_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, String> {
+    let Some(first) = batches.first() else {
+        return Ok(Vec::new());
+    };
+    let mut buf = Vec::new();
+    {
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &first.schema())
+            .map_err(|e| format!("ipc encode: {e}"))?;
+        for batch in batches {
+            writer.write(batch).map_err(|e| format!("ipc write: {e}"))?;
+        }
+        writer.finish().map_err(|e| format!("ipc finish: {e}"))?;
+    }
+    Ok(buf)
+}
+
 /// Execution backend for the Flight SQL service.
 ///
 /// Each variant provides the same operations through a different mechanism.
@@ -48,6 +66,15 @@ pub struct FlightExecutionHost {
     operation_registry: Arc<krishiv_sql::OperationRegistry>,
     /// Optional HTTP URL of a remote coordinator, for informational / test use.
     coordinator_http_url: Option<String>,
+    /// Continuous-drain put-back buffer for the `InProcess` backend.
+    ///
+    /// Draining is consume-once, but a taker can discover after the take that
+    /// it cannot deliver (the `ContinuousDrain` action's response-size cap).
+    /// The `Coordinator` backend returns such payloads to the coordinator's
+    /// own store (one source of truth for the HTTP drain surface too); the
+    /// in-process cluster has no return path, so the host holds returned
+    /// batches here and re-serves them first on the next drain.
+    pending_drains: Arc<DashMap<String, Vec<RecordBatch>>>,
 }
 
 impl FlightExecutionHost {
@@ -61,6 +88,7 @@ impl FlightExecutionHost {
             catalog: Arc::new(DashMap::new()),
             operation_registry: Arc::new(krishiv_sql::OperationRegistry::new()),
             coordinator_http_url: None,
+            pending_drains: Arc::new(DashMap::new()),
         })
     }
 
@@ -75,6 +103,7 @@ impl FlightExecutionHost {
             catalog: Arc::new(DashMap::new()),
             operation_registry: Arc::new(krishiv_sql::OperationRegistry::new()),
             coordinator_http_url: None,
+            pending_drains: Arc::new(DashMap::new()),
         }
     }
 
@@ -89,6 +118,7 @@ impl FlightExecutionHost {
             catalog: Arc::new(DashMap::new()),
             operation_registry: Arc::new(krishiv_sql::OperationRegistry::new()),
             coordinator_http_url: url,
+            pending_drains: Arc::new(DashMap::new()),
         })
     }
 
@@ -397,11 +427,19 @@ impl FlightExecutionHost {
 
     /// Drain completed results from a continuous streaming job.
     pub async fn drain_continuous_stream(&self, job_id: &str) -> Result<Vec<RecordBatch>, Status> {
-        match self.backend.as_ref() {
+        // Batches returned by an earlier taker that could not deliver them
+        // (see `return_drained_batches`) are re-served first, ahead of any
+        // newer cycle output, so emission order survives the round trip.
+        let mut returned = self
+            .pending_drains
+            .remove(job_id)
+            .map(|(_, batches)| batches)
+            .unwrap_or_default();
+        let fresh = match self.backend.as_ref() {
             FlightHostBackend::InProcess(cluster) => {
                 let job_id = job_id.to_string();
                 let cluster = Arc::clone(cluster);
-                run_blocking(move || cluster.drain_continuous_job(&job_id))
+                run_blocking(move || cluster.drain_continuous_job(&job_id))?
             }
             FlightHostBackend::Coordinator(coordinator) => {
                 // Delegate to the public helper in krishiv-scheduler which
@@ -412,9 +450,69 @@ impl FlightExecutionHost {
                         .map_err(|e| Status::internal(e.to_string()))?;
 
                 krishiv_scheduler::decode_inline_record_batches(&ipc_payloads)
-                    .map_err(|e| Status::internal(e.to_string()))
+                    .map_err(|e| Status::internal(e.to_string()))?
+            }
+        };
+        returned.extend(fresh);
+        Ok(returned)
+    }
+
+    /// Return batches taken by [`Self::drain_continuous_stream`] that the
+    /// caller could not deliver.
+    ///
+    /// Draining is consume-once; a taker that fails AFTER the take (the
+    /// `ContinuousDrain` action's response-size cap is the live case — 87k
+    /// windowed rows were consumed, rejected as oversized, and the client's
+    /// streaming fallback re-drained an empty store, reporting "0 rows" with
+    /// no error) must hand the batches back through here before surfacing
+    /// its error, so the client's retry finds the data intact.
+    ///
+    /// The `Coordinator` backend re-encodes and prepends to the
+    /// coordinator's own inline-result store — keeping one source of truth
+    /// that the HTTP drain surface also sees. The in-process cluster has no
+    /// return path, so those batches wait in the host's `pending_drains`
+    /// buffer instead.
+    pub async fn return_drained_batches(&self, job_id: &str, batches: Vec<RecordBatch>) {
+        if batches.is_empty() {
+            return;
+        }
+        if let FlightHostBackend::Coordinator(coordinator) = self.backend.as_ref() {
+            match encode_record_batches_single_ipc(&batches) {
+                Ok(payload) => {
+                    if let Err(e) = krishiv_scheduler::return_continuous_stream_payloads(
+                        coordinator,
+                        job_id,
+                        vec![payload],
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            job_id,
+                            error = %e,
+                            "failed to return drained batches to the coordinator store; \
+                             holding them in the host buffer instead"
+                        );
+                    } else {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        job_id,
+                        error = %e,
+                        "failed to re-encode drained batches; holding them in the host buffer"
+                    );
+                }
             }
         }
+        self.pending_drains
+            .entry(job_id.to_owned())
+            .and_modify(|pending| {
+                let newer = std::mem::take(pending);
+                *pending = batches.clone();
+                pending.extend(newer);
+            })
+            .or_insert(batches);
     }
 
     /// Explain a SQL query. Always local/DataFusion regardless of backend.
@@ -473,6 +571,10 @@ impl FlightExecutionHost {
         let Ok(uri) = std::env::var("KRISHIV_ICEBERG_REST_URI") else {
             return Ok(false);
         };
+        // Set-but-empty is "unset" (compose `${TOKEN:+…}` interpolation).
+        if uri.trim().is_empty() {
+            return Ok(false);
+        }
         let warehouse = std::env::var("KRISHIV_ICEBERG_REST_WAREHOUSE").unwrap_or_default();
         let token = std::env::var("KRISHIV_ICEBERG_REST_TOKEN").ok();
         let name =

@@ -1838,6 +1838,30 @@ pub async fn drain_continuous_stream_coordinated(
         .unwrap_or_default())
 }
 
+/// Return previously drained continuous-stream payloads to the FRONT of the
+/// job's inline result store.
+///
+/// The companion of [`drain_continuous_stream_coordinated`] for takers that
+/// discover — after the consume-once take — that they cannot deliver what
+/// they took (e.g. the Flight `ContinuousDrain` action's response-size cap).
+/// Returning the payloads lets the caller surface a retryable error while the
+/// client's streaming fallback finds the data still there, instead of the
+/// silent 0-row loss this replaced.
+pub async fn return_continuous_stream_payloads(
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+    payloads: Vec<Vec<u8>>,
+) -> Result<(), ContinuousStreamError> {
+    let job_id_typed = krishiv_proto::JobId::try_new(job_id).map_err(|e| {
+        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
+            message: e.to_string(),
+        })
+    })?;
+    let mut coord = coordinator.write().await;
+    coord.unshift_job_inline_results(&job_id_typed, payloads);
+    Ok(())
+}
+
 /// Stage a one-shot continuous-stream restore snapshot for the next cycle.
 pub async fn restore_continuous_stream_coordinated(
     coordinator: &SharedCoordinator,
@@ -1892,6 +1916,42 @@ mod tests {
 
     async fn make_coordinator_with_executor(suffix: &str) -> SharedCoordinator {
         make_coordinator_with_executor_hb(suffix, None).await
+    }
+
+    /// A taker that cannot deliver what it took must be able to hand the
+    /// payloads back — AHEAD of any output that landed in between — so the
+    /// retry drains the same data in the same order. Without this, the
+    /// Flight `ContinuousDrain` action's oversized-response rejection
+    /// consumed a whole cycle's output and the client's fallback re-drained
+    /// an empty store (87k windowed rows reported as "0 rows", 2026-08-10).
+    #[test]
+    fn unshift_puts_payloads_back_ahead_of_newer_output() {
+        let mut coordinator =
+            Coordinator::active(CoordinatorId::try_new("unshift-coord").unwrap());
+        let job_id = krishiv_proto::JobId::try_new("unshift-job").unwrap();
+
+        // Newer cycle output arrived between the take and the return.
+        coordinator
+            .job_inline_results
+            .insert(job_id.clone(), vec![vec![3u8]]);
+        coordinator.unshift_job_inline_results(&job_id, vec![vec![1u8], vec![2u8]]);
+        assert_eq!(
+            coordinator.take_job_inline_results(&job_id),
+            Some(vec![vec![1u8], vec![2u8], vec![3u8]]),
+            "returned payloads must drain first, in their original order"
+        );
+
+        // Returning to a fully drained store must recreate the entry.
+        coordinator.unshift_job_inline_results(&job_id, vec![vec![9u8]]);
+        assert_eq!(
+            coordinator.take_job_inline_results(&job_id),
+            Some(vec![vec![9u8]]),
+        );
+
+        // An empty return is a no-op, not an empty entry that would trip the
+        // push fence's undrained-output check.
+        coordinator.unshift_job_inline_results(&job_id, Vec::new());
+        assert_eq!(coordinator.take_job_inline_results(&job_id), None);
     }
 
     /// Build a coordinator + one in-process executor, optionally pinning the
