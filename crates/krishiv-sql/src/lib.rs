@@ -3147,6 +3147,22 @@ impl SqlEngine {
                 .map_err(|message| SqlError::DataFusion { message })?;
         }
 
+        // Refuse a subquery that reads a streaming source before DataFusion
+        // decorrelates it. Its decorrelation rules assume a bounded input, so an
+        // unbounded one is mishandled rather than rejected.
+        //
+        // `subquery::validate_no_streaming_subqueries` was written for exactly
+        // this and had no callers anywhere — the guard existed but guarded
+        // nothing. It short-circuits on an empty set, and the atomic keeps the
+        // parse off the path entirely for engines with no streaming sources.
+        if self.has_streaming_sources.load(Ordering::Acquire) {
+            let sources = self
+                .streaming_sources
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            subquery::validate_no_streaming_subqueries(&rewritten, &sources)?;
+        }
+
         let dataframe = self.context.sql(&rewritten).await?;
 
         // After CREATE EXTERNAL TABLE DDL, try to extract row-count statistics

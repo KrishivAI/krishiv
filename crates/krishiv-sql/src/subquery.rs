@@ -201,6 +201,53 @@ pub fn explain_subqueries(sql: &str) -> Option<String> {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod reachability_tests {
+    /// The guard has to be reached from `SqlEngine::sql`, not merely correct.
+    ///
+    /// `validate_no_streaming_subqueries` had zero callers anywhere in the
+    /// workspace, so a subquery over a streaming source went straight to
+    /// DataFusion — whose decorrelation assumes a bounded input. The unit tests
+    /// below all called the function directly and passed throughout.
+    #[tokio::test]
+    async fn a_subquery_over_a_streaming_source_is_refused_by_the_engine() {
+        let engine = crate::SqlEngine::new();
+        engine
+            .register_streaming_source_name("live_events")
+            .expect("register streaming source");
+
+        let error = engine
+            .sql("SELECT * FROM t WHERE id IN (SELECT id FROM live_events)")
+            .await
+            .expect_err("a subquery over a streaming source must be refused");
+        let message = error.to_string();
+        assert!(
+            message.to_lowercase().contains("streaming"),
+            "the refusal must name the reason, got: {message}"
+        );
+    }
+
+    /// ...and an ordinary subquery over batch tables is untouched.
+    #[tokio::test]
+    async fn a_batch_subquery_is_not_affected_by_the_guard() {
+        let engine = crate::SqlEngine::new();
+        engine
+            .register_streaming_source_name("live_events")
+            .expect("register streaming source");
+
+        // References no streaming source, so the guard must not fire. Planning
+        // fails on the missing table, not on the guard.
+        let error = engine
+            .sql("SELECT * FROM absent_a WHERE id IN (SELECT id FROM absent_b)")
+            .await
+            .expect_err("tables do not exist");
+        assert!(
+            !error.to_string().to_lowercase().contains("streaming"),
+            "the guard must not fire for batch-only subqueries: {error}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
