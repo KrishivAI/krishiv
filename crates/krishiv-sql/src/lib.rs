@@ -1936,6 +1936,12 @@ impl SqlEngine {
                 Ok(uri) => uri,
                 Err(_) => return Ok(false),
             };
+            // Set-but-empty is "unset": compose files parameterize this via
+            // `${TOKEN:+http://…}`-style interpolation, which yields an empty
+            // string until the operator fills the token in.
+            if uri.trim().is_empty() {
+                return Ok(false);
+            }
             let warehouse = std::env::var("KRISHIV_ICEBERG_REST_WAREHOUSE").unwrap_or_default();
             let token = std::env::var("KRISHIV_ICEBERG_REST_TOKEN").ok();
             // The platform's canonical governed catalog is `main` (every pipeline
