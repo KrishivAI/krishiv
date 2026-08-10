@@ -84,8 +84,19 @@ pub fn parse_pivot(sql: &str) -> SqlResult<Option<PivotClause>> {
 
     let source = sql[..pivot_pos].trim().to_owned();
 
-    // Find the matching closing paren.
-    let body_start = pivot_pos + pivot_kw.len();
+    // Locate the opening paren rather than assuming the keyword's length.
+    //
+    // `pivot_pos` may have come from either `" PIVOT ("` (8 bytes) or
+    // `" PIVOT("` (7). Adding `pivot_kw.len()` unconditionally overshot the
+    // shorter spelling by one, so the body began mid-token and `SUM(amount)`
+    // parsed as the function `UM`. `parse_unpivot` already does it this way.
+    let body_start = pivot_pos
+        + sql[pivot_pos..]
+            .find('(')
+            .ok_or_else(|| SqlError::Unsupported {
+                feature: "PIVOT: missing opening parenthesis".into(),
+            })?
+        + 1;
     let body_end = find_closing_paren(&sql[body_start..]).ok_or_else(|| SqlError::Unsupported {
         feature: "PIVOT: unmatched parenthesis".into(),
     })? + body_start;
@@ -326,12 +337,46 @@ fn find_closing_paren(s: &str) -> Option<usize> {
 /// Strip a leading `SELECT * FROM ` or `SELECT … FROM ` prefix from the source
 /// fragment so the caller can use it directly as a FROM clause.
 fn strip_select_star_prefix(s: &str) -> &str {
-    let upper = s.to_ascii_uppercase();
-    if let Some(from_pos) = upper.rfind(" FROM ") {
-        s[from_pos + 6..].trim()
-    } else {
-        s.trim()
+    match top_level_from(s) {
+        Some(from_pos) => s[from_pos + 6..].trim(),
+        None => s.trim(),
     }
+}
+
+/// Byte index of the first `" FROM "` that is not inside parentheses.
+///
+/// This used to be `rfind(" FROM ")`, which finds the innermost one. A
+/// subquery source — `SELECT * FROM (SELECT cat, amt FROM base) s PIVOT (…)` —
+/// then had its FROM clause truncated to `base) s`: the subquery's own FROM
+/// won, leaving a fragment with an unbalanced paren. `find` alone is not right
+/// either, because a subquery in the *select list* would win instead. Only the
+/// depth-0 occurrence is the statement's own FROM.
+fn top_level_from(s: &str) -> Option<usize> {
+    const FROM: &str = " FROM ";
+    let bytes = s.as_bytes();
+    let upper = s.to_ascii_uppercase();
+    let mut depth = 0i32;
+    let mut in_quote: Option<u8> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match in_quote {
+            Some(q) => {
+                if b == q {
+                    in_quote = None;
+                }
+            }
+            None => match b {
+                b'\'' | b'"' => in_quote = Some(b),
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {
+                    if depth == 0 && upper.get(i..i + FROM.len()) == Some(FROM) {
+                        return Some(i);
+                    }
+                }
+            },
+        }
+    }
+    None
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -384,6 +429,57 @@ mod tests {
         let sql = "SELECT * FROM t WHERE x = 1";
         let result = rewrite_pivot(sql).unwrap();
         assert_eq!(result, sql);
+    }
+
+    /// `PIVOT(` with no space is the spelling `contains_pivot` explicitly
+    /// accepts, but `parse_pivot` always advanced by the length of `" PIVOT ("`
+    /// — one byte too many — so the body started mid-token and `SUM` was read as
+    /// `UM`. Every existing test used the spaced form. `parse_unpivot` locates
+    /// the `(` instead and was always right.
+    #[test]
+    fn parses_pivot_without_a_space_before_the_paren() {
+        let sql = "SELECT * FROM sales PIVOT(SUM(amount) FOR category IN ('food', 'tech'))";
+        let pivot = parse_pivot(sql).unwrap().unwrap();
+        assert_eq!(pivot.agg_fn, "SUM", "the aggregate name must not be clipped");
+        assert_eq!(pivot.agg_column, "amount");
+        assert_eq!(pivot.for_column, "category");
+        assert_eq!(pivot.in_values, vec!["'food'", "'tech'"]);
+    }
+
+    /// A subquery source must survive intact. `strip_select_star_prefix` used
+    /// `rfind(" FROM ")`, which finds the *inner* FROM and truncates the
+    /// subquery to a fragment with an unbalanced paren.
+    #[test]
+    fn pivot_keeps_a_subquery_source_intact() {
+        let sql = "SELECT * FROM (SELECT cat, amt FROM base) s \
+                   PIVOT (SUM(amt) FOR cat IN ('x'))";
+        let rewritten = rewrite_pivot(sql).unwrap();
+        assert!(
+            rewritten.contains("(SELECT cat, amt FROM base) s"),
+            "the whole subquery must be the FROM clause: {rewritten}"
+        );
+        assert_eq!(
+            rewritten.matches('(').count(),
+            rewritten.matches(')').count(),
+            "parens must balance: {rewritten}"
+        );
+    }
+
+    /// Same for UNPIVOT, which shares the helper.
+    #[test]
+    fn unpivot_keeps_a_subquery_source_intact() {
+        let sql = "SELECT * FROM (SELECT jan, feb FROM base) s \
+                   UNPIVOT (value FOR month IN (jan, feb))";
+        let rewritten = rewrite_unpivot(sql).unwrap();
+        assert!(
+            rewritten.contains("(SELECT jan, feb FROM base) s"),
+            "{rewritten}"
+        );
+        assert_eq!(
+            rewritten.matches('(').count(),
+            rewritten.matches(')').count(),
+            "parens must balance: {rewritten}"
+        );
     }
 
     #[test]
