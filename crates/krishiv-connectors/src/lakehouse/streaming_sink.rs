@@ -146,6 +146,77 @@ impl IcebergStreamingSink {
         })
     }
 
+    /// Open the sink against an **injected persistent catalog** — the
+    /// platform's governed REST catalog (G7) — so windowed streaming output
+    /// lands in the same catalog the query path resolves, instead of a local,
+    /// ephemeral-catalog table root. `namespace` is the pipeline schema and
+    /// `target.table` the table name; `target.root` is unused (the catalog
+    /// assigns the location). Exactly-once is unchanged: it rides on the
+    /// snapshot-summary offsets + idempotency gate, which are catalog-generic.
+    ///
+    /// The catalog is built by `catalog_builder` **on this sink's own
+    /// persistent runtime** — the same runtime that later drives every commit —
+    /// so the catalog's HTTP client is never orphaned by a dropped runtime (a
+    /// real hazard if the catalog were built on a throwaway runtime and handed
+    /// in). The builder is decoupled (a future yielding an `Arc<dyn Catalog>`)
+    /// so this crate stays free of a catalog-implementation dependency.
+    ///
+    /// Append only. A governed upsert sink would need a merge-on-read commit
+    /// with no version-hint generation swap — a separate, not-yet-built path —
+    /// so upsert is rejected here rather than silently misbehaving.
+    pub fn open_with_catalog<F, Fut>(
+        catalog_builder: F,
+        namespace: &str,
+        target: IcebergSinkTarget,
+        schema_version: SchemaVersion,
+    ) -> ConnectorResult<Self>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<
+                Output = Result<std::sync::Arc<dyn iceberg::Catalog + Send + Sync>, String>,
+            >,
+    {
+        if target.mode == IcebergSinkMode::Upsert {
+            return Err(ConnectorError::Protocol {
+                message: "iceberg streaming sink: upsert mode is not supported for a governed \
+                          (catalog) sink yet — windowed streaming output is append-only"
+                    .into(),
+            });
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| ConnectorError::Protocol {
+                message: format!("iceberg streaming sink: runtime build failed: {e}"),
+            })?;
+        let table = runtime
+            .block_on(async {
+                let catalog =
+                    catalog_builder()
+                        .await
+                        .map_err(|message| ConnectorError::Protocol {
+                            message: format!("governed iceberg sink: {message}"),
+                        })?;
+                IcebergNativeTwoPhaseCommit::open_with_catalog(
+                    catalog,
+                    namespace,
+                    &target.table,
+                    &schema_version,
+                )
+                .await
+                .map_err(lake_err)
+            })?;
+        Ok(Self {
+            runtime: Some(runtime),
+            table,
+            target,
+            schema_version,
+            open: Vec::new(),
+            pending_offsets: BTreeMap::new(),
+            prepared: BTreeMap::new(),
+        })
+    }
+
     /// Capabilities of this sink (feeds the engine capability metadata that
     /// the platform surfaces as delivery-guarantee labels). Delegates to the
     /// shared, feature-independent metadata so the coordinator's advertised
@@ -165,6 +236,16 @@ impl IcebergStreamingSink {
     /// Read the committed table contents (testing/inspection).
     pub fn read_committed(&self) -> ConnectorResult<Vec<RecordBatch>> {
         self.rt().block_on(self.table.read_all()).map_err(lake_err)
+    }
+
+    /// The committed source offsets recorded in the current snapshot summary —
+    /// the exactly-once idempotency oracle. Exposed for tests to assert offset
+    /// durability + recovery across a reopen (catalog-generic).
+    #[cfg(test)]
+    pub(crate) fn committed_offsets(&self) -> BTreeMap<String, i64> {
+        self.rt()
+            .block_on(self.table.committed_kafka_offsets())
+            .unwrap_or_default()
     }
 
     /// Commit one epoch's staged content according to the sink mode.
@@ -707,6 +788,129 @@ mod tests {
         assert_eq!(committed_rows(&sink), vec![("a".into(), 1)]);
     }
 
+    /// G7: the streaming sink committed through an **injected persistent
+    /// catalog** (modelling the platform REST catalog) commits rows + source
+    /// offsets, and a reopened sink recovers the committed state from the
+    /// catalog alone (no version-hint) and accumulates the next cycle. This is
+    /// the same exactly-once machinery as the local path — offsets ride in the
+    /// snapshot summary — proven catalog-generic.
+    #[test]
+    fn governed_catalog_sink_commits_offsets_and_recovers_across_reopen() {
+        use std::collections::{BTreeMap, HashMap};
+
+        use iceberg::CatalogBuilder;
+        use iceberg::io::StorageFactory;
+        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+
+        // One catalog instance reused across opens = a persistent catalog. The
+        // `memory://` warehouse's backing store is process-global, so the data
+        // and metadata written by the first sink are visible to the second.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let warehouse = "memory://governed-sink-0/warehouse";
+        let catalog: Arc<dyn iceberg::Catalog + Send + Sync> = rt.block_on(async {
+            let factory: Arc<dyn StorageFactory> =
+                Arc::new(crate::lakehouse::object_store_io::KrishivStorageFactory);
+            Arc::new(
+                MemoryCatalogBuilder::default()
+                    .with_storage_factory(factory)
+                    .load(
+                        "test",
+                        HashMap::from([(
+                            MEMORY_CATALOG_WAREHOUSE.to_string(),
+                            warehouse.to_string(),
+                        )]),
+                    )
+                    .await
+                    .unwrap(),
+            )
+        });
+
+        let sv = schema_version_from_arrow(&arrow_schema(false), None).unwrap();
+        let target = || IcebergSinkTarget {
+            root: std::path::PathBuf::new(),
+            table: "win".into(),
+            mode: IcebergSinkMode::Append,
+            key_columns: Vec::new(),
+            op_column: None,
+        };
+        // A builder yielding the shared catalog (runs on the sink's own runtime).
+        let build = |cat: Arc<dyn iceberg::Catalog + Send + Sync>| {
+            move || {
+                let cat = cat.clone();
+                async move { Ok::<_, String>(cat) }
+            }
+        };
+
+        // Cycle 1: create the governed table, commit a row + offset.
+        let mut sink =
+            IcebergStreamingSink::open_with_catalog(build(catalog.clone()), "sales", target(), sv)
+                .unwrap();
+        sink.stage(&batch(&[("a", 1)])).unwrap();
+        sink.stage_source_offsets(&BTreeMap::from([("p0".to_string(), 10)]))
+            .unwrap();
+        sink.pre_commit(1).unwrap();
+        assert_eq!(sink.commit_through(1).unwrap(), 1);
+        assert_eq!(committed_rows(&sink), vec![("a".into(), 1)]);
+        assert_eq!(
+            sink.committed_offsets(),
+            BTreeMap::from([("p0".to_string(), 10)])
+        );
+        drop(sink);
+
+        // Reopen against the SAME catalog: recovery loads the committed table
+        // (rows + offsets persist through the catalog, no version hint), and a
+        // second cycle appends.
+        let sv2 = schema_version_from_arrow(&arrow_schema(false), None).unwrap();
+        let mut sink2 =
+            IcebergStreamingSink::open_with_catalog(build(catalog.clone()), "sales", target(), sv2)
+                .unwrap();
+        assert_eq!(committed_rows(&sink2), vec![("a".into(), 1)]);
+        assert_eq!(
+            sink2.committed_offsets(),
+            BTreeMap::from([("p0".to_string(), 10)])
+        );
+        sink2.stage(&batch(&[("b", 2)])).unwrap();
+        sink2
+            .stage_source_offsets(&BTreeMap::from([("p0".to_string(), 20)]))
+            .unwrap();
+        sink2.pre_commit(1).unwrap();
+        assert_eq!(sink2.commit_through(1).unwrap(), 1);
+        assert_eq!(
+            committed_rows(&sink2),
+            vec![("a".into(), 1), ("b".into(), 2)]
+        );
+        assert_eq!(
+            sink2.committed_offsets(),
+            BTreeMap::from([("p0".to_string(), 20)])
+        );
+    }
+
+    /// A governed (catalog) sink is append-only in this pass; upsert is refused
+    /// at open rather than silently mishandled.
+    #[test]
+    fn governed_catalog_sink_rejects_upsert() {
+        let sv = schema_version_from_arrow(&arrow_schema(true), Some("__op")).unwrap();
+        let result = IcebergStreamingSink::open_with_catalog(
+            || async { Err::<Arc<dyn iceberg::Catalog + Send + Sync>, String>("unused".into()) },
+            "sales",
+            IcebergSinkTarget {
+                root: std::path::PathBuf::new(),
+                table: "win".into(),
+                mode: IcebergSinkMode::Upsert,
+                key_columns: vec!["k".into()],
+                op_column: Some("__op".into()),
+            },
+            sv,
+        );
+        match result {
+            Ok(_) => panic!("upsert must be rejected for a governed sink"),
+            Err(e) => assert!(e.to_string().contains("append-only"), "{e}"),
+        }
+    }
+
     #[test]
     fn committed_snapshots_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -788,7 +992,6 @@ mod tests {
         sink.pre_commit(1).unwrap();
         sink.commit_through(1).unwrap();
 
-        use iceberg::Catalog as _;
         let table = sink
             .rt()
             .block_on(sink.table.catalog.load_table(&sink.table.ident))

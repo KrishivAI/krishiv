@@ -177,6 +177,8 @@ mod proto_tests {
             mode: crate::IcebergSinkMode::Upsert,
             key_columns: vec![String::from("window_start"), String::from("key")],
             op_column: Some(String::from("__op")),
+            catalog: None,
+            namespace: None,
         };
         let ids = TaskAttemptRef::new(
             JobId::try_new("job-iceberg").unwrap(),

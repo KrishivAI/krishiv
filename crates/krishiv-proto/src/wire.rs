@@ -1497,6 +1497,8 @@ fn output_contract_descriptor_to_wire(
             mode,
             key_columns,
             op_column,
+            catalog,
+            namespace,
         } => v1::OutputContractDescriptor {
             kind: v1::OutputContractDescriptorKind::IcebergSink as i32,
             iceberg_root: root.clone(),
@@ -1504,6 +1506,8 @@ fn output_contract_descriptor_to_wire(
             iceberg_mode: mode.as_str().to_owned(),
             iceberg_key_columns: key_columns.clone(),
             iceberg_op_column: op_column.clone().unwrap_or_default(),
+            iceberg_catalog: catalog.clone().unwrap_or_default(),
+            iceberg_namespace: namespace.clone().unwrap_or_default(),
             ..Default::default()
         },
         OutputContractDescriptor::KafkaSink {
@@ -1560,7 +1564,6 @@ fn output_contract_descriptor_from_wire(
             Ok(OutputContractDescriptor::ParquetSink { path: value.path })
         }
         v1::OutputContractDescriptorKind::IcebergSink => {
-            require_non_empty(&value.iceberg_root, "iceberg sink table root")?;
             require_non_empty(&value.iceberg_table, "iceberg sink table name")?;
             let mode = crate::IcebergSinkMode::parse(&value.iceberg_mode).ok_or_else(|| {
                 WireError::new(format!(
@@ -1568,12 +1571,25 @@ fn output_contract_descriptor_from_wire(
                     value.iceberg_mode
                 ))
             })?;
+            let catalog = non_empty_string(value.iceberg_catalog);
+            let namespace = non_empty_string(value.iceberg_namespace);
+            // A local-root sink needs a root; a governed (catalog) sink has none.
+            if catalog.is_none() {
+                require_non_empty(&value.iceberg_root, "iceberg sink table root")?;
+            }
+            if catalog.is_some() && namespace.is_none() {
+                return Err(WireError::new(
+                    "iceberg sink catalog set but namespace missing",
+                ));
+            }
             Ok(OutputContractDescriptor::IcebergSink {
                 root: value.iceberg_root,
                 table: value.iceberg_table,
                 mode,
                 key_columns: value.iceberg_key_columns,
                 op_column: non_empty_string(value.iceberg_op_column),
+                catalog,
+                namespace,
             })
         }
         v1::OutputContractDescriptorKind::KafkaSink => {

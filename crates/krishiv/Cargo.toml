@@ -59,7 +59,7 @@ ui = ["dep:krishiv-ui"]
 flight-sql = ["dep:krishiv-flight-sql"]
 # Platform catalog bridge: the local daemon can attach an Iceberg REST
 # catalog (KRISHIV_ICEBERG_REST_* env) so SQL resolves governed tables.
-rest-catalog = ["flight-sql", "krishiv-flight-sql/rest-catalog"]
+rest-catalog = ["flight-sql", "krishiv-flight-sql/rest-catalog", "krishiv-executor/rest-catalog", "iceberg"]
 shuffle = ["dep:krishiv-shuffle"]
 etcd = ["krishiv-scheduler/etcd"]
 kafka = ["krishiv-connectors/kafka"]

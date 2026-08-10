@@ -175,6 +175,18 @@ pub struct ContinuousSinkSpec {
     /// Optional column carrying per-row ops (`upsert`/`delete`).
     #[serde(default)]
     pub op_column: Option<String>,
+    /// G7: when set, the sink commits through the platform's governed REST
+    /// catalog of this name (the catalog the query path resolves) instead of a
+    /// local table root. `namespace` then holds the governed table's namespace
+    /// (the pipeline schema) and `root` the warehouse it lives under. The
+    /// executor connects to the catalog from its `KRISHIV_ICEBERG_REST_*`
+    /// environment; `None` keeps the legacy local-root filesystem sink.
+    #[serde(default)]
+    pub catalog: Option<String>,
+    /// Governed-table namespace (pipeline schema) — required when `catalog` is
+    /// set, ignored otherwise.
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 fn default_sink_mode() -> String {
@@ -194,11 +206,25 @@ impl ContinuousSinkSpec {
         {
             return self.registry_contract_string(kind);
         }
-        if self.root.trim().is_empty() || self.table.trim().is_empty() {
+        let governed = self
+            .catalog
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|c| !c.is_empty());
+        if self.table.trim().is_empty() {
             return Err(SchedulerError::InvalidJob {
                 message: String::from(
                     "continuous sink requires either `connector` (registry sink) or \
-                     `root` + `table` (Iceberg sink)",
+                     `table` (Iceberg sink)",
+                ),
+            });
+        }
+        // A local-root Iceberg sink needs a `root`; a governed (catalog) sink
+        // has none — the catalog assigns the table location.
+        if !governed && self.root.trim().is_empty() {
+            return Err(SchedulerError::InvalidJob {
+                message: String::from(
+                    "continuous Iceberg sink requires `root` (or set `catalog` for a governed sink)",
                 ),
             });
         }
@@ -214,6 +240,22 @@ impl ContinuousSinkSpec {
         }
         if let Some(op) = &self.op_column {
             contract.push_str(&format!("|op={op}"));
+        }
+        if let Some(catalog) = self
+            .catalog
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
+            contract.push_str(&format!("|catalog={catalog}"));
+        }
+        if let Some(namespace) = self
+            .namespace
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            contract.push_str(&format!("|namespace={namespace}"));
         }
         // Validate through the shared parser so a malformed spec is rejected
         // at registration instead of failing every cycle on the executor.
@@ -2243,6 +2285,8 @@ mod tests {
                 mode: default_sink_mode(),
                 key_columns: Vec::new(),
                 op_column: None,
+                catalog: None,
+                namespace: None,
             };
             let contract = spec.contract_string().expect("registry contract");
             assert!(contract.starts_with("registry-sink:csv|"), "{contract}");
@@ -2267,6 +2311,8 @@ mod tests {
                 mode: default_sink_mode(),
                 key_columns: Vec::new(),
                 op_column: None,
+                catalog: None,
+                namespace: None,
             };
             let error = empty.contract_string().expect_err("must be rejected");
             assert!(error.to_string().contains("connector"), "{error}");
@@ -2285,6 +2331,8 @@ mod tests {
                     mode: "append".into(),
                     key_columns: Vec::new(),
                     op_column: None,
+                    catalog: None,
+                    namespace: None,
                 }),
                 parallelism: None,
                 mode: None,

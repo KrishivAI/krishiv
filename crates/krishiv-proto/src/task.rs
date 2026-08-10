@@ -1183,9 +1183,12 @@ pub enum OutputContractDescriptor {
     /// checkpoint epoch and the checkpoint-complete notification makes it
     /// visible as an Iceberg snapshot.
     IcebergSink {
-        /// Local table root directory (contains `data/` + `metadata/`).
+        /// Local table root directory (contains `data/` + `metadata/`) for the
+        /// legacy filesystem sink, or — when `catalog` is set (G7) — the
+        /// warehouse root the governed table lives under.
         root: String,
-        /// Iceberg table name inside the root.
+        /// Iceberg table name. Bare table name inside `root` for the local
+        /// sink; the governed table's name within `namespace` for a REST sink.
         table: String,
         /// Row-level semantics applied at commit.
         mode: IcebergSinkMode,
@@ -1194,6 +1197,16 @@ pub enum OutputContractDescriptor {
         /// Optional column carrying per-row ops (`upsert` default, `delete`).
         /// The column is stripped before rows reach the table.
         op_column: Option<String>,
+        /// G7: when set, the sink commits through the platform's governed
+        /// persistent Iceberg catalog (the REST catalog the query path
+        /// resolves) instead of a local, ephemeral-catalog table root. Holds
+        /// the catalog name (e.g. `main`); the executor connects to it from its
+        /// `KRISHIV_ICEBERG_REST_*` environment. `None` keeps the legacy local
+        /// filesystem sink byte-for-byte.
+        catalog: Option<String>,
+        /// Governed-table namespace (the pipeline schema) — required whenever
+        /// `catalog` is set, ignored otherwise.
+        namespace: Option<String>,
     },
     /// Stream continuous output into a Kafka topic through the checkpoint-
     /// aligned two-phase commit registry (Phase 55, sink descriptors beyond
@@ -1272,6 +1285,8 @@ impl OutputContractDescriptor {
                 mode,
                 key_columns,
                 op_column,
+                catalog,
+                namespace,
             } => {
                 let mut out = format!("{ICEBERG_SINK_PREFIX}{root}|{table}|mode={mode}");
                 if !key_columns.is_empty() {
@@ -1279,6 +1294,12 @@ impl OutputContractDescriptor {
                 }
                 if let Some(op) = op_column {
                     out.push_str(&format!("|op={op}"));
+                }
+                if let Some(catalog) = catalog {
+                    out.push_str(&format!("|catalog={catalog}"));
+                }
+                if let Some(namespace) = namespace {
+                    out.push_str(&format!("|namespace={namespace}"));
                 }
                 out
             }
@@ -1350,10 +1371,9 @@ impl OutputContractDescriptor {
     pub fn parse_iceberg_sink(description: &str) -> Option<Result<Self, String>> {
         let payload = description.trim().strip_prefix(ICEBERG_SINK_PREFIX)?;
         let mut parts = payload.split('|');
-        let root = match parts.next().map(str::trim) {
-            Some(r) if !r.is_empty() => r.to_owned(),
-            _ => return Some(Err("iceberg-sink contract missing table root".into())),
-        };
+        // Root may be empty for a governed (catalog) sink — validated below once
+        // the catalog field is known; a local sink still requires it.
+        let root = parts.next().map(str::trim).unwrap_or_default().to_owned();
         let table = match parts.next().map(str::trim) {
             Some(t) if !t.is_empty() => t.to_owned(),
             _ => return Some(Err("iceberg-sink contract missing table name".into())),
@@ -1361,6 +1381,8 @@ impl OutputContractDescriptor {
         let mut mode = None;
         let mut key_columns = Vec::new();
         let mut op_column = None;
+        let mut catalog = None;
+        let mut namespace = None;
         for field in parts {
             let field = field.trim();
             if field.is_empty() {
@@ -1389,6 +1411,18 @@ impl OutputContractDescriptor {
                         .collect();
                 }
                 "op" => op_column = Some(v.trim().to_owned()),
+                "catalog" => {
+                    let v = v.trim();
+                    if !v.is_empty() {
+                        catalog = Some(v.to_owned());
+                    }
+                }
+                "namespace" => {
+                    let v = v.trim();
+                    if !v.is_empty() {
+                        namespace = Some(v.to_owned());
+                    }
+                }
                 other => {
                     return Some(Err(format!(
                         "unknown iceberg-sink contract field '{other}'"
@@ -1404,12 +1438,35 @@ impl OutputContractDescriptor {
                 "iceberg-sink upsert mode requires at least one key column".into(),
             ));
         }
+        // A local-root sink requires a root; a governed (catalog) sink has none.
+        if catalog.is_none() && root.is_empty() {
+            return Some(Err("iceberg-sink contract missing table root".into()));
+        }
+        // A governed (REST-catalog) sink is identified by `catalog`; it needs a
+        // namespace to place the table, and — in this pass — supports append
+        // only (windowed streaming output; a REST upsert sink is a separate,
+        // not-yet-built merge-on-read path).
+        if catalog.is_some() && namespace.is_none() {
+            return Some(Err(
+                "iceberg-sink catalog set but namespace missing (a governed table needs a namespace)"
+                    .into(),
+            ));
+        }
+        if catalog.is_some() && mode == IcebergSinkMode::Upsert {
+            return Some(Err(
+                "iceberg-sink upsert mode is not supported for a governed (catalog) sink yet — \
+                 windowed streaming output is append-only"
+                    .into(),
+            ));
+        }
         Some(Ok(Self::IcebergSink {
             root,
             table,
             mode,
             key_columns,
             op_column,
+            catalog,
+            namespace,
         }))
     }
 }

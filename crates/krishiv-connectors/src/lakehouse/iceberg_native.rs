@@ -26,9 +26,7 @@ pub mod native {
         Struct, Type,
     };
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
-    use iceberg::{
-        Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, TableCreation, TableIdent,
-    };
+    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
     use parquet::arrow::ArrowWriter;
     use tokio::sync::Mutex;
     use url::Url;
@@ -52,7 +50,15 @@ pub mod native {
     /// iceberg-spec table metadata (manifests + `table-metadata.json`) so that
     /// no partially committed snapshot is ever visible to readers.
     pub struct IcebergNativeTwoPhaseCommit {
-        pub(crate) catalog: Arc<MemoryCatalog>,
+        /// The metadata catalog of record. Either an ephemeral `MemoryCatalog`
+        /// rebuilt on every [`open`](Self::open) (the local/object-store sink,
+        /// whose durable pointer is the `version-hint.text` file), or an
+        /// injected **persistent** catalog — the platform's governed REST
+        /// catalog (G7, [`open_with_catalog`](Self::open_with_catalog)) — which
+        /// tracks the current-metadata pointer itself, so no version hint is
+        /// used. Either way the data-file writes and the `fast_append`/offset
+        /// machinery are catalog-generic.
+        pub(crate) catalog: Arc<dyn Catalog + Send + Sync>,
         pub(crate) ident: TableIdent,
         /// Local root path (canonicalized) for a `file://` table. For an
         /// object-store table this holds the raw `s3://…` root as an opaque
@@ -65,6 +71,13 @@ pub mod native {
         /// `file://` URI of the local root. Staged files and the version-hint are
         /// addressed beneath it on the object-store branch.
         root_uri: String,
+        /// `true` when this instance owns its durable current-metadata pointer
+        /// via `version-hint.text` (the ephemeral-`MemoryCatalog` path). `false`
+        /// when an injected persistent catalog (REST) is the source of truth —
+        /// recovery then loads current metadata from the catalog and no hint is
+        /// written. Also gates the throwaway-catalog upsert generation swap,
+        /// which has no persistent-catalog analog.
+        uses_version_hint: bool,
         /// Scheme-dispatching object-store bridge, exercised only on the
         /// object-store branch. `file://` I/O stays on `std::fs` to preserve the
         /// certified fsync/rename crash-atomicity.
@@ -142,7 +155,7 @@ pub mod native {
                 )
                 .await
                 .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
-            let catalog = Arc::new(catalog);
+            let catalog: Arc<dyn Catalog + Send + Sync> = Arc::new(catalog);
 
             let namespace = NamespaceIdent::new("default".to_string());
             let ident = TableIdent::new(namespace.clone(), table_name.to_string());
@@ -215,6 +228,7 @@ pub mod native {
                 root,
                 is_object_store,
                 root_uri: table_uri,
+                uses_version_hint: true,
                 store,
                 pending: Mutex::new(HashMap::new()),
                 // Seed snap_counter with a per-instance nanosecond timestamp so
@@ -224,6 +238,97 @@ pub mod native {
                 // so a fresh sink could reuse an orphan's name and DUR-2
                 // re-staging could clobber the file it just committed). The
                 // counter still increments monotonically within an instance.
+                snap_counter: AtomicI64::new(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as i64)
+                        .unwrap_or_else(|_| (std::process::id() as i64) << 32),
+                ),
+            })
+        }
+
+        /// Open (or create) a governed table through an **injected persistent
+        /// catalog** — the platform's REST catalog (G7) that the query path
+        /// resolves. Unlike [`open`](Self::open), the catalog is itself the
+        /// durable current-metadata pointer, so there is no `version-hint.text`:
+        /// recovery loads current metadata from the catalog and its latest
+        /// snapshot summary carries the committed source offsets that keep the
+        /// streaming sink exactly-once. Everything downstream (Parquet staging,
+        /// `fast_append`, the offset summary, DUR-2 recovery) is unchanged and
+        /// catalog-generic; only the metadata-of-record differs.
+        ///
+        /// Data files are staged under the table's own catalog-assigned
+        /// warehouse location, scheme-dispatched exactly like [`open`]
+        /// (local `file://` via `std::fs`, `s3://` via the object-store bridge).
+        pub async fn open_with_catalog(
+            catalog: Arc<dyn Catalog + Send + Sync>,
+            namespace: &str,
+            table_name: &str,
+            schema_version: &SchemaVersion,
+        ) -> Result<Self, LakehouseError> {
+            let ns = NamespaceIdent::new(namespace.to_string());
+            let ident = TableIdent::new(ns.clone(), table_name.to_string());
+
+            // Namespace creation is idempotent — an already-exists error means a
+            // concurrent creator won the race, which is fine.
+            let _ = catalog.create_namespace(&ns, HashMap::new()).await;
+
+            let exists = catalog
+                .table_exists(&ident)
+                .await
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+            // Recovery is load-not-hint: an existing governed table is opened
+            // from the catalog's current metadata (whose snapshot summary holds
+            // the committed offsets); a fresh one is created from the schema and
+            // the catalog assigns its location under the warehouse.
+            let table = if exists {
+                catalog
+                    .load_table(&ident)
+                    .await
+                    .map_err(|e| LakehouseError::Iceberg(e.to_string()))?
+            } else {
+                let iceberg_schema = schema_version_to_iceberg(schema_version)?;
+                let creation = TableCreation::builder()
+                    .name(table_name.to_string())
+                    .schema(iceberg_schema)
+                    .build();
+                catalog
+                    .create_table(&ns, creation)
+                    .await
+                    .map_err(|e| LakehouseError::Iceberg(e.to_string()))?
+            };
+
+            let location = table.metadata().location().to_string();
+            let is_object_store = is_object_store_root(Path::new(&location));
+            let store = KrishivStorage::default();
+            let (root, root_uri): (PathBuf, String) = if is_object_store {
+                let uri = location.trim_end_matches('/').to_string();
+                (PathBuf::from(&uri), uri)
+            } else {
+                let path = Url::parse(&location)
+                    .map_err(|e| LakehouseError::Io(format!("table location '{location}': {e}")))?
+                    .to_file_path()
+                    .map_err(|()| {
+                        LakehouseError::Io(format!("non-file table location '{location}'"))
+                    })?;
+                // The catalog wrote `metadata/`; ensure `data/` exists for the
+                // std::fs staging path (mirrors `open`).
+                fs::create_dir_all(path.join("data"))
+                    .map_err(|e| LakehouseError::Io(e.to_string()))?;
+                let uri = path_to_uri(&path)?;
+                (path, uri)
+            };
+
+            Ok(Self {
+                catalog,
+                ident,
+                root,
+                is_object_store,
+                root_uri,
+                // The injected catalog is the source of truth; no version hint.
+                uses_version_hint: false,
+                store,
+                pending: Mutex::new(HashMap::new()),
                 snap_counter: AtomicI64::new(
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -327,10 +432,14 @@ pub mod native {
             }
 
             let committed =
-                fast_append_via(&self.catalog, &self.ident, data_files, &kafka_offsets).await?;
+                fast_append_via(&*self.catalog, &self.ident, data_files, &kafka_offsets).await?;
 
             // Best-effort recovery hint; the commit above is already durable.
-            if let Some(loc) = committed.metadata_location()
+            // Skipped for an injected persistent catalog (REST): the catalog is
+            // itself the durable current-metadata pointer, so there is no hint
+            // to maintain — recovery reads current metadata from the catalog.
+            if self.uses_version_hint
+                && let Some(loc) = committed.metadata_location()
                 && let Err(e) = self.update_version_hint(loc)
             {
                 tracing::warn!(
@@ -540,6 +649,19 @@ pub mod native {
             kafka_offsets: BTreeMap<String, i64>,
             schema_version: &SchemaVersion,
         ) -> Result<i64, LakehouseError> {
+            // The overwrite path builds a new table generation under a throwaway
+            // MemoryCatalog and flips the version-hint as the durable commit
+            // point — a mechanism with no analog for an injected persistent
+            // catalog. Upsert-over-REST is a separate merge-on-read path; the
+            // streaming sink rejects upsert for a governed sink at open, so this
+            // is a defensive guard, not a reachable path for windowed streaming.
+            if !self.uses_version_hint {
+                return Err(LakehouseError::Concurrency {
+                    message: "upsert (overwrite_commit) is not supported for a catalog-backed \
+                              streaming sink; only append is"
+                        .into(),
+                });
+            }
             let namespace = self.ident.namespace().clone();
             let table_uri = if self.is_object_store {
                 self.root_uri.clone()
@@ -768,7 +890,7 @@ pub mod native {
     /// path and the overwrite path (which commits into a throwaway catalog
     /// before flipping the version-hint). Does NOT touch the version-hint.
     async fn fast_append_via(
-        catalog: &MemoryCatalog,
+        catalog: &(dyn Catalog + Send + Sync),
         ident: &TableIdent,
         data_files: Vec<iceberg::spec::DataFile>,
         kafka_offsets: &BTreeMap<String, i64>,

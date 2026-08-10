@@ -1070,15 +1070,15 @@ impl ExecutorTaskRunner {
         descriptor: krishiv_proto::OutputContractDescriptor,
         outputs: &[RecordBatch],
     ) -> ExecutorResult<()> {
-        use krishiv_connectors::lakehouse::streaming_sink::{
-            IcebergSinkTarget, IcebergStreamingSink, schema_version_from_arrow,
-        };
+        use krishiv_connectors::lakehouse::streaming_sink::schema_version_from_arrow;
         let krishiv_proto::OutputContractDescriptor::IcebergSink {
             root,
             table,
             mode,
             key_columns,
             op_column,
+            catalog,
+            namespace,
         } = descriptor
         else {
             return Err(ExecutorError::InvalidAssignment {
@@ -1094,14 +1094,14 @@ impl ExecutorTaskRunner {
         tokio::task::spawn_blocking(move || {
             let participant = registry.get_or_register(&job, || {
                 let schema_version = schema_version_from_arrow(&schema, op_column.as_deref())?;
-                IcebergStreamingSink::open(
-                    IcebergSinkTarget {
-                        root: std::path::PathBuf::from(root),
-                        table,
-                        mode,
-                        key_columns,
-                        op_column,
-                    },
+                crate::fragment::streaming::open_streaming_iceberg_sink(
+                    root,
+                    table,
+                    mode,
+                    key_columns,
+                    op_column,
+                    catalog,
+                    namespace,
                     schema_version,
                 )
             })?;

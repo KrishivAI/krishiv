@@ -761,6 +761,105 @@ async fn execute_loop_fragment(
     Ok(output)
 }
 
+/// Build the streaming Iceberg sink for a continuous job's output contract:
+/// route to the platform's **governed REST catalog** (G7) when the descriptor
+/// names one — so windowed output lands in the catalog the query path resolves
+/// — and to a local table root otherwise. Fully synchronous (the sink owns its
+/// runtime) so it is callable from the `get_or_register` init closure on a
+/// blocking thread. Shared by the cycle and run-loop stage paths.
+#[cfg(feature = "iceberg")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn open_streaming_iceberg_sink(
+    root: String,
+    table: String,
+    mode: krishiv_proto::IcebergSinkMode,
+    key_columns: Vec<String>,
+    op_column: Option<String>,
+    catalog: Option<String>,
+    namespace: Option<String>,
+    schema_version: krishiv_connectors::lakehouse::SchemaVersion,
+) -> Result<
+    krishiv_connectors::lakehouse::streaming_sink::IcebergStreamingSink,
+    krishiv_connectors::ConnectorError,
+> {
+    use krishiv_connectors::lakehouse::streaming_sink::{IcebergSinkTarget, IcebergStreamingSink};
+    let target = IcebergSinkTarget {
+        root: std::path::PathBuf::from(root),
+        table,
+        mode,
+        key_columns,
+        op_column,
+    };
+    let Some(_catalog_name) = catalog else {
+        // Legacy local-root filesystem sink — byte-for-byte unchanged.
+        return IcebergStreamingSink::open(target, schema_version);
+    };
+    let namespace = namespace.ok_or_else(|| krishiv_connectors::ConnectorError::Protocol {
+        message: "governed iceberg sink is missing its namespace".into(),
+    })?;
+    open_governed_streaming_iceberg_sink(&namespace, target, schema_version)
+}
+
+/// The governed (REST-catalog) sink build, isolated so the whole `rest-catalog`
+/// feature surface is one function. Connects to the same catalog the query path
+/// resolves, from the executor's `KRISHIV_ICEBERG_REST_*` environment; the
+/// bearer token stays in the env and never rides the task's sink contract.
+#[cfg(all(feature = "iceberg", feature = "rest-catalog"))]
+fn open_governed_streaming_iceberg_sink(
+    namespace: &str,
+    target: krishiv_connectors::lakehouse::streaming_sink::IcebergSinkTarget,
+    schema_version: krishiv_connectors::lakehouse::SchemaVersion,
+) -> Result<
+    krishiv_connectors::lakehouse::streaming_sink::IcebergStreamingSink,
+    krishiv_connectors::ConnectorError,
+> {
+    use krishiv_connectors::lakehouse::streaming_sink::IcebergStreamingSink;
+    let uri = std::env::var("KRISHIV_ICEBERG_REST_URI").map_err(|_| {
+        krishiv_connectors::ConnectorError::Protocol {
+            message: "governed iceberg sink requires KRISHIV_ICEBERG_REST_URI in the executor \
+                      environment (the platform catalog the query path resolves)"
+                .into(),
+        }
+    })?;
+    let warehouse = std::env::var("KRISHIV_ICEBERG_REST_WAREHOUSE").unwrap_or_default();
+    let token = std::env::var("KRISHIV_ICEBERG_REST_TOKEN").ok();
+    // The builder runs on the sink's own runtime (see `open_with_catalog`), so
+    // the REST catalog's HTTP client shares that runtime for its whole life.
+    IcebergStreamingSink::open_with_catalog(
+        move || async move {
+            krishiv_sql::catalog::unified::KrishivCatalog::rest(
+                &uri,
+                &warehouse,
+                token.as_deref(),
+            )
+            .await
+            .map(|catalog| catalog.as_iceberg())
+            .map_err(|e| format!("REST catalog: {e}"))
+        },
+        namespace,
+        target,
+        schema_version,
+    )
+}
+
+/// Built without `rest-catalog`: a governed sink cannot be served, so fail
+/// loudly rather than silently dropping the governed table's output.
+#[cfg(all(feature = "iceberg", not(feature = "rest-catalog")))]
+fn open_governed_streaming_iceberg_sink(
+    _namespace: &str,
+    _target: krishiv_connectors::lakehouse::streaming_sink::IcebergSinkTarget,
+    _schema_version: krishiv_connectors::lakehouse::SchemaVersion,
+) -> Result<
+    krishiv_connectors::lakehouse::streaming_sink::IcebergStreamingSink,
+    krishiv_connectors::ConnectorError,
+> {
+    Err(krishiv_connectors::ConnectorError::Protocol {
+        message: "governed (catalog) iceberg sink requested but this executor was built without \
+                  the `rest-catalog` feature"
+            .into(),
+    })
+}
+
 /// Stage one continuous cycle's output into the job's Iceberg sink
 /// participant (registering it on first use) and commit it as one
 /// cycle-aligned epoch (G7/G8).
@@ -777,9 +876,7 @@ async fn stage_iceberg_sink_output(
     output_batches: &[arrow::record_batch::RecordBatch],
     offsets: std::collections::BTreeMap<String, i64>,
 ) -> ExecutorResult<()> {
-    use krishiv_connectors::lakehouse::streaming_sink::{
-        IcebergSinkTarget, IcebergStreamingSink, schema_version_from_arrow,
-    };
+    use krishiv_connectors::lakehouse::streaming_sink::schema_version_from_arrow;
 
     if output_batches.is_empty() && offsets.is_empty() {
         return Ok(());
@@ -790,6 +887,8 @@ async fn stage_iceberg_sink_output(
         mode,
         key_columns,
         op_column,
+        catalog,
+        namespace,
     } = descriptor
     else {
         return Err(ExecutorError::InvalidAssignment {
@@ -808,14 +907,14 @@ async fn stage_iceberg_sink_output(
     tokio::task::spawn_blocking(move || {
         let participant = registry.get_or_register(&job, || {
             let schema_version = schema_version_from_arrow(&schema, op_column.as_deref())?;
-            IcebergStreamingSink::open(
-                IcebergSinkTarget {
-                    root: std::path::PathBuf::from(root),
-                    table,
-                    mode,
-                    key_columns,
-                    op_column,
-                },
+            open_streaming_iceberg_sink(
+                root,
+                table,
+                mode,
+                key_columns,
+                op_column,
+                catalog,
+                namespace,
                 schema_version,
             )
         })?;

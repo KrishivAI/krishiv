@@ -14,6 +14,9 @@ readme = "README.md"
 kafka = ["krishiv-connectors/kafka"]
 # G7: checkpoint-aligned streaming Iceberg sink for continuous cycle output.
 iceberg = ["krishiv-connectors/iceberg"]
+# G7: commit windowed streaming output through the platform's governed REST
+# catalog (the catalog the query path resolves) instead of a local table root.
+rest-catalog = ["iceberg", "krishiv-sql/rest-catalog"]
 jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]

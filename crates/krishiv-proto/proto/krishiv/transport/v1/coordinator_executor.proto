@@ -338,6 +338,13 @@ message OutputContractDescriptor {
   string iceberg_mode = 8;
   repeated string iceberg_key_columns = 9;
   string iceberg_op_column = 10;
+  // G7 governed sink: when non-empty, the sink commits through the platform's
+  // persistent Iceberg catalog of this name (the REST catalog the query path
+  // resolves) rather than a local table root; iceberg_namespace then holds the
+  // governed table's namespace (the pipeline schema). Empty keeps the legacy
+  // local-root filesystem sink.
+  string iceberg_catalog = 14;
+  string iceberg_namespace = 15;
   // Transactional Kafka sink target (Phase 55, sink descriptors beyond
   // Iceberg): output produced between checkpoint barriers is written inside a
   // Kafka transaction prepared at the barrier and committed by the

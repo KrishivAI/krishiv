@@ -385,7 +385,6 @@ mod tests {
                 let tpc = IcebergNativeTwoPhaseCommit::open(dir.path(), "t", &sv)
                     .await
                     .unwrap();
-                use iceberg::Catalog;
                 let table = tpc.catalog.load_table(&tpc.ident).await.unwrap();
                 assert!(
                     table.metadata().current_snapshot().is_some(),
@@ -448,7 +447,6 @@ mod tests {
             let tpc2 = IcebergNativeTwoPhaseCommit::open(dir.path(), "t", &sv)
                 .await
                 .unwrap();
-            use iceberg::Catalog;
             let table = tpc2.catalog.load_table(&tpc2.ident).await.unwrap();
             assert!(
                 table.metadata().current_snapshot().is_some(),
@@ -496,7 +494,6 @@ mod tests {
                 let tpc = IcebergNativeTwoPhaseCommit::open(dir.path(), "t", &sv)
                     .await
                     .unwrap();
-                use iceberg::Catalog;
                 let table = tpc.catalog.load_table(&tpc.ident).await.unwrap();
                 let props = table.metadata().properties();
                 assert_eq!(
