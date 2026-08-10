@@ -22,11 +22,15 @@
 //! semantics (empty array ⇒ true; a definite `false` dominates; otherwise a
 //! `NULL` predicate result poisons the row to `NULL`).
 //!
-//! The remaining Spark HOFs — `aggregate`/`reduce` (two-lambda fold),
-//! `zip_with` (binary lambda over two arrays), and the map lambdas
-//! (`map_filter`, `transform_keys`, `transform_values`) — require the
-//! multi-step lambda-parameter protocol / map-lambda machinery and are tracked
-//! as `Planned` in the feature matrix rather than shipped approximately.
+//! Spark's `aggregate`/`reduce` (left-fold with a seed accumulator) is
+//! implemented here as [`ArrayReduce`] and registered under all three spellings
+//! (`aggregate`, `reduce`, `array_aggregate`).
+//!
+//! The remaining Spark HOFs — `zip_with` (binary lambda over two arrays) and
+//! the map lambdas (`map_filter`, `transform_keys`, `transform_values`) —
+//! require the multi-step lambda-parameter protocol / map-lambda machinery and
+//! are tracked as `Planned` in the feature matrix rather than shipped
+//! approximately.
 
 use std::sync::Arc;
 
@@ -58,6 +62,7 @@ type DFResult<T> = Result<T, DataFusionError>;
 /// - `filter`    → `array_filter`    (alias, exact)
 /// - `exists`    → `array_any_match` (alias, exact)
 /// - `forall`    → [`ArrayAllMatch`] (new, exact all-match semantics)
+/// - `aggregate` / `reduce` → [`ArrayReduce`] (new, left-fold with a seed)
 pub fn register_higher_order_spark_functions(ctx: &SessionContext) -> DFResult<()> {
     // Aliases delegate through DataFusion's own `AliasedHigherOrderUDFImpl`,
     // which forwards every trait method — so the Spark name is the exact same

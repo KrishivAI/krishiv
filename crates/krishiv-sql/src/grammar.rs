@@ -654,9 +654,16 @@ static FEATURES: &[FeatureEntry] = &[
         S,
     ),
     FeatureEntry::batch_only(
-        "functions.hof.aggregate_zip_map",
+        "functions.hof.aggregate",
         "FUNCTIONS",
-        "aggregate/reduce, zip_with, map_filter, transform_keys/values",
+        "aggregate/reduce(array, start, (acc, x) -> …) left-fold",
+        S,
+    )
+    .with_note("ArrayReduce; registered as aggregate / reduce / array_aggregate"),
+    FeatureEntry::batch_only(
+        "functions.hof.zip_map",
+        "FUNCTIONS",
+        "zip_with, map_filter, transform_keys/values",
         PL,
     )
     .with_note("require DataFusion's multi-step lambda / map-lambda protocol; itemized shortfall"),

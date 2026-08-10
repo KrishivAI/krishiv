@@ -108,6 +108,7 @@ Krishiv targets Spark-SQL reference parity as a **measured** number. This page i
 - `hints.repartition` — /*+ REPARTITION(n)|COALESCE(n) */ partitioning hints _(parsed and recorded; applied where the distributed planner supports it)_
 - `window.tumble` — TUMBLE(col, interval) streaming window _(batch rewrites the TVF to scalar UDFs (streaming_tvf.rs); streaming compiles it natively)_
 - `functions.hof.exists` — exists / any_match(array, x -> …) predicate-any _(any_match is reachable; the `exists(...)` spelling is shadowed by the EXISTS-subquery keyword in the parser (documented dialect difference))_
+- `functions.hof.aggregate` — aggregate/reduce(array, start, (acc, x) -> …) left-fold _(ArrayReduce; registered as aggregate / reduce / array_aggregate)_
 - `functions.spark.date_format` — date_format(ts, fmt) with **Spark** pattern letters (yyyy-MM-dd) _(supported Spark pattern letters translate exactly to chrono; unsupported letters (era/timezone) error clearly rather than emitting wrong output. Differs from DataFusion's chrono-pattern date_format — see honesty page.)_
 - `dml.copy_to` — COPY (query) TO 'path' (FORMAT …) _(inherited from DataFusion's native parser/planner; no Krishiv-side code involved)_
 - `dml.delete` — DELETE FROM table WHERE … _(supported on Iceberg tables; in-memory and Parquet tables require rewrite)_
@@ -135,7 +136,7 @@ Krishiv targets Spark-SQL reference parity as a **measured** number. This page i
 - `functions.json.from_to_json` — from_json / to_json struct⇄JSON conversion _(requires a typed arrow⇄JSON converter + a Spark-DDL schema parser with Spark's version-specific null-field/timestamp rules; itemized shortfall, not shipped approximate)_
 - `functions.json.json_tuple` — json_tuple(json, k1, k2, …) multi-key extraction (generator) _(needs table-generating/LATERAL VIEW machinery; use get_json_object per key today)_
 - `functions.json.schema_of_json` — schema_of_json(json) infer a DDL schema string _(planned)_
-- `functions.hof.aggregate_zip_map` — aggregate/reduce, zip_with, map_filter, transform_keys/values _(require DataFusion's multi-step lambda / map-lambda protocol; itemized shortfall)_
+- `functions.hof.zip_map` — zip_with, map_filter, transform_keys/values _(require DataFusion's multi-step lambda / map-lambda protocol; itemized shortfall)_
 - `functions.spark.hash_generators` — xxhash64, stack, posexplode, inline _(xxhash64 needs byte-exact replication of Spark's seed-42 typed hashing; stack/posexplode/inline need generator machinery — itemized shortfall)_
 - `dml.truncate` — TRUNCATE TABLE (Iceberg + memory) _(itemized shortfall: TRUNCATE is not yet wired for memory/Iceberg session tables)_
 - `stmt.cache` — CACHE / UNCACHE / CLEAR CACHE TABLE (session materialization) _(itemized shortfall: needs a session-scoped materialization + provider swap/restore)_

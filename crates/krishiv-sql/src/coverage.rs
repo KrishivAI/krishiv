@@ -269,6 +269,10 @@ pub static CHECKLIST: &[ChecklistCase] = &[
         "functions.hof.forall",
         "SELECT forall([2, 4, 6], x -> x % 2 = 0) AS r",
     ),
+    sql(
+        "functions.hof.aggregate",
+        "SELECT aggregate([1, 2, 3, 4], 0, (acc, x) -> acc + x) AS s",
+    ),
     // ── FUNCTIONS: Spark scalar aliases ───────────────────────────────────────
     sql(
         "functions.spark.nvl",

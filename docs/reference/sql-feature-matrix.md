@@ -118,7 +118,8 @@ Each feature is dimensioned across the three Krishiv execution engines: **batch*
 | `functions.hof.filter` | filter(array, x -> …) — Spark alias for array_filter | supported | n/a | n/a |  |
 | `functions.hof.exists` | exists / any_match(array, x -> …) predicate-any | partial | n/a | n/a | any_match is reachable; the `exists(...)` spelling is shadowed by the EXISTS-subquery keyword in the parser (documented dialect difference) |
 | `functions.hof.forall` | forall(array, x -> …) predicate-all (new, exact all-match) | supported | n/a | n/a |  |
-| `functions.hof.aggregate_zip_map` | aggregate/reduce, zip_with, map_filter, transform_keys/values | planned | n/a | n/a | require DataFusion's multi-step lambda / map-lambda protocol; itemized shortfall |
+| `functions.hof.aggregate` | aggregate/reduce(array, start, (acc, x) -> …) left-fold | supported | n/a | n/a | ArrayReduce; registered as aggregate / reduce / array_aggregate |
+| `functions.hof.zip_map` | zip_with, map_filter, transform_keys/values | planned | n/a | n/a | require DataFusion's multi-step lambda / map-lambda protocol; itemized shortfall |
 | `functions.spark.nvl` | nvl / nvl2 null-coalescing (DataFusion-native, exact) | supported | n/a | n/a |  |
 | `functions.spark.substring_index` | substring_index(str, delim, count) (DataFusion-native, exact) | supported | n/a | n/a |  |
 | `functions.spark.date_format` | date_format(ts, fmt) with **Spark** pattern letters (yyyy-MM-dd) | supported | n/a | n/a | supported Spark pattern letters translate exactly to chrono; unsupported letters (era/timezone) error clearly rather than emitting wrong output. Differs from DataFusion's chrono-pattern date_format — see honesty page. |
