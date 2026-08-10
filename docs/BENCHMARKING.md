@@ -66,16 +66,43 @@ committed back, so every nightly run there compares against the same stale
 baseline instead of the previous night), and opens a tracked `performance`-
 labeled issue on a sustained breach.
 
-**What this gate does not cover yet**: `tpch_sf10`, `tpch_distributed`,
-`tpch_overhead`, and `tpcds_smoke` all need `KRISHIV_TPCH_DATA_DIR_*` /
-`KRISHIV_TPCDS_DATA_DIR` pointing at pre-generated multi-GB data that CI
-does not provision — they self-skip (stderr notice) rather than fail when
-unset, which is correct behavior for the bench itself but means declaring a
-budget for them today would either go permanently "NO DATA YET" or, worse,
-permanently fail `--require-fresh` for an infrastructure reason having
-nothing to do with performance. Those stay manual (`just bench-tpch`,
-`scripts/bench-tpcds-gate.sh`) until a runner with the datasets is wired in
-— tracked, not silently dropped.
+`scripts/bench-datasets-tier.sh` (the `dataset-tier` job in the same
+workflow) covers the two dataset-backed targets that are small enough for
+CI to provision itself: `tpch_distributed` over TPC-H SF1 (`tpchgen-cli`)
+and `tpcds_smoke` over TPC-DS SF1 (`scripts/bench/gen_tpcds_sf1.py`, DuckDB
+`dsdgen`). Both generators are deterministic per version and scale factor,
+and the generated data is cached between nights, so day-over-day rows
+measure the engine, not the data. Same append → commit-to-main → gate
+pipeline as the nightly tier, evaluated with `--tier datasets
+--require-fresh 8` against the `"tier": "datasets"` budgets in
+`benchmarks/budgets.json`. The tpch_distributed budgets are bootstrap
+values (no ci-shared measurement existed when they were declared — each
+budget's note records the derivation) and the TPC-DS budgets start at the
+60 s `QUERY_TIMEOUT_MS` contract from `krishiv-bench/src/tpcds.rs`; both
+are to be re-baselined at ~1.5x the observed medians once the first
+committed week of ci-shared history exists.
+
+**The gate has been proven to fail when it should**:
+`scripts/plant_regression_demo.sh` is the planted-regression proof. It runs
+the smallest gated bench (`streaming_latency_embedded`) for a clean
+baseline, re-runs it twice with `KRISHIV_BENCH_PLANT_REGRESSION_MS=25` —
+the bench harness's own gate-self-test hook in
+`benches/streaming_latency.rs`, which sleeps that long inside every timed
+iteration (two planted runs because a single breach only warns; the FAIL
+rule requires a sustained, 2-consecutive-runs breach) — and exits 0 only
+when `bench_gate.py` flags the plant as a SUSTAINED breach. Entirely
+local: the gate runs against a scratch copy of its own layout, and nothing
+under `benchmarks/` is touched.
+
+**What this gate does not cover yet**: `tpch_sf10` and `tpch_overhead`
+need `KRISHIV_TPCH_DATA_DIR_*` pointing at pre-generated multi-GB data
+that CI does not provision — they self-skip (stderr notice) rather than
+fail when unset, which is correct behavior for the bench itself but means
+declaring a budget for them today would either go permanently "NO DATA
+YET" or, worse, permanently fail `--require-fresh` for an infrastructure
+reason having nothing to do with performance. Those stay manual (`just
+bench-tpch`, `scripts/bench-tpch-tier.sh`) until a runner with the
+datasets is wired in — tracked, not silently dropped.
 
 ## Publishing comparisons
 
@@ -535,3 +562,39 @@ Findings:
    unverified — that inspection stays open on #179.
 3. Next step for a non-provisional pin: rerun
    `KRISHIV_BENCH_IVM_ROWS=5000000,6000000,7000000,7500000` on an idle box.
+
+### 2026-08-11 — Phase 65 oversubscription contract proven (all_slots_busy)
+
+- **Revision**: engine `52f3e49` (includes the five in-process concurrency
+  fixes this bench flushed out — see below).
+- **Hardware**: Intel i7-9750H, 12 threads (6 cores × SMT), 61 GiB RAM,
+  Linux 7.0.0-29-generic, rustc 1.92.0, bench profile (opt-level=3 +
+  thin LTO). Desktop box, niced run (`nice -n 5`).
+- **Dataset**: TPC-H SF1 Parquet (`tpchgen-cli parquet -s 1`), warm cache.
+- **Method**: `benches/all_slots_busy.rs` — task slots pinned to the core
+  count, `KRISHIV_TARGET_PARALLELISM=1` (so slots × DF-partitions = cores
+  exactly), 12 identical q1 queries released together per round through one
+  shared `InProcessCluster`'s coordinator job path; 51 rounds → 612
+  per-query wall-time samples per mode. Two separate processes because the
+  compute pool sizes once per process: `serial` = `KRISHIV_COMPUTE_THREADS=1`,
+  `pooled` = default auto-sizing.
+
+**Per-query wall time (ms), every slot busy:**
+
+| mode   | p50    | p95    | p99    | max    |
+|--------|-------:|-------:|-------:|-------:|
+| serial | 1322.2 | 2000.7 | 2117.6 | 2189.4 |
+| pooled | 1340.8 | 1993.3 | 2099.6 | 2161.6 |
+
+**Verdict: contract holds.** Pooled p99 is 0.9% *below* serial p99 (and
+p95/max agree); the default pool sizing does not oversubscribe the machine
+when every task slot is occupied. p50 +1.4% is within round-to-round noise.
+
+The bench earned its keep before producing a number: getting 12 concurrent
+drivers through one in-process cluster exposed five real concurrency bugs,
+each fixed with a regression test — executor swept Lost by concurrent
+drivers' ticks (`650b85c`), cross-driver row leakage from the shared report
+stream (`f89bc6f`), premature job-done declaration (`f9aec5e`), caller input
+partitions never reaching tick-launched tasks + the quiescent exit firing
+mid-stage-transition (`bf8f76f`), and a waiting driver never draining the
+shared inbox, wedging at the stage cap (`52f3e49`).

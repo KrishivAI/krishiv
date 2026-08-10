@@ -54,6 +54,30 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use krishiv_dataflow::ContinuousWindowExecutor;
 use krishiv_plan::window::WindowExecutionSpec;
 
+/// Dev-only self-test hook for the regression gate (`scripts/bench_gate.py`).
+///
+/// When `KRISHIV_BENCH_PLANT_REGRESSION_MS=<ms>` is set, every timed
+/// iteration of the gated cells below sleeps that long — a deliberately
+/// planted, known-magnitude slowdown that lets
+/// `scripts/plant_regression_demo.sh` prove end-to-end that the gate
+/// actually fails on a real measured regression, without touching CI or the
+/// committed history. Never set this for a recorded run: a result measured
+/// with it is a gate self-test artifact, not a benchmark. When unset (the
+/// only configuration CI ever runs), the cost is one static read and a
+/// branch — noise against the ~140µs cells this file measures.
+fn plant_regression_delay() {
+    use std::sync::OnceLock;
+    static PLANT_MS: OnceLock<Option<u64>> = OnceLock::new();
+    let ms = *PLANT_MS.get_or_init(|| {
+        std::env::var("KRISHIV_BENCH_PLANT_REGRESSION_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    });
+    if let Some(ms) = ms {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
 /// `n` rows spaced 1ms apart starting at `ts_base`, cycling through 100
 /// distinct keys (`u0`..`u99`). The 1ms stride keeps an `n`-row batch's span
 /// under `n` milliseconds, so several batches can tile one tumbling window
@@ -117,6 +141,7 @@ fn bench_embedded_tumbling(c: &mut Criterion) {
                 (executor, steady_state_batch())
             },
             |(executor, batch)| {
+                plant_regression_delay();
                 let _ = executor.drain(vec![batch.clone()]);
             },
             BatchSize::SmallInput,
@@ -160,6 +185,7 @@ fn bench_single_node_tumbling(c: &mut Criterion) {
                 (ckpt_dir, executor, steady_state_batch())
             },
             |(_ckpt_dir, executor, batch)| {
+                plant_regression_delay();
                 let _ = executor.drain(vec![batch.clone()]);
             },
             BatchSize::SmallInput,

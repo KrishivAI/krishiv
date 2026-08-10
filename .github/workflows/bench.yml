@@ -86,7 +86,8 @@ jobs:
   # reviewing a push; this job is a small, fast, unattended-safe subset
   # (streaming_latency, ivm_vs_full_recompute, nexmark — the krishiv-bench
   # targets that need no external dataset) that can actually FAIL the
-  # check and open a tracked issue. TPC-H/TPC-DS budgets are intentionally
+  # check and open a tracked issue. tpch_distributed/tpcds_smoke run in the
+  # dataset-tier job below; tpch_sf10/tpch_overhead budgets are intentionally
   # not included yet — see benchmarks/budgets.json and BENCHMARKING.md.
   regression-gate:
     name: Nightly regression gate
@@ -141,4 +142,104 @@ jobs:
           gh issue create \
             --title "Nightly benchmark gate: sustained budget breach ($(date -u +%F))" \
             --body "scripts/bench_gate.py failed on a sustained (2-night) breach or a stale budget. History: benchmarks/results.jsonl @ ${{ github.sha }}. See docs/BENCHMARKING.md for budgets." \
+            --label performance || true
+
+  # Phase 66: nightly dataset tier — the two bench targets that need generated
+  # data but are small enough for CI to provision itself at SF1.
+  # tpch_distributed measures the InProcessCluster submission path over TPC-H
+  # SF1 (tpchgen-cli); tpcds_smoke runs the bundled TPC-DS queries over
+  # DuckDB-dsdgen SF1 (scripts/bench/gen_tpcds_sf1.py). Both generators are
+  # deterministic per version+scale and the datasets are cached between
+  # nights, so the rows measure the engine, not the data. Measurements feed
+  # the same committed results.jsonl history and bench_gate.py comparison as
+  # regression-gate above, under the "datasets" tier in benchmarks/budgets.json.
+  # Kept out of the regression-gate job because dataset generation plus two
+  # more bench-profile targets would roughly double that job's wall time;
+  # `needs: regression-gate` (with !cancelled() so a breach there doesn't skip
+  # measurement here) serializes the two history commits so this job can
+  # rebase cleanly on top of the other's.
+  dataset-tier:
+    name: Nightly dataset tier (TPC-H distributed / TPC-DS)
+    needs: regression-gate
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    concurrency:
+      group: bench-dataset-tier-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      issues: write
+      contents: write
+    env:
+      CARGO_BUILD_JOBS: "1"
+      KRISHIV_TPCH_DATA_DIR_SF1: /home/runner/krishiv-bench-data/tpch/sf1
+      KRISHIV_TPCDS_DATA_DIR: /home/runner/krishiv-bench-data/tpcds/sf1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: bench-dataset-tier
+
+      - name: Restore SF1 datasets
+        id: datasets
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/krishiv-bench-data
+          # Bump the -v1 suffix to regenerate (e.g. after a generator version
+          # change); a cache hit measures the same bytes as the night the
+          # cache was built, which is exactly what day-over-day compares want.
+          key: bench-datasets-sf1-v1
+
+      - name: Generate TPC-H SF1
+        if: steps.datasets.outputs.cache-hit != 'true'
+        run: |
+          cargo install tpchgen-cli --locked
+          mkdir -p "$KRISHIV_TPCH_DATA_DIR_SF1"
+          tpchgen-cli parquet -s 1 --output-dir "$KRISHIV_TPCH_DATA_DIR_SF1"
+
+      - name: Generate TPC-DS SF1
+        if: steps.datasets.outputs.cache-hit != 'true'
+        env:
+          PIP_BREAK_SYSTEM_PACKAGES: "1"
+        run: |
+          python3 -m pip install --quiet duckdb
+          python3 scripts/bench/gen_tpcds_sf1.py "$KRISHIV_TPCDS_DATA_DIR"
+
+      - name: Gate self-test
+        run: python3 scripts/bench_gate.py --self-test
+
+      - name: Dataset tier
+        run: BENCH_ENV=ci-shared scripts/bench-datasets-tier.sh
+
+      # Same persistence rule as regression-gate above: always commit this
+      # run's rows — a breach row is exactly what the next night needs to
+      # confirm "sustained". regression-gate commits its history first (this
+      # job runs after it but checked out the pre-commit SHA), so rebase onto
+      # the moved main before pushing; results.jsonl is append-only, so the
+      # union merge driver resolves the concurrent appends cleanly.
+      - name: Commit benchmark history
+        if: always()
+        run: |
+          if git diff --quiet -- benchmarks/results.jsonl; then
+            echo "no new measurements to commit"
+            exit 0
+          fi
+          TOKEN="${{ secrets.GH_WORKFLOW_PAT || secrets.GITHUB_TOKEN }}"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git"
+          git add benchmarks/results.jsonl
+          git commit -m "bench: nightly dataset-tier measurements ($(date -u +%F))"
+          echo "benchmarks/results.jsonl merge=union" >> .git/info/attributes
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+      - name: Open tracked issue on sustained breach
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "Nightly dataset-tier gate: sustained budget breach ($(date -u +%F))" \
+            --body "scripts/bench-datasets-tier.sh failed on a sustained (2-night) breach or a stale budget (tier: datasets). History: benchmarks/results.jsonl @ ${{ github.sha }}. See docs/BENCHMARKING.md for budgets." \
             --label performance || true

@@ -5,14 +5,15 @@
 # one JSONL row per measurement to benchmarks/results.jsonl (with
 # commit/date/env provenance) before running the regression gate.
 #
-# TPC-H (tpch_sf10/tpch_distributed/tpch_overhead) and TPC-DS (tpcds_smoke)
-# are deliberately NOT run here: they need KRISHIV_TPCH_DATA_DIR_*/
-# KRISHIV_TPCDS_DATA_DIR pointing at pre-generated multi-GB data that CI does
-# not provision, and self-skip with a stderr notice when unset — silently
-# "passing" a budget nothing measured is worse than not declaring the budget
-# (see benchmarks/budgets.json's _doc and BENCHMARKING.md). Run those with
-# `just bench-tpch` / `scripts/bench-tpcds-gate.sh` on a machine that has the
-# datasets.
+# Dataset-backed targets are deliberately NOT run here: tpch_distributed and
+# tpcds_smoke run in the nightly dataset tier (scripts/bench-datasets-tier.sh,
+# bench.yml's dataset-tier job — CI generates its own SF1 data for those);
+# tpch_sf10 and tpch_overhead still need KRISHIV_TPCH_DATA_DIR_* pointing at
+# pre-generated multi-GB data that CI does not provision, and self-skip with a
+# stderr notice when unset — silently "passing" a budget nothing measured is
+# worse than not declaring the budget (see benchmarks/budgets.json's _doc and
+# BENCHMARKING.md). Run those with `just bench-tpch` /
+# `scripts/bench-tpch-tier.sh` on a machine that has the datasets.
 #
 # Env:
 #   BENCH_ENV                    -> environment label (required)

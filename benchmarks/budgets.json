@@ -1,5 +1,5 @@
 {
- "_doc": "Latency budgets for the engine's own nightly-measurable benchmarks (Phase 66). Each budget names its owner criterion group/id under crates/krishiv-bench/benches/ so scripts/bench-tier.sh knows where to read target/criterion/<path>/new/estimates.json. The gate (scripts/bench_gate.py, ported from the platform repo's Phase 29) flags results exceeding budget by >20% on two consecutive nightly runs. Units: milliseconds unless noted. TPC-H budgets are declared under `\"tier\": \"tpch\"` and are evaluated ONLY by `scripts/bench-tpch-tier.sh --tier tpch` on a host that has the dataset; the nightly job passes `--tier nightly` so `--require-fresh` never fails on them. TPC-DS is still excluded entirely:  those benches need KRISHIV_TPCH_DATA_DIR_*/KRISHIV_TPCDS_DATA_DIR pointing at multi-GB generated data that CI does not provision, so they self-skip today (see BENCHMARKING.md's 'What this gate does not cover yet') rather than being declared here and permanently failing --require-fresh for an infrastructure reason, not a performance one.",
+ "_doc": "Latency budgets for the engine's own nightly-measurable benchmarks (Phase 66). Each budget names its owner criterion group/id under crates/krishiv-bench/benches/ so scripts/bench-tier.sh knows where to read target/criterion/<path>/new/estimates.json. The gate (scripts/bench_gate.py, ported from the platform repo's Phase 29) flags results exceeding budget by >20% on two consecutive nightly runs. Units: milliseconds unless noted. TPC-H budgets are declared under `\"tier\": \"tpch\"` and are evaluated ONLY by `scripts/bench-tpch-tier.sh --tier tpch` on a host that has the dataset; the nightly job passes `--tier nightly` so `--require-fresh` never fails on them. `\"tier\": \"datasets\"` budgets cover the two targets CI provisions its own SF1 data for (tpch_distributed via tpchgen-cli, tpcds_smoke via scripts/bench/gen_tpcds_sf1.py) — run nightly by scripts/bench-datasets-tier.sh from bench.yml's dataset-tier job with `--tier datasets`. tpch_sf10 and tpch_overhead still need multi-GB pre-generated data that CI does not provision, so they self-skip (see BENCHMARKING.md's 'What this gate does not cover yet') rather than being declared here and permanently failing --require-fresh for an infrastructure reason, not a performance one.",
  "budgets": [
   {
    "path": "streaming_latency_embedded_p50",
@@ -126,6 +126,83 @@
    "tier": "tpch",
    "benchmark": "scripts/bench-tpch-tier.sh (tpch_q18/q18_large_volume_customer/sf10)",
    "note": "first measured 2026-07-25 on dev-box at 6572.0ms; budget is ~1.5x that. Baseline is machine-specific \u2014 re-baseline on whichever host runs this tier regularly rather than treating these as portable numbers."
+  },
+  {
+   "path": "tpch_distributed_q1_sf1_p50",
+   "budget_ms": 600,
+   "tier": "datasets",
+   "benchmark": "scripts/bench-datasets-tier.sh (tpch_distributed_q1/q1_pricing_summary/sf1)",
+   "note": "bootstrap budget, not yet measured on ci-shared: 4x the embedded tpch-tier sf1 budget (the coordinated hop measured +23% to +71% over embedded in BENCHMARKING.md's 2026-07-11 Phase 52 entry; the rest is ci-shared runner headroom). Re-baseline at ~1.5x the observed ci-shared median once the first committed week of history exists."
+  },
+  {
+   "path": "tpch_distributed_q3_sf1_p50",
+   "budget_ms": 1000,
+   "tier": "datasets",
+   "benchmark": "scripts/bench-datasets-tier.sh (tpch_distributed_q3/q3_shipping_priority/sf1)",
+   "note": "bootstrap budget, not yet measured on ci-shared: 4x the embedded tpch-tier sf1 budget (the coordinated hop measured +23% to +71% over embedded in BENCHMARKING.md's 2026-07-11 Phase 52 entry; the rest is ci-shared runner headroom). Re-baseline at ~1.5x the observed ci-shared median once the first committed week of history exists."
+  },
+  {
+   "path": "tpch_distributed_q5_sf1_p50",
+   "budget_ms": 1450,
+   "tier": "datasets",
+   "benchmark": "scripts/bench-datasets-tier.sh (tpch_distributed_q5/q5_local_supplier_volume/sf1)",
+   "note": "bootstrap budget, not yet measured on ci-shared: 4x the embedded tpch-tier sf1 budget (the coordinated hop measured +23% to +71% over embedded in BENCHMARKING.md's 2026-07-11 Phase 52 entry; the rest is ci-shared runner headroom). Re-baseline at ~1.5x the observed ci-shared median once the first committed week of history exists."
+  },
+  {
+   "path": "tpch_distributed_q6_sf1_p50",
+   "budget_ms": 450,
+   "tier": "datasets",
+   "benchmark": "scripts/bench-datasets-tier.sh (tpch_distributed_q6/q6_forecasting_revenue/sf1)",
+   "note": "bootstrap budget, not yet measured on ci-shared: 4x the embedded tpch-tier sf1 budget (the coordinated hop measured +23% to +71% over embedded in BENCHMARKING.md's 2026-07-11 Phase 52 entry; the rest is ci-shared runner headroom). Re-baseline at ~1.5x the observed ci-shared median once the first committed week of history exists."
+  },
+  {
+   "path": "tpch_distributed_q10_sf1_p50",
+   "budget_ms": 1000,
+   "tier": "datasets",
+   "benchmark": "scripts/bench-datasets-tier.sh (tpch_distributed_q10/q10_returned_item_reporting/sf1)",
+   "note": "bootstrap budget, not yet measured on ci-shared: 4x the embedded tpch-tier sf1 budget (the coordinated hop measured +23% to +71% over embedded in BENCHMARKING.md's 2026-07-11 Phase 52 entry; the rest is ci-shared runner headroom). Re-baseline at ~1.5x the observed ci-shared median once the first committed week of history exists."
+  },
+  {
+   "path": "tpch_distributed_q18_sf1_p50",
+   "budget_ms": 2700,
+   "tier": "datasets",
+   "benchmark": "scripts/bench-datasets-tier.sh (tpch_distributed_q18/q18_large_volume_customer/sf1)",
+   "note": "bootstrap budget, not yet measured on ci-shared: 4x the embedded tpch-tier sf1 budget (the coordinated hop measured +23% to +71% over embedded in BENCHMARKING.md's 2026-07-11 Phase 52 entry; the rest is ci-shared runner headroom). Re-baseline at ~1.5x the observed ci-shared median once the first committed week of history exists."
+  },
+  {
+   "path": "tpcds_q1_sf1_p50",
+   "budget_ms": 60000,
+   "tier": "datasets",
+   "benchmark": "scripts/bench-datasets-tier.sh (tpcds_smoke/query/q1)",
+   "note": "bootstrap budget = the 60s QUERY_TIMEOUT_MS contract in krishiv-bench/src/tpcds.rs (the only recorded TPC-DS SLO) \u2014 a completes-within-timeout gate, deliberately loose because no TPC-DS measurement exists on any recorded host yet. Tighten to ~1.5x the observed ci-shared median once the first committed week of history exists."
+  },
+  {
+   "path": "tpcds_q3_sf1_p50",
+   "budget_ms": 60000,
+   "tier": "datasets",
+   "benchmark": "scripts/bench-datasets-tier.sh (tpcds_smoke/query/q3)",
+   "note": "bootstrap budget = the 60s QUERY_TIMEOUT_MS contract in krishiv-bench/src/tpcds.rs (the only recorded TPC-DS SLO) \u2014 a completes-within-timeout gate, deliberately loose because no TPC-DS measurement exists on any recorded host yet. Tighten to ~1.5x the observed ci-shared median once the first committed week of history exists."
+  },
+  {
+   "path": "tpcds_q6_sf1_p50",
+   "budget_ms": 60000,
+   "tier": "datasets",
+   "benchmark": "scripts/bench-datasets-tier.sh (tpcds_smoke/query/q6)",
+   "note": "bootstrap budget = the 60s QUERY_TIMEOUT_MS contract in krishiv-bench/src/tpcds.rs (the only recorded TPC-DS SLO) \u2014 a completes-within-timeout gate, deliberately loose because no TPC-DS measurement exists on any recorded host yet. Tighten to ~1.5x the observed ci-shared median once the first committed week of history exists."
+  },
+  {
+   "path": "tpcds_q12_sf1_p50",
+   "budget_ms": 60000,
+   "tier": "datasets",
+   "benchmark": "scripts/bench-datasets-tier.sh (tpcds_smoke/query/q12)",
+   "note": "bootstrap budget = the 60s QUERY_TIMEOUT_MS contract in krishiv-bench/src/tpcds.rs (the only recorded TPC-DS SLO) \u2014 a completes-within-timeout gate, deliberately loose because no TPC-DS measurement exists on any recorded host yet. Tighten to ~1.5x the observed ci-shared median once the first committed week of history exists."
+  },
+  {
+   "path": "tpcds_q27_sf1_p50",
+   "budget_ms": 60000,
+   "tier": "datasets",
+   "benchmark": "scripts/bench-datasets-tier.sh (tpcds_smoke/query/q27)",
+   "note": "bootstrap budget = the 60s QUERY_TIMEOUT_MS contract in krishiv-bench/src/tpcds.rs (the only recorded TPC-DS SLO) \u2014 a completes-within-timeout gate, deliberately loose because no TPC-DS measurement exists on any recorded host yet. Tighten to ~1.5x the observed ci-shared median once the first committed week of history exists."
   }
  ]
 }
