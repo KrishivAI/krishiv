@@ -659,6 +659,201 @@ mod phase3_recovery {
         assert_eq!(staged, 0, "epoch-2 output aborted (recover-and-abort)");
     }
 
+    /// DUR-2 Phase B: executor death BETWEEN prepare and commit.
+    ///
+    /// The first incarnation stages sink output and pre-commits epoch 1 (a
+    /// durable `.parquet.tmp` on disk), acks the refs to the coordinator,
+    /// and dies before the commit — its in-memory prepared log is gone, so
+    /// `restore_to` (the coordinator-restart half of DUR-2) has nothing to
+    /// reconcile. The restore command's durable refs must reconstruct and
+    /// commit the transaction on the SECOND incarnation, exactly once.
+    #[test]
+    fn death_between_prepare_and_commit_commits_from_durable_refs() {
+        let job = "p3-2pc-death";
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let sink_dir = tempdir().unwrap();
+
+        // ── First incarnation: stage, prepare epoch 1, die before commit. ──
+        let prepare_path;
+        {
+            let (runner, _assignment) = runner_with_running_task(job, "task-p3-2pc-death");
+            let participant = runner
+                .transaction_log
+                .get_or_register(job, || {
+                    Ok(EpochTransactionLog::new(LocalParquetTwoPhaseCommitSink::new(
+                        sink_dir.path(),
+                    )))
+                })
+                .unwrap();
+            let batch =
+                krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![500_i64])
+                    .unwrap();
+            {
+                let mut guard = participant.lock().unwrap();
+                guard.stage(&batch).unwrap();
+                guard.pre_commit(1).unwrap();
+            }
+            // What the checkpoint ack reported before the death.
+            let refs = runner.transaction_log.prepared_refs(job).unwrap();
+            assert_eq!(refs.len(), 1, "one prepared transaction for epoch 1");
+            prepare_path = refs[0].prepare_path.clone();
+
+            let ack = CheckpointAckRequest {
+                job_id: JobId::try_new(job).unwrap(),
+                operator_id: krishiv_proto::OperatorId::try_new("operator-task-p3-2pc-death")
+                    .unwrap(),
+                task_id: TaskId::try_new("task-p3-2pc-death").unwrap(),
+                epoch: 1,
+                fencing_token: FencingToken::initial(),
+                source_offsets: vec![],
+                snapshot_path: None,
+                unaligned_buffers: Vec::new(),
+                sink_transactions: vec![krishiv_proto::SinkTransactionRef {
+                    sink_id: prepare_path.clone(),
+                    epoch: 1,
+                    prepare_path: prepare_path.clone(),
+                    committed: false,
+                }],
+            };
+            seal_epoch_from_acks(storage.as_ref(), job, 1, &[ack]);
+            // Executor dies here: the runner — and the only in-memory record
+            // of the prepared transaction — drops.
+        }
+        assert!(
+            std::path::Path::new(&prepare_path).exists(),
+            "the durable staging file must survive the death"
+        );
+
+        // ── Second incarnation: fresh runner, cold prepared log. Task
+        // re-creation registers a participant over the same sink root.
+        let (runner2, _assignment2) = runner_with_running_task(job, "task-p3-2pc-death-2");
+        runner2
+            .transaction_log
+            .get_or_register(job, || {
+                Ok(EpochTransactionLog::new(LocalParquetTwoPhaseCommitSink::new(
+                    sink_dir.path(),
+                )))
+            })
+            .unwrap();
+
+        let cmd = RestoreFromCheckpointCommand {
+            job_id: JobId::try_new(job).unwrap(),
+            epoch: 1,
+            fencing_token: FencingToken::initial(),
+            sink_commit: vec![krishiv_proto::SinkTransactionRef {
+                sink_id: prepare_path.clone(),
+                epoch: 1,
+                prepare_path: prepare_path.clone(),
+                committed: false,
+            }],
+            sink_abort: Vec::new(),
+        };
+        let fallback = CheckpointStateHandle::from_backend(
+            krishiv_state::RocksDbStateBackend::ephemeral().unwrap(),
+        );
+        runner2
+            .restore_job_from_checkpoint(&cmd, &fallback, storage.as_ref())
+            .unwrap();
+
+        let mut finals = 0;
+        let mut staged = 0;
+        for entry in std::fs::read_dir(sink_dir.path()).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if name.ends_with(".parquet.tmp") {
+                staged += 1;
+            } else if name.ends_with(".parquet") {
+                finals += 1;
+            }
+        }
+        assert_eq!(
+            finals, 1,
+            "the prepared transaction must commit from its durable ref on the second incarnation"
+        );
+        assert_eq!(staged, 0, "no orphaned staging file may remain after recovery");
+    }
+
+    /// DUR-2 Phase B ordering: prepared-sink recovery runs BEFORE source
+    /// offsets are restored, and a sink-recovery failure must abort the
+    /// restore without stashing offsets — offsets restored past uncommitted
+    /// sink output would re-consume input whose previous output is in limbo.
+    #[test]
+    fn sink_recovery_failure_blocks_source_offset_restore() {
+        let job = "p3-2pc-order";
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let sink_dir = tempdir().unwrap();
+        let (runner, _assignment) = runner_with_running_task(job, "task-p3-2pc-order");
+        runner
+            .transaction_log
+            .get_or_register(job, || {
+                Ok(EpochTransactionLog::new(LocalParquetTwoPhaseCommitSink::new(
+                    sink_dir.path(),
+                )))
+            })
+            .unwrap();
+
+        // Checkpoint metadata carries a real Kafka offset to restore.
+        let ack = CheckpointAckRequest {
+            job_id: JobId::try_new(job).unwrap(),
+            operator_id: krishiv_proto::OperatorId::try_new("operator-task-p3-2pc-order").unwrap(),
+            task_id: TaskId::try_new("task-p3-2pc-order").unwrap(),
+            epoch: 1,
+            fencing_token: FencingToken::initial(),
+            source_offsets: vec![krishiv_proto::CheckpointSourceOffset {
+                partition_id: krishiv_proto::PartitionId::try_new("kafka-events-0").unwrap(),
+                offset: 42,
+                encoded_offset: krishiv_connectors::kafka::KafkaOffset {
+                    topic: "events".into(),
+                    partition: 0,
+                    offset: 42,
+                }
+                .encode(),
+            }],
+            snapshot_path: None,
+            unaligned_buffers: Vec::new(),
+            sink_transactions: Vec::new(),
+        };
+        seal_epoch_from_acks(storage.as_ref(), job, 1, &[ack]);
+
+        // A commit ref whose staging file is gone: recovery cannot finalize.
+        let missing = sink_dir
+            .path()
+            .join("1-999.parquet.tmp")
+            .to_string_lossy()
+            .into_owned();
+        let cmd = RestoreFromCheckpointCommand {
+            job_id: JobId::try_new(job).unwrap(),
+            epoch: 1,
+            fencing_token: FencingToken::initial(),
+            sink_commit: vec![krishiv_proto::SinkTransactionRef {
+                sink_id: missing.clone(),
+                epoch: 1,
+                prepare_path: missing,
+                committed: false,
+            }],
+            sink_abort: Vec::new(),
+        };
+        let fallback = CheckpointStateHandle::from_backend(
+            krishiv_state::RocksDbStateBackend::ephemeral().unwrap(),
+        );
+        let err = runner
+            .restore_job_from_checkpoint(&cmd, &fallback, storage.as_ref())
+            .expect_err("an unrecoverable prepared-sink ref must fail the restore");
+        assert!(
+            err.to_string().contains("DUR-2"),
+            "the failure must identify the sink-recovery stage: {err}"
+        );
+        assert!(
+            runner.kafka_restore_offsets.get(job).is_none(),
+            "source offsets must NOT be restored when sink recovery failed first"
+        );
+        assert!(
+            runner.source_restore_offsets.get(job).is_none(),
+            "generic source offsets must NOT be restored when sink recovery failed first"
+        );
+    }
+
     /// Repeated failure loop: every iteration feeds one batch, checkpoints
     /// real window state, kills the process, and restores a fresh one.
     /// The victim's emitted windows must match a control executor that
