@@ -565,7 +565,7 @@ Findings:
 
 ### 2026-08-11 — Phase 65 oversubscription contract proven (all_slots_busy)
 
-- **Revision**: engine `52f3e49` (includes the five in-process concurrency
+- **Revision**: engine `34346b2` (includes the five in-process concurrency
   fixes this bench flushed out — see below).
 - **Hardware**: Intel i7-9750H, 12 threads (6 cores × SMT), 61 GiB RAM,
   Linux 7.0.0-29-generic, rustc 1.92.0, bench profile (opt-level=3 +
@@ -593,8 +593,8 @@ when every task slot is occupied. p50 +1.4% is within round-to-round noise.
 The bench earned its keep before producing a number: getting 12 concurrent
 drivers through one in-process cluster exposed five real concurrency bugs,
 each fixed with a regression test — executor swept Lost by concurrent
-drivers' ticks (`650b85c`), cross-driver row leakage from the shared report
-stream (`f89bc6f`), premature job-done declaration (`f9aec5e`), caller input
+drivers' ticks (`4598acc`), cross-driver row leakage from the shared report
+stream (`f6bec6b`), premature job-done declaration (`932938c`), caller input
 partitions never reaching tick-launched tasks + the quiescent exit firing
-mid-stage-transition (`bf8f76f`), and a waiting driver never draining the
-shared inbox, wedging at the stage cap (`52f3e49`).
+mid-stage-transition (`f34fd9c`), and a waiting driver never draining the
+shared inbox, wedging at the stage cap (`34346b2`).
