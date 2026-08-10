@@ -655,6 +655,20 @@ impl InProcessStreamingRuntime {
             std::sync::atomic::Ordering::Relaxed,
         );
 
+        let initial_partitions: Vec<InputPartition> = tables
+            .iter()
+            .enumerate()
+            .map(|(idx, table)| {
+                InputPartition::new(format!("local-parquet-{idx}"), String::new()).with_descriptor(
+                    InputPartitionDescriptor::LocalParquet {
+                        table_name: table.table_name.clone(),
+                        path: table.path.to_string_lossy().into_owned(),
+                    },
+                )
+            })
+            .chain(stream_partitions)
+            .collect();
+
         {
             let mut coord = self
                 .coordinator
@@ -670,34 +684,28 @@ impl InProcessStreamingRuntime {
                     });
                 }
             }
+            // Register the caller's input partitions coordinator-side, inside
+            // the same lock hold as the submit. The inbox is shared across
+            // concurrent drivers, so this job's task can be launched by ANY
+            // driver's coordinator_tick — a driver-side attach (the previous
+            // design) only covered launches made by this job's own loop, and
+            // tick-launched tasks scanned zero rows (found by the
+            // all-slots-busy bench). Staged dfplan tasks carry their scans
+            // inside the encoded plan and ignore this registration.
+            coord.register_job_input_partitions(job_id.clone(), initial_partitions);
         }
 
         // C5: Multi-stage in-process execution.  Repeatedly:
-        //  1. Ask the coordinator for currently-assigned tasks for this job.
-        //  2. For the first stage's first task, attach the input partitions
-        //     supplied by the caller (parquet tables / stream partitions).
-        //  3. Push every assignment into the inbox.
-        //  4. Drain the inbox via the runner.
-        //  5. Loop until no new assignments are launched (terminal stages all done).
-        let initial_partitions: Vec<InputPartition> = tables
-            .iter()
-            .enumerate()
-            .map(|(idx, table)| {
-                InputPartition::new(format!("local-parquet-{idx}"), String::new()).with_descriptor(
-                    InputPartitionDescriptor::LocalParquet {
-                        table_name: table.table_name.clone(),
-                        path: table.path.to_string_lossy().into_owned(),
-                    },
-                )
-            })
-            .chain(stream_partitions)
-            .collect();
-
+        //  1. Ask the coordinator for currently-assigned tasks for this job
+        //     (caller-supplied input partitions attach at launch, on every
+        //     launch path, via the registration above).
+        //  2. Push every assignment into the inbox.
+        //  3. Drain the inbox via the runner.
+        //  4. Loop until no new assignments are launched (terminal stages all done).
         let bridge = self.bridge.clone();
         let runner = Arc::clone(&self.runner);
         let mut output_batches = Vec::new();
         let mut iter_count = 0usize;
-        let mut first_iteration_partitions = Some(initial_partitions);
         // G1: Track the max watermark from the previous stage so it can be
         // injected as a WatermarkHint into the first assignment of the next stage.
         let mut stage_watermark_ms: Option<i64> = None;
@@ -722,7 +730,7 @@ impl InProcessStreamingRuntime {
                 // O4: Merge launch_assigned_task_assignments + job_snapshot into
                 // one lock acquisition (previously two separate locks per iteration).
                 // coordinator_tick is kept after task execution below.
-                let (mut assignments, job_state, tasks_in_flight) = {
+                let (mut assignments, job_state, tasks_unfinished) = {
                     let mut coord = self.coordinator.lock().map_err(|_| {
                         RuntimeError::transport(
                             "coordinator lock poisoned during task assignment launch",
@@ -733,10 +741,22 @@ impl InProcessStreamingRuntime {
                         .map_err(|e| RuntimeError::transport(e.to_string()))?;
                     let snapshot = coord.job_snapshot(&job_id).ok();
                     let job_state = snapshot.as_ref().map(|s| s.state());
-                    let tasks_in_flight = snapshot
-                        .map(|s| s.assigned_task_count() + s.running_task_count())
+                    // Unfinished = total − succeeded − failed, NOT
+                    // assigned + running: during a stage transition the next
+                    // stage's tasks are PENDING (eligible but not yet assigned
+                    // by a tick), and counting only assigned/running here made
+                    // the quiescent exit below fire mid-job — the driver
+                    // returned zero rows while its reduce stage had not even
+                    // been assigned yet (third concurrency hole found by the
+                    // all-slots-busy bench).
+                    let tasks_unfinished = snapshot
+                        .map(|s| {
+                            s.task_count()
+                                .saturating_sub(s.succeeded_task_count())
+                                .saturating_sub(s.failed_task_count())
+                        })
                         .unwrap_or(0);
-                    (assignments, job_state, tasks_in_flight)
+                    (assignments, job_state, tasks_unfinished)
                 };
                 // Dispatch assignments the previous tick launched (they are
                 // already launch-in-flight, so the call above cannot return
@@ -773,18 +793,34 @@ impl InProcessStreamingRuntime {
                             Ok(())
                         };
                     }
-                    // Tasks still Assigned/Running with nothing for US to
-                    // launch: a CONCURRENT driver popped this job's work from
-                    // the shared inbox and is executing it — this holds even
-                    // on OUR first iteration (another driver's coordinator
-                    // tick can launch this job's tasks before we ever loop).
-                    // Returning here (the old behavior) declared the job
-                    // "effectively done" and handed back an EMPTY result
-                    // while the terminal task ran on another thread — the
-                    // second concurrency hole the all-slots-busy bench
-                    // exposed. Wait for the report to land instead;
+                    // Tasks still Pending/Assigned/Running with nothing for
+                    // US to launch: either a CONCURRENT driver popped this
+                    // job's work from the shared inbox and is executing it
+                    // (holds even on OUR first iteration — another driver's
+                    // coordinator tick can launch this job's tasks before we
+                    // ever loop), or the next stage's tasks are awaiting
+                    // assignment by a tick. Returning here (the old behavior)
+                    // declared the job "effectively done" and handed back an
+                    // EMPTY result while work remained — the second and third
+                    // concurrency holes the all-slots-busy bench exposed.
+                    // Tick to advance assignment, then wait for reports;
                     // MAX_STAGE_ITERATIONS still bounds a wedge.
-                    if tasks_in_flight > 0 {
+                    if tasks_unfinished > 0 {
+                        // `continue` skips the tick at the bottom of the loop,
+                        // so tick HERE too: with no other driver ticking (they
+                        // all finished), a Pending next-stage task would
+                        // otherwise never be assigned and this loop would spin
+                        // to MAX_STAGE_ITERATIONS. The next iteration's
+                        // dispatch routes anything this tick launches.
+                        {
+                            let mut coord = self.coordinator.lock().map_err(|_| {
+                                RuntimeError::InvalidState {
+                                    message: "coordinator lock poisoned during wait tick".into(),
+                                }
+                            })?;
+                            let _ = coord.touch_executor(&self.executor_id);
+                            tick_assignments = coord.coordinator_tick().unwrap_or_default();
+                        }
                         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                         continue;
                     }
@@ -836,15 +872,6 @@ impl InProcessStreamingRuntime {
                     }
                 }
 
-                // Attach caller-supplied input partitions to the FIRST assignment
-                // emitted by the FIRST iteration only.  Subsequent stages source
-                // their input from shuffle outputs.
-                if let Some(partitions) = first_iteration_partitions.take() {
-                    let first = assignments.remove(0).with_input_partitions(partitions);
-                    self.inbox
-                        .push(first)
-                        .map_err(|e| RuntimeError::transport(e.to_string()))?;
-                }
                 for assignment in assignments {
                     self.inbox
                         .push(assignment)
@@ -1726,6 +1753,56 @@ mod tests {
                                 got, tag,
                                 "query {tag} received ANOTHER query's rows (got {got})"
                             );
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    h.join().expect("worker panicked");
+                }
+            });
+        }
+    }
+
+    /// Same shape as the all-slots-busy bench: concurrent aggregations over a
+    /// real parquet table, which take the STAGED (dfplan) path rather than the
+    /// single-task `sql:` path the table-less test above exercises. Staged
+    /// jobs source rows through shuffle + inline results, so this covers the
+    /// concurrency seams the table-less test cannot.
+    #[test]
+    fn concurrent_staged_queries_each_get_their_own_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = write_staged_test_parquet(tmp.path());
+        let runtime = std::sync::Arc::new(InProcessStreamingRuntime::new().unwrap());
+        let tables = vec![BatchSqlTable {
+            table_name: "t".into(),
+            path: table_dir,
+            ..Default::default()
+        }];
+        let expected = runtime
+            .execute_batch_sql_via_coordinator(
+                "SELECT category, COUNT(*) AS n, SUM(amount) AS total FROM t GROUP BY category",
+                &tables,
+            )
+            .expect("sequential staged query");
+        let expected_rows: usize = expected.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(expected_rows, 3, "3 categories expected from the fixture");
+
+        for _round in 0..2 {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|_| {
+                        let runtime = std::sync::Arc::clone(&runtime);
+                        let tables = tables.clone();
+                        scope.spawn(move || {
+                            let batches = runtime
+                                .execute_batch_sql_via_coordinator(
+                                    "SELECT category, COUNT(*) AS n, SUM(amount) AS total \
+                                     FROM t GROUP BY category",
+                                    &tables,
+                                )
+                                .expect("concurrent staged query failed");
+                            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                            assert_eq!(rows, 3, "concurrent staged query lost rows");
                         })
                     })
                     .collect();
