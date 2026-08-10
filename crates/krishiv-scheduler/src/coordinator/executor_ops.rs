@@ -506,6 +506,12 @@ impl Coordinator {
         })
     }
 
+    /// Liveness-only refresh for an executor that provably shares this
+    /// process (the in-process bridge). See `ExecutorRegistry::touch`.
+    pub fn touch_executor(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()> {
+        self.exec.executors.touch(executor_id)
+    }
+
     pub fn mark_executor_lost(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()> {
         self.ensure_active()?;
         self.prune_executor_channel(executor_id);

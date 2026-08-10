@@ -120,6 +120,25 @@ impl ExecutorRegistry {
         Ok(())
     }
 
+    /// Refresh liveness only — no lease round-trip, no state replacement.
+    ///
+    /// For the in-process bridge, whose executor IS the calling process: any
+    /// driver activity proves it alive, but it never sends real heartbeats,
+    /// so every `coordinator_tick` aged it toward the timeout sweep. Under
+    /// N concurrent in-process drivers the shared clock advances N× faster
+    /// than a single query's iterations, the "executor" got marked Lost
+    /// mid-flight, its lease bumped, and every in-flight Succeeded report
+    /// bounced as StaleLease (found by the all-slots-busy bench). A full
+    /// [`Self::heartbeat`] is wrong here: it REPLACES `running_tasks` with
+    /// the report's list, clobbering coordinator-side bookkeeping the
+    /// bridge never mirrors.
+    pub fn touch(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()> {
+        let current_tick = self.current_tick;
+        let executor = self.find_executor_mut(executor_id)?;
+        executor.last_heartbeat_tick = current_tick;
+        Ok(())
+    }
+
     /// Deregister an executor through the graceful fast path.
     pub fn deregister(
         &mut self,

@@ -89,7 +89,7 @@ pub struct InProcessStreamingRuntime {
     inbox: ExecutorAssignmentInbox,
     runner: Arc<ExecutorTaskRunner>,
     continuous_registry: SharedContinuousStreamRegistry,
-    _executor_id: ExecutorId,
+    executor_id: ExecutorId,
     /// Per-cluster job counter so each `InProcessStreamingRuntime` has its
     /// own job id namespace (C1).
     job_counter: Arc<AtomicU64>,
@@ -201,7 +201,7 @@ impl InProcessStreamingRuntime {
             inbox,
             runner,
             continuous_registry: registry,
-            _executor_id: executor_id,
+            executor_id,
             job_counter: Arc::new(AtomicU64::new(1)),
             suffix,
             last_batch_job_stage_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -870,6 +870,13 @@ impl InProcessStreamingRuntime {
                             .map_err(|_| RuntimeError::InvalidState {
                                 message: "coordinator lock poisoned during coordinator tick".into(),
                             })?;
+                    // The in-process executor IS this process: refresh its
+                    // liveness before advancing the clock, or N concurrent
+                    // drivers tick the shared clock N× faster than any query
+                    // finishes, the executor gets swept Lost mid-flight, and
+                    // every in-flight Succeeded report bounces StaleLease
+                    // (found by the all-slots-busy oversubscription bench).
+                    let _ = coord.touch_executor(&self.executor_id);
                     // The tick may launch newly-eligible tasks (stages whose
                     // upstream shuffle dependencies just completed); it hands
                     // them back for dispatch on the next loop iteration.
