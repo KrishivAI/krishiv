@@ -945,6 +945,12 @@ pub struct SqlEngine {
     /// Override for shuffle partition count (`SET shuffle.partitions = N`).
     /// When `Some`, exchange nodes use this bucket count instead of auto-sizing.
     shuffle_partitions: Arc<std::sync::RwLock<Option<u32>>>,
+    /// Phase 60 `CACHE TABLE`: the ORIGINAL provider of every currently
+    /// cached table, keyed by the name it was cached under — `UNCACHE`/
+    /// `CLEAR CACHE` restore from here. Session-scoped by construction
+    /// (lives and dies with this engine).
+    cached_table_originals:
+        Arc<std::sync::RwLock<HashMap<String, Arc<dyn datafusion::datasource::TableProvider>>>>,
     /// Estimated row counts for registered tables, keyed by table name.
     /// Populated by `register_parquet` and `register_record_batches`.
     /// Used by `krishiv_logical_plan` to annotate scan nodes for the
@@ -1332,6 +1338,7 @@ impl SqlEngine {
             udf_last_synced_version: Arc::new(AtomicU64::new(u64::MAX)),
             plan_cache: Arc::new(Mutex::new(PlanCache::new(resolve_plan_cache_max_entries()))),
             shuffle_partitions: Arc::new(std::sync::RwLock::new(None)),
+            cached_table_originals: Arc::new(std::sync::RwLock::new(HashMap::new())),
             table_row_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
             memory_limit_bytes,
             #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
@@ -1373,6 +1380,7 @@ impl SqlEngine {
             udf_last_synced_version: Arc::new(AtomicU64::new(u64::MAX)),
             plan_cache: Arc::new(Mutex::new(PlanCache::new(resolve_plan_cache_max_entries()))),
             shuffle_partitions: Arc::new(std::sync::RwLock::new(None)),
+            cached_table_originals: Arc::new(std::sync::RwLock::new(HashMap::new())),
             table_row_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
             memory_limit_bytes: None,
             #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
@@ -2749,6 +2757,49 @@ impl SqlEngine {
                 self.attach_query_metadata(self.make_sql_df("show-databases", dataframe), query)
             );
         }
+        // ── Phase 60 statement close-out: TRUNCATE / CACHE / DESCRIBE / SHOW
+        // PARTITIONS — the itemized shortfall the matrix carried as Planned.
+        if let Some(table) = statement_completion::parse_truncate(query) {
+            self.execute_truncate(&table).await?;
+            let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
+            return Ok(self.attach_query_metadata(self.make_sql_df("truncate", empty), query));
+        }
+        if let Some(parsed) = statement_completion::parse_cache(query) {
+            let statement = parsed.map_err(|feature| SqlError::Unsupported { feature })?;
+            self.execute_cache_statement(statement).await?;
+            let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
+            return Ok(self.attach_query_metadata(self.make_sql_df("cache", empty), query));
+        }
+        if let Some(rewrite) = statement_completion::rewrite_describe_function(query)
+            .or_else(|| statement_completion::rewrite_describe_database(query))
+        {
+            let dataframe = self.context.sql(&rewrite).await?;
+            return Ok(self.attach_query_metadata(self.make_sql_df("describe", dataframe), query));
+        }
+        if let Some(inner) = statement_completion::parse_describe_query(query) {
+            // Plan (never execute) the inner query; describe its schema in the
+            // same shape as DESCRIBE <table>.
+            let dataframe = self.context.sql(&inner).await?;
+            let schema = dataframe.schema().as_arrow().clone();
+            let batch = introspection_sql::describe_schema(&schema)?;
+            let res_table = next_ephemeral_name("describe_query");
+            lakehouse::register_scan_batches(&self.context, &res_table, vec![batch]).await?;
+            let out = self
+                .context
+                .sql(&format!("SELECT * FROM {res_table}"))
+                .await?;
+            return Ok(self.attach_query_metadata(self.make_sql_df("describe-query", out), query));
+        }
+        if let Some(table) = statement_completion::parse_show_partitions(query) {
+            let batch = self.show_partitions(&table).await?;
+            let res_table = next_ephemeral_name("show_partitions");
+            lakehouse::register_scan_batches(&self.context, &res_table, vec![batch]).await?;
+            let out = self
+                .context
+                .sql(&format!("SELECT * FROM {res_table} ORDER BY 1"))
+                .await?;
+            return Ok(self.attach_query_metadata(self.make_sql_df("show-partitions", out), query));
+        }
 
         // ── Intercept CREATE FUNCTION … RETURNS TABLE ────────────────────────
         // DataFusion does not understand this extended DDL syntax. Parse and
@@ -3377,6 +3428,279 @@ impl SqlEngine {
     /// to any existing statistic for `table_ref`. Tables never analyzed or
     /// written through this engine are left alone — a delta without a base
     /// count would fabricate data.
+    /// Phase 60 `TRUNCATE TABLE`: an Iceberg table truncates through the
+    /// copy-on-write delete path (durable, snapshot-committed); a memory
+    /// table swaps its provider for an empty one with the same schema.
+    /// Anything else is refused with the reason — an external file-backed
+    /// table IS its files, and pretending to truncate it would lie.
+    async fn execute_truncate(&self, table: &str) -> SqlResult<()> {
+        #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+        if let Some((iceberg_catalog, table_ident)) = self.resolve_iceberg_table(table) {
+            let (deleted, _) = krishiv_connectors::lakehouse::dml::iceberg_delete_where(
+                iceberg_catalog,
+                &table_ident,
+                "TRUE",
+                &self.context,
+            )
+            .await
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
+            self.adjust_table_row_count_stat(table, -(deleted as i64));
+            return Ok(());
+        }
+        let provider =
+            self.context
+                .table_provider(table)
+                .await
+                .map_err(|error| SqlError::DataFusion {
+                    message: format!("TRUNCATE: table '{table}' not found: {error}"),
+                })?;
+        // `TableProvider: Any` (supertrait) — upcast to downcast.
+        let provider_any: &dyn std::any::Any = provider.as_ref();
+        if provider_any
+            .downcast_ref::<datafusion::datasource::MemTable>()
+            .is_none()
+        {
+            return Err(SqlError::Unsupported {
+                feature: format!(
+                    "TRUNCATE TABLE '{table}' — only memory and Iceberg tables truncate; \
+                     an external file-backed table is its files (drop and re-register it)"
+                ),
+            });
+        }
+        let empty = datafusion::datasource::MemTable::try_new(provider.schema(), vec![vec![]])
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
+        self.context
+            .deregister_table(table)
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
+        self.context
+            .register_table(table, Arc::new(empty))
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
+        if let Ok(mut counts) = self.table_row_counts.write()
+            && let Some(count) = counts.get_mut(table)
+        {
+            *count = 0;
+        }
+        Ok(())
+    }
+
+    /// Phase 60 `CACHE / UNCACHE TABLE`, `CLEAR CACHE`: session-scoped
+    /// materialization. CACHE collects the table once into a `MemTable`
+    /// and swaps it in, keeping the ORIGINAL provider for restore;
+    /// UNCACHE/CLEAR put the originals back. Nothing here survives the
+    /// session — this is a per-engine cache, not storage.
+    async fn execute_cache_statement(
+        &self,
+        statement: statement_completion::CacheStatement,
+    ) -> SqlResult<()> {
+        use statement_completion::CacheStatement;
+        let lock_err = |e: String| SqlError::DataFusion { message: e };
+        match statement {
+            CacheStatement::Cache(name) => {
+                {
+                    let cached = self
+                        .cached_table_originals
+                        .read()
+                        .map_err(|e| lock_err(e.to_string()))?;
+                    if cached.contains_key(&name) {
+                        return Err(SqlError::DataFusion {
+                            message: format!("table '{name}' is already cached"),
+                        });
+                    }
+                }
+                let original = self.context.table_provider(&name).await.map_err(|error| {
+                    SqlError::DataFusion {
+                        message: format!("CACHE: table '{name}' not found: {error}"),
+                    }
+                })?;
+                let batches = self
+                    .context
+                    .sql(&format!("SELECT * FROM {name}"))
+                    .await?
+                    .collect()
+                    .await?;
+                let cached = datafusion::datasource::MemTable::try_new(
+                    original.schema(),
+                    vec![batches],
+                )
+                .map_err(|e| SqlError::DataFusion {
+                    message: e.to_string(),
+                })?;
+                self.context
+                    .deregister_table(&name)
+                    .map_err(|e| SqlError::DataFusion {
+                        message: e.to_string(),
+                    })?;
+                self.context
+                    .register_table(&name, Arc::new(cached))
+                    .map_err(|e| SqlError::DataFusion {
+                        message: e.to_string(),
+                    })?;
+                self.cached_table_originals
+                    .write()
+                    .map_err(|e| lock_err(e.to_string()))?
+                    .insert(name, original);
+                Ok(())
+            }
+            CacheStatement::Uncache(name) => {
+                let original = self
+                    .cached_table_originals
+                    .write()
+                    .map_err(|e| lock_err(e.to_string()))?
+                    .remove(&name)
+                    .ok_or_else(|| SqlError::DataFusion {
+                        message: format!("table '{name}' is not cached"),
+                    })?;
+                self.context
+                    .deregister_table(&name)
+                    .map_err(|e| SqlError::DataFusion {
+                        message: e.to_string(),
+                    })?;
+                self.context
+                    .register_table(&name, original)
+                    .map_err(|e| SqlError::DataFusion {
+                        message: e.to_string(),
+                    })?;
+                Ok(())
+            }
+            CacheStatement::Clear => {
+                let drained: Vec<_> = {
+                    let mut cached = self
+                        .cached_table_originals
+                        .write()
+                        .map_err(|e| lock_err(e.to_string()))?;
+                    cached.drain().collect()
+                };
+                for (name, original) in drained {
+                    self.context
+                        .deregister_table(&name)
+                        .map_err(|e| SqlError::DataFusion {
+                            message: e.to_string(),
+                        })?;
+                    self.context
+                        .register_table(&name, original)
+                        .map_err(|e| SqlError::DataFusion {
+                            message: e.to_string(),
+                        })?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Phase 60 `SHOW PARTITIONS`: list an Iceberg table's live partitions,
+    /// Spark-shaped (`partition` column, `col=value/col=value` rows).
+    /// Identity transforms only in v1 — a bucket/day-partitioned table is
+    /// refused with the spec named, and an unpartitioned or non-Iceberg
+    /// table errors like Spark does instead of returning an empty lie.
+    async fn show_partitions(&self, table: &str) -> SqlResult<RecordBatch> {
+        #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+        if let Some((iceberg_catalog, table_ident)) = self.resolve_iceberg_table(table) {
+            use arrow::array::StringArray;
+            use arrow::datatypes::{DataType, Field, Schema};
+            let loaded = iceberg_catalog
+                .load_table(&table_ident)
+                .await
+                .map_err(|e| SqlError::DataFusion {
+                    message: format!("SHOW PARTITIONS: cannot load '{table}': {e}"),
+                })?;
+            let metadata = loaded.metadata();
+            let spec = metadata.default_partition_spec();
+            if spec.fields().is_empty() {
+                return Err(SqlError::DataFusion {
+                    message: format!("SHOW PARTITIONS: table '{table}' is not partitioned"),
+                });
+            }
+            let schema = metadata.current_schema();
+            let mut columns = Vec::new();
+            for field in spec.fields() {
+                if !matches!(field.transform, iceberg::spec::Transform::Identity) {
+                    return Err(SqlError::Unsupported {
+                        feature: format!(
+                            "SHOW PARTITIONS on non-identity transform \
+                             '{}' (field '{}') — v1 lists identity partitions only",
+                            field.transform, field.name
+                        ),
+                    });
+                }
+                let source = schema.field_by_id(field.source_id).ok_or_else(|| {
+                    SqlError::DataFusion {
+                        message: format!(
+                            "SHOW PARTITIONS: partition source id {} missing from schema",
+                            field.source_id
+                        ),
+                    }
+                })?;
+                columns.push(source.name.clone());
+            }
+            const MAX_PARTITIONS: usize = 10_000;
+            let projection = columns.join(", ");
+            let batches = self
+                .context
+                .sql(&format!(
+                    "SELECT DISTINCT {projection} FROM {table} \
+                     ORDER BY {projection} LIMIT {}",
+                    MAX_PARTITIONS + 1
+                ))
+                .await?
+                .collect()
+                .await?;
+            let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+            if total > MAX_PARTITIONS {
+                return Err(SqlError::DataFusion {
+                    message: format!(
+                        "SHOW PARTITIONS: '{table}' has more than {MAX_PARTITIONS} \
+                         partitions — query the partition columns directly"
+                    ),
+                });
+            }
+            let mut rows = Vec::with_capacity(total);
+            for batch in &batches {
+                let display: Vec<_> = (0..batch.num_columns())
+                    .map(|c| arrow::util::display::ArrayFormatter::try_new(
+                        batch.column(c).as_ref(),
+                        &arrow::util::display::FormatOptions::default(),
+                    ))
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| SqlError::DataFusion {
+                        message: e.to_string(),
+                    })?;
+                for r in 0..batch.num_rows() {
+                    let parts: Vec<String> = columns
+                        .iter()
+                        .zip(&display)
+                        .map(|(name, fmt)| format!("{name}={}", fmt.value(r)))
+                        .collect();
+                    rows.push(parts.join("/"));
+                }
+            }
+            let out_schema = Arc::new(Schema::new(vec![Field::new(
+                "partition",
+                DataType::Utf8,
+                false,
+            )]));
+            let array = Arc::new(StringArray::from(rows));
+            return RecordBatch::try_new(out_schema, vec![array]).map_err(|e| {
+                SqlError::DataFusion {
+                    message: e.to_string(),
+                }
+            });
+        }
+        Err(SqlError::Unsupported {
+            feature: format!(
+                "SHOW PARTITIONS '{table}' — only Iceberg tables carry a partition spec \
+                 (memory/external tables have none)"
+            ),
+        })
+    }
+
     #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
     fn adjust_table_row_count_stat(&self, table_ref: &str, delta: i64) {
         let registry = krishiv_plan::optimizer::global_table_stats();

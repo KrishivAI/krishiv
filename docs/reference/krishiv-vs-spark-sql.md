@@ -113,6 +113,7 @@ Krishiv targets Spark-SQL reference parity as a **measured** number. This page i
 - `dml.copy_to` — COPY (query) TO 'path' (FORMAT …) _(inherited from DataFusion's native parser/planner; no Krishiv-side code involved)_
 - `dml.delete` — DELETE FROM table WHERE … _(supported on Iceberg tables; in-memory and Parquet tables require rewrite)_
 - `dml.update` — UPDATE table SET col = … WHERE … _(supported on Iceberg tables via MERGE rewrite)_
+- `dml.truncate` — TRUNCATE TABLE (Iceberg + memory) _(Phase 60 close-out: memory tables swap to an empty provider (schema intact); Iceberg tables truncate through the copy-on-write delete path (snapshot-committed). External file-backed tables are refused with the reason — their files ARE the table)_
 - `ddl.create_table_as` — CREATE TABLE … AS SELECT (CTAS) _(durable Iceberg landing (G17) when the target resolves to a registered Iceberg catalog; session table otherwise)_
 - `ddl.partitioned_by` — CREATE TABLE … PARTITIONED BY (col | bucket/truncate/year/month/day/hour(col)) AS SELECT _(Iceberg catalog tables only; transforms follow the Iceberg partition spec)_
 - `ddl.alter_table` — ALTER TABLE ADD/DROP COLUMN, RENAME _(Iceberg schema evolution via ALTER TABLE is supported)_
@@ -120,7 +121,10 @@ Krishiv targets Spark-SQL reference parity as a **measured** number. This page i
 - `ddl.connector_source_sink` — CREATE SOURCE/SINK … WITH (connector=…) resolved through the connector registry _(registry-backed dispatch replacing the parquet-only hardcoded factory (audit §8b); supported kinds come from connector descriptors, unsupported kinds fail loudly)_
 - `stmt.set_reset` — SET / RESET / SET TIMEZONE session config _(DataFusion-native session config)_
 - `stmt.use` — USE [CATALOG|SCHEMA] current-namespace _(Phase 60: mutates the session default catalog/schema)_
-- `show.tables_databases_functions` — SHOW TABLES | DATABASES | SCHEMAS | FUNCTIONS | COLUMNS _(TABLES/FUNCTIONS/COLUMNS are DataFusion-native; DATABASES/SCHEMAS added in Phase 60 (information_schema.schemata). SHOW PARTITIONS (Iceberg) and SHOW VIEWS remain the gap.)_
+- `stmt.cache` — CACHE / UNCACHE / CLEAR CACHE TABLE (session materialization) _(Phase 60 close-out: eager session-scoped materialization with provider swap/restore. LAZY and CACHE … AS SELECT are refused with direction (cache a view instead))_
+- `show.tables_databases_functions` — SHOW TABLES | DATABASES | SCHEMAS | FUNCTIONS | COLUMNS _(TABLES/FUNCTIONS/COLUMNS are DataFusion-native; DATABASES/SCHEMAS added in Phase 60 (information_schema.schemata). SHOW VIEWS remains the gap.)_
+- `show.partitions` — SHOW PARTITIONS (Iceberg, identity transforms) _(Phase 60 close-out: lists live partitions Spark-shaped (col=value/…) from the Iceberg spec + DISTINCT scan, capped at 10k. Non-identity transforms and unpartitioned/non-Iceberg tables are refused with the reason, never an empty lie)_
+- `describe.function_database_query` — DESCRIBE FUNCTION | DATABASE | QUERY _(Phase 60 close-out: FUNCTION/DATABASE rewrite to information_schema (routines/schemata); QUERY plans — never runs — the inner statement and describes its schema in the DESCRIBE <table> shape)_
 - `temporal.match_recognize` — MATCH_RECOGNIZE pattern matching over ordered rows _(streaming CEP subset: PARTITION BY / ORDER BY / PATTERN (…) / WITHIN <duration>; DEFINE (pattern-variable predicates) and MEASURES (computed output) clauses are the remaining gap vs Oracle/Flink's full grammar)_
 - `temporal.system_time` — FOR SYSTEM_TIME AS OF (Iceberg time-travel) _(alias for AS OF on Iceberg tables)_
 - `prepared.parameters` — Positional parameter binding ($1, $2, …) _(local PreparedStatement::bind and Flight SQL DoPut parameter batches)_
@@ -138,7 +142,4 @@ Krishiv targets Spark-SQL reference parity as a **measured** number. This page i
 - `functions.json.schema_of_json` — schema_of_json(json) infer a DDL schema string _(planned)_
 - `functions.hof.zip_map` — zip_with, map_filter, transform_keys/values _(require DataFusion's multi-step lambda / map-lambda protocol; itemized shortfall)_
 - `functions.spark.hash_generators` — xxhash64, stack, posexplode, inline _(xxhash64 needs byte-exact replication of Spark's seed-42 typed hashing; stack/posexplode/inline need generator machinery — itemized shortfall)_
-- `dml.truncate` — TRUNCATE TABLE (Iceberg + memory) _(itemized shortfall: TRUNCATE is not yet wired for memory/Iceberg session tables)_
-- `stmt.cache` — CACHE / UNCACHE / CLEAR CACHE TABLE (session materialization) _(itemized shortfall: needs a session-scoped materialization + provider swap/restore)_
-- `describe.function_database_query` — DESCRIBE FUNCTION | DATABASE | QUERY _(DESCRIBE <table> is native; FUNCTION/DATABASE/QUERY are the itemized shortfall)_
 

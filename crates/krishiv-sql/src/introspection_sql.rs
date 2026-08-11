@@ -52,6 +52,17 @@ fn parse_describe_target(trimmed: &str, upper: &str) -> Option<String> {
     for prefix in PREFIXES {
         if upper.starts_with(prefix) {
             let table = trimmed[prefix.len()..].trim().trim_end_matches(';').trim();
+            // Phase 60: DESCRIBE FUNCTION|DATABASE|SCHEMA|QUERY are their
+            // own statements (statement_completion handles them later in
+            // the dispatch) — never a table named "FUNCTION abs".
+            let head = table
+                .split_whitespace()
+                .next()
+                .map(str::to_ascii_uppercase)
+                .unwrap_or_default();
+            if matches!(head.as_str(), "FUNCTION" | "DATABASE" | "SCHEMA" | "QUERY") {
+                return None;
+            }
             if !table.is_empty() {
                 return Some(table.to_string());
             }
@@ -120,7 +131,14 @@ pub async fn describe_table(context: &SessionContext, table: &str) -> SqlResult<
         .map_err(|error| SqlError::DataFusion {
             message: format!("DESCRIBE: table '{table}' not found: {error}"),
         })?;
-    let schema = provider.schema();
+    describe_schema(provider.schema().as_ref())
+}
+
+/// Describe any schema in the `DESCRIBE <table>` output shape
+/// (`col_name`, `data_type`, `nullable`) — shared by `DESCRIBE <table>`
+/// and Phase 60's `DESCRIBE QUERY <select>` (which plans, never runs,
+/// the inner query).
+pub fn describe_schema(schema: &Schema) -> SqlResult<RecordBatch> {
     let col_name = Arc::new(StringArray::from(
         schema
             .fields()

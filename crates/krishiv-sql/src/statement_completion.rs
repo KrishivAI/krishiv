@@ -13,9 +13,19 @@
 //!   `information_schema.schemata` query returning a Spark-style `namespace`
 //!   column.
 //!
-//! `CACHE/UNCACHE TABLE` (session materialization), `SHOW PARTITIONS` (Iceberg
-//! metadata), and `DESCRIBE FUNCTION|DATABASE|QUERY` remain the itemized
-//! statement shortfall in the matrix.
+//! Phase 60 close-out adds the remaining itemized statements:
+//!
+//! - **`TRUNCATE TABLE <t>`** — parsed here; the engine empties a memory
+//!   table by provider swap and routes an Iceberg table through the
+//!   copy-on-write delete path (parse only in this module).
+//! - **`CACHE / UNCACHE TABLE <t>` and `CLEAR CACHE`** — session-scoped
+//!   materialization (parse here, provider swap/restore in the engine).
+//! - **`DESCRIBE FUNCTION|DATABASE <name>`** — rewritten to
+//!   `information_schema` queries; **`DESCRIBE QUERY <select>`** — parsed
+//!   here, schema described by the engine.
+//! - **`SHOW PARTITIONS <t>`** — parsed here; the engine answers from the
+//!   Iceberg partition spec (a clear error on unpartitioned/non-Iceberg
+//!   tables, never a silently empty result).
 
 use datafusion::prelude::SessionContext;
 
@@ -170,6 +180,141 @@ pub fn rewrite_show_databases(query: &str) -> Option<String> {
         "SELECT schema_name AS namespace FROM information_schema.schemata{where_clause} \
          ORDER BY namespace"
     ))
+}
+
+/// Parse `TRUNCATE TABLE <name>` (the `TABLE` keyword optional, per Spark)
+/// into the table reference, or `None` for any other statement.
+pub fn parse_truncate(query: &str) -> Option<String> {
+    let q = query.trim().trim_end_matches(';').trim();
+    let upper = q.to_ascii_uppercase();
+    let rest = upper
+        .strip_prefix("TRUNCATE TABLE ")
+        .map(|_| &q["TRUNCATE TABLE ".len()..])
+        .or_else(|| upper.strip_prefix("TRUNCATE ").map(|_| &q["TRUNCATE ".len()..]))?;
+    let name = rest.trim();
+    (!name.is_empty() && !name.contains(char::is_whitespace)).then(|| unquote(name))
+}
+
+/// A parsed cache-family statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheStatement {
+    /// `CACHE TABLE <t>` — materialize and swap the provider.
+    Cache(String),
+    /// `UNCACHE TABLE <t>` — restore the original provider.
+    Uncache(String),
+    /// `CLEAR CACHE` — restore every cached table.
+    Clear,
+}
+
+/// Parse the `CACHE TABLE` family, or `None` for other statements.
+///
+/// `Some(Err(_))` marks a cache statement using an unsupported form
+/// (`LAZY`, `AS SELECT`, `OPTIONS`) — refused with direction rather than
+/// silently approximated.
+pub fn parse_cache(query: &str) -> Option<Result<CacheStatement, String>> {
+    let q = query.trim().trim_end_matches(';').trim();
+    let upper = q.to_ascii_uppercase();
+    if upper == "CLEAR CACHE" {
+        return Some(Ok(CacheStatement::Clear));
+    }
+    if upper.starts_with("CACHE LAZY") {
+        return Some(Err(
+            "CACHE LAZY TABLE is not supported — Krishiv caches eagerly; drop LAZY".into(),
+        ));
+    }
+    for (prefix, is_cache) in [("CACHE TABLE ", true), ("UNCACHE TABLE ", false)] {
+        if let Some(rest) = upper.strip_prefix(prefix) {
+            if is_cache && (rest.contains(" AS ") || rest.contains("OPTIONS")) {
+                return Some(Err(
+                    "CACHE TABLE … AS SELECT / OPTIONS are not supported — CREATE VIEW the \
+                     query, then CACHE TABLE the view"
+                        .into(),
+                ));
+            }
+            let name = q[prefix.len()..].trim();
+            if name.is_empty() || name.contains(char::is_whitespace) {
+                return Some(Err(format!(
+                    "{} expects exactly one table name",
+                    prefix.trim()
+                )));
+            }
+            let name = unquote(name);
+            return Some(Ok(if is_cache {
+                CacheStatement::Cache(name)
+            } else {
+                CacheStatement::Uncache(name)
+            }));
+        }
+    }
+    None
+}
+
+/// Rewrite `DESCRIBE FUNCTION <name>` to an `information_schema.routines`
+/// query (Spark-shaped columns), or `None` for other statements.
+pub fn rewrite_describe_function(query: &str) -> Option<String> {
+    let q = query.trim().trim_end_matches(';').trim();
+    let upper = q.to_ascii_uppercase();
+    let rest = ["DESCRIBE FUNCTION EXTENDED ", "DESCRIBE FUNCTION ", "DESC FUNCTION "]
+        .iter()
+        .find_map(|p| upper.starts_with(p).then(|| q[p.len()..].trim()))?;
+    if rest.is_empty() || rest.contains(char::is_whitespace) {
+        return None;
+    }
+    let name = unquote(rest).replace('\'', "''");
+    Some(format!(
+        "SELECT routine_name AS function_name, data_type AS return_type, \
+                description, syntax_example \
+         FROM information_schema.routines \
+         WHERE lower(routine_name) = lower('{name}') \
+         ORDER BY 2"
+    ))
+}
+
+/// Rewrite `DESCRIBE DATABASE|SCHEMA <name>` to an
+/// `information_schema.schemata` query, or `None` for other statements.
+pub fn rewrite_describe_database(query: &str) -> Option<String> {
+    let q = query.trim().trim_end_matches(';').trim();
+    let upper = q.to_ascii_uppercase();
+    let rest = [
+        "DESCRIBE DATABASE EXTENDED ",
+        "DESCRIBE DATABASE ",
+        "DESCRIBE SCHEMA ",
+        "DESC DATABASE ",
+        "DESC SCHEMA ",
+    ]
+    .iter()
+    .find_map(|p| upper.starts_with(p).then(|| q[p.len()..].trim()))?;
+    if rest.is_empty() || rest.contains(char::is_whitespace) {
+        return None;
+    }
+    let name = unquote(rest).replace('\'', "''");
+    Some(format!(
+        "SELECT catalog_name AS catalog, schema_name AS namespace \
+         FROM information_schema.schemata \
+         WHERE lower(schema_name) = lower('{name}')"
+    ))
+}
+
+/// Parse `DESCRIBE QUERY <select>` into the inner query, or `None`.
+pub fn parse_describe_query(query: &str) -> Option<String> {
+    let q = query.trim().trim_end_matches(';').trim();
+    let upper = q.to_ascii_uppercase();
+    ["DESCRIBE QUERY ", "DESC QUERY "]
+        .iter()
+        .find_map(|p| upper.starts_with(p).then(|| q[p.len()..].trim().to_string()))
+        .filter(|inner| !inner.is_empty())
+}
+
+/// Parse `SHOW PARTITIONS <table>` into the table reference, or `None`.
+/// (Spark's optional `PARTITION (spec)` filter is not accepted in v1 —
+/// the caller sees the whole tail and refuses it with direction.)
+pub fn parse_show_partitions(query: &str) -> Option<String> {
+    let q = query.trim().trim_end_matches(';').trim();
+    let upper = q.to_ascii_uppercase();
+    let rest = upper
+        .strip_prefix("SHOW PARTITIONS ")
+        .map(|_| q["SHOW PARTITIONS ".len()..].trim())?;
+    (!rest.is_empty()).then(|| unquote(rest))
 }
 
 /// The catalog named by a trailing `{FROM|IN} <catalog>`, if present.
@@ -332,6 +477,181 @@ mod tests {
                 .value(0)
         };
         assert!(total > 0, "information_schema.tables should be non-empty");
+    }
+
+    #[test]
+    fn phase60_statement_parsers() {
+        assert_eq!(parse_truncate("TRUNCATE TABLE t"), Some("t".into()));
+        assert_eq!(parse_truncate("truncate t;"), Some("t".into()));
+        assert_eq!(parse_truncate("TRUNCATE TABLE `t`"), Some("t".into()));
+        assert_eq!(parse_truncate("SELECT 1"), None);
+        assert_eq!(parse_truncate("TRUNCATE TABLE a b"), None);
+
+        assert_eq!(
+            parse_cache("CACHE TABLE t"),
+            Some(Ok(CacheStatement::Cache("t".into())))
+        );
+        assert_eq!(
+            parse_cache("UNCACHE TABLE t;"),
+            Some(Ok(CacheStatement::Uncache("t".into())))
+        );
+        assert_eq!(parse_cache("CLEAR CACHE"), Some(Ok(CacheStatement::Clear)));
+        assert!(matches!(parse_cache("CACHE LAZY TABLE t"), Some(Err(_))));
+        assert!(matches!(
+            parse_cache("CACHE TABLE t AS SELECT 1"),
+            Some(Err(_))
+        ));
+        assert_eq!(parse_cache("SELECT 1"), None);
+
+        let f = rewrite_describe_function("DESCRIBE FUNCTION abs").unwrap();
+        assert!(f.contains("information_schema.routines"), "{f}");
+        assert!(f.contains("lower('abs')"), "{f}");
+        assert!(rewrite_describe_function("DESCRIBE FUNCTION").is_none());
+
+        let d = rewrite_describe_database("DESC DATABASE public").unwrap();
+        assert!(d.contains("information_schema.schemata"), "{d}");
+
+        assert_eq!(
+            parse_describe_query("DESCRIBE QUERY SELECT 1 AS x"),
+            Some("SELECT 1 AS x".into())
+        );
+        assert_eq!(parse_describe_query("DESCRIBE t"), None);
+
+        assert_eq!(
+            parse_show_partitions("SHOW PARTITIONS ns.t"),
+            Some("ns.t".into())
+        );
+        assert_eq!(parse_show_partitions("SHOW TABLES"), None);
+    }
+
+    #[tokio::test]
+    async fn truncate_empties_a_memory_table() {
+        let engine = crate::SqlEngine::new();
+        engine
+            .sql("CREATE TABLE t AS SELECT * FROM (VALUES (1), (2), (3)) AS v(x)")
+            .await
+            .expect("create")
+            .collect()
+            .await
+            .expect("create collect");
+        engine
+            .sql("TRUNCATE TABLE t")
+            .await
+            .expect("truncate runs")
+            .collect()
+            .await
+            .expect("truncate collect");
+        let rows = engine
+            .sql("SELECT COUNT(*) AS n FROM t")
+            .await
+            .expect("count")
+            .collect()
+            .await
+            .expect("collect");
+        use arrow::array::Int64Array;
+        let n = rows[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 0, "truncated table must be empty, schema intact");
+    }
+
+    #[tokio::test]
+    async fn cache_uncache_roundtrip_preserves_rows() {
+        let engine = crate::SqlEngine::new();
+        engine
+            .sql("CREATE TABLE c AS SELECT * FROM (VALUES (10), (20)) AS v(x)")
+            .await
+            .expect("create")
+            .collect()
+            .await
+            .expect("create collect");
+        for stmt in ["CACHE TABLE c", "UNCACHE TABLE c", "CACHE TABLE c", "CLEAR CACHE"] {
+            engine
+                .sql(stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{stmt} failed: {e}"))
+                .collect()
+                .await
+                .expect("collect");
+            let rows = engine
+                .sql("SELECT SUM(x) AS s FROM c")
+                .await
+                .expect("sum")
+                .collect()
+                .await
+                .expect("collect");
+            use arrow::array::Int64Array;
+            let s = rows[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0);
+            assert_eq!(s, 30, "rows must survive {stmt}");
+        }
+        let err = engine.sql("UNCACHE TABLE c").await.err().expect("not cached");
+        assert!(err.to_string().contains("not cached"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn describe_function_database_query_run() {
+        let engine = crate::SqlEngine::new();
+        let batches = engine
+            .sql("DESCRIBE FUNCTION abs")
+            .await
+            .expect("describe function")
+            .collect()
+            .await
+            .expect("collect");
+        assert!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>() >= 1,
+            "abs must be described"
+        );
+
+        let batches = engine
+            .sql("DESCRIBE DATABASE public")
+            .await
+            .expect("describe database")
+            .collect()
+            .await
+            .expect("collect");
+        assert_eq!(batches[0].schema().field(1).name(), "namespace");
+
+        let batches = engine
+            .sql("DESCRIBE QUERY SELECT 1 AS answer, 'x' AS label")
+            .await
+            .expect("describe query")
+            .collect()
+            .await
+            .expect("collect");
+        use arrow::array::StringArray;
+        let names = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "answer");
+        assert_eq!(names.value(1), "label");
+    }
+
+    #[tokio::test]
+    async fn show_partitions_refuses_non_iceberg() {
+        let engine = crate::SqlEngine::new();
+        engine
+            .sql("CREATE TABLE p AS SELECT * FROM (VALUES (1)) AS v(x)")
+            .await
+            .expect("create")
+            .collect()
+            .await
+            .expect("collect");
+        let err = engine.sql("SHOW PARTITIONS p").await.err().expect("refused");
+        assert!(
+            err.to_string().contains("Iceberg"),
+            "must explain why: {err}"
+        );
     }
 
     #[tokio::test]

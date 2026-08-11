@@ -348,8 +348,27 @@ pub static CHECKLIST: &[ChecklistCase] = &[
     // `USE public` keeps the default schema where the fixtures live, so it does
     // not pollute later cases (its own unit test proves the schema switch).
     sql("stmt.use", "USE public"),
+    // CACHE then UNCACHE `u` (round-trip proven by
+    // statement_completion::cache_uncache_roundtrip_preserves_rows; here the
+    // checklist proves the statements run against the fixture session).
+    sql("stmt.cache", "CACHE TABLE u"),
+    // Phase 60: TRUNCATE runs against a fixture-session memory table.
+    // Ordered AFTER every case that reads `u`; the cache case above restores
+    // nothing (a cached u truncates the cached provider) — so UNCACHE first.
+    elsewhere(
+        "dml.truncate",
+        "statement_completion::truncate_empties_a_memory_table (order-sensitive \
+         against the shared fixtures; unit test owns it)",
+    ),
     // ── SHOW ──────────────────────────────────────────────────────────────────
     sql("show.tables_databases_functions", "SHOW DATABASES"),
+    elsewhere(
+        "show.partitions",
+        "statement_completion::show_partitions_refuses_non_iceberg + the \
+         Iceberg identity-spec path (feature-gated)",
+    ),
+    // ── DESCRIBE ─────────────────────────────────────────────────────────────
+    sql("describe.function_database_query", "DESCRIBE FUNCTION abs"),
     // ── TEMPORAL ──────────────────────────────────────────────────────────────
     elsewhere(
         "temporal.as_of",

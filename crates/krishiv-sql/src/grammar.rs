@@ -733,8 +733,12 @@ static FEATURES: &[FeatureEntry] = &[
         "Atomic Iceberg MERGE with row-level deletes",
         S,
     ),
-    FeatureEntry::batch_only("dml.truncate", "DML", "TRUNCATE TABLE (Iceberg + memory)", PL)
-        .with_note("itemized shortfall: TRUNCATE is not yet wired for memory/Iceberg session tables"),
+    FeatureEntry::batch_only("dml.truncate", "DML", "TRUNCATE TABLE (Iceberg + memory)", S)
+        .with_note(
+            "Phase 60 close-out: memory tables swap to an empty provider (schema intact); \
+             Iceberg tables truncate through the copy-on-write delete path (snapshot-committed). \
+             External file-backed tables are refused with the reason — their files ARE the table",
+        ),
     // ── DDL ──────────────────────────────────────────────────────────────────
     FeatureEntry::batch_only(
         "ddl.create_external_table",
@@ -816,9 +820,12 @@ static FEATURES: &[FeatureEntry] = &[
         "stmt.cache",
         "SESSION",
         "CACHE / UNCACHE / CLEAR CACHE TABLE (session materialization)",
-        PL,
+        S,
     )
-    .with_note("itemized shortfall: needs a session-scoped materialization + provider swap/restore"),
+    .with_note(
+        "Phase 60 close-out: eager session-scoped materialization with provider swap/restore. \
+         LAZY and CACHE … AS SELECT are refused with direction (cache a view instead)",
+    ),
     // ── SHOW / DESCRIBE (Phase 60) ───────────────────────────────────────────
     FeatureEntry::batch_only(
         "show.tables_databases_functions",
@@ -828,15 +835,30 @@ static FEATURES: &[FeatureEntry] = &[
     )
     .with_note(
         "TABLES/FUNCTIONS/COLUMNS are DataFusion-native; DATABASES/SCHEMAS added in Phase 60 \
-         (information_schema.schemata). SHOW PARTITIONS (Iceberg) and SHOW VIEWS remain the gap.",
+         (information_schema.schemata). SHOW VIEWS remains the gap.",
+    ),
+    FeatureEntry::batch_only(
+        "show.partitions",
+        "SHOW",
+        "SHOW PARTITIONS (Iceberg, identity transforms)",
+        S,
+    )
+    .with_note(
+        "Phase 60 close-out: lists live partitions Spark-shaped (col=value/…) from the \
+         Iceberg spec + DISTINCT scan, capped at 10k. Non-identity transforms and \
+         unpartitioned/non-Iceberg tables are refused with the reason, never an empty lie",
     ),
     FeatureEntry::batch_only(
         "describe.function_database_query",
         "DESCRIBE",
         "DESCRIBE FUNCTION | DATABASE | QUERY",
-        PL,
+        S,
     )
-    .with_note("DESCRIBE <table> is native; FUNCTION/DATABASE/QUERY are the itemized shortfall"),
+    .with_note(
+        "Phase 60 close-out: FUNCTION/DATABASE rewrite to information_schema \
+         (routines/schemata); QUERY plans — never runs — the inner statement and \
+         describes its schema in the DESCRIBE <table> shape",
+    ),
     // ── TEMPORAL ─────────────────────────────────────────────────────────────
     FeatureEntry::batch_only("temporal.as_of", "TEMPORAL", "AS OF TIMESTAMP point-in-time queries", S),
     FeatureEntry::new(
