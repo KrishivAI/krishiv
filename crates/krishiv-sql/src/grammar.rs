@@ -632,11 +632,16 @@ static FEATURES: &[FeatureEntry] = &[
         S,
     )
     .with_note(
-        "Phase 36 G19 first half: similarity expressible in plain governed SQL over \
+        "Phase 36 G19: similarity expressible in plain governed SQL over \
          List/FixedSizeList embeddings. Zero-magnitude cosine is NULL (undefined, not an \
          error); per-row length mismatches and NULL elements error — corrupt embeddings \
-         must not silently rank. ANN acceleration (IVF-in-Parquet probe rewrite) is the \
-         open second half; ORDER BY distance LIMIT k runs exact today",
+         must not silently rank. IVF ANN acceleration landed 2026-08-11 (vector_index: \
+         k-means cells + probe, results-identical at nprobe>=nlist; vector_search: \
+         SqlEngine::ann_search over a governed table, multi-batch re-rank; vector_quantize: \
+         data-oblivious scalar codes for candidate scoring). Remaining wire-in: the \
+         Parquet-footer read/write + the physical-optimizer ORDER-BY-distance-LIMIT-k \
+         auto-rewrite (today ann_search is the explicit accelerated entry point; \
+         ORDER BY distance LIMIT k still runs exact through the planner)",
     ),
     // ── FUNCTIONS: higher-order array lambdas (Phase 60) ─────────────────────
     FeatureEntry::batch_only(

@@ -42,6 +42,8 @@ fn list_f64() -> DataType {
 type RowScore = fn(&[f64], &[f64]) -> Option<f64>;
 
 fn cosine_of(a: &[f64], b: &[f64]) -> Option<f64> {
+    // f64 for the SQL built-in (SQL floats are f64); the IVF index uses the
+    // f32 `VectorMetric::Cosine` with identical math, so ordering agrees.
     let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
     for (x, y) in a.iter().zip(b) {
         dot += x * y;
