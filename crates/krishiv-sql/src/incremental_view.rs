@@ -346,7 +346,10 @@ pub fn execute_incremental_view_ddl(
 
 /// Split `<name> AS <body>` into `(name, body)`.
 fn split_name_and_body(rest: &str) -> SqlResult<(String, String)> {
-    let upper = rest.to_uppercase();
+    // ASCII folding: `as_pos` indexes `rest`, so the folded copy must keep the
+    // same byte length. Unicode folding does not (U+FB01 -> "FI"), which
+    // truncated the view name and could slice a character in half.
+    let upper = rest.to_ascii_uppercase();
     let as_pos = upper.find(" AS ").ok_or_else(|| SqlError::Unsupported {
         feature: "CREATE INCREMENTAL VIEW / DECLARE RECURSIVE VIEW requires AS <query>".into(),
     })?;
@@ -370,7 +373,9 @@ fn split_name_and_body(rest: &str) -> SqlResult<(String, String)> {
 fn split_body_and_lateness(
     body_with_lateness: &str,
 ) -> SqlResult<(String, Vec<LatenessAnnotation>)> {
-    let upper = body_with_lateness.to_uppercase();
+    // ASCII folding: `lat_pos` indexes `body_with_lateness`. The body is
+    // arbitrary user SQL and may contain non-ASCII string literals.
+    let upper = body_with_lateness.to_ascii_uppercase();
 
     // Find the LAST occurrence of LATENESS (it follows the body SQL).
     // We look for the keyword followed by a valid column name and INTERVAL.
@@ -424,13 +429,11 @@ fn find_lateness_clause_start(upper: &str) -> Option<usize> {
 
 /// Parse one or more `LATENESS <col> INTERVAL '<n>' <unit>` clauses.
 fn parse_lateness_clauses(lateness_str: &str) -> SqlResult<Vec<LatenessAnnotation>> {
-    // Tokenize: split on LATENESS keyword (handling multiple)
-    let upper = lateness_str.to_uppercase();
     let mut result = Vec::new();
     let mut remaining = lateness_str.trim();
 
     loop {
-        let upper_rem = remaining.to_uppercase();
+        let upper_rem = remaining.to_ascii_uppercase();
         let stripped = if upper_rem.starts_with("LATENESS ") {
             &remaining["LATENESS ".len()..]
         } else if upper_rem.starts_with(", LATENESS ") {
@@ -440,7 +443,10 @@ fn parse_lateness_clauses(lateness_str: &str) -> SqlResult<Vec<LatenessAnnotatio
         };
 
         // Parse: <col> INTERVAL '<n>' <unit>
-        let tokens: Vec<&str> = stripped.splitn(5, char::is_whitespace).collect();
+        // `split_whitespace` collapses runs; `splitn(_, char::is_whitespace)`
+        // does not, so a second space shifted every field by one and the
+        // INTERVAL keyword landed where the value was read from.
+        let tokens: Vec<&str> = stripped.split_whitespace().collect();
         if tokens.len() < 4 {
             break;
         }
@@ -450,7 +456,16 @@ fn parse_lateness_clauses(lateness_str: &str) -> SqlResult<Vec<LatenessAnnotatio
             .unwrap_or("")
             .trim_matches(',')
             .to_string();
-        // tokens[1] should be INTERVAL (case-insensitive)
+        // The comment here used to say "tokens[1] should be INTERVAL" without
+        // checking it, so `LATENESS ts NOTINTERVAL '5' MINUTE` parsed happily.
+        let keyword = tokens.get(1).copied().unwrap_or("");
+        if !keyword.eq_ignore_ascii_case("INTERVAL") {
+            return Err(SqlError::Unsupported {
+                feature: format!(
+                    "LATENESS {col} expects the INTERVAL keyword before the value, got '{keyword}'"
+                ),
+            });
+        }
         let interval_str = tokens.get(2).copied().unwrap_or("").trim_matches('\'');
         let unit_str = tokens.get(3).copied().unwrap_or("").trim_matches(',');
         let n: u64 = interval_str.parse().map_err(|_| SqlError::Unsupported {
@@ -477,14 +492,12 @@ fn parse_lateness_clauses(lateness_str: &str) -> SqlResult<Vec<LatenessAnnotatio
             lateness_ms: ms,
         });
 
-        // Advance past this clause
-        let consumed_upper: String = upper_rem
-            .chars()
-            .take("LATENESS ".len() + stripped.len() - stripped.trim_start().len())
-            .collect();
-        let _ = consumed_upper; // advance is approximate; find next LATENESS
-        // Find next "LATENESS" or ", LATENESS" in remaining
-        let next = remaining[1..].to_uppercase().find("LATENESS");
+        // Advance to the next LATENESS clause, if any. `remaining` always begins
+        // at a LATENESS/", LATENESS" token here, so skipping one byte before
+        // searching cannot split a character.
+        let next = remaining
+            .get(1..)
+            .and_then(|tail| tail.to_ascii_uppercase().find("LATENESS"));
         match next {
             Some(pos) => {
                 remaining = &remaining[1 + pos..];
@@ -493,11 +506,67 @@ fn parse_lateness_clauses(lateness_str: &str) -> SqlResult<Vec<LatenessAnnotatio
         }
     }
 
-    let _ = upper; // suppress unused warning
     Ok(result)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod folding_and_whitespace_tests {
+    use super::*;
+
+    /// The name offset is found in an uppercased copy and applied to the
+    /// original, so the two must have equal byte length. Unicode folding does
+    /// not preserve it (U+FB01 -> "FI", 3 bytes to 2).
+    #[test]
+    fn a_view_name_whose_uppercase_is_shorter_is_not_truncated() {
+        let stmt = parse_incremental_view_statement(
+            "CREATE INCREMENTAL VIEW \u{FB01}x AS SELECT 1",
+        )
+        .unwrap()
+        .unwrap();
+        match stmt {
+            IncrementalViewStatement::Create { name, body_sql, .. } => {
+                assert_eq!(name, "\u{FB01}x", "the whole name must survive");
+                assert_eq!(body_sql, "SELECT 1");
+            }
+            other => panic!("expected create, got {other:?}"),
+        }
+    }
+
+    /// Extra whitespace between LATENESS tokens must not shift the fields.
+    /// `splitn(_, char::is_whitespace)` does not collapse runs, so a double
+    /// space made the INTERVAL token land where the value was expected.
+    #[test]
+    fn lateness_tolerates_repeated_whitespace() {
+        let stmt = parse_incremental_view_statement(
+            "CREATE INCREMENTAL VIEW v AS SELECT 1 LATENESS ts  INTERVAL '5' MINUTE",
+        )
+        .unwrap()
+        .unwrap();
+        match stmt {
+            IncrementalViewStatement::Create { lateness, .. } => {
+                assert_eq!(lateness.len(), 1, "one annotation");
+                let a = lateness.first().expect("one");
+                assert_eq!(a.column, "ts");
+                assert_eq!(a.lateness_ms, 300_000, "5 minutes");
+            }
+            other => panic!("expected create, got {other:?}"),
+        }
+    }
+
+    /// The token after the column must actually be INTERVAL; the code carried a
+    /// comment saying so but never checked.
+    #[test]
+    fn lateness_requires_the_interval_keyword() {
+        let err = parse_incremental_view_statement(
+            "CREATE INCREMENTAL VIEW v AS SELECT 1 LATENESS ts NOTINTERVAL '5' MINUTE",
+        )
+        .expect_err("a missing INTERVAL keyword must be rejected");
+        assert!(err.to_string().contains("INTERVAL"), "{err}");
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
