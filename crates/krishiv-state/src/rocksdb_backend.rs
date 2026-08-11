@@ -175,20 +175,23 @@ impl RocksDbStateBackend {
 
     /// Snapshot the RocksDB backend state to bytes.
     ///
-    /// Offloads the blocking RocksDB I/O to `block_in_place` so the Tokio
-    /// reactor thread is not stalled.  Requires a multi-threaded Tokio runtime.
+    /// Offloads the blocking RocksDB I/O via `run_blocking` so the Tokio
+    /// reactor thread is not stalled on a multi-thread runtime. A bare
+    /// `block_in_place` here *panicked* on a current-thread runtime, which is
+    /// why the tests below pin `flavor = "multi_thread"`.
     pub async fn snapshot_async(&self) -> StateResult<Vec<u8>> {
         use crate::backend::StateBackend;
-        tokio::task::block_in_place(|| self.snapshot())
+        krishiv_common::async_util::run_blocking(|| self.snapshot())
     }
 
     /// Restore RocksDB backend state from a snapshot.
     ///
-    /// Offloads the blocking RocksDB I/O to `block_in_place` so the Tokio
-    /// reactor thread is not stalled.  Requires a multi-threaded Tokio runtime.
+    /// Offloads the blocking RocksDB I/O via `run_blocking` so the Tokio
+    /// reactor thread is not stalled on a multi-thread runtime. See
+    /// `snapshot_async` for why a bare `block_in_place` was wrong.
     pub async fn load_snapshot_async(&mut self, bytes: Vec<u8>) -> StateResult<()> {
         use crate::backend::StateBackend;
-        tokio::task::block_in_place(|| self.load_snapshot(&bytes))
+        krishiv_common::async_util::run_blocking(|| self.load_snapshot(&bytes))
     }
 
     fn rocksdb_key(namespace: &Namespace, key: &[u8]) -> Vec<u8> {

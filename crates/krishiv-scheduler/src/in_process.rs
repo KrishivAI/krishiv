@@ -272,9 +272,12 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
         };
 
         // Phase 2: run blocking filesystem I/O outside the sync lock.
-        // `block_in_place` lets Tokio move other tasks off this thread while we block.
+        // `run_blocking` lets Tokio move other tasks off this thread while we
+        // block on a multi-thread runtime, and runs inline on a current-thread
+        // one — where a bare `block_in_place` would panic mid-publish and take
+        // the DUR-1 commit/fail resolution below down with it.
         if !sink_work.is_empty() {
-            tokio::task::block_in_place(|| {
+            krishiv_common::async_util::run_blocking(|| {
                 for work in sink_work {
                     let job_id = work.job_id.clone();
                     let publish_ok = work.execute();

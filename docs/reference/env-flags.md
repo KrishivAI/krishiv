@@ -175,6 +175,12 @@ Regenerate with:
 | `KRISHIV_UNITY_TOKEN` | secret | `unset` | Bearer token for Unity Catalog. |
 | `KRISHIV_WATERMARK_IDLE_MS` | uint | `30000` | Run-loop per-split watermark idleness timeout: a silent split is excluded from the min-combine after this long (Phase 55 watermarks v2). |
 | `KRISHIV_WAREHOUSE_ROOT` | path | `.` | Root path for connector-table warehouse storage. |
+| `KRISHIV_DIMENSION_REDUCTION` | bool | `false` | Enable the broadcast-dimension reducer (physical). Opt-in: the logical form of this rule was cleared by a three-query A/B, shipped on, and cost q10 18x. |
+| `KRISHIV_SEMI_JOIN_DIMENSION` | bool | `false` | Enable the selective-dimension semi-join reducer, which reduces a fact stream by a filtered dimension before the large joins (q7). |
+| `KRISHIV_ELASTIC_DF_SHARE` | bool | `true` | Let a task slot borrow idle DataFusion partitions from other slots. Set 0/false to disable; an explicit KRISHIV_TARGET_PARALLELISM pin disables it outright. |
+| `KRISHIV_FLIGHT_DRAIN_ACTION_MAX_BYTES` | uint | `50331648` | Response budget in bytes for the Flight SQL ContinuousDrain do_action. Must stay under the client's 64 MiB do_action cap; oversized responses error with the data put back. |
+| `KRISHIV_KAFKA_DECODE_BATCH` | uint | `512` | Maximum records decoded per Kafka source poll. Values <= 0 are ignored. |
+| `KRISHIV_SHUFFLE_FETCH_OPEN_TIMEOUT_SECS` | uint | `15` | Per-attempt timeout for opening a shuffle fetch stream, before the retry policy's transport grace applies. |
 
 ## Test-only flags
 
@@ -191,6 +197,7 @@ Regenerate with:
 | `KRISHIV_TPCH_ONLY` | text | `unset` | Comma-separated TPC-H query names (e.g. `q10,q21`) restricting a verify/bench run; unset runs all 22. |
 | `KRISHIV_TPCH_SCALE_FACTOR` | float | `1.0` | TPC-H scale factor the verifier assumes; q11's threshold is scale-dependent, so this must match the data being checked. |
 | `KRISHIV_TEST_S3_BUCKET` | text | `unset` | S3 bucket for object-store integration tests. |
+| `KRISHIV_SOAK_SECONDS` | uint | `86400` | Duration of the lateness soak harness run. |
 
 ## Benchmark flags
 
@@ -201,6 +208,8 @@ Regenerate with:
 | `KRISHIV_TPCH_DATA_DIR_SF1` | path | `unset` | TPC-H SF1 dataset directory. |
 | `KRISHIV_TPCH_DATA_DIR_SF10` | path | `unset` | TPC-H SF10 dataset directory. |
 | `KRISHIV_TPCH_DATA_DIR_SF100` | path | `unset` | TPC-H SF100 dataset directory. |
+| `KRISHIV_BENCH_IVM_ROWS` | text | `unset` | Comma-separated row counts replacing the IVM-vs-full-recompute ladder outright, for pinning a crossover between the fixed rungs. |
+| `KRISHIV_BENCH_PLANT_REGRESSION_MS` | uint | `unset` | Add this many milliseconds to every timed streaming-latency sample, to verify the regression gate actually fires. |
 
 ## Dynamic namespaces
 

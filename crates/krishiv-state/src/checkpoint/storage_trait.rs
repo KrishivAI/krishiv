@@ -61,6 +61,12 @@ pub trait CheckpointStorage: Send + Sync {
 /// Tokio runtime, falls back to a short-lived runtime when no runtime is
 /// active, and returns a clear `Storage` error when called from a
 /// `current_thread` runtime (where neither approach is safe).
+// Deliberately not `async_util::run_blocking`: this is the sync-over-async
+// (drive-a-future) direction, and on a current-thread runtime it returns a
+// diagnosable `Storage` error rather than silently hopping to another thread —
+// callers here want to be told to use the async API. The flavor is checked
+// below, so the raw primitive is sound.
+#[allow(clippy::disallowed_methods)]
 pub fn run_blocking_on_tokio<F, T>(label: &'static str, fut: F) -> CheckpointResult<T>
 where
     F: std::future::Future<Output = CheckpointResult<T>> + Send,

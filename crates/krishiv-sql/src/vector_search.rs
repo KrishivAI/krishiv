@@ -283,7 +283,7 @@ mod tests {
 
     async fn brute_force_ids(engine: &crate::SqlEngine, q: &str, k: usize) -> Vec<String> {
         let batches = engine
-            .sql(&format!(
+            .sql(format!(
                 "SELECT id FROM docs ORDER BY cosine_distance(emb, {q}) LIMIT {k}"
             ))
             .await
@@ -398,8 +398,7 @@ mod tests {
                 &[1.0, 2.0],
             )
             .await
-            .err()
-            .expect("ragged must error");
+            .expect_err("ragged must error");
         assert!(err.to_string().contains("ragged"), "{err}");
     }
 }

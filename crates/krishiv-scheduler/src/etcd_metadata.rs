@@ -170,10 +170,7 @@ where
                 ),
             })
     };
-    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
-        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(recv),
-        _ => recv(),
-    }
+    krishiv_common::async_util::run_blocking(recv)
 }
 
 const JOB_KEY_PREFIX: &str = "/krishiv/jobs/";

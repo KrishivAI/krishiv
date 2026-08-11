@@ -1935,8 +1935,7 @@ mod tests {
                 &[],
                 false,
             )
-            .err()
-            .expect("duplicate without OR REPLACE must error");
+            .expect_err("duplicate without OR REPLACE must error");
         assert!(err.to_string().contains("clicks_1s"), "{err}");
     }
 

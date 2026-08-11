@@ -303,8 +303,14 @@ fn schema_contract_matches(actual: &Schema, expected: &Schema) -> bool {
 /// A [`TableUdf`] whose body is a SQL query executed via a DataFusion session.
 ///
 /// Created by `SqlEngine` when `CREATE FUNCTION … LANGUAGE sql AS '…'` is
-/// processed.  Uses `block_in_place` so the sync `TableFunctionImpl::call()`
-/// can safely block on async SQL execution without deadlocking the runtime.
+/// processed.  The sync `TableFunctionImpl::call()` drives the async SQL body
+/// through `async_util::block_on`, the audited sync-over-async bridge.
+///
+/// This used to guard on `runtime_flavor()` and *reject* the call outright with
+/// "requires a multi-thread Tokio runtime", because the bare `block_in_place`
+/// underneath would otherwise panic. `async_util::block_on` handles the
+/// current-thread and no-runtime cases too, so SQL UDTFs now work on any
+/// runtime rather than erroring on two of the three.
 #[derive(Clone)]
 pub struct SqlBodyTableUdf {
     pub(crate) name: String,
@@ -360,6 +366,8 @@ impl TableUdf for SqlBodyTableUdf {
         &self.schema
     }
 
+    // Sync-surface boundary: `TableUdf::call` is sync, the SQL body is async.
+    #[allow(clippy::disallowed_methods)]
     fn call(&self, args: &[ScalarValue]) -> Result<RecordBatch, UdfError> {
         if args.len() != self.argument_count {
             return Err(UdfError::InvalidArgument {
@@ -377,27 +385,8 @@ impl TableUdf for SqlBodyTableUdf {
         let ctx = Arc::clone(&self.ctx);
         let sql = bind_sql_body_args(&self.body_sql, args)?;
         let schema = Arc::new(self.schema.clone());
-        let handle =
-            tokio::runtime::Handle::try_current().map_err(|error| UdfError::Execution {
-                message: format!(
-                    "SQL UDTF '{}' requires an active Tokio runtime: {error}",
-                    self.name
-                ),
-            })?;
-        if !matches!(
-            handle.runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::MultiThread
-        ) {
-            return Err(UdfError::Execution {
-                message: format!(
-                    "SQL UDTF '{}' requires a multi-thread Tokio runtime",
-                    self.name
-                ),
-            });
-        }
         catch_unwind(AssertUnwindSafe(|| {
-            tokio::task::block_in_place(|| {
-                handle.block_on(async {
+            krishiv_common::async_util::block_on(async {
                     let df = ctx.sql(&sql).await.map_err(|e| UdfError::Execution {
                         message: e.to_string(),
                     })?;
@@ -427,8 +416,7 @@ impl TableUdf for SqlBodyTableUdf {
                             ),
                         });
                     }
-                    Ok(batch)
-                })
+                Ok(batch)
             })
         }))
         .map_err(|payload| {
@@ -815,21 +803,45 @@ mod tests {
         assert!(matches!(udf.call(&[]), Err(UdfError::Panic(_))));
     }
 
-    #[test]
-    fn sql_body_udtf_without_runtime_returns_typed_error() {
-        let udf = SqlBodyTableUdf::try_new(
-            "runtime_required",
+    fn value_udtf(name: &str) -> SqlBodyTableUdf {
+        SqlBodyTableUdf::try_new(
+            name,
             Schema::new(vec![Field::new("value", DataType::Int64, false)]),
             "SELECT 1 AS value",
             0,
             Arc::new(datafusion::prelude::SessionContext::new()),
         )
-        .unwrap();
+        .unwrap()
+    }
 
-        let error = udf
+    /// This used to assert the *limitation* — that calling with no Tokio
+    /// runtime returned a typed error — because the bare `block_in_place`
+    /// underneath could not cope. `async_util::block_on` drives the body on the
+    /// fallback runtime, so the honest assertion is that it produces the row.
+    #[test]
+    fn sql_body_udtf_without_a_runtime_executes() {
+        let batch = value_udtf("no_runtime")
             .call(&[])
-            .expect_err("missing Tokio runtime must not panic");
-        assert!(matches!(error, UdfError::Execution { .. }));
+            .expect("no ambient runtime must still execute the body");
+        assert_eq!(batch.num_rows(), 1);
+    }
+
+    /// The flavor that used to be rejected outright with "requires a
+    /// multi-thread Tokio runtime" — `#[tokio::test]`'s default.
+    #[tokio::test]
+    async fn sql_body_udtf_on_a_current_thread_runtime_executes() {
+        let batch = value_udtf("current_thread")
+            .call(&[])
+            .expect("a current-thread runtime must not be rejected");
+        assert_eq!(batch.num_rows(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sql_body_udtf_on_a_multi_thread_runtime_executes() {
+        let batch = value_udtf("multi_thread")
+            .call(&[])
+            .expect("the multi-thread path must keep working");
+        assert_eq!(batch.num_rows(), 1);
     }
 
     #[test]

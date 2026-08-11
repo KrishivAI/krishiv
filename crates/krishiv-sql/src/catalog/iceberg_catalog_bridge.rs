@@ -95,22 +95,21 @@ impl IcebergCatalogBridge {
 
     /// Block on `fut` from a synchronous DataFusion trait method.
     ///
-    /// DataFusion's `CatalogProvider::schema_names` is synchronous but the
-    /// Iceberg catalog is async. We bridge with the current Tokio runtime via
-    /// `block_in_place` (multi-thread runtime) and fall back to a private
-    /// current-thread runtime when not inside a runtime worker.
-    // Building a current-thread runtime only fails on OS resource exhaustion,
-    // from which this synchronous bridge has no way to recover.
-    #[allow(clippy::expect_used)]
-    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
-            Err(_) => tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build fallback Tokio runtime")
-                .block_on(fut),
-        }
+    /// DataFusion's `CatalogProvider::schema_names` / `SchemaProvider::
+    /// table_names` are synchronous but the Iceberg catalog is async, which
+    /// makes this a genuine sync-surface boundary per
+    /// `docs/implementation/async-contract.md`.
+    ///
+    /// This used to hand-roll the bridge as
+    /// `block_in_place(|| handle.block_on(fut))` for *any* current runtime.
+    /// `block_in_place` panics on a current-thread runtime, so every one of
+    /// these entry points aborted under `#[tokio::test]`'s default flavor or a
+    /// `current_thread` embedded deployment — which is why the tests in this
+    /// module all pin `flavor = "multi_thread"`. `async_util::block_on` is the
+    /// audited bridge that handles all three runtime contexts.
+    #[allow(clippy::disallowed_methods)]
+    fn block_on<T: Send, F: std::future::Future<Output = T> + Send>(fut: F) -> T {
+        krishiv_common::async_util::block_on(fut)
     }
 }
 
@@ -296,5 +295,37 @@ mod tests {
         let provider = provider.unwrap();
         let arrow_schema = TableProvider::schema(&*provider);
         assert!(arrow_schema.field_with_name("id").is_ok());
+    }
+
+    /// `block_in_place` panics on a current-thread runtime, so the bridge must
+    /// not take that path when one is current. `#[tokio::test]` defaults to the
+    /// current-thread flavor, which is exactly the shape this reproduces — and
+    /// is why every other test in this module pins `flavor = "multi_thread"`.
+    #[tokio::test]
+    async fn block_on_works_inside_a_current_thread_runtime() {
+        let value = IcebergCatalogBridge::block_on(async { 7_u32 });
+        assert_eq!(
+            value, 7,
+            "the bridge must not panic on a current-thread runtime"
+        );
+    }
+
+    /// The helper being sound is not the claim that matters — the claim is that
+    /// the `CatalogProvider` methods DataFusion actually calls work under a
+    /// current-thread runtime. Assert that against the real entry points.
+    #[tokio::test]
+    async fn catalog_provider_entry_points_work_on_a_current_thread_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(KrishivCatalog::local(dir.path()).await.unwrap());
+        catalog
+            .create_table("sales", "orders", sample_schema(), "")
+            .await
+            .unwrap();
+
+        let bridge = IcebergCatalogBridge::new(catalog, "iceberg");
+        assert!(bridge.schema_names().contains(&"sales".to_string()));
+        let schema = bridge.schema("sales").expect("namespace schema");
+        assert!(schema.table_exist("orders"));
+        assert!(schema.table_names().contains(&"orders".to_string()));
     }
 }

@@ -951,15 +951,7 @@ fn snapshot_nonblocking<F, T>(f: F) -> T
 where
     F: FnOnce() -> T,
 {
-    use tokio::runtime::RuntimeFlavor;
-    if tokio::runtime::Handle::try_current()
-        .map(|h| h.runtime_flavor() == RuntimeFlavor::MultiThread)
-        .unwrap_or(false)
-    {
-        tokio::task::block_in_place(f)
-    } else {
-        f()
-    }
+    krishiv_common::async_util::run_blocking(f)
 }
 
 /// A spawned, continuously-running streaming job with a clean stop control.

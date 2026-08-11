@@ -927,6 +927,11 @@ fn reattach_python_udf_comments(directives: &[FlightDirective]) -> Vec<String> {
         .collect()
 }
 
+// Deliberately not `async_util::run_blocking`: on a current-thread runtime
+// this hops `f` to its own thread instead of running it inline, so a Flight SQL
+// handler cannot stall the single reactor for the length of a query. The flavor
+// is checked below, so the raw primitive is sound.
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn run_blocking<T: Send>(
     f: impl FnOnce() -> Result<T, krishiv_runtime::RuntimeError> + Send,
 ) -> Result<T, Status> {

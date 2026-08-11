@@ -1315,6 +1315,60 @@ pub static FLAGS: &[FlagSpec] = &[
         "unset",
         "TPC-H SF100 dataset directory.",
     ),
+    rt(
+        "KRISHIV_DIMENSION_REDUCTION",
+        FlagKind::Bool,
+        "false",
+        "Enable the broadcast-dimension reducer (physical). Opt-in: the logical form of this rule was cleared by a three-query A/B, shipped on, and cost q10 18x.",
+    ),
+    rt(
+        "KRISHIV_SEMI_JOIN_DIMENSION",
+        FlagKind::Bool,
+        "false",
+        "Enable the selective-dimension semi-join reducer, which reduces a fact stream by a filtered dimension before the large joins (q7).",
+    ),
+    rt(
+        "KRISHIV_ELASTIC_DF_SHARE",
+        FlagKind::Bool,
+        "true",
+        "Let a task slot borrow idle DataFusion partitions from other slots. Set 0/false to disable; an explicit KRISHIV_TARGET_PARALLELISM pin disables it outright.",
+    ),
+    rt(
+        "KRISHIV_FLIGHT_DRAIN_ACTION_MAX_BYTES",
+        FlagKind::UInt,
+        "50331648",
+        "Response budget in bytes for the Flight SQL ContinuousDrain do_action. Must stay under the client's 64 MiB do_action cap; oversized responses error with the data put back.",
+    ),
+    rt(
+        "KRISHIV_KAFKA_DECODE_BATCH",
+        FlagKind::UInt,
+        "512",
+        "Maximum records decoded per Kafka source poll. Values <= 0 are ignored.",
+    ),
+    rt(
+        "KRISHIV_SHUFFLE_FETCH_OPEN_TIMEOUT_SECS",
+        FlagKind::UInt,
+        "15",
+        "Per-attempt timeout for opening a shuffle fetch stream, before the retry policy's transport grace applies.",
+    ),
+    bench(
+        "KRISHIV_BENCH_IVM_ROWS",
+        FlagKind::Text,
+        "unset",
+        "Comma-separated row counts replacing the IVM-vs-full-recompute ladder outright, for pinning a crossover between the fixed rungs.",
+    ),
+    bench(
+        "KRISHIV_BENCH_PLANT_REGRESSION_MS",
+        FlagKind::UInt,
+        "unset",
+        "Add this many milliseconds to every timed streaming-latency sample, to verify the regression gate actually fires.",
+    ),
+    test(
+        "KRISHIV_SOAK_SECONDS",
+        FlagKind::UInt,
+        "86400",
+        "Duration of the lateness soak harness run.",
+    ),
 ];
 
 /// Look up a declared flag by exact name, falling back to prefix namespaces.

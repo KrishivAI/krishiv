@@ -57,6 +57,9 @@ fn fallback_runtime() -> &'static tokio::runtime::Runtime {
 ///    lazily-initialised multi-thread fallback runtime. The fallback is
 ///    deliberately lazy because constructing a runtime while another runtime
 ///    is active on the same thread is undefined behaviour in Tokio.
+// This module is the audited bridge, so it is where the raw primitive may
+// appear; the flavor is matched on explicitly below.
+#[allow(clippy::disallowed_methods)]
 pub fn block_on<T: Send, F: Future<Output = T> + Send>(fut: F) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => match handle.runtime_flavor() {
@@ -71,6 +74,42 @@ pub fn block_on<T: Send, F: Future<Output = T> + Send>(fut: F) -> T {
             }),
         },
         Err(_) => fallback_runtime().block_on(fut),
+    }
+}
+
+/// Run blocking work `f` from inside an `async fn` without stalling the reactor
+/// where that is possible.
+///
+/// This is the *other* half of the sync/async boundary from [`block_on`]: the
+/// caller is already async and needs to run something that blocks (RocksDB
+/// fsync, a state scan, filesystem publish), rather than being sync and needing
+/// to drive a future.
+///
+/// * **multi-thread runtime** — delegates to `block_in_place`, so Tokio can
+///   migrate other tasks off this worker thread for the blocking window.
+/// * **current-thread runtime or no runtime** — calls `f` inline.
+///   `block_in_place` *panics* on a current-thread runtime, so this is not an
+///   optimisation choice: calling it there aborts the caller. Running inline
+///   stalls the single reactor thread for the duration, which is the documented
+///   cost of driving blocking work on a current-thread runtime.
+///
+/// Prefer this over a hand-rolled `block_in_place` call. Hand-rolled bridges
+/// are why `IcebergCatalogBridge`'s `CatalogProvider` methods used to panic
+/// under `#[tokio::test]`'s default (current-thread) flavor.
+// This module *is* the audited bridge, so it is where the raw primitive is
+// allowed to appear; every other call site must come through here.
+#[allow(clippy::disallowed_methods)]
+pub fn run_blocking<T, F: FnOnce() -> T>(f: F) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle)
+            if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) =>
+        {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
     }
 }
 
