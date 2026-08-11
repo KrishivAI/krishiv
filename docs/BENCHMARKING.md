@@ -598,3 +598,79 @@ stream (`f6bec6b`), premature job-done declaration (`932938c`), caller input
 partitions never reaching tick-launched tasks + the quiescent exit firing
 mid-stage-transition (`f34fd9c`), and a waiting driver never draining the
 shared inbox, wedging at the stage cap (`34346b2`).
+
+### 2026-08-11 — Phase 66 build-optimization ladder: fat-LTO / PGO / DataFusion-CLI
+
+- **Revision**: engine `f58d203`. Same box as the all_slots_busy entry above
+  (i7-9750H, 12 threads, 61 GiB, rustc 1.92.0), same TPC-H SF1 parquet.
+- **Method**: `tpch_distributed` (criterion, 10 samples, 30 s target,
+  cluster construction + table registration inside the timed region),
+  three separate full builds in isolated target dirs, run sequentially on
+  an otherwise-idle box: (A) the default bench profile (thin LTO,
+  codegen-units=1); (B) `CARGO_PROFILE_BENCH_LTO=fat`; (C) PGO —
+  `-Cprofile-generate` → exercise every query ~3 s → `llvm-profdata merge`
+  → `-Cprofile-use` rebuild. DataFusion-CLI 54.1.0 (`cargo install`) ran
+  the byte-identical SQL against the same files (DDL excluded from its
+  timing; krishiv's numbers include session + registration, so the
+  comparison slightly favors the CLI).
+
+**Median ms per query (SF1):**
+
+| Query | thin (baseline) | fat LTO | PGO | datafusion-cli 54.1 |
+|-------|----------------:|--------:|----:|--------------------:|
+| q1    | 112.7 | 115.0 | 118.2 | ~112 |
+| q3    | 117.0 | 119.1 | 119.1 | ~113 |
+| q5    | 148.6 | 159.9 | 156.1 | ~159 |
+| q6    |  80.9 |  75.8 |  77.2 |  ~68 |
+| q10   | 138.7 | 144.0 | 147.2 | ~144 |
+| q18   | 200.9 | 202.6 | 196.8 | ~298 |
+
+**Verdicts, honestly:**
+
+1. **Fat LTO: not adopted.** −6.3% on scan-bound q6 but +7.6% on
+   join-heavy q5 and ≤+4% drift elsewhere — no consistent win to justify
+   the ~2× build-time cost. The current thin-LTO + codegen-units=1
+   profile stays.
+2. **PGO: not adopted at this scale.** Within ±5% of baseline on every
+   query (−2% best case, q18). At SF1 the hot paths are already
+   well-predicted; re-evaluate at SF10+ with a longer training run before
+   writing it off for release artifacts.
+3. **DataFusion-CLI baseline: parity.** The coordinator submission path
+   costs nothing measurable vs the raw engine on 5 of 6 queries (q6's
+   ~16% gap is the per-slot `target_partitions` share — the Phase 65
+   elastic-DF-share item); q18 is 31% *faster* through krishiv, likely
+   plan-config divergence worth a look rather than a claim.
+4. **BOLT: blocked-on-root on this box** — `llvm-bolt` is not installed
+   and there is no sudo; documented rather than silently skipped.
+
+### 2026-08-11 — ClickBench first entry (krishiv CLI vs DataFusion-CLI)
+
+- **Revision**: engine `f58d203` release binary (pre-elastic-share — the
+  CLI's embedded path plans at full cores either way). Same i7-9750H box.
+- **Dataset**: official single-file `hits.parquet` (14 GB, 99,997,497
+  rows) from datasets.clickhouse.com; queries are DataFusion's own
+  ClickBench variants (43 queries, apache/datafusion @ main).
+- **Method**: one process per query invocation for BOTH engines (each
+  pays startup + table registration inside the measured wall time),
+  3 runs per query interleaved between engines, medians; raw CSV
+  committed at `benchmarks/clickbench-2026-08-11.csv`.
+
+**Result over the 36 comparable queries**: krishiv 148.3 s total vs
+DataFusion-CLI 54.1 109.3 s — **1.36× overall**, per-query ratio median
+1.23× (best 0.88× on q6, worst 1.53× on q28). The gap concentrates in
+the string-heavy aggregation queries (q20–q28, q32–q34: 1.3–1.5×);
+short scans are near parity.
+
+**q36–q42 fail on BOTH engines with the identical error** (`Cannot cast
+string '2013-07-01' to value of UInt16 type` — the official parquet
+stores `EventDate` as UInt16 days-since-epoch and DataFusion's
+simplify_expressions refuses the string comparison; krishiv inherits
+this). Worth knowing: `datafusion-cli` exits 0 on a failed statement, so
+a naive harness records those as 40 ms "wins" — this one checks output.
+Not counted for either engine.
+
+Honest read: the krishiv CLI carries a governed-session layer over the
+same DataFusion 54 core, and on cold single-process invocations that
+costs ~20-35% on heavy aggregations. The DuckDB gap (single-box §
+2026-08-08) remains the real Phase 65/66 target; this entry exists so
+the next optimization round has a committed ClickBench baseline to move.
