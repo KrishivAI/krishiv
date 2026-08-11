@@ -195,8 +195,7 @@ mod tests {
             Ok(df) => df
                 .collect()
                 .await
-                .err()
-                .expect("mismatch must error")
+                .expect_err("mismatch must error")
                 .to_string(),
         };
         assert!(err.contains("length mismatch"), "{err}");

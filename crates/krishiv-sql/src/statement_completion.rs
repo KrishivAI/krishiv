@@ -592,7 +592,7 @@ mod tests {
                 .value(0);
             assert_eq!(s, 30, "rows must survive {stmt}");
         }
-        let err = engine.sql("UNCACHE TABLE c").await.err().expect("not cached");
+        let err = engine.sql("UNCACHE TABLE c").await.expect_err("not cached");
         assert!(err.to_string().contains("not cached"), "{err}");
     }
 
@@ -647,7 +647,7 @@ mod tests {
             .collect()
             .await
             .expect("collect");
-        let err = engine.sql("SHOW PARTITIONS p").await.err().expect("refused");
+        let err = engine.sql("SHOW PARTITIONS p").await.expect_err("refused");
         assert!(
             err.to_string().contains("Iceberg"),
             "must explain why: {err}"

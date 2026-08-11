@@ -158,7 +158,11 @@ fn parse_named_type_list(list: &str, item_kind: &str) -> Result<Vec<(String, Dat
 /// Map a SQL type keyword (as used in DDL) to an Arrow [`DataType`].
 ///
 /// Only the types commonly seen in `RETURNS TABLE` declarations are mapped.
-/// Unknown types fall back to `DataType::Utf8`.
+/// An unknown type is an **error**, not a fallback: silently treating
+/// `DECIMAL(10,2)` as `Utf8` would give the UDTF a column whose declared type
+/// does not match what the body returns, and `schema_contract_matches` would
+/// then reject it at call time with a confusing message. (This doc previously
+/// claimed a `Utf8` fallback the code has never performed.)
 fn sql_type_to_arrow(type_str: &str) -> Result<DataType, String> {
     match type_str.trim().to_ascii_uppercase().as_str() {
         "BOOLEAN" | "BOOL" => Ok(DataType::Boolean),
