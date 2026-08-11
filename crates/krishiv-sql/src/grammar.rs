@@ -624,6 +624,20 @@ static FEATURES: &[FeatureEntry] = &[
         "schema_of_json(json) infer a DDL schema string",
         PL,
     ),
+    // ── FUNCTIONS: vector distances (Phase 36 leg b(1), G19) ─────────────────
+    FeatureEntry::batch_only(
+        "functions.vector.distances",
+        "FUNCTIONS",
+        "cosine_distance / array_cosine_distance / inner_product (+ native array_distance L2)",
+        S,
+    )
+    .with_note(
+        "Phase 36 G19 first half: similarity expressible in plain governed SQL over \
+         List/FixedSizeList embeddings. Zero-magnitude cosine is NULL (undefined, not an \
+         error); per-row length mismatches and NULL elements error — corrupt embeddings \
+         must not silently rank. ANN acceleration (IVF-in-Parquet probe rewrite) is the \
+         open second half; ORDER BY distance LIMIT k runs exact today",
+    ),
     // ── FUNCTIONS: higher-order array lambdas (Phase 60) ─────────────────────
     FeatureEntry::batch_only(
         "functions.hof.transform",

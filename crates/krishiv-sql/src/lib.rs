@@ -130,6 +130,7 @@ pub mod coverage;
 mod higher_order_functions;
 mod json_functions;
 mod spark_functions;
+pub mod vector_functions;
 pub mod statement_completion;
 pub mod streaming;
 pub mod streaming_table_ddl;
@@ -1325,6 +1326,9 @@ impl SqlEngine {
                 message: format!("failed to register Spark scalar UDFs: {e}"),
             }
         })?;
+        // Phase 36 leg b(1) (G19): vector distance built-ins — cosine +
+        // inner product beside DataFusion's native L2 array_distance.
+        vector_functions::register_vector_functions(&context);
         Ok(Self {
             context,
             target_parallelism: target_partitions,

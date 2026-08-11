@@ -369,6 +369,12 @@ pub static CHECKLIST: &[ChecklistCase] = &[
     ),
     // ── DESCRIBE ─────────────────────────────────────────────────────────────
     sql("describe.function_database_query", "DESCRIBE FUNCTION abs"),
+    // ── FUNCTIONS: vector distances (Phase 36 G19) ───────────────────────────
+    sql(
+        "functions.vector.distances",
+        "SELECT cosine_distance([1.0, 0.0], [0.0, 1.0]), \
+                inner_product([1.0, 2.0], [3.0, 4.0])",
+    ),
     // ── TEMPORAL ──────────────────────────────────────────────────────────────
     elsewhere(
         "temporal.as_of",
