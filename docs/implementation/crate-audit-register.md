@@ -33,7 +33,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | # | crate | LOC | files | read whole | why here |
 |---|---|---|---|---|---|
 | **Tier 1 — critical path** |
-| 1 | krishiv-sql | 46,632 | 61 | 24 | 17 files read whole 2026-08-09 — **18 live defects fixed**, incl. MERGE INTO never working, silent time-travel-to-present, and an orphan (never-compiled) feature file |
+| 1 | krishiv-sql | 46,632 | 61 | 38 | **34 live defects fixed**; 4 unreachable modules found; a crate-wide Unicode-folding bug class swept. Remaining are the big four: `distributed_plan` (8.5k), `spillable_join` (3.3k), `catalog/` (5.9k), `sql_tests` (2k) |
 | 2 | krishiv-executor | 28,927 | 40 | **40 — COMPLETE 2026-08-02** | second crate fully read; 3 defects fixed |
 | 3 | krishiv-shuffle | 14,329 | 36 | **36 — COMPLETE 2026-08-02** | first crate fully read; 4 defects fixed |
 | 4 | krishiv-scheduler | **51,438** | **78** | **78 (COMPLETE)** | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
@@ -66,7 +66,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 
 ---
 
-## 1. krishiv-sql — 24 of 61 files read whole (2026-08-09)
+## 1. krishiv-sql — 38 of 61 files read whole (2026-08-09 → 08-11)
 
 Measured coverage: **78.01% regions, 70.84% functions, 76.87% lines.**
 
@@ -275,6 +275,88 @@ Uncovered-region concentration (this decides what to test next):
 krishiv-sql lacks a `mod` declaration. Repeated across the whole workspace, the
 only hits are eight `src/bin/*.rs` — Cargo auto-discovers binary targets, so
 those are false positives, not findings.
+
+#### Batches 5–12 (read whole, 2026-08-09 → 08-11)
+
+**Wrong answers**
+
+- [x] **A `HOP` window put each event in one window instead of `size/slide`.**
+      `streaming_tvf`'s own doc says "each event appears in (size/slide)
+      windows"; the rewrite was a *scalar projection*, which cannot fan one row
+      into several, so every grouped aggregate over a HOP undercounted. Fixed
+      with `hop_first_start` + `generate_series` + `unnest`. Running the **full**
+      suite exposed the coupling: `streaming_window_plan` pattern-matches the
+      rewrite's *shape* to recover kind/size/slide, so the fan-out broke the
+      streaming compile until `extract_window` learned to resolve a
+      column-alias `window_start` through the `_tvf_hop` layer. `f30df557`
+- [x] **`PIVOT(` with no space parsed `SUM` as `UM`** — the parser advanced by
+      the length of the *spaced* keyword unconditionally. Every test used the
+      spaced form. And `strip_select_star_prefix` used `rfind(" FROM ")`, so a
+      subquery source was truncated to a fragment with an unbalanced paren; now
+      scans for the first `" FROM "` at paren depth 0. `89d7c85c`
+- [x] **Unicode case folding shifted byte offsets into the original SQL** —
+      a whole bug *class*, swept crate-wide. These parsers fold a copy to find a
+      keyword then index the original; `to_uppercase` is not length-preserving
+      (U+FB01 -> "FI"). In `live_table.rs` it truncated the registered name and
+      **panicked** on a non-char boundary; also fixed in `spark_sql_ext`,
+      `pipe_syntax`, `incremental_view` (3 sites) and `pipeline_ddl`.
+      `222c4fb2`, `87353591`, `229af32d`
+- [x] `SHOW SCHEMAS IN <catalog>` ignored the catalog and listed every one;
+      ``USE `my.schema` `` split a quoted identifier on its dot. `b0000e95`
+- [x] `incremental_view` LATENESS: `splitn(_, char::is_whitespace)` does not
+      collapse runs, so a second space shifted every field; and the code carried
+      the comment "tokens[1] should be INTERVAL" without checking it.
+      `87353591`
+
+**Unreachable code — four modules**
+
+- [x] **`pipe_syntax.rs` had no `mod` declaration anywhere**: never compiled,
+      its six tests ran zero times (`running 0 tests`), and the documented
+      feature did not exist. Wired, after fixing what the dead code hid —
+      repeated stages silently overwrote, and a filter after `GROUP BY` was
+      emitted as `WHERE`. `7cf02964`
+- [x] **`spark_sql_ext.rs`**: all 11 public fns have zero callers. Its rewrites
+      named things that do not exist (`explode`, and
+      `information_schema.table_properties`, zero hits in datafusion-catalog-54),
+      and `rewrite_transform` returned its input while documenting a rewrite.
+      Made correct-if-wired; **wire-or-delete left as a recorded product
+      decision**, not guessed at. `458047bc`
+- [x] **`subquery.rs`'s streaming guard had no callers, so it guarded nothing.**
+      Wired into `SqlEngine::sql`. Note the register itself recorded this module
+      as *fixed* in `927c1243` — a real fix to a guard nothing invoked. `5af86e97`
+- [x] `coverage.rs` looked dead by the same measure and **is not**: it is a
+      self-exercising test harness. Checked before believing.
+
+**Honesty / published surface**
+
+- [x] The feature matrix reported `aggregate`/`reduce` as `planned`; they ship
+      and have end-to-end tests. Split the bundled entry, added the checklist
+      case the CI rule then required. The drift guard caught the docs pages and
+      names its own bless command — the one mechanism in this crate that
+      actively *prevents* doc/code divergence. `958fa098`
+- [x] Every `SqlError::DataFusion` mapped to `XX000` "engine fault", so a user's
+      typo was reported to JDBC/ODBC clients as an engine bug. Classified by
+      DataFusion's own `error_prefix()` literals, verified by round-tripping real
+      error variants. `190b92ea`
+- [x] `MERGE INTO` was rejected unconditionally (non-capturing `WHEN` arms);
+      insert-only merges also updated; the `iceberg:` branch reported a merge
+      that never happened. `3200c987`
+- [x] An `AS OF` qualifier the mapper could not read was silently dropped, so
+      time travel returned the present. `51f66bd1`
+- [x] `ContinuousTableInput::cancel()` was a graceful close despite documenting
+      a hard cancel; a tokio mpsc receiver drains its buffer first. `b6d28985`
+
+**Verified correct (recorded so they are not re-derived)**
+
+`join_estimates.rs` (documents *why* two rules must read the same statistics
+differently), `higher_order_functions.rs` and `spark_functions.rs` (alias onto
+DataFusion's exact impls; refuse to approximate), `create_function_ddl.rs` —
+whose `CREATE_FUNCTION_RE` shows the correct optional-capture idiom `MERGE_RE`
+got wrong, and whose `bind_sql_body_args` is a real tokenizer, so the
+`LANGUAGE SQL` UDTF body is **not** injectable. Also `json_functions.rs`,
+`object_store_registry.rs`, `rest_catalog_wrapper.rs`, `streaming_table_ddl.rs`,
+`scalar_udf.rs`, `introspection_sql.rs`, and `REFRESH PIPELINE … FULL` (looks
+like the folding bug, slices by `rest.len()`, is safe — pinned by a test).
 
 Five lessons from these files, all about *my own* method:
 
