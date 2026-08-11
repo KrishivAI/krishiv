@@ -114,6 +114,7 @@ Each feature is dimensioned across the three Krishiv execution engines: **batch*
 | `functions.json.from_to_json` | from_json / to_json struct⇄JSON conversion | planned | n/a | n/a | requires a typed arrow⇄JSON converter + a Spark-DDL schema parser with Spark's version-specific null-field/timestamp rules; itemized shortfall, not shipped approximate |
 | `functions.json.json_tuple` | json_tuple(json, k1, k2, …) multi-key extraction (generator) | planned | n/a | n/a | needs table-generating/LATERAL VIEW machinery; use get_json_object per key today |
 | `functions.json.schema_of_json` | schema_of_json(json) infer a DDL schema string | planned | n/a | n/a |  |
+| `functions.vector.distances` | cosine_distance / array_cosine_distance / inner_product (+ native array_distance L2) | supported | n/a | n/a | Phase 36 G19 first half: similarity expressible in plain governed SQL over List/FixedSizeList embeddings. Zero-magnitude cosine is NULL (undefined, not an error); per-row length mismatches and NULL elements error — corrupt embeddings must not silently rank. ANN acceleration (IVF-in-Parquet probe rewrite) is the open second half; ORDER BY distance LIMIT k runs exact today |
 | `functions.hof.transform` | transform(array, x -> …) — Spark alias for array_transform | supported | n/a | n/a |  |
 | `functions.hof.filter` | filter(array, x -> …) — Spark alias for array_filter | supported | n/a | n/a |  |
 | `functions.hof.exists` | exists / any_match(array, x -> …) predicate-any | partial | n/a | n/a | any_match is reachable; the `exists(...)` spelling is shadowed by the EXISTS-subquery keyword in the parser (documented dialect difference) |
@@ -137,7 +138,7 @@ Each feature is dimensioned across the three Krishiv execution engines: **batch*
 | `dml.update` | UPDATE table SET col = … WHERE … | partial | n/a | n/a | supported on Iceberg tables via MERGE rewrite |
 | `dml.merge` | MERGE INTO target USING source ON … WHEN MATCHED … | supported | n/a | n/a |  |
 | `dml.iceberg_merge` | Atomic Iceberg MERGE with row-level deletes | supported | n/a | n/a |  |
-| `dml.truncate` | TRUNCATE TABLE (Iceberg + memory) | planned | n/a | n/a | itemized shortfall: TRUNCATE is not yet wired for memory/Iceberg session tables |
+| `dml.truncate` | TRUNCATE TABLE (Iceberg + memory) | supported | n/a | n/a | Phase 60 close-out: memory tables swap to an empty provider (schema intact); Iceberg tables truncate through the copy-on-write delete path (snapshot-committed). External file-backed tables are refused with the reason — their files ARE the table |
 
 ## DDL
 
@@ -163,19 +164,20 @@ Each feature is dimensioned across the three Krishiv execution engines: **batch*
 |---|---|---|---|---|---|
 | `stmt.set_reset` | SET / RESET / SET TIMEZONE session config | supported | n/a | n/a | DataFusion-native session config |
 | `stmt.use` | USE [CATALOG|SCHEMA] current-namespace | supported | n/a | n/a | Phase 60: mutates the session default catalog/schema |
-| `stmt.cache` | CACHE / UNCACHE / CLEAR CACHE TABLE (session materialization) | planned | n/a | n/a | itemized shortfall: needs a session-scoped materialization + provider swap/restore |
+| `stmt.cache` | CACHE / UNCACHE / CLEAR CACHE TABLE (session materialization) | supported | n/a | n/a | Phase 60 close-out: eager session-scoped materialization with provider swap/restore. LAZY and CACHE … AS SELECT are refused with direction (cache a view instead) |
 
 ## SHOW
 
 | Feature | Description | Batch | Streaming | Incremental | Notes |
 |---|---|---|---|---|---|
-| `show.tables_databases_functions` | SHOW TABLES | DATABASES | SCHEMAS | FUNCTIONS | COLUMNS | partial | n/a | n/a | TABLES/FUNCTIONS/COLUMNS are DataFusion-native; DATABASES/SCHEMAS added in Phase 60 (information_schema.schemata). SHOW PARTITIONS (Iceberg) and SHOW VIEWS remain the gap. |
+| `show.tables_databases_functions` | SHOW TABLES | DATABASES | SCHEMAS | FUNCTIONS | COLUMNS | partial | n/a | n/a | TABLES/FUNCTIONS/COLUMNS are DataFusion-native; DATABASES/SCHEMAS added in Phase 60 (information_schema.schemata). SHOW VIEWS remains the gap. |
+| `show.partitions` | SHOW PARTITIONS (Iceberg, identity transforms) | supported | n/a | n/a | Phase 60 close-out: lists live partitions Spark-shaped (col=value/…) from the Iceberg spec + DISTINCT scan, capped at 10k. Non-identity transforms and unpartitioned/non-Iceberg tables are refused with the reason, never an empty lie |
 
 ## DESCRIBE
 
 | Feature | Description | Batch | Streaming | Incremental | Notes |
 |---|---|---|---|---|---|
-| `describe.function_database_query` | DESCRIBE FUNCTION | DATABASE | QUERY | planned | n/a | n/a | DESCRIBE <table> is native; FUNCTION/DATABASE/QUERY are the itemized shortfall |
+| `describe.function_database_query` | DESCRIBE FUNCTION | DATABASE | QUERY | supported | n/a | n/a | Phase 60 close-out: FUNCTION/DATABASE rewrite to information_schema (routines/schemata); QUERY plans — never runs — the inner statement and describes its schema in the DESCRIBE <table> shape |
 
 ## TEMPORAL
 
