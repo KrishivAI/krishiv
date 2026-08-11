@@ -423,6 +423,25 @@ impl InProcessStreamingRuntime {
         tables: &[BatchSqlTable],
         is_streaming: bool,
     ) -> RuntimeResult<Vec<RecordBatch>> {
+        // Phase 60 "SQL DDL for the other two engines", embedded leg:
+        // CREATE STREAMING TABLE registers a continuous job on THIS
+        // runtime's registry — the body compiles through the same
+        // streaming front door as every cluster submission, so an
+        // unsupported query fails at the planner with the planner's
+        // reason. Feed it with push_continuous_input(<name>) and read it
+        // with drain_continuous_job(<name>): the same lifecycle every
+        // continuous job has here.
+        if let Some(ddl) = krishiv_sql::streaming_table_ddl::parse_create_streaming_table(query) {
+            let plan = krishiv_sql::streaming_window_plan::compile_streaming_window_sql(&ddl.query)
+                .map_err(|e| RuntimeError::InvalidState {
+                    message: e.to_string(),
+                })?;
+            if ddl.or_replace && self.continuous_registry.has_job(&ddl.name) {
+                self.continuous_registry.deregister_job(&ddl.name)?;
+            }
+            self.register_continuous_job(&ddl.name, plan.spec)?;
+            return Ok(Vec::new());
+        }
         // Fast path: bypass the coordinator state machine for non-streaming
         // batch queries. The coordinator was designed for distributed job
         // lifecycle; routing in-process single-stage SQL through it adds
@@ -1842,6 +1861,83 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// Phase 60 embedded leg: CREATE STREAMING TABLE registers a continuous
+    /// job on this runtime; pushing input and draining produce windowed
+    /// output under the table's name, and OR REPLACE re-registers.
+    #[test]
+    fn create_streaming_table_registers_and_drains() {
+        use arrow::array::Int64Array;
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let batches = runtime
+            .execute_batch_sql(
+                "CREATE STREAMING TABLE clicks_1s AS \
+                 SELECT user_id, COUNT(*) AS n \
+                 FROM TUMBLE(TABLE events, DESCRIPTOR(event_time), 1000) \
+                 GROUP BY user_id, window_start, window_end",
+                &[],
+                false,
+            )
+            .expect("streaming table DDL registers");
+        assert!(batches.is_empty(), "DDL returns no rows");
+        assert!(
+            runtime.list_continuous_jobs().contains(&"clicks_1s".to_string()),
+            "job registered under the table name"
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("event_time", DataType::Int64, false),
+        ]));
+        let input = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["u1", "u1", "u2"])),
+                Arc::new(Int64Array::from(vec![100, 200, 300])),
+            ],
+        )
+        .unwrap();
+        // Second batch far past the first window closes it.
+        let schema2 = input.schema();
+        let closer = RecordBatch::try_new(
+            schema2,
+            vec![
+                Arc::new(StringArray::from(vec!["u3"])),
+                Arc::new(Int64Array::from(vec![10_000])),
+            ],
+        )
+        .unwrap();
+        runtime
+            .push_continuous_input("clicks_1s", vec![input, closer])
+            .expect("push");
+        let out = runtime.drain_continuous_job("clicks_1s").expect("drain");
+        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert!(rows >= 2, "closed window must emit u1 and u2 rows, got {rows}");
+
+        // OR REPLACE re-registers; plain CREATE on an existing name errors.
+        runtime
+            .execute_batch_sql(
+                "CREATE OR REPLACE STREAMING TABLE clicks_1s AS \
+                 SELECT user_id, COUNT(*) AS n \
+                 FROM TUMBLE(TABLE events, DESCRIPTOR(event_time), 5000) \
+                 GROUP BY user_id, window_start, window_end",
+                &[],
+                false,
+            )
+            .expect("OR REPLACE re-registers");
+        let err = runtime
+            .execute_batch_sql(
+                "CREATE STREAMING TABLE clicks_1s AS \
+                 SELECT user_id, COUNT(*) AS n \
+                 FROM TUMBLE(TABLE events, DESCRIPTOR(event_time), 1000) \
+                 GROUP BY user_id, window_start, window_end",
+                &[],
+                false,
+            )
+            .err()
+            .expect("duplicate without OR REPLACE must error");
+        assert!(err.to_string().contains("clicks_1s"), "{err}");
     }
 
     #[test]
