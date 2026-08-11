@@ -949,11 +949,102 @@ impl Coordinator {
                 );
             }
         }
-        for job_id in jobs_to_reassign {
-            if let Err(error) = self.assign_pending_tasks(&job_id) {
+        for job_id in &jobs_to_reassign {
+            if let Err(error) = self.assign_pending_tasks(job_id) {
                 tracing::warn!(job_id = %job_id, error = %error, "failed to reassign tasks after executor loss");
             }
         }
+        // Phase 55/58 residual: a run-loop job's keyed-exchange peer table
+        // was baked into its stored input partitions at launch; after a
+        // reassignment those partitions still name the LOST executor's
+        // endpoint, so every relaunch rejoined a dead exchange and the job
+        // burned its whole loss budget on the same stale table. Re-bake
+        // from the current assignments so relaunches converge.
+        for job_id in &jobs_to_reassign {
+            if self.refresh_rloop_peer_partitions(job_id) {
+                tracing::info!(
+                    job_id = %job_id,
+                    executor_id = %lost_id,
+                    "stream:rloop peer table re-baked from post-loss assignments"
+                );
+            }
+        }
+    }
+
+    /// Rebuild a run-loop job's `stream-peers:` input partition from its
+    /// CURRENT task assignments, replacing the launch-time table stored in
+    /// `job_task_input_partitions` (the map relaunch assignments are built
+    /// from — `JobRecord::launch_ready` reads it as `task_inline_partitions`).
+    ///
+    /// Surviving subtasks still hold the old table in-process: their next
+    /// delivery to the moved peer fails, the task self-reports `Failed`,
+    /// [`Self::rescue_failed_continuous_task`] relaunches it, and the
+    /// relaunch reads the table rebuilt here — bounded convergence (one
+    /// restart per survivor, within the existing loss budget) instead of
+    /// the permanent stale-table failure loop. A live in-process refresh
+    /// for survivors (heartbeat-piggybacked, like the throttle commands)
+    /// is the deferred optimization; this is the correctness half.
+    ///
+    /// Returns whether any stored partition changed. Declines (leaving the
+    /// stored table untouched) while any rloop subtask is unassigned or its
+    /// executor has no task endpoint — a partial table would fail the
+    /// exchange closed at parse time, which is strictly worse than letting
+    /// the next assignment round complete the placement first.
+    pub(crate) fn refresh_rloop_peer_partitions(&mut self, job_id: &JobId) -> bool {
+        const PREFIX: &str = "stream-peers:";
+        let profile = self.durability_profile;
+        let Some(job_arc) = self.job_coordinators.get(job_id).cloned() else {
+            return false;
+        };
+        let mut peers: Vec<(usize, krishiv_proto::TaskId, String)> = Vec::new();
+        {
+            let job = job_arc.read_record();
+            for stage in job.spec.stages() {
+                for (index, task) in stage.tasks().iter().enumerate() {
+                    let is_rloop = krishiv_plan::task_body_for_profile(task.description(), profile)
+                        .is_ok_and(|body| body.starts_with("stream:rloop:"));
+                    if !is_rloop {
+                        continue;
+                    }
+                    let assigned = job
+                        .stages
+                        .iter()
+                        .flat_map(|s| s.tasks())
+                        .find(|t| t.task_id() == task.task_id())
+                        .and_then(|t| t.assigned_executor().cloned());
+                    let Some(executor_id) = assigned else {
+                        return false;
+                    };
+                    let Some(endpoint) = self.find_executor_endpoint(&executor_id) else {
+                        return false;
+                    };
+                    peers.push((index, task.task_id().clone(), endpoint));
+                }
+            }
+        }
+        if peers.is_empty() {
+            return false;
+        }
+        let entries: Vec<String> = peers
+            .iter()
+            .map(|(subtask, task_id, endpoint)| format!("{subtask}={task_id}@{endpoint}"))
+            .collect();
+        let payload = format!("{PREFIX}{}", entries.join(";"));
+        let Some(per_task) = self.job_task_input_partitions.get_mut(job_id) else {
+            return false;
+        };
+        let mut changed = false;
+        for partitions in per_task.values_mut() {
+            for partition in partitions.iter_mut() {
+                if partition.description().trim().starts_with(PREFIX)
+                    && partition.description().trim() != payload
+                {
+                    *partition = krishiv_proto::InputPartition::new("stream-peers", payload.clone());
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     /// Rescue a continuous (`stream:loop`) task that reported `Failed`
@@ -1025,6 +1116,10 @@ impl Coordinator {
             if let Err(error) = self.assign_pending_tasks(job_id) {
                 tracing::warn!(job_id = %job_id, error = %error, "failed to reassign after continuous rescue");
             }
+            // The rescued task may have moved; relaunches (this one and any
+            // sibling that fails against the old endpoint next) must read a
+            // peer table naming the CURRENT endpoints.
+            self.refresh_rloop_peer_partitions(job_id);
         }
         rescued
     }
@@ -1499,5 +1594,183 @@ mod stuck_assigned_reclaim_tests {
              Assigned, not only once it later reaches Running — otherwise \
              reset_stuck_assigned_tasks can never see it"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod rloop_peer_refresh_tests {
+    use super::*;
+    use krishiv_proto::{ExecutorDescriptor, ExecutorId, JobSpec, StageSpec, TaskSpec};
+
+    fn rloop_job(job_id: &JobId) -> JobSpec {
+        JobSpec::new(job_id.clone(), "rloop-refresh-test", JobKind::Batch).with_stage(
+            StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage")
+                .with_task(TaskSpec::new(
+                    TaskId::try_new("rl-0").unwrap(),
+                    "stream:rloop:refresh-job:0:2:tumbling",
+                ))
+                .with_task(TaskSpec::new(
+                    TaskId::try_new("rl-1").unwrap(),
+                    "stream:rloop:refresh-job:1:2:tumbling",
+                )),
+        )
+    }
+
+    /// Phase 55/58 residual: the launch-time `stream-peers:` table stored in
+    /// `job_task_input_partitions` is what every RELAUNCH assignment carries.
+    /// Losing an executor must re-bake it from the post-loss assignments —
+    /// with the stale table, each relaunch rejoined a dead exchange endpoint
+    /// and the task burned its whole loss budget on the same wrong address.
+    #[test]
+    fn executor_loss_rebakes_the_stored_rloop_peer_table() {
+        let mut coord = Coordinator::new_active(None).unwrap();
+        let exec_a = ExecutorId::try_new("exec-rl-a").unwrap();
+        let exec_b = ExecutorId::try_new("exec-rl-b").unwrap();
+        coord
+            .register_executor(
+                ExecutorDescriptor::new(exec_a.clone(), "host-a", 4)
+                    .with_task_endpoint("http://host-a:2005"),
+            )
+            .unwrap();
+        coord
+            .register_executor(
+                ExecutorDescriptor::new(exec_b.clone(), "host-b", 4)
+                    .with_task_endpoint("http://host-b:2005"),
+            )
+            .unwrap();
+
+        let job_id = JobId::try_new("refresh-job").unwrap();
+        coord.submit_job(rloop_job(&job_id)).unwrap();
+        coord.assign_pending_tasks(&job_id).unwrap();
+
+        // Launch-time state: the per-task partition map carries the peer
+        // table as launch_run_loop_job would have written it, naming the
+        // CURRENT endpoints of the freshly assigned tasks.
+        assert!(
+            !coord.refresh_rloop_peer_partitions(&job_id),
+            "no stored partitions yet — nothing to rewrite"
+        );
+        let initial = {
+            let jc = coord.job_coordinators.get(&job_id).unwrap();
+            let record = jc.read_record();
+            let entries: Vec<String> = record.spec.stages()[0]
+                .tasks()
+                .iter()
+                .enumerate()
+                .map(|(idx, task)| {
+                    let assigned = record
+                        .stages()
+                        .iter()
+                        .flat_map(|s| s.tasks())
+                        .find(|t| t.task_id() == task.task_id())
+                        .and_then(|t| t.assigned_executor().cloned())
+                        .expect("assigned after assign_pending_tasks");
+                    let endpoint = coord.find_executor_endpoint(&assigned).unwrap();
+                    format!("{idx}={}@{endpoint}", task.task_id())
+                })
+                .collect();
+            format!("stream-peers:{}", entries.join(";"))
+        };
+        let mut per_task = std::collections::HashMap::new();
+        for task_id in ["rl-0", "rl-1"] {
+            per_task.insert(
+                TaskId::try_new(task_id).unwrap(),
+                vec![krishiv_proto::InputPartition::new(
+                    "stream-peers",
+                    initial.clone(),
+                )],
+            );
+        }
+        coord.job_task_input_partitions.insert(job_id.clone(), per_task);
+
+        // Find which executor holds a task, then lose it.
+        let lost = {
+            let jc = coord.job_coordinators.get(&job_id).unwrap();
+            let record = jc.read_record();
+            record.stages()[0].tasks()[0]
+                .assigned_executor()
+                .cloned()
+                .expect("task 0 assigned")
+        };
+        let lost_endpoint = coord.find_executor_endpoint(&lost).unwrap();
+        coord.mark_executor_lost(&lost).unwrap();
+
+        // Every task must now be assigned to a live executor, and the STORED
+        // peer table must name only live endpoints — the relaunch reads this.
+        let survivor_endpoint = if lost == exec_a {
+            "http://host-b:2005"
+        } else {
+            "http://host-a:2005"
+        };
+        let stored = coord
+            .job_task_input_partitions
+            .get(&job_id)
+            .unwrap()
+            .values()
+            .flatten()
+            .map(|p| p.description().to_owned())
+            .collect::<Vec<_>>();
+        assert!(!stored.is_empty());
+        for description in &stored {
+            assert!(
+                description.starts_with("stream-peers:"),
+                "partition kind preserved: {description}"
+            );
+            assert!(
+                !description.contains(&lost_endpoint),
+                "stale endpoint of the lost executor survived the re-bake: {description}"
+            );
+            assert!(
+                description.contains(survivor_endpoint),
+                "re-baked table must name the surviving executor: {description}"
+            );
+            assert!(
+                description.contains("0=rl-0@") && description.contains("1=rl-1@"),
+                "both subtasks present with their launch indices: {description}"
+            );
+        }
+    }
+
+    /// A partially assigned job must NOT get a partial peer table: the
+    /// refresh declines and leaves the stored table alone until placement
+    /// completes (a missing subtask entry fails the exchange closed).
+    #[test]
+    fn refresh_declines_while_a_subtask_is_unassigned() {
+        let mut coord = Coordinator::new_active(None).unwrap();
+        let exec_a = ExecutorId::try_new("exec-rl-solo").unwrap();
+        coord
+            .register_executor(
+                ExecutorDescriptor::new(exec_a.clone(), "host-solo", 4)
+                    .with_task_endpoint("http://host-solo:2005"),
+            )
+            .unwrap();
+        let job_id = JobId::try_new("refresh-partial").unwrap();
+        coord.submit_job(rloop_job(&job_id)).unwrap();
+        let stale = "stream-peers:0=rl-0@http://gone:1;1=rl-1@http://gone:1";
+        let mut per_task = std::collections::HashMap::new();
+        per_task.insert(
+            TaskId::try_new("rl-0").unwrap(),
+            vec![krishiv_proto::InputPartition::new("stream-peers", stale)],
+        );
+        coord.job_task_input_partitions.insert(job_id.clone(), per_task);
+
+        // Lose the ONLY executor: tasks reset to Pending with nowhere to go.
+        // The loss-path refresh (and any direct call) must decline rather
+        // than store a partial table.
+        coord.mark_executor_lost(&exec_a).unwrap();
+        assert!(
+            !coord.refresh_rloop_peer_partitions(&job_id),
+            "unassigned subtasks must decline the refresh"
+        );
+        let stored = coord
+            .job_task_input_partitions
+            .get(&job_id)
+            .unwrap()
+            .values()
+            .flatten()
+            .map(|p| p.description().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(stored, vec![stale.to_owned()], "stored table untouched");
     }
 }
