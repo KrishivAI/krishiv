@@ -45,6 +45,18 @@ impl IvfIndex {
         self.inverted.len()
     }
 
+    /// The centroids, row-major (`nlist * dim`). Read-only: exposed for the
+    /// exact pruned traversal (`vector_search`), which needs cell geometry.
+    pub fn centroids(&self) -> &[f32] {
+        &self.centroids
+    }
+
+    /// The inverted lists: per cell, the member row offsets. Read-only, for
+    /// the same traversal.
+    pub fn cells(&self) -> &[Vec<u32>] {
+        &self.inverted
+    }
+
     /// Total indexed rows across all cells.
     pub fn len(&self) -> usize {
         self.inverted.iter().map(Vec::len).sum()

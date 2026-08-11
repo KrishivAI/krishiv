@@ -638,10 +638,14 @@ static FEATURES: &[FeatureEntry] = &[
          must not silently rank. IVF ANN acceleration landed 2026-08-11 (vector_index: \
          k-means cells + probe, results-identical at nprobe>=nlist; vector_search: \
          SqlEngine::ann_search over a governed table, multi-batch re-rank; vector_quantize: \
-         data-oblivious scalar codes for candidate scoring). Remaining wire-in: the \
-         Parquet-footer read/write + the physical-optimizer ORDER-BY-distance-LIMIT-k \
-         auto-rewrite (today ann_search is the explicit accelerated entry point; \
-         ORDER BY distance LIMIT k still runs exact through the planner)",
+         data-oblivious scalar codes for candidate scoring). Wire-in landed same day: \
+         Parquet-footer index write/read (vector_footer, degrade-to-brute-force on foreign \
+         footers) and the ann_rewrite optimizer rule — ORDER BY distance LIMIT k over an \
+         indexed table gains an EXACT plan-time τ pre-filter under the untouched Sort \
+         (results-identical by construction; cache invalidated on every DML; \
+         KRISHIV_ANN_AUTO_REWRITE=off disables). Single-node engine only: the staged \
+         distributed planner registers the same rule over an empty cache, so it is \
+         present but inert there — distributed kNN still runs exact unaccelerated",
     ),
     // ── FUNCTIONS: higher-order array lambdas (Phase 60) ─────────────────────
     FeatureEntry::batch_only(

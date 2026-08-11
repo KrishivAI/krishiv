@@ -130,10 +130,12 @@ pub mod coverage;
 mod higher_order_functions;
 mod json_functions;
 mod spark_functions;
+pub mod ann_rewrite;
 pub mod vector_metric;
 pub mod vector_index;
 pub mod vector_quantize;
 pub mod vector_functions;
+pub mod vector_footer;
 pub mod vector_search;
 pub mod statement_completion;
 pub mod streaming;
@@ -740,12 +742,34 @@ pub fn with_krishiv_optimizer_rules(
     with_krishiv_optimizer_rules_with_join_threshold(builder, None)
 }
 
+/// As [`with_krishiv_optimizer_rules`], wiring the ANN top-k rule to a
+/// LIVE vector-index cache (an engine's own). The plain variant registers
+/// the same rule over an empty cache — present but inert — so the staged
+/// planner and the engine run the identical rule list and can only differ
+/// where engine-resident index data actually exists.
+#[must_use]
+fn with_krishiv_optimizer_rules_with_vector_cache(
+    builder: datafusion::execution::session_state::SessionStateBuilder,
+    vector_indexes: crate::vector_search::VectorIndexCache,
+) -> datafusion::execution::session_state::SessionStateBuilder {
+    with_krishiv_optimizer_rules_inner(builder, None, vector_indexes)
+}
+
 /// As [`with_krishiv_optimizer_rules`], with the spillable-join build-side
 /// threshold given explicitly; `None` derives it from this process's capacity.
 #[must_use]
 pub fn with_krishiv_optimizer_rules_with_join_threshold(
     builder: datafusion::execution::session_state::SessionStateBuilder,
     spill_join_build_bytes: Option<u64>,
+) -> datafusion::execution::session_state::SessionStateBuilder {
+    with_krishiv_optimizer_rules_inner(builder, spill_join_build_bytes, std::sync::Arc::default())
+}
+
+#[must_use]
+fn with_krishiv_optimizer_rules_inner(
+    builder: datafusion::execution::session_state::SessionStateBuilder,
+    spill_join_build_bytes: Option<u64>,
+    vector_indexes: crate::vector_search::VectorIndexCache,
 ) -> datafusion::execution::session_state::SessionStateBuilder {
     let spillable_join = match spill_join_build_bytes {
         // Deliberately NOT grace-aware: this builder plans the stages the
@@ -822,6 +846,14 @@ pub fn with_krishiv_optimizer_rules_with_join_threshold(
         // is what actually prunes the deferred columns out of the scans.
         .with_optimizer_rule(std::sync::Arc::new(
             crate::late_materialize::LateMaterializeTopKAggregate::default(),
+        ))
+        // Phase 36 G19: `ORDER BY distance(col, literal) LIMIT k` over an
+        // indexed table gains an exact τ pre-filter. Results-identical by
+        // construction (the Sort is untouched); fires only when the cache
+        // this rule was built over holds an index for the scanned table —
+        // an empty cache (the staged planner, the CLI) makes it inert.
+        .with_optimizer_rule(std::sync::Arc::new(
+            crate::ann_rewrite::AnnTopKPrefilter::new(vector_indexes),
         ))
 }
 
@@ -961,6 +993,11 @@ pub struct SqlEngine {
     /// Used by `krishiv_logical_plan` to annotate scan nodes for the
     /// `BroadcastAutoRule` optimizer.
     table_row_counts: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    /// Per-table vector indexes (Phase 36 G19), shared with the
+    /// `ann_rewrite::AnnTopKPrefilter` optimizer rule so an index built
+    /// through any entry point accelerates plain-SQL kNN immediately.
+    /// Invalidated by every DML / re-registration path.
+    vector_indexes: crate::vector_search::VectorIndexCache,
     /// DataFusion memory pool limit in bytes for this engine, when bounded.
     /// `None` means the default unbounded pool. When `Some`, the engine runs
     /// with a `FairSpillPool` so sorts, hash joins, and aggregations spill to
@@ -1251,10 +1288,15 @@ impl SqlEngine {
         // correctly register in is_streaming_query.
         let streaming_sources: Arc<RwLock<std::collections::HashSet<String>>> =
             Arc::new(RwLock::new(std::collections::HashSet::new()));
+        // Created before the session state so the ANN top-k rule and the
+        // engine share one map (Phase 36 G19): an index built through any
+        // engine entry point is immediately visible at plan time.
+        let vector_indexes: crate::vector_search::VectorIndexCache = Arc::default();
 
-        let mut state_builder = with_krishiv_optimizer_rules(
+        let mut state_builder = with_krishiv_optimizer_rules_with_vector_cache(
             datafusion::execution::session_state::SessionStateBuilder::new()
                 .with_default_features(),
+            vector_indexes.clone(),
         )
         .with_config(build_single_node_session_config(
             target_partitions,
@@ -1348,6 +1390,7 @@ impl SqlEngine {
             shuffle_partitions: Arc::new(std::sync::RwLock::new(None)),
             cached_table_originals: Arc::new(std::sync::RwLock::new(HashMap::new())),
             table_row_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            vector_indexes,
             memory_limit_bytes,
             #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
             iceberg_catalogs: Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -1364,9 +1407,11 @@ impl SqlEngine {
     fn build_absolute_minimal(target_partitions: NonZeroUsize) -> Self {
         let streaming_sources: Arc<RwLock<std::collections::HashSet<String>>> =
             Arc::new(RwLock::new(std::collections::HashSet::new()));
-        let mut state = with_krishiv_optimizer_rules(
+        let vector_indexes: crate::vector_search::VectorIndexCache = Arc::default();
+        let mut state = with_krishiv_optimizer_rules_with_vector_cache(
             datafusion::execution::session_state::SessionStateBuilder::new()
                 .with_default_features(),
+            vector_indexes.clone(),
         )
         .with_config(build_single_node_session_config(target_partitions, None))
         .build();
@@ -1390,6 +1435,7 @@ impl SqlEngine {
             shuffle_partitions: Arc::new(std::sync::RwLock::new(None)),
             cached_table_originals: Arc::new(std::sync::RwLock::new(HashMap::new())),
             table_row_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            vector_indexes,
             memory_limit_bytes: None,
             #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
             iceberg_catalogs: Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -1773,6 +1819,7 @@ impl SqlEngine {
         if name.trim().is_empty() {
             return Err(SqlError::EmptyTableName);
         }
+        self.invalidate_vector_indexes(name);
         let _ = self
             .context
             .deregister_table(name)
@@ -2396,6 +2443,8 @@ impl SqlEngine {
         let spec = crate::distributed_plan::ParquetTableSpec::new(table_name, path)
             .with_primary_key(primary_key.iter().map(|c| c.as_ref().to_owned()));
         crate::distributed_plan::register_parquet_table(&self.context, &spec).await?;
+        // (Re-)registration replaces the rows a vector index described.
+        self.invalidate_vector_indexes(table_name);
         // Extract estimated row count from table provider statistics.
         if let Ok(provider) = self.context.table_provider(table_name).await
             && let Some(stats) = provider.statistics()
@@ -2464,6 +2513,8 @@ impl SqlEngine {
             .map_err(|e| SqlError::DataFusion {
                 message: e.to_string(),
             })?;
+        // (Re-)registration replaces the rows a vector index described.
+        self.invalidate_vector_indexes(table_name);
         if total_rows > 0
             && let Ok(mut counts) = self.table_row_counts.write()
         {
@@ -2581,6 +2632,7 @@ impl SqlEngine {
         if query.trim().is_empty() {
             return Err(SqlError::EmptyQuery);
         }
+        self.invalidate_vector_indexes_for_statement(query);
 
         // ── Multi-statement scripts ──────────────────────────────────────────
         // Distributed batch fragments are re-planned on a fresh engine per
@@ -3412,6 +3464,9 @@ impl SqlEngine {
     /// statistics stay warm without an explicit `ANALYZE TABLE` run.
     #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
     fn record_table_row_count_stat(&self, table_ref: &str, row_count: u64) {
+        // A recorded count means the table's rows just changed (CTAS,
+        // replace): any vector index over them is stale.
+        self.invalidate_vector_indexes(table_ref);
         let registry = krishiv_plan::optimizer::global_table_stats();
         let mut names = vec![table_ref];
         let bare = table_ref.rsplit('.').next().unwrap_or(table_ref);
@@ -3442,6 +3497,7 @@ impl SqlEngine {
     /// Anything else is refused with the reason — an external file-backed
     /// table IS its files, and pretending to truncate it would lie.
     async fn execute_truncate(&self, table: &str) -> SqlResult<()> {
+        self.invalidate_vector_indexes(table);
         #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
         if let Some((iceberg_catalog, table_ident)) = self.resolve_iceberg_table(table) {
             let (deleted, _) = krishiv_connectors::lakehouse::dml::iceberg_delete_where(
@@ -3711,6 +3767,9 @@ impl SqlEngine {
 
     #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
     fn adjust_table_row_count_stat(&self, table_ref: &str, delta: i64) {
+        // A row-count delta means DML touched the table: any vector index
+        // over it is stale.
+        self.invalidate_vector_indexes(table_ref);
         let registry = krishiv_plan::optimizer::global_table_stats();
         let mut names = vec![table_ref];
         let bare = table_ref.rsplit('.').next().unwrap_or(table_ref);
