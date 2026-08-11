@@ -321,12 +321,52 @@ pub fn execute_pipeline_ddl(registry: &PipelineRegistry, sql: &str) -> SqlResult
 /// Split `rest` on the first case-insensitive occurrence of `keyword`
 /// (e.g. " AS "), returning `(before_trimmed, after)`.
 fn split_keyword(rest: &str, keyword: &str) -> Option<(String, String)> {
-    let upper = rest.to_uppercase();
-    let key_upper = keyword.to_uppercase();
+    // ASCII folding: `idx` indexes `rest`, so the folded copy must keep the same
+    // byte length. Unicode folding does not (U+FB01 -> "FI", 3 bytes to 2),
+    // which truncated the name before the keyword and could slice a character
+    // in half.
+    let upper = rest.to_ascii_uppercase();
+    let key_upper = keyword.to_ascii_uppercase();
     let idx = upper.find(&key_upper)?;
     let before = rest[..idx].trim().to_string();
     let after = rest[idx + keyword.len()..].to_string();
     Some((before, after))
+}
+
+#[cfg(test)]
+mod folding_tests {
+    use super::*;
+
+    /// `split_keyword` takes the keyword offset from a folded copy and applies
+    /// it to the original, so the fold has to preserve byte length.
+    #[test]
+    fn a_source_name_whose_uppercase_is_shorter_is_not_truncated() {
+        let stmt = parse_pipeline_statement("CREATE SOURCE \u{FB01}x AS SELECT 1")
+            .unwrap()
+            .unwrap();
+        match stmt {
+            PipelineStatement::CreateSource { name, .. } => {
+                assert_eq!(name, "\u{FB01}x", "the whole name must survive");
+            }
+            other => panic!("expected create source, got {other:?}"),
+        }
+    }
+
+    /// The `FULL` suffix is stripped by `rest.len()`, not by the folded length,
+    /// so it is already safe — pinned so a later refactor cannot regress it.
+    #[test]
+    fn refresh_full_suffix_survives_a_non_ascii_sink_name() {
+        let stmt = parse_pipeline_statement("REFRESH PIPELINE \u{FB01}x FULL")
+            .unwrap()
+            .unwrap();
+        match stmt {
+            PipelineStatement::RefreshPipeline { sink, full } => {
+                assert_eq!(sink, "\u{FB01}x");
+                assert!(full, "FULL must be recognised");
+            }
+            other => panic!("expected refresh, got {other:?}"),
+        }
+    }
 }
 
 fn require_nonempty(s: &str) -> SqlResult<()> {
