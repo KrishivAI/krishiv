@@ -972,12 +972,52 @@ pub(crate) fn task_engine_memory_limit(
         .map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX))
 }
 
+/// Tasks currently executing on this process — armed by the runner's
+/// `RunningAttemptGuard` (incremented when a task starts, decremented when
+/// its guard drops), read by [`task_engine_parallelism`] to lend idle slots'
+/// parallelism to the tasks that are actually running (Phase 65 elastic
+/// DF-share).
+pub(crate) static OCCUPIED_TASK_SLOTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Elastic share: `cores / occupied`, floored at the static per-slot share
+/// and capped at the core count. Pure so it is directly testable; occupancy
+/// is sampled once at engine construction — a task keeps the width it
+/// planned with, so a burst arriving mid-flight transiently oversubscribes
+/// (DataFusion partitions are cooperative Tokio tasks, not pinned threads)
+/// and drains back to the static share as construction-time occupancy rises.
+fn elastic_parallelism(
+    base: std::num::NonZeroUsize,
+    cores: std::num::NonZeroUsize,
+    occupied: usize,
+) -> std::num::NonZeroUsize {
+    let lent = (cores.get() / occupied.max(1)).max(base.get()).min(cores.get());
+    std::num::NonZeroUsize::new(lent).unwrap_or(base)
+}
+
+/// Elastic DF-share is on by default; `KRISHIV_ELASTIC_DF_SHARE=0` (or
+/// `false`) disables it, and an explicit `KRISHIV_TARGET_PARALLELISM` pin
+/// wins outright — a pinned width must never be widened behind the
+/// operator's back (the all-slots-busy bench depends on exactly this).
+fn elastic_df_share_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if std::env::var("KRISHIV_TARGET_PARALLELISM").is_ok() {
+            return false;
+        }
+        !matches!(
+            std::env::var("KRISHIV_ELASTIC_DF_SHARE").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    })
+}
+
 /// DataFusion `target_partitions` for engines created inside a task slot.
 ///
 /// [`krishiv_sql::SqlEngine::new`] defaults to the machine's full CPU
 /// parallelism — right for the embedded placement, but an executor runs up to
-/// `slots` fragments concurrently, so each per-task engine gets its per-slot
-/// share: `max(1, cores / slots)`.
+/// `slots` fragments concurrently, so each per-task engine gets at least its
+/// per-slot share: `max(1, cores / slots)`.
 ///
 /// The share is taken from the resolved [`executor_capacity`], not from
 /// `KRISHIV_TASK_SLOTS` directly. Reading the environment variable here was a
@@ -985,8 +1025,19 @@ pub(crate) fn task_engine_memory_limit(
 /// without setting the variable, so the share was computed against the
 /// *default* slot count. On a 4-core executor started with `--slots 1` the
 /// single task got 1 partition instead of 4 and used a quarter of the CPU.
+///
+/// Phase 65 elastic DF-share: a task starting while most slots are IDLE gets
+/// the idle slots' shares lent to it (`cores / running-tasks`), so a lone
+/// batch task on a 12-core/12-slot executor plans 12-wide instead of 1-wide.
+/// Under full occupancy this is exactly the old static share.
 pub(crate) fn task_engine_parallelism() -> std::num::NonZeroUsize {
-    executor_capacity().task_parallelism
+    let capacity = executor_capacity();
+    let base = capacity.task_parallelism;
+    if !elastic_df_share_enabled() {
+        return base;
+    }
+    let occupied = OCCUPIED_TASK_SLOTS.load(std::sync::atomic::Ordering::Relaxed);
+    elastic_parallelism(base, capacity.cores, occupied)
 }
 
 /// Build the per-task SQL engine: its memory source, its job's UDF resource
@@ -1469,12 +1520,46 @@ mod tests {
         // independent reading of KRISHIV_TASK_SLOTS — that divergence is what
         // made `--slots N` a no-op for per-task parallelism. The arithmetic
         // itself is covered by krishiv_common::executor_capacity's tests.
+        //
+        // With the Phase 65 elastic share the exact value depends on the
+        // process-global occupancy gauge (other tests run tasks
+        // concurrently), so the wired function is bounded, not pinned:
+        // never below the static per-slot share, never above the cores.
+        // The exact lending arithmetic is pinned by the elastic_parallelism
+        // tests below.
         let capacity = super::executor_capacity();
-        assert_eq!(super::task_engine_parallelism(), capacity.task_parallelism);
+        let got = super::task_engine_parallelism();
+        assert!(
+            got >= capacity.task_parallelism && got <= capacity.cores.max(capacity.task_parallelism),
+            "elastic share {got} must stay within [per-slot share {}, cores {}]",
+            capacity.task_parallelism,
+            capacity.cores,
+        );
         assert!(
             capacity.task_parallelism.get() * capacity.slots.get() <= capacity.cores.get().max(1),
             "per-slot shares must not oversubscribe the cores they divide"
         );
+    }
+
+    #[test]
+    fn elastic_parallelism_lends_idle_slots_to_a_lone_task() {
+        let nz = |n: usize| std::num::NonZeroUsize::new(n).unwrap();
+        // 12 cores / 12 slots: static share is 1. A lone task (occupancy 1)
+        // gets the whole machine; a gauge that has not been armed yet
+        // (occupancy 0) reads the same as a lone task.
+        assert_eq!(super::elastic_parallelism(nz(1), nz(12), 0), nz(12));
+        assert_eq!(super::elastic_parallelism(nz(1), nz(12), 1), nz(12));
+        // Half occupied: idle shares split among the runners.
+        assert_eq!(super::elastic_parallelism(nz(1), nz(12), 6), nz(2));
+        // Fully occupied: exactly the old static per-slot share.
+        assert_eq!(super::elastic_parallelism(nz(1), nz(12), 12), nz(1));
+        // Overloaded (more tasks than cores): floored at the static share.
+        assert_eq!(super::elastic_parallelism(nz(1), nz(12), 24), nz(1));
+        // Non-trivial base (4 cores / 2 slots = 2): lone task gets 4,
+        // full occupancy the base 2, and the base always floors the result.
+        assert_eq!(super::elastic_parallelism(nz(2), nz(4), 1), nz(4));
+        assert_eq!(super::elastic_parallelism(nz(2), nz(4), 2), nz(2));
+        assert_eq!(super::elastic_parallelism(nz(2), nz(4), 4), nz(2));
     }
 
     #[test]

@@ -381,6 +381,12 @@ impl Drop for RunningAttemptGuard {
         if let Some(ranges) = &self.key_group_ranges {
             ranges.remove(&self.task_id);
         }
+        // The occupancy gauge decrements HERE and only here — the explicit
+        // early `clear_running_attempt` calls also remove from the map, but a
+        // second gauge decrement would undercount and hand out over-wide
+        // elastic shares (fragment/common.rs `task_engine_parallelism`).
+        crate::fragment::common::OCCUPIED_TASK_SLOTS
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1374,6 +1380,11 @@ impl ExecutorTaskRunner {
     /// `clear_running_attempt` calls stay — freeing the slot early is still
     /// worth doing, and a second removal is a no-op.
     fn running_attempt_guard(&self, assignment: &ExecutorTaskAssignment) -> RunningAttemptGuard {
+        // Occupancy gauge for the Phase 65 elastic DF-share: incremented for
+        // every task the runner starts (guard creation is unconditional in
+        // run_assignment_with), decremented exactly once in the guard's Drop.
+        crate::fragment::common::OCCUPIED_TASK_SLOTS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         RunningAttemptGuard {
             running_attempts: self.running_attempts.clone(),
             key_group_ranges: self.key_group_ranges.clone(),
