@@ -280,13 +280,20 @@ impl SlidingWindowOperator {
             return Ok(vec![]);
         }
         closed.sort_by(|(ka, wa), (kb, wb)| wa.cmp(wb).then(ka.cmp(kb)));
-        let mut output = Vec::with_capacity(closed.len());
-        for bucket in closed {
-            if let Some(state) = self.accumulators.remove(&bucket) {
-                output.push(self.build_output_batch(&bucket.0, bucket.1, &state)?);
-            }
-        }
-        Ok(output)
+        // Phase 65: same order-preserving pool fan-out as the tumbling close
+        // path — the bucket list is sorted BEFORE the parallel region and
+        // `par_map` keeps input order, so output is byte-identical to the
+        // serial loop. State removal stays serial (it mutates the map);
+        // batch building is `&self`-only and independent per bucket.
+        let drained: Vec<((String, i64), AggState)> = closed
+            .into_iter()
+            .filter_map(|bucket| self.accumulators.remove(&bucket).map(|state| (bucket, state)))
+            .collect();
+        krishiv_common::compute_pool::par_map(drained, |(bucket, state)| {
+            self.build_output_batch(&bucket.0, bucket.1, &state)
+        })
+        .into_iter()
+        .collect()
     }
 
     fn build_output_batch(
@@ -337,6 +344,74 @@ mod sliding_state_tests {
     use crate::aggregate::AggFunction;
     use arrow::datatypes::{DataType, Field, Schema};
     use krishiv_state::{Namespace, RocksDbStateBackend};
+
+    /// The Phase 65 pool fan-out in `flush_closed_windows` must be
+    /// order-preserving: buckets are sorted (window_start, key) BEFORE the
+    /// parallel region and `par_map` keeps input order, so the flush output
+    /// is byte-identical to the old serial loop. Mirrors tumbling's
+    /// `parallel_flush_keeps_deterministic_order`.
+    #[test]
+    fn parallel_flush_keeps_deterministic_order() {
+        let spec = SlidingWindowSpec {
+            key_column: "k".into(),
+            key_column_type: "utf8".into(),
+            event_time_column: "ts".into(),
+            window_size_ms: 2000,
+            slide_ms: 1000,
+            agg_exprs: vec![AggExpr {
+                filter: None,
+                input_column: "v".into(),
+                output_column: "sum_v".into(),
+                function: AggFunction::Sum,
+            }],
+            agg_is_float: vec![false],
+        };
+        let mut op = SlidingWindowOperator::new(spec).unwrap();
+        // 30 keys inserted in scrambled order; each event lands in two
+        // sliding windows (size 2000, slide 1000).
+        let rows: Vec<(String, i64)> = (0..30)
+            .map(|k| (format!("key-{:02}", (k * 7) % 30), 1500 + k))
+            .collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(
+                    rows.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, ts)| *ts).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(vec![1i64; rows.len()])),
+            ],
+        )
+        .unwrap();
+        // Watermark past every window end closes both windows per key.
+        let out = op.process_batch(&batch, 10_000).unwrap();
+        let mut seen: Vec<(i64, String)> = Vec::new();
+        for b in &out {
+            assert_eq!(b.num_rows(), 1, "one batch per (key, window) bucket");
+            let start = b
+                .column_by_name("window_start_ms")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .map(|a| a.value(0))
+                .unwrap();
+            let key = b
+                .column_by_name("k")
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>())
+                .map(|a| a.value(0).to_string())
+                .unwrap();
+            seen.push((start, key));
+        }
+        assert_eq!(seen.len(), 60, "30 keys x 2 overlapping windows");
+        let mut expected = seen.clone();
+        expected.sort();
+        assert_eq!(seen, expected, "flush order must be (window_start, key) sorted");
+    }
 
     #[test]
     fn sliding_state_persist_and_restore_roundtrip() {
