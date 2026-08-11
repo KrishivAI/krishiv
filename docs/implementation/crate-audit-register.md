@@ -1903,3 +1903,53 @@ session, and a half-applied multi-file deletion is worse than a recorded
 finding. Whoever picks this up should delete `barrier.rs`, the `BarrierSimulator`
 block in `gap6.rs.inc`, and the import in `core.rs.inc` — or, if the model is
 wanted, make it call the real `BarrierInjector` so it cannot drift again.
+
+## §4b — `block_in_place` on a current-thread runtime (defects 35–38, `25a52b8c`)
+
+Found by sweeping a *class* rather than a file. `tokio::task::block_in_place`
+panics outright when the current runtime is `current_thread`. Four sites
+hand-rolled the sync/async bridge with a bare call, so each was a latent abort
+rather than a style question:
+
+- **`IcebergCatalogBridge`** — every `CatalogProvider` / `SchemaProvider` method
+  (`schema_names`, `schema`, `table_names`, `table_exist`). Reproduced with a
+  failing test at `iceberg_catalog_bridge.rs:107` *before* fixing.
+- **`RocksdbBackend::snapshot_async` / `load_snapshot_async`** — on the durable
+  checkpoint write path reached from `krishiv-scheduler`. Both carried the doc
+  "Requires a multi-threaded Tokio runtime" — a documented precondition with no
+  enforcement.
+- **The DUR-1 sink publish path** (`in_process.rs`) — a panic mid-publish would
+  take the commit/fail resolution with it.
+- **`SqlBodyTableUdf::call`** — guarded the flavor but *rejected* the call, so
+  SQL UDTFs worked on one of the three runtime contexts. They now work on all
+  three.
+
+**The tests encoded the workaround instead of catching the bug.** Both existing
+iceberg-bridge tests pinned `flavor = "multi_thread"`; the RocksDB ones did too;
+and `sql_body_udtf_without_runtime_returns_typed_error` asserted the
+*limitation* by name. Replaced with tests that exercise the real entry points
+under all three runtime contexts.
+
+**Why nothing caught it.** `clippy.toml` opens with "sync-over-async bridging is
+policed by lint, not convention" — but the rule only named
+`async_util::block_on`. A raw `block_in_place` was policed by nothing, so the
+policy had a hole exactly the size of these four bugs. Added
+`tokio::task::block_in_place` to `disallowed-methods` and promoted the guarded
+helper (previously private to `krishiv-engines`) to
+`async_util::run_blocking`. Three pre-existing bridges were already correct and
+keep their deliberate semantics behind justified allows: `storage_trait.rs`
+returns a diagnosable error on current-thread, and `host.rs` hops to its own
+thread so a Flight SQL handler cannot stall a single reactor.
+
+**Lesson.** A lint that names one helper does not police a pattern. Every
+correct implementation in the tree — `async_util::block_on`,
+`snapshot_nonblocking`, `run_blocking_on_tokio`, `host::run_blocking` — was
+evidence the authors knew the hazard; the four broken ones were written by
+people who did not, and no gate told them.
+
+Also fixed, surfaced only once the build got past the first error (both
+pre-existing, from other sessions): an `.err().expect()` in `krishiv-runtime`
+(`93272cd3`), two clippy errors in the just-landed `vector_search.rs`
+(`a3c4cd8e` — **main was red when this branch rebased onto it**), and nine
+`KRISHIV_*` flags read in source but never declared in `env_registry::FLAGS`,
+now declared with their real defaults.
