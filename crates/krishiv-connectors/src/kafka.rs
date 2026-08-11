@@ -850,6 +850,11 @@ pub struct RdkafkaKafkaSource {
     group_id: String,
     /// Timeout per poll attempt in milliseconds.
     poll_timeout_ms: u64,
+    /// Maximum messages folded into ONE RecordBatch per `read_batch` call
+    /// (Phase 65). The first message is awaited up to `poll_timeout_ms`;
+    /// the rest are drained only if already buffered client-side, so this
+    /// caps batch size without ever adding latency.
+    max_decode_batch: usize,
     /// Latest offset read per partition — tracks all partitions, not just the last one.
     partition_offsets: std::collections::HashMap<i32, i64>,
     /// Optional schema registry deserializer for Confluent-framed Avro/Protobuf payloads.
@@ -928,6 +933,11 @@ impl RdkafkaKafkaSource {
             topic,
             group_id: group_id.as_ref().to_string(),
             poll_timeout_ms: 100,
+            max_decode_batch: std::env::var("KRISHIV_KAFKA_DECODE_BATCH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(512),
             partition_offsets: std::collections::HashMap::new(),
             #[cfg(feature = "schema-registry")]
             schema_registry: None,
@@ -1036,56 +1046,77 @@ impl RdkafkaKafkaSource {
             .collect()
     }
 
-    /// Deserialise a raw UTF-8 Kafka payload into a single-row `RecordBatch`.
+    /// Build ONE multi-row batch from N drained payloads (Phase 65: the
+    /// DUR-2 cert found every Kafka message arriving as its own single-row
+    /// batch — the per-batch fixed costs downstream dominate at high rates).
     ///
-    /// If the payload is valid JSON the top-level object's string values are
-    /// unpacked into separate `Utf8` columns (sorted alphabetically for schema
-    /// stability).  Non-JSON payloads are returned as a single `_raw: Utf8`
-    /// column so the pipeline never silently discards messages.
-    fn payload_to_batch(payload: &str) -> crate::ConnectorResult<arrow::record_batch::RecordBatch> {
+    /// Per-row semantics are IDENTICAL to the old per-message decode: a
+    /// valid JSON object's values land in per-key `Utf8` columns (sorted
+    /// alphabetically for schema stability, non-string values stringified),
+    /// non-object payloads in a `_raw: Utf8` column so the pipeline never
+    /// silently discards messages. The schema is the sorted union of the
+    /// drained objects' keys (plus `_raw` if any non-object payload is
+    /// present); a row leaves keys it doesn't have as NULL. A single-payload
+    /// call therefore produces byte-identical schema and rows to the old
+    /// per-message path.
+    fn payloads_to_batch(
+        payloads: &[String],
+    ) -> crate::ConnectorResult<arrow::record_batch::RecordBatch> {
         use arrow::array::StringArray;
         use arrow::datatypes::{DataType, Field, Schema};
         use std::sync::Arc;
 
-        // Try to parse as a JSON object.
-        if let Ok(serde_json::Value::Object(map)) =
-            serde_json::from_str::<serde_json::Value>(payload)
-        {
-            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
-            keys.sort_unstable();
+        // Parse once: Some(object) rows contribute keyed columns, None rows
+        // contribute `_raw`. JSON arrays/scalars stay `_raw` — same as the
+        // single-message path always treated them.
+        let parsed: Vec<Option<serde_json::Map<String, serde_json::Value>>> = payloads
+            .iter()
+            .map(|p| match serde_json::from_str::<serde_json::Value>(p) {
+                Ok(serde_json::Value::Object(map)) => Some(map),
+                _ => None,
+            })
+            .collect();
 
-            let fields: Vec<Field> = keys
-                .iter()
-                .map(|k| Field::new(*k, DataType::Utf8, true))
-                .collect();
-            let schema = Arc::new(Schema::new(fields));
-
-            let columns: Vec<Arc<dyn arrow::array::Array>> = keys
-                .iter()
-                .map(|k| {
-                    let v = match map.get(*k).unwrap_or(&serde_json::Value::Null) {
-                        serde_json::Value::Null => None,
-                        serde_json::Value::String(s) => Some(s.clone()),
-                        other => Some(other.to_string()),
-                    };
-                    let arr: StringArray = std::iter::once(v.as_deref()).collect();
-                    Arc::new(arr) as Arc<dyn arrow::array::Array>
-                })
-                .collect();
-
-            return arrow::record_batch::RecordBatch::try_new(schema, columns).map_err(|e| {
-                crate::ConnectorError::Schema {
-                    message: format!("failed to build batch from Kafka JSON payload: {e}"),
-                }
-            });
+        let mut keys: Vec<&str> = parsed
+            .iter()
+            .flatten()
+            .flat_map(|map| map.keys().map(String::as_str))
+            .collect::<std::collections::BTreeSet<&str>>()
+            .into_iter()
+            .collect();
+        let any_raw = parsed.iter().any(Option::is_none);
+        if any_raw {
+            keys.insert(0, "_raw");
         }
 
-        // Non-JSON payload: wrap in a `_raw` column.
-        let schema = Arc::new(Schema::new(vec![Field::new("_raw", DataType::Utf8, true)]));
-        let arr: StringArray = std::iter::once(Some(payload)).collect();
-        arrow::record_batch::RecordBatch::try_new(schema, vec![Arc::new(arr)]).map_err(|e| {
+        let fields: Vec<Field> = keys
+            .iter()
+            .map(|k| Field::new(*k, DataType::Utf8, true))
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+
+        let columns: Vec<Arc<dyn arrow::array::Array>> = keys
+            .iter()
+            .map(|k| {
+                let arr: StringArray = parsed
+                    .iter()
+                    .zip(payloads)
+                    .map(|(row, payload)| match row {
+                        Some(map) => match map.get(*k) {
+                            None | Some(serde_json::Value::Null) => None,
+                            Some(serde_json::Value::String(s)) => Some(s.clone()),
+                            Some(other) => Some(other.to_string()),
+                        },
+                        None => (*k == "_raw").then(|| payload.clone()),
+                    })
+                    .collect();
+                Arc::new(arr) as Arc<dyn arrow::array::Array>
+            })
+            .collect();
+
+        arrow::record_batch::RecordBatch::try_new(schema, columns).map_err(|e| {
             crate::ConnectorError::Schema {
-                message: format!("failed to build _raw batch from Kafka payload: {e}"),
+                message: format!("failed to build batch from Kafka payloads: {e}"),
             }
         })
     }
@@ -1177,10 +1208,63 @@ impl Source for RdkafkaKafkaSource {
                     }
                 };
 
-                let batch = Self::payload_to_batch(payload)?;
-                // Record per-partition consumer lag (high_watermark - current_offset).
-                let partition = msg.partition();
-                let current = msg.offset();
+                // Phase 65: fold every message rdkafka has ALREADY buffered
+                // client-side into this batch (up to max_decode_batch) instead
+                // of returning one single-row batch per message — the shape
+                // the DUR-2 cert flagged. `now_or_never` polls the recv
+                // future exactly once, so a not-yet-buffered message never
+                // adds wait time; rdkafka's recv is cancel-safe, so dropping
+                // the pending future loses nothing. Offsets are recorded for
+                // exactly the messages folded into the returned batch, which
+                // keeps checkpoint offsets aligned with delivered rows.
+                let mut payloads: Vec<String> = vec![payload.to_owned()];
+                let mut partition = msg.partition();
+                let mut current = msg.offset();
+                while payloads.len() < self.max_decode_batch {
+                    use futures::FutureExt;
+                    match self.consumer.recv().now_or_never() {
+                        Some(Ok(next)) => {
+                            let new_partition =
+                                !self.partition_offsets.contains_key(&next.partition());
+                            self.partition_offsets.insert(next.partition(), next.offset());
+                            if new_partition {
+                                tracing::info!(
+                                    topic = %self.topic,
+                                    partition = next.partition(),
+                                    "Kafka partition assigned to this consumer via group rebalance"
+                                );
+                            }
+                            partition = next.partition();
+                            current = next.offset();
+                            match next.payload_view::<str>() {
+                                Some(Ok(s)) => payloads.push(s.to_owned()),
+                                Some(Err(_)) | None => {
+                                    tracing::warn!(
+                                        topic = %self.topic,
+                                        partition = next.partition(),
+                                        offset = next.offset(),
+                                        "skipping unreadable Kafka message in drain"
+                                    );
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            // Deliver what we have; the error resurfaces on
+                            // the next read_batch call if it persists.
+                            tracing::warn!(
+                                topic = %self.topic,
+                                error = %e,
+                                "rdkafka receive error while draining buffered messages"
+                            );
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+
+                let batch = Self::payloads_to_batch(&payloads)?;
+                // Record per-partition consumer lag (high_watermark - current_offset)
+                // against the LAST drained message.
                 let topic = self.topic.clone();
                 let group_id = self.group_id.clone();
                 let consumer = std::sync::Arc::clone(&self.consumer);
@@ -1359,6 +1443,87 @@ mod tests {
     // -----------------------------------------------------------------------
     // MultiKafkaOffset
     // -----------------------------------------------------------------------
+
+    #[cfg(feature = "kafka")]
+    mod payload_batching {
+        use super::super::RdkafkaKafkaSource;
+        use arrow::array::{Array, StringArray};
+
+        fn col<'a>(
+            batch: &'a arrow::record_batch::RecordBatch,
+            name: &str,
+        ) -> &'a StringArray {
+            batch
+                .column_by_name(name)
+                .unwrap_or_else(|| panic!("column {name} missing"))
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8 column")
+        }
+
+        #[test]
+        fn single_payload_matches_legacy_single_message_shape() {
+            let single =
+                RdkafkaKafkaSource::payloads_to_batch(&[r#"{"b":"2","a":"1"}"#.to_owned()])
+                    .unwrap();
+            assert_eq!(
+                single.schema().fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+                vec!["a", "b"],
+                "keys sorted for schema stability, exactly the legacy shape"
+            );
+            assert_eq!(single.num_rows(), 1);
+            assert_eq!(col(&single, "a").value(0), "1");
+            assert_eq!(col(&single, "b").value(0), "2");
+        }
+
+        #[test]
+        fn drained_payloads_fold_into_one_multi_row_batch() {
+            let batch = RdkafkaKafkaSource::payloads_to_batch(&[
+                r#"{"user":"u1","n":1}"#.to_owned(),
+                r#"{"user":"u2","n":2}"#.to_owned(),
+                r#"{"user":"u3","n":3}"#.to_owned(),
+            ])
+            .unwrap();
+            assert_eq!(batch.num_rows(), 3, "one batch, one row per message");
+            assert_eq!(batch.num_columns(), 2);
+            assert_eq!(col(&batch, "user").value(2), "u3");
+            assert_eq!(col(&batch, "n").value(0), "1", "non-string JSON stringified as before");
+        }
+
+        #[test]
+        fn heterogeneous_keys_union_with_nulls() {
+            let batch = RdkafkaKafkaSource::payloads_to_batch(&[
+                r#"{"a":"1"}"#.to_owned(),
+                r#"{"b":"2"}"#.to_owned(),
+            ])
+            .unwrap();
+            assert_eq!(batch.num_rows(), 2);
+            assert!(col(&batch, "a").is_null(1), "row 2 has no key a");
+            assert!(col(&batch, "b").is_null(0), "row 1 has no key b");
+            assert_eq!(col(&batch, "b").value(1), "2");
+        }
+
+        #[test]
+        fn mixed_json_and_raw_payloads_keep_both() {
+            let batch = RdkafkaKafkaSource::payloads_to_batch(&[
+                r#"{"a":"1"}"#.to_owned(),
+                "not json".to_owned(),
+            ])
+            .unwrap();
+            assert_eq!(batch.num_rows(), 2);
+            assert_eq!(col(&batch, "a").value(0), "1");
+            assert!(col(&batch, "_raw").is_null(0));
+            assert_eq!(col(&batch, "_raw").value(1), "not json");
+            assert!(col(&batch, "a").is_null(1));
+        }
+
+        #[test]
+        fn raw_only_payload_matches_legacy_raw_shape() {
+            let batch = RdkafkaKafkaSource::payloads_to_batch(&["plain".to_owned()]).unwrap();
+            assert_eq!(batch.num_columns(), 1);
+            assert_eq!(col(&batch, "_raw").value(0), "plain");
+        }
+    }
 
     #[test]
     fn multi_kafka_offset_empty_roundtrip() {
