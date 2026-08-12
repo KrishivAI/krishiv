@@ -174,18 +174,39 @@ impl Catalog for PostgresCatalog {
         let name = ns_key(namespace);
         let props = serde_json::to_value(&properties)
             .map_err(|e| iceberg_err(format!("serialize properties: {e}")))?;
-        sqlx::query(
+        // `DO NOTHING` keeps this idempotent, which callers rely on
+        // (`KrishivCatalog::create_table` and `LocalCatalog::recover_from_disk`
+        // both create namespaces speculatively). But it also means an existing
+        // row keeps its *old* properties — so returning `properties` here
+        // reported the caller's values as though they had been applied. The
+        // `RETURNING` clause yields a row only when the insert actually
+        // happened; when it did not, read back what is really stored.
+        let inserted: Option<serde_json::Value> = sqlx::query_scalar(
             "INSERT INTO krishiv_namespaces (namespace_name, properties)
              VALUES ($1, $2)
-             ON CONFLICT (namespace_name) DO NOTHING",
+             ON CONFLICT (namespace_name) DO NOTHING
+             RETURNING properties",
         )
         .bind(&name)
         .bind(&props)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|e| iceberg_err(format!("create_namespace: {e}")))?;
 
-        Ok(Namespace::with_properties(namespace.clone(), properties))
+        let stored = match inserted {
+            Some(value) => value,
+            None => sqlx::query_scalar(
+                "SELECT properties FROM krishiv_namespaces WHERE namespace_name = $1",
+            )
+            .bind(&name)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| iceberg_err(format!("create_namespace read-back: {e}")))?,
+        };
+
+        let stored: HashMap<String, String> = serde_json::from_value(stored)
+            .map_err(|e| iceberg_err(format!("deserialize properties: {e}")))?;
+        Ok(Namespace::with_properties(namespace.clone(), stored))
     }
 
     async fn get_namespace(&self, namespace: &NamespaceIdent) -> IcebergResult<Namespace> {
