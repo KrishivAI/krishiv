@@ -327,16 +327,58 @@ impl crate::source::CheckpointSource for JdbcSource {
 
 // ── JdbcSink ─────────────────────────────────────────────────────────────────
 
-/// Postgres JDBC sink: writes Arrow [`RecordBatch`] values row-by-row via
-/// `INSERT INTO <table> (<columns>) VALUES (<values>)`.
+/// Postgres JDBC sink.
+///
+/// Two delivery modes, and the difference is what the platform is allowed
+/// to *label* the sink:
+///
+/// - **Append** (no conflict keys): plain `INSERT`. Re-delivering a batch
+///   after a crash duplicates rows, so this is **at-least-once**, and
+///   nothing may call it idempotent.
+/// - **Upsert** (conflict keys declared): `INSERT … ON CONFLICT (keys) DO
+///   UPDATE SET …`. Re-delivering the same row converges to the same
+///   state, which is what makes **at-least-once idempotent upsert** a true
+///   label rather than an aspiration.
+///
+/// The keys are declared, never inferred: guessing a primary key would
+/// silently turn a duplicate-row bug into an overwrite bug, and the two
+/// fail in opposite directions.
 pub struct JdbcSink {
     pool: PgPool,
     table: String,
+    /// Columns forming the conflict target. Empty = append mode.
+    conflict_keys: Vec<String>,
+    /// Rows per multi-row INSERT. Batching is what makes this usable for
+    /// anything but a toy: one round trip per row is the difference
+    /// between a sink and a bottleneck.
+    batch_rows: usize,
 }
 
+/// Default rows per statement. Postgres binds at most 65535 parameters
+/// per statement, so the effective cap is `65535 / columns`; this default
+/// stays well inside that for wide tables and is clamped per batch.
+const DEFAULT_BATCH_ROWS: usize = 500;
+
+/// Hard ceiling from the Postgres wire protocol: a statement may bind at
+/// most 65535 parameters. Exceeding it is a driver error, not a slow
+/// query, so the sink computes rows-per-statement from the column count
+/// rather than hoping.
+const MAX_BIND_PARAMS: usize = 65535;
+
 impl JdbcSink {
-    /// Open a connection pool and return a [`JdbcSink`].
+    /// Open a connection pool in APPEND mode (at-least-once).
     pub async fn connect(url: &str, table: impl Into<String>) -> ConnectorResult<Self> {
+        Self::connect_with(url, table, Vec::new(), DEFAULT_BATCH_ROWS).await
+    }
+
+    /// Open a connection pool with explicit conflict keys (upsert mode)
+    /// and batch size.
+    pub async fn connect_with(
+        url: &str,
+        table: impl Into<String>,
+        conflict_keys: Vec<String>,
+        batch_rows: usize,
+    ) -> ConnectorResult<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(4)
             .connect(url)
@@ -345,8 +387,81 @@ impl JdbcSink {
         Ok(Self {
             pool,
             table: table.into(),
+            conflict_keys,
+            batch_rows: batch_rows.max(1),
         })
     }
+
+    /// Whether this sink upserts (and may therefore be labelled
+    /// idempotent) or merely appends.
+    pub fn is_upsert(&self) -> bool {
+        !self.conflict_keys.is_empty()
+    }
+}
+
+/// Render the INSERT for `rows` rows of `columns` columns.
+///
+/// Split out as a pure function so the SQL — especially the ON CONFLICT
+/// clause and the parameter numbering across a multi-row VALUES list —
+/// is testable without a database.
+pub(crate) fn render_insert(
+    table: &str,
+    columns: &[String],
+    rows: usize,
+    conflict_keys: &[String],
+) -> String {
+    let cols_clause = columns
+        .iter()
+        .map(|c| quote_identifier(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut tuples = Vec::with_capacity(rows);
+    let mut param = 1usize;
+    for _ in 0..rows {
+        let ph: Vec<String> = (0..columns.len())
+            .map(|_| {
+                let p = format!("${param}");
+                param += 1;
+                p
+            })
+            .collect();
+        tuples.push(format!("({})", ph.join(", ")));
+    }
+    let mut sql = format!(
+        "INSERT INTO {} ({}) VALUES {}",
+        quote_qualified(table),
+        cols_clause,
+        tuples.join(", ")
+    );
+    if !conflict_keys.is_empty() {
+        let target = conflict_keys
+            .iter()
+            .map(|c| quote_identifier(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Update every NON-key column from the proposed row. A key column
+        // in the SET list would be a no-op at best and a rewrite of the
+        // conflict target at worst.
+        let updates: Vec<String> = columns
+            .iter()
+            .filter(|c| !conflict_keys.iter().any(|k| k.eq_ignore_ascii_case(c)))
+            .map(|c| {
+                let q = quote_identifier(c);
+                format!("{q} = EXCLUDED.{q}")
+            })
+            .collect();
+        if updates.is_empty() {
+            // Every column is part of the key: there is nothing to update,
+            // and DO NOTHING is the honest idempotent form.
+            sql.push_str(&format!(" ON CONFLICT ({target}) DO NOTHING"));
+        } else {
+            sql.push_str(&format!(
+                " ON CONFLICT ({target}) DO UPDATE SET {}",
+                updates.join(", ")
+            ));
+        }
+    }
+    sql
 }
 
 impl Sink for JdbcSink {
@@ -357,20 +472,29 @@ impl Sink for JdbcSink {
     async fn write_batch(&mut self, batch: RecordBatch) -> ConnectorResult<()> {
         let schema = batch.schema();
         let ncols = schema.fields().len();
-        let cols_clause = schema
+        if ncols == 0 || batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let columns: Vec<String> = schema
             .fields()
             .iter()
-            .map(|f| quote_identifier(f.name()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let placeholders: Vec<String> = (1..=ncols).map(|i| format!("${i}")).collect();
-        let ph_clause = placeholders.join(", ");
-        let sql = format!(
-            "INSERT INTO {} ({}) VALUES ({})",
-            quote_qualified(&self.table),
-            cols_clause,
-            ph_clause
-        );
+            .map(|f| f.name().clone())
+            .collect();
+        // A conflict key that is not in the batch would render SQL the
+        // server rejects at execution time, halfway through a transaction.
+        // Fail before opening it, naming the column.
+        for key in &self.conflict_keys {
+            if !columns.iter().any(|c| c.eq_ignore_ascii_case(key)) {
+                return Err(ConnectorError::Io(std::io::Error::other(format!(
+                    "jdbc sink: conflict key '{key}' is not a column of the batch \
+                     ({}) — an upsert cannot key on a column it is not writing",
+                    columns.join(", ")
+                ))));
+            }
+        }
+
+        // Rows per statement, bounded by the wire protocol's parameter cap.
+        let per_stmt = self.batch_rows.min((MAX_BIND_PARAMS / ncols).max(1));
 
         let mut tx = self
             .pool
@@ -378,15 +502,21 @@ impl Sink for JdbcSink {
             .await
             .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
 
-        for row_idx in 0..batch.num_rows() {
+        let mut start = 0usize;
+        while start < batch.num_rows() {
+            let rows = per_stmt.min(batch.num_rows() - start);
+            let sql = render_insert(&self.table, &columns, rows, &self.conflict_keys);
             let mut q = sqlx::query(&sql);
-            for col_idx in 0..ncols {
-                let col = batch.column(col_idx);
-                q = bind_column_value(q, col.as_ref(), row_idx)?;
+            for row_idx in start..start + rows {
+                for col_idx in 0..ncols {
+                    let col = batch.column(col_idx);
+                    q = bind_column_value(q, col.as_ref(), row_idx)?;
+                }
             }
             q.execute(&mut *tx)
                 .await
                 .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
+            start += rows;
         }
 
         tx.commit()
@@ -725,5 +855,68 @@ mod tests {
     fn offset_decode_rejects_unknown_tag() {
         let err = JdbcOffset::decode(&[99]).unwrap_err();
         assert!(matches!(err, ConnectorError::Config { .. }));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod sink_sql_tests {
+    use super::render_insert;
+
+    fn cols(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn append_mode_emits_no_conflict_clause() {
+        // Without declared keys this is at-least-once APPEND, and the SQL
+        // must not imply otherwise.
+        let sql = render_insert("public.t", &cols(&["id", "v"]), 2, &[]);
+        assert_eq!(
+            sql,
+            r#"INSERT INTO "public"."t" ("id", "v") VALUES ($1, $2), ($3, $4)"#
+        );
+        assert!(!sql.contains("ON CONFLICT"));
+    }
+
+    #[test]
+    fn upsert_updates_every_non_key_column() {
+        let sql = render_insert("t", &cols(&["id", "v", "w"]), 1, &cols(&["id"]));
+        assert!(sql.contains(r#"ON CONFLICT ("id") DO UPDATE SET"#), "{sql}");
+        assert!(sql.contains(r#""v" = EXCLUDED."v""#), "{sql}");
+        assert!(sql.contains(r#""w" = EXCLUDED."w""#), "{sql}");
+        // A key column in the SET list would rewrite the conflict target.
+        assert!(!sql.contains(r#""id" = EXCLUDED."id""#), "{sql}");
+    }
+
+    #[test]
+    fn parameters_number_continuously_across_a_multi_row_values_list() {
+        // Off-by-one here binds the wrong column to the wrong row — a
+        // silent data-corruption bug rather than an error.
+        let sql = render_insert("t", &cols(&["a", "b", "c"]), 3, &[]);
+        for n in 1..=9 {
+            assert!(sql.contains(&format!("${n}")), "missing ${n} in {sql}");
+        }
+        assert!(!sql.contains("$10"), "{sql}");
+        assert!(sql.contains("($1, $2, $3), ($4, $5, $6), ($7, $8, $9)"), "{sql}");
+    }
+
+    #[test]
+    fn an_all_key_table_upserts_as_do_nothing() {
+        // Every column is part of the key: there is nothing to update, and
+        // DO NOTHING is the honest idempotent form (DO UPDATE SET with an
+        // empty list is a syntax error).
+        let sql = render_insert("t", &cols(&["a", "b"]), 1, &cols(&["a", "b"]));
+        assert!(sql.ends_with(r#"ON CONFLICT ("a", "b") DO NOTHING"#), "{sql}");
+    }
+
+    #[test]
+    fn conflict_keys_match_columns_case_insensitively() {
+        // Postgres folds unquoted identifiers to lower case, so a declared
+        // key of `ID` must not produce `"ID" = EXCLUDED."ID"` in the SET
+        // list while the conflict target says `"ID"`.
+        let sql = render_insert("t", &cols(&["id", "v"]), 1, &cols(&["ID"]));
+        assert!(!sql.contains(r#""id" = EXCLUDED."id""#), "{sql}");
+        assert!(sql.contains(r#""v" = EXCLUDED."v""#), "{sql}");
     }
 }
