@@ -73,7 +73,6 @@ Krishiv targets Spark-SQL reference parity as a **measured** number. This page i
 - `dml.insert_overwrite` — INSERT OVERWRITE (full partition replace)
 - `dml.merge` — MERGE INTO target USING source ON … WHEN MATCHED …
 - `dml.iceberg_merge` — Atomic Iceberg MERGE with row-level deletes
-- `ddl.create_external_table` — CREATE EXTERNAL TABLE … STORED AS …
 - `ddl.create_view` — CREATE VIEW name AS SELECT …
 - `ddl.create_function` — CREATE FUNCTION … LANGUAGE SQL|PYTHON
 - `ddl.drop_table` — DROP TABLE [IF EXISTS]
@@ -115,6 +114,7 @@ Krishiv targets Spark-SQL reference parity as a **measured** number. This page i
 - `dml.delete` — DELETE FROM table WHERE … _(supported on Iceberg tables; in-memory and Parquet tables require rewrite)_
 - `dml.update` — UPDATE table SET col = … WHERE … _(supported on Iceberg tables via MERGE rewrite)_
 - `dml.truncate` — TRUNCATE TABLE (Iceberg + memory) _(Phase 60 close-out: memory tables swap to an empty provider (schema intact); Iceberg tables truncate through the copy-on-write delete path (snapshot-committed). External file-backed tables are refused with the reason — their files ARE the table)_
+- `ddl.create_external_table` — CREATE EXTERNAL TABLE … STORED AS … _(Phase 69 serve-back: a `STORED AS JDBC` external table is now WRITABLE —          INSERT INTO … SELECT routes rows through the registry sink (append by default;          adding OPTIONS ('conflict_keys' '<cols>') upgrades it to an idempotent upsert via          ON CONFLICT DO UPDATE, verified live against Postgres: a re-delivered key updates          in place rather than duplicating). INSERT OVERWRITE/REPLACE are refused rather          than downgraded to an append, which would silently leave stale rows)_
 - `ddl.create_table_as` — CREATE TABLE … AS SELECT (CTAS) _(durable Iceberg landing (G17) when the target resolves to a registered Iceberg catalog; session table otherwise)_
 - `ddl.partitioned_by` — CREATE TABLE … PARTITIONED BY (col | bucket/truncate/year/month/day/hour(col)) AS SELECT _(Iceberg catalog tables only; transforms follow the Iceberg partition spec)_
 - `ddl.alter_table` — ALTER TABLE ADD/DROP COLUMN, RENAME _(Iceberg schema evolution via ALTER TABLE is supported)_

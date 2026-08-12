@@ -164,7 +164,17 @@ pub fn connector_config_from_ddl(
                 // `format.` — accept both spellings of the same option.
                 let key = key.strip_prefix("format.").unwrap_or(key);
                 match key {
+                    // Read options.
                     "table" | "cursor.column" | "cursor.after" | "batch_size" => {
+                        cfg = cfg.with_property(key, value.clone());
+                    }
+                    // Write option (Phase 69 serve-back): declaring the
+                    // conflict target is what upgrades INSERT INTO on this
+                    // table from at-least-once append to idempotent upsert.
+                    // It rides on the SOURCE config and is copied to the
+                    // sink config by `sink_config_for`, so one DDL declares
+                    // a table that is both readable and writable.
+                    "conflict_keys" => {
                         cfg = cfg.with_property(key, value.clone());
                     }
                     other => {
@@ -172,7 +182,8 @@ pub fn connector_config_from_ddl(
                             ConnectorError::Unsupported {
                                 message: format!(
                                     "unknown JDBC option '{other}' (expected table, \
-                                     cursor.column, cursor.after, batch_size)"
+                                     cursor.column, cursor.after, batch_size, \
+                                     conflict_keys)"
                                 ),
                             },
                         )));
@@ -363,6 +374,129 @@ impl TableProvider for BoundedConnectorProvider {
         });
         let table = StreamingTable::try_new(Arc::clone(&self.schema), vec![partition])?;
         table.scan(state, projection, filters, limit).await
+    }
+
+    /// `INSERT INTO <external table> SELECT …` for connector-backed
+    /// tables (Phase 69 serve-back; ADR-0021 boundary unchanged — the
+    /// ENGINE owns the connector, this only routes rows into it).
+    ///
+    /// Without this, DataFusion's default returns "Insert into not
+    /// implemented for this table" and a `STORED AS JDBC` external table
+    /// could not be written from SQL at all.
+    ///
+    /// Only `InsertOp::Append` is accepted. Overwrite and replace would
+    /// require the connector to express truncate/upsert-all semantics it
+    /// does not have, and silently downgrading either to an append would
+    /// leave stale rows behind — a wrong answer, not a slow one.
+    async fn insert_into(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: datafusion::logical_expr::dml::InsertOp,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        use datafusion::logical_expr::dml::InsertOp;
+        if insert_op != InsertOp::Append {
+            return Err(DataFusionError::NotImplemented(format!(
+                "connector tables support INSERT INTO … (append) only; {insert_op:?} would \
+                 need truncate/replace semantics the connector does not express, and \
+                 downgrading it to an append would silently leave stale rows"
+            )));
+        }
+        let sink = Arc::new(ConnectorDataSink {
+            registry: Arc::clone(&self.registry),
+            config: sink_config_for(&self.config)?,
+            schema: Arc::clone(&self.schema),
+        });
+        Ok(Arc::new(
+            datafusion::datasource::sink::DataSinkExec::new(input, sink, None),
+        ))
+    }
+}
+
+/// Derive the SINK config from a source table's config.
+///
+/// A `STORED AS JDBC` table names the *source* connector kind; writing to
+/// it needs the paired sink kind. The mapping is explicit rather than a
+/// string suffix, so a source with no writable counterpart fails here
+/// naming itself instead of failing later inside the registry.
+fn sink_config_for(source: &ConnectorConfig) -> DataFusionResult<ConnectorConfig> {
+    let sink_kind = match source.kind.as_str() {
+        "jdbc" | "postgres" | "postgresql" => "jdbc_sink",
+        other => {
+            return Err(DataFusionError::NotImplemented(format!(
+                "connector kind '{other}' has no writable sink counterpart; INSERT INTO is \
+                 supported for jdbc/postgres external tables"
+            )));
+        }
+    };
+    let mut config = ConnectorConfig::new(source.name.clone(), sink_kind);
+    for (key, value) in source.properties() {
+        config = config.with_property(key, value);
+    }
+    Ok(config)
+}
+
+/// Routes an execution plan's batches into a registry sink.
+struct ConnectorDataSink {
+    registry: Arc<ConnectorRegistry>,
+    config: ConnectorConfig,
+    schema: SchemaRef,
+}
+
+impl std::fmt::Debug for ConnectorDataSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectorDataSink")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl datafusion::physical_plan::DisplayAs for ConnectorDataSink {
+    fn fmt_as(
+        &self,
+        _t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(f, "ConnectorDataSink(kind={})", self.config.kind)
+    }
+}
+
+#[async_trait]
+impl datafusion::datasource::sink::DataSink for ConnectorDataSink {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    async fn write_all(
+        &self,
+        mut data: datafusion::execution::SendableRecordBatchStream,
+        _context: &Arc<datafusion::execution::TaskContext>,
+    ) -> DataFusionResult<u64> {
+        use futures::StreamExt as _;
+        let mut sink = self
+            .registry
+            .open_sink(&self.config)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let mut rows = 0u64;
+        while let Some(batch) = data.next().await {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            rows += batch.num_rows() as u64;
+            sink.write_batch_dyn(batch)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        }
+        // Flush BEFORE reporting success: a sink that buffers would
+        // otherwise have its last batch counted as written while still in
+        // memory, and the statement would return a row count for data that
+        // never landed.
+        sink.flush_dyn()
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(rows)
     }
 }
 
@@ -561,5 +695,84 @@ mod tests {
         ] {
             assert!(!is_object_store_url(uri), "{uri} must not be object storage");
         }
+    }
+}
+
+#[cfg(all(test, feature = "jdbc"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod insert_into_tests {
+    use super::*;
+
+    /// Phase 69 serve-back: `INSERT INTO <jdbc external table> SELECT …`
+    /// must actually land rows in Postgres. Before `insert_into` existed,
+    /// DataFusion returned "Insert into not implemented for this table"
+    /// and a connector table could not be written from SQL at all.
+    ///
+    /// Requires a live Postgres at `KRISHIV_TEST_DATABASE_URL`; self-skips
+    /// with a visible marker otherwise, so `cargo test` works everywhere
+    /// and CI's service container exercises the real path.
+    #[tokio::test]
+    async fn insert_into_a_jdbc_external_table_lands_rows() {
+        let Ok(url) = std::env::var("KRISHIV_TEST_DATABASE_URL") else {
+            eprintln!("SKIP: KRISHIV_TEST_DATABASE_URL unset");
+            return;
+        };
+        let engine = crate::SqlEngine::new();
+        let ddl = format!(
+            "CREATE EXTERNAL TABLE sb (id BIGINT, v VARCHAR) STORED AS JDBC \
+             LOCATION '{url}' OPTIONS ('table' 'serveback', 'conflict_keys' 'id')"
+        );
+        engine.sql(&ddl).await.expect("ddl").collect().await.expect("ddl run");
+
+        // The write the phase needs: a computed lake-side result landing in
+        // the operational store.
+        engine
+            .sql("INSERT INTO sb SELECT * FROM (VALUES (1, 'a'), (2, 'b')) v(id, v)")
+            .await
+            .expect("insert plans")
+            .collect()
+            .await
+            .expect("insert runs");
+
+        let back = engine.sql("SELECT id, v FROM sb ORDER BY id").await.unwrap();
+        let batches = back.collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2, "rows must be readable back through the source path");
+
+        // Re-delivering the SAME keys must converge, not duplicate — this
+        // is what earns the "idempotent upsert" label the sink advertises.
+        engine
+            .sql("INSERT INTO sb SELECT * FROM (VALUES (1, 'a2'), (3, 'c')) v(id, v)")
+            .await
+            .expect("second insert plans")
+            .collect()
+            .await
+            .expect("second insert runs");
+        let batches = engine
+            .sql("SELECT id, v FROM sb ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total, 3,
+            "an upsert re-delivery must converge to 3 rows, not append to 5"
+        );
+    }
+
+    #[tokio::test]
+    async fn overwrite_is_refused_rather_than_silently_appended() {
+        // Downgrading OVERWRITE to an append would leave stale rows —
+        // a wrong answer, not a slow one.
+        let source = ConnectorConfig::new("t", "jdbc").with_property("table", "x");
+        let sink = sink_config_for(&source).unwrap();
+        assert_eq!(sink.kind, "jdbc_sink");
+        assert_eq!(sink.get("table").as_deref(), Some("x"));
+
+        let unwritable = ConnectorConfig::new("t", "kafka");
+        let err = sink_config_for(&unwritable).unwrap_err().to_string();
+        assert!(err.contains("no writable sink counterpart"), "{err}");
     }
 }

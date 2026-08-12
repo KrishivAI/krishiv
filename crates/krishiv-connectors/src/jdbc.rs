@@ -693,6 +693,29 @@ fn bind_column_value<'q>(
                 .to_owned();
             q.bind(v)
         }
+        // DataFusion 54 produces Utf8View for string literals and many
+        // string kernels, so a sink that only handled Utf8 could not
+        // write the engine's own default string type — `INSERT INTO …
+        // SELECT 'a'` failed at bind time. LargeUtf8 is here for the same
+        // reason: these are representations of the same value, and the
+        // wire protocol takes text either way.
+        DataType::Utf8View => {
+            let v = downcast_or_err::<arrow::array::StringViewArray>(col, "Utf8View")?
+                .value(row_idx)
+                .to_owned();
+            q.bind(v)
+        }
+        DataType::LargeUtf8 => {
+            let v = downcast_or_err::<arrow::array::LargeStringArray>(col, "LargeUtf8")?
+                .value(row_idx)
+                .to_owned();
+            q.bind(v)
+        }
+        // Temporal types are deliberately NOT bound here: sqlx needs its
+        // chrono/time feature for them, and enabling that workspace-wide
+        // is a wider change than this leg justifies. The fall-through
+        // below names the type, so a date column fails loudly at the
+        // first write rather than silently binding as text.
         other => {
             return Err(ConnectorError::Io(std::io::Error::other(format!(
                 "unsupported column type for JDBC bind: {other}"

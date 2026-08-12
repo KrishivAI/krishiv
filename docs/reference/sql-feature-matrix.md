@@ -144,7 +144,7 @@ Each feature is dimensioned across the three Krishiv execution engines: **batch*
 
 | Feature | Description | Batch | Streaming | Incremental | Notes |
 |---|---|---|---|---|---|
-| `ddl.create_external_table` | CREATE EXTERNAL TABLE … STORED AS … | supported | n/a | n/a |  |
+| `ddl.create_external_table` | CREATE EXTERNAL TABLE … STORED AS … | supported | n/a | n/a | Phase 69 serve-back: a `STORED AS JDBC` external table is now WRITABLE —          INSERT INTO … SELECT routes rows through the registry sink (append by default;          adding OPTIONS ('conflict_keys' '<cols>') upgrades it to an idempotent upsert via          ON CONFLICT DO UPDATE, verified live against Postgres: a re-delivered key updates          in place rather than duplicating). INSERT OVERWRITE/REPLACE are refused rather          than downgraded to an append, which would silently leave stale rows |
 | `ddl.create_view` | CREATE VIEW name AS SELECT … | supported | n/a | n/a |  |
 | `ddl.create_function` | CREATE FUNCTION … LANGUAGE SQL|PYTHON | supported | n/a | n/a |  |
 | `ddl.drop_table` | DROP TABLE [IF EXISTS] | supported | n/a | n/a |  |

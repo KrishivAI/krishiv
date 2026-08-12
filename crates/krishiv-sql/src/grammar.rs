@@ -771,6 +771,9 @@ static FEATURES: &[FeatureEntry] = &[
         "DDL",
         "CREATE EXTERNAL TABLE … STORED AS …",
         S,
+    )
+    .with_note(
+        "Phase 69 serve-back: a `STORED AS JDBC` external table is now WRITABLE —          INSERT INTO … SELECT routes rows through the registry sink (append by default;          adding OPTIONS ('conflict_keys' '<cols>') upgrades it to an idempotent upsert via          ON CONFLICT DO UPDATE, verified live against Postgres: a re-delivered key updates          in place rather than duplicating). INSERT OVERWRITE/REPLACE are refused rather          than downgraded to an append, which would silently leave stale rows",
     ),
     FeatureEntry::batch_only("ddl.create_view", "DDL", "CREATE VIEW name AS SELECT …", S),
     FeatureEntry::batch_only(
