@@ -149,13 +149,40 @@ impl Catalog for PostgresCatalog {
 
     async fn list_namespaces(
         &self,
-        _parent: Option<&NamespaceIdent>,
+        parent: Option<&NamespaceIdent>,
     ) -> IcebergResult<Vec<NamespaceIdent>> {
-        let rows = sqlx::query_scalar::<_, String>(
-            "SELECT namespace_name FROM krishiv_namespaces ORDER BY namespace_name",
-        )
-        .fetch_all(&self.pool)
-        .await
+        // `parent` used to be `_parent` — discarded, so listing the children of
+        // `a` returned every namespace in the catalog.
+        //
+        // `starts_with` rather than LIKE on purpose: namespace names may
+        // contain `_`, which LIKE treats as a single-character wildcard, so a
+        // LIKE pattern would over-match sibling namespaces.
+        //
+        // The `None` case deliberately returns *all* namespaces flattened
+        // rather than only top-level ones: this catalog is surfaced through
+        // DataFusion, whose schema space is flat, so a nested `a.b` has to be
+        // visible as its own schema or it cannot be queried at all.
+        let rows = match parent {
+            Some(parent) => {
+                let prefix = ns_key(parent);
+                sqlx::query_scalar::<_, String>(
+                    "SELECT namespace_name FROM krishiv_namespaces
+                      WHERE starts_with(namespace_name, $1 || '.')
+                        AND strpos(substr(namespace_name, length($1) + 2), '.') = 0
+                      ORDER BY namespace_name",
+                )
+                .bind(&prefix)
+                .fetch_all(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT namespace_name FROM krishiv_namespaces ORDER BY namespace_name",
+                )
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
         .map_err(|e| iceberg_err(format!("list_namespaces: {e}")))?;
 
         rows.into_iter()
@@ -260,11 +287,37 @@ impl Catalog for PostgresCatalog {
 
     async fn drop_namespace(&self, namespace: &NamespaceIdent) -> IcebergResult<()> {
         let name = ns_key(namespace);
-        sqlx::query("DELETE FROM krishiv_namespaces WHERE namespace_name = $1")
+        // `krishiv_tables` has no foreign key onto `krishiv_namespaces`, so a
+        // bare DELETE left every table row in place: the namespace vanished
+        // from `list_namespaces` while `list_tables` and `load_table` kept
+        // serving its tables. Refuse a non-empty namespace, as the Iceberg
+        // contract requires, rather than orphaning them.
+        let dropped = sqlx::query(
+            "DELETE FROM krishiv_namespaces
+              WHERE namespace_name = $1
+                AND NOT EXISTS (SELECT 1 FROM krishiv_tables WHERE namespace = $1)",
+        )
+        .bind(&name)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| iceberg_err(format!("drop_namespace: {e}")))?
+        .rows_affected();
+
+        if dropped == 0 {
+            // Distinguish "no such namespace" from "namespace not empty".
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM krishiv_namespaces WHERE namespace_name = $1)",
+            )
             .bind(&name)
-            .execute(&self.pool)
+            .fetch_one(&self.pool)
             .await
-            .map_err(|e| iceberg_err(format!("drop_namespace: {e}")))?;
+            .map_err(|e| iceberg_err(format!("drop_namespace check: {e}")))?;
+            return Err(iceberg_err(if exists {
+                format!("namespace not empty: {name}")
+            } else {
+                format!("namespace not found: {name}")
+            }));
+        }
         Ok(())
     }
 
@@ -375,12 +428,23 @@ impl Catalog for PostgresCatalog {
 
     async fn drop_table(&self, table: &TableIdent) -> IcebergResult<()> {
         let ns = ns_key(table.namespace());
-        sqlx::query("DELETE FROM krishiv_tables WHERE namespace = $1 AND table_name = $2")
+        let dropped = sqlx::query("DELETE FROM krishiv_tables WHERE namespace = $1 AND table_name = $2")
             .bind(&ns)
             .bind(table.name())
             .execute(&self.pool)
             .await
-            .map_err(|e| iceberg_err(format!("drop_table: {e}")))?;
+            .map_err(|e| iceberg_err(format!("drop_table: {e}")))?
+            .rows_affected();
+        if dropped == 0 {
+            // A DELETE that matches nothing is a successful statement, not a
+            // successful drop. Returning Ok here told the caller a table it
+            // never had was gone.
+            return Err(iceberg_err(format!(
+                "table not found: {}.{}",
+                ns,
+                table.name()
+            )));
+        }
         Ok(())
     }
 
@@ -403,7 +467,7 @@ impl Catalog for PostgresCatalog {
     async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> IcebergResult<()> {
         let src_ns = ns_key(src.namespace());
         let dest_ns = ns_key(dest.namespace());
-        sqlx::query(
+        let renamed = sqlx::query(
             "UPDATE krishiv_tables
                 SET namespace = $3, table_name = $4, updated_at = NOW()
               WHERE namespace = $1 AND table_name = $2",
@@ -414,7 +478,19 @@ impl Catalog for PostgresCatalog {
         .bind(dest.name())
         .execute(&self.pool)
         .await
-        .map_err(|e| iceberg_err(format!("rename_table: {e}")))?;
+        .map_err(|e| iceberg_err(format!("rename_table: {e}")))?
+        .rows_affected();
+        if renamed == 0 {
+            // Renaming a table that does not exist matched no rows and
+            // reported success. (A rename onto an *existing* destination is
+            // already caught: it violates the primary key and surfaces as an
+            // error from the statement above.)
+            return Err(iceberg_err(format!(
+                "table not found: {}.{}",
+                src_ns,
+                src.name()
+            )));
+        }
         Ok(())
     }
 
@@ -667,6 +743,133 @@ mod tests {
             props.get("writer-c2").map(String::as_str),
             Some("yes"),
             "c2's retried commit did not apply"
+        );
+    }
+
+    /// Every assertion below covers a case where this backend used to report
+    /// success for work it had not done — a DELETE or UPDATE that matched no
+    /// rows is a successful *statement*, not a successful operation.
+    #[tokio::test]
+    #[ignore = "requires KRISHIV_TEST_DATABASE_URL"]
+    async fn absent_targets_are_errors_not_silent_successes() {
+        let url = test_db_url().expect("KRISHIV_TEST_DATABASE_URL not set");
+        let dir = tempfile::tempdir().unwrap();
+        let warehouse = url::Url::from_file_path(dir.path()).unwrap().to_string();
+        let catalog = PostgresCatalog::new(&url, &warehouse).await.unwrap();
+
+        let ns = NamespaceIdent::new("absent_targets".to_string());
+        let missing = TableIdent::new(ns.clone(), "never_created".to_string());
+
+        assert!(
+            catalog.drop_table(&missing).await.is_err(),
+            "dropping a table that does not exist must not report success"
+        );
+        assert!(
+            catalog
+                .rename_table(&missing, &TableIdent::new(ns.clone(), "dest".to_string()))
+                .await
+                .is_err(),
+            "renaming a table that does not exist must not report success"
+        );
+        assert!(
+            catalog
+                .drop_namespace(&NamespaceIdent::new("no_such_namespace".to_string()))
+                .await
+                .is_err(),
+            "dropping a namespace that does not exist must not report success"
+        );
+    }
+
+    /// `krishiv_tables` has no foreign key onto `krishiv_namespaces`, so a bare
+    /// DELETE orphaned every table in the namespace: gone from
+    /// `list_namespaces`, still served by `list_tables` and `load_table`.
+    #[tokio::test]
+    #[ignore = "requires KRISHIV_TEST_DATABASE_URL"]
+    async fn drop_namespace_refuses_to_orphan_tables() {
+        let url = test_db_url().expect("KRISHIV_TEST_DATABASE_URL not set");
+        let dir = tempfile::tempdir().unwrap();
+        let warehouse = url::Url::from_file_path(dir.path()).unwrap().to_string();
+        let catalog = PostgresCatalog::new(&url, &warehouse).await.unwrap();
+
+        let ns = NamespaceIdent::new("orphan_check".to_string());
+        let ident = TableIdent::new(ns.clone(), "t".to_string());
+        let _ = catalog.drop_table(&ident).await;
+        let _ = catalog.drop_namespace(&ns).await;
+
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("t".to_string())
+                    .schema(sample_schema())
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let err = catalog
+            .drop_namespace(&ns)
+            .await
+            .expect_err("a non-empty namespace must not be droppable");
+        assert!(
+            err.to_string().contains("not empty"),
+            "expected a not-empty error, got: {err}"
+        );
+        assert!(
+            catalog.table_exists(&ident).await.unwrap(),
+            "the refused drop must leave the table reachable"
+        );
+
+        catalog.drop_table(&ident).await.unwrap();
+        catalog
+            .drop_namespace(&ns)
+            .await
+            .expect("an emptied namespace drops cleanly");
+    }
+
+    /// `list_namespaces` took a `parent` argument and discarded it, so asking
+    /// for the children of `a` returned every namespace in the catalog.
+    #[tokio::test]
+    #[ignore = "requires KRISHIV_TEST_DATABASE_URL"]
+    async fn list_namespaces_honours_its_parent_argument() {
+        let url = test_db_url().expect("KRISHIV_TEST_DATABASE_URL not set");
+        let dir = tempfile::tempdir().unwrap();
+        let warehouse = url::Url::from_file_path(dir.path()).unwrap().to_string();
+        let catalog = PostgresCatalog::new(&url, &warehouse).await.unwrap();
+
+        // `parent_probe_x` is a sibling whose name shares the `parent_probe`
+        // prefix — it must NOT be reported as a child, which a naive
+        // `starts_with(name, parent)` would get wrong. `_` is also a LIKE
+        // wildcard, which is why the query avoids LIKE.
+        for name in [
+            "parent_probe",
+            "parent_probe.child_a",
+            "parent_probe.child_b",
+            "parent_probe.child_a.grandchild",
+            "parent_probe_x",
+        ] {
+            let _ = catalog
+                .create_namespace(&NamespaceIdent::from_vec(
+                    name.split('.').map(str::to_string).collect(),
+                )
+                .unwrap(), HashMap::new())
+                .await;
+        }
+
+        let parent = NamespaceIdent::new("parent_probe".to_string());
+        let mut children: Vec<String> = catalog
+            .list_namespaces(Some(&parent))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|n| n.inner().join("."))
+            .collect();
+        children.sort();
+        assert_eq!(
+            children,
+            vec!["parent_probe.child_a", "parent_probe.child_b"],
+            "only immediate children — not grandchildren, not prefix-sharing siblings"
         );
     }
 }
