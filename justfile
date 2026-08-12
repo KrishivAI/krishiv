@@ -373,7 +373,19 @@ lint-features:
     # fix the feature or delete it.
     {{ cargo }} hack check --each-feature --no-dev-deps -p krishiv-connectors
     {{ cargo }} hack check --each-feature --no-dev-deps -p krishiv-sql
-    @echo "✓ per-feature builds clean (no quarantined features)"
+    # `--no-dev-deps` above is what makes the per-feature sweep fast, but it
+    # also means it never builds a *test* target — so `#[cfg(test)]` code behind
+    # an optional feature was checked by nothing. That is not hypothetical: the
+    # unity-catalog and glue-catalog test modules called `std::env::set_var`
+    # inside `unsafe`, which this crate's `#![forbid(unsafe_code)]` rejects, so
+    # those two backends' entire test suites had never compiled. The guard read
+    # as "every optional feature must compile on its own" while checking only
+    # half of each one.
+    #
+    # This second pass builds the test targets too. It is the slower half; keep
+    # it, and do not "optimise" it back into the --no-dev-deps line.
+    {{ cargo }} hack check --each-feature --all-targets -p krishiv-sql
+    @echo "✓ per-feature builds clean, lib and tests (no quarantined features)"
 
 # Phase 62 gate: every versioned compatibility promise must match the code and
 # have an enforcing test (docs/COMPATIBILITY.md drifts otherwise — it published
