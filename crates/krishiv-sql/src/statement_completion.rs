@@ -195,6 +195,125 @@ pub fn parse_truncate(query: &str) -> Option<String> {
     (!name.is_empty() && !name.contains(char::is_whitespace)).then(|| unquote(name))
 }
 
+/// A parsed `CREATE VECTOR INDEX` statement (Phase 36 G19): the governed
+/// SQL entry point that arms the ANN accelerator — the embed tick issues
+/// this after landing embeddings, and any user can issue it by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateVectorIndex {
+    /// Table holding the embedding column.
+    pub table: String,
+    /// The embedding column (`List`/`FixedSizeList` of floats).
+    pub column: String,
+    /// `cosine` (default) or `l2`.
+    pub metric: String,
+    /// Voronoi cells; `0` auto-sizes to `~sqrt(rows)`.
+    pub nlist: usize,
+}
+
+/// Parse `CREATE VECTOR INDEX [<name>] ON <table>(<column>)
+/// [WITH (metric = 'cosine'|'l2' [, nlist = <n>])]`.
+///
+/// `None` for any other statement; `Some(Err)` for a malformed spelling of
+/// THIS statement — refused with direction, never silently ignored. The
+/// optional index name is accepted for dialect familiarity and discarded:
+/// the engine keys one index per (table, column).
+pub fn parse_create_vector_index(query: &str) -> Option<Result<CreateVectorIndex, String>> {
+    const PREFIX: &str = "CREATE VECTOR INDEX";
+    let q = query.trim().trim_end_matches(';').trim();
+    if q.len() <= PREFIX.len() || !q.get(..PREFIX.len())?.eq_ignore_ascii_case(PREFIX) {
+        return None;
+    }
+    let mut body = q.get(PREFIX.len()..)?.trim();
+    if !body.to_ascii_uppercase().starts_with("ON ") {
+        // Optional index name before ON.
+        let Some((_name, rest)) = body.split_once(char::is_whitespace) else {
+            return Some(Err(
+                "CREATE VECTOR INDEX: expected ON <table>(<column>)".into(),
+            ));
+        };
+        body = rest.trim();
+        if !body.to_ascii_uppercase().starts_with("ON ") {
+            return Some(Err(
+                "CREATE VECTOR INDEX: expected ON <table>(<column>)".into(),
+            ));
+        }
+    }
+    body = body.get(3..).unwrap_or("").trim();
+    let Some((table_part, rest)) = body.split_once('(') else {
+        return Some(Err(
+            "CREATE VECTOR INDEX: expected <table>(<column>) after ON".into(),
+        ));
+    };
+    let Some((column_part, tail)) = rest.split_once(')') else {
+        return Some(Err(
+            "CREATE VECTOR INDEX: unclosed '(' — expected <table>(<column>)".into(),
+        ));
+    };
+    let table = unquote(table_part.trim());
+    let column = unquote(column_part.trim());
+    if table.is_empty() || column.is_empty() || column.contains(',') {
+        return Some(Err(
+            "CREATE VECTOR INDEX: one table and exactly one embedding column".into(),
+        ));
+    }
+    let mut metric = String::from("cosine");
+    let mut nlist = 0usize;
+    let tail = tail.trim();
+    if !tail.is_empty() {
+        let Some(options) = tail
+            .to_ascii_uppercase()
+            .starts_with("WITH")
+            .then(|| tail.get(4..).unwrap_or("").trim())
+            .and_then(|w| w.strip_prefix('('))
+            .and_then(|w| w.strip_suffix(')'))
+        else {
+            return Some(Err(format!(
+                "CREATE VECTOR INDEX: unexpected trailing '{tail}' — options go in \
+                 WITH (metric = 'cosine'|'l2', nlist = <n>)"
+            )));
+        };
+        for pair in options.split(',') {
+            let Some((key, value)) = pair.split_once('=') else {
+                return Some(Err(format!(
+                    "CREATE VECTOR INDEX: option '{}' must be <key> = <value>",
+                    pair.trim()
+                )));
+            };
+            let value = value.trim().trim_matches('\'').trim_matches('"');
+            match key.trim().to_ascii_lowercase().as_str() {
+                "metric" => match value.to_ascii_lowercase().as_str() {
+                    m @ ("cosine" | "l2") => metric = m.to_owned(),
+                    other => {
+                        return Some(Err(format!(
+                            "CREATE VECTOR INDEX: metric '{other}' — cosine | l2"
+                        )));
+                    }
+                },
+                "nlist" => match value.parse::<usize>() {
+                    Ok(n) => nlist = n,
+                    Err(_) => {
+                        return Some(Err(format!(
+                            "CREATE VECTOR INDEX: nlist '{value}' must be a non-negative \
+                             integer (0 = auto)"
+                        )));
+                    }
+                },
+                other => {
+                    return Some(Err(format!(
+                        "CREATE VECTOR INDEX: unknown option '{other}' — metric, nlist"
+                    )));
+                }
+            }
+        }
+    }
+    Some(Ok(CreateVectorIndex {
+        table,
+        column,
+        metric,
+        nlist,
+    }))
+}
+
 /// A parsed cache-family statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheStatement {

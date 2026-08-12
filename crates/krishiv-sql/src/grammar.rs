@@ -645,7 +645,10 @@ static FEATURES: &[FeatureEntry] = &[
          (results-identical by construction; cache invalidated on every DML; \
          KRISHIV_ANN_AUTO_REWRITE=off disables). Single-node engine only: the staged \
          distributed planner registers the same rule over an empty cache, so it is \
-         present but inert there — distributed kNN still runs exact unaccelerated",
+         present but inert there — distributed kNN still runs exact unaccelerated. \
+         CREATE VECTOR INDEX [name] ON t(col) WITH (metric='cosine'|'l2', nlist=N) is \
+         the governed SQL arming statement (build stats returned; the embed tick's \
+         entry point)",
     ),
     // ── FUNCTIONS: higher-order array lambdas (Phase 60) ─────────────────────
     FeatureEntry::batch_only(

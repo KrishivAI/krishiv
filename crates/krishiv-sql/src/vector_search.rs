@@ -709,6 +709,11 @@ impl crate::SqlEngine {
         {
             return;
         }
+        // CREATE VECTOR INDEX mutates no rows — it POPULATES this cache;
+        // clearing other tables' indexes for it would be pure loss.
+        if crate::statement_completion::parse_create_vector_index(sql).is_some() {
+            return;
+        }
         let first_word = sql
             .trim_start()
             .split(|c: char| c.is_whitespace() || c == '(' || c == ';')

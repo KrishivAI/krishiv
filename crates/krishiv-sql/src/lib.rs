@@ -2830,6 +2830,30 @@ impl SqlEngine {
             let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
             return Ok(self.attach_query_metadata(self.make_sql_df("cache", empty), query));
         }
+        // ── Phase 36 G19: CREATE VECTOR INDEX arms the ANN accelerator ──────
+        // The governed SQL entry point over `build_vector_index`: the embed
+        // tick issues it after landing embeddings; users can too. Returns
+        // the build stats so callers can see what was indexed.
+        if let Some(parsed) = statement_completion::parse_create_vector_index(query) {
+            let spec = parsed.map_err(|feature| SqlError::Unsupported { feature })?;
+            let metric = match spec.metric.as_str() {
+                "l2" => crate::vector_metric::VectorMetric::L2,
+                _ => crate::vector_metric::VectorMetric::Cosine,
+            };
+            let stats = self
+                .build_vector_index(&spec.table, &spec.column, metric, spec.nlist)
+                .await?;
+            let out = self
+                .context
+                .sql(&format!(
+                    "SELECT {} AS rows, {} AS dim, {} AS nlist",
+                    stats.rows, stats.dim, stats.nlist
+                ))
+                .await?;
+            return Ok(
+                self.attach_query_metadata(self.make_sql_df("create-vector-index", out), query)
+            );
+        }
         if let Some(rewrite) = statement_completion::rewrite_describe_function(query)
             .or_else(|| statement_completion::rewrite_describe_database(query))
         {

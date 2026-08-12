@@ -491,6 +491,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_vector_index_statement_arms_the_rewrite() {
+        use arrow::array::Int64Array;
+        let engine = seeded_engine(120).await;
+        let baseline = ids(&engine, KNN).await;
+        // The governed SQL spelling — what the platform embed tick issues.
+        let batches = engine
+            .sql("CREATE VECTOR INDEX ON docs(emb) WITH (metric = 'cosine')")
+            .await
+            .expect("statement accepted")
+            .collect()
+            .await
+            .expect("collect");
+        let stats = &batches[0];
+        let rows = stats
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("rows column");
+        assert_eq!(rows.value(0), 120, "build stats report the indexed rows");
+        let plan = explain(&engine, KNN).await;
+        assert!(
+            plan.contains("<="),
+            "the statement must arm the τ rewrite:\n{plan}"
+        );
+        assert_eq!(ids(&engine, KNN).await, baseline, "answers unmoved");
+        // Creating an index is not a mutation: it must not clear OTHER
+        // cached indexes through the front-door statement guard.
+        assert!(
+            engine.vector_index_entry("docs", "emb").is_some(),
+            "the guard must not clear the index its own statement built"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_vector_index_rejects_bad_spellings_with_direction() {
+        let engine = seeded_engine(10).await;
+        for (sql, expect) in [
+            (
+                "CREATE VECTOR INDEX ON docs(emb) WITH (metric = 'dot')",
+                "cosine | l2",
+            ),
+            (
+                "CREATE VECTOR INDEX ON docs(emb) WITH (fanout = 3)",
+                "unknown option",
+            ),
+            ("CREATE VECTOR INDEX docs emb", "expected ON"),
+            (
+                "CREATE VECTOR INDEX ON docs(emb) EXTRA",
+                "WITH (metric",
+            ),
+        ] {
+            let err = engine.sql(sql).await.err().map(|e| e.to_string());
+            let err = err.unwrap_or_else(|| panic!("'{sql}' must be refused"));
+            assert!(err.contains(expect), "'{sql}' → {err}");
+        }
+    }
+
+    #[tokio::test]
     async fn disabled_rule_rewrites_nothing() {
         use datafusion::optimizer::OptimizerContext;
         let cache: VectorIndexCache = Arc::default();
