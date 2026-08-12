@@ -2050,3 +2050,50 @@ supporting re-registration is a feature decision.
 Not yet read in this crate: `catalog/iceberg_rest.rs` (1,537 lines), the back
 half of `catalog/mod.rs`, plus `distributed_plan.rs` (8,464) and
 `spillable_join.rs` (3,307).
+
+## §6 — closing every open item from this session (`8a358a49` … `fccd5994`)
+
+**46. SQL time travel was unreachable — for Delta as well as Iceberg.**
+This corrects §5 above, which recorded the gap as Iceberg-only.
+`preprocess_as_of_sql` strips the clause before DataFusion sees the query;
+`apply_as_of_refs` registered the pinned provider under
+`table.replace('.', "_")`, a name the rewritten SQL never mentions. No spelling
+of a time-travel query reached a pinned snapshot.
+
+**No test had ever run an `AS OF` query** — `as_of.rs` tests the preprocessor,
+`providers.rs` tests only the error paths. Both halves green, feature dead: the
+same shape as the MERGE gap in §2 and the `block_in_place` tests in §4b. Fixed
+by renaming the reference to a generated `__krishiv_as_of_<n>` alias in the AST
+and registering under it. `tests/as_of_end_to_end.rs` is the missing test:
+3 rows at v0, 6 at v1, `VERSION AS OF 0` must return 3.
+
+Note the test that had to change: `parses_version_as_of` asserted
+`sql.contains("FROM orders")` — that the name survives the rewrite. It was
+asserting the bug.
+
+**47. `spark_sql_ext` wired — and wiring exposed a live defect.**
+Resolves the wire-or-delete decision. `contains_transform` matched `TRANSFORM(`
+anywhere, so `transform(array, x -> x * 2)` — the higher-order function this
+crate supports — was rejected as "Spark TRANSFORM has no SQL equivalent". Three
+tests failed the moment the module was wired. Spark's TRANSFORM *clause* is
+always `SELECT TRANSFORM(cols) USING '<script>'`, so the guard now requires the
+`USING`. **The defect was invisible for as long as the module was dead** —
+which is the argument for wiring over deleting.
+
+**48. `cep_sql`: nested PATTERN groups truncated, keywords matched inside
+identifiers.** `extract_parenthesized_after` took the *first* `)`, so
+`PATTERN ((A B) C)` yielded `(A B)` — a different, still-valid pattern, so the
+query ran and matched the wrong sequence. Both it and `parse_within_ms` found
+their keyword by substring, so a partition column `my_pattern` shadowed
+`PATTERN` and a pattern variable `WITHINRANGE` looked like a `WITHIN` clause.
+Added balanced-paren scanning and `find_keyword` (word boundaries). Two tests;
+against the old logic they fail 2/2.
+
+**49–50.** `iceberg_table_provider.rs` claimed DataFusion 53.x (it is 54.x);
+`DataFusionCatalogBridge::invalidate` documented itself as guarding a scenario
+`register_table`'s `TableAlreadyExists` makes impossible. Both corrected.
+
+Still open and now the only items left from this crate: `iceberg_rest.rs`
+(1,537 lines), the back half of `catalog/mod.rs`, `distributed_plan.rs` (8,464)
+and `spillable_join.rs` (3,307) are unread; and the live-Kafka exercise of the
+boundedness fix is still owed.

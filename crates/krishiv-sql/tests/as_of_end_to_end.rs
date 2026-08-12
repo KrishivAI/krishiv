@@ -12,6 +12,10 @@
 //! precise outcome `apply_as_of_refs`'s own doc says a time-travel query must
 //! never produce.
 
+// Integration-test crate: helpers run outside `#[test]` fns, so clippy.toml's
+// `allow-expect-in-tests` does not reach them. A panic is the failure signal here.
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing)]
+
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -51,7 +55,7 @@ async fn count_rows(engine: &SqlEngine, sql: &str) -> Result<i64, String> {
     if total == 0 {
         return Ok(0);
     }
-    let first = &batches[0];
+    let first = batches.first().expect("non-empty checked above");
     let col = first
         .column(0)
         .as_any()
