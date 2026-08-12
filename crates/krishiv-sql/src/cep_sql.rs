@@ -458,9 +458,12 @@ fn find_keyword(hay_upper: &str, keyword: &str) -> Option<usize> {
     let mut from = 0usize;
     while let Some(rel) = hay_upper[from..].find(keyword) {
         let at = from + rel;
-        let before_ok = at == 0 || !is_ident(bytes[at - 1]);
+        let before_ok = at
+            .checked_sub(1)
+            .and_then(|i| bytes.get(i))
+            .is_none_or(|b| !is_ident(*b));
         let after = at + keyword.len();
-        let after_ok = after >= bytes.len() || !is_ident(bytes[after]);
+        let after_ok = bytes.get(after).is_none_or(|b| !is_ident(*b));
         if before_ok && after_ok {
             return Some(at);
         }
