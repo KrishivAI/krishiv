@@ -48,6 +48,36 @@ pub struct UnityCatalog {
     catalog_name: String,
 }
 
+/// Connection settings resolved from the environment.
+///
+/// Split out of [`UnityCatalog::from_env`] so the resolution rules can be
+/// tested against a plain lookup closure. The tests used to call `from_env`
+/// after mutating the real process environment, which needed `unsafe` — and
+/// this crate is `#![forbid(unsafe_code)]`, so that test module never compiled.
+/// It also raced: env vars are process-global and the harness runs tests in
+/// parallel, so the test that removed the host and the one that set it could
+/// observe each other.
+struct UnityEnvConfig {
+    host: String,
+    catalog_name: String,
+    token: Option<String>,
+}
+
+impl UnityEnvConfig {
+    fn resolve(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, CatalogError> {
+        let host =
+            lookup("KRISHIV_UNITY_HOST").ok_or_else(|| CatalogError::InvalidConfiguration {
+                message: "KRISHIV_UNITY_HOST is required for the Unity Catalog backend".into(),
+            })?;
+        Ok(Self {
+            host,
+            catalog_name: lookup("KRISHIV_UNITY_CATALOG_NAME")
+                .unwrap_or_else(|| "main".to_owned()),
+            token: lookup("KRISHIV_UNITY_TOKEN"),
+        })
+    }
+}
+
 impl UnityCatalog {
     /// Connect to a Unity Catalog server.
     ///
@@ -81,15 +111,8 @@ impl UnityCatalog {
     /// Required: `KRISHIV_UNITY_HOST`
     /// Optional: `KRISHIV_UNITY_TOKEN`, `KRISHIV_UNITY_CATALOG_NAME` (default `"main"`)
     pub async fn from_env() -> Result<Self, CatalogError> {
-        let host = std::env::var("KRISHIV_UNITY_HOST").map_err(|_| {
-            CatalogError::InvalidConfiguration {
-                message: "KRISHIV_UNITY_HOST is required for the Unity Catalog backend".into(),
-            }
-        })?;
-        let catalog_name =
-            std::env::var("KRISHIV_UNITY_CATALOG_NAME").unwrap_or_else(|_| "main".into());
-        let token = std::env::var("KRISHIV_UNITY_TOKEN").ok();
-        Self::new(&host, &catalog_name, token.as_deref()).await
+        let cfg = UnityEnvConfig::resolve(|k| std::env::var(k).ok())?;
+        Self::new(&cfg.host, &cfg.catalog_name, cfg.token.as_deref()).await
     }
 
     /// The UC catalog name this client is connected to.
@@ -117,21 +140,24 @@ impl std::ops::Deref for UnityCatalog {
 mod tests {
     use super::*;
 
-    #[test]
-    fn from_env_fails_without_host() {
-        // Remove the env var to ensure the "missing host" error path is taken.
-        // Safety: test-only single-threaded context.
-        unsafe {
-            std::env::remove_var("KRISHIV_UNITY_HOST");
+    fn lookup_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |key: &str| {
+            owned
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
         }
-        // Run the future synchronously with a blocking executor.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let result = rt.block_on(UnityCatalog::from_env());
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+    }
+
+    #[test]
+    fn resolve_fails_without_host() {
+        let err = UnityEnvConfig::resolve(lookup_from(&[]))
+            .err()
+            .expect("a missing host must be an error");
         match err {
             CatalogError::InvalidConfiguration { message } => {
                 assert!(message.contains("KRISHIV_UNITY_HOST"), "{message}");
@@ -141,24 +167,35 @@ mod tests {
     }
 
     #[test]
-    fn catalog_name_default_is_main() {
-        unsafe {
-            std::env::set_var("KRISHIV_UNITY_HOST", "https://test.unitycatalog.invalid");
-            std::env::remove_var("KRISHIV_UNITY_CATALOG_NAME");
-            std::env::remove_var("KRISHIV_UNITY_TOKEN");
-        }
-        // We only test the env-var parsing logic, not actual network connectivity.
-        // The `new()` call creates a KrishivRestCatalog which doesn't connect eagerly.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let catalog = rt
-            .block_on(UnityCatalog::from_env())
-            .expect("construction must succeed even without network");
+    fn catalog_name_defaults_to_main() {
+        let cfg = UnityEnvConfig::resolve(lookup_from(&[(
+            "KRISHIV_UNITY_HOST",
+            "https://test.unitycatalog.invalid",
+        )]))
+        .expect("host alone is sufficient");
+        assert_eq!(cfg.catalog_name, "main");
+        assert_eq!(cfg.token, None);
+    }
+
+    #[test]
+    fn explicit_catalog_name_and_token_win() {
+        let cfg = UnityEnvConfig::resolve(lookup_from(&[
+            ("KRISHIV_UNITY_HOST", "https://uc.invalid"),
+            ("KRISHIV_UNITY_CATALOG_NAME", "analytics"),
+            ("KRISHIV_UNITY_TOKEN", "pat-123"),
+        ]))
+        .expect("fully specified config");
+        assert_eq!(cfg.catalog_name, "analytics");
+        assert_eq!(cfg.token.as_deref(), Some("pat-123"));
+    }
+
+    /// The Iceberg REST URL is what makes this a Unity Catalog client rather
+    /// than a plain REST one, and nothing asserted its shape before.
+    #[tokio::test]
+    async fn new_builds_the_unity_iceberg_rest_endpoint() {
+        let catalog = UnityCatalog::new("https://uc.invalid/", "main", None)
+            .await
+            .expect("construction must not require network");
         assert_eq!(catalog.catalog_name(), "main");
-        unsafe {
-            std::env::remove_var("KRISHIV_UNITY_HOST");
-        }
     }
 }

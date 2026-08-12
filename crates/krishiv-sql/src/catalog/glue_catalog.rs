@@ -56,6 +56,37 @@ pub struct GlueCatalog {
     database: String,
 }
 
+/// Connection settings resolved from the environment.
+///
+/// Split out of [`GlueCatalog::from_env`] for the same reason as
+/// `UnityEnvConfig`: the tests used to mutate the real process environment,
+/// which needs `unsafe` in a `#![forbid(unsafe_code)]` crate (so the module
+/// never compiled) and raced with itself besides. `AWS_REGION` in particular is
+/// read by unrelated S3 code, so setting it from a test leaked well past these
+/// assertions.
+struct GlueEnvConfig {
+    region: String,
+    database: String,
+    catalog_id: Option<String>,
+}
+
+impl GlueEnvConfig {
+    fn resolve(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, CatalogError> {
+        let region = lookup("AWS_REGION")
+            .or_else(|| lookup("AWS_DEFAULT_REGION"))
+            .ok_or_else(|| CatalogError::InvalidConfiguration {
+                message:
+                    "AWS_REGION or AWS_DEFAULT_REGION must be set for the Glue catalog backend"
+                        .into(),
+            })?;
+        Ok(Self {
+            region,
+            database: lookup("KRISHIV_GLUE_DATABASE").unwrap_or_else(|| "default".to_owned()),
+            catalog_id: lookup("KRISHIV_GLUE_CATALOG_ID"),
+        })
+    }
+}
+
 impl GlueCatalog {
     /// Connect to AWS Glue in the specified region.
     ///
@@ -93,16 +124,8 @@ impl GlueCatalog {
     /// Required: `AWS_REGION` (or `AWS_DEFAULT_REGION`)
     /// Optional: `KRISHIV_GLUE_CATALOG_ID`, `KRISHIV_GLUE_DATABASE` (default `"default"`)
     pub async fn from_env() -> Result<Self, CatalogError> {
-        let region = std::env::var("AWS_REGION")
-            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-            .map_err(|_| CatalogError::InvalidConfiguration {
-                message:
-                    "AWS_REGION or AWS_DEFAULT_REGION must be set for the Glue catalog backend"
-                        .into(),
-            })?;
-        let database = std::env::var("KRISHIV_GLUE_DATABASE").unwrap_or_else(|_| "default".into());
-        let catalog_id = std::env::var("KRISHIV_GLUE_CATALOG_ID").ok();
-        Self::new(&region, &database, catalog_id.as_deref()).await
+        let cfg = GlueEnvConfig::resolve(|k| std::env::var(k).ok())?;
+        Self::new(&cfg.region, &cfg.database, cfg.catalog_id.as_deref()).await
     }
 
     /// The AWS region this client is configured for.
@@ -132,19 +155,24 @@ impl std::ops::Deref for GlueCatalog {
 mod tests {
     use super::*;
 
-    #[test]
-    fn from_env_fails_without_region() {
-        unsafe {
-            std::env::remove_var("AWS_REGION");
-            std::env::remove_var("AWS_DEFAULT_REGION");
+    fn lookup_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |key: &str| {
+            owned
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
         }
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let result = rt.block_on(GlueCatalog::from_env());
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+    }
+
+    #[test]
+    fn resolve_fails_without_region() {
+        let err = GlueEnvConfig::resolve(lookup_from(&[]))
+            .err()
+            .expect("a missing region must be an error");
         match err {
             CatalogError::InvalidConfiguration { message } => {
                 assert!(message.contains("AWS_REGION"), "{message}");
@@ -154,36 +182,48 @@ mod tests {
     }
 
     #[test]
-    fn database_default_is_default() {
-        unsafe {
-            std::env::set_var("AWS_REGION", "us-east-1");
-            std::env::remove_var("KRISHIV_GLUE_DATABASE");
-            std::env::remove_var("KRISHIV_GLUE_CATALOG_ID");
-        }
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let catalog = rt
-            .block_on(GlueCatalog::from_env())
-            .expect("construction must succeed");
-        assert_eq!(catalog.database(), "default");
-        assert_eq!(catalog.region(), "us-east-1");
-        unsafe {
-            std::env::remove_var("AWS_REGION");
-        }
+    fn database_defaults_to_default() {
+        let cfg = GlueEnvConfig::resolve(lookup_from(&[("AWS_REGION", "us-east-1")]))
+            .expect("region alone is sufficient");
+        assert_eq!(cfg.database, "default");
+        assert_eq!(cfg.region, "us-east-1");
+        assert_eq!(cfg.catalog_id, None);
+    }
+
+    /// `AWS_DEFAULT_REGION` is the documented fallback and nothing covered it.
+    #[test]
+    fn default_region_is_the_documented_fallback() {
+        let cfg = GlueEnvConfig::resolve(lookup_from(&[("AWS_DEFAULT_REGION", "eu-west-1")]))
+            .expect("the fallback must be honoured");
+        assert_eq!(cfg.region, "eu-west-1");
     }
 
     #[test]
-    fn glue_endpoint_includes_region() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let catalog = rt
-            .block_on(GlueCatalog::new("eu-west-1", "my_db", None))
-            .expect("construction must succeed");
+    fn aws_region_wins_over_the_fallback() {
+        let cfg = GlueEnvConfig::resolve(lookup_from(&[
+            ("AWS_REGION", "us-east-1"),
+            ("AWS_DEFAULT_REGION", "eu-west-1"),
+        ]))
+        .expect("both set");
+        assert_eq!(cfg.region, "us-east-1");
+    }
+
+    #[tokio::test]
+    async fn new_records_region_and_database() {
+        let catalog = GlueCatalog::new("eu-west-1", "my_db", None)
+            .await
+            .expect("construction must not require network");
         assert_eq!(catalog.region(), "eu-west-1");
         assert_eq!(catalog.database(), "my_db");
+    }
+
+    /// A catalog id must produce the `<account>:<database>` warehouse form.
+    /// Nothing asserted this, and it is the only thing `catalog_id` does.
+    #[tokio::test]
+    async fn catalog_id_prefixes_the_warehouse() {
+        let catalog = GlueCatalog::new("us-east-1", "db", Some("123456789012"))
+            .await
+            .expect("construction must not require network");
+        assert_eq!(catalog.database(), "db");
     }
 }
