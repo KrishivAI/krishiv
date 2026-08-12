@@ -1,9 +1,9 @@
 //! Real Iceberg read path via iceberg scan + DataFusion Parquet listing (Phase J2).
 //!
 //! `iceberg-datafusion 0.9.1` depends on DataFusion 52.x while the workspace
-//! uses DataFusion 53.x, making `IcebergStaticTableProvider` incompatible with
+//! uses DataFusion 54.x, making `IcebergStaticTableProvider` incompatible with
 //! the workspace `SessionContext`. Instead, we enumerate Parquet files through
-//! iceberg's `plan_files()` and wrap them in DataFusion 53's `ListingTable`,
+//! iceberg's `plan_files()` and wrap them in the workspace `ListingTable`,
 //! which provides native pushdown of projections and partition filters.
 
 pub mod iceberg_scan {

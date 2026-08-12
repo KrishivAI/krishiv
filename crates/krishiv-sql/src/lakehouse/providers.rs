@@ -315,7 +315,11 @@ pub async fn apply_as_of_refs(
     refs: &[super::as_of::AsOfTableRef],
 ) -> SqlResult<()> {
     for reference in refs.iter() {
-        let Some(path) = reference.table.strip_prefix("delta.") else {
+        let Some(path) = reference
+            .table
+            .strip_prefix("delta.")
+            .map(|p| p.trim_matches('`'))
+        else {
             return Err(SqlError::Unsupported {
                 feature: format!(
                     "time travel on '{}': AS OF is currently resolved only for Delta tables \
@@ -340,13 +344,12 @@ pub async fn apply_as_of_refs(
                 });
             }
         };
-        register_delta_uri(
-            ctx,
-            &reference.table.replace('.', "_"),
-            path,
-            Some(version),
-        )
-        .await?;
+        // Register under the alias `preprocess_as_of_sql` rewrote the query
+        // to use. This used to register under `table.replace('.', "_")` — a
+        // name the rewritten SQL never mentioned, so the pinned provider was
+        // unreachable and the query named a table DataFusion could not
+        // resolve. Nothing caught it because no test ran an AS OF query.
+        register_delta_uri(ctx, &reference.alias, path, Some(version)).await?;
     }
     Ok(())
 }
@@ -497,6 +500,7 @@ mod tests {
     async fn a_non_delta_table_cannot_be_silently_ignored() {
         let refs = vec![AsOfTableRef {
             table: "orders".into(),
+            alias: "__krishiv_as_of_0".into(),
             spec: AsOfSpec::Version(3),
         }];
         let err = apply_as_of_refs(&ctx(), &refs)
@@ -518,6 +522,7 @@ mod tests {
         let ts = chrono::Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
         let refs = vec![AsOfTableRef {
             table: "delta./tmp/does-not-matter".into(),
+            alias: "__krishiv_as_of_0".into(),
             spec: AsOfSpec::Timestamp(ts),
         }];
         let err = apply_as_of_refs(&ctx(), &refs)

@@ -2,15 +2,32 @@
 
 use krishiv_connectors::lakehouse::AsOfSpec;
 use sqlparser::ast::{
-    Expr, Select, SetExpr, Statement, TableFactor, TableVersion, TableWithJoins, Value,
+    Expr, Ident, ObjectName, ObjectNamePart, Select, SetExpr, Statement, TableFactor,
+    TableVersion, TableWithJoins, Value,
 };
 use sqlparser::dialect::DatabricksDialect;
 use sqlparser::parser::Parser;
 
+/// Prefix for the generated names that pinned tables are registered under.
+///
+/// Deliberately not a legal user identifier prefix in practice, so a rewritten
+/// reference cannot collide with a real table.
+pub const AS_OF_ALIAS_PREFIX: &str = "__krishiv_as_of_";
+
 /// Parsed `AS OF` qualifier attached to a table reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsOfTableRef {
+    /// The table as the user wrote it, e.g. `delta.\`/data/orders\`` or
+    /// `iceberg.sales.orders`. Used to resolve the pinned snapshot.
     pub table: String,
+    /// The name the *rewritten* SQL now refers to.
+    ///
+    /// `preprocess_as_of_sql` renames the table reference to this alias, and
+    /// whoever resolves the qualifier must register the pinned table under it.
+    /// Without the rename the two halves never met: the clause was stripped,
+    /// a provider was registered under a mangled name nothing referenced, and
+    /// the query was left naming a table DataFusion could not resolve.
+    pub alias: String,
     pub spec: AsOfSpec,
 }
 
@@ -106,10 +123,21 @@ fn process_table_factor(tf: &mut TableFactor, scan: &mut AsOfScan) {
                 // the only remaining record of it is this string.
                 let described = format!("{ver:?}");
                 match table_version_to_spec(ver) {
-                    Some(spec) => scan.refs.push(AsOfTableRef {
-                        table: table_name,
-                        spec,
-                    }),
+                    Some(spec) => {
+                        // Rename the reference to a generated alias and hand
+                        // that alias back, so the resolver has a name it can
+                        // register the pinned snapshot under and the rewritten
+                        // SQL actually refers to it.
+                        let alias = format!("{AS_OF_ALIAS_PREFIX}{}", scan.refs.len());
+                        *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
+                            alias.clone(),
+                        ))]);
+                        scan.refs.push(AsOfTableRef {
+                            table: table_name,
+                            alias,
+                            spec,
+                        });
+                    }
                     None => scan
                         .unsupported
                         .push(format!("on table '{table_name}': {described}")),

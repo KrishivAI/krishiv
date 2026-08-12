@@ -679,15 +679,23 @@ pub mod datafusion_bridge {
         }
 
         /// Invalidate the MemTable cache for `name`, forcing the next
-        /// `table()` call to rebuild the cached `MemTable` from the
-        /// catalog's batch store. Call this after `register_table_with_batches`
-        /// mutates the underlying catalog so the bridge does not serve
-        /// a stale `MemTable` referencing the previous batch payload.
+        /// `table()` call to rebuild the cached `MemTable` from the catalog's
+        /// batch store.
         ///
-        /// The `DashMap` cache is per-bridge and survives across DataFusion
-        /// `table()` calls; without this invalidation hook a second
-        /// `register_table_with_batches` for the same name would not be
-        /// visible to the DataFusion query plan.
+        /// # What this does and does not protect against
+        ///
+        /// This used to be documented as guarding a scenario that cannot
+        /// happen: "without this hook a second `register_table_with_batches`
+        /// for the same name would not be visible". `register_table` returns
+        /// `TableAlreadyExists`, so the second call fails before it can touch
+        /// `table_data` — the cache cannot go stale that way, and this method
+        /// had no production caller.
+        ///
+        /// It is kept, and now honest about its purpose: it is the hook a
+        /// caller needs if `InMemoryCatalog` ever gains replace-in-place
+        /// semantics, and it is exercised by `bridge_invalidate_rebuilds_the_
+        /// cached_memtable`. Anything that mutates a registered table's batches
+        /// must call it; today nothing can.
         pub fn invalidate(&self, name: &str) {
             self.schema_cache.remove(name);
         }
