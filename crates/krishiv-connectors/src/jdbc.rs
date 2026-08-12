@@ -410,6 +410,23 @@ pub(crate) fn render_insert(
     rows: usize,
     conflict_keys: &[String],
 ) -> String {
+    // Resolve each declared key to the column's ACTUAL spelling.
+    // `quote_identifier` always double-quotes and never folds, so a
+    // declared `ID` against a column `id` would render ON CONFLICT ("ID")
+    // and fail with 42703 INSIDE the transaction — past the pre-flight
+    // guard that matches case-insensitively and exists precisely to fail
+    // before the transaction opens.
+    let conflict_keys: Vec<String> = conflict_keys
+        .iter()
+        .map(|k| {
+            columns
+                .iter()
+                .find(|c| c.eq_ignore_ascii_case(k))
+                .cloned()
+                .unwrap_or_else(|| k.clone())
+        })
+        .collect();
+    let conflict_keys = conflict_keys.as_slice();
     let cols_clause = columns
         .iter()
         .map(|c| quote_identifier(c))
@@ -496,18 +513,52 @@ impl Sink for JdbcSink {
         // Rows per statement, bounded by the wire protocol's parameter cap.
         let per_stmt = self.batch_rows.min((MAX_BIND_PARAMS / ncols).max(1));
 
+        // In UPSERT mode, a statement may not touch the same conflict key
+        // twice: Postgres raises 21000 "ON CONFLICT DO UPDATE command
+        // cannot affect row a second time" and rolls back the ENTIRE
+        // batch, including the duplicate-free rows. Worse, whether two
+        // duplicate rows land in the same statement depends on upstream
+        // batch sizes, so identical logical input would pass or fail
+        // non-deterministically.
+        //
+        // Deduplicate by conflict key across the whole batch, keeping the
+        // LAST occurrence: that is what a sequence of individual upserts
+        // would converge to, so batching changes throughput and not
+        // semantics.
+        let row_order: Vec<usize> = if self.conflict_keys.is_empty() {
+            (0..batch.num_rows()).collect()
+        } else {
+            let key_indices: Vec<usize> = self
+                .conflict_keys
+                .iter()
+                .filter_map(|k| columns.iter().position(|c| c.eq_ignore_ascii_case(k)))
+                .collect();
+            let mut last_for_key: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for row_idx in 0..batch.num_rows() {
+                let mut key = String::new();
+                for &col_idx in &key_indices {
+                    let col = batch.column(col_idx);
+                    key.push_str(&cell_key(col.as_ref(), row_idx));
+                    key.push('\u{1f}');
+                }
+                last_for_key.insert(key, row_idx);
+            }
+            let mut kept: Vec<usize> = last_for_key.into_values().collect();
+            kept.sort_unstable();
+            kept
+        };
+
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
 
-        let mut start = 0usize;
-        while start < batch.num_rows() {
-            let rows = per_stmt.min(batch.num_rows() - start);
-            let sql = render_insert(&self.table, &columns, rows, &self.conflict_keys);
+        for chunk in row_order.chunks(per_stmt) {
+            let sql = render_insert(&self.table, &columns, chunk.len(), &self.conflict_keys);
             let mut q = sqlx::query(&sql);
-            for row_idx in start..start + rows {
+            for &row_idx in chunk {
                 for col_idx in 0..ncols {
                     let col = batch.column(col_idx);
                     q = bind_column_value(q, col.as_ref(), row_idx)?;
@@ -516,7 +567,6 @@ impl Sink for JdbcSink {
             q.execute(&mut *tx)
                 .await
                 .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
-            start += rows;
         }
 
         tx.commit()
@@ -660,7 +710,27 @@ fn bind_column_value<'q>(
         BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, StringArray,
     };
     if col.is_null(row_idx) {
-        return Ok(q.bind(Option::<i64>::None));
+        // A NULL must still be bound at the COLUMN's type. sqlx's
+        // `Encode for Option<T>` reports `T::type_info()` even for `None`,
+        // so binding Option::<i64>::None declares OID 20 (int8) — and
+        // since render_insert emits bare `$n` with no casts, Postgres
+        // rejects the whole batch the moment any bool/text/float column
+        // holds a NULL. Bind the right None per type instead.
+        return Ok(match col.data_type() {
+            DataType::Boolean => q.bind(Option::<bool>::None),
+            DataType::Int16 => q.bind(Option::<i16>::None),
+            DataType::Int32 => q.bind(Option::<i32>::None),
+            DataType::Int64 => q.bind(Option::<i64>::None),
+            DataType::Float32 => q.bind(Option::<f32>::None),
+            DataType::Float64 => q.bind(Option::<f64>::None),
+            DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => {
+                q.bind(Option::<String>::None)
+            }
+            // Unsupported types error on the non-null path below; a NULL
+            // of such a type is bound as text, which Postgres accepts for
+            // any column since an untyped NULL literal is polymorphic.
+            _ => q.bind(Option::<String>::None),
+        });
     }
     let bound = match col.data_type() {
         DataType::Int16 => {
@@ -934,6 +1004,17 @@ mod sink_sql_tests {
     }
 
     #[test]
+    fn a_declared_key_renders_the_columns_actual_spelling() {
+        // Regression (adversarial review, 2026-08-12): quote_identifier
+        // never folds, so ON CONFLICT ("ID") against column `id` failed
+        // with 42703 INSIDE the transaction — past the pre-flight guard
+        // that exists to fail before it opens.
+        let sql = render_insert("t", &cols(&["id", "v"]), 1, &cols(&["ID"]));
+        assert!(sql.contains(r#"ON CONFLICT ("id")"#), "must fold to the real column: {sql}");
+        assert!(!sql.contains(r#"ON CONFLICT ("ID")"#), "{sql}");
+    }
+
+    #[test]
     fn conflict_keys_match_columns_case_insensitively() {
         // Postgres folds unquoted identifiers to lower case, so a declared
         // key of `ID` must not produce `"ID" = EXCLUDED."ID"` in the SET
@@ -942,4 +1023,39 @@ mod sink_sql_tests {
         assert!(!sql.contains(r#""id" = EXCLUDED."id""#), "{sql}");
         assert!(sql.contains(r#""v" = EXCLUDED."v""#), "{sql}");
     }
+}
+
+/// A row's value for one column rendered as a dedup key. Only used to
+/// collapse duplicate conflict targets within a batch, so it needs to be
+/// stable and collision-free for equal values — not human-readable.
+fn cell_key(col: &dyn Array, row_idx: usize) -> String {
+    use arrow::array::{
+        BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+        LargeStringArray, StringArray, StringViewArray,
+    };
+    if col.is_null(row_idx) {
+        return "\u{0}NULL".into();
+    }
+    macro_rules! as_str {
+        ($t:ty) => {
+            col.as_any()
+                .downcast_ref::<$t>()
+                .map(|a| a.value(row_idx).to_string())
+        };
+    }
+    let rendered = match col.data_type() {
+        DataType::Boolean => as_str!(BooleanArray),
+        DataType::Int16 => as_str!(Int16Array),
+        DataType::Int32 => as_str!(Int32Array),
+        DataType::Int64 => as_str!(Int64Array),
+        DataType::Float32 => as_str!(Float32Array),
+        DataType::Float64 => as_str!(Float64Array),
+        DataType::Utf8 => as_str!(StringArray),
+        DataType::Utf8View => as_str!(StringViewArray),
+        DataType::LargeUtf8 => as_str!(LargeStringArray),
+        _ => None,
+    };
+    // An unrenderable key type falls back to the row index, which makes
+    // the row unique to itself — no dedup, but never a WRONG collapse.
+    rendered.unwrap_or_else(|| format!("\u{0}row{row_idx}"))
 }

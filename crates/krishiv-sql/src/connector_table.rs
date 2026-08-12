@@ -776,3 +776,53 @@ mod insert_into_tests {
         assert!(err.contains("no writable sink counterpart"), "{err}");
     }
 }
+
+#[cfg(all(test, feature = "jdbc"))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)]
+mod review_regression_tests {
+    /// Regressions from the 2026-08-12 adversarial review, each proven
+    /// against a real Postgres because each failed only at execution
+    /// time — a unit test over the rendered SQL passed happily.
+    #[tokio::test]
+    async fn nulls_duplicates_and_case_folded_keys_all_land() {
+        let Ok(url) = std::env::var("KRISHIV_TEST_DATABASE_URL") else {
+            eprintln!("SKIP: KRISHIV_TEST_DATABASE_URL unset");
+            return;
+        };
+        let engine = crate::SqlEngine::new();
+        // 'ID' deliberately mis-cased against column `id` (defect 13).
+        let ddl = format!(
+            "CREATE EXTERNAL TABLE fx (id BIGINT, flag BOOLEAN, note VARCHAR, score DOUBLE) \
+             STORED AS JDBC LOCATION '{url}' \
+             OPTIONS ('table' 'fixprobe', 'conflict_keys' 'ID')"
+        );
+        engine.sql(&ddl).await.expect("ddl").collect().await.expect("ddl run");
+
+        // A NULL bool and a NULL text in one batch (defect 11): the old
+        // code bound both as int8 NULL and Postgres rejected the batch.
+        // Two rows share id=1 in ONE statement (defect 12): the old code
+        // hit 21000 and rolled back everything.
+        engine
+            .sql(
+                "INSERT INTO fx SELECT * FROM (VALUES \
+                   (1, true,  'first',  1.5), \
+                   (1, false, NULL,     2.5), \
+                   (2, NULL,  'second', NULL)) v(id, flag, note, score)",
+            )
+            .await
+            .expect("insert plans")
+            .collect()
+            .await
+            .expect("insert runs");
+
+        let batches = engine
+            .sql("SELECT id, note FROM fx ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2, "id=1 deduped to the LAST occurrence, id=2 kept");
+    }
+}
