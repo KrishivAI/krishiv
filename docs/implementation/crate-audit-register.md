@@ -2002,3 +2002,51 @@ the current snapshot), which is why this is a gap and not a defect.
 **Open — doc drift in `iceberg_table_provider.rs`.** The module doc says the
 workspace uses "DataFusion 53.x" and that `iceberg-datafusion 0.9.1` targets
 52.x. The workspace is on DF 54.
+
+## §5b — postgres_catalog.rs + catalog/mod.rs (defects 42–45, `5f72fa45`)
+
+**42–45. The Postgres backend reported success for four operations it never
+performed.** A DELETE or UPDATE matching no rows is a successful *statement*,
+not a successful operation, and this backend conflated the two:
+
+- `drop_table` on a table that does not exist → `Ok(())`.
+- `rename_table` from a source that does not exist → `Ok(())`.
+- `drop_namespace` deleted the namespace row without checking for tables.
+  There is no foreign key from `krishiv_tables`, so every table in it was
+  orphaned: absent from `list_namespaces`, still served by `list_tables`, still
+  loadable by `load_table`.
+- `list_namespaces` took a `parent` and discarded it (`_parent`), so listing the
+  children of `a` returned the entire catalog.
+
+All four now error or filter correctly. The `parent` query uses `starts_with`
+rather than LIKE deliberately: namespace names may contain `_`, which LIKE reads
+as a wildcard, so a LIKE pattern would report prefix-sharing siblings as
+children. The `None` case still returns every namespace flattened — a
+*deliberate* divergence, because this catalog is surfaced through DataFusion,
+whose schema space is flat, so a nested `a.b` must appear as its own schema to
+be queryable at all.
+
+**Verified against a real Postgres 16 in a throwaway container, not by
+inspection.** The two pre-existing `#[ignore]`d integration tests still pass,
+including the CAS concurrent-commit test that asserts no lost update. Three new
+tests cover the four behaviours; spliced onto the *unfixed* code they fail 3/3,
+so they discriminate rather than merely pass.
+
+The CAS itself (`UPDATE … WHERE metadata_location = $expected`) is correct and
+genuinely well tested — that test asserts the surviving property (no lost
+update), not the mechanism.
+
+**Open — `DataFusionCatalogBridge::invalidate` is unreachable, and its own doc
+argues for it with an impossible scenario.** Its only caller is its own test.
+The doc says "without this invalidation hook a second
+`register_table_with_batches` for the same name would not be visible to the
+DataFusion query plan" — but `register_table` returns `TableAlreadyExists`, so a
+second call for the same name cannot succeed, and `table_data` is therefore
+never mutated for an already-registered name. The cache it guards cannot go
+stale through the public API. Disposition is wire-or-delete: either support
+re-registration (making the hook real) or remove it. Recorded rather than done —
+supporting re-registration is a feature decision.
+
+Not yet read in this crate: `catalog/iceberg_rest.rs` (1,537 lines), the back
+half of `catalog/mod.rs`, plus `distributed_plan.rs` (8,464) and
+`spillable_join.rs` (3,307).
