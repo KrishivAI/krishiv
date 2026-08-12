@@ -1953,3 +1953,52 @@ pre-existing, from other sessions): an `.err().expect()` in `krishiv-runtime`
 (`a3c4cd8e` — **main was red when this branch rebased onto it**), and nine
 `KRISHIV_*` flags read in source but never declared in `env_registry::FLAGS`,
 now declared with their real defaults.
+
+## §5 — catalog/ (defects 39–41, `759f80b1` `2d5f7310` `b6677e2a`)
+
+Read whole: `object_store_io.rs`, `rest_catalog_wrapper.rs`, `unity_catalog.rs`,
+`glue_catalog.rs`, `unified.rs`, `iceberg_table_provider.rs`,
+`local_catalog.rs`, and the first third of `postgres_catalog.rs`. Not yet read:
+the rest of `postgres_catalog.rs`, `iceberg_rest.rs` (1,537), `mod.rs` (2,398).
+
+**39. The unity-catalog and glue-catalog test suites had never compiled.**
+Both test modules call `std::env::set_var`/`remove_var` inside `unsafe`, and
+this crate is `#![forbid(unsafe_code)]` — which an inner `allow` cannot
+override. On the pristine tree `cargo check --all-targets --features
+unity-catalog,glue-catalog` exits 101. Five tests that read as coverage of two
+advertised catalog backends could not be built. They were racy besides: two
+tests in each file fought over one process-global variable, and the Glue pair
+set `AWS_REGION`, which unrelated S3 code reads. Fixed by extracting the
+resolution rules into pure `UnityEnvConfig::resolve` / `GlueEnvConfig::resolve`
+taking a lookup closure — no env, no `unsafe`, no race. 5 uncompilable tests
+became 10 passing ones, covering two rules nothing asserted before (the
+`AWS_DEFAULT_REGION` fallback and its precedence).
+
+**40. `lint-features` checked half of every optional feature.** The recipe runs
+`cargo hack check --each-feature --no-dev-deps`; `--no-dev-deps` skips test
+targets, so `#[cfg(test)]` code behind a feature was policed by nothing. This is
+the same shape as §4b: the recipe's comment says "every optional feature must
+compile on its own" and it had a structural hole. Added an `--all-targets` pass;
+green across all 13 features after 39, failing on glue-catalog before it.
+
+**41. Postgres `create_namespace` reported properties it never stored.**
+`ON CONFLICT DO NOTHING` (correctly — callers depend on idempotency) followed by
+returning the *caller's* properties. On an existing namespace the stored
+properties were untouched while the caller was handed its own values back as
+though applied. Now uses `RETURNING properties`, reading the row back when the
+insert did not happen.
+
+**Open — Iceberg time travel is implemented and unreachable.**
+`iceberg_table_provider_at_snapshot` is a complete snapshot-pinned provider with
+**zero callers**. Meanwhile `lakehouse/providers.rs::apply_as_of_refs` errors on
+any table not named `delta.<path>`, telling the user "AS OF is currently
+resolved only for Delta tables". So `VERSION AS OF <n>` on an Iceberg table is
+refused by a code path that sits next to its own implementation. Wiring it needs
+a catalog handle threaded into `apply_as_of_refs`, which today takes only
+`&SessionContext` — a feature change, not an audit fix, so it is recorded rather
+than done. The error is at least honest (it refuses instead of silently reading
+the current snapshot), which is why this is a gap and not a defect.
+
+**Open — doc drift in `iceberg_table_provider.rs`.** The module doc says the
+workspace uses "DataFusion 53.x" and that `iceberg-datafusion 0.9.1` targets
+52.x. The workspace is on DF 54.
