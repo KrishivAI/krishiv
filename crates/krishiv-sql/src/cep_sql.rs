@@ -445,31 +445,67 @@ fn extract_after_keyword(
     Ok(value)
 }
 
+/// Find `keyword` in `hay_upper` as a *word*, not a substring.
+///
+/// A plain `find` matched the keyword inside identifiers: a pattern variable
+/// `WITHINRANGE` or a column `my_pattern` was read as the clause keyword and
+/// the parse went off the rails from there. `hay_upper` must already be
+/// ASCII-uppercased; the returned index is a byte offset valid in the original
+/// string, since `to_ascii_uppercase` is length-preserving.
+fn find_keyword(hay_upper: &str, keyword: &str) -> Option<usize> {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = hay_upper.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = hay_upper[from..].find(keyword) {
+        let at = from + rel;
+        let before_ok = at == 0 || !is_ident(bytes[at - 1]);
+        let after = at + keyword.len();
+        let after_ok = after >= bytes.len() || !is_ident(bytes[after]);
+        if before_ok && after_ok {
+            return Some(at);
+        }
+        from = at + keyword.len();
+    }
+    None
+}
+
 fn extract_parenthesized_after(body: &str, body_upper: &str, keyword: &str) -> SqlResult<String> {
-    let start = body_upper
-        .find(keyword)
-        .ok_or_else(|| SqlError::Unsupported {
-            feature: format!("MATCH_RECOGNIZE requires {keyword}"),
-        })?
-        + keyword.len();
+    let start = find_keyword(body_upper, keyword).ok_or_else(|| SqlError::Unsupported {
+        feature: format!("MATCH_RECOGNIZE requires {keyword}"),
+    })? + keyword.len();
     let open = body[start..]
         .find('(')
         .ok_or_else(|| SqlError::Unsupported {
             feature: format!("MATCH_RECOGNIZE {keyword} requires '('"),
         })?
         + start;
-    let close = body[open + 1..]
-        .find(')')
-        .ok_or_else(|| SqlError::Unsupported {
-            feature: format!("MATCH_RECOGNIZE {keyword} requires ')'"),
-        })?
-        + open
-        + 1;
+
+    // Match the *balanced* close paren. Taking the first `)` truncated any
+    // nested group: `PATTERN ((A B) C)` yielded `(A B`, a different pattern
+    // that still parsed, so the query ran and matched the wrong thing.
+    let mut depth = 0usize;
+    let mut close = None;
+    for (offset, ch) in body[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + offset);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close.ok_or_else(|| SqlError::Unsupported {
+        feature: format!("MATCH_RECOGNIZE {keyword} requires a balanced ')'"),
+    })?;
     Ok(body[open + 1..close].trim().to_string())
 }
 
 fn parse_within_ms(body: &str, body_upper: &str) -> SqlResult<Option<u64>> {
-    let Some(start) = body_upper.find("WITHIN") else {
+    let Some(start) = find_keyword(body_upper, "WITHIN") else {
         return Ok(None);
     };
     let mut parts = body[start + "WITHIN".len()..].split_whitespace();
@@ -881,4 +917,40 @@ mod tests {
         assert_eq!(stmt.pattern.stages.len(), 2);
         assert_eq!(stmt.pattern.window_ms, 10_000);
     }
+    /// `PATTERN ((A B) C)` used to truncate at the first `)`, yielding `(A B`
+    /// — a different, still-parseable pattern. The query ran and matched the
+    /// wrong thing, which is worse than refusing it.
+    #[test]
+    fn a_nested_pattern_group_is_not_truncated_at_the_first_paren() {
+        let body = "PARTITION BY u ORDER BY ts PATTERN ((A B) C) DEFINE A AS x > 0";
+        let upper = body.to_ascii_uppercase();
+        let pattern = super::extract_parenthesized_after(body, &upper, "PATTERN")
+            .expect("a nested group must extract");
+        assert_eq!(
+            pattern, "(A B) C",
+            "the balanced close paren is the last one, not the first"
+        );
+    }
+
+    /// The keyword search was a plain substring match, so an identifier that
+    /// merely contains the keyword was read as the clause.
+    #[test]
+    fn keywords_are_matched_as_words_not_substrings() {
+        // `MY_PATTERN` precedes the real PATTERN clause.
+        let body = "PARTITION BY my_pattern ORDER BY ts PATTERN (A B)";
+        let upper = body.to_ascii_uppercase();
+        let pattern = super::extract_parenthesized_after(body, &upper, "PATTERN")
+            .expect("the real PATTERN clause must be found");
+        assert_eq!(pattern, "A B", "matched `my_pattern` instead of the keyword");
+
+        // A pattern variable containing WITHIN must not look like a WITHIN clause.
+        let body = "PATTERN (WITHINRANGE B)";
+        let upper = body.to_ascii_uppercase();
+        assert_eq!(
+            super::parse_within_ms(body, &upper).expect("must not error"),
+            None,
+            "`WITHINRANGE` is a pattern variable, not a WITHIN clause"
+        );
+    }
+
 }
