@@ -85,3 +85,65 @@ today, as an operator would:
 - Day-7 verdict lands on 2026-08-17. Until then this phase's soak box
   stays open with this report as the interim record; nothing before
   2026-08-10 counts as soak evidence.
+
+---
+
+## Evidence audit — 2026-08-12
+
+Two findings from checking the running soak's evidence chain rather than
+its liveness. Neither invalidates the soak; both bound what its verdict
+may claim.
+
+### 1. The counters were unreadable for ~43 hours (now fixed forward)
+
+The soak driver has run continuously since 2026-08-10 22:16 UTC, and the
+cluster is healthy — coordinator plus executors Running, the chaos
+CronJob firing every 6 h on schedule, the 12:17Z kill of
+`cert-v2-executor-…-2xhp9` recovered. But the driver runs as **uid 1001**,
+so its stdout is not readable from this account and it is not redirected
+to a file. **The last counters actually observed are
+`2026-08-10T23:01:21Z — n=320 ok=318 availability_fail=2
+correctness_fail=0`.**
+
+A live process plus a healthy cluster is *not* the same evidence as
+correctness counters, and must not be reported as if it were.
+
+**Fixed forward, not retroactively:** a `ga-soak-probe` Deployment now
+runs in `krishiv-cert`, submitting a distributed batch query with a known
+answer every 60 s and logging to stdout, so `kubectl logs` is a readable,
+durable record from 2026-08-12T15:29Z onward. **The 08-10 → 08-12 window
+remains unverified and the day-7 verdict must say so.**
+
+### 2. The soak runs `--durability-profile dev-local`, so HTTP auth is OFF
+
+Measured from inside the cluster: `POST /api/v1/batch-sql/submit` returns
+**200 with no `Authorization` header, and 200 with a deliberately invalid
+bearer**.
+
+This is **correct engine behaviour, not a defect**:
+
+- `require_coordinator_bearer` is fail-closed by design — with an empty
+  accepted-token set it returns 401 ("auth is required but no bearer
+  tokens are configured").
+- It is simply **not applied**: `http_auth_required()` is
+  `profile != DevLocal || is_production_mode()`, and the cert coordinator
+  runs `--durability-profile dev-local`.
+
+What it means for the verdict: **this soak evidences availability and
+correctness under chaos on a dev-local profile. It is not evidence of
+authenticated or certified-profile operation.** Phase 63's SEC-7
+certification covered authenticated Flight on a *certified-profile*
+deployment — a different configuration, and the two must not be conflated
+in any GA claim.
+
+### Latent config mismatch (harmless today, worth fixing)
+
+`KRISHIV_COORDINATOR_BEARER_TOKENS` (the **server-side accepted-token**
+set) references secret `krishiv-cert-tokens` key **`tokens`**, which does
+not exist — the secret holds `apikeys`, `coordinator`, `task`, `token`.
+The reference is `optional: true`, so the variable is simply unset.
+
+Moot under `dev-local`. If the profile is ever raised without fixing the
+key, the coordinator will reject **every** request with 401 rather than
+silently running open — the correct failure direction, but a startup
+surprise. Fix the key name when the profile changes.
