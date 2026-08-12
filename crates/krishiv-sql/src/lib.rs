@@ -3230,6 +3230,19 @@ impl SqlEngine {
         })?;
         let query: &str = &piped;
 
+        // Spark-compat surface rewrites (LATERAL VIEW, TABLESAMPLE, DESCRIBE
+        // EXTENDED). Every rewrite is guarded by its own `contains_*` check, so
+        // this is a no-op for SQL that uses none of them.
+        //
+        // This module had zero callers since the initial commit: 11 public
+        // functions, a full test suite, and nothing in the query path ever
+        // invoked them, while `status.md` described it as *providing* those
+        // features. Wiring it is the "wire" half of the wire-or-delete decision
+        // recorded in the audit register — the rewrites were corrected in
+        // 458047bc, so what they emit now exists in DataFusion 54.
+        let spark_rewritten = spark_sql_ext::preprocess_spark_sql(query)?;
+        let query: &str = &spark_rewritten;
+
         let query = &pivot_sql::rewrite_pivot_unpivot(query)?;
 
         // Rewrite TUMBLE/HOP/SESSION TVFs before other preprocessing.

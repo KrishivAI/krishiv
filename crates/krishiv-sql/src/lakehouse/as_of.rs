@@ -192,12 +192,26 @@ mod tests {
     use super::*;
     use krishiv_connectors::lakehouse::AsOfSpec;
 
+    /// This used to assert `sql.contains("FROM orders")` — that the table name
+    /// survives the rewrite untouched. That was the bug: the clause was
+    /// stripped, the name left alone, and the pinned provider registered under
+    /// a third name nothing referenced, so no time-travel query could resolve.
+    /// The reference must now be renamed to the alias the resolver registers
+    /// under, with the original preserved on the ref for snapshot lookup.
     #[test]
     fn parses_version_as_of() {
         let (sql, refs) = preprocess_as_of_sql("SELECT * FROM orders VERSION AS OF 3").unwrap();
-        assert!(sql.contains("FROM orders"));
         assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].table, "orders", "the original name is kept on the ref");
         assert_eq!(refs[0].spec, AsOfSpec::Version(3));
+        assert!(
+            sql.contains(&refs[0].alias),
+            "the rewritten SQL must name the alias the pinned table is registered under: {sql}"
+        );
+        assert!(
+            !sql.contains("VERSION AS OF"),
+            "the qualifier is consumed: {sql}"
+        );
     }
 
     #[test]

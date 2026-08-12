@@ -297,7 +297,23 @@ pub fn rewrite_tablesample(sql: &str) -> SqlResult<String> {
 
 /// Detects `TRANSFORM` in SQL.
 pub fn contains_transform(sql: &str) -> bool {
-    sql.to_uppercase().contains("TRANSFORM(") || sql.to_uppercase().contains("TRANSFORM (")
+    // Spark's TRANSFORM *clause* pipes rows through an external process and is
+    // always `SELECT TRANSFORM(cols) USING '<script>'`. Matching on `TRANSFORM(`
+    // alone also matched `transform(array, x -> x * 2)` — the higher-order
+    // function, which this crate genuinely supports. Wiring this module with
+    // the loose guard turned every `transform()` call into
+    // "TRANSFORM has no SQL equivalent"; the checklist and HOF tests caught it.
+    //
+    // Requiring `USING` after the call distinguishes the clause from the
+    // function.
+    let upper = sql.to_ascii_uppercase();
+    let Some(at) = upper
+        .find("TRANSFORM(")
+        .or_else(|| upper.find("TRANSFORM ("))
+    else {
+        return false;
+    };
+    upper[at..].contains(" USING ")
 }
 
 /// Rewrites Spark `TRANSFORM(...)` to standard SQL.
