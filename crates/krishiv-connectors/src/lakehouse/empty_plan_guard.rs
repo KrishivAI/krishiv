@@ -45,21 +45,6 @@ use crate::lakehouse::LakehouseError;
 /// Iceberg's standard snapshot-summary key for the data-file count.
 const TOTAL_DATA_FILES: &str = "total-data-files";
 
-/// What a caller does with an empty plan, which decides how hard the guard
-/// fails when the table's own metadata cannot settle the question.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OnEmptyPlan {
-    /// The caller deletes, overwrites, or recreates based on the result. An
-    /// empty plan it cannot PROVE is refused: the cost of a false refusal is a
-    /// maintenance run that has to be retried, and the cost of a false
-    /// acceptance is the table.
-    Destructive,
-    /// The caller only reads. An unprovable empty plan is logged and allowed —
-    /// returning no rows is recoverable, and failing every read on a table
-    /// whose summary lacks a key would be a worse trade.
-    ReadOnly,
-}
-
 /// Refuse a scan that planned nothing while the snapshot says it holds files.
 ///
 /// `context` names the operation for the error and the log line; it should read
@@ -67,7 +52,6 @@ pub(crate) enum OnEmptyPlan {
 pub(crate) fn guard_empty_plan(
     table: &iceberg::table::Table,
     planned: usize,
-    stance: OnEmptyPlan,
     context: &str,
 ) -> Result<(), LakehouseError> {
     if planned > 0 {
@@ -98,82 +82,63 @@ pub(crate) fn guard_empty_plan(
         ))),
         // Unparseable or absent. iceberg-rust writes this key on every commit,
         // so its absence means the snapshot came from somewhere else, and we
-        // cannot tell an empty table from a broken scan.
-        _ => match stance {
-            OnEmptyPlan::ReadOnly => {
-                tracing::warn!(
-                    context,
-                    snapshot_id = snapshot.snapshot_id(),
-                    "scan planned 0 files and the snapshot records no `total-data-files`; \
-                     treating the table as empty because this caller only reads"
-                );
-                Ok(())
-            }
-            OnEmptyPlan::Destructive => Err(LakehouseError::Io(format!(
-                "{context}: the scan planned 0 files and snapshot {} carries no \
-                 `total-data-files` summary, so an empty table cannot be told apart from \
-                 a failed scan. Refusing, because this operation would delete or replace \
-                 data on that answer. The table has NOT been modified.",
-                snapshot.snapshot_id()
-            ))),
-        },
+        // cannot tell an empty table from a broken scan. Every caller of this
+        // guard deletes, overwrites, or recreates on the answer, so refuse:
+        // the cost of a false refusal is a run that has to be retried, and the
+        // cost of a false acceptance is the table.
+        _ => Err(LakehouseError::Io(format!(
+            "{context}: the scan planned 0 files and snapshot {} carries no \
+             `total-data-files` summary, so an empty table cannot be told apart from \
+             a failed scan. Refusing, because this operation would delete or replace \
+             data on that answer. The table has NOT been modified.",
+            snapshot.snapshot_id()
+        ))),
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::*;
-
     /// The decision table, exercised directly. `guard_empty_plan` needs a real
     /// `iceberg::table::Table` to test end to end, which needs a catalog and a
     /// runtime — the very things whose failure this guards. So the branching
     /// logic is factored to be checkable on its own inputs, and the wiring is
     /// covered by the callers' own tests.
-    fn decide(planned: usize, recorded: Option<&str>, stance: OnEmptyPlan) -> bool {
+    fn decide(planned: usize, recorded: Option<&str>) -> bool {
         if planned > 0 {
             return true;
         }
-        match recorded.map(|v| v.trim().parse::<u64>()) {
-            Some(Ok(0)) => true,
-            Some(Ok(_)) => false,
-            _ => stance == OnEmptyPlan::ReadOnly,
-        }
+        matches!(recorded.map(|v| v.trim().parse::<u64>()), Some(Ok(0)))
     }
 
     #[test]
     fn a_plan_with_files_always_passes() {
-        assert!(decide(3, Some("3"), OnEmptyPlan::Destructive));
-        assert!(decide(1, None, OnEmptyPlan::Destructive));
+        assert!(decide(3, Some("3")));
+        assert!(decide(1, None));
     }
 
     #[test]
     fn an_empty_plan_agreeing_with_an_empty_snapshot_passes() {
         // The case that would make a naive "snapshot exists = must have files"
         // tripwire refuse legitimate work.
-        assert!(decide(0, Some("0"), OnEmptyPlan::Destructive));
-        assert!(decide(0, Some(" 0 "), OnEmptyPlan::Destructive));
+        assert!(decide(0, Some("0")));
+        assert!(decide(0, Some(" 0 ")));
     }
 
     #[test]
     fn an_empty_plan_contradicting_the_snapshot_is_refused_for_everyone() {
         // Not stance-dependent: a contradiction means the scan is wrong, and a
         // reader acting on a wrong empty answer still returns a wrong answer.
-        assert!(!decide(0, Some("1"), OnEmptyPlan::Destructive));
-        assert!(!decide(0, Some("1"), OnEmptyPlan::ReadOnly));
-        assert!(!decide(0, Some("4096"), OnEmptyPlan::Destructive));
+        assert!(!decide(0, Some("1")));
+        assert!(!decide(0, Some("4096")));
     }
 
     #[test]
-    fn an_unprovable_empty_plan_splits_on_stance() {
+    fn an_unprovable_empty_plan_is_refused() {
         for missing in [None, Some(""), Some("not-a-number")] {
             assert!(
-                !decide(0, missing, OnEmptyPlan::Destructive),
-                "destructive callers must refuse what they cannot prove: {missing:?}"
-            );
-            assert!(
-                decide(0, missing, OnEmptyPlan::ReadOnly),
-                "read-only callers must not be broken by a missing key: {missing:?}"
+                !decide(0, missing),
+                "what cannot be proven empty must not be acted on: {missing:?}"
             );
         }
     }

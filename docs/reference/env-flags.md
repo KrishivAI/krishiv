@@ -12,6 +12,7 @@ Regenerate with:
 | `KRISHIV_ALLOW_ANONYMOUS_HTTP` | bool | `false` | Allow unauthenticated HTTP control-plane routes. Logs a warning when active in production mode. |
 | `KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS` | bool | `false` | Permit native (full-privilege) scalar UDF registration under restrictive durability profiles. |
 | `KRISHIV_ALLOW_LEGACY_FRAGMENTS` | bool | `false` | Permit untyped legacy task fragments (stream:*, raw SQL strings) outside dev-local. |
+| `KRISHIV_ANN_AUTO_REWRITE` | bool | `on` | ANN auto-rewrite of `ORDER BY <distance> LIMIT k` onto a staged vector index (Phase 36 G19). `off` disables the rewrite entirely and every such query runs as an exact scan. Single-node engine only. |
 | `KRISHIV_API_KEY` | secret | `unset` | Single Flight SQL API key presented by clients (fallback for KRISHIV_FLIGHT_API_KEY). |
 | `KRISHIV_AQE` | bool | `on` | Adaptive query execution master switch (Phase 54). `off` disables every stage-boundary rewrite (coalescing, skew split) and the placeholder-plan hint pass; per-mechanism flags refine it. |
 | `KRISHIV_AQE_COALESCE` | bool | `on` | AQE reduce-partition coalescing: merge small measured shuffle partitions into fewer reduce tasks (dfplan multi-partition bodies). Subordinate to KRISHIV_AQE. |

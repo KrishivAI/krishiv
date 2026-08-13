@@ -76,7 +76,6 @@ async fn scan_iceberg_table(
     crate::lakehouse::empty_plan_guard::guard_empty_plan(
         table,
         tasks.len(),
-        crate::lakehouse::empty_plan_guard::OnEmptyPlan::Destructive,
         "scan_iceberg_table",
     )?;
     if tasks.is_empty() {

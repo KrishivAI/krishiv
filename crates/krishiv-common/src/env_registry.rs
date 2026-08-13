@@ -149,6 +149,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "Permit untyped legacy task fragments (stream:*, raw SQL strings) outside dev-local.",
     ),
     rt(
+        "KRISHIV_ANN_AUTO_REWRITE",
+        FlagKind::Bool,
+        "on",
+        "ANN auto-rewrite of `ORDER BY <distance> LIMIT k` onto a staged vector index (Phase 36 G19). `off` disables the rewrite entirely and every such query runs as an exact scan. Single-node engine only.",
+    ),
+    rt(
         "KRISHIV_API_KEY",
         FlagKind::Secret,
         "unset",

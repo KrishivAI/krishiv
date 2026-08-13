@@ -50,7 +50,6 @@ async fn file_paths_for_snapshot(
     crate::lakehouse::empty_plan_guard::guard_empty_plan(
         table,
         tasks.len(),
-        crate::lakehouse::empty_plan_guard::OnEmptyPlan::Destructive,
         &format!("file_paths_for_snapshot(snapshot {snapshot_id})"),
     )?;
     Ok(tasks
@@ -801,7 +800,7 @@ mod tests {
     #[tokio::test]
     async fn the_empty_plan_tripwire_reads_a_real_snapshot_summary() {
         use crate::lakehouse::dml::land_ctas_with_target;
-        use crate::lakehouse::empty_plan_guard::{OnEmptyPlan, guard_empty_plan};
+        use crate::lakehouse::empty_plan_guard::guard_empty_plan;
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
         use datafusion::datasource::MemTable;
@@ -866,19 +865,15 @@ mod tests {
         );
 
         // A real plan passes.
-        guard_empty_plan(&table, 2, OnEmptyPlan::Destructive, "test")
-            .expect("a plan with files must pass");
+        guard_empty_plan(&table, 2, "test").expect("a plan with files must pass");
 
         // The failure this exists for: zero planned against a snapshot that
-        // says otherwise. Both stances refuse — a reader acting on a wrong
-        // empty answer still returns a wrong answer.
-        for stance in [OnEmptyPlan::Destructive, OnEmptyPlan::ReadOnly] {
-            let err = guard_empty_plan(&table, 0, stance, "test")
-                .expect_err("an empty plan contradicting the snapshot must be refused");
-            let msg = err.to_string();
-            assert!(msg.contains("planned 0 files"), "{msg}");
-            assert!(msg.contains("NOT been modified"), "{msg}");
-        }
+        // says otherwise.
+        let err = guard_empty_plan(&table, 0, "test")
+            .expect_err("an empty plan contradicting the snapshot must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("planned 0 files"), "{msg}");
+        assert!(msg.contains("NOT been modified"), "{msg}");
     }
 
     #[tokio::test]

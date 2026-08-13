@@ -491,8 +491,7 @@ pub mod native {
             crate::lakehouse::empty_plan_guard::guard_empty_plan(
                 &table,
                 tasks.len(),
-                crate::lakehouse::empty_plan_guard::OnEmptyPlan::Destructive,
-                "read_all",
+                        "read_all",
             )?;
 
             let mut batches = Vec::new();
