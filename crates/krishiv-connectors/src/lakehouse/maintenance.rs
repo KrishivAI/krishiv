@@ -45,6 +45,14 @@ async fn file_paths_for_snapshot(
             "failed to collect file tasks for snapshot {snapshot_id}: {e}"
         ))
     })?;
+    // An empty file set here means "nothing is referenced", and both callers
+    // turn that into deletions. Prove it before believing it.
+    crate::lakehouse::empty_plan_guard::guard_empty_plan(
+        table,
+        tasks.len(),
+        crate::lakehouse::empty_plan_guard::OnEmptyPlan::Destructive,
+        &format!("file_paths_for_snapshot(snapshot {snapshot_id})"),
+    )?;
     Ok(tasks
         .into_iter()
         .map(|t| t.data_file_path().to_string())
@@ -778,6 +786,99 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(compacted, 0, "fresh table has nothing to compact");
+    }
+
+    /// The empty-plan tripwire, against a REAL table rather than its decision
+    /// table.
+    ///
+    /// The unit tests in `empty_plan_guard` cover the branching on plain
+    /// inputs. What they cannot cover is the assumption the guard rests on:
+    /// that a krishiv-written snapshot actually carries a parseable
+    /// `total-data-files` in `summary().additional_properties`. If iceberg
+    /// stopped writing that key, the guard would silently degrade to its
+    /// "unprovable" branch — still safe for destructive callers, but no longer
+    /// the check it claims to be. This pins it.
+    #[tokio::test]
+    async fn the_empty_plan_tripwire_reads_a_real_snapshot_summary() {
+        use crate::lakehouse::dml::land_ctas_with_target;
+        use crate::lakehouse::empty_plan_guard::{OnEmptyPlan, guard_empty_plan};
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+
+        let dir = tempfile::tempdir().unwrap();
+        let warehouse = url::Url::from_file_path(dir.path()).unwrap().to_string();
+        let catalog: Arc<dyn Catalog + Send + Sync> = Arc::new(
+            MemoryCatalogBuilder::default()
+                .with_storage_factory(Arc::new(LocalFsStorageFactory))
+                .load(
+                    "mem",
+                    HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
+                )
+                .await
+                .unwrap(),
+        );
+        let ident = TableIdent::new(NamespaceIdent::new("ns".into()), "tripwire".into());
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = arrow::array::RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let mem = MemTable::try_new(Arc::clone(&arrow_schema), vec![vec![batch]]).unwrap();
+        ctx.register_table("src", Arc::new(mem)).unwrap();
+        let stream = ctx
+            .sql("SELECT * FROM src")
+            .await
+            .unwrap()
+            .execute_stream()
+            .await
+            .unwrap();
+        land_ctas_with_target(Arc::clone(&catalog), &ident, false, &[], stream, 1)
+            .await
+            .expect("land table");
+
+        let table = catalog.load_table(&ident).await.unwrap();
+
+        // The assumption, asserted: the snapshot records a file count > 0.
+        let recorded = table
+            .metadata()
+            .current_snapshot()
+            .expect("a snapshot")
+            .summary()
+            .additional_properties
+            .get("total-data-files")
+            .cloned();
+        let recorded = recorded.expect(
+            "iceberg must record `total-data-files`; without it the tripwire degrades to \
+             its unprovable branch and stops being the check it claims to be",
+        );
+        assert!(
+            recorded.trim().parse::<u64>().unwrap() > 0,
+            "expected a non-empty table, got total-data-files={recorded}"
+        );
+
+        // A real plan passes.
+        guard_empty_plan(&table, 2, OnEmptyPlan::Destructive, "test")
+            .expect("a plan with files must pass");
+
+        // The failure this exists for: zero planned against a snapshot that
+        // says otherwise. Both stances refuse — a reader acting on a wrong
+        // empty answer still returns a wrong answer.
+        for stance in [OnEmptyPlan::Destructive, OnEmptyPlan::ReadOnly] {
+            let err = guard_empty_plan(&table, 0, stance, "test")
+                .expect_err("an empty plan contradicting the snapshot must be refused");
+            let msg = err.to_string();
+            assert!(msg.contains("planned 0 files"), "{msg}");
+            assert!(msg.contains("NOT been modified"), "{msg}");
+        }
     }
 
     #[tokio::test]

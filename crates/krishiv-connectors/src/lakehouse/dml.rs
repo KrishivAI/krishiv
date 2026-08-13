@@ -70,6 +70,15 @@ async fn scan_iceberg_table(
         .await
         .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
 
+    // Every caller of this helper (delete_where, update_where, merge_into)
+    // reads the whole table and then rewrites it, so an empty read is a
+    // rewrite that keeps nothing. This early return is that exact path.
+    crate::lakehouse::empty_plan_guard::guard_empty_plan(
+        table,
+        tasks.len(),
+        crate::lakehouse::empty_plan_guard::OnEmptyPlan::Destructive,
+        "scan_iceberg_table",
+    )?;
     if tasks.is_empty() {
         return Ok(vec![]);
     }

@@ -12,6 +12,8 @@ mod delta;
 mod delta_lake;
 #[cfg(feature = "iceberg")]
 pub mod dml;
+#[cfg(feature = "iceberg")]
+pub(crate) mod empty_plan_guard;
 mod hudi;
 mod iceberg_fs;
 #[cfg(feature = "iceberg")]

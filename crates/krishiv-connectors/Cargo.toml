@@ -40,7 +40,7 @@ state = ["dep:krishiv-state"]
 
 # Lakehouse table formats (implementation in `crate::lakehouse`)
 lakehouse = ["dep:async-trait", "dep:chrono", "dep:rocksdb", "dep:serde", "dep:tempfile", "dep:url"]
-iceberg = ["lakehouse", "dep:iceberg", "dep:iceberg-datafusion", "dep:uuid", "dep:datafusion", "dep:typetag"]
+iceberg = ["lakehouse", "dep:iceberg", "dep:uuid", "dep:datafusion", "dep:typetag"]
 delta = ["lakehouse"]
 hudi = ["lakehouse"]
 
@@ -101,7 +101,6 @@ rocksdb = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 iceberg = { workspace = true, optional = true }
-iceberg-datafusion = { workspace = true, optional = true }
 datafusion = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 krishiv-state = { path = "../krishiv-state", version = "0.1.0", optional = true }

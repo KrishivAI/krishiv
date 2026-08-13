@@ -486,6 +486,14 @@ pub mod native {
                 .try_collect()
                 .await
                 .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+            // read_all feeds the streaming sink's overwrite commit, so an
+            // empty read here rewrites the table with nothing.
+            crate::lakehouse::empty_plan_guard::guard_empty_plan(
+                &table,
+                tasks.len(),
+                crate::lakehouse::empty_plan_guard::OnEmptyPlan::Destructive,
+                "read_all",
+            )?;
 
             let mut batches = Vec::new();
             for task in tasks {
