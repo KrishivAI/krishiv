@@ -248,6 +248,14 @@ pub struct KafkaConfig {
     pub sasl_mechanisms: Option<String>,
     pub enable_idempotence: Option<bool>,
     pub transactional_id: Option<String>,
+    /// Typed-decode column declaration (Phase 65): a JSON array of
+    /// `{"name": …, "type": …}` in the engine's landing vocabulary
+    /// (`Int64`, `Float64`, `Utf8`, `Boolean`, `Timestamp`, …). When set,
+    /// JSON payloads decode through arrow-json against this schema —
+    /// typed columns instead of everything-as-Utf8. A payload the typed
+    /// decoder cannot handle falls the WHOLE batch back to the untyped
+    /// path (messages are never lost to a decode upgrade).
+    pub decode_columns: Option<String>,
 }
 
 impl std::fmt::Debug for KafkaConfig {
@@ -273,6 +281,7 @@ impl std::fmt::Debug for KafkaConfig {
             .field("sasl_mechanisms", &self.sasl_mechanisms)
             .field("enable_idempotence", &self.enable_idempotence)
             .field("transactional_id", &self.transactional_id)
+            .field("decode_columns", &self.decode_columns.is_some())
             .finish()
     }
 }
@@ -308,6 +317,7 @@ impl KafkaConfig {
                 .get("enable.idempotence")
                 .and_then(|s| s.parse().ok()),
             transactional_id: config.get("transactional.id").map(|s| s.to_string()),
+            decode_columns: config.get("decode.columns").map(|s| s.to_string()),
         })
     }
 
@@ -317,6 +327,72 @@ impl KafkaConfig {
         self.auto_commit_interval_ms = Some(interval_ms);
         self
     }
+}
+
+/// Render an Arrow schema into a `decode.columns` declaration —
+/// the inverse of [`decode_schema_from_columns`]. Returns `None` when any
+/// field has no vocabulary mapping; the caller then simply leaves typed
+/// decode off and the untyped fold applies (never a hard failure).
+pub fn decode_columns_from_schema(schema: &arrow::datatypes::Schema) -> Option<String> {
+    use arrow::datatypes::DataType;
+    let mut cols = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        let type_name = match field.data_type() {
+            DataType::Int8 => "Int8",
+            DataType::Int16 => "Int16",
+            DataType::Int32 => "Int32",
+            DataType::Int64 => "Int64",
+            DataType::Float32 => "Float32",
+            DataType::Float64 => "Float64",
+            DataType::Utf8 | DataType::LargeUtf8 => "Utf8",
+            DataType::Boolean => "Boolean",
+            DataType::Date32 => "Date32",
+            DataType::Timestamp(_, _) => "Timestamp",
+            _ => return None,
+        };
+        cols.push(serde_json::json!({ "name": field.name(), "type": type_name }));
+    }
+    serde_json::to_string(&cols).ok()
+}
+
+/// Parse a `decode.columns` declaration into an Arrow schema.
+///
+/// The vocabulary is the engine's landing set — the same names the DDL and
+/// pipeline manifests use — mapped to Arrow types. All columns nullable:
+/// a Kafka payload owes nothing, and NULL-on-absent matches the untyped
+/// fold's behavior.
+pub fn decode_schema_from_columns(
+    json: &str,
+) -> Result<std::sync::Arc<arrow::datatypes::Schema>, String> {
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    let cols: Vec<serde_json::Value> =
+        serde_json::from_str(json).map_err(|e| format!("decode.columns is not JSON: {e}"))?;
+    let mut fields = Vec::with_capacity(cols.len());
+    for col in &cols {
+        let name = col
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or("decode.columns entries need a name")?;
+        let type_name = col
+            .get("type")
+            .and_then(|v| v.as_str())
+            .ok_or("decode.columns entries need a type")?;
+        let data_type = match type_name {
+            "Int8" => DataType::Int8,
+            "Int16" => DataType::Int16,
+            "Int32" => DataType::Int32,
+            "Int64" => DataType::Int64,
+            "Float32" => DataType::Float32,
+            "Float64" => DataType::Float64,
+            "Utf8" | "LargeUtf8" => DataType::Utf8,
+            "Boolean" => DataType::Boolean,
+            "Date32" => DataType::Date32,
+            t if t.starts_with("Timestamp") => DataType::Timestamp(TimeUnit::Millisecond, None),
+            other => return Err(format!("decode.columns: no mapping for type '{other}'")),
+        };
+        fields.push(Field::new(name, data_type, true));
+    }
+    Ok(std::sync::Arc::new(Schema::new(fields)))
 }
 
 // ---------------------------------------------------------------------------
@@ -857,6 +933,9 @@ pub struct RdkafkaKafkaSource {
     max_decode_batch: usize,
     /// Latest offset read per partition — tracks all partitions, not just the last one.
     partition_offsets: std::collections::HashMap<i32, i64>,
+    /// Typed-decode schema derived from `KafkaConfig::decode_columns`
+    /// (Phase 65). `None` = the untyped all-Utf8 fold.
+    decode_schema: Option<std::sync::Arc<arrow::datatypes::Schema>>,
     /// Optional schema registry deserializer for Confluent-framed Avro/Protobuf payloads.
     #[cfg(feature = "schema-registry")]
     schema_registry: Option<std::sync::Arc<dyn crate::schema_registry::KafkaDeserializer>>,
@@ -928,10 +1007,19 @@ impl RdkafkaKafkaSource {
             .subscribe(&[topic.as_str()])
             .map_err(|e| format!("rdkafka subscribe to '{topic}' failed: {e}"))?;
 
+        // A malformed declaration is a config ERROR, not a silent fallback:
+        // the caller asked for typed decode and would otherwise never learn
+        // it did not happen.
+        let decode_schema = match kafka_cfg.and_then(|kc| kc.decode_columns.as_deref()) {
+            Some(json) => Some(decode_schema_from_columns(json)?),
+            None => None,
+        };
+
         Ok(Self {
             consumer: std::sync::Arc::new(consumer),
             topic,
             group_id: group_id.as_ref().to_string(),
+            decode_schema,
             poll_timeout_ms: 100,
             max_decode_batch: std::env::var("KRISHIV_KAFKA_DECODE_BATCH")
                 .ok()
@@ -1059,6 +1147,54 @@ impl RdkafkaKafkaSource {
     /// present); a row leaves keys it doesn't have as NULL. A single-payload
     /// call therefore produces byte-identical schema and rows to the old
     /// per-message path.
+    /// Typed decode (Phase 65's second half): the declared schema drives an
+    /// arrow-json `Decoder`, so `Int64` lands as Int64 and a window's
+    /// `Timestamp` column needs no downstream cast. All payloads of one
+    /// fold decode together; any failure rejects the WHOLE fold so the
+    /// caller can fall back untyped without losing a message.
+    fn typed_payloads_to_batch(
+        schema: &std::sync::Arc<arrow::datatypes::Schema>,
+        payloads: &[String],
+    ) -> crate::ConnectorResult<arrow::record_batch::RecordBatch> {
+        let mut decoder = arrow::json::reader::ReaderBuilder::new(std::sync::Arc::clone(schema))
+            .build_decoder()
+            .map_err(|e| crate::ConnectorError::Config {
+                message: format!("typed kafka decoder: {e}"),
+            })?;
+        let ndjson = payloads.join("\n");
+        let consumed = decoder
+            .decode(ndjson.as_bytes())
+            .map_err(|e| crate::ConnectorError::Config {
+                message: format!("typed kafka decode: {e}"),
+            })?;
+        if consumed < ndjson.len() {
+            return Err(crate::ConnectorError::Config {
+                message: "typed kafka decode: trailing undecodable payload".to_string(),
+            });
+        }
+        let batch = decoder
+            .flush()
+            .map_err(|e| crate::ConnectorError::Config {
+                message: format!("typed kafka decode flush: {e}"),
+            })?
+            .ok_or_else(|| crate::ConnectorError::Config {
+                message: "typed kafka decode produced no rows".to_string(),
+            })?;
+        if batch.num_rows() != payloads.len() {
+            // A dropped row here would vanish silently INSIDE a fold whose
+            // offsets are already recorded — the exact shape of loss the
+            // fold was built to avoid. Reject and let untyped keep it.
+            return Err(crate::ConnectorError::Config {
+                message: format!(
+                    "typed kafka decode kept {} of {} payloads",
+                    batch.num_rows(),
+                    payloads.len()
+                ),
+            });
+        }
+        Ok(batch)
+    }
+
     fn payloads_to_batch(
         payloads: &[String],
     ) -> crate::ConnectorResult<arrow::record_batch::RecordBatch> {
@@ -1262,7 +1398,23 @@ impl Source for RdkafkaKafkaSource {
                     }
                 }
 
-                let batch = Self::payloads_to_batch(&payloads)?;
+                let batch = match &self.decode_schema {
+                    Some(schema) => match Self::typed_payloads_to_batch(schema, &payloads) {
+                        Ok(batch) => batch,
+                        Err(e) => {
+                            // Never lose messages to a decode upgrade: the
+                            // untyped fold accepts anything, and the warn
+                            // names why the typed path declined.
+                            tracing::warn!(
+                                topic = %self.topic,
+                                error = %e,
+                                "typed kafka decode fell back to untyped for this batch"
+                            );
+                            Self::payloads_to_batch(&payloads)?
+                        }
+                    },
+                    None => Self::payloads_to_batch(&payloads)?,
+                };
                 // Record per-partition consumer lag (high_watermark - current_offset)
                 // against the LAST drained message.
                 let topic = self.topic.clone();
@@ -1423,6 +1575,7 @@ mod tests {
 
     fn test_kafka_config() -> KafkaConfig {
         KafkaConfig {
+            decode_columns: None,
             bootstrap_servers: "localhost:9092".into(),
             topic: "events".into(),
             group_id: "test-group".into(),
@@ -1937,5 +2090,84 @@ mod tests {
                 prop_assert_eq!(enc1, enc2);
             }
         }
+    }
+
+    /// Phase 65 typed decode: the declared schema drives arrow-json, so a
+    /// declared Int64 IS an Int64 downstream — no everything-as-Utf8.
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn typed_decode_lands_typed_columns_and_round_trips_the_declaration() {
+        use arrow::array::{Float64Array, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let declared = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Float64, true),
+        ]);
+        // The DDL side renders the declaration…
+        let cols = decode_columns_from_schema(&declared).expect("mappable schema");
+        // …and the consumer side parses it back — one vocabulary.
+        let schema = decode_schema_from_columns(&cols).unwrap();
+
+        let payloads = vec![
+            r#"{"id": 1, "amount": 10.5}"#.to_string(),
+            r#"{"id": 2}"#.to_string(),
+        ];
+        let batch = RdkafkaKafkaSource::typed_payloads_to_batch(&schema, &payloads).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let ids = batch
+            .column(batch.schema().index_of("id").unwrap())
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id must be a REAL Int64 column")
+            .clone();
+        assert_eq!(ids.value(0), 1);
+        assert_eq!(ids.value(1), 2);
+        let amounts = batch
+            .column(batch.schema().index_of("amount").unwrap())
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("amount must be a REAL Float64 column")
+            .clone();
+        assert_eq!(amounts.value(0), 10.5);
+        use arrow::array::Array as _;
+        assert!(amounts.is_null(1), "absent key -> NULL, same as the untyped fold");
+    }
+
+    /// A payload the typed decoder cannot handle rejects the WHOLE fold —
+    /// the read path then falls back to the untyped path, so no message is
+    /// ever lost to the decode upgrade.
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn typed_decode_rejects_the_fold_rather_than_dropping_a_payload() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let payloads = vec![
+            r#"{"id": 1}"#.to_string(),
+            "not json at all".to_string(),
+            r#"{"id": 3}"#.to_string(),
+        ];
+        RdkafkaKafkaSource::typed_payloads_to_batch(&schema, &payloads)
+            .expect_err("a malformed payload must reject the fold, not vanish");
+        // And the fallback accepts exactly the same payloads.
+        let untyped = RdkafkaKafkaSource::payloads_to_batch(&payloads).unwrap();
+        assert_eq!(untyped.num_rows(), 3, "the untyped fold keeps every message");
+    }
+
+    /// An unmappable declared field means NO typed declaration (untyped
+    /// fold applies) — never a hard failure at registration.
+    #[test]
+    fn unmappable_declared_fields_leave_typed_decode_off() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let exotic = Schema::new(vec![Field::new(
+            "blob",
+            DataType::Binary,
+            true,
+        )]);
+        assert!(decode_columns_from_schema(&exotic).is_none());
     }
 }

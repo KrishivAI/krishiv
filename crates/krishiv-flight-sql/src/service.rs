@@ -1934,6 +1934,88 @@ mod continuous_drain_tests {
             "the retried drain must return the windows the rejected attempt consumed; got {rows} rows"
         );
     }
+
+    /// Phase 55 drain-ack half-step: the streaming-SQL drain (the >48 MiB
+    /// fallback) delivers through a guard stream, so a client that dies
+    /// MID-TRANSFER no longer loses the payload — every batch the stream
+    /// had not yet yielded is returned to the store, and a retry drains it.
+    #[tokio::test]
+    async fn a_client_killed_mid_stream_drain_does_not_lose_undelivered_batches() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use futures::StreamExt as _;
+        use krishiv_runtime::flight_protocol::encode_continuous_drain;
+
+        let host = FlightExecutionHost::embedded().expect("embedded host");
+        let spec = krishiv_plan::window::WindowExecutionSpec::tumbling("k", "t", 1_000);
+        host.register_continuous_stream("drain-ack", &spec)
+            .await
+            .expect("register");
+
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("t", DataType::Int64, false),
+        ]));
+        let events = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(StringArray::from(vec!["a", "b", "a", "b"])),
+                std::sync::Arc::new(Int64Array::from(vec![100, 200, 1_100, 1_200])),
+            ],
+        )
+        .expect("events batch");
+        let advance = RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(StringArray::from(vec!["a"])),
+                std::sync::Arc::new(Int64Array::from(vec![10_000])),
+            ],
+        )
+        .expect("advance batch");
+        host.push_continuous_input("drain-ack", vec![events])
+            .await
+            .expect("push events");
+        host.push_continuous_input("drain-ack", vec![advance])
+            .await
+            .expect("push advance");
+
+        // The streaming-SQL drain path (what the client's oversize fallback
+        // issues). Take ONE batch, then DROP the stream — the client died.
+        let sql = encode_continuous_drain("drain-ack");
+        let delivery = host.execute_sql_stream(&sql).await.expect("streamed drain");
+        let mut delivered_rows = 0usize;
+        let total_expected;
+        match delivery {
+            crate::host::SqlResultDelivery::Streamed { mut batches, .. } => {
+                let first = batches
+                    .next()
+                    .await
+                    .expect("at least one drained batch")
+                    .expect("first batch ok");
+                delivered_rows += first.num_rows();
+                total_expected = delivered_rows; // at least this many more exist
+                drop(batches); // the client is gone mid-transfer
+            }
+            crate::host::SqlResultDelivery::Buffered(_) => {
+                panic!("the drain must deliver through the guard STREAM, not a buffer")
+            }
+        }
+        let _ = total_expected;
+        // The drop guard returns undelivered batches on a spawned task.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // A retry re-drains everything the dead client never received.
+        let retry = host
+            .drain_continuous_stream("drain-ack")
+            .await
+            .expect("retry drain");
+        let retried_rows: usize = retry.iter().map(RecordBatch::num_rows).sum();
+        assert!(
+            retried_rows > 0,
+            "the batches the dead client never received must survive;              delivered {delivered_rows} rows before death, retry saw {retried_rows}"
+        );
+    }
 }
 
 #[cfg(test)]

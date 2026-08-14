@@ -1597,6 +1597,10 @@ impl SqlEngine {
             bootstrap_servers: bootstrap_servers.into(),
             topic: topic.into(),
             group_id: group_id.into(),
+            // Phase 65 typed decode: this registration path KNOWS the
+            // declared schema, so payloads decode straight into typed
+            // columns; None (an unmappable field) leaves the untyped fold.
+            decode_columns: krishiv_connectors::kafka::decode_columns_from_schema(&schema),
             auto_commit_interval_ms: {
                 let profile = krishiv_common::resolve_durability_profile();
                 if krishiv_common::requires_manual_kafka_commit(profile) {
@@ -1669,6 +1673,7 @@ impl SqlEngine {
             bootstrap_servers: bootstrap_servers.into(),
             topic: topic.into(),
             group_id: "krishiv-sql-writer".into(),
+            decode_columns: None, // a sink never decodes
             auto_commit_interval_ms: None,
             security_protocol: None,
             ssl_ca_location: None,

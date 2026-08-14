@@ -753,6 +753,34 @@ impl FlightExecutionHost {
                     | FlightDirective::BoundedWindow { .. }
             )
         });
+        // Phase 55 drain-ack: the streaming-SQL drain (the >48 MiB fallback
+        // path) used to consume the store and then deliver as a plain
+        // buffered result — a client killed mid-transfer lost the whole
+        // payload. It now delivers through a guard stream that hands every
+        // UNDELIVERED batch back to the store when the client goes away
+        // mid-stream. The loss window shrinks from "the entire payload" to
+        // "batches already yielded into gRPC's in-flight buffers"; the path
+        // stays labeled at-least-once (a retry after a mid-stream death can
+        // re-deliver batches the client did receive).
+        if let Some(FlightDirective::ContinuousDrain { job_id }) = directives
+            .iter()
+            .find(|d| matches!(d, FlightDirective::ContinuousDrain { .. }))
+        {
+            let batches = self.drain_continuous_stream(job_id).await?;
+            let schema = batches
+                .first()
+                .map(|b| b.schema())
+                .unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
+            let guard = DrainDeliveryGuard {
+                host: self.clone(),
+                job_id: job_id.clone(),
+                remaining: batches.into(),
+            };
+            return Ok(SqlResultDelivery::Streamed {
+                schema,
+                batches: Box::pin(guard),
+            });
+        }
         if has_special_directive || matches!(self.backend.as_ref(), FlightHostBackend::InProcess(_))
         {
             return self
@@ -1011,6 +1039,57 @@ pub(crate) fn status_batch(label: &str) -> Result<RecordBatch, Status> {
     )]));
     let col = Arc::new(StringArray::from(vec![label])) as ArrayRef;
     RecordBatch::try_new(schema, vec![col]).map_err(|e| Status::internal(e.to_string()))
+}
+
+/// Streams drained batches to the client and, when dropped before the
+/// stream is exhausted (client death, cancelled RPC), returns every
+/// still-undelivered batch to the job's store — the Phase 55 drain-ack
+/// half-step. See `execute_sql_stream`.
+struct DrainDeliveryGuard {
+    host: FlightExecutionHost,
+    job_id: String,
+    remaining: std::collections::VecDeque<RecordBatch>,
+}
+
+impl futures::Stream for DrainDeliveryGuard {
+    type Item = Result<RecordBatch, arrow_flight::error::FlightError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::task::Poll::Ready(self.remaining.pop_front().map(Ok))
+    }
+}
+
+impl Drop for DrainDeliveryGuard {
+    fn drop(&mut self) {
+        if self.remaining.is_empty() {
+            return;
+        }
+        let host = self.host.clone();
+        let job_id = std::mem::take(&mut self.job_id);
+        let batches: Vec<RecordBatch> = std::mem::take(&mut self.remaining).into();
+        tracing::warn!(
+            job_id = %job_id,
+            undelivered = batches.len(),
+            "drain stream dropped mid-delivery; returning undelivered batches to the store"
+        );
+        // Drop runs in sync context; the return is async. A detached task
+        // is correct here: the put-back is best-effort recovery of data
+        // the client never saw, and blocking a drop on it would deadlock
+        // single-threaded runtimes.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                host.return_drained_batches(&job_id, batches).await;
+            });
+        } else {
+            tracing::error!(
+                job_id = %job_id,
+                "no runtime at drop; undelivered drained batches were LOST"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
