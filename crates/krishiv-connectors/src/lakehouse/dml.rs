@@ -552,20 +552,71 @@ fn ctas_target_file_bytes() -> usize {
 /// Convert a workspace-arrow schema to an Iceberg schema with fresh field ids.
 ///
 /// Hand-rolled (inverse of the read-side map in
-/// `krishiv-sql/src/catalog/iceberg_table_provider.rs`) because iceberg-rust
-/// 0.9.1 pins arrow 57 while the workspace is on arrow 58, so
-/// `iceberg::arrow::arrow_schema_to_schema` cannot accept our types. Flat
-/// primitive columns only — nested/list/struct results must be flattened in
-/// SQL before a durable CTAS.
+/// `krishiv-sql/src/catalog/iceberg_table_provider.rs`); originally forced by
+/// the 0.9-era arrow version split, kept because our field-id assignment
+/// (top-level ids `1..=n`, the scheme every existing table was created with)
+/// must stay byte-stable — `iceberg::arrow::arrow_schema_to_schema` expects
+/// pre-assigned PARQUET field ids CTAS schemas don't carry. Primitive columns
+/// plus LISTS OF PRIMITIVES (the Phase 36 embedding column shape, unlocked by
+/// the 0.10 bump); other nesting must still be flattened in SQL. Element
+/// fields take ids ABOVE the top-level range (`n+1..`), so top-level ids are
+/// unchanged for every schema that was mappable before.
 pub fn arrow_schema_to_iceberg_schema(
     schema: &arrow::datatypes::Schema,
 ) -> Result<iceberg::spec::Schema, LakehouseError> {
-    use arrow::datatypes::{DataType, TimeUnit};
-    use iceberg::spec::{NestedField, PrimitiveType, Type};
+    use arrow::datatypes::DataType;
+    use iceberg::spec::{ListType, NestedField, Type};
 
     let mut fields: Vec<Arc<NestedField>> = Vec::with_capacity(schema.fields().len());
+    let mut next_nested_id = schema.fields().len() as i32;
     for (idx, field) in schema.fields().iter().enumerate() {
-        let prim = match field.data_type() {
+        let ty = match field.data_type() {
+            DataType::List(el) | DataType::LargeList(el) | DataType::FixedSizeList(el, _) => {
+                let el_prim = map_primitive(el.data_type()).map_err(|other| {
+                    LakehouseError::Iceberg(format!(
+                        "durable CTAS cannot map result column '{}': list element type                          {other} has no Iceberg mapping; cast the elements in the SELECT",
+                        field.name()
+                    ))
+                })?;
+                next_nested_id += 1;
+                Type::List(ListType {
+                    element_field: Arc::new(NestedField::list_element(
+                        next_nested_id,
+                        Type::Primitive(el_prim),
+                        !el.is_nullable(),
+                    )),
+                })
+            }
+            other => Type::Primitive(map_primitive(other).map_err(|other| {
+                LakehouseError::Iceberg(format!(
+                    "durable CTAS cannot map result column '{}' of type {other} to an                      Iceberg type; cast or flatten it in the SELECT",
+                    field.name()
+                ))
+            })?),
+        };
+        let iceberg_field = if field.is_nullable() {
+            NestedField::optional(idx as i32 + 1, field.name(), ty)
+        } else {
+            NestedField::required(idx as i32 + 1, field.name(), ty)
+        };
+        fields.push(Arc::new(iceberg_field));
+    }
+    iceberg::spec::Schema::builder()
+        .with_fields(fields)
+        .build()
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))
+}
+
+/// The primitive half of the mapping, shared by flat columns and list
+/// elements. `Err` carries the unmappable arrow type for the caller's
+/// column-naming error.
+fn map_primitive(
+    data_type: &arrow::datatypes::DataType,
+) -> Result<iceberg::spec::PrimitiveType, arrow::datatypes::DataType> {
+    use arrow::datatypes::{DataType, TimeUnit};
+    use iceberg::spec::PrimitiveType;
+    {
+        let prim = match data_type {
             DataType::Boolean => PrimitiveType::Boolean,
             DataType::Int8 | DataType::Int16 | DataType::Int32 => PrimitiveType::Int,
             DataType::Int64 => PrimitiveType::Long,
@@ -587,25 +638,10 @@ pub fn arrow_schema_to_iceberg_schema(
                     scale: *scale as u32,
                 }
             }
-            other => {
-                return Err(LakehouseError::Iceberg(format!(
-                    "durable CTAS cannot map result column '{}' of type {other} to an \
-                     Iceberg type; cast or flatten it in the SELECT",
-                    field.name()
-                )));
-            }
+            other => return Err(other.clone()),
         };
-        let iceberg_field = if field.is_nullable() {
-            NestedField::optional(idx as i32 + 1, field.name(), Type::Primitive(prim))
-        } else {
-            NestedField::required(idx as i32 + 1, field.name(), Type::Primitive(prim))
-        };
-        fields.push(Arc::new(iceberg_field));
+        Ok(prim)
     }
-    iceberg::spec::Schema::builder()
-        .with_fields(fields)
-        .build()
-        .map_err(|e| LakehouseError::Iceberg(e.to_string()))
 }
 
 /// Normalize a batch so its physical Parquet encoding matches the Iceberg
@@ -1719,11 +1755,24 @@ mod tests {
     }
 
     #[test]
-    fn arrow_schema_conversion_rejects_nested_types() {
+    fn arrow_schema_conversion_rejects_deep_nesting_but_takes_primitive_lists() {
         use arrow::datatypes::{DataType, Field, Schema};
-        let nested = Schema::new(vec![Field::new(
+        // A list of PRIMITIVES maps since the 0.10 bump (the Phase 36
+        // embedding column); this used to be a refusal.
+        let flat_list = Schema::new(vec![Field::new(
             "xs",
             DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            true,
+        )]);
+        assert!(arrow_schema_to_iceberg_schema(&flat_list).is_ok());
+        // Deeper nesting still refuses, naming the column.
+        let nested = Schema::new(vec![Field::new(
+            "xs",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(vec![Field::new("a", DataType::Int64, true)].into()),
+                true,
+            ))),
             true,
         )]);
         let err = arrow_schema_to_iceberg_schema(&nested).unwrap_err();
@@ -1876,5 +1925,56 @@ mod tests {
             vec![1, 3],
             "id=2 stays deleted (not resurrected by the rewrite), id=4 newly deleted"
         );
+    }
+
+    /// The Phase 36 embedding shape: a durable CTAS with a List<Float64>
+    /// column maps to an Iceberg list type (unlocked by the 0.10 bump; the
+    /// 0.9-era mapping refused every list). Top-level field ids stay `1..=n`
+    /// — the scheme every existing table was created with — and element ids
+    /// live above that range.
+    #[test]
+    fn ctas_schema_maps_lists_of_primitives_with_stable_top_level_ids() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let arrow_schema = Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new(
+                "embedding",
+                DataType::List(std::sync::Arc::new(Field::new_list_field(
+                    DataType::Float64,
+                    true,
+                ))),
+                true,
+            ),
+        ]);
+        let iceberg = arrow_schema_to_iceberg_schema(&arrow_schema).unwrap();
+        let k = iceberg.field_by_name("k").unwrap();
+        assert_eq!(k.id, 1, "top-level ids stay 1..=n");
+        let emb = iceberg.field_by_name("embedding").unwrap();
+        assert_eq!(emb.id, 2);
+        match &*emb.field_type {
+            iceberg::spec::Type::List(l) => {
+                assert!(l.element_field.id > 2, "element ids live above the top range");
+                assert!(matches!(
+                    *l.element_field.field_type,
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Double)
+                ));
+            }
+            other => panic!("embedding must map to a list, got {other:?}"),
+        }
+
+        // A list of something unmappable still refuses, naming the column.
+        let nested = Schema::new(vec![Field::new(
+            "bad",
+            DataType::List(std::sync::Arc::new(Field::new_list_field(
+                DataType::List(std::sync::Arc::new(Field::new_list_field(
+                    DataType::Int64,
+                    true,
+                ))),
+                true,
+            ))),
+            true,
+        )]);
+        let err = arrow_schema_to_iceberg_schema(&nested).unwrap_err().to_string();
+        assert!(err.contains("'bad'"), "{err}");
     }
 }
