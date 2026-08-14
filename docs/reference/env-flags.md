@@ -68,7 +68,7 @@ Regenerate with:
 | `KRISHIV_GRPC_ADDR` | host:port | `127.0.0.1:50051` | Coordinator gRPC listen address. |
 | `KRISHIV_GRPC_MAX_MESSAGE_BYTES` | uint | `268435456` | Maximum gRPC message size for coordinator/executor transports. |
 | `KRISHIV_HEALTH_PORT` | uint | `unset` | Standalone health-endpoint port for daemon deployments. |
-| `KRISHIV_HEARTBEAT_INTERVAL_SECS` | uint | `5` | Executor→coordinator heartbeat interval. |
+| `KRISHIV_HEARTBEAT_INTERVAL_SECS` | uint | `10` | Executor→coordinator heartbeat interval. |
 | `KRISHIV_HOT_KEY_BASE_ROWS_PER_SECOND` | uint | `10000` | Baseline per-key rate used by the adaptive hot-key detector. |
 | `KRISHIV_HTTP_ADDR` | host:port | `unset` | Executor HTTP listen address (control endpoints). |
 | `KRISHIV_ICEBERG_REST_NAME` | text | `main` | Catalog name to register the Iceberg REST catalog under. |
@@ -94,7 +94,7 @@ Regenerate with:
 | `KRISHIV_MAX_SHUFFLE_REGEN` | uint | `8` | Maximum times a lost shuffle partition may be regenerated before the job fails terminally (consumer-driven FetchFailed recovery bound). |
 | `KRISHIV_MCP_ADDR` | host:port | `127.0.0.1:8811` | MCP server listen address (http transport). |
 | `KRISHIV_MCP_ALLOW_WRITE_SQL` | bool | `false` | Allow the MCP run_sql tool to execute write statements. |
-| `KRISHIV_MCP_MAX_ROWS` | uint | `1000` | Row cap on MCP query results. |
+| `KRISHIV_MCP_MAX_ROWS` | uint | `100` | Row cap on MCP query results. |
 | `KRISHIV_MCP_TIMEOUT_MS` | uint | `30000` | MCP tool execution timeout. |
 | `KRISHIV_MCP_TRANSPORT` | stdio \| http | `stdio` | MCP server transport. |
 | `KRISHIV_METADATA_BACKEND` | memory \| rocksdb \| redb | `rocksdb` | Coordinator metadata store backend. |
@@ -106,7 +106,7 @@ Regenerate with:
 | `KRISHIV_NAMESPACE_MAX_MEMORY_BYTES` | uint | `unset` | Admission cap: maximum aggregate memory per namespace. |
 | `KRISHIV_OIDC_AUDIENCE` | text | `unset` | Expected audience claim for OIDC-authenticated coordinator requests. |
 | `KRISHIV_OIDC_JWKS_URI` | url | `unset` | JWKS endpoint for OIDC token verification; presence activates OIDC auth. |
-| `KRISHIV_PLAN_CACHE_MAX_ENTRIES` | uint | `128` | Logical-plan cache capacity per SQL session. |
+| `KRISHIV_PLAN_CACHE_MAX_ENTRIES` | uint | `256` | Logical-plan cache capacity per SQL session. |
 | `KRISHIV_PRODUCTION` | bool | `false` | Production mode: tightens defaults (fail-closed metadata, auth requirements, connector restrictions). |
 | `KRISHIV_PYTHON_UDF_TIMEOUT_MS` | uint | `30000` | Per-call timeout for sandboxed Python UDF execution. |
 | `KRISHIV_QUERY_MEMORY_LIMIT_BYTES` | uint | `cgroup-derived` | Total FairSpillPool budget SHARED by every engine in the process (task slots, Flight SQL, IVM); 0 disables the limit. |

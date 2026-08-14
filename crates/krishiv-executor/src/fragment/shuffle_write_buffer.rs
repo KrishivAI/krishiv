@@ -158,7 +158,11 @@ pub(crate) fn coalesce_shuffle_batches(
     let mut group_bytes = 0usize;
 
     // Concatenate one accumulated group, or pass it through if concat fails.
-    fn flush(group: Vec<RecordBatch>, schema: &arrow::datatypes::SchemaRef, out: &mut Vec<RecordBatch>) {
+    fn flush(
+        group: Vec<RecordBatch>,
+        schema: &arrow::datatypes::SchemaRef,
+        out: &mut Vec<RecordBatch>,
+    ) {
         if group.len() <= 1 {
             out.extend(group);
             return;
@@ -264,7 +268,8 @@ impl DrainTally {
     /// plan the next stage from a number inflated by the bucket count. That is
     /// how TPC-H q10's `dist-s1` came to report 1.74 TB for a 100 GB dataset.
     fn observe(&self, batch: &RecordBatch) {
-        self.rows.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+        self.rows
+            .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
         self.bytes.fetch_add(
             krishiv_shuffle::logical_batch_bytes(batch) as u64,
             Ordering::Relaxed,
@@ -1439,24 +1444,27 @@ mod tests {
         use futures::StreamExt as _;
         const POOL_BYTES: usize = 256 * 1024;
         let dir = temp_dir("unlink");
-        let mut buffer = ShuffleWriteBuffer::new(
-            1,
-            Some(pool_of(POOL_BYTES)),
-            POOL_BYTES as u64,
-            dir.clone(),
-        );
+        let mut buffer =
+            ShuffleWriteBuffer::new(1, Some(pool_of(POOL_BYTES)), POOL_BYTES as u64, dir.clone());
         for i in 0..48i64 {
             buffer.push(0, batch(i * 4096, 4096)).await.unwrap();
         }
         let spills = buffer.spill_count();
-        assert!(spills >= 4, "need several runs to observe reclamation, got {spills}");
+        assert!(
+            spills >= 4,
+            "need several runs to observe reclamation, got {spills}"
+        );
 
         let count_files = || {
             std::fs::read_dir(&dir)
                 .map(|d| d.filter_map(|e| e.ok()).count())
                 .unwrap_or(0)
         };
-        assert_eq!(count_files(), spills, "every run should be on disk before the drain");
+        assert_eq!(
+            count_files(),
+            spills,
+            "every run should be on disk before the drain"
+        );
 
         let schema = buffer.pushed_schema().expect("rows were pushed");
         let (mut stream, _tally) = buffer.drain_partition_stream(0, schema);
@@ -1684,7 +1692,11 @@ mod coalesce_tests {
         let input: Vec<_> = (0..200).map(|i| batch(&schema, 4, i)).collect();
         let rows_in = total_rows(&input);
         let out = coalesce_shuffle_batches(input, &schema);
-        assert!(out.len() < 20, "expected heavy coalescing, got {}", out.len());
+        assert!(
+            out.len() < 20,
+            "expected heavy coalescing, got {}",
+            out.len()
+        );
         assert_eq!(total_rows(&out), rows_in, "coalescing must not lose rows");
     }
 
@@ -1699,7 +1711,10 @@ mod coalesce_tests {
         let rows_in = total_rows(&input);
         let out = coalesce_shuffle_batches(input, &schema);
         assert_eq!(total_rows(&out), rows_in, "coalescing must not lose rows");
-        assert!(out.len() > 1, "a 40 MiB partition must not become one batch");
+        assert!(
+            out.len() > 1,
+            "a 40 MiB partition must not become one batch"
+        );
         for b in &out {
             assert!(
                 b.get_array_memory_size() < SHUFFLE_COALESCE_TARGET_BYTES.saturating_mul(2),
@@ -1838,8 +1853,7 @@ mod view_bucket_tests {
             Field::new("c_comment", DataType::Utf8View, false),
         ]));
         let keys = Int64Array::from_iter_values(0..rows as i64);
-        let comments =
-            StringViewArray::from_iter_values((0..rows).map(|i| format!("{i:0>73}")));
+        let comments = StringViewArray::from_iter_values((0..rows).map(|i| format!("{i:0>73}")));
         RecordBatch::try_new(schema, vec![Arc::new(keys), Arc::new(comments)]).unwrap()
     }
 
@@ -1872,12 +1886,8 @@ mod view_bucket_tests {
             .partition(&batch)
             .expect("partition");
 
-        let mut buffer = ShuffleWriteBuffer::new(
-            BUCKETS as usize,
-            None,
-            CEILING,
-            temp_dir("view-spill"),
-        );
+        let mut buffer =
+            ShuffleWriteBuffer::new(BUCKETS as usize, None, CEILING, temp_dir("view-spill"));
         for (index, bucket) in buckets.into_iter().enumerate() {
             buffer.push(index, bucket).await.unwrap();
         }

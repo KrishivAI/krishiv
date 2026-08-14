@@ -434,7 +434,10 @@ impl ExecutorCapacity {
                 let memory_bound = query_pool_bytes
                     .map(|pool| usize::try_from(pool / MIN_TASK_MEMORY_BYTES).unwrap_or(usize::MAX))
                     .unwrap_or(usize::MAX);
-                (cores.get().min(memory_bound).max(1), CapacitySource::Derived)
+                (
+                    cores.get().min(memory_bound).max(1),
+                    CapacitySource::Derived,
+                )
             }
         };
         let slots = NonZeroUsize::new(slots).unwrap_or(NonZeroUsize::MIN);
@@ -561,7 +564,9 @@ mod tests {
         // (2.5 GiB - 512 MiB) * 0.6 ≈ 1.25 GiB, shared across all slots. The
         // 40% left over is what the pool cannot see: Arrow batches in flight,
         // shuffle buffers, allocator retention.
-        let pool = cap.query_pool_bytes.expect("bounded container yields a pool");
+        let pool = cap
+            .query_pool_bytes
+            .expect("bounded container yields a pool");
         assert!(
             (1_150_000_000..1_350_000_000).contains(&pool),
             "pool {pool} outside the expected ~1.25 GiB band"
@@ -580,8 +585,11 @@ mod tests {
         // of the cgroup each meant total claimed memory grew with slot count.
         // The shared pool is a single number, so it cannot.
         for slots in 1..=64 {
-            let cap = ExecutorCapacity::derive(64, Some(4 * GIB), Some(slots), None, None, None, None);
-            let pool = cap.query_pool_bytes.expect("bounded container yields a pool");
+            let cap =
+                ExecutorCapacity::derive(64, Some(4 * GIB), Some(slots), None, None, None, None);
+            let pool = cap
+                .query_pool_bytes
+                .expect("bounded container yields a pool");
             assert!(
                 pool < 4 * GIB,
                 "slots={slots} claimed {pool} of a {} byte container",
@@ -660,7 +668,11 @@ mod tests {
         // share at 1 instead of 4 and used a quarter of the CPU.
         let cap = ExecutorCapacity::derive(4, Some(8 * GIB), Some(1), None, None, None, None);
         assert_eq!(cap.slots.get(), 1);
-        assert_eq!(cap.task_parallelism.get(), 4, "one task should get all cores");
+        assert_eq!(
+            cap.task_parallelism.get(),
+            4,
+            "one task should get all cores"
+        );
     }
 
     #[test]
@@ -681,7 +693,11 @@ mod tests {
     fn no_cgroup_limit_yields_an_unbounded_pool_and_cpu_bound_slots() {
         let cap = ExecutorCapacity::derive(8, None, None, None, None, None, None);
         assert_eq!(cap.query_pool_bytes, None);
-        assert_eq!(cap.slots.get(), 8, "nothing but cores bounds an unbounded pool");
+        assert_eq!(
+            cap.slots.get(),
+            8,
+            "nothing but cores bounds an unbounded pool"
+        );
     }
 
     #[test]
@@ -695,7 +711,11 @@ mod tests {
             .expect("a small container is still bounded");
         assert!(pool >= MIN_VIABLE_POOL_BYTES);
         assert_eq!(cap.slots.get(), 1, "233 MiB cannot feed two 256 MiB shares");
-        assert_eq!(cap.task_parallelism.get(), 2, "the one task gets both cores");
+        assert_eq!(
+            cap.task_parallelism.get(),
+            2,
+            "the one task gets both cores"
+        );
     }
 
     #[test]
@@ -705,7 +725,11 @@ mod tests {
         // memory to complete, so it is not built.
         let cap = ExecutorCapacity::derive(2, Some(629_145_600), None, None, None, None, None);
         assert_eq!(cap.query_pool_bytes, None);
-        assert_eq!(cap.slots.get(), 2, "nothing but cores bounds an unbounded pool");
+        assert_eq!(
+            cap.slots.get(),
+            2,
+            "nothing but cores bounds an unbounded pool"
+        );
     }
 
     #[test]
@@ -718,7 +742,8 @@ mod tests {
 
     #[test]
     fn summary_names_every_derived_quantity() {
-        let summary = ExecutorCapacity::derive(4, Some(4 * GIB), None, None, None, None, None).summary();
+        let summary =
+            ExecutorCapacity::derive(4, Some(4 * GIB), None, None, None, None, None).summary();
         for expected in [
             "slots=",
             "cores=",
@@ -726,7 +751,10 @@ mod tests {
             "shuffle_store=",
             "task_parallelism=",
         ] {
-            assert!(summary.contains(expected), "summary missing {expected}: {summary}");
+            assert!(
+                summary.contains(expected),
+                "summary missing {expected}: {summary}"
+            );
         }
     }
 
@@ -784,7 +812,10 @@ mod tests {
                 "container {limit_mib}Mi still allows a 2 GiB shuffle store: {:?}",
                 cap.shuffle_store_bytes,
             );
-            assert!(cap.accounted_bytes() <= limit, "container {limit_mib}Mi over-commits");
+            assert!(
+                cap.accounted_bytes() <= limit,
+                "container {limit_mib}Mi over-commits"
+            );
         }
     }
 

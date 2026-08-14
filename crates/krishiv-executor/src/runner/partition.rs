@@ -443,12 +443,10 @@ mod local_parquet_tests {
     /// `split_once` takes the FIRST separator, so only the table name is cut.
     #[test]
     fn only_the_first_colon_separates_the_table_from_the_path() {
-        let parsed = LocalParquetPartition::parse(&described(
-            0,
-            "local-parquet:orders:file:///data/o.pq",
-        ))
-        .expect("parse")
-        .expect("recognised");
+        let parsed =
+            LocalParquetPartition::parse(&described(0, "local-parquet:orders:file:///data/o.pq"))
+                .expect("parse")
+                .expect("recognised");
         assert_eq!(parsed.table_name(), "orders");
         assert_eq!(parsed.path(), Path::new("file:///data/o.pq"));
     }
@@ -466,8 +464,8 @@ mod local_parquet_tests {
             ("local-parquet::/data/o.pq", "table name"),
             ("local-parquet:orders:", "path"),
         ] {
-            let err = LocalParquetPartition::parse(&described(0, desc))
-                .expect_err("must be refused");
+            let err =
+                LocalParquetPartition::parse(&described(0, desc)).expect_err("must be refused");
             assert!(
                 err.to_string().contains(want),
                 "{desc}: error must name the missing field, got {err}"
@@ -519,12 +517,16 @@ mod declared_default_guard {
     #[test]
     fn the_documented_default_matches_the_compiled_in_one() {
         assert_eq!(
-            krishiv_common::env_registry::declared_default_number("KRISHIV_STREAMING_TASK_TIMEOUT_SECS"),
+            krishiv_common::env_registry::declared_default_number(
+                "KRISHIV_STREAMING_TASK_TIMEOUT_SECS"
+            ),
             Some(super::DEFAULT_STREAMING_TASK_TIMEOUT_SECS),
             "KRISHIV_STREAMING_TASK_TIMEOUT_SECS: docs and code disagree"
         );
         assert_eq!(
-            krishiv_common::env_registry::declared_default_number("KRISHIV_BATCH_TASK_TIMEOUT_SECS"),
+            krishiv_common::env_registry::declared_default_number(
+                "KRISHIV_BATCH_TASK_TIMEOUT_SECS"
+            ),
             Some(super::DEFAULT_BATCH_TASK_TIMEOUT_SECS),
             "KRISHIV_BATCH_TASK_TIMEOUT_SECS: docs and code disagree"
         );

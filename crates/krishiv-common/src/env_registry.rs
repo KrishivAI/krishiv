@@ -493,7 +493,9 @@ pub static FLAGS: &[FlagSpec] = &[
     rt(
         "KRISHIV_HEARTBEAT_INTERVAL_SECS",
         FlagKind::UInt,
-        "5",
+        // Real default is 10 (krishiv-executor cli.rs `unwrap_or(10)`); the
+        // registry declared 5, so docs/env-flags.md and `krishiv doctor` lied.
+        "10",
         "Executor→coordinator heartbeat interval.",
     ),
     rt(
@@ -651,7 +653,8 @@ pub static FLAGS: &[FlagSpec] = &[
     rt(
         "KRISHIV_MCP_MAX_ROWS",
         FlagKind::UInt,
-        "1000",
+        // Real default is 100 (krishiv-mcp `DEFAULT_MAX_ROWS`); was declared 1000.
+        "100",
         "Row cap on MCP query results.",
     ),
     rt(
@@ -729,7 +732,8 @@ pub static FLAGS: &[FlagSpec] = &[
     rt(
         "KRISHIV_PLAN_CACHE_MAX_ENTRIES",
         FlagKind::UInt,
-        "128",
+        // Real default is 256 (krishiv-sql `PLAN_CACHE_MAX_ENTRIES`); was declared 128.
+        "256",
         "Logical-plan cache capacity per SQL session.",
     ),
     rt(
@@ -1701,7 +1705,17 @@ mod tests {
                     continue;
                 }
                 scan_flags(&path, exclude_registry, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
+                || path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".rs.inc"))
+            {
+                // `.rs.inc` sections are compiled via `include!` and hold real
+                // `KRISHIV_*` reads (e.g. krishiv-executor/src/sections/*.rs.inc).
+                // Their extension is `inc`, not `rs`, so the plain `== "rs"`
+                // filter skipped them — the registry-rot guard had a hole a flag
+                // read only from a `.rs.inc` would slip through.
                 if exclude_registry && path.ends_with("krishiv-common/src/env_registry.rs") {
                     continue;
                 }

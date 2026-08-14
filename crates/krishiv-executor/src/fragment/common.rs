@@ -991,7 +991,9 @@ fn elastic_parallelism(
     cores: std::num::NonZeroUsize,
     occupied: usize,
 ) -> std::num::NonZeroUsize {
-    let lent = (cores.get() / occupied.max(1)).max(base.get()).min(cores.get());
+    let lent = (cores.get() / occupied.max(1))
+        .max(base.get())
+        .min(cores.get());
     std::num::NonZeroUsize::new(lent).unwrap_or(base)
 }
 
@@ -1530,7 +1532,8 @@ mod tests {
         let capacity = super::executor_capacity();
         let got = super::task_engine_parallelism();
         assert!(
-            got >= capacity.task_parallelism && got <= capacity.cores.max(capacity.task_parallelism),
+            got >= capacity.task_parallelism
+                && got <= capacity.cores.max(capacity.task_parallelism),
             "elastic share {got} must stay within [per-slot share {}, cores {}]",
             capacity.task_parallelism,
             capacity.cores,

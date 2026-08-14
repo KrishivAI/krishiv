@@ -827,14 +827,10 @@ fn open_governed_streaming_iceberg_sink(
     // the REST catalog's HTTP client shares that runtime for its whole life.
     IcebergStreamingSink::open_with_catalog(
         move || async move {
-            krishiv_sql::catalog::unified::KrishivCatalog::rest(
-                &uri,
-                &warehouse,
-                token.as_deref(),
-            )
-            .await
-            .map(|catalog| catalog.as_iceberg())
-            .map_err(|e| format!("REST catalog: {e}"))
+            krishiv_sql::catalog::unified::KrishivCatalog::rest(&uri, &warehouse, token.as_deref())
+                .await
+                .map(|catalog| catalog.as_iceberg())
+                .map_err(|e| format!("REST catalog: {e}"))
         },
         namespace,
         target,

@@ -848,7 +848,10 @@ fn proc_kb_value(contents: &str, key: &str) -> Option<u64> {
 /// Read process RSS (resident set size) in bytes from `/proc/self/status`.
 /// Returns `None` if the file cannot be read or parsed (e.g. non-Linux).
 fn read_proc_rss_bytes() -> Option<u64> {
-    proc_kb_value(&std::fs::read_to_string("/proc/self/status").ok()?, "VmRSS:")
+    proc_kb_value(
+        &std::fs::read_to_string("/proc/self/status").ok()?,
+        "VmRSS:",
+    )
 }
 
 /// Read total system memory in bytes from `/proc/meminfo`.
@@ -930,10 +933,7 @@ mod proc_parsing_tests {
     #[test]
     fn meminfo_total_is_read_and_scaled() {
         let meminfo = "MemTotal:       65805312 kB\nMemFree:         1234 kB\n";
-        assert_eq!(
-            proc_kb_value(meminfo, "MemTotal:"),
-            Some(65_805_312 * 1024)
-        );
+        assert_eq!(proc_kb_value(meminfo, "MemTotal:"), Some(65_805_312 * 1024));
     }
 
     /// A missing key, or a value that is not a number, must read as "unknown"

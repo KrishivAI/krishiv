@@ -1188,6 +1188,12 @@ impl ExecutorCliConfig {
             heartbeat_interval_secs: env::var("KRISHIV_HEARTBEAT_INTERVAL_SECS")
                 .ok()
                 .and_then(|value| value.parse().ok())
+                // Reject 0 the same way the `--heartbeat-interval-secs` argv
+                // guard does: the env path is the one Kubernetes takes (the
+                // operator injects KRISHIV_HEARTBEAT_INTERVAL_SECS), and a 0
+                // feeds `sleep(Duration::from_secs(0))`, busy-looping heartbeats
+                // against the coordinator. Fall back to the default instead.
+                .filter(|&v: &u64| v > 0)
                 .unwrap_or(10),
             http_addr: env::var("KRISHIV_HTTP_ADDR")
                 .ok()
@@ -1611,7 +1617,6 @@ fn apply_checkpoint_default(
         }
     }
 }
-
 
 /// Bridges streaming progress snapshots from runner tasks to the heartbeat loop
 /// via a shared DashMap. Runner tasks write progress; the heartbeat loop drains

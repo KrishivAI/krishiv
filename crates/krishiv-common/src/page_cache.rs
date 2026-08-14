@@ -295,7 +295,11 @@ mod tests {
     fn a_partition_larger_than_the_ceiling_does_not_wedge_the_budget() {
         let b = budget(100);
         b.record_written("/tmp/krishiv-pc-huge".into(), 10_000);
-        assert_eq!(b.held_bytes(), 0, "oversized entry is trimmed straight back");
+        assert_eq!(
+            b.held_bytes(),
+            0,
+            "oversized entry is trimmed straight back"
+        );
         b.record_written("/tmp/krishiv-pc-small".into(), 50);
         assert_eq!(b.held_bytes(), 50, "budget still usable afterwards");
     }

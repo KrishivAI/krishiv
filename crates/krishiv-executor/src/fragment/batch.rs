@@ -708,8 +708,7 @@ async fn execute_shuffle_write_fragment(
     // violated — "column types must match schema types". The stream's schema
     // is the physical one, is known before the first batch, and is correct
     // when there are no batches at all, which is the case A2 exists for.
-    let mut output_schema: arrow::datatypes::SchemaRef =
-        physical_output_schema;
+    let mut output_schema: arrow::datatypes::SchemaRef = physical_output_schema;
     let mut hot_key_acc = HotKeyAccumulator::new();
     let mut ess_writer: Option<krishiv_shuffle::SortShuffleWriter> = if ctx.ess_index.is_some() {
         Some(
@@ -774,7 +773,10 @@ async fn execute_shuffle_write_fragment(
     // `Decimal128(30, 15)`). The reduce side concatenates across map tasks and
     // rejects the mixture.
     let observed_schema = buffer.pushed_schema();
-    super::shuffle_write_buffer::warn_on_schema_divergence(observed_schema.as_ref(), &output_schema);
+    super::shuffle_write_buffer::warn_on_schema_divergence(
+        observed_schema.as_ref(),
+        &output_schema,
+    );
     for p in 0..num_partitions {
         // `_reservation` must outlive `part_batches` — it is the pool's view
         // of this partition while it is concatenated and serialised.
@@ -1008,8 +1010,7 @@ impl krishiv_sql::distributed_plan::ShufflePartitionReader for InmemDfplanShuffl
                     }
                 })?;
                 drop(permit);
-                Ok(Box::pin(stream.map(|b| b.map_err(|e| e.to_string())))
-                    as ShuffleFragmentStream)
+                Ok(Box::pin(stream.map(|b| b.map_err(|e| e.to_string()))) as ShuffleFragmentStream)
             });
         }
 
@@ -1033,7 +1034,10 @@ impl krishiv_sql::distributed_plan::ShufflePartitionReader for InmemDfplanShuffl
             // A local read streams too: the file is on this node's disk, so
             // there is no reason to build the whole fragment in anonymous
             // memory before the first batch can be joined.
-            let found = store.stream_partition(&id).await.map_err(|e| e.to_string())?;
+            let found = store
+                .stream_partition(&id)
+                .await
+                .map_err(|e| e.to_string())?;
             match found {
                 Some(p) => Ok(Box::pin(p.batches.map(|b| b.map_err(|e| e.to_string())))
                     as ShuffleFragmentStream),
@@ -1396,7 +1400,10 @@ async fn execute_inmem_shuffle_write(
     // One schema for this task's whole output — see the identical latch in the
     // shuffle-write path above and in `drain_into_store`.
     let observed_schema = buffer.pushed_schema();
-    super::shuffle_write_buffer::warn_on_schema_divergence(observed_schema.as_ref(), &output_schema);
+    super::shuffle_write_buffer::warn_on_schema_divergence(
+        observed_schema.as_ref(),
+        &output_schema,
+    );
     for p in 0..num_partitions {
         // `_reservation` must outlive `part_batches` — it is the pool's view
         // of this partition while it is concatenated and serialised.
@@ -2486,16 +2493,18 @@ mod tests {
         }
         let mut rows = 0usize;
         for stream in opened {
-            let batches: Vec<RecordBatch> = tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                stream.try_collect(),
-            )
-            .await
-            .expect("draining an opened fragment must not block")
-            .unwrap();
+            let batches: Vec<RecordBatch> =
+                tokio::time::timeout(std::time::Duration::from_secs(20), stream.try_collect())
+                    .await
+                    .expect("draining an opened fragment must not block")
+                    .unwrap();
             rows += batches.iter().map(|b| b.num_rows()).sum::<usize>();
         }
-        assert_eq!(rows, map_tasks * 3, "every opened fragment must deliver its rows");
+        assert_eq!(
+            rows,
+            map_tasks * 3,
+            "every opened fragment must deliver its rows"
+        );
         server.abort();
     }
 

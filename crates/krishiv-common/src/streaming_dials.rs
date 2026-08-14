@@ -148,7 +148,11 @@ mod tests {
     #[test]
     fn anything_else_is_low_latency() {
         for raw in [None, Some(""), Some("low-latency"), Some("typo")] {
-            assert_eq!(StreamProfile::parse(raw), StreamProfile::LowLatency, "{raw:?}");
+            assert_eq!(
+                StreamProfile::parse(raw),
+                StreamProfile::LowLatency,
+                "{raw:?}"
+            );
         }
     }
 

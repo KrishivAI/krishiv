@@ -287,7 +287,19 @@ impl UnifiedMemoryManager {
         let min = self.region_min_bytes(region);
         let region_headroom = min.saturating_sub(used);
         let total_free = self.remaining_bytes();
-        total_free.max(region_headroom)
+        // Bound the region's own protected headroom by what the pool actually
+        // has free. The result must be 0 when EITHER the pool is exhausted OR
+        // the region is over its soft minimum (as documented) — that is `min`,
+        // not `max`. `max` returned `region_headroom` even with a full pool,
+        // reporting bytes `try_reserve` (which enforces the global total) can
+        // never grant; the sole caller (krishiv-executor
+        // fragment/common.rs `available_for_region(Execution).min(want)` then
+        // `try_reserve`) would then fail the reservation and fall through to
+        // the unreserved over-commit path instead of taking the smaller-but-real
+        // grant. NOTE: a region's protected minimum is therefore NOT reclaimable
+        // once other regions have over-borrowed the pool — `try_reserve` has no
+        // region-aware path — so this "protected minimum" is advisory only.
+        total_free.min(region_headroom)
     }
 
     /// Whether `region` is under pressure: it has exceeded its soft minimum
@@ -310,8 +322,11 @@ impl UnifiedMemoryManager {
     //
     // A *stage reservation* sits on top of the per-region counters: the
     // reservation bytes are added to whichever region the stage charges
-    // against, and counted again in the per-stage accounting so a single
-    // stage cannot blow the global pool even if no other region is busy.
+    // against and recorded in `stage_reservations` for idempotent replacement
+    // and telemetry. NOTE: there is no independent per-stage cap —
+    // `try_reserve_stage` delegates to the global `try_reserve`, so a stage is
+    // bounded by the global pool exactly like any other reservation. The
+    // `by_stage` map is pure bookkeeping (`total_used_bytes` never reads it).
 
     /// Try to reserve `bytes` for `region` on behalf of `stage_id`.
     ///
@@ -441,6 +456,29 @@ mod tests {
         assert!(umm.try_reserve(MemoryRegion::Shuffle, 700));
         assert!(umm.try_reserve(MemoryRegion::Shuffle, 200));
         assert!(!umm.try_reserve(MemoryRegion::Shuffle, 200), "pool full");
+    }
+
+    #[test]
+    fn available_for_region_is_bounded_by_the_free_pool() {
+        // total=1000, execution_min_fraction=0.4 → Execution soft min = 400.
+        let umm = UnifiedMemoryManager::with_total(1000);
+        // Shuffle borrows most of the pool; Execution is still under its min.
+        assert!(umm.try_reserve(MemoryRegion::Shuffle, 850));
+        // Free pool = 150; Execution headroom = 400. Availability must be the
+        // free pool (150), NOT the region headroom (400) — the old `.max`
+        // returned 400, bytes `try_reserve` could never grant. Reverting to
+        // `.max` makes this fail (400 != 150).
+        assert_eq!(umm.available_for_region(MemoryRegion::Execution), 150);
+
+        // Doc contract: returns 0 when the total pool is exhausted, even though
+        // Execution is still under its soft minimum. `.max` returned 150 here.
+        assert!(umm.try_reserve(MemoryRegion::Shuffle, 150), "fill the pool");
+        assert_eq!(umm.remaining_bytes(), 0);
+        assert_eq!(
+            umm.available_for_region(MemoryRegion::Execution),
+            0,
+            "pool exhausted → 0, per the documented contract"
+        );
     }
 
     #[test]

@@ -730,13 +730,15 @@ pub fn publish_staged_outputs(
         } else {
             dest_dir.join(&hive_path).join(&final_name)
         };
-        if final_path.exists() {
-            outcome.skipped_existing += 1;
-            continue;
-        }
         // S18: per-partition overwrite. Before publishing into `hive_path`,
         // remove foreign files in the same partition (but only the first
         // time we see this partition to keep cost O(partitions-touched)).
+        // This runs BEFORE the idempotent `final_path.exists()` skip below:
+        // dynamic overwrite must own the produced partition regardless of
+        // whether our own part file is already published, otherwise a
+        // re-publish of an already-committed partition would leave foreign
+        // files a first-time publish would have cleared. Our own final file is
+        // excluded by name, so clearing-then-skipping is safe.
         if matches!(spec.mode, WriteMode::OverwriteDynamic)
             && !hive_path.is_empty()
             && dynamic_partitions_cleared.insert(hive_path.clone())
@@ -750,6 +752,10 @@ pub fn publish_staged_outputs(
                     }
                 }
             }
+        }
+        if final_path.exists() {
+            outcome.skipped_existing += 1;
+            continue;
         }
         move_file(&entry.path, &final_path)?;
         outcome.published.push(final_path);
@@ -871,5 +877,135 @@ mod tests {
     fn hive_escape_keeps_safe_chars() {
         assert_eq!(hive_escape("US-east_1.zone"), "US-east_1.zone");
         assert_eq!(hive_escape("a/b=c"), "a%2Fb%3Dc");
+    }
+
+    // ── On-disk durability tests ──────────────────────────────────────────
+    //
+    // Before these, publish/cleanup were only covered for parsing and name
+    // formatting: you could make `publish_staged_outputs` return
+    // `Ok(default)` and every test still passed. These stage real bytes and
+    // assert the atomic-publish contract on disk.
+
+    /// A unique temp directory that removes itself on drop. No external crate
+    /// (`tempfile` is not a dependency); uniqueness comes from pid + a
+    /// per-call atomic counter so parallel tests never collide.
+    struct TempDir {
+        path: std::path::PathBuf,
+    }
+    impl TempDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "krishiv_write_commit_test_{}_{}",
+                std::process::id(),
+                n
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp base");
+            Self { path }
+        }
+        fn str(&self) -> &str {
+            self.path.to_str().expect("utf8 temp path")
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn stage_file(
+        spec: &SinkWriteSpec,
+        job: &str,
+        hive: &str,
+        task: &str,
+        attempt: u32,
+        bytes: &[u8],
+    ) {
+        let rel = spec.staged_file_rel(job, hive, task, attempt);
+        let full = Path::new(&spec.base_dir).join(rel);
+        std::fs::create_dir_all(full.parent().unwrap()).expect("mkdir staging");
+        std::fs::write(&full, bytes).expect("write staged file");
+    }
+
+    #[test]
+    fn publish_moves_staged_bytes_to_final_and_removes_staging() {
+        let tmp = TempDir::new();
+        let spec = SinkWriteSpec::staged(tmp.str(), "out", WriteMode::Append, vec![]).unwrap();
+        let job = "job-1";
+        stage_file(&spec, job, "", "task-0", 0, b"hello-parquet");
+
+        let outcome = publish_staged_outputs(&spec, job).expect("publish");
+        assert_eq!(outcome.published.len(), 1, "one file published");
+
+        // The bytes must land at the final part path...
+        let final_path = Path::new(&spec.base_dir)
+            .join("out")
+            .join(final_part_file_name(0, job));
+        assert!(final_path.exists(), "final file must exist after publish");
+        assert_eq!(
+            std::fs::read(&final_path).unwrap(),
+            b"hello-parquet",
+            "published bytes must match staged bytes"
+        );
+        // ...and the staging directory must be gone.
+        let staging = Path::new(&spec.base_dir).join(spec.staging_dir_rel(job));
+        assert!(
+            !staging.exists(),
+            "staging dir must be removed after publish"
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_staging_without_publishing() {
+        let tmp = TempDir::new();
+        let spec = SinkWriteSpec::staged(tmp.str(), "out", WriteMode::Append, vec![]).unwrap();
+        let job = "job-2";
+        stage_file(&spec, job, "", "task-0", 0, b"aborted");
+
+        cleanup_staged_outputs(&spec, job).expect("cleanup");
+        let staging = Path::new(&spec.base_dir).join(spec.staging_dir_rel(job));
+        assert!(!staging.exists(), "cleanup must remove staging");
+        // Nothing was published.
+        let final_path = Path::new(&spec.base_dir)
+            .join("out")
+            .join(final_part_file_name(0, job));
+        assert!(!final_path.exists(), "cleanup must not publish anything");
+    }
+
+    #[test]
+    fn overwrite_dynamic_clears_foreign_in_produced_partition_even_on_republish() {
+        let tmp = TempDir::new();
+        let spec = SinkWriteSpec::staged(
+            tmp.str(),
+            "out",
+            WriteMode::OverwriteDynamic,
+            vec!["c".into()],
+        )
+        .unwrap();
+        let job = "job-3";
+        let partition_dir = Path::new(&spec.base_dir).join("out").join("c=US");
+        std::fs::create_dir_all(&partition_dir).unwrap();
+        // Our own file is already published (simulating an idempotent re-run)...
+        let our_final = partition_dir.join(final_part_file_name(0, job));
+        std::fs::write(&our_final, b"ours").unwrap();
+        // ...and a foreign file exists in the SAME produced partition.
+        let foreign = partition_dir.join("part-foreign.parquet");
+        std::fs::write(&foreign, b"stale").unwrap();
+        // Stage the same partition again.
+        stage_file(&spec, job, "c=US", "task-0", 0, b"ours");
+
+        publish_staged_outputs(&spec, job).expect("republish");
+
+        // The produced partition must be owned: foreign file cleared, ours kept.
+        // Reverting the clear to run AFTER the `final_path.exists()` skip leaves
+        // the foreign file in place and fails this.
+        assert!(
+            !foreign.exists(),
+            "foreign file in produced partition must be cleared"
+        );
+        assert!(our_final.exists(), "our own published file must survive");
     }
 }

@@ -20,9 +20,8 @@ use crate::{
 };
 
 use super::partition::{
-    MAX_CHECKPOINT_ACK_RETRIES, default_batch_task_timeout_secs,
-    collect_missing_shuffle_partitions, default_streaming_task_timeout_secs,
-    format_failure_message,
+    MAX_CHECKPOINT_ACK_RETRIES, collect_missing_shuffle_partitions,
+    default_batch_task_timeout_secs, default_streaming_task_timeout_secs, format_failure_message,
 };
 use super::task_output::{
     CheckpointStateHandle, ExecutorTaskOutput, ExecutorTaskRunReport, RestoredJobCheckpoint,
@@ -362,7 +361,6 @@ impl fmt::Debug for ExecutorTaskRunner {
             .finish()
     }
 }
-
 
 /// Removes a task's running-attempt entry on drop, so a slot cannot be leaked
 /// by an early return. See `ExecutorTaskRunner::running_attempt_guard` for the

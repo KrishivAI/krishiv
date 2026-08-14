@@ -148,8 +148,16 @@ fn digest_for_key(array: &dyn Array, row: usize) -> Result<[u8; 32], PartitionEr
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| downcast_error("Float64"))?;
             let value = values.value(row);
+            // Canonicalise both NaN payloads and signed zero. `-0.0` and `+0.0`
+            // compare equal under SQL (`0.0 = -0.0`) but have distinct bit
+            // patterns (0x8000… vs 0x0), so hashing raw bits would route them to
+            // different shards — a co-partitioned join on a Float64 key would
+            // then silently drop the matching pair. `value == 0.0` is true for
+            // both zeros, so mapping it to `+0.0` collapses them.
             let canonical_bits = if value.is_nan() {
                 f64::NAN.to_bits()
+            } else if value == 0.0 {
+                0.0_f64.to_bits()
             } else {
                 value.to_bits()
             };
@@ -570,6 +578,27 @@ mod tests {
         assert_eq!(
             shard_index(&canonical, 0, shard_count).unwrap(),
             shard_index(&alternate, 0, shard_count).unwrap()
+        );
+    }
+
+    #[test]
+    fn partitioning_canonicalizes_signed_zero() {
+        // `+0.0` and `-0.0` are SQL-equal (`0.0 = -0.0`) but have distinct bit
+        // patterns. Without canonicalisation they route to different shards, so
+        // a co-partitioned join on a Float64 key silently drops the matching
+        // pair. Reverting the `value == 0.0` arm to `value.to_bits()` fails this.
+        let positive = Float64Array::from(vec![0.0_f64]);
+        let negative = Float64Array::from(vec![-0.0_f64]);
+        let shard_count = NonZeroUsize::new(31).unwrap();
+        assert_ne!(
+            positive.value(0).to_bits(),
+            negative.value(0).to_bits(),
+            "precondition: the two zeros must have different raw bits"
+        );
+        assert_eq!(
+            shard_index(&positive, 0, shard_count).unwrap(),
+            shard_index(&negative, 0, shard_count).unwrap(),
+            "+0.0 and -0.0 must hash to the same shard"
         );
     }
 }

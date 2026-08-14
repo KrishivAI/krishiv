@@ -39,7 +39,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 4 | krishiv-scheduler | **51,438** | **78** | **78 (COMPLETE)** | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
 | **Tier 2 — correctness blast radius** |
 | 5 | krishiv-plan | 14,371 | 25 | **25 (COMPLETE)** | plan IR every surface depends on; 3 can't-fail tests fixed, 2 unreachable AQE rules with latent outer-join bugs documented, 4 dead pub surfaces recorded |
-| 6 | krishiv-common | 7,966 | 23 | 0 | env registry, durability profiles, memory budget |
+| 6 | krishiv-common | 7,966 | 23 | **23 (COMPLETE)** | 2 wrong-answer fixes (Float64 signed-zero shard split, UMM available `max`→`min`), a heartbeat env busy-loop, 3 declared-default drifts, registry `.rs.inc` scan blindness |
 | 7 | krishiv-connectors | 39,930 | 97 | 0 | ingest correctness; 42 files with no tests |
 | 8 | krishiv-state | 12,357 | 37 | 0 | checkpoints/restore; fewer than half the files tested |
 | **Tier 3 — runtime & surfaces** |
@@ -1749,7 +1749,137 @@ change:
 
 ---
 
-## 6–27. Not yet started
+## 6. krishiv-common — 23 of 23 files read whole (COMPLETE, 2026-08-14)
+
+Sixth crate. 8,065 lines. The foundation crate (env registry, durability
+profiles, memory budget, the sync/async `block_on` bridge, the distributed
+partition-key hash). Two of the fixes below are genuine silent-wrong-answer
+correctness bugs, one is a busy-loop DoS reachable from a Kubernetes env var,
+and three are declared-vs-real default drift that made the published env
+reference and `krishiv doctor` lie.
+
+### Fixed reading it
+
+- [x] **Float64 partition keys did not canonicalise signed zero** (wrong answer,
+      A). `digest_for_key`'s `Float64` arm canonicalised NaN payloads but not
+      `-0.0`: `+0.0` (bits `0x0`) and `-0.0` (bits `0x8000…`) produce different
+      SHA-256 digests and route to different shards, though SQL treats them equal
+      (`0.0 = -0.0`). A co-partitioned join on a Float64 key with `-0.0` on one
+      side and `+0.0` on the other silently drops the matching pair. Fixed by
+      mapping `value == 0.0` (true for both zeros) to `+0.0` bits, right beside
+      the existing NaN canonicalisation. **Revert-proven**:
+      `partitioning_canonicalizes_signed_zero` fails against the pre-fix bits.
+      `partition.rs`.
+- [x] **`UnifiedMemoryManager::available_for_region` used `max` where the doc
+      (and the only caller) needs `min`** (wrong accounting, A + E). It returned
+      `total_free.max(region_headroom)` — the region's soft-min headroom even
+      when the pool is full — while the doc says "returns 0 when the total pool
+      is exhausted OR the region exceeded its soft minimum" (that is `min`). The
+      sole caller, krishiv-executor `fragment/common.rs:1171`, does
+      `available_for_region(Execution).min(want)` then `try_reserve(remaining)`;
+      the over-reported value fails the real global-total check in `try_reserve`
+      and the task falls through to the **unreserved over-commit** path instead
+      of taking the smaller-but-real grant. Concrete: total 1000, Shuffle holds
+      850, Execution min 400 → `max`=400 (ungrantable), `min`=150 (the true
+      free pool). **Revert-proven**:
+      `available_for_region_is_bounded_by_the_free_pool` fails against `max`.
+      Also recorded in place: a region's protected minimum is NOT reclaimable
+      once other regions over-borrow (`try_reserve` has no region-aware path), so
+      "protected minimum" is advisory. `unified_memory_manager.rs`.
+- [x] **`KRISHIV_HEARTBEAT_INTERVAL_SECS=0` busy-loops the coordinator**
+      (config, A — cross-crate, fixed in krishiv-executor). The argv path
+      `--heartbeat-interval-secs` explicitly rejects 0, but the env path
+      (`cli.rs:1188`, `unwrap_or(10)`) had no zero-guard and fed
+      `sleep(Duration::from_secs(0))`. The env var is the one Kubernetes injects
+      (it is in the operator's `ALLOWED_EXECUTOR_ENV_VARS`), so the *deployed*
+      path was the unguarded one — the exact argv-clamped/env-unvalidated shape
+      the scheduler audit already found for the JCP poll interval. Fixed with
+      `.filter(|&v| v > 0)`. `krishiv-executor/src/cli.rs`.
+- [x] **Three env-registry declared defaults drifted from the real accessor
+      defaults** (honesty, A/E). The registry `default` field generates
+      `docs/reference/env-flags.md` and `krishiv doctor`; none of the three is
+      pinned by `declared_default_number`, so the drift was live and untested:
+      `KRISHIV_MCP_MAX_ROWS` declared 1000, real 100 (10×);
+      `KRISHIV_PLAN_CACHE_MAX_ENTRIES` declared 128, real 256 (2×);
+      `KRISHIV_HEARTBEAT_INTERVAL_SECS` declared 5, real 10 (2×). Corrected each
+      declared value to the code's real default and re-blessed the reference doc
+      (`KRISHIV_BLESS_ENV_REFERENCE=1`). `env_registry.rs`.
+- [x] **The registry-rot guard was blind to `.rs.inc` sections** (reachability
+      of the guard itself, B/C). `every_flag_read_in_source_is_declared` /
+      `every_declared_flag_still_exists_in_source` scanned only files whose
+      extension is `rs`; the repo keeps 36 `.rs.inc` include sections that
+      contain real `KRISHIV_*` reads, whose extension is `inc`. A flag read only
+      from a `.rs.inc` would neither be caught as undeclared nor keep a declared
+      entry alive. Same `--include='*.rs'`-only blind spot the shuffle/scheduler
+      audits were burned by. Extended the scan to `*.rs` + `*.rs.inc`; no new
+      undeclared flags surfaced (so no latent rot today), but the guard now
+      actually covers what it claims. `env_registry.rs`.
+- [x] **`write_commit.rs`'s durability path had no on-disk test** (test-coverage,
+      C). Publish/cleanup were covered only for parsing/name-formatting — you
+      could make `publish_staged_outputs` return `Ok(default)` and every test
+      passed. Added three on-disk tests (a self-cleaning `TempDir`, no external
+      crate): publish moves staged bytes to the final path and removes staging;
+      cleanup removes staging without publishing; and the OverwriteDynamic
+      produced-partition clear. `write_commit.rs`.
+- [x] **`write_commit.rs` OverwriteDynamic skipped the foreign-file clear on an
+      idempotent re-publish** (edge-case correctness, A). The per-partition
+      foreign-file clear ran *after* the `final_path.exists()` skip, so a
+      re-publish into an already-committed dynamic partition left foreign files a
+      first-time publish would have removed — the partition was not fully "owned."
+      Moved the clear before the skip (our own final file is excluded by name, so
+      clear-then-skip is safe). **Revert-proven**:
+      `overwrite_dynamic_clears_foreign_in_produced_partition_even_on_republish`
+      fails against the old ordering. `write_commit.rs`.
+- [x] **Corrected the misleading per-stage-cap comment** (honesty, E) at
+      `unified_memory_manager.rs:309`: it claimed stage bytes are "counted again
+      … so a single stage cannot blow the pool," but `try_reserve_stage`
+      delegates to the global `try_reserve` — there is no independent per-stage
+      cap; `by_stage` is pure bookkeeping. Comment now states the real behaviour.
+
+### Verified correct (recorded so they are not re-derived)
+
+- **`async_util.rs`** — the `block_on` bridge is correct: multi-thread runtime →
+      `block_in_place`; current-thread runtime → hop to a fresh OS thread via
+      `thread::scope` (Tokio's nesting guard is per-OS-thread, not
+      per-runtime-instance); no runtime → fallback. `Send` bounds present. The
+      three regression tests each pin a real nesting case that used to panic.
+- **`partition.rs` / `hash.rs`** — the distributed-shuffle hasher is **stable**:
+      SHA-256 with a fixed `krishiv.partition-key.v1` domain over fixed-endian
+      bytes, not `DefaultHasher`/`RandomState`/address-based. The three string
+      encodings (Utf8/LargeUtf8/Utf8View) share one tag so a value routes
+      identically regardless of Arrow encoding.
+- **`memory_budget.rs`**, **`page_cache.rs`** (FIFO trim + saturating add/sub,
+      ceiling sourced from `ExecutorCapacity`), **`backpressure.rs`** (registers
+      the `Notify` listener before the second load — no missed wakeup; no lock
+      across `.await`), **`executor_capacity.rs`** (every fraction truncates with
+      `as u64` — rounds *down*, the safe direction; the three fractions sum to
+      the accounted-ceiling and `budgets_always_fit_inside_the_container` sweeps
+      512 MiB–64 GiB) — all clean on the wrong-accounting axis.
+- **`durability.rs` / `production.rs` / `validate.rs` / `streaming_dials.rs`** —
+      every gate checks its override *first* then the gated predicate (not the
+      "returns Err on line 1" anti-pattern); `parse_idle_tick_ms` deliberately
+      allows explicit `0`; profile predicates use the right ordering.
+- **`write_commit.rs`** — durability-clean: `publish_staged_outputs` /
+      `cleanup_staged_outputs` are synchronous (no dropped-future path), staged
+      files survive a mid-way error and re-publish converges via the
+      `final_path.exists()` skip (idempotent), `move_file` falls back to
+      copy+delete on `CrossesDevices`. No "dry-run reports success" path.
+- **`sql_util.rs`** (no case-folding, so no fold-then-index-original panic;
+      quote-doubling correct), **`auth_util.rs`** (parse/redact only — no
+      constant-time compare lives here), **`compute_pool.rs`**, **`chaos.rs`**,
+      **`panic_util.rs`**, **`stream_quality.rs`**, **`test_fixtures.rs`** — clean.
+- No dead `pub fn`: every public symbol has an external caller across `*.rs`
+      and `*.rs.inc`.
+
+### Open
+
+- [ ] Coverage not yet measured with `cargo llvm-cov`; `env_registry.rs` (1873)
+      is the largest remaining surface to profile (`write_commit.rs` now has its
+      durability path under test).
+
+---
+
+## 7–27. Not yet started
 
 Each crate gets the same treatment and its own section here: measured
 coverage, a table of uncovered-region concentration, a fixed list with commit
