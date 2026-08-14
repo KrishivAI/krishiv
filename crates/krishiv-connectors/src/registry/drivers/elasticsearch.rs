@@ -41,7 +41,17 @@ impl SinkDriver for ElasticsearchSinkDriver {
             let url = config.required("url")?.to_string();
             let index = config.required("index")?.to_string();
 
-            let es_config = ElasticsearchConfig::new(url, index);
+            let mut es_config = ElasticsearchConfig::new(url, index);
+            // `id_column` is what turns a retried bulk request from
+            // duplicates into an idempotent upsert — without it a movement
+            // labeled "idempotent" would be lying. Optional because
+            // append-only indexing (auto IDs) is a legitimate mode.
+            if let Some(col) = config.get("id_column") {
+                es_config = es_config.with_id_column(col);
+            }
+            if let (Some(user), Some(pass)) = (config.get("username"), config.get("password")) {
+                es_config = es_config.with_credentials(user, pass);
+            }
             let sink = ElasticsearchSink::connect(es_config).await.map_err(|e| {
                 ConnectorError::Config {
                     message: format!("elasticsearch sink open failed: {e}"),

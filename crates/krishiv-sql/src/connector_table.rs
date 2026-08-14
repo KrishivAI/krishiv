@@ -103,6 +103,27 @@ pub fn register_connector_table_factories(
             shared_connector_registry(),
         )),
     );
+    // Batch export sinks (Phase 67 movements; engine #197 one-registry
+    // dispatch). `STORED AS ELASTICSEARCH` / `STORED AS KAFKA_SINK` create
+    // external tables whose INSERT INTO routes through the registered sink
+    // drivers — the same door serve-back uses for `STORED AS JDBC`.
+    // `KAFKA_SINK` is a distinct token because bare `KAFKA` is the
+    // STREAMING source factory; this one is the bounded batch door.
+    #[cfg(feature = "elasticsearch")]
+    table_factories.insert(
+        "ELASTICSEARCH".to_string(),
+        Arc::new(ConnectorTableFactory::sink_only(
+            "elasticsearch",
+            shared_connector_registry(),
+        )),
+    );
+    table_factories.insert(
+        "KAFKA_SINK".to_string(),
+        Arc::new(ConnectorTableFactory::sink_only(
+            "kafka",
+            shared_connector_registry(),
+        )),
+    );
 }
 
 /// Build a [`ConnectorConfig`] from a `CREATE EXTERNAL TABLE` command.
@@ -148,6 +169,21 @@ pub fn connector_config_from_ddl(
             }
             if let Some(ms) = kafka_auto_commit_interval_ms() {
                 cfg = cfg.with_property("auto.commit.interval.ms", ms.to_string());
+            }
+            cfg
+        }
+        // Elasticsearch export sink (Phase 67): LOCATION is the cluster URL,
+        // `index` names the target index, `id_column` (optional) is what
+        // makes a retried bulk request an idempotent upsert instead of
+        // duplicates. This table exists to be INSERTed into; reading it is
+        // refused by the registry (no Elasticsearch SOURCE driver), which is
+        // the honest answer rather than a guessed scan.
+        "elasticsearch" => {
+            let mut cfg =
+                ConnectorConfig::new(name, kind).with_property("url", cmd.location.clone());
+            for (key, value) in &cmd.options {
+                let key = key.strip_prefix("format.").unwrap_or(key);
+                cfg = cfg.with_property(key, value.clone());
             }
             cfg
         }
@@ -205,6 +241,11 @@ pub struct ConnectorTableFactory {
     connector_kind: &'static str,
     registry: Arc<ConnectorRegistry>,
     streaming_sources: Option<Arc<RwLock<HashSet<String>>>>,
+    /// A sink-only door (`STORED AS ELASTICSEARCH` / `KAFKA_SINK`): the
+    /// table exists to be INSERTed into. DDL validates the SINK driver —
+    /// there may legitimately be no source driver for the kind — and the
+    /// kafka kind must NOT fall into the streaming-source provider here.
+    sink_only: bool,
 }
 
 impl std::fmt::Debug for ConnectorTableFactory {
@@ -221,6 +262,16 @@ impl ConnectorTableFactory {
             connector_kind,
             registry,
             streaming_sources: None,
+            sink_only: false,
+        }
+    }
+
+    pub fn sink_only(connector_kind: &'static str, registry: Arc<ConnectorRegistry>) -> Self {
+        Self {
+            connector_kind,
+            registry,
+            streaming_sources: None,
+            sink_only: true,
         }
     }
 
@@ -229,6 +280,7 @@ impl ConnectorTableFactory {
             connector_kind: "kafka",
             registry: shared_connector_registry(),
             streaming_sources: Some(streaming_sources),
+            sink_only: false,
         }
     }
 }
@@ -271,6 +323,21 @@ impl TableProviderFactory for ConnectorTableFactory {
                         message: format!("connector config validation task panicked: {e}"),
                     }))
                 })??;
+        if self.sink_only {
+            // Validate against the SINK driver's contract: this is the door
+            // the table exists for, and a write-only kind may have no
+            // source driver at all. Reading the table still fails honestly
+            // at scan time with the registry's "no source driver" error.
+            self.registry
+                .validate_sink(&sink_config_for_kind(self.connector_kind, &config)?)
+                .map_err(connector_error)?;
+            let schema: SchemaRef = cmd.schema.as_ref().inner().clone();
+            return Ok(Arc::new(BoundedConnectorProvider {
+                registry: Arc::clone(&self.registry),
+                config,
+                schema,
+            }));
+        }
         self.registry
             .validate_source(&config)
             .map_err(connector_error)?;
@@ -420,8 +487,19 @@ impl TableProvider for BoundedConnectorProvider {
 /// string suffix, so a source with no writable counterpart fails here
 /// naming itself instead of failing later inside the registry.
 fn sink_config_for(source: &ConnectorConfig) -> DataFusionResult<ConnectorConfig> {
-    let sink_kind = match source.kind.as_str() {
+    sink_config_for_kind(&source.kind.clone(), source)
+}
+
+/// Kind-keyed half of [`sink_config_for`], shared with the sink-only DDL
+/// validation which knows the kind before a provider exists.
+fn sink_config_for_kind(kind: &str, source: &ConnectorConfig) -> DataFusionResult<ConnectorConfig> {
+    let sink_kind = match kind {
         "jdbc" | "postgres" | "postgresql" => "jdbc_sink",
+        // Batch export sinks (Phase 67). Same kind on both sides: the
+        // registry separates roles, not names, so `elasticsearch` and
+        // `kafka` resolve to their registered SinkDriver here.
+        "elasticsearch" => "elasticsearch",
+        "kafka" => "kafka",
         other => {
             return Err(DataFusionError::NotImplemented(format!(
                 "connector kind '{other}' has no writable sink counterpart; INSERT INTO is \
@@ -620,6 +698,90 @@ mod tests {
         );
     }
 
+    /// Phase 67 export sinks: the ES/Kafka batch doors resolve their SINK
+    /// drivers and honest-fail without live services. The DDL must succeed
+    /// offline, INSERT INTO must reach the driver (failing at connect, not
+    /// at "no writable sink counterpart"), and the delivery-shaping options
+    /// (`id_column`) must survive the source→sink config derivation.
+    #[cfg(feature = "elasticsearch")]
+    #[tokio::test]
+    async fn elasticsearch_external_table_routes_insert_to_the_sink_driver() {
+        let engine = crate::SqlEngine::new();
+        engine
+            .sql(
+                "CREATE EXTERNAL TABLE es_out (id BIGINT, name VARCHAR) \
+                 STORED AS ELASTICSEARCH LOCATION 'http://127.0.0.1:1' \
+                 OPTIONS ('index' 'orders', 'id_column' 'id')",
+            )
+            .await
+            .expect("elasticsearch DDL must succeed without a live cluster");
+
+        // The insert reaches the ES sink driver and fails at CONNECT — port 1
+        // refuses — proving dispatch went to the sink, not to a missing
+        // "writable counterpart" error.
+        let planned = engine
+            .sql("INSERT INTO es_out VALUES (1, 'a')")
+            .await
+            .expect("the insert must PLAN — dispatch resolves the sink driver");
+        let err = planned
+            .collect()
+            .await
+            .expect_err("no cluster is listening on port 1");
+        let msg = err.to_string();
+        // The error names the bulk endpoint — the request went to the real
+        // ES wire path (`<url>/<index>/_bulk`), not to a generic refusal.
+        assert!(
+            msg.contains("_bulk"),
+            "the failure must come from the elasticsearch bulk request, got: {msg}"
+        );
+        assert!(
+            !msg.contains("no writable sink counterpart"),
+            "dispatch must not refuse the kind: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kafka_sink_external_table_is_a_distinct_batch_door() {
+        let engine = crate::SqlEngine::new();
+        engine
+            .sql(
+                "CREATE EXTERNAL TABLE k_out (id BIGINT, name VARCHAR) \
+                 STORED AS KAFKA_SINK LOCATION 'orders-topic' \
+                 OPTIONS ('bootstrap.servers' '127.0.0.1:1')",
+            )
+            .await
+            .expect("kafka sink DDL must succeed without a live broker");
+        // Dispatch resolves the registered Kafka SinkDriver; rdkafka's
+        // producer construction is lazy, so the statement may fail at
+        // delivery rather than connect — either way it must NOT fail with
+        // the "no writable sink counterpart" refusal.
+        let planned = engine
+            .sql("INSERT INTO k_out VALUES (1, 'a')")
+            .await
+            .expect("the insert must PLAN — dispatch resolves the sink driver");
+        let err = planned
+            .collect()
+            .await
+            .expect_err("no broker is listening on port 1");
+        assert!(
+            !err.to_string().contains("no writable sink counterpart"),
+            "dispatch must reach the kafka sink driver: {err}"
+        );
+    }
+
+    #[cfg(feature = "elasticsearch")]
+    #[test]
+    fn sink_config_for_carries_es_options_through() {
+        let source = ConnectorConfig::new("es_out", "elasticsearch")
+            .with_property("url", "http://127.0.0.1:9200")
+            .with_property("index", "orders")
+            .with_property("id_column", "id");
+        let sink = sink_config_for(&source).expect("elasticsearch has a sink counterpart");
+        assert_eq!(sink.kind, "elasticsearch");
+        assert_eq!(sink.get("id_column"), Some("id"));
+        assert_eq!(sink.get("index"), Some("orders"));
+    }
+
     #[test]
     fn bounded_connector_provider_statistics_returns_none_for_unknown_table() {
         let registry = Arc::new(krishiv_connectors::ConnectorRegistry::new());
@@ -771,7 +933,9 @@ mod insert_into_tests {
         assert_eq!(sink.kind, "jdbc_sink");
         assert_eq!(sink.get("table").as_deref(), Some("x"));
 
-        let unwritable = ConnectorConfig::new("t", "kafka");
+        // kafka gained a sink counterpart with the Phase 67 batch door, so
+        // the honest-refusal case moved to a kind that truly has none.
+        let unwritable = ConnectorConfig::new("t", "csv");
         let err = sink_config_for(&unwritable).unwrap_err().to_string();
         assert!(err.contains("no writable sink counterpart"), "{err}");
     }

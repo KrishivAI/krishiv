@@ -72,6 +72,8 @@ hudi = ["krishiv-connectors/hudi"]
 # registry's JdbcSourceDriver (Postgres via sqlx), incl. incremental keyset
 # cursors (`cursor.column` / `cursor.after`). Phase 31 ingest breadth.
 jdbc = ["krishiv-connectors/jdbc"]
+# Elasticsearch batch export sink door (`STORED AS ELASTICSEARCH`), Phase 67.
+elasticsearch = ["krishiv-connectors/elasticsearch"]
 # J1-J4 unified catalog backends.
 local-catalog = ["dep:iceberg"]
 # These shared-warehouse backends resolve `s3://` through the object-store
