@@ -56,6 +56,11 @@ impl KrishivRestCatalog {
             .with_storage_factory(Arc::new(
                 crate::catalog::object_store_io::KrishivStorageFactory,
             ))
+            // Explicit on purpose: the builder would otherwise capture
+            // whatever runtime is current at build time silently. This
+            // catalog is built on the engine's main runtime, which lives as
+            // long as the process — stating it here makes that a decision.
+            .with_runtime(iceberg::Runtime::current())
             .load("rest", props)
             .await
             .map_err(|e| CatalogError::Iceberg(e.to_string()))?;
@@ -125,6 +130,10 @@ impl Catalog for KrishivRestCatalog {
 
     async fn drop_table(&self, table: &TableIdent) -> IcebergResult<()> {
         self.inner.drop_table(table).await
+    }
+
+    async fn purge_table(&self, table: &TableIdent) -> IcebergResult<()> {
+        self.inner.purge_table(table).await
     }
 
     async fn table_exists(&self, table: &TableIdent) -> IcebergResult<bool> {

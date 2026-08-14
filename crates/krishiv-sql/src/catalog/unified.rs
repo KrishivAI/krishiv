@@ -69,6 +69,9 @@ impl KrishivCatalog {
     pub async fn memory(warehouse: &str) -> Result<Self, CatalogError> {
         let catalog = MemoryCatalogBuilder::default()
             .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            // Explicit runtime: built on the engine's process-lifetime
+            // runtime; an implicit capture is the empty-plan tripwire's prey.
+            .with_runtime(iceberg::Runtime::current())
             .load(
                 "memory",
                 HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.to_string())]),

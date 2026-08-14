@@ -372,9 +372,13 @@ async fn read_parquet_file(
 /// target, and lone small files with nothing to merge with, are carried over
 /// untouched.
 ///
-/// The metadata swap is drop+recreate preserving the partition spec
-/// (iceberg-rust 0.9.1 exposes no public rewrite/replace snapshot action;
-/// a true atomic rewrite commit lands with the 0.10 bump, task #163),
+/// The metadata swap is drop+recreate preserving the partition spec.
+/// Checked against iceberg-rust 0.10.1 at the bump (2026-08-14): its
+/// `Transaction` still exposes only fast_append / expire_snapshots /
+/// metadata updates — no public rewrite/replace-files action — so the
+/// earlier claim that "a true atomic rewrite commit lands with the 0.10
+/// bump" was wrong. Task #163 stays open, re-check on the next release.
+/// The swap is
 /// guarded by a G3-style conflict check: immediately before the swap the
 /// table is reloaded, and if any snapshot was committed after planning the
 /// compaction aborts (cleaning up its part files) instead of silently

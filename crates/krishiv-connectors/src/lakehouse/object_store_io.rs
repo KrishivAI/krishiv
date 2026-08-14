@@ -310,6 +310,20 @@ impl Storage for KrishivStorage {
         }
     }
 
+    async fn delete_stream(
+        &self,
+        mut paths: futures::stream::BoxStream<'static, String>,
+    ) -> Result<()> {
+        // Sequential on purpose, mirroring `delete_prefix`: every caller of
+        // this path is maintenance-shaped (orphan cleanup, expire), where a
+        // partial failure must stop at the first error rather than fan out
+        // more deletes whose outcome we then cannot report.
+        while let Some(path) = paths.next().await {
+            self.delete(&path).await?;
+        }
+        Ok(())
+    }
+
     fn new_input(&self, path: &str) -> Result<InputFile> {
         Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
     }

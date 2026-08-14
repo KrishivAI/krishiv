@@ -75,6 +75,9 @@ impl LocalCatalog {
 
         let inner = MemoryCatalogBuilder::default()
             .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            // Explicit runtime: built on the engine's process-lifetime
+            // runtime; an implicit capture is the empty-plan tripwire's prey.
+            .with_runtime(iceberg::Runtime::current())
             .load(
                 "local",
                 HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_uri)]),
@@ -262,6 +265,18 @@ impl Catalog for LocalCatalog {
             .map_err(to_iceberg_err)?;
         self.inner.drop_table(table).await?;
         // Remove the version hint so a later recovery does not resurrect the table.
+        remove_file_if_exists(&dir.join(VERSION_HINT)).map_err(to_iceberg_err)?;
+        Ok(())
+    }
+
+    async fn purge_table(&self, table: &TableIdent) -> IcebergResult<()> {
+        let dir = self
+            .table_metadata_dir(table.namespace(), table.name())
+            .map_err(to_iceberg_err)?;
+        // The inner MemoryCatalog's purge walks the metadata and deletes the
+        // table's data, manifests and metadata files (honouring gc.enabled),
+        // which is strictly what "purge" promises; the version hint is ours.
+        self.inner.purge_table(table).await?;
         remove_file_if_exists(&dir.join(VERSION_HINT)).map_err(to_iceberg_err)?;
         Ok(())
     }

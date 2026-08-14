@@ -364,7 +364,7 @@ impl Catalog for PostgresCatalog {
         // Serialise and write metadata.json to the warehouse.
         let metadata_json = serde_json::to_string_pretty(&metadata)
             .map_err(|e| iceberg_err(format!("serialize metadata: {e}")))?;
-        let metadata_location = MetadataLocation::new_with_table_location(&location).to_string();
+        let metadata_location = MetadataLocation::new_with_metadata(&location, &metadata).to_string();
 
         self.file_io
             .new_output(&metadata_location)
@@ -417,11 +417,17 @@ impl Catalog for PostgresCatalog {
         let metadata: iceberg::spec::TableMetadata = serde_json::from_slice(&bytes)
             .map_err(|e| iceberg_err(format!("deserialize metadata: {e}")))?;
 
+        // The runtime is captured HERE, at load time, not at catalog build:
+        // the runtime that loads a table is the runtime that will scan it. A
+        // build-time capture would hand every table a handle to whatever
+        // runtime happened to exist at startup — the exact shape the
+        // empty-plan tripwire in krishiv-connectors exists to catch.
         Table::builder()
             .metadata(metadata)
             .metadata_location(metadata_location)
             .identifier(table.clone())
             .file_io(self.file_io.clone())
+            .runtime(iceberg::Runtime::try_current().map_err(|e| iceberg_err(e.to_string()))?)
             .build()
             .map_err(|e| iceberg_err(e.to_string()))
     }
@@ -445,6 +451,22 @@ impl Catalog for PostgresCatalog {
                 table.name()
             )));
         }
+        Ok(())
+    }
+
+    async fn purge_table(&self, table: &TableIdent) -> IcebergResult<()> {
+        // Load BEFORE dropping: the catalog row is the only pointer to the
+        // metadata, and files can only be found through the loaded table.
+        let loaded = self.load_table(table).await?;
+        self.drop_table(table).await?;
+        // Every table this catalog creates owns its directory (the location
+        // is minted under the warehouse per table), so removing the location
+        // prefix is exactly the table's own data + metadata and nothing else.
+        loaded
+            .file_io()
+            .delete_prefix(loaded.metadata().location())
+            .await
+            .map_err(|e| iceberg_err(format!("purge_table file cleanup: {e}")))?;
         Ok(())
     }
 
@@ -675,6 +697,50 @@ mod tests {
 
         catalog.drop_table(&ident).await.unwrap();
         assert!(!catalog.table_exists(&ident).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires KRISHIV_TEST_DATABASE_URL"]
+    async fn postgres_catalog_purge_deletes_the_files_drop_leaves_behind() {
+        let url = test_db_url().expect("KRISHIV_TEST_DATABASE_URL not set");
+        let dir = tempfile::tempdir().unwrap();
+        let warehouse = url::Url::from_file_path(dir.path()).unwrap().to_string();
+        let catalog = PostgresCatalog::new(&url, &warehouse).await.unwrap();
+
+        let ns = NamespaceIdent::new("purge_ns".to_string());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let creation = TableCreation::builder()
+            .name("victims".to_string())
+            .schema(sample_schema())
+            .build();
+        catalog.create_table(&ns, creation).await.unwrap();
+        let ident = TableIdent::new(ns.clone(), "victims".to_string());
+
+        // Creation wrote at least metadata.json under the table's directory.
+        let table_dir = dir.path().join("purge_ns").join("victims");
+        let files_before = walkdir_count(&table_dir);
+        assert!(files_before > 0, "creation must have written metadata");
+
+        catalog.purge_table(&ident).await.unwrap();
+        assert!(!catalog.table_exists(&ident).await.unwrap());
+        assert_eq!(
+            walkdir_count(&table_dir),
+            0,
+            "purge must remove the table's files, not just the catalog row"
+        );
+    }
+
+    fn walkdir_count(dir: &std::path::Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(|e| e.ok())
+            .map(|e| {
+                let p = e.path();
+                if p.is_dir() { walkdir_count(&p) } else { 1 }
+            })
+            .sum()
     }
 
     #[tokio::test]

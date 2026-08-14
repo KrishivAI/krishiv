@@ -805,7 +805,18 @@ mod tests {
         // One catalog instance reused across opens = a persistent catalog. The
         // `memory://` warehouse's backing store is process-global, so the data
         // and metadata written by the first sink are visible to the second.
-        let rt = tokio::runtime::Builder::new_current_thread()
+        //
+        // Since iceberg 0.10 the catalog CAPTURES the runtime it is built on
+        // and spawns scan work onto it. A catalog that outlives its runtime's
+        // driver deadlocks — this test hung exactly there when the runtime
+        // was a current-thread one nobody kept driving. A shared persistent
+        // catalog therefore needs a runtime with its own worker thread, alive
+        // for the catalog's whole life. (Production is unaffected: each sink
+        // builds its catalog on the sink's own runtime and drives every call
+        // through it; the REST catalog's state lives server-side, so no
+        // catalog instance is ever shared across sink runtimes there.)
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
             .enable_all()
             .build()
             .unwrap();
