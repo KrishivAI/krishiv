@@ -230,7 +230,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cep::pattern::Pattern;
+    use crate::cep::pattern::{CepCompileError, Pattern};
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
@@ -302,11 +302,14 @@ mod tests {
 
     #[test]
     fn empty_pattern_compile_rejected() {
-        let result = Pattern::begin("a")
-            .compile()
-            .unwrap() // 1-stage is fine
-            ;
-        assert_eq!(result.stages.len(), 1);
+        // The name promises the *rejection* path. The previous body compiled a
+        // one-stage pattern and asserted it succeeded — it never touched the
+        // `stages.is_empty()` guard, so deleting that guard left it green.
+        let err = Pattern::default().compile().unwrap_err();
+        assert!(matches!(err, CepCompileError::EmptyPattern));
+        // A one-stage pattern is still accepted (the boundary on the other side).
+        let ok = Pattern::begin("a").compile().expect("one stage compiles");
+        assert_eq!(ok.stages.len(), 1);
     }
 
     #[test]
@@ -962,18 +965,11 @@ mod tests {
         assert_eq!(state.last_event_ms, 0);
     }
 
-    #[test]
-    fn partial_match_default_values() {
-        let pm = PartialMatch {
-            stage_index: 0,
-            captured_events: Vec::new(),
-            start_time_ms: 0,
-            captured_event_count: 0,
-        };
-        assert_eq!(pm.stage_index, 0);
-        assert!(pm.captured_events.is_empty());
-        assert_eq!(pm.start_time_ms, 0);
-    }
+    // Removed `partial_match_default_values`: it built a `PartialMatch` from
+    // struct literals and asserted those same literals back, so no production
+    // line could be deleted to make it fail. Real advancement of
+    // `stage_index` / `captured_event_count` is covered by
+    // `stage_ordering_enforced` and `out_of_order_stage_after_partial_resets_correctly`.
 
     #[test]
     fn compiled_pattern_clone() {

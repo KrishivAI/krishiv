@@ -1043,10 +1043,18 @@ mod tests {
             },
         ];
         for op in &ops {
-            let cloned = op.clone();
-            assert_eq!(&cloned, op);
-            // Verify Debug works.
-            let _ = format!("{cloned:?}");
+            // A real round trip: serialise through serde_json and back, which
+            // is how `NodeOp` actually crosses the wire (task fragments are
+            // JSON-encoded). The previous body only did `op.clone()` +
+            // `assert_eq!`, which exercises the derived `Clone`/`PartialEq`
+            // alone — a value is always equal to its own clone, so no
+            // production serialization line could be deleted to make it fail.
+            let json = serde_json::to_string(op).expect("NodeOp serialises");
+            let back: NodeOp = serde_json::from_str(&json).expect("NodeOp round-trips");
+            assert_eq!(
+                &back, op,
+                "NodeOp did not survive a serde round trip: {json}"
+            );
         }
     }
 

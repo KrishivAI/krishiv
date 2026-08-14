@@ -38,7 +38,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 3 | krishiv-shuffle | 14,329 | 36 | **36 — COMPLETE 2026-08-02** | first crate fully read; 4 defects fixed |
 | 4 | krishiv-scheduler | **51,438** | **78** | **78 (COMPLETE)** | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
 | **Tier 2 — correctness blast radius** |
-| 5 | krishiv-plan | 14,371 | 25 | 0 | plan IR every surface depends on |
+| 5 | krishiv-plan | 14,371 | 25 | **25 (COMPLETE)** | plan IR every surface depends on; 3 can't-fail tests fixed, 2 unreachable AQE rules with latent outer-join bugs documented, 4 dead pub surfaces recorded |
 | 6 | krishiv-common | 7,966 | 23 | 0 | env registry, durability profiles, memory budget |
 | 7 | krishiv-connectors | 39,930 | 97 | 0 | ingest correctness; 42 files with no tests |
 | 8 | krishiv-state | 12,357 | 37 | 0 | checkpoints/restore; fewer than half the files tested |
@@ -1616,7 +1616,140 @@ return at all.* Six of the nine defects below are one of those two.
 
 ---
 
-## 5–27. Not yet started
+## 5. krishiv-plan — 25 of 25 files read whole (COMPLETE, 2026-08-14)
+
+Fifth crate. 14,390 lines. The plan IR every other crate lowers through, so a
+silent wrong answer here has the widest blast radius in the workspace. It is
+also the cleanest surface audited so far: no `async`, no `Notify`, no
+`block_on`, one `#[allow]` (a `clippy::question_mark` in the dead DPP rule), no
+`#[ignore]`d tests, no real TODO/HACK (the only "XXX" hits are the
+`secretXXX` governance test fixture).
+
+**The headline is a reachability finding, not a live wrong answer.** The
+optimizer rules that *could* miscompile a plan are the ones that cannot run.
+
+### Fixed reading it
+
+- [x] **`node_op_variants_round_trip` could not fail** (test-validity, C). The
+      body did `op.clone(); assert_eq!(&cloned, op)` — a value is always equal to
+      its own clone, so no production serialization line could be deleted to make
+      it fail, despite the name promising a round trip. `NodeOp` derives
+      `serde::{Serialize, Deserialize}` and crosses the wire as JSON (task
+      fragments). Rewrote to `serde_json::to_string` → `from_str` → `assert_eq`,
+      which now exercises both derives. `lib.rs`.
+- [x] **`empty_pattern_compile_rejected` tested the opposite of its name**
+      (test-validity, C). It compiled a **one-stage** pattern and asserted it
+      *succeeded* — never touching the `stages.is_empty()` guard it claimed to
+      test. Rewrote to `Pattern::default().compile()` → assert
+      `Err(EmptyPattern)`, plus the one-stage boundary on the other side.
+      **Revert-proven**: commenting out `return Err(CepCompileError::EmptyPattern)`
+      in `pattern.rs` now turns this red (it stayed green before). `cep/matcher.rs`.
+- [x] **`partial_match_default_values` was a pure tautology** (test-validity, C).
+      It built a `PartialMatch` from struct literals and asserted those same
+      literals back — zero production code in the assertion path. Deleted; real
+      advancement of `stage_index` / `captured_event_count` is covered by
+      `stage_ordering_enforced` and
+      `out_of_order_stage_after_partial_resets_correctly`. `cep/matcher.rs`.
+- [x] **Documented that two AQE rules are unreachable and carry latent
+      correctness bugs** (honesty, E). `default_aqe_optimizer_with_parallelism`
+      registers `BroadcastRuntimeRule`, `AutoPartitionRule`, `CoalesceRule`,
+      `SkewJoinRule`, but only `CoalesceRule` has a live effect. Both production
+      call sites are in krishiv-scheduler `job_lifecycle.rs`: the stage-succeeded
+      path (`:786`) applies the optimizer to a synthesised placeholder built only
+      from `Exchange` + `Sink` nodes and reads back *only*
+      `plan.coalesced_partition_count()` — no `Join` node for `SkewJoinRule`, no
+      `Broadcast` node for `BroadcastRuntimeRule`, node-type rewrites discarded;
+      `submit_physical_plan` (`:1272`) passes the real plan but with **empty
+      stats**, on which both rules no-op. And `NodeOp::SkewJoin` has **no
+      consumer** in lowering or any executor crate. So neither rule can fire
+      today. Their latent obligations — `SkewJoinRule` salts **any** `JoinType`
+      (outer/anti included) with no per-side guard (would duplicate null-extended
+      rows of a FULL/RIGHT outer join once a `SkewJoin` executor exists);
+      `BroadcastRuntimeRule` demotes a colocating `Broadcast` to a
+      non-colocating `RoundRobin` (would drop join matches for any consumer
+      relying on the broadcast for colocation) — are now recorded at the
+      registration site so they are not "known safe because registered." `optimizer.rs`.
+
+### Recorded, not fixed — needs a decision (wire-or-delete)
+
+Per the register's standing rule, wire-or-delete is a product decision, not an
+audit edit. Four dead pub surfaces, each safe to delete with zero behaviour
+change:
+
+- **`DynamicPartitionPruningRule`** (`optimizer/dynamic_partition_pruning.rs`,
+  424 lines) — a fully implemented `AqeRule` **never registered** in any
+  pipeline; only its own `mod`/`pub use`/tests reference it. Benign even if it
+  fired (it only relabels the join node with the identical op), so the defect is
+  pure unreachability. Carries the crate's one `#[allow(clippy::question_mark)]`.
+- **`SkewJoinRule` / `BroadcastRuntimeRule`** — registered but unreachable (see
+  above); wire the guards before wiring the executor, or delete the node-type
+  rewrites and keep only the coalesce hint.
+- **`diff_plans` / `PlanDiff`** (`lib.rs:763`) — doc claims operators use it for
+  adaptive-repartition diffs (R7/R9); repo-wide grep finds only its own tests.
+- **`PlanNode::with_exchange`** (`lib.rs:412`) — doc names `DataFrame::repartition()`
+  as the caller; that method does not call it. Zero callers repo-wide.
+
+### Verified correct (recorded so they are not re-derived)
+
+- **`graph.rs::validate_plan`** — the highest-blast-radius function in the crate.
+  Correct Kahn cycle check + duplicate-node-id, missing-input, self-reference,
+  blank-id, duplicate-input-edge, and `MAX_PLAN_NODES` cap. Reachable in
+  production via `lower_to_physical` (3 external callers). Indegrees mutated
+  during traversal are correctly reused to report blocked nodes — no
+  state-not-restored bug.
+- **`predicate_pushdown.rs`** — conservative and correct: a conjunct is pushed
+  only when all its columns belong to exactly one scan; only descends through
+  `JoinType::Inner`; qualified columns require an exact table match. The one
+  thing to verify cross-crate: pushdown *removes* the `Filter` node once all
+  conjuncts land in `Scan.filters`, which is sound only if the execution layer
+  is guaranteed to apply scan filters (check when auditing krishiv-sql's scan
+  providers).
+- **`constant_folding.rs`** — every ambiguous case falls through to `Unknown`
+  (unchanged); integer arithmetic is checked (`checked_add`/`div`-by-zero),
+  string comparison only folds `=`/`!=`, precedence (OR<AND<NOT<cmp) is correct.
+- **`join_reorder.rs`** — correctly restricted to commutative `Inner`/`Cross`;
+  outer/semi/anti left untouched.
+- **`skew_join.rs` detection / `coalesce.rs` / `auto_partition.rs` /
+  `broadcast.rs` / `stats.rs` / `small_file.rs`** — the count/partition changes
+  are answer-preserving; `coalesce.advise` is a true partition of the index set
+  (`every_input_partition_survives_grouping` pins it); all correctly return
+  `None` on no-op.
+- **`optimizer.rs` driver** — single-pass (not a fixpoint loop); "applied"
+  detection correctly gates on `new_plan != current`, so a no-op rule is not
+  recorded and cannot mask later rules.
+- **`cep/matcher.rs` state machine** — advancement requires
+  `stage_idx == partial.stage_index + 1` exactly; window expiry clears the
+  partial before the stage check, so the streaming MATCH_RECOGNIZE fabrication
+  shape (fixed in krishiv-sql) is not present here; `evict_stalest` always finds
+  a victim, `evict_keys_before` retains `>= cutoff`. Window boundary
+  (`event - start > window_ms`) is off-by-one-correct.
+- **`window.rs` validation** — thorough and consistent with its ST11/R5.2 docs
+  (Session `size==0` exemption, Count `slide<=size`, `ttl==0` / `lateness==0`
+  rejections). HOP/SLIDING event *assignment* lives in krishiv-dataflow, not
+  here, so the size/slide fan-out bug class cannot occur in this crate.
+- **`expression.rs`**, **`lowering.rs`** (SQL-injection guard on scan tables is
+  real), **`task_fragment.rs`** (version + legacy-profile rejection),
+  **`governance.rs`** (constant-time key comparison is genuinely
+  non-short-circuiting), **`udf.rs`** (pure trait/registry plumbing — the
+  min/max-by-name HACK is in krishiv-**sql**'s `udf.rs`, not this one).
+
+### Low severity, noted
+
+- `window.rs::encode_stream_fragment`'s single-aggregate path skips
+  `validate_window_execution_spec` (the multi-agg/JSON path calls it), so an
+  invalid single-agg spec encodes and then fails loudly at *decode* — an
+  asymmetry, not a silent wrong answer.
+
+### Open
+
+- [ ] Coverage not yet measured with `cargo llvm-cov` (tool installed this
+      session). The read pass found the defects above; the uncovered-region
+      table is still owed and will decide what to test next — `udf.rs` (1635)
+      and `window.rs` (1256) are the largest untested-surface candidates.
+
+---
+
+## 6–27. Not yet started
 
 Each crate gets the same treatment and its own section here: measured
 coverage, a table of uncovered-region concentration, a fixed list with commit

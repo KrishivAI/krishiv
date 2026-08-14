@@ -647,6 +647,25 @@ pub fn default_aqe_optimizer() -> AqeOptimizer {
 /// no matter how much CPU the rows cost to produce. TPC-H q2 at SF100 hit this
 /// on four of its eleven stages and took 24 minutes on a nine-slot cluster
 /// that was one-ninth busy. See [`CoalesceRule::with_min_partitions`].
+// AUDIT (crate-audit-register.md, krishiv-plan): of the four rules registered
+// below, only `CoalesceRule` has a live effect in production today. Both
+// production call sites live in krishiv-scheduler `job_lifecycle.rs`:
+//   * the stage-succeeded path (`:786`) applies this optimizer to a synthesised
+//     placeholder plan built only from `Exchange` + `Sink` nodes and then reads
+//     back *only* `plan.coalesced_partition_count()` — it has no `Join` node for
+//     `SkewJoinRule` to match and no `Broadcast` node for `BroadcastRuntimeRule`,
+//     and it discards every node-type rewrite;
+//   * `submit_physical_plan` (`:1272`) passes the real plan but with EMPTY
+//     stats, and both `SkewJoinRule` and `BroadcastRuntimeRule` no-op on empty
+//     stats.
+// So `SkewJoinRule` and `BroadcastRuntimeRule` cannot fire on any current path,
+// and `NodeOp::SkewJoin` has no consumer in lowering or any executor crate.
+// Their rewrites carry latent correctness obligations that are currently
+// unreachable — `SkewJoinRule` salts ANY `JoinType` (outer/anti included) with
+// no per-side guard, and `BroadcastRuntimeRule` demotes a colocating Broadcast
+// to a non-colocating RoundRobin. Before wiring a `SkewJoin` executor or feeding
+// these rules a plan that carries Join/Broadcast nodes, add the join-type/side
+// guards — do NOT assume the registration here means the rewrites are safe.
 pub fn default_aqe_optimizer_with_parallelism(min_partitions: usize) -> AqeOptimizer {
     let mut optimizer = AqeOptimizer::new();
     // 1. Promote/demote broadcast joins from observed sizes before bucket
