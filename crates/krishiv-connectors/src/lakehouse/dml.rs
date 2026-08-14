@@ -82,6 +82,23 @@ async fn scan_iceberg_table(
         return Ok(vec![]);
     }
 
+    // A task with delete files means rows in the data files are dead. Raw
+    // parquet reads would resurrect them silently, so those tables go
+    // through iceberg's delete-applying arrow reader (new in 0.10) instead.
+    // Every caller rewrites what it reads, so the rewrite also compacts the
+    // deletes away — the output table is delete-free.
+    if tasks.iter().any(|t| !t.deletes.is_empty()) {
+        use futures::TryStreamExt as _;
+        let stream = scan
+            .to_arrow()
+            .await
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+        return stream
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()));
+    }
+
     // Collect local file paths; strip file:// prefix for DataFusion.
     let file_paths: Vec<String> = tasks
         .iter()
@@ -1816,5 +1833,48 @@ mod tests {
         // INSERT INTO must target an EXISTING table — CREATE [OR REPLACE]
         // TABLE AS is the (separate, already-supported) create path.
         assert!(iceberg_append_into(catalog, &ident, stream).await.is_err());
+    }
+
+    /// DML on a foreign merge-on-read table: the copy-on-write read must go
+    /// through the delete-applying reader, so the rewrite neither resurrects
+    /// the equality-deleted row nor carries the delete file forward.
+    #[tokio::test]
+    async fn delete_where_on_a_mor_table_does_not_resurrect_deleted_rows() {
+        use futures::TryStreamExt as _;
+        let (catalog, ident, _dir) =
+            crate::lakehouse::maintenance::tests::mor_table_with_live_equality_delete().await;
+        let ctx = SessionContext::new();
+
+        // Table is ids {1,3,4} once the equality delete on id=2 is applied.
+        let (deleted, _snap) =
+            iceberg_delete_where(Arc::clone(&catalog), &ident, "id = 4", &ctx)
+                .await
+                .expect("delete_where over a MoR table must work since iceberg 0.10");
+        assert_eq!(deleted, 1, "exactly the id=4 row is deleted");
+
+        let table = catalog.load_table(&ident).await.unwrap();
+        let scan = table.scan().build().unwrap();
+        let tasks: Vec<iceberg::scan::FileScanTask> =
+            scan.plan_files().await.unwrap().try_collect().await.unwrap();
+        assert!(
+            tasks.iter().all(|t| t.deletes.is_empty()),
+            "the rewrite must land delete-free"
+        );
+        let batches = scan_iceberg_table(&table, &ctx).await.unwrap();
+        let mut ids: Vec<i64> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column(b.schema().index_of("id").unwrap())
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            ids.extend(col.iter().flatten());
+        }
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 3],
+            "id=2 stays deleted (not resurrected by the rewrite), id=4 newly deleted"
+        );
     }
 }

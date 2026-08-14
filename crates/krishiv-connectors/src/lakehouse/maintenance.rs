@@ -425,58 +425,61 @@ pub async fn compact_data_files(
         return Ok(0);
     }
 
-    // This engine's writers never produce delete files today; refuse rather
-    // than silently drop deletes a foreign writer may have committed.
-    if tasks.iter().any(|t| !t.deletes.is_empty()) {
-        return Err(LakehouseError::Iceberg(format!(
-            "compact_data_files: {table_ident} has delete files; compaction over delete files \
-             is not supported yet"
-        )));
-    }
+    // A table with delete files cannot be bin-packed file-by-file: carrying
+    // any data file over while dropping its delete files would RESURRECT the
+    // deleted rows, and concatenating raw parquet would do the same inside a
+    // bin. So deletes force the whole table through the delete-applying
+    // arrow reader (new in iceberg 0.10) and a full rewrite — the result is
+    // a delete-free table, which is exactly what compacting deletes means.
+    let has_deletes = tasks.iter().any(|t| !t.deletes.is_empty());
 
     // Group files by partition value, then bin-pack the small ones within
     // each partition. A file without a manifest row count cannot be carried
     // over (its DataFile descriptor needs the count), so it is always
-    // rewritten.
-    let mut groups: std::collections::BTreeMap<String, Vec<&iceberg::scan::FileScanTask>> =
-        std::collections::BTreeMap::new();
-    for task in &tasks {
-        let key = format!("{:?}", task.partition);
-        groups.entry(key).or_default().push(task);
-    }
-
+    // rewritten. (Skipped entirely under `has_deletes`: nothing is carried
+    // over there, every file is rewritten.)
     let mut bins: Vec<Vec<&iceberg::scan::FileScanTask>> = Vec::new();
     let mut kept: Vec<&iceberg::scan::FileScanTask> = Vec::new();
-    for (_, mut files) in groups {
-        files.sort_by_key(|t| t.file_size_in_bytes);
-        let mut bin: Vec<&iceberg::scan::FileScanTask> = Vec::new();
-        let mut bin_bytes = 0u64;
-        for task in files {
-            if task.file_size_in_bytes >= target_file_size_bytes && task.record_count.is_some() {
-                kept.push(task);
-                continue;
+    if !has_deletes {
+        let mut groups: std::collections::BTreeMap<String, Vec<&iceberg::scan::FileScanTask>> =
+            std::collections::BTreeMap::new();
+        for task in &tasks {
+            let key = format!("{:?}", task.partition);
+            groups.entry(key).or_default().push(task);
+        }
+
+        for (_, mut files) in groups {
+            files.sort_by_key(|t| t.file_size_in_bytes);
+            let mut bin: Vec<&iceberg::scan::FileScanTask> = Vec::new();
+            let mut bin_bytes = 0u64;
+            for task in files {
+                if task.file_size_in_bytes >= target_file_size_bytes && task.record_count.is_some()
+                {
+                    kept.push(task);
+                    continue;
+                }
+                bin_bytes += task.file_size_in_bytes.max(1);
+                bin.push(task);
+                if bin_bytes >= target_file_size_bytes {
+                    bins.push(std::mem::take(&mut bin));
+                    bin_bytes = 0;
+                }
             }
-            bin_bytes += task.file_size_in_bytes.max(1);
-            bin.push(task);
-            if bin_bytes >= target_file_size_bytes {
-                bins.push(std::mem::take(&mut bin));
-                bin_bytes = 0;
+            if !bin.is_empty() {
+                bins.push(bin);
             }
         }
-        if !bin.is_empty() {
-            bins.push(bin);
+        // A one-file bin with a known row count gains nothing from a rewrite.
+        bins.retain(|bin| match bin.as_slice() {
+            [only] if only.record_count.is_some() => {
+                kept.push(only);
+                false
+            }
+            _ => true,
+        });
+        if bins.is_empty() {
+            return Ok(0);
         }
-    }
-    // A one-file bin with a known row count gains nothing from a rewrite.
-    bins.retain(|bin| match bin.as_slice() {
-        [only] if only.record_count.is_some() => {
-            kept.push(only);
-            false
-        }
-        _ => true,
-    });
-    if bins.is_empty() {
-        return Ok(0);
     }
 
     let file_io = table.file_io().clone();
@@ -502,6 +505,78 @@ pub async fn compact_data_files(
     // corrected rather than propagated.
     let mut pending: Vec<PendingPart> = Vec::new();
     let mut replaced: Vec<String> = Vec::new();
+    if has_deletes {
+        // Full rewrite through the delete-applying reader: stream the scan
+        // (deletes applied by iceberg's arrow reader), fan out into
+        // per-partition buffers, and flush any buffer that reaches the
+        // target size — memory stays bounded by (partitions × target size),
+        // the same bound as the bin path. Every data file AND every delete
+        // file is replaced; nothing is carried over.
+        use futures::TryStreamExt as _;
+        let mut buffers = std::collections::BTreeMap::new();
+        let mut fanout: Option<PartitionFanout> = None;
+        let mut stream = scan
+            .to_arrow()
+            .await
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?
+        {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let f = match &fanout {
+                Some(f) => f,
+                None => fanout.get_or_insert(PartitionFanout::try_new(
+                    batch.schema().as_ref(),
+                    &partition_by,
+                )?),
+            };
+            fanout_into_buffers(f, &batch, &mut buffers)?;
+            let full: Vec<String> = buffers
+                .iter()
+                .filter(|(_, b)| b.bytes as u64 >= target_file_size_bytes)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in full {
+                if let Some(buf) = buffers.remove(&key) {
+                    pending.push(
+                        write_ctas_part(
+                            &file_io,
+                            &table_location,
+                            &buf.path,
+                            buf.partition,
+                            buf.batches,
+                        )
+                        .await?,
+                    );
+                }
+            }
+        }
+        for (_, buf) in buffers {
+            pending.push(
+                write_ctas_part(
+                    &file_io,
+                    &table_location,
+                    &buf.path,
+                    buf.partition,
+                    buf.batches,
+                )
+                .await?,
+            );
+        }
+        for task in &tasks {
+            replaced.push(task.data_file_path().to_string());
+            for delete in &task.deletes {
+                let path = delete.file_path.clone();
+                if !replaced.contains(&path) {
+                    replaced.push(path);
+                }
+            }
+        }
+    }
     for bin in &bins {
         let mut buffers = std::collections::BTreeMap::new();
         let mut fanout: Option<PartitionFanout> = None;
@@ -714,7 +789,7 @@ pub async fn maintain_table(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use iceberg::io::LocalFsStorageFactory;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
@@ -1013,5 +1088,275 @@ mod tests {
                 removed_orphans: 0
             }
         );
+    }
+
+    /// A REAL merge-on-read table — data files plus a live equality-delete
+    /// file — built through iceberg's public spec APIs, because this engine
+    /// (and iceberg-rust 0.10.1 itself) has no transaction that can commit
+    /// one: `fast_append` refuses non-Data content. Foreign writers (Spark,
+    /// Flink) produce exactly this shape, and until the 0.10 bump every read
+    /// path here would have silently RESURRECTED the deleted row.
+    ///
+    /// Table: ids 1..=4 in one data file; an equality delete on id=2.
+    pub(crate) async fn mor_table_with_live_equality_delete() -> (
+        Arc<dyn Catalog + Send + Sync>,
+        TableIdent,
+        tempfile::TempDir,
+    ) {
+        use crate::lakehouse::dml::land_ctas_with_target;
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+        use iceberg::spec::{
+            DataContentType, DataFileBuilder, DataFileFormat, ManifestListWriter,
+            ManifestWriterBuilder, Operation, Snapshot, SnapshotReference, SnapshotRetention,
+            Struct, Summary, TableMetadataBuilder,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let warehouse = url::Url::from_file_path(dir.path()).unwrap().to_string();
+        let catalog: Arc<dyn Catalog + Send + Sync> = Arc::new(
+            MemoryCatalogBuilder::default()
+                .with_storage_factory(Arc::new(LocalFsStorageFactory))
+                .load(
+                    "mem",
+                    HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
+                )
+                .await
+                .unwrap(),
+        );
+        let ident = TableIdent::new(NamespaceIdent::new("ns".into()), "mor".into());
+
+        // Snapshot 1: a normal krishiv landing, ids 1..=4.
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = arrow::array::RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![Arc::new(Int64Array::from(vec![1i64, 2, 3, 4]))],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let mem = MemTable::try_new(Arc::clone(&arrow_schema), vec![vec![batch]]).unwrap();
+        ctx.register_table("src", Arc::new(mem)).unwrap();
+        let stream = ctx
+            .sql("SELECT * FROM src")
+            .await
+            .unwrap()
+            .execute_stream()
+            .await
+            .unwrap();
+        land_ctas_with_target(Arc::clone(&catalog), &ident, false, &[], stream, usize::MAX)
+            .await
+            .expect("land base table");
+
+        let table = catalog.load_table(&ident).await.unwrap();
+        let metadata = table.metadata();
+        let file_io = table.file_io().clone();
+        let location = metadata.location().to_string();
+        let snap1 = metadata.current_snapshot().expect("base snapshot").clone();
+
+        // The equality-delete parquet: one row, id=2, with the iceberg field
+        // id so the delete-file reader can map it back to column 1.
+        let delete_field = Field::new("id", DataType::Int64, false).with_metadata(
+            HashMap::from([("PARQUET:field_id".to_string(), "1".to_string())]),
+        );
+        let delete_schema = Arc::new(ArrowSchema::new(vec![delete_field]));
+        let delete_batch = arrow::array::RecordBatch::try_new(
+            Arc::clone(&delete_schema),
+            vec![Arc::new(Int64Array::from(vec![2i64]))],
+        )
+        .unwrap();
+        let mut delete_bytes = Vec::new();
+        {
+            let mut w = parquet::arrow::ArrowWriter::try_new(
+                &mut delete_bytes,
+                Arc::clone(&delete_schema),
+                None,
+            )
+            .unwrap();
+            w.write(&delete_batch).unwrap();
+            w.close().unwrap();
+        }
+        let delete_path = format!("{location}/data/eq-delete-00000.parquet");
+        file_io
+            .new_output(&delete_path)
+            .unwrap()
+            .write(delete_bytes.clone().into())
+            .await
+            .unwrap();
+
+        let snap2_id = snap1.snapshot_id() + 1;
+        let seq2 = snap1.sequence_number() + 1;
+
+        let delete_data_file = DataFileBuilder::default()
+            .content(DataContentType::EqualityDeletes)
+            .file_path(delete_path.clone())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(delete_bytes.len() as u64)
+            .record_count(1)
+            .partition(Struct::empty())
+            .partition_spec_id(metadata.default_partition_spec_id())
+            .equality_ids(Some(vec![1]))
+            .build()
+            .unwrap();
+
+        let delete_manifest_path = format!("{location}/metadata/eq-delete-m0.avro");
+        let mut mw = ManifestWriterBuilder::new(
+            file_io.new_output(&delete_manifest_path).unwrap(),
+            Some(snap2_id),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().as_ref().clone(),
+        )
+        .build_v2_deletes();
+        mw.add_file(delete_data_file, seq2).unwrap();
+        let delete_manifest = mw.write_manifest_file().await.unwrap();
+
+        // New manifest list: everything snapshot 1 tracked, plus the deletes.
+        let old_entries = table
+            .manifest_list_reader(&snap1)
+            .load()
+            .await
+            .unwrap();
+        let list_path = format!("{location}/metadata/snap-{snap2_id}-manifest-list.avro");
+        let mut lw = ManifestListWriter::v2(
+            file_io.new_output(&list_path).unwrap().writer().await.unwrap(),
+            snap2_id,
+            Some(snap1.snapshot_id()),
+            seq2,
+        );
+        lw.add_manifests(
+            old_entries
+                .entries()
+                .iter()
+                .cloned()
+                .chain(std::iter::once(delete_manifest)),
+        )
+        .unwrap();
+        lw.close().await.unwrap();
+
+        // Snapshot 2 keeps `total-data-files` honest so the empty-plan
+        // tripwire judges this table the same way it judges krishiv's own.
+        let snap2 = Snapshot::builder()
+            .with_snapshot_id(snap2_id)
+            .with_parent_snapshot_id(Some(snap1.snapshot_id()))
+            .with_sequence_number(seq2)
+            .with_timestamp_ms(snap1.timestamp_ms() + 1)
+            .with_manifest_list(list_path)
+            .with_schema_id(snap1.schema_id().unwrap())
+            .with_summary(Summary {
+                operation: Operation::Overwrite,
+                additional_properties: HashMap::from([
+                    ("total-data-files".to_string(), "1".to_string()),
+                    ("total-delete-files".to_string(), "1".to_string()),
+                ]),
+            })
+            .build();
+
+        let new_metadata = TableMetadataBuilder::new_from_metadata(
+            metadata.clone(),
+            table.metadata_location().map(str::to_string),
+        )
+        .add_snapshot(snap2)
+        .unwrap()
+        .set_ref(
+            "main",
+            SnapshotReference {
+                snapshot_id: snap2_id,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            },
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        let metadata_path = format!("{location}/metadata/00002-mor.metadata.json");
+        file_io
+            .new_output(&metadata_path)
+            .unwrap()
+            .write(serde_json::to_vec(&new_metadata).unwrap().into())
+            .await
+            .unwrap();
+        catalog.drop_table(&ident).await.unwrap();
+        catalog.register_table(&ident, metadata_path).await.unwrap();
+
+        (catalog, ident, dir)
+    }
+
+    /// The fixture itself proves the hazard: the scan plans a task whose
+    /// deletes are non-empty, and a raw parquet read of the data files
+    /// returns the deleted row. If this ever stops holding, the two tests
+    /// below are testing nothing.
+    #[tokio::test]
+    async fn the_mor_fixture_really_carries_a_live_delete() {
+        use futures::TryStreamExt as _;
+        let (catalog, ident, _dir) = mor_table_with_live_equality_delete().await;
+        let table = catalog.load_table(&ident).await.unwrap();
+        let scan = table.scan().build().unwrap();
+        let tasks: Vec<iceberg::scan::FileScanTask> =
+            scan.plan_files().await.unwrap().try_collect().await.unwrap();
+        assert!(
+            tasks.iter().any(|t| !t.deletes.is_empty()),
+            "fixture must plan tasks with delete files"
+        );
+        let mut raw_rows = 0usize;
+        for t in &tasks {
+            for b in read_parquet_file(table.file_io(), t.data_file_path())
+                .await
+                .unwrap()
+            {
+                raw_rows += b.num_rows();
+            }
+        }
+        assert_eq!(
+            raw_rows, 4,
+            "raw parquet must still hold the deleted row — that is the trap"
+        );
+    }
+
+    /// Compaction over a merge-on-read table: reads THROUGH the deletes,
+    /// rewrites, and the result is a delete-free table without the dead row.
+    #[tokio::test]
+    async fn compact_applies_equality_deletes_and_lands_a_delete_free_table() {
+        use futures::TryStreamExt as _;
+        let (catalog, ident, _dir) = mor_table_with_live_equality_delete().await;
+
+        let compacted = compact_data_files(Arc::clone(&catalog), &ident, 128 * 1024 * 1024)
+            .await
+            .expect("compaction over delete files must succeed since iceberg 0.10");
+        assert!(compacted >= 1, "a rewrite must have produced files");
+
+        let table = catalog.load_table(&ident).await.unwrap();
+        let scan = table.scan().build().unwrap();
+        let tasks: Vec<iceberg::scan::FileScanTask> =
+            scan.plan_files().await.unwrap().try_collect().await.unwrap();
+        assert!(
+            tasks.iter().all(|t| t.deletes.is_empty()),
+            "the compacted table must carry no delete files"
+        );
+        let mut ids = Vec::new();
+        for t in &tasks {
+            for b in read_parquet_file(table.file_io(), t.data_file_path())
+                .await
+                .unwrap()
+            {
+                let col = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap();
+                ids.extend(col.iter().flatten());
+            }
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 3, 4], "id=2 must stay deleted after the rewrite");
     }
 }

@@ -494,6 +494,22 @@ pub mod native {
                         "read_all",
             )?;
 
+            // Delete files mean rows in the data files are dead; the raw
+            // parquet loop below would resurrect them. Route such tables
+            // (foreign merge-on-read writers) through iceberg's
+            // delete-applying arrow reader instead — and since read_all
+            // feeds a rewrite, the rewrite lands delete-free.
+            if tasks.iter().any(|t| !t.deletes.is_empty()) {
+                let stream = scan
+                    .to_arrow()
+                    .await
+                    .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+                return stream
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .map_err(|e| LakehouseError::Iceberg(e.to_string()));
+            }
+
             let mut batches = Vec::new();
             for task in tasks {
                 let path = task.data_file_path();
