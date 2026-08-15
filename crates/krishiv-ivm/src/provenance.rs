@@ -111,12 +111,14 @@ impl ProvenanceIndex {
     /// without bound.
     pub fn forget(&mut self, input_hash: u64) {
         self.input_to_outputs.remove(&input_hash);
+        self.input_epochs.remove(&input_hash);
     }
 
     /// Forget provenance for a batch of input hashes.
     pub fn forget_many(&mut self, input_hashes: &[u64]) {
         for h in input_hashes {
             self.input_to_outputs.remove(h);
+            self.input_epochs.remove(h);
         }
     }
 
@@ -172,6 +174,19 @@ mod tests {
         assert!(idx.outputs_for(1).is_some());
         idx.forget(1);
         assert!(idx.outputs_for(1).is_none());
+    }
+
+    /// Regression (crate-12 audit, F-class): `forget`/`forget_many` removed the
+    /// output mapping but leaked the `input_epochs` entry, so epoch-tracked
+    /// hashes forgotten individually accumulated forever.
+    #[test]
+    fn forget_also_drops_epoch_metadata() {
+        let mut idx = ProvenanceIndex::new();
+        idx.record_with_epoch(1, 100, 5);
+        idx.record_with_epoch(2, 200, 5);
+        idx.forget(1);
+        idx.forget_many(&[2]);
+        assert!(idx.input_epochs.is_empty(), "epoch map must not leak");
     }
 
     #[test]

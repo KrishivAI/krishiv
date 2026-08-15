@@ -837,14 +837,17 @@ fn expr_to_aggregation(expr: &Expr, output_col: &str) -> Option<Aggregation> {
                         output_col: output_col.to_string(),
                     })
                 }
-                "min" | "min_by" => {
+                // NOT min_by/max_by: those return the value of arg0 at the
+                // extremum of arg1, which plain Min/Max over arg0 silently
+                // mis-computes — they must degrade to DiffBased.
+                "min" => {
                     let input_col = agg_fn.params.args.first().and_then(expr_col_name)?;
                     Some(Aggregation::Min {
                         input_col,
                         output_col: output_col.to_string(),
                     })
                 }
-                "max" | "max_by" => {
+                "max" => {
                     let input_col = agg_fn.params.args.first().and_then(expr_col_name)?;
                     Some(Aggregation::Max {
                         input_col,
@@ -998,5 +1001,38 @@ mod tests {
         )
         .await;
         assert_eq!(cross_side.kind(), ViewPlanKind::DiffBased);
+    }
+
+    /// Regression (crate-12 audit, A-class): MIN_BY/MAX_BY return the value of
+    /// arg0 at the extremum of arg1 — the previous mapping to plain Min/Max of
+    /// arg0 silently computed the wrong answer on the O(Δ) path. They must
+    /// degrade to DiffBased.
+    #[tokio::test]
+    async fn min_by_max_by_degrade_to_diff_based() {
+        let (_ctx, schemas, _) = join_ctx_and_schemas();
+        let out_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("customer_id", DataType::Int32, true),
+            Field::new("first_order", DataType::Int32, true),
+        ]));
+        let plan = build_view_plan(
+            "SELECT customer_id, MIN_BY(order_id, order_id) AS first_order \
+             FROM orders GROUP BY customer_id",
+            &out_schema,
+            &schemas,
+        )
+        .await;
+        assert_eq!(
+            plan.kind(),
+            ViewPlanKind::DiffBased,
+            "MIN_BY must not lower to the incremental Min operator"
+        );
+        let plan = build_view_plan(
+            "SELECT customer_id, MAX_BY(order_id, order_id) AS last_order \
+             FROM orders GROUP BY customer_id",
+            &out_schema,
+            &schemas,
+        )
+        .await;
+        assert_eq!(plan.kind(), ViewPlanKind::DiffBased);
     }
 }

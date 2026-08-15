@@ -182,6 +182,9 @@ fn extract_string_at(arr: &dyn Array, row: usize) -> IvmResult<String> {
     }
     // Fallback: coerce via Int64
     if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Int64Array>() {
+        if a.is_null(row) {
+            return Err(IvmError::execution("vector view: null id value"));
+        }
         return Ok(a.value(row).to_string());
     }
     Err(IvmError::execution(format!(
@@ -214,6 +217,21 @@ fn extract_f32_list_at(arr: &dyn Array, row: usize) -> IvmResult<Vec<f32>> {
         "vector view: vector column has unsupported type {:?}; expected FixedSizeList<Float32>",
         arr.data_type()
     )))
+}
+
+#[cfg(test)]
+mod extract_tests {
+    use super::*;
+
+    /// Regression (crate-12 audit): a null Int64 id must error like the null
+    /// string paths do — previously `a.value(row)` on a null slot silently
+    /// produced the id "0", corrupting the vector index.
+    #[test]
+    fn null_int64_id_errors_instead_of_becoming_zero() {
+        let arr = arrow::array::Int64Array::from(vec![Some(7), None]);
+        assert_eq!(extract_string_at(&arr, 0).unwrap(), "7");
+        assert!(extract_string_at(&arr, 1).is_err(), "null id must error");
+    }
 }
 
 // ── InMemoryVectorSink (for tests and in-process HTTP use) ───────────────────
