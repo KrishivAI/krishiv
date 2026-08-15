@@ -77,17 +77,18 @@ impl PyStreamingQueryProgress {
 /// Returned by :py:meth:`DataStreamWriter.start`.
 #[pyclass(name = "StreamingQuery")]
 pub struct PyStreamingQuery {
-    // All `StreamingQuery` methods are `&self`, so no Mutex is needed; the
-    // `Arc` lets `StreamingQueryManager.get()` hand back the same live handle.
-    inner: Arc<StreamingQuery>,
+    // All `StreamingQuery` methods are `&self`, and the handle itself is a
+    // cheap clone over shared inner state, so `StreamingQueryManager.get()`
+    // hands back the same live query.
+    inner: StreamingQuery,
 }
 
 impl PyStreamingQuery {
     pub fn new(q: StreamingQuery) -> Self {
-        Self { inner: Arc::new(q) }
+        Self { inner: q }
     }
 
-    pub(crate) fn from_arc(inner: Arc<StreamingQuery>) -> Self {
+    pub(crate) fn from_query(inner: StreamingQuery) -> Self {
         Self { inner }
     }
 }
@@ -153,7 +154,7 @@ impl PyStreamingQuery {
     /// Raises ``RuntimeError`` on query failure or timeout.
     #[pyo3(signature = (timeout_ms=None))]
     fn await_termination(&self, py: Python<'_>, timeout_ms: Option<u64>) -> PyResult<()> {
-        let q = Arc::clone(&self.inner);
+        let q = self.inner.clone();
         // Release the GIL for the (potentially long, up to timeout_ms) wait
         // so other Python threads are not frozen.
         py.detach(move || {
@@ -326,12 +327,14 @@ impl PyStreamingQueryManager {
 
     /// Look up a tracked query by its id (Spark ``sqm.get(id)``).
     fn get(&self, id: &str) -> Option<PyStreamingQuery> {
-        self.inner.get(id).map(PyStreamingQuery::from_arc)
+        self.inner.get(id).map(PyStreamingQuery::from_query)
     }
 
     /// Look up a tracked query by its name.
     fn get_by_name(&self, name: &str) -> Option<PyStreamingQuery> {
-        self.inner.get_by_name(name).map(PyStreamingQuery::from_arc)
+        self.inner
+            .get_by_name(name)
+            .map(PyStreamingQuery::from_query)
     }
 }
 

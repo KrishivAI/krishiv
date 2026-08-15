@@ -3,14 +3,14 @@
 > Generated from `crates/krishiv-api/src/pyspark_parity.rs` — do not edit by hand.
 > Regenerate with `KRISHIV_BLESS_PYSPARK_PARITY=1 cargo test -p krishiv-api pyspark_parity`.
 
-**Overall parity: 121/128 = 95%** of the enumerated PySpark surface (Supported or Partial). Each shortfall is itemized below.
+**Overall parity: 122/127 = 96%** of the enumerated PySpark surface (Supported or Partial). Each shortfall is itemized below.
 
 ## Coverage by namespace
 
 | Namespace | Covered | Total | % |
 |---|---|---|---|
-| DataFrame | 41 | 47 | 87% |
-| Column | 21 | 22 | 95% |
+| DataFrame | 42 | 47 | 89% |
+| Column | 21 | 21 | 100% |
 | functions | 35 | 35 | 100% |
 | GroupedData | 7 | 7 | 100% |
 | Window | 6 | 6 | 100% |
@@ -67,7 +67,7 @@
 | `toPandas` | planned | — | Phase 61 gap: zero-copy Arrow → pandas (Python surface) |
 | `write` | supported | write | DataFrameWriter |
 | `writeStream` | supported | write_stream | Phase 61 keystone: df.write_stream().refresh(Batch|Incremental|Continuous).to_table(session, name) selects the engine by refresh mode (also session.create_live_table); Continuous execution + Interval/cron are the coordinator/scheduler-gated residual |
-| `foreachBatch` | planned | — | Phase 61 gap: micro-batch sink callback |
+| `foreachBatch` | partial | DataStreamWriter::foreach_batch | micro-batch sink callback on write_stream()/DataStreamWriter (PySpark hangs it off writeStream); reachable, placement differs |
 
 ## Column
 
@@ -80,7 +80,6 @@
 | `desc` | supported | Expr::desc |  |
 | `and` | supported | Expr::and | `&` |
 | `or` | supported | Expr::or | `|` |
-| `eqNullSafe` | planned | — | null-safe equality (<=>) not exposed |
 | `isNull` | supported | Expr::is_null |  |
 | `isNotNull` | supported | Expr::is_not_null |  |
 | `over` | supported | Expr::over | window spec |

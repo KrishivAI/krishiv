@@ -156,6 +156,34 @@ pub fn save_streaming_checkpoint(
     })
 }
 
+/// Persist a streaming checkpoint's source offsets under
+/// `<dir>/<checkpoint_id>/<source>.offset`, then update `<dir>/latest.txt`
+/// with the checkpoint id so a restart can locate the newest one.
+fn persist_streaming_checkpoint(dir: &str, checkpoint: &StreamingCheckpoint) -> Result<()> {
+    let base = std::path::Path::new(dir).join(&checkpoint.checkpoint_id);
+    std::fs::create_dir_all(&base)
+        .map_err(|e| rt(format!("create checkpoint dir '{}': {e}", base.display())))?;
+    for (source, offset) in &checkpoint.source_offsets {
+        let safe: String = source
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let path = base.join(format!("{safe}.offset"));
+        std::fs::write(&path, offset)
+            .map_err(|e| rt(format!("write source offset '{}': {e}", path.display())))?;
+    }
+    let latest = std::path::Path::new(dir).join("latest.txt");
+    std::fs::write(&latest, &checkpoint.checkpoint_id)
+        .map_err(|e| rt(format!("write '{}': {e}", latest.display())))?;
+    Ok(())
+}
+
 /// Restore streaming sources from checkpoint.
 ///
 /// The connector validates that the encoded bytes belong to the source and name
@@ -228,7 +256,7 @@ pub(super) async fn run_incremental(pipeline: Pipeline, policy: RunPolicy) -> Re
     }
 
     // 3. Feed sources, advancing per policy.
-    let mut rows_since_step = 0usize;
+    let mut pacer = StepPacer::new();
     for (sname, ingest) in sources {
         match ingest {
             Ingest::Memory(batches) => {
@@ -239,8 +267,8 @@ pub(super) async fn run_incremental(pipeline: Pipeline, policy: RunPolicy) -> Re
                     let n = b.num_rows();
                     let delta = DeltaBatch::from_inserts(b).map_err(rt)?;
                     job.feed(&sname, &delta).await?;
-                    rows_since_step += n;
-                    maybe_step(&job, policy, &mut rows_since_step).await?;
+                    pacer.record_rows(n);
+                    maybe_step(&job, policy, &mut pacer).await?;
                 }
             }
             Ingest::Cdc(changes) => {
@@ -248,8 +276,8 @@ pub(super) async fn run_incremental(pipeline: Pipeline, policy: RunPolicy) -> Re
                     if let Some(delta) = DeltaBatch::from_cdc(c.before, c.after).map_err(rt)? {
                         let n = delta.num_rows();
                         job.feed(&sname, &delta).await?;
-                        rows_since_step += n;
-                        maybe_step(&job, policy, &mut rows_since_step).await?;
+                        pacer.record_rows(n);
+                        maybe_step(&job, policy, &mut pacer).await?;
                     }
                 }
             }
@@ -286,16 +314,45 @@ async fn normalize_sources(sources: Vec<(String, Ingest)>) -> Result<Vec<(String
     Ok(out)
 }
 
-async fn maybe_step(job: &IvmJob, policy: RunPolicy, rows_since_step: &mut usize) -> Result<()> {
+/// Row/time accounting the incremental feed loop steps against.
+struct StepPacer {
+    rows_since_step: usize,
+    last_step: std::time::Instant,
+}
+
+impl StepPacer {
+    fn new() -> Self {
+        Self {
+            rows_since_step: 0,
+            last_step: std::time::Instant::now(),
+        }
+    }
+
+    fn record_rows(&mut self, n: usize) {
+        self.rows_since_step += n;
+    }
+
+    fn reset(&mut self) {
+        self.rows_since_step = 0;
+        self.last_step = std::time::Instant::now();
+    }
+}
+
+async fn maybe_step(job: &IvmJob, policy: RunPolicy, pacer: &mut StepPacer) -> Result<()> {
     let should = match policy {
         RunPolicy::Once => false,
         RunPolicy::OnChange => true,
-        RunPolicy::EveryRows(n) => *rows_since_step >= n.max(1),
-        RunPolicy::EveryMs(_) => true,
+        RunPolicy::EveryRows(n) => pacer.rows_since_step >= n.max(1),
+        // Time-coalesced: step at most every `ms` milliseconds. (An earlier
+        // version stepped on every feed here, which silently degraded the
+        // policy to OnChange and defeated the coalescing knob.)
+        RunPolicy::EveryMs(ms) => {
+            pacer.rows_since_step > 0 && pacer.last_step.elapsed().as_millis() >= u128::from(ms)
+        }
     };
     if should {
         job.step().await?;
-        *rows_since_step = 0;
+        pacer.reset();
     }
     Ok(())
 }
@@ -831,12 +888,16 @@ pub(super) async fn run_streaming(pipeline: Pipeline, config: StreamingConfig) -
                     &streaming_sources,
                     &format!("cp-{}", checkpoint_counter),
                 )?;
-                tracing::debug!(
-                    timestamp_ms = checkpoint.timestamp_ms,
-                    "Saved checkpoint {} with {} source offsets",
-                    checkpoint.checkpoint_id,
-                    checkpoint.source_offsets.len()
-                );
+                match &config.checkpoint_dir {
+                    Some(dir) => persist_streaming_checkpoint(dir, &checkpoint)?,
+                    None => tracing::debug!(
+                        timestamp_ms = checkpoint.timestamp_ms,
+                        "captured checkpoint {} with {} source offsets \
+                         (no checkpoint_dir configured; offsets not persisted)",
+                        checkpoint.checkpoint_id,
+                        checkpoint.source_offsets.len()
+                    ),
+                }
                 last_checkpoint = std::time::Instant::now();
             }
         }

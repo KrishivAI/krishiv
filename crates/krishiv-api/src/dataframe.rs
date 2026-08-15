@@ -894,7 +894,9 @@ Execution statistics:
         let batches = self.pre_collected.clone().ok_or_else(|| {
             KrishivError::unsupported("DataFrame has neither SQL ops nor collected data")
         })?;
-        if batches.iter().all(|b| b.num_rows() == 0) && batches.is_empty() {
+        // Zero batches means no schema to register; a non-empty batch list
+        // with zero rows still carries its schema and registers fine.
+        if batches.is_empty() {
             return Err(KrishivError::unsupported(
                 "cannot transform an empty pre-collected DataFrame with no schema",
             ));
@@ -1726,15 +1728,28 @@ Execution statistics:
             krishiv_common::write_commit::WriteMode::Append,
             &[],
         )? {
-            return Ok(());
+            // A zero-row result publishes no part files through the staged
+            // sink, leaving nothing at `path` despite the Ok. Fall through to
+            // the local write so success always leaves a (schema-only) file.
+            if Path::new(path).exists() {
+                return Ok(());
+            }
         }
 
         let result = krishiv_common::async_util::block_on(self.collect_async())?;
         let batches = result.into_batches();
-        let [first, ..] = batches.as_slice() else {
-            return Ok(());
+        // A zero-batch result must still produce a (schema-only) file — a
+        // silent Ok with no file on disk reads as success while writing
+        // nothing. The schema comes from the plan when no batch carries it.
+        let schema = match batches.first() {
+            Some(first) => first.schema(),
+            None => self.schema().map_err(|e| KrishivError::Runtime {
+                message: format!(
+                    "write_parquet: empty result and no schema available to \
+                     write a schema-only file at '{path}': {e}"
+                ),
+            })?,
         };
-        let schema = first.schema();
         let file = File::create(Path::new(path)).map_err(|e| KrishivError::Runtime {
             message: format!("failed to create parquet file '{path}': {e}"),
         })?;
@@ -1761,9 +1776,8 @@ Execution statistics:
 
         let result = krishiv_common::async_util::block_on(self.collect_async())?;
         let batches = result.into_batches();
-        if batches.is_empty() {
-            return Ok(());
-        }
+        // Even an empty result creates the file (empty), so a successful
+        // write_csv always leaves a file at `path`.
         let file = File::create(Path::new(path)).map_err(|e| KrishivError::Runtime {
             message: format!("failed to create csv file '{path}': {e}"),
         })?;
@@ -1784,9 +1798,8 @@ Execution statistics:
 
         let result = krishiv_common::async_util::block_on(self.collect_async())?;
         let batches = result.into_batches();
-        if batches.is_empty() {
-            return Ok(());
-        }
+        // Even an empty result creates the file (empty NDJSON), so a
+        // successful write_json always leaves a file at `path`.
         let file = File::create(Path::new(path)).map_err(|e| KrishivError::Runtime {
             message: format!("failed to create json file '{path}': {e}"),
         })?;
@@ -1895,10 +1908,16 @@ Execution statistics:
         use std::fs::File;
         let result = krishiv_common::async_util::block_on(self.collect_async())?;
         let batches = result.into_batches();
-        let [first, ..] = batches.as_slice() else {
-            return Ok(());
+        // Match write_parquet: an empty result still writes a schema-only file.
+        let schema = match batches.first() {
+            Some(first) => first.schema(),
+            None => self.schema().map_err(|e| KrishivError::Runtime {
+                message: format!(
+                    "write_parquet_with_options: empty result and no schema \
+                     available to write a schema-only file at '{path}': {e}"
+                ),
+            })?,
         };
-        let schema = first.schema();
         let props = build_parquet_writer_props(opts)?;
         let file = File::create(path).map_err(|e| KrishivError::Runtime {
             message: format!("failed to create parquet file '{path}': {e}"),
@@ -1929,9 +1948,7 @@ Execution statistics:
         use std::fs::File;
         let result = krishiv_common::async_util::block_on(self.collect_async())?;
         let batches = result.into_batches();
-        if batches.is_empty() {
-            return Ok(());
-        }
+        // Even an empty result creates the file, matching write_csv.
         let file = File::create(path).map_err(|e| KrishivError::Runtime {
             message: format!("failed to create csv file '{path}': {e}"),
         })?;

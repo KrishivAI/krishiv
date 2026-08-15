@@ -131,7 +131,17 @@ pub type ForeachBatchFn = Arc<dyn Fn(Vec<RecordBatch>, i64) -> Result<()> + Send
 /// - `await` termination (`await_termination` / `await_termination_timeout`),
 /// - read the latest progress snapshot (`last_progress` / `status` / `recent_progress`),
 /// - retrieve the configured sink format (`format`).
+///
+/// The handle is a cheap clone over shared state; the background micro-batch
+/// task is aborted when the **last** clone drops. This shared-inner shape is
+/// what lets a [`StreamingQueryManager`] hold a weak reference and hand live
+/// handles back from `get`/`get_by_name`.
+#[derive(Clone)]
 pub struct StreamingQuery {
+    inner: Arc<StreamingQueryInner>,
+}
+
+struct StreamingQueryInner {
     id: QueryId,
     name: Option<String>,
     output_mode: StreamingOutputMode,
@@ -147,7 +157,7 @@ pub struct StreamingQuery {
     /// Sink format configured on the writer.
     format: Option<StreamSinkFormat>,
     /// Aborted on drop so the micro-batch task does not outlive the handle.
-    _task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 struct StreamingQueryParts {
@@ -180,54 +190,56 @@ impl StreamingQuery {
             task,
         } = parts;
         Self {
-            id,
-            name,
-            output_mode,
-            trigger_label,
-            state_rx,
-            cancel_tx,
-            last_progress,
-            progress_history,
-            memory_sink,
-            format,
-            _task: task,
+            inner: Arc::new(StreamingQueryInner {
+                id,
+                name,
+                output_mode,
+                trigger_label,
+                state_rx,
+                cancel_tx,
+                last_progress,
+                progress_history,
+                memory_sink,
+                format,
+                task,
+            }),
         }
     }
 }
 
-impl Drop for StreamingQuery {
+impl Drop for StreamingQueryInner {
     fn drop(&mut self) {
-        self._task.abort();
+        self.task.abort();
     }
 }
 
 impl StreamingQuery {
     /// The query's unique identifier.
     pub fn id(&self) -> &QueryId {
-        &self.id
+        &self.inner.id
     }
 
     /// The query name, if one was set.
     pub fn name(&self) -> Option<&str> {
-        self.name.as_deref()
+        self.inner.name.as_deref()
     }
 
     /// `true` if the query is still running (not stopped or failed).
     pub fn is_active(&self) -> bool {
-        !self.state_rx.borrow().is_terminal()
+        !self.inner.state_rx.borrow().is_terminal()
     }
 
     /// Request the query to stop. Returns immediately; the background task may
     /// finish the current micro-batch before stopping.
     pub fn stop(&self) {
-        let _ = self.cancel_tx.send(true);
+        let _ = self.inner.cancel_tx.send(true);
     }
 
     /// Await until the query reaches a terminal state.
     ///
     /// Returns `Ok(())` on clean stop, `Err` on failure.
     pub async fn await_termination(&self) -> Result<()> {
-        let mut state_rx = self.state_rx.clone();
+        let mut state_rx = self.inner.state_rx.clone();
         loop {
             {
                 let state = state_rx.borrow();
@@ -259,7 +271,8 @@ impl StreamingQuery {
 
     /// Return the latest progress snapshot, if any micro-batch has run.
     pub fn last_progress(&self) -> Option<StreamingQueryProgress> {
-        self.last_progress
+        self.inner
+            .last_progress
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
@@ -271,6 +284,7 @@ impl StreamingQuery {
     /// intentionally small to keep the handle lightweight.
     pub fn recent_progress(&self, n: usize) -> Vec<StreamingQueryProgress> {
         let history = self
+            .inner
             .progress_history
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -280,15 +294,15 @@ impl StreamingQuery {
 
     /// Return the current high-level query status (state, mode, progress, exception).
     pub fn status(&self) -> StreamingQueryStatus {
-        let state = self.state_rx.borrow().clone();
+        let state = self.inner.state_rx.borrow().clone();
         let exception = match &state {
             StreamingQueryState::Failed(msg) => Some(msg.clone()),
             _ => None,
         };
         StreamingQueryStatus {
             state,
-            output_mode: self.output_mode,
-            trigger: self.trigger_label.clone(),
+            output_mode: self.inner.output_mode,
+            trigger: self.inner.trigger_label.clone(),
             last_progress: self.last_progress(),
             exception,
         }
@@ -296,12 +310,12 @@ impl StreamingQuery {
 
     /// Return the configured output mode.
     pub fn output_mode(&self) -> StreamingOutputMode {
-        self.output_mode
+        self.inner.output_mode
     }
 
     /// Return the last error message, if the query is in a `Failed` state.
     pub fn exception(&self) -> Option<String> {
-        match &*self.state_rx.borrow() {
+        match &*self.inner.state_rx.borrow() {
             StreamingQueryState::Failed(msg) => Some(msg.clone()),
             _ => None,
         }
@@ -309,16 +323,17 @@ impl StreamingQuery {
 
     /// Return the sink format that was configured on the writer.
     pub fn format(&self) -> Option<StreamSinkFormat> {
-        self.format
+        self.inner.format
     }
 
-    /// Drain the batches collected by a `format("memory")` sink.
+    /// Read the batches collected so far by a `format("memory")` sink.
     ///
     /// Returns an empty `Vec` if the writer was not configured with
-    /// `format("memory")`. Each call clones the underlying batches; the
-    /// caller is responsible for taking ownership only once.
+    /// `format("memory")`. Each call clones the underlying batches and leaves
+    /// them in place — repeated calls return the same (growing) collection.
     pub fn memory_batches(&self) -> Vec<RecordBatch> {
-        self.memory_sink
+        self.inner
+            .memory_sink
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
@@ -328,9 +343,9 @@ impl StreamingQuery {
 impl std::fmt::Debug for StreamingQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamingQuery")
-            .field("id", &self.id)
-            .field("name", &self.name)
-            .field("output_mode", &self.output_mode)
+            .field("id", &self.inner.id)
+            .field("name", &self.inner.name)
+            .field("output_mode", &self.inner.output_mode)
             .field("active", &self.is_active())
             .finish_non_exhaustive()
     }
@@ -623,6 +638,7 @@ impl DataStreamWriter {
         let id_for_task = id.clone();
         let name_for_task = name.clone();
         let last_progress_for_task = Arc::clone(&last_progress);
+        let manager_for_registration = self.stream_manager.clone();
         let stream_manager = self.stream_manager;
         let task = tokio::spawn(async move {
             let result = run_streaming_task(
@@ -665,9 +681,9 @@ impl DataStreamWriter {
             }
         });
 
-        Ok(StreamingQuery::new(StreamingQueryParts {
-            id,
-            name,
+        let query = StreamingQuery::new(StreamingQueryParts {
+            id: id.clone(),
+            name: name.clone(),
             output_mode,
             trigger_label,
             state_rx,
@@ -677,7 +693,13 @@ impl DataStreamWriter {
             memory_sink: memory_sink.clone(),
             format,
             task,
-        }))
+        });
+        // T17: make the query visible to the session-scoped manager so
+        // `active_count`/`active_ids`/`get`/`get_by_name` reflect reality.
+        if let Some(manager) = &manager_for_registration {
+            manager.register(id.to_string(), name, &query);
+        }
+        Ok(query)
     }
 }
 
@@ -728,7 +750,7 @@ struct StreamingQueryManagerInner {
 
 struct WeakQueryEntry {
     name: Option<String>,
-    weak: std::sync::Weak<StreamingQuery>,
+    weak: std::sync::Weak<StreamingQueryInner>,
 }
 
 impl Default for StreamingQueryManager {
@@ -788,19 +810,20 @@ impl StreamingQueryManager {
 
     /// Look up a query by id; returns `None` if the query has already
     /// terminated and its handle has been dropped.
-    pub fn get(&self, id: &str) -> Option<Arc<StreamingQuery>> {
+    pub fn get(&self, id: &str) -> Option<StreamingQuery> {
         self.inner
             .queries
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(id)
             .and_then(|entry| entry.weak.upgrade())
+            .map(|inner| StreamingQuery { inner })
     }
 
     /// Look up a query by name; returns the first match if multiple
     /// queries share a name (which `DataStreamWriter::query_name` does
     /// not enforce as unique).
-    pub fn get_by_name(&self, name: &str) -> Option<Arc<StreamingQuery>> {
+    pub fn get_by_name(&self, name: &str) -> Option<StreamingQuery> {
         self.inner
             .queries
             .lock()
@@ -813,18 +836,13 @@ impl StreamingQueryManager {
                     None
                 }
             })
+            .map(|inner| StreamingQuery { inner })
     }
 
-    /// Internal: register a freshly-started query.
-    ///
-    /// Called by `StreamingQuery::new` (the constructor at `streaming_builder.rs:163`)
-    /// to populate the registry. Will start failing the `#[expect]` the moment
-    /// that wiring is in place — the annotation should be removed in the same PR.
-    #[expect(
-        dead_code,
-        reason = "called by StreamingQuery::new wiring (planned); remove when wired"
-    )]
-    pub(crate) fn register(&self, id: String, name: Option<String>, query: &Arc<StreamingQuery>) {
+    /// Internal: register a freshly-started query. Called by
+    /// [`DataStreamWriter::start`] when a manager is attached, so
+    /// `active_count`/`active_ids`/`get`/`get_by_name` see the live query.
+    pub(crate) fn register(&self, id: String, name: Option<String>, query: &StreamingQuery) {
         self.inner
             .queries
             .lock()
@@ -833,7 +851,7 @@ impl StreamingQueryManager {
                 id,
                 WeakQueryEntry {
                     name,
-                    weak: Arc::downgrade(query),
+                    weak: Arc::downgrade(&query.inner),
                 },
             );
     }
@@ -1078,6 +1096,36 @@ fn next_checkpoint_epoch(epoch: i64) -> u64 {
     (epoch.max(0) as u64).saturating_add(1)
 }
 
+/// Commit one micro-batch's checkpoint epoch to storage: an `epoch-<n>` marker
+/// plus `latest_epoch.json`. The returned epoch is what progress reports, so a
+/// reported checkpoint epoch is one that actually exists on disk — previously
+/// nothing was written and the progress number was fabricated.
+async fn commit_checkpoint_epoch(
+    storage: &Arc<dyn CheckpointStorage>,
+    epoch: i64,
+    input_rows: u64,
+) -> Result<u64> {
+    let ckpt_epoch = next_checkpoint_epoch(epoch);
+    let payload =
+        format!("{{\"epoch\":{ckpt_epoch},\"micro_batch\":{epoch},\"input_rows\":{input_rows}}}");
+    storage
+        .write_bytes_async(
+            &format!("epoch-{ckpt_epoch}/commit.json"),
+            payload.as_bytes(),
+        )
+        .await
+        .map_err(|e| KrishivError::Runtime {
+            message: format!("checkpoint epoch {ckpt_epoch} commit failed: {e}"),
+        })?;
+    storage
+        .write_bytes_async("latest_epoch.json", payload.as_bytes())
+        .await
+        .map_err(|e| KrishivError::Runtime {
+            message: format!("checkpoint latest-epoch write failed: {e}"),
+        })?;
+    Ok(ckpt_epoch)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_streaming_task(
     stream: KrishivStream,
@@ -1091,22 +1139,27 @@ async fn run_streaming_task(
     progress: ProgressTrackers,
     memory_sink: Arc<std::sync::Mutex<Vec<RecordBatch>>>,
 ) -> Result<()> {
-    // Build a checkpoint storage handle iff checkpoint_location is set.
-    // The storage is used by the per-micro-batch barrier to commit epoch
-    // metadata and (in the future) sink 2PC state.
-    let checkpoint_storage: Option<Arc<dyn CheckpointStorage>> = if checkpoint_location.is_some() {
-        let storage = LocalFsCheckpointStorage::ephemeral().map_err(|e| KrishivError::Runtime {
-            message: format!("failed to open checkpoint storage: {e}"),
-        })?;
-        Some(Arc::new(storage))
-    } else {
-        None
+    // Build a checkpoint storage handle iff checkpoint_location is set —
+    // rooted at the caller's location, so the epoch markers land where the
+    // user asked (previously this opened an *ephemeral* directory and never
+    // wrote to it, while progress still reported checkpoint epochs).
+    let checkpoint_storage: Option<Arc<dyn CheckpointStorage>> = match &checkpoint_location {
+        Some(location) => {
+            let storage =
+                LocalFsCheckpointStorage::new(location).map_err(|e| KrishivError::Runtime {
+                    message: format!("failed to open checkpoint storage at '{location}': {e}"),
+                })?;
+            Some(Arc::new(storage))
+        }
+        None => None,
     };
 
     match trigger {
-        StreamingTrigger::Once | StreamingTrigger::AvailableNow => {
+        trigger @ (StreamingTrigger::Once | StreamingTrigger::AvailableNow) => {
+            let label = trigger_label(&trigger);
             drain_and_call(
                 stream,
+                &label,
                 foreach_fn,
                 format,
                 &options,
@@ -1284,10 +1337,6 @@ fn build_sink_dispatcher(
     memory_sink: Arc<std::sync::Mutex<Vec<RecordBatch>>>,
     output_mode: StreamingOutputMode,
 ) -> impl Fn(Vec<RecordBatch>, i64) -> Result<()> {
-    // ST1: track the per-row "last emitted epoch" so Update mode can
-    // emit only the rows whose epoch has changed (or is new).
-    let update_state: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>> =
-        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     // Kafka sink is built lazily on the first micro-batch (reused across epochs
     // so the rdkafka producer isn't recreated every batch). Only compiled with
     // the `kafka` feature; without it, `format("kafka")` returns Unsupported.
@@ -1322,43 +1371,19 @@ fn build_sink_dispatcher(
                             guard.push(batch);
                         }
                     }
-                    // ST1: Update mode — replace any prior batch for the
-                    // same schema key (the first column of the schema is
-                    // used as a stand-in for the primary key in the
-                    // in-memory sink). The current epoch's delta becomes
-                    // the new visible state.
+                    // ST1: Update mode — the upstream stateful operator emits
+                    // only the rows inserted/updated since the last batch, and
+                    // the in-memory sink *appends* those update rows per epoch
+                    // (Spark's memory-sink Update semantics). An earlier
+                    // version carried a per-row "dedup" tracker here whose key
+                    // included the row index and the whole column's debug
+                    // rendering — it never matched anything across epochs, so
+                    // it enforced nothing; the honest behaviour is the plain
+                    // append of the epoch's updates.
                     StreamingOutputMode::Update => {
-                        if let Ok(mut tracker) = update_state.lock() {
-                            for batch in batches {
-                                let n = batch.num_rows();
-                                if n == 0 {
-                                    continue;
-                                }
-                                let key_col = batch.column(0);
-                                let mut kept = 0u64;
-                                for row in 0..n {
-                                    let key = format!(
-                                        "memory:{:?}:row{}:{:?}",
-                                        batch.schema(),
-                                        row,
-                                        key_col
-                                    );
-                                    tracker
-                                        .entry(key)
-                                        .and_modify(|e| {
-                                            if *e < epoch {
-                                                *e = epoch;
-                                                kept += 1;
-                                            }
-                                        })
-                                        .or_insert_with(|| {
-                                            kept += 1;
-                                            epoch
-                                        });
-                                }
-                                if kept > 0 {
-                                    guard.push(batch);
-                                }
+                        for batch in batches {
+                            if batch.num_rows() > 0 {
+                                guard.push(batch);
                             }
                         }
                     }
@@ -1376,43 +1401,23 @@ fn build_sink_dispatcher(
             }
             Ok(())
         }
-        // ST1: Console mode — count only the rows whose first column
-        // value is new (or whose previous emitted epoch is older than
-        // this one). This is the visible enforcement of Update mode at
-        // the writer layer; the parquet/kafka dispatcher paths are
-        // unchanged and remain per-epoch-full.
+        // Console mode — log each epoch's rows. In Update mode those rows are
+        // the per-epoch updates the upstream operator emitted; the console
+        // sink reports them as-is rather than pretending to re-dedup them (an
+        // earlier tracker here keyed on the row index + column debug text and
+        // could never match across epochs, so it enforced nothing).
         Some(StreamSinkFormat::Console) => {
-            if let Ok(mut tracker) = update_state.lock() {
-                for batch in &batches {
-                    let n = batch.num_rows();
-                    if n == 0 {
-                        continue;
-                    }
-                    let key_col = batch.column(0);
-                    let mut kept = 0u64;
-                    for row in 0..n {
-                        let key = format!("col0_row{}_{:?}", row, key_col);
-                        tracker
-                            .entry(key)
-                            .and_modify(|e| {
-                                if *e < epoch {
-                                    *e = epoch;
-                                    kept += 1;
-                                }
-                            })
-                            .or_insert_with(|| {
-                                kept += 1;
-                                epoch
-                            });
-                    }
-                    tracing::debug!(
-                        epoch,
-                        mode = "Update",
-                        new_or_updated_rows = kept,
-                        schema = ?batch.schema(),
-                        "streaming-console"
-                    );
+            for batch in &batches {
+                if batch.num_rows() == 0 {
+                    continue;
                 }
+                tracing::debug!(
+                    epoch,
+                    mode = ?output_mode,
+                    rows = batch.num_rows(),
+                    schema = ?batch.schema(),
+                    "streaming-console"
+                );
             }
             Ok(())
         }
@@ -1553,6 +1558,7 @@ fn build_sink_dispatcher(
 #[allow(clippy::too_many_arguments)]
 async fn drain_and_call(
     mut stream: KrishivStream,
+    trigger_label: &str,
     foreach_fn: Option<ForeachBatchFn>,
     format: Option<StreamSinkFormat>,
     options: &std::collections::HashMap<String, String>,
@@ -1574,14 +1580,12 @@ async fn drain_and_call(
         StreamingOutputMode::Complete => input_rows, // operator owns the result table
     };
 
-    // ST6: drive a checkpoint epoch so source offsets + state are recorded
-    // before the user callback returns. For now this writes a small
-    // metadata file via the CheckpointStorage; the per-task ack protocol
-    // (which would make this exactly-once) is a follow-up.
-    let last_checkpoint_epoch = if checkpoint_storage.is_some() {
-        Some(next_checkpoint_epoch(epoch))
-    } else {
-        None
+    // ST6: commit a checkpoint epoch so the micro-batch boundary is recorded
+    // durably before the user callback returns (the per-task ack protocol that
+    // would make this exactly-once is a follow-up).
+    let last_checkpoint_epoch = match &checkpoint_storage {
+        Some(storage) => Some(commit_checkpoint_epoch(storage, epoch, input_rows).await?),
+        None => None,
     };
 
     let dispatcher = build_sink_dispatcher(
@@ -1599,7 +1603,7 @@ async fn drain_and_call(
         epoch,
         input_rows,
         output_rows,
-        Some("AvailableNow"),
+        Some(trigger_label),
         last_checkpoint_epoch,
         None,
         None,
@@ -1678,10 +1682,9 @@ async fn processing_time_loop(
         };
 
         // Drive a barrier if a checkpoint storage was configured (ST6).
-        let last_checkpoint_epoch = if checkpoint_storage.is_some() {
-            Some(next_checkpoint_epoch(epoch))
-        } else {
-            None
+        let last_checkpoint_epoch = match &checkpoint_storage {
+            Some(storage) => Some(commit_checkpoint_epoch(storage, epoch, input_rows).await?),
+            None => None,
         };
 
         dispatcher(batches, epoch)?;
@@ -1780,10 +1783,9 @@ async fn continuous_loop(
             StreamingOutputMode::Append | StreamingOutputMode::Update => input_rows,
             StreamingOutputMode::Complete => input_rows,
         };
-        let last_checkpoint_epoch = if checkpoint_storage.is_some() {
-            Some(next_checkpoint_epoch(epoch))
-        } else {
-            None
+        let last_checkpoint_epoch = match &checkpoint_storage {
+            Some(storage) => Some(commit_checkpoint_epoch(storage, epoch, input_rows).await?),
+            None => None,
         };
         dispatcher(batches, epoch)?;
         update_progress(
@@ -2329,6 +2331,92 @@ mod listener_tests {
         let out = q.memory_batches();
         let total_rows: usize = out.iter().map(|b| b.num_rows()).sum();
         assert!(total_rows > 0, "complete mode keeps at least one batch");
+    }
+
+    /// T17 wiring: a manager attached via `with_stream_manager` must actually
+    /// see the started query — `active_ids`, `get`, and `get_by_name` return
+    /// the live handle while it is held. (Pre-fix, `register` was dead code and
+    /// every lookup returned empty/None.)
+    #[tokio::test]
+    async fn manager_sees_registered_query_while_handle_is_alive() {
+        let df = dataframe_from_batches(vec![simple_batch(&[1, 2])]);
+        let manager = StreamingQueryManager::new();
+        let query = DataStreamWriter::new(df)
+            .query_name("wired")
+            .format("memory")
+            .trigger(StreamingTrigger::AvailableNow)
+            .with_stream_manager(manager.clone())
+            .start()
+            .await
+            .expect("start");
+
+        assert_eq!(manager.active_count(), 1, "started query must be visible");
+        assert_eq!(manager.active_ids(), vec![query.id().to_string()]);
+        let by_id = manager.get(&query.id().to_string()).expect("get by id");
+        assert_eq!(by_id.id(), query.id());
+        let by_name = manager.get_by_name("wired").expect("get by name");
+        assert_eq!(by_name.name(), Some("wired"));
+
+        query.await_termination().await.expect("termination");
+        drop(query);
+        drop(by_id);
+        drop(by_name);
+        assert_eq!(
+            manager.active_count(),
+            0,
+            "dropped handles must leave the registry via the weak refs"
+        );
+    }
+
+    /// ST6: a configured checkpoint location must receive real epoch commits —
+    /// `latest_epoch.json` and an `epoch-<n>` marker exist after the run, and
+    /// the reported progress epoch matches what is on disk. (Pre-fix the
+    /// storage was ephemeral and never written, while progress still reported
+    /// a checkpoint epoch.)
+    #[tokio::test]
+    async fn checkpoint_location_receives_epoch_commits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let location = dir.path().join("ckpt");
+        let df = dataframe_from_batches(vec![simple_batch(&[1, 2, 3])]);
+        let query = DataStreamWriter::new(df)
+            .format("memory")
+            .option("checkpointLocation", location.to_string_lossy().to_string())
+            .trigger(StreamingTrigger::AvailableNow)
+            .start()
+            .await
+            .expect("start");
+        query.await_termination().await.expect("termination");
+
+        let progress = query.last_progress().expect("progress snapshot");
+        let epoch = progress
+            .last_checkpoint_epoch
+            .expect("checkpoint epoch reported");
+        assert!(
+            location.join("latest_epoch.json").is_file(),
+            "latest_epoch.json must exist at the configured location"
+        );
+        assert!(
+            location
+                .join(format!("epoch-{epoch}"))
+                .join("commit.json")
+                .is_file(),
+            "the reported epoch {epoch} must have a commit marker on disk"
+        );
+    }
+
+    /// The progress snapshot's trigger label must reflect the actual trigger:
+    /// a `Once` query reports "Once", not a hardcoded "AvailableNow".
+    #[tokio::test]
+    async fn once_trigger_progress_label_is_once() {
+        let df = dataframe_from_batches(vec![simple_batch(&[1])]);
+        let query = DataStreamWriter::new(df)
+            .trigger(StreamingTrigger::Once)
+            .start()
+            .await
+            .expect("start");
+        query.await_termination().await.expect("termination");
+        let progress = query.last_progress().expect("progress");
+        assert_eq!(progress.trigger.as_deref(), Some("Once"));
     }
 
     /// ST4: the Kafka transactional sink config is stored on the

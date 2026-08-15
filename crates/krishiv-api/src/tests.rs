@@ -2775,6 +2775,121 @@ async fn pipeline_temp_view_intermediate() {
     assert_eq!(n, 1, "only the amount=100 row passes the temp view filter");
 }
 
+// ── Empty-result writes still create the output file ────────────────────────
+
+#[test]
+fn write_csv_of_empty_result_still_creates_the_file() {
+    let session = Session::builder().build().unwrap();
+    let df = session.sql("SELECT 1 AS v WHERE false").unwrap();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("empty.csv");
+    df.write_csv(path.to_str().unwrap()).unwrap();
+    assert!(
+        path.is_file(),
+        "a successful write_csv must leave a file even for an empty result"
+    );
+}
+
+#[test]
+fn write_parquet_of_empty_result_writes_schema_only_file() {
+    let session = Session::builder().build().unwrap();
+    let df = session.sql("SELECT 1 AS v WHERE false").unwrap();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("empty.parquet");
+    df.write_parquet(path.to_str().unwrap()).unwrap();
+    assert!(
+        path.is_file(),
+        "a successful write_parquet must leave a (schema-only) file even for \
+         an empty result"
+    );
+    // The file must be valid parquet carrying the query's schema.
+    let read_back = session.read_parquet(&path).unwrap().collect().unwrap();
+    assert_eq!(read_back.row_count(), 0);
+}
+
+// ── RunPolicy::EveryMs is time-coalesced, not per-feed ──────────────────────
+
+#[tokio::test]
+async fn every_ms_policy_coalesces_feeds_between_steps() {
+    use crate::{FeedableJob, PipelineMode, RunPolicy};
+    use std::sync::{Arc as StdArc, Mutex};
+
+    let sink: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let session = Session::builder().build().unwrap();
+
+    // A huge interval: no time-based step may fire during the run, so the only
+    // step is the driver's final flush. (Pre-fix, EveryMs stepped after every
+    // feed — indistinguishable from OnChange, defeating the coalescing knob.)
+    session
+        .pipeline("everyms_coalesce")
+        .source_memory("raw", vec![amounts(&[10]), amounts(&[5])])
+        .view("total", "SELECT SUM(amount) AS s FROM raw", true)
+        .sink_memory("total", sink.clone())
+        .mode(PipelineMode::Ivm)
+        .run(RunPolicy::EveryMs(600_000))
+        .await
+        .unwrap();
+
+    // The persisted job's tick counter counts steps. Two feeds + one flush step
+    // must have advanced it exactly once; this extra step makes it 2.
+    let job = session.ivm("everyms_coalesce").await.unwrap();
+    let report = job.step().await.unwrap();
+    assert_eq!(
+        report.tick, 2,
+        "EveryMs(10min) must not step per feed: expected 1 flush step during \
+         the run (+1 for this probe step)"
+    );
+}
+
+// ── Streaming checkpoint_dir receives persisted offsets ─────────────────────
+
+#[tokio::test]
+async fn streaming_checkpoint_dir_receives_persisted_checkpoints() {
+    use crate::pipeline::{Egress, Ingest, StreamingConfig};
+    use crate::{PipelineMode, RunPolicy};
+    use std::collections::VecDeque;
+    use std::sync::{Arc as StdArc, Mutex};
+
+    let dir = tempdir().unwrap();
+    let ckpt_dir = dir.path().join("stream-ckpt");
+    let src = VecSource {
+        batches: VecDeque::from(vec![amounts(&[1]), amounts(&[2])]),
+    };
+    let collected: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let sink = VecSink {
+        out: collected.clone(),
+    };
+
+    let session = Session::builder().build().unwrap();
+    session
+        .pipeline("ckpt_stream")
+        .mode(PipelineMode::Stream)
+        .streaming_config(StreamingConfig {
+            run_policy: RunPolicy::EveryRows(1),
+            checkpoint_interval_ms: Some(0),
+            checkpoint_dir: Some(ckpt_dir.to_string_lossy().into_owned()),
+            ..StreamingConfig::default()
+        })
+        .source("raw", Ingest::Connector(Box::new(src)))
+        .view("total", "SELECT SUM(amount) AS s FROM raw", true)
+        .sink("total", Egress::Connector(Box::new(sink)))
+        .run(RunPolicy::EveryRows(1))
+        .await
+        .unwrap();
+
+    // Pre-fix, checkpoints were captured and only logged — nothing on disk.
+    let latest = ckpt_dir.join("latest.txt");
+    assert!(
+        latest.is_file(),
+        "checkpoint_dir must receive latest.txt after a checkpointed run"
+    );
+    let cp = std::fs::read_to_string(&latest).unwrap();
+    assert!(
+        ckpt_dir.join(&cp).is_dir(),
+        "the checkpoint id in latest.txt ('{cp}') must name a persisted directory"
+    );
+}
+
 // ── DP-B: persistent incremental runs + refresh (full-refresh) ──────────────
 
 #[tokio::test]

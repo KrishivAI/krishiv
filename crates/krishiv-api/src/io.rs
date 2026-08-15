@@ -574,6 +574,9 @@ impl DataFrameWriter {
             if dataframe
                 .try_distributed_parquet_sink(&path_str, sink_mode, &partition_by)?
                 .is_some()
+                // A zero-row result publishes nothing through the staged sink;
+                // fall through to the local writer so success leaves output.
+                && path.exists()
             {
                 return Ok(());
             }

@@ -277,9 +277,10 @@ pub const PARITY: &[ApiEntry] = &[
     entry(
         DataFrame,
         "foreachBatch",
-        Planned,
-        "",
-        "Phase 61 gap: micro-batch sink callback",
+        Partial,
+        "DataStreamWriter::foreach_batch",
+        "micro-batch sink callback on write_stream()/DataStreamWriter (PySpark hangs it off \
+         writeStream); reachable, placement differs",
     ),
     // ── Column ───────────────────────────────────────────────────────────────
     entry(Column, "alias", Supported, "Expr::alias", ""),
@@ -289,13 +290,6 @@ pub const PARITY: &[ApiEntry] = &[
     entry(Column, "desc", Supported, "Expr::desc", ""),
     entry(Column, "and", Supported, "Expr::and", "`&`"),
     entry(Column, "or", Supported, "Expr::or", "`|`"),
-    entry(
-        Column,
-        "eqNullSafe",
-        Planned,
-        "",
-        "null-safe equality (<=>) not exposed",
-    ),
     entry(Column, "isNull", Supported, "Expr::is_null", ""),
     entry(Column, "isNotNull", Supported, "Expr::is_not_null", ""),
     entry(Column, "over", Supported, "Expr::over", "window spec"),
@@ -665,6 +659,28 @@ mod tests {
                 "matrix claims DataFrame::{method} (for PySpark {}) but no `pub fn {method}` exists",
                 e.pyspark
             );
+        }
+    }
+
+    /// A method must not appear twice with contradictory coverage — the matrix
+    /// once listed `Column::eqNullSafe` as both Planned("not exposed") and
+    /// Supported(`Expr::eq_null_safe`), double-counting the surface and
+    /// contradicting itself in the published page.
+    #[test]
+    fn no_duplicate_contradictory_entries() {
+        use std::collections::HashMap;
+        let mut seen: HashMap<(&str, &str), ParityStatus> = HashMap::new();
+        for e in PARITY {
+            if let Some(prev) = seen.insert((e.namespace.as_str(), e.pyspark), e.status) {
+                assert_eq!(
+                    prev.is_covered(),
+                    e.status.is_covered(),
+                    "{}::{} appears twice with contradictory coverage ({prev:?} vs {:?})",
+                    e.namespace.as_str(),
+                    e.pyspark,
+                    e.status
+                );
+            }
         }
     }
 

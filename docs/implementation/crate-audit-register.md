@@ -43,7 +43,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 7 | krishiv-connectors | 39,930 | 97 | **97 (COMPLETE)** | ~60 defects fixed incl. avro silent corruption, kafka/cdc offset-before-delivery, NULL-predicate DELETE, orphan-cleanup deleting live MoR delete files, LanceDB fragment loss, 2PC later-epoch drops; streaming_unify deleted; ~120 tests added |
 | 8 | krishiv-state | 12,357 | 37 | **37 (COMPLETE)** | 9 revert-proven fixes incl. savepoint-restore skipping manifest coverage, key-group task-index formula diverging from ranges, 1M-entry restore cap, DFS unstable-hash filenames + collision returning wrong key's value, sequential "async" executor; 2 can't-fail tests strengthened |
 | **Tier 3 — runtime & surfaces** |
-| 9 | krishiv-api | 25,111 | 38 | 0 | |
+| 9 | krishiv-api | 25,111 | 38 | COMPLETE | 9 defects fixed (A1–A9); see §9 |
 | 10 | krishiv-runtime | 13,648 | 17 | 0 | |
 | 11 | krishiv-dataflow | 18,107 | 38 | 0 | |
 | 12 | krishiv-ivm | 7,019 | 10 | 0 | |
@@ -2813,3 +2813,113 @@ Still open and now the only items left from this crate: `iceberg_rest.rs`
 (1,537 lines), the back half of `catalog/mod.rs`, `distributed_plan.rs` (8,464)
 and `spillable_join.rs` (3,307) are unread; and the live-Kafka exercise of the
 boundedness fix is still owed.
+
+
+## 9. krishiv-api — read end to end (2026-08-15)
+
+Method: full-file read of all 41 src files (session.rs 3,951; tests.rs 2,839;
+streaming_builder.rs 2,349; dataframe.rs 2,024; connector_runtime.rs 1,935;
+streaming_dataframe.rs 1,812; pipeline/* 2,559; io.rs 960; the 25 smaller
+files), tests/streaming_collect_guard.rs, and the three examples. Clean files
+(no findings): session.rs, blocking.rs, error.rs, lib.rs, types.rs, query.rs,
+stream.rs, window.rs, catalog.rs, prepared.rs, expression.rs,
+materialized_table.rs, sql_job.rs, connector_runtime.rs,
+streaming_dataframe.rs, io.rs (behavioural), process.rs, timers.rs, compute/*,
+incremental_flow.rs, conformance/delivery-cert/mode-conformance/differential
+corpus test files, pipeline/{source,sink,spine,connector_factory}.rs.
+
+Defects (all fixed this session, one commit):
+
+**A1. `StreamingQueryManager` was permanently empty (B: dead wiring behind a
+live public surface).** `register` carried `#[expect(dead_code)]`; nothing ever
+called it, so `active_count`/`active_ids`/`get`/`get_by_name` always returned
+empty/None — and the Python test papered over it (`got is None or …`, a
+cannot-fail test). Fix: `StreamingQuery` is now a cheap clone over
+`Arc<StreamingQueryInner>` (the task aborts when the *last* clone drops);
+`DataStreamWriter::start` registers into the attached manager, whose entries
+hold `Weak<StreamingQueryInner>`. API change: `get`/`get_by_name` return
+`Option<StreamingQuery>` (was `Option<Arc<StreamingQuery>>`); krishiv-python
+adjusted. Test `manager_sees_registered_query_while_handle_is_alive` —
+revert-proven red by removing the `register` call.
+
+**A2. Streaming checkpoints were fabricated (A/E: progress lied).**
+`run_streaming_task` opened an *ephemeral* `LocalFsCheckpointStorage`,
+ignoring the user's `checkpointLocation`, and never wrote a byte — while every
+progress snapshot still reported `last_checkpoint_epoch = Some(n)`. Fix:
+storage is rooted at the configured location and `commit_checkpoint_epoch`
+writes `epoch-<n>/commit.json` + `latest_epoch.json` before the epoch is
+reported; a write failure fails the query. Test
+`checkpoint_location_receives_epoch_commits` — revert-proven red by restoring
+the report-without-write line.
+
+**A3. Update-mode "dedup" tracker enforced nothing (A+C).** The memory and
+console sinks kept a per-row map whose key embedded the row *index* and the
+whole column's `{:?}` rendering — no two epochs could ever collide, so Update
+mode behaved exactly like Append while the code (and comments) claimed
+writer-layer dedup enforcement; `output_mode_update_emits_rows` could not
+fail. Removed the tracker; the sinks now honestly append each epoch's
+update rows (Spark memory-sink Update semantics — the upstream stateful
+operator owns which rows are "updates") and the comments say so.
+
+**A4. `Once` trigger reported "AvailableNow" in progress snapshots (E).**
+`drain_and_call` hardcoded the label. Now receives the real trigger label.
+Test `once_trigger_progress_label_is_once` — revert-proven.
+
+**A5. `RunPolicy::EveryMs` stepped on every feed in the IVM driver (A: knob
+did the wrong thing).** `maybe_step` matched `EveryMs(_) => true`, silently
+degrading the time-coalescing contract ("at most every ms") to OnChange. Fix:
+`StepPacer` tracks `last_step`; steps only when rows are pending and the
+interval elapsed. Test `every_ms_policy_coalesces_feeds_between_steps` (huge
+interval ⇒ exactly one flush step, proven via the persisted job's tick
+counter) — revert-proven.
+
+**A6. Pipeline streaming checkpoints went nowhere (E).**
+`save_streaming_checkpoint` captured source offsets and *logged* them;
+`restore_streaming_checkpoint` was `#[cfg(test)]`-only — checkpointing was
+decorative. Fix: new `StreamingConfig.checkpoint_dir`; when set, offsets
+persist as `<dir>/<cp-id>/<source>.offset` + `latest.txt`; when unset the
+debug log now says offsets are not persisted. Test
+`streaming_checkpoint_dir_receives_persisted_checkpoints` — revert-proven.
+
+**A7. Dead config knobs removed (G).** `StreamingConfig.execution_profile` and
+`.output_buffer` (api-local duplicates of the krishiv-dataflow types) were
+never read by the driver — config enforced by nothing. Deleted both fields and
+the duplicated `StreamingExecutionProfile`/`OutputBufferPolicy` types (no
+consumers anywhere in the workspace); the dataflow crate's enforced types are
+unaffected.
+
+**A8. Parity matrix contradicted itself (E).** `Column::eqNullSafe` appeared
+twice — `Planned("not exposed")` *and* `Supported(Expr::eq_null_safe)` (which
+exists) — double-counting the surface; `DataFrame::foreachBatch` was `Planned`
+although `DataStreamWriter::foreach_batch` ships. Removed the stale entry,
+re-classified foreachBatch as Partial, re-blessed
+`docs/reference/pyspark-parity.md` (now 122/127 = 96%). New matrix test
+`no_duplicate_contradictory_entries` — revert-proven by re-adding the dup.
+
+**A9. Empty-result writes silently produced no file (A).**
+`write_parquet`/`write_csv`/`write_json`/`*_with_options` returned `Ok(())`
+without creating anything when the result had zero batches — and the embedded
+staged-sink fast path publishes no part files for a zero-row result either, so
+`df.write_parquet(p)` could "succeed" with nothing at `p`. Fix: csv/json
+always create the file; parquet writes a schema-only file (schema from the
+plan when no batch carries one); the sink fast path falls through to the
+local writer when it published nothing. Tests
+`write_csv_of_empty_result_still_creates_the_file` and
+`write_parquet_of_empty_result_writes_schema_only_file` — both revert-proven.
+
+Doc-only: `StreamingQuery::memory_batches` said "Drain" while it clones and
+leaves the batches in place; `as_sql_backed`'s empty guard was
+`all(rows==0) && is_empty()` (the `all` clause vacuous) — both corrected.
+
+Notes / not defects: `interval_join` H-1 per-key fix verified with its four
+regression tests; connector_runtime's registry fallthrough (#197) is fully
+tested; `prepared.rs`'s `unwrap_or_default()` on a missing bind parameter is
+unreachable (bind() length-checks against the validated max placeholder);
+`repartition()` only annotates the logical plan (documented Partial in the
+parity matrix — left as is). Coverage re-measured post-fix (see summary in the
+commit).
+
+Gates: `cargo test -p krishiv-api` (293 lib + 1 integration, 2 env-ignored),
+`just test`, `just lint`, `cargo clippy -p krishiv-api --all-targets`,
+`cargo fmt` — all green. krishiv-python compiles (`cargo check`); its `.so`
+link needs libpython3.14, absent on this host (pre-existing, unrelated).
