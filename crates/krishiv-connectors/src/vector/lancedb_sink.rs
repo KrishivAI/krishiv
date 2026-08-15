@@ -22,6 +22,13 @@ use super::id::point_id_from_doc_epoch;
 use super::memory::InMemoryVectorSink;
 use super::traits::{PayloadFilter, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult};
 
+/// A persisted Parquet fragment and the point ids it contains.
+#[derive(Debug, Clone)]
+struct FragmentMeta {
+    path: PathBuf,
+    point_ids: Vec<String>,
+}
+
 /// Lance-style local sink: persists Parquet under `uri` and serves queries from an in-memory index.
 #[derive(Debug)]
 pub struct LanceDbSink {
@@ -29,7 +36,7 @@ pub struct LanceDbSink {
     table_name: String,
     vector_dim: usize,
     index: InMemoryVectorSink,
-    manifest: RwLock<HashMap<String, PathBuf>>,
+    manifest: RwLock<HashMap<String, FragmentMeta>>,
 }
 
 impl LanceDbSink {
@@ -86,37 +93,51 @@ impl LanceDbSink {
         .await
         .map_err(|e| VectorSinkError::Connection(e.to_string()))??;
         for path in entries {
-            let batch = tokio::task::spawn_blocking({
-                let path = path.clone();
-                move || -> VectorSinkResult<Vec<RecordBatch>> {
-                    let file = std::fs::File::open(&path)
-                        .map_err(|e| VectorSinkError::Query(e.to_string()))?;
-                    let reader =
-                        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
-                            file,
-                        )
-                        .map_err(|e| VectorSinkError::Query(e.to_string()))?
-                        .build()
-                        .map_err(|e| VectorSinkError::Query(e.to_string()))?;
-                    reader
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| VectorSinkError::Query(e.to_string()))
+            let batches = Self::read_fragment_batches(&path).await?;
+            for batch in batches {
+                if batch.num_rows() == 0 {
+                    continue;
                 }
-            })
-            .await
-            .map_err(|e| VectorSinkError::Query(e.to_string()))??;
-            for batch in batch {
                 let restored = Self::arrow_batch_to_embedding(&batch, self.vector_dim)?;
+                let point_ids: Vec<String> = restored
+                    .doc_ids
+                    .iter()
+                    .map(|doc_id| point_id_from_doc_epoch(doc_id, restored.epoch))
+                    .collect();
                 self.index.upsert_batch(&restored).await?;
                 if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
                     self.manifest
                         .write()
                         .map_err(|e| VectorSinkError::Upsert(e.to_string()))?
-                        .insert(id.to_string(), path.clone());
+                        .insert(
+                            id.to_string(),
+                            FragmentMeta {
+                                path: path.clone(),
+                                point_ids,
+                            },
+                        );
                 }
             }
         }
         Ok(())
+    }
+
+    async fn read_fragment_batches(path: &Path) -> VectorSinkResult<Vec<RecordBatch>> {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || -> VectorSinkResult<Vec<RecordBatch>> {
+            let file =
+                std::fs::File::open(&path).map_err(|e| VectorSinkError::Query(e.to_string()))?;
+            let reader =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                    .map_err(|e| VectorSinkError::Query(e.to_string()))?
+                    .build()
+                    .map_err(|e| VectorSinkError::Query(e.to_string()))?;
+            reader
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| VectorSinkError::Query(e.to_string()))
+        })
+        .await
+        .map_err(|e| VectorSinkError::Query(e.to_string()))?
     }
 
     fn fragment_path(&self, id: &str) -> PathBuf {
@@ -125,7 +146,12 @@ impl LanceDbSink {
             .join(format!("{id}.parquet"))
     }
 
-    async fn write_fragment(&self, id: &str, batch: &RecordBatch) -> VectorSinkResult<()> {
+    async fn write_fragment(
+        &self,
+        id: &str,
+        batch: &RecordBatch,
+        point_ids: Vec<String>,
+    ) -> VectorSinkResult<()> {
         let path = self.fragment_path(id);
         let batch = batch.clone();
         let path2 = path.clone();
@@ -153,7 +179,7 @@ impl LanceDbSink {
         self.manifest
             .write()
             .map_err(|e| VectorSinkError::Upsert(e.to_string()))?
-            .insert(id, path);
+            .insert(id, FragmentMeta { path, point_ids });
         Ok(())
     }
 
@@ -236,7 +262,11 @@ impl LanceDbSink {
             doc_ids: Vec::new(),
             vectors: Vec::new(),
             payloads: vec![HashMap::new(); batch.num_rows()],
-            epoch: epochs.value(0) as u64,
+            epoch: if batch.num_rows() == 0 {
+                0
+            } else {
+                epochs.value(0) as u64
+            },
         };
         for row in 0..batch.num_rows() {
             out.doc_ids.push(doc_ids.value(row).to_string());
@@ -263,35 +293,101 @@ impl VectorSink for LanceDbSink {
     }
 
     async fn upsert_batch(&self, batch: &EmbeddingBatch) -> VectorSinkResult<()> {
+        // Zero-row fragments would break reload (no epoch row to read), and
+        // there is nothing to persist anyway.
+        if batch.is_empty() {
+            return Ok(());
+        }
         self.index.upsert_batch(batch).await?;
         let record = Self::batch_to_arrow(batch, self.vector_dim)?;
         // Write the entire batch as a single Parquet fragment instead of one
-        // file per row, which was catastrophic for filesystem overhead.
-        let batch_id = point_id_from_doc_epoch("batch", batch.epoch);
-        self.write_fragment(&batch_id, &record).await?;
+        // file per row, which was catastrophic for filesystem overhead. The
+        // fragment id is derived from the batch content (point ids), so
+        // distinct batches at the same epoch land in distinct fragments while
+        // an identical re-upsert idempotently overwrites its own fragment.
+        let point_ids: Vec<String> = batch
+            .doc_ids
+            .iter()
+            .map(|doc_id| point_id_from_doc_epoch(doc_id, batch.epoch))
+            .collect();
+        let mut parts: Vec<&[u8]> = point_ids.iter().map(|id| id.as_bytes()).collect();
+        let epoch_bytes = batch.epoch.to_le_bytes();
+        parts.push(&epoch_bytes);
+        let digest = krishiv_common::hash::sha256_bytes_multi(&parts);
+        let batch_id: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+        self.write_fragment(&batch_id, &record, point_ids).await?;
         Ok(())
     }
 
     async fn delete_by_ids(&self, ids: &[String]) -> VectorSinkResult<()> {
         self.index.delete_by_ids(ids).await?;
-        let mut guard = self
-            .manifest
-            .write()
-            .map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
-        for id in ids {
-            if let Some(path) = guard.remove(id) {
-                // Filesystem deletes can fail transiently (file held open by
-                // a reader, NFS hiccup). Log at warn so the failure is
-                // observable; the in-memory index is already updated, so
-                // the next query will return the right results.
-                if let Err(e) = std::fs::remove_file(&path) {
-                    tracing::warn!(
-                        sink = "lancedb",
-                        id = %id,
-                        path = %path.display(),
-                        error = %e,
-                        "failed to remove Parquet fragment during delete_by_ids"
-                    );
+        // Find fragments containing any of the deleted point ids.
+        let affected: Vec<(String, FragmentMeta)> = {
+            let guard = self
+                .manifest
+                .read()
+                .map_err(|e| VectorSinkError::Delete(e.to_string()))?;
+            guard
+                .iter()
+                .filter(|(_, meta)| meta.point_ids.iter().any(|p| ids.contains(p)))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        for (fragment_id, meta) in affected {
+            let batches = Self::read_fragment_batches(&meta.path).await?;
+            let mut remaining: Option<EmbeddingBatch> = None;
+            for batch in batches {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let restored = Self::arrow_batch_to_embedding(&batch, self.vector_dim)?;
+                let keep = remaining.get_or_insert_with(|| EmbeddingBatch {
+                    doc_ids: Vec::new(),
+                    vectors: Vec::new(),
+                    payloads: Vec::new(),
+                    epoch: restored.epoch,
+                });
+                for (doc_id, vector) in restored.doc_ids.iter().zip(restored.vectors.iter()) {
+                    let point_id = point_id_from_doc_epoch(doc_id, restored.epoch);
+                    if !ids.contains(&point_id) {
+                        keep.doc_ids.push(doc_id.clone());
+                        keep.vectors.push(vector.clone());
+                        keep.payloads.push(HashMap::new());
+                    }
+                }
+            }
+            match remaining {
+                Some(keep) if !keep.is_empty() => {
+                    // Rewrite the fragment without the deleted points, keeping
+                    // its id and path stable.
+                    let record = Self::batch_to_arrow(&keep, self.vector_dim)?;
+                    let point_ids: Vec<String> = keep
+                        .doc_ids
+                        .iter()
+                        .map(|doc_id| point_id_from_doc_epoch(doc_id, keep.epoch))
+                        .collect();
+                    self.write_fragment(&fragment_id, &record, point_ids)
+                        .await?;
+                }
+                _ => {
+                    // Every point in the fragment was deleted: drop the file.
+                    // Filesystem deletes can fail transiently (file held open
+                    // by a reader, NFS hiccup). Log at warn so the failure is
+                    // observable; the in-memory index is already updated, so
+                    // the next query will return the right results.
+                    self.manifest
+                        .write()
+                        .map_err(|e| VectorSinkError::Delete(e.to_string()))?
+                        .remove(&fragment_id);
+                    if let Err(e) = std::fs::remove_file(&meta.path) {
+                        tracing::warn!(
+                            sink = "lancedb",
+                            fragment = %fragment_id,
+                            path = %meta.path.display(),
+                            error = %e,
+                            "failed to remove Parquet fragment during delete_by_ids"
+                        );
+                    }
                 }
             }
         }

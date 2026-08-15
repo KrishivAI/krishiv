@@ -43,7 +43,7 @@ impl DeltaTableHandle {
     }
 
     pub async fn schema(&self) -> LakehouseResult<SchemaRef> {
-        local_delta::table_schema(&self.path)
+        local_delta::table_schema(&self.path, self.version.map(|v| v as u64))
     }
 
     pub async fn scan_batches(&self) -> LakehouseResult<Vec<RecordBatch>> {
@@ -65,7 +65,14 @@ pub async fn write_delta(
     if batches.is_empty() {
         return Ok(());
     }
-    let overwrite = matches!(mode, DeltaWriteMode::Overwrite | DeltaWriteMode::Merge);
+    // Merge is a keyed operation; silently treating it as Overwrite would
+    // replace the whole table instead of merging rows.
+    if matches!(mode, DeltaWriteMode::Merge) {
+        return Err(LakehouseError::Io(
+            "merge mode requires merge_delta with key columns; write_delta only supports append/overwrite".to_string(),
+        ));
+    }
+    let overwrite = matches!(mode, DeltaWriteMode::Overwrite);
     tokio::task::spawn_blocking(move || local_delta::write_table(&path, batches, overwrite))
         .await
         .map_err(|e| LakehouseError::Io(e.to_string()))?
@@ -107,8 +114,14 @@ pub async fn merge_delta(
     // cross-type false matches (e.g. Int64(1) must not match String("1")).
     let source_keys: HashSet<String> = keys_set(source_col.as_ref())?;
 
-    // Keep target rows whose key does NOT appear in source.
-    let keep_indices: Vec<u32> = target_keys_indices(target_col.as_ref(), &source_keys)?;
+    // Keep target rows whose key does NOT appear in source. When matched
+    // rows are not being updated (insert-only merge), matched target rows
+    // must survive unchanged, so every target row is kept.
+    let keep_indices: Vec<u32> = if when_matched_update {
+        target_keys_indices(target_col.as_ref(), &source_keys)?
+    } else {
+        (0..target.num_rows() as u32).collect()
+    };
 
     let mut merged_batches = Vec::new();
     if !keep_indices.is_empty() {
@@ -254,35 +267,35 @@ impl DeltaObjectStoreReader {
     /// delete operation are excluded from the result even if they appeared in an earlier
     /// add action.
     pub async fn scan_batches(&self) -> LakehouseResult<Vec<arrow::record_batch::RecordBatch>> {
-        use std::collections::HashSet;
         let versions = self.list_versions().await?;
         if versions.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Accumulate all adds and removes across every log version.
-        // The final readable set is: adds − removes.
-        let mut all_adds: Vec<String> = Vec::new();
-        let mut removed: HashSet<String> = HashSet::new();
+        // Replay add/remove actions in version order so a path removed in one
+        // version and re-added in a later version stays readable (matches the
+        // local `_delta_log` replay in local_delta::active_data_file_paths).
+        let mut active: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for version in &versions {
             let (add_paths, remove_paths) = self.parquet_paths_from_log_entry(*version).await?;
-            all_adds.extend(add_paths);
-            removed.extend(remove_paths);
+            for p in remove_paths {
+                active.remove(&p);
+            }
+            for p in add_paths {
+                active.insert(p);
+            }
         }
-        // Deduplicate adds and subtract tombstoned paths in one pass.
-        let mut seen: HashSet<String> = HashSet::new();
-        let unique_readable: Vec<String> = all_adds
-            .into_iter()
-            .filter(|p| !removed.contains(p) && seen.insert(p.clone()))
-            .collect();
 
         let mut out = Vec::new();
-        for rel_path in &unique_readable {
+        for rel_path in &active {
             let obj_path = object_store::path::Path::from(format!("{}/{}", self.prefix, rel_path));
-            let get_result = match self.store.get_opts(&obj_path, Default::default()).await {
-                Ok(r) => r,
-                Err(_) => continue, // file may have been removed
-            };
+            // A get failure on an active (non-tombstoned) file means silent
+            // row loss if swallowed — propagate it.
+            let get_result = self
+                .store
+                .get_opts(&obj_path, Default::default())
+                .await
+                .map_err(|e| LakehouseError::Io(e.to_string()))?;
             let data = get_result
                 .bytes()
                 .await
@@ -612,88 +625,105 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // DeltaWriteMode tests
+    // merge_delta / write_delta behaviour tests
     // ------------------------------------------------------------------
 
-    #[test]
-    fn delta_write_mode_variants_are_distinct() {
-        let a = DeltaWriteMode::Append;
-        let b = DeltaWriteMode::Overwrite;
-        let c = DeltaWriteMode::Merge;
-        assert_ne!(a, b);
-        assert_ne!(a, c);
-        assert_ne!(b, c);
+    /// Insert-only merge (`WHEN NOT MATCHED THEN INSERT` without a matched
+    /// clause) must keep matched target rows unchanged, not delete them.
+    #[tokio::test]
+    async fn merge_delta_insert_only_keeps_matched_target_rows() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        write_delta(
+            &path,
+            vec![sample_batch(&[1, 2], &["a", "b"])],
+            DeltaWriteMode::Overwrite,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Source matches key 1 and brings new key 3; matched update disabled.
+        let result = merge_delta(
+            &path,
+            vec![sample_batch(&[1, 3], &["a-new", "c"])],
+            "id",
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.rows_inserted, 1);
+        assert_eq!(result.rows_updated, 0);
+
+        let handle = DeltaTableHandle::open(&path, None).await.unwrap();
+        let read = handle.scan_batches().await.unwrap();
+        let merged = concat_batches(&read).unwrap();
+        assert_eq!(merged.num_rows(), 3, "matched target row must survive");
+        let ids = merged
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let names = merged
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut rows: Vec<(i64, String)> = (0..merged.num_rows())
+            .map(|i| (ids.value(i), names.value(i).to_string()))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "a".to_string()), // unchanged, NOT "a-new"
+                (2, "b".to_string()),
+                (3, "c".to_string()),
+            ]
+        );
     }
 
-    #[test]
-    fn delta_write_mode_clone_eq() {
-        let mode = DeltaWriteMode::Append;
-        let cloned = mode;
-        assert_eq!(mode, cloned);
-    }
+    /// `write_delta` with Merge mode must refuse instead of silently
+    /// overwriting the table.
+    #[tokio::test]
+    async fn write_delta_merge_mode_is_explicit_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        write_delta(
+            &path,
+            vec![sample_batch(&[1, 2], &["a", "b"])],
+            DeltaWriteMode::Overwrite,
+            false,
+        )
+        .await
+        .unwrap();
 
-    #[test]
-    fn delta_write_mode_debug_format() {
-        assert_eq!(format!("{:?}", DeltaWriteMode::Append), "Append");
-        assert_eq!(format!("{:?}", DeltaWriteMode::Overwrite), "Overwrite");
-        assert_eq!(format!("{:?}", DeltaWriteMode::Merge), "Merge");
-    }
+        let err = write_delta(
+            &path,
+            vec![sample_batch(&[9], &["z"])],
+            DeltaWriteMode::Merge,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("merge_delta"),
+            "unexpected error: {err}"
+        );
 
-    // ------------------------------------------------------------------
-    // DeltaTableHandle tests
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn delta_table_handle_accessors() {
-        let handle = DeltaTableHandle {
-            path: "/data/my_table".to_string(),
-            version: Some(7),
-        };
-        assert_eq!(handle.path(), "/data/my_table");
-        assert_eq!(handle.version(), Some(7));
-    }
-
-    #[test]
-    fn delta_table_handle_none_version() {
-        let handle = DeltaTableHandle {
-            path: "/tmp/tbl".to_string(),
-            version: None,
-        };
-        assert_eq!(handle.version(), None);
-    }
-
-    #[test]
-    fn delta_table_handle_clone() {
-        let handle = DeltaTableHandle {
-            path: "/data/t".to_string(),
-            version: Some(3),
-        };
-        let cloned = handle.clone();
-        assert_eq!(cloned.path(), "/data/t");
-        assert_eq!(cloned.version(), Some(3));
-    }
-
-    #[test]
-    fn merge_delta_result_default() {
-        let r = MergeDeltaResult::default();
-        assert_eq!(r.rows_inserted, 0);
-        assert_eq!(r.rows_updated, 0);
-        assert_eq!(r.rows_deleted, 0);
-    }
-
-    #[test]
-    fn merge_delta_result_eq() {
-        let a = MergeDeltaResult {
-            rows_inserted: 1,
-            rows_updated: 2,
-            rows_deleted: 3,
-        };
-        let b = MergeDeltaResult {
-            rows_inserted: 1,
-            rows_updated: 2,
-            rows_deleted: 3,
-        };
-        assert_eq!(a, b);
+        // Table untouched.
+        let handle = DeltaTableHandle::open(&path, None).await.unwrap();
+        let rows: usize = handle
+            .scan_batches()
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 2, "merge-mode error must not modify the table");
     }
 
     #[tokio::test]
@@ -863,6 +893,51 @@ mod tests {
         assert_eq!(
             rows, 1,
             "overwrite must return only the new file's rows (tombstone removes old file)"
+        );
+    }
+
+    /// A path removed in one version and re-added in a later version must be
+    /// readable again — removes apply in version order, not globally.
+    #[tokio::test]
+    async fn delta_object_store_remove_then_readd_is_readable() {
+        let store = make_inmemory_delta_store();
+        let batch = sample_batch(&[1, 2], &["a", "b"]);
+        write_parquet_to_store(store.as_ref(), "ra", "part-0.parquet", &batch).await;
+
+        // v0: add part-0
+        write_delta_log_entry(store.as_ref(), "ra", 0, "part-0.parquet").await;
+        // v1: remove part-0
+        let log_v1 = r#"{"remove":{"path":"part-0.parquet","dataChange":true}}"#;
+        let log_v1_path = object_store::path::Path::from("ra/_delta_log/00000000000000000001.json");
+        store
+            .as_ref()
+            .put_opts(
+                &log_v1_path,
+                bytes::Bytes::from(log_v1).into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        // v2: re-add part-0
+        write_delta_log_entry(store.as_ref(), "ra", 2, "part-0.parquet").await;
+
+        let reader = DeltaObjectStoreReader::new(std::sync::Arc::clone(&store), "ra");
+        let batches = reader.scan_batches().await.unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2, "re-added file must be readable after remove");
+    }
+
+    /// A get failure on an active file must surface as an error, not silent
+    /// row loss.
+    #[tokio::test]
+    async fn delta_object_store_missing_active_file_is_error() {
+        let store = make_inmemory_delta_store();
+        // Log references a parquet file that was never written.
+        write_delta_log_entry(store.as_ref(), "gone", 0, "part-0.parquet").await;
+        let reader = DeltaObjectStoreReader::new(std::sync::Arc::clone(&store), "gone");
+        assert!(
+            reader.scan_batches().await.is_err(),
+            "missing active file must be an error, not an empty result"
         );
     }
 

@@ -65,7 +65,10 @@ impl SchemaNormalizeOperator {
                 });
             }
         }
-        if source_schema == self.target {
+        // The fast-path is only sound when no renames are configured: a source
+        // schema that happens to equal the target can still contain a column
+        // that the rename map says must be sourced from a *different* name.
+        if self.renames.target_to_source.is_empty() && source_schema == self.target {
             return Ok(batch.clone());
         }
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.target.fields().len());

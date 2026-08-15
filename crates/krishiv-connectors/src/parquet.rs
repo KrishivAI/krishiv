@@ -38,8 +38,9 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 pub struct ParquetReadOptions {
     /// Push down filter predicates to the row-group / page index layer.
-    /// Defaults to `true` so that file-level row-group statistics can be
-    /// used to skip whole groups without reading them.
+    /// `ParquetReadOptions::default()` leaves every flag `false`; use
+    /// [`ParquetReadOptions::all`] (what [`ParquetSource::open`] does) to
+    /// enable them all.
     pub pushdown_filters: bool,
     /// Enable the Parquet page index for finer-grained skipping within a
     /// row group. Requires the file to have been written with page
@@ -72,6 +73,10 @@ pub struct ParquetSource {
     estimated_row_count: Option<u64>,
     reader: Option<ParquetRecordBatchReader>,
     cursor: usize,
+    /// Set when the file has been read to the end; prevents `ensure_reader`
+    /// from re-opening and re-decoding the whole file on every poll of an
+    /// exhausted source. Cleared by `reset` and `restore_offset`.
+    exhausted: bool,
     /// T8: read-side optimisation flags. Defaults to all-enabled via
     /// [`ParquetReadOptions::all`].
     options: ParquetReadOptions,
@@ -98,6 +103,7 @@ impl ParquetSource {
             estimated_row_count,
             reader: None,
             cursor: 0,
+            exhausted: false,
             options,
         })
     }
@@ -307,6 +313,9 @@ impl Source for ParquetSource {
     }
 
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
+        if self.exhausted {
+            return Ok(None);
+        }
         let reader = self.ensure_reader()?;
         match reader.next() {
             Some(Ok(batch)) => {
@@ -318,6 +327,7 @@ impl Source for ParquetSource {
             ))),
             None => {
                 self.reader = None;
+                self.exhausted = true;
                 Ok(None)
             }
         }
@@ -340,6 +350,7 @@ impl Source for ParquetSource {
     fn reset(&mut self) {
         self.cursor = 0;
         self.reader = None;
+        self.exhausted = false;
     }
 }
 
@@ -359,6 +370,7 @@ impl CheckpointSource for ParquetSource {
         let reader = self.reader_skipped_to(offset.batch_index)?;
         self.cursor = offset.batch_index;
         self.reader = Some(reader);
+        self.exhausted = false;
         Ok(())
     }
 }

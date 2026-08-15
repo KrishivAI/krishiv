@@ -398,7 +398,11 @@ mod tests {
     fn finds_a_subquery_behind_parentheses() {
         let sql = "SELECT * FROM t WHERE (id IN (SELECT id FROM s))";
         let found = detect_subqueries(sql).unwrap();
-        assert_eq!(found.len(), 1, "parenthesised predicate not scanned: {found:?}");
+        assert_eq!(
+            found.len(),
+            1,
+            "parenthesised predicate not scanned: {found:?}"
+        );
     }
 
     /// The point of the module: the guard must not be bypassable by writing

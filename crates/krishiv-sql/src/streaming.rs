@@ -261,7 +261,9 @@ pub fn create_continuous_table_with_capacity(
     let table = StreamingTable::try_new(schema.clone(), vec![partition])?;
     Ok((
         Arc::new(table),
-        Arc::new(ContinuousTableInput::with_cancel_flag(schema, tx, cancelled)),
+        Arc::new(ContinuousTableInput::with_cancel_flag(
+            schema, tx, cancelled,
+        )),
     ))
 }
 
@@ -274,7 +276,8 @@ mod cancel_semantics_tests {
     /// Build a producer/consumer pair sharing one cancellation flag, exactly as
     /// `create_continuous_table_with_capacity` does.
     fn linked_pair(capacity: usize) -> (SchemaRef, ChannelPartitionStream, ContinuousTableInput) {
-        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let (tx, rx) = mpsc::channel(capacity);
         let cancelled = Arc::new(AtomicBool::new(false));
         (

@@ -387,35 +387,35 @@ impl TableUdf for SqlBodyTableUdf {
         let schema = Arc::new(self.schema.clone());
         catch_unwind(AssertUnwindSafe(|| {
             krishiv_common::async_util::block_on(async {
-                    let df = ctx.sql(&sql).await.map_err(|e| UdfError::Execution {
-                        message: e.to_string(),
-                    })?;
-                    let batches = df.collect().await.map_err(|e| UdfError::Execution {
-                        message: e.to_string(),
-                    })?;
-                    if batches.is_empty() {
-                        return Ok(RecordBatch::new_empty(schema));
-                    }
-                    let batch = arrow::compute::concat_batches(
-                        &batches
-                            .first()
-                            .ok_or_else(|| UdfError::Execution {
-                                message: "empty batch list".into(),
-                            })?
-                            .schema(),
-                        &batches,
-                    )
-                    .map_err(|e| UdfError::Arrow(e.to_string()))?;
-                    if !schema_contract_matches(batch.schema().as_ref(), schema.as_ref()) {
-                        return Err(UdfError::Execution {
-                            message: format!(
-                                "SQL UDTF '{}' returned schema {:?}, expected {:?}",
-                                self.name,
-                                batch.schema(),
-                                schema
-                            ),
-                        });
-                    }
+                let df = ctx.sql(&sql).await.map_err(|e| UdfError::Execution {
+                    message: e.to_string(),
+                })?;
+                let batches = df.collect().await.map_err(|e| UdfError::Execution {
+                    message: e.to_string(),
+                })?;
+                if batches.is_empty() {
+                    return Ok(RecordBatch::new_empty(schema));
+                }
+                let batch = arrow::compute::concat_batches(
+                    &batches
+                        .first()
+                        .ok_or_else(|| UdfError::Execution {
+                            message: "empty batch list".into(),
+                        })?
+                        .schema(),
+                    &batches,
+                )
+                .map_err(|e| UdfError::Arrow(e.to_string()))?;
+                if !schema_contract_matches(batch.schema().as_ref(), schema.as_ref()) {
+                    return Err(UdfError::Execution {
+                        message: format!(
+                            "SQL UDTF '{}' returned schema {:?}, expected {:?}",
+                            self.name,
+                            batch.schema(),
+                            schema
+                        ),
+                    });
+                }
                 Ok(batch)
             })
         }))

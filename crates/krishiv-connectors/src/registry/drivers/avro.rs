@@ -19,12 +19,18 @@ fn require_path(config: &ConnectorConfig) -> ConnectorResult<PathBuf> {
     Ok(PathBuf::from(config.required("path")?))
 }
 
-fn batch_size(config: &ConnectorConfig) -> usize {
-    config
-        .get("batch_size")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1024)
-        .max(1)
+fn batch_size(config: &ConnectorConfig) -> ConnectorResult<usize> {
+    match config.get("batch_size") {
+        None => Ok(1024),
+        // A malformed value is an ERROR, not a silent fall-back to 1024.
+        Some(value) => value.parse::<usize>().map(|n| n.max(1)).map_err(|_| {
+            crate::error::ConnectorError::Config {
+                message: format!(
+                    "avro option 'batch_size' must be a positive integer, got '{value}'"
+                ),
+            }
+        }),
+    }
 }
 
 struct AvroFileSource {
@@ -74,10 +80,12 @@ impl Sink for AvroFileSink {
             let sink = AvroSink::new(BufWriter::new(file), batch.schema().as_ref())?;
             self.inner = Some(sink);
         }
-        self.inner
-            .as_mut()
-            .expect("avro sink initialized on first batch")
-            .write_batch(&batch)
+        match self.inner.as_mut() {
+            Some(sink) => sink.write_batch(&batch),
+            None => Err(crate::error::ConnectorError::Io(std::io::Error::other(
+                "avro sink not initialized",
+            ))),
+        }
     }
 
     async fn flush(&mut self) -> ConnectorResult<()> {
@@ -103,6 +111,7 @@ impl SourceDriver for AvroSourceDriver {
 
     fn validate(&self, config: &ConnectorConfig) -> ConnectorResult<()> {
         let _ = require_path(config)?;
+        let _ = batch_size(config)?;
         Ok(())
     }
 
@@ -110,7 +119,7 @@ impl SourceDriver for AvroSourceDriver {
         Box::pin(async move {
             let path = require_path(config)?;
             let file = File::open(&path).map_err(crate::error::ConnectorError::Io)?;
-            let source = AvroSource::open(file, batch_size(config))?;
+            let source = AvroSource::open(file, batch_size(config)?)?;
             Ok(Box::new(AvroFileSource { inner: source }) as Box<dyn DynSource>)
         })
     }
@@ -140,5 +149,29 @@ impl SinkDriver for AvroSinkDriver {
             let sink = AvroFileSink { inner: None, path };
             Ok(Box::new(sink) as Box<dyn DynSink>)
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn config(pairs: &[(&str, &str)]) -> ConnectorConfig {
+        let mut c = ConnectorConfig::new("probe", "avro");
+        for (k, v) in pairs {
+            c = c.with_property(*k, *v);
+        }
+        c
+    }
+
+    #[test]
+    fn malformed_batch_size_is_a_validate_error() {
+        let bad = config(&[("path", "/tmp/x.avro"), ("batch_size", "1O24")]);
+        assert!(AvroSourceDriver.validate(&bad).is_err());
+
+        let ok = config(&[("path", "/tmp/x.avro"), ("batch_size", "128")]);
+        assert!(AvroSourceDriver.validate(&ok).is_ok());
+        assert_eq!(batch_size(&ok).unwrap(), 128);
     }
 }

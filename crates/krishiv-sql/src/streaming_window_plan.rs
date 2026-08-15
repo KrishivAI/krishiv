@@ -165,9 +165,11 @@ fn extract_window(select: &Select) -> SqlResult<(WindowParams, String)> {
     // slide and size this compiler needs.
     let (func, inner) = match boundary {
         Expr::Function(func) => (func, inner.as_ref()),
-        Expr::Identifier(ident) => resolve_through_fanout(inner, &ident.value).ok_or_else(|| {
-            unsupported("window_start must be produced by a window boundary function")
-        })?,
+        Expr::Identifier(ident) => {
+            resolve_through_fanout(inner, &ident.value).ok_or_else(|| {
+                unsupported("window_start must be produced by a window boundary function")
+            })?
+        }
         _ => {
             return Err(unsupported(
                 "window_start must be produced by a window boundary function",
@@ -185,7 +187,10 @@ fn extract_window(select: &Select) -> SqlResult<(WindowParams, String)> {
 /// unnest(generate_series(hop_first_start(…), hop_start(…), slide)) AS _ws FROM
 /// src) AS _tvf_hop`, returns the `hop_start(…)` call and the *inner* select, so
 /// the caller reads the source table from the right level.
-fn resolve_through_fanout<'a>(outer: &'a Select, column: &str) -> Option<(&'a Function, &'a Select)> {
+fn resolve_through_fanout<'a>(
+    outer: &'a Select,
+    column: &str,
+) -> Option<(&'a Function, &'a Select)> {
     let fanout = outer.from.iter().find_map(|twj| match &twj.relation {
         TableFactor::Derived {
             subquery, alias, ..
@@ -209,7 +214,9 @@ fn find_hop_start(expr: &Expr) -> Option<&Function> {
         if func.name.to_string().eq_ignore_ascii_case("hop_start") {
             return Some(func);
         }
-        return function_arg_exprs(func).into_iter().find_map(find_hop_start);
+        return function_arg_exprs(func)
+            .into_iter()
+            .find_map(find_hop_start);
     }
     None
 }

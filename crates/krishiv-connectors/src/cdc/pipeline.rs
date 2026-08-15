@@ -49,6 +49,29 @@ pub trait CdcEventSource: Send {
     fn commit_offsets(&mut self) -> Result<(), ConnectorError> {
         Ok(())
     }
+
+    /// Position the source just past previously committed offsets.
+    ///
+    /// `offsets` maps `"{table_or_topic}-{partition}"` keys to the next offset
+    /// to read, as recorded in Iceberg snapshot summaries or a durable offset
+    /// tracker. Seekable sources should skip records below these offsets so a
+    /// restart after a sink commit does not re-deliver already-committed rows.
+    /// The default is a no-op for stateless in-memory sources.
+    fn resume_from(&mut self, offsets: &BTreeMap<String, i64>) -> Result<(), ConnectorError> {
+        let _ = offsets;
+        Ok(())
+    }
+
+    /// Per-partition next-offsets of tombstone (null-payload) records consumed
+    /// since the last offset commit.
+    ///
+    /// C6: the Iceberg sink path merges these into the epoch's committed
+    /// offset summary so a partition whose tail is a tombstone does not lose
+    /// its offset on crash. The default is empty for sources without
+    /// tombstones.
+    fn pending_tombstone_offsets(&self) -> BTreeMap<u32, i64> {
+        BTreeMap::new()
+    }
 }
 
 /// In-memory [`CdcEventSource`] backed by a pre-loaded `Vec<String>`.
@@ -102,6 +125,14 @@ pub struct CdcToLakehousePipeline {
     pub schema_registry_url: Option<String>,
     /// Payload format used when `raw_bytes` records are decoded.
     pub schema_registry_format: CdcSchemaRegistryFormat,
+    /// Opt-in acknowledgement that schema-registry decoding is append-only.
+    ///
+    /// Limitation: the registry decode path produces flat rows with no CDC
+    /// envelope metadata (`op`/`before`/`after`), so updates and deletes
+    /// cannot be represented — every decoded row is appended as an insert.
+    /// Binary registry records are therefore rejected unless this flag is set,
+    /// which declares that the stream carries append-only data.
+    pub schema_registry_append_only: bool,
     /// Number of CDC events to accumulate before writing a single Arrow batch.
     ///
     /// Defaults to 1000. Higher values reduce write amplification; lower values
@@ -137,6 +168,7 @@ impl CdcToLakehousePipeline {
             primary_key_columns,
             schema_registry_url: None,
             schema_registry_format: CdcSchemaRegistryFormat::default(),
+            schema_registry_append_only: false,
             batch_size: 1000,
             schema_evolution: true,
         }
@@ -145,6 +177,16 @@ impl CdcToLakehousePipeline {
     /// Attach a schema registry URL.
     pub fn with_schema_registry(mut self, url: impl Into<String>) -> Self {
         self.schema_registry_url = Some(url.into());
+        self
+    }
+
+    /// Declare the schema-registry stream as append-only flat rows.
+    ///
+    /// See [`Self::schema_registry_append_only`] for the limitation this
+    /// acknowledges.
+    #[must_use]
+    pub fn with_schema_registry_append_only(mut self, append_only: bool) -> Self {
+        self.schema_registry_append_only = append_only;
         self
     }
 
@@ -305,6 +347,16 @@ impl CdcToLakehousePipeline {
                     let client = registry_client.as_ref().ok_or_else(|| {
                         ConnectorError::Cdc("binary CDC records require schema_registry_url".into())
                     })?;
+                    if !self.schema_registry_append_only {
+                        return Err(ConnectorError::Cdc(
+                            "schema-registry decoding drops CDC envelope semantics \
+                             (op/before/after): decoded rows are appended as inserts, so \
+                             updates and deletes would be misapplied. The registry path \
+                             currently supports append-only flat rows only; opt in with \
+                             with_schema_registry_append_only(true)"
+                                .into(),
+                        ));
+                    }
                     let format = match self.schema_registry_format {
                         CdcSchemaRegistryFormat::Avro => {
                             crate::schema_registry::RegistryFormat::Avro
@@ -338,11 +390,10 @@ impl CdcToLakehousePipeline {
                     }
                     concat_registry_batches(&batches).map_err(ConnectorError::Cdc)
                 } else {
+                    // parse_debezium_records yields one event per record or errors,
+                    // so `events` is non-empty whenever `raw` is.
                     let events = super::debezium::parse_debezium_records(&raw)
                         .map_err(ConnectorError::Cdc)?;
-                    if events.is_empty() {
-                        continue;
-                    }
                     build_batch_from_events(&events)
                         .map_err(|e| ConnectorError::Cdc(format!("batch error: {e}")))
                 }
@@ -355,11 +406,10 @@ impl CdcToLakehousePipeline {
                             .into(),
                     ));
                 }
+                // parse_debezium_records yields one event per record or errors,
+                // so `events` is non-empty whenever `raw` is.
                 let events =
                     super::debezium::parse_debezium_records(&raw).map_err(ConnectorError::Cdc)?;
-                if events.is_empty() {
-                    continue;
-                }
                 build_batch_from_events(&events)
                     .map_err(|e| ConnectorError::Cdc(format!("batch error: {e}")))
             };
@@ -429,6 +479,15 @@ impl CdcToLakehousePipeline {
         let mut schema_state = CdcSchemaEvolutionState::default();
         let mut committed_snapshots = Vec::new();
 
+        // Crash-window duplicate suppression: if a previous run committed an
+        // Iceberg snapshot but crashed before advancing source offsets, the
+        // snapshot summary still records the committed offsets. Replay them
+        // into the source so already-committed records are skipped.
+        let committed_offsets = iceberg.committed_kafka_offsets().await;
+        if !committed_offsets.is_empty() {
+            source.resume_from(&committed_offsets)?;
+        }
+
         loop {
             if *shutdown.borrow() {
                 break;
@@ -472,18 +531,32 @@ impl CdcToLakehousePipeline {
             if self.schema_evolution {
                 batch = schema_state.normalize(batch).map_err(ConnectorError::Cdc)?;
             }
-            let offsets = kafka_offsets_for_events(&events);
+            let mut offsets = kafka_offsets_for_events(&events);
+            // C6: merge tombstone-only partition offsets into the snapshot
+            // summary so a partition whose tail is a tombstone still has its
+            // offset recorded durably. Tombstones carry no table name, so
+            // their keys use the source topic.
+            for (partition, next_offset) in source.pending_tombstone_offsets() {
+                offsets
+                    .entry(format!("{}-{}", self.source_topic, partition))
+                    .and_modify(|v: &mut i64| *v = (*v).max(next_offset))
+                    .or_insert(next_offset);
+            }
             let staged = iceberg
                 .prepare(vec![batch])
                 .await
                 .map_err(|e| ConnectorError::Cdc(format!("iceberg prepare failed: {e}")))?;
 
             // Commit Iceberg FIRST, then commit source offsets.
-            // If Iceberg commit fails, offsets are NOT advanced → on retry the
-            // same batch is re-read (duplicates are safe because the pipeline
-            // declares primary_key_columns for upsert semantics).
-            // If offsets were committed first and Iceberg then failed, the batch
-            // would be permanently lost (offsets past data → data loss).
+            // This is at-least-once append: if the process crashes between the
+            // Iceberg commit and the source offset commit, a naive restart
+            // re-reads and re-appends the same batch (primary_key_columns is
+            // validation-only today — nothing dedups appended rows). The
+            // startup `resume_from(committed_kafka_offsets)` call above closes
+            // that crash window by skipping records the snapshot summary
+            // already covers.
+            // The reverse order would be worse: offsets committed first and an
+            // Iceberg failure after would permanently lose the batch.
             let snapshot_id = match iceberg.commit(staged.clone(), offsets).await {
                 Ok(snapshot_id) => snapshot_id,
                 Err(e) => {
@@ -545,6 +618,104 @@ impl CdcToLakehousePipeline {
         );
         let source = RdkafkaCdcEventSource::new(&config)?;
         self.run_with_iceberg_sink(source, iceberg, shutdown).await
+    }
+}
+
+#[cfg(feature = "state")]
+impl CdcToLakehousePipeline {
+    /// Run CDC ingestion into an Iceberg sink with durable offset tracking.
+    ///
+    /// This is the `state`-feature offset persistence promised by
+    /// [`CdcToLakehousePipeline::new`]: on startup, offsets previously
+    /// persisted to `tracker` (keyed `"{source_topic}-{partition}"`) and any
+    /// offsets recorded in Iceberg snapshot summaries are replayed into
+    /// [`CdcEventSource::resume_from`]; after every successful Iceberg commit
+    /// the consumed per-partition offsets are persisted to `tracker`.
+    pub async fn run_with_iceberg_sink_and_offset_tracker<S, I>(
+        &self,
+        mut source: S,
+        iceberg: &I,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+        tracker: &mut super::offset::CdcOffsetTracker,
+    ) -> Result<Vec<i64>, ConnectorError>
+    where
+        S: CdcEventSource,
+        I: crate::lakehouse::IcebergTwoPhaseCommit,
+    {
+        self.validate()?;
+        let stored: BTreeMap<String, i64> = tracker
+            .offsets()
+            .iter()
+            .map(|(partition, offset)| (format!("{}-{}", self.source_topic, partition), *offset))
+            .collect();
+        if !stored.is_empty() {
+            source.resume_from(&stored)?;
+        }
+        let tracked = OffsetTrackedSource {
+            inner: source,
+            tracker,
+            pending: BTreeMap::new(),
+        };
+        self.run_with_iceberg_sink_inner(tracked, iceberg, shutdown, None)
+            .await
+    }
+}
+
+/// Wraps a [`CdcEventSource`] so that per-partition offsets are persisted to a
+/// [`CdcOffsetTracker`](super::offset::CdcOffsetTracker) whenever the inner
+/// source's offsets are committed (i.e. after a successful sink commit).
+#[cfg(feature = "state")]
+struct OffsetTrackedSource<'a, S: CdcEventSource> {
+    inner: S,
+    tracker: &'a mut super::offset::CdcOffsetTracker,
+    /// Next-offset per partition observed since the last commit.
+    pending: BTreeMap<u32, i64>,
+}
+
+#[cfg(feature = "state")]
+impl<S: CdcEventSource> CdcEventSource for OffsetTrackedSource<'_, S> {
+    fn poll_events(&mut self, max: usize) -> Result<Vec<String>, ConnectorError> {
+        self.inner.poll_events(max)
+    }
+
+    fn poll_records(&mut self, max: usize) -> Result<Vec<RawCdcRecord>, ConnectorError> {
+        let records = self.inner.poll_records(max)?;
+        for record in &records {
+            let next_offset = record.offset.saturating_add(1);
+            self.pending
+                .entry(record.partition_id)
+                .and_modify(|v| *v = (*v).max(next_offset))
+                .or_insert(next_offset);
+        }
+        Ok(records)
+    }
+
+    fn is_live(&self) -> bool {
+        self.inner.is_live()
+    }
+
+    fn commit_offsets(&mut self) -> Result<(), ConnectorError> {
+        // Capture tombstone offsets before the inner commit clears them.
+        let tombstones = self.inner.pending_tombstone_offsets();
+        self.inner.commit_offsets()?;
+        for (partition, next_offset) in tombstones {
+            self.pending
+                .entry(partition)
+                .and_modify(|v| *v = (*v).max(next_offset))
+                .or_insert(next_offset);
+        }
+        for (partition, next_offset) in std::mem::take(&mut self.pending) {
+            self.tracker.commit_offset(partition, next_offset)?;
+        }
+        Ok(())
+    }
+
+    fn resume_from(&mut self, offsets: &BTreeMap<String, i64>) -> Result<(), ConnectorError> {
+        self.inner.resume_from(offsets)
+    }
+
+    fn pending_tombstone_offsets(&self) -> BTreeMap<u32, i64> {
+        self.inner.pending_tombstone_offsets()
     }
 }
 

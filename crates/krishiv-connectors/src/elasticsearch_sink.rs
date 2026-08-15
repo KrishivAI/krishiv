@@ -7,7 +7,7 @@
 //!
 //! ```no_run
 //! # #[cfg(feature = "elasticsearch")]
-//! # async fn example() -> anyhow::Result<()> {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! use krishiv_connectors::elasticsearch_sink::{ElasticsearchConfig, ElasticsearchSink};
 //!
 //! let cfg = ElasticsearchConfig::new("http://localhost:9200", "my-index");
@@ -138,16 +138,26 @@ impl ElasticsearchSink {
         let docs = batch_to_json_docs(batch);
         let mut ops = BulkOperations::new();
 
-        let id_col_idx = self
-            .config
-            .id_column
-            .as_deref()
-            .and_then(|name| batch.schema().index_of(name).ok());
+        // A configured id_column that is missing from the batch is an ERROR,
+        // not a silent downgrade to auto-generated ids — auto-ids would break
+        // the idempotency the caller configured the column for.
+        let id_col_idx =
+            match self.config.id_column.as_deref() {
+                Some(name) => Some(batch.schema().index_of(name).map_err(|_| {
+                    ConnectorError::Schema {
+                        message: format!(
+                            "elasticsearch sink: configured id_column '{name}' is not a column \
+                         of the batch"
+                        ),
+                    }
+                })?),
+                None => None,
+            };
 
         for (row_idx, doc) in docs.into_iter().enumerate() {
             let source = JsonValue::Object(doc);
             if let Some(col_idx) = id_col_idx {
-                let id = extract_id(batch, col_idx, row_idx);
+                let id = extract_id(batch, col_idx, row_idx)?;
                 ops.push(elasticsearch::BulkOperation::<JsonValue>::index(source).id(id))
                     .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
             } else {
@@ -294,14 +304,51 @@ fn arrow_scalar_to_json(col: &dyn Array, row: usize) -> JsonValue {
     }
 }
 
-fn extract_id(batch: &RecordBatch, col_idx: usize, row: usize) -> String {
+/// Render the `_id` for one row from the configured id column.
+///
+/// Never falls back to the batch-local row index: that value repeats across
+/// batches, so documents from a later batch would silently OVERWRITE earlier
+/// ones. A null id, or a column type that cannot be rendered as a stable
+/// string, is an error instead.
+fn extract_id(batch: &RecordBatch, col_idx: usize, row: usize) -> ConnectorResult<String> {
+    use arrow::array::{Int32Array, Int64Array};
     let col = batch.column(col_idx);
-    if let Some(arr) = col.as_any().downcast_ref::<StringArray>()
-        && !arr.is_null(row)
-    {
-        return arr.value(row).to_owned();
+    let name = batch.schema().field(col_idx).name().clone();
+    if col.is_null(row) {
+        return Err(ConnectorError::Schema {
+            message: format!(
+                "elasticsearch sink: id column '{name}' is null at row {row} — every row \
+                 needs a document id"
+            ),
+        });
     }
-    row.to_string()
+    match col.data_type() {
+        DataType::Utf8 => col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|arr| arr.value(row).to_owned()),
+        DataType::Int32 => col
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .map(|arr| arr.value(row).to_string()),
+        DataType::Int64 => col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|arr| arr.value(row).to_string()),
+        other => {
+            return Err(ConnectorError::Schema {
+                message: format!(
+                    "elasticsearch sink: id column '{name}' has unsupported type {other} — \
+                     use Utf8, Int32 or Int64"
+                ),
+            });
+        }
+    }
+    .ok_or_else(|| ConnectorError::Schema {
+        message: format!(
+            "elasticsearch sink: id column '{name}' did not downcast to its reported type"
+        ),
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -384,6 +431,40 @@ mod tests {
             .with_id_column("doc_id");
         assert!(cfg.credentials.is_some());
         assert_eq!(cfg.id_column.as_deref(), Some("doc_id"));
+    }
+
+    #[test]
+    fn extract_id_formats_strings_and_integers_and_rejects_the_rest() {
+        let batch = make_batch(); // id: Utf8, age: Int32, score: Float64
+        assert_eq!(extract_id(&batch, 0, 1).unwrap(), "u2");
+        assert_eq!(extract_id(&batch, 1, 0).unwrap(), "25");
+        // Float ids are not stable document keys.
+        assert!(extract_id(&batch, 2, 0).is_err());
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id64",
+            DataType::Int64,
+            false,
+        )]));
+        let batch64 = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::Int64Array::from(vec![7i64]))],
+        )
+        .unwrap();
+        assert_eq!(extract_id(&batch64, 0, 0).unwrap(), "7");
+    }
+
+    #[test]
+    fn extract_id_null_is_an_error_not_a_row_index() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some("a"), None]))],
+        )
+        .unwrap();
+        assert_eq!(extract_id(&batch, 0, 0).unwrap(), "a");
+        let err = extract_id(&batch, 0, 1).unwrap_err();
+        assert!(err.to_string().contains("null"), "{err}");
     }
 
     #[test]

@@ -54,10 +54,20 @@ fn vector_config_from_connector(config: &ConnectorConfig) -> ConnectorResult<Vec
                     message: "vector_size must be an integer".into(),
                 }
             })?,
-            create_collection_if_missing: config
-                .get("create_collection_if_missing")
-                .map(|value| value == "true")
-                .unwrap_or(true),
+            create_collection_if_missing: match config.get("create_collection_if_missing") {
+                None => true,
+                // Strict bool: a typo like "ture" silently meaning `false`
+                // would flip the sink's behaviour, so it is an error.
+                Some(v) if v.eq_ignore_ascii_case("true") => true,
+                Some(v) if v.eq_ignore_ascii_case("false") => false,
+                Some(v) => {
+                    return Err(ConnectorError::Config {
+                        message: format!(
+                            "create_collection_if_missing must be 'true' or 'false', got '{v}'"
+                        ),
+                    });
+                }
+            },
         }),
         #[cfg(feature = "pgvector")]
         ConnectorKind::Pgvector => Ok(VectorSinkConfig::Pgvector {
@@ -135,4 +145,34 @@ pub(crate) fn register_builtin_vector_drivers(registry: &mut ConnectorRegistry) 
     registry.register_vector_sink(
         Arc::new(GenericVectorSinkDriver::new(ConnectorKind::Pgvector)) as SharedVectorSinkDriver,
     );
+}
+
+#[cfg(all(test, feature = "qdrant"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qdrant_create_collection_flag_is_a_strict_bool() {
+        let base = |flag: Option<&str>| {
+            let mut c = ConnectorConfig::new("probe", "qdrant")
+                .with_property("url", "http://localhost:6334")
+                .with_property("collection", "c")
+                .with_property("vector_size", "3");
+            if let Some(v) = flag {
+                c = c.with_property("create_collection_if_missing", v);
+            }
+            c
+        };
+
+        assert!(vector_config_from_connector(&base(None)).is_ok());
+        assert!(vector_config_from_connector(&base(Some("true"))).is_ok());
+        assert!(vector_config_from_connector(&base(Some("FALSE"))).is_ok());
+        // A typo must be an error, not a silent `false`.
+        let err = vector_config_from_connector(&base(Some("ture"))).unwrap_err();
+        assert!(
+            err.to_string().contains("create_collection_if_missing"),
+            "{err}"
+        );
+    }
 }

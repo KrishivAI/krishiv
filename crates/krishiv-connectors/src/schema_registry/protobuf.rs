@@ -35,18 +35,20 @@ impl ProtobufDeserializer {
 #[async_trait]
 impl KafkaDeserializer for ProtobufDeserializer {
     async fn decode(&self, payload: &[u8]) -> SchemaRegistryResult<(SchemaRef, Vec<RecordBatch>)> {
-        if payload.len() < 5 || payload[0] != 0 {
+        if payload.len() < 5 || payload.first() != Some(&0) {
             return Err(SchemaRegistryError::Decode(
                 "expected Confluent magic byte 0".into(),
             ));
         }
-        let schema_id_bytes: [u8; 4] = payload[1..5]
-            .try_into()
-            .map_err(|_| SchemaRegistryError::Decode("failed to read schema id bytes".into()))?;
+        let schema_id_bytes: [u8; 4] = payload
+            .get(1..5)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| SchemaRegistryError::Decode("failed to read schema id bytes".into()))?;
         let schema_id = u32::from_be_bytes(schema_id_bytes);
         let proto_schema = self.client.fetch_protobuf_schema(schema_id).await?;
         let arrow_schema = proto_fields_to_arrow_schema(&proto_schema);
-        let message_payload = strip_confluent_protobuf_message_indexes(&payload[5..])?;
+        let message_payload =
+            strip_confluent_protobuf_message_indexes(payload.get(5..).unwrap_or_default())?;
         let records = decode_protobuf_wire(message_payload, &proto_schema)?;
         let batches = proto_records_to_batches(&records, &arrow_schema)?;
 
@@ -296,8 +298,12 @@ fn parse_proto_text_field(
             "unsupported protobuf field declaration '{line}'"
         )));
     }
-    let proto_type = tokens[0];
-    let name = tokens[1].to_string();
+    let (Some(proto_type), Some(name)) = (tokens.first().copied(), tokens.get(1)) else {
+        return Err(SchemaRegistryError::Decode(format!(
+            "unsupported protobuf field declaration '{line}'"
+        )));
+    };
+    let name = (*name).to_string();
     let (wire_type, field_type) = proto_scalar_type(proto_type).ok_or_else(|| {
         SchemaRegistryError::Decode(format!(
             "unsupported protobuf scalar type '{proto_type}' in field '{name}'"
@@ -366,8 +372,8 @@ pub(crate) fn strip_confluent_protobuf_message_indexes(data: &[u8]) -> SchemaReg
             "protobuf payload missing message indexes".into(),
         ));
     }
-    if data[0] == 0 {
-        return Ok(&data[1..]);
+    if data.first() == Some(&0) {
+        return Ok(data.get(1..).unwrap_or_default());
     }
 
     let mut buf = data;
@@ -437,13 +443,16 @@ pub(crate) fn decode_protobuf_wire(
             .map_err(|e| SchemaRegistryError::Decode(e.to_string()))?;
         saw_wire_field = true;
         let field_number = tag;
-        let idx = field_map.get(&field_number).copied();
-        if let Some(i) = idx
-            && Some(fields[i].wire_type) != prost_wire_type_id(wire_type)
+        let known = field_map
+            .get(&field_number)
+            .copied()
+            .and_then(|i| fields.get(i).map(|f| (i, f)));
+        if let Some((_, field)) = known
+            && Some(field.wire_type) != prost_wire_type_id(wire_type)
         {
             return Err(SchemaRegistryError::Decode(format!(
                 "protobuf field '{}' expected wire type {} but payload used {:?}",
-                fields[i].name, fields[i].wire_type, wire_type
+                field.name, field.wire_type, wire_type
             )));
         }
 
@@ -451,29 +460,32 @@ pub(crate) fn decode_protobuf_wire(
             prost::encoding::WireType::Varint => {
                 let value = prost::encoding::decode_varint(&mut buf)
                     .map_err(|e| SchemaRegistryError::Decode(e.to_string()))?;
-                if let Some(i) = idx {
-                    current_row[i] = match fields[i].field_type {
+                if let Some((i, field)) = known {
+                    let decoded = match field.field_type {
                         ProtoFieldType::Bool => ProtoValue::Bool(value != 0),
                         ProtoFieldType::Int32 => {
-                            ProtoValue::Int32(checked_proto_i32(value as i64, &fields[i].name)?)
+                            ProtoValue::Int32(checked_proto_i32(value as i64, &field.name)?)
                         }
                         ProtoFieldType::UInt32 => {
                             ProtoValue::UInt32(u32::try_from(value).map_err(|_| {
                                 SchemaRegistryError::Decode(format!(
                                     "protobuf uint32 field '{}' overflowed",
-                                    fields[i].name
+                                    field.name
                                 ))
                             })?)
                         }
                         ProtoFieldType::UInt64 => ProtoValue::UInt64(value),
                         ProtoFieldType::SInt32 => ProtoValue::Int32(checked_proto_i32(
                             decode_zigzag_i64(value),
-                            &fields[i].name,
+                            &field.name,
                         )?),
                         ProtoFieldType::SInt64 => ProtoValue::Int64(decode_zigzag_i64(value)),
                         _ => ProtoValue::Int64(value as i64),
                     };
-                    saw_field = true;
+                    if let Some(slot) = current_row.get_mut(i) {
+                        *slot = decoded;
+                        saw_field = true;
+                    }
                 }
             }
             prost::encoding::WireType::SixtyFourBit => {
@@ -483,19 +495,22 @@ pub(crate) fn decode_protobuf_wire(
                     ));
                 }
                 let bytes = buf.get_u64_le();
-                if let Some(i) = idx {
-                    current_row[i] = match fields[i].field_type {
+                if let Some((i, field)) = known {
+                    let decoded = match field.field_type {
                         ProtoFieldType::Float64 => ProtoValue::Float64(f64::from_bits(bytes)),
                         ProtoFieldType::Fixed64 => ProtoValue::UInt64(bytes),
                         ProtoFieldType::SFixed64 => ProtoValue::Int64(bytes as i64),
                         _ => {
                             return Err(SchemaRegistryError::Decode(format!(
                                 "unsupported protobuf 64-bit field type for '{}'",
-                                fields[i].name
+                                field.name
                             )));
                         }
                     };
-                    saw_field = true;
+                    if let Some(slot) = current_row.get_mut(i) {
+                        *slot = decoded;
+                        saw_field = true;
+                    }
                 }
             }
             prost::encoding::WireType::LengthDelimited => {
@@ -508,8 +523,8 @@ pub(crate) fn decode_protobuf_wire(
                     ));
                 }
                 let chunk = buf.copy_to_bytes(len);
-                if let Some(i) = idx {
-                    current_row[i] = match fields[i].field_type {
+                if let Some((i, field)) = known {
+                    let decoded = match field.field_type {
                         ProtoFieldType::Bytes => ProtoValue::Bytes(chunk.to_vec()),
                         _ => {
                             ProtoValue::String(String::from_utf8(chunk.to_vec()).map_err(|e| {
@@ -519,7 +534,10 @@ pub(crate) fn decode_protobuf_wire(
                             })?)
                         }
                     };
-                    saw_field = true;
+                    if let Some(slot) = current_row.get_mut(i) {
+                        *slot = decoded;
+                        saw_field = true;
+                    }
                 }
             }
             prost::encoding::WireType::ThirtyTwoBit => {
@@ -529,19 +547,22 @@ pub(crate) fn decode_protobuf_wire(
                     ));
                 }
                 let bytes = buf.get_u32_le();
-                if let Some(i) = idx {
-                    current_row[i] = match fields[i].field_type {
+                if let Some((i, field)) = known {
+                    let decoded = match field.field_type {
                         ProtoFieldType::Float32 => ProtoValue::Float32(f32::from_bits(bytes)),
                         ProtoFieldType::Fixed32 => ProtoValue::UInt32(bytes),
                         ProtoFieldType::SFixed32 => ProtoValue::Int32(bytes as i32),
                         _ => {
                             return Err(SchemaRegistryError::Decode(format!(
                                 "unsupported protobuf 32-bit field type for '{}'",
-                                fields[i].name
+                                field.name
                             )));
                         }
                     };
-                    saw_field = true;
+                    if let Some(slot) = current_row.get_mut(i) {
+                        *slot = decoded;
+                        saw_field = true;
+                    }
                 }
             }
             _ => {
@@ -637,8 +658,8 @@ pub(crate) fn proto_records_to_batches(
 
     for row in rows {
         for (i, val) in row.iter().enumerate() {
-            if i < num_fields {
-                columns[i].push(val);
+            if let Some(col) = columns.get_mut(i) {
+                col.push(val);
             }
         }
     }

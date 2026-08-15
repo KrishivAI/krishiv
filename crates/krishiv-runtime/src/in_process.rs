@@ -998,12 +998,12 @@ impl InProcessStreamingRuntime {
         // Succeeded report deposits its inline IPC there, keyed by job).
         {
             let inline = {
-                let mut coord = self
-                    .coordinator
-                    .lock()
-                    .map_err(|_| RuntimeError::InvalidState {
-                        message: "coordinator lock poisoned during result claim".into(),
-                    })?;
+                let mut coord =
+                    self.coordinator
+                        .lock()
+                        .map_err(|_| RuntimeError::InvalidState {
+                            message: "coordinator lock poisoned during result claim".into(),
+                        })?;
                 coord.take_job_inline_results(&job_id).unwrap_or_default()
             };
             if !inline.is_empty() {
@@ -1882,7 +1882,9 @@ mod tests {
             .expect("streaming table DDL registers");
         assert!(batches.is_empty(), "DDL returns no rows");
         assert!(
-            runtime.list_continuous_jobs().contains(&"clicks_1s".to_string()),
+            runtime
+                .list_continuous_jobs()
+                .contains(&"clicks_1s".to_string()),
             "job registered under the table name"
         );
 
@@ -1913,7 +1915,10 @@ mod tests {
             .expect("push");
         let out = runtime.drain_continuous_job("clicks_1s").expect("drain");
         let rows: usize = out.iter().map(|b| b.num_rows()).sum();
-        assert!(rows >= 2, "closed window must emit u1 and u2 rows, got {rows}");
+        assert!(
+            rows >= 2,
+            "closed window must emit u1 and u2 rows, got {rows}"
+        );
 
         // OR REPLACE re-registers; plain CREATE on an existing name errors.
         runtime

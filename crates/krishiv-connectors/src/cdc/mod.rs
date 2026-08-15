@@ -747,10 +747,19 @@ mod tests {
 
     #[tokio::test]
     async fn run_with_source_shutdown_stops_loop() {
+        // A live source that never runs dry: the loop can only exit via the
+        // shutdown channel, not via the empty-poll exhaustion path.
         struct InfiniteSource;
         impl CdcEventSource for InfiniteSource {
             fn poll_events(&mut self, _max: usize) -> Result<Vec<String>, ConnectorError> {
-                Ok(vec![])
+                Ok(vec![
+                    r#"{"op":"c","source":{"lsn":1,"ts_ms":1,"table":"orders"},"after":{"id":"1"}}"#
+                        .to_string(),
+                ])
+            }
+
+            fn is_live(&self) -> bool {
+                true
             }
         }
 
@@ -763,12 +772,20 @@ mod tests {
         );
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        drop(shutdown_tx);
+        let handle = tokio::spawn(async move {
+            pipeline
+                .run_with_source(InfiniteSource, |_| Ok(()), shutdown_rx)
+                .await
+        });
+        shutdown_tx
+            .send(true)
+            .expect("pipeline task holds receiver");
 
-        let result = pipeline
-            .run_with_source(InfiniteSource, |_| Ok(()), shutdown_rx)
-            .await;
-        assert!(result.is_ok(), "shutdown via empty source should succeed");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("shutdown signal must stop the loop")
+            .expect("pipeline task must not panic");
+        assert!(result.is_ok(), "shutdown must exit the loop cleanly");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -786,5 +803,343 @@ mod tests {
             err.to_string()
                 .contains("cannot prove downstream durability")
         );
+    }
+
+    /// In-memory source with real offset identity that honors `resume_from`
+    /// by dropping records below the committed next-offset for its partition.
+    struct ResumableRecordSource {
+        records: std::collections::VecDeque<RawCdcRecord>,
+        table: String,
+    }
+
+    impl ResumableRecordSource {
+        fn orders(offsets: std::ops::Range<i64>) -> Self {
+            Self {
+                records: offsets
+                    .map(|offset| {
+                        RawCdcRecord::new(
+                            format!(
+                                r#"{{"op":"c","source":{{"lsn":{offset},"ts_ms":1,"table":"orders"}},"after":{{"id":"{offset}"}}}}"#
+                            ),
+                            0,
+                            offset,
+                        )
+                    })
+                    .collect(),
+                table: "orders".to_string(),
+            }
+        }
+    }
+
+    impl CdcEventSource for ResumableRecordSource {
+        fn poll_events(&mut self, max: usize) -> Result<Vec<String>, ConnectorError> {
+            Ok(self
+                .poll_records(max)?
+                .into_iter()
+                .map(|record| record.payload)
+                .collect())
+        }
+
+        fn poll_records(&mut self, max: usize) -> Result<Vec<RawCdcRecord>, ConnectorError> {
+            let n = max.min(self.records.len());
+            Ok(self.records.drain(..n).collect())
+        }
+
+        fn resume_from(
+            &mut self,
+            offsets: &std::collections::BTreeMap<String, i64>,
+        ) -> Result<(), ConnectorError> {
+            let table = self.table.clone();
+            self.records.retain(|record| {
+                offsets
+                    .get(&format!("{}-{}", table, record.partition_id))
+                    .is_none_or(|next| record.offset >= *next)
+            });
+            Ok(())
+        }
+    }
+
+    async fn orders_lakehouse() -> (
+        Arc<crate::lakehouse::MemoryLakehouseTable>,
+        crate::lakehouse::MemoryIcebergTwoPhaseCommit,
+    ) {
+        use crate::lakehouse::{
+            IcebergTableRef, MemoryIcebergTwoPhaseCommit, MemoryLakehouseTable, SchemaField,
+            SchemaVersion,
+        };
+        let schema = SchemaVersion {
+            schema_id: 1,
+            fields: vec![SchemaField {
+                id: 1,
+                name: "id".to_string(),
+                required: false,
+                data_type: "string".to_string(),
+            }],
+        };
+        let table = Arc::new(MemoryLakehouseTable::new(
+            IcebergTableRef::new("cat", "ns", "orders"),
+            schema,
+        ));
+        let tpc = MemoryIcebergTwoPhaseCommit::new(table.clone());
+        (table, tpc)
+    }
+
+    async fn table_row_count(table: &crate::lakehouse::MemoryLakehouseTable) -> usize {
+        use crate::lakehouse::{IcebergScanOptions, LakehouseTable};
+        table
+            .scan(&IcebergScanOptions::default())
+            .await
+            .unwrap()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum()
+    }
+
+    fn orders_pipeline() -> CdcToLakehousePipeline {
+        CdcToLakehousePipeline::new(
+            "orders",
+            vec!["broker:9092".to_string()],
+            "my_catalog",
+            "warehouse.orders",
+            vec!["id".to_string()],
+        )
+    }
+
+    /// Crash-window regression: a snapshot commits but the process dies before
+    /// the source offset commit. On restart the source is positioned earlier,
+    /// yet the rows already covered by the snapshot's committed offsets must
+    /// not be appended a second time.
+    #[tokio::test]
+    async fn run_with_iceberg_sink_restart_does_not_duplicate_committed_rows() {
+        let (table, tpc) = orders_lakehouse().await;
+        let pipeline = orders_pipeline();
+
+        let (_tx1, rx1) = tokio::sync::watch::channel(false);
+        let snapshots = pipeline
+            .run_with_iceberg_sink(ResumableRecordSource::orders(0..3), &tpc, rx1)
+            .await
+            .unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(table_row_count(&table).await, 3);
+
+        // "Crash" before the source offset commit landed: restart the pipeline
+        // with a fresh source positioned back at offset 0.
+        let (_tx2, rx2) = tokio::sync::watch::channel(false);
+        pipeline
+            .run_with_iceberg_sink(ResumableRecordSource::orders(0..3), &tpc, rx2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            table_row_count(&table).await,
+            3,
+            "restart must skip rows covered by committed offsets, not re-append them"
+        );
+    }
+
+    /// C6 regression: a partition whose only consumed records since the last
+    /// commit are tombstones must still have its offset merged into the
+    /// snapshot's committed offset summary.
+    #[tokio::test]
+    async fn run_with_iceberg_sink_commits_tombstone_tail_offsets() {
+        struct TombstoneTailSource {
+            records: std::collections::VecDeque<RawCdcRecord>,
+        }
+
+        impl CdcEventSource for TombstoneTailSource {
+            fn poll_events(&mut self, _max: usize) -> Result<Vec<String>, ConnectorError> {
+                Ok(Vec::new())
+            }
+
+            fn poll_records(&mut self, max: usize) -> Result<Vec<RawCdcRecord>, ConnectorError> {
+                let n = max.min(self.records.len());
+                Ok(self.records.drain(..n).collect())
+            }
+
+            fn pending_tombstone_offsets(&self) -> std::collections::BTreeMap<u32, i64> {
+                [(1_u32, 5_i64)].into_iter().collect()
+            }
+        }
+
+        let (_table, tpc) = orders_lakehouse().await;
+        let pipeline = orders_pipeline();
+        let source = TombstoneTailSource {
+            records: [RawCdcRecord::new(
+                r#"{"op":"c","source":{"lsn":1,"ts_ms":1,"table":"orders"},"after":{"id":"1"}}"#,
+                0,
+                0,
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+
+        pipeline
+            .run_with_iceberg_sink(source, &tpc, rx)
+            .await
+            .unwrap();
+
+        let offsets = tpc.committed_kafka_offsets().await;
+        assert_eq!(offsets.get("orders-0"), Some(&1), "event partition offset");
+        assert_eq!(
+            offsets.get("orders-1"),
+            Some(&5),
+            "tombstone-tail partition offset must be merged into the summary"
+        );
+    }
+
+    /// The schema-registry decode path drops CDC envelope semantics, so a CDC
+    /// pipeline must fail closed on binary records unless the caller opted in
+    /// to append-only ingestion.
+    #[cfg(feature = "schema-registry")]
+    #[tokio::test]
+    async fn registry_cdc_fails_closed_for_binary_records_without_append_only_optin() {
+        struct BinarySource {
+            records: Option<Vec<RawCdcRecord>>,
+        }
+
+        impl CdcEventSource for BinarySource {
+            fn poll_events(&mut self, _max: usize) -> Result<Vec<String>, ConnectorError> {
+                Ok(Vec::new())
+            }
+
+            fn poll_records(&mut self, _max: usize) -> Result<Vec<RawCdcRecord>, ConnectorError> {
+                Ok(self.records.take().unwrap_or_default())
+            }
+        }
+
+        let pipeline = CdcToLakehousePipeline::new(
+            "orders.cdc",
+            vec!["kafka:9092".into()],
+            "iceberg",
+            "warehouse.orders",
+            vec!["id".into()],
+        )
+        .with_schema_registry("http://registry:8081");
+        let source = BinarySource {
+            records: Some(vec![RawCdcRecord::with_bytes(
+                br#"{"id":1}"#.to_vec(),
+                0,
+                1,
+            )]),
+        };
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+
+        let error = pipeline
+            .run_with_source(source, |_| Ok(()), rx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("append-only"),
+            "expected the append-only fail-closed error, got: {error}"
+        );
+    }
+
+    #[cfg(feature = "state")]
+    mod state_offset_tests {
+        use std::sync::{Arc, Mutex};
+
+        use krishiv_state::{InMemoryStateBackend, Namespace, StateBackend, StateResult};
+
+        use super::super::CdcOffsetTracker;
+        use super::{ResumableRecordSource, orders_lakehouse, orders_pipeline, table_row_count};
+
+        /// Test double sharing one in-memory backend across "restarts".
+        #[derive(Clone)]
+        struct SharedBackend(Arc<Mutex<InMemoryStateBackend>>);
+
+        impl SharedBackend {
+            fn lock(&self) -> std::sync::MutexGuard<'_, InMemoryStateBackend> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            }
+        }
+
+        impl StateBackend for SharedBackend {
+            fn get(&self, ns: &Namespace, key: &[u8]) -> StateResult<Option<Vec<u8>>> {
+                self.lock().get(ns, key)
+            }
+
+            fn put(&mut self, ns: &Namespace, key: Vec<u8>, value: Vec<u8>) -> StateResult<()> {
+                self.lock().put(ns, key, value)
+            }
+
+            fn delete(&mut self, ns: &Namespace, key: &[u8]) -> StateResult<()> {
+                self.lock().delete(ns, key)
+            }
+
+            fn clear_namespace(&mut self, ns: &Namespace) -> StateResult<()> {
+                self.lock().clear_namespace(ns)
+            }
+
+            fn list_namespaces(&self) -> StateResult<Vec<Namespace>> {
+                self.lock().list_namespaces()
+            }
+
+            fn list_keys(&self, ns: &Namespace) -> StateResult<Vec<Vec<u8>>> {
+                self.lock().list_keys(ns)
+            }
+
+            fn snapshot(&self) -> StateResult<Vec<u8>> {
+                self.lock().snapshot()
+            }
+
+            fn load_snapshot(&mut self, bytes: &[u8]) -> StateResult<()> {
+                self.lock().load_snapshot(bytes)
+            }
+        }
+
+        /// The `state` feature's offset persistence must survive a restart:
+        /// offsets committed by run 1 are read back by run 2 and used to seek
+        /// the source past already-processed records.
+        #[tokio::test]
+        async fn offset_tracker_restart_resumes_from_persisted_offsets() {
+            let backend = SharedBackend(Arc::new(Mutex::new(InMemoryStateBackend::default())));
+            let pipeline = orders_pipeline();
+
+            // Run 1: process three records, persisting offsets to the tracker.
+            let (table1, tpc1) = orders_lakehouse().await;
+            let mut tracker = CdcOffsetTracker::new(Box::new(backend.clone()));
+            let (_tx1, rx1) = tokio::sync::watch::channel(false);
+            pipeline
+                .run_with_iceberg_sink_and_offset_tracker(
+                    ResumableRecordSource::orders(0..3),
+                    &tpc1,
+                    rx1,
+                    &mut tracker,
+                )
+                .await
+                .unwrap();
+            assert_eq!(table_row_count(&table1).await, 3);
+            assert_eq!(tracker.get_offset(0), Some(3));
+
+            // Run 2 ("restart"): a fresh tracker over the same backend and a
+            // fresh sink — resume must come from the persisted offsets alone.
+            let (table2, tpc2) = orders_lakehouse().await;
+            let mut tracker = CdcOffsetTracker::new(Box::new(backend));
+            assert_eq!(
+                tracker.get_offset(0),
+                Some(3),
+                "tracker must reload persisted offsets on startup"
+            );
+            let (_tx2, rx2) = tokio::sync::watch::channel(false);
+            let snapshots = pipeline
+                .run_with_iceberg_sink_and_offset_tracker(
+                    ResumableRecordSource::orders(0..3),
+                    &tpc2,
+                    rx2,
+                    &mut tracker,
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                snapshots.is_empty(),
+                "already-committed records must be skipped after restart"
+            );
+            assert_eq!(table_row_count(&table2).await, 0);
+        }
     }
 }

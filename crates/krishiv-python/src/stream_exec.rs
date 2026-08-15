@@ -138,4 +138,3 @@ pub(crate) fn execute_pipeline(pipeline: &StreamPipeline) -> PyResult<Vec<PyBatc
         .map_err(|e| map_krishiv_error(krishiv_api::KrishivError::from(e)))?;
     Ok(output.into_iter().map(PyBatch::from_record_batch).collect())
 }
-

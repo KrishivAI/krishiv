@@ -440,7 +440,10 @@ mod tests {
     fn parses_pivot_without_a_space_before_the_paren() {
         let sql = "SELECT * FROM sales PIVOT(SUM(amount) FOR category IN ('food', 'tech'))";
         let pivot = parse_pivot(sql).unwrap().unwrap();
-        assert_eq!(pivot.agg_fn, "SUM", "the aggregate name must not be clipped");
+        assert_eq!(
+            pivot.agg_fn, "SUM",
+            "the aggregate name must not be clipped"
+        );
         assert_eq!(pivot.agg_column, "amount");
         assert_eq!(pivot.for_column, "category");
         assert_eq!(pivot.in_values, vec!["'food'", "'tech'"]);

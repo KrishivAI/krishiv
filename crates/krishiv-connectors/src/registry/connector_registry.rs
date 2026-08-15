@@ -33,23 +33,43 @@ impl ConnectorRegistry {
 
     pub fn register_source(&mut self, driver: SharedSourceDriver) {
         let kind = driver.descriptor().kind;
-        self.sources.insert(kind, driver);
+        if self.sources.insert(kind, driver).is_some() {
+            tracing::warn!(
+                kind = kind.as_str(),
+                "replacing previously registered source driver"
+            );
+        }
     }
 
     pub fn register_sink(&mut self, driver: SharedSinkDriver) {
         let kind = driver.descriptor().kind;
-        self.sinks.insert(kind, driver);
+        if self.sinks.insert(kind, driver).is_some() {
+            tracing::warn!(
+                kind = kind.as_str(),
+                "replacing previously registered sink driver"
+            );
+        }
     }
 
     pub fn register_two_phase_sink(&mut self, driver: SharedTwoPhaseSinkDriver) {
         let kind = driver.descriptor().kind;
-        self.two_phase_sinks.insert(kind, driver);
+        if self.two_phase_sinks.insert(kind, driver).is_some() {
+            tracing::warn!(
+                kind = kind.as_str(),
+                "replacing previously registered two-phase sink driver"
+            );
+        }
     }
 
     #[cfg(feature = "vector-sinks")]
     pub fn register_vector_sink(&mut self, driver: SharedVectorSinkDriver) {
         let kind = driver.descriptor().kind;
-        self.vector_sinks.insert(kind, driver);
+        if self.vector_sinks.insert(kind, driver).is_some() {
+            tracing::warn!(
+                kind = kind.as_str(),
+                "replacing previously registered vector sink driver"
+            );
+        }
     }
 
     pub fn source_descriptor(&self, kind: ConnectorKind) -> Option<ConnectorDescriptor> {

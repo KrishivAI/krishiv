@@ -72,7 +72,11 @@ pub(crate) fn embeddings_to_f32(
     let mut flat = Vec::new();
     let mut dim: Option<usize> = None;
     let mut push_row = |values: &dyn Array| -> SqlResult<()> {
-        let downcast_err = || err(format!("ann_search: '{column_name}' element downcast failed"));
+        let downcast_err = || {
+            err(format!(
+                "ann_search: '{column_name}' element downcast failed"
+            ))
+        };
         let row: Vec<f32> = match values.data_type() {
             DataType::Float32 => values
                 .as_any()
@@ -153,9 +157,12 @@ pub(crate) fn concat_embedding_batches(
     let mut flat = Vec::new();
     let mut dim = 0usize;
     for batch in batches {
-        let column = batch.columns().get(col_idx).ok_or_else(|| SqlError::DataFusion {
-            message: format!("embedding column index {col_idx} out of range"),
-        })?;
+        let column = batch
+            .columns()
+            .get(col_idx)
+            .ok_or_else(|| SqlError::DataFusion {
+                message: format!("embedding column index {col_idx} out of range"),
+            })?;
         let (rows, batch_dim) = embeddings_to_f32(column.as_ref(), column_name)?;
         if batch_dim != 0 {
             if dim != 0 && dim != batch_dim {
@@ -264,7 +271,9 @@ impl SmallestK {
     }
     /// The current k-th smallest, once `k` values have been kept.
     fn kth(&self) -> Option<f64> {
-        (self.heap.len() == self.k).then(|| self.heap.peek().map(|t| t.0)).flatten()
+        (self.heap.len() == self.k)
+            .then(|| self.heap.peek().map(|t| t.0))
+            .flatten()
     }
 }
 
@@ -431,8 +440,7 @@ impl TableVectorIndex {
 
 /// The per-engine cache: `table␟column` → its index. Shared with the
 /// `ann_rewrite` optimizer rule, which holds a clone of this `Arc`.
-pub(crate) type VectorIndexCache =
-    Arc<std::sync::RwLock<HashMap<String, Arc<TableVectorIndex>>>>;
+pub(crate) type VectorIndexCache = Arc<std::sync::RwLock<HashMap<String, Arc<TableVectorIndex>>>>;
 
 /// Normalize a table reference for cache keying: the bare table segment,
 /// unquoted, lowercased. Schema-qualified spellings of one table collapse
@@ -721,8 +729,7 @@ impl crate::SqlEngine {
             .unwrap_or("")
             .to_ascii_uppercase();
         const READ_SHAPED: &[&str] = &[
-            "SELECT", "WITH", "VALUES", "EXPLAIN", "SHOW", "DESCRIBE", "DESC", "TABLE",
-            "ANALYZE",
+            "SELECT", "WITH", "VALUES", "EXPLAIN", "SHOW", "DESCRIBE", "DESC", "TABLE", "ANALYZE",
         ];
         if !READ_SHAPED.contains(&first_word.as_str()) {
             if let Ok(mut cache) = self.vector_indexes.write() {
@@ -937,7 +944,10 @@ mod tests {
             .await
             .unwrap();
         let ids: Vec<String> = hits.into_iter().map(|h| h.id).collect();
-        assert_eq!(ids, brute_force_ids(&engine, "[20.0, 21.0, 19.0, 20.5]", 5).await);
+        assert_eq!(
+            ids,
+            brute_force_ids(&engine, "[20.0, 21.0, 19.0, 20.5]", 5).await
+        );
     }
 
     #[tokio::test]
@@ -1005,7 +1015,10 @@ mod tests {
             .await
             .unwrap();
         let ann_ids: Vec<String> = hits.into_iter().map(|h| h.id).collect();
-        assert_eq!(ann_ids, brute_force_ids(&engine, "[20.0, 21.0, 19.0, 20.5]", 5).await);
+        assert_eq!(
+            ann_ids,
+            brute_force_ids(&engine, "[20.0, 21.0, 19.0, 20.5]", 5).await
+        );
 
         // A plain file (no footer) registers fine but loads no index.
         let plain = dir.path().join("plain.parquet");
@@ -1013,19 +1026,19 @@ mod tests {
         let engine2 = crate::SqlEngine::new();
         // Strip the footer by rewriting through a plain writer.
         let file = std::fs::File::open(&plain).unwrap();
-        let reader = datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+        let reader =
+            datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                file,
+            )
             .unwrap()
             .build()
             .unwrap();
         let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
         let stripped = dir.path().join("stripped.parquet");
         let out = std::fs::File::create(&stripped).unwrap();
-        let mut writer = datafusion::parquet::arrow::ArrowWriter::try_new(
-            out,
-            batches[0].schema(),
-            None,
-        )
-        .unwrap();
+        let mut writer =
+            datafusion::parquet::arrow::ArrowWriter::try_new(out, batches[0].schema(), None)
+                .unwrap();
         for b in &batches {
             writer.write(b).unwrap();
         }
@@ -1037,7 +1050,9 @@ mod tests {
         assert!(!loaded, "no footer, no index — but the table still works");
         assert!(engine2.vector_index_entry("docs", "emb").is_none());
         assert_eq!(
-            brute_force_ids(&engine2, "[20.0, 21.0, 19.0, 20.5]", 5).await.len(),
+            brute_force_ids(&engine2, "[20.0, 21.0, 19.0, 20.5]", 5)
+                .await
+                .len(),
             5
         );
     }
@@ -1068,7 +1083,10 @@ mod tests {
             let got = entry
                 .exact_kth_sql_distance(&q, k, SqlDistanceFn::Euclidean)
                 .unwrap();
-            assert!((got - expected).abs() < 1e-12, "euclid k={k}: {got} vs {expected}");
+            assert!(
+                (got - expected).abs() < 1e-12,
+                "euclid k={k}: {got} vs {expected}"
+            );
 
             // Brute-force k-th, cosine (zero vectors excluded, as SQL NULLs).
             let mut cos: Vec<f64> = rows
@@ -1080,7 +1098,10 @@ mod tests {
             let got = entry
                 .exact_kth_sql_distance(&q, k, SqlDistanceFn::CosineDistance)
                 .unwrap();
-            assert!((got - expected).abs() < 1e-12, "cosine k={k}: {got} vs {expected}");
+            assert!(
+                (got - expected).abs() < 1e-12,
+                "cosine k={k}: {got} vs {expected}"
+            );
         }
 
         // More rows requested than defined distances → decline.

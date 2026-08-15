@@ -164,7 +164,9 @@ mod tests {
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
         (0..n * dim)
             .map(|_| {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let u = (state >> 40) as f32 / (1u64 << 24) as f32; // [0,1)
                 u * 20.0 - 10.0
             })
@@ -249,19 +251,16 @@ mod tests {
         let reranked = candidates
             .iter()
             .min_by(|&&a, &&b| {
-                let da = VectorMetric::L2.distance(
-                    &q,
-                    rows.chunks_exact(dim).nth(a).unwrap(),
-                );
-                let db = VectorMetric::L2.distance(
-                    &q,
-                    rows.chunks_exact(dim).nth(b).unwrap(),
-                );
+                let da = VectorMetric::L2.distance(&q, rows.chunks_exact(dim).nth(a).unwrap());
+                let db = VectorMetric::L2.distance(&q, rows.chunks_exact(dim).nth(b).unwrap());
                 da.total_cmp(&db)
             })
             .copied()
             .unwrap();
-        assert_eq!(reranked, exact_best, "exact re-rank recovers the true top-1");
+        assert_eq!(
+            reranked, exact_best,
+            "exact re-rank recovers the true top-1"
+        );
     }
 
     #[test]
@@ -286,7 +285,10 @@ mod tests {
     #[test]
     fn rejects_bad_shapes() {
         assert!(ScalarQuantizer::fit(&[], 4, 8).is_err());
-        assert!(ScalarQuantizer::fit(&[1.0, 2.0, 3.0], 2, 8).is_err(), "ragged");
+        assert!(
+            ScalarQuantizer::fit(&[1.0, 2.0, 3.0], 2, 8).is_err(),
+            "ragged"
+        );
         assert!(ScalarQuantizer::fit(&[1.0, 2.0], 2, 0).is_err(), "bits 0");
         assert!(ScalarQuantizer::fit(&[1.0, 2.0], 2, 17).is_err(), "bits 17");
     }

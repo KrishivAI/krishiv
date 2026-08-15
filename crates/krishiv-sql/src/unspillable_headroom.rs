@@ -180,7 +180,11 @@ impl MemoryPool for UnspillableHeadroomPool {
         self.inner.shrink(reservation, shrink);
     }
 
-    fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> datafusion::error::Result<()> {
+    fn try_grow(
+        &self,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) -> datafusion::error::Result<()> {
         if !reservation.consumer().can_spill() {
             return self.inner.try_grow(reservation, additional);
         }
@@ -192,18 +196,20 @@ impl MemoryPool for UnspillableHeadroomPool {
         };
         let requested = used.saturating_add(additional);
         if requested > self.spillable_ceiling {
-            return Err(datafusion::error::DataFusionError::ResourcesExhausted(format!(
-                "spillable consumers are capped at {} of the {} pool so that operators \
+            return Err(datafusion::error::DataFusionError::ResourcesExhausted(
+                format!(
+                    "spillable consumers are capped at {} of the {} pool so that operators \
                  which cannot spill (hash join build sides) keep a usable floor; \
                  '{}' asked for {additional} more with {} already held across all \
                  spillable consumers. This consumer should spill. Set {}=0 to \
                  restore unbounded fair-share behaviour.",
-                human_bytes(self.spillable_ceiling),
-                human_bytes(self.pool_size),
-                reservation.consumer().name(),
-                human_bytes(*used),
-                UNSPILLABLE_HEADROOM_PERCENT_ENV,
-            )));
+                    human_bytes(self.spillable_ceiling),
+                    human_bytes(self.pool_size),
+                    reservation.consumer().name(),
+                    human_bytes(*used),
+                    UNSPILLABLE_HEADROOM_PERCENT_ENV,
+                ),
+            ));
         }
         self.inner.try_grow(reservation, additional)?;
         *used = requested;
@@ -252,15 +258,14 @@ mod tests {
         let spiller = MemoryConsumer::new("ShuffleWriteBuffer")
             .with_can_spill(true)
             .register(&bare);
-        spiller.try_grow(SIZE).expect("the only spiller may take it all");
+        spiller
+            .try_grow(SIZE)
+            .expect("the only spiller may take it all");
         let join = MemoryConsumer::new("HashJoinInput").register(&bare);
         let error = join
             .try_grow(877)
             .expect_err("this is the q10/q11 failure and it must reproduce");
-        assert!(
-            error.to_string().contains("HashJoinInput"),
-            "got: {error}"
-        );
+        assert!(error.to_string().contains("HashJoinInput"), "got: {error}");
 
         // With headroom: the spiller is capped, and the join is served.
         let guarded = pool(SIZE, SIZE / 4);
@@ -349,7 +354,9 @@ mod tests {
             );
             // Behaviour, not just the name: a lone spiller must be refused the
             // whole budget so a hash join build side keeps a floor.
-            let spiller = MemoryConsumer::new("s").with_can_spill(true).register(&pool);
+            let spiller = MemoryConsumer::new("s")
+                .with_can_spill(true)
+                .register(&pool);
             assert!(
                 spiller.try_grow(SIZE).is_err(),
                 "{label}: a lone spiller took the entire pool, so the guard is absent"
@@ -385,6 +392,8 @@ mod tests {
         let spiller = MemoryConsumer::new("s")
             .with_can_spill(true)
             .register(&guarded);
-        spiller.try_grow(SIZE).expect("ceiling disabled, not zeroed");
+        spiller
+            .try_grow(SIZE)
+            .expect("ceiling disabled, not zeroed");
     }
 }

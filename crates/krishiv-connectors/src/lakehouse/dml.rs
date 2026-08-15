@@ -73,11 +73,7 @@ async fn scan_iceberg_table(
     // Every caller of this helper (delete_where, update_where, merge_into)
     // reads the whole table and then rewrites it, so an empty read is a
     // rewrite that keeps nothing. This early return is that exact path.
-    crate::lakehouse::empty_plan_guard::guard_empty_plan(
-        table,
-        tasks.len(),
-        "scan_iceberg_table",
-    )?;
+    crate::lakehouse::empty_plan_guard::guard_empty_plan(table, tasks.len(), "scan_iceberg_table")?;
     if tasks.is_empty() {
         return Ok(vec![]);
     }
@@ -143,7 +139,6 @@ pub async fn iceberg_delete_where(
         return Ok((0, -1)); // -1: no snapshot needed (table empty, no-op)
     }
 
-    let total_rows: i64 = all_batches.iter().map(|b| b.num_rows() as i64).sum();
     let schema = all_batches
         .first()
         .ok_or_else(|| LakehouseError::Iceberg("empty batches".to_string()))?
@@ -156,7 +151,21 @@ pub async fn iceberg_delete_where(
     ctx.register_table(&tmp_name, Arc::new(mem))
         .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
 
-    let survive_sql = format!("SELECT * FROM \"{tmp_name}\" WHERE NOT ({predicate_sql})");
+    // SQL DELETE removes only rows where the predicate is TRUE — rows where
+    // it evaluates to NULL survive, so `NOT (pred)` (NULL for them) would
+    // wrongly drop them. `IS DISTINCT FROM TRUE` keeps FALSE and NULL rows.
+    let count_sql = format!("SELECT COUNT(*) FROM \"{tmp_name}\" WHERE {predicate_sql}");
+    let count_batches = ctx
+        .sql(&count_sql)
+        .await
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?
+        .collect()
+        .await
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+    let deleted = extract_count(&count_batches).max(0) as u64;
+
+    let survive_sql =
+        format!("SELECT * FROM \"{tmp_name}\" WHERE ({predicate_sql}) IS DISTINCT FROM TRUE");
     let surviving_batches = ctx
         .sql(&survive_sql)
         .await
@@ -166,9 +175,6 @@ pub async fn iceberg_delete_where(
         .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
 
     let _ = ctx.deregister_table(&tmp_name);
-
-    let surviving_rows: i64 = surviving_batches.iter().map(|b| b.num_rows() as i64).sum();
-    let deleted = (total_rows - surviving_rows).max(0) as u64;
 
     let snapshot_id = overwrite_table_pub(catalog, table_ident, surviving_batches).await?;
     Ok((deleted, snapshot_id))
@@ -266,6 +272,17 @@ pub async fn iceberg_merge_into(
         return Ok((0, -1));
     }
 
+    // The in-memory twin rejects duplicate source keys outright; the FULL
+    // OUTER JOIN below would silently fan each matched target row out once
+    // per duplicate, so enforce the same contract here.
+    let key_columns: Vec<String> = merge_keys.iter().map(|k| (*k).to_string()).collect();
+    super::collect_keys(&source_batches, &key_columns)?;
+
+    // With duplicates rejected, each source row either updates or inserts
+    // exactly one target row, so the affected count is the source row count
+    // (never the post-merge table size).
+    let rows_affected: u64 = source_batches.iter().map(|b| b.num_rows() as u64).sum();
+
     let table = catalog
         .load_table(target_ident)
         .await
@@ -305,11 +322,21 @@ pub async fn iceberg_merge_into(
             .collect::<Vec<_>>()
             .join(" AND ");
 
+        // The first merge key doubles as the match marker: a non-NULL
+        // s.<key> means the source side is present for this joined row, so
+        // the source value wins even when it is NULL (COALESCE could never
+        // write a NULL over an existing target value). A source row whose
+        // KEY is NULL never matches anything under SQL join semantics, so
+        // the marker cannot misread it as absent-vs-present.
+        let marker_key = merge_keys.first().ok_or_else(|| {
+            LakehouseError::Iceberg("merge requires at least one key column".to_string())
+        })?;
+        let qm = quote_identifier(marker_key);
         let select_cols: Vec<String> = field_names
             .iter()
             .map(|col| {
                 let qc = quote_identifier(col);
-                format!("COALESCE(s.{qc}, t.{qc}) AS {qc}")
+                format!("CASE WHEN s.{qm} IS NOT NULL THEN s.{qc} ELSE t.{qc} END AS {qc}")
             })
             .collect();
 
@@ -325,7 +352,6 @@ pub async fn iceberg_merge_into(
             .collect()
             .await
             .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
-        let rows_affected: u64 = merged_batches.iter().map(|b| b.num_rows() as u64).sum();
 
         let _ = ctx.deregister_table(&target_name);
         let _ = ctx.deregister_table(&source_name);
@@ -334,7 +360,6 @@ pub async fn iceberg_merge_into(
         Ok((rows_affected, snapshot_id))
     } else {
         // Empty target: just insert all source rows.
-        let rows_affected: u64 = source_batches.iter().map(|b| b.num_rows() as u64).sum();
         let snapshot_id = overwrite_table_pub(catalog, target_ident, source_batches).await?;
         Ok((rows_affected, snapshot_id))
     }
@@ -378,6 +403,35 @@ pub async fn overwrite_table_pub(
         )
     };
 
+    // Collect the current snapshot's data files up front: drop+recreate is
+    // metadata-only, so without explicit cleanup every copy-on-write rewrite
+    // would orphan the previous snapshot's Parquet files (same unbounded
+    // growth land_ctas replaces guard against). Deleted only after the new
+    // state is committed.
+    let mut replaced_files: Vec<String> = Vec::new();
+    if table.metadata().current_snapshot().is_some() {
+        match table.scan().build() {
+            Ok(scan) => match scan.plan_files().await {
+                Ok(stream) => {
+                    let tasks: Vec<iceberg::scan::FileScanTask> =
+                        stream.try_collect().await.unwrap_or_default();
+                    replaced_files = tasks
+                        .iter()
+                        .map(|t| t.data_file_path().to_string())
+                        .collect();
+                }
+                Err(e) => {
+                    tracing::warn!(table = %ident, error = %e,
+                        "cannot enumerate replaced data files; they will be orphaned");
+                }
+            },
+            Err(e) => {
+                tracing::warn!(table = %ident, error = %e,
+                    "cannot plan replaced table scan; old data files will be orphaned");
+            }
+        }
+    }
+
     let has_rows = batches.iter().any(|b| b.num_rows() > 0);
 
     if !has_rows {
@@ -386,16 +440,15 @@ pub async fn overwrite_table_pub(
             .drop_table(ident)
             .await
             .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
-        let creation = TableCreation::builder()
-            .name(ident.name().to_string())
-            .schema((*iceberg_schema).clone())
-            .partition_spec_opt(unbound_spec)
-            .location(table_location)
-            .build();
-        let new_table = catalog
-            .create_table(ident.namespace(), creation)
-            .await
-            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+        let new_table = recreate_with_restore(
+            &catalog,
+            ident,
+            iceberg_schema.as_ref(),
+            unbound_spec,
+            &table_location,
+        )
+        .await?;
+        delete_replaced_files(&file_io, ident, &replaced_files).await;
         // -1 sentinel: iceberg-rust 0.9.1 returns no snapshot for empty tables;
         // callers must treat -1 as "no snapshot"
         return Ok(new_table
@@ -441,45 +494,14 @@ pub async fn overwrite_table_pub(
         .await
         .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
 
-    let create_result = catalog
-        .create_table(
-            ident.namespace(),
-            TableCreation::builder()
-                .name(ident.name().to_string())
-                .schema((*iceberg_schema).clone())
-                .partition_spec_opt(unbound_spec.clone())
-                .location(table_location.clone())
-                .build(),
-        )
-        .await;
-
-    let new_table = match create_result {
-        Ok(t) => t,
-        Err(create_err) => {
-            // Recreate failed — try to restore the original table so we don't leave it invisible
-            // (best-effort: if this also fails, log and propagate the original error)
-            if let Err(restore_err) = catalog
-                .create_table(
-                    ident.namespace(),
-                    TableCreation::builder()
-                        .name(ident.name().to_string())
-                        .schema((*iceberg_schema).clone())
-                        .partition_spec_opt(unbound_spec.clone())
-                        .location(table_location.clone())
-                        .build(),
-                )
-                .await
-            {
-                tracing::error!(
-                    table = %ident,
-                    create_error = %create_err,
-                    restore_error = %restore_err,
-                    "CRITICAL: table is invisible after failed overwrite and restore attempt; manual intervention required"
-                );
-            }
-            return Err(LakehouseError::Iceberg(create_err.to_string()));
-        }
-    };
+    let new_table = recreate_with_restore(
+        &catalog,
+        ident,
+        iceberg_schema.as_ref(),
+        unbound_spec,
+        &table_location,
+    )
+    .await?;
 
     // Stamp the parts with the recreated table's spec id and commit them
     // via fast_append.
@@ -500,8 +522,12 @@ pub async fn overwrite_table_pub(
 
     // CONN-4: Update the version-hint after commit so DML changes survive
     // restart. Without this, the hint still points at the old (dropped)
-    // table's metadata and all DML changes are silently rolled back on restart.
-    if let Some(loc) = committed.metadata_location() {
+    // table's metadata and all DML changes are silently rolled back on
+    // restart. Local-FS native tables only; object-store tables (REST
+    // catalog) do not use one.
+    if table_location.starts_with("file://")
+        && let Some(loc) = committed.metadata_location()
+    {
         let table_root = std::path::Path::new(table_location.trim_start_matches("file://"));
         if let Err(e) = super::iceberg_native::native::write_version_hint(table_root, loc) {
             tracing::warn!(
@@ -513,12 +539,75 @@ pub async fn overwrite_table_pub(
         }
     }
 
+    delete_replaced_files(&file_io, ident, &replaced_files).await;
+
     let snapshot_id = committed
         .metadata()
         .current_snapshot()
         .map(|s| s.snapshot_id())
         .unwrap_or(-1);
     Ok(snapshot_id)
+}
+
+/// Drop+recreate step shared by the truncate and rewrite paths of
+/// [`overwrite_table_pub`]: recreate the table after the drop; if the
+/// recreate fails, attempt to restore the original table so it is not left
+/// invisible (best-effort — a double failure logs CRITICAL for manual
+/// intervention and the original error propagates).
+async fn recreate_with_restore(
+    catalog: &Arc<dyn Catalog + Send + Sync>,
+    ident: &TableIdent,
+    schema: &iceberg::spec::Schema,
+    unbound_spec: Option<iceberg::spec::UnboundPartitionSpec>,
+    location: &str,
+) -> Result<iceberg::table::Table, LakehouseError> {
+    let creation = || {
+        TableCreation::builder()
+            .name(ident.name().to_string())
+            .schema(schema.clone())
+            .partition_spec_opt(unbound_spec.clone())
+            .location(location.to_string())
+            .build()
+    };
+    match catalog.create_table(ident.namespace(), creation()).await {
+        Ok(t) => Ok(t),
+        Err(create_err) => {
+            if let Err(restore_err) = catalog.create_table(ident.namespace(), creation()).await {
+                tracing::error!(
+                    table = %ident,
+                    create_error = %create_err,
+                    restore_error = %restore_err,
+                    "CRITICAL: table is invisible after failed overwrite and restore attempt; manual intervention required"
+                );
+            }
+            Err(LakehouseError::Iceberg(create_err.to_string()))
+        }
+    }
+}
+
+/// Best-effort removal of a replaced snapshot's data files once the new
+/// state is committed and visible. A failed delete only leaves an orphan; it
+/// never corrupts the new table.
+async fn delete_replaced_files(
+    file_io: &iceberg::io::FileIO,
+    ident: &TableIdent,
+    replaced_files: &[String],
+) {
+    if replaced_files.is_empty() {
+        return;
+    }
+    let mut removed = 0usize;
+    for path in replaced_files {
+        match file_io.delete(path).await {
+            Ok(()) => removed += 1,
+            Err(e) => {
+                tracing::warn!(table = %ident, path, error = %e,
+                    "failed to delete replaced data file (orphaned)");
+            }
+        }
+    }
+    tracing::info!(table = %ident, removed, total = replaced_files.len(),
+        "removed replaced snapshot's data files");
 }
 
 // ── CTAS landing (durable CREATE [OR REPLACE] TABLE … AS SELECT) ─────────────
@@ -1424,6 +1513,222 @@ mod tests {
         assert_eq!(deleted, 0, "empty table: no rows to delete");
     }
 
+    async fn batches_of(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
+        ctx.sql(sql).await.unwrap().collect().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn delete_where_keeps_rows_with_null_predicate() {
+        let (catalog, _dir) = make_empty_catalog().await;
+        let ctx = SessionContext::new();
+        let ident = TableIdent::new(NamespaceIdent::new("pipe".into()), "nulls".into());
+        let stream = stream_of(
+            &ctx,
+            "SELECT * FROM (VALUES (1, 'x'), (2, NULL), (3, 'y')) AS t(id, name)",
+        )
+        .await;
+        land_ctas(Arc::clone(&catalog), &ident, false, &[], stream)
+            .await
+            .unwrap();
+
+        // SQL DELETE removes only pred=TRUE rows; the NULL-name row's
+        // predicate evaluates to NULL and the row must survive.
+        let (deleted, _snap) =
+            iceberg_delete_where(Arc::clone(&catalog), &ident, "name = 'x'", &ctx)
+                .await
+                .unwrap();
+        assert_eq!(deleted, 1, "only the pred-TRUE row counts as deleted");
+        let rows: usize = table_rows(&catalog, &ident, &ctx)
+            .await
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 2, "the NULL-predicate row must survive the delete");
+    }
+
+    #[tokio::test]
+    async fn merge_reports_source_driven_affected_count() {
+        let (catalog, _dir) = make_empty_catalog().await;
+        let ctx = SessionContext::new();
+        let ident = TableIdent::new(NamespaceIdent::new("pipe".into()), "merge_cnt".into());
+        let stream = stream_of(
+            &ctx,
+            "SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) AS t(id, name)",
+        )
+        .await;
+        land_ctas(Arc::clone(&catalog), &ident, false, &[], stream)
+            .await
+            .unwrap();
+
+        // One matched (update) + one unmatched (insert) source row.
+        let source = batches_of(
+            &ctx,
+            "SELECT * FROM (VALUES (2, 'B'), (9, 'z')) AS t(id, name)",
+        )
+        .await;
+        let (affected, _snap) =
+            iceberg_merge_into(Arc::clone(&catalog), &ident, source, &["id"], &ctx)
+                .await
+                .unwrap();
+        assert_eq!(
+            affected, 2,
+            "affected must be the source-driven count, not the post-merge table size"
+        );
+        let rows: usize = table_rows(&catalog, &ident, &ctx)
+            .await
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 4);
+    }
+
+    #[tokio::test]
+    async fn merge_writes_null_source_values_over_target() {
+        let (catalog, _dir) = make_empty_catalog().await;
+        let ctx = SessionContext::new();
+        let ident = TableIdent::new(NamespaceIdent::new("pipe".into()), "merge_null".into());
+        let stream = stream_of(
+            &ctx,
+            "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name)",
+        )
+        .await;
+        land_ctas(Arc::clone(&catalog), &ident, false, &[], stream)
+            .await
+            .unwrap();
+
+        // The matched source row carries NULL in the non-key column: the
+        // merge must set the target column to NULL, not keep 'a'.
+        let source = batches_of(
+            &ctx,
+            "SELECT * FROM (VALUES (1, CAST(NULL AS VARCHAR))) AS t(id, name)",
+        )
+        .await;
+        iceberg_merge_into(Arc::clone(&catalog), &ident, source, &["id"], &ctx)
+            .await
+            .unwrap();
+
+        let batches = table_rows(&catalog, &ident, &ctx).await;
+        let mut found = false;
+        for b in &batches {
+            let ids = b
+                .column(b.schema().index_of("id").unwrap())
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .clone();
+            let names = b.column(b.schema().index_of("name").unwrap()).clone();
+            for row in 0..b.num_rows() {
+                if ids.value(row) == 1 {
+                    found = true;
+                    assert!(
+                        names.is_null(row),
+                        "matched source NULL must overwrite the target value"
+                    );
+                }
+            }
+        }
+        assert!(found, "id=1 row must still exist after the merge");
+    }
+
+    #[tokio::test]
+    async fn merge_rejects_duplicate_source_keys() {
+        let (catalog, _dir) = make_empty_catalog().await;
+        let ctx = SessionContext::new();
+        let ident = TableIdent::new(NamespaceIdent::new("pipe".into()), "merge_dup".into());
+        let stream = stream_of(
+            &ctx,
+            "SELECT * FROM (VALUES (1, 'a'), (5, 'e')) AS t(id, name)",
+        )
+        .await;
+        land_ctas(Arc::clone(&catalog), &ident, false, &[], stream)
+            .await
+            .unwrap();
+
+        // Same contract as the in-memory twin: duplicate source keys would
+        // fan matched target rows out through the FULL OUTER JOIN.
+        let source = batches_of(
+            &ctx,
+            "SELECT * FROM (VALUES (5, 'p'), (5, 'q')) AS t(id, name)",
+        )
+        .await;
+        let err = iceberg_merge_into(Arc::clone(&catalog), &ident, source, &["id"], &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("duplicate key"), "got: {err}");
+        let rows: usize = table_rows(&catalog, &ident, &ctx)
+            .await
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 2, "a rejected merge must not change the table");
+    }
+
+    #[tokio::test]
+    async fn dml_overwrite_deletes_replaced_data_files() {
+        fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+            let mut out = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(root) {
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        out.extend(walkdir(&p));
+                    } else {
+                        out.push(p);
+                    }
+                }
+            }
+            out
+        }
+        let parquet_count = |root: &std::path::Path| -> usize {
+            walkdir(root)
+                .iter()
+                .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+                .count()
+        };
+
+        let (catalog, dir) = make_empty_catalog().await;
+        let ctx = SessionContext::new();
+        let ident = TableIdent::new(NamespaceIdent::new("pipe".into()), "cow_gc".into());
+        let stream = stream_of(
+            &ctx,
+            "SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) AS t(id, name)",
+        )
+        .await;
+        land_ctas(Arc::clone(&catalog), &ident, false, &[], stream)
+            .await
+            .unwrap();
+        assert_eq!(parquet_count(dir.path()), 1);
+
+        // Copy-on-write rewrite: the replaced file must be gone, the new one
+        // and the surviving data present.
+        let (deleted, _snap) = iceberg_delete_where(Arc::clone(&catalog), &ident, "id = 2", &ctx)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            parquet_count(dir.path()),
+            1,
+            "the replaced data file must be deleted after the rewrite commits"
+        );
+        let rows: usize = table_rows(&catalog, &ident, &ctx)
+            .await
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 2, "surviving rows still readable after cleanup");
+
+        // Truncate path (all rows deleted) must also clean up its old file.
+        let (deleted, _snap) = iceberg_delete_where(Arc::clone(&catalog), &ident, "id > 0", &ctx)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(
+            parquet_count(dir.path()),
+            0,
+            "truncate must delete the replaced data file too"
+        );
+    }
+
     // ── land_ctas ─────────────────────────────────────────────────────────────
 
     async fn make_empty_catalog() -> (Arc<dyn Catalog + Send + Sync>, tempfile::TempDir) {
@@ -1895,16 +2200,20 @@ mod tests {
         let ctx = SessionContext::new();
 
         // Table is ids {1,3,4} once the equality delete on id=2 is applied.
-        let (deleted, _snap) =
-            iceberg_delete_where(Arc::clone(&catalog), &ident, "id = 4", &ctx)
-                .await
-                .expect("delete_where over a MoR table must work since iceberg 0.10");
+        let (deleted, _snap) = iceberg_delete_where(Arc::clone(&catalog), &ident, "id = 4", &ctx)
+            .await
+            .expect("delete_where over a MoR table must work since iceberg 0.10");
         assert_eq!(deleted, 1, "exactly the id=4 row is deleted");
 
         let table = catalog.load_table(&ident).await.unwrap();
         let scan = table.scan().build().unwrap();
-        let tasks: Vec<iceberg::scan::FileScanTask> =
-            scan.plan_files().await.unwrap().try_collect().await.unwrap();
+        let tasks: Vec<iceberg::scan::FileScanTask> = scan
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
         assert!(
             tasks.iter().all(|t| t.deletes.is_empty()),
             "the rewrite must land delete-free"
@@ -1953,7 +2262,10 @@ mod tests {
         assert_eq!(emb.id, 2);
         match &*emb.field_type {
             iceberg::spec::Type::List(l) => {
-                assert!(l.element_field.id > 2, "element ids live above the top range");
+                assert!(
+                    l.element_field.id > 2,
+                    "element ids live above the top range"
+                );
                 assert!(matches!(
                     *l.element_field.field_type,
                     iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Double)
@@ -1974,7 +2286,9 @@ mod tests {
             ))),
             true,
         )]);
-        let err = arrow_schema_to_iceberg_schema(&nested).unwrap_err().to_string();
+        let err = arrow_schema_to_iceberg_schema(&nested)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("'bad'"), "{err}");
     }
 }

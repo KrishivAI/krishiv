@@ -25,8 +25,8 @@ use std::path::Path;
 use arrow::record_batch::RecordBatch;
 use base64::Engine as _;
 use datafusion::parquet::arrow::ArrowWriter;
-use datafusion::parquet::file::properties::WriterProperties;
 use datafusion::parquet::file::metadata::KeyValue;
+use datafusion::parquet::file::properties::WriterProperties;
 use datafusion::parquet::file::reader::FileReader;
 use datafusion::parquet::file::serialized_reader::SerializedFileReader;
 
@@ -61,8 +61,9 @@ pub fn write_parquet_with_vector_index(
         .index_of(embedding_col)
         .map_err(|e| format!("vector footer write: column '{embedding_col}': {e}"))?;
 
-    let (rows, dim) = crate::vector_search::concat_embedding_batches(batches, col_idx, embedding_col)
-        .map_err(|e| format!("vector footer write: {e}"))?;
+    let (rows, dim) =
+        crate::vector_search::concat_embedding_batches(batches, col_idx, embedding_col)
+            .map_err(|e| format!("vector footer write: {e}"))?;
     if dim == 0 {
         return Err("vector footer write: no rows to index".into());
     }
@@ -202,8 +203,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("docs.parquet");
         let batch = embedding_batch(25);
-        write_parquet_with_vector_index(&path, std::slice::from_ref(&batch), "emb", VectorMetric::L2, 0)
-            .unwrap();
+        write_parquet_with_vector_index(
+            &path,
+            std::slice::from_ref(&batch),
+            "emb",
+            VectorMetric::L2,
+            0,
+        )
+        .unwrap();
         let file = std::fs::File::open(&path).unwrap();
         let reader =
             datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(

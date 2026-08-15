@@ -88,10 +88,17 @@ impl SqlConnector {
         };
         // Optional `:<table>` tail. We look for the *last* `:` in
         // `rest`, but only treat it as the table separator when the
-        // suffix has no path/host separator (`/`) — otherwise it's
-        // userinfo (`u:p@h/d`) or a port (`h:3306/db`).
+        // suffix cannot be part of the URL itself:
+        // - contains `/` → it's the path (`u:p@h/d`, `h:3306/db`);
+        // - all digits → it's a port (`h:3306`);
+        // - contains `@` → it's the credential/host part (`u:p@h`).
         let (url, table) = match rest.rsplit_once(':') {
-            Some((u, t)) if !t.is_empty() && !t.contains('/') => {
+            Some((u, t))
+                if !t.is_empty()
+                    && !t.contains('/')
+                    && !t.contains('@')
+                    && !t.bytes().all(|b| b.is_ascii_digit()) =>
+            {
                 (u.to_string(), Some(t.to_string()))
             }
             _ => (rest.to_string(), None),
@@ -164,6 +171,26 @@ mod tests {
         assert_eq!(o.kind(), ConnectorKind::Oracle);
         assert_eq!(o.url(), "h/svc");
         assert_eq!(o.table(), None);
+    }
+
+    /// T9: URL forms whose tail is part of the URL itself must not have it
+    /// carved off as a table.
+    #[test]
+    fn parse_jdbc_keeps_port_and_credentials_out_of_the_table_slot() {
+        // Trailing port with no path: `3306` is a port, not a table.
+        let m = SqlConnector::parse_jdbc("jdbc:mysql://host:3306").unwrap();
+        assert_eq!(m.url(), "host:3306");
+        assert_eq!(m.table(), None);
+
+        // Credentials with no path: `p@host` is userinfo+host, not a table.
+        let c = SqlConnector::parse_jdbc("jdbc:mysql://u:p@host").unwrap();
+        assert_eq!(c.url(), "u:p@host");
+        assert_eq!(c.table(), None);
+
+        // A real table tail still parses.
+        let t = SqlConnector::parse_jdbc("jdbc:mysql://host:3306/db:orders").unwrap();
+        assert_eq!(t.url(), "host:3306/db");
+        assert_eq!(t.table(), Some("orders"));
     }
 
     /// T9: unrecognised engine token returns `None`.

@@ -16,7 +16,7 @@
 //!
 //! ```no_run
 //! # #[cfg(feature = "hbase")]
-//! # async fn example() -> anyhow::Result<()> {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! use krishiv_connectors::hbase_connector::{HBaseConfig, HBaseSink};
 //!
 //! let cfg = HBaseConfig::new("localhost:9090", "my_table", "cf");

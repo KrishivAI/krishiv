@@ -98,6 +98,9 @@ impl JdbcSource {
     /// CONN-5: Set the key column for keyset pagination. When set, the source
     /// uses `WHERE key > $last_key ORDER BY key LIMIT N` instead of
     /// `OFFSET`-based pagination, which is unstable under concurrent writes.
+    ///
+    /// The column must be `BIGINT` (int8); `read_batch` errors if the last
+    /// row's key cannot be read as an `i64`.
     #[must_use]
     pub fn with_key_column(mut self, col: impl Into<String>) -> Self {
         self.key_column = Some(col.into());
@@ -163,11 +166,21 @@ impl Source for JdbcSource {
             self.exhausted = true;
             return Ok(None);
         }
-        // CONN-5: Track the last key for keyset pagination.
+        // CONN-5: Track the last key for keyset pagination. The key column
+        // MUST be BIGINT (int8): a decode failure here means every page
+        // would re-issue the same WHERE clause and loop on the first page
+        // forever, so it is an error rather than a silent skip.
         if let Some(ref key_col) = self.key_column
             && let Some(last_row) = rows.last()
-            && let Ok(val) = last_row.try_get::<i64, _>(key_col.as_str())
         {
+            let val = last_row.try_get::<i64, _>(key_col.as_str()).map_err(|e| {
+                ConnectorError::Config {
+                    message: format!(
+                        "jdbc keyset pagination: key column '{key_col}' must be BIGINT \
+                         (int8) — could not read it as i64: {e}"
+                    ),
+                }
+            })?;
             self.last_key = Some(val);
         }
         self.offset = self.offset.saturating_add(rows.len() as u64);
@@ -215,8 +228,10 @@ pub enum JdbcOffset {
     Keyset {
         /// Column name used for keyset pagination.
         column: String,
-        /// Last observed key value.
-        last_key: i64,
+        /// Last observed key value; `None` when no row has been read yet,
+        /// so a restore returns to the no-`WHERE` first page rather than
+        /// inventing a sentinel key that would skip real rows.
+        last_key: Option<i64>,
     },
 }
 
@@ -229,11 +244,23 @@ impl crate::offset::Offset for JdbcOffset {
                 buf.extend_from_slice(&v.to_le_bytes());
             }
             JdbcOffset::Keyset { column, last_key } => {
-                buf.push(1); // tag: keyset mode
-                let col_bytes = column.as_bytes();
-                buf.extend_from_slice(&(col_bytes.len() as u32).to_le_bytes());
-                buf.extend_from_slice(col_bytes);
-                buf.extend_from_slice(&last_key.to_le_bytes());
+                // Tag 1 = keyset with a key (wire-compatible with pre-Option
+                // checkpoints); tag 2 = keyset before any read (no key).
+                match last_key {
+                    Some(k) => {
+                        buf.push(1);
+                        let col_bytes = column.as_bytes();
+                        buf.extend_from_slice(&(col_bytes.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(col_bytes);
+                        buf.extend_from_slice(&k.to_le_bytes());
+                    }
+                    None => {
+                        buf.push(2);
+                        let col_bytes = column.as_bytes();
+                        buf.extend_from_slice(&(col_bytes.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(col_bytes);
+                    }
+                }
             }
         }
         buf
@@ -285,7 +312,30 @@ impl crate::offset::Offset for JdbcOffset {
                         message: "keyset key decode failed".into(),
                     }
                 })?);
-                Ok(JdbcOffset::Keyset { column, last_key })
+                Ok(JdbcOffset::Keyset {
+                    column,
+                    last_key: Some(last_key),
+                })
+            }
+            2 => {
+                let len_field = bytes.get(1..5).ok_or_else(|| truncated("Keyset"))?;
+                let col_len = u32::from_le_bytes(len_field.try_into().map_err(|_| {
+                    ConnectorError::Config {
+                        message: "keyset col_len decode failed".into(),
+                    }
+                })?) as usize;
+                let column_field = bytes
+                    .get(5..5 + col_len)
+                    .ok_or_else(|| truncated("Keyset column"))?;
+                let column = String::from_utf8(column_field.to_vec()).map_err(|e| {
+                    ConnectorError::Config {
+                        message: format!("keyset column not valid utf-8: {e}"),
+                    }
+                })?;
+                Ok(JdbcOffset::Keyset {
+                    column,
+                    last_key: None,
+                })
             }
             other => Err(ConnectorError::Config {
                 message: format!("unknown JDBC offset tag: {other}"),
@@ -301,7 +351,7 @@ impl crate::source::CheckpointSource for JdbcSource {
         if let Some(ref col) = self.key_column {
             Ok(JdbcOffset::Keyset {
                 column: col.clone(),
-                last_key: self.last_key.unwrap_or(-1),
+                last_key: self.last_key,
             })
         } else {
             Ok(JdbcOffset::Offset(self.offset))
@@ -316,7 +366,9 @@ impl crate::source::CheckpointSource for JdbcSource {
             }
             JdbcOffset::Keyset { column, last_key } => {
                 self.key_column = Some(column.clone());
-                self.last_key = Some(*last_key);
+                // `None` = the checkpoint was taken before any read, so the
+                // restore returns to the fresh no-WHERE first page.
+                self.last_key = *last_key;
                 self.offset = 0;
             }
         }
@@ -492,11 +544,7 @@ impl Sink for JdbcSink {
         if ncols == 0 || batch.num_rows() == 0 {
             return Ok(());
         }
-        let columns: Vec<String> = schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
+        let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
         // A conflict key that is not in the batch would render SQL the
         // server rejects at execution time, halfway through a transaction.
         // Fail before opening it, naming the column.
@@ -536,12 +584,7 @@ impl Sink for JdbcSink {
             let mut last_for_key: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
             for row_idx in 0..batch.num_rows() {
-                let mut key = String::new();
-                for &col_idx in &key_indices {
-                    let col = batch.column(col_idx);
-                    key.push_str(&cell_key(col.as_ref(), row_idx));
-                    key.push('\u{1f}');
-                }
+                let key = composite_row_key(&batch, &key_indices, row_idx);
                 last_for_key.insert(key, row_idx);
             }
             let mut kept: Vec<usize> = last_for_key.into_values().collect();
@@ -804,10 +847,24 @@ mod tests {
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
 
-    /// Verify that `pg_rows_to_batch` round-trips a manually-constructed list
-    /// of typed builders — no live database required.
+    /// `pg_rows_to_batch` with zero rows still honours the schema — the only
+    /// input constructible without a live `PgRow`.
     #[test]
-    fn batch_round_trip_via_builders() {
+    fn pg_rows_to_batch_empty_rows_yield_empty_batch_with_schema() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = pg_rows_to_batch(Arc::clone(&schema), &[]).unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.schema(), schema);
+    }
+
+    /// Manually-built Arrow arrays round-trip through `RecordBatch` — a
+    /// builder-level sanity check; `pg_rows_to_batch` over real rows needs a
+    /// live database and is covered by integration tests.
+    #[test]
+    fn arrow_batch_manual_construction_round_trips() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, true),
             Field::new("name", DataType::Utf8, true),
@@ -866,11 +923,12 @@ mod tests {
         );
     }
 
-    /// `JdbcSource` and `JdbcSink` capabilities are correct.
+    /// Capability-builder flags compose as the JDBC connectors expect. This
+    /// does NOT exercise `JdbcSource::capabilities()` / `JdbcSink::
+    /// capabilities()` themselves — those need a live `PgPool` to construct
+    /// the connector and are covered by integration tests.
     #[test]
-    fn source_and_sink_capabilities() {
-        // We can't instantiate without a live PgPool, so verify the capability
-        // values via the builder methods directly.
+    fn capability_builder_flags_compose_for_source_and_sink_shapes() {
         let source_caps = ConnectorCapabilities::new()
             .with_bounded()
             .with_rewindable();
@@ -893,7 +951,7 @@ mod tests {
 
         let keyset = JdbcOffset::Keyset {
             column: "id".to_owned(),
-            last_key: -7,
+            last_key: Some(-7),
         };
         assert_eq!(JdbcOffset::decode(&keyset.encode()).unwrap(), keyset);
 
@@ -901,11 +959,35 @@ mod tests {
         // `bytes.get(5..key_start)` slice explicitly.
         let unicode_keyset = JdbcOffset::Keyset {
             column: "ключ".to_owned(),
-            last_key: 0,
+            last_key: Some(0),
         };
         assert_eq!(
             JdbcOffset::decode(&unicode_keyset.encode()).unwrap(),
             unicode_keyset
+        );
+    }
+
+    /// A keyset checkpoint taken BEFORE any read carries `last_key: None`
+    /// and must round-trip as such — restoring it puts the source back in
+    /// the fresh no-`WHERE` state instead of skipping rows `<=` a sentinel.
+    #[test]
+    fn keyset_offset_before_any_read_round_trips_as_none() {
+        let fresh = JdbcOffset::Keyset {
+            column: "id".to_owned(),
+            last_key: None,
+        };
+        let decoded = JdbcOffset::decode(&fresh.encode()).unwrap();
+        assert_eq!(decoded, fresh);
+        // The None encoding must be DISTINCT from any concrete key.
+        let sentinel = JdbcOffset::Keyset {
+            column: "id".to_owned(),
+            last_key: Some(-1),
+        };
+        assert_ne!(fresh.encode(), sentinel.encode());
+        assert_eq!(
+            JdbcOffset::decode(&sentinel.encode()).unwrap(),
+            sentinel,
+            "Some(-1) must stay a real key, not collapse into None"
         );
     }
 
@@ -924,7 +1006,7 @@ mod tests {
 
         let full_keyset = JdbcOffset::Keyset {
             column: "id".to_owned(),
-            last_key: 1,
+            last_key: Some(1),
         }
         .encode();
         // Cut before the col_len u32 is complete.
@@ -991,7 +1073,10 @@ mod sink_sql_tests {
             assert!(sql.contains(&format!("${n}")), "missing ${n} in {sql}");
         }
         assert!(!sql.contains("$10"), "{sql}");
-        assert!(sql.contains("($1, $2, $3), ($4, $5, $6), ($7, $8, $9)"), "{sql}");
+        assert!(
+            sql.contains("($1, $2, $3), ($4, $5, $6), ($7, $8, $9)"),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -1000,7 +1085,10 @@ mod sink_sql_tests {
         // DO NOTHING is the honest idempotent form (DO UPDATE SET with an
         // empty list is a syntax error).
         let sql = render_insert("t", &cols(&["a", "b"]), 1, &cols(&["a", "b"]));
-        assert!(sql.ends_with(r#"ON CONFLICT ("a", "b") DO NOTHING"#), "{sql}");
+        assert!(
+            sql.ends_with(r#"ON CONFLICT ("a", "b") DO NOTHING"#),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -1010,8 +1098,55 @@ mod sink_sql_tests {
         // with 42703 INSIDE the transaction — past the pre-flight guard
         // that exists to fail before it opens.
         let sql = render_insert("t", &cols(&["id", "v"]), 1, &cols(&["ID"]));
-        assert!(sql.contains(r#"ON CONFLICT ("id")"#), "must fold to the real column: {sql}");
+        assert!(
+            sql.contains(r#"ON CONFLICT ("id")"#),
+            "must fold to the real column: {sql}"
+        );
         assert!(!sql.contains(r#"ON CONFLICT ("ID")"#), "{sql}");
+    }
+
+    #[test]
+    fn composite_dedup_key_cannot_be_forged_across_column_boundaries() {
+        use super::composite_row_key;
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        // Two DIFFERENT key tuples whose naive `\u{1f}`-joined renderings
+        // are identical: ("a\u{1f}b", "c") vs ("a", "b\u{1f}c").
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k1", DataType::Utf8, false),
+            Field::new("k2", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["a\u{1f}b", "a"])),
+                Arc::new(StringArray::from(vec!["c", "b\u{1f}c"])),
+            ],
+        )
+        .unwrap();
+        let key0 = composite_row_key(&batch, &[0, 1], 0);
+        let key1 = composite_row_key(&batch, &[0, 1], 1);
+        assert_ne!(
+            key0, key1,
+            "distinct key tuples must not collapse into one dedup key"
+        );
+
+        // Equal tuples still dedup to the same key.
+        let dup = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["x", "x"])),
+                Arc::new(StringArray::from(vec!["y", "y"])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            composite_row_key(&dup, &[0, 1], 0),
+            composite_row_key(&dup, &[0, 1], 1)
+        );
     }
 
     #[test]
@@ -1023,6 +1158,24 @@ mod sink_sql_tests {
         assert!(!sql.contains(r#""id" = EXCLUDED."id""#), "{sql}");
         assert!(sql.contains(r#""v" = EXCLUDED."v""#), "{sql}");
     }
+}
+
+/// Join the per-column dedup keys for one row into a single map key.
+///
+/// Each component is length-prefixed (`<len>:<bytes>`) rather than joined
+/// with a bare separator: a separator that can also appear INSIDE a string
+/// value would let two different key tuples render identically (e.g.
+/// `("a<sep>b", "c")` vs `("a", "b<sep>c")`), silently collapsing distinct
+/// rows into one upsert.
+fn composite_row_key(batch: &RecordBatch, key_indices: &[usize], row_idx: usize) -> String {
+    let mut key = String::new();
+    for &col_idx in key_indices {
+        let part = cell_key(batch.column(col_idx).as_ref(), row_idx);
+        key.push_str(&part.len().to_string());
+        key.push(':');
+        key.push_str(&part);
+    }
+    key
 }
 
 /// A row's value for one column rendered as a dedup key. Only used to

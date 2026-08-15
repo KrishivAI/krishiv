@@ -103,46 +103,46 @@ pub mod grammar;
 pub mod incremental_view;
 pub mod introspection_sql;
 
+/// One reading of a join build side's size estimate, shared by the broadcast
+/// override and the spillable-join choice so the two cannot disagree.
+pub(crate) mod join_estimates;
 pub mod kafka_table;
 pub mod lakehouse;
 pub mod late_materialize;
 pub mod live_table;
-/// One reading of a join build side's size estimate, shared by the broadcast
-/// override and the spillable-join choice so the two cannot disagree.
-pub(crate) mod join_estimates;
 pub mod object_store_registry;
-pub mod pipeline_ddl;
 pub mod pipe_syntax;
+pub mod pipeline_ddl;
 pub mod pivot_sql;
 pub mod python_udf;
+pub mod runtime_filter_exec;
 pub mod scalar_udf;
 pub mod semi_join_reduction;
 /// Spark SQL extensions: LATERAL VIEW, TABLESAMPLE, TRANSFORM, DESCRIBE EXTENDED, etc.
 pub mod spark_sql_ext;
-pub mod runtime_filter_exec;
 pub mod spillable_join;
 pub mod sqlstate;
 pub mod subquery;
 pub mod unnest_sql;
 pub mod unspillable_headroom;
 
+pub mod ann_rewrite;
 pub mod coverage;
 mod higher_order_functions;
 mod json_functions;
 mod spark_functions;
-pub mod ann_rewrite;
-pub mod vector_metric;
-pub mod vector_index;
-pub mod vector_quantize;
-pub mod vector_functions;
-pub mod vector_footer;
-pub mod vector_search;
 pub mod statement_completion;
 pub mod streaming;
 pub mod streaming_table_ddl;
 pub mod streaming_tvf;
 pub mod streaming_window_plan;
 mod udf;
+pub mod vector_footer;
+pub mod vector_functions;
+pub mod vector_index;
+pub mod vector_metric;
+pub mod vector_quantize;
+pub mod vector_search;
 mod window_functions;
 
 pub use cep_sql::{
@@ -231,7 +231,11 @@ impl PlanCache {
     /// reason the cache exists. An expired entry is dropped here rather than
     /// left to age out, so a dead `LogicalPlan` is not held until eviction.
     fn get(&mut self, key: &str) -> Option<&datafusion::logical_expr::LogicalPlan> {
-        match self.map.get(key).map(|(_, at)| at.elapsed() < PLAN_CACHE_TTL) {
+        match self
+            .map
+            .get(key)
+            .map(|(_, at)| at.elapsed() < PLAN_CACHE_TTL)
+        {
             None => None,
             Some(false) => {
                 self.map.remove(key);
@@ -509,8 +513,9 @@ pub fn process_query_pool() -> Option<&'static Arc<dyn MemoryPool>> {
 /// `Private`, so the protection was absent from the one deployment that needed
 /// it. One constructor is what keeps that from being possible.
 fn guarded_fair_pool(bytes: usize) -> Arc<dyn MemoryPool> {
-    let inner: Arc<dyn MemoryPool> =
-        Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(bytes));
+    let inner: Arc<dyn MemoryPool> = Arc::new(
+        datafusion::execution::memory_pool::FairSpillPool::new(bytes),
+    );
     Arc::new(crate::unspillable_headroom::UnspillableHeadroomPool::new(
         inner,
         bytes,
@@ -3228,11 +3233,10 @@ impl SqlEngine {
         // reaches it. This module existed but was never declared as a module —
         // it was not compiled, its tests never ran, and the documented feature
         // was silently absent.
-        let piped = pipe_syntax::process_pipe_syntax(query).map_err(|error| {
-            SqlError::Unsupported {
+        let piped =
+            pipe_syntax::process_pipe_syntax(query).map_err(|error| SqlError::Unsupported {
                 feature: error.to_string(),
-            }
-        })?;
+            })?;
         let query: &str = &piped;
 
         // Spark-compat surface rewrites (LATERAL VIEW, TABLESAMPLE, DESCRIBE
@@ -3632,13 +3636,11 @@ impl SqlEngine {
                     .await?
                     .collect()
                     .await?;
-                let cached = datafusion::datasource::MemTable::try_new(
-                    original.schema(),
-                    vec![batches],
-                )
-                .map_err(|e| SqlError::DataFusion {
-                    message: e.to_string(),
-                })?;
+                let cached =
+                    datafusion::datasource::MemTable::try_new(original.schema(), vec![batches])
+                        .map_err(|e| SqlError::DataFusion {
+                            message: e.to_string(),
+                        })?;
                 self.context
                     .deregister_table(&name)
                     .map_err(|e| SqlError::DataFusion {
@@ -3690,11 +3692,11 @@ impl SqlEngine {
                         .map_err(|e| SqlError::DataFusion {
                             message: e.to_string(),
                         })?;
-                    self.context
-                        .register_table(&name, original)
-                        .map_err(|e| SqlError::DataFusion {
+                    self.context.register_table(&name, original).map_err(|e| {
+                        SqlError::DataFusion {
                             message: e.to_string(),
-                        })?;
+                        }
+                    })?;
                 }
                 Ok(())
             }
@@ -3736,14 +3738,15 @@ impl SqlEngine {
                         ),
                     });
                 }
-                let source = schema.field_by_id(field.source_id).ok_or_else(|| {
-                    SqlError::DataFusion {
-                        message: format!(
-                            "SHOW PARTITIONS: partition source id {} missing from schema",
-                            field.source_id
-                        ),
-                    }
-                })?;
+                let source =
+                    schema
+                        .field_by_id(field.source_id)
+                        .ok_or_else(|| SqlError::DataFusion {
+                            message: format!(
+                                "SHOW PARTITIONS: partition source id {} missing from schema",
+                                field.source_id
+                            ),
+                        })?;
                 columns.push(source.name.clone());
             }
             const MAX_PARTITIONS: usize = 10_000;
@@ -3770,10 +3773,12 @@ impl SqlEngine {
             let mut rows = Vec::with_capacity(total);
             for batch in &batches {
                 let display: Vec<_> = (0..batch.num_columns())
-                    .map(|c| arrow::util::display::ArrayFormatter::try_new(
-                        batch.column(c).as_ref(),
-                        &arrow::util::display::FormatOptions::default(),
-                    ))
+                    .map(|c| {
+                        arrow::util::display::ArrayFormatter::try_new(
+                            batch.column(c).as_ref(),
+                            &arrow::util::display::FormatOptions::default(),
+                        )
+                    })
                     .collect::<Result<_, _>>()
                     .map_err(|e| SqlError::DataFusion {
                         message: e.to_string(),

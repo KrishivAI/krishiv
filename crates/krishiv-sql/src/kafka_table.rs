@@ -28,9 +28,7 @@ pub(crate) fn kafka_auto_commit_interval_ms() -> Option<u64> {
 /// Kept pure so it can be tested directly: mutating process environment from
 /// a test is unsound under a multi-threaded runner, and the workspace denies
 /// the `unsafe` that edition 2024 requires for `set_var`.
-pub(crate) fn auto_commit_interval_for(
-    profile: krishiv_common::DurabilityProfile,
-) -> Option<u64> {
+pub(crate) fn auto_commit_interval_for(profile: krishiv_common::DurabilityProfile) -> Option<u64> {
     if krishiv_common::requires_manual_kafka_commit(profile) {
         None
     } else {
@@ -115,23 +113,36 @@ impl PartitionStream for KafkaPartitionStream {
                                 break;
                             }
                         }
-                        if manual_commit {
-                            let guard = source.lock().await;
-                            guard.commit_current_offset();
-                        }
                         if pending_rows >= COALESCE_MAX_ROWS {
                             pending_rows = 0;
                             if flush_pending(&tx, &schema, &mut pending).await.is_err() {
                                 break; // receiver dropped — query cancelled
+                            }
+                            // Commit broker offsets only AFTER the rows they
+                            // cover have been handed off downstream. The
+                            // `commit_offsets` contract (kafka.rs) requires the
+                            // downstream to have received the data first —
+                            // committing while rows sit in `pending` would
+                            // advance offsets past rows never delivered.
+                            if manual_commit {
+                                let guard = source.lock().await;
+                                guard.commit_current_offset();
                             }
                         }
                     }
                     Ok(None) => {
                         // Poll gap — flush what we have so consumers see low
                         // latency, then yield and retry.
+                        let had_pending = !pending.is_empty();
                         pending_rows = 0;
                         if flush_pending(&tx, &schema, &mut pending).await.is_err() {
                             break;
+                        }
+                        // Same ordering contract as above: delivered, then
+                        // committed.
+                        if manual_commit && had_pending {
+                            let guard = source.lock().await;
+                            guard.commit_current_offset();
                         }
                         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
                     }
@@ -414,7 +425,11 @@ mod tests {
         assert!(pending.is_empty(), "flush must drain the buffer");
 
         let got = rx.recv().await.expect("one batch").expect("ok");
-        assert_eq!(got.num_rows(), 3, "three messages must arrive as three rows");
+        assert_eq!(
+            got.num_rows(),
+            3,
+            "three messages must arrive as three rows"
+        );
         let ids = got.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(ids.values(), &[0i64, 1, 2], "order must be preserved");
     }

@@ -18,6 +18,20 @@ fn require_path(config: &ConnectorConfig) -> ConnectorResult<PathBuf> {
     Ok(PathBuf::from(config.required("path")?))
 }
 
+/// Strictly parse the optional `recursive` flag: `"true"`/`"false"`
+/// (case-insensitive) only. A malformed value is an ERROR, not a silent
+/// non-recursive scan.
+fn parse_recursive(config: &ConnectorConfig) -> ConnectorResult<bool> {
+    match config.get("recursive") {
+        None => Ok(false),
+        Some(v) if v.eq_ignore_ascii_case("true") => Ok(true),
+        Some(v) if v.eq_ignore_ascii_case("false") => Ok(false),
+        Some(v) => Err(crate::error::ConnectorError::Config {
+            message: format!("parquet option 'recursive' must be 'true' or 'false', got '{v}'"),
+        }),
+    }
+}
+
 pub struct ParquetSourceDriver;
 
 impl SourceDriver for ParquetSourceDriver {
@@ -75,6 +89,7 @@ impl SourceDriver for ParquetDirectorySourceDriver {
 
     fn validate(&self, config: &ConnectorConfig) -> ConnectorResult<()> {
         let _ = require_path(config)?;
+        let _ = parse_recursive(config)?;
         Ok(())
     }
 
@@ -84,10 +99,7 @@ impl SourceDriver for ParquetDirectorySourceDriver {
     ) -> Pin<Box<dyn Future<Output = ConnectorResult<Box<dyn DynSource>>> + Send + 'a>> {
         Box::pin(async move {
             let path = require_path(config)?;
-            let recursive = config
-                .get("recursive")
-                .map(|v| v == "true")
-                .unwrap_or(false);
+            let recursive = parse_recursive(config)?;
             let source = ParquetDirectorySource::open(path, recursive)?;
             Ok(Box::new(source) as Box<dyn DynSource>)
         })
@@ -121,5 +133,31 @@ impl SinkDriver for ParquetSinkDriver {
             let sink = ParquetSink::create(path)?;
             Ok(Box::new(sink) as Box<dyn DynSink>)
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn config(pairs: &[(&str, &str)]) -> ConnectorConfig {
+        let mut c = ConnectorConfig::new("probe", "parquet_directory");
+        for (k, v) in pairs {
+            c = c.with_property(*k, *v);
+        }
+        c
+    }
+
+    #[test]
+    fn malformed_recursive_flag_is_a_validate_error() {
+        let bad = config(&[("path", "/tmp"), ("recursive", "yes")]);
+        assert!(ParquetDirectorySourceDriver.validate(&bad).is_err());
+
+        for (v, want) in [("true", true), ("FALSE", false)] {
+            let cfg = config(&[("path", "/tmp"), ("recursive", v)]);
+            assert!(ParquetDirectorySourceDriver.validate(&cfg).is_ok());
+            assert_eq!(parse_recursive(&cfg).unwrap(), want);
+        }
     }
 }

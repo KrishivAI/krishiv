@@ -8,6 +8,10 @@ pub struct EmbeddingBatch {
     pub doc_ids: Vec<String>,
     pub vectors: Vec<Vec<f32>>,
     pub payloads: Vec<HashMap<String, PayloadValue>>,
+    /// Versioning epoch: point ids are `hash(doc_id || epoch)`, so re-upserting
+    /// a doc at the same epoch overwrites its point (idempotent, ADR-R17.3),
+    /// while a new epoch creates a new point alongside the old one. Callers
+    /// that do not version their embeddings should use a constant epoch.
     pub epoch: u64,
 }
 

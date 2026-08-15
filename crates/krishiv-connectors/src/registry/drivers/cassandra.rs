@@ -14,16 +14,24 @@ use crate::sink::DynSink;
 
 pub struct CassandraSinkDriver;
 
+/// Shared by the descriptor and the opened sink so the two cannot drift.
+///
+/// Cassandra INSERTs are idempotent for the same row key, and each
+/// `write_batch` writes through (no internal buffering), so `flush` leaves the
+/// sink usable — resumable flush.
+fn cassandra_sink_capabilities() -> ConnectorCapabilities {
+    ConnectorCapabilities::new()
+        .with_unbounded()
+        .with_idempotent()
+        .with_resumable_flush()
+}
+
 impl SinkDriver for CassandraSinkDriver {
     fn descriptor(&self) -> ConnectorDescriptor {
         ConnectorDescriptor::new(
             ConnectorKind::Cassandra,
             ConnectorRole::Sink,
-            // Cassandra INSERT operations are idempotent when using the same row key.
-            ConnectorCapabilities::new()
-                .with_unbounded()
-                .with_idempotent()
-                .with_resumable_flush(),
+            cassandra_sink_capabilities(),
         )
     }
 
@@ -59,9 +67,7 @@ struct CassandraSinkWrapper(CassandraSink);
 
 impl crate::sink::Sink for CassandraSinkWrapper {
     fn capabilities(&self) -> crate::capabilities::ConnectorCapabilities {
-        ConnectorCapabilities::new()
-            .with_unbounded()
-            .with_idempotent()
+        cassandra_sink_capabilities()
     }
 
     async fn write_batch(
@@ -73,5 +79,22 @@ impl crate::sink::Sink for CassandraSinkWrapper {
 
     async fn flush(&mut self) -> crate::error::ConnectorResult<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The descriptor and the opened-instance wrapper share
+    /// `cassandra_sink_capabilities`, so the advertised and actual capability
+    /// sets (including resumable flush for the write-through sink) cannot
+    /// drift.
+    #[test]
+    fn cassandra_sink_descriptor_matches_instance_capabilities() {
+        let caps = CassandraSinkDriver.descriptor().default_capabilities;
+        assert_eq!(caps, cassandra_sink_capabilities());
+        assert!(caps.resumable_flush(), "write-through flush is resumable");
+        assert!(caps.is_idempotent());
     }
 }

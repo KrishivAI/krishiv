@@ -266,9 +266,7 @@ fn row_preserving_scan(mut node: &LogicalPlan) -> Option<&TableScan> {
         match node {
             LogicalPlan::Projection(projection) => node = &projection.input,
             LogicalPlan::SubqueryAlias(alias) => node = &alias.input,
-            LogicalPlan::TableScan(scan)
-                if scan.filters.is_empty() && scan.fetch.is_none() =>
-            {
+            LogicalPlan::TableScan(scan) if scan.filters.is_empty() && scan.fetch.is_none() => {
                 return Some(scan);
             }
             _ => return None,
@@ -369,7 +367,10 @@ mod tests {
             "the τ pre-filter must appear in the optimized plan:\n{plan}"
         );
         let accelerated = ids(&engine, KNN).await;
-        assert_eq!(accelerated, baseline, "the rewrite may never move an answer");
+        assert_eq!(
+            accelerated, baseline,
+            "the rewrite may never move an answer"
+        );
     }
 
     #[tokio::test]
@@ -537,10 +538,7 @@ mod tests {
                 "unknown option",
             ),
             ("CREATE VECTOR INDEX docs emb", "expected ON"),
-            (
-                "CREATE VECTOR INDEX ON docs(emb) EXTRA",
-                "WITH (metric",
-            ),
+            ("CREATE VECTOR INDEX ON docs(emb) EXTRA", "WITH (metric"),
         ] {
             let err = engine.sql(sql).await.err().map(|e| e.to_string());
             let err = err.unwrap_or_else(|| panic!("'{sql}' must be refused"));

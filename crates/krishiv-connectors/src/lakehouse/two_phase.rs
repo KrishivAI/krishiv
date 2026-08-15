@@ -28,6 +28,15 @@ pub trait IcebergTwoPhaseCommit: Send + Sync {
         kafka_offsets: BTreeMap<String, i64>,
     ) -> Result<i64, LakehouseError>;
     async fn abort(&self, staged: StagedSnapshot) -> Result<(), LakehouseError>;
+
+    /// Kafka offsets recorded by previously committed snapshots.
+    ///
+    /// Pipelines use this on startup to position their source past data that
+    /// is already durably committed (crash-window duplicate suppression).
+    /// The default returns an empty map for sinks that do not persist offsets.
+    async fn committed_kafka_offsets(&self) -> BTreeMap<String, i64> {
+        BTreeMap::new()
+    }
 }
 
 /// Memory-backed two-phase commit for tests and embedded pipelines.
@@ -100,7 +109,10 @@ impl IcebergTwoPhaseCommit for MemoryIcebergTwoPhaseCommit {
                 .ok_or_else(|| LakehouseError::Concurrency {
                     message: "snapshot missing after commit".to_string(),
                 })?;
-        *self.committed_offsets.lock().await = kafka_offsets;
+        // Merge per-partition: a commit carrying offsets for a subset of
+        // partitions must not erase progress recorded for the others (the
+        // native impl's snapshot-summary offsets are cumulative the same way).
+        self.committed_offsets.lock().await.extend(kafka_offsets);
         pending.retain(|candidate| candidate.snapshot_id != staged.snapshot_id);
         self.committed
             .lock()
@@ -115,6 +127,10 @@ impl IcebergTwoPhaseCommit for MemoryIcebergTwoPhaseCommit {
             .await
             .retain(|s| s.snapshot_id != staged.snapshot_id);
         Ok(())
+    }
+
+    async fn committed_kafka_offsets(&self) -> BTreeMap<String, i64> {
+        self.committed_offsets.lock().await.clone()
     }
 }
 
@@ -214,7 +230,15 @@ impl DistributedIcebergCommitCoordinator {
         };
         match self.committer.commit(staged.clone(), offsets).await {
             Ok(snapshot) => {
-                self.committed_epochs.lock().await.insert(epoch, snapshot);
+                let mut committed = self.committed_epochs.lock().await;
+                committed.insert(epoch, snapshot);
+                // Bound the idempotency memory: retries only ever target
+                // recent epochs, so entries far behind the newest are dead
+                // weight — keep a sliding window of the last 1024 epochs.
+                if let Some((&newest, _)) = committed.iter().next_back() {
+                    let cutoff = newest.saturating_sub(1024);
+                    committed.retain(|&e, _| e >= cutoff);
+                }
                 Ok(snapshot)
             }
             Err(error) => {
@@ -320,6 +344,28 @@ mod tests {
             .map(RecordBatch::num_rows)
             .sum();
         assert_eq!(rows, 2);
+    }
+
+    /// Committed offsets accumulate per partition: a commit carrying only one
+    /// partition must not erase progress recorded for another.
+    #[tokio::test]
+    async fn two_phase_commit_merges_offsets_across_partitions() {
+        let tpc = MemoryIcebergTwoPhaseCommit::new(table());
+
+        let staged = tpc.prepare(vec![batch(1)]).await.unwrap();
+        tpc.commit(staged, BTreeMap::from([("orders-0".to_string(), 10)]))
+            .await
+            .unwrap();
+        let staged = tpc.prepare(vec![batch(2)]).await.unwrap();
+        tpc.commit(staged, BTreeMap::from([("orders-1".to_string(), 20)]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tpc.committed_kafka_offsets().await,
+            BTreeMap::from([("orders-0".to_string(), 10), ("orders-1".to_string(), 20)]),
+            "disjoint-partition commits must both stay visible"
+        );
     }
 
     #[tokio::test]

@@ -155,7 +155,9 @@ fn spark_generator_to_unnest(func_call: &str) -> String {
             && trimmed
                 .get(..prefix_len)
                 .is_some_and(|head| head.eq_ignore_ascii_case(generator))
-            && trimmed.get(prefix_len..).is_some_and(|r| r.starts_with('('))
+            && trimmed
+                .get(prefix_len..)
+                .is_some_and(|r| r.starts_with('('))
         {
             let args = trimmed.get(prefix_len..).unwrap_or("");
             return format!("UNNEST{args}");
@@ -486,7 +488,8 @@ mod tests {
     /// `posexplode` maps too, and a non-Spark generator is left alone.
     #[test]
     fn only_spark_generators_are_mapped_to_unnest() {
-        let mapped = rewrite_lateral_view("SELECT a FROM t LATERAL VIEW posexplode(arr) AS p").unwrap();
+        let mapped =
+            rewrite_lateral_view("SELECT a FROM t LATERAL VIEW posexplode(arr) AS p").unwrap();
         assert!(mapped.contains("UNNEST(arr)"), "{mapped}");
         let untouched =
             rewrite_lateral_view("SELECT a FROM t LATERAL VIEW my_gen(arr) AS p").unwrap();
@@ -616,7 +619,10 @@ mod tests {
             .expect_err("no table-properties relation is exposed");
         let message = err.to_string();
         assert!(message.contains("my_table"), "{message}");
-        assert!(!message.contains("my_table;"), "semicolon not stripped: {message}");
+        assert!(
+            !message.contains("my_table;"),
+            "semicolon not stripped: {message}"
+        );
     }
 
     #[test]

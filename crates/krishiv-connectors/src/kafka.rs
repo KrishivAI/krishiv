@@ -1092,8 +1092,9 @@ impl RdkafkaKafkaSource {
         }
     }
 
-    /// Latest committed offset for the most recently read partition.
-    /// For multi-partition topics use [`all_current_offsets`] instead.
+    /// Next-to-read offset for the partition whose last-read offset is
+    /// numerically highest — NOT necessarily the most recently read partition.
+    /// For multi-partition topics use [`Self::all_current_offsets`] instead.
     pub fn current_kafka_offset(&self) -> Option<KafkaOffset> {
         self.partition_offsets
             .iter()
@@ -1162,11 +1163,12 @@ impl RdkafkaKafkaSource {
                 message: format!("typed kafka decoder: {e}"),
             })?;
         let ndjson = payloads.join("\n");
-        let consumed = decoder
-            .decode(ndjson.as_bytes())
-            .map_err(|e| crate::ConnectorError::Config {
-                message: format!("typed kafka decode: {e}"),
-            })?;
+        let consumed =
+            decoder
+                .decode(ndjson.as_bytes())
+                .map_err(|e| crate::ConnectorError::Config {
+                    message: format!("typed kafka decode: {e}"),
+                })?;
         if consumed < ndjson.len() {
             return Err(crate::ConnectorError::Config {
                 message: "typed kafka decode: trailing undecodable payload".to_string(),
@@ -1256,6 +1258,22 @@ impl RdkafkaKafkaSource {
             }
         })
     }
+
+    /// Merge offsets staged during a `read_batch` drain into the
+    /// checkpointable per-partition map — but only when the drained payloads
+    /// were successfully decoded into a batch. On an error the staged offsets
+    /// are dropped, so a later `commit_offsets`/checkpoint cannot advance
+    /// past messages that were never delivered downstream.
+    fn commit_staged_on_success<T>(
+        result: crate::ConnectorResult<T>,
+        staged: std::collections::HashMap<i32, i64>,
+        partition_offsets: &mut std::collections::HashMap<i32, i64>,
+    ) -> crate::ConnectorResult<T> {
+        if result.is_ok() {
+            partition_offsets.extend(staged);
+        }
+        result
+    }
 }
 
 #[cfg(feature = "kafka")]
@@ -1285,11 +1303,17 @@ impl Source for RdkafkaKafkaSource {
                 retriable: true,
             }),
             Ok(Ok(msg)) => {
-                // C6: Track offset per partition. Log when a new partition is
+                // C6: Track offset per partition. Offsets are STAGED locally
+                // during the drain and merged into `partition_offsets` only
+                // once a batch has been successfully built — an error path
+                // must not advance checkpoint offsets past messages that were
+                // never delivered downstream. Log when a new partition is
                 // first assigned — this happens after a consumer group rebalance
                 // and surfaces which partitions each executor instance owns.
+                let mut staged_offsets: std::collections::HashMap<i32, i64> =
+                    std::collections::HashMap::new();
                 let new_partition = !self.partition_offsets.contains_key(&msg.partition());
-                self.partition_offsets.insert(msg.partition(), msg.offset());
+                staged_offsets.insert(msg.partition(), msg.offset());
                 if new_partition {
                     tracing::info!(
                         topic = %self.topic,
@@ -1303,29 +1327,37 @@ impl Source for RdkafkaKafkaSource {
                 if let Some(ref deser) = self.schema_registry {
                     let raw_bytes = msg.payload().unwrap_or(&[]);
                     if raw_bytes.is_empty() {
+                        self.partition_offsets.extend(staged_offsets);
                         return Ok(Some(arrow::record_batch::RecordBatch::new_empty(
                             std::sync::Arc::new(arrow::datatypes::Schema::empty()),
                         )));
                     }
+                    // A decode failure returns before the staged offset is
+                    // merged, so a later commit cannot skip this message.
                     let (_schema, batches) = deser.decode(raw_bytes).await.map_err(|e| {
                         crate::ConnectorError::Schema {
                             message: format!("schema registry decode: {e}"),
                         }
                     })?;
-                    if batches.is_empty() {
+                    let Some(first) = batches.first() else {
+                        self.partition_offsets.extend(staged_offsets);
                         return Ok(Some(arrow::record_batch::RecordBatch::new_empty(
                             std::sync::Arc::new(arrow::datatypes::Schema::empty()),
                         )));
-                    }
+                    };
                     if batches.len() == 1 {
-                        return Ok(Some(batches.into_iter().next().unwrap()));
+                        self.partition_offsets.extend(staged_offsets);
+                        return Ok(batches.into_iter().next());
                     }
-                    let schema = batches[0].schema();
-                    return arrow::compute::concat_batches(&schema, &batches)
-                        .map(Some)
-                        .map_err(|e| crate::ConnectorError::Schema {
-                            message: format!("schema registry batch concat: {e}"),
-                        });
+                    let schema = first.schema();
+                    let concatenated =
+                        arrow::compute::concat_batches(&schema, &batches).map_err(|e| {
+                            crate::ConnectorError::Schema {
+                                message: format!("schema registry batch concat: {e}"),
+                            }
+                        })?;
+                    self.partition_offsets.extend(staged_offsets);
+                    return Ok(Some(concatenated));
                 }
 
                 let payload = match msg.payload_view::<str>() {
@@ -1338,6 +1370,7 @@ impl Source for RdkafkaKafkaSource {
                             offset = msg.offset(),
                             "skipping unreadable Kafka message"
                         );
+                        self.partition_offsets.extend(staged_offsets);
                         return Ok(Some(arrow::record_batch::RecordBatch::new_empty(
                             std::sync::Arc::new(arrow::datatypes::Schema::empty()),
                         )));
@@ -1361,8 +1394,9 @@ impl Source for RdkafkaKafkaSource {
                     match self.consumer.recv().now_or_never() {
                         Some(Ok(next)) => {
                             let new_partition =
-                                !self.partition_offsets.contains_key(&next.partition());
-                            self.partition_offsets.insert(next.partition(), next.offset());
+                                !self.partition_offsets.contains_key(&next.partition())
+                                    && !staged_offsets.contains_key(&next.partition());
+                            staged_offsets.insert(next.partition(), next.offset());
                             if new_partition {
                                 tracing::info!(
                                     topic = %self.topic,
@@ -1398,9 +1432,9 @@ impl Source for RdkafkaKafkaSource {
                     }
                 }
 
-                let batch = match &self.decode_schema {
+                let decoded = match &self.decode_schema {
                     Some(schema) => match Self::typed_payloads_to_batch(schema, &payloads) {
-                        Ok(batch) => batch,
+                        Ok(batch) => Ok(batch),
                         Err(e) => {
                             // Never lose messages to a decode upgrade: the
                             // untyped fold accepts anything, and the warn
@@ -1410,11 +1444,16 @@ impl Source for RdkafkaKafkaSource {
                                 error = %e,
                                 "typed kafka decode fell back to untyped for this batch"
                             );
-                            Self::payloads_to_batch(&payloads)?
+                            Self::payloads_to_batch(&payloads)
                         }
                     },
-                    None => Self::payloads_to_batch(&payloads)?,
+                    None => Self::payloads_to_batch(&payloads),
                 };
+                let batch = Self::commit_staged_on_success(
+                    decoded,
+                    staged_offsets,
+                    &mut self.partition_offsets,
+                )?;
                 // Record per-partition consumer lag (high_watermark - current_offset)
                 // against the LAST drained message.
                 let topic = self.topic.clone();
@@ -1458,12 +1497,18 @@ impl Source for RdkafkaKafkaSource {
     }
 }
 
-/// Broker-backed exactly-once checkpoint support via partition assignment + seek.
+/// Broker-backed checkpoint support via seek within the current assignment.
 ///
-/// On restore, `consumer.assign()` bypasses the group rebalance protocol and
-/// seeks each partition directly to the stored offset, guaranteeing that the
-/// next `read_batch()` call returns the message at exactly that offset — no
-/// duplicates, no gaps.
+/// On restore, each stored partition is `seek()`-ed to its stored offset, so
+/// the next `read_batch()` call for that partition resumes exactly there —
+/// **for as long as the current partition assignment holds**. The guarantee
+/// is per-assignment-epoch only: the consumer stays subscribed through the
+/// group rebalance protocol, so a rebalance can reassign partitions and
+/// revert their positions to the group's committed offsets, replaying or
+/// skipping messages relative to the restored checkpoint. Restore refuses to
+/// seek unless every stored partition is currently assigned (all-or-nothing),
+/// so a partial restore can never leave some partitions repositioned and
+/// others not.
 #[cfg(feature = "kafka")]
 impl CheckpointSource for RdkafkaKafkaSource {
     type Offset = MultiKafkaOffset;
@@ -1487,6 +1532,38 @@ impl CheckpointSource for RdkafkaKafkaSource {
         // assignment mode, permanently breaking rebalancing. seek() positions
         // the consumer at a specific offset while keeping the existing
         // subscription intact.
+        //
+        // All-or-nothing: validate that every stored partition is currently
+        // assigned BEFORE seeking any. Seeking a not-yet-assigned partition
+        // fails mid-loop, which would leave some partitions repositioned and
+        // others not, with no state mutated to record the difference.
+        let assignment = self
+            .consumer
+            .assignment()
+            .map_err(|e| ConnectorError::Offset {
+                message: format!("restore: failed to fetch current assignment: {e}"),
+            })?;
+        let assigned: std::collections::HashSet<(String, i32)> = assignment
+            .elements()
+            .iter()
+            .map(|el| (el.topic().to_string(), el.partition()))
+            .collect();
+        let missing: Vec<String> = offset
+            .offsets
+            .iter()
+            .filter(|ko| !assigned.contains(&(ko.topic.clone(), ko.partition)))
+            .map(|ko| format!("{}/{}", ko.topic, ko.partition))
+            .collect();
+        if !missing.is_empty() {
+            return Err(ConnectorError::Offset {
+                message: format!(
+                    "restore: partition(s) not currently assigned to this consumer: {}; \
+                     refusing to seek any partition (all-or-nothing restore)",
+                    missing.join(", ")
+                ),
+            });
+        }
+
         for ko in &offset.offsets {
             self.consumer
                 .seek(
@@ -1602,10 +1679,7 @@ mod tests {
         use super::super::RdkafkaKafkaSource;
         use arrow::array::{Array, StringArray};
 
-        fn col<'a>(
-            batch: &'a arrow::record_batch::RecordBatch,
-            name: &str,
-        ) -> &'a StringArray {
+        fn col<'a>(batch: &'a arrow::record_batch::RecordBatch, name: &str) -> &'a StringArray {
             batch
                 .column_by_name(name)
                 .unwrap_or_else(|| panic!("column {name} missing"))
@@ -1620,7 +1694,12 @@ mod tests {
                 RdkafkaKafkaSource::payloads_to_batch(&[r#"{"b":"2","a":"1"}"#.to_owned()])
                     .unwrap();
             assert_eq!(
-                single.schema().fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+                single
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect::<Vec<_>>(),
                 vec!["a", "b"],
                 "keys sorted for schema stability, exactly the legacy shape"
             );
@@ -1640,7 +1719,11 @@ mod tests {
             assert_eq!(batch.num_rows(), 3, "one batch, one row per message");
             assert_eq!(batch.num_columns(), 2);
             assert_eq!(col(&batch, "user").value(2), "u3");
-            assert_eq!(col(&batch, "n").value(0), "1", "non-string JSON stringified as before");
+            assert_eq!(
+                col(&batch, "n").value(0),
+                "1",
+                "non-string JSON stringified as before"
+            );
         }
 
         #[test]
@@ -2007,8 +2090,101 @@ mod tests {
         let result =
             super::RdkafkaKafkaSource::new("localhost:1", "test-group", "test-topic", None, None);
         // rdkafka validates config synchronously; creation may succeed or fail
-        // depending on platform.  Both are acceptable — we only assert no panic.
-        let _ = result;
+        // depending on platform. Assert the contract on whichever branch we
+        // got: a constructed source advertises unbounded + checkpoint
+        // capabilities, and a failure carries a non-empty diagnostic.
+        match result {
+            Ok(source) => {
+                let caps = crate::Source::capabilities(&source);
+                assert!(caps.is_unbounded(), "broker source must be unbounded");
+                assert!(
+                    caps.is_checkpoint_capable(),
+                    "broker source must advertise checkpoint capability"
+                );
+            }
+            Err(message) => assert!(
+                !message.is_empty(),
+                "constructor failure must carry a descriptive error"
+            ),
+        }
+    }
+
+    /// Offsets staged during a `read_batch` drain must be dropped when the
+    /// decode fails: an error return means the messages were never delivered,
+    /// so a later `commit_offsets`/checkpoint must not advance past them.
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn staged_offsets_are_not_merged_when_decode_fails() {
+        use std::collections::HashMap;
+        let mut partition_offsets: HashMap<i32, i64> = HashMap::from([(0, 5)]);
+        let staged: HashMap<i32, i64> = HashMap::from([(0, 9), (1, 3)]);
+
+        let err: crate::ConnectorResult<()> = Err(crate::ConnectorError::Schema {
+            message: "decode failed".into(),
+        });
+        let result = super::RdkafkaKafkaSource::commit_staged_on_success(
+            err,
+            staged,
+            &mut partition_offsets,
+        );
+        assert!(result.is_err(), "the decode error must propagate");
+        assert_eq!(
+            partition_offsets,
+            HashMap::from([(0, 5)]),
+            "a failed decode must leave checkpoint offsets untouched"
+        );
+    }
+
+    /// Offsets staged during a successful drain are merged, keeping
+    /// checkpoint offsets aligned with delivered rows.
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn staged_offsets_are_merged_on_successful_decode() {
+        use std::collections::HashMap;
+        let mut partition_offsets: HashMap<i32, i64> = HashMap::from([(0, 5)]);
+        let staged: HashMap<i32, i64> = HashMap::from([(0, 9), (1, 3)]);
+
+        let result = super::RdkafkaKafkaSource::commit_staged_on_success(
+            Ok(()),
+            staged,
+            &mut partition_offsets,
+        );
+        assert!(result.is_ok());
+        assert_eq!(partition_offsets, HashMap::from([(0, 9), (1, 3)]));
+    }
+
+    /// `restore_offset` must refuse to seek when a stored partition is not in
+    /// the current assignment — all-or-nothing, with no state mutated. A fresh
+    /// consumer with no broker connection has an empty assignment, so every
+    /// stored partition is "missing".
+    #[cfg(feature = "kafka")]
+    #[tokio::test]
+    async fn restore_offset_rejects_unassigned_partitions_without_mutating_state() {
+        let Ok(mut source) =
+            super::RdkafkaKafkaSource::new("localhost:1", "test-group", "events", None, None)
+        else {
+            // Constructor behaviour is platform-dependent without a broker;
+            // the validation path needs a constructed consumer.
+            return;
+        };
+        let stored = super::MultiKafkaOffset {
+            offsets: vec![super::KafkaOffset {
+                topic: "events".into(),
+                partition: 0,
+                offset: 42,
+            }],
+        };
+        let err = crate::CheckpointSource::restore_offset(&mut source, &stored)
+            .expect_err("unassigned partition must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("not currently assigned") && message.contains("events/0"),
+            "error must list the missing partition(s), got: {message}"
+        );
+        assert!(
+            source.all_current_offsets().is_empty(),
+            "a refused restore must not mutate partition offsets"
+        );
     }
 
     /// `RdkafkaKafkaSource` implements `Source`.
@@ -2131,7 +2307,10 @@ mod tests {
             .clone();
         assert_eq!(amounts.value(0), 10.5);
         use arrow::array::Array as _;
-        assert!(amounts.is_null(1), "absent key -> NULL, same as the untyped fold");
+        assert!(
+            amounts.is_null(1),
+            "absent key -> NULL, same as the untyped fold"
+        );
     }
 
     /// A payload the typed decoder cannot handle rejects the WHOLE fold —
@@ -2141,11 +2320,8 @@ mod tests {
     #[test]
     fn typed_decode_rejects_the_fold_rather_than_dropping_a_payload() {
         use arrow::datatypes::{DataType, Field, Schema};
-        let schema = std::sync::Arc::new(Schema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            false,
-        )]));
+        let schema =
+            std::sync::Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let payloads = vec![
             r#"{"id": 1}"#.to_string(),
             "not json at all".to_string(),
@@ -2155,7 +2331,11 @@ mod tests {
             .expect_err("a malformed payload must reject the fold, not vanish");
         // And the fallback accepts exactly the same payloads.
         let untyped = RdkafkaKafkaSource::payloads_to_batch(&payloads).unwrap();
-        assert_eq!(untyped.num_rows(), 3, "the untyped fold keeps every message");
+        assert_eq!(
+            untyped.num_rows(),
+            3,
+            "the untyped fold keeps every message"
+        );
     }
 
     /// An unmappable declared field means NO typed declaration (untyped
@@ -2163,11 +2343,7 @@ mod tests {
     #[test]
     fn unmappable_declared_fields_leave_typed_decode_off() {
         use arrow::datatypes::{DataType, Field, Schema};
-        let exotic = Schema::new(vec![Field::new(
-            "blob",
-            DataType::Binary,
-            true,
-        )]);
+        let exotic = Schema::new(vec![Field::new("blob", DataType::Binary, true)]);
         assert!(decode_columns_from_schema(&exotic).is_none());
     }
 }

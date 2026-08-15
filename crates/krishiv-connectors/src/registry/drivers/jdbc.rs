@@ -4,9 +4,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::capabilities::ConnectorCapabilities;
+use crate::capabilities::DeliveryGuarantee;
 use crate::config::ConnectorConfig;
 use crate::error::{ConnectorError, ConnectorResult};
-use crate::capabilities::DeliveryGuarantee;
 use crate::jdbc::{JdbcSink, JdbcSource};
 use crate::registry::descriptor::ConnectorDescriptor;
 use crate::registry::driver::{SinkDriver, SourceDriver};
@@ -20,6 +20,22 @@ fn require_url(config: &ConnectorConfig) -> ConnectorResult<String> {
 
 fn require_table(config: &ConnectorConfig) -> ConnectorResult<String> {
     Ok(config.required("table")?.to_owned())
+}
+
+/// Strictly parse an optional positive-integer option. A malformed value is
+/// an ERROR, not a silent fall-back to the default — a typo like
+/// `batch_size=1O00` must not quietly run with 1 000.
+fn parse_opt_usize_option(
+    config: &ConnectorConfig,
+    key: &str,
+    default: usize,
+) -> ConnectorResult<usize> {
+    match config.get(key) {
+        None => Ok(default),
+        Some(v) => v.parse::<usize>().map_err(|_| ConnectorError::Config {
+            message: format!("jdbc option '{key}' must be a positive integer, got '{v}'"),
+        }),
+    }
 }
 
 /// Fail-fast validation of the incremental-cursor options, so a bad config
@@ -49,7 +65,9 @@ fn validate_cursor_options(config: &ConnectorConfig) -> ConnectorResult<()> {
 ///
 /// Optional config keys:
 /// - `batch_size` — rows per page (default 1 000)
-/// - `cursor.column` — keyset-pagination column for incremental pull
+/// - `cursor.column` — keyset-pagination column for incremental pull; the
+///   column must be `BIGINT` (int8) — reads error if its value cannot be
+///   decoded as an `i64`
 /// - `cursor.after` — Int64 cursor to resume strictly after (needs
 ///   `cursor.column`)
 pub struct JdbcSourceDriver;
@@ -69,6 +87,7 @@ impl SourceDriver for JdbcSourceDriver {
         require_url(config)?;
         require_table(config)?;
         validate_cursor_options(config)?;
+        let _ = parse_opt_usize_option(config, "batch_size", 1_000)?;
         Ok(())
     }
 
@@ -79,10 +98,9 @@ impl SourceDriver for JdbcSourceDriver {
         Box::pin(async move {
             let url = require_url(config)?;
             let table = require_table(config)?;
-            let batch_size: u32 = config
-                .get("batch_size")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1_000);
+            let batch_size = parse_opt_usize_option(config, "batch_size", 1_000)?
+                .try_into()
+                .unwrap_or(u32::MAX);
             let mut source = JdbcSource::connect(&url, table)
                 .await
                 .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?
@@ -144,6 +162,7 @@ impl SinkDriver for JdbcSinkDriver {
     fn validate(&self, config: &ConnectorConfig) -> ConnectorResult<()> {
         require_url(config)?;
         require_table(config)?;
+        let _ = parse_opt_usize_option(config, "batch_rows", 500)?;
         Ok(())
     }
 
@@ -155,15 +174,57 @@ impl SinkDriver for JdbcSinkDriver {
             let url = require_url(config)?;
             let table = require_table(config)?;
             let conflict_keys = sink_conflict_keys(config);
-            let batch_rows = config
-                .get("batch_rows")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(500);
+            let batch_rows = parse_opt_usize_option(config, "batch_rows", 500)?;
+            let capabilities = jdbc_sink_capabilities(config);
             let sink = JdbcSink::connect_with(&url, table, conflict_keys, batch_rows)
                 .await
                 .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
-            Ok(Box::new(sink) as Box<dyn DynSink>)
+            Ok(Box::new(ConfiguredJdbcSink {
+                inner: sink,
+                capabilities,
+            }) as Box<dyn DynSink>)
         })
+    }
+}
+
+/// Opened JDBC sink reporting capabilities derived from its configuration.
+///
+/// This is how [`jdbc_sink_delivery`] reaches consumers: the opened sink's
+/// `capabilities().delivery_guarantee()` reports `EffectivelyOnce` only when
+/// conflict keys were declared (upsert mode).
+struct ConfiguredJdbcSink {
+    inner: JdbcSink,
+    capabilities: ConnectorCapabilities,
+}
+
+impl crate::sink::Sink for ConfiguredJdbcSink {
+    fn capabilities(&self) -> ConnectorCapabilities {
+        self.capabilities.clone()
+    }
+
+    async fn write_batch(
+        &mut self,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> ConnectorResult<()> {
+        self.inner.write_batch(batch).await
+    }
+
+    async fn flush(&mut self) -> ConnectorResult<()> {
+        self.inner.flush().await
+    }
+}
+
+/// Capabilities an opened sink earns **for a given config**, derived from
+/// [`jdbc_sink_delivery`]: upsert mode (conflict keys declared) adds the
+/// idempotent flag, which is what `delivery_guarantee()` reports as
+/// `EffectivelyOnce`.
+pub(crate) fn jdbc_sink_capabilities(config: &ConnectorConfig) -> ConnectorCapabilities {
+    let base = ConnectorCapabilities::new()
+        .with_bounded()
+        .with_resumable_flush();
+    match jdbc_sink_delivery(config) {
+        DeliveryGuarantee::EffectivelyOnce => base.with_idempotent(),
+        _ => base,
     }
 }
 
@@ -231,6 +292,56 @@ mod sink_delivery_tests {
             jdbc_sink_delivery(&upsert),
             DeliveryGuarantee::EffectivelyOnce
         );
+    }
+
+    #[test]
+    fn malformed_batch_options_are_errors_not_silent_defaults() {
+        use crate::registry::driver::{SinkDriver as _, SourceDriver as _};
+        let source_cfg = config(&[
+            ("url", "postgres://h/d"),
+            ("table", "t"),
+            ("batch_size", "1O00"),
+        ]);
+        assert!(JdbcSourceDriver.validate(&source_cfg).is_err());
+
+        let sink_cfg = config(&[
+            ("url", "postgres://h/d"),
+            ("table", "t"),
+            ("batch_rows", "many"),
+        ]);
+        assert!(JdbcSinkDriver.validate(&sink_cfg).is_err());
+
+        // Well-formed values still validate.
+        let ok = config(&[
+            ("url", "postgres://h/d"),
+            ("table", "t"),
+            ("batch_rows", "250"),
+        ]);
+        assert!(JdbcSinkDriver.validate(&ok).is_ok());
+    }
+
+    /// The opened sink's capability surface is where the delivery guarantee
+    /// becomes visible to consumers: upsert-configured sinks report
+    /// `EffectivelyOnce`, append-mode sinks do not.
+    #[test]
+    fn opened_sink_capabilities_surface_the_configured_delivery() {
+        let upsert = config(&[
+            ("url", "postgres://h/d"),
+            ("table", "t"),
+            ("conflict_keys", "id"),
+        ]);
+        assert_eq!(
+            jdbc_sink_capabilities(&upsert).delivery_guarantee(),
+            DeliveryGuarantee::EffectivelyOnce
+        );
+
+        let append = config(&[("url", "postgres://h/d"), ("table", "t")]);
+        assert_ne!(
+            jdbc_sink_capabilities(&append).delivery_guarantee(),
+            DeliveryGuarantee::EffectivelyOnce,
+            "append mode must not be labeled effectively-once"
+        );
+        assert!(!jdbc_sink_capabilities(&append).is_idempotent());
     }
 
     #[test]

@@ -6,7 +6,9 @@ use serde_json::json;
 
 use super::batch::EmbeddingBatch;
 use super::id::point_id_from_doc_epoch;
-use super::traits::{PayloadFilter, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult};
+use super::traits::{
+    PayloadFilter, PayloadValue, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult,
+};
 
 /// Pinecone REST upsert sink.
 #[derive(Clone)]
@@ -40,6 +42,16 @@ impl PineconeSink {
             namespace,
         }
     }
+
+    /// Build a request URL, defaulting to https when `host` has no scheme.
+    fn endpoint(&self, path: &str) -> String {
+        let base = self.host.trim_end_matches('/');
+        if base.starts_with("http://") || base.starts_with("https://") {
+            format!("{base}/{path}")
+        } else {
+            format!("https://{base}/{path}")
+        }
+    }
 }
 
 #[async_trait]
@@ -56,10 +68,13 @@ impl VectorSink for PineconeSink {
             .zip(batch.payloads.iter())
             .map(|((doc_id, vector), payload)| {
                 let id = point_id_from_doc_epoch(doc_id, batch.epoch);
-                let metadata: HashMap<String, serde_json::Value> = payload
+                let mut metadata: HashMap<String, serde_json::Value> = payload
                     .iter()
                     .map(|(k, v)| (k.clone(), v.to_json()))
                     .collect();
+                // Store the doc id so queries can map matches back to source
+                // documents (the point id is an opaque hash).
+                metadata.insert("doc_id".into(), json!(doc_id));
                 json!({
                     "id": id,
                     "values": vector,
@@ -73,12 +88,7 @@ impl VectorSink for PineconeSink {
         {
             obj.insert("namespace".to_string(), json!(ns));
         }
-        let base = self.host.trim_end_matches('/');
-        let url = if base.starts_with("http://") || base.starts_with("https://") {
-            format!("{base}/vectors/upsert")
-        } else {
-            format!("https://{base}/vectors/upsert")
-        };
+        let url = self.endpoint("vectors/upsert");
         let response = self
             .client
             .post(&url)
@@ -104,12 +114,7 @@ impl VectorSink for PineconeSink {
         {
             obj.insert("namespace".to_string(), json!(ns));
         }
-        let base = self.host.trim_end_matches('/');
-        let url = if base.starts_with("http://") || base.starts_with("https://") {
-            format!("{base}/vectors/delete")
-        } else {
-            format!("https://{base}/vectors/delete")
-        };
+        let url = self.endpoint("vectors/delete");
         let response = self
             .client
             .post(&url)
@@ -135,7 +140,7 @@ impl VectorSink for PineconeSink {
         &self,
         vector: &[f32],
         top_k: usize,
-        _filter: Option<&PayloadFilter>,
+        filter: Option<&PayloadFilter>,
     ) -> VectorSinkResult<Vec<ScoredChunk>> {
         let mut body = json!({
             "vector": vector,
@@ -147,7 +152,18 @@ impl VectorSink for PineconeSink {
         {
             obj.insert("namespace".to_string(), json!(ns));
         }
-        let url = format!("https://{}/query", self.host);
+        if let Some(filter) = filter
+            && !filter.equals.is_empty()
+            && let Some(obj) = body.as_object_mut()
+        {
+            let clauses: serde_json::Map<String, serde_json::Value> = filter
+                .equals
+                .iter()
+                .map(|(k, v)| (k.clone(), json!({ "$eq": v.to_json() })))
+                .collect();
+            obj.insert("filter".to_string(), serde_json::Value::Object(clauses));
+        }
+        let url = self.endpoint("query");
         let response = self
             .client
             .post(&url)
@@ -180,15 +196,53 @@ impl VectorSink for PineconeSink {
             .filter_map(|m| {
                 let score = m.get("score")?.as_f64()? as f32;
                 let id = m.get("id")?.as_str()?.to_string();
+                let metadata = m
+                    .get("metadata")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                let doc_id = metadata
+                    .get("doc_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or(id);
+                let text = metadata
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let chunk_index = metadata
+                    .get("chunk_index")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as usize;
+                let payload: HashMap<String, PayloadValue> = metadata
+                    .iter()
+                    .filter_map(|(k, v)| json_to_payload_value(v).map(|pv| (k.clone(), pv)))
+                    .collect();
                 Some(ScoredChunk {
-                    doc_id: id,
-                    chunk_index: 0,
-                    text: String::new(),
+                    doc_id,
+                    chunk_index,
+                    text,
                     score,
-                    payload: HashMap::new(),
+                    payload,
                 })
             })
             .collect())
+    }
+}
+
+fn json_to_payload_value(v: &serde_json::Value) -> Option<PayloadValue> {
+    match v {
+        serde_json::Value::String(s) => Some(PayloadValue::String(s.clone())),
+        serde_json::Value::Bool(b) => Some(PayloadValue::Bool(*b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(PayloadValue::Int(i))
+            } else {
+                n.as_f64().map(PayloadValue::Float)
+            }
+        }
+        _ => None,
     }
 }
 
@@ -237,6 +291,88 @@ mod tests {
             }
             other => panic!("expected Delete error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn pinecone_query_uses_scheme_aware_url_and_reads_metadata() {
+        let mut server = mockito::Server::new_async().await;
+        let body = serde_json::json!({
+            "matches": [{
+                "id": "abcdef0123456789",
+                "score": 0.87,
+                "metadata": {
+                    "doc_id": "d1",
+                    "text": "hello",
+                    "chunk_index": 4
+                }
+            }]
+        });
+        let m = server
+            .mock("POST", "/query")
+            .with_status(200)
+            .with_body(body.to_string())
+            .create_async()
+            .await;
+        // server.url() already carries an http:// scheme; the query must not
+        // prepend a second scheme.
+        let sink = PineconeSink::new(server.url(), "test-key", None);
+        let hits = sink.query_nearest(&[1.0, 0.0], 5, None).await.unwrap();
+        m.assert_async().await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "d1");
+        assert_eq!(hits[0].text, "hello");
+        assert_eq!(hits[0].chunk_index, 4);
+        assert_eq!(
+            hits[0].payload.get("text"),
+            Some(&super::super::traits::PayloadValue::String("hello".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn pinecone_query_sends_filter_in_body() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/query")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "filter": { "lang": { "$eq": "en" } }
+            })))
+            .with_status(200)
+            .with_body(r#"{"matches": []}"#)
+            .create_async()
+            .await;
+        let sink = PineconeSink::new(server.url(), "test-key", None);
+        let mut equals = HashMap::new();
+        equals.insert(
+            "lang".to_string(),
+            super::super::traits::PayloadValue::String("en".into()),
+        );
+        let filter = PayloadFilter { equals };
+        sink.query_nearest(&[1.0, 0.0], 5, Some(&filter))
+            .await
+            .unwrap();
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pinecone_upsert_stores_doc_id_in_metadata() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/vectors/upsert")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "vectors": [{ "metadata": { "doc_id": "doc" } }]
+            })))
+            .with_status(200)
+            .create_async()
+            .await;
+        let sink = PineconeSink::new(server.url(), "test-key", None);
+        let batch = EmbeddingBatch::new(
+            vec!["doc".into()],
+            vec![vec![1.0, 0.0]],
+            vec![HashMap::new()],
+            7,
+        );
+        sink.upsert_batch(&batch).await.unwrap();
+        m.assert_async().await;
     }
 
     #[tokio::test]

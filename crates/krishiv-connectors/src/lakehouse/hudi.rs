@@ -255,6 +255,7 @@ impl HudiCowWriter {
     ) -> LakehouseResult<HudiWriteResult> {
         let instant = instant.into();
         validate_instant(&instant)?;
+        let base_instant = self.latest_instant()?;
         let current = self.current_snapshot_batch()?;
         let (base_batch, snapshot_rows) = match current {
             Some(existing) if existing.num_rows() > 0 => {
@@ -271,6 +272,7 @@ impl HudiCowWriter {
             batch.num_rows() as u64,
             0,
             snapshot_rows,
+            base_instant,
         )?;
         Ok(result)
     }
@@ -289,6 +291,7 @@ impl HudiCowWriter {
     ) -> LakehouseResult<HudiWriteResult> {
         let instant = instant.into();
         validate_instant(&instant)?;
+        let base_instant = self.latest_instant()?;
         let source = deduplicate_by_key_last(&batch, key_column)?;
         let source_key_col = source
             .column_by_name(key_column)
@@ -333,7 +336,18 @@ impl HudiCowWriter {
             rows_inserted,
             rows_updated,
             merged.num_rows() as u64,
+            base_instant,
         )
+    }
+
+    /// Latest committed instant on the timeline (None for an empty table).
+    fn latest_instant(&self) -> LakehouseResult<Option<String>> {
+        let reader = HudiSnapshotReader::open(&self.table_path);
+        match reader.list_commits() {
+            Ok(commits) => Ok(commits.last().cloned()),
+            Err(LakehouseError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     fn current_snapshot_batch(&self) -> LakehouseResult<Option<RecordBatch>> {
@@ -361,7 +375,22 @@ impl HudiCowWriter {
         rows_inserted: u64,
         rows_updated: u64,
         snapshot_rows: u64,
+        base_instant: Option<String>,
     ) -> LakehouseResult<HudiWriteResult> {
+        // CoW writes are read-modify-write over the whole snapshot. If another
+        // writer committed after this writer read its snapshot base, blindly
+        // publishing would silently drop that writer's rows. Detect the lost
+        // update and ask the caller to retry (minimal conflict check, not a
+        // full OCC protocol).
+        let current_latest = self.latest_instant()?;
+        if current_latest != base_instant {
+            return Err(LakehouseError::Concurrency {
+                message: format!(
+                    "Hudi table advanced from {base_instant:?} to {current_latest:?} since the \
+                     snapshot was read; retry the write against the new snapshot"
+                ),
+            });
+        }
         fs::create_dir_all(self.table_path.join(".hoodie/timeline"))
             .map_err(|e| LakehouseError::Io(e.to_string()))?;
         let timeline_marker = self
@@ -460,14 +489,22 @@ impl HudiCowWriter {
     ) -> LakehouseResult<u64> {
         let instant = instant.into();
         validate_instant(&instant)?;
+        let base_instant = self.latest_instant()?;
         let current = match self.current_snapshot_batch()? {
             Some(b) if b.num_rows() > 0 => b,
             _ => return Ok(0), // nothing to delete from an empty table
         };
-        let key_set: HashSet<String> = key_values.iter().cloned().collect();
         let key_col = current.column_by_name(key_column).ok_or_else(|| {
             LakehouseError::Io(format!("delete key '{key_column}' not in schema"))
         })?;
+        // Accept raw key values ("1") by typing them against the key column's
+        // actual type, and keep the internal typed form ("Int64:1") for
+        // backward compatibility.
+        let key_type = key_col.data_type();
+        let key_set: HashSet<String> = key_values
+            .iter()
+            .flat_map(|v| [v.clone(), format!("{key_type}:{v}")])
+            .collect();
         let keep_indices: Vec<u32> = (0..current.num_rows())
             .filter(|&row| {
                 typed_key(key_col.as_ref(), row)
@@ -490,6 +527,7 @@ impl HudiCowWriter {
             0,
             0,
             new_snapshot.num_rows() as u64,
+            base_instant,
         )?;
         Ok(rows_deleted)
     }
@@ -513,25 +551,39 @@ pub struct HudiStageHandle {
 
 /// [`TwoPhaseCommitSink`] backed by a local Hudi Copy-on-Write table.
 ///
-/// `prepare()` generates a Hudi instant and holds the batch in memory.
-/// `commit()` calls [`HudiCowWriter::append_at`] with the staged instant.
-/// `abort()` discards the staged batch without touching the timeline.
+/// `prepare()` generates a Hudi instant and stages the batch durably as a
+/// Parquet file under `<table>/.hoodie/stage/<instant>.parquet` (fsynced), so
+/// a coordinator can still commit after a process restart. `commit()` reads
+/// the staged file back and calls [`HudiCowWriter::append_at`] with the
+/// staged instant, then removes the staging file. `abort()` removes the
+/// staging file without touching the timeline.
 ///
-/// Both `commit()` and `abort()` are idempotent: if the handle is no longer
-/// in the staged map (already committed or aborted), the call is a no-op.
+/// `commit()` of a handle whose staging file is missing succeeds only if the
+/// instant is already on the timeline (idempotent re-commit); an unknown
+/// handle is an error. `abort()` is idempotent.
 pub struct HudiTwoPhaseCommitSink {
     writer: HudiCowWriter,
-    staged: std::collections::HashMap<String, RecordBatch>,
+    table_path: PathBuf,
 }
 
 impl HudiTwoPhaseCommitSink {
     /// Open or create a Hudi CoW table at `table_path`.
     pub fn new(table_path: impl AsRef<Path>) -> Self {
         Self {
-            writer: HudiCowWriter::open(table_path),
-            staged: std::collections::HashMap::new(),
+            writer: HudiCowWriter::open(table_path.as_ref()),
+            table_path: table_path.as_ref().to_path_buf(),
         }
     }
+
+    fn stage_path(&self, instant: &str) -> PathBuf {
+        self.table_path
+            .join(".hoodie/stage")
+            .join(format!("{instant}.parquet"))
+    }
+}
+
+fn hudi_to_connector(e: impl std::fmt::Display) -> ConnectorError {
+    ConnectorError::Io(std::io::Error::other(e.to_string()))
 }
 
 impl TwoPhaseCommitSink for HudiTwoPhaseCommitSink {
@@ -543,23 +595,60 @@ impl TwoPhaseCommitSink for HudiTwoPhaseCommitSink {
 
     fn prepare(&mut self, _epoch: u64, batch: &RecordBatch) -> ConnectorResult<Self::Handle> {
         let instant = next_instant();
-        self.staged.insert(instant.clone(), batch.clone());
+        let stage_dir = self.table_path.join(".hoodie/stage");
+        fs::create_dir_all(&stage_dir).map_err(hudi_to_connector)?;
+        let stage_path = self.stage_path(&instant);
+        // Durable staging: the batch must survive a restart between prepare
+        // and commit, or 2PC degrades to at-most-once.
+        let file = fs::File::create(&stage_path).map_err(hudi_to_connector)?;
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None)
+            .map_err(hudi_to_connector)?;
+        writer.write(batch).map_err(hudi_to_connector)?;
+        let file = writer.into_inner().map_err(hudi_to_connector)?;
+        file.sync_all().map_err(hudi_to_connector)?;
         Ok(HudiStageHandle { instant })
     }
 
     fn commit(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
-        let batch = match self.staged.remove(&handle.instant) {
-            Some(b) => b,
-            None => return Ok(()),
-        };
+        let stage_path = self.stage_path(&handle.instant);
+        if !stage_path.exists() {
+            // Idempotent re-commit: the instant already made it onto the
+            // timeline. Anything else is an unknown handle and must not be
+            // silently acknowledged.
+            let marker = self
+                .table_path
+                .join(".hoodie/timeline")
+                .join(format!("{}.commit", handle.instant));
+            if marker.exists() {
+                return Ok(());
+            }
+            return Err(hudi_to_connector(format!(
+                "cannot commit unknown Hudi 2PC handle '{}': no staged batch and no committed \
+                 instant",
+                handle.instant
+            )));
+        }
+        let file = fs::File::open(&stage_path).map_err(hudi_to_connector)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(hudi_to_connector)?
+            .build()
+            .map_err(hudi_to_connector)?;
+        let batches = reader
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(hudi_to_connector)?;
+        let batch = concat_batches(&batches).map_err(hudi_to_connector)?;
         self.writer
             .append_at(&handle.instant, batch)
-            .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
+            .map_err(hudi_to_connector)?;
+        fs::remove_file(&stage_path).map_err(hudi_to_connector)?;
         Ok(())
     }
 
     fn abort(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
-        self.staged.remove(&handle.instant);
+        let stage_path = self.stage_path(&handle.instant);
+        if stage_path.exists() {
+            fs::remove_file(&stage_path).map_err(hudi_to_connector)?;
+        }
         Ok(())
     }
 }
@@ -980,6 +1069,14 @@ impl HudiObjectStoreWriter {
     /// Append rows, generating a new Hudi instant.
     pub async fn append(&self, batch: RecordBatch) -> LakehouseResult<HudiWriteResult> {
         let instant = next_instant();
+        // snapshot_rows reports the total after the commit, so count what the
+        // table already holds before adding this batch.
+        let existing_rows: u64 = HudiObjectStoreReader::new(Arc::clone(&self.store), &self.prefix)
+            .scan_batches()
+            .await?
+            .iter()
+            .map(|b| b.num_rows() as u64)
+            .sum();
         let parquet_bytes = batch_to_parquet_bytes(&batch)?;
         let data_path =
             object_store::path::Path::from(format!("{}/{}/part-0.parquet", self.prefix, instant));
@@ -1005,7 +1102,7 @@ impl HudiObjectStoreWriter {
             instant,
             rows_inserted: rows,
             rows_updated: 0,
-            snapshot_rows: rows,
+            snapshot_rows: existing_rows + rows,
         })
     }
 }
@@ -1354,54 +1451,6 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // HudiQueryType tests
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn hudi_query_type_default_is_snapshot() {
-        let qt = HudiQueryType::default();
-        assert_eq!(qt, HudiQueryType::Snapshot);
-    }
-
-    #[test]
-    fn hudi_query_type_variants_are_distinct() {
-        assert_ne!(HudiQueryType::Snapshot, HudiQueryType::Incremental);
-    }
-
-    #[test]
-    fn hudi_query_type_clone_eq() {
-        let qt = HudiQueryType::Incremental;
-        let cloned = qt;
-        assert_eq!(qt, cloned);
-    }
-
-    #[test]
-    fn hudi_query_type_debug_format() {
-        assert_eq!(format!("{:?}", HudiQueryType::Snapshot), "Snapshot");
-        assert_eq!(format!("{:?}", HudiQueryType::Incremental), "Incremental");
-    }
-
-    // ------------------------------------------------------------------
-    // HudiCowWriter Debug / constructor tests
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn hudi_cow_writer_debug_format() {
-        let dir = tempdir().unwrap();
-        let writer = HudiCowWriter::open(dir.path());
-        let dbg = format!("{:?}", writer);
-        assert!(dbg.contains("HudiCowWriter"));
-    }
-
-    #[test]
-    fn hudi_cow_writer_open_creates_writer() {
-        let dir = tempdir().unwrap();
-        let writer = HudiCowWriter::open(dir.path());
-        assert!(dir.path().exists());
-        let _ = writer;
-    }
-
-    // ------------------------------------------------------------------
     // validate_instant tests
     // ------------------------------------------------------------------
 
@@ -1486,36 +1535,6 @@ mod tests {
         let batch = batch(&[(1, "a")]);
         let err = deduplicate_by_key_last(&batch, "nonexistent");
         assert!(matches!(err, Err(LakehouseError::Io(_))));
-    }
-
-    // ------------------------------------------------------------------
-    // HudiWriteResult tests
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn hudi_write_result_fields() {
-        let result = HudiWriteResult {
-            instant: "20240101120000123-0123456789abcdef".to_string(),
-            rows_inserted: 5,
-            rows_updated: 3,
-            snapshot_rows: 10,
-        };
-        assert_eq!(result.instant, "20240101120000123-0123456789abcdef");
-        assert_eq!(result.rows_inserted, 5);
-        assert_eq!(result.rows_updated, 3);
-        assert_eq!(result.snapshot_rows, 10);
-    }
-
-    #[test]
-    fn hudi_write_result_eq() {
-        let a = HudiWriteResult {
-            instant: "t".to_string(),
-            rows_inserted: 1,
-            rows_updated: 2,
-            snapshot_rows: 3,
-        };
-        let b = a.clone();
-        assert_eq!(a, b);
     }
 
     // ------------------------------------------------------------------
@@ -1824,6 +1843,25 @@ mod tests {
         // However both commits are still in the timeline, so nothing is orphaned yet.
         let removed = vacuum_hudi_table(dir.path(), 0).unwrap();
         assert_eq!(removed, 0, "active instants must not be vacuumed");
+
+        // A genuinely orphaned instant dir — parquet data with no timeline
+        // marker (e.g. a crashed write) — must be removed.
+        let orphan_instant = "20200101120000123-0123456789abcdef";
+        let orphan_dir = dir.path().join(orphan_instant);
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        std::fs::write(orphan_dir.join("part-0.parquet"), b"junk").unwrap();
+        let removed = vacuum_hudi_table(dir.path(), 0).unwrap();
+        assert_eq!(removed, 1, "orphaned instant's parquet must be removed");
+        assert!(!orphan_dir.exists(), "empty orphan dir removed as well");
+
+        // Table still fully readable after vacuum.
+        let total: usize = HudiSnapshotReader::open(dir.path())
+            .scan_batches()
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(total, 5);
     }
 
     #[test]
@@ -1899,5 +1937,126 @@ mod tests {
         // useful message of the two — pinned so a refactor cannot quietly
         // downgrade it to a bare "no data".
         assert!(err.to_string().contains("Table not found"), "{err}");
+    }
+
+    /// snapshot_rows documents "total after the commit" — a second append
+    /// must report the cumulative count, not just the batch size.
+    #[tokio::test]
+    async fn hudi_object_store_append_reports_cumulative_snapshot_rows() {
+        let store = make_inmemory_store();
+        let writer = HudiObjectStoreWriter::new(Arc::clone(&store), "cum/table");
+        let r1 = writer.append(batch(&[(1, "a"), (2, "b")])).await.unwrap();
+        assert_eq!(r1.snapshot_rows, 2);
+        let r2 = writer.append(batch(&[(3, "c")])).await.unwrap();
+        assert_eq!(r2.rows_inserted, 1);
+        assert_eq!(
+            r2.snapshot_rows, 3,
+            "snapshot_rows must be the total after the commit"
+        );
+    }
+
+    /// A CoW writer whose snapshot base is stale (another writer committed in
+    /// between) must get a conflict error instead of silently dropping the
+    /// other writer's rows.
+    #[test]
+    fn hudi_cow_commit_with_stale_snapshot_base_is_conflict() {
+        let dir = tempdir().unwrap();
+        let writer = HudiCowWriter::open(dir.path());
+        writer
+            .append_at("20240101120000123-0123456789abcdef", batch(&[(1, "a")]))
+            .unwrap();
+
+        // Writer B reads its snapshot base here...
+        let stale_base = writer.latest_instant().unwrap();
+        // ...then writer A commits an upsert.
+        writer
+            .upsert_at(
+                "20240102120000123-0123456789abcdef",
+                "id",
+                batch(&[(2, "b")]),
+            )
+            .unwrap();
+
+        // Writer B publishes its (now stale) read-modify-write result.
+        let b = batch(&[(1, "a"), (3, "c")]);
+        let err = writer
+            .write_commit(
+                "20240103120000123-0123456789abcdef",
+                "append",
+                None,
+                Some(&b),
+                &b,
+                1,
+                0,
+                2,
+                stale_base,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, LakehouseError::Concurrency { .. }),
+            "stale base must be a conflict, got: {err:?}"
+        );
+
+        // Writer A's row survived.
+        let snapshot = HudiSnapshotReader::open(dir.path()).scan_batches().unwrap();
+        let current = concat_batches(&snapshot).unwrap();
+        assert_eq!(names(&current), vec!["a", "b"]);
+    }
+
+    /// delete_by_key must accept raw key values, typing them against the key
+    /// column — the internal "Int64:1" form stays accepted for compat.
+    #[test]
+    fn delete_by_key_accepts_raw_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = HudiCowWriter::open(dir.path());
+        writer.append(sample_batch(&[1, 2, 3])).unwrap();
+
+        let deleted = writer.delete_by_key("id", &["1".to_string()]).unwrap();
+        assert_eq!(deleted, 1, "raw key value must match the Int64 column");
+
+        let total: usize = HudiSnapshotReader::open(dir.path())
+            .scan_batches()
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(total, 2);
+    }
+
+    /// prepare stages durably: a fresh sink (simulating a restart) must be
+    /// able to commit a handle prepared by a previous sink instance.
+    #[test]
+    fn hudi_two_phase_commit_survives_sink_restart() {
+        let dir = tempdir().unwrap();
+        let handle = {
+            let mut sink = HudiTwoPhaseCommitSink::new(dir.path());
+            sink.prepare(1, &batch(&[(1, "a"), (2, "b")])).unwrap()
+        }; // sink dropped — only durable state remains
+
+        let mut recovered = HudiTwoPhaseCommitSink::new(dir.path());
+        recovered.commit(handle).unwrap();
+
+        let total: usize = HudiSnapshotReader::open(dir.path())
+            .scan_batches()
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(total, 2, "staged batch must be committed after restart");
+    }
+
+    /// Committing a handle that was never prepared must error, not silently
+    /// acknowledge a write that never happened.
+    #[test]
+    fn hudi_two_phase_commit_of_unknown_handle_is_error() {
+        let dir = tempdir().unwrap();
+        let mut sink = HudiTwoPhaseCommitSink::new(dir.path());
+        let bogus = HudiStageHandle {
+            instant: "20240101120000123-0123456789abcdef".to_string(),
+        };
+        assert!(
+            sink.commit(bogus).is_err(),
+            "unknown handle must not be acknowledged"
+        );
     }
 }

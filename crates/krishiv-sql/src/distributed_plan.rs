@@ -6876,7 +6876,10 @@ mod staged_tpch_tests {
             .expect("still a hash join");
         assert_eq!(*converted_join.partition_mode(), PartitionMode::Partitioned);
         assert_eq!(
-            converted_join.left().output_partitioning().partition_count(),
+            converted_join
+                .left()
+                .output_partitioning()
+                .partition_count(),
             build_partitions,
             "the rescue must keep the build side's parallelism, not collapse to the probe's 1"
         );

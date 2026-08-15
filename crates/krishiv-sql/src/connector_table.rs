@@ -33,11 +33,9 @@ fn is_object_store_url(location: &str) -> bool {
         Some((scheme, _)) => scheme,
         None => return false,
     };
-    [
-        "s3", "s3a", "gs", "gcs", "az", "azure", "abfs", "abfss",
-    ]
-    .iter()
-    .any(|known| scheme.eq_ignore_ascii_case(known))
+    ["s3", "s3a", "gs", "gcs", "az", "azure", "abfs", "abfss"]
+        .iter()
+        .any(|known| scheme.eq_ignore_ascii_case(known))
 }
 
 /// Reject paths that escape the warehouse root via traversal or absolutes.
@@ -474,9 +472,9 @@ impl TableProvider for BoundedConnectorProvider {
             config: sink_config_for(&self.config)?,
             schema: Arc::clone(&self.schema),
         });
-        Ok(Arc::new(
-            datafusion::datasource::sink::DataSinkExec::new(input, sink, None),
-        ))
+        Ok(Arc::new(datafusion::datasource::sink::DataSinkExec::new(
+            input, sink, None,
+        )))
     }
 }
 
@@ -827,8 +825,15 @@ mod tests {
     #[test]
     fn object_store_schemes_are_recognised_regardless_of_case() {
         for uri in [
-            "s3://bucket/k", "S3://bucket/k", "S3A://bucket/k", "Gs://b/k",
-            "GCS://b/k", "AZ://b/k", "Azure://b/k", "ABFS://b/k", "AbFsS://b/k",
+            "s3://bucket/k",
+            "S3://bucket/k",
+            "S3A://bucket/k",
+            "Gs://b/k",
+            "GCS://b/k",
+            "AZ://b/k",
+            "Azure://b/k",
+            "ABFS://b/k",
+            "AbFsS://b/k",
         ] {
             assert!(is_object_store_url(uri), "{uri} must be object storage");
         }
@@ -855,7 +860,10 @@ mod tests {
             "https://example.com/x",
             "",
         ] {
-            assert!(!is_object_store_url(uri), "{uri} must not be object storage");
+            assert!(
+                !is_object_store_url(uri),
+                "{uri} must not be object storage"
+            );
         }
     }
 }
@@ -884,7 +892,13 @@ mod insert_into_tests {
             "CREATE EXTERNAL TABLE sb (id BIGINT, v VARCHAR) STORED AS JDBC \
              LOCATION '{url}' OPTIONS ('table' 'serveback', 'conflict_keys' 'id')"
         );
-        engine.sql(&ddl).await.expect("ddl").collect().await.expect("ddl run");
+        engine
+            .sql(&ddl)
+            .await
+            .expect("ddl")
+            .collect()
+            .await
+            .expect("ddl run");
 
         // The write the phase needs: a computed lake-side result landing in
         // the operational store.
@@ -896,10 +910,16 @@ mod insert_into_tests {
             .await
             .expect("insert runs");
 
-        let back = engine.sql("SELECT id, v FROM sb ORDER BY id").await.unwrap();
+        let back = engine
+            .sql("SELECT id, v FROM sb ORDER BY id")
+            .await
+            .unwrap();
         let batches = back.collect().await.unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total, 2, "rows must be readable back through the source path");
+        assert_eq!(
+            total, 2,
+            "rows must be readable back through the source path"
+        );
 
         // Re-delivering the SAME keys must converge, not duplicate — this
         // is what earns the "idempotent upsert" label the sink advertises.
@@ -960,7 +980,13 @@ mod review_regression_tests {
              STORED AS JDBC LOCATION '{url}' \
              OPTIONS ('table' 'fixprobe', 'conflict_keys' 'ID')"
         );
-        engine.sql(&ddl).await.expect("ddl").collect().await.expect("ddl run");
+        engine
+            .sql(&ddl)
+            .await
+            .expect("ddl")
+            .collect()
+            .await
+            .expect("ddl run");
 
         // A NULL bool and a NULL text in one batch (defect 11): the old
         // code bound both as int8 NULL and Postgres rejected the batch.

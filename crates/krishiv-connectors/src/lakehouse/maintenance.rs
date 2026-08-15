@@ -52,10 +52,17 @@ async fn file_paths_for_snapshot(
         tasks.len(),
         &format!("file_paths_for_snapshot(snapshot {snapshot_id})"),
     )?;
-    Ok(tasks
-        .into_iter()
-        .map(|t| t.data_file_path().to_string())
-        .collect())
+    // Delete files (equality/position deletes) are live table state too: a
+    // task's `deletes` are read on every scan, so treating them as
+    // unreferenced would resurrect the rows they delete.
+    let mut paths = HashSet::new();
+    for task in tasks {
+        for delete in &task.deletes {
+            paths.insert(delete.file_path.clone());
+        }
+        paths.insert(task.data_file_path().to_string());
+    }
+    Ok(paths)
 }
 
 // ── expire_snapshots ──────────────────────────────────────────────────────────
@@ -63,12 +70,11 @@ async fn file_paths_for_snapshot(
 /// Remove snapshots older than `older_than` from the table history, keeping at
 /// least `retain_last` snapshots regardless of age.
 ///
-/// Returns the number of snapshots marked for removal. Data files that are only
-/// referenced by expired snapshots (not by any kept snapshot) are deleted via
-/// the table's `FileIO` — this works for local, S3, GCS, and Azure backends.
-///
-/// Expired snapshot IDs are also recorded in the `krishiv.expired-snapshot-ids`
-/// table property so that external tools have an audit trail.
+/// Returns the number of snapshots removed. The expired snapshots are removed
+/// from the table metadata via `Transaction::expire_snapshots`, then data
+/// files that were only referenced by them (not by any kept snapshot) are
+/// deleted via the table's `FileIO` — this works for local, S3, GCS, and
+/// Azure backends. Idempotent: a second run selects nothing and returns 0.
 pub async fn expire_snapshots(
     catalog: Arc<dyn Catalog + Send + Sync>,
     table_ident: &TableIdent,
@@ -119,44 +125,66 @@ pub async fn expire_snapshots(
         kept_files.extend(paths);
     }
 
-    // Delete data files referenced ONLY by expired snapshots.
-    let mut files_deleted = 0usize;
+    // Collect the expiring snapshots' file sets BEFORE the metadata commit —
+    // once a snapshot is removed from the metadata it can no longer be scanned.
+    let mut expiring_files: HashSet<String> = HashSet::new();
     for snap_id in &to_expire {
-        let expiring_files = file_paths_for_snapshot(&table, *snap_id).await?;
-        for path in expiring_files {
-            if !kept_files.contains(&path) {
-                match file_io.delete(&path).await {
-                    Ok(()) => files_deleted += 1,
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %path,
-                            error = %e,
-                            "expire_snapshots: failed to delete orphan file"
-                        );
-                    }
-                }
-            }
+        expiring_files.extend(file_paths_for_snapshot(&table, *snap_id).await?);
+    }
+
+    // Remove the expired snapshots from the table metadata. This is the real
+    // expiry: after this commit, time travel to them fails loudly instead of
+    // silently reading files deleted below, and a re-run sees them gone
+    // (idempotent — the second run selects nothing and returns 0). The age
+    // cutoff is pinned to 0 so only the explicitly selected ids expire; the
+    // selection above already applied `older_than` / `retain_last`.
+    let tx = Transaction::new(&table);
+    let action = tx
+        .expire_snapshots()
+        .expire_snapshot_ids(to_expire.iter().copied())
+        .expire_older_than_ms(0);
+    let tx = action
+        .apply(tx)
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+    let committed = tx
+        .commit(&*catalog)
+        .await
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+
+    // Keep the local-FS version hint pointing at the post-expiry metadata so a
+    // reopen does not resurrect the expired history (best effort, like
+    // compaction: the commit above is already durable in the catalog).
+    if let Some(loc) = committed.metadata_location() {
+        let table_root =
+            std::path::Path::new(table.metadata().location().trim_start_matches("file://"));
+        if table_root.join("metadata").is_dir()
+            && let Err(e) = super::iceberg_native::native::write_version_hint(table_root, loc)
+        {
+            tracing::warn!(
+                table = %table_ident,
+                location = loc,
+                error = %e,
+                "version hint update failed after expire_snapshots commit; hint may be stale"
+            );
         }
     }
 
-    // Record expired IDs in table properties for audit/observability. Best-effort.
-    let expired_ids_csv = to_expire
-        .iter()
-        .map(|id| id.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    let tx = Transaction::new(&table);
-    let action = tx
-        .update_table_properties()
-        .set("krishiv.expired-snapshot-ids".to_string(), expired_ids_csv);
-    if let Ok(tx) = action.apply(tx)
-        && let Err(e) = tx.commit(&*catalog).await
-    {
-        tracing::warn!(
-            table = %table_ident,
-            error = %e,
-            "expire_snapshots: failed to persist expired-snapshot-ids property"
-        );
+    // Delete data files referenced ONLY by expired snapshots (now that the
+    // metadata no longer references them).
+    let mut files_deleted = 0usize;
+    for path in expiring_files {
+        if !kept_files.contains(&path) {
+            match file_io.delete(&path).await {
+                Ok(()) => files_deleted += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path,
+                        error = %e,
+                        "expire_snapshots: failed to delete orphan file"
+                    );
+                }
+            }
+        }
     }
 
     tracing::info!(
@@ -183,10 +211,10 @@ pub async fn expire_snapshots(
 ///
 /// **Cloud storage** (S3, GCS, Azure): listing requires credentials the caller
 /// holds implicitly via iceberg's `FileIO`. We enumerate files that appear in
-/// expired snapshots (tracked in `krishiv.expired-snapshot-ids`) but are absent
-/// from any current live snapshot, then delete them via `FileIO`. This catches
-/// files orphaned by `expire_snapshots`; files orphaned by failed partial writes
-/// require external storage-side scanning.
+/// snapshots recorded by a legacy `krishiv.expired-snapshot-ids` property (a
+/// pre-metadata-expiry audit trail) but are absent from any current live
+/// snapshot, then delete them via `FileIO`. Files orphaned by failed partial
+/// writes require external storage-side scanning.
 pub async fn remove_orphan_files(
     catalog: Arc<dyn Catalog + Send + Sync>,
     table_ident: &TableIdent,
@@ -314,6 +342,11 @@ pub async fn remove_orphan_files(
             );
         } else {
             for snap_id in expired_ids {
+                // A snapshot already removed from the metadata (real expiry)
+                // cannot be scanned; nothing to enumerate for it here.
+                if metadata.snapshot_by_id(snap_id).is_none() {
+                    continue;
+                }
                 let expiring_files = file_paths_for_snapshot(&table, snap_id).await?;
                 for path in expiring_files {
                     if referenced.contains(&path) {
@@ -698,15 +731,46 @@ pub async fn compact_data_files(
         data_files.push(part.into_data_file(spec_id)?);
     }
 
-    let tx = Transaction::new(&new_table);
-    let action = tx.fast_append().add_data_files(data_files);
-    let tx = action
-        .apply(tx)
-        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
-    let committed = tx
+    // The recreated table is EMPTY until this commit lands, so a commit
+    // failure must not be surfaced without a restore attempt — mirroring the
+    // create-failure fallback above. The full file set (kept + compacted) is
+    // retried on a freshly loaded table; if that also fails the table is left
+    // empty and needs manual intervention.
+    let append_files = |files: Vec<iceberg::spec::DataFile>, table: &iceberg::table::Table| {
+        let tx = Transaction::new(table);
+        let action = tx.fast_append().add_data_files(files);
+        action
+            .apply(tx)
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))
+    };
+    let committed = match append_files(data_files.clone(), &new_table)?
         .commit(&*catalog)
         .await
-        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+    {
+        Ok(t) => t,
+        Err(commit_err) => {
+            let restored = match catalog.load_table(table_ident).await {
+                Ok(reloaded) => match append_files(data_files, &reloaded) {
+                    Ok(tx) => tx.commit(&*catalog).await.map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                },
+                Err(e) => Err(e.to_string()),
+            };
+            match restored {
+                Ok(t) => t,
+                Err(restore_err) => {
+                    tracing::error!(
+                        table = %table_ident,
+                        commit_error = %commit_err,
+                        restore_error = %restore_err,
+                        "CRITICAL: table is EMPTY after failed compaction commit and restore \
+                         attempt; manual intervention required (re-append its data files)"
+                    );
+                    return Err(LakehouseError::Iceberg(commit_err.to_string()));
+                }
+            }
+        }
+    };
 
     // Keep the local-FS version hint current so the compaction survives a
     // restart (CONN-4).
@@ -1161,9 +1225,11 @@ pub(crate) mod tests {
 
         // The equality-delete parquet: one row, id=2, with the iceberg field
         // id so the delete-file reader can map it back to column 1.
-        let delete_field = Field::new("id", DataType::Int64, false).with_metadata(
-            HashMap::from([("PARQUET:field_id".to_string(), "1".to_string())]),
-        );
+        let delete_field =
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                "PARQUET:field_id".to_string(),
+                "1".to_string(),
+            )]));
         let delete_schema = Arc::new(ArrowSchema::new(vec![delete_field]));
         let delete_batch = arrow::array::RecordBatch::try_new(
             Arc::clone(&delete_schema),
@@ -1216,14 +1282,15 @@ pub(crate) mod tests {
         let delete_manifest = mw.write_manifest_file().await.unwrap();
 
         // New manifest list: everything snapshot 1 tracked, plus the deletes.
-        let old_entries = table
-            .manifest_list_reader(&snap1)
-            .load()
-            .await
-            .unwrap();
+        let old_entries = table.manifest_list_reader(&snap1).load().await.unwrap();
         let list_path = format!("{location}/metadata/snap-{snap2_id}-manifest-list.avro");
         let mut lw = ManifestListWriter::v2(
-            file_io.new_output(&list_path).unwrap().writer().await.unwrap(),
+            file_io
+                .new_output(&list_path)
+                .unwrap()
+                .writer()
+                .await
+                .unwrap(),
             snap2_id,
             Some(snap1.snapshot_id()),
             seq2,
@@ -1278,7 +1345,11 @@ pub(crate) mod tests {
         .unwrap()
         .metadata;
 
-        let metadata_path = format!("{location}/metadata/00002-mor.metadata.json");
+        // `<version>-<uuid>.metadata.json`: catalogs parse the uuid segment of
+        // the current metadata filename when deriving the next one, so it must
+        // be a real uuid.
+        let metadata_path =
+            format!("{location}/metadata/00002-8c05c396-9e02-4b0d-9a7a-6f1c7a4d3ab1.metadata.json");
         file_io
             .new_output(&metadata_path)
             .unwrap()
@@ -1301,8 +1372,13 @@ pub(crate) mod tests {
         let (catalog, ident, _dir) = mor_table_with_live_equality_delete().await;
         let table = catalog.load_table(&ident).await.unwrap();
         let scan = table.scan().build().unwrap();
-        let tasks: Vec<iceberg::scan::FileScanTask> =
-            scan.plan_files().await.unwrap().try_collect().await.unwrap();
+        let tasks: Vec<iceberg::scan::FileScanTask> = scan
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
         assert!(
             tasks.iter().any(|t| !t.deletes.is_empty()),
             "fixture must plan tasks with delete files"
@@ -1322,6 +1398,262 @@ pub(crate) mod tests {
         );
     }
 
+    /// Live delete files are table state, not orphans: removing them would
+    /// resurrect the rows they delete. `older_than` is set in the future so
+    /// every unreferenced file is age-eligible — only the referenced set
+    /// protects the equality-delete file.
+    #[tokio::test]
+    async fn remove_orphan_files_keeps_live_delete_files() {
+        use futures::TryStreamExt as _;
+        let (catalog, ident, _dir) = mor_table_with_live_equality_delete().await;
+
+        remove_orphan_files(Arc::clone(&catalog), &ident, Duration::hours(-1))
+            .await
+            .unwrap();
+
+        let table = catalog.load_table(&ident).await.unwrap();
+        let scan = table.scan().build().unwrap();
+        let batches: Vec<arrow::array::RecordBatch> = scan
+            .to_arrow()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .expect("the equality-delete file must survive orphan removal");
+        let mut ids: Vec<i64> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            ids.extend(col.iter().flatten());
+        }
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 3, 4],
+            "id=2 must stay deleted — deleting the live delete file resurrects it"
+        );
+    }
+
+    /// Real expiry: the expired snapshot leaves the table metadata (time
+    /// travel to it fails loudly instead of silently reading deleted files),
+    /// and a second run finds nothing to expire.
+    #[tokio::test]
+    async fn expire_snapshots_removes_snapshots_from_metadata_and_is_idempotent() {
+        let (catalog, ident, _dir) = mor_table_with_live_equality_delete().await;
+        let before = catalog.load_table(&ident).await.unwrap();
+        let old_id = before
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .parent_snapshot_id()
+            .expect("fixture has a two-snapshot history");
+
+        // Let the snapshots age past a zero-duration cutoff.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let removed = expire_snapshots(Arc::clone(&catalog), &ident, Duration::zero(), 1)
+            .await
+            .unwrap();
+        assert_eq!(removed, 1, "the non-current snapshot must expire");
+
+        let after = catalog.load_table(&ident).await.unwrap();
+        assert!(
+            after.metadata().snapshot_by_id(old_id).is_none(),
+            "expired snapshot must be removed from the table metadata"
+        );
+        assert!(
+            after.metadata().current_snapshot().is_some(),
+            "the current snapshot must survive"
+        );
+
+        let again = expire_snapshots(Arc::clone(&catalog), &ident, Duration::zero(), 1)
+            .await
+            .unwrap();
+        assert_eq!(again, 0, "a second run must find nothing to expire");
+    }
+
+    /// Delegating catalog that fails the first `update_table` (the final
+    /// compaction commit for a `MemoryCatalog` table) and then recovers —
+    /// modelling a transient commit failure after the drop+recreate swap.
+    #[derive(Debug)]
+    struct FailFirstUpdateCatalog {
+        inner: Arc<dyn Catalog + Send + Sync>,
+        remaining_failures: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Catalog for FailFirstUpdateCatalog {
+        async fn list_namespaces(
+            &self,
+            parent: Option<&NamespaceIdent>,
+        ) -> iceberg::Result<Vec<NamespaceIdent>> {
+            self.inner.list_namespaces(parent).await
+        }
+        async fn create_namespace(
+            &self,
+            namespace: &NamespaceIdent,
+            properties: HashMap<String, String>,
+        ) -> iceberg::Result<iceberg::Namespace> {
+            self.inner.create_namespace(namespace, properties).await
+        }
+        async fn get_namespace(
+            &self,
+            namespace: &NamespaceIdent,
+        ) -> iceberg::Result<iceberg::Namespace> {
+            self.inner.get_namespace(namespace).await
+        }
+        async fn namespace_exists(&self, namespace: &NamespaceIdent) -> iceberg::Result<bool> {
+            self.inner.namespace_exists(namespace).await
+        }
+        async fn update_namespace(
+            &self,
+            namespace: &NamespaceIdent,
+            properties: HashMap<String, String>,
+        ) -> iceberg::Result<()> {
+            self.inner.update_namespace(namespace, properties).await
+        }
+        async fn drop_namespace(&self, namespace: &NamespaceIdent) -> iceberg::Result<()> {
+            self.inner.drop_namespace(namespace).await
+        }
+        async fn list_tables(
+            &self,
+            namespace: &NamespaceIdent,
+        ) -> iceberg::Result<Vec<TableIdent>> {
+            self.inner.list_tables(namespace).await
+        }
+        async fn create_table(
+            &self,
+            namespace: &NamespaceIdent,
+            creation: TableCreation,
+        ) -> iceberg::Result<iceberg::table::Table> {
+            self.inner.create_table(namespace, creation).await
+        }
+        async fn load_table(&self, table: &TableIdent) -> iceberg::Result<iceberg::table::Table> {
+            self.inner.load_table(table).await
+        }
+        async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+            self.inner.drop_table(table).await
+        }
+        async fn purge_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+            self.inner.purge_table(table).await
+        }
+        async fn table_exists(&self, table: &TableIdent) -> iceberg::Result<bool> {
+            self.inner.table_exists(table).await
+        }
+        async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> iceberg::Result<()> {
+            self.inner.rename_table(src, dest).await
+        }
+        async fn register_table(
+            &self,
+            table: &TableIdent,
+            metadata_location: String,
+        ) -> iceberg::Result<iceberg::table::Table> {
+            self.inner.register_table(table, metadata_location).await
+        }
+        async fn update_table(
+            &self,
+            commit: iceberg::TableCommit,
+        ) -> iceberg::Result<iceberg::table::Table> {
+            use std::sync::atomic::Ordering;
+            if self
+                .remaining_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(iceberg::Error::new(
+                    iceberg::ErrorKind::Unexpected,
+                    "injected commit failure",
+                ));
+            }
+            self.inner.update_table(commit).await
+        }
+    }
+
+    /// A transient failure of the post-swap commit must not leave the table
+    /// EMPTY: the restore fallback re-appends the full file set.
+    #[tokio::test]
+    async fn compact_commit_failure_restores_table_contents() {
+        use crate::lakehouse::dml::land_ctas_with_target;
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+
+        let dir = tempfile::tempdir().unwrap();
+        let warehouse = url::Url::from_file_path(dir.path()).unwrap().to_string();
+        let inner: Arc<dyn Catalog + Send + Sync> = Arc::new(
+            MemoryCatalogBuilder::default()
+                .with_storage_factory(Arc::new(LocalFsStorageFactory))
+                .load(
+                    "mem",
+                    HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
+                )
+                .await
+                .unwrap(),
+        );
+        let ident = TableIdent::new(NamespaceIdent::new("ns".into()), "flaky".into());
+
+        // Two small files (roll threshold 1 flushes each batch) so compaction
+        // has work to do.
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let make_batch = |ids: &[i64]| {
+            arrow::array::RecordBatch::try_new(
+                Arc::clone(&arrow_schema),
+                vec![Arc::new(Int64Array::from(ids.to_vec()))],
+            )
+            .unwrap()
+        };
+        let batches = vec![make_batch(&[1, 2]), make_batch(&[3])];
+        let ctx = SessionContext::new();
+        let mem = MemTable::try_new(Arc::clone(&arrow_schema), vec![batches]).unwrap();
+        let stream = ctx
+            .read_table(Arc::new(mem))
+            .unwrap()
+            .execute_stream()
+            .await
+            .unwrap();
+        land_ctas_with_target(Arc::clone(&inner), &ident, false, &[], stream, 1)
+            .await
+            .unwrap();
+
+        let flaky: Arc<dyn Catalog + Send + Sync> = Arc::new(FailFirstUpdateCatalog {
+            inner: Arc::clone(&inner),
+            remaining_failures: std::sync::atomic::AtomicUsize::new(1),
+        });
+        compact_data_files(flaky, &ident, 128 * 1024 * 1024)
+            .await
+            .expect("the restore fallback must recover from a transient commit failure");
+
+        let table = inner.load_table(&ident).await.unwrap();
+        let tasks: Vec<iceberg::scan::FileScanTask> = table
+            .scan()
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut rows = 0usize;
+        for task in &tasks {
+            let batches = read_parquet_file(table.file_io(), task.data_file_path())
+                .await
+                .unwrap();
+            rows += batches.iter().map(|b| b.num_rows()).sum::<usize>();
+        }
+        assert_eq!(
+            rows, 3,
+            "the table must not be left empty after the failed commit"
+        );
+    }
+
     /// Compaction over a merge-on-read table: reads THROUGH the deletes,
     /// rewrites, and the result is a delete-free table without the dead row.
     #[tokio::test]
@@ -1336,8 +1668,13 @@ pub(crate) mod tests {
 
         let table = catalog.load_table(&ident).await.unwrap();
         let scan = table.scan().build().unwrap();
-        let tasks: Vec<iceberg::scan::FileScanTask> =
-            scan.plan_files().await.unwrap().try_collect().await.unwrap();
+        let tasks: Vec<iceberg::scan::FileScanTask> = scan
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
         assert!(
             tasks.iter().all(|t| t.deletes.is_empty()),
             "the compacted table must carry no delete files"
@@ -1357,6 +1694,10 @@ pub(crate) mod tests {
             }
         }
         ids.sort_unstable();
-        assert_eq!(ids, vec![1, 3, 4], "id=2 must stay deleted after the rewrite");
+        assert_eq!(
+            ids,
+            vec![1, 3, 4],
+            "id=2 must stay deleted after the rewrite"
+        );
     }
 }

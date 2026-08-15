@@ -198,14 +198,17 @@ mod tests {
         );
     }
 
-    // ── Kafka exactly-once certification ─────────────────────────────────────
+    // ── EpochTransactionLog exactly-once (in-memory sink) ────────────────────
+    // These tests exercise the commit protocol against the in-memory double
+    // only. Evidence against real Kafka brokers / S3 object stores lives in
+    // the external certification matrix (`cert_matrix.rs`).
 
-    /// Certifies Kafka exactly-once semantics via `EpochTransactionLog`:
+    /// Certifies the epoch-log protocol over the in-memory two-phase sink:
     /// data staged before a simulated crash is committed on recovery; data that
     /// was never pre-committed is not replayed and is not lost after the
     /// checkpoint epoch is re-processed.
     #[test]
-    fn kafka_exactly_once_no_data_loss_or_duplication() {
+    fn two_phase_inmemory_epoch_log_no_data_loss_or_duplication() {
         let mut log = EpochTransactionLog::new(InMemoryTwoPhaseCommitSink::new());
 
         // Epoch 1 — data arrives from Kafka, staged and pre-committed.
@@ -270,14 +273,17 @@ mod tests {
         );
     }
 
-    // ── S3 exactly-once certification ────────────────────────────────────────
+    // ── Local-FS Parquet two-phase certification ─────────────────────────────
+    // Exercises `LocalParquetTwoPhaseCommitSink` on the local filesystem only;
+    // real S3 evidence lives in the external certification matrix
+    // (`cert_matrix.rs`).
 
-    /// Certifies S3 exactly-once delivery using `LocalParquetTwoPhaseCommitSink`:
-    /// data written by `prepare` is not visible until `commit`; after `commit`
-    /// the Parquet file is durably present; and re-committing (coordinator retry)
-    /// is idempotent — no duplicate files are created.
+    /// Certifies the local Parquet two-phase protocol: data written by
+    /// `prepare` is not visible until `commit`; after `commit` the Parquet
+    /// file is durably present; and re-committing (coordinator retry) is
+    /// idempotent — no duplicate files are created.
     #[test]
-    fn s3_roundtrip_exactly_once_with_checkpoint_restore() {
+    fn local_parquet_roundtrip_two_phase_with_checkpoint_restore() {
         let dir = tempfile::tempdir().unwrap();
         let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path());
         let batch = make_batch(vec![10, 20, 30]);
@@ -401,27 +407,48 @@ mod tests {
             let sv = schema_version();
 
             // Session 1: commit one snapshot, then prepare another but crash.
-            let staged_id = {
+            let (committed_snapshot, staged) = {
                 let tpc = IcebergNativeTwoPhaseCommit::open(dir.path(), "t", &sv)
                     .await
                     .unwrap();
                 let s = tpc.prepare(vec![batch(vec![10])]).await.unwrap();
-                tpc.commit(s, BTreeMap::new()).await.unwrap();
-                // Prepare but do NOT commit — simulates crash.
+                let committed = tpc.commit(s, BTreeMap::new()).await.unwrap();
+                // Prepare but do NOT commit — simulates crash. The stale handle
+                // outlives the crashed instance.
                 let staged = tpc.prepare(vec![batch(vec![99])]).await.unwrap();
-                staged.snapshot_id
+                (committed, staged)
             };
 
-            // Session 2: open fresh — pending map is empty, uncommitted staged ID
-            // is not in the new pending map, so it can never be committed.
+            // Session 2: open fresh — the uncommitted staged snapshot is not in
+            // the recovered pending map, is not visible in the table, and a
+            // commit with the stale handle must fail rather than resurrect it.
             let tpc = IcebergNativeTwoPhaseCommit::open(dir.path(), "t", &sv)
                 .await
                 .unwrap();
-            let pending = tpc.pending.lock().await;
-            assert!(
-                !pending.contains_key(&staged_id),
-                "uncommitted staged snapshot must not appear in recovered pending map"
+            {
+                let pending = tpc.pending.lock().await;
+                assert!(
+                    !pending.contains_key(&staged.snapshot_id),
+                    "uncommitted staged snapshot must not appear in recovered pending map"
+                );
+            }
+            let table = tpc.catalog.load_table(&tpc.ident).await.unwrap();
+            assert_eq!(
+                table
+                    .metadata()
+                    .current_snapshot()
+                    .map(|snapshot| snapshot.snapshot_id()),
+                Some(committed_snapshot),
+                "recovered table must point at the committed snapshot, not the staged one"
             );
+            assert_eq!(
+                table.metadata().snapshots().count(),
+                1,
+                "only the committed snapshot may be visible after recovery"
+            );
+            tpc.commit(staged, BTreeMap::new())
+                .await
+                .expect_err("committing a stale pre-crash staged handle must fail");
         }
 
         /// `overwrite_commit` replaces the entire table content and the new

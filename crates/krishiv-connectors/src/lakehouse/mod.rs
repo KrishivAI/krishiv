@@ -32,8 +32,6 @@ pub mod partitioned_write;
 /// G7: checkpoint-aligned streaming Iceberg sink (append + row-level upsert).
 #[cfg(feature = "iceberg")]
 pub mod streaming_sink;
-/// P12: Streaming Lakehouse Unification — unified streaming source/sink over Delta, Hudi, Paimon.
-pub mod streaming_unify;
 mod two_phase;
 
 pub use as_of::AsOfSpec;
@@ -340,27 +338,39 @@ impl MemoryLakehouseTableState {
         }
     }
 
-    fn batches_up_to_snapshot(&self, snapshot_id: i64) -> Vec<RecordBatch> {
+    fn batches_up_to_snapshot(&self, snapshot_id: i64) -> Result<Vec<RecordBatch>, LakehouseError> {
         let eligible = self
             .layers
             .iter()
             .filter(|layer| layer.snapshot_id <= snapshot_id)
             .collect::<Vec<_>>();
+        // A non-empty table with no layer at or below the target snapshot means
+        // the snapshot was expired by compaction (or never existed). Silently
+        // returning zero rows would let time-travel reads misreport an empty
+        // table, so this is an error, not an empty result.
+        if eligible.is_empty() && !self.layers.is_empty() {
+            return Err(LakehouseError::Iceberg(format!(
+                "snapshot {snapshot_id} is older than the oldest retained snapshot; \
+                 it has been compacted away or never existed"
+            )));
+        }
         let start = eligible
             .iter()
             .rposition(|layer| layer.replace_all)
             .unwrap_or(0);
-        eligible
+        Ok(eligible
             .get(start..)
             .unwrap_or(&[])
             .iter()
             .flat_map(|layer| layer.batches.iter().cloned())
-            .collect()
+            .collect())
     }
 
     fn all_batches(&self) -> Vec<RecordBatch> {
+        // The current snapshot id is always >= every retained layer's id, so
+        // this lookup cannot hit the expired-snapshot error.
         self.current_snapshot_id()
-            .map(|snapshot| self.batches_up_to_snapshot(snapshot))
+            .and_then(|snapshot| self.batches_up_to_snapshot(snapshot).ok())
             .unwrap_or_default()
     }
 
@@ -389,9 +399,9 @@ impl MemoryLakehouseTableState {
     }
 
     /// Compact oldest snapshot layers into one when `max_snapshot_layers` is set
-    /// and the current layer count exceeds it. Preserves all data; only changes
-    /// the granularity of snapshot boundaries (time-travel before the merge point
-    /// will resolve to the merged snapshot).
+    /// and the current layer count exceeds it. Preserves all currently visible
+    /// data; snapshots older than the merge point are expired, so time-travel
+    /// to them errors afterwards (matching Iceberg snapshot expiration).
     fn maybe_compact(&mut self) {
         let Some(max) = self.max_snapshot_layers else {
             return;
@@ -527,6 +537,28 @@ impl MemoryLakehouseTable {
         self.references.read().await.get(name).cloned()
     }
 
+    /// Scan the table at the snapshot pinned by a named branch or tag.
+    ///
+    /// Errors if the reference does not exist, or if the referenced snapshot
+    /// has since been expired by layer compaction (a reference is a pin on a
+    /// snapshot id, not on the data — compaction can dangle it).
+    pub async fn scan_reference(&self, name: &str) -> Result<Vec<RecordBatch>, LakehouseError> {
+        let reference = self
+            .reference(name)
+            .await
+            .ok_or_else(|| LakehouseError::NotFound {
+                table: format!("reference '{name}'"),
+            })?;
+        self.scan(&IcebergScanOptions::new().with_snapshot(reference.snapshot_id))
+            .await
+            .map_err(|e| {
+                LakehouseError::Iceberg(format!(
+                    "reference '{name}' points at snapshot {}: {e}",
+                    reference.snapshot_id
+                ))
+            })
+    }
+
     /// Atomically verify the guard's expected snapshot and append batches.
     ///
     /// Holds the table mutex across the precondition check and snapshot commit so
@@ -565,7 +597,7 @@ impl LakehouseTable for MemoryLakehouseTable {
     async fn scan(&self, opts: &IcebergScanOptions) -> Result<Vec<RecordBatch>, LakehouseError> {
         let state = self.state.lock().await;
         let batches = if let Some(target) = opts.snapshot_id {
-            state.batches_up_to_snapshot(target)
+            state.batches_up_to_snapshot(target)?
         } else {
             state.all_batches()
         };
@@ -945,27 +977,6 @@ impl MultiWriterGuard {
     pub fn writer_id(&self) -> &str {
         &self.writer_id
     }
-}
-
-/// Verify that the table's current snapshot matches the guard's expected snapshot.
-/// Returns `Err(LakehouseError::Concurrency)` if they differ.
-#[doc = "**Beta API**: may change between minor releases."]
-pub async fn check_write_precondition(
-    table: &dyn LakehouseTable,
-    guard: &MultiWriterGuard,
-) -> Result<(), LakehouseError> {
-    let current = table.current_snapshot_id().await?;
-    if current != guard.expected_snapshot {
-        return Err(LakehouseError::Concurrency {
-            message: format!(
-                "writer '{}' expected snapshot {:?} but found {:?}",
-                guard.writer_id(),
-                guard.expected_snapshot(),
-                current,
-            ),
-        });
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1362,6 +1373,74 @@ mod tests {
             layer_count <= 10,
             "layer count must be ≤ max_snapshot_layers after compaction; got {layer_count}"
         );
+    }
+
+    #[tokio::test]
+    async fn time_travel_to_compacted_snapshot_errors() {
+        let table = MemoryLakehouseTable::with_compaction_limit(
+            make_table_ref(),
+            make_schema_version(),
+            Some(1),
+        );
+        table.append(vec![make_batch(vec![1])]).await.unwrap();
+        let snap1 = table.current_snapshot_id().await.unwrap().unwrap();
+        // Second append pushes the layer count over the limit and compacts,
+        // expiring snap1.
+        table.append(vec![make_batch(vec![2])]).await.unwrap();
+
+        let err = table
+            .scan(&IcebergScanOptions::new().with_snapshot(snap1))
+            .await
+            .expect_err("compacted-away snapshot must error, not silently return empty");
+        assert!(err.to_string().contains("compacted"), "got: {err}");
+
+        // The current snapshot is still readable.
+        let snap2 = table.current_snapshot_id().await.unwrap().unwrap();
+        let rows: usize = table
+            .scan(&IcebergScanOptions::new().with_snapshot(snap2))
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 2);
+    }
+
+    #[tokio::test]
+    async fn scan_reference_reads_tag_and_errors_after_compaction() {
+        let table = MemoryLakehouseTable::with_compaction_limit(
+            make_table_ref(),
+            make_schema_version(),
+            Some(1),
+        );
+        table.append(vec![make_batch(vec![1, 2])]).await.unwrap();
+        let snap1 = table.current_snapshot_id().await.unwrap().unwrap();
+        table
+            .create_reference("v1", snap1, IcebergReferenceKind::Tag)
+            .await
+            .unwrap();
+
+        let rows: usize = table
+            .scan_reference("v1")
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 2, "the tag must read the pinned snapshot");
+
+        assert!(
+            table.scan_reference("nope").await.is_err(),
+            "unknown reference must error"
+        );
+
+        // Compaction expires snap1; the tag must now dangle loudly.
+        table.append(vec![make_batch(vec![3])]).await.unwrap();
+        let err = table
+            .scan_reference("v1")
+            .await
+            .expect_err("a reference to a compacted-away snapshot must error");
+        assert!(err.to_string().contains("'v1'"), "got: {err}");
     }
 
     #[tokio::test]

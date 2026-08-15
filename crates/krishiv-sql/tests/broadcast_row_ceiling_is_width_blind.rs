@@ -23,11 +23,11 @@
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::Partitioning;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::repartition::RepartitionExec;
-use datafusion::physical_plan::Partitioning;
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use krishiv_sql::distributed_plan::{ShuffleReadExec, planning_session_context_with_options};
 use std::sync::Arc;
 
@@ -130,10 +130,9 @@ fn a_wide_sub_ceiling_build_side_with_no_byte_estimate_is_broadcast() {
 #[test]
 fn the_wide_broadcast_is_converted_to_a_partitioned_join() {
     let join = wide_join(900_000).expect("wide join");
-    let converted = krishiv_sql::distributed_plan::redistribute_unsplittable_broadcast_joins(
-        Arc::clone(&join),
-    )
-    .expect("conversion");
+    let converted =
+        krishiv_sql::distributed_plan::redistribute_unsplittable_broadcast_joins(Arc::clone(&join))
+            .expect("conversion");
 
     let mode = converted
         .downcast_ref::<HashJoinExec>()
@@ -189,22 +188,20 @@ fn a_narrow_sub_ceiling_build_side_stays_broadcast() {
 
 /// Build the wide `CollectLeft` join the fix targets.
 fn wide_join(rows: usize) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-    Ok(Arc::new(
-        HashJoinExec::try_new(
-            build_side(rows),
-            probe_side()?,
-            vec![(
-                Arc::new(Column::new("c_custkey", 0)),
-                Arc::new(Column::new("o_custkey", 0)),
-            )],
-            None,
-            &datafusion::common::JoinType::Inner,
-            None,
-            PartitionMode::CollectLeft,
-            datafusion::common::NullEquality::NullEqualsNothing,
-            false,
-        )?,
-    ))
+    Ok(Arc::new(HashJoinExec::try_new(
+        build_side(rows),
+        probe_side()?,
+        vec![(
+            Arc::new(Column::new("c_custkey", 0)),
+            Arc::new(Column::new("o_custkey", 0)),
+        )],
+        None,
+        &datafusion::common::JoinType::Inner,
+        None,
+        PartitionMode::CollectLeft,
+        datafusion::common::NullEquality::NullEqualsNothing,
+        false,
+    )?))
 }
 
 #[test]

@@ -14,16 +14,24 @@ use crate::sink::DynSink;
 
 pub struct ElasticsearchSinkDriver;
 
+/// Shared by the descriptor and the opened sink so the two cannot drift.
+///
+/// Elasticsearch bulk indexing is not idempotent (retries may produce
+/// duplicates unless the caller provides explicit document IDs), but each
+/// `write_batch` is a self-contained bulk request, so `flush` leaves the sink
+/// usable — resumable flush.
+fn elasticsearch_sink_capabilities() -> ConnectorCapabilities {
+    ConnectorCapabilities::new()
+        .with_unbounded()
+        .with_resumable_flush()
+}
+
 impl SinkDriver for ElasticsearchSinkDriver {
     fn descriptor(&self) -> ConnectorDescriptor {
         ConnectorDescriptor::new(
             ConnectorKind::Elasticsearch,
             ConnectorRole::Sink,
-            // Elasticsearch bulk indexing is not idempotent (retries may produce duplicates
-            // unless the caller provides explicit document IDs).
-            ConnectorCapabilities::new()
-                .with_unbounded()
-                .with_resumable_flush(),
+            elasticsearch_sink_capabilities(),
         )
     }
 
@@ -67,7 +75,7 @@ struct ElasticsearchSinkWrapper(ElasticsearchSink);
 
 impl crate::sink::Sink for ElasticsearchSinkWrapper {
     fn capabilities(&self) -> crate::capabilities::ConnectorCapabilities {
-        ConnectorCapabilities::new().with_unbounded()
+        elasticsearch_sink_capabilities()
     }
 
     async fn write_batch(
@@ -82,5 +90,25 @@ impl crate::sink::Sink for ElasticsearchSinkWrapper {
     /// buffering to drain.
     async fn flush(&mut self) -> crate::error::ConnectorResult<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The descriptor and the opened-instance wrapper share
+    /// `elasticsearch_sink_capabilities`, so the advertised and actual
+    /// capability sets (including resumable flush for the self-contained bulk
+    /// writes) cannot drift.
+    #[test]
+    fn elasticsearch_sink_descriptor_matches_instance_capabilities() {
+        let caps = ElasticsearchSinkDriver.descriptor().default_capabilities;
+        assert_eq!(caps, elasticsearch_sink_capabilities());
+        assert!(caps.resumable_flush(), "bulk writes leave flush resumable");
+        assert!(
+            !caps.is_idempotent(),
+            "bulk indexing without ids may duplicate"
+        );
     }
 }

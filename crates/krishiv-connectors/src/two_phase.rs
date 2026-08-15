@@ -527,7 +527,24 @@ impl<S: TwoPhaseCommitSink> TransactionalSinkParticipant for EpochTransactionLog
         }
         let mut handles = Vec::with_capacity(self.open.len());
         for batch in &self.open {
-            handles.push(self.sink.prepare(epoch, batch)?);
+            match self.sink.prepare(epoch, batch) {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    // Roll back the handles prepared so far in this call so
+                    // their durable staging files do not leak as orphans; the
+                    // open buffer is intact, so a later barrier retries them.
+                    for handle in handles {
+                        if let Err(abort_error) = self.sink.abort(handle) {
+                            tracing::warn!(
+                                epoch,
+                                error = %abort_error,
+                                "pre_commit rollback: abort of partially prepared handle failed"
+                            );
+                        }
+                    }
+                    return Err(error);
+                }
+            }
         }
         // Only clear the open buffer after every prepare succeeded so a
         // failed pre_commit can be retried for a later epoch without loss.
@@ -542,15 +559,21 @@ impl<S: TwoPhaseCommitSink> TransactionalSinkParticipant for EpochTransactionLog
         self.prepared.append(&mut later);
 
         let mut committed = 0usize;
-        for (txn_epoch, handles) in to_commit {
+        let mut epochs = to_commit.into_iter();
+        while let Some((txn_epoch, handles)) = epochs.next() {
             let mut remaining = handles.into_iter();
             for handle in remaining.by_ref() {
                 if let Err(error) = self.sink.commit(handle.clone()) {
                     // Re-queue the failed handle and the rest for retry —
-                    // commit is idempotent, so retrying is safe.
+                    // commit is idempotent, so retrying is safe. Later epochs
+                    // were split out of `prepared` too; every unprocessed one
+                    // goes back so no prepared handle is silently dropped.
                     let mut requeue = vec![handle];
                     requeue.extend(remaining);
                     self.prepared.insert(txn_epoch, requeue);
+                    for (later_epoch, later_handles) in epochs {
+                        self.prepared.insert(later_epoch, later_handles);
+                    }
                     return Err(error);
                 }
                 committed += 1;
@@ -563,13 +586,19 @@ impl<S: TwoPhaseCommitSink> TransactionalSinkParticipant for EpochTransactionLog
         self.open.clear();
         let to_abort = self.prepared.split_off(&(epoch.saturating_add(1)));
         let mut aborted = 0usize;
-        for (txn_epoch, handles) in to_abort {
+        let mut epochs = to_abort.into_iter();
+        while let Some((txn_epoch, handles)) = epochs.next() {
             let mut remaining = handles.into_iter();
             for handle in remaining.by_ref() {
                 if let Err(error) = self.sink.abort(handle.clone()) {
                     let mut requeue = vec![handle];
                     requeue.extend(remaining);
                     self.prepared.insert(txn_epoch, requeue);
+                    // Put every unprocessed later epoch back as well so its
+                    // handles stay eligible for a retried abort.
+                    for (later_epoch, later_handles) in epochs {
+                        self.prepared.insert(later_epoch, later_handles);
+                    }
                     return Err(error);
                 }
                 aborted += 1;
@@ -678,6 +707,146 @@ mod tests {
             !std::path::Path::new(&final_abort).exists(),
             "aborted txn must never be published"
         );
+    }
+
+    // ── EpochTransactionLog failure handling ────────────────────────────────
+
+    /// In-memory sink with injectable prepare/commit/abort failures, for the
+    /// requeue-on-error invariants below.
+    struct FlakySink {
+        inner: InMemoryTwoPhaseCommitSink,
+        prepares_before_failure: Option<usize>,
+        commit_failures: usize,
+        abort_failures: usize,
+    }
+
+    impl FlakySink {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryTwoPhaseCommitSink::new(),
+                prepares_before_failure: None,
+                commit_failures: 0,
+                abort_failures: 0,
+            }
+        }
+    }
+
+    impl TwoPhaseCommitSink for FlakySink {
+        type Handle = InMemoryCommitHandle;
+
+        fn capabilities(&self) -> ConnectorCapabilities {
+            self.inner.capabilities()
+        }
+
+        fn prepare(
+            &mut self,
+            epoch: u64,
+            batch: &arrow::record_batch::RecordBatch,
+        ) -> ConnectorResult<Self::Handle> {
+            if let Some(remaining) = self.prepares_before_failure.as_mut() {
+                if *remaining == 0 {
+                    return Err(ConnectorError::Protocol {
+                        message: "injected prepare failure".into(),
+                    });
+                }
+                *remaining -= 1;
+            }
+            self.inner.prepare(epoch, batch)
+        }
+
+        fn commit(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
+            if self.commit_failures > 0 {
+                self.commit_failures -= 1;
+                return Err(ConnectorError::Protocol {
+                    message: "injected commit failure".into(),
+                });
+            }
+            self.inner.commit(handle)
+        }
+
+        fn abort(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
+            if self.abort_failures > 0 {
+                self.abort_failures -= 1;
+                return Err(ConnectorError::Protocol {
+                    message: "injected abort failure".into(),
+                });
+            }
+            self.inner.abort(handle)
+        }
+    }
+
+    /// A commit failure in an early epoch must re-queue EVERY not-yet-committed
+    /// epoch — dropping the later ones would leave their staged output
+    /// invisible forever.
+    #[test]
+    fn commit_through_failure_requeues_later_epochs() {
+        let mut sink = FlakySink::new();
+        sink.commit_failures = 1;
+        let mut log = EpochTransactionLog::new(sink);
+        log.stage(&make_batch()).unwrap();
+        log.pre_commit(1).unwrap();
+        log.stage(&make_batch()).unwrap();
+        log.pre_commit(2).unwrap();
+
+        log.commit_through(2)
+            .expect_err("the injected epoch-1 commit failure must surface");
+        assert_eq!(
+            log.prepared_epochs(),
+            vec![1, 2],
+            "epoch 2 must stay queued after epoch 1's commit failure"
+        );
+
+        // Retry succeeds end-to-end.
+        assert_eq!(log.commit_through(2).unwrap(), 2);
+        assert!(log.prepared_epochs().is_empty());
+        assert_eq!(log.sink().inner.committed().len(), 2);
+    }
+
+    /// Same shape for abort: a failure while rolling back one epoch must keep
+    /// every later epoch queued for a retried abort.
+    #[test]
+    fn abort_after_failure_requeues_later_epochs() {
+        let mut sink = FlakySink::new();
+        sink.abort_failures = 1;
+        let mut log = EpochTransactionLog::new(sink);
+        log.stage(&make_batch()).unwrap();
+        log.pre_commit(1).unwrap();
+        log.stage(&make_batch()).unwrap();
+        log.pre_commit(2).unwrap();
+
+        log.abort_after(0)
+            .expect_err("the injected epoch-1 abort failure must surface");
+        assert_eq!(
+            log.prepared_epochs(),
+            vec![1, 2],
+            "epoch 2 must stay queued after epoch 1's abort failure"
+        );
+
+        assert_eq!(log.abort_after(0).unwrap(), 2);
+        assert!(log.prepared_epochs().is_empty());
+        assert_eq!(log.sink().inner.staged_count(), 0);
+    }
+
+    /// A partial prepare failure must roll back the handles staged earlier in
+    /// the same call so their durable staging does not leak, while the open
+    /// buffer stays intact for a retry at a later barrier.
+    #[test]
+    fn pre_commit_partial_prepare_failure_aborts_earlier_handles() {
+        let mut sink = FlakySink::new();
+        sink.prepares_before_failure = Some(1);
+        let mut log = EpochTransactionLog::new(sink);
+        log.stage(&make_batch()).unwrap();
+        log.stage(&make_batch()).unwrap();
+
+        log.pre_commit(1)
+            .expect_err("the injected second prepare failure must surface");
+        assert_eq!(
+            log.sink().inner.staged_count(),
+            0,
+            "the first batch's staged handle must be aborted, not leaked"
+        );
+        assert_eq!(log.open_rows(), 4, "the open buffer survives for retry");
+        assert!(log.prepared_epochs().is_empty());
     }
 
     // ── EpochTransactionLog lifecycle ───────────────────────────────────────

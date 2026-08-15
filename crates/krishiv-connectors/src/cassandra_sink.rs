@@ -7,7 +7,7 @@
 //!
 //! ```no_run
 //! # #[cfg(feature = "cassandra")]
-//! # async fn example() -> anyhow::Result<()> {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! use krishiv_connectors::cassandra_sink::{CassandraConfig, CassandraSink};
 //!
 //! let cfg = CassandraConfig::new("127.0.0.1:9042", "my_keyspace", "my_table");
@@ -114,20 +114,7 @@ impl CassandraSink {
 
         let schema = batch.schema();
         let column_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        let placeholders = column_names
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(", ");
-        let cols = column_names.join(", ");
-
-        let insert_cql = format!(
-            "INSERT INTO \"{}\".\"{}\" ({}) VALUES ({})",
-            self.config.keyspace.replace('"', "\"\""),
-            self.config.table.replace('"', "\"\""),
-            cols,
-            placeholders,
-        );
+        let insert_cql = build_insert_cql(&self.config.keyspace, &self.config.table, &column_names);
 
         let mut cql_batch = Batch::new(BatchType::Unlogged);
         let mut all_values: Vec<Vec<Option<CqlValue>>> = Vec::with_capacity(batch.num_rows());
@@ -155,6 +142,37 @@ impl CassandraSink {
 
         Ok(())
     }
+}
+
+// ── CQL rendering ─────────────────────────────────────────────────────────────
+
+/// Double-quote a CQL identifier, escaping embedded quotes by doubling.
+fn quote_cql_identifier(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// Render the INSERT for `column_names` into `keyspace.table`. Every
+/// identifier — keyspace, table AND each column — is quoted with the same
+/// doubling rule, so reserved-word or mixed-case column names cannot break
+/// (or be injected into) the statement.
+fn build_insert_cql(keyspace: &str, table: &str, column_names: &[&str]) -> String {
+    let cols = column_names
+        .iter()
+        .map(|c| quote_cql_identifier(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders = column_names
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "INSERT INTO {}.{} ({}) VALUES ({})",
+        quote_cql_identifier(keyspace),
+        quote_cql_identifier(table),
+        cols,
+        placeholders,
+    )
 }
 
 // ── Arrow → CQL conversion ────────────────────────────────────────────────────
@@ -300,7 +318,7 @@ mod tests {
 
     #[test]
     fn arrow_to_cql_float64() {
-        let arr = Arc::new(Float64Array::from(vec![3.14]));
+        let arr = Arc::new(Float64Array::from(vec![2.5]));
         let cql = arrow_scalar_to_cql(arr.as_ref(), 0, &DataType::Float64);
         assert!(matches!(cql, Some(CqlValue::Double(_))));
     }
@@ -310,6 +328,17 @@ mod tests {
         let arr = Arc::new(Int32Array::from(vec![None::<i32>]));
         let cql = arrow_scalar_to_cql(arr.as_ref(), 0, &DataType::Int32);
         assert_eq!(cql, None);
+    }
+
+    #[test]
+    fn insert_cql_quotes_every_column_identifier() {
+        // `order` is a CQL reserved word; unquoted it is a syntax error, and
+        // an unquoted arbitrary name is an injection vector.
+        let cql = build_insert_cql("ks", "tbl", &["order", "va\"lue"]);
+        assert_eq!(
+            cql,
+            "INSERT INTO \"ks\".\"tbl\" (\"order\", \"va\"\"lue\") VALUES (?, ?)"
+        );
     }
 
     #[test]

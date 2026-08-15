@@ -95,7 +95,10 @@ impl ParquetFilesSource {
 // ── Iceberg ──────────────────────────────────────────────────────────────────
 
 struct IcebergSource {
-    batches: std::collections::VecDeque<RecordBatch>,
+    /// Original scan result kept intact so `reset` can rewind to the start —
+    /// the advertised rewindable capability requires re-reading the same rows.
+    batches: Vec<RecordBatch>,
+    cursor: usize,
 }
 
 impl IcebergSource {
@@ -114,9 +117,7 @@ impl IcebergSource {
             .scan(&IcebergScanOptions::new())
             .await
             .map_err(map_lh)?;
-        Ok(Self {
-            batches: batches.into(),
-        })
+        Ok(Self { batches, cursor: 0 })
     }
 }
 
@@ -128,12 +129,19 @@ impl crate::source::Source for IcebergSource {
     }
 
     fn read_batch(&mut self) -> impl Future<Output = ConnectorResult<Option<RecordBatch>>> + Send {
-        let batch = self.batches.pop_front();
+        let batch = self.batches.get(self.cursor).cloned();
+        if batch.is_some() {
+            self.cursor += 1;
+        }
         async move { Ok(batch) }
     }
 
     fn current_offset(&self) -> Option<Box<dyn std::any::Any + Send>> {
         None
+    }
+
+    fn reset(&mut self) {
+        self.cursor = 0;
     }
 }
 
@@ -163,9 +171,9 @@ impl IcebergSink {
 
 impl crate::sink::Sink for IcebergSink {
     fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::new()
-            .with_bounded()
-            .with_idempotent()
+        // Append-only: a redelivered batch creates a second snapshot with the
+        // same rows, so no idempotent claim (aligned with Delta/Hudi sinks).
+        ConnectorCapabilities::new().with_bounded()
     }
 
     fn write_batch(
@@ -225,9 +233,7 @@ impl SinkDriver for IcebergSinkDriver {
         ConnectorDescriptor::new(
             ConnectorKind::Iceberg,
             ConnectorRole::Sink,
-            ConnectorCapabilities::new()
-                .with_bounded()
-                .with_idempotent(),
+            ConnectorCapabilities::new().with_bounded(),
         )
     }
 
@@ -579,6 +585,42 @@ mod tests {
         assert_eq!(total_rows, 5, "expected 5 rows after two appends");
         ids_seen.sort_unstable();
         assert_eq!(ids_seen, vec![1, 2, 3, 4, 5]);
+    }
+
+    /// The Iceberg source advertises rewindable: after reading to the end,
+    /// `reset` must rewind so a second pass returns the same rows.
+    #[tokio::test]
+    async fn iceberg_source_reset_rewinds_to_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let config = ConnectorConfig::new("t", "iceberg").with_property("path", &path);
+
+        let mut sink = IcebergSinkDriver.open(&config).await.expect("open sink");
+        sink.write_batch_dyn(make_batch(vec![1, 2, 3], vec!["a", "b", "c"]))
+            .await
+            .expect("write");
+        sink.flush_dyn().await.expect("flush");
+        drop(sink);
+
+        let mut source = IcebergSourceDriver
+            .open(&config)
+            .await
+            .expect("open source");
+        let mut first_pass = 0usize;
+        while let Some(b) = source.read_batch_dyn().await.expect("read") {
+            first_pass += b.num_rows();
+        }
+        assert_eq!(first_pass, 3);
+
+        source.reset_dyn();
+        let mut second_pass = 0usize;
+        while let Some(b) = source.read_batch_dyn().await.expect("read after reset") {
+            second_pass += b.num_rows();
+        }
+        assert_eq!(
+            second_pass, 3,
+            "reset must rewind the rewindable source to the first batch"
+        );
     }
 
     /// Verify that a second append creates a new snapshot and both are readable.

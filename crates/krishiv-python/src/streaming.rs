@@ -84,9 +84,7 @@ pub struct PyStreamingQuery {
 
 impl PyStreamingQuery {
     pub fn new(q: StreamingQuery) -> Self {
-        Self {
-            inner: Arc::new(q),
-        }
+        Self { inner: Arc::new(q) }
     }
 
     pub(crate) fn from_arc(inner: Arc<StreamingQuery>) -> Self {
@@ -94,7 +92,9 @@ impl PyStreamingQuery {
     }
 }
 
-fn progress_to_py(p: krishiv_api::streaming_builder::StreamingQueryProgress) -> PyStreamingQueryProgress {
+fn progress_to_py(
+    p: krishiv_api::streaming_builder::StreamingQueryProgress,
+) -> PyStreamingQueryProgress {
     PyStreamingQueryProgress {
         epoch: p.epoch,
         input_rows: p.input_rows,
@@ -280,10 +280,7 @@ struct PyQueryListener {
 }
 
 impl krishiv_api::streaming_builder::StreamingQueryListener for PyQueryListener {
-    fn on_query_terminated(
-        &self,
-        event: &krishiv_api::streaming_builder::QueryTerminatedEvent,
-    ) {
+    fn on_query_terminated(&self, event: &krishiv_api::streaming_builder::QueryTerminatedEvent) {
         Python::attach(|py| {
             let d = pyo3::types::PyDict::new(py);
             let _ = d.set_item("event", "query_terminated");

@@ -123,7 +123,8 @@ pub enum DebeziumParseError {
 ///   "source": { "lsn": 12345, "ts_ms": 1716201600000 } }
 /// ```
 ///
-/// Returns `None` if the envelope is malformed or `op` is unrecognized.
+/// Returns a [`DebeziumParseError`] if the envelope is malformed or `op` is
+/// unrecognized.
 pub fn parse_debezium_envelope(
     json: &str,
     partition_id: u32,

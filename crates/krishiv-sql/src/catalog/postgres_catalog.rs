@@ -364,7 +364,8 @@ impl Catalog for PostgresCatalog {
         // Serialise and write metadata.json to the warehouse.
         let metadata_json = serde_json::to_string_pretty(&metadata)
             .map_err(|e| iceberg_err(format!("serialize metadata: {e}")))?;
-        let metadata_location = MetadataLocation::new_with_metadata(&location, &metadata).to_string();
+        let metadata_location =
+            MetadataLocation::new_with_metadata(&location, &metadata).to_string();
 
         self.file_io
             .new_output(&metadata_location)
@@ -434,13 +435,14 @@ impl Catalog for PostgresCatalog {
 
     async fn drop_table(&self, table: &TableIdent) -> IcebergResult<()> {
         let ns = ns_key(table.namespace());
-        let dropped = sqlx::query("DELETE FROM krishiv_tables WHERE namespace = $1 AND table_name = $2")
-            .bind(&ns)
-            .bind(table.name())
-            .execute(&self.pool)
-            .await
-            .map_err(|e| iceberg_err(format!("drop_table: {e}")))?
-            .rows_affected();
+        let dropped =
+            sqlx::query("DELETE FROM krishiv_tables WHERE namespace = $1 AND table_name = $2")
+                .bind(&ns)
+                .bind(table.name())
+                .execute(&self.pool)
+                .await
+                .map_err(|e| iceberg_err(format!("drop_table: {e}")))?
+                .rows_affected();
         if dropped == 0 {
             // A DELETE that matches nothing is a successful statement, not a
             // successful drop. Returning Ok here told the caller a table it
@@ -916,10 +918,11 @@ mod tests {
             "parent_probe_x",
         ] {
             let _ = catalog
-                .create_namespace(&NamespaceIdent::from_vec(
-                    name.split('.').map(str::to_string).collect(),
+                .create_namespace(
+                    &NamespaceIdent::from_vec(name.split('.').map(str::to_string).collect())
+                        .unwrap(),
+                    HashMap::new(),
                 )
-                .unwrap(), HashMap::new())
                 .await;
         }
 

@@ -31,26 +31,26 @@ use krishiv_ivm::VectorFuture;
 /// Wraps a `krishiv-connectors::VectorSink` and implements `IvmVectorSink`.
 pub struct VectorSinkBridge {
     inner: Arc<dyn VectorSink>,
-    /// Monotonically increasing epoch counter for idempotent upserts.
-    epoch: std::sync::atomic::AtomicU64,
 }
+
+/// Constant epoch for bridge upserts. Point ids are `hash(doc_id || epoch)`,
+/// so a fixed epoch keeps the id stable per `doc_id` and makes re-upserts
+/// idempotent overwrites (ADR-R17.3). Callers that genuinely version their
+/// embeddings should build an `EmbeddingBatch` with their own epoch directly.
+const BRIDGE_EPOCH: u64 = 0;
 
 impl VectorSinkBridge {
     pub fn new(sink: Arc<dyn VectorSink>) -> Self {
-        Self {
-            inner: sink,
-            epoch: std::sync::atomic::AtomicU64::new(0),
-        }
+        Self { inner: sink }
     }
 }
 
 impl krishiv_ivm::IvmVectorSink for VectorSinkBridge {
     fn upsert_batch<'a>(&'a self, ids: &'a [String], vectors: &'a [Vec<f32>]) -> VectorFuture<'a> {
         Box::pin(async move {
-            let epoch = self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let payloads: Vec<HashMap<String, PayloadValue>> =
                 (0..ids.len()).map(|_| HashMap::new()).collect();
-            let batch = EmbeddingBatch::new(ids.to_vec(), vectors.to_vec(), payloads, epoch);
+            let batch = EmbeddingBatch::new(ids.to_vec(), vectors.to_vec(), payloads, BRIDGE_EPOCH);
             self.inner
                 .upsert_batch(&batch)
                 .await
@@ -65,5 +65,25 @@ impl krishiv_ivm::IvmVectorSink for VectorSinkBridge {
                 .await
                 .map_err(|e| krishiv_ivm::IvmError::execution(e.to_string()))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use krishiv_connectors::vector::{InMemoryVectorSink, VectorSink};
+    use krishiv_ivm::IvmVectorSink;
+
+    #[tokio::test]
+    async fn vector_bridge_upsert_is_idempotent_per_doc_id() {
+        let inner = Arc::new(InMemoryVectorSink::new());
+        let bridge = VectorSinkBridge::new(inner.clone() as Arc<dyn VectorSink>);
+        let ids = vec!["doc-1".to_string()];
+        let vectors = vec![vec![1.0_f32, 0.0]];
+        bridge.upsert_batch(&ids, &vectors).await.unwrap();
+        bridge.upsert_batch(&ids, &vectors).await.unwrap();
+        let results = inner.query_nearest(&[1.0, 0.0], 10, None).await.unwrap();
+        assert_eq!(results.len(), 1, "re-upsert must overwrite, not duplicate");
+        assert_eq!(results[0].doc_id, "doc-1");
     }
 }

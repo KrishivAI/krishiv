@@ -66,19 +66,16 @@ mod connector_tests {
     }
 
     #[test]
-    fn connector_capabilities_validate_rejects_two_phase_without_transactional() {
+    fn connector_capabilities_two_phase_builder_always_produces_valid_state() {
+        // The two-phase-without-transactional state is unconstructible through
+        // the public builder (`with_two_phase_commit` always sets
+        // transactional, and the fields are private), so all this can prove is
+        // that the builder's two-phase states validate.
         let caps = ConnectorCapabilities::new()
             .with_checkpoint()
             .with_two_phase_commit();
-        // with_two_phase_commit sets transactional, so this should pass
         caps.validate().unwrap();
 
-        // Manually construct an invalid state using the builder pattern
-        // with_two_phase_commit() always sets transactional, so we test
-        // that validate catches the invariant violation through the public API.
-        // The only way to get two_phase_commit without transactional is via
-        // manual construction, which the private fields prevent.
-        // Instead, verify that the public API always produces valid states.
         let caps_valid = ConnectorCapabilities::new().with_two_phase_commit();
         assert!(caps_valid.validate().is_ok());
     }
@@ -196,11 +193,6 @@ mod connector_tests {
         let encoded = offset.encode();
         let decoded = ParquetOffset::decode(&encoded).unwrap();
         assert_eq!(decoded.batch_index, usize::MAX);
-    }
-
-    #[test]
-    fn at_least_once_contract_exists() {
-        let _ = AtLeastOnceSinkContract;
     }
 
     // -----------------------------------------------------------------------

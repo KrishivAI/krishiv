@@ -34,6 +34,63 @@ fn delta_log_dir(root: &Path) -> PathBuf {
     root.join("_delta_log")
 }
 
+/// Maximum retries when racing other writers for a log version.
+const MAX_COMMIT_ATTEMPTS: usize = 16;
+
+/// Per-process-unique suffix for data/tmp file names so concurrent writers
+/// never truncate each other's files while racing for the same version.
+fn commit_attempt_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id() as u64;
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{pid:08x}{counter:08x}")
+}
+
+/// Atomically claim `_delta_log/<version>.json` with `contents` (put-if-absent).
+///
+/// Writes a writer-unique tmp file, fsyncs it, then publishes it via
+/// `hard_link` — which fails with `AlreadyExists` if another writer claimed
+/// the version first. Returns `Ok(true)` if this writer won the claim,
+/// `Ok(false)` on a version collision (the caller must pick a new version
+/// and retry); never overwrites another writer's committed log entry.
+fn claim_commit_log(root: &Path, version: u64, contents: &str) -> LakehouseResult<bool> {
+    let log_dir = delta_log_dir(root);
+    fs::create_dir_all(&log_dir).map_err(|e| LakehouseError::Io(e.to_string()))?;
+    let final_path = log_dir.join(format!("{version:020}.json"));
+    let tmp_path = log_dir.join(format!(
+        "{version:020}-{}.json.tmp",
+        commit_attempt_suffix()
+    ));
+    {
+        let mut tmp = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        tmp.write_all(contents.as_bytes())
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        tmp.sync_all()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+    }
+    let claimed = match fs::hard_link(&tmp_path, &final_path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(LakehouseError::Io(e.to_string()));
+        }
+    };
+    let _ = fs::remove_file(&tmp_path);
+    if claimed {
+        // Fsync the parent directory so the new link is durable.
+        if let Ok(dir_file) = File::open(&log_dir) {
+            dir_file.sync_all().ok();
+        }
+    }
+    Ok(claimed)
+}
+
 fn next_version(root: &Path) -> LakehouseResult<u64> {
     let dir = delta_log_dir(root);
     fs::create_dir_all(&dir).map_err(|e| LakehouseError::Io(e.to_string()))?;
@@ -90,6 +147,41 @@ fn active_data_file_paths(root: &Path, max_version: Option<u64>) -> LakehouseRes
         }
     }
     Ok(active.into_iter().collect())
+}
+
+/// Union of every `add` path across all log versions — the set of data files
+/// referenced by at least one table version (time-travel safety set).
+fn all_logged_data_file_paths(root: &Path) -> LakehouseResult<std::collections::HashSet<String>> {
+    let dir = delta_log_dir(root);
+    let mut referenced = std::collections::HashSet::new();
+    if !dir.exists() {
+        return Ok(referenced);
+    }
+    for entry in fs::read_dir(&dir).map_err(|e| LakehouseError::Io(e.to_string()))? {
+        let entry = entry.map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name
+            .strip_suffix(".json")
+            .is_none_or(|s| s.parse::<u64>().is_err())
+        {
+            continue;
+        }
+        let text =
+            fs::read_to_string(entry.path()).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: serde_json::Value =
+                serde_json::from_str(line).map_err(|e| LakehouseError::Io(e.to_string()))?;
+            if let Some(add) = value.get("add").and_then(|a| a.get("path"))
+                && let Some(rel) = add.as_str()
+            {
+                referenced.insert(rel.to_string());
+            }
+        }
+    }
+    Ok(referenced)
 }
 
 fn list_data_files(root: &Path, max_version: Option<u64>) -> LakehouseResult<Vec<PathBuf>> {
@@ -185,6 +277,20 @@ fn compute_add_stats(batches: &[RecordBatch]) -> serde_json::Value {
         let mut col_min: Option<String> = None;
         let mut col_max: Option<String> = None;
 
+        // Numeric columns must compare numerically — comparing the formatted
+        // strings would order "10" before "9".
+        let numeric = field.data_type().is_numeric();
+        let less = |a: &str, b: &str| -> bool {
+            if numeric {
+                match (a.parse::<f64>(), b.parse::<f64>()) {
+                    (Ok(x), Ok(y)) => x < y,
+                    _ => a < b,
+                }
+            } else {
+                a < b
+            }
+        };
+
         for batch in batches {
             let col = batch.column(col_idx);
             let Ok(formatter) = ArrayFormatter::try_new(col.as_ref(), &fmt_opts) else {
@@ -198,7 +304,7 @@ fn compute_add_stats(batches: &[RecordBatch]) -> serde_json::Value {
                 col_min = Some(match col_min.take() {
                     None => v.clone(),
                     Some(m) => {
-                        if v < m {
+                        if less(&v, &m) {
                             v.clone()
                         } else {
                             m
@@ -208,7 +314,7 @@ fn compute_add_stats(batches: &[RecordBatch]) -> serde_json::Value {
                 col_max = Some(match col_max.take() {
                     None => v.clone(),
                     Some(m) => {
-                        if v > m {
+                        if less(&m, &v) {
                             v.clone()
                         } else {
                             m
@@ -334,9 +440,11 @@ pub fn vacuum_table(path: &str, retention_hours: u64) -> LakehouseResult<usize> 
         return Ok(0);
     }
 
-    // All files still referenced by the current snapshot.
-    let active: std::collections::HashSet<String> =
-        active_data_file_paths(root, None)?.into_iter().collect();
+    // Files referenced by ANY log version: a file added at version v belongs
+    // to version v's active set, so removing it would break time travel even
+    // if a later version tombstoned it. The union of active sets across all
+    // versions is exactly the union of all `add` paths in the log.
+    let active: std::collections::HashSet<String> = all_logged_data_file_paths(root)?;
 
     // Cutoff: files modified before this instant are eligible for deletion.
     let now = std::time::SystemTime::now();
@@ -433,18 +541,17 @@ pub fn write_table(path: &str, batches: Vec<RecordBatch>, overwrite: bool) -> La
         }
     }
 
-    let mut removed_paths: Vec<String> = Vec::new();
-    if overwrite {
-        removed_paths = active_data_file_paths(root, None)?;
-    }
-    let version = next_version(root)?;
-    let is_new_table = version == 0;
-    let file_name = format!("part-{version:05}.parquet");
-    let file_path = root.join(&file_name);
     let schema = batches
         .first()
         .ok_or_else(|| LakehouseError::Io("empty batches".to_string()))?
         .schema();
+
+    // Write the data file once under a writer-unique name so a concurrent
+    // writer racing for the same version can never truncate it.
+    let suffix = commit_attempt_suffix();
+    let mut version = next_version(root)?;
+    let mut file_name = format!("part-{version:05}-{suffix}.parquet");
+    let file_path = root.join(&file_name);
     let f = File::create(&file_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
     let mut writer = ArrowWriter::try_new(f, schema.clone(), None)
         .map_err(|e| LakehouseError::Io(e.to_string()))?;
@@ -462,45 +569,55 @@ pub fn write_table(path: &str, batches: Vec<RecordBatch>, overwrite: bool) -> La
     let meta = file
         .metadata()
         .map_err(|e| LakehouseError::Io(e.to_string()))?;
-    let log_dir = delta_log_dir(root);
-    let log_path = log_dir.join(format!("{version:020}.json"));
-    let tmp_log_path = log_dir.join(format!("{version:020}.json.tmp"));
 
     // ── T19: compute per-column stats for predicate pushdown ──
     let stats = compute_add_stats(&batches);
 
-    // Write commit log atomically: write to .tmp, fsync, rename.
-    let ts = chrono::Utc::now().timestamp_millis();
-    let commit = json!({"commitInfo":{"operation":"WRITE","timestamp":ts}});
-    let add = json!({"add":{"path":file_name,"size":meta.len(),"dataChange":true,"stats":stats}});
-    {
-        let mut log = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_log_path)
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+    // Claim the version with put-if-absent semantics; on a collision with a
+    // concurrent writer, re-read the next version and retry.
+    for _ in 0..MAX_COMMIT_ATTEMPTS {
+        let is_new_table = version == 0;
+        // Recompute inside the loop: a racing overwrite changes the active set.
+        let removed_paths: Vec<String> = if overwrite {
+            active_data_file_paths(root, None)?
+        } else {
+            Vec::new()
+        };
+        let ts = chrono::Utc::now().timestamp_millis();
+        let commit = json!({"commitInfo":{"operation":"WRITE","timestamp":ts}});
+        let add =
+            json!({"add":{"path":file_name,"size":meta.len(),"dataChange":true,"stats":stats}});
+        let mut contents = Vec::new();
         // ── T19: write protocol+metaData preamble on table creation ──
         if is_new_table {
-            write_initial_protocol_metadata(&mut log, &schema)?;
+            write_initial_protocol_metadata(&mut contents, &schema)?;
         }
-        writeln!(log, "{commit}").map_err(|e| LakehouseError::Io(e.to_string()))?;
+        writeln!(contents, "{commit}").map_err(|e| LakehouseError::Io(e.to_string()))?;
         // S6: Emit remove actions for every file deleted during overwrite.
         for removed in &removed_paths {
             let remove =
                 json!({"remove":{"path":removed,"dataChange":true,"deletionTimestamp":ts}});
-            writeln!(log, "{remove}").map_err(|e| LakehouseError::Io(e.to_string()))?;
+            writeln!(contents, "{remove}").map_err(|e| LakehouseError::Io(e.to_string()))?;
         }
-        writeln!(log, "{add}").map_err(|e| LakehouseError::Io(e.to_string()))?;
-        log.sync_all()
+        writeln!(contents, "{add}").map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let contents =
+            String::from_utf8(contents).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        if claim_commit_log(root, version, &contents)? {
+            return Ok(());
+        }
+        // Lost the race: move the data file to the next version's name and retry.
+        version = next_version(root)?;
+        let new_name = format!("part-{version:05}-{suffix}.parquet");
+        fs::rename(root.join(&file_name), root.join(&new_name))
             .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        file_name = new_name;
     }
-    fs::rename(&tmp_log_path, &log_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
-    // Fsync the parent directory so the rename is durable.
-    if let Ok(dir_file) = File::open(&log_dir) {
-        dir_file.sync_all().ok();
-    }
-    Ok(())
+    let _ = fs::remove_file(root.join(&file_name));
+    Err(LakehouseError::Concurrency {
+        message: format!(
+            "could not claim a Delta log version after {MAX_COMMIT_ATTEMPTS} attempts"
+        ),
+    })
 }
 
 // ── TwoPhaseCommitSink ────────────────────────────────────────────────────────────────
@@ -587,33 +704,35 @@ impl TwoPhaseCommitSink for LocalDeltaTwoPhaseCommitSink {
         }
         let root = &self.root;
         fs::create_dir_all(root).map_err(to_connector)?;
-        let version = next_version(root).map_err(to_connector)?;
-        let file_name = format!("part-{version:05}-stage.parquet");
-        let final_path = root.join(&file_name);
-        fs::rename(&handle.staging_path, &final_path).map_err(to_connector)?;
-        let meta = final_path.metadata().map_err(to_connector)?;
-        let log_dir = delta_log_dir(root);
-        fs::create_dir_all(&log_dir).map_err(to_connector)?;
-        let log_path = log_dir.join(format!("{version:020}.json"));
-        let tmp_log_path = log_dir.join(format!("{version:020}.json.tmp"));
-        let commit_entry = json!({"commitInfo":{"operation":"WRITE","epoch":handle.epoch}});
-        let add_entry = json!({"add":{"path":file_name,"size":meta.len(),"dataChange":true}});
-        {
-            let mut log = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp_log_path)
-                .map_err(to_connector)?;
-            writeln!(log, "{commit_entry}").map_err(to_connector)?;
-            writeln!(log, "{add_entry}").map_err(to_connector)?;
-            log.sync_all().map_err(to_connector)?;
+        let suffix = commit_attempt_suffix();
+        let mut version = next_version(root).map_err(to_connector)?;
+        let mut file_name = format!("part-{version:05}-stage-{suffix}.parquet");
+        // The final name is writer-unique, so a concurrent writer racing for
+        // the same version can never replace this file.
+        fs::rename(&handle.staging_path, root.join(&file_name)).map_err(to_connector)?;
+        let meta = root.join(&file_name).metadata().map_err(to_connector)?;
+        for _ in 0..MAX_COMMIT_ATTEMPTS {
+            // `timestamp` keeps these versions visible to version_at_timestamp
+            // (AS OF), matching write_table's commitInfo.
+            let ts = chrono::Utc::now().timestamp_millis();
+            let commit_entry = json!(
+                {"commitInfo":{"operation":"WRITE","epoch":handle.epoch,"timestamp":ts}}
+            );
+            let add_entry = json!({"add":{"path":file_name,"size":meta.len(),"dataChange":true}});
+            let contents = format!("{commit_entry}\n{add_entry}\n");
+            if claim_commit_log(root, version, &contents).map_err(to_connector)? {
+                return Ok(());
+            }
+            // Lost the race: rename to the next version's name and retry.
+            version = next_version(root).map_err(to_connector)?;
+            let new_name = format!("part-{version:05}-stage-{suffix}.parquet");
+            fs::rename(root.join(&file_name), root.join(&new_name)).map_err(to_connector)?;
+            file_name = new_name;
         }
-        fs::rename(&tmp_log_path, &log_path).map_err(to_connector)?;
-        if let Ok(dir_file) = File::open(&log_dir) {
-            dir_file.sync_all().ok();
-        }
-        Ok(())
+        let _ = fs::remove_file(root.join(&file_name));
+        Err(to_connector(format!(
+            "could not claim a Delta log version after {MAX_COMMIT_ATTEMPTS} attempts"
+        )))
     }
 
     fn abort(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
@@ -624,12 +743,22 @@ impl TwoPhaseCommitSink for LocalDeltaTwoPhaseCommitSink {
     }
 }
 
-pub fn table_schema(path: &str) -> LakehouseResult<SchemaRef> {
-    let batches = read_table(path, None)?;
-    Ok(batches
-        .first()
-        .map(|b| b.schema())
-        .unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty())))
+/// Read the table schema from the first data file's Parquet footer for the
+/// pinned `version` (latest when `None`), without materializing any rows.
+///
+/// An empty table has no footer to read and is an explicit error rather than
+/// a silently empty schema.
+pub fn table_schema(path: &str, version: Option<u64>) -> LakehouseResult<SchemaRef> {
+    let files = list_data_files(Path::new(path), version)?;
+    let first = files.first().ok_or_else(|| {
+        LakehouseError::Io(format!(
+            "delta table at {path} has no data files; schema unavailable"
+        ))
+    })?;
+    let f = File::open(first).map_err(|e| LakehouseError::Io(e.to_string()))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+        .map_err(|e| LakehouseError::Io(e.to_string()))?;
+    Ok(reader.schema().clone())
 }
 
 #[cfg(test)]
@@ -736,13 +865,24 @@ mod tests {
         assert_eq!(version_zero_rows, 3);
     }
 
+    fn parquet_files_in(root: &Path) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+            .collect();
+        files.sort();
+        files
+    }
+
     #[test]
     fn overwrite_keeps_removed_data_files_for_time_travel() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_string_lossy().to_string();
 
         write_table(&path, vec![batch(&[1, 2, 3])], true).unwrap();
-        let old_file = dir.path().join("part-00000.parquet");
+        let old_file = parquet_files_in(dir.path()).remove(0);
         assert!(old_file.exists());
 
         write_table(&path, vec![batch(&[10])], true).unwrap();
@@ -834,39 +974,48 @@ mod tests {
         assert!(has_num_records, "add entry must include numRecords stat");
     }
 
-    /// `vacuum_table` with 0 retention removes only unreferenced Parquet files.
+    /// `vacuum_table` with 0 retention removes only genuinely-orphaned Parquet
+    /// files — ones referenced by no log version at all.
     #[test]
     fn vacuum_removes_unreferenced_parquet_files() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_string_lossy().to_string();
 
-        // Write and then overwrite — leaves the original part file unreferenced.
         write_table(&path, vec![batch(&[1, 2, 3])], false).unwrap();
-        write_table(&path, vec![batch(&[10])], true).unwrap();
-
-        // Both files exist before vacuum.
-        assert!(dir.path().join("part-00000.parquet").exists());
-        assert!(dir.path().join("part-00001.parquet").exists());
+        // A stray data file no log version references (e.g. an aborted write).
+        let orphan = dir.path().join("part-99999-orphan.parquet");
+        std::fs::write(&orphan, b"junk").unwrap();
 
         let removed = vacuum_table(&path, 0).unwrap();
-        assert_eq!(
-            removed, 1,
-            "exactly the one overwritten file should be removed"
-        );
-
-        // Active file must still exist; unreferenced one must be gone.
-        assert!(
-            !dir.path().join("part-00000.parquet").exists(),
-            "tombstoned file removed"
-        );
-        assert!(
-            dir.path().join("part-00001.parquet").exists(),
-            "active file retained"
-        );
+        assert_eq!(removed, 1, "exactly the orphaned file should be removed");
+        assert!(!orphan.exists(), "orphaned file removed");
 
         // Table still readable after vacuum.
         let rows = read_table(&path, None).unwrap();
-        assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    }
+
+    /// Files referenced by a prior version must survive vacuum so time travel
+    /// keeps working, even when the current snapshot has tombstoned them.
+    #[test]
+    fn vacuum_preserves_files_referenced_by_prior_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        write_table(&path, vec![batch(&[1, 2, 3])], false).unwrap();
+        write_table(&path, vec![batch(&[10])], true).unwrap();
+        assert_eq!(parquet_files_in(dir.path()).len(), 2);
+
+        let removed = vacuum_table(&path, 0).unwrap();
+        assert_eq!(
+            removed, 0,
+            "files referenced by any prior version must not be vacuumed"
+        );
+        assert_eq!(parquet_files_in(dir.path()).len(), 2);
+
+        // Time travel to version 0 still returns its rows.
+        let v0 = read_table(&path, Some(0)).unwrap();
+        assert_eq!(v0.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
     }
 
     /// `vacuum_table` does not remove files still within the retention window.
@@ -915,5 +1064,117 @@ mod tests {
         // A very large timestamp should return version 1.
         let v2 = version_at_timestamp(root, i64::MAX).unwrap();
         assert_eq!(v2, Some(1), "max timestamp should return latest version");
+    }
+
+    fn write_test_parquet(path: &Path, b: &RecordBatch) -> u64 {
+        let f = File::create(path).unwrap();
+        let mut w = ArrowWriter::try_new(f, b.schema(), None).unwrap();
+        w.write(b).unwrap();
+        w.close().unwrap();
+        path.metadata().unwrap().len()
+    }
+
+    /// Two writers pre-positioned at the same version: the second claim must
+    /// fail (put-if-absent) instead of replacing the first writer's commit,
+    /// and after retrying at a new version both writers' rows are visible.
+    #[test]
+    fn version_claim_is_put_if_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let root = dir.path();
+
+        write_table(&path, vec![batch(&[1])], false).unwrap(); // v0
+        let version = next_version(root).unwrap(); // both writers compute 1
+
+        // Each racing writer has already written its own data file.
+        let name_a = format!("part-{version:05}-aaaa.parquet");
+        let name_b = format!("part-{version:05}-bbbb.parquet");
+        let size_a = write_test_parquet(&root.join(&name_a), &batch(&[2]));
+        let size_b = write_test_parquet(&root.join(&name_b), &batch(&[3]));
+        let entry = |name: &str, size: u64| {
+            format!(
+                "{}\n{}\n",
+                json!({"commitInfo":{"operation":"WRITE","timestamp":chrono::Utc::now().timestamp_millis()}}),
+                json!({"add":{"path":name,"size":size,"dataChange":true}}),
+            )
+        };
+
+        assert!(
+            claim_commit_log(root, version, &entry(&name_a, size_a)).unwrap(),
+            "first claim must win"
+        );
+        assert!(
+            !claim_commit_log(root, version, &entry(&name_b, size_b)).unwrap(),
+            "second claim of the same version must be rejected"
+        );
+
+        // Winner's commit is intact.
+        let log_text =
+            std::fs::read_to_string(root.join("_delta_log").join(format!("{version:020}.json")))
+                .unwrap();
+        assert!(log_text.contains(&name_a), "writer A's commit survives");
+        assert!(!log_text.contains(&name_b), "writer B must not clobber A");
+
+        // Loser retries at the next version; then all rows are visible.
+        let retry_version = next_version(root).unwrap();
+        assert_eq!(retry_version, version + 1);
+        assert!(claim_commit_log(root, retry_version, &entry(&name_b, size_b)).unwrap());
+        let rows = read_table(&path, None).unwrap();
+        assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    }
+
+    /// Numeric stats must compare numerically: [9, 10] → min 9, max 10 (a
+    /// string comparison would give min "10").
+    #[test]
+    fn add_stats_numeric_min_max() {
+        let stats = compute_add_stats(&[batch(&[9, 10])]);
+        assert_eq!(stats["minValues"]["id"], "9");
+        assert_eq!(stats["maxValues"]["id"], "10");
+    }
+
+    /// 2PC commits carry commitInfo.timestamp so AS OF timestamp reads can
+    /// resolve to them.
+    #[test]
+    fn two_phase_commit_versions_visible_to_timestamp_time_travel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let mut sink = LocalDeltaTwoPhaseCommitSink::new(dir.path());
+        let handle = sink.prepare(7, &batch(&[1, 2])).unwrap();
+        sink.commit(handle).unwrap();
+
+        let v = version_at_timestamp(dir.path(), i64::MAX).unwrap();
+        assert_eq!(v, Some(0), "2PC commit must be resolvable by timestamp");
+        let rows = read_table_at_timestamp(&path, i64::MAX).unwrap();
+        assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    }
+
+    /// table_schema reads the footer of the pinned version and errors on an
+    /// empty table instead of inventing an empty schema.
+    #[test]
+    fn table_schema_respects_version_and_rejects_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        assert!(
+            table_schema(&path, None).is_err(),
+            "empty table must be a schema error"
+        );
+
+        write_table(&path, vec![batch(&[1])], false).unwrap(); // v0: (id)
+        // v1 overwrites with a different schema.
+        let schema2 = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let names: Arc<dyn arrow::array::Array> =
+            Arc::new(arrow::array::StringArray::from(vec!["a"]));
+        write_table(
+            &path,
+            vec![RecordBatch::try_new(schema2, vec![names]).unwrap()],
+            true,
+        )
+        .unwrap();
+
+        let v0 = table_schema(&path, Some(0)).unwrap();
+        assert_eq!(v0.field(0).name(), "id", "pinned version 0 schema");
+        let latest = table_schema(&path, None).unwrap();
+        assert_eq!(latest.field(0).name(), "name", "latest schema");
     }
 }

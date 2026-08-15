@@ -357,8 +357,8 @@ pub async fn apply_as_of_refs(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::*;
     use super::super::as_of::AsOfTableRef;
+    use super::*;
     use chrono::TimeZone;
 
     fn ctx() -> SessionContext {
@@ -383,7 +383,9 @@ mod tests {
                 Arc::clone(&schema),
                 vec![
                     Arc::new(Int64Array::from(chunk.to_vec())),
-                    Arc::new(Int64Array::from(chunk.iter().map(|v| v * 10).collect::<Vec<_>>())),
+                    Arc::new(Int64Array::from(
+                        chunk.iter().map(|v| v * 10).collect::<Vec<_>>(),
+                    )),
                 ],
             )
             .unwrap();
@@ -482,7 +484,13 @@ mod tests {
         let table = parquet_files_table(Vec::new(), schema, 4).unwrap();
         let ctx = ctx();
         ctx.register_table("empty", table).unwrap();
-        let batches = ctx.sql("SELECT * FROM empty").await.unwrap().collect().await.unwrap();
+        let batches = ctx
+            .sql("SELECT * FROM empty")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
     }
 
@@ -519,7 +527,9 @@ mod tests {
     /// the present.
     #[tokio::test]
     async fn a_timestamp_spec_is_refused_rather_than_read_as_latest() {
-        let ts = chrono::Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+        let ts = chrono::Utc
+            .with_ymd_and_hms(2024, 1, 15, 10, 30, 0)
+            .unwrap();
         let refs = vec![AsOfTableRef {
             table: "delta./tmp/does-not-matter".into(),
             alias: "__krishiv_as_of_0".into(),

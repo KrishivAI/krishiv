@@ -28,9 +28,14 @@ impl VectorSinkRegistry {
         Self::default()
     }
 
-    /// Register a sink by name.
+    /// Register a sink by name, replacing any existing sink with that name.
     pub fn register(&mut self, name: impl Into<String>, sink: Arc<dyn VectorSink>) {
-        self.sinks.push((name.into(), sink));
+        let name = name.into();
+        if let Some(entry) = self.sinks.iter_mut().find(|(n, _)| *n == name) {
+            entry.1 = sink;
+        } else {
+            self.sinks.push((name, sink));
+        }
     }
 
     /// Look up a sink by name.

@@ -162,10 +162,7 @@ pub fn rewrite_show_databases(query: &str) -> Option<String> {
     if let Some(catalog) = catalog_qualifier(before_like) {
         // Single-quote escaping so a catalog name containing `'` cannot end the
         // literal early.
-        predicates.push(format!(
-            "catalog_name = '{}'",
-            catalog.replace('\'', "''")
-        ));
+        predicates.push(format!("catalog_name = '{}'", catalog.replace('\'', "''")));
     }
     if let Some(pattern) = like_pattern.filter(|p| !p.is_empty()) {
         predicates.push(format!("schema_name LIKE {pattern}"));
@@ -190,7 +187,11 @@ pub fn parse_truncate(query: &str) -> Option<String> {
     let rest = upper
         .strip_prefix("TRUNCATE TABLE ")
         .map(|_| &q["TRUNCATE TABLE ".len()..])
-        .or_else(|| upper.strip_prefix("TRUNCATE ").map(|_| &q["TRUNCATE ".len()..]))?;
+        .or_else(|| {
+            upper
+                .strip_prefix("TRUNCATE ")
+                .map(|_| &q["TRUNCATE ".len()..])
+        })?;
     let name = rest.trim();
     (!name.is_empty() && !name.contains(char::is_whitespace)).then(|| unquote(name))
 }
@@ -228,13 +229,13 @@ pub fn parse_create_vector_index(query: &str) -> Option<Result<CreateVectorIndex
         // Optional index name before ON.
         let Some((_name, rest)) = body.split_once(char::is_whitespace) else {
             return Some(Err(
-                "CREATE VECTOR INDEX: expected ON <table>(<column>)".into(),
+                "CREATE VECTOR INDEX: expected ON <table>(<column>)".into()
             ));
         };
         body = rest.trim();
         if !body.to_ascii_uppercase().starts_with("ON ") {
             return Some(Err(
-                "CREATE VECTOR INDEX: expected ON <table>(<column>)".into(),
+                "CREATE VECTOR INDEX: expected ON <table>(<column>)".into()
             ));
         }
     }
@@ -373,9 +374,13 @@ pub fn parse_cache(query: &str) -> Option<Result<CacheStatement, String>> {
 pub fn rewrite_describe_function(query: &str) -> Option<String> {
     let q = query.trim().trim_end_matches(';').trim();
     let upper = q.to_ascii_uppercase();
-    let rest = ["DESCRIBE FUNCTION EXTENDED ", "DESCRIBE FUNCTION ", "DESC FUNCTION "]
-        .iter()
-        .find_map(|p| upper.starts_with(p).then(|| q[p.len()..].trim()))?;
+    let rest = [
+        "DESCRIBE FUNCTION EXTENDED ",
+        "DESCRIBE FUNCTION ",
+        "DESC FUNCTION ",
+    ]
+    .iter()
+    .find_map(|p| upper.starts_with(p).then(|| q[p.len()..].trim()))?;
     if rest.is_empty() || rest.contains(char::is_whitespace) {
         return None;
     }
@@ -420,7 +425,11 @@ pub fn parse_describe_query(query: &str) -> Option<String> {
     let upper = q.to_ascii_uppercase();
     ["DESCRIBE QUERY ", "DESC QUERY "]
         .iter()
-        .find_map(|p| upper.starts_with(p).then(|| q[p.len()..].trim().to_string()))
+        .find_map(|p| {
+            upper
+                .starts_with(p)
+                .then(|| q[p.len()..].trim().to_string())
+        })
         .filter(|inner| !inner.is_empty())
 }
 
@@ -687,7 +696,12 @@ mod tests {
             .collect()
             .await
             .expect("create collect");
-        for stmt in ["CACHE TABLE c", "UNCACHE TABLE c", "CACHE TABLE c", "CLEAR CACHE"] {
+        for stmt in [
+            "CACHE TABLE c",
+            "UNCACHE TABLE c",
+            "CACHE TABLE c",
+            "CLEAR CACHE",
+        ] {
             engine
                 .sql(stmt)
                 .await

@@ -131,20 +131,42 @@ mod imp {
             &self,
             vector: &[f32],
             top_k: usize,
-            _filter: Option<&PayloadFilter>,
+            filter: Option<&PayloadFilter>,
         ) -> VectorSinkResult<Vec<ScoredChunk>> {
+            // Equality filters compile to a JSONB containment check with the
+            // whole filter object bound as one parameter, so keys and values
+            // never touch the SQL text.
+            let filter_json = match filter {
+                Some(f) if !f.equals.is_empty() => Some(serde_json::Value::Object(
+                    f.equals
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.to_json()))
+                        .collect(),
+                )),
+                _ => None,
+            };
+            let where_clause = if filter_json.is_some() {
+                "WHERE payload @> $3::jsonb"
+            } else {
+                ""
+            };
             let sql = format!(
                 r#"
                 SELECT payload, 1 - (vector <=> $1::vector) AS score
                 FROM "{}"
+                {}
                 ORDER BY vector <=> $1::vector
                 LIMIT $2
                 "#,
-                self.table_name
+                self.table_name, where_clause
             );
-            let rows = sqlx::query_as::<_, (serde_json::Value, f64)>(&sql)
+            let mut query = sqlx::query_as::<_, (serde_json::Value, f64)>(&sql)
                 .bind(vector_to_pg(vector))
-                .bind(top_k as i64)
+                .bind(top_k as i64);
+            if let Some(json) = filter_json {
+                query = query.bind(json);
+            }
+            let rows = query
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| VectorSinkError::Query(e.to_string()))?;

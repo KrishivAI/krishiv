@@ -189,23 +189,21 @@ impl IcebergStreamingSink {
             .map_err(|e| ConnectorError::Protocol {
                 message: format!("iceberg streaming sink: runtime build failed: {e}"),
             })?;
-        let table = runtime
-            .block_on(async {
-                let catalog =
-                    catalog_builder()
-                        .await
-                        .map_err(|message| ConnectorError::Protocol {
-                            message: format!("governed iceberg sink: {message}"),
-                        })?;
-                IcebergNativeTwoPhaseCommit::open_with_catalog(
-                    catalog,
-                    namespace,
-                    &target.table,
-                    &schema_version,
-                )
+        let table = runtime.block_on(async {
+            let catalog = catalog_builder()
                 .await
-                .map_err(lake_err)
-            })?;
+                .map_err(|message| ConnectorError::Protocol {
+                    message: format!("governed iceberg sink: {message}"),
+                })?;
+            IcebergNativeTwoPhaseCommit::open_with_catalog(
+                catalog,
+                namespace,
+                &target.table,
+                &schema_version,
+            )
+            .await
+            .map_err(lake_err)
+        })?;
         Ok(Self {
             runtime: Some(runtime),
             table,
@@ -424,14 +422,24 @@ impl TransactionalSinkParticipant for IcebergStreamingSink {
         // so a fresh sink after an executor crash can reconstruct and
         // idempotently finalize the prepared transaction from its durable path.
         let sidecar = dur2_sidecar_path(&path);
-        self.table
+        if let Err(e) = self
+            .table
             .write_file(&sidecar.to_string_lossy(), &kafka_offsets_json(&offsets))
-            .map_err(|e| ConnectorError::Protocol {
+        {
+            // The epoch is not durably prepared without its sidecar: put the
+            // taken rows and offsets back so a retried pre_commit stages them
+            // again, and drop the now-unreferenced staged Parquet so the retry
+            // does not orphan it.
+            self.open = batches;
+            self.pending_offsets = offsets;
+            self.table.remove_file_best_effort(&path.to_string_lossy());
+            return Err(ConnectorError::Protocol {
                 message: format!(
                     "iceberg streaming sink: DUR-2 sidecar write {}: {e}",
                     sidecar.display()
                 ),
-            })?;
+            });
+        }
         self.prepared.insert(
             epoch,
             PreparedEpoch {
@@ -534,6 +542,15 @@ impl TransactionalSinkParticipant for IcebergStreamingSink {
         // Idempotency gate: if the current committed snapshot already covers
         // this epoch's offsets, it was committed — `fast_append` is not
         // idempotent, so a blind re-append would double-write. Treat as done.
+        //
+        // Residual window: an epoch whose sidecar holds a genuinely EMPTY
+        // offset map (no source offsets staged before the barrier) has no
+        // oracle — `offsets.is_empty()` can never satisfy the gate, so a crash
+        // after its commit but before the sidecar removal re-appends it once
+        // on recovery. Every offset-carrying epoch (the normal streaming case,
+        // including empty-batch commits, which still record their offsets) is
+        // covered; closing the offsetless hole needs an epoch number recorded
+        // in the snapshot summary, which the sidecar format does not carry yet.
         let committed = self
             .rt()
             .block_on(self.table.committed_kafka_offsets())
@@ -1031,6 +1048,50 @@ mod tests {
         assert_eq!(sink.open_rows(), 1);
         sink.pre_commit(6).unwrap();
         assert_eq!(sink.prepared_epochs(), vec![5, 6]);
+    }
+
+    /// A failed DUR-2 sidecar write must leave the sink retryable: the taken
+    /// rows and offsets go back into the open buffer and the staged Parquet is
+    /// cleaned up, so a later barrier stages the same rows again instead of
+    /// silently dropping them.
+    #[test]
+    fn pre_commit_sidecar_failure_restores_buffer_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = open_sink(dir.path(), IcebergSinkMode::Append);
+        sink.stage(&batch(&[("a", 1)])).unwrap();
+        sink.stage_source_offsets(&BTreeMap::from([("p0".to_string(), 5)]))
+            .unwrap();
+
+        // Block the sidecar write: pre-create a DIRECTORY at the exact path
+        // the sidecar for the next staged file will use, so `fs::write` fails
+        // after the Parquet staging itself succeeded.
+        let data_dir = dir.path().canonicalize().unwrap().join("data");
+        let staged_name = sink.table.peek_next_staged_file_name();
+        let sidecar_block = data_dir.join(format!("{staged_name}.dur2.json"));
+        std::fs::create_dir_all(&sidecar_block).unwrap();
+
+        let err = sink.pre_commit(1).expect_err("sidecar write must fail");
+        assert!(err.to_string().contains("DUR-2 sidecar write"), "{err}");
+        assert_eq!(
+            sink.open_rows(),
+            1,
+            "the taken rows must be restored for retry"
+        );
+        assert!(sink.prepared_epochs().is_empty());
+        assert!(
+            !data_dir.join(&staged_name).exists(),
+            "the staged Parquet of the failed pre_commit must be cleaned up"
+        );
+
+        // Retry after the obstacle is gone: the same rows + offsets commit.
+        std::fs::remove_dir(&sidecar_block).unwrap();
+        sink.pre_commit(1).unwrap();
+        assert_eq!(sink.commit_through(1).unwrap(), 1);
+        assert_eq!(committed_rows(&sink), vec![("a".into(), 1)]);
+        assert_eq!(
+            sink.committed_offsets(),
+            BTreeMap::from([("p0".to_string(), 5)])
+        );
     }
 
     // ---- DUR-2: barrier-model prepared-sink recovery ----

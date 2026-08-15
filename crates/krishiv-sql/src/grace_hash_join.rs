@@ -442,7 +442,11 @@ async fn join(
 
     // Pass 3: one in-memory join per bucket, streamed in turn so that only one
     // bucket's build side is resident at a time.
-    let pairs: Vec<(usize, Option<RefCountedTempFile>, Option<RefCountedTempFile>)> = build_files
+    let pairs: Vec<(
+        usize,
+        Option<RefCountedTempFile>,
+        Option<RefCountedTempFile>,
+    )> = build_files
         .into_iter()
         .zip(probe_files)
         .enumerate()
@@ -592,8 +596,11 @@ fn memory_source(
     partitions: Vec<Vec<RecordBatch>>,
     schema: SchemaRef,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let exec =
-        datafusion::datasource::memory::MemorySourceConfig::try_new_exec(&partitions, schema, None)?;
+    let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+        &partitions,
+        schema,
+        None,
+    )?;
     Ok(exec)
 }
 
@@ -805,7 +812,10 @@ mod tests {
     /// Build side across two batches: duplicate keys, and keys matching nothing.
     fn build_rows() -> Vec<RecordBatch> {
         vec![
-            build_batch(vec![Some(1), Some(1), Some(2)], vec![Some("a1"), Some("a2"), Some("b")]),
+            build_batch(
+                vec![Some(1), Some(1), Some(2)],
+                vec![Some("a1"), Some("a2"), Some("b")],
+            ),
             build_batch(vec![Some(3), Some(7)], vec![Some("c"), Some("g")]),
         ]
     }
@@ -832,10 +842,7 @@ mod tests {
             HashJoinExec::try_new(
                 source(build_schema(), build_rows()),
                 source(probe_schema(), probe_rows()),
-                vec![(
-                    Arc::new(Column::new("k", 0)),
-                    Arc::new(Column::new("k", 0)),
-                )],
+                vec![(Arc::new(Column::new("k", 0)), Arc::new(Column::new("k", 0)))],
                 None,
                 &join_type,
                 projection,
@@ -903,7 +910,11 @@ mod tests {
             JoinType::RightSemi,
             JoinType::RightAnti,
         ] {
-            let expected = cells(hash_join(join_type, NullEquality::NullEqualsNothing, None), &ctx).await;
+            let expected = cells(
+                hash_join(join_type, NullEquality::NullEqualsNothing, None),
+                &ctx,
+            )
+            .await;
 
             // Budget of 1 byte: the first batch overflows, so every run of this
             // test takes the partitioning path.
@@ -920,7 +931,10 @@ mod tests {
                 spill_files(&grace) > 0,
                 "{join_type:?} took the in-memory path, so this proved nothing"
             );
-            assert_eq!(actual, expected, "{join_type:?} disagreed after partitioning");
+            assert_eq!(
+                actual, expected,
+                "{join_type:?} disagreed after partitioning"
+            );
         }
     }
 
@@ -961,7 +975,11 @@ mod tests {
         assert_eq!(spill_files(&grace), 0, "a fitting build side spilled");
         assert_eq!(
             actual,
-            cells(hash_join(JoinType::Inner, NullEquality::NullEqualsNothing, None), &ctx).await
+            cells(
+                hash_join(JoinType::Inner, NullEquality::NullEqualsNothing, None),
+                &ctx
+            )
+            .await
         );
     }
 
@@ -972,7 +990,10 @@ mod tests {
     #[tokio::test]
     async fn null_keys_survive_partitioning_under_both_null_equalities() {
         let ctx = SessionContext::new();
-        for null_equality in [NullEquality::NullEqualsNothing, NullEquality::NullEqualsNull] {
+        for null_equality in [
+            NullEquality::NullEqualsNothing,
+            NullEquality::NullEqualsNull,
+        ] {
             let join = || {
                 Arc::new(
                     HashJoinExec::try_new(
@@ -987,10 +1008,7 @@ mod tests {
                             probe_schema(),
                             vec![probe_batch(vec![None, Some(1)], vec![Some(99), Some(10)])],
                         ),
-                        vec![(
-                            Arc::new(Column::new("k", 0)),
-                            Arc::new(Column::new("k", 0)),
-                        )],
+                        vec![(Arc::new(Column::new("k", 0)), Arc::new(Column::new("k", 0)))],
                         None,
                         &JoinType::Full,
                         None,
@@ -1002,10 +1020,12 @@ mod tests {
                 )
             };
             let expected = cells(join(), &ctx).await;
-            let grace =
-                Arc::new(GraceHashJoinExec::try_new(join(), 4, 1).expect("grace join"));
+            let grace = Arc::new(GraceHashJoinExec::try_new(join(), 4, 1).expect("grace join"));
             let actual = cells(Arc::clone(&grace) as Arc<dyn ExecutionPlan>, &ctx).await;
-            assert!(spill_files(&grace) > 0, "{null_equality:?} stayed in memory");
+            assert!(
+                spill_files(&grace) > 0,
+                "{null_equality:?} stayed in memory"
+            );
             assert_eq!(actual, expected, "{null_equality:?} disagreed");
         }
     }
@@ -1071,7 +1091,11 @@ mod tests {
         // Columns 1 (v) and 3 (w) of the k,v,k,w join schema.
         let projection = Some(vec![1, 3]);
         let expected = cells(
-            hash_join(JoinType::Inner, NullEquality::NullEqualsNothing, projection.clone()),
+            hash_join(
+                JoinType::Inner,
+                NullEquality::NullEqualsNothing,
+                projection.clone(),
+            ),
             &ctx,
         )
         .await;
@@ -1099,8 +1123,7 @@ mod tests {
     #[test]
     fn the_node_reports_the_same_schema_and_partitioning_as_its_template() {
         let template = hash_join(JoinType::Inner, NullEquality::NullEqualsNothing, None);
-        let grace =
-            GraceHashJoinExec::try_new(Arc::clone(&template), 4, 1).expect("grace join");
+        let grace = GraceHashJoinExec::try_new(Arc::clone(&template), 4, 1).expect("grace join");
         assert_eq!(grace.schema(), template.schema());
         assert_eq!(
             format!("{:?}", grace.properties().partitioning),
@@ -1122,10 +1145,7 @@ mod tests {
                     probe_schema(),
                 )
                 .unwrap(),
-                vec![(
-                    Arc::new(Column::new("k", 0)),
-                    Arc::new(Column::new("k", 0)),
-                )],
+                vec![(Arc::new(Column::new("k", 0)), Arc::new(Column::new("k", 0)))],
                 None,
                 &JoinType::Inner,
                 None,
@@ -1152,10 +1172,7 @@ mod tests {
                 HashJoinExec::try_new(
                     source(build_schema(), vec![]),
                     source(probe_schema(), probe_rows()),
-                    vec![(
-                        Arc::new(Column::new("k", 0)),
-                        Arc::new(Column::new("k", 0)),
-                    )],
+                    vec![(Arc::new(Column::new("k", 0)), Arc::new(Column::new("k", 0)))],
                     None,
                     &JoinType::Right,
                     None,
@@ -1200,7 +1217,10 @@ mod tests {
         // 10 GB against a 256 MB budget wants far more than the floor, and is
         // capped rather than allowed to open unbounded files.
         let big = bucket_count(10 * 1024 * 1024 * 1024, 256 * 1024 * 1024);
-        assert!(big > DEFAULT_BUCKETS, "expected more than the floor, got {big}");
+        assert!(
+            big > DEFAULT_BUCKETS,
+            "expected more than the floor, got {big}"
+        );
         assert!(big <= MAX_BUCKETS);
         // A zero budget must not divide by zero.
         assert!(bucket_count(1, 0) >= MIN_BUCKETS);

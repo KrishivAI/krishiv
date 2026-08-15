@@ -10,8 +10,16 @@
 //! | `float`            | `Float32`     |
 //! | `double`           | `Float64`     |
 //! | `bytes` / `fixed`  | `Binary`      |
-//! | `string` / `enum`  | `Utf8`        |
+//! | `string` / `enum` / `uuid` | `Utf8` |
+//! | `date`             | `Date32`      |
+//! | `time-millis` / `time-micros` | `Time32(ms)` / `Time64(us)` |
+//! | `timestamp-millis` / `timestamp-micros` (incl. local) | `Timestamp(ms/us)` |
+//! | `record` / `array` | `Struct` / `List` |
 //! | `union [null, T]`  | nullable T    |
+//!
+//! Anything outside this table (maps, decimals, durations, unions with more
+//! than one non-null variant, nanosecond timestamps) is rejected with an error
+//! in both directions — never silently coerced.
 //!
 //! [Apache Avro]: https://avro.apache.org/
 
@@ -22,10 +30,13 @@ use apache_avro::{
     Reader as AvroReader, Schema as AvroSchema, Writer as AvroWriter, types::Value as AvroValue,
 };
 use arrow::array::{
-    ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int32Builder, Int64Builder,
-    NullArray, StringBuilder,
+    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder,
+    Int32Builder, Int64Builder, ListArray, NullArray, StringBuilder, StructArray,
+    Time32MillisecondBuilder, Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
+    TimestampMillisecondBuilder, builder::BooleanBufferBuilder,
 };
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::buffer::{NullBuffer, OffsetBuffer};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
 use crate::capabilities::ConnectorCapabilities;
@@ -64,18 +75,33 @@ fn avro_schema_to_arrow_type(schema: &AvroSchema) -> ConnectorResult<(DataType, 
         AvroSchema::Float => Ok((DataType::Float32, false)),
         AvroSchema::Double => Ok((DataType::Float64, false)),
         AvroSchema::Bytes | AvroSchema::Fixed(_) => Ok((DataType::Binary, false)),
-        AvroSchema::String | AvroSchema::Enum(_) => Ok((DataType::Utf8, false)),
+        AvroSchema::String | AvroSchema::Enum(_) | AvroSchema::Uuid => Ok((DataType::Utf8, false)),
+        AvroSchema::Date => Ok((DataType::Date32, false)),
+        AvroSchema::TimeMillis => Ok((DataType::Time32(TimeUnit::Millisecond), false)),
+        AvroSchema::TimeMicros => Ok((DataType::Time64(TimeUnit::Microsecond), false)),
+        AvroSchema::TimestampMillis | AvroSchema::LocalTimestampMillis => {
+            Ok((DataType::Timestamp(TimeUnit::Millisecond, None), false))
+        }
+        AvroSchema::TimestampMicros | AvroSchema::LocalTimestampMicros => {
+            Ok((DataType::Timestamp(TimeUnit::Microsecond, None), false))
+        }
         AvroSchema::Union(u) => {
             let variants = u.variants();
             let non_null: Vec<_> = variants
                 .iter()
                 .filter(|s| !matches!(s, AvroSchema::Null))
                 .collect();
-            if non_null.len() == 1 && variants.len() == 2 {
-                let (dt, _) = avro_schema_to_arrow_type(non_null[0])?;
+            if let (Some(inner), 2) = (non_null.first(), variants.len())
+                && non_null.len() == 1
+            {
+                let (dt, _) = avro_schema_to_arrow_type(inner)?;
                 Ok((dt, true))
             } else {
-                Ok((DataType::Utf8, true))
+                Err(ConnectorError::Io(std::io::Error::other(format!(
+                    "avro: unions with more than one non-null variant are not supported \
+                     (got {} variants)",
+                    variants.len()
+                ))))
             }
         }
         AvroSchema::Record(rec) => {
@@ -93,7 +119,9 @@ fn avro_schema_to_arrow_type(schema: &AvroSchema) -> ConnectorResult<(DataType, 
                 false,
             ))
         }
-        _ => Ok((DataType::Utf8, true)),
+        other => Err(ConnectorError::Io(std::io::Error::other(format!(
+            "avro: unsupported avro schema type {other:?}"
+        )))),
     }
 }
 
@@ -118,8 +146,8 @@ pub fn avro_values_to_batch(
             )));
         };
         for (i, (_name, val)) in fields.iter().enumerate() {
-            if i < n_cols {
-                columns[i].push(val);
+            if let Some(col) = columns.get_mut(i) {
+                col.push(val);
             }
         }
     }
@@ -128,12 +156,33 @@ pub fn avro_values_to_batch(
         .fields()
         .iter()
         .enumerate()
-        .map(|(i, field)| build_array(field.data_type(), &columns[i]))
+        .map(|(i, field)| {
+            build_array(
+                field.data_type(),
+                columns.get(i).map_or(&[][..], Vec::as_slice),
+            )
+        })
         .collect();
 
     RecordBatch::try_new(arrow_schema.clone(), arrays?)
         .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))
 }
+
+/// A decoded Avro value whose variant does not match the Arrow column type.
+///
+/// A mismatch is always an error: silently substituting NULL (or a debug
+/// string) for a value the producer wrote is data loss the reader cannot see.
+/// The only cross-variant conversions accepted are Avro's own schema-resolution
+/// promotions (`int → long → float → double`), which are lossless by spec
+/// definition (int/long → float/double follow the Avro spec even where the
+/// float mantissa rounds).
+fn type_mismatch(dt: &DataType, v: &AvroValue) -> ConnectorError {
+    ConnectorError::Io(std::io::Error::other(format!(
+        "avro: value {v:?} does not match arrow column type {dt:?}"
+    )))
+}
+
+static AVRO_NULL: AvroValue = AvroValue::Null;
 
 fn build_array(dt: &DataType, values: &[&AvroValue]) -> ConnectorResult<ArrayRef> {
     match dt {
@@ -143,7 +192,7 @@ fn build_array(dt: &DataType, values: &[&AvroValue]) -> ConnectorResult<ArrayRef
                 match unwrap_union(v) {
                     AvroValue::Boolean(x) => b.append_value(*x),
                     AvroValue::Null => b.append_null(),
-                    _ => b.append_null(),
+                    other => return Err(type_mismatch(dt, other)),
                 }
             }
             Ok(Arc::new(b.finish()))
@@ -153,9 +202,10 @@ fn build_array(dt: &DataType, values: &[&AvroValue]) -> ConnectorResult<ArrayRef
             for v in values {
                 match unwrap_union(v) {
                     AvroValue::Int(x) => b.append_value(*x),
-                    AvroValue::Long(x) => b.append_value(*x as i32),
                     AvroValue::Null => b.append_null(),
-                    _ => b.append_null(),
+                    // long → int is a narrowing Avro does not sanction; a
+                    // truncating `as i32` here silently wrapped values.
+                    other => return Err(type_mismatch(dt, other)),
                 }
             }
             Ok(Arc::new(b.finish()))
@@ -165,9 +215,9 @@ fn build_array(dt: &DataType, values: &[&AvroValue]) -> ConnectorResult<ArrayRef
             for v in values {
                 match unwrap_union(v) {
                     AvroValue::Long(x) => b.append_value(*x),
-                    AvroValue::Int(x) => b.append_value(*x as i64),
+                    AvroValue::Int(x) => b.append_value(i64::from(*x)),
                     AvroValue::Null => b.append_null(),
-                    _ => b.append_null(),
+                    other => return Err(type_mismatch(dt, other)),
                 }
             }
             Ok(Arc::new(b.finish()))
@@ -177,8 +227,10 @@ fn build_array(dt: &DataType, values: &[&AvroValue]) -> ConnectorResult<ArrayRef
             for v in values {
                 match unwrap_union(v) {
                     AvroValue::Float(x) => b.append_value(*x),
+                    AvroValue::Int(x) => b.append_value(*x as f32),
+                    AvroValue::Long(x) => b.append_value(*x as f32),
                     AvroValue::Null => b.append_null(),
-                    _ => b.append_null(),
+                    other => return Err(type_mismatch(dt, other)),
                 }
             }
             Ok(Arc::new(b.finish()))
@@ -188,8 +240,11 @@ fn build_array(dt: &DataType, values: &[&AvroValue]) -> ConnectorResult<ArrayRef
             for v in values {
                 match unwrap_union(v) {
                     AvroValue::Double(x) => b.append_value(*x),
+                    AvroValue::Float(x) => b.append_value(f64::from(*x)),
+                    AvroValue::Int(x) => b.append_value(f64::from(*x)),
+                    AvroValue::Long(x) => b.append_value(*x as f64),
                     AvroValue::Null => b.append_null(),
-                    _ => b.append_null(),
+                    other => return Err(type_mismatch(dt, other)),
                 }
             }
             Ok(Arc::new(b.finish()))
@@ -200,20 +255,168 @@ fn build_array(dt: &DataType, values: &[&AvroValue]) -> ConnectorResult<ArrayRef
                 match unwrap_union(v) {
                     AvroValue::String(s) => b.append_value(s),
                     AvroValue::Enum(_, s) => b.append_value(s),
+                    AvroValue::Uuid(u) => b.append_value(u.to_string()),
                     AvroValue::Null => b.append_null(),
-                    other => b.append_value(format!("{other:?}")),
+                    other => return Err(type_mismatch(dt, other)),
                 }
             }
             Ok(Arc::new(b.finish()))
         }
-        DataType::Null => Ok(Arc::new(NullArray::new(values.len()))),
-        _ => {
-            let mut b = StringBuilder::new();
+        DataType::Binary => {
+            let mut b = BinaryBuilder::new();
             for v in values {
-                b.append_value(format!("{v:?}"));
+                match unwrap_union(v) {
+                    AvroValue::Bytes(bytes) | AvroValue::Fixed(_, bytes) => b.append_value(bytes),
+                    AvroValue::Null => b.append_null(),
+                    other => return Err(type_mismatch(dt, other)),
+                }
             }
             Ok(Arc::new(b.finish()))
         }
+        DataType::Date32 => {
+            let mut b = Date32Builder::with_capacity(values.len());
+            for v in values {
+                match unwrap_union(v) {
+                    AvroValue::Date(d) => b.append_value(*d),
+                    AvroValue::Int(d) => b.append_value(*d),
+                    AvroValue::Null => b.append_null(),
+                    other => return Err(type_mismatch(dt, other)),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Time32(TimeUnit::Millisecond) => {
+            let mut b = Time32MillisecondBuilder::with_capacity(values.len());
+            for v in values {
+                match unwrap_union(v) {
+                    AvroValue::TimeMillis(t) => b.append_value(*t),
+                    AvroValue::Int(t) => b.append_value(*t),
+                    AvroValue::Null => b.append_null(),
+                    other => return Err(type_mismatch(dt, other)),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Time64(TimeUnit::Microsecond) => {
+            let mut b = Time64MicrosecondBuilder::with_capacity(values.len());
+            for v in values {
+                match unwrap_union(v) {
+                    AvroValue::TimeMicros(t) => b.append_value(*t),
+                    AvroValue::Long(t) => b.append_value(*t),
+                    AvroValue::Null => b.append_null(),
+                    other => return Err(type_mismatch(dt, other)),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let mut b =
+                TimestampMillisecondBuilder::with_capacity(values.len()).with_data_type(dt.clone());
+            for v in values {
+                match unwrap_union(v) {
+                    AvroValue::TimestampMillis(t) | AvroValue::LocalTimestampMillis(t) => {
+                        b.append_value(*t)
+                    }
+                    AvroValue::Long(t) => b.append_value(*t),
+                    AvroValue::Null => b.append_null(),
+                    other => return Err(type_mismatch(dt, other)),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let mut b =
+                TimestampMicrosecondBuilder::with_capacity(values.len()).with_data_type(dt.clone());
+            for v in values {
+                match unwrap_union(v) {
+                    AvroValue::TimestampMicros(t) | AvroValue::LocalTimestampMicros(t) => {
+                        b.append_value(*t)
+                    }
+                    AvroValue::Long(t) => b.append_value(*t),
+                    AvroValue::Null => b.append_null(),
+                    other => return Err(type_mismatch(dt, other)),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Struct(fields) => {
+            let mut child_cols: Vec<Vec<&AvroValue>> =
+                vec![Vec::with_capacity(values.len()); fields.len()];
+            let mut validity = BooleanBufferBuilder::new(values.len());
+            for v in values {
+                match unwrap_union(v) {
+                    AvroValue::Record(rec_fields) => {
+                        if rec_fields.len() != fields.len() {
+                            return Err(ConnectorError::Io(std::io::Error::other(format!(
+                                "avro: record has {} fields, arrow struct expects {}",
+                                rec_fields.len(),
+                                fields.len()
+                            ))));
+                        }
+                        for (i, (_name, fv)) in rec_fields.iter().enumerate() {
+                            if let Some(col) = child_cols.get_mut(i) {
+                                col.push(fv);
+                            }
+                        }
+                        validity.append(true);
+                    }
+                    AvroValue::Null => {
+                        for col in &mut child_cols {
+                            col.push(&AVRO_NULL);
+                        }
+                        validity.append(false);
+                    }
+                    other => return Err(type_mismatch(dt, other)),
+                }
+            }
+            let arrays: ConnectorResult<Vec<ArrayRef>> = fields
+                .iter()
+                .zip(child_cols.iter())
+                .map(|(f, col)| build_array(f.data_type(), col))
+                .collect();
+            Ok(Arc::new(StructArray::new(
+                fields.clone(),
+                arrays?,
+                Some(NullBuffer::new(validity.finish())),
+            )))
+        }
+        DataType::List(item_field) => {
+            let mut flat: Vec<&AvroValue> = Vec::new();
+            let mut offsets: Vec<i32> = Vec::with_capacity(values.len() + 1);
+            offsets.push(0);
+            let mut validity = BooleanBufferBuilder::new(values.len());
+            for v in values {
+                match unwrap_union(v) {
+                    AvroValue::Array(items) => {
+                        flat.extend(items.iter());
+                        let end = i32::try_from(flat.len()).map_err(|_| {
+                            ConnectorError::Io(std::io::Error::other(
+                                "avro: list offsets overflow i32",
+                            ))
+                        })?;
+                        offsets.push(end);
+                        validity.append(true);
+                    }
+                    AvroValue::Null => {
+                        let last = offsets.last().copied().unwrap_or(0);
+                        offsets.push(last);
+                        validity.append(false);
+                    }
+                    other => return Err(type_mismatch(dt, other)),
+                }
+            }
+            let child = build_array(item_field.data_type(), &flat)?;
+            Ok(Arc::new(ListArray::new(
+                item_field.clone(),
+                OffsetBuffer::new(offsets.into()),
+                child,
+                Some(NullBuffer::new(validity.finish())),
+            )))
+        }
+        DataType::Null => Ok(Arc::new(NullArray::new(values.len()))),
+        other => Err(ConnectorError::Io(std::io::Error::other(format!(
+            "avro: unsupported arrow column type {other:?}"
+        )))),
     }
 }
 
@@ -233,7 +436,7 @@ fn unwrap_union(v: &AvroValue) -> &AvroValue {
 pub fn arrow_schema_to_avro(schema: &Schema) -> ConnectorResult<AvroSchema> {
     let mut fields = Vec::with_capacity(schema.fields().len());
     for f in schema.fields() {
-        let avro_type = arrow_type_to_avro_json(f.data_type(), f.is_nullable());
+        let avro_type = arrow_type_to_avro_json(f.data_type(), f.is_nullable(), f.name())?;
         fields.push(serde_json::json!({
             "name": f.name(),
             "type": avro_type,
@@ -250,7 +453,13 @@ pub fn arrow_schema_to_avro(schema: &Schema) -> ConnectorResult<AvroSchema> {
         .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))
 }
 
-fn arrow_type_to_avro_json(dt: &DataType, nullable: bool) -> serde_json::Value {
+/// `name` seeds the generated names of nested Avro records (which must be
+/// named), keeping them unique within one schema as long as field names are.
+fn arrow_type_to_avro_json(
+    dt: &DataType,
+    nullable: bool,
+    name: &str,
+) -> ConnectorResult<serde_json::Value> {
     let base = match dt {
         DataType::Null => serde_json::json!("null"),
         DataType::Boolean => serde_json::json!("boolean"),
@@ -262,14 +471,51 @@ fn arrow_type_to_avro_json(dt: &DataType, nullable: bool) -> serde_json::Value {
         DataType::Float64 => serde_json::json!("double"),
         DataType::Utf8 | DataType::LargeUtf8 => serde_json::json!("string"),
         DataType::Binary | DataType::LargeBinary => serde_json::json!("bytes"),
-        _ => serde_json::json!("string"),
+        DataType::Date32 => serde_json::json!({"type": "int", "logicalType": "date"}),
+        DataType::Time32(TimeUnit::Millisecond) => {
+            serde_json::json!({"type": "int", "logicalType": "time-millis"})
+        }
+        DataType::Time64(TimeUnit::Microsecond) => {
+            serde_json::json!({"type": "long", "logicalType": "time-micros"})
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            serde_json::json!({"type": "long", "logicalType": "timestamp-millis"})
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            serde_json::json!({"type": "long", "logicalType": "timestamp-micros"})
+        }
+        DataType::List(item) => {
+            let items = arrow_type_to_avro_json(
+                item.data_type(),
+                item.is_nullable(),
+                &format!("{name}_item"),
+            )?;
+            serde_json::json!({"type": "array", "items": items})
+        }
+        DataType::Struct(fields) => {
+            let mut rec_fields = Vec::with_capacity(fields.len());
+            for f in fields {
+                let ft = arrow_type_to_avro_json(
+                    f.data_type(),
+                    f.is_nullable(),
+                    &format!("{name}_{}", f.name()),
+                )?;
+                rec_fields.push(serde_json::json!({"name": f.name(), "type": ft}));
+            }
+            serde_json::json!({"type": "record", "name": format!("{name}_rec"), "fields": rec_fields})
+        }
+        other => {
+            return Err(ConnectorError::Io(std::io::Error::other(format!(
+                "avro: arrow type {other:?} (column '{name}') has no avro mapping"
+            ))));
+        }
     };
 
-    if nullable {
+    Ok(if nullable {
         serde_json::json!(["null", base])
     } else {
         base
-    }
+    })
 }
 
 // ── Value conversion: Arrow → Avro ────────────────────────────────────────────
@@ -283,7 +529,7 @@ pub fn batch_to_avro_values(batch: &RecordBatch) -> ConnectorResult<Vec<AvroValu
         let mut fields: Vec<(String, AvroValue)> = Vec::with_capacity(batch.num_columns());
         for (col_idx, field) in schema.fields().iter().enumerate() {
             let col = batch.column(col_idx);
-            let val = arrow_scalar_to_avro(col.as_ref(), row, field.is_nullable());
+            let val = arrow_scalar_to_avro(col.as_ref(), row, field.is_nullable())?;
             fields.push((field.name().clone(), val));
         }
         rows.push(AvroValue::Record(fields));
@@ -291,8 +537,28 @@ pub fn batch_to_avro_values(batch: &RecordBatch) -> ConnectorResult<Vec<AvroValu
     Ok(rows)
 }
 
-fn arrow_scalar_to_avro(col: &dyn arrow::array::Array, row: usize, nullable: bool) -> AvroValue {
-    use arrow::array::*;
+/// Downcast a column to its concrete array type; a mismatch is an internal
+/// invariant violation (the `data_type` dispatch chose the type) and errors
+/// rather than silently degrading to NULL.
+fn dc<T: 'static>(col: &dyn arrow::array::Array) -> ConnectorResult<&T> {
+    col.as_any().downcast_ref::<T>().ok_or_else(|| {
+        ConnectorError::Io(std::io::Error::other(
+            "avro: column downcast does not match its declared data type",
+        ))
+    })
+}
+
+fn arrow_scalar_to_avro(
+    col: &dyn arrow::array::Array,
+    row: usize,
+    nullable: bool,
+) -> ConnectorResult<AvroValue> {
+    use arrow::array::{
+        BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int8Array, Int16Array,
+        Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
+        Time32MillisecondArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    };
 
     let is_null = col.is_null(row);
 
@@ -301,92 +567,83 @@ fn arrow_scalar_to_avro(col: &dyn arrow::array::Array, row: usize, nullable: boo
     } else {
         match col.data_type() {
             DataType::Null => AvroValue::Null,
-            DataType::Boolean => col
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .map(|arr| AvroValue::Boolean(arr.value(row)))
-                .unwrap_or(AvroValue::Null),
-            DataType::Int8 => col
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .map(|arr| AvroValue::Int(arr.value(row) as i32))
-                .unwrap_or(AvroValue::Null),
-            DataType::Int16 => col
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .map(|arr| AvroValue::Int(arr.value(row) as i32))
-                .unwrap_or(AvroValue::Null),
-            DataType::Int32 => col
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .map(|arr| AvroValue::Int(arr.value(row)))
-                .unwrap_or(AvroValue::Null),
-            DataType::Int64 => col
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .map(|arr| AvroValue::Long(arr.value(row)))
-                .unwrap_or(AvroValue::Null),
-            DataType::UInt8 => col
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .map(|arr| AvroValue::Int(arr.value(row) as i32))
-                .unwrap_or(AvroValue::Null),
-            DataType::UInt16 => col
-                .as_any()
-                .downcast_ref::<UInt16Array>()
-                .map(|arr| AvroValue::Int(arr.value(row) as i32))
-                .unwrap_or(AvroValue::Null),
-            DataType::UInt32 => col
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .map(|arr| AvroValue::Long(arr.value(row) as i64))
-                .unwrap_or(AvroValue::Null),
-            DataType::UInt64 => col
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .map(|arr| AvroValue::Long(arr.value(row) as i64))
-                .unwrap_or(AvroValue::Null),
-            DataType::Float32 => col
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .map(|arr| AvroValue::Float(arr.value(row)))
-                .unwrap_or(AvroValue::Null),
-            DataType::Float64 => col
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .map(|arr| AvroValue::Double(arr.value(row)))
-                .unwrap_or(AvroValue::Null),
-            DataType::Utf8 => col
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .map(|arr| AvroValue::String(arr.value(row).to_owned()))
-                .unwrap_or(AvroValue::Null),
-            DataType::LargeUtf8 => col
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .map(|arr| AvroValue::String(arr.value(row).to_owned()))
-                .unwrap_or(AvroValue::Null),
-            DataType::Binary => col
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .map(|arr| AvroValue::Bytes(arr.value(row).to_vec()))
-                .unwrap_or(AvroValue::Null),
-            DataType::LargeBinary => col
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .map(|arr| AvroValue::Bytes(arr.value(row).to_vec()))
-                .unwrap_or(AvroValue::Null),
-            _ => AvroValue::String(format!("{:?}", col.data_type())),
+            DataType::Boolean => AvroValue::Boolean(dc::<BooleanArray>(col)?.value(row)),
+            DataType::Int8 => AvroValue::Int(i32::from(dc::<Int8Array>(col)?.value(row))),
+            DataType::Int16 => AvroValue::Int(i32::from(dc::<Int16Array>(col)?.value(row))),
+            DataType::Int32 => AvroValue::Int(dc::<Int32Array>(col)?.value(row)),
+            DataType::Int64 => AvroValue::Long(dc::<Int64Array>(col)?.value(row)),
+            DataType::UInt8 => AvroValue::Int(i32::from(dc::<UInt8Array>(col)?.value(row))),
+            DataType::UInt16 => AvroValue::Int(i32::from(dc::<UInt16Array>(col)?.value(row))),
+            DataType::UInt32 => AvroValue::Long(i64::from(dc::<UInt32Array>(col)?.value(row))),
+            DataType::UInt64 => {
+                let v = dc::<UInt64Array>(col)?.value(row);
+                let as_long = i64::try_from(v).map_err(|_| {
+                    ConnectorError::Io(std::io::Error::other(format!(
+                        "avro: uint64 value {v} exceeds the avro long range"
+                    )))
+                })?;
+                AvroValue::Long(as_long)
+            }
+            DataType::Float32 => AvroValue::Float(dc::<Float32Array>(col)?.value(row)),
+            DataType::Float64 => AvroValue::Double(dc::<Float64Array>(col)?.value(row)),
+            DataType::Utf8 => AvroValue::String(dc::<StringArray>(col)?.value(row).to_owned()),
+            DataType::LargeUtf8 => {
+                AvroValue::String(dc::<LargeStringArray>(col)?.value(row).to_owned())
+            }
+            DataType::Binary => AvroValue::Bytes(dc::<BinaryArray>(col)?.value(row).to_vec()),
+            DataType::LargeBinary => {
+                AvroValue::Bytes(dc::<LargeBinaryArray>(col)?.value(row).to_vec())
+            }
+            DataType::Date32 => AvroValue::Date(dc::<Date32Array>(col)?.value(row)),
+            DataType::Time32(TimeUnit::Millisecond) => {
+                AvroValue::TimeMillis(dc::<Time32MillisecondArray>(col)?.value(row))
+            }
+            DataType::Time64(TimeUnit::Microsecond) => {
+                AvroValue::TimeMicros(dc::<Time64MicrosecondArray>(col)?.value(row))
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                AvroValue::TimestampMillis(dc::<TimestampMillisecondArray>(col)?.value(row))
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                AvroValue::TimestampMicros(dc::<TimestampMicrosecondArray>(col)?.value(row))
+            }
+            DataType::Struct(fields) => {
+                let arr = dc::<StructArray>(col)?;
+                let mut rec = Vec::with_capacity(fields.len());
+                for (i, f) in fields.iter().enumerate() {
+                    let child = arrow_scalar_to_avro(arr.column(i).as_ref(), row, f.is_nullable())?;
+                    rec.push((f.name().clone(), child));
+                }
+                AvroValue::Record(rec)
+            }
+            DataType::List(item_field) => {
+                let arr = dc::<ListArray>(col)?;
+                let items = arr.value(row);
+                let mut out = Vec::with_capacity(items.len());
+                for j in 0..items.len() {
+                    out.push(arrow_scalar_to_avro(
+                        items.as_ref(),
+                        j,
+                        item_field.is_nullable(),
+                    )?);
+                }
+                AvroValue::Array(out)
+            }
+            other => {
+                return Err(ConnectorError::Io(std::io::Error::other(format!(
+                    "avro: arrow type {other:?} has no avro value mapping"
+                ))));
+            }
         }
     };
 
-    if nullable {
+    Ok(if nullable {
         // Union index 0 = null branch, 1 = value (matches ["null", T]).
         let idx = if is_null { 0u32 } else { 1u32 };
         AvroValue::Union(idx, Box::new(val))
     } else {
         val
-    }
+    })
 }
 
 // ── AvroSource ────────────────────────────────────────────────────────────────
@@ -446,7 +703,8 @@ impl AvroSource {
             return Ok(None);
         }
         let end = (self.cursor + self.batch_size).min(self.records.len());
-        let batch = avro_values_to_batch(&self.arrow_schema, &self.records[self.cursor..end])?;
+        let window = self.records.get(self.cursor..end).unwrap_or_default();
+        let batch = avro_values_to_batch(&self.arrow_schema, window)?;
         self.cursor = end;
         Ok(Some(batch))
     }
@@ -702,6 +960,246 @@ mod tests {
         let read_batch = src.read_batch().unwrap().unwrap();
         assert_eq!(read_batch.num_rows(), 3);
         assert_eq!(read_batch.num_columns(), 3);
+    }
+
+    #[test]
+    fn decode_type_mismatch_is_an_error_not_a_silent_null() {
+        // A Float64 column receiving a Boolean must error; the pre-fix code
+        // silently appended NULL, losing the producer's value.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "score",
+            DataType::Float64,
+            true,
+        )]));
+        let records = vec![AvroValue::Record(vec![(
+            "score".to_owned(),
+            AvroValue::Boolean(true),
+        )])];
+        let err = avro_values_to_batch(&schema, &records).unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn long_into_int32_column_errors_instead_of_truncating() {
+        // Pre-fix: `Long(2^32 + 1)` became `1` via `as i32`.
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+        let records = vec![AvroValue::Record(vec![(
+            "id".to_owned(),
+            AvroValue::Long(4_294_967_297),
+        )])];
+        let err = avro_values_to_batch(&schema, &records).unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn unsupported_sink_type_errors_instead_of_writing_type_names() {
+        // Pre-fix: every row of an unmapped column was written as the literal
+        // data-type debug string (e.g. "Duration(..)").
+        let schema = Schema::new(vec![Field::new(
+            "d",
+            DataType::Duration(arrow::datatypes::TimeUnit::Millisecond),
+            false,
+        )]);
+        let err = arrow_schema_to_avro(&schema).unwrap_err();
+        assert!(err.to_string().contains("no avro mapping"), "{err}");
+    }
+
+    #[test]
+    fn multi_variant_union_is_rejected() {
+        // Pre-fix: ["null","int","string"] mapped to Utf8 and int values were
+        // stored as the debug string "Int(5)".
+        const MULTI_UNION: &str = r#"{
+            "type": "record",
+            "name": "U",
+            "fields": [{"name": "v", "type": ["null", "int", "string"]}]
+        }"#;
+        let s = AvroSchema::parse_str(MULTI_UNION).unwrap();
+        let err = avro_schema_to_arrow(&s).unwrap_err();
+        assert!(err.to_string().contains("non-null variant"), "{err}");
+    }
+
+    #[test]
+    fn uint64_beyond_long_range_errors_instead_of_wrapping() {
+        use arrow::array::UInt64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::UInt64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt64Array::from(vec![u64::MAX])) as ArrayRef],
+        )
+        .unwrap();
+        let err = batch_to_avro_values(&batch).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds the avro long range"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn binary_round_trips_through_sink_and_source() {
+        use arrow::array::BinaryArray;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Binary,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(BinaryArray::from(vec![&b"\x00\xffhi"[..], &b""[..]])) as ArrayRef],
+        )
+        .unwrap();
+        let mut sink = AvroSink::new(Vec::<u8>::new(), &schema).unwrap();
+        sink.write_batch(&batch).unwrap();
+        let bytes = sink.flush().unwrap();
+
+        let mut src = AvroSource::open(Cursor::new(bytes), 100).unwrap();
+        let back = src.read_batch().unwrap().unwrap();
+        let col = back
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(col.value(0), b"\x00\xffhi");
+        assert_eq!(col.value(1), b"");
+    }
+
+    #[test]
+    fn timestamp_and_date_round_trip() {
+        use arrow::array::{Date32Array, TimestampMicrosecondArray};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("day", DataType::Date32, false),
+            Field::new(
+                "at",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Date32Array::from(vec![19_000])) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    1_700_000_000_000_000_i64,
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut sink = AvroSink::new(Vec::<u8>::new(), &schema).unwrap();
+        sink.write_batch(&batch).unwrap();
+        let bytes = sink.flush().unwrap();
+
+        let mut src = AvroSource::open(Cursor::new(bytes), 100).unwrap();
+        assert_eq!(src.schema().field(0).data_type(), &DataType::Date32);
+        assert_eq!(
+            src.schema().field(1).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        let back = src.read_batch().unwrap().unwrap();
+        use arrow::array::{Date32Array as D, TimestampMicrosecondArray as T};
+        assert_eq!(
+            back.column(0)
+                .as_any()
+                .downcast_ref::<D>()
+                .unwrap()
+                .value(0),
+            19_000
+        );
+        assert_eq!(
+            back.column(1)
+                .as_any()
+                .downcast_ref::<T>()
+                .unwrap()
+                .value(0),
+            1_700_000_000_000_000_i64
+        );
+    }
+
+    #[test]
+    fn struct_and_list_round_trip() {
+        use arrow::array::{Array, Int64Builder, ListBuilder, StringBuilder, StructBuilder};
+        use arrow::datatypes::Fields;
+
+        let struct_fields = Fields::from(vec![
+            Field::new("city", DataType::Utf8, false),
+            Field::new("zip", DataType::Int64, true),
+        ]);
+        let list_field = Arc::new(Field::new("item", DataType::Int64, false));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("addr", DataType::Struct(struct_fields.clone()), true),
+            Field::new("nums", DataType::List(list_field), true),
+        ]));
+
+        let mut sb = StructBuilder::new(
+            struct_fields,
+            vec![
+                Box::new(StringBuilder::new()),
+                Box::new(Int64Builder::new()),
+            ],
+        );
+        sb.field_builder::<StringBuilder>(0)
+            .unwrap()
+            .append_value("pune");
+        sb.field_builder::<Int64Builder>(1)
+            .unwrap()
+            .append_value(411001);
+        sb.append(true);
+        sb.field_builder::<StringBuilder>(0).unwrap().append_null();
+        sb.field_builder::<Int64Builder>(1).unwrap().append_null();
+        sb.append(false);
+
+        let mut lb = ListBuilder::new(Int64Builder::new()).with_field(Arc::new(Field::new(
+            "item",
+            DataType::Int64,
+            false,
+        )));
+        lb.values().append_value(1);
+        lb.values().append_value(2);
+        lb.append(true);
+        lb.append(false);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(sb.finish()) as ArrayRef,
+                Arc::new(lb.finish()) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let mut sink = AvroSink::new(Vec::<u8>::new(), &schema).unwrap();
+        sink.write_batch(&batch).unwrap();
+        let bytes = sink.flush().unwrap();
+
+        let mut src = AvroSource::open(Cursor::new(bytes), 100).unwrap();
+        let back = src.read_batch().unwrap().unwrap();
+        assert_eq!(back.num_rows(), 2);
+
+        let addr = back
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(addr.is_valid(0) && addr.is_null(1));
+        let city = addr
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(city.value(0), "pune");
+        let zip = addr
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(zip.value(0), 411001);
+
+        let nums = back.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(nums.is_valid(0) && nums.is_null(1));
+        let first = nums.value(0);
+        let first = first
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!((first.value(0), first.value(1)), (1, 2));
     }
 
     #[test]

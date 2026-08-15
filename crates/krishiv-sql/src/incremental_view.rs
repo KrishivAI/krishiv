@@ -520,11 +520,10 @@ mod folding_and_whitespace_tests {
     /// not preserve it (U+FB01 -> "FI", 3 bytes to 2).
     #[test]
     fn a_view_name_whose_uppercase_is_shorter_is_not_truncated() {
-        let stmt = parse_incremental_view_statement(
-            "CREATE INCREMENTAL VIEW \u{FB01}x AS SELECT 1",
-        )
-        .unwrap()
-        .unwrap();
+        let stmt =
+            parse_incremental_view_statement("CREATE INCREMENTAL VIEW \u{FB01}x AS SELECT 1")
+                .unwrap()
+                .unwrap();
         match stmt {
             IncrementalViewStatement::Create { name, body_sql, .. } => {
                 assert_eq!(name, "\u{FB01}x", "the whole name must survive");
@@ -566,7 +565,6 @@ mod folding_and_whitespace_tests {
         assert!(err.to_string().contains("INTERVAL"), "{err}");
     }
 }
-
 
 #[cfg(test)]
 mod tests {

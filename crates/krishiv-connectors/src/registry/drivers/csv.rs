@@ -18,6 +18,43 @@ fn require_path(config: &ConnectorConfig) -> ConnectorResult<PathBuf> {
     Ok(PathBuf::from(config.required("path")?))
 }
 
+/// Strictly parse the optional `delimiter`: it must be exactly one byte.
+/// `"||"` or `"\t"` typed as two characters silently splitting on `|` or
+/// `\` would corrupt every row.
+fn parse_delimiter(config: &ConnectorConfig) -> ConnectorResult<Option<u8>> {
+    match config.get("delimiter") {
+        None => Ok(None),
+        Some(value) => match value.as_bytes() {
+            [b] => Ok(Some(*b)),
+            _ => Err(crate::error::ConnectorError::Config {
+                message: format!(
+                    "csv option 'delimiter' must be exactly one byte, got '{value}' \
+                     ({} bytes)",
+                    value.len()
+                ),
+            }),
+        },
+    }
+}
+
+/// Strictly parse the optional `batch_size`: a malformed value is an ERROR,
+/// not a silent fall-back to the default.
+fn parse_batch_size(config: &ConnectorConfig) -> ConnectorResult<Option<usize>> {
+    match config.get("batch_size") {
+        None => Ok(None),
+        Some(value) => {
+            value
+                .parse::<usize>()
+                .map(Some)
+                .map_err(|_| crate::error::ConnectorError::Config {
+                    message: format!(
+                        "csv option 'batch_size' must be a positive integer, got '{value}'"
+                    ),
+                })
+        }
+    }
+}
+
 struct CsvFileSource {
     inner: CsvSource,
 }
@@ -59,6 +96,8 @@ impl SourceDriver for CsvSourceDriver {
 
     fn validate(&self, config: &ConnectorConfig) -> ConnectorResult<()> {
         let _ = require_path(config)?;
+        let _ = parse_delimiter(config)?;
+        let _ = parse_batch_size(config)?;
         Ok(())
     }
 
@@ -69,13 +108,10 @@ impl SourceDriver for CsvSourceDriver {
             if let Some(value) = config.get("has_header") {
                 opts = opts.with_has_header(value == "true" || value == "1");
             }
-            if let Some(value) = config.get("delimiter") {
-                let delimiter = value.as_bytes().first().copied().unwrap_or(b',');
+            if let Some(delimiter) = parse_delimiter(config)? {
                 opts = opts.with_delimiter(delimiter);
             }
-            if let Some(value) = config.get("batch_size")
-                && let Ok(batch_size) = value.parse::<usize>()
-            {
+            if let Some(batch_size) = parse_batch_size(config)? {
                 opts = opts.with_batch_size(batch_size);
             }
             let file = File::open(&path).map_err(crate::error::ConnectorError::Io)?;
@@ -130,7 +166,11 @@ impl std::io::Write for SyncedFile {
 
 impl Sink for CsvFileSink {
     fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::new().with_bounded()
+        // `SyncedFile` exists precisely so `flush` fsyncs and leaves the sink
+        // usable for the next cycle — the descriptor's resumable_flush claim.
+        ConnectorCapabilities::new()
+            .with_bounded()
+            .with_resumable_flush()
     }
 
     async fn write_batch(
@@ -172,6 +212,7 @@ impl SinkDriver for CsvSinkDriver {
 
     fn validate(&self, config: &ConnectorConfig) -> ConnectorResult<()> {
         let _ = require_path(config)?;
+        let _ = parse_delimiter(config)?;
         Ok(())
     }
 
@@ -182,9 +223,7 @@ impl SinkDriver for CsvSinkDriver {
             if let Some(value) = config.get("has_header") {
                 builder = builder.with_header(value == "true" || value == "1");
             }
-            if let Some(value) = config.get("delimiter")
-                && let Some(delimiter) = value.as_bytes().first().copied()
-            {
+            if let Some(delimiter) = parse_delimiter(config)? {
                 builder = builder.with_delimiter(delimiter);
             }
             let file = File::create(&path).map_err(crate::error::ConnectorError::Io)?;
@@ -194,5 +233,55 @@ impl SinkDriver for CsvSinkDriver {
                 file: shared,
             }) as Box<dyn DynSink>)
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn config(pairs: &[(&str, &str)]) -> ConnectorConfig {
+        let mut c = ConnectorConfig::new("probe", "csv");
+        for (k, v) in pairs {
+            c = c.with_property(*k, *v);
+        }
+        c
+    }
+
+    /// The descriptor's advertised capabilities must match what an opened
+    /// sink instance actually reports (resumable flush via `SyncedFile`).
+    #[tokio::test]
+    async fn csv_sink_descriptor_matches_opened_instance_capabilities() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("caps.csv");
+        let cfg = config(&[("path", path.to_str().expect("utf-8 path"))]);
+
+        let sink = CsvSinkDriver.open(&cfg).await.expect("open csv sink");
+        assert_eq!(
+            CsvSinkDriver.descriptor().default_capabilities,
+            sink.capabilities(),
+            "descriptor and opened-instance capabilities must agree"
+        );
+    }
+
+    #[test]
+    fn multi_byte_delimiter_is_a_validate_error() {
+        let bad = config(&[("path", "/tmp/x.csv"), ("delimiter", "||")]);
+        assert!(CsvSourceDriver.validate(&bad).is_err());
+
+        let ok = config(&[("path", "/tmp/x.csv"), ("delimiter", "|")]);
+        assert!(CsvSourceDriver.validate(&ok).is_ok());
+        assert_eq!(parse_delimiter(&ok).unwrap(), Some(b'|'));
+    }
+
+    #[test]
+    fn malformed_batch_size_is_a_validate_error() {
+        let bad = config(&[("path", "/tmp/x.csv"), ("batch_size", "10k")]);
+        assert!(CsvSourceDriver.validate(&bad).is_err());
+
+        let ok = config(&[("path", "/tmp/x.csv"), ("batch_size", "256")]);
+        assert!(CsvSourceDriver.validate(&ok).is_ok());
+        assert_eq!(parse_batch_size(&ok).unwrap(), Some(256));
     }
 }

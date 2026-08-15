@@ -165,9 +165,7 @@ fn build_bytes_estimate(hash_join: &HashJoinExec) -> Option<u64> {
     let stats = hash_join.left().partition_statistics(None).ok()?;
     match stats.total_byte_size {
         Precision::Exact(bytes) | Precision::Inexact(bytes) => u64::try_from(bytes).ok(),
-        Precision::Absent => {
-            estimated_build_bytes_from_rows(&stats, &hash_join.left().schema())
-        }
+        Precision::Absent => estimated_build_bytes_from_rows(&stats, &hash_join.left().schema()),
     }
 }
 
@@ -284,7 +282,9 @@ fn left_first_filter(filter: &JoinFilter) -> Option<JoinFilter> {
                     moved_to.len()
                 )));
             };
-            Ok(Transformed::yes(Arc::new(Column::new(column.name(), to)) as Expr))
+            Ok(Transformed::yes(
+                Arc::new(Column::new(column.name(), to)) as Expr
+            ))
         })
         .ok()?
         .data;
@@ -445,8 +445,12 @@ fn collect_join_facts(
     if let Some(hash_join) = any.downcast_ref::<HashJoinExec>() {
         out.push(JoinFacts {
             bytes: build_bytes_estimate(hash_join),
-            convertible: convertible_mode(hash_join, target_partitions, rescue_degenerate_broadcast)
-                .is_some(),
+            convertible: convertible_mode(
+                hash_join,
+                target_partitions,
+                rescue_degenerate_broadcast,
+            )
+            .is_some(),
         });
     }
 }
@@ -604,8 +608,8 @@ impl SpillableJoinSelection {
             // A coordinator installs this same rule in its planning session, and
             // there an added exchange is an added stage boundary: scoping by
             // call site does not work, because both reach `from_capacity`.
-            rescue_degenerate_broadcast:
-                krishiv_common::executor_capacity::is_single_query_process(),
+            rescue_degenerate_broadcast: krishiv_common::executor_capacity::is_single_query_process(
+            ),
         }
     }
 
@@ -674,7 +678,10 @@ impl SpillableJoinSelection {
     #[must_use]
     fn with_grace_gated(self, single_query_process: bool, flag: bool) -> Self {
         if single_query_process && flag {
-            Self { grace: true, ..self }
+            Self {
+                grace: true,
+                ..self
+            }
         } else {
             self
         }
@@ -820,7 +827,6 @@ impl SpillableJoinSelection {
         }
     }
 
-
     /// Replace `hash_join` with the spilling grace hash join.
     ///
     /// No projection to restore and no sorts to insert: the operator keeps the
@@ -866,10 +872,10 @@ impl SpillableJoinSelection {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // `builder()` clones the node; `reset_state()` drops the original's
         // collected build side and dynamic filter so the copy starts clean.
-        let mut builder = hash_join.builder().reset_state().with_new_children(vec![
-            Arc::clone(build_input),
-            Arc::clone(probe_input),
-        ])?;
+        let mut builder = hash_join
+            .builder()
+            .reset_state()
+            .with_new_children(vec![Arc::clone(build_input), Arc::clone(probe_input)])?;
         // Both sides are now hash-partitioned on the join keys, so the mode has
         // to say so. `CollectLeft` over partitioned children is not merely
         // mislabelled: grace runs `left().execute(partition)` for each output
@@ -897,7 +903,11 @@ impl SpillableJoinSelection {
         // better trade lost 2.8x, on bookkeeping rather than on the join.
         let per_task_build_bytes = match mode {
             PartitionMode::Partitioned => {
-                let partitions = template.left().output_partitioning().partition_count().max(1);
+                let partitions = template
+                    .left()
+                    .output_partitioning()
+                    .partition_count()
+                    .max(1);
                 build_bytes / partitions as u64
             }
             // `CollectLeft` buffers the entire build side in every task, so the
@@ -939,13 +949,13 @@ impl SpillableJoinSelection {
             let Some(field) = schema.fields().get(index) else {
                 // The projection does not address this plan's schema after all.
                 // Refusing here is safe: the caller keeps the hash join.
-                return datafusion::error::Result::Err(
-                    datafusion::error::DataFusionError::Plan(format!(
+                return datafusion::error::Result::Err(datafusion::error::DataFusionError::Plan(
+                    format!(
                         "spillable-join: projection index {index} is outside the \
                          converted join's {} columns",
                         schema.fields().len()
-                    )),
-                );
+                    ),
+                ));
             };
             exprs.push((
                 Arc::new(Column::new(field.name(), index)),
@@ -984,9 +994,11 @@ impl SpillableJoinSelection {
         // With one partition, "sorted" is the whole requirement — there is no
         // distribution to preserve — so the conversion is *simpler* here than
         // in the partitioned case, not riskier.
-        let Some(conversion) =
-            convertible_mode(hash_join, target_partitions, self.rescue_degenerate_broadcast)
-        else {
+        let Some(conversion) = convertible_mode(
+            hash_join,
+            target_partitions,
+            self.rescue_degenerate_broadcast,
+        ) else {
             tracing::debug!(
                 mode = ?hash_join.partition_mode(),
                 threshold,
@@ -1134,10 +1146,9 @@ impl SpillableJoinSelection {
             .iter()
             .map(|(_, r)| PhysicalSortExpr::new_default(Arc::clone(r)))
             .collect();
-        let (Some(left_ordering), Some(right_ordering)) = (
-            LexOrdering::new(left_keys),
-            LexOrdering::new(right_keys),
-        ) else {
+        let (Some(left_ordering), Some(right_ordering)) =
+            (LexOrdering::new(left_keys), LexOrdering::new(right_keys))
+        else {
             return Ok(None);
         };
         let sort_options = left_ordering
@@ -1396,8 +1407,14 @@ mod tests {
     /// declines, which makes the conversion test pass vacuously.
     fn partitioned_join_ctx() -> SessionContext {
         let mut config = SessionConfig::new().with_target_partitions(4);
-        config.options_mut().optimizer.hash_join_single_partition_threshold = 0;
-        config.options_mut().optimizer.hash_join_single_partition_threshold_rows = 0;
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold = 0;
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold_rows = 0;
         SessionContext::new_with_config(config)
     }
 
@@ -1407,7 +1424,11 @@ mod tests {
         ctx.sql("CREATE TABLE small AS SELECT v AS k FROM (VALUES (1)) t(x), UNNEST(range(0, 100)) AS u(v)")
             .await.unwrap().collect().await.unwrap();
         ctx.sql("SELECT b.k, count(*) FROM big b JOIN small s ON b.k = s.k GROUP BY b.k")
-            .await.unwrap().create_physical_plan().await.unwrap()
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap()
     }
 
     fn contains(plan: &Arc<dyn ExecutionPlan>, name: &str) -> bool {
@@ -1424,7 +1445,10 @@ mod tests {
     async fn an_oversized_build_side_converts_and_still_answers_correctly() {
         let ctx = partitioned_join_ctx();
         let plan = joined_plan(&ctx).await;
-        assert!(contains(&plan, "HashJoinExec"), "precondition: hash join planned");
+        assert!(
+            contains(&plan, "HashJoinExec"),
+            "precondition: hash join planned"
+        );
         assert!(
             contains(&plan, "mode=Partitioned"),
             "precondition: the join must be Partitioned or the rule correctly declines:\n{}",
@@ -1432,7 +1456,9 @@ mod tests {
         );
 
         let rule = SpillableJoinSelection::with_threshold(Some(1));
-        let optimized = rule.optimize(Arc::clone(&plan), &ConfigOptions::default()).unwrap();
+        let optimized = rule
+            .optimize(Arc::clone(&plan), &ConfigOptions::default())
+            .unwrap();
         assert!(
             contains(&optimized, "SortMergeJoin"),
             "an over-threshold build side must convert:\n{}",
@@ -1445,11 +1471,17 @@ mod tests {
         // panics ("partition not used yet") if one instance is executed twice.
         let baseline_plan = ctx
             .sql("SELECT b.k, count(*) FROM big b JOIN small s ON b.k = s.k GROUP BY b.k")
-            .await.unwrap().create_physical_plan().await.unwrap();
-        let baseline =
-            datafusion::physical_plan::collect(baseline_plan, ctx.task_ctx()).await.unwrap();
-        let converted =
-            datafusion::physical_plan::collect(optimized, ctx.task_ctx()).await.unwrap();
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let baseline = datafusion::physical_plan::collect(baseline_plan, ctx.task_ctx())
+            .await
+            .unwrap();
+        let converted = datafusion::physical_plan::collect(optimized, ctx.task_ctx())
+            .await
+            .unwrap();
         let count = |bs: &[arrow::record_batch::RecordBatch]| -> usize {
             bs.iter().map(|b| b.num_rows()).sum()
         };
@@ -1487,11 +1519,17 @@ mod tests {
         // with `plan`, and RepartitionExec panics if one instance runs twice.
         let baseline_plan = ctx
             .sql("SELECT b.k, count(*) FROM big b JOIN small s ON b.k = s.k GROUP BY b.k")
-            .await.unwrap().create_physical_plan().await.unwrap();
-        let baseline =
-            datafusion::physical_plan::collect(baseline_plan, ctx.task_ctx()).await.unwrap();
-        let converted =
-            datafusion::physical_plan::collect(optimized, ctx.task_ctx()).await.unwrap();
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let baseline = datafusion::physical_plan::collect(baseline_plan, ctx.task_ctx())
+            .await
+            .unwrap();
+        let converted = datafusion::physical_plan::collect(optimized, ctx.task_ctx())
+            .await
+            .unwrap();
 
         // Values, not row counts: a mispaired partition would drop some groups
         // and keep the total plausible. `k` is the group key, so sorting the
@@ -1512,7 +1550,11 @@ mod tests {
             out
         };
         let expected = cells(&baseline);
-        assert_eq!(expected.len(), 100, "fixture should produce one group per key");
+        assert_eq!(
+            expected.len(),
+            100,
+            "fixture should produce one group per key"
+        );
         assert_eq!(cells(&converted), expected, "grace changed the answer");
     }
 
@@ -1524,8 +1566,13 @@ mod tests {
         let ctx = partitioned_join_ctx();
         let plan = joined_plan(&ctx).await;
         let rule = SpillableJoinSelection::with_threshold(Some(u64::MAX));
-        let optimized = rule.optimize(Arc::clone(&plan), &ConfigOptions::default()).unwrap();
-        assert!(contains(&optimized, "HashJoinExec"), "under-threshold joins stay hash");
+        let optimized = rule
+            .optimize(Arc::clone(&plan), &ConfigOptions::default())
+            .unwrap();
+        assert!(
+            contains(&optimized, "HashJoinExec"),
+            "under-threshold joins stay hash"
+        );
         assert!(!contains(&optimized, "SortMergeJoin"));
     }
 
@@ -1553,7 +1600,13 @@ mod tests {
         let sql = "SELECT l1.k FROM l1 \
                    WHERE EXISTS (SELECT 1 FROM l2 WHERE l2.k = l1.k) \
                      AND NOT EXISTS (SELECT 1 FROM l3 WHERE l3.k = l1.k)";
-        let plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
 
         let joins = |plan: &Arc<dyn ExecutionPlan>| -> usize {
             datafusion::physical_plan::displayable(plan.as_ref())
@@ -1595,16 +1648,28 @@ mod tests {
 
         // Skipping a sort must not change what comes out. Planned afresh: the
         // optimized tree shares untransformed Arc subtrees with `plan`.
-        let baseline_plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
-        let baseline =
-            datafusion::physical_plan::collect(baseline_plan, ctx.task_ctx()).await.unwrap();
-        let converted =
-            datafusion::physical_plan::collect(optimized, ctx.task_ctx()).await.unwrap();
+        let baseline_plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let baseline = datafusion::physical_plan::collect(baseline_plan, ctx.task_ctx())
+            .await
+            .unwrap();
+        let converted = datafusion::physical_plan::collect(optimized, ctx.task_ctx())
+            .await
+            .unwrap();
         let rows = |bs: &[arrow::record_batch::RecordBatch]| -> usize {
             bs.iter().map(|b| b.num_rows()).sum()
         };
         assert!(rows(&baseline) > 0, "fixture must produce rows");
-        assert_eq!(rows(&converted), rows(&baseline), "skipping the sort changed the answer");
+        assert_eq!(
+            rows(&converted),
+            rows(&baseline),
+            "skipping the sort changed the answer"
+        );
     }
 
     /// No memory cap means no threshold means no change — the embedded engine
@@ -1614,7 +1679,9 @@ mod tests {
         let ctx = partitioned_join_ctx();
         let plan = joined_plan(&ctx).await;
         let rule = SpillableJoinSelection::with_threshold(None);
-        let optimized = rule.optimize(Arc::clone(&plan), &ConfigOptions::default()).unwrap();
+        let optimized = rule
+            .optimize(Arc::clone(&plan), &ConfigOptions::default())
+            .unwrap();
         assert!(contains(&optimized, "HashJoinExec"));
         assert!(!contains(&optimized, "SortMergeJoin"));
     }
@@ -1726,7 +1793,10 @@ mod collect_left_tests {
     }
 
     fn shows(plan: &Arc<dyn ExecutionPlan>, name: &str) -> bool {
-        displayable(plan.as_ref()).indent(true).to_string().contains(name)
+        displayable(plan.as_ref())
+            .indent(true)
+            .to_string()
+            .contains(name)
     }
 
     async fn one_partition_join_plan(ctx: &SessionContext) -> Arc<dyn ExecutionPlan> {
@@ -1788,7 +1858,10 @@ mod collect_left_tests {
         let plan = one_partition_join_plan(&ctx).await;
         let rule = SpillableJoinSelection::with_threshold(Some(64 * 1024 * 1024));
         let out = rule.optimize(plan, ctx.copied_config().options()).unwrap();
-        assert!(shows(&out, "HashJoin"), "small join should stay a hash join");
+        assert!(
+            shows(&out, "HashJoin"),
+            "small join should stay a hash join"
+        );
         assert!(!shows(&out, "SortMergeJoin"));
     }
 
@@ -1801,7 +1874,9 @@ mod collect_left_tests {
         let plan = one_partition_join_plan(&ctx).await;
         let task_ctx = ctx.task_ctx();
 
-        let hash_rows = collect(Arc::clone(&plan), Arc::clone(&task_ctx)).await.unwrap();
+        let hash_rows = collect(Arc::clone(&plan), Arc::clone(&task_ctx))
+            .await
+            .unwrap();
         let converted = SpillableJoinSelection::with_threshold(Some(1))
             .optimize(plan, ctx.copied_config().options())
             .unwrap();
@@ -1827,7 +1902,10 @@ mod degenerate_broadcast_tests {
     use datafusion::prelude::{SessionConfig, SessionContext};
 
     fn shows(plan: &Arc<dyn ExecutionPlan>, name: &str) -> bool {
-        displayable(plan.as_ref()).indent(true).to_string().contains(name)
+        displayable(plan.as_ref())
+            .indent(true)
+            .to_string()
+            .contains(name)
     }
 
     /// Multi-partition, which is what an embedded session uses: an engine built
@@ -1919,7 +1997,10 @@ mod degenerate_broadcast_tests {
         // anything, so assert the premise separately and first.
         let ctx = multi_partition_ctx();
         let plan = broadcast_join_over_split_probe(&ctx, true).await;
-        assert!(shows(&plan, "CollectLeft"), "fixture is not a broadcast join");
+        assert!(
+            shows(&plan, "CollectLeft"),
+            "fixture is not a broadcast join"
+        );
         assert_eq!(
             plan.children()[0].output_partitioning().partition_count(),
             1,
@@ -2008,7 +2089,10 @@ mod degenerate_broadcast_tests {
         let converted = SpillableJoinSelection::with_threshold_and_grace(Some(1), true)
             .optimize(plan, ctx.copied_config().options())
             .unwrap();
-        assert!(shows(&converted, "GraceHashJoin"), "precondition: grace must have applied");
+        assert!(
+            shows(&converted, "GraceHashJoin"),
+            "precondition: grace must have applied"
+        );
         let after = all_rows(converted, task_ctx).await;
 
         assert_eq!(before, after, "row count changed across the re-plan");
@@ -2085,7 +2169,10 @@ mod degenerate_broadcast_tests {
     async fn an_honest_broadcast_join_is_never_repartitioned() {
         let ctx = multi_partition_ctx();
         let plan = broadcast_join_over_split_probe(&ctx, false).await;
-        assert!(shows(&plan, "CollectLeft"), "premise: an honest broadcast join");
+        assert!(
+            shows(&plan, "CollectLeft"),
+            "premise: an honest broadcast join"
+        );
         // Threshold 1 byte: every join is "oversized". Only the degenerate
         // estimate may buy an exchange, so this must still change nothing.
         let out = SpillableJoinSelection::with_threshold(Some(1))
@@ -2154,7 +2241,10 @@ mod degenerate_broadcast_tests {
             .create_physical_plan()
             .await
             .unwrap();
-        assert!(shows(&plan, "CollectLeft"), "premise: one partition broadcasts");
+        assert!(
+            shows(&plan, "CollectLeft"),
+            "premise: one partition broadcasts"
+        );
         let out = SpillableJoinSelection::with_threshold(Some(1))
             .optimize(plan, ctx.copied_config().options())
             .unwrap();
@@ -2244,7 +2334,10 @@ mod never_fails_the_query_tests {
         );
         let rows = collect(out, task_ctx).await.unwrap();
         let total: usize = rows.iter().map(arrow::array::RecordBatch::num_rows).sum();
-        assert_eq!(total, 1, "the declined plan must still produce the join result");
+        assert_eq!(
+            total, 1,
+            "the declined plan must still produce the join result"
+        );
     }
 }
 
@@ -2315,7 +2408,10 @@ mod budget_tests {
     fn without_pressure_nothing_is_chosen() {
         let plan = plan_with_build_sizes(&[50, 60]);
         let facts = facts(&plan);
-        let total: u64 = sizes_of(&facts).iter().copied().fold(0, u64::saturating_add);
+        let total: u64 = sizes_of(&facts)
+            .iter()
+            .copied()
+            .fold(0, u64::saturating_add);
         let decisions = SpillableJoinSelection::conversion_decisions(&facts, total + 1);
         assert!(
             decisions.iter().all(|convert| !convert),
@@ -2344,10 +2440,22 @@ mod budget_tests {
     fn unmeasurable_joins_still_create_aggregate_pressure() {
         // Four joins whose size the planner cannot estimate at all.
         let facts = vec![
-            JoinFacts { bytes: None, convertible: true },
-            JoinFacts { bytes: None, convertible: true },
-            JoinFacts { bytes: None, convertible: true },
-            JoinFacts { bytes: Some(900), convertible: true },
+            JoinFacts {
+                bytes: None,
+                convertible: true,
+            },
+            JoinFacts {
+                bytes: None,
+                convertible: true,
+            },
+            JoinFacts {
+                bytes: None,
+                convertible: true,
+            },
+            JoinFacts {
+                bytes: Some(900),
+                convertible: true,
+            },
         ];
         let threshold = 1000;
         // Before the fix `total` was 900, which fits 1000, so this returned all
@@ -2370,8 +2478,14 @@ mod budget_tests {
     #[test]
     fn measurable_plans_are_unaffected_by_the_unknown_pressure_term() {
         let facts = vec![
-            JoinFacts { bytes: Some(50), convertible: true },
-            JoinFacts { bytes: Some(60), convertible: true },
+            JoinFacts {
+                bytes: Some(50),
+                convertible: true,
+            },
+            JoinFacts {
+                bytes: Some(60),
+                convertible: true,
+            },
         ];
         assert_eq!(
             super::unknown_build_pressure(&facts, 1000),
@@ -2390,9 +2504,15 @@ mod budget_tests {
     #[test]
     fn a_single_unknown_among_many_does_not_force_conversion() {
         let mut facts: Vec<JoinFacts> = (0..9)
-            .map(|_| JoinFacts { bytes: Some(1), convertible: true })
+            .map(|_| JoinFacts {
+                bytes: Some(1),
+                convertible: true,
+            })
             .collect();
-        facts.push(JoinFacts { bytes: None, convertible: true });
+        facts.push(JoinFacts {
+            bytes: None,
+            convertible: true,
+        });
         // 10 joins, threshold 1000 -> one unknown is charged 100; 9 + 100 fits.
         let decisions = SpillableJoinSelection::conversion_decisions(&facts, 1000);
         assert!(
@@ -2418,7 +2538,10 @@ mod budget_tests {
     #[test]
     fn an_all_unknown_plan_is_beyond_the_budgets_reach() {
         let facts: Vec<JoinFacts> = (0..4)
-            .map(|_| JoinFacts { bytes: None, convertible: true })
+            .map(|_| JoinFacts {
+                bytes: None,
+                convertible: true,
+            })
             .collect();
         assert_eq!(
             super::unknown_build_pressure(&facts, 1000),
@@ -2483,8 +2606,14 @@ mod budget_tests {
     /// consumer stays put.
     #[test]
     fn unconvertible_joins_are_charged_to_the_budget_first() {
-        let big_unconvertible = JoinFacts { bytes: Some(100), convertible: false };
-        let small_candidate = JoinFacts { bytes: Some(30), convertible: true };
+        let big_unconvertible = JoinFacts {
+            bytes: Some(100),
+            convertible: false,
+        };
+        let small_candidate = JoinFacts {
+            bytes: Some(30),
+            convertible: true,
+        };
         let facts = [big_unconvertible, small_candidate];
 
         // 100 is already spent by the join that cannot convert, so the 30-byte
@@ -2503,8 +2632,14 @@ mod budget_tests {
     #[test]
     fn unmeasurable_joins_are_never_chosen() {
         let facts = [
-            JoinFacts { bytes: None, convertible: true },
-            JoinFacts { bytes: Some(500), convertible: true },
+            JoinFacts {
+                bytes: None,
+                convertible: true,
+            },
+            JoinFacts {
+                bytes: Some(500),
+                convertible: true,
+            },
         ];
         let decisions = SpillableJoinSelection::conversion_decisions(&facts, 10);
         assert_eq!(decisions, vec![false, true]);
@@ -2691,7 +2826,9 @@ mod projection_tests {
         let task_ctx = ctx.task_ctx();
         assert!(has_projected_hash_join(&plan), "fixture must project");
 
-        let before = collect(Arc::clone(&plan), Arc::clone(&task_ctx)).await.unwrap();
+        let before = collect(Arc::clone(&plan), Arc::clone(&task_ctx))
+            .await
+            .unwrap();
         let out = SpillableJoinSelection::with_threshold(Some(1))
             .optimize(plan, ctx.copied_config().options())
             .unwrap();
@@ -2701,8 +2838,16 @@ mod projection_tests {
         );
         let after = collect(out, task_ctx).await.unwrap();
 
-        assert_eq!(cells(&before), cells(&after), "converted plan changed the data");
-        assert_eq!(cells(&after), vec![String::from("a|3")], "expected the single matching row");
+        assert_eq!(
+            cells(&before),
+            cells(&after),
+            "converted plan changed the data"
+        );
+        assert_eq!(
+            cells(&after),
+            vec![String::from("a|3")],
+            "expected the single matching row"
+        );
     }
 }
 
@@ -2716,18 +2861,34 @@ mod grace_tests {
 
     async fn joined_plan(ctx: &SessionContext) -> Arc<dyn ExecutionPlan> {
         ctx.sql("CREATE TABLE l(k INT, v INT) AS VALUES (1, 10), (2, 20), (3, 30)")
-            .await.unwrap().collect().await.unwrap();
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         ctx.sql("CREATE TABLE r(k INT, w INT) AS VALUES (1, 100), (2, 200), (2, 201)")
-            .await.unwrap().collect().await.unwrap();
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         ctx.sql("SELECT l.v, r.w FROM l JOIN r ON l.k = r.k")
-            .await.unwrap().create_physical_plan().await.unwrap()
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap()
     }
 
     fn grace_joins(plan: &Arc<dyn ExecutionPlan>) -> usize {
         // `ExecutionPlan: Any` — upcast to downcast (DF 54 has no `as_any`).
         let any = plan.as_ref() as &dyn std::any::Any;
         usize::from(any.downcast_ref::<GraceHashJoinExec>().is_some())
-            + plan.children().iter().map(|c| grace_joins(c)).sum::<usize>()
+            + plan
+                .children()
+                .iter()
+                .map(|c| grace_joins(c))
+                .sum::<usize>()
     }
 
     /// A partitioned grace join buckets for what ONE TASK builds.
@@ -2746,8 +2907,14 @@ mod grace_tests {
     #[tokio::test]
     async fn a_partitioned_grace_join_buckets_per_task_not_per_relation() {
         let mut config = SessionConfig::new().with_target_partitions(4);
-        config.options_mut().optimizer.hash_join_single_partition_threshold = 0;
-        config.options_mut().optimizer.hash_join_single_partition_threshold_rows = 0;
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold = 0;
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold_rows = 0;
         let ctx = SessionContext::new_with_config(config);
         ctx.sql("CREATE TABLE big AS SELECT v % 1000 AS k, v AS payload FROM (VALUES (1)) t(x), UNNEST(range(0, 20000)) AS u(v)")
             .await.unwrap().collect().await.unwrap();
@@ -2755,9 +2922,16 @@ mod grace_tests {
             .await.unwrap().collect().await.unwrap();
         let plan = ctx
             .sql("SELECT b.k, count(*) FROM big b JOIN small s ON b.k = s.k GROUP BY b.k")
-            .await.unwrap().create_physical_plan().await.unwrap();
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
         assert!(
-            displayable(plan.as_ref()).indent(true).to_string().contains("mode=Partitioned"),
+            displayable(plan.as_ref())
+                .indent(true)
+                .to_string()
+                .contains("mode=Partitioned"),
             "precondition: a partitioned join, or per-task and per-relation agree"
         );
 
@@ -2774,7 +2948,10 @@ mod grace_tests {
         }
         let grace = grace_of(&out).expect("grace join");
         let partitions = grace.children()[0].output_partitioning().partition_count();
-        assert!(partitions > 1, "precondition: more than one partition to divide by");
+        assert!(
+            partitions > 1,
+            "precondition: more than one partition to divide by"
+        );
 
         let whole_relation =
             crate::grace_hash_join::bucket_count(build_bytes_of(&out).unwrap_or(0), 1);
@@ -2802,9 +2979,7 @@ mod grace_tests {
                 let stats = build.partition_statistics(None).ok()?;
                 return match stats.total_byte_size {
                     Precision::Exact(b) | Precision::Inexact(b) => u64::try_from(b).ok(),
-                    Precision::Absent => {
-                        estimated_build_bytes_from_rows(&stats, &build.schema())
-                    }
+                    Precision::Absent => estimated_build_bytes_from_rows(&stats, &build.schema()),
                 };
             }
             plan.children().iter().find_map(|c| walk(c))
@@ -2828,7 +3003,10 @@ mod grace_tests {
             displayable(out.as_ref()).indent(true)
         );
         assert!(
-            !displayable(out.as_ref()).indent(true).to_string().contains("SortMergeJoin"),
+            !displayable(out.as_ref())
+                .indent(true)
+                .to_string()
+                .contains("SortMergeJoin"),
             "grace should have been preferred over sort-merge"
         );
     }
@@ -2842,9 +3020,16 @@ mod grace_tests {
         let out = SpillableJoinSelection::with_threshold(Some(1))
             .optimize(plan, ctx.copied_config().options())
             .unwrap();
-        assert_eq!(grace_joins(&out), 0, "the flag is off; no grace join should appear");
+        assert_eq!(
+            grace_joins(&out),
+            0,
+            "the flag is off; no grace join should appear"
+        );
         assert!(
-            displayable(out.as_ref()).indent(true).to_string().contains("SortMergeJoin"),
+            displayable(out.as_ref())
+                .indent(true)
+                .to_string()
+                .contains("SortMergeJoin"),
             "the sort-merge path must still work"
         );
     }
@@ -2856,12 +3041,18 @@ mod grace_tests {
         let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
         let plan = joined_plan(&ctx).await;
         let task_ctx = ctx.task_ctx();
-        let baseline = collect(Arc::clone(&plan), Arc::clone(&task_ctx)).await.unwrap();
+        let baseline = collect(Arc::clone(&plan), Arc::clone(&task_ctx))
+            .await
+            .unwrap();
 
         let out = SpillableJoinSelection::with_threshold_and_grace(Some(1), true)
             .optimize(plan, ctx.copied_config().options())
             .unwrap();
-        assert_eq!(grace_joins(&out), 1, "the rule declined; this proved nothing");
+        assert_eq!(
+            grace_joins(&out),
+            1,
+            "the rule declined; this proved nothing"
+        );
         let converted = collect(out, task_ctx).await.unwrap();
 
         let cells = |bs: &[arrow::array::RecordBatch]| -> Vec<String> {
@@ -2896,7 +3087,11 @@ mod grace_tests {
         let plan = joined_plan(&ctx).await;
         let out = SpillableJoinSelection::with_threshold_and_grace(Some(1), true)
             .optimize(Arc::clone(&plan), ctx.copied_config().options());
-        assert!(out.is_ok(), "a refusal must never fail the plan: {:?}", out.err());
+        assert!(
+            out.is_ok(),
+            "a refusal must never fail the plan: {:?}",
+            out.err()
+        );
     }
 }
 
@@ -2924,8 +3119,14 @@ mod join_filter_order_tests {
         JoinFilter::new(
             expression,
             vec![
-                ColumnIndex { index: 0, side: JoinSide::Right },
-                ColumnIndex { index: 0, side: JoinSide::Left },
+                ColumnIndex {
+                    index: 0,
+                    side: JoinSide::Right,
+                },
+                ColumnIndex {
+                    index: 0,
+                    side: JoinSide::Left,
+                },
             ],
             schema,
         )
@@ -2983,13 +3184,22 @@ mod join_filter_order_tests {
         let filter = JoinFilter::new(
             expression,
             vec![
-                ColumnIndex { index: 0, side: JoinSide::Left },
-                ColumnIndex { index: 0, side: JoinSide::Right },
+                ColumnIndex {
+                    index: 0,
+                    side: JoinSide::Left,
+                },
+                ColumnIndex {
+                    index: 0,
+                    side: JoinSide::Right,
+                },
             ],
             schema,
         );
         let out = left_first_filter(&filter).expect("normalisable");
-        assert_eq!(format!("{}", out.expression()), format!("{}", filter.expression()));
+        assert_eq!(
+            format!("{}", out.expression()),
+            format!("{}", filter.expression())
+        );
         assert_eq!(out.column_indices(), filter.column_indices());
     }
 
@@ -3006,10 +3216,22 @@ mod join_filter_order_tests {
         let filter = JoinFilter::new(
             Arc::new(Column::new("l1", 3)),
             vec![
-                ColumnIndex { index: 7, side: JoinSide::Right },
-                ColumnIndex { index: 5, side: JoinSide::Left },
-                ColumnIndex { index: 9, side: JoinSide::Right },
-                ColumnIndex { index: 6, side: JoinSide::Left },
+                ColumnIndex {
+                    index: 7,
+                    side: JoinSide::Right,
+                },
+                ColumnIndex {
+                    index: 5,
+                    side: JoinSide::Left,
+                },
+                ColumnIndex {
+                    index: 9,
+                    side: JoinSide::Right,
+                },
+                ColumnIndex {
+                    index: 6,
+                    side: JoinSide::Left,
+                },
             ],
             schema,
         );
@@ -3041,7 +3263,11 @@ mod encodability_tests {
     fn grace_joins(plan: &Arc<dyn ExecutionPlan>) -> usize {
         let any = plan.as_ref() as &dyn std::any::Any;
         usize::from(any.downcast_ref::<GraceHashJoinExec>().is_some())
-            + plan.children().iter().map(|c| grace_joins(c)).sum::<usize>()
+            + plan
+                .children()
+                .iter()
+                .map(|c| grace_joins(c))
+                .sum::<usize>()
     }
 
     /// The staging planner must never produce a grace hash join.
@@ -3077,16 +3303,16 @@ mod encodability_tests {
     /// was wired backwards.
     #[test]
     fn grace_opens_only_where_plans_are_never_encoded() {
-        let coordinator = SpillableJoinSelection::with_threshold(Some(1))
-            .with_grace_gated(false, true);
+        let coordinator =
+            SpillableJoinSelection::with_threshold(Some(1)).with_grace_gated(false, true);
         assert!(
             !coordinator.grace,
             "the flag opened grace on a process whose plans get encoded — a \
              grace join in a stage plan runs the whole query as a SINGLE TASK"
         );
 
-        let one_shot_cli = SpillableJoinSelection::with_threshold(Some(1))
-            .with_grace_gated(true, true);
+        let one_shot_cli =
+            SpillableJoinSelection::with_threshold(Some(1)).with_grace_gated(true, true);
         assert!(
             one_shot_cli.grace,
             "grace stayed shut in a process that never encodes a plan, which \
@@ -3095,8 +3321,8 @@ mod encodability_tests {
 
         // And the flag still governs: a single-query process without it opted
         // in gets today's behaviour, not grace by default.
-        let flag_off = SpillableJoinSelection::with_threshold(Some(1))
-            .with_grace_gated(true, false);
+        let flag_off =
+            SpillableJoinSelection::with_threshold(Some(1)).with_grace_gated(true, false);
         assert!(!flag_off.grace, "the gate turned grace on by itself");
     }
 

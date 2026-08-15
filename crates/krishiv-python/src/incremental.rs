@@ -180,7 +180,8 @@ impl PyDeltaBatch {
     /// ``RecordBatch`` (last column must be ``_weight: Int64``).
     #[staticmethod]
     pub fn from_weighted(batch: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let db = DeltaBatch::from_weighted(record_batch_from_py(batch)?).map_err(map_delta_error)?;
+        let db =
+            DeltaBatch::from_weighted(record_batch_from_py(batch)?).map_err(map_delta_error)?;
         Ok(Self { inner: db })
     }
 

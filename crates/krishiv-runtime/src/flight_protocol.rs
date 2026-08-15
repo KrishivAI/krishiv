@@ -186,9 +186,13 @@ fn read_local_parquet(
         )));
     }
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| RuntimeError::transport(format!("parquet reader for '{}': {e}", path.display())))?
+        .map_err(|e| {
+            RuntimeError::transport(format!("parquet reader for '{}': {e}", path.display()))
+        })?
         .build()
-        .map_err(|e| RuntimeError::transport(format!("parquet build for '{}': {e}", path.display())))?;
+        .map_err(|e| {
+            RuntimeError::transport(format!("parquet build for '{}': {e}", path.display()))
+        })?;
     reader
         .collect::<Result<_, _>>()
         .map_err(|e| RuntimeError::transport(format!("parquet read: {e}")))
@@ -210,9 +214,9 @@ fn read_object_store_parquet(
         .strip_prefix("s3://")
         .or_else(|| uri.strip_prefix("s3a://"))
         .unwrap_or(uri);
-    let (bucket, key) = rest
-        .split_once('/')
-        .ok_or_else(|| RuntimeError::transport(format!("object-store URI '{uri}' has no object key")))?;
+    let (bucket, key) = rest.split_once('/').ok_or_else(|| {
+        RuntimeError::transport(format!("object-store URI '{uri}' has no object key"))
+    })?;
     let store: std::sync::Arc<dyn ObjectStore> = build_s3_object_store(bucket)?;
     let os_path = OsPath::from(key);
     let data: bytes::Bytes = krishiv_common::async_util::block_on(async move {
@@ -1285,7 +1289,10 @@ mod tests {
         let (_dir, path) = write_parquet(&test_batch());
         // Under a generous cap the local reader returns the batch(es).
         let batches = read_local_parquet(&path, 64 * 1024 * 1024).expect("under cap reads");
-        assert!(!batches.is_empty(), "small table should read at least one batch");
+        assert!(
+            !batches.is_empty(),
+            "small table should read at least one batch"
+        );
         // A 1-byte cap is rejected before reading, naming the cap knob.
         let err = read_local_parquet(&path, 1).expect_err("over cap must error");
         assert!(

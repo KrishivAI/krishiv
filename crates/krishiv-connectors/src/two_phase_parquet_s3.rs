@@ -206,8 +206,10 @@ mod tests {
         .unwrap()
     }
 
+    // These tests run against the local filesystem, not S3; real object-store
+    // evidence lives in the external certification matrix (`cert_matrix.rs`).
     #[test]
-    fn s3_2pc_exactly_once_crash_recovery_commits_staged() {
+    fn local_parquet_2pc_crash_recovery_commits_staged() {
         let dir = tempdir().unwrap();
         let mut sink = TwoPhaseParquetSink::new(dir.path(), 1);
         let h = sink.prepare(1, &batch()).unwrap();
@@ -219,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn s3_2pc_prepare_commit_round_trip() {
+    fn local_parquet_2pc_prepare_commit_round_trip() {
         let dir = tempdir().unwrap();
         let mut sink = TwoPhaseParquetSink::new(dir.path(), 1);
         let h = sink.prepare(1, &batch()).unwrap();

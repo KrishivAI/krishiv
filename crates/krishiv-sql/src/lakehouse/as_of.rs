@@ -2,8 +2,8 @@
 
 use krishiv_connectors::lakehouse::AsOfSpec;
 use sqlparser::ast::{
-    Expr, Ident, ObjectName, ObjectNamePart, Select, SetExpr, Statement, TableFactor,
-    TableVersion, TableWithJoins, Value,
+    Expr, Ident, ObjectName, ObjectNamePart, Select, SetExpr, Statement, TableFactor, TableVersion,
+    TableWithJoins, Value,
 };
 use sqlparser::dialect::DatabricksDialect;
 use sqlparser::parser::Parser;
@@ -129,9 +129,8 @@ fn process_table_factor(tf: &mut TableFactor, scan: &mut AsOfScan) {
                         // register the pinned snapshot under and the rewritten
                         // SQL actually refers to it.
                         let alias = format!("{AS_OF_ALIAS_PREFIX}{}", scan.refs.len());
-                        *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
-                            alias.clone(),
-                        ))]);
+                        *name =
+                            ObjectName(vec![ObjectNamePart::Identifier(Ident::new(alias.clone()))]);
                         scan.refs.push(AsOfTableRef {
                             table: table_name,
                             alias,
@@ -202,7 +201,10 @@ mod tests {
     fn parses_version_as_of() {
         let (sql, refs) = preprocess_as_of_sql("SELECT * FROM orders VERSION AS OF 3").unwrap();
         assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].table, "orders", "the original name is kept on the ref");
+        assert_eq!(
+            refs[0].table, "orders",
+            "the original name is kept on the ref"
+        );
         assert_eq!(refs[0].spec, AsOfSpec::Version(3));
         assert!(
             sql.contains(&refs[0].alias),
@@ -287,9 +289,10 @@ mod tests {
     /// so this query read the current snapshot.
     #[test]
     fn parses_timestamp_as_of_typed_literal() {
-        let (sql, refs) =
-            preprocess_as_of_sql("SELECT * FROM t TIMESTAMP AS OF TIMESTAMP '2024-06-01T00:00:00Z'")
-                .unwrap();
+        let (sql, refs) = preprocess_as_of_sql(
+            "SELECT * FROM t TIMESTAMP AS OF TIMESTAMP '2024-06-01T00:00:00Z'",
+        )
+        .unwrap();
         assert_eq!(refs.len(), 1, "the qualifier must be captured, not dropped");
         assert!(!sql.contains("AS OF"));
     }

@@ -301,7 +301,10 @@ mod tests {
     fn a_filter_before_group_by_stays_a_where() {
         let sql = "FROM orders |> WHERE amount > 0 |> GROUP BY region";
         let result = process_pipe_syntax(sql).unwrap();
-        assert_eq!(result, "SELECT * FROM orders WHERE amount > 0 GROUP BY region");
+        assert_eq!(
+            result,
+            "SELECT * FROM orders WHERE amount > 0 GROUP BY region"
+        );
     }
 
     /// A repeated stage that cannot be flattened must be refused, not silently
@@ -340,7 +343,11 @@ mod tests {
         use std::sync::Arc;
 
         let engine = crate::SqlEngine::new();
-        let schema = Arc::new(Schema::new(vec![Field::new("amount", DataType::Int64, false)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Int64,
+            false,
+        )]));
         let batch = arrow::record_batch::RecordBatch::try_new(
             schema,
             vec![Arc::new(Int64Array::from(vec![50_i64, 150, 250]))],

@@ -71,9 +71,13 @@ async fn write_tables(dir: &std::path::Path) -> (String, String) {
 async fn staged_context(orders: &str, lineitem: &str) -> SessionContext {
     let ctx = planning_session_context_with_options(4, Some(0), Some(0));
     for (name, path) in [("orders", orders), ("lineitem", lineitem)] {
-        ctx.register_parquet(name, path, datafusion::prelude::ParquetReadOptions::default())
-            .await
-            .unwrap_or_else(|e| panic!("register {name}: {e}"));
+        ctx.register_parquet(
+            name,
+            path,
+            datafusion::prelude::ParquetReadOptions::default(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("register {name}: {e}"));
     }
     ctx
 }
@@ -123,13 +127,17 @@ async fn report_whether_the_duplicated_lineitem_scan_collapses() {
     let task_ctx = krishiv_sql::distributed_plan::fragment_decode_session_context().task_ctx();
     let codec = krishiv_sql::distributed_plan::KrishivPhysicalCodec::coordinator();
 
-    println!("\n=== q18-shape staged plan: {} stages ===", staged.stages.len());
+    println!(
+        "\n=== q18-shape staged plan: {} stages ===",
+        staged.stages.len()
+    );
     let mut scans_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (index, stage) in staged.stages.iter().enumerate() {
         let Some(body) = stage.task_bodies.first() else {
             continue;
         };
-        let text = match krishiv_sql::distributed_plan::decode_dfplan_task(body, &task_ctx, &codec) {
+        let text = match krishiv_sql::distributed_plan::decode_dfplan_task(body, &task_ctx, &codec)
+        {
             Ok((_, plan)) => datafusion::physical_plan::displayable(plan.as_ref())
                 .indent(false)
                 .to_string(),

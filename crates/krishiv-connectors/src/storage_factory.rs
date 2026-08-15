@@ -138,7 +138,10 @@ impl StorageFactory {
                 prefix,
                 ..Default::default()
             })
-        } else if uri.starts_with("az://") || uri.starts_with("abfs://") {
+        } else if uri.starts_with("az://")
+            || uri.starts_with("abfs://")
+            || uri.starts_with("adls://")
+        {
             let stripped = uri
                 .strip_prefix("az://")
                 .or_else(|| uri.strip_prefix("abfs://"))
@@ -360,6 +363,22 @@ mod tests {
         let config = StorageFactory::config_from_uri("gs://my-bucket/path").unwrap();
         assert_eq!(config.bucket.as_deref(), Some("my-bucket"));
         assert_eq!(config.prefix.as_deref(), Some("path"));
+    }
+
+    #[test]
+    fn config_from_azure_uris() {
+        // All three Azure schemes accepted by `from_uri` must parse a
+        // bucket/container — `adls://` in particular used to fall through to
+        // the local-path branch.
+        for uri in [
+            "az://container/path",
+            "abfs://container/path",
+            "adls://container/path",
+        ] {
+            let config = StorageFactory::config_from_uri(uri).unwrap();
+            assert_eq!(config.bucket.as_deref(), Some("container"), "{uri}");
+            assert_eq!(config.prefix.as_deref(), Some("path"), "{uri}");
+        }
     }
 
     #[test]

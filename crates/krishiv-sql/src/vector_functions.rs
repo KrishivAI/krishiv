@@ -99,15 +99,12 @@ fn make_pairwise(name: &'static str, score: RowScore) -> ScalarUDF {
 }
 
 fn as_list<'a>(name: &str, array: &'a ArrayRef) -> Result<&'a ListArray, DataFusionError> {
-    array
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| {
-            DataFusionError::Internal(format!(
-                "{name}: argument must coerce to List(Float64), got {}",
-                array.data_type()
-            ))
-        })
+    array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+        DataFusionError::Internal(format!(
+            "{name}: argument must coerce to List(Float64), got {}",
+            array.data_type()
+        ))
+    })
 }
 
 fn row_values(name: &str, list: &ListArray, row: usize) -> Result<Vec<f64>, DataFusionError> {

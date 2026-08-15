@@ -33,7 +33,6 @@
 //! ```
 
 use std::path::Path;
-use std::sync::Arc;
 
 use arrow::array::{ArrayRef as ArrowArrayRef, StructArray as ArrowStructArray};
 use arrow::record_batch::RecordBatch;
@@ -140,6 +139,7 @@ mod tests {
     use super::*;
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
 
     fn make_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![

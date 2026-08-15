@@ -96,7 +96,7 @@ pub use krishiv_connectors::{
 pub use krishiv_connectors::{
     IcebergScanOptions, IcebergTableRef, LakehouseError, LakehouseTable, MemoryLakehouseTable,
     MultiWriterGuard, PartitionField, PartitionSpecResolver, PartitionSpecVersion, SchemaField,
-    SchemaVersion, check_write_precondition,
+    SchemaVersion,
 };
 
 // ── Top-level aliases ─────────────────────────────────────────────────────────

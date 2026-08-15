@@ -36,16 +36,24 @@ const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// # Handle
 ///
-/// The `Handle` is a `String` formatted as `"{epoch}-{uuid}"` to give the
-/// coordinator a human-readable correlation ID for log tracing.
+/// The `Handle` is a `String` formatted as `"{epoch}-{counter}"`, where the
+/// counter is a process-local atomic sequence (unique within a process
+/// lifetime), giving the coordinator a human-readable correlation ID for log
+/// tracing.
 pub struct RdkafkaTransactionalSink {
     producer: ThreadedProducer<rdkafka::producer::DefaultProducerContext>,
     topic: String,
     /// True when a Kafka transaction has been opened but not yet committed/aborted.
     transaction_open: bool,
-    /// The epoch of the currently open transaction (if any). Used to reject
-    /// duplicate or non-monotonic `prepare` calls.
+    /// The epoch of the currently open transaction (if any).
     current_epoch: Option<u64>,
+    /// The handle of the currently open transaction (if any). `commit`/`abort`
+    /// verify the caller's handle against this to reject stale duplicates.
+    open_handle: Option<String>,
+    /// The epoch of the last *committed* transaction. Persists across
+    /// commit so `prepare` can reject duplicate or stale (non-monotonic)
+    /// epoch retries.
+    last_finalized_epoch: Option<u64>,
     /// Transaction timeout in milliseconds. Must be ≤ broker
     /// `transaction.max.timeout.ms` (default 15 min).
     transaction_timeout_ms: u32,
@@ -118,8 +126,66 @@ impl RdkafkaTransactionalSink {
             topic: topic.into(),
             transaction_open: false,
             current_epoch: None,
+            open_handle: None,
+            last_finalized_epoch: None,
             transaction_timeout_ms: timeout_ms,
         })
+    }
+
+    /// Validate a `prepare(epoch)` call against the sink's transaction state.
+    ///
+    /// Rejects a call while a transaction is still open, and rejects an epoch
+    /// that is not strictly greater than the last committed epoch (a
+    /// duplicate or stale retry).
+    fn validate_prepare(
+        transaction_open: bool,
+        current_epoch: Option<u64>,
+        last_finalized_epoch: Option<u64>,
+        epoch: u64,
+    ) -> ConnectorResult<()> {
+        if transaction_open {
+            return Err(ConnectorError::Protocol {
+                message: format!(
+                    "transaction for epoch {} is still open; commit or abort it first",
+                    current_epoch.unwrap_or(0)
+                ),
+            });
+        }
+        if let Some(finalized) = last_finalized_epoch
+            && epoch <= finalized
+        {
+            return Err(ConnectorError::Config {
+                message: format!(
+                    "prepare epoch {epoch} is not greater than last committed epoch {finalized}"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate a `commit`/`abort` handle against the open transaction.
+    ///
+    /// Returns `Ok(false)` when no transaction is open (idempotent no-op),
+    /// `Ok(true)` when the handle matches the open transaction, and an error
+    /// when the handle belongs to a different (stale) transaction.
+    fn validate_finalize(
+        transaction_open: bool,
+        open_handle: Option<&str>,
+        handle: &str,
+        op: &str,
+    ) -> ConnectorResult<bool> {
+        if !transaction_open {
+            return Ok(false);
+        }
+        match open_handle {
+            Some(open) if open == handle => Ok(true),
+            _ => Err(ConnectorError::Protocol {
+                message: format!(
+                    "{op} handle {handle} does not match the open transaction handle {}",
+                    open_handle.unwrap_or("<none>")
+                ),
+            }),
+        }
     }
 
     /// Derive a stable `transactional.id` from `{job_id}/{task_slot}`.
@@ -134,7 +200,8 @@ impl RdkafkaTransactionalSink {
 }
 
 impl TwoPhaseCommitSink for RdkafkaTransactionalSink {
-    /// The handle is `"{epoch}-{uuid}"` for correlation in coordinator logs.
+    /// The handle is `"{epoch}-{counter}"` (process-local sequence, unique
+    /// within a process lifetime) for correlation in coordinator logs.
     type Handle = String;
 
     fn capabilities(&self) -> ConnectorCapabilities {
@@ -155,25 +222,14 @@ impl TwoPhaseCommitSink for RdkafkaTransactionalSink {
     /// again. This matches the `TwoPhaseCommitSink` contract: per-handle
     /// isolation.
     fn prepare(&mut self, epoch: u64, batch: &RecordBatch) -> ConnectorResult<Self::Handle> {
-        if self.transaction_open {
-            return Err(ConnectorError::Protocol {
-                message: format!(
-                    "transaction for epoch {} is still open; commit or abort it first",
-                    self.current_epoch.unwrap_or(0)
-                ),
-            });
-        }
-
-        // Validate epoch monotonicity to catch stale retries.
-        if let Some(current) = self.current_epoch
-            && epoch <= current
-        {
-            return Err(ConnectorError::Config {
-                message: format!(
-                    "prepare epoch {epoch} is not greater than current epoch {current}"
-                ),
-            });
-        }
+        // Validate epoch monotonicity against the last committed epoch to
+        // catch duplicate or stale retries.
+        Self::validate_prepare(
+            self.transaction_open,
+            self.current_epoch,
+            self.last_finalized_epoch,
+            epoch,
+        )?;
 
         self.producer
             .begin_transaction()
@@ -213,13 +269,19 @@ impl TwoPhaseCommitSink for RdkafkaTransactionalSink {
                 retriable: true,
             })?;
 
+        self.open_handle = Some(handle.clone());
         Ok(handle)
     }
 
     /// Commit the open Kafka transaction, making all staged messages visible to
     /// downstream consumers configured with `isolation.level=read_committed`.
-    fn commit(&mut self, _handle: Self::Handle) -> ConnectorResult<()> {
-        if !self.transaction_open {
+    fn commit(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
+        if !Self::validate_finalize(
+            self.transaction_open,
+            self.open_handle.as_deref(),
+            &handle,
+            "commit",
+        )? {
             // Already committed — idempotent.
             return Ok(());
         }
@@ -231,13 +293,20 @@ impl TwoPhaseCommitSink for RdkafkaTransactionalSink {
                 retriable: true,
             })?;
         self.transaction_open = false;
+        self.last_finalized_epoch = self.current_epoch;
         self.current_epoch = None;
+        self.open_handle = None;
         Ok(())
     }
 
     /// Abort the open Kafka transaction, discarding all staged messages.
-    fn abort(&mut self, _handle: Self::Handle) -> ConnectorResult<()> {
-        if !self.transaction_open {
+    fn abort(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
+        if !Self::validate_finalize(
+            self.transaction_open,
+            self.open_handle.as_deref(),
+            &handle,
+            "abort",
+        )? {
             // Nothing staged — idempotent.
             return Ok(());
         }
@@ -248,8 +317,58 @@ impl TwoPhaseCommitSink for RdkafkaTransactionalSink {
                 message: format!("rdkafka abort_transaction failed: {e}"),
                 retriable: true,
             })?;
+        // An aborted epoch may legitimately be retried, so it does not
+        // advance `last_finalized_epoch` — only a commit does.
         self.transaction_open = false;
         self.current_epoch = None;
+        self.open_handle = None;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RdkafkaTransactionalSink as Sink;
+
+    /// A prepare for an epoch at or below the last committed epoch is a
+    /// duplicate/stale retry and must be rejected — even though no
+    /// transaction is currently open.
+    #[test]
+    fn prepare_rejects_epoch_not_greater_than_last_committed() {
+        // State after prepare(5) + commit: closed, last committed epoch 5.
+        assert!(Sink::validate_prepare(false, None, Some(5), 4).is_err());
+        assert!(Sink::validate_prepare(false, None, Some(5), 5).is_err());
+        assert!(Sink::validate_prepare(false, None, Some(5), 6).is_ok());
+        // First-ever prepare: nothing committed yet.
+        assert!(Sink::validate_prepare(false, None, None, 1).is_ok());
+    }
+
+    /// A second prepare while a transaction is open stays rejected.
+    #[test]
+    fn prepare_rejects_while_transaction_open() {
+        assert!(Sink::validate_prepare(true, Some(6), Some(5), 7).is_err());
+    }
+
+    /// Commit/abort of a handle that does not match the open transaction is
+    /// a stale duplicate and must error rather than finalize the wrong
+    /// transaction.
+    #[test]
+    fn finalize_rejects_mismatched_handle() {
+        // prepare -> commit -> prepare(new): open handle "6-2", stale "5-1".
+        let err = Sink::validate_finalize(true, Some("6-2"), "5-1", "commit")
+            .expect_err("stale handle must not commit the open transaction");
+        assert!(err.to_string().contains("5-1"));
+        assert!(Sink::validate_finalize(true, Some("6-2"), "5-1", "abort").is_err());
+    }
+
+    /// The matching handle finalizes; with no open transaction the call is
+    /// an idempotent no-op regardless of handle.
+    #[test]
+    fn finalize_accepts_matching_handle_and_is_idempotent_when_closed() {
+        assert!(Sink::validate_finalize(true, Some("6-2"), "6-2", "commit").expect("matching"));
+        assert!(
+            !Sink::validate_finalize(false, None, "6-2", "commit")
+                .expect("duplicate commit after close is idempotent"),
+        );
     }
 }

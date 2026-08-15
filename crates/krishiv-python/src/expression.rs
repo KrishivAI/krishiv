@@ -115,11 +115,7 @@ impl PyColumn {
     }
 
     /// PySpark `Column.between(lower, upper)` — inclusive range test.
-    pub fn between(
-        &self,
-        lower: &Bound<'_, PyAny>,
-        upper: &Bound<'_, PyAny>,
-    ) -> PyResult<Self> {
+    pub fn between(&self, lower: &Bound<'_, PyAny>, upper: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self::new(self.inner.clone().between(
             expression_from_python(lower)?,
             expression_from_python(upper)?,
@@ -130,7 +126,9 @@ impl PyColumn {
     #[pyo3(signature = (*values))]
     pub fn isin(&self, values: Vec<Bound<'_, PyAny>>) -> PyResult<Self> {
         Ok(Self::new(
-            self.inner.clone().is_in(collect_value_exprs(values)?, false),
+            self.inner
+                .clone()
+                .is_in(collect_value_exprs(values)?, false),
         ))
     }
 
@@ -151,7 +149,9 @@ impl PyColumn {
     /// `NOT LIKE pattern` (the negation of [`Self::like`]).
     pub fn not_like(&self, pattern: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self::new(
-            self.inner.clone().not_like(expression_from_python(pattern)?),
+            self.inner
+                .clone()
+                .not_like(expression_from_python(pattern)?),
         ))
     }
 
@@ -174,7 +174,9 @@ impl PyColumn {
     /// PySpark `Column.startswith(other)`.
     pub fn startswith(&self, other: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self::new(
-            self.inner.clone().starts_with(expression_from_python(other)?),
+            self.inner
+                .clone()
+                .starts_with(expression_from_python(other)?),
         ))
     }
 
@@ -198,7 +200,9 @@ impl PyColumn {
     #[pyo3(name = "eqNullSafe")]
     pub fn eq_null_safe(&self, other: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self::new(
-            self.inner.clone().eq_null_safe(expression_from_python(other)?),
+            self.inner
+                .clone()
+                .eq_null_safe(expression_from_python(other)?),
         ))
     }
 
@@ -239,11 +243,7 @@ impl PyColumn {
         Self::new(self.inner.clone().logical_not())
     }
 
-    fn __pow__(
-        &self,
-        other: &Bound<'_, PyAny>,
-        _modulo: &Bound<'_, PyAny>,
-    ) -> PyResult<Self> {
+    fn __pow__(&self, other: &Bound<'_, PyAny>, _modulo: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self::new(
             self.inner.clone().power(expression_from_python(other)?),
         ))

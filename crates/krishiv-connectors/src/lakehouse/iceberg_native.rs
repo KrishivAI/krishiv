@@ -352,6 +352,17 @@ pub mod native {
             }
         }
 
+        /// Test-only: the file name the NEXT `stage_parquet` call will use,
+        /// so failure-injection tests can pre-place an obstacle at a derived
+        /// path (e.g. the DUR-2 sidecar) before staging happens.
+        #[cfg(test)]
+        pub(crate) fn peek_next_staged_file_name(&self) -> String {
+            format!(
+                "staged-{:016x}.parquet",
+                self.snap_counter.load(Ordering::Relaxed)
+            )
+        }
+
         /// Durably stage `batches` as one Parquet file under `{root}/data/`
         /// and return its `DataFile` descriptor plus the staged path.
         ///
@@ -413,6 +424,12 @@ pub mod native {
         /// snapshot summary. Retry-safe: the caller keeps the `DataFile`
         /// descriptors until this returns `Ok`, so a failed transaction can
         /// simply be retried with the same files.
+        ///
+        /// An empty `data_files` vec is a no-op that returns the current
+        /// snapshot id WITHOUT recording `kafka_offsets` anywhere — callers
+        /// that need offsets durably recorded for an empty batch must not take
+        /// this path (the streaming sink pre-guards: `pre_commit` skips empty
+        /// buffers entirely, so no offsets reach here without data).
         pub async fn append_data_files(
             &self,
             data_files: Vec<iceberg::spec::DataFile>,
@@ -488,11 +505,7 @@ pub mod native {
                 .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
             // read_all feeds the streaming sink's overwrite commit, so an
             // empty read here rewrites the table with nothing.
-            crate::lakehouse::empty_plan_guard::guard_empty_plan(
-                &table,
-                tasks.len(),
-                        "read_all",
-            )?;
+            crate::lakehouse::empty_plan_guard::guard_empty_plan(&table, tasks.len(), "read_all")?;
 
             // Delete files mean rows in the data files are dead; the raw
             // parquet loop below would resurrect them. Route such tables
@@ -713,26 +726,26 @@ pub mod native {
                 .schema(iceberg_schema)
                 .location(table_uri)
                 .build();
-            let created = scratch
+            scratch
                 .create_table(&namespace, creation)
                 .await
                 .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
 
-            let (new_meta_loc, snapshot_id) = if batches.is_empty() {
-                let loc = created
-                    .metadata_location()
-                    .map(String::from)
-                    .ok_or_else(|| {
-                        LakehouseError::Iceberg(
-                            "replacement table creation returned no metadata location".into(),
-                        )
-                    })?;
-                (loc, 0)
+            // Empty `batches` still commits a real (zero-file) snapshot so the
+            // offsets land in its summary — they are the committed-offset
+            // oracle the DUR-2 idempotency gate reads; dropping them would let
+            // stale prepared refs re-commit on recovery. iceberg permits a
+            // fast_append with no data files as long as snapshot properties
+            // are set, which `fast_append_via` always does.
+            let data_files = if batches.is_empty() {
+                Vec::new()
             } else {
-                let (_, data_file) = self.stage_parquet(&batches)?;
-                let committed =
-                    fast_append_via(&scratch, &self.ident, vec![data_file], &kafka_offsets).await?;
-                let loc = committed
+                vec![self.stage_parquet(&batches)?.1]
+            };
+            let committed =
+                fast_append_via(&scratch, &self.ident, data_files, &kafka_offsets).await?;
+            let new_meta_loc =
+                committed
                     .metadata_location()
                     .map(String::from)
                     .ok_or_else(|| {
@@ -740,15 +753,13 @@ pub mod native {
                             "replacement commit returned no metadata location".into(),
                         )
                     })?;
-                let snap = committed
-                    .metadata()
-                    .current_snapshot()
-                    .map(|s| s.snapshot_id())
-                    .ok_or_else(|| LakehouseError::Concurrency {
-                        message: "snapshot id missing after overwrite commit".to_string(),
-                    })?;
-                (loc, snap)
-            };
+            let snapshot_id = committed
+                .metadata()
+                .current_snapshot()
+                .map(|s| s.snapshot_id())
+                .ok_or_else(|| LakehouseError::Concurrency {
+                    message: "snapshot id missing after overwrite commit".to_string(),
+                })?;
 
             // 2. Durable commit point: flip the hint to the new generation.
             self.update_version_hint(&new_meta_loc)?;
@@ -758,6 +769,10 @@ pub mod native {
             // The scratch catalog is simply dropped from memory (never
             // drop_table'd), so the new generation's files survive it.
             let _ = self.catalog.drop_table(&self.ident).await;
+            // Clearing the WHOLE pending map is intentional: the overwrite
+            // replaced the table generation, so every staged-but-uncommitted
+            // entry describes data files of the superseded generation and must
+            // not be fast_append'ed into the new one.
             self.pending.lock().await.clear();
             self.catalog
                 .register_table(&self.ident, new_meta_loc)
@@ -1377,6 +1392,38 @@ pub mod native {
                 std::fs::read_to_string(dir.path().join("metadata").join("version-hint.text"))
                     .unwrap();
             assert!(hint.contains("metadata.json"));
+        }
+
+        /// An overwrite with NO batches must still record its offsets: they
+        /// are the committed-offset oracle the DUR-2 idempotency gate reads,
+        /// so wiping them lets stale prepared refs re-commit on recovery.
+        #[tokio::test]
+        async fn iceberg_native_empty_overwrite_records_offsets() {
+            let dir = tempfile::tempdir().unwrap();
+            let sv = schema_version();
+            let tpc = IcebergNativeTwoPhaseCommit::open(dir.path(), "test", &sv)
+                .await
+                .unwrap();
+
+            let staged = tpc.prepare(vec![batch(vec![1, 2])]).await.unwrap();
+            tpc.commit(staged, BTreeMap::from([("p0".to_string(), 3)]))
+                .await
+                .unwrap();
+
+            // Empty overwrite (e.g. an upsert epoch that deleted every row).
+            tpc.overwrite_commit(vec![], BTreeMap::from([("p0".to_string(), 9)]), &sv)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                tpc.committed_kafka_offsets().await.unwrap(),
+                BTreeMap::from([("p0".to_string(), 9)]),
+                "the empty overwrite must keep the committed-offset oracle alive"
+            );
+            assert!(
+                tpc.read_all().await.unwrap().is_empty(),
+                "the table itself is empty after the overwrite"
+            );
         }
 
         #[tokio::test]

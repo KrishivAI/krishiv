@@ -39,6 +39,32 @@ mod imp {
             .collect()
     }
 
+    /// Render a `PayloadFilter` as a Qdrant `must` filter. Qdrant `match`
+    /// conditions have no exact float equality, so `Float` values are
+    /// rejected rather than silently ignored.
+    fn filter_to_qdrant(filter: &PayloadFilter) -> VectorSinkResult<qdrant_client::qdrant::Filter> {
+        use qdrant_client::qdrant::r#match::MatchValue;
+        use qdrant_client::qdrant::{Condition, Filter};
+        let mut must = Vec::with_capacity(filter.equals.len());
+        for (key, value) in &filter.equals {
+            let match_value = match value {
+                PayloadValue::String(s) => MatchValue::Keyword(s.clone()),
+                PayloadValue::Int(i) => MatchValue::Integer(*i),
+                PayloadValue::Bool(b) => MatchValue::Boolean(*b),
+                PayloadValue::Float(_) => {
+                    return Err(VectorSinkError::Query(format!(
+                        "qdrant does not support exact float match on filter key {key}"
+                    )));
+                }
+            };
+            must.push(Condition::matches(key.clone(), match_value));
+        }
+        Ok(Filter {
+            must,
+            ..Default::default()
+        })
+    }
+
     /// Qdrant vector sink.
     #[derive(Clone)]
     pub struct QdrantSink {
@@ -182,8 +208,12 @@ mod imp {
             &self,
             vector: &[f32],
             top_k: usize,
-            _filter: Option<&PayloadFilter>,
+            filter: Option<&PayloadFilter>,
         ) -> VectorSinkResult<Vec<ScoredChunk>> {
+            let qdrant_filter = match filter {
+                Some(f) if !f.equals.is_empty() => Some(filter_to_qdrant(f)?),
+                _ => None,
+            };
             let response = self
                 .client
                 .search_points(qdrant_client::qdrant::SearchPoints {
@@ -191,6 +221,7 @@ mod imp {
                     vector: vector.to_vec(),
                     limit: top_k as u64,
                     with_payload: Some(true.into()),
+                    filter: qdrant_filter,
                     ..Default::default()
                 })
                 .await
@@ -237,6 +268,35 @@ mod imp {
                 })
                 .collect();
             Ok(chunks)
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // Qdrant speaks gRPC, so the request body cannot be asserted with an
+        // HTTP mock; the filter construction is certified directly instead.
+        #[test]
+        fn filter_to_qdrant_builds_must_conditions() {
+            let mut equals = HashMap::new();
+            equals.insert("lang".to_string(), PayloadValue::String("en".into()));
+            equals.insert("chunk_index".to_string(), PayloadValue::Int(3));
+            equals.insert("active".to_string(), PayloadValue::Bool(true));
+            let filter = filter_to_qdrant(&PayloadFilter { equals }).unwrap();
+            assert_eq!(filter.must.len(), 3);
+            let rendered = format!("{filter:?}");
+            assert!(rendered.contains("lang"));
+            assert!(rendered.contains("en"));
+            assert!(rendered.contains("chunk_index"));
+            assert!(rendered.contains("active"));
+        }
+
+        #[test]
+        fn filter_to_qdrant_rejects_float_equality() {
+            let mut equals = HashMap::new();
+            equals.insert("score".to_string(), PayloadValue::Float(0.5));
+            let err = filter_to_qdrant(&PayloadFilter { equals }).unwrap_err();
+            assert!(matches!(err, VectorSinkError::Query(_)));
         }
     }
 }

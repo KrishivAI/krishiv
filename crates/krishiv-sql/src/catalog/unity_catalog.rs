@@ -71,8 +71,7 @@ impl UnityEnvConfig {
             })?;
         Ok(Self {
             host,
-            catalog_name: lookup("KRISHIV_UNITY_CATALOG_NAME")
-                .unwrap_or_else(|| "main".to_owned()),
+            catalog_name: lookup("KRISHIV_UNITY_CATALOG_NAME").unwrap_or_else(|| "main".to_owned()),
             token: lookup("KRISHIV_UNITY_TOKEN"),
         })
     }
@@ -145,12 +144,7 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
-        move |key: &str| {
-            owned
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.clone())
-        }
+        move |key: &str| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
     }
 
     #[test]

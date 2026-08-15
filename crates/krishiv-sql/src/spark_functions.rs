@@ -312,11 +312,7 @@ mod tests {
 
         let engine = crate::SqlEngine::new();
         let schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                false,
-            ),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
             Field::new("f", DataType::Utf8, false),
         ]));
         let batch = arrow::record_batch::RecordBatch::try_new(

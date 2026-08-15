@@ -276,10 +276,8 @@ impl OptimizerRule for LateMaterializeTopKAggregate {
         // Rebuild the projection chain over the new node, outermost last.
         let mut rebuilt = rewritten;
         for proj in projections.into_iter().rev() {
-            rebuilt = LogicalPlan::Projection(Projection::try_new(
-                proj.expr.clone(),
-                Arc::new(rebuilt),
-            )?);
+            rebuilt =
+                LogicalPlan::Projection(Projection::try_new(proj.expr.clone(), Arc::new(rebuilt))?);
         }
         Ok(Transformed::yes(LogicalPlan::Sort(
             datafusion::logical_expr::Sort {
@@ -337,7 +335,12 @@ fn rewrite_aggregate(
     }
     // Restore the group list's own order, so the narrowed aggregate's schema is
     // a sub-sequence of the original's rather than an arbitrary permutation.
-    key.sort_by_key(|col| group_cols.iter().position(|g| g == col).unwrap_or(usize::MAX));
+    key.sort_by_key(|col| {
+        group_cols
+            .iter()
+            .position(|g| g == col)
+            .unwrap_or(usize::MAX)
+    });
     let deferred: Vec<Column> = group_cols
         .iter()
         .filter(|col| !key.contains(col))
@@ -688,10 +691,8 @@ impl InputFacts {
             let (index, mut link) = self.reach_one(&available, &used)?;
             for probe in &mut link.probe_keys {
                 if !materialised.contains(&probe.flat_name()) {
-                    *probe = Column::new(
-                        Some(TableReference::bare(TOPN_ALIAS)),
-                        probe.name.clone(),
-                    );
+                    *probe =
+                        Column::new(Some(TableReference::bare(TOPN_ALIAS)), probe.name.clone());
                 }
             }
             for col in self.columns_of(index) {
@@ -850,9 +851,9 @@ fn index_of(schema: &DFSchema, col: &Column) -> Option<usize> {
 mod tests {
     use super::*;
     use datafusion::arrow::array::{Array as _, Decimal128Array, Int64Array, StringArray};
-    use datafusion::common::get_required_group_by_exprs_indices;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::common::get_required_group_by_exprs_indices;
     use datafusion::common::{Constraint, Constraints};
     use datafusion::datasource::MemTable;
     use datafusion::execution::session_state::SessionStateBuilder;
@@ -943,16 +944,17 @@ mod tests {
         )
         .unwrap();
         let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-        Arc::new(table.with_constraints(Constraints::new_unverified(vec![
-            Constraint::PrimaryKey(vec![0]),
-        ])))
+        Arc::new(
+            table.with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0],
+            )])),
+        )
     }
 
     fn context(with_rule: bool, with_keys: bool) -> SessionContext {
         let mut builder = SessionStateBuilder::new().with_default_features();
         if with_rule {
-            builder =
-                builder.with_optimizer_rule(Arc::new(LateMaterializeTopKAggregate::forced()));
+            builder = builder.with_optimizer_rule(Arc::new(LateMaterializeTopKAggregate::forced()));
         }
         let ctx = SessionContext::new_with_state(builder.build());
         ctx.register_table("customer", customer_table(with_keys))
@@ -1307,7 +1309,12 @@ mod tests {
     #[tokio::test]
     async fn datafusion_alone_does_not_reach_through_the_second_table() {
         let ctx = context(false, true);
-        let plan = ctx.sql(Q10_SHAPE).await.unwrap().into_optimized_plan().unwrap();
+        let plan = ctx
+            .sql(Q10_SHAPE)
+            .await
+            .unwrap()
+            .into_optimized_plan()
+            .unwrap();
         let agg = find_aggregate(&plan)
             .unwrap_or_else(|| panic!("no aggregate in:\n{}", plan.display_indent()));
         let names: Vec<String> = agg

@@ -141,7 +141,10 @@ pub struct RdkafkaCdcEventSource {
     /// offsets are not lost on crash — `commit_consumer_state` commits them
     /// to the broker, but the snapshot summary provides a second durable
     /// record.
-    tombstone_offsets: std::collections::HashMap<i32, i64>,
+    tombstone_offsets: std::collections::BTreeMap<u32, i64>,
+    /// Per-partition next-offsets replayed via `resume_from`; records below
+    /// these offsets are already durably committed downstream and are skipped.
+    resume_offsets: std::collections::HashMap<u32, i64>,
 }
 
 #[cfg(feature = "kafka")]
@@ -187,7 +190,8 @@ impl RdkafkaCdcEventSource {
         Ok(Self {
             consumer: std::sync::Arc::new(consumer),
             poll_timeout_ms: 100,
-            tombstone_offsets: std::collections::HashMap::new(),
+            tombstone_offsets: std::collections::BTreeMap::new(),
+            resume_offsets: std::collections::HashMap::new(),
         })
     }
 
@@ -220,7 +224,7 @@ impl RdkafkaCdcEventSource {
     /// Callers should merge these into the Iceberg snapshot's kafka offset
     /// summary to prevent offset loss on crash for partitions that only
     /// received tombstone messages.
-    pub fn tombstone_partition_offsets(&self) -> &std::collections::HashMap<i32, i64> {
+    pub fn tombstone_partition_offsets(&self) -> &std::collections::BTreeMap<u32, i64> {
         &self.tombstone_offsets
     }
 }
@@ -286,16 +290,25 @@ impl CdcEventSource for RdkafkaCdcEventSource {
                                 "skipping tombstone message (null payload); offset stored for checkpoint"
                             );
                             use rdkafka::consumer::Consumer;
-                            let _ = self.consumer.store_offset(
+                            if let Err(error) = self.consumer.store_offset(
                                 msg.topic(),
                                 msg.partition(),
                                 msg.offset(),
-                            );
+                            ) {
+                                tracing::warn!(
+                                    partition = msg.partition(),
+                                    offset = msg.offset(),
+                                    %error,
+                                    "failed to store tombstone offset for consumer commit"
+                                );
+                            }
                             // Track the tombstone offset so the Iceberg snapshot
                             // checkpoint summary can include it — prevention of
                             // offset loss on crash for tombstone-only partitions.
-                            self.tombstone_offsets
-                                .insert(msg.partition(), msg.offset().saturating_add(1));
+                            if let Ok(partition) = u32::try_from(msg.partition()) {
+                                self.tombstone_offsets
+                                    .insert(partition, msg.offset().saturating_add(1));
+                            }
                             continue;
                         }
                     };
@@ -305,6 +318,15 @@ impl CdcEventSource for RdkafkaCdcEventSource {
                             msg.partition()
                         ))
                     })?;
+                    // Skip records below offsets already committed downstream
+                    // (crash-window replay after an Iceberg commit).
+                    if self
+                        .resume_offsets
+                        .get(&partition_id)
+                        .is_some_and(|next| msg.offset() < *next)
+                    {
+                        continue;
+                    }
                     events.push(RawCdcRecord::new(payload, partition_id, msg.offset()));
                 }
             }
@@ -319,5 +341,37 @@ impl CdcEventSource for RdkafkaCdcEventSource {
 
     fn commit_offsets(&mut self) -> Result<(), ConnectorError> {
         self.commit_offsets_inner()
+    }
+
+    /// Skip records below previously committed offsets on the next polls.
+    ///
+    /// Keys are `"{table_or_topic}-{partition}"`; the partition is parsed from
+    /// the suffix after the final `-`. Filtering (rather than seeking) keeps
+    /// this correct under consumer-group rebalances: the group cursor stays
+    /// authoritative and only already-committed records are dropped.
+    fn resume_from(
+        &mut self,
+        offsets: &std::collections::BTreeMap<String, i64>,
+    ) -> Result<(), ConnectorError> {
+        for (key, next_offset) in offsets {
+            let Some(partition) = key
+                .rsplit('-')
+                .next()
+                .and_then(|suffix| suffix.parse::<u32>().ok())
+            else {
+                tracing::warn!(
+                    key,
+                    "ignoring committed offset key without a partition suffix"
+                );
+                continue;
+            };
+            let entry = self.resume_offsets.entry(partition).or_insert(*next_offset);
+            *entry = (*entry).max(*next_offset);
+        }
+        Ok(())
+    }
+
+    fn pending_tombstone_offsets(&self) -> std::collections::BTreeMap<u32, i64> {
+        self.tombstone_offsets.clone()
     }
 }

@@ -82,14 +82,20 @@ fn lakehouse_schema_v1() -> SchemaVersion {
 }
 
 struct RecordingSink {
-    batches: Vec<RecordBatch>,
+    /// Shared so a test can keep a handle to the received batches after the
+    /// sink itself is moved into a wrapper (e.g. `DeadLetterSink`).
+    batches: Arc<std::sync::Mutex<Vec<RecordBatch>>>,
 }
 
 impl RecordingSink {
     fn new() -> Self {
         Self {
-            batches: Vec::new(),
+            batches: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    fn received(&self) -> Arc<std::sync::Mutex<Vec<RecordBatch>>> {
+        Arc::clone(&self.batches)
     }
 }
 
@@ -99,7 +105,7 @@ impl Sink for RecordingSink {
     }
 
     async fn write_batch(&mut self, batch: RecordBatch) -> ConnectorResult<()> {
-        self.batches.push(batch);
+        self.batches.lock().unwrap().push(batch);
         Ok(())
     }
 
@@ -408,12 +414,43 @@ async fn dead_letter_sink_secondary_sink_receives_rejected() {
     );
 
     let secondary = RecordingSink::new();
+    let received = secondary.received();
     let mut dead_letter_sink =
         DeadLetterSink::new("test_with_secondary", config).with_secondary_sink(secondary);
 
     let (accepted, rejected) = dead_letter_sink.process_batch(&batch).await.unwrap();
     assert_eq!(accepted.num_rows(), 2);
     assert_eq!(rejected.len(), 1);
+
+    // The rejected row must actually reach the secondary sink, carrying the
+    // original column (null value) plus the appended `_error` metadata column.
+    let received = received.lock().unwrap();
+    assert_eq!(received.len(), 1, "secondary sink must receive one batch");
+    let dlq_batch = &received[0];
+    assert_eq!(
+        dlq_batch.num_rows(),
+        1,
+        "exactly the rejected row forwarded"
+    );
+    let v_idx = dlq_batch.schema().index_of("v").unwrap();
+    assert!(
+        dlq_batch.column(v_idx).is_null(0),
+        "forwarded row must be the null-valued rejected row"
+    );
+    let err_idx = dlq_batch
+        .schema()
+        .index_of("_error")
+        .expect("dead-letter batch must carry the _error column");
+    let errors = dlq_batch
+        .column(err_idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(
+        errors.value(0).contains("NotNull"),
+        "error metadata must name the violated rule, got: {}",
+        errors.value(0)
+    );
 }
 
 #[tokio::test]

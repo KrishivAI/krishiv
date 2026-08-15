@@ -160,12 +160,7 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
-        move |key: &str| {
-            owned
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.clone())
-        }
+        move |key: &str| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
     }
 
     #[test]

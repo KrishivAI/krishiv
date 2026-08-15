@@ -407,10 +407,7 @@ mod tests {
                 && out.contains("unnest(generate_series("),
             "{out}"
         );
-        assert!(
-            out.contains("_ws + 60000 AS window_end"),
-            "{out}"
-        );
+        assert!(out.contains("_ws + 60000 AS window_end"), "{out}");
     }
 
     #[test]

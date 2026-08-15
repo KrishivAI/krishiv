@@ -31,11 +31,9 @@ async fn versioned_delta_table(dir: &std::path::Path) -> String {
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
     let path = dir.join("versioned").to_string_lossy().into_owned();
     for chunk in [vec![1_i64, 2, 3], vec![4, 5, 6]] {
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(chunk))],
-        )
-        .expect("batch");
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(chunk))])
+                .expect("batch");
         krishiv_connectors::lakehouse::write_delta(
             path.clone(),
             vec![batch],

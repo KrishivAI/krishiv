@@ -14,7 +14,15 @@ use crate::streaming_dataframe::PyStreamingDataFrame;
 /// streaming source (Kafka/Kinesis/Pulsar/Iceberg). `watermark_col` empty means
 /// no event-time watermark is set. This is the single unified streaming entry —
 /// the old DataStream `Stream` classes were retired.
-#[cfg_attr(not(any(feature = "kafka", feature = "iceberg", feature = "kinesis", feature = "pulsar")), allow(dead_code))]
+#[cfg_attr(
+    not(any(
+        feature = "kafka",
+        feature = "iceberg",
+        feature = "kinesis",
+        feature = "pulsar"
+    )),
+    allow(dead_code)
+)]
 fn streaming_df_from_sql(
     session: &PySession,
     sql: String,
@@ -124,12 +132,7 @@ pub fn read_kafka(
             .register_kafka_source(&topic, arrow_schema, &bootstrap_servers, &topic, gid)
             .map_err(crate::errors::map_krishiv_error)?;
         let escaped_topic = topic.replace('"', "\"\"");
-        streaming_df_from_sql(
-            session,
-            format!("SELECT * FROM \"{escaped_topic}\""),
-            "",
-            0,
-        )
+        streaming_df_from_sql(session, format!("SELECT * FROM \"{escaped_topic}\""), "", 0)
     }
 }
 

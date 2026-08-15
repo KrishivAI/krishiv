@@ -181,12 +181,24 @@ mod tests {
     fn datafusion_user_errors_do_not_map_to_internal_error() {
         let cases: &[(&str, &str)] = &[
             ("SQL error: ParserError(\"Expected: ...\")", SYNTAX_ERROR),
-            ("Error during planning: table 'orders' not found", UNDEFINED_TABLE),
+            (
+                "Error during planning: table 'orders' not found",
+                UNDEFINED_TABLE,
+            ),
             ("Error during planning: No table named foo", UNDEFINED_TABLE),
-            ("Error during planning: Coercion from [Utf8] to ... failed", SYNTAX_ERROR),
+            (
+                "Error during planning: Coercion from [Utf8] to ... failed",
+                SYNTAX_ERROR,
+            ),
             ("Schema error: No field named custkey.", SYNTAX_ERROR),
-            ("This feature is not implemented: GROUPING SETS", FEATURE_NOT_SUPPORTED),
-            ("Arrow error: Cast error: Cannot cast 'x' to Int64", DATA_EXCEPTION),
+            (
+                "This feature is not implemented: GROUPING SETS",
+                FEATURE_NOT_SUPPORTED,
+            ),
+            (
+                "Arrow error: Cast error: Cannot cast 'x' to Int64",
+                DATA_EXCEPTION,
+            ),
             ("Object Store error: Generic S3 error", SYSTEM_ERROR),
             ("Parquet error: EOF", SYSTEM_ERROR),
             ("IO error: broken pipe", SYSTEM_ERROR),
@@ -213,15 +225,13 @@ mod tests {
     fn prefixes_match_real_datafusion_errors() {
         use datafusion::error::DataFusionError;
 
-        let planning: SqlError =
-            DataFusionError::Plan("table 'nope' not found".to_string()).into();
+        let planning: SqlError = DataFusionError::Plan("table 'nope' not found".to_string()).into();
         assert_eq!(sqlstate_for(&planning), UNDEFINED_TABLE);
 
         let internal: SqlError = DataFusionError::Internal("bug".to_string()).into();
         assert_eq!(sqlstate_for(&internal), INTERNAL_ERROR);
 
-        let exhausted: SqlError =
-            DataFusionError::ResourcesExhausted("pool".to_string()).into();
+        let exhausted: SqlError = DataFusionError::ResourcesExhausted("pool".to_string()).into();
         assert_eq!(sqlstate_for(&exhausted), GENERAL_ERROR);
     }
 

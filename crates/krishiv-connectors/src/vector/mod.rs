@@ -498,10 +498,12 @@ mod tests {
         let mut reg = VectorSinkRegistry::new();
         let s1: Arc<dyn VectorSink> = Arc::new(InMemoryVectorSink::new());
         let s2: Arc<dyn VectorSink> = Arc::new(InMemoryVectorSink::new());
-        reg.register("my_sink", s1);
-        reg.register("my_sink", s2);
+        reg.register("my_sink", s1.clone());
+        reg.register("my_sink", s2.clone());
         let got = reg.get("my_sink").unwrap();
-        assert_eq!(got.sink_name(), "memory");
+        // The later registration must replace the earlier one.
+        assert!(Arc::ptr_eq(&got, &s2));
+        assert!(!Arc::ptr_eq(&got, &s1));
     }
 
     #[test]
@@ -664,6 +666,113 @@ mod tests {
             .unwrap();
         let results = sink.query_nearest(&[1.0, 0.0], 10, None).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lancedb_sink_two_batches_same_epoch_survive_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let sink = LanceDbSink::open(temp.path(), "test_table", 2)
+                .await
+                .unwrap();
+            let b1 = EmbeddingBatch::new(
+                vec!["d1".into()],
+                vec![vec![1.0, 0.0]],
+                vec![HashMap::<String, PayloadValue>::new()],
+                1,
+            );
+            let b2 = EmbeddingBatch::new(
+                vec!["d2".into()],
+                vec![vec![0.0, 1.0]],
+                vec![HashMap::<String, PayloadValue>::new()],
+                1,
+            );
+            sink.upsert_batch(&b1).await.unwrap();
+            sink.upsert_batch(&b2).await.unwrap();
+        }
+        let reopened = LanceDbSink::open(temp.path(), "test_table", 2)
+            .await
+            .unwrap();
+        let results = reopened.query_nearest(&[1.0, 0.0], 10, None).await.unwrap();
+        let mut doc_ids: Vec<&str> = results.iter().map(|r| r.doc_id.as_str()).collect();
+        doc_ids.sort_unstable();
+        assert_eq!(doc_ids, vec!["d1", "d2"]);
+    }
+
+    #[tokio::test]
+    async fn lancedb_sink_delete_persists_across_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let sink = LanceDbSink::open(temp.path(), "test_table", 2)
+                .await
+                .unwrap();
+            let batch = EmbeddingBatch::new(
+                vec!["d1".into(), "d2".into()],
+                vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+                vec![
+                    HashMap::<String, PayloadValue>::new(),
+                    HashMap::<String, PayloadValue>::new(),
+                ],
+                1,
+            );
+            sink.upsert_batch(&batch).await.unwrap();
+            let id = id::point_id_from_doc_epoch("d1", 1);
+            sink.delete_by_ids(&[id]).await.unwrap();
+        }
+        let reopened = LanceDbSink::open(temp.path(), "test_table", 2)
+            .await
+            .unwrap();
+        let results = reopened.query_nearest(&[1.0, 0.0], 10, None).await.unwrap();
+        assert_eq!(results.len(), 1, "deleted point must not resurrect");
+        assert_eq!(results[0].doc_id, "d2");
+    }
+
+    #[tokio::test]
+    async fn lancedb_sink_empty_upsert_then_reopen_ok() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let sink = LanceDbSink::open(temp.path(), "test_table", 2)
+                .await
+                .unwrap();
+            let empty = EmbeddingBatch::new(vec![], vec![], vec![], 1);
+            sink.upsert_batch(&empty).await.unwrap();
+        }
+        // No zero-row fragment may be written: it has no epoch row to read
+        // back and only bloats the table directory.
+        let table_dir = temp.path().join("test_table");
+        let fragments = std::fs::read_dir(&table_dir)
+            .map(|iter| iter.filter_map(|e| e.ok()).count())
+            .unwrap_or(0);
+        assert_eq!(fragments, 0, "empty upsert must not write a fragment");
+        let reopened = LanceDbSink::open(temp.path(), "test_table", 2).await;
+        assert!(reopened.is_ok());
+    }
+
+    #[tokio::test]
+    async fn memory_sink_delete_lock_poison_is_delete_error() {
+        let sink = Arc::new(InMemoryVectorSink::new());
+        let poisoner = Arc::clone(&sink);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.points.write().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        let err = sink.delete_by_ids(&["x".into()]).await.unwrap_err();
+        assert!(matches!(err, VectorSinkError::Delete(_)));
+    }
+
+    #[tokio::test]
+    async fn memory_sink_query_dim_mismatch_errors() {
+        let sink = InMemoryVectorSink::new();
+        let batch = EmbeddingBatch::new(
+            vec!["d1".into()],
+            vec![vec![1.0, 0.0, 0.0]],
+            vec![HashMap::<String, PayloadValue>::new()],
+            1,
+        );
+        sink.upsert_batch(&batch).await.unwrap();
+        let err = sink.query_nearest(&[1.0, 0.0], 10, None).await.unwrap_err();
+        assert!(matches!(err, VectorSinkError::Query(_)));
     }
 
     #[tokio::test]

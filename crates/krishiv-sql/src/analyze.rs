@@ -189,7 +189,11 @@ fn sort_keys(array: &dyn Array) -> Option<Vec<Vec<u8>>> {
     let rows = converter
         .convert_columns(&[arrow::array::make_array(array.to_data())])
         .ok()?;
-    Some((0..rows.num_rows()).map(|i| rows.row(i).as_ref().to_vec()).collect())
+    Some(
+        (0..rows.num_rows())
+            .map(|i| rows.row(i).as_ref().to_vec())
+            .collect(),
+    )
 }
 
 /// Render every value of `array` the way Arrow itself displays it.

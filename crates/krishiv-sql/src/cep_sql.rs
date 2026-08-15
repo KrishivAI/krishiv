@@ -896,7 +896,10 @@ mod tests {
             &mut state,
         )
         .unwrap();
-        assert!(first.is_empty(), "one event is only the start of the pattern");
+        assert!(
+            first.is_empty(),
+            "one event is only the start of the pattern"
+        );
 
         let second = execute_streaming_match_recognize(
             &stmt,
@@ -944,7 +947,10 @@ mod tests {
         let upper = body.to_ascii_uppercase();
         let pattern = super::extract_parenthesized_after(body, &upper, "PATTERN")
             .expect("the real PATTERN clause must be found");
-        assert_eq!(pattern, "A B", "matched `my_pattern` instead of the keyword");
+        assert_eq!(
+            pattern, "A B",
+            "matched `my_pattern` instead of the keyword"
+        );
 
         // A pattern variable containing WITHIN must not look like a WITHIN clause.
         let body = "PATTERN (WITHINRANGE B)";
@@ -955,5 +961,4 @@ mod tests {
             "`WITHINRANGE` is a pattern variable, not a WITHIN clause"
         );
     }
-
 }

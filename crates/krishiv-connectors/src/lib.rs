@@ -126,10 +126,10 @@ pub use lakehouse::{
     LakehouseTable, MemoryDeltaStore, MemoryIcebergTwoPhaseCommit, MemoryLakehouseTable,
     MergeDeltaResult, MultiWriterGuard, PartitionField, PartitionSpecResolver,
     PartitionSpecVersion, RedbDeltaStore, SchemaField, SchemaVersion, StagedSnapshot,
-    check_write_precondition, ensure_hoodie_properties, kafka_offsets_json, merge_delta,
-    parse_kafka_offsets_json, read_hoodie_properties, read_table_at_timestamp,
-    remove_merge_key_column, vacuum_hudi_table, vacuum_table, write_delta, write_hudi_cow_append,
-    write_hudi_cow_fixture, write_hudi_cow_upsert,
+    ensure_hoodie_properties, kafka_offsets_json, merge_delta, parse_kafka_offsets_json,
+    read_hoodie_properties, read_table_at_timestamp, remove_merge_key_column, vacuum_hudi_table,
+    vacuum_table, write_delta, write_hudi_cow_append, write_hudi_cow_fixture,
+    write_hudi_cow_upsert,
 };
 #[cfg(all(feature = "lakehouse", feature = "kafka"))]
 pub use lakehouse::{KafkaDeltaStore, RdkafkaDeltaStore};

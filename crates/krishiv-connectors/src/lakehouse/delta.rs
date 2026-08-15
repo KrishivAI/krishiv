@@ -148,6 +148,12 @@ impl DeltaStore for MemoryDeltaStore {
 }
 
 /// RocksDB-backed durable delta store for embedded / single-node live tables.
+///
+/// Key layout (format v2): `b"v2:" ++ namespace ++ seq.to_be_bytes()`.
+/// Big-endian sequence numbers keep RocksDB's lexicographic iteration order
+/// identical to append order (little-endian keys misorder after seq 255).
+/// Stores written with the unversioned v1 (little-endian) layout are detected
+/// at open time and rejected with an explicit error: they must be rebuilt.
 pub struct RocksDbDeltaStore {
     db: DB,
     namespace: Vec<u8>,
@@ -155,6 +161,9 @@ pub struct RocksDbDeltaStore {
     // Keep tempdir alive for ephemeral instances.
     _tempdir: Option<tempfile::TempDir>,
 }
+
+/// Version prefix prepended to every key in the current format.
+const KEY_FORMAT_PREFIX: &[u8] = b"v2:";
 
 /// Legacy alias so existing callers continue to compile.
 pub type RedbDeltaStore = RocksDbDeltaStore;
@@ -168,7 +177,9 @@ impl RocksDbDeltaStore {
         opts.create_if_missing(true);
         let ns = namespace.as_ref().to_vec();
         let db = DB::open(&opts, path.as_ref()).map_err(|e| LakehouseError::Io(e.to_string()))?;
-        let seq = Self::load_max_seq(&db, &ns);
+        Self::reject_legacy_format(&db, &ns)?;
+        let prefix = Self::key_prefix(&ns);
+        let seq = Self::load_max_seq(&db, &prefix);
         Ok(Self {
             db,
             namespace: ns,
@@ -191,6 +202,33 @@ impl RocksDbDeltaStore {
         })
     }
 
+    fn key_prefix(namespace: &[u8]) -> Vec<u8> {
+        let mut prefix = KEY_FORMAT_PREFIX.to_vec();
+        prefix.extend_from_slice(namespace);
+        prefix
+    }
+
+    /// Detect keys written by the pre-versioned little-endian layout
+    /// (`namespace ++ seq_le`, no `v2:` prefix). Reading them with the v2
+    /// big-endian decoding would silently misorder entries, so refuse.
+    fn reject_legacy_format(db: &DB, namespace: &[u8]) -> Result<(), LakehouseError> {
+        for item in db.iterator(IteratorMode::Start) {
+            let Ok((k, _)) = item else { continue };
+            if k.starts_with(namespace)
+                && k.len() == namespace.len() + 8
+                && !k.starts_with(KEY_FORMAT_PREFIX)
+            {
+                return Err(LakehouseError::Io(format!(
+                    "RocksDbDeltaStore: namespace {:?} contains legacy (v1 little-endian) keys; \
+                     the key format changed to big-endian sequence ordering — rebuild the store \
+                     from its source before reopening",
+                    String::from_utf8_lossy(namespace)
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn load_max_seq(db: &DB, prefix: &[u8]) -> u64 {
         let mut max = 0u64;
         for item in db.iterator(IteratorMode::Start) {
@@ -199,7 +237,7 @@ impl RocksDbDeltaStore {
                 let seq = k
                     .get(prefix.len()..)
                     .and_then(|s| <[u8; 8]>::try_from(s).ok())
-                    .map(u64::from_le_bytes)
+                    .map(u64::from_be_bytes)
                     .unwrap_or(0);
                 if seq >= max {
                     max = seq + 1;
@@ -213,8 +251,8 @@ impl RocksDbDeltaStore {
         let mut seq = self.seq.lock().unwrap_or_else(|e| e.into_inner());
         let id = *seq;
         *seq += 1;
-        let mut key = self.namespace.clone();
-        key.extend_from_slice(&id.to_le_bytes());
+        let mut key = Self::key_prefix(&self.namespace);
+        key.extend_from_slice(&id.to_be_bytes());
         key
     }
 }
@@ -229,15 +267,21 @@ impl DeltaStore for RocksDbDeltaStore {
     }
 
     fn scan(&self) -> Result<Vec<DeltaEntry>, LakehouseError> {
-        let prefix = self.namespace.as_slice();
+        let prefix = Self::key_prefix(&self.namespace);
         let mut out = Vec::new();
         for item in self
             .db
-            .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward))
+            .iterator(IteratorMode::From(&prefix, rocksdb::Direction::Forward))
         {
             let (k, v) = item.map_err(|e| LakehouseError::Io(e.to_string()))?;
-            if !k.starts_with(prefix) {
+            if !k.starts_with(&prefix) {
                 break;
+            }
+            // Same length check as load_max_seq: a sibling namespace that
+            // extends this one (e.g. "orders2" vs "orders") shares the byte
+            // prefix but has a longer key.
+            if k.len() != prefix.len() + 8 {
+                continue;
             }
             out.push(decode_entry(&v)?);
         }
@@ -245,15 +289,18 @@ impl DeltaStore for RocksDbDeltaStore {
     }
 
     fn truncate(&self) -> Result<(), LakehouseError> {
-        let prefix = self.namespace.as_slice();
+        let prefix = Self::key_prefix(&self.namespace);
         let mut batch = WriteBatch::default();
         for item in self
             .db
-            .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward))
+            .iterator(IteratorMode::From(&prefix, rocksdb::Direction::Forward))
         {
             let (k, _) = item.map_err(|e| LakehouseError::Io(e.to_string()))?;
-            if !k.starts_with(prefix) {
+            if !k.starts_with(&prefix) {
                 break;
+            }
+            if k.len() != prefix.len() + 8 {
+                continue;
             }
             batch.delete(&*k);
         }
@@ -319,6 +366,12 @@ mod kafka_delta {
     use rdkafka::producer::{FutureProducer, FutureRecord};
 
     /// Broker-backed compacted-topic delta store.
+    ///
+    /// Write-only: this uses a plain idempotent producer (no Kafka
+    /// transactions — a `transactional.id` without `init_transactions` /
+    /// `begin_transaction` would be misleading). `scan`, `len`, and
+    /// `truncate` require a consumer / admin client and return an explicit
+    /// error instead of pretending the log is empty.
     pub struct RdkafkaDeltaStore {
         producer: FutureProducer,
         topic: String,
@@ -333,10 +386,6 @@ mod kafka_delta {
             let producer: FutureProducer = ClientConfig::new()
                 .set("bootstrap.servers", bootstrap_servers)
                 .set("enable.idempotence", "true")
-                .set(
-                    "transactional.id",
-                    format!("krishiv-delta-{}", std::process::id()),
-                )
                 .create()
                 .map_err(|e| LakehouseError::Io(e.to_string()))?;
             Ok(Self {
@@ -374,11 +423,18 @@ mod kafka_delta {
         }
 
         fn truncate(&self) -> Result<(), LakehouseError> {
-            Ok(())
+            Err(LakehouseError::Io(
+                "RdkafkaDeltaStore::truncate is unsupported: deleting a compacted topic's \
+                 records requires an admin client"
+                    .to_string(),
+            ))
         }
 
         fn len(&self) -> Result<usize, LakehouseError> {
-            Ok(0)
+            Err(LakehouseError::Io(
+                "RdkafkaDeltaStore::len is unsupported: counting records requires a consumer"
+                    .to_string(),
+            ))
         }
     }
 }
@@ -412,6 +468,90 @@ mod tests {
         assert_eq!(store.len().unwrap(), 0);
     }
 
+    fn entry_id(entry: &DeltaEntry) -> i64 {
+        entry
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    }
+
+    /// Scan order must equal append order past sequence 255 — little-endian
+    /// key encoding misorders there (0x00,0x01 sorts before 0xff,0x00), which
+    /// can replay a delete before its insert.
+    #[test]
+    fn rocksdb_delta_store_scan_preserves_append_order_past_256() {
+        let store = RocksDbDeltaStore::open_in_memory(b"seqorder").unwrap();
+        let n = 300i64;
+        for i in 0..n {
+            store.append(sample_batch(i), DeltaOp::Insert).unwrap();
+        }
+        let entries = store.scan().unwrap();
+        assert_eq!(entries.len(), n as usize);
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                entry_id(entry),
+                i as i64,
+                "entry at position {i} out of append order"
+            );
+        }
+    }
+
+    /// A namespace must not leak entries from a sibling namespace that merely
+    /// extends its byte prefix ("orders" vs "orders2").
+    #[test]
+    fn rocksdb_delta_store_prefix_namespace_does_not_leak() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let sibling = RocksDbDeltaStore::open(dir.path(), b"orders2").unwrap();
+            sibling.append(sample_batch(99), DeltaOp::Insert).unwrap();
+            sibling.append(sample_batch(98), DeltaOp::Insert).unwrap();
+        }
+        {
+            let store = RocksDbDeltaStore::open(dir.path(), b"orders").unwrap();
+            store.append(sample_batch(1), DeltaOp::Insert).unwrap();
+
+            assert_eq!(store.len().unwrap(), 1, "scan must not see orders2 rows");
+            let entries = store.scan().unwrap();
+            assert_eq!(entry_id(&entries[0]), 1);
+
+            // truncate must only delete this namespace's entries.
+            store.truncate().unwrap();
+            assert_eq!(store.len().unwrap(), 0);
+        }
+        let sibling = RocksDbDeltaStore::open(dir.path(), b"orders2").unwrap();
+        assert_eq!(
+            sibling.len().unwrap(),
+            2,
+            "truncate of 'orders' must not delete 'orders2' entries"
+        );
+    }
+
+    /// Reopening a store containing v1 (unversioned little-endian) keys must
+    /// fail loudly rather than silently misreading the sequence order.
+    #[test]
+    fn rocksdb_delta_store_rejects_legacy_key_format() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            let db = DB::open(&opts, dir.path()).unwrap();
+            // Legacy v1 key layout: namespace ++ seq.to_le_bytes().
+            let mut key = b"orders".to_vec();
+            key.extend_from_slice(&0u64.to_le_bytes());
+            db.put(key, b"legacy").unwrap();
+        }
+        let Err(err) = RocksDbDeltaStore::open(dir.path(), b"orders") else {
+            panic!("legacy key format must be rejected");
+        };
+        assert!(
+            err.to_string().contains("legacy"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn redb_delta_store_roundtrip() {
         let store = RedbDeltaStore::open_in_memory(b"orders").unwrap();
@@ -420,5 +560,23 @@ mod tests {
         assert_eq!(store.len().unwrap(), 2);
         store.truncate().unwrap();
         assert_eq!(store.len().unwrap(), 0);
+    }
+
+    /// Write-only Kafka store must refuse len/truncate instead of lying
+    /// (len == 0 made is_empty() report an empty log for any topic).
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn rdkafka_delta_store_len_and_truncate_are_unsupported_errors() {
+        // Producer creation is lazy — no broker connection is made here.
+        let store = RdkafkaDeltaStore::new("localhost:1", "krishiv-test-topic").unwrap();
+        assert!(store.len().is_err(), "len must not report a fake 0");
+        assert!(
+            store.is_empty().is_err(),
+            "is_empty must propagate the error"
+        );
+        assert!(
+            store.truncate().is_err(),
+            "truncate must not silently no-op"
+        );
     }
 }

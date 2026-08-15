@@ -7,7 +7,8 @@ use serde_json::json;
 use super::batch::EmbeddingBatch;
 use super::id::point_id_from_doc_epoch;
 use super::traits::{
-    PayloadFilter, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult, validate_identifier,
+    PayloadFilter, PayloadValue, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult,
+    validate_identifier,
 };
 
 /// Weaviate REST vector sink.
@@ -54,6 +55,59 @@ impl WeaviateSink {
     }
 }
 
+/// Derive a deterministic RFC-4122 UUID (v5-style, name-based via SHA-256)
+/// from a Krishiv point id. Weaviate rejects object ids that are not UUIDs.
+fn uuid_from_point_id(point_id: &str) -> String {
+    let digest = krishiv_common::hash::sha256_bytes_multi(&[point_id.as_bytes()]);
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50; // version 5
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC-4122 variant
+    let hex = |range: std::ops::Range<usize>| -> String {
+        bytes
+            .get(range)
+            .map(|group| group.iter().map(|b| format!("{b:02x}")).collect())
+            .unwrap_or_default()
+    };
+    format!(
+        "{}-{}-{}-{}-{}",
+        hex(0..4),
+        hex(4..6),
+        hex(6..8),
+        hex(8..10),
+        hex(10..16)
+    )
+}
+
+/// Render a `PayloadFilter` as a Weaviate GraphQL `where` argument.
+fn filter_to_where(filter: &PayloadFilter) -> VectorSinkResult<String> {
+    let mut operands = Vec::new();
+    for (key, value) in &filter.equals {
+        validate_identifier(key)
+            .map_err(|_| VectorSinkError::Query(format!("invalid filter key: {key}")))?;
+        let clause = match value {
+            PayloadValue::String(s) => {
+                let quoted = serde_json::Value::String(s.clone()).to_string();
+                format!("{{ path: [\"{key}\"], operator: Equal, valueText: {quoted} }}")
+            }
+            PayloadValue::Int(i) => {
+                format!("{{ path: [\"{key}\"], operator: Equal, valueInt: {i} }}")
+            }
+            PayloadValue::Float(f) => {
+                format!("{{ path: [\"{key}\"], operator: Equal, valueNumber: {f} }}")
+            }
+            PayloadValue::Bool(b) => {
+                format!("{{ path: [\"{key}\"], operator: Equal, valueBoolean: {b} }}")
+            }
+        };
+        operands.push(clause);
+    }
+    Ok(format!(
+        "{{ operator: And, operands: [{}] }}",
+        operands.join(", ")
+    ))
+}
+
 #[async_trait]
 impl VectorSink for WeaviateSink {
     fn sink_name(&self) -> &str {
@@ -67,7 +121,7 @@ impl VectorSink for WeaviateSink {
             .zip(batch.vectors.iter())
             .zip(batch.payloads.iter())
         {
-            let id = point_id_from_doc_epoch(doc_id, batch.epoch);
+            let id = uuid_from_point_id(&point_id_from_doc_epoch(doc_id, batch.epoch));
             let mut properties: HashMap<String, serde_json::Value> = payload
                 .iter()
                 .map(|(k, v)| (k.clone(), v.to_json()))
@@ -97,7 +151,7 @@ impl VectorSink for WeaviateSink {
 
     async fn delete_by_ids(&self, ids: &[String]) -> VectorSinkResult<()> {
         for id in ids {
-            let url = format!("{}/v1/objects/{}", self.base_url, id);
+            let url = format!("{}/v1/objects/{}", self.base_url, uuid_from_point_id(id));
             let response = self
                 .auth(self.client.delete(&url))
                 .send()
@@ -120,11 +174,17 @@ impl VectorSink for WeaviateSink {
         &self,
         vector: &[f32],
         top_k: usize,
-        _filter: Option<&PayloadFilter>,
+        filter: Option<&PayloadFilter>,
     ) -> VectorSinkResult<Vec<ScoredChunk>> {
+        let where_arg = match filter {
+            Some(f) if !f.equals.is_empty() => format!(", where: {}", filter_to_where(f)?),
+            _ => String::new(),
+        };
+        // Weaviate GraphQL contract: requested properties are top-level fields
+        // on each hit, and nearVector exposes `distance` under `_additional`.
         let body = json!({
             "query": format!(
-                "{{ Get {{ {class}(limit: {limit}, nearVector: {{ vector: [{vec}] }}) {{ properties {{ text chunk_index doc_id }} _additional {{ score }} }} }} }}",
+                "{{ Get {{ {class}(limit: {limit}, nearVector: {{ vector: [{vec}] }}{where_arg}) {{ text chunk_index doc_id _additional {{ distance }} }} }} }}",
                 class = self.class_name,
                 limit = top_k,
                 vec = vector.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
@@ -151,24 +211,20 @@ impl VectorSink for WeaviateSink {
             return Ok(out);
         };
         for hit in hits {
+            // Cosine distance is in [0, 2]; convert to a similarity score.
             let score = hit
-                .pointer("/_additional/score")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<f32>().ok())
-                .or_else(|| hit.get("score").and_then(|v| v.as_f64()).map(|f| f as f32))
+                .pointer("/_additional/distance")
+                .and_then(|v| v.as_f64())
+                .map(|d| 1.0 - d as f32)
                 .unwrap_or(0.0);
-            let props = hit.get("properties").or_else(|| hit.get("_additional"));
-            let text = props
-                .and_then(|p| p.get("text"))
+            let text = hit
+                .get("text")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let chunk_index = props
-                .and_then(|p| p.get("chunk_index"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as usize;
-            let doc_id = props
-                .and_then(|p| p.get("doc_id"))
+            let chunk_index = hit.get("chunk_index").and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+            let doc_id = hit
+                .get("doc_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -192,12 +248,16 @@ mod tests {
     #[tokio::test]
     async fn weaviate_query_returns_results() {
         let mut server = mockito::Server::new_async().await;
+        // Real Weaviate GraphQL response shape: requested properties are
+        // top-level fields on the hit; nearVector exposes `distance`.
         let body = serde_json::json!({
             "data": {
                 "Get": {
                     "Document": [{
-                        "properties": { "text": "hello", "chunk_index": 2 },
-                        "_additional": { "score": "0.91" }
+                        "text": "hello",
+                        "chunk_index": 2,
+                        "doc_id": "d1",
+                        "_additional": { "distance": 0.09 }
                     }]
                 }
             }
@@ -213,6 +273,77 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].text, "hello");
         assert_eq!(hits[0].chunk_index, 2);
+        assert_eq!(hits[0].doc_id, "d1");
+        assert!((hits[0].score - 0.91).abs() < 1e-6);
+    }
+
+    #[test]
+    fn weaviate_object_id_is_rfc4122_uuid() {
+        let id = uuid_from_point_id(&point_id_from_doc_epoch("d1", 1));
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(parts.len(), 5);
+        let lens: Vec<usize> = parts.iter().map(|p| p.len()).collect();
+        assert_eq!(lens, vec![8, 4, 4, 4, 12]);
+        assert!(parts[2].starts_with('5'), "version nibble must be 5: {id}");
+        assert!(
+            matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'),
+            "variant nibble must be RFC-4122: {id}"
+        );
+        // Deterministic across calls.
+        assert_eq!(id, uuid_from_point_id(&point_id_from_doc_epoch("d1", 1)));
+    }
+
+    #[tokio::test]
+    async fn weaviate_upsert_sends_uuid_object_id() {
+        let mut server = mockito::Server::new_async().await;
+        let expected_id = uuid_from_point_id(&point_id_from_doc_epoch("d1", 1));
+        let m = server
+            .mock("PUT", "/v1/objects")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({ "id": expected_id }),
+            ))
+            .with_status(200)
+            .create_async()
+            .await;
+        let sink = WeaviateSink::new(server.url(), "Document", None).unwrap();
+        let batch = EmbeddingBatch::new(
+            vec!["d1".into()],
+            vec![vec![0.1, 0.2]],
+            vec![HashMap::new()],
+            1,
+        );
+        sink.upsert_batch(&batch).await.unwrap();
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn weaviate_query_sends_where_filter() {
+        let mut server = mockito::Server::new_async().await;
+        let body = serde_json::json!({ "data": { "Get": { "Document": [] } } });
+        let m = server
+            .mock("POST", "/v1/graphql")
+            .match_request(|req| {
+                let text = req
+                    .body()
+                    .map(|b| String::from_utf8_lossy(b).to_string())
+                    .unwrap_or_default();
+                text.contains("where:")
+                    && text.contains("operator: Equal")
+                    && text.contains(r#"path: [\"lang\"]"#)
+                    && text.contains(r#"valueText: \"en\""#)
+            })
+            .with_status(200)
+            .with_body(body.to_string())
+            .create_async()
+            .await;
+        let sink = WeaviateSink::new(server.url(), "Document", None).unwrap();
+        let mut equals = HashMap::new();
+        equals.insert("lang".into(), PayloadValue::String("en".into()));
+        let filter = PayloadFilter { equals };
+        sink.query_nearest(&[0.1, 0.2], 1, Some(&filter))
+            .await
+            .unwrap();
+        m.assert_async().await;
     }
 
     #[tokio::test]

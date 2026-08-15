@@ -1602,6 +1602,19 @@ impl PySession {
                                         );
                                         break;
                                     }
+                                    // The batch is now handed to the streaming
+                                    // table: acknowledge it so the broker's
+                                    // unacked backlog (and our pending buffer)
+                                    // do not grow without bound. An ack failure
+                                    // is not fatal — unacked messages are simply
+                                    // redelivered (at-least-once).
+                                    if let Err(e) = src.ack_all_pending().await {
+                                        tracing::warn!(
+                                            task = %name_for_task,
+                                            error = %e,
+                                            "pulsar consumer: ack failed; messages will be redelivered"
+                                        );
+                                    }
                                     message_count += n;
                                     if message_count % 10_000 == 0 {
                                         tracing::debug!(
@@ -1612,11 +1625,10 @@ impl PySession {
                                     }
                                 }
                                 Ok(None) => {
-                                    tracing::debug!(
-                                        task = %name_for_task,
-                                        "pulsar consumer: end of topic"
-                                    );
-                                    break;
+                                    // Idle — no message arrived within the poll
+                                    // window. A Pulsar topic has no end; keep
+                                    // polling until the input is closed.
+                                    continue;
                                 }
                                 Err(e) => {
                                     tracing::warn!(

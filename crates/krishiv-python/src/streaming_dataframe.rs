@@ -136,7 +136,11 @@ impl PyStreamingDataFrame {
     pub fn select(&self, columns: Vec<String>) -> PyResult<Self> {
         let cols: Vec<&str> = columns.iter().map(String::as_str).collect();
         Ok(Self {
-            inner: self.inner.clone().select(&cols).map_err(map_krishiv_error)?,
+            inner: self
+                .inner
+                .clone()
+                .select(&cols)
+                .map_err(map_krishiv_error)?,
         })
     }
 

@@ -548,7 +548,9 @@ impl Sink for S3Sink {
         {
             return Err(ConnectorError::ObjectStore {
                 message: format!(
-                    "S3Sink pending byte limit ({} bytes) exceeded; flush before writing more",
+                    "S3Sink pending byte limit ({} bytes) exceeded; this sink uploads one \
+                     object at a fixed key on flush (a second flush would overwrite the \
+                     first) — write the remaining data through a new sink with a new key",
                     self.max_pending_bytes
                 ),
                 status: None,
@@ -685,9 +687,30 @@ mod tests {
             .unwrap();
         sink.flush().await.unwrap();
 
-        let source = S3Source::open(store, path).await.unwrap();
-        // Verify the source can be opened and schema probed successfully.
-        let _ = source.schema();
+        // Read the whole object once, checkpointing after the first batch.
+        let mut first = S3Source::open(Arc::clone(&store), path.clone())
+            .await
+            .unwrap();
+        let head = first.read_batch().await.unwrap().expect("one batch");
+        let rows_before_checkpoint = head.num_rows();
+        let offset = first.checkpoint_offset().unwrap();
+        assert_eq!(offset.batch_index, 1, "cursor advances with reads");
+        let mut rows_after_checkpoint = 0usize;
+        while let Some(b) = first.read_batch().await.unwrap() {
+            rows_after_checkpoint += b.num_rows();
+        }
+
+        // A FRESH source restored to that offset must resume exactly there:
+        // it re-reads only the rows that came after the checkpoint.
+        let mut restored = S3Source::open(store, path).await.unwrap();
+        restored.restore_offset(&offset).unwrap();
+        assert_eq!(restored.checkpoint_offset().unwrap().batch_index, 1);
+        let mut restored_rows = 0usize;
+        while let Some(b) = restored.read_batch().await.unwrap() {
+            restored_rows += b.num_rows();
+        }
+        assert_eq!(restored_rows, rows_after_checkpoint);
+        assert_eq!(rows_before_checkpoint + restored_rows, 2);
     }
 
     /// Regression (Wave 1 — Large File OOM): `S3Sink` must bound the total

@@ -92,7 +92,7 @@ impl VectorSink for InMemoryVectorSink {
         let mut guard = self
             .points
             .write()
-            .map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
+            .map_err(|e| VectorSinkError::Delete(e.to_string()))?;
         for id in ids {
             guard.remove(id);
         }
@@ -109,6 +109,13 @@ impl VectorSink for InMemoryVectorSink {
             .points
             .read()
             .map_err(|e| VectorSinkError::Query(e.to_string()))?;
+        if let Some(p) = guard.values().find(|p| p.vector.len() != vector.len()) {
+            return Err(VectorSinkError::Query(format!(
+                "query dim mismatch: query has {}, stored point has {}",
+                vector.len(),
+                p.vector.len()
+            )));
+        }
         let mut scored: Vec<ScoredChunk> = guard
             .values()
             .filter(|p| Self::matches_filter(&p.payload, filter))

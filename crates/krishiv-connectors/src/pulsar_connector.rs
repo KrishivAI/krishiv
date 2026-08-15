@@ -86,6 +86,9 @@ pub struct PulsarConfig {
     pub sub_type: SubType,
     /// Maximum messages per `read_batch` call (default: 500).
     pub batch_size: usize,
+    /// How long a single poll waits for the next message before the batch
+    /// is returned as-is (default: 1s).
+    pub poll_timeout: std::time::Duration,
 }
 
 impl PulsarConfig {
@@ -97,6 +100,7 @@ impl PulsarConfig {
             subscription: "krishiv-default".into(),
             sub_type: SubType::Exclusive,
             batch_size: 500,
+            poll_timeout: std::time::Duration::from_secs(1),
         }
     }
 
@@ -114,6 +118,12 @@ impl PulsarConfig {
         self.batch_size = n.max(1);
         self
     }
+
+    /// Override the per-message poll timeout (default 1s).
+    pub fn with_poll_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.poll_timeout = timeout;
+        self
+    }
 }
 
 // ── Source ────────────────────────────────────────────────────────────────────
@@ -122,17 +132,22 @@ impl PulsarConfig {
 ///
 /// Messages are consumed lazily. Each call to
 /// [`next_batch`][PulsarSource::next_batch] polls the consumer for up to
-/// `max_messages` messages and converts them to a batch.
+/// `max_messages` messages (bounded per-message by `poll_timeout`) and
+/// converts them to a batch.
 ///
-/// Returns `Ok(None)` if no messages are available within the first poll.
+/// Returns `Ok(None)` if no message arrives within the poll window — the
+/// source is idle, not exhausted; callers should keep polling.
 pub struct PulsarSource {
     consumer: Consumer<RawBytes, TokioExecutor>,
     schema: SchemaRef,
     batch_size: usize,
-    /// Messages read but not yet acknowledged.  The consumer holds them in
-    /// unacked state until `ack_all_pending()` is called, providing
-    /// at-least-once delivery semantics.
-    pending_messages: VecDeque<(String, Option<String>, i64, Vec<u8>, MessageData)>,
+    poll_timeout: std::time::Duration,
+    /// Ids of messages read and DELIVERED but not yet acknowledged. Only the
+    /// `(topic, MessageData)` needed to ack is retained — payloads are not,
+    /// so the pending buffer stays small. The broker holds them in unacked
+    /// state until `ack_all_pending()` is called, providing at-least-once
+    /// delivery semantics.
+    pending_messages: VecDeque<(String, MessageData)>,
 }
 
 impl PulsarSource {
@@ -156,6 +171,7 @@ impl PulsarSource {
             consumer,
             schema: pulsar_arrow_schema(),
             batch_size: config.batch_size,
+            poll_timeout: config.poll_timeout,
             pending_messages: VecDeque::new(),
         })
     }
@@ -168,7 +184,10 @@ impl PulsarSource {
     /// Poll for up to `max_messages` Pulsar messages and convert them to a
     /// single [`RecordBatch`].
     ///
-    /// Returns `Ok(None)` when no message is ready immediately.
+    /// Each poll waits at most the configured `poll_timeout` (default 1s)
+    /// for the next message; on timeout the messages collected so far are
+    /// returned as a partial batch, or `Ok(None)` if nothing arrived within
+    /// the window. `Ok(None)` therefore means "idle", not end-of-topic.
     ///
     /// Messages are NOT acked here. Call [`ack_all_pending`][Self::ack_all_pending]
     /// after confirming downstream durability. This prevents data loss: if the
@@ -184,32 +203,29 @@ impl PulsarSource {
         let mut ts_col = Int64Builder::new();
         let mut data_col = BinaryBuilder::new();
         let mut count = 0usize;
+        // Ack ids for THIS batch only. They join `pending_messages` after
+        // the batch is successfully built: a message consumed during a
+        // failed call must never be queued for ack, because acking what was
+        // not delivered downstream silently drops it.
+        let mut batch_ids: Vec<(String, MessageData)> = Vec::new();
 
         while count < max_messages {
-            match self.consumer.try_next().await {
-                Ok(Some(msg)) => {
+            match tokio::time::timeout(self.poll_timeout, self.consumer.try_next()).await {
+                // Poll window elapsed: return what we have as a partial batch.
+                Err(_) => break,
+                Ok(Ok(Some(msg))) => {
                     topic_col.append_value(&msg.topic);
-                    let partition_key = msg.payload.metadata.partition_key.clone();
-                    match &partition_key {
+                    match &msg.payload.metadata.partition_key {
                         Some(k) => key_col.append_value(k),
                         None => key_col.append_null(),
                     }
-                    let publish_time = msg.payload.metadata.publish_time as i64;
-                    ts_col.append_value(publish_time);
-                    let payload_data = msg.payload.data.clone();
-                    data_col.append_value(&payload_data);
+                    ts_col.append_value(msg.payload.metadata.publish_time as i64);
+                    data_col.append_value(&msg.payload.data);
                     count += 1;
-                    // Record the message for deferred ack.
-                    self.pending_messages.push_back((
-                        msg.topic.clone(),
-                        partition_key,
-                        publish_time,
-                        payload_data,
-                        msg.message_id.clone(),
-                    ));
+                    batch_ids.push((msg.topic.clone(), msg.message_id.clone()));
                 }
-                Ok(None) => break,
-                Err(e) => {
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => {
                     return Err(ConnectorError::Io(std::io::Error::other(e.to_string())));
                 }
             }
@@ -230,6 +246,10 @@ impl PulsarSource {
         )
         .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
 
+        // The batch is now delivered to the caller: only from this point may
+        // its messages be acked.
+        self.pending_messages.extend(batch_ids);
+
         Ok(Some(batch))
     }
 
@@ -239,7 +259,7 @@ impl PulsarSource {
     /// the data. Calling before durability creates a gap where acknowledged
     /// messages are lost on crash.
     pub async fn ack_all_pending(&mut self) -> ConnectorResult<()> {
-        while let Some((topic, _key, _ts, _data, msg_id)) = self.pending_messages.pop_front() {
+        while let Some((topic, msg_id)) = self.pending_messages.pop_front() {
             // `Consumer::ack` needs the whole consumed `Message`, which we do
             // not retain (only its id, so the pending buffer stays small);
             // `ack_with_id` is the id-addressed form and needs the message's
@@ -259,7 +279,14 @@ impl PulsarSource {
 
     /// Connector capabilities: unbounded streaming source.
     pub fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::default().with_unbounded()
+        Self::source_capabilities()
+    }
+
+    /// The capabilities this source honestly advertises: unbounded streaming
+    /// with NO checkpoint support (offsets are managed by the Pulsar
+    /// subscription's ack cursor, not by encoded checkpoints).
+    pub fn source_capabilities() -> ConnectorCapabilities {
+        ConnectorCapabilities::new().with_unbounded()
     }
 }
 
@@ -267,7 +294,7 @@ impl PulsarSource {
 
 impl Source for PulsarSource {
     fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::new().with_unbounded()
+        Self::source_capabilities()
     }
 
     fn source_schema(&self) -> Option<SchemaRef> {
@@ -282,7 +309,7 @@ impl Source for PulsarSource {
         // Return the latest pending message ID as the current position.
         self.pending_messages
             .back()
-            .map(|(_t, _k, _ts, _d, msg_id)| Box::new(msg_id.clone()) as Box<dyn Any + Send>)
+            .map(|(_t, msg_id)| Box::new(msg_id.clone()) as Box<dyn Any + Send>)
     }
 }
 
@@ -426,16 +453,19 @@ mod tests {
 
     #[test]
     fn capabilities_unbounded() {
-        let caps = ConnectorCapabilities::default().with_unbounded();
+        // Assert on the capabilities the SOURCE actually advertises.
+        let caps = PulsarSource::source_capabilities();
         assert!(!caps.is_bounded());
+        assert!(caps.is_unbounded());
     }
 
     #[test]
-    fn source_capabilities_include_checkpoint() {
-        let caps = ConnectorCapabilities::new()
-            .with_unbounded()
-            .with_checkpoint();
-        assert!(caps.is_checkpoint_capable());
+    fn source_does_not_advertise_checkpoint() {
+        // The Pulsar `Source` impl has no checkpoint support — offsets ride
+        // on the subscription's ack cursor. Advertising checkpoint here
+        // would be an overclaim the platform would act on.
+        let caps = PulsarSource::source_capabilities();
+        assert!(!caps.is_checkpoint_capable());
         assert!(!caps.is_bounded());
     }
 

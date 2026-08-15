@@ -1024,7 +1024,8 @@ mod tests {
         // whole response is one gRPC message, so this is the transport-level
         // signal that a response was too big to even receive, not just too
         // big by the application's own accounting.
-        let s = tonic::Status::out_of_range("decoded message length too large: found 999, limit 100");
+        let s =
+            tonic::Status::out_of_range("decoded message length too large: found 999, limit 100");
         match map_do_action_status(s) {
             RuntimeError::ResultTooLarge { message } => {
                 assert!(message.contains("too large"));
@@ -1461,7 +1462,9 @@ mod tests {
         // failed with a raw, unclassified tonic decode error before the
         // app-level cap (or ResultTooLarge classification) ever ran.
         let result = do_action_against_oversized_mock(40 * 1024 * 1024, 1).await?;
-        let body = result.expect("40 MiB single-chunk response must succeed, not hit gRPC's decode-length default");
+        let body = result.expect(
+            "40 MiB single-chunk response must succeed, not hit gRPC's decode-length default",
+        );
         assert_eq!(body.len(), 40 * 1024 * 1024);
         Ok(())
     }
@@ -1557,16 +1560,16 @@ mod tests {
         )]));
         RecordBatch::try_new(
             schema,
-            vec![Arc::new(Int64Array::from_iter_values(
-                0..rows as i64,
-            ))],
+            vec![Arc::new(Int64Array::from_iter_values(0..rows as i64))],
         )
         .expect("valid batch")
     }
 
     #[tokio::test]
     async fn collect_flight_batches_zero_cap_is_unbounded() {
-        let stream = Box::pin(futures::stream::iter((0..3).map(|_| Ok(sized_batch(1_000)))))
+        let stream = Box::pin(futures::stream::iter(
+            (0..3).map(|_| Ok(sized_batch(1_000))),
+        ))
             as std::pin::Pin<
                 Box<dyn futures::Stream<Item = arrow_flight::error::Result<RecordBatch>>>,
             >;
@@ -1579,7 +1582,9 @@ mod tests {
     #[tokio::test]
     async fn collect_flight_batches_under_cap_is_accepted() {
         let one_batch_bytes = sized_batch(1_000).get_array_memory_size();
-        let stream = Box::pin(futures::stream::iter((0..3).map(|_| Ok(sized_batch(1_000)))))
+        let stream = Box::pin(futures::stream::iter(
+            (0..3).map(|_| Ok(sized_batch(1_000))),
+        ))
             as std::pin::Pin<
                 Box<dyn futures::Stream<Item = arrow_flight::error::Result<RecordBatch>>>,
             >;
@@ -1592,7 +1597,9 @@ mod tests {
     #[tokio::test]
     async fn collect_flight_batches_over_cap_is_rejected() {
         let one_batch_bytes = sized_batch(1_000).get_array_memory_size();
-        let stream = Box::pin(futures::stream::iter((0..3).map(|_| Ok(sized_batch(1_000)))))
+        let stream = Box::pin(futures::stream::iter(
+            (0..3).map(|_| Ok(sized_batch(1_000))),
+        ))
             as std::pin::Pin<
                 Box<dyn futures::Stream<Item = arrow_flight::error::Result<RecordBatch>>>,
             >;

@@ -33,18 +33,19 @@ impl AvroDeserializer {
 #[async_trait]
 impl KafkaDeserializer for AvroDeserializer {
     async fn decode(&self, payload: &[u8]) -> SchemaRegistryResult<(SchemaRef, Vec<RecordBatch>)> {
-        if payload.len() < 5 || payload[0] != 0 {
+        if payload.len() < 5 || payload.first() != Some(&0) {
             return Err(SchemaRegistryError::Decode(
                 "expected Confluent magic byte 0".into(),
             ));
         }
-        let schema_id_bytes: [u8; 4] = payload[1..5]
-            .try_into()
-            .map_err(|_| SchemaRegistryError::Decode("failed to read schema id bytes".into()))?;
+        let schema_id_bytes: [u8; 4] = payload
+            .get(1..5)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| SchemaRegistryError::Decode("failed to read schema id bytes".into()))?;
         let schema_id = u32::from_be_bytes(schema_id_bytes);
         let avro_schema = self.client.fetch_avro_schema(schema_id).await?;
 
-        decode_avro_datum_payload(&avro_schema, &payload[5..])
+        decode_avro_datum_payload(&avro_schema, payload.get(5..).unwrap_or_default())
     }
 }
 
@@ -177,10 +178,13 @@ pub(crate) fn avro_records_to_batches(
     for record in records {
         match record {
             Value::Record(fields) => {
-                let orig_len = columns[0].len();
+                let orig_len = columns.first().map_or(0, Vec::len);
                 for (name, val) in fields {
-                    if let Some(&col_idx) = name_to_idx.get(name.as_str()) {
-                        columns[col_idx].push(val);
+                    if let Some(col) = name_to_idx
+                        .get(name.as_str())
+                        .and_then(|&col_idx| columns.get_mut(col_idx))
+                    {
+                        col.push(val);
                     }
                 }
                 for col in columns.iter_mut() {
@@ -190,10 +194,15 @@ pub(crate) fn avro_records_to_batches(
                 }
             }
             other => {
-                if let Some(&col_idx) = name_to_idx.get("value") {
-                    columns[col_idx].push(other);
-                } else if num_fields == 1 {
-                    columns[0].push(other);
+                if let Some(col) = name_to_idx
+                    .get("value")
+                    .and_then(|&col_idx| columns.get_mut(col_idx))
+                {
+                    col.push(other);
+                } else if num_fields == 1
+                    && let Some(col) = columns.first_mut()
+                {
+                    col.push(other);
                 }
             }
         }

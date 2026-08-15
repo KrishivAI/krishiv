@@ -8,13 +8,13 @@
 //! | `sequence_number`      | `Utf8`      | Kinesis sequence number            |
 //! | `partition_key`        | `Utf8`      | Kinesis partition key              |
 //! | `data`                 | `Binary`    | Raw record payload bytes           |
-//! | `arrival_timestamp_ms` | `Int64`     | Approx. arrival epoch ms; -1 if absent |
+//! | `arrival_timestamp_ms` | `Int64`     | Approx. arrival epoch ms; null if absent |
 //!
 //! # Usage
 //!
 //! ```no_run
 //! # #[cfg(feature = "kinesis")]
-//! # async fn example() -> anyhow::Result<()> {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! use krishiv_connectors::kinesis::{KinesisConfig, KinesisSource, ShardPosition};
 //!
 //! let cfg = KinesisConfig {
@@ -241,6 +241,12 @@ impl KinesisSource {
     /// Returns `Ok(None)` when the stream is exhausted (end of shard or no
     /// more data and `MillisBehindLatest == 0` with no iterator).
     pub async fn next_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
+        // A pending checkpoint restore applies here (not only via
+        // `Source::read_batch`) so direct callers of the public API resume
+        // from the restored position too.
+        if let Some(seq) = self.restore_to_sequence.take() {
+            self.shard_iterator = self.get_shard_iterator_after(&seq).await?;
+        }
         let iterator = match self.shard_iterator.take() {
             Some(it) => it,
             None => return Ok(None),
@@ -267,7 +273,25 @@ impl KinesisSource {
             self.last_sequence_number = Some(last.sequence_number().to_owned());
         }
 
-        Ok(Some(records_to_batch(&self.schema, records)))
+        Ok(Some(records_to_batch(&self.schema, records)?))
+    }
+
+    /// Build a source around an offline client for state-machine tests
+    /// (checkpoint/restore) that never issue an AWS call.
+    #[cfg(test)]
+    fn offline_for_tests() -> Self {
+        let conf = aws_sdk_kinesis::Config::builder()
+            .behavior_version(aws_sdk_kinesis::config::BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .build();
+        Self {
+            client: Client::from_conf(conf),
+            config: KinesisConfig::new("test-stream", "us-east-1"),
+            schema: kinesis_arrow_schema(),
+            shard_iterator: None,
+            last_sequence_number: None,
+            restore_to_sequence: None,
+        }
     }
 
     /// Connector capabilities: unbounded streaming source.
@@ -290,9 +314,7 @@ impl Source for KinesisSource {
     }
 
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
-        if let Some(seq) = self.restore_to_sequence.take() {
-            self.shard_iterator = self.get_shard_iterator_after(&seq).await?;
-        }
+        // `next_batch` applies any pending checkpoint restore itself.
         self.next_batch().await
     }
 
@@ -317,8 +339,15 @@ impl CheckpointSource for KinesisSource {
     type Offset = KinesisOffset;
 
     fn checkpoint_offset(&self) -> ConnectorResult<KinesisOffset> {
+        // A checkpoint taken after a restore but before the first read must
+        // carry the restored position forward, not regress to "empty"
+        // (which would restart the shard from its configured start).
         Ok(KinesisOffset {
-            sequence_number: self.last_sequence_number.clone().unwrap_or_default(),
+            sequence_number: self
+                .last_sequence_number
+                .clone()
+                .or_else(|| self.restore_to_sequence.clone())
+                .unwrap_or_default(),
         })
     }
 
@@ -333,7 +362,7 @@ impl CheckpointSource for KinesisSource {
 // ── Conversion ────────────────────────────────────────────────────────────────
 
 /// Convert a slice of Kinesis [`Record`] values to an Arrow [`RecordBatch`].
-pub fn records_to_batch(schema: &SchemaRef, records: &[Record]) -> RecordBatch {
+pub fn records_to_batch(schema: &SchemaRef, records: &[Record]) -> ConnectorResult<RecordBatch> {
     let n = records.len();
     let mut seq_col = StringBuilder::with_capacity(n, n * 32);
     let mut key_col = StringBuilder::with_capacity(n, n * 16);
@@ -362,7 +391,9 @@ pub fn records_to_batch(schema: &SchemaRef, records: &[Record]) -> RecordBatch {
             Arc::new(ts_col.finish()),
         ],
     )
-    .expect("schema matches builders — infallible")
+    .map_err(|e| ConnectorError::Schema {
+        message: format!("kinesis records_to_batch: schema/builder mismatch: {e}"),
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -416,7 +447,7 @@ mod tests {
             make_record("seq-001", "pk-a", b"hello"),
             make_record("seq-002", "pk-b", b"world"),
         ];
-        let batch = records_to_batch(&schema, &records);
+        let batch = records_to_batch(&schema, &records).unwrap();
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 4);
 
@@ -443,7 +474,7 @@ mod tests {
     #[test]
     fn empty_records_produces_empty_batch() {
         let schema = kinesis_arrow_schema();
-        let batch = records_to_batch(&schema, &[]);
+        let batch = records_to_batch(&schema, &[]).unwrap();
         assert_eq!(batch.num_rows(), 0);
     }
 
@@ -475,8 +506,10 @@ mod tests {
 
     #[test]
     fn capabilities_unbounded() {
-        // Test without connecting — just verify the capabilities flag.
-        let caps = ConnectorCapabilities::default().with_unbounded();
+        // Assert on the SOURCE's own inherent capabilities, not a hand-built
+        // duplicate of what they ought to be.
+        let src = KinesisSource::offline_for_tests();
+        let caps = src.capabilities();
         assert!(!caps.is_bounded());
     }
 
@@ -507,23 +540,33 @@ mod tests {
 
     #[test]
     fn source_capabilities_include_checkpoint() {
-        let caps = ConnectorCapabilities::new()
-            .with_unbounded()
-            .with_checkpoint();
+        // Assert on the Source impl's own capabilities.
+        let src = KinesisSource::offline_for_tests();
+        let caps = Source::capabilities(&src);
         assert!(caps.is_checkpoint_capable());
         assert!(!caps.is_bounded());
     }
 
     #[test]
     fn restore_offset_stores_pending_sequence() {
-        // We can test `restore_offset` logic without connecting by building
-        // a KinesisSource from the batch-conversion API (pure functions).
-        // Just verify the encode/decode round-trip covers the restore path.
+        // `restore_offset` must actually park the sequence for the next
+        // read, and a checkpoint taken BEFORE that read must carry the
+        // restored position rather than regressing to the empty offset.
+        let mut src = KinesisSource::offline_for_tests();
         let offset = KinesisOffset {
             sequence_number: "seq-abc-123".into(),
         };
-        let encoded = offset.encode();
-        let decoded = KinesisOffset::decode(&encoded).unwrap();
-        assert_eq!(decoded.sequence_number, "seq-abc-123");
+        src.restore_offset(&offset).unwrap();
+        let checkpoint = src.checkpoint_offset().unwrap();
+        assert_eq!(checkpoint.sequence_number, "seq-abc-123");
+
+        // An empty offset (nothing ever read) is a no-op restore.
+        let mut fresh = KinesisSource::offline_for_tests();
+        fresh
+            .restore_offset(&KinesisOffset {
+                sequence_number: String::new(),
+            })
+            .unwrap();
+        assert_eq!(fresh.checkpoint_offset().unwrap().sequence_number, "");
     }
 }

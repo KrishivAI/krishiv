@@ -40,7 +40,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | **Tier 2 — correctness blast radius** |
 | 5 | krishiv-plan | 14,371 | 25 | **25 (COMPLETE)** | plan IR every surface depends on; 3 can't-fail tests fixed, 2 unreachable AQE rules with latent outer-join bugs documented, 4 dead pub surfaces recorded |
 | 6 | krishiv-common | 7,966 | 23 | **23 (COMPLETE)** | 2 wrong-answer fixes (Float64 signed-zero shard split, UMM available `max`→`min`), a heartbeat env busy-loop, 3 declared-default drifts, registry `.rs.inc` scan blindness |
-| 7 | krishiv-connectors | 39,930 | 97 | 0 | ingest correctness; 42 files with no tests |
+| 7 | krishiv-connectors | 39,930 | 97 | **97 (COMPLETE)** | ~60 defects fixed incl. avro silent corruption, kafka/cdc offset-before-delivery, NULL-predicate DELETE, orphan-cleanup deleting live MoR delete files, LanceDB fragment loss, 2PC later-epoch drops; streaming_unify deleted; ~120 tests added |
 | 8 | krishiv-state | 12,357 | 37 | 0 | checkpoints/restore; fewer than half the files tested |
 | **Tier 3 — runtime & surfaces** |
 | 9 | krishiv-api | 25,111 | 38 | 0 | |
@@ -1879,7 +1879,216 @@ reference and `krishiv doctor` lie.
 
 ---
 
-## 7–27. Not yet started
+## 7. krishiv-connectors — 97 of 97 files read whole (COMPLETE, 2026-08-15)
+
+Read via 11 parallel reader agents over every `src/**/*.rs` + `tests/` file
+(no `.rs.inc` sections in this crate; zero orphan files; zero `unsafe`),
+each finding verified against the code and its workspace callers before any
+edit. ~60 defects found; **all fixed in this session** (user directive: no
+deferrals), including completing missing features rather than rejecting.
+Pre-fix coverage baseline (default features): 66.09% lines.
+
+### Fixed — silent wrong answers / data loss (highest severity)
+
+- [x] **avro.rs was a corruption machine.** Unsupported Arrow types were
+      *written* as their type-name debug string for every row (`"Date32"` in
+      every cell) while the schema mapped them to `string`, so writes
+      succeeded; decode-side type mismatches silently became NULL; `long`
+      values were truncated `as i32`; multi-variant unions decoded to Rust
+      debug strings (`"Int(5)"`); UInt64 > i64::MAX wrapped negative; the
+      doc-promised `bytes`/`fixed` → Binary read path could not build its
+      arrays. Rewrote both directions: mismatches and unsupported types are
+      hard errors (only Avro's own `int→long→float→double` promotions
+      accepted), and completed Binary, Date32, Time32/64,
+      Timestamp(ms/us incl. local), Struct (recursive), and List (recursive)
+      support in schema + values, both read and write. 7 new revert-proven
+      tests incl. binary/timestamp/struct+list round-trips.
+- [x] **kafka.rs committed offsets for undelivered rows** — offsets were
+      recorded per message *before* decode, so a decode/build error advanced
+      the checkpoint past rows the pipeline never received. Offsets now stage
+      in a local map and merge only after the batch is successfully built
+      (`commit_staged_on_success`; revert-proven both ways). The
+      krishiv-sql `kafka_table.rs` manual-commit path had the same shape at
+      the next layer (broker commit before `flush_pending`) — reordered.
+- [x] **dml.rs `iceberg_delete_where` deleted NULL-predicate rows** —
+      survivors were `WHERE NOT (pred)`, so rows where the predicate is NULL
+      (e.g. `name = 'x'` with `name` NULL) were silently deleted. Now
+      `(pred) IS DISTINCT FROM TRUE`, with the deleted count counting only
+      pred-TRUE rows (revert-proven).
+- [x] **MERGE fixes (dml.rs):** `rows_affected` reported the whole post-merge
+      table size; `COALESCE(s.col, t.col)` made it impossible to set a column
+      to NULL from source (now match-marker CASE on the join key); duplicate
+      source keys silently fanned out target rows (now rejected, matching the
+      in-memory twin); `merge_delta` (delta_lake.rs) with
+      `when_matched_update=false` *deleted* every matched target row on an
+      insert-only merge (matched rows now kept).
+- [x] **maintenance.rs deleted live data.** `remove_orphan_files` ignored
+      equality/position-delete files (`t.deletes`), so a MoR table's live
+      delete files were "orphans" — deleted rows resurrected.
+      `expire_snapshots` deleted data files but never expired the snapshots
+      from metadata (time-travel to them silently broke; re-runs
+      double-counted) — now uses `Transaction::expire_snapshots` and is
+      idempotent. Compaction commit-failure no longer leaves an empty table
+      (restore fallback extended past drop+recreate).
+- [x] **streaming_sink.rs `pre_commit` lost the epoch's rows** when the DUR-2
+      sidecar write failed after `mem::take` — taken batches/offsets are put
+      back and the staged parquet removed, so a retry re-stages them
+      (revert-proven).
+- [x] **iceberg_native.rs `overwrite_commit` with empty batches wiped the
+      committed-offset oracle** the DUR-2 idempotency gate depends on
+      (delete-everything epochs re-opened the duplicate/resurrection window).
+      Empty-batch commits now durably record the cumulative kafka offsets and
+      return a real commit identity.
+- [x] **two_phase.rs `commit_through`/`abort_after` dropped every later
+      epoch's prepared handles on a mid-iteration failure** (durably prepared
+      data orphaned as `.tmp` forever under a committed checkpoint) — all
+      unprocessed epochs are re-queued before returning Err (revert-proven).
+      Partial `prepare` failure in `pre_commit` now aborts the handles staged
+      so far instead of leaking them.
+- [x] **Vector store:** LanceDB fragment ids were epoch-only — a second batch
+      at the same epoch overwrote the first's Parquet on disk (data gone
+      after restart; now content-derived ids, revert-proven);
+      `delete_by_ids` could never remove a fragment (point-level ids vs
+      batch-level manifest keys — deletes resurrected on reopen; now a
+      point→fragment index with fragment rewrite); zero-row fragments
+      crashed reload; all four remote sinks (pinecone/weaviate/pgvector/
+      qdrant) silently ignored `PayloadFilter` — filter pushdown implemented
+      per backend; Pinecone query URL broke on scheme-prefixed hosts and
+      returned internal hex ids with empty text (metadata now stored and
+      read back); Weaviate used non-UUID ids (422 on real servers) and an
+      invented GraphQL shape — both fixed to the real API contract;
+      the krishiv-runtime bridge minted a fresh epoch per upsert call,
+      breaking ADR-R17.3 idempotent upsert (now stable ids, revert-proven);
+      dimension mismatches zip-truncated into plausible wrong scores (now
+      errors).
+- [x] **jdbc.rs keyset pagination looped forever returning duplicates** when
+      the key column wasn't BIGINT (`try_get::<i64>` error swallowed — now
+      surfaced); checkpoint-before-first-read invented `last_key=-1`
+      (now `Option<i64>`); composite upsert dedup keys were forgeable via
+      embedded `\u{1f}` (now escaped).
+- [x] **elasticsearch_sink `_id` fell back to the batch-local row index**
+      (cross-batch overwrites: N batches ended as only the last batch) — a
+      configured id column that is missing/null/mistyped is now an error,
+      Int64 ids supported.
+- [x] **pulsar at-least-once never completed:** `ack_all_pending` had zero
+      callers (unbounded pending growth incl. full payloads; total redelivery
+      on restart) — wired into the python streaming loop, payloads no longer
+      retained; messages consumed in a failed batch are no longer queued for
+      ack; `next_batch` no longer blocks until `max_messages` (poll timeout)
+      and stream-idle is no longer treated as end-of-topic.
+- [x] **local_delta.rs commits were not put-if-absent** — concurrent writers
+      clobbered each other's data file and `_delta_log/N.json` silently (now
+      `create_new` version claim with bounded retry, both write_table and the
+      2PC sink); numeric file stats compared as strings (`min "10" > max
+      "9"` → wrong file skipping); vacuum deleted files still referenced by
+      prior versions despite its Safety doc; 2PC commits lacked
+      `commitInfo.timestamp` so AS OF skipped them; `table_schema`
+      materialized the whole table and ignored the pinned version.
+- [x] **delta.rs RocksDbDeltaStore keys were little-endian** — scan order was
+      wrong after 255 appends (deletes replayed before their inserts) — now
+      big-endian with legacy-format detection; namespace prefix scan leaked
+      sibling namespaces (`orders2` under `orders`); Rdkafka store's
+      `len()=0`/no-op `truncate()` lies are now explicit Unsupported errors.
+- [x] **hudi.rs:** 2PC sink staged only in-process and `commit` of an unknown
+      handle returned `Ok` (at-most-once as 2PC) — now durable disk staging
+      with restart recovery and unknown-handle errors; CoW read-modify-write
+      lost concurrent upserts (now conflict detection at commit);
+      `snapshot_rows` reported batch rows not table rows; `delete_by_key`
+      silently no-opped on raw (untyped) key values.
+- [x] **CDC:** `CdcOffsetTracker` had zero callers — the "state feature
+      persists offsets" promise was false; completed the feature
+      (`resume_from` seam + startup filtering by the sink's committed
+      offsets, closing the crash-window duplicate the false "upsert
+      semantics" comment papered over). Tombstone offsets now merge into the
+      snapshot summary (the C6 claim is true now). Registry-decoded CDC with
+      envelope semantics fails closed (append-only opt-in) instead of
+      resurrecting deletes.
+- [x] **Registry/drivers:** IcebergSource advertised rewindable but rewind
+      returned zero rows (reset now real); IcebergSink dropped its false
+      `idempotent` claim; descriptor-vs-instance capability mismatches
+      aligned (cassandra/hbase/es/csv); malformed driver options now error
+      instead of silently defaulting (batch sizes, `recursive`,
+      `start_position`, bool flags, multi-byte delimiter);
+      `jdbc_sink_delivery` wired to a reachable surface; duplicate driver
+      registration warn-logs; `storage_factory` `adls://` reached the
+      local-path branch (bucket now parsed); cassandra column identifiers
+      quoted; hbase `zookeeper_quorum` renamed to `thrift_address` with a
+      guarded alias; `sql.rs` `parse_jdbc` no longer treats a port as a
+      table name.
+- [x] **Parquet:** exhausted `ParquetSource` re-opened and re-decoded the
+      whole file on every poll (now an `exhausted` flag, cleared by
+      reset/restore — revert-proven by deleting the file after exhaustion);
+      `pushdown_filters` doc claimed a `true` default the derive didn't give.
+- [x] **schema_normalize.rs fast-path skipped configured renames** when the
+      source schema coincidentally equaled the target.
+- [x] **kinesis:** checkpoint restore only worked through one of the two read
+      APIs and a checkpoint-after-restore-before-read regressed to empty;
+      production `.expect()` in a CI-unlinted feature (the lint gap itself is
+      recorded below).
+
+### Fixed — honesty, dead code, tests that could not fail
+
+- [x] `lakehouse/streaming_unify.rs` DELETED — documented exactly-once/2PC,
+      caps, and "None = latest", none implemented; zero callers.
+- [x] `check_write_precondition` (TOCTOU twin of `check_and_append`, zero
+      callers) deleted incl. both re-exports.
+- [x] Iceberg branch/tag references were write-only — added
+      `scan_reference()` so they are readable, with clear errors when
+      compaction expired the pinned snapshot; in-memory time-travel to a
+      compacted-away snapshot now errors instead of silently returning zero
+      rows.
+- [x] Kafka transactional sink: unreachable epoch-monotonicity check made
+      real (`last_finalized_epoch`); commit/abort now verify the handle
+      (stale-handle commit of a *different* open transaction was accepted);
+      fencing simulator let fenced zombies keep writing (certification could
+      not catch a coordinator ignoring fences) — fenced sinks now error.
+- [x] `tests/exactly_once.rs` encoded an at-most-once protocol and hardcoded
+      the recovery position its own assertions were supposed to derive —
+      rewritten to couple offset commits to sink commits, resume from
+      recovered offsets, abort the crashed stage, and prove 9000-rows-exact.
+- [x] Certification headers/tests claiming "Kafka/S3 exactly-once" over
+      in-memory/local-FS sinks renamed to what they exercise; LanceDb added
+      to vector certification alongside memory.
+- [x] ~15 cannot-fail tests fixed or deleted across kafka.rs, kinesis.rs,
+      s3.rs, pulsar, jdbc, transactional.rs, src/tests.rs, cdc/mod.rs,
+      integration_connector_lakehouse.rs (DLQ secondary-sink forwarding now
+      actually observed), hudi/delta_lake derive-only tests deleted,
+      hudi vacuum orphan-removal path now genuinely exercised.
+- [x] Kafka restore: all-or-nothing assignment validation before any seek
+      (no partial-restore state); the false "assign() bypasses rebalance"
+      doc replaced with the honest per-assignment-epoch guarantee.
+- [x] Feature-gated lint debt exposed and cleared: CI clippy runs without
+      `--all-features`, so avro/schema-registry/vector/kinesis/etc. carried
+      ~53 violations incl. a production `.expect()` and ~40
+      indexing/slicing sites — all fixed properly (no blanket allows);
+      `cargo clippy --all-features --all-targets` is now clean and is the
+      new bar for this crate.
+
+### Verification
+
+- 683 lib + 18 integration/doc tests pass (`--all-features`); krishiv-sql
+  775 lib tests pass; krishiv-runtime bridge test passes; krishiv-python and
+  krishiv compile clean; workspace clippy (CI config) clean; fmt clean on
+  every touched crate.
+- Revert-proofs: agents proved most per-finding; I independently re-proved
+  the five headline fixes red→green (NULL-predicate delete, commit_through
+  later-epoch requeue, pre_commit buffer restore, LanceDB fragment
+  uniqueness, kafka staged-offset guard).
+
+### Open
+
+- [ ] CI still runs clippy/tests without `--all-features` for this crate —
+      the lint gap that hid the feature-gated debt. Add an all-features lane
+      (cross-cutting; affects other crates too).
+- [ ] Kafka group-rebalance re-seek (ConsumerContext hooks) — the honest doc
+      now states the per-assignment-epoch guarantee; full rebalance-aware
+      restore is a design item.
+- [ ] Coverage re-measure with the ~120 new tests (baseline 66.09% lines,
+      default features).
+
+---
+
+## 8–27. Not yet started
 
 Each crate gets the same treatment and its own section here: measured
 coverage, a table of uncovered-region concentration, a fixed list with commit

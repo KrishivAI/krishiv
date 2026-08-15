@@ -60,4 +60,10 @@ impl CdcOffsetTracker {
     pub fn get_offset(&self, partition: u32) -> Option<i64> {
         self.offsets.get(&partition).copied()
     }
+
+    /// All persisted per-partition offsets, loaded at construction and kept
+    /// current by `commit_offset`.
+    pub fn offsets(&self) -> &std::collections::HashMap<u32, i64> {
+        &self.offsets
+    }
 }

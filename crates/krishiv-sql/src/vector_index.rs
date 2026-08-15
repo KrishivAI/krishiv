@@ -122,8 +122,7 @@ impl IvfIndex {
             let mut counts = vec![0u32; nlist];
             for (&c, r) in assign.iter().zip(rows.chunks_exact(dim)) {
                 let c = c as usize;
-                if let (Some(cnt), Some(s)) =
-                    (counts.get_mut(c), sums.chunks_exact_mut(dim).nth(c))
+                if let (Some(cnt), Some(s)) = (counts.get_mut(c), sums.chunks_exact_mut(dim).nth(c))
                 {
                     *cnt += 1;
                     for (sd, &rd) in s.iter_mut().zip(r) {
@@ -415,15 +414,23 @@ mod tests {
         assert_eq!(index, back);
         // ~0.3% overhead claim sanity: index bytes are a small multiple of
         // nlist*dim floats + row offsets, far under the raw embedding bytes.
-        assert!(bytes.len() < rows.len() * 4, "index smaller than the vectors");
+        assert!(
+            bytes.len() < rows.len() * 4,
+            "index smaller than the vectors"
+        );
     }
 
     #[test]
     fn foreign_or_truncated_footer_is_none_not_panic() {
         assert!(IvfIndex::from_bytes(b"not an ivf footer").is_none());
         let (rows, dim) = fixture(4, 10);
-        let good = IvfIndex::build(&rows, dim, 4, 5, VectorMetric::L2).unwrap().to_bytes();
-        assert!(IvfIndex::from_bytes(&good[..good.len() - 3]).is_none(), "truncated");
+        let good = IvfIndex::build(&rows, dim, 4, 5, VectorMetric::L2)
+            .unwrap()
+            .to_bytes();
+        assert!(
+            IvfIndex::from_bytes(&good[..good.len() - 3]).is_none(),
+            "truncated"
+        );
     }
 
     #[test]
@@ -431,6 +438,9 @@ mod tests {
         let (rows, dim) = fixture(5, 20);
         let a = IvfIndex::build(&rows, dim, 5, 12, VectorMetric::L2).unwrap();
         let b = IvfIndex::build(&rows, dim, 5, 12, VectorMetric::L2).unwrap();
-        assert_eq!(a, b, "same data → identical index (content-addressable footer)");
+        assert_eq!(
+            a, b,
+            "same data → identical index (content-addressable footer)"
+        );
     }
 }

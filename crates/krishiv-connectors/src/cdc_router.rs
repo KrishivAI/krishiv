@@ -11,6 +11,11 @@ use crate::cdc::{CdcEvent, CdcEventSource, CdcOp};
 /// Routes CDC events from one source to per-table delta stores.
 pub struct CdcRouter {
     routes: HashMap<String, Arc<Mutex<TableRoute>>>,
+    /// Test seam: invoked between the schema capture and the append re-check
+    /// so the capture/append race with `update_schema` is deterministically
+    /// reproducible.
+    #[cfg(test)]
+    schema_race_hook: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 struct TableRoute {
@@ -22,6 +27,8 @@ impl CdcRouter {
     pub fn new() -> Self {
         Self {
             routes: HashMap::new(),
+            #[cfg(test)]
+            schema_race_hook: None,
         }
     }
 
@@ -50,26 +57,58 @@ impl CdcRouter {
             .as_ref()
             .or(event.before.as_ref())
             .ok_or_else(|| ConnectorError::Cdc("cdc event missing payload".into()))?;
-        // Clone the target schema outside the mutex lock so schema normalization
-        // does not extend the critical section unnecessarily.
-        let target_schema = {
-            route
-                .lock()
-                .map_err(|_| ConnectorError::Cdc("cdc router lock poisoned".into()))?
-                .target_schema
-                .clone()
-        };
-        let normalized = crate::schema_normalize::SchemaNormalizeOperator::new(target_schema)
-            .normalize(batch)
-            .map_err(|e| ConnectorError::Cdc(e.to_string()))?;
         let op = match event.op {
             CdcOp::Insert | CdcOp::SnapshotRead => DeltaOp::Insert,
             CdcOp::Update => DeltaOp::Update,
             CdcOp::Delete => DeltaOp::Delete,
         };
-        route
+        // Clone the target schema outside the mutex lock so schema normalization
+        // does not extend the critical section unnecessarily. A concurrent
+        // `update_schema` may land between the capture and the append, so the
+        // schema is re-checked under the append lock and normalization retried
+        // against the fresh schema when it changed.
+        const MAX_SCHEMA_RETRIES: usize = 8;
+        for attempt in 0..MAX_SCHEMA_RETRIES {
+            let target_schema = {
+                route
+                    .lock()
+                    .map_err(|_| ConnectorError::Cdc("cdc router lock poisoned".into()))?
+                    .target_schema
+                    .clone()
+            };
+            #[cfg(test)]
+            if attempt == 0
+                && let Some(hook) = &self.schema_race_hook
+            {
+                hook();
+            }
+            #[cfg(not(test))]
+            let _ = attempt;
+            let normalized =
+                crate::schema_normalize::SchemaNormalizeOperator::new(target_schema.clone())
+                    .normalize(batch)
+                    .map_err(|e| ConnectorError::Cdc(e.to_string()))?;
+            let guard = route
+                .lock()
+                .map_err(|_| ConnectorError::Cdc("cdc router lock poisoned".into()))?;
+            if !Arc::ptr_eq(&guard.target_schema, &target_schema) {
+                continue;
+            }
+            return guard
+                .store
+                .append(normalized, op)
+                .map_err(|e| ConnectorError::Cdc(e.to_string()));
+        }
+        // Contention fallback: normalize while holding the lock so the schema
+        // cannot change underneath the append.
+        let guard = route
             .lock()
-            .map_err(|_| ConnectorError::Cdc("cdc router lock poisoned".into()))?
+            .map_err(|_| ConnectorError::Cdc("cdc router lock poisoned".into()))?;
+        let normalized =
+            crate::schema_normalize::SchemaNormalizeOperator::new(guard.target_schema.clone())
+                .normalize(batch)
+                .map_err(|e| ConnectorError::Cdc(e.to_string()))?;
+        guard
             .store
             .append(normalized, op)
             .map_err(|e| ConnectorError::Cdc(e.to_string()))
@@ -225,6 +264,69 @@ mod tests {
         assert!(
             matches!(&err, ConnectorError::Cdc(msg) if msg.contains("missing payload")),
             "expected a 'missing payload' ConnectorError::Cdc, got: {err:?}"
+        );
+    }
+
+    /// Regression: a concurrent `update_schema` landing between the schema
+    /// capture and the append must not produce a stale-schema append — the
+    /// re-check under the append lock retries normalization against the fresh
+    /// schema. The race window is made deterministic via `schema_race_hook`.
+    #[test]
+    fn route_event_renormalizes_when_schema_updated_between_capture_and_append() {
+        use std::sync::Mutex;
+
+        use crate::lakehouse::{DeltaEntry, LakehouseError};
+
+        #[derive(Default)]
+        struct RecordingStore {
+            appended_schemas: Mutex<Vec<Arc<Schema>>>,
+        }
+
+        impl crate::lakehouse::DeltaStore for RecordingStore {
+            fn append(&self, batch: RecordBatch, _op: DeltaOp) -> Result<(), LakehouseError> {
+                self.appended_schemas.lock().unwrap().push(batch.schema());
+                Ok(())
+            }
+
+            fn scan(&self) -> Result<Vec<DeltaEntry>, LakehouseError> {
+                Ok(Vec::new())
+            }
+
+            fn truncate(&self) -> Result<(), LakehouseError> {
+                Ok(())
+            }
+
+            fn len(&self) -> Result<usize, LakehouseError> {
+                Ok(self.appended_schemas.lock().unwrap().len())
+            }
+        }
+
+        let updated_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("extra", DataType::Utf8, true),
+        ]));
+        let store = Arc::new(RecordingStore::default());
+        let mut router = CdcRouter::new();
+        router.register_table("orders", schema(), Some(store.clone()));
+
+        // Flip the route's target schema in the window between the schema
+        // capture and the append re-check.
+        let route = Arc::clone(router.routes.get("orders").unwrap());
+        let hook_schema = Arc::clone(&updated_schema);
+        router.schema_race_hook = Some(Box::new(move || {
+            route.lock().unwrap().target_schema = Arc::clone(&hook_schema);
+        }));
+
+        router
+            .route_event(&event("orders", "1", CdcOp::Insert))
+            .unwrap();
+
+        let appended = store.appended_schemas.lock().unwrap();
+        assert_eq!(appended.len(), 1);
+        assert!(
+            appended[0].index_of("extra").is_ok(),
+            "batch was appended with the stale pre-update schema: {:?}",
+            appended[0]
         );
     }
 
