@@ -816,14 +816,14 @@ impl FlightExecutionHost {
         let FlightHostBackend::Coordinator(coordinator) = self.backend.as_ref() else {
             unreachable!("InProcess already returned above");
         };
-        let outcome =
-            execute_batch_sql_coordinated_with_paths(coordinator, &sql, &ipc_tables, &[])
-                .await
-                .map_err(scheduler_error_to_status)?;
-        let inline = krishiv_scheduler::decode_inline_record_batches(
-            &outcome.inline_record_batch_ipc,
-        )
-        .map_err(|e| krishiv_metrics::grpc::internal_status("decode inline result batches", &e))?;
+        let outcome = execute_batch_sql_coordinated_with_paths(coordinator, &sql, &ipc_tables, &[])
+            .await
+            .map_err(scheduler_error_to_status)?;
+        let inline =
+            krishiv_scheduler::decode_inline_record_batches(&outcome.inline_record_batch_ipc)
+                .map_err(|e| {
+                    krishiv_metrics::grpc::internal_status("decode inline result batches", &e)
+                })?;
         let mut spools = outcome.result_spools.into_iter();
 
         /// One spool's batches as a boxed `Result<RecordBatch, Status>`
@@ -838,10 +838,9 @@ impl FlightExecutionHost {
                 Ok(reader) => Box::new(reader.map(|r| {
                     r.map_err(|e| krishiv_metrics::grpc::internal_status("decode result spool", &e))
                 })),
-                Err(e) => Box::new(std::iter::once(Err(krishiv_metrics::grpc::internal_status(
-                    "decode result spool",
-                    &e,
-                )))),
+                Err(e) => Box::new(std::iter::once(Err(
+                    krishiv_metrics::grpc::internal_status("decode result spool", &e),
+                ))),
             }
         }
 
@@ -943,13 +942,23 @@ fn reattach_python_udf_comments(directives: &[FlightDirective]) -> Vec<String> {
                 input_types,
                 output_type,
                 pickle_b64,
-            } => Some(encode_python_udf(name, input_types, output_type, pickle_b64)),
+            } => Some(encode_python_udf(
+                name,
+                input_types,
+                output_type,
+                pickle_b64,
+            )),
             FlightDirective::RegisterPythonUdaf {
                 name,
                 input_types,
                 output_type,
                 pickle_b64,
-            } => Some(encode_python_udaf(name, input_types, output_type, pickle_b64)),
+            } => Some(encode_python_udaf(
+                name,
+                input_types,
+                output_type,
+                pickle_b64,
+            )),
             _ => None,
         })
         .collect()

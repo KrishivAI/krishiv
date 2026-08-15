@@ -776,7 +776,7 @@ impl FlightSqlService for KrishivFlightSqlService {
                 .and_then(|cache| cache.get(&handle))
                 .and_then(|b| b.first())
             {
-                Some(batch) => substitute_sql_params(&sql, batch),
+                Some(batch) => substitute_sql_params(&sql, batch)?,
                 None => sql,
             }
         };
@@ -846,7 +846,7 @@ impl FlightSqlService for KrishivFlightSqlService {
                 .and_then(|cache| cache.get(&handle))
                 .and_then(|b| b.first())
             {
-                Some(batch) => substitute_sql_params(&sql, batch),
+                Some(batch) => substitute_sql_params(&sql, batch)?,
                 None => sql,
             }
         };
@@ -1506,10 +1506,7 @@ fn check_batch_result_size(
     if max_result_bytes == 0 {
         return Ok(());
     }
-    let total: usize = batches
-        .iter()
-        .map(RecordBatch::get_array_memory_size)
-        .sum();
+    let total: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
     if total > max_result_bytes {
         return Err(KrishivActionError::Status(Status::resource_exhausted(
             format!(
@@ -1558,10 +1555,7 @@ mod result_size_cap_tests {
     #[test]
     fn result_over_cap_is_rejected_with_resource_exhausted() {
         let batches = vec![batch_of(1000)];
-        let total: usize = batches
-            .iter()
-            .map(RecordBatch::get_array_memory_size)
-            .sum();
+        let total: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
         let err = check_batch_result_size(&batches, total - 1).unwrap_err();
         match err {
             KrishivActionError::Status(status) => {
@@ -1641,7 +1635,9 @@ impl KrishivFlightSqlService {
                     // rows, live 2026-08-10) reported as "0 rows" with no
                     // error anywhere.
                     let batch_count = batches.len();
-                    self.host.return_drained_batches(&body.job_id, batches).await;
+                    self.host
+                        .return_drained_batches(&body.job_id, batches)
+                        .await;
                     return Err(KrishivActionError::Status(Status::resource_exhausted(
                         format!(
                             "continuous drain response ({} bytes across {batch_count} batches) \
@@ -2442,9 +2438,11 @@ mod prepared_statement_schema_tests {
         // parameter schema). Inserted directly — the DoPut storage path is
         // separate and simpler; this isolates the getFlightInfo substitution.
         let param_schema = Arc::new(Schema::new(vec![Field::new("p1", DataType::Utf8, false)]));
-        let param_batch =
-            RecordBatch::try_new(param_schema, vec![Arc::new(StringArray::from(vec!["world"]))])
-                .unwrap();
+        let param_batch = RecordBatch::try_new(
+            param_schema,
+            vec![Arc::new(StringArray::from(vec!["world"]))],
+        )
+        .unwrap();
         {
             let mut map = svc.bound_params.lock().await;
             map.entry("__anon__".to_string())
@@ -2471,7 +2469,8 @@ mod prepared_statement_schema_tests {
             .ticket
             .clone();
         let any = Any::decode(ticket).expect("decode Any");
-        let tsq: TicketStatementQuery = any.unpack().expect("unpack").expect("TicketStatementQuery");
+        let tsq: TicketStatementQuery =
+            any.unpack().expect("unpack").expect("TicketStatementQuery");
         let sql = std::str::from_utf8(&tsq.statement_handle[4..]).expect("sql utf8");
         assert_eq!(
             sql, "SELECT 'world' AS v",

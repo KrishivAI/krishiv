@@ -26,13 +26,47 @@ impl From<Status> for KrishivActionError {
 
 // Prepared statement parameter binding helpers.
 
+/// Track single-/double-quote state byte-by-byte so `$N` scanning can skip
+/// string literals and quoted identifiers (crate-14 audit: the `?` normalizer
+/// below was quote-aware, but the `$N` counter/substituter were not — a `$1`
+/// inside a literal like `'$1'` was counted as a parameter and replaced with
+/// the bound value, silently changing the data). `''`/`""` escapes are
+/// handled by the natural toggle: the closing quote flips state off and the
+/// escaped quote flips it back on, and no `$` is consumed in between.
+#[derive(Default, Clone, Copy)]
+struct QuoteState {
+    in_single: bool,
+    in_double: bool,
+}
+
+impl QuoteState {
+    fn observe(&mut self, b: u8) {
+        match b {
+            b'\'' if !self.in_double => self.in_single = !self.in_single,
+            b'"' if !self.in_single => self.in_double = !self.in_double,
+            _ => {}
+        }
+    }
+
+    fn in_quotes(&self) -> bool {
+        self.in_single || self.in_double
+    }
+}
+
 /// Count the highest `$N` positional placeholder index in `sql`.
+///
+/// Quote-aware: `$N` inside a string literal or quoted identifier is text,
+/// not a parameter.
 pub(crate) fn count_sql_params(sql: &str) -> usize {
     let bytes = sql.as_bytes();
     let mut max = 0usize;
     let mut i = 0;
+    let mut quotes = QuoteState::default();
     while i < bytes.len() {
-        if bytes.get(i) == Some(&b'$') {
+        if let Some(&b) = bytes.get(i) {
+            quotes.observe(b);
+        }
+        if bytes.get(i) == Some(&b'$') && !quotes.in_quotes() {
             i += 1;
             let start = i;
             while bytes.get(i).is_some_and(|b| b.is_ascii_digit()) {
@@ -149,7 +183,12 @@ pub(crate) fn normalize_question_mark_params(sql: &str) -> String {
 /// ASCII and can never appear inside a multi-byte UTF-8 sequence, so scanning
 /// the bytes is UTF-8 safe; verbatim text is copied via `&str` slices taken at
 /// valid character boundaries.
-pub(crate) fn substitute_sql_params(sql: &str, batch: &RecordBatch) -> String {
+/// Sentinel returned by `col_literal` for a parameter type it cannot render
+/// as a SQL literal; `substitute_sql_params` converts it into an
+/// `invalid_argument` error rather than silently binding NULL.
+const UNSUPPORTED_PARAM_SENTINEL: &str = "\u{0}UNSUPPORTED_PARAM:";
+
+pub(crate) fn substitute_sql_params(sql: &str, batch: &RecordBatch) -> Result<String, Status> {
     use arrow::array::{
         BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
         StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
@@ -356,12 +395,11 @@ pub(crate) fn substitute_sql_params(sql: &str, batch: &RecordBatch) -> String {
                     None => "NULL".to_string(),
                 }
             }
-            DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
-                "NULL".to_string()
-            }
-            DataType::Struct(_) => "NULL".to_string(),
-            DataType::Map(_, _) => "NULL".to_string(),
-            _ => "NULL".to_string(),
+            // Crate-14 audit: unsupported parameter types previously bound as
+            // SQL NULL silently — a caller's array/struct/map param vanished
+            // into a NULL with no error. Return a sentinel the caller maps to
+            // InvalidArgument instead.
+            other => format!("{UNSUPPORTED_PARAM_SENTINEL}{other:?}"),
         }
     }
 
@@ -397,15 +435,19 @@ pub(crate) fn substitute_sql_params(sql: &str, batch: &RecordBatch) -> String {
 
     let ncols = batch.num_columns();
     if ncols == 0 || batch.num_rows() == 0 {
-        return sql.to_string();
+        return Ok(sql.to_string());
     }
 
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len() + 64);
     let mut text_start = 0usize;
     let mut i = 0usize;
+    let mut quotes = QuoteState::default();
     while i < bytes.len() {
-        if bytes.get(i) == Some(&b'$') {
+        if let Some(&b) = bytes.get(i) {
+            quotes.observe(b);
+        }
+        if bytes.get(i) == Some(&b'$') && !quotes.in_quotes() {
             let digit_start = i + 1;
             let mut j = digit_start;
             while bytes.get(j).is_some_and(|b| b.is_ascii_digit()) {
@@ -418,7 +460,14 @@ pub(crate) fn substitute_sql_params(sql: &str, batch: &RecordBatch) -> String {
                 if text_start < i {
                     out.push_str(&sql[text_start..i]);
                 }
-                out.push_str(&col_literal(batch.column(n - 1).as_ref(), 0));
+                let lit = col_literal(batch.column(n - 1).as_ref(), 0);
+                if let Some(ty) = lit.strip_prefix(UNSUPPORTED_PARAM_SENTINEL) {
+                    return Err(Status::invalid_argument(format!(
+                        "prepared-statement parameter ${n} has unsupported type {ty}; \
+                         bind a scalar (numeric/string/temporal/binary) value"
+                    )));
+                }
+                out.push_str(&lit);
                 i = j;
                 text_start = j;
                 continue;
@@ -429,7 +478,7 @@ pub(crate) fn substitute_sql_params(sql: &str, batch: &RecordBatch) -> String {
     if text_start < bytes.len() {
         out.push_str(&sql[text_start..]);
     }
-    out
+    Ok(out)
 }
 
 pub(crate) fn encode_batches_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, KrishivActionError> {

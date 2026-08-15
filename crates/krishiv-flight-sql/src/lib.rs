@@ -763,6 +763,56 @@ mod tests {
         );
     }
 
+    /// Regression (crate-14 audit, A-class): `$N` inside a string literal or
+    /// quoted identifier is text, not a parameter — previously it was counted
+    /// AND substituted with the bound value, silently changing the data.
+    #[test]
+    fn dollar_placeholders_inside_quotes_are_not_parameters() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        assert_eq!(count_sql_params("SELECT '$3' AS tag, $1 AS v"), 1);
+        assert_eq!(count_sql_params(r#"SELECT "$2col" FROM t WHERE x = $1"#), 1);
+
+        let schema = Arc::new(Schema::new(vec![Field::new("p1", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["bound"])) as Arc<dyn arrow::array::Array>],
+        )
+        .unwrap();
+        let result = substitute_sql_params("SELECT '$1' AS tag, $1 AS v", &batch).unwrap();
+        assert_eq!(
+            result, "SELECT '$1' AS tag, 'bound' AS v",
+            "the quoted $1 must stay literal; only the bare $1 is substituted"
+        );
+    }
+
+    /// Regression (crate-14 audit, A-class): an unsupported bound-param type
+    /// (list/struct/map) must error, not silently bind SQL NULL.
+    #[test]
+    fn unsupported_param_type_errors_instead_of_null() {
+        use arrow::array::{Int32Array, ListArray};
+        use arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+
+        let list =
+            ListArray::from_iter_primitive::<arrow::datatypes::Int32Type, _, _>(vec![Some(vec![
+                Some(1),
+                Some(2),
+            ])]);
+        let list: Arc<dyn arrow::array::Array> = Arc::new(list);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "p1",
+            list.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![list]).unwrap();
+        let err = substitute_sql_params("SELECT $1", &batch).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        let _ = Int32Array::from(vec![1]); // keep import used
+    }
+
     #[test]
     fn build_param_schema_creates_n_utf8_fields() {
         let schema = build_param_schema(3);
@@ -796,7 +846,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let result = substitute_sql_params("SELECT $1, $2", &batch);
+        let result = substitute_sql_params("SELECT $1, $2", &batch).unwrap();
         assert_eq!(result, "SELECT 'hello', 'world'");
     }
 
@@ -812,7 +862,7 @@ mod tests {
             vec![Arc::new(StringArray::from(vec!["O'Brien"])) as Arc<dyn arrow::array::Array>],
         )
         .unwrap();
-        let result = substitute_sql_params("SELECT $1 AS name", &batch);
+        let result = substitute_sql_params("SELECT $1 AS name", &batch).unwrap();
         assert_eq!(result, "SELECT 'O''Brien' AS name");
     }
 
@@ -831,7 +881,7 @@ mod tests {
                     as Arc<dyn arrow::array::Array>],
             )
             .unwrap();
-        let result = substitute_sql_params("SELECT $1 AS x", &batch);
+        let result = substitute_sql_params("SELECT $1 AS x", &batch).unwrap();
         assert_eq!(
             result, "SELECT '$1 downstream' AS x",
             "the literal substituted for $1 must not be re-scanned for placeholders"
@@ -857,7 +907,7 @@ mod tests {
             })
             .collect();
         let batch = RecordBatch::try_new(schema, cols).unwrap();
-        let result = substitute_sql_params("SELECT $10, $1", &batch);
+        let result = substitute_sql_params("SELECT $10, $1", &batch).unwrap();
         assert_eq!(result, "SELECT 'v10', 'v1'");
     }
 
@@ -874,7 +924,7 @@ mod tests {
         )
         .unwrap();
         // $2 and $0 are not bound columns (only p1 exists); they must stay literal.
-        let result = substitute_sql_params("SELECT $1, $2, $0", &batch);
+        let result = substitute_sql_params("SELECT $1, $2, $0", &batch).unwrap();
         assert_eq!(result, "SELECT 'only', $2, $0");
     }
 
@@ -890,7 +940,7 @@ mod tests {
             vec![Arc::new(StringArray::from(vec!["café"])) as Arc<dyn arrow::array::Array>],
         )
         .unwrap();
-        let result = substitute_sql_params("SELECT $1 — café", &batch);
+        let result = substitute_sql_params("SELECT $1 — café", &batch).unwrap();
         assert_eq!(result, "SELECT 'café' — café");
     }
 
