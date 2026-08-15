@@ -44,7 +44,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 8 | krishiv-state | 12,357 | 37 | **37 (COMPLETE)** | 9 revert-proven fixes incl. savepoint-restore skipping manifest coverage, key-group task-index formula diverging from ranges, 1M-entry restore cap, DFS unstable-hash filenames + collision returning wrong key's value, sequential "async" executor; 2 can't-fail tests strengthened |
 | **Tier 3 — runtime & surfaces** |
 | 9 | krishiv-api | 25,111 | 38 | COMPLETE | 9 defects fixed (A1–A9); see §9 |
-| 10 | krishiv-runtime | 13,648 | 17 | 0 | |
+| 10 | krishiv-runtime | 13,648 | 17 | COMPLETE | 3 defects fixed (R1–R3); see §10 |
 | 11 | krishiv-dataflow | 18,107 | 38 | 0 | |
 | 12 | krishiv-ivm | 7,019 | 10 | 0 | |
 | 13 | krishiv-delta | 7,098 | 20 | 0 | |
@@ -2923,3 +2923,69 @@ Gates: `cargo test -p krishiv-api` (293 lib + 1 integration, 2 env-ignored),
 `just test`, `just lint`, `cargo clippy -p krishiv-api --all-targets`,
 `cargo fmt` — all green. krishiv-python compiles (`cargo check`); its `.so`
 link needs libpython3.14, absent on this host (pre-existing, unrelated).
+
+
+## 10. krishiv-runtime — read end to end (2026-08-15)
+
+Method: full-file read of all 16 src files (in_process.rs 2,043;
+execution_runtime.rs 1,677; flight_client.rs 1,654; coordinator_http_client.rs
+1,494; flight_protocol.rs 1,321; continuous_stream.rs 1,034; flight_action.rs
+919; in_process_cluster.rs 859; lib.rs 833; ivm_job.rs, local_streaming.rs,
+stream_kafka.rs, plan.rs, streaming_job.rs, vector_sink_bridge.rs) plus
+tests/{integration_distributed,spooled_results}.rs. Coverage pre-fix: 72.5%
+regions / 69.7% lines (`cargo llvm-cov -p krishiv-runtime`).
+
+The crate is in unusually good shape — the in-process driver loop
+(in_process.rs run_terminal_task) and the do_action size-cap/fallback ladder
+(flight_client.rs) carry a comment-per-guard record of the live incidents that
+shaped them (all-slots-busy bench holes, #217 cancelled-query resurrection,
+OutOfRange decode classification), each with a regression test that names the
+incident. Clean files: lib.rs, execution_runtime.rs, in_process.rs,
+in_process_cluster.rs, continuous_stream.rs, flight_action.rs,
+flight_protocol.rs, plan.rs, local_streaming.rs, stream_kafka.rs, ivm_job.rs,
+streaming_job.rs, vector_sink_bridge.rs, both test files.
+
+Defects (fixed this session, one commit):
+
+**R1. `FlightClientPool::with_alternate` could diverge the endpoint and
+health lists (B: unreachable failover target).** The endpoint was pushed
+unconditionally while the matching `EndpointHealth` entry was added only when
+`Arc::get_mut` succeeded — on an already-cloned pool the health entry was
+silently dropped, leaving an alternate endpoint no health walk (failover /
+select_healthy_endpoint iterate the health list) could ever select. No current
+caller clones before configuring, so this was latent, but the builder is pub.
+Fix: the endpoint is added only together with its health entry; a shared pool
+logs a warning and skips both, keeping the lists in lockstep. New
+`endpoint_count()` accessor + test
+`with_alternate_keeps_endpoints_and_health_in_lockstep` — revert-proven red.
+
+**R2. IVM coordinator routes interpolated caller-supplied names into URL
+paths without percent-encoding (G: inconsistent hardening).** The job/
+continuous routes used `urlencoding::encode`; the ten IVM routes (views, feed,
+step, checkpoint, checkpoint-delta, snapshot incl. view name, restore,
+restore-delta, stream-bridge, stream-delta) and the batch-sql poll URL
+interpolated raw `{job_id}`/`{source_name}`/`{view_name}` — a `/` or space in
+a job name silently re-shaped the route (wrong endpoint → opaque 404), and a
+`?` truncated it into a query string. Fix: shared `seg()` helper
+percent-encodes every caller-supplied path segment. Test
+`path_segments_are_percent_encoded` — revert-proven red (helper reverted to
+identity).
+
+**R3. Poll-timeout message hardcoded "300s"** instead of interpolating
+`BOUNDED_WINDOW_POLL_TIMEOUT_SECS` — correct today, silently wrong the day the
+constant changes. Message now uses the constant (no test: tautological while
+the value is 300).
+
+Notes / not defects: `streaming_job.rs` is 0%-covered — a 64-line delegation
+shell over the coordinator HTTP functions, exercised by the daemon-gated
+integration and Python live tests; `coordinator_http_client.rs` sits at 10%
+for the same reason (network calls; its pure logic — payload decode, URL
+normalization, jitter — is unit-tested). `select_healthy_endpoint` returning
+the current endpoint when none are healthy is deliberate (fail with the real
+connect error, not a synthetic one). The five `#[ignore]`d tests are
+env/daemon-gated with accurate reasons (TPC-H data dir, local cluster,
+sandbox TCP listeners).
+
+Gates: `cargo test -p krishiv-runtime` (350 lib + 13 integration, 5 ignored),
+`cargo clippy -p krishiv-runtime --all-targets`, `just lint`, `just test`,
+`cargo fmt` — all green.

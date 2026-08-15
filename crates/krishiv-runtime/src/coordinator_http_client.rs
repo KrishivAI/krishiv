@@ -60,6 +60,13 @@ fn apply_coordinator_bearer(builder: reqwest::RequestBuilder) -> reqwest::Reques
     }
 }
 
+/// Percent-encode one URL path segment (job ids, source and view names are
+/// caller-supplied strings; a `/`, space, or `?` in one must not re-shape the
+/// route). The job/continuous routes already encoded — the IVM routes did not.
+fn seg(value: &str) -> String {
+    urlencoding::encode(value).into_owned()
+}
+
 fn normalize_http_base(url: &str) -> RuntimeResult<String> {
     let trimmed = url.trim().trim_end_matches('/');
     if trimmed.is_empty() {
@@ -183,7 +190,7 @@ async fn poll_batch_sql_job(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(RuntimeError::transport(format!(
-                "batch-sql job {job_id} timed out after 300s"
+                "batch-sql job {job_id} timed out after {BOUNDED_WINDOW_POLL_TIMEOUT_SECS}s"
             )));
         }
         let poll_resp = apply_coordinator_bearer(client.get(poll_url))
@@ -293,7 +300,7 @@ pub async fn execute_coordinator_batch_sql(
         .job_id;
 
     // Step 2: poll until terminal state.
-    let poll_url = format!("{base}/api/v1/batch-sql/{job_id}");
+    let poll_url = format!("{base}/api/v1/batch-sql/{}", seg(&job_id));
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(BOUNDED_WINDOW_POLL_TIMEOUT_SECS);
     poll_batch_sql_job(&client, &poll_url, &job_id, deadline).await
@@ -385,7 +392,7 @@ pub async fn execute_coordinator_batch_sql_inline(
         .map_err(|e| RuntimeError::transport(format!("batch-sql submit decode failed: {e}")))?
         .job_id;
 
-    let poll_url = format!("{base}/api/v1/batch-sql/{job_id}");
+    let poll_url = format!("{base}/api/v1/batch-sql/{}", seg(&job_id));
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(BOUNDED_WINDOW_POLL_TIMEOUT_SECS);
     poll_batch_sql_job(&client, &poll_url, &job_id, deadline).await
@@ -541,6 +548,19 @@ mod tests {
     fn normalize_http_base_preserves_path() {
         let result = normalize_http_base("http://host:8080/api/v1").unwrap();
         assert_eq!(result, "http://host:8080/api/v1");
+    }
+
+    /// IVM route segments are caller-supplied (job names, source and view
+    /// names). A `/`, space, or `?` in one must be percent-encoded so it
+    /// cannot re-shape the route — the job/continuous routes already encoded;
+    /// the IVM routes did not.
+    #[test]
+    fn path_segments_are_percent_encoded() {
+        assert_eq!(super::seg("plain-job_1.2"), "plain-job_1.2");
+        assert_eq!(super::seg("a/b c"), "a%2Fb%20c");
+        assert_eq!(super::seg("x?y=1"), "x%3Fy%3D1");
+        let url = format!("http://h/api/v1/ivm/jobs/{}/step", super::seg("a/b c"));
+        assert_eq!(url, "http://h/api/v1/ivm/jobs/a%2Fb%20c/step");
     }
 
     #[test]
@@ -1004,12 +1024,13 @@ pub async fn execute_coordinator_ivm_register_view(
         is_materialized: spec.is_materialized,
         is_recursive: spec.is_recursive,
     };
-    let resp =
-        apply_coordinator_bearer(client.post(format!("{base}/api/v1/ivm/jobs/{job_id}/views")))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| RuntimeError::transport(format!("ivm register view: {e}")))?;
+    let resp = apply_coordinator_bearer(
+        client.post(format!("{base}/api/v1/ivm/jobs/{}/views", seg(job_id))),
+    )
+    .json(&body)
+    .send()
+    .await
+    .map_err(|e| RuntimeError::transport(format!("ivm register view: {e}")))?;
     if !resp.status().is_success() {
         return Err(RuntimeError::transport(format!(
             "ivm register view HTTP {}",
@@ -1038,7 +1059,9 @@ pub async fn execute_coordinator_ivm_feed_source(
     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ipc);
     let body = IvmFeedSourceBody { delta_ipc_b64: b64 };
     let resp = apply_coordinator_bearer(client.post(format!(
-        "{base}/api/v1/ivm/jobs/{job_id}/sources/{source_name}/feed"
+        "{base}/api/v1/ivm/jobs/{}/sources/{}/feed",
+        seg(job_id),
+        seg(source_name)
     )))
     .json(&body)
     .send()
@@ -1075,12 +1098,13 @@ pub async fn execute_coordinator_ivm_step(
 ) -> RuntimeResult<RemoteStepSummary> {
     let base = normalize_http_base(coordinator_http)?;
     let client = coordinator_http_client()?;
-    let resp =
-        apply_coordinator_bearer(client.post(format!("{base}/api/v1/ivm/jobs/{job_id}/step")))
-            .json(&serde_json::Value::Null)
-            .send()
-            .await
-            .map_err(|e| RuntimeError::transport(format!("ivm step: {e}")))?;
+    let resp = apply_coordinator_bearer(
+        client.post(format!("{base}/api/v1/ivm/jobs/{}/step", seg(job_id))),
+    )
+    .json(&serde_json::Value::Null)
+    .send()
+    .await
+    .map_err(|e| RuntimeError::transport(format!("ivm step: {e}")))?;
     if !resp.status().is_success() {
         return Err(RuntimeError::transport(format!(
             "ivm step HTTP {}",
@@ -1111,7 +1135,7 @@ pub async fn execute_coordinator_ivm_checkpoint(
     let base = normalize_http_base(coordinator_http)?;
     let client = coordinator_http_client()?;
     let resp = apply_coordinator_bearer(
-        client.post(format!("{base}/api/v1/ivm/jobs/{job_id}/checkpoint")),
+        client.post(format!("{base}/api/v1/ivm/jobs/{}/checkpoint", seg(job_id))),
     )
     .json(&serde_json::Value::Null)
     .send()
@@ -1153,9 +1177,10 @@ pub async fn execute_coordinator_ivm_checkpoint_delta(
 ) -> RuntimeResult<Vec<u8>> {
     let base = normalize_http_base(coordinator_http)?;
     let client = coordinator_http_client()?;
-    let resp = apply_coordinator_bearer(
-        client.post(format!("{base}/api/v1/ivm/jobs/{job_id}/checkpoint-delta")),
-    )
+    let resp = apply_coordinator_bearer(client.post(format!(
+        "{base}/api/v1/ivm/jobs/{}/checkpoint-delta",
+        seg(job_id)
+    )))
     .json(&serde_json::Value::Null)
     .send()
     .await
@@ -1195,7 +1220,9 @@ pub async fn execute_coordinator_ivm_snapshot(
     let base = normalize_http_base(coordinator_http)?;
     let client = coordinator_http_client()?;
     let resp = apply_coordinator_bearer(client.get(format!(
-        "{base}/api/v1/ivm/jobs/{job_id}/views/{view_name}/snap"
+        "{base}/api/v1/ivm/jobs/{}/views/{}/snap",
+        seg(job_id),
+        seg(view_name)
     )))
     .send()
     .await
@@ -1237,9 +1264,10 @@ pub async fn execute_coordinator_ivm_restore_delta(
     let body = IvmRestoreDeltaBody {
         checkpoint_delta_b64: b64,
     };
-    let resp = apply_coordinator_bearer(
-        client.post(format!("{base}/api/v1/ivm/jobs/{job_id}/restore-delta")),
-    )
+    let resp = apply_coordinator_bearer(client.post(format!(
+        "{base}/api/v1/ivm/jobs/{}/restore-delta",
+        seg(job_id)
+    )))
     .json(&body)
     .send()
     .await
@@ -1299,7 +1327,9 @@ pub async fn execute_coordinator_ivm_stream_bridge(
         snapshot_ipc_b64: b64,
     };
     let resp = apply_coordinator_bearer(client.post(format!(
-        "{base}/api/v1/ivm/jobs/{job_id}/sources/{source_name}/stream-bridge"
+        "{base}/api/v1/ivm/jobs/{}/sources/{}/stream-bridge",
+        seg(job_id),
+        seg(source_name)
     )))
     .json(&body)
     .send()
@@ -1331,7 +1361,9 @@ pub async fn execute_coordinator_ivm_feed_stream_delta(
     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ipc);
     let body = IvmFeedSourceBody { delta_ipc_b64: b64 };
     let resp = apply_coordinator_bearer(client.post(format!(
-        "{base}/api/v1/ivm/jobs/{job_id}/sources/{source_name}/stream-delta"
+        "{base}/api/v1/ivm/jobs/{}/sources/{}/stream-delta",
+        seg(job_id),
+        seg(source_name)
     )))
     .json(&body)
     .send()
@@ -1358,12 +1390,13 @@ pub async fn execute_coordinator_ivm_restore(
     let body = IvmRestoreBody {
         checkpoint_b64: b64,
     };
-    let resp =
-        apply_coordinator_bearer(client.post(format!("{base}/api/v1/ivm/jobs/{job_id}/restore")))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| RuntimeError::transport(format!("ivm restore: {e}")))?;
+    let resp = apply_coordinator_bearer(
+        client.post(format!("{base}/api/v1/ivm/jobs/{}/restore", seg(job_id))),
+    )
+    .json(&body)
+    .send()
+    .await
+    .map_err(|e| RuntimeError::transport(format!("ivm restore: {e}")))?;
     if !resp.status().is_success() {
         return Err(RuntimeError::transport(format!(
             "ivm restore HTTP {}",

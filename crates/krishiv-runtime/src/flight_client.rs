@@ -406,15 +406,30 @@ impl FlightClientPool {
         let raw = url.into();
         match normalize_flight_endpoint(&raw) {
             Ok(endpoint) => {
-                self.endpoints.push(endpoint.clone());
                 let health = EndpointHealth {
-                    endpoint,
+                    endpoint: endpoint.clone(),
                     consecutive_failures: 0,
                     last_check: None,
                     is_healthy: true,
                 };
-                if let Some(rw) = Arc::get_mut(&mut self.health_state) {
-                    rw.get_mut().push(health);
+                // The endpoint list and the health list must stay in lockstep:
+                // failover walks the health entries, so an endpoint without one
+                // is unreachable dead weight. `Arc::get_mut` fails when the
+                // pool has already been cloned — in that case skip the whole
+                // addition (loudly) rather than pushing the endpoint alone and
+                // leaving the two lists divergent.
+                match Arc::get_mut(&mut self.health_state) {
+                    Some(rw) => {
+                        rw.get_mut().push(health);
+                        self.endpoints.push(endpoint);
+                    }
+                    None => {
+                        tracing::warn!(
+                            url = %raw,
+                            "ignoring alternate Flight endpoint: pool already shared \
+                             (call with_alternate before cloning the pool)"
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -426,6 +441,11 @@ impl FlightClientPool {
             }
         }
         self
+    }
+
+    /// Number of configured endpoints (primary + alternates).
+    pub fn endpoint_count(&self) -> usize {
+        self.endpoints.len()
     }
 
     pub fn flight_url(&self) -> &str {
@@ -1108,6 +1128,30 @@ mod tests {
         let plan = PhysicalPlan::new("", ExecutionKind::Batch);
         let sql = plan_to_sql(&plan);
         assert!(sql.contains("SELECT '' AS plan_name"));
+    }
+
+    #[tokio::test]
+    async fn with_alternate_keeps_endpoints_and_health_in_lockstep() {
+        // Fresh pool: the alternate lands in BOTH lists.
+        let pool = FlightClientPool::new("http://primary:1")
+            .expect("pool")
+            .with_alternate("http://alt:2");
+        assert_eq!(pool.endpoint_count(), 2);
+        assert_eq!(pool.endpoint_health().await.len(), 2);
+
+        // Cloned (shared) pool: the health entry cannot be recorded, so the
+        // endpoint must not be added either — the two lists never diverge.
+        // (Pre-fix, the endpoint was pushed while the health entry was
+        // silently dropped, leaving a failover target no health walk could
+        // ever select.)
+        let shared = FlightClientPool::new("http://primary:1").expect("pool");
+        let _held_clone = shared.clone();
+        let shared = shared.with_alternate("http://alt:2");
+        assert_eq!(
+            shared.endpoint_count(),
+            shared.endpoint_health().await.len(),
+            "endpoint list and health list must stay in lockstep"
+        );
     }
 
     #[test]
