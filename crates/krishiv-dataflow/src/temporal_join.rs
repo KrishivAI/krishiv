@@ -291,6 +291,7 @@ fn format_column_value(array: &dyn Array, row: usize) -> String {
     //   M<ms>    = Timestamp(Millisecond)
     //   m<us>    = Timestamp(Microsecond)
     //   s<ns>    = Timestamp(Nanosecond)
+    //   t<s>     = Timestamp(Second)
     //   S<s>  = Utf8 string s
     //   ?     = unsupported type (cannot match any real value)
     //
@@ -342,7 +343,7 @@ fn format_column_value(array: &dyn Array, row: usize) -> String {
         return format!("s{}", arr.value(row));
     }
     if let Some(arr) = array.as_any().downcast_ref::<TimestampSecondArray>() {
-        return format!("S{}", arr.value(row));
+        return format!("t{}", arr.value(row));
     }
     if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
         return format!("S{}", arr.value(row));
@@ -778,6 +779,22 @@ mod tests {
             scores.value(0),
             42,
             "key 'a|b' must match its own table version, not key 'a'"
+        );
+    }
+
+    #[test]
+    fn timestamp_second_key_does_not_collide_with_utf8_key() {
+        // H-2 follow-up: Timestamp(Second) previously shared the "S" tag with
+        // Utf8, so TimestampSecond(123) and the string "123" produced the same
+        // join key and cross-type rows falsely matched.
+        use arrow::array::TimestampSecondArray;
+        let ts: ArrayRef = Arc::new(TimestampSecondArray::from(vec![123i64]));
+        let s: ArrayRef = Arc::new(StringArray::from(vec!["123"]));
+        let ts_key = format_column_value(ts.as_ref(), 0);
+        let s_key = format_column_value(s.as_ref(), 0);
+        assert_ne!(
+            ts_key, s_key,
+            "TimestampSecond(123) and Utf8 \"123\" must encode to distinct join keys"
         );
     }
 }

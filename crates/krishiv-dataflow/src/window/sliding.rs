@@ -287,7 +287,11 @@ impl SlidingWindowOperator {
         // batch building is `&self`-only and independent per bucket.
         let drained: Vec<((String, i64), AggState)> = closed
             .into_iter()
-            .filter_map(|bucket| self.accumulators.remove(&bucket).map(|state| (bucket, state)))
+            .filter_map(|bucket| {
+                self.accumulators
+                    .remove(&bucket)
+                    .map(|state| (bucket, state))
+            })
             .collect();
         krishiv_common::compute_pool::par_map(drained, |(bucket, state)| {
             self.build_output_batch(&bucket.0, bucket.1, &state)
@@ -410,7 +414,10 @@ mod sliding_state_tests {
         assert_eq!(seen.len(), 60, "30 keys x 2 overlapping windows");
         let mut expected = seen.clone();
         expected.sort();
-        assert_eq!(seen, expected, "flush order must be (window_start, key) sorted");
+        assert_eq!(
+            seen, expected,
+            "flush order must be (window_start, key) sorted"
+        );
     }
 
     #[test]

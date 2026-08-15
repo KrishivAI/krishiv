@@ -345,7 +345,10 @@ impl<In: StateValue, Acc: StateValue, Out> AggregatingState<In, Acc, Out> {
 
     /// Read the projected output, or `None` if nothing has been added.
     pub fn get(&self, raw: &[u8]) -> Result<Option<Out>, StateError> {
-        Ok(self.accumulator(raw)?.as_ref().map(|acc| (self.result_fn)(acc)))
+        Ok(self
+            .accumulator(raw)?
+            .as_ref()
+            .map(|acc| (self.result_fn)(acc)))
     }
 
     /// Fold a new input value into the accumulator (starting from

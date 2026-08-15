@@ -234,13 +234,14 @@ impl OperatorQueueReceiver {
     ///    and returned on subsequent calls — before the next data item.
     ///
     /// In unaligned mode, records that arrive after a barrier and before
-    /// the next barrier are *held* in the in-flight buffer (not delivered
-    /// to the operator) so the snapshot can record them. When the next
-    /// barrier arrives, the buffer is drained back to the operator in
-    /// FIFO order — so the operator sees those records only after the
-    /// barrier. This is the unaligned-checkpoint contract: the operator
-    /// makes progress, but the data plane and the control plane see
-    /// records at slightly different points so the snapshot is complete.
+    /// the next barrier are *copied* into the in-flight buffer and then
+    /// delivered to the operator on the same `recv` loop (step 0 pops the
+    /// record the moment step 5 buffers it). The buffer is a tee for the
+    /// snapshot path — [`Self::drain_unaligned_buffer`] captures the exact
+    /// set of post-barrier records into the checkpoint — it never withholds
+    /// or reorders delivery. This is the unaligned-checkpoint contract: the
+    /// operator makes progress without waiting for alignment, and the
+    /// snapshot stays complete because the in-flight records travel with it.
     pub async fn recv(&mut self) -> Option<OperatorMessage> {
         loop {
             // 0. In unaligned mode, deliver buffered in-flight records first.

@@ -110,15 +110,21 @@ pub fn extract_agg_key(batch: &RecordBatch, col_idx: usize, row: usize) -> ExecR
         // string columns (e.g. `CAST(x AS VARCHAR)`), and can also produce
         // `LargeUtf8`; both are the same logical string key.
         DataType::Utf8View => {
-            let arr = col.as_any().downcast_ref::<StringViewArray>().ok_or_else(|| {
-                ExecError::UnsupportedType("declared Utf8View key failed downcast".into())
-            })?;
+            let arr = col
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| {
+                    ExecError::UnsupportedType("declared Utf8View key failed downcast".into())
+                })?;
             Ok(AggKey::Utf8(arr.value(row).to_string()))
         }
         DataType::LargeUtf8 => {
-            let arr = col.as_any().downcast_ref::<LargeStringArray>().ok_or_else(|| {
-                ExecError::UnsupportedType("declared LargeUtf8 key failed downcast".into())
-            })?;
+            let arr = col
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| {
+                    ExecError::UnsupportedType("declared LargeUtf8 key failed downcast".into())
+                })?;
             Ok(AggKey::Utf8(arr.value(row).to_string()))
         }
         DataType::Boolean => {

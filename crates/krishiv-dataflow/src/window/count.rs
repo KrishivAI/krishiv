@@ -166,7 +166,11 @@ impl CountWindowOperator {
     /// Flush all per-key buffered rows as a partial window (end-of-stream).
     pub fn flush(&mut self) -> ExecResult<Vec<RecordBatch>> {
         let mut output = Vec::new();
-        for (key_str, state) in &self.key_states {
+        // Sort by key so replayed runs produce identical output order — the
+        // same determinism contract the tumbling/sliding/session flushes keep.
+        let mut keyed: Vec<(&String, &KeyState)> = self.key_states.iter().collect();
+        keyed.sort_by(|a, b| a.0.cmp(b.0));
+        for (key_str, state) in keyed {
             if state.buf.is_empty() {
                 continue;
             }
@@ -390,6 +394,35 @@ mod tests {
         let cnt = final_out[0].column_by_name("cnt").unwrap();
         let cnt = cnt.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(cnt.value(0), 3, "partial window has 3 rows");
+    }
+
+    #[test]
+    fn flush_output_order_is_deterministic_sorted_by_key() {
+        // Determinism contract shared with the other window operators: two
+        // identical runs must flush partial windows in identical (sorted-key)
+        // order, not HashMap iteration order.
+        for _ in 0..5 {
+            let mut op = CountWindowOperator::new(make_spec(10, 10)).unwrap();
+            let batch = make_batch(&[8, 3, 6, 1, 7, 2, 5, 4]);
+            assert!(op.process_batch(&batch).unwrap().is_empty());
+            let out = op.flush().unwrap();
+            let keys: Vec<i32> = out
+                .iter()
+                .map(|rb| {
+                    rb.column_by_name("user_id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .value(0)
+                })
+                .collect();
+            assert_eq!(
+                keys,
+                vec![1, 2, 3, 4, 5, 6, 7, 8],
+                "flush must emit keys in sorted order on every run"
+            );
+        }
     }
 
     #[test]

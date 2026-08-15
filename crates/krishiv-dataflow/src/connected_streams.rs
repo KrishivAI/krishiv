@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use arrow::record_batch::RecordBatch;
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ExecResult;
@@ -85,9 +86,16 @@ struct CoProcessSnapshot {
     state: HashMap<String, Vec<u8>>,
     timers: Vec<TimerEntry>,
     current_watermark_ms: i64,
+    /// Absent in pre-cap snapshots — defaults to empty (keys become
+    /// eviction candidates in insertion order as they are next touched).
+    #[serde(default)]
+    access_order: Vec<String>,
 }
 
 // ── CoProcessExecutor ─────────────────────────────────────────────────────────
+
+/// Default cap on the number of distinct per-key states retained in memory.
+const DEFAULT_COPROCESS_MAX_KEYS: usize = 100_000;
 
 /// Executor for a [`CoProcessFunction`] over two record-batch input streams.
 pub struct CoProcessExecutor {
@@ -98,6 +106,8 @@ pub struct CoProcessExecutor {
     /// Timer map: `fire_time_ms → Vec<key_str>` (event-time only for simplicity).
     timers: BTreeMap<i64, Vec<String>>,
     current_watermark_ms: i64,
+    max_keys: usize,
+    access_order: IndexMap<String, ()>,
 }
 
 impl CoProcessExecutor {
@@ -109,6 +119,29 @@ impl CoProcessExecutor {
             state: HashMap::new(),
             timers: BTreeMap::new(),
             current_watermark_ms: i64::MIN,
+            max_keys: DEFAULT_COPROCESS_MAX_KEYS,
+            access_order: IndexMap::new(),
+        }
+    }
+
+    /// Override the maximum number of distinct per-key states retained in
+    /// memory before the least-recently-used key is evicted.
+    #[must_use]
+    pub fn with_max_keys(mut self, max_keys: usize) -> Self {
+        self.max_keys = max_keys.max(1);
+        self
+    }
+
+    fn touch_key(&mut self, key: &str) {
+        self.access_order.shift_remove(key);
+        self.access_order.insert(key.to_owned(), ());
+    }
+
+    fn maybe_evict(&mut self) {
+        if self.access_order.len() > self.max_keys
+            && let Some((oldest, _)) = self.access_order.shift_remove_index(0)
+        {
+            self.state.remove(&oldest);
         }
     }
 
@@ -149,6 +182,8 @@ impl CoProcessExecutor {
         for row in 0..batch.num_rows() {
             let key = crate::join::extract_agg_key(batch, key_idx, row)?;
             let key_str = key.to_string();
+            self.touch_key(&key_str);
+            self.maybe_evict();
             let key_state = self.state.entry(key_str.clone()).or_default();
 
             let mut ctx = ProcessContext {
@@ -236,6 +271,7 @@ impl CoProcessExecutor {
             state: self.state.clone(),
             timers,
             current_watermark_ms: self.current_watermark_ms,
+            access_order: self.access_order.keys().cloned().collect(),
         };
         serde_json::to_vec(&snap).map_err(|e| {
             crate::ExecError::InvalidInput(format!("snapshot serialization failed: {e}"))
@@ -248,7 +284,12 @@ impl CoProcessExecutor {
             .map_err(|e| crate::ExecError::InvalidInput(e.to_string()))?;
 
         for (k, v) in snap.state {
+            self.access_order.entry(k.clone()).or_insert(());
             self.state.insert(k, v);
+        }
+        for key in &snap.access_order {
+            self.access_order.shift_remove(key);
+            self.access_order.insert(key.clone(), ());
         }
         self.current_watermark_ms = self.current_watermark_ms.max(snap.current_watermark_ms);
         self.merge_timers(snap.timers);
@@ -379,5 +420,30 @@ mod tests {
 
         // Timer fires at watermark 200.
         let _out = exec2.fire_timers(200).unwrap();
+    }
+
+    /// Regression (crate-11 audit, F-class): the per-key state map must not
+    /// grow without bound — beyond `max_keys` the least-recently-used key is
+    /// evicted, matching every other keyed executor in this crate.
+    #[test]
+    fn co_process_state_is_capped_by_max_keys() {
+        let tracker = StreamTracker::new();
+        let mut exec = CoProcessExecutor::new("id", Box::new(tracker)).with_max_keys(2);
+
+        exec.process_stream1(&int_batch(&[1]), 0).unwrap();
+        exec.process_stream2(&int_batch(&[2]), 0).unwrap();
+        assert_eq!(exec.state_map().len(), 2);
+
+        // A third distinct key pushes past the cap; the LRU key ("1") goes.
+        exec.process_stream1(&int_batch(&[3]), 0).unwrap();
+        assert_eq!(
+            exec.state_map().len(),
+            2,
+            "state map must stay capped at max_keys"
+        );
+        assert!(
+            !exec.state_map().contains_key("1"),
+            "least-recently-used key must have been evicted"
+        );
     }
 }

@@ -151,6 +151,12 @@ impl DeduplicationOperator {
     }
 
     /// Encode the dedup columns for one row into a stable key.
+    ///
+    /// Every variable-length segment (column name, Utf8 value) is
+    /// length-prefixed with a `u32` LE so the concatenation is injective:
+    /// without prefixes, multi-column Utf8 keys like `("Xb=s:Y", "Z")` and
+    /// `("X", "Yb=s:Z")` encode to identical bytes and distinct rows are
+    /// falsely deduplicated.
     fn row_key(&self, batch: &RecordBatch, row: usize) -> ExecResult<Vec<u8>> {
         let mut key = Vec::new();
         for col_name in &self.cfg.columns {
@@ -158,17 +164,17 @@ impl DeduplicationOperator {
                 ExecError::ColumnNotFound(format!("dedup column '{col_name}' not in schema"))
             })?;
             let col = batch.column(col_idx);
-            // Write the column name as a separator so two distinct columns
-            // with the same value at the same row hash distinctly.
-            let sep = format!("{col_name}=");
-            sep.encode_utf16().for_each(|u| key.push(u as u8));
+            // Length-prefixed column name so distinct columns with the same
+            // value at the same row hash distinctly, unambiguously.
+            key.extend_from_slice(&(col_name.len() as u32).to_le_bytes());
+            key.extend_from_slice(col_name.as_bytes());
             match col.data_type() {
                 DataType::Int64 => {
                     if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
                         if arr.is_null(row) {
-                            key.extend_from_slice(b"null");
+                            key.push(b'n');
                         } else {
-                            key.extend_from_slice(b"i:");
+                            key.push(b'i');
                             let v = arr.value(row);
                             key.extend_from_slice(&v.to_le_bytes());
                         }
@@ -181,10 +187,12 @@ impl DeduplicationOperator {
                 DataType::Utf8 => {
                     if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
                         if arr.is_null(row) {
-                            key.extend_from_slice(b"null");
+                            key.push(b'n');
                         } else {
-                            key.extend_from_slice(b"s:");
-                            key.extend_from_slice(arr.value(row).as_bytes());
+                            let v = arr.value(row).as_bytes();
+                            key.push(b's');
+                            key.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                            key.extend_from_slice(v);
                         }
                     } else {
                         return Err(ExecError::UnsupportedType(format!(
@@ -260,5 +268,34 @@ mod tests {
             all_new += out.num_rows();
         }
         assert_eq!(all_new, 20, "all 20 distinct keys should be retained");
+    }
+
+    /// Regression (crate-11 audit, A-class): without length prefixes the
+    /// multi-column key encoding is ambiguous — ("Xb=s:Y", "Z") and
+    /// ("X", "Yb=s:Z") concatenate to identical bytes, so the second
+    /// distinct row was falsely dropped as a duplicate.
+    #[test]
+    fn multi_column_utf8_keys_do_not_collide_across_boundaries() {
+        use arrow::array::StringArray;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, false),
+            Field::new("b", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["Xb=s:Y", "X"])) as _,
+                Arc::new(StringArray::from(vec!["Z", "Yb=s:Z"])) as _,
+            ],
+        )
+        .unwrap();
+        let cfg = DeduplicationConfig::new(vec!["a".to_string(), "b".to_string()]);
+        let mut op = DeduplicationOperator::ephemeral(cfg).expect("op");
+        let out = op.process_batch(&batch).expect("process");
+        assert_eq!(
+            out.num_rows(),
+            2,
+            "two distinct (a, b) rows must both survive dedup"
+        );
     }
 }

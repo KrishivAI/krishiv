@@ -45,7 +45,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | **Tier 3 — runtime & surfaces** |
 | 9 | krishiv-api | 25,111 | 38 | COMPLETE | 9 defects fixed (A1–A9); see §9 |
 | 10 | krishiv-runtime | 13,648 | 17 | COMPLETE | 3 defects fixed (R1–R3); see §10 |
-| 11 | krishiv-dataflow | 18,107 | 38 | 0 | |
+| 11 | krishiv-dataflow | 18,107 | 38 | COMPLETE | 6 defects fixed (D1–D6); see §11 |
 | 12 | krishiv-ivm | 7,019 | 10 | 0 | |
 | 13 | krishiv-delta | 7,098 | 20 | 0 | |
 | 14 | krishiv-flight-sql | 5,199 | 6 | 0 | |
@@ -2989,3 +2989,93 @@ sandbox TCP listeners).
 Gates: `cargo test -p krishiv-runtime` (350 lib + 13 integration, 5 ignored),
 `cargo clippy -p krishiv-runtime --all-targets`, `just lint`, `just test`,
 `cargo fmt` — all green.
+
+## 11. krishiv-dataflow — read end to end (2026-08-16)
+
+All 35 production files + lib_tests.rs + watermark_e2e.rs +
+tests/streaming_window_float64.rs read end to end. The crate is broadly
+battle-hardened (Wave/GAP/ST/STREAM/H-series incident comments with proptests
+throughout: tumbling double-emission guard, GAP-14 idle-source policy,
+STREAM-3 bounded join buffers, H-2 typed join-key tags, LRU key caps on every
+keyed executor — except one, see D4). Coverage pre-fix: 82.9% regions /
+81.6% lines (`/tmp/claude-1000/dataflow_cov.txt`).
+
+**D1 (A) temporal_join.rs — TimestampSecond/Utf8 join-key collision.**
+`format_column_value` tagged `Timestamp(Second)` values with `"S"`, the same
+tag as Utf8 — `TimestampSecond(123)` and the string `"123"` produced identical
+join keys, so cross-type rows falsely matched: exactly the H-2 class the
+function's own doc table claims to fix (the table did not list
+TimestampSecond at all). Fix: distinct `t<s>` tag + doc-table entry. Test
+`timestamp_second_key_does_not_collide_with_utf8_key`; revert-proven (tag
+back to `"S"` → red).
+
+**D2 (A) window/count.rs — non-deterministic flush order.**
+`CountWindowOperator::flush()` iterated `self.key_states` (HashMap), so
+end-of-stream partial windows were emitted in random per-process order —
+unlike the tumbling/sliding/session flushes, which sort for deterministic
+replay. Fix: collect + sort by key before emitting. Test
+`flush_output_order_is_deterministic_sorted_by_key` (8 keys × 5 fresh
+operators); revert-proven (unsorted iteration → red).
+
+**D3 (E) queue.rs — Unaligned-mode `recv()` doc contradicted behavior.**
+The doc claimed post-barrier records are "held in the in-flight buffer (not
+delivered to the operator)… drained back when the next barrier arrives". The
+implementation actually tees each post-barrier record into the buffer and
+delivers it on the same loop iteration (step 0 pops what step 5 buffers) —
+which is the correct unaligned-checkpoint contract (no withheld delivery;
+`drain_unaligned_buffer` captures the set for the snapshot). Doc rewritten to
+match the code. Wiring note: `CheckpointAlignment::Unaligned` still has no
+production constructor — the executor builds aligned `operator_queue` only
+(engine-core "once wired"); recorded as an open wiring gap, not guessed at.
+
+**D4 (F) connected_streams.rs — unbounded per-key state in CoProcessExecutor.**
+Every sibling keyed executor (process_fn, broadcast_state, group_state, cep)
+caps per-key state at an LRU bound; `CoProcessExecutor` (reachable from
+Python via `krishiv_api::CoProcessExecutor` / streaming_dataframe.rs:240) grew
+one entry per distinct key forever. Fix: `max_keys` (default 100k) +
+IndexMap access-order LRU, `with_max_keys` builder, access order carried in
+the snapshot (`#[serde(default)]` keeps old snapshots loadable). Test
+`co_process_state_is_capped_by_max_keys`; revert-proven (drop `maybe_evict()`
+call → red).
+
+**D5 (A) dedup_operator.rs — ambiguous multi-column key encoding.**
+`row_key` concatenated `"{col}="` + tag + raw Utf8 bytes with no length
+prefixes, so multi-column keys `("Xb=s:Y", "Z")` and `("X", "Yb=s:Z")`
+encoded to identical bytes and the second distinct row was silently dropped
+as a duplicate (production path: `StreamingDataFrame::drop_duplicates`).
+Also `sep.encode_utf16()` truncated to `u8` was lossy for non-ASCII column
+names. Fix: u32-LE length prefix on column name and Utf8 value (Int64 stays
+fixed 8-byte). Note: this changes the persisted dedup key format — old-format
+seen-keys no longer match, so a restored pre-fix dedup state re-admits each
+old key once; accepted (old format was wrong). Test
+`multi_column_utf8_keys_do_not_collide_across_boundaries`; revert-proven
+(prefix-free encoding → red).
+
+**D6 (B) envelope.rs, profile.rs, buffer.rs — dead modules, deleted.**
+Zero callers anywhere in the workspace and 0% coverage all three. The real
+`StreamingExecutionProfile` / `OutputBufferPolicy` live in krishiv-proto
+(api's pipeline/mod.rs says so explicitly), and the api-side duplicates were
+already deleted in §9 (A4) — these were the orphaned dataflow-side
+counterparts (`StreamEnvelope` included, never constructed anywhere).
+`AutoProfileManager::new(_config)` even ignored its own argument. Deleted
+all three modules + their `pub mod` lines; `CheckpointAlignment` (the one
+type envelope.rs re-exported) lives in queue.rs and is unaffected.
+
+Clean files (no defects): adaptive.rs (SpaceSaving + RateLimiter + advisor,
+P1.28/M8 guards all real), aggregate.rs, barrier_align.rs, broadcast_state.rs,
+cep.rs (budget-reservation edge cases carefully handled), continuous.rs,
+delta_join.rs (STREAM-3/4), group_state.rs, interval_join.rs (G5 snapshots),
+join.rs, live_table.rs, memo.rs (single-mutex LRU, TOCTOU-free),
+operator_config.rs, operator_runtime.rs, process_fn.rs, queue.rs (impl; doc
+was D3), schema_normalize.rs (lossy-widen rejection incl. Int64→Float64),
+side_output.rs, state_descriptor.rs, state_persistence.rs, state_tumbling.rs,
+temporal_join.rs (impl beyond D1), tumbling/sliding/session/count (beyond D2),
+watermark_join.rs, watermark_util.rs, watermark_e2e.rs, lib_tests.rs,
+streaming_window_float64.rs. Minor note (not a defect): watermark_join's
+`snapshot_roundtrips_spec_and_watermark` tail deliberately doesn't assert the
+post-restore match count — the head of the test asserts real snapshot values.
+
+Gates: `cargo test -p krishiv-dataflow` (298 lib + 1 integration green — note:
+restoring reverted files with `mv` preserves the old mtime and cargo skips the
+rebuild; `touch` after restore before trusting a green run), clippy
+`--all-targets` clean, `just lint`, `just test`, `cargo fmt` — all green.

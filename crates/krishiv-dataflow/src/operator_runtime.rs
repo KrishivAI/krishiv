@@ -152,7 +152,8 @@ fn sort_bounded_input_by_event_time(
         // leave input untouched rather than fail.
         return Ok(vec![combined]);
     };
-    let indices = arrow::compute::sort_to_indices(ts.as_ref(), None, None).map_err(ExecError::from)?;
+    let indices =
+        arrow::compute::sort_to_indices(ts.as_ref(), None, None).map_err(ExecError::from)?;
     let columns = combined
         .columns()
         .iter()

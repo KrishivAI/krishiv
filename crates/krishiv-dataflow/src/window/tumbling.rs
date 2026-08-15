@@ -294,7 +294,11 @@ impl TumblingWindowOperator {
         // `&self`-only and independent per bucket.
         let drained: Vec<((String, i64), AggState)> = closed
             .into_iter()
-            .filter_map(|bucket| self.accumulators.remove(&bucket).map(|state| (bucket, state)))
+            .filter_map(|bucket| {
+                self.accumulators
+                    .remove(&bucket)
+                    .map(|state| (bucket, state))
+            })
             .collect();
         krishiv_common::compute_pool::par_map(drained, |(bucket, state)| {
             self.build_output_batch(&bucket.0, bucket.1, &state)
@@ -322,11 +326,11 @@ impl TumblingWindowOperator {
         // Phase 65: same order-preserving pool fan-out as the close path;
         // read-only over `&self`, state untouched (early fires must never
         // mutate).
-        krishiv_common::compute_pool::par_map(open, |bucket| {
-            match self.accumulators.get(&bucket) {
-                Some(state) => self.build_output_batch(&bucket.0, bucket.1, state).map(Some),
-                None => Ok(None),
-            }
+        krishiv_common::compute_pool::par_map(open, |bucket| match self.accumulators.get(&bucket) {
+            Some(state) => self
+                .build_output_batch(&bucket.0, bucket.1, state)
+                .map(Some),
+            None => Ok(None),
         })
         .into_iter()
         .filter_map(Result::transpose)
@@ -743,7 +747,10 @@ mod aggregation_proptests {
         }
         let mut expected = seen.clone();
         expected.sort();
-        assert_eq!(seen, expected, "flush output must stay (window_start, key)-sorted");
+        assert_eq!(
+            seen, expected,
+            "flush output must stay (window_start, key)-sorted"
+        );
         assert_eq!(seen.len(), 40 * 5);
     }
 
