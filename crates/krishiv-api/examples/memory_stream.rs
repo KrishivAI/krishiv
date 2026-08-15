@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-
 // Benchmark harness: a panic is the failure signal, and clippy.toml's
 // `allow-*-in-tests` does not cover bench targets.
 #![allow(

@@ -63,10 +63,10 @@ impl JwtAuth {
         }
         let mut validation = jsonwebtoken::Validation::default();
         validation.set_audience(&[&audience]);
-        if let Some(iss) = issuer {
-            if !iss.is_empty() {
-                validation.set_issuer(&[&iss]);
-            }
+        if let Some(iss) = issuer
+            && !iss.is_empty()
+        {
+            validation.set_issuer(&[&iss]);
         }
         Ok(Self { keys, validation })
     }
@@ -1012,6 +1012,7 @@ impl PySession {
     /// - `finalize(state: bytes) -> int | float | str | bool | bytes | None`
     /// - `merge(state_a: bytes, state_b: bytes) -> bytes`
     #[pyo3(signature = (name, accumulate_fn, finalize_fn, merge_fn, *, input_types, output_type, output_name=None))]
+    #[allow(clippy::too_many_arguments)] // keyword-only pyfunction surface
     pub fn register_aggregate_udf(
         &self,
         py: Python<'_>,
@@ -1489,9 +1490,7 @@ impl PySession {
             let stream_label = format!("{stream_name}/{shard_id_owned}");
 
             let input: Arc<krishiv_sql::ContinuousTableInput> = py
-                .allow_threads(|| {
-                    py.detach(move || inner.register_unbounded(&name_for_session, arrow_schema))
-                })
+                .detach(move || inner.register_unbounded_source(&name_for_session, arrow_schema))
                 .map_err(map_krishiv_error)?;
 
             let input_clone = Arc::clone(&input);
@@ -1500,7 +1499,7 @@ impl PySession {
                     Ok(mut src) => loop {
                         match src.next_batch().await {
                             Ok(Some(batch)) => {
-                                if let Err(e) = input_clone.push(batch).await {
+                                if let Err(e) = input_clone.send(batch).await {
                                     tracing::warn!(
                                         task = %name_for_task,
                                         error = %e,
@@ -1580,9 +1579,7 @@ impl PySession {
             let name_for_task = name.clone();
 
             let input: Arc<krishiv_sql::ContinuousTableInput> = py
-                .allow_threads(|| {
-                    py.detach(move || inner.register_unbounded(&name_for_session, arrow_schema))
-                })
+                .detach(move || inner.register_unbounded_source(&name_for_session, arrow_schema))
                 .map_err(map_krishiv_error)?;
 
             let input_clone = Arc::clone(&input);
@@ -1594,7 +1591,7 @@ impl PySession {
                             match src.next_batch(100).await {
                                 Ok(Some(batch)) => {
                                     let n = batch.num_rows();
-                                    if let Err(e) = input_clone.push(batch).await {
+                                    if let Err(e) = input_clone.send(batch).await {
                                         tracing::warn!(
                                             task = %name_for_task,
                                             error = %e,
@@ -1616,7 +1613,7 @@ impl PySession {
                                         );
                                     }
                                     message_count += n;
-                                    if message_count % 10_000 == 0 {
+                                    if message_count.is_multiple_of(10_000) {
                                         tracing::debug!(
                                             task = %name_for_task,
                                             consumed = message_count,

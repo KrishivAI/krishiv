@@ -164,22 +164,20 @@ impl QueryResult {
                 if batch.num_rows() == 0 {
                     continue;
                 }
-                writer.write(batch).map_err(|error| {
-                    crate::error::KrishivError::Runtime {
+                writer
+                    .write(batch)
+                    .map_err(|error| crate::error::KrishivError::Runtime {
                         message: format!("failed to serialize result rows as JSON: {error}"),
-                    }
-                })?;
+                    })?;
             }
-            writer.finish().map_err(|error| {
-                crate::error::KrishivError::Runtime {
+            writer
+                .finish()
+                .map_err(|error| crate::error::KrishivError::Runtime {
                     message: format!("failed to finish JSON result serialization: {error}"),
-                }
-            })?;
+                })?;
         }
-        String::from_utf8(buffer).map_err(|error| {
-            crate::error::KrishivError::Runtime {
-                message: format!("result JSON was not valid UTF-8: {error}"),
-            }
+        String::from_utf8(buffer).map_err(|error| crate::error::KrishivError::Runtime {
+            message: format!("result JSON was not valid UTF-8: {error}"),
         })
     }
 

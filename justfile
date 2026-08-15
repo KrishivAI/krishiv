@@ -352,6 +352,22 @@ lint:
         --features etcd \
         --all-targets \
         -- -D warnings
+    # krishiv-python is excluded from the workspace pass (CI tiers), and its
+    # kinesis/pulsar arms shipped never-compiled (removed pyo3 API, drifted
+    # register_unbounded signature, drifted KafkaConfig field set). Lint the
+    # full python feature graph so the bindings can't silently rot again.
+    {{ cargo }} clippy \
+        -p krishiv-python \
+        --all-features \
+        -- -D warnings
+    # Same blindspot in the connector feature graph: avro/schema-registry/
+    # kinesis/vector modules accumulated ~53 denials the plain workspace pass
+    # never compiled. Keep the full graph lint-clean.
+    {{ cargo }} clippy \
+        -p krishiv-connectors \
+        --all-features \
+        --all-targets \
+        -- -D warnings
 
 # Verify each optional feature compiles on its own — catches forwarding-flag
 # rot and "doesn't build with --no-default-features" breakage in the crates

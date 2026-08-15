@@ -399,12 +399,12 @@ impl PyListState {
     /// Return the current list; returns ``[]`` for empty state.
     fn get_json<'py>(&self, py: Python<'py>, raw: &[u8]) -> PyResult<Bound<'py, PyAny>> {
         if raw.is_empty() {
-            return Ok(py.eval(c"[]", None, None)?);
+            return py.eval(c"[]", None, None);
         }
         let s = std::str::from_utf8(raw).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("state contains invalid UTF-8: {e}"))
         })?;
-        Ok(py.import("json")?.getattr("loads")?.call1((s,))?)
+        py.import("json")?.getattr("loads")?.call1((s,))
     }
 
     /// Append ``item`` to the list and return new raw bytes.
@@ -452,12 +452,12 @@ impl PyMapState {
     /// Return the map; returns ``{}`` for empty state.
     fn get_map_json<'py>(&self, py: Python<'py>, raw: &[u8]) -> PyResult<Bound<'py, PyAny>> {
         if raw.is_empty() {
-            return Ok(py.eval(c"{}", None, None)?);
+            return py.eval(c"{}", None, None);
         }
         let s = std::str::from_utf8(raw).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("state contains invalid UTF-8: {e}"))
         })?;
-        Ok(py.import("json")?.getattr("loads")?.call1((s,))?)
+        py.import("json")?.getattr("loads")?.call1((s,))
     }
 
     /// Put ``k → v`` and return new raw bytes.
@@ -548,7 +548,7 @@ impl PyAggregatingState {
         let s = std::str::from_utf8(raw).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("state contains invalid UTF-8: {e}"))
         })?;
-        Ok(py.import("json")?.getattr("loads")?.call1((s,))?)
+        py.import("json")?.getattr("loads")?.call1((s,))
     }
 
     /// Fold ``value`` into the accumulator (via ``add``) and return new raw bytes.

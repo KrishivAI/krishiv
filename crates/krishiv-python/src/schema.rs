@@ -161,8 +161,10 @@ fn python_annotation_to_arrow(py: Python<'_>, ann: Bound<'_, PyAny>) -> PyResult
             let args_obj = ann.getattr("__args__")?;
             let args = args_obj.cast::<PyTuple>()?;
             let non_none: Vec<Bound<'_, PyAny>> = args.iter().filter(|a| !a.is_none()).collect();
-            if non_none.len() == 1 {
-                return python_annotation_to_arrow(py, non_none[0].clone());
+            if non_none.len() == 1
+                && let Some(only) = non_none.first()
+            {
+                return python_annotation_to_arrow(py, only.clone());
             }
         }
     }

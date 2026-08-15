@@ -2144,10 +2144,7 @@ impl Session {
         // future, and a borrowed `&[S]` is only `Send` when `S: Sync`. Cloning
         // a handful of column names is cheaper than putting that bound on a
         // public signature every caller would then have to satisfy.
-        let declared: Vec<String> = primary_key
-            .iter()
-            .map(|c| c.as_ref().to_owned())
-            .collect();
+        let declared: Vec<String> = primary_key.iter().map(|c| c.as_ref().to_owned()).collect();
         block_on({
             let declared = declared.clone();
             let table_name = table_name.clone();
@@ -2197,6 +2194,19 @@ impl Session {
     pub fn register_unbounded(&self, name: &str, schema: SchemaRef) -> Result<()> {
         self.register_unbounded_input(name, schema, None)?;
         Ok(())
+    }
+
+    /// Register an unbounded streaming table and return its push handle.
+    ///
+    /// Connector bridge loops (the Kinesis/Pulsar consumers in the Python
+    /// bindings) push batches through the handle; terminate the source with
+    /// [`Session::close_unbounded_input`].
+    pub fn register_unbounded_source(
+        &self,
+        name: &str,
+        schema: SchemaRef,
+    ) -> Result<Arc<ContinuousTableInput>> {
+        self.register_unbounded_input(name, schema, None)
     }
 
     /// Register an unbounded streaming table with a specific queue capacity.

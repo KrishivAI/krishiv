@@ -170,13 +170,13 @@ impl PyStreamingQuery {
                             None => Ok(()),
                         };
                     }
-                    if let Some(d) = deadline {
-                        if tokio::time::Instant::now() >= d {
-                            return Err(krishiv_api::KrishivError::Runtime {
-                                message: "streaming query timed out waiting for termination"
-                                    .to_string(),
-                            });
-                        }
+                    if let Some(d) = deadline
+                        && tokio::time::Instant::now() >= d
+                    {
+                        return Err(krishiv_api::KrishivError::Runtime {
+                            message: "streaming query timed out waiting for termination"
+                                .to_string(),
+                        });
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -257,19 +257,6 @@ impl PyStreamingQuery {
 
 // ── PyDataStreamWriter ────────────────────────────────────────────────────────
 
-/// Fluent builder for writing a streaming pipeline to a sink.
-///
-/// Obtain one via :py:meth:`DataFrame.write_stream`.
-///
-/// ## Example
-///
-/// ```python
-/// writer = df.write_stream()
-/// writer.output_mode("append")
-/// writer.trigger("once")
-/// writer.query_name("etl-job")
-/// query = writer.start()
-/// ```
 // ── StreamingQueryManager + listener (Spark parity) ──────────────────────────
 
 /// Rust adapter that forwards streaming-query lifecycle events to a Python
@@ -348,6 +335,19 @@ impl PyStreamingQueryManager {
     }
 }
 
+/// Fluent builder for writing a streaming pipeline to a sink.
+///
+/// Obtain one via :py:meth:`DataFrame.write_stream`.
+///
+/// ## Example
+///
+/// ```python
+/// writer = df.write_stream()
+/// writer.output_mode("append")
+/// writer.trigger("once")
+/// writer.query_name("etl-job")
+/// query = writer.start()
+/// ```
 #[pyclass(name = "DataStreamWriter")]
 pub struct PyDataStreamWriter {
     df: Option<DataFrame>,

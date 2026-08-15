@@ -78,6 +78,12 @@ pub struct PyInMemoryVectorSink {
     inner: Arc<InMemoryVectorSink>,
 }
 
+impl Default for PyInMemoryVectorSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[pymethods]
 impl PyInMemoryVectorSink {
     #[new]

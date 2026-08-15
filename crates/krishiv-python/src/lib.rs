@@ -84,6 +84,10 @@ pub use vector_sinks::{
 
 pub(crate) static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> =
     std::sync::LazyLock::new(|| {
+        // A failed runtime build at module import is unrecoverable: nothing in
+        // the bindings can run without the reactor, so aborting the import is
+        // the only honest outcome.
+        #[allow(clippy::expect_used)]
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -132,6 +136,7 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<sinks::PyParquetSink>()?;
     m.add_class::<sinks::PyConnectorSink>()?;
+    m.add_class::<sources::PyConnectorSource>()?;
     m.add_class::<sinks::PyKafkaSink>()?;
     m.add_class::<sinks::PyIcebergSink>()?;
     m.add_class::<sinks::PyCassandraSink>()?;

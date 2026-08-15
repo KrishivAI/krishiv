@@ -91,6 +91,7 @@ impl PyKafkaSink {
                 sasl_mechanisms: None,
                 enable_idempotence: None,
                 transactional_id: None,
+                decode_columns: None,
             };
             let mut sink = KafkaSink::new(cfg)
                 .map_err(|e| PyRuntimeError::new_err(format!("kafka sink init: {e}")))?;
@@ -180,7 +181,10 @@ impl PyIcebergSink {
                 [ns @ .., last] => (ns.join("."), (*last).to_string()),
             };
             let table_ref = IcebergTableRef::new("default", namespace, name);
-            let schema_version = schema_version_from_arrow(records[0].schema().as_ref(), None)
+            let Some(first) = records.first() else {
+                return Ok(0);
+            };
+            let schema_version = schema_version_from_arrow(first.schema().as_ref(), None)
                 .map_err(|e| PyRuntimeError::new_err(format!("iceberg schema: {e}")))?;
             let tbl = IcebergFsTable::new(&base, table_ref, schema_version)
                 .map_err(|e| PyRuntimeError::new_err(format!("iceberg open: {e}")))?;

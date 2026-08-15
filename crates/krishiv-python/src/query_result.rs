@@ -45,7 +45,11 @@ impl PyQueryResult {
         let text = self.pretty()?;
         let lines: Vec<&str> = text.lines().collect();
         let printed: Vec<&str> = lines.iter().take(n + 3).copied().collect();
-        println!("{}", printed.join("\n"));
+        // Write through the process stdout handle rather than `println!` so a
+        // broken pipe surfaces as a Python exception instead of a panic.
+        use std::io::Write;
+        writeln!(std::io::stdout(), "{}", printed.join("\n"))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(())
     }
 
@@ -127,8 +131,7 @@ impl PyQueryResultIter {
     }
 
     fn __next__(&mut self) -> PyResult<PyBatch> {
-        if self.pos < self.batches.len() {
-            let batch = self.batches[self.pos].clone();
+        if let Some(batch) = self.batches.get(self.pos).cloned() {
             self.pos += 1;
             Ok(batch)
         } else {

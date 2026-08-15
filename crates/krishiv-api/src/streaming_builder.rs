@@ -1458,6 +1458,7 @@ fn build_sink_dispatcher(
                         sasl_mechanisms: None,
                         enable_idempotence: None,
                         transactional_id: None,
+                        decode_columns: None,
                     };
                     let sink = KafkaSink::new(cfg).map_err(|e| KrishivError::Runtime {
                         message: format!("kafka sink init: {e}"),

@@ -344,6 +344,7 @@ impl PyStreamingDataFrame {
 
 #[pyfunction]
 #[pyo3(signature = (left, right, left_time_col, right_time_col, left_key_col, right_key_col, lower_bound_ms, upper_bound_ms))]
+#[allow(clippy::too_many_arguments)] // keyword-only pyfunction surface
 pub fn interval_join(
     left: Vec<crate::batch::PyBatch>,
     right: Vec<crate::batch::PyBatch>,
@@ -413,7 +414,7 @@ pub fn stream_table_join(
         .map(|(stream_batch, table_batch)| {
             (
                 crate::batch::PyBatch::from_record_batch(stream_batch),
-                table_batch.map(|batch| crate::batch::PyBatch::from_record_batch(batch)),
+                table_batch.map(crate::batch::PyBatch::from_record_batch),
             )
         })
         .collect())
@@ -458,7 +459,7 @@ pub fn temporal_join(
         .map(|(stream_batch, table_batch)| {
             (
                 crate::batch::PyBatch::from_record_batch(stream_batch),
-                table_batch.map(|batch| crate::batch::PyBatch::from_record_batch(batch)),
+                table_batch.map(crate::batch::PyBatch::from_record_batch),
             )
         })
         .collect())
@@ -466,6 +467,7 @@ pub fn temporal_join(
 
 #[pyfunction]
 #[pyo3(signature = (left, right, left_time_col, right_time_col, left_key_col, right_key_col, lower_bound_ms, upper_bound_ms))]
+#[allow(clippy::too_many_arguments)] // keyword-only pyfunction surface
 pub fn stream_stream_join(
     left: Vec<crate::batch::PyBatch>,
     right: Vec<crate::batch::PyBatch>,

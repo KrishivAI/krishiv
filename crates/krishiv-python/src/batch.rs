@@ -119,18 +119,18 @@ impl PyBatch {
 }
 
 #[pyfunction]
-pub fn make_example_batch() -> PyBatch {
+pub fn make_example_batch() -> pyo3::PyResult<PyBatch> {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
     let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
     let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
-        .expect("example batch");
-    PyBatch::from_record_batch(batch)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    Ok(PyBatch::from_record_batch(batch))
 }
 
 fn array_value_at(array: &dyn arrow::array::Array, row: usize) -> String {
-    use arrow::array::*;
+    use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
     use arrow::datatypes::DataType;
 
     if array.is_null(row) {

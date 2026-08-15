@@ -264,10 +264,10 @@ impl PyRelation {
         let result = py.detach(|| self.collect_internal())?;
         py.detach(move || {
             let batches = result.into_batches();
-            if batches.is_empty() {
+            let Some(first) = batches.first() else {
                 return Ok(());
-            }
-            let schema = batches[0].schema();
+            };
+            let schema = first.schema();
             let file = std::fs::File::create(&path)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
             let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, None)

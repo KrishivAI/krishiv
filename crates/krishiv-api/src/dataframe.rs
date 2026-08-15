@@ -15,9 +15,9 @@ use krishiv_runtime::{ExecutionRuntime, JobId, JobState, JobStatus, LocalJobRegi
 use krishiv_sql::KrishivDataFrameOps;
 
 use crate::error::{KrishivError, Result};
-use crate::session::RegisteredParquet;
 use crate::expression::Expr;
 use crate::io::DataFrameWriter;
+use crate::session::RegisteredParquet;
 use crate::types::{ExecutionMode, QueryResult};
 
 /// Unified execution result for [`DataFrame::execute`].

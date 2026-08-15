@@ -142,9 +142,12 @@ pub fn read_kafka(
 ///
 /// **Feature gate**: Requires `pip install krishiv[iceberg]` or building with `--features iceberg`.
 ///
-/// **Alpha (with feature)**: Performs an in-memory validation scan only. The `catalog_uri`
-/// is not used for real REST catalog connectivity — it is stored as a source identifier.
-/// The returned stream has no watermark set.
+/// **Alpha (with feature)**: `catalog_uri` must be a filesystem catalog — a local
+/// directory (or `file://` URI) laid out by the engine's Iceberg filesystem
+/// tables (what `krishiv.sinks.iceberg` writes). The table is scanned for real;
+/// an empty `catalog_uri` gives an empty in-memory table (schema-only
+/// pipelines/tests), and any other URI is rejected. REST catalogs are not
+/// reachable from this surface yet. The returned stream has no watermark set.
 pub fn read_iceberg(
     py: Python<'_>,
     session: &PySession,
@@ -226,19 +229,47 @@ fn read_iceberg_impl(
             fields: vec![],
         }
     };
-    let table = MemoryLakehouseTable::new(table_ref.clone(), schema_version);
-    let _opts = IcebergScanOptions::new();
-    // Validate catalog reachability via in-memory scan (empty table is OK).
-    // Reuse the shared crate::RUNTIME instead of building a one-off runtime
-    // per call, and release the GIL for the wait.
-    let scanned = py.detach(|| {
-        crate::RUNTIME.block_on(async {
-            table
-                .scan(&_opts)
-                .await
-                .map_err(|e| ConnectorError::new_err(format!("Iceberg catalog error: {e}")))
-        })
-    })?;
+    let opts = IcebergScanOptions::new();
+    // A filesystem catalog (a local directory or file:// URI) is read for
+    // real through `IcebergFsTable`. Anything else is rejected loudly — the
+    // old behaviour validated against an always-empty in-memory table, which
+    // silently returned zero rows for every existing table.
+    let fs_root = catalog_uri
+        .strip_prefix("file://")
+        .unwrap_or(catalog_uri.as_str());
+    let scanned = if !fs_root.is_empty() && std::path::Path::new(fs_root).is_dir() {
+        let table = krishiv_connectors::lakehouse::IcebergFsTable::new(
+            fs_root,
+            table_ref.clone(),
+            schema_version,
+        )
+        .map_err(|e| ConnectorError::new_err(format!("Iceberg open error: {e}")))?;
+        py.detach(|| {
+            crate::RUNTIME.block_on(async {
+                table
+                    .scan(&opts)
+                    .await
+                    .map_err(|e| ConnectorError::new_err(format!("Iceberg scan error: {e}")))
+            })
+        })?
+    } else if catalog_uri.is_empty() {
+        // No catalog: an in-memory empty table, useful for schema-only
+        // pipelines and tests.
+        let table = MemoryLakehouseTable::new(table_ref.clone(), schema_version);
+        py.detach(|| {
+            crate::RUNTIME.block_on(async {
+                table
+                    .scan(&opts)
+                    .await
+                    .map_err(|e| ConnectorError::new_err(format!("Iceberg catalog error: {e}")))
+            })
+        })?
+    } else {
+        return Err(ConnectorError::new_err(format!(
+            "read_iceberg supports filesystem catalogs only (a local directory or file:// URI); \
+             '{catalog_uri}' is not an existing directory"
+        )));
+    };
     // Register the scanned rows as a SQL table so the source is a unified
     // StreamingDataFrame (the old Stream/pipeline path was retired).
     let table_name = format!("iceberg_{}", table_ref.full_name().replace('.', "_"));
@@ -266,8 +297,9 @@ fn read_iceberg_impl(
 ///   `"after:<seq>"`, or `"at:<seq>"`.
 #[pyfunction]
 #[pyo3(signature = (session, stream_name, region, *, shard_id="shardId-000000000000", start_position="trim_horizon", max_batches=10, batch_size=100))]
+#[allow(clippy::too_many_arguments)] // keyword-only pyfunction surface
 pub fn read_kinesis(
-    _py: Python<'_>,
+    py: Python<'_>,
     session: &PySession,
     stream_name: String,
     region: String,
@@ -315,34 +347,30 @@ pub fn read_kinesis(
         };
         let inner = session.inner.clone();
         let name = stream_name.clone();
-        let batches = py
-            .detach(move || {
-                crate::session::block_on_async(async move {
-                    let mut src = KinesisSource::new(cfg).await.map_err(|e| {
-                        krishiv_api::KrishivError::Runtime {
-                            message: e.to_string(),
-                        }
-                    })?;
-                    let mut collected = Vec::new();
-                    for _ in 0..max_batches {
-                        match src.next_batch().await {
-                            Ok(Some(batch)) => collected.push(batch),
-                            Ok(None) => break,
-                            Err(e) => {
-                                return Err(krishiv_api::KrishivError::Runtime {
-                                    message: e.to_string(),
-                                });
-                            }
+        py.detach(move || {
+            crate::session::block_on_async(async move {
+                let mut src = KinesisSource::new(cfg).await.map_err(|e| {
+                    krishiv_api::KrishivError::Runtime {
+                        message: e.to_string(),
+                    }
+                })?;
+                let mut collected = Vec::new();
+                for _ in 0..max_batches {
+                    match src.next_batch().await {
+                        Ok(Some(batch)) => collected.push(batch),
+                        Ok(None) => break,
+                        Err(e) => {
+                            return Err(krishiv_api::KrishivError::Runtime {
+                                message: e.to_string(),
+                            });
                         }
                     }
-                    inner
-                        .register_record_batches(&name, collected)
-                        .map_err(krishiv_api::KrishivError::from)?;
-                    Ok::<_, krishiv_api::KrishivError>(())
-                })
+                }
+                inner.register_record_batches(&name, collected)?;
+                Ok::<_, krishiv_api::KrishivError>(())
             })
-            .map_err(crate::errors::map_krishiv_error)?;
-        let _ = batches;
+        })
+        .map_err(crate::errors::map_krishiv_error)?;
         let escaped = stream_name.replace('"', "\"\"");
         streaming_df_from_sql(session, format!("SELECT * FROM \"{escaped}\""), "", 0)
     }
@@ -362,7 +390,7 @@ pub fn read_kinesis(
 #[pyfunction]
 #[pyo3(signature = (session, broker_url, topic, *, subscription="krishiv-default", max_batches=10, batch_size=100))]
 pub fn read_pulsar(
-    _py: Python<'_>,
+    py: Python<'_>,
     session: &PySession,
     broker_url: String,
     topic: String,
@@ -410,14 +438,120 @@ pub fn read_pulsar(
                         }
                     }
                 }
-                inner
-                    .register_record_batches(&name, collected)
-                    .map_err(krishiv_api::KrishivError::from)
+                inner.register_record_batches(&name, collected)
             })
         })
         .map_err(crate::errors::map_krishiv_error)?;
 
         let escaped = topic.replace('"', "\"\"");
         streaming_df_from_sql(session, format!("SELECT * FROM \"{escaped}\""), "", 0)
+    }
+}
+
+// ── Registry-generic source (mirror of sinks::ConnectorSink) ─────────────────
+
+/// Registry-dispatched source — reads Arrow record batches through **any**
+/// connector source driver registered in the engine's one connector registry.
+///
+/// The mirror of `krishiv.sinks.ConnectorSink`: a Python job reaches whatever
+/// sources the build registers (`parquet`, `csv`, `avro`, `s3`, `jdbc`,
+/// `delta`, `hudi`, `iceberg`, …) without a new pyfunction per kind. An
+/// unregistered kind raises the registry's own error.
+///
+/// ```python
+/// from krishiv import ConnectorSource
+/// src = ConnectorSource("csv", {"path": "/tmp/in.csv"})
+/// batches = src.read_batches()
+/// ```
+#[pyclass(name = "ConnectorSource")]
+pub struct PyConnectorSource {
+    kind: String,
+    name: String,
+    options: std::collections::BTreeMap<String, String>,
+}
+
+#[pymethods]
+impl PyConnectorSource {
+    #[new]
+    #[pyo3(signature = (kind, options = None, name = None))]
+    pub fn new(
+        kind: String,
+        options: Option<std::collections::BTreeMap<String, String>>,
+        name: Option<String>,
+    ) -> Self {
+        Self {
+            kind,
+            name: name.unwrap_or_else(|| String::from("python-connector-source")),
+            options: options.unwrap_or_default(),
+        }
+    }
+
+    #[getter]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// Read batches through the registered source driver.
+    ///
+    /// `max_batches` bounds the read. It is required for unbounded sources
+    /// (streams have no end, so an uncapped read would never return) and
+    /// optional for bounded ones, which read to exhaustion by default.
+    #[pyo3(signature = (max_batches = None))]
+    // Sync-over-async boundary (same contract as the sinks module): the
+    // synchronous Python surface bridges to the async connector core.
+    #[allow(clippy::disallowed_methods)]
+    pub fn read_batches(
+        &self,
+        py: Python<'_>,
+        max_batches: Option<usize>,
+    ) -> PyResult<Vec<crate::batch::PyBatch>> {
+        use krishiv_common::async_util::block_on;
+        use krishiv_connectors::{ConnectorConfig, default_registry};
+
+        let mut config = ConnectorConfig::new(&self.name, &self.kind);
+        for (key, value) in &self.options {
+            config = config.with_property(key, value);
+        }
+
+        let batches = py.detach(move || {
+            block_on(async move {
+                let registry = default_registry();
+                let mut src = registry.open_source(&config).await.map_err(|e| {
+                    PyRuntimeError::new_err(format!("connector source open ({}): {e}", config.kind))
+                })?;
+                if max_batches.is_none() && !src.capabilities().is_bounded() {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "connector source ({}) is unbounded; pass max_batches to bound the read",
+                        config.kind
+                    )));
+                }
+                let cap = max_batches.unwrap_or(usize::MAX);
+                let mut out = Vec::new();
+                while out.len() < cap {
+                    match src.read_batch_dyn().await.map_err(|e| {
+                        PyRuntimeError::new_err(format!(
+                            "connector source read ({}): {e}",
+                            config.kind
+                        ))
+                    })? {
+                        Some(batch) => out.push(batch),
+                        None => break,
+                    }
+                }
+                Ok::<_, PyErr>(out)
+            })
+        })?;
+        Ok(batches
+            .into_iter()
+            .map(crate::batch::PyBatch::from_record_batch)
+            .collect())
+    }
+
+    pub fn __repr__(&self) -> String {
+        format!(
+            "ConnectorSource(kind={:?}, options={} keys)",
+            self.kind,
+            self.options.len()
+        )
     }
 }

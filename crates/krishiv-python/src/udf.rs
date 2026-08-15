@@ -722,6 +722,7 @@ impl krishiv_plan::udf::AggregateUdf for PythonAggregateUdf {
 }
 
 /// Build a Python UDAF from three Python callables and type metadata.
+#[allow(clippy::too_many_arguments)] // mirrors the keyword-only pyfunction it backs
 pub(crate) fn build_python_aggregate_udf(
     py: Python<'_>,
     name: String,

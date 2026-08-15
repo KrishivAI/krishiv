@@ -334,6 +334,7 @@ impl PyIvmJob {
     /// Register an incremental view with LATENESS annotations
     /// (``lateness_ms`` maps column name → lateness in milliseconds).
     #[pyo3(signature = (name, body_sql, schema, lateness_ms, is_materialized=false, is_recursive=false))]
+    #[allow(clippy::too_many_arguments)] // keyword-only pyfunction surface
     pub fn register_view_with_lateness(
         &self,
         py: Python<'_>,

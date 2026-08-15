@@ -2100,6 +2100,45 @@ hashes, and an open list. Sections are appended as the audit reaches them.
 
 Things that are not one crate's problem.
 
+- [x] **Python↔connector integration audit (2026-08-15, follow-on to crate 7).**
+      Traced every source/sink connector's reachability from the Python API
+      across batch, SQL, delta-batch, and streaming modes. Findings, all fixed:
+      - **The `kinesis` and `pulsar` feature arms of krishiv-python did not
+        compile at all** (removed pyo3 `allow_threads` API, `_py`/`py`
+        mismatch, and `register_unbounded` no longer returning the push
+        handle) — the "continuous streaming" registration paths for both
+        connectors had never been built. Fixed via a new
+        `Session::register_unbounded_source` (krishiv-api) that returns the
+        `ContinuousTableInput` handle, `send()` instead of the removed
+        `push()`, and the pyo3 `detach` API.
+      - **krishiv-api's own `kafka` feature did not compile** (KafkaConfig
+        grew `decode_columns`; `streaming_builder.rs` and python `sinks.rs`
+        initializers were never updated).
+      - **`read_iceberg` returned empty data by construction** — it scanned a
+        freshly created in-memory table and registered zero rows for every
+        existing table. Now scans real filesystem catalogs via
+        `IcebergFsTable` (the same layout `krishiv.sinks.iceberg` writes),
+        keeps the empty in-memory table only for an empty `catalog_uri`, and
+        rejects other URIs loudly.
+      - **No registry-generic source existed** — `ConnectorSink` reached every
+        registered sink driver but batch *reads* had no equivalent. Added
+        `ConnectorSource` (registry `open_source` → `read_batches()`, with a
+        mandatory `max_batches` for unbounded sources).
+      - Cleared the python crate's accumulated lint debt (8 denials incl.
+        prod `println!`/`expect`/indexing + 23 warnings) now that the crate
+        is lintable at all.
+      - **Guard:** `just lint` now lints `krishiv-python --all-features` and
+        `krishiv-connectors --all-features --all-targets`, closing the
+        CI blindspot that let both never-compiled feature arms ship.
+      Mode map after the fixes: batch (per-kind sinks + ConnectorSink/
+      ConnectorSource + parquet/kinesis/pulsar snapshot reads), SQL
+      (session.sql over registered connector tables; engine DDL registry
+      falsification test already guards driver presence), delta batch
+      (read/write_delta, read/write_hudi — real, merge mode errors honestly),
+      streaming (register_kafka/kinesis/pulsar_source continuous paths +
+      DataStreamWriter kafka/parquet/iceberg via streaming_builder, pulsar
+      acks wired).
+
 - [x] **The streaming dials exist twice, byte-identically.** Consolidated
       `76f3fbba` into `krishiv_common::streaming_dials`; both
       `krishiv-executor/src/fragment/run_loop.rs` and `krishiv-engines` now
