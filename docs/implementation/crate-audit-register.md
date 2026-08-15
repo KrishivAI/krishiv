@@ -41,7 +41,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 5 | krishiv-plan | 14,371 | 25 | **25 (COMPLETE)** | plan IR every surface depends on; 3 can't-fail tests fixed, 2 unreachable AQE rules with latent outer-join bugs documented, 4 dead pub surfaces recorded |
 | 6 | krishiv-common | 7,966 | 23 | **23 (COMPLETE)** | 2 wrong-answer fixes (Float64 signed-zero shard split, UMM available `max`→`min`), a heartbeat env busy-loop, 3 declared-default drifts, registry `.rs.inc` scan blindness |
 | 7 | krishiv-connectors | 39,930 | 97 | **97 (COMPLETE)** | ~60 defects fixed incl. avro silent corruption, kafka/cdc offset-before-delivery, NULL-predicate DELETE, orphan-cleanup deleting live MoR delete files, LanceDB fragment loss, 2PC later-epoch drops; streaming_unify deleted; ~120 tests added |
-| 8 | krishiv-state | 12,357 | 37 | 0 | checkpoints/restore; fewer than half the files tested |
+| 8 | krishiv-state | 12,357 | 37 | **37 (COMPLETE)** | 9 revert-proven fixes incl. savepoint-restore skipping manifest coverage, key-group task-index formula diverging from ranges, 1M-entry restore cap, DFS unstable-hash filenames + collision returning wrong key's value, sequential "async" executor; 2 can't-fail tests strengthened |
 | **Tier 3 — runtime & surfaces** |
 | 9 | krishiv-api | 25,111 | 38 | 0 | |
 | 10 | krishiv-runtime | 13,648 | 17 | 0 | |
@@ -2095,6 +2095,105 @@ coverage, a table of uncovered-region concentration, a fixed list with commit
 hashes, and an open list. Sections are appended as the audit reaches them.
 
 ---
+
+## 8. krishiv-state — 37 of 37 files read whole (COMPLETE, 2026-08-15)
+
+Coverage before: 83.0% regions / 78.4% lines (`cargo llvm-cov`). Weakest files:
+backend.rs 27% (default trait methods), storage_uri 32%, ephemeral 59%, io 63%.
+All 12 findings below were fixed in this session; every behavioral fix was
+proven red by reverting the production line (noted per item). Commit: see
+`fix(krishiv-state)` audit commit on this date.
+
+**Defects fixed (revert-proven unless noted):**
+
+1. **F1 — `restore_savepoint` skipped the metadata⊆manifest coverage check**
+   (`checkpoint/io.rs`). `validate_epoch` rejects a metadata-declared snapshot
+   missing from `manifest.sha256`; restore accepted the same inconsistency and
+   copied the never-hash-verified file into the live checkpoints dir,
+   re-hashing it as valid. Restore now reads the savepoint manifest once,
+   validates its entries, and requires `manifest.contains(rel)` per declared
+   snapshot. Test: `restore_savepoint_rejects_metadata_snapshot_not_in_manifest`
+   (red on revert). `validate_manifest_at_prefix` became test-only.
+2. **F2 — `task_index_for_key_group` disagreed with
+   `key_group_ranges_for_parallelism`** whenever `NUM_KEY_GROUPS % p != 0`
+   (first divergence p=5 at kg=19661): the O(1) floor formula vs the
+   remainder-first ranges. Zero production callers today — a landmine, not a
+   live bug — but any future caller would route keys to a task that does not
+   own them. Reimplemented as the exact inverse of the range assignment; the
+   old test used only p=4 (32768%4==0 — cannot fail) and now sweeps
+   p ∈ {1..7,11,16,100} over every key group (red on revert).
+3. **F3 — portable-snapshot decode capped at 1M entries while encode had no
+   cap** (`snapshot.rs`): a backend with >1M keys checkpointed fine and failed
+   only at restore. Replaced the arbitrary cap with the structural bound
+   `count ≤ (len−12)/32` (each entry needs ≥32 bytes), keeping the forged-count
+   DoS guard. Tests: `snapshot_decode_accepts_more_than_a_million_entries`
+   (red on revert) + `snapshot_decode_rejects_forged_entry_count`.
+4. **F4 — DFS backend filenames used 64-bit `DefaultHasher` and `get()`
+   ignored the record's embedded key** (`dfs_backend.rs`): (a) `DefaultHasher`
+   is documented as unstable across Rust releases — a toolchain upgrade would
+   orphan every durable DFS record; (b) a hash collision made `get(a)` silently
+   return `b`'s value, and `put` overwrote the shared file. Filenames now use
+   `sha256_hex(key)`; `get()` errors `CorruptEntry` when the embedded key
+   mismatches. Tests: `dfs_filenames_use_stable_sha256_of_key`,
+   `dfs_get_rejects_record_with_mismatched_embedded_key` (both red on revert).
+5. **F5 — DFS cache-size accounting inflated on overwrite**: `write_to_cache`
+   charged `+len` without releasing the old entry's bytes, so hot keys inflated
+   the counter until LRU eviction thrashed the cache empty. Old size is now
+   released first. Test: `cache_size_stays_flat_when_overwriting_same_key`
+   (pre-fix accounted 1000 bytes for one 100-byte value; red on revert).
+6. **F6 — DFS `load_snapshot` allocated `vec![0; len]` from untrusted u64
+   lengths** before any bounds check: a corrupt snapshot aborted the process
+   (capacity overflow) instead of erroring. Extracted `read_len_prefixed` that
+   validates the claimed length against the remaining buffer first. Test:
+   `load_snapshot_rejects_oversized_length_prefix` (panics on revert).
+7. **F7 — `AsyncOperatorExecutor::drive_futures` was sequential** while
+   documented "concurrently via Tokio… bounded concurrency" — the batching was
+   a no-op, and `executor_drives_futures_concurrently` could not tell. Batches
+   now run under `join_all`. Test:
+   `drive_futures_overlaps_accesses_within_a_batch` measures peak overlap with
+   a 50ms-sleeping backend (peak=1 pre-fix; red on revert).
+8. **F9 — incremental SST dedup keyed on filename alone**
+   (`incremental_checkpoint.rs`, unwired Phase-56 surface): a same-named SST
+   with different content (file-number reuse after restore into a fresh DB)
+   was never re-uploaded, so restore would fetch the stale blob and fail its
+   hash check. Dedup map is now `filename → sha256`. Test:
+   `upload_reuploads_same_filename_with_different_content` (red on revert).
+9. **F11 — TTL `list_keys` reported a corrupt (<8-byte) entry as live while
+   `get` errors `CorruptEntry` on the same entry.** Aligned to error. Test:
+   `ttl_list_keys_errors_on_corrupt_entry_like_get_does` (red on revert).
+
+**Efficiency/honesty fixes with no behavioral delta (not revert-provable):**
+
+10. **F8** — `BatchedStateAccess::get_batch` did per-key `get`s, bypassing
+    `StateBackend::get_batch` overrides (RocksDB single read txn). Now
+    delegates; results identical, covered by `batched_state_access_works`.
+11. **F10** — `incremental_gc_retains_newest_epochs` ended in
+    `let _ = manifest; let _ = up;` ("verify gc didn't panic") — a cannot-fail
+    test. Now asserts retained epoch 4 dedups and GC'd epoch 1 re-uploads.
+12. **F12** — `list_valid_epochs` warned "skipping non-numeric checkpoint
+    epoch directory" for `latest_epoch.json` (its own hint file) on every
+    listing. The hint filename is now skipped silently.
+
+**Recorded, not fixed (design notes, no defect):**
+- `LocalFsCheckpointStorage::full_path("")` resolves to the base dir, so
+  `delete_prefix("")` would delete every job; all callers pass epoch/savepoint
+  dirs. Temp-file (`*.tmp.N`) leak possible if the process dies between create
+  and rename — invisible to restore (manifest-driven), disk-only.
+- DFS `load_snapshot` uses `from_utf8_lossy` for op/state names (decode path
+  elsewhere errors on non-UTF-8); v2 format is DFS-local, never redistributed.
+- TTL semantics on restore: snapshot strips expiry prefixes and load re-arms
+  `now + ttl` — documented (P0.16), noted as a restore-extends-TTL behavior.
+- `SavepointCoordinator::delete_savepoint` durable delete is best-effort by
+  design (in-memory removal wins); `list_savepoints` (io.rs) silently skips
+  non-numeric names where the checkpoint listing warns.
+- checkpoint/tests.rs, proptest_checkpoint_kill.rs are genuinely strong
+  (commit-or-abort kill model, byte-flip fencing, committed v1 savepoint
+  fixture as the format-compatibility exit gate).
+
+Verification: krishiv-state 356 lib + 8 integration tests green (8 new
+regression tests added), `just lint` clean, `cargo clippy -p krishiv-state
+--all-targets --all-features` 0 warnings, `cargo fmt` clean, full `just test`
+workspace gate green.
 
 ## Cross-cutting findings
 

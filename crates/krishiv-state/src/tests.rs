@@ -917,15 +917,19 @@ fn key_group_range_as_range() {
 
 #[test]
 fn task_index_for_key_group_matches_ranges() {
-    let parallelism = 4u32;
-    let ranges = key_group::key_group_ranges_for_parallelism(parallelism);
-    for (task_idx, range) in ranges.iter().enumerate() {
-        for kg in range.as_range() {
-            let assigned = key_group::task_index_for_key_group(kg, parallelism);
-            assert_eq!(
-                assigned, task_idx as u32,
-                "key group {kg} should map to task {task_idx}, got {assigned}"
-            );
+    // Cover non-divisor parallelisms: NUM_KEY_GROUPS % p != 0 is exactly where
+    // the former floor-arithmetic formula disagreed with the range assignment
+    // (p=5 first diverged at kg=19661). p=4 alone could never fail.
+    for parallelism in [1u32, 2, 3, 4, 5, 6, 7, 11, 16, 100] {
+        let ranges = key_group::key_group_ranges_for_parallelism(parallelism);
+        for (task_idx, range) in ranges.iter().enumerate() {
+            for kg in range.as_range() {
+                let assigned = key_group::task_index_for_key_group(kg, parallelism);
+                assert_eq!(
+                    assigned, task_idx as u32,
+                    "p={parallelism}: key group {kg} should map to task {task_idx}, got {assigned}"
+                );
+            }
         }
     }
 }
@@ -998,13 +1002,21 @@ fn incremental_gc_retains_newest_epochs() {
         writer.record_committed(m);
     }
     writer.gc(2);
-    // Only epochs 3 and 4 should remain.
-    let manifest = writer.plan_incremental_upload(5, b"s5", Some(4));
-    // The previous epoch (4) must still be tracked.
-    let (_, up) = writer.plan_incremental_upload(6, b"s6", Some(5));
-    // Just verify gc didn't panic and the writer is still usable.
-    let _ = manifest;
-    let _ = up;
+    // Only epochs 3 and 4 remain tracked. Planning against a retained epoch
+    // with unchanged content must skip the upload...
+    let (_, up_kept) = writer.plan_incremental_upload(5, b"s4", Some(4));
+    assert!(
+        up_kept.is_empty(),
+        "epoch 4 must survive gc(2), so identical content is deduplicated"
+    );
+    // ...while planning against a GC'd epoch must re-upload even identical
+    // content (its manifest is gone).
+    let (_, up_gcd) = writer.plan_incremental_upload(5, b"s1", Some(1));
+    assert_eq!(
+        up_gcd.len(),
+        1,
+        "epoch 1 must have been dropped by gc(2), forcing a full upload"
+    );
 }
 
 #[test]
@@ -1131,4 +1143,50 @@ fn large_state_snapshot_restore_and_redistribution_integrity() {
         }
     }
     assert_eq!(total, KEYS, "no entry lost or duplicated by redistribution");
+}
+
+// ── Audit crate-8 regression tests ───────────────────────────────────────
+
+/// F3: the decoder must accept any snapshot the encoder can produce — a
+/// former fixed 1M-entry cap made >1M-key state checkpointable but
+/// unrestorable. Encoded size bounds the count instead.
+#[test]
+fn snapshot_decode_accepts_more_than_a_million_entries() {
+    const N: usize = 1_000_001;
+    let entries: Vec<crate::snapshot::SnapshotEntry> = (0..N)
+        .map(|_| (String::new(), String::new(), Vec::new(), Vec::new()))
+        .collect();
+    let bytes = encode_snapshot_entries(&entries);
+    let decoded = decode_snapshot_entries(&bytes).expect("entry count above 1M must decode");
+    assert_eq!(decoded.len(), N);
+}
+
+/// F3 guard retained: a forged header claiming more entries than the payload
+/// could hold must be rejected before any allocation happens.
+#[test]
+fn snapshot_decode_rejects_forged_entry_count() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+    bytes.extend_from_slice(&[0u8; 64]); // 64 payload bytes can hold at most 2 entries
+    let err = decode_snapshot_entries(&bytes).expect_err("forged count must be rejected");
+    assert!(matches!(err, StateError::SnapshotCorrupt { .. }));
+}
+
+/// F11: list_keys must agree with get() about corrupt (sub-8-byte) TTL
+/// entries — get() errors, so listing the same entry as live is a lie.
+#[test]
+fn ttl_list_keys_errors_on_corrupt_entry_like_get_does() {
+    let mut inner = RocksDbStateBackend::new().unwrap();
+    let n = ns("op1", "session");
+    inner.put(&n, b"bad".to_vec(), b"sho".to_vec()).unwrap();
+    let ttl = TtlStateBackend::new(inner, TtlConfig::new(60_000));
+    assert!(matches!(
+        ttl.get(&n, b"bad").unwrap_err(),
+        StateError::CorruptEntry { .. }
+    ));
+    let err = ttl
+        .list_keys(&n)
+        .expect_err("list_keys must error on the entry get() rejects");
+    assert!(matches!(err, StateError::CorruptEntry { .. }));
 }

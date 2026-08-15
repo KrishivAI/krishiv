@@ -17,7 +17,7 @@
 //! {prefix}/epochs/{epoch:020}/sst_manifest.json — epoch manifest
 //! ```
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -88,8 +88,11 @@ impl SstEpochManifest {
 #[derive(Debug, Clone)]
 pub struct RocksDbIncrementalCheckpointer {
     work_dir: PathBuf,
-    /// Filenames already uploaded to storage during this run.
-    uploaded_filenames: HashSet<String>,
+    /// `filename → sha256` of SST blobs known to be in storage. Keyed by
+    /// content hash as well as name: a same-named SST with different content
+    /// (file-number reuse after a restore into a fresh DB) must be re-uploaded,
+    /// or restore would fetch the stale blob and fail its hash check.
+    uploaded_filenames: HashMap<String, String>,
 }
 
 impl RocksDbIncrementalCheckpointer {
@@ -101,7 +104,7 @@ impl RocksDbIncrementalCheckpointer {
         })?;
         Ok(Self {
             work_dir,
-            uploaded_filenames: HashSet::new(),
+            uploaded_filenames: HashMap::new(),
         })
     }
 
@@ -232,7 +235,7 @@ impl RocksDbIncrementalCheckpointer {
                 message: format!("parse prev sst manifest: {e}"),
             })?;
         for sst in prev.sst_files {
-            self.uploaded_filenames.insert(sst.filename);
+            self.uploaded_filenames.insert(sst.filename, sst.sha256_hex);
         }
         Ok(())
     }
@@ -268,9 +271,10 @@ impl RocksDbIncrementalCheckpointer {
                 let sha256 = krishiv_common::hash::sha256_hex(&data);
                 let storage_path = format!("{prefix}/sst/{filename}");
 
-                if !self.uploaded_filenames.contains(&filename) {
+                if self.uploaded_filenames.get(&filename) != Some(&sha256) {
                     storage.write_bytes(&storage_path, &data)?;
-                    self.uploaded_filenames.insert(filename.clone());
+                    self.uploaded_filenames
+                        .insert(filename.clone(), sha256.clone());
                 }
 
                 sst_files.push(SstFileRef {
@@ -450,5 +454,33 @@ mod tests {
             restore_dir.path(),
         );
         assert!(result.is_err(), "restore should fail on hash mismatch");
+    }
+
+    /// F9: SST dedup must key on content hash, not filename alone. A
+    /// same-named SST whose content changed (file-number reuse after a
+    /// restore into a fresh DB) must be re-uploaded, or restore fetches the
+    /// stale blob and fails its hash check.
+    #[test]
+    fn upload_reuploads_same_filename_with_different_content() {
+        let storage = make_storage();
+        let work = tempfile::tempdir().unwrap();
+        let mut ckpt = RocksDbIncrementalCheckpointer::new(work.path()).unwrap();
+
+        // Pretend "000001.sst" was uploaded earlier with different content.
+        ckpt.uploaded_filenames
+            .insert("000001.sst".to_owned(), "old-hash".to_owned());
+
+        let local = tempfile::tempdir().unwrap();
+        std::fs::write(local.path().join("000001.sst"), b"new-content").unwrap();
+        let (sst_files, _) = ckpt
+            .upload_files(local.path(), 2, &*storage, "job/sst-test")
+            .unwrap();
+        assert_eq!(sst_files.len(), 1);
+
+        let stored = storage
+            .read_bytes("job/sst-test/sst/000001.sst")
+            .unwrap()
+            .expect("changed content under a reused filename must be uploaded");
+        assert_eq!(stored, b"new-content");
     }
 }

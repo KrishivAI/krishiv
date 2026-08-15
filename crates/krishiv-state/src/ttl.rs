@@ -171,8 +171,18 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
                         live.push(key);
                     }
                 }
-                Some(_) => live.push(key), // not TTL-encoded — pass through
-                None => {}                 // concurrently deleted
+                // Match get(): a value too short for the TTL prefix is corrupt,
+                // not live — listing it as live while get() errors on it made
+                // the two views of the same entry disagree.
+                Some(_) => {
+                    return Err(StateError::CorruptEntry {
+                        message: format!(
+                            "ttl value for key {:?} is too short for the 8-byte expiry prefix",
+                            String::from_utf8_lossy(&key)
+                        ),
+                    });
+                }
+                None => {} // concurrently deleted
             }
         }
         Ok(live)

@@ -2192,3 +2192,43 @@ fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) {
         }
     }
 }
+
+/// F1 (crate-8 audit): restore_savepoint must enforce the same
+/// metadata⊆manifest coverage contract as validate_epoch. A savepoint whose
+/// manifest is internally consistent but does not cover a metadata-declared
+/// snapshot (the snapshot bytes were never hash-verified) must be rejected —
+/// not copied into the live checkpoints directory and re-hashed as valid.
+#[test]
+fn restore_savepoint_rejects_metadata_snapshot_not_in_manifest() {
+    let s = make_storage();
+    let meta = sample_metadata_for_job("j-sp-cover", 1);
+    let meta_json = serde_json::to_vec_pretty(&meta).unwrap();
+    let sp_dir = savepoint_epoch_dir("j-sp-cover", 1);
+
+    // Hand-build a savepoint: manifest covers ONLY metadata.json (and hashes
+    // it correctly), while metadata declares an op-0/task-0 snapshot whose
+    // file exists on disk but has no manifest entry.
+    s.write_bytes(&format!("{sp_dir}/metadata.json"), &meta_json)
+        .unwrap();
+    s.write_bytes(&format!("{sp_dir}/op-0/task-0/state.bin"), b"unverified")
+        .unwrap();
+    let mut manifest = IntegrityManifest::new();
+    manifest.insert_bytes("metadata.json", &meta_json);
+    s.write_bytes(&format!("{sp_dir}/manifest.sha256"), &manifest.serialize())
+        .unwrap();
+
+    let result = restore_savepoint(&s, "j-sp-cover", 1, 5);
+    assert!(
+        matches!(result, Err(CheckpointError::Corrupt { epoch: 1, .. })),
+        "restore must reject a metadata-declared snapshot missing from the \
+         savepoint manifest, got {result:?}"
+    );
+    // Nothing may have been laundered into the active checkpoints area.
+    assert!(
+        s.read_bytes(&metadata_path("j-sp-cover", 1))
+            .unwrap()
+            .is_none()
+            || !validate_epoch(&s, "j-sp-cover", 1).unwrap(),
+        "no valid active epoch may be fabricated from the bad savepoint"
+    );
+}

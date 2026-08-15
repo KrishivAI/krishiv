@@ -63,10 +63,15 @@ pub fn decode_snapshot_entries(bytes: &[u8]) -> StateResult<Vec<SnapshotEntry>> 
             .try_into()
             .map_err(|_| corrupt("failed to read entry count bytes"))?,
     ) as usize;
-    const MAX_ENTRIES: usize = 1_000_000;
-    if count > MAX_ENTRIES {
+    // Structural bound: every entry occupies at least 32 bytes (four 8-byte
+    // length prefixes), so a claimed count larger than the payload could hold
+    // is corrupt. This bound replaces a former fixed 1M-entry cap that made
+    // any backend with more than 1M keys snapshot fine and then fail restore.
+    let max_possible = bytes.len().saturating_sub(12) / 32;
+    if count > max_possible {
         return Err(corrupt(&format!(
-            "entry count {count} exceeds maximum {MAX_ENTRIES}"
+            "entry count {count} exceeds what {} payload bytes could hold ({max_possible})",
+            bytes.len().saturating_sub(12)
         )));
     }
     let mut pos = 12usize;

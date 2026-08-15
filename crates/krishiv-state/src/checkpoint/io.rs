@@ -266,6 +266,10 @@ fn read_required_manifest(
     read_optional_manifest(storage, path, epoch)?.ok_or(CheckpointError::NoValidEpoch)
 }
 
+/// Test-only since `restore_savepoint` started reading the manifest itself
+/// (to enforce metadata⊆manifest coverage); kept to assert savepoint prefixes
+/// validate as a unit.
+#[cfg(test)]
 pub(super) fn validate_manifest_at_prefix(
     storage: &dyn CheckpointStorage,
     base_prefix: &str,
@@ -527,7 +531,11 @@ pub fn list_valid_epochs(
     let mut valid = Vec::new();
     for name in epoch_dirs {
         let Ok(epoch) = name.parse::<u64>() else {
-            tracing::warn!(epoch_dir = %name, "skipping non-numeric checkpoint epoch directory");
+            // The epoch-hint file lives in the same directory; it is expected,
+            // not a stray entry worth warning about on every listing.
+            if name != "latest_epoch.json" {
+                tracing::warn!(epoch_dir = %name, "skipping non-numeric checkpoint epoch directory");
+            }
             continue;
         };
         match validate_epoch(storage, job_id, epoch) {
@@ -553,7 +561,11 @@ pub async fn list_valid_epochs_async(
     let mut valid = Vec::new();
     for name in epoch_dirs {
         let Ok(epoch) = name.parse::<u64>() else {
-            tracing::warn!(epoch_dir = %name, "skipping non-numeric checkpoint epoch directory");
+            // The epoch-hint file lives in the same directory; it is expected,
+            // not a stray entry worth warning about on every listing.
+            if name != "latest_epoch.json" {
+                tracing::warn!(epoch_dir = %name, "skipping non-numeric checkpoint epoch directory");
+            }
             continue;
         };
         match validate_epoch_async(storage, job_id, epoch).await {
@@ -830,11 +842,23 @@ pub fn restore_savepoint(
     current_fencing_token: u64,
 ) -> CheckpointResult<CheckpointMetadata> {
     let savepoint_dir = savepoint_epoch_dir(job_id, savepoint_epoch);
-    if !validate_manifest_at_prefix(
+    let savepoint_manifest = read_required_manifest(
         storage,
-        &savepoint_dir,
         &format!("{savepoint_dir}/manifest.sha256"),
         savepoint_epoch,
+    )
+    .map_err(|e| match e {
+        CheckpointError::NoValidEpoch => CheckpointError::Corrupt {
+            epoch: savepoint_epoch,
+            message: "savepoint manifest is missing".to_owned(),
+        },
+        other => other,
+    })?;
+    if !validate_manifest_entries(
+        storage,
+        &savepoint_dir,
+        savepoint_epoch,
+        &savepoint_manifest,
     )? {
         return Err(CheckpointError::Corrupt {
             epoch: savepoint_epoch,
@@ -864,6 +888,20 @@ pub fn restore_savepoint(
     let mut snapshot_files = Vec::with_capacity(metadata.operator_snapshots.len());
     for snap in &metadata.operator_snapshots {
         let rel = snapshot_relative_path(job_id, savepoint_epoch, snap)?;
+        // Same contract as validate_epoch: every metadata-declared snapshot
+        // must be covered by the integrity manifest. Without this, a snapshot
+        // file present on disk but absent from manifest.sha256 (never
+        // hash-verified) would be copied into the live checkpoints directory
+        // and re-hashed as if it were valid.
+        if !savepoint_manifest.contains(rel) {
+            return Err(CheckpointError::Corrupt {
+                epoch: savepoint_epoch,
+                message: format!(
+                    "savepoint snapshot {rel} is declared by metadata but not covered \
+                     by the savepoint manifest"
+                ),
+            });
+        }
         let savepoint_snap = format!("{savepoint_dir}/{rel}");
         let data =
             storage

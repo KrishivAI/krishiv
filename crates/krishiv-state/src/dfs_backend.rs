@@ -113,35 +113,33 @@ impl DisaggregatedStateBackend {
         })
     }
 
+    /// Stable filename hash of a state key.
+    ///
+    /// SHA-256 (not `DefaultHasher`): this names durable on-disk records, so
+    /// the hash must be stable across Rust releases and processes, and wide
+    /// enough that two live keys never share a file (a 64-bit `DefaultHasher`
+    /// collision made `get(a)` silently return `b`'s value).
+    fn key_hash(key: &[u8]) -> String {
+        krishiv_common::hash::sha256_hex(key)
+    }
+
     /// Compute the DFS path for a `(namespace, key)` pair.
     fn dfs_path(&self, namespace: &Namespace, key: &[u8]) -> PathBuf {
-        let key_hash = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            key.hash(&mut hasher);
-            format!("{:016x}", hasher.finish())
-        };
         self.config.dfs_root.join(format!(
             "{}__{}__{}.dat",
             namespace.operator_id(),
             namespace.state_name(),
-            key_hash
+            Self::key_hash(key)
         ))
     }
 
     /// Compute the local cache path for a `(namespace, key)` pair.
     fn cache_path(&self, namespace: &Namespace, key: &[u8]) -> PathBuf {
-        let key_hash = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            key.hash(&mut hasher);
-            format!("{:016x}", hasher.finish())
-        };
         self.config.local_cache_dir.join(format!(
             "{}__{}__{}.dat",
             namespace.operator_id(),
             namespace.state_name(),
-            key_hash
+            Self::key_hash(key)
         ))
     }
 
@@ -215,6 +213,24 @@ impl DisaggregatedStateBackend {
         // Check if entry fits in cache
         if data_len as u64 > self.config.max_entry_bytes {
             return Ok(cache_path); // Too large to cache
+        }
+
+        // Overwriting an already-cached entry: release the old entry's bytes
+        // from the accounting first, otherwise every re-put of a hot key
+        // inflates `cache_size` until eviction thrashes the cache empty.
+        let already_cached = self
+            .cache_index
+            .read()
+            .map_err(|_| StateError::BackendUnavailable {
+                message: "cache index lock poisoned".into(),
+                source: None,
+            })?
+            .contains_key(&(namespace.clone(), key.to_vec()));
+        if already_cached
+            && let Ok(metadata) = std::fs::metadata(&cache_path)
+            && let Ok(mut cache_size) = self.cache_size.write()
+        {
+            *cache_size = cache_size.saturating_sub(metadata.len());
         }
 
         // Evict if needed
@@ -400,7 +416,19 @@ impl StateBackend for DisaggregatedStateBackend {
         // 2. Fetch from DFS (records carry `[key_len][key][value]`)
         let dfs_path = self.dfs_path(namespace, key);
         if let Some(record) = self.read_from_dfs(&dfs_path)? {
-            let (_, value) = Self::decode_dfs_record(&record)?;
+            let (stored_key, value) = Self::decode_dfs_record(&record)?;
+            // The record embeds the real key: a mismatch means the filename
+            // hash collided or the record was corrupted. Never return another
+            // key's value as this key's.
+            if stored_key != key {
+                return Err(StateError::CorruptEntry {
+                    message: format!(
+                        "DFS record at {} embeds a different key than requested \
+                         (filename hash collision or corruption)",
+                        dfs_path.display()
+                    ),
+                });
+            }
             // Populate local cache with the raw value
             let _ = self.write_to_cache(namespace, key, &value);
             return Ok(Some(value));
@@ -659,67 +687,10 @@ impl StateBackend for DisaggregatedStateBackend {
         self.clear_cache()?;
 
         for _ in 0..entry_count {
-            let mut len_bytes = [0u8; 8];
-
-            cursor
-                .read_exact(&mut len_bytes)
-                .map_err(|e| StateError::BackendUnavailable {
-                    message: format!("snapshot read failed: {e}"),
-                    source: Some(Box::new(e)),
-                })?;
-            let op_id_len = u64::from_le_bytes(len_bytes) as usize;
-            let mut op_id = vec![0u8; op_id_len];
-            cursor
-                .read_exact(&mut op_id)
-                .map_err(|e| StateError::BackendUnavailable {
-                    message: format!("snapshot read failed: {e}"),
-                    source: Some(Box::new(e)),
-                })?;
-
-            cursor
-                .read_exact(&mut len_bytes)
-                .map_err(|e| StateError::BackendUnavailable {
-                    message: format!("snapshot read failed: {e}"),
-                    source: Some(Box::new(e)),
-                })?;
-            let name_len = u64::from_le_bytes(len_bytes) as usize;
-            let mut name = vec![0u8; name_len];
-            cursor
-                .read_exact(&mut name)
-                .map_err(|e| StateError::BackendUnavailable {
-                    message: format!("snapshot read failed: {e}"),
-                    source: Some(Box::new(e)),
-                })?;
-
-            cursor
-                .read_exact(&mut len_bytes)
-                .map_err(|e| StateError::BackendUnavailable {
-                    message: format!("snapshot read failed: {e}"),
-                    source: Some(Box::new(e)),
-                })?;
-            let key_len = u64::from_le_bytes(len_bytes) as usize;
-            let mut key = vec![0u8; key_len];
-            cursor
-                .read_exact(&mut key)
-                .map_err(|e| StateError::BackendUnavailable {
-                    message: format!("snapshot read failed: {e}"),
-                    source: Some(Box::new(e)),
-                })?;
-
-            cursor
-                .read_exact(&mut len_bytes)
-                .map_err(|e| StateError::BackendUnavailable {
-                    message: format!("snapshot read failed: {e}"),
-                    source: Some(Box::new(e)),
-                })?;
-            let val_len = u64::from_le_bytes(len_bytes) as usize;
-            let mut value = vec![0u8; val_len];
-            cursor
-                .read_exact(&mut value)
-                .map_err(|e| StateError::BackendUnavailable {
-                    message: format!("snapshot read failed: {e}"),
-                    source: Some(Box::new(e)),
-                })?;
+            let op_id = read_len_prefixed(&mut cursor, "op_id")?;
+            let name = read_len_prefixed(&mut cursor, "state_name")?;
+            let key = read_len_prefixed(&mut cursor, "key")?;
+            let value = read_len_prefixed(&mut cursor, "value")?;
 
             let ns = Namespace::new(
                 String::from_utf8_lossy(&op_id),
@@ -729,6 +700,38 @@ impl StateBackend for DisaggregatedStateBackend {
         }
         Ok(())
     }
+}
+
+/// Read one `[u64 LE len][bytes]` segment from `cursor`, validating the
+/// claimed length against the remaining buffer BEFORE allocating — a corrupt
+/// snapshot must produce an error, not an out-of-memory abort.
+fn read_len_prefixed(cursor: &mut &[u8], what: &str) -> StateResult<Vec<u8>> {
+    use std::io::Read;
+    let mut len_bytes = [0u8; 8];
+    cursor
+        .read_exact(&mut len_bytes)
+        .map_err(|e| StateError::BackendUnavailable {
+            message: format!("snapshot read failed ({what} length): {e}"),
+            source: Some(Box::new(e)),
+        })?;
+    let len = u64::from_le_bytes(len_bytes) as usize;
+    if len > cursor.len() {
+        return Err(StateError::BackendUnavailable {
+            message: format!(
+                "snapshot {what} claims {len} bytes but only {} remain",
+                cursor.len()
+            ),
+            source: None,
+        });
+    }
+    let mut buf = vec![0u8; len];
+    cursor
+        .read_exact(&mut buf)
+        .map_err(|e| StateError::BackendUnavailable {
+            message: format!("snapshot read failed ({what}): {e}"),
+            source: Some(Box::new(e)),
+        })?;
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -907,5 +910,74 @@ mod tests {
 
         // Cache should have evicted some entries
         assert!(backend.cache_size_bytes() <= 100);
+    }
+
+    /// F4: filenames must come from a stable content hash (SHA-256), not
+    /// `DefaultHasher` — the on-disk layout must survive Rust upgrades.
+    #[test]
+    fn dfs_filenames_use_stable_sha256_of_key() {
+        let config = temp_config();
+        let backend = DisaggregatedStateBackend::new(config).unwrap();
+        let ns = Namespace::new("op", "s");
+        let path = backend.dfs_path(&ns, b"stable-key");
+        let expected = krishiv_common::hash::sha256_hex(b"stable-key");
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, format!("op__s__{expected}.dat"));
+    }
+
+    /// F4: a DFS record embedding a different key than the one requested
+    /// (filename-hash collision or corruption) must error — never return the
+    /// other key's value as this key's.
+    #[test]
+    fn dfs_get_rejects_record_with_mismatched_embedded_key() {
+        let config = temp_config();
+        let backend = DisaggregatedStateBackend::new(config).unwrap();
+        let ns = Namespace::new("op", "s");
+        // Plant a record at key-A's path that embeds key-B.
+        let path = backend.dfs_path(&ns, b"key-A");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            DisaggregatedStateBackend::encode_dfs_record(b"key-B", b"b-value"),
+        )
+        .unwrap();
+        let err = backend
+            .get(&ns, b"key-A")
+            .expect_err("mismatched embedded key must be an error, not b-value");
+        assert!(matches!(err, StateError::CorruptEntry { .. }));
+    }
+
+    /// F5: re-putting the same key must not inflate the cache-size counter —
+    /// the old entry's bytes are released before the new bytes are charged.
+    #[test]
+    fn cache_size_stays_flat_when_overwriting_same_key() {
+        let config = temp_config();
+        let mut backend = DisaggregatedStateBackend::new(config).unwrap();
+        let ns = Namespace::new("op", "s");
+        let value = vec![b'x'; 100];
+        for _ in 0..10 {
+            backend.put(&ns, b"hot".to_vec(), value.clone()).unwrap();
+        }
+        assert_eq!(
+            backend.cache_size_bytes(),
+            100,
+            "10 overwrites of one 100-byte value must account exactly 100 bytes"
+        );
+    }
+
+    /// F6: a snapshot whose length prefix claims more bytes than remain must
+    /// produce an error, not attempt a giant allocation.
+    #[test]
+    fn load_snapshot_rejects_oversized_length_prefix() {
+        let config = temp_config();
+        let mut backend = DisaggregatedStateBackend::new(config).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // version
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // one entry
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes()); // absurd op_id len
+        let err = backend
+            .load_snapshot(&bytes)
+            .expect_err("oversized length prefix must error, not allocate");
+        assert!(err.to_string().contains("claims"), "got: {err}");
     }
 }

@@ -164,6 +164,11 @@ impl AsyncOperatorExecutor {
     }
 
     /// Drive a set of state futures to completion with bounded concurrency.
+    ///
+    /// Each batch of up to `concurrency_limit` futures is polled concurrently
+    /// (`join_all`), so independent state accesses overlap. The previous
+    /// implementation awaited every future sequentially — the batching was a
+    /// no-op and "async operator execution" was serial in disguise.
     pub async fn drive_futures<T: Send + 'static>(
         &self,
         futures: Vec<StateFuture<T>>,
@@ -174,13 +179,11 @@ impl AsyncOperatorExecutor {
         while !remaining.is_empty() {
             let batch_size = remaining.len().min(self.concurrency_limit);
             let batch: Vec<_> = remaining.drain(..batch_size).collect();
-
-            let mut batch_results = Vec::new();
-            for fut in batch {
-                let result = fut.await_result().await?;
-                batch_results.push(result);
+            let batch_results =
+                futures::future::join_all(batch.into_iter().map(StateFuture::await_result)).await;
+            for result in batch_results {
+                results.push(result?);
             }
-            results.extend(batch_results);
         }
 
         Ok(results)
@@ -219,16 +222,26 @@ impl BatchedStateAccess {
     }
 
     /// Get multiple keys at once from the backend.
+    ///
+    /// Delegates to `StateBackend::get_batch` so backends with a real batched
+    /// read path (RocksDB opens one read transaction for all keys) are used —
+    /// the previous per-key loop bypassed those overrides.
     pub fn get_batch(
         &self,
         namespace: &Namespace,
         keys: &[Vec<u8>],
     ) -> StateResult<Vec<Option<Vec<u8>>>> {
-        let mut results = Vec::with_capacity(keys.len());
-        for key in keys {
-            results.push(self.backend.get(namespace, key)?);
-        }
-        Ok(results)
+        let triples: Vec<(&str, &str, &[u8])> = keys
+            .iter()
+            .map(|key| {
+                (
+                    namespace.operator_id(),
+                    namespace.state_name(),
+                    key.as_slice(),
+                )
+            })
+            .collect();
+        self.backend.get_batch(&triples)
     }
 
     /// Get a single key, returning a future for consistency with batched pattern.
@@ -314,5 +327,64 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0], Some(b"val1".to_vec()));
         assert_eq!(results[1], None);
+    }
+
+    /// F7: drive_futures must actually overlap state accesses within a batch.
+    /// Each backend get sleeps 50ms and records the peak number of concurrent
+    /// gets; a sequential executor (the pre-fix behavior) never exceeds 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn drive_futures_overlaps_accesses_within_a_batch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SlowBackend {
+            current: AtomicUsize,
+            peak: AtomicUsize,
+        }
+        impl StateBackend for SlowBackend {
+            fn get(&self, _: &Namespace, _: &[u8]) -> StateResult<Option<Vec<u8>>> {
+                let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                self.current.fetch_sub(1, Ordering::SeqCst);
+                Ok(Some(b"v".to_vec()))
+            }
+            fn put(&mut self, _: &Namespace, _: Vec<u8>, _: Vec<u8>) -> StateResult<()> {
+                Ok(())
+            }
+            fn delete(&mut self, _: &Namespace, _: &[u8]) -> StateResult<()> {
+                Ok(())
+            }
+            fn clear_namespace(&mut self, _: &Namespace) -> StateResult<()> {
+                Ok(())
+            }
+            fn list_namespaces(&self) -> StateResult<Vec<Namespace>> {
+                Ok(vec![])
+            }
+            fn list_keys(&self, _: &Namespace) -> StateResult<Vec<Vec<u8>>> {
+                Ok(vec![])
+            }
+            fn snapshot(&self) -> StateResult<Vec<u8>> {
+                Ok(vec![])
+            }
+            fn load_snapshot(&mut self, _: &[u8]) -> StateResult<()> {
+                Ok(())
+            }
+        }
+
+        let backend = Arc::new(SlowBackend {
+            current: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let ctx = AsyncOperatorContext::new(backend.clone(), Namespace::new("op", "s"));
+        let executor = AsyncOperatorExecutor::new(4);
+        let futures: Vec<_> = (0..4).map(|_| ctx.state_get(b"k").then(|v| v)).collect();
+        let results = executor.drive_futures(futures).await.unwrap();
+        assert_eq!(results.len(), 4);
+        assert!(
+            backend.peak.load(Ordering::SeqCst) >= 2,
+            "a batch of 4 with limit 4 must overlap at least 2 accesses; \
+             peak={} means execution was sequential",
+            backend.peak.load(Ordering::SeqCst)
+        );
     }
 }

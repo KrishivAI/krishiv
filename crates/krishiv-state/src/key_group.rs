@@ -60,10 +60,27 @@ pub fn key_group_ranges_for_parallelism(parallelism: u32) -> Vec<KeyGroupRange> 
 
 /// Map a key group to task index for `parallelism` slots.
 ///
-/// Uses O(1) arithmetic: `task_idx = key_group * parallelism / NUM_KEY_GROUPS`.
+/// Uses O(1) arithmetic that inverts [`key_group_ranges_for_parallelism`]'s
+/// remainder-first distribution (the first `groups % p` tasks own one extra
+/// group). The former `kg * p / NUM_KEY_GROUPS` floor formula disagreed with
+/// the ranges whenever `NUM_KEY_GROUPS % p != 0` (e.g. p=5, kg=19661), which
+/// would route keys to a task that does not own them.
 pub fn task_index_for_key_group(key_group: u16, parallelism: u32) -> u32 {
     let p = parallelism.max(1);
-    (key_group as u32) * p / u32::from(NUM_KEY_GROUPS)
+    let groups = u32::from(NUM_KEY_GROUPS);
+    let base = groups / p;
+    let rem = groups % p;
+    let kg = u32::from(key_group);
+    let fat_span = rem * (base + 1); // groups owned by the first `rem` tasks
+    if kg < fat_span {
+        kg / (base + 1)
+    } else if base == 0 {
+        // parallelism > NUM_KEY_GROUPS: every group sits in the fat span;
+        // out-of-range kg (impossible for u16 < groups) clamps to last task.
+        p - 1
+    } else {
+        rem + (kg - fat_span) / base
+    }
 }
 
 #[cfg(test)]
