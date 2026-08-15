@@ -211,6 +211,23 @@ pub fn scalar_to_key(arr: &dyn Array, row: usize) -> Option<String> {
     None
 }
 
+/// Null-unambiguous group-key component for equality/hashing callers.
+///
+/// `scalar_to_string` returns the sentinel `"NULL"` for SQL nulls, which a
+/// Utf8 value `"NULL"` collides with — consolidation would cancel a real
+/// `"NULL"` string against a SQL null (crate-13 audit). This variant prefixes
+/// every real value with `'v'` and encodes null as `"n"`, so the two can
+/// never produce the same key component.
+pub fn scalar_to_group_key(arr: &dyn Array, row: usize) -> String {
+    if arr.is_null(row) {
+        return "n".to_string();
+    }
+    let mut s = String::with_capacity(16);
+    s.push('v');
+    s.push_str(&scalar_to_string(arr, row));
+    s
+}
+
 /// Hex-encode a byte slice with a `0x` prefix for stable binary key strings.
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(2 + bytes.len() * 2);

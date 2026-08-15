@@ -34,7 +34,6 @@ use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use tokio::sync::watch;
 
-use krishiv_delta::operators::key_util::scalar_to_string;
 use krishiv_delta::{
     DeltaBatch, DeltaError, IncrementalView, IncrementalViewRegistry, IncrementalViewSpec,
     LatenessSpec, WatermarkTracker, apply_delta, consolidate_batch, deserialize_delta_batch,
@@ -2007,7 +2006,11 @@ impl std::fmt::Debug for IncrementalFlow {
 pub(crate) fn hash_row(batch: &RecordBatch, row: usize) -> u64 {
     let mut combined: Vec<u8> = Vec::with_capacity(64);
     for col in batch.columns() {
-        let s = scalar_to_string(col.as_ref(), row);
+        // Null-unambiguous encoding (crate-13 audit): the plain
+        // `scalar_to_string` renders SQL null as the sentinel "NULL", which a
+        // Utf8 value "NULL" collides with — dedup would silently drop the
+        // legitimate row. `scalar_to_group_key` prefixes real values.
+        let s = krishiv_delta::operators::key_util::scalar_to_group_key(col.as_ref(), row);
         combined.extend_from_slice(s.as_bytes());
         combined.push(0u8);
     }

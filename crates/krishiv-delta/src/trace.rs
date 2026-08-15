@@ -408,41 +408,13 @@ fn extract_key(batch: &RecordBatch, key_indices: &[usize], row: usize) -> KeyTup
         .collect()
 }
 
+/// Crate-13 audit: this used to be a private stringifier with a `"NULL"`
+/// sentinel (colliding with a real `"NULL"` string) and no coverage for
+/// Utf8View / LargeUtf8 / temporal / binary types, which all collapsed into
+/// one `<unsupported:…>` bucket and falsely matched each other in probes.
+/// Now delegates to the shared null-unambiguous helper.
 fn array_scalar_to_string(arr: &dyn Array, row: usize) -> String {
-    use arrow::array::{
-        BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-        StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-    };
-    macro_rules! try_downcast {
-        ($t:ty) => {
-            if let Some(a) = arr.as_any().downcast_ref::<$t>() {
-                return if a.is_null(row) {
-                    "NULL".to_string()
-                } else {
-                    a.value(row).to_string()
-                };
-            }
-        };
-    }
-    try_downcast!(Int8Array);
-    try_downcast!(Int16Array);
-    try_downcast!(Int32Array);
-    try_downcast!(Int64Array);
-    try_downcast!(UInt8Array);
-    try_downcast!(UInt16Array);
-    try_downcast!(UInt32Array);
-    try_downcast!(UInt64Array);
-    try_downcast!(Float32Array);
-    try_downcast!(Float64Array);
-    try_downcast!(BooleanArray);
-    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return if a.is_null(row) {
-            "NULL".to_string()
-        } else {
-            a.value(row).to_string()
-        };
-    }
-    format!("<unsupported:{}>", arr.data_type())
+    crate::operators::key_util::scalar_to_group_key(arr, row)
 }
 
 fn build_key_set(keys: &RecordBatch, key_indices: &[usize]) -> ahash::AHashSet<KeyTuple> {
@@ -514,6 +486,61 @@ mod tests {
         trace.consolidate().unwrap();
         let snap = trace.snapshot().unwrap();
         assert_eq!(snap.num_rows(), 0);
+    }
+
+    /// Regression (crate-13 audit, A-class): Utf8View key columns previously
+    /// stringified to the shared `<unsupported:…>` bucket, so *every* row of
+    /// that type matched every probe key.
+    #[test]
+    fn trace_probe_utf8view_keys_match_exactly() {
+        use arrow::array::StringViewArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "k",
+            DataType::Utf8View,
+            false,
+        )]));
+        let batch = |vals: &[&str]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringViewArray::from(vals.to_vec()))],
+            )
+            .unwrap()
+        };
+        let mut trace = Trace::new(schema.clone(), &["k"]).unwrap();
+        trace.insert(DeltaBatch::from_inserts(batch(&["a", "b"])).unwrap());
+        let hit = trace.probe_by_keys(&batch(&["a"])).unwrap();
+        assert_eq!(hit.num_rows(), 1, "probe must match exactly one row");
+    }
+
+    /// Regression (crate-13 audit, A-class): a SQL null key and the string
+    /// "NULL" previously produced the same probe key and falsely matched.
+    #[test]
+    fn trace_probe_null_does_not_match_null_string() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, true)]));
+        let mut trace = Trace::new(schema.clone(), &["k"]).unwrap();
+        trace.insert(
+            DeltaBatch::from_inserts(
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(StringArray::from(vec![Some("NULL")]))],
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let null_probe = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![None::<&str>]))],
+        )
+        .unwrap();
+        let hit = trace.probe_by_keys(&null_probe).unwrap();
+        assert!(
+            hit.is_empty(),
+            "SQL-null probe key must not match the string \"NULL\" row"
+        );
     }
 
     /// #160: state round-trip preserves accumulated weights exactly (a row

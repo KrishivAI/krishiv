@@ -938,7 +938,15 @@ fn scalar_eq(a: &dyn Array, ai: usize, b: &dyn Array, bi: usize) -> bool {
     ) {
         return av.value(ai) == bv.value(bi);
     }
-    false
+    // Crate-13 audit: other key types (Utf8View, Int16, floats, temporals,
+    // binary, …) previously returned `false` unconditionally, so a join keyed
+    // on them silently matched nothing on the delta-probe paths. Fall back to
+    // the shared injective key encoding; genuinely unsupported (nested) types
+    // stay non-matching rather than colliding.
+    match (scalar_to_key(a, ai), scalar_to_key(b, bi)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
 }
 
 fn build_join_batch(
@@ -1298,6 +1306,58 @@ mod tests {
         assert!(
             emitted_null,
             "restored op must emit the null-padded row on the positive→0 crossing"
+        );
+    }
+
+    /// Regression (crate-13 audit, A-class): `scalar_eq` returned `false` for
+    /// every key type outside Int64/Int32/Utf8, so a join keyed on e.g.
+    /// Utf8View silently emitted no rows from the delta-probe paths.
+    #[test]
+    fn join_on_utf8view_keys_matches() {
+        use arrow::array::StringViewArray;
+        let left_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8View, false),
+            Field::new("lv", DataType::Int32, false),
+        ]));
+        let right_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8View, false),
+            Field::new("rv", DataType::Int32, false),
+        ]));
+        let mut op = IncrementalJoinOp::new(
+            left_schema.clone(),
+            right_schema.clone(),
+            vec!["k".into()],
+            vec!["k".into()],
+            IncrJoinType::Inner,
+        )
+        .unwrap();
+        let left = RecordBatch::try_new(
+            left_schema,
+            vec![
+                Arc::new(StringViewArray::from(vec!["a"])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let right = RecordBatch::try_new(
+            right_schema,
+            vec![
+                Arc::new(StringViewArray::from(vec!["a"])),
+                Arc::new(Int32Array::from(vec![2])),
+            ],
+        )
+        .unwrap();
+        // Same-tick cross term exercises `keys_match`/`scalar_eq` directly.
+        let out = op
+            .apply(
+                Some(DeltaBatch::from_inserts(left).unwrap()),
+                Some(DeltaBatch::from_inserts(right).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            out.num_rows(),
+            1,
+            "Utf8View-keyed join must match on the same-tick cross term"
         );
     }
 

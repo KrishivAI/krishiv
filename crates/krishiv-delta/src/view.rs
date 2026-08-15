@@ -340,11 +340,19 @@ impl IncrementalViewRegistry {
     }
 
     pub fn drop_view(&self, name: &str) -> DeltaResult<bool> {
-        let mut views = self
-            .views
-            .lock()
-            .map_err(|_| DeltaError::Operator("registry lock poisoned".into()))?;
-        Ok(views.remove(name).is_some())
+        let removed = {
+            let mut views = self
+                .views
+                .lock()
+                .map_err(|_| DeltaError::Operator("registry lock poisoned".into()))?;
+            views.remove(name).is_some()
+        };
+        // Crate-13 audit: the paired receiver entry leaked for every dropped
+        // view (one watch receiver retained forever per drop).
+        if let Ok(mut receivers) = self.receivers.lock() {
+            receivers.remove(name);
+        }
+        Ok(removed)
     }
 }
 
@@ -396,5 +404,20 @@ mod tests {
         reg.register(test_spec("v1")).unwrap();
         assert!(reg.drop_view("v1").unwrap());
         assert!(!reg.contains("v1"));
+    }
+
+    /// Regression (crate-13 audit, F-class): dropping a view previously left
+    /// its watch receiver in the registry forever.
+    #[test]
+    fn drop_view_releases_receiver_entry() {
+        let reg = IncrementalViewRegistry::new();
+        reg.register(test_spec("v1")).unwrap();
+        assert_eq!(reg.receivers.lock().unwrap().len(), 1);
+        reg.drop_view("v1").unwrap();
+        assert_eq!(
+            reg.receivers.lock().unwrap().len(),
+            0,
+            "dropped view's receiver must be released"
+        );
     }
 }

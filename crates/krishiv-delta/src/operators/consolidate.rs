@@ -13,7 +13,7 @@ use arrow::datatypes::SchemaRef;
 
 use crate::delta_batch::{DeltaBatch, WEIGHT_COLUMN};
 use crate::error::{DeltaError, DeltaResult};
-use crate::operators::key_util::scalar_to_string;
+use crate::operators::key_util::scalar_to_group_key;
 
 /// Consolidate a `DeltaBatch`: for each group of rows with identical key
 /// column values, sum their weights. Rows with weight == 0 are dropped.
@@ -64,9 +64,11 @@ pub fn consolidate_batch(
     let mut key_order: Vec<Vec<String>> = Vec::new();
 
     for row in 0..data.num_rows() {
+        // Null-unambiguous keys: a SQL null and the string "NULL" must never
+        // consolidate together (crate-13 audit).
         let row_key: Vec<String> = col_indices
             .iter()
-            .map(|&idx| scalar_to_string(data.column(idx), row))
+            .map(|&idx| scalar_to_group_key(data.column(idx), row))
             .collect();
         let w = weights.value(row);
         if let Some(entry) = groups.get_mut(&row_key) {
@@ -178,5 +180,37 @@ mod tests {
         let a = DeltaBatch::from_inserts(batch_from(&[1, 2])).unwrap();
         let result = consolidate_batch(a, &["id".to_string()], &schema()).unwrap();
         assert_eq!(result.num_rows(), 2);
+    }
+
+    /// Regression (crate-13 audit, A-class): a SQL null and the string "NULL"
+    /// previously encoded to the same key, so an insert of the string "NULL"
+    /// and a retraction of an actual null cancelled each other.
+    #[test]
+    fn null_and_null_string_do_not_consolidate_together() {
+        use arrow::array::StringArray;
+        let s = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)]));
+        let ins = DeltaBatch::from_inserts(
+            RecordBatch::try_new(
+                s.clone(),
+                vec![Arc::new(StringArray::from(vec![Some("NULL")]))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let del = DeltaBatch::from_deletes(
+            RecordBatch::try_new(
+                s.clone(),
+                vec![Arc::new(StringArray::from(vec![None::<&str>]))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let merged = DeltaBatch::concat(&[ins, del]).unwrap();
+        let out = consolidate_batch(merged, &[], &s).unwrap();
+        assert_eq!(
+            out.num_rows(),
+            2,
+            "string \"NULL\" (+1) and SQL null (-1) are distinct rows and must not cancel"
+        );
     }
 }

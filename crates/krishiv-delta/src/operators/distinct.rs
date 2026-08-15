@@ -21,7 +21,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 
 use crate::delta_batch::{DeltaBatch, WEIGHT_COLUMN};
 use crate::error::{DeltaError, DeltaResult};
-use crate::operators::key_util::scalar_to_string;
+use crate::operators::key_util::scalar_to_group_key;
 
 /// Incremental DISTINCT operator with per-row threshold tracking.
 pub struct IncrementalDistinctOp {
@@ -69,8 +69,10 @@ impl IncrementalDistinctOp {
         let mut out_weights: Vec<i64> = Vec::new();
 
         for row in 0..data.num_rows() {
+            // Null-unambiguous keys (crate-13 audit): a SQL null and the
+            // string "NULL" must count as distinct rows.
             let row_key: Vec<String> = (0..n_cols)
-                .map(|ci| scalar_to_string(data.column(ci), row))
+                .map(|ci| scalar_to_group_key(data.column(ci), row))
                 .collect();
 
             let old_count = *self.counts.get(&row_key).unwrap_or(&0);
@@ -116,6 +118,11 @@ impl IncrementalDistinctOp {
     /// || i64 count)*`.
     pub fn state_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
+        // v2 magic (crate-13 audit): the key encoding changed to the
+        // null-unambiguous form; pre-v2 blobs must fail restore (→ the caller
+        // falls back to seed-from-snapshots) instead of silently installing
+        // keys the new encoding can never match.
+        out.extend_from_slice(b"DST2");
         out.extend_from_slice(&(self.counts.len() as u32).to_le_bytes());
         for (key, count) in &self.counts {
             out.extend_from_slice(&(key.len() as u32).to_le_bytes());
@@ -131,6 +138,13 @@ impl IncrementalDistinctOp {
     /// Replace the multiplicity map with one produced by [`state_bytes`].
     pub fn restore_state_bytes(&mut self, bytes: &[u8]) -> DeltaResult<()> {
         let err = || DeltaError::Operator("distinct state truncated".into());
+        let bytes = bytes.strip_prefix(b"DST2".as_slice()).ok_or_else(|| {
+            DeltaError::Operator(
+                "distinct state blob is not format v2 (null-unambiguous keys); \
+                 restore falls back to seed-from-snapshots"
+                    .into(),
+            )
+        })?;
         let mut pos = 0usize;
         let rd_u32 = |pos: &mut usize| -> DeltaResult<u32> {
             let raw = bytes.get(*pos..*pos + 4).ok_or_else(err)?;
@@ -182,7 +196,7 @@ fn build_output(
     'outer: for key in &row_keys {
         for orig_row in 0..original_data.num_rows() {
             let orig_key: Vec<String> = (0..n_cols)
-                .map(|ci| scalar_to_string(original_data.column(ci), orig_row))
+                .map(|ci| scalar_to_group_key(original_data.column(ci), orig_row))
                 .collect();
             if &orig_key == key {
                 row_indices.push(orig_row);
@@ -275,5 +289,60 @@ mod tests {
         let out2 = op.apply(d4).unwrap();
         assert_eq!(out2.num_rows(), 1);
         assert_eq!(out2.weights().value(0), -1);
+    }
+
+    /// Regression (crate-13 audit, A-class): a SQL null row and the string
+    /// "NULL" row are distinct — retracting the null must not consume the
+    /// string row's count.
+    #[test]
+    fn null_and_null_string_are_distinct_rows() {
+        use arrow::array::StringArray;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)]));
+        let string_null = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![Some("NULL")]))],
+        )
+        .unwrap();
+        let real_null = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![None::<&str>]))],
+        )
+        .unwrap();
+        let mut op = IncrementalDistinctOp::new();
+        op.apply(DeltaBatch::from_inserts(string_null).unwrap())
+            .unwrap();
+        // Retract the *actual null* row, which was never inserted: the string
+        // "NULL" row's presence must be unaffected (its count stays 1); the
+        // null row's count goes to -1 and emits its own retraction.
+        let out = op
+            .apply(DeltaBatch::from_deletes(real_null).unwrap())
+            .unwrap();
+        for i in 0..out.num_rows() {
+            assert!(
+                out.data_batch().column(0).is_null(i) || out.weights().value(i) >= 0,
+                "the string \"NULL\" row must not be retracted by a SQL-null delete"
+            );
+        }
+        assert_eq!(
+            op.count_for_key(&["vNULL".to_string()]),
+            1,
+            "string \"NULL\" count must remain 1"
+        );
+    }
+
+    /// Pre-v2 (magic-less) state blobs must fail restore so the caller reseeds
+    /// instead of installing keys the new encoding can never match.
+    #[test]
+    fn restore_rejects_pre_v2_state_blob() {
+        let mut op = IncrementalDistinctOp::new();
+        // A well-formed *old-format* blob: 0 rows, no magic.
+        assert!(op.restore_state_bytes(&0u32.to_le_bytes()).is_err());
+        // v2 round-trip still works.
+        op.apply(DeltaBatch::from_inserts(id_batch(&[1])).unwrap())
+            .unwrap();
+        let bytes = op.state_bytes();
+        let mut fresh = IncrementalDistinctOp::new();
+        fresh.restore_state_bytes(&bytes).unwrap();
+        assert_eq!(fresh.count_for_key(&["v1".to_string()]), 1);
     }
 }

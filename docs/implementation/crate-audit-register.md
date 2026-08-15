@@ -46,8 +46,8 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 9 | krishiv-api | 25,111 | 38 | COMPLETE | 9 defects fixed (A1–A9); see §9 |
 | 10 | krishiv-runtime | 13,648 | 17 | COMPLETE | 3 defects fixed (R1–R3); see §10 |
 | 11 | krishiv-dataflow | 18,107 | 38 | COMPLETE | 6 defects fixed (D1–D6); see §11 |
-| 12 | krishiv-ivm | 7,019 | 10 | 0 | |
-| 13 | krishiv-delta | 7,098 | 20 | 0 | |
+| 12 | krishiv-ivm | 7,019 | 10 | COMPLETE | 3 defects fixed (I1–I3) + 1 needs-decision (watch-channel delta coalescing); see §12 |
+| 13 | krishiv-delta | 7,098 | 20 | COMPLETE | 5 defects fixed (K1–K5) + cross-crate hash_row re-key; see §13 |
 | 14 | krishiv-flight-sql | 5,199 | 6 | 0 | |
 | 15 | krishiv-proto | 8,130 | 12 | 0 | 8k LOC, 3 test files |
 | 16 | krishiv-metrics | 3,731 | 6 | 0 | |
@@ -3079,3 +3079,133 @@ Gates: `cargo test -p krishiv-dataflow` (298 lib + 1 integration green — note:
 restoring reverted files with `mv` preserves the old mtime and cargo skips the
 rebuild; `touch` after restore before trusting a green run), clippy
 `--all-targets` clean, `just lint`, `just test`, `cargo fmt` — all green.
+
+## 12. krishiv-ivm — read end to end (2026-08-16)
+
+All 8 src files (error, spill, provenance, vector_sink, plan, partitioned,
+flow at 3.6k LOC, lib) + tests/property_tests.rs + tests/proptest_ivm.rs read
+end to end. The crate is heavily self-audited (AUD-1..9, G2/G5/G6/G14, #160,
+IVM-6/7 comments all verified against the code — each one checks out,
+including the bounded_capacity length-prefix-attack clamp and the G6/F4
+5-cycle recreate convergence test). Coverage pre-fix: 74.0% regions / 73.6%
+lines (`/tmp/claude-1000/ivm_cov.txt`); vector_sink.rs is the outlier at 11%.
+
+**I1 (F) provenance.rs — `forget`/`forget_many` leaked `input_epochs`.**
+Both removed the `input_to_outputs` entry but left the epoch-metadata entry
+behind, so epoch-tracked hashes forgotten individually accumulated forever.
+Fix: remove from both maps. Test `forget_also_drops_epoch_metadata`;
+revert-proven (drop the epoch removal → red).
+
+**I2 (B) plan.rs — `min_by`/`max_by` mapped to plain Min/Max.**
+`expr_to_aggregation` matched `"min" | "min_by"` (and max) and aggregated
+arg0 — which for MIN_BY(a, b) is semantically wrong (it returns a at the
+minimum of b, not min(a)). Currently *unreachable*: this DataFusion build has
+no `min_by` function ("Invalid function 'min_by'"), so `ctx.sql` fails in
+`build_view_plan` and such views already degrade to DiffBased. Removed the
+arms anyway — the moment a DataFusion upgrade adds min_by, they would have
+become a live A-class silent wrong answer on the O(Δ) path. Test
+`min_by_max_by_degrade_to_diff_based` pins the DiffBased contract; it cannot
+go red against today's pre-fix build (SQL fails either way — verified with a
+plan-shape probe) but trips if a future build makes the bad arms reachable.
+
+**I3 (A) vector_sink.rs — null Int64 id silently became "0".**
+`extract_string_at`'s Int64 fallback skipped the null check the Utf8/LargeUtf8
+paths have; a null id row upserted/deleted vector-store point "0". Fix: error
+on null like the string paths. Test
+`null_int64_id_errors_instead_of_becoming_zero`; revert-proven (drop the
+null check → red).
+
+**Not fixed — needs a decision (D/A): vector-sink delta coalescing.**
+`spawn_vector_view` subscribes via `IncrementalView::subscribe()` — a tokio
+`watch` channel, which retains only the *latest* value. If two ticks emit
+output deltas between task wakeups, the earlier delta is dropped; unlike a
+snapshot, a missed delta is a permanently missed upsert/retraction in the
+vector index. Fixing properly means an mpsc/broadcast (or ack'd pull)
+publish surface on `krishiv_delta::IncrementalView` — a cross-crate design
+change to the view-output contract, recorded here rather than guessed at.
+Mitigation today: single-consumer flows step and drain synchronously, so the
+race window is a busy sink awaiting `upsert_batch` across ≥2 ticks.
+
+Clean files: error.rs, spill.rs (FairSpillPool sizing + honest tiny-pool
+test), partitioned.rs (drain-correct snapshot differentiation at the
+partitioned level, shard-count-validated checkpoints, Utf8View regression
+pin), flow.rs (dirty-bit topo scheduling, cached tick context reconciliation,
+resident/authoritative tick mirroring, fence protocol docs), both property
+test files (incremental == diff-based == recompute == Rust model, randomized
+with group-emptying retractions).
+
+Gates: `cargo test -p krishiv-ivm` (62 lib + 6 + 1 integration green),
+clippy `--all-targets` clean, `just lint`, `just test`, `cargo fmt` — green.
+
+## 13. krishiv-delta — read end to end (2026-08-16)
+
+All 20 files read (delta_batch, trace, view, lateness, coalesce,
+behavior_version, error, lib, gap_tests, the 9 operator modules, and
+tests/proptest_zset.rs). The Z-set core is proptest-verified against a plain
+Rust model (consolidation = model addition, commutativity, negation cancels,
+idempotence, serialization exact round-trip, trace snapshot = model positive
+part). Coverage measured pre-fix (`/tmp/claude-1000/delta_cov.txt`).
+
+The crate-wide defect family: **string-keyed equality with a colliding
+`"NULL"` sentinel and incomplete type coverage** — the exact class D5/H-2
+already produced in dataflow. Five heads of it, one shared fix:
+`key_util::scalar_to_group_key` (null → `"n"`, value → `'v' + value`; a Utf8
+`"NULL"` can never equal a SQL null again).
+
+**K1 (A) consolidate.rs — SQL null vs the string "NULL" consolidated
+together.** `consolidate_batch` (used by `apply_delta`, trace merges, IVM
+coalescing — the hottest correctness path in the crate) keyed rows via
+`scalar_to_string`, so an insert of Utf8 `"NULL"` cancelled a retraction of an
+actual null. Test `null_and_null_string_do_not_consolidate_together`;
+revert-proven (helper back to bare `scalar_to_string` → red, together with
+K3/K4's tests).
+
+**K2 (A) trace.rs — probe keys collapsed unsupported types into one bucket.**
+The private stringifier lacked Utf8View / LargeUtf8 / temporal / binary
+coverage: every value of such a type rendered `<unsupported:…>`, so probes
+matched *all* rows of that type ("region" Utf8View keys — the exact encoding
+modern DataFusion emits, see the 2026-07-10 prod incident pinned in
+partitioned.rs — falsely joined everything); plus the `"NULL"` collision.
+Now delegates to `scalar_to_group_key` (full key_util type coverage). Tests
+`trace_probe_utf8view_keys_match_exactly` and
+`trace_probe_null_does_not_match_null_string`; both revert-proven.
+
+**K3 (A) distinct.rs — same "NULL" collision in the multiplicity map**, and
+its persisted state format now carries a `DST2` magic: pre-v2 blobs (whose
+keys the new encoding can never match) fail restore loudly and the caller
+reseeds, instead of silently keeping phantom counts. Tests
+`null_and_null_string_are_distinct_rows`,
+`restore_rejects_pre_v2_state_blob`; revert-proven.
+
+**K4 (A) join.rs — `scalar_eq` matched nothing for most key types.** The
+same-tick ΔA⋈ΔB cross term and both probe-output builders compared keys with
+a function that handled only Int64/Int32/Utf8 and returned `false` for
+everything else — a join keyed on Utf8View/Int16/Float/timestamp silently
+emitted no rows on those paths. Fix: fall back to `scalar_to_key` equality
+(injective over all key_util-supported types; nested types stay
+non-matching). Test `join_on_utf8view_keys_matches`; revert-proven
+(fallback → `false` → red).
+
+**K5 (F) view.rs — registry `drop_view` leaked the receiver entry** (one
+watch receiver retained forever per dropped view). Test
+`drop_view_releases_receiver_entry`; revert-proven.
+
+**Cross-crate: krishiv-ivm `hash_row`** (content-addressed dedup +
+provenance) shared the "NULL"-sentinel hashing and now uses
+`scalar_to_group_key`, so a legitimate Utf8 `"NULL"` row is no longer dropped
+as a re-delivery of a null row. (In-memory hashes only — no persisted-state
+compat impact.)
+
+Clean files: delta_batch.rs (magic-prefixed versioned IPC with legacy
+fallback), stream.rs (RowConverter-keyed differentiate — already null-safe;
+#160 multiset apply_delta), aggregate.rs (exceptional: AUD-3/AUD-7 typed
+readers, arrow row-format group keys — no string keys at all, AGGS2 portable
+state), filter.rs, map.rs, recursive.rs, lateness.rs, coalesce.rs,
+behavior_version.rs, gap_tests.rs, proptest_zset.rs. Minor notes (not
+defects): MIN/MAX orders i64 values as f64 keys (exact only to 2^53);
+distinct's `build_output` "key not found → sentinel row 0" branch is
+unreachable (keys always come from the same batch) — its comment overstates.
+
+Gates: `cargo test -p krishiv-delta` (121 lib + 8 proptest green),
+`cargo test -p krishiv-ivm` green on the re-keyed hash_row, `just lint`,
+`just test`, `cargo fmt` — green.
