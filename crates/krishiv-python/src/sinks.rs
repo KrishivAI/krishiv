@@ -219,16 +219,19 @@ pub struct PyCassandraSink {
     node: String,
     keyspace: String,
     table: String,
+    consistency: Option<String>,
 }
 
 #[pymethods]
 impl PyCassandraSink {
     #[new]
-    pub fn new(node: String, keyspace: String, table: String) -> Self {
+    #[pyo3(signature = (node, keyspace, table, consistency=None))]
+    pub fn new(node: String, keyspace: String, table: String, consistency: Option<String>) -> Self {
         Self {
             node,
             keyspace,
             table,
+            consistency,
         }
     }
 
@@ -244,7 +247,12 @@ impl PyCassandraSink {
                 return Ok(0);
             }
             let total_rows: usize = records.iter().map(|b| b.num_rows()).sum();
-            let cfg = CassandraConfig::new(&self.node, &self.keyspace, &self.table);
+            let mut cfg = CassandraConfig::new(&self.node, &self.keyspace, &self.table);
+            if let Some(level) = &self.consistency {
+                cfg = cfg
+                    .with_consistency_name(level)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            }
             let sink = block_on(CassandraSink::connect(cfg))
                 .map_err(|e| PyRuntimeError::new_err(format!("cassandra sink init: {e}")))?;
             block_on(async {
@@ -417,8 +425,14 @@ fn sinks_iceberg(catalog: String, table: String) -> PyIcebergSink {
 
 #[pyfunction]
 #[pyo3(name = "cassandra")]
-fn sinks_cassandra(node: String, keyspace: String, table: String) -> PyCassandraSink {
-    PyCassandraSink::new(node, keyspace, table)
+#[pyo3(signature = (node, keyspace, table, consistency=None))]
+fn sinks_cassandra(
+    node: String,
+    keyspace: String,
+    table: String,
+    consistency: Option<String>,
+) -> PyCassandraSink {
+    PyCassandraSink::new(node, keyspace, table, consistency)
 }
 
 #[pyfunction]

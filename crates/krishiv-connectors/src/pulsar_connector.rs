@@ -89,6 +89,10 @@ pub struct PulsarConfig {
     /// How long a single poll waits for the next message before the batch
     /// is returned as-is (default: 1s).
     pub poll_timeout: std::time::Duration,
+    /// Where a brand-new subscription starts reading: `true` = earliest
+    /// available message, `false` = only messages published after the
+    /// subscription is created (the Pulsar default).
+    pub start_at_earliest: bool,
 }
 
 impl PulsarConfig {
@@ -101,6 +105,7 @@ impl PulsarConfig {
             sub_type: SubType::Exclusive,
             batch_size: 500,
             poll_timeout: std::time::Duration::from_secs(1),
+            start_at_earliest: false,
         }
     }
 
@@ -122,6 +127,14 @@ impl PulsarConfig {
     /// Override the per-message poll timeout (default 1s).
     pub fn with_poll_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.poll_timeout = timeout;
+        self
+    }
+
+    /// Start a brand-new subscription at the earliest available message
+    /// instead of the Pulsar default (latest). Without this, messages
+    /// published before the subscription existed are invisible.
+    pub fn with_start_at_earliest(mut self, earliest: bool) -> Self {
+        self.start_at_earliest = earliest;
         self
     }
 }
@@ -158,11 +171,20 @@ impl PulsarSource {
             .await
             .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
 
+        let initial_position = if config.start_at_earliest {
+            pulsar::consumer::InitialPosition::Earliest
+        } else {
+            pulsar::consumer::InitialPosition::Latest
+        };
         let consumer: Consumer<RawBytes, TokioExecutor> = pulsar_client
             .consumer()
             .with_topic(&config.topic)
             .with_subscription(&config.subscription)
             .with_subscription_type(config.sub_type)
+            .with_options(pulsar::ConsumerOptions {
+                initial_position,
+                ..Default::default()
+            })
             .build()
             .await
             .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;

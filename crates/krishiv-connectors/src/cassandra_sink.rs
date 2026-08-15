@@ -44,9 +44,42 @@ pub struct CassandraConfig {
     pub keyspace: String,
     /// Target table.
     pub table: String,
+    /// Write consistency level. `None` keeps the driver default
+    /// (LOCAL_QUORUM), which single-node dev clusters cannot satisfy —
+    /// pass `Consistency::One` there.
+    pub consistency: Option<scylla::statement::Consistency>,
 }
 
 impl CassandraConfig {
+    /// Set the write consistency level (e.g. `Consistency::One` for a
+    /// single-node cluster).
+    pub fn with_consistency(mut self, consistency: scylla::statement::Consistency) -> Self {
+        self.consistency = Some(consistency);
+        self
+    }
+
+    /// Set the write consistency level from its lower-case name
+    /// (`one`, `two`, `quorum`, `local_quorum`, `all`). Callers without a
+    /// direct scylla dependency (the Python bindings) use this form.
+    pub fn with_consistency_name(self, name: &str) -> crate::error::ConnectorResult<Self> {
+        use scylla::statement::Consistency;
+        let consistency = match name.to_ascii_lowercase().as_str() {
+            "one" => Consistency::One,
+            "two" => Consistency::Two,
+            "quorum" => Consistency::Quorum,
+            "local_quorum" => Consistency::LocalQuorum,
+            "all" => Consistency::All,
+            other => {
+                return Err(crate::error::ConnectorError::Config {
+                    message: format!(
+                        "unknown consistency '{other}'; expected one, two, quorum, local_quorum, or all"
+                    ),
+                });
+            }
+        };
+        Ok(self.with_consistency(consistency))
+    }
+
     pub fn new(
         node: impl Into<String>,
         keyspace: impl Into<String>,
@@ -56,6 +89,7 @@ impl CassandraConfig {
             node: node.into(),
             keyspace: keyspace.into(),
             table: table.into(),
+            consistency: None,
         }
     }
 }
@@ -89,9 +123,12 @@ impl CassandraSink {
         // execution profile, not on `SessionBuilder` (a `SessionBuilder::
         // request_timeout(..)` call here did not exist on this driver version
         // and broke the `cassandra` feature build outright).
-        let profile = scylla::client::execution_profile::ExecutionProfile::builder()
-            .request_timeout(Some(std::time::Duration::from_secs(30)))
-            .build();
+        let mut profile_builder = scylla::client::execution_profile::ExecutionProfile::builder()
+            .request_timeout(Some(std::time::Duration::from_secs(30)));
+        if let Some(consistency) = config.consistency {
+            profile_builder = profile_builder.consistency(consistency);
+        }
+        let profile = profile_builder.build();
         let session: scylla::client::session::Session = SessionBuilder::new()
             .known_node(&config.node)
             .connection_timeout(std::time::Duration::from_secs(5))

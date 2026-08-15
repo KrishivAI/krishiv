@@ -2100,6 +2100,54 @@ hashes, and an open list. Sections are appended as the audit reaches them.
 
 Things that are not one crate's problem.
 
+- [x] **Live connector test matrix (2026-08-15/16, follow-on to crate 7 +
+      python integration audit).** Every locally-installable connector backend
+      exercised through the Python API with real data (NYC yellow-taxi Jan-2024
+      parquet, 2.96M rows; taxi-zone lookup CSV, 265 rows; 2,000 real JSON
+      trip events), across batch, delta batch, and streaming: 25/25 scenarios
+      green — parquet/CSV/registry ConnectorSource+Sink, Delta
+      (append/time-travel/merge-honesty), Hudi (append/upsert/accounting),
+      Iceberg-fs (write + the fixed real read), Kafka via Redpanda (continuous
+      source → memory sink, 2,000 events; batch sink), MinIO S3 (the
+      `#[ignore]` round-trip, un-ignored), live Postgres (jdbc sink/source,
+      upsert redelivery, keyset guard; postgres-catalog 6/6 incl. concurrent
+      commit), Qdrant + pgvector (filter pushdown live), LocalStack Kinesis
+      (snapshot + continuous — first runtime proof of the previously
+      never-compiled arm), Pulsar (earliest-position snapshot), OpenSearch,
+      Scylla, Weaviate. Live-only defects found and fixed:
+      - **`collect()` on SQL over any unbounded source blocked forever across
+        the whole api/python surface**: the `KrishivDataFrameOps` impl of
+        `krishiv_logical_plan` hardcoded `ExecutionKind::Batch`, so the
+        existing collect-guard never fired despite correct engine
+        classification. One-line kind propagation +
+        `tests/streaming_collect_guard.rs` (hangs pre-fix, passes in 10ms
+        post-fix).
+      - **pgvector**: `CREATE EXTENSION; CREATE TABLE` in one prepared
+        statement (Postgres rejects multi-command prepares — connect always
+        failed against real PG); query read `doc_id` from payload JSON but
+        upsert never stored it (every hit came back with an empty doc_id) and
+        the result payload was dropped.
+      - **Weaviate**: upsert used `PUT /v1/objects` (405 on real servers —
+        now class-scoped PUT with POST-create fallback); queries requested
+        `chunk_index`, a property upsert never writes, so real servers
+        errored — and the GraphQL in-band `errors` field was swallowed into
+        an empty result set (now surfaced).
+      - **Pulsar**: no initial-position support existed — brand-new
+        subscriptions started at Latest, so pre-existing messages were
+        invisible; added `with_start_at_earliest` + python
+        `start_position="earliest"` default.
+      - **Cassandra**: no consistency knob (driver LOCAL_QUORUM default is
+        unusable on single-node clusters) — added
+        `with_consistency{,_name}` + python `consistency=` kwarg.
+      - **Python surface**: `read_iceberg` registered its table under a name
+        embedding the whole catalog path (unqueryable) — now
+        `iceberg_{ns}_{table}`; `ConnectorSink`/`ConnectorSource` were missing
+        from the package `__init__` re-exports; no `jdbc` pip extra existed.
+      Rig: docker containers `audit-{redpanda,minio,pg,qdrant,localstack,
+      opensearch,scylla,weaviate,pulsar}` on ports clear of production;
+      harness scripts in the session scratchpad (rig-specific, not
+      committed).
+
 - [x] **Python↔connector integration audit (2026-08-15, follow-on to crate 7).**
       Traced every source/sink connector's reachability from the Python API
       across batch, SQL, delta-batch, and streaming modes. Findings, all fixed:

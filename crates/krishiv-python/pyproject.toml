@@ -31,6 +31,7 @@ pyarrow = ["pyarrow>=14.0"]
 arrow = ["pyarrow>=14.0", "pandas>=1.5"]
 kafka = []
 iceberg = []
+jdbc = []
 all = ["pandas>=1.5", "pyarrow>=14.0", "kafka", "iceberg"]
 
 [tool.maturin]

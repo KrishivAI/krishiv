@@ -5457,8 +5457,12 @@ impl KrishivDataFrameOps for SqlDataFrame {
     }
     fn krishiv_logical_plan(&self) -> LogicalPlan {
         let label = self.dataframe.logical_plan().to_string();
-        let mut plan = LogicalPlan::new(self.name.clone(), ExecutionKind::Batch).with_node(
-            PlanNode::new("datafusion-logical", label, ExecutionKind::Batch),
+        // Propagate the execution kind attached by `attach_query_metadata`:
+        // hardcoding Batch here dropped the Streaming classification, so the
+        // collect()-on-unbounded guard downstream never fired and a bare
+        // collect over a streaming source blocked forever.
+        let mut plan = LogicalPlan::new(self.name.clone(), self.execution_kind).with_node(
+            PlanNode::new("datafusion-logical", label, self.execution_kind),
         );
         if let Some(n) = self.shuffle_partitions {
             plan = plan.with_shuffle_partitions(Some(n));

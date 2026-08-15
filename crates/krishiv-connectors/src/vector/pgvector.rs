@@ -56,19 +56,22 @@ mod imp {
         async fn ensure_table(&self) -> VectorSinkResult<()> {
             // Table name is validated at connect time; double-quote it so
             // case-sensitive names are preserved and injection is impossible.
-            let sql = format!(
-                r#"
-                CREATE EXTENSION IF NOT EXISTS vector;
-                CREATE TABLE IF NOT EXISTS "{}" (
+            // One statement per query: sqlx prepares each statement, and
+            // Postgres rejects multiple commands inside a prepared statement.
+            sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| VectorSinkError::SchemaConflict(e.to_string()))?;
+            let create_table = format!(
+                r#"CREATE TABLE IF NOT EXISTS "{}" (
                     id TEXT PRIMARY KEY,
                     vector vector({}),
                     payload JSONB NOT NULL DEFAULT '{{}}'::jsonb,
                     epoch BIGINT NOT NULL
-                );
-                "#,
+                )"#,
                 self.table_name, self.vector_dim
             );
-            sqlx::query(&sql)
+            sqlx::query(&create_table)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| VectorSinkError::SchemaConflict(e.to_string()))?;
@@ -90,7 +93,15 @@ mod imp {
                 .zip(batch.payloads.iter())
             {
                 let id = point_id_from_doc_epoch(doc_id, batch.epoch);
-                let payload_json = serde_json::to_value(payload_to_json(payload))
+                // The query path recovers `doc_id` from the payload JSON, so
+                // it must be stored there — without it every hit came back
+                // with an empty doc_id.
+                let mut payload_map = payload_to_json(payload);
+                payload_map.insert(
+                    "doc_id".to_string(),
+                    serde_json::Value::String(doc_id.clone()),
+                );
+                let payload_json = serde_json::to_value(payload_map)
                     .map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
                 let sql = format!(
                     r#"
@@ -193,12 +204,30 @@ mod imp {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let mut out_payload = HashMap::new();
+        for (k, v) in &obj {
+            if k == "doc_id" || k == "text" {
+                continue;
+            }
+            let pv = match v {
+                serde_json::Value::String(s) => Some(PayloadValue::String(s.clone())),
+                serde_json::Value::Bool(b) => Some(PayloadValue::Bool(*b)),
+                serde_json::Value::Number(n) => n
+                    .as_i64()
+                    .map(PayloadValue::Int)
+                    .or_else(|| n.as_f64().map(PayloadValue::Float)),
+                _ => None,
+            };
+            if let Some(pv) = pv {
+                out_payload.insert(k.clone(), pv);
+            }
+        }
         ScoredChunk {
             doc_id,
             chunk_index: 0,
             text,
             score,
-            payload: HashMap::new(),
+            payload: out_payload,
         }
     }
 }

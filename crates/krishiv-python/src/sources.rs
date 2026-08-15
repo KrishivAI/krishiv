@@ -271,8 +271,15 @@ fn read_iceberg_impl(
         )));
     };
     // Register the scanned rows as a SQL table so the source is a unified
-    // StreamingDataFrame (the old Stream/pipeline path was retired).
-    let table_name = format!("iceberg_{}", table_ref.full_name().replace('.', "_"));
+    // StreamingDataFrame (the old Stream/pipeline path was retired). The name
+    // is derived from namespace+table only — `full_name()` includes the
+    // catalog string, which for filesystem catalogs is a whole directory path
+    // and produced unusable table names like `iceberg_/tmp/..._default_zones`.
+    let table_name = format!(
+        "iceberg_{}_{}",
+        table_ref.namespace.replace('.', "_"),
+        table_ref.name
+    );
     session
         .inner
         .register_record_batches(&table_name, scanned)
@@ -388,7 +395,8 @@ pub fn read_kinesis(
 /// Schema: `topic Utf8`, `partition_key Utf8 (nullable)`, `publish_time_ms Int64`,
 /// `data Binary`.
 #[pyfunction]
-#[pyo3(signature = (session, broker_url, topic, *, subscription="krishiv-default", max_batches=10, batch_size=100))]
+#[pyo3(signature = (session, broker_url, topic, *, subscription="krishiv-default", max_batches=10, batch_size=100, start_position="earliest"))]
+#[allow(clippy::too_many_arguments)] // keyword-only pyfunction surface
 pub fn read_pulsar(
     py: Python<'_>,
     session: &PySession,
@@ -397,6 +405,7 @@ pub fn read_pulsar(
     subscription: &str,
     max_batches: usize,
     batch_size: usize,
+    start_position: &str,
 ) -> PyResult<PyStreamingDataFrame> {
     #[cfg(not(feature = "pulsar"))]
     {
@@ -407,6 +416,7 @@ pub fn read_pulsar(
             subscription,
             max_batches,
             batch_size,
+            start_position,
         );
         return Err(ConnectorError::new_err(
             "Pulsar support requires the `pulsar` feature (pip install krishiv[pulsar])",
@@ -416,7 +426,18 @@ pub fn read_pulsar(
     {
         use krishiv_connectors::pulsar_connector::{PulsarConfig, PulsarSource};
 
-        let cfg = PulsarConfig::new(&broker_url, &topic).with_subscription(subscription);
+        let earliest = match start_position {
+            "earliest" | "Earliest" => true,
+            "latest" | "Latest" => false,
+            other => {
+                return Err(ConnectorError::new_err(format!(
+                    "unknown start_position '{other}'; expected earliest or latest"
+                )));
+            }
+        };
+        let cfg = PulsarConfig::new(&broker_url, &topic)
+            .with_subscription(subscription)
+            .with_start_at_earliest(earliest);
         let inner = session.inner.clone();
         let name = topic.clone();
         py.detach(move || {

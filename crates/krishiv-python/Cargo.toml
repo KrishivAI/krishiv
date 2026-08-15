@@ -46,6 +46,7 @@ iceberg = ["krishiv-connectors/iceberg", "krishiv-api/iceberg-sink"]
 # Cloud object-store backends (S3/MinIO, GCS, Azure) — required for Iceberg
 # tables and other sinks whose `path` is an `s3://` URI.
 cloud = ["krishiv-connectors/cloud", "krishiv-runtime/cloud"]
+jdbc = ["krishiv-connectors/jdbc"]
 kinesis = ["krishiv-connectors/kinesis"]
 pulsar = ["krishiv-connectors/pulsar-source"]
 cassandra = ["krishiv-connectors/cassandra"]

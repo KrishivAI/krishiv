@@ -12,6 +12,8 @@ from .krishiv import (  # noqa: F401
     JobStatus,
     CheckpointError,
     ConnectorError,
+    ConnectorSink,
+    ConnectorSource,
     Column,
     DataFrame,
     DataFrameStream,

@@ -134,14 +134,30 @@ impl VectorSink for WeaviateSink {
                 "vector": vector,
                 "properties": properties,
             });
-            let url = format!("{}/v1/objects", self.base_url);
+            // Weaviate's REST contract: PUT replaces an existing object at
+            // /v1/objects/{class}/{id}; creating a new one is POST /v1/objects
+            // (the collection path rejects PUT with 405). Upsert = replace,
+            // falling back to create when the object does not exist yet.
+            let put_url = format!("{}/v1/objects/{}/{}", self.base_url, self.class_name, id);
             let response = self
-                .auth(self.client.put(&url).json(&body))
+                .auth(self.client.put(&put_url).json(&body))
                 .send()
                 .await
                 .map_err(|e| VectorSinkError::Connection(e.to_string()))?;
-            if !response.status().is_success() {
-                let status = response.status();
+            let status = response.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                let post_url = format!("{}/v1/objects", self.base_url);
+                let create = self
+                    .auth(self.client.post(&post_url).json(&body))
+                    .send()
+                    .await
+                    .map_err(|e| VectorSinkError::Connection(e.to_string()))?;
+                if !create.status().is_success() {
+                    let status = create.status();
+                    let text = create.text().await.unwrap_or_default();
+                    return Err(VectorSinkError::Upsert(format!("{status}: {text}")));
+                }
+            } else if !status.is_success() {
                 let text = response.text().await.unwrap_or_default();
                 return Err(VectorSinkError::Upsert(format!("{status}: {text}")));
             }
@@ -184,7 +200,7 @@ impl VectorSink for WeaviateSink {
         // on each hit, and nearVector exposes `distance` under `_additional`.
         let body = json!({
             "query": format!(
-                "{{ Get {{ {class}(limit: {limit}, nearVector: {{ vector: [{vec}] }}{where_arg}) {{ text chunk_index doc_id _additional {{ distance }} }} }} }}",
+                "{{ Get {{ {class}(limit: {limit}, nearVector: {{ vector: [{vec}] }}{where_arg}) {{ text doc_id _additional {{ distance }} }} }} }}",
                 class = self.class_name,
                 limit = top_k,
                 vec = vector.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
@@ -203,6 +219,15 @@ impl VectorSink for WeaviateSink {
             .json()
             .await
             .map_err(|e| VectorSinkError::Query(e.to_string()))?;
+        // GraphQL transports errors in-band with HTTP 200; swallowing them
+        // silently turned every malformed query into an empty result set.
+        if let Some(errors) = payload.get("errors")
+            && errors.as_array().is_some_and(|a| !a.is_empty())
+        {
+            return Err(VectorSinkError::Query(format!(
+                "weaviate graphql error: {errors}"
+            )));
+        }
         let mut out = Vec::new();
         let Some(hits) = payload
             .pointer(&format!("/data/Get/{}", self.class_name))
@@ -222,7 +247,7 @@ impl VectorSink for WeaviateSink {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let chunk_index = hit.get("chunk_index").and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+            let chunk_index = 0;
             let doc_id = hit
                 .get("doc_id")
                 .and_then(|v| v.as_str())
@@ -255,7 +280,6 @@ mod tests {
                 "Get": {
                     "Document": [{
                         "text": "hello",
-                        "chunk_index": 2,
                         "doc_id": "d1",
                         "_additional": { "distance": 0.09 }
                     }]
@@ -272,7 +296,7 @@ mod tests {
         let hits = sink.query_nearest(&[0.1, 0.2], 1, None).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].text, "hello");
-        assert_eq!(hits[0].chunk_index, 2);
+        assert_eq!(hits[0].chunk_index, 0);
         assert_eq!(hits[0].doc_id, "d1");
         assert!((hits[0].score - 0.91).abs() < 1e-6);
     }
@@ -294,11 +318,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn weaviate_upsert_sends_uuid_object_id() {
+    async fn weaviate_upsert_replaces_via_class_scoped_put() {
         let mut server = mockito::Server::new_async().await;
         let expected_id = uuid_from_point_id(&point_id_from_doc_epoch("d1", 1));
         let m = server
-            .mock("PUT", "/v1/objects")
+            .mock(
+                "PUT",
+                format!("/v1/objects/Document/{expected_id}").as_str(),
+            )
             .match_body(mockito::Matcher::PartialJson(
                 serde_json::json!({ "id": expected_id }),
             ))
@@ -314,6 +341,38 @@ mod tests {
         );
         sink.upsert_batch(&batch).await.unwrap();
         m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn weaviate_upsert_creates_via_post_when_object_is_new() {
+        let mut server = mockito::Server::new_async().await;
+        let expected_id = uuid_from_point_id(&point_id_from_doc_epoch("d1", 1));
+        let put = server
+            .mock(
+                "PUT",
+                format!("/v1/objects/Document/{expected_id}").as_str(),
+            )
+            .with_status(404)
+            .create_async()
+            .await;
+        let post = server
+            .mock("POST", "/v1/objects")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({ "id": expected_id }),
+            ))
+            .with_status(200)
+            .create_async()
+            .await;
+        let sink = WeaviateSink::new(server.url(), "Document", None).unwrap();
+        let batch = EmbeddingBatch::new(
+            vec!["d1".into()],
+            vec![vec![0.1, 0.2]],
+            vec![HashMap::new()],
+            1,
+        );
+        sink.upsert_batch(&batch).await.unwrap();
+        put.assert_async().await;
+        post.assert_async().await;
     }
 
     #[tokio::test]
@@ -350,7 +409,10 @@ mod tests {
     async fn weaviate_upsert_is_idempotent_with_mock() {
         let mut server = mockito::Server::new_async().await;
         let m = server
-            .mock("PUT", "/v1/objects")
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex("/v1/objects/Document/.*".into()),
+            )
             .with_status(200)
             .expect(2)
             .create_async()
