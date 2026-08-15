@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use sysinfo::System;
 
@@ -25,6 +25,11 @@ pub struct SystemMetrics {
     system_available_memory_bytes: AtomicU64,
     /// System-wide CPU usage as a percentage × 100 (e.g. 250.0 = 2.5 cores → 25000).
     system_cpu_usage_x100: AtomicU64,
+    /// Persistent `sysinfo` sampler (crate-16 audit, M1): CPU usage is a delta
+    /// between two refreshes of the SAME `System` instance. The previous code
+    /// built `System::new_all()` on every call, so both CPU gauges were
+    /// deltas-from-nothing and read ~0 forever.
+    sampler: Mutex<System>,
 }
 
 static SYSTEM_METRICS: OnceLock<SystemMetrics> = OnceLock::new();
@@ -39,18 +44,27 @@ pub fn system_metrics() -> &'static SystemMetrics {
         system_total_memory_bytes: AtomicU64::new(0),
         system_available_memory_bytes: AtomicU64::new(0),
         system_cpu_usage_x100: AtomicU64::new(0),
+        sampler: Mutex::new(System::new_all()),
     })
 }
 
 impl SystemMetrics {
     /// Snapshot the current process and system metrics into the atomics.
+    ///
+    /// Uses the persistent sampler so CPU usage is a real delta between this
+    /// refresh and the previous one (M1) — a fresh `System` has no prior
+    /// sample and reports 0 for every CPU gauge.
     pub fn refresh(&self) {
-        let mut sys = System::new_all();
+        let mut sys = self
+            .sampler
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         sys.refresh_memory();
         sys.refresh_cpu_all();
 
         // Process-level metrics.
         let pid = sysinfo::get_current_pid().unwrap_or_else(|_| sysinfo::Pid::from_u32(0));
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
         if let Some(proc) = sys.process(pid) {
             self.process_memory_bytes
                 .store(proc.memory(), Ordering::Relaxed);
@@ -220,5 +234,27 @@ mod tests {
         let m = system_metrics();
         m.refresh();
         assert!(m.process_thread_count() > 0);
+    }
+
+    /// Regression (crate-16 audit, M1): CPU usage is a delta between two
+    /// refreshes of the SAME `System`; a fresh instance per call reads ~0
+    /// forever. Burn CPU between two spaced refreshes and require a nonzero
+    /// system-CPU reading (the whole machine is never at exactly 0%).
+    #[test]
+    fn cpu_gauges_read_nonzero_after_spaced_refreshes() {
+        let m = system_metrics();
+        m.refresh();
+        // Busy-spin past sysinfo's MINIMUM_CPU_UPDATE_INTERVAL (200ms).
+        let start = std::time::Instant::now();
+        let mut x: u64 = 0;
+        while start.elapsed() < std::time::Duration::from_millis(300) {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+        }
+        std::hint::black_box(x);
+        m.refresh();
+        assert!(
+            m.system_cpu_usage_x100() > 0,
+            "system CPU must read nonzero after two spaced refreshes of a persistent sampler"
+        );
     }
 }

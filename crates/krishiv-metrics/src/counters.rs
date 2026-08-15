@@ -693,11 +693,12 @@ impl KrishivMetrics {
         self.source_read_duration.remove(job_id);
         self.stream_record_latency.remove(job_id);
         self.checkpoint_alignment_duration.remove(job_id);
-        self.output_buffer_flushes.clear();
-        self.sink_prepare_duration.clear();
-        self.sink_commit_duration.clear();
-        self.sink_abort_duration.clear();
-        self.object_store_requests.clear();
+        // Crate-16 audit (M2): output_buffer_flushes (labeled by reason),
+        // sink_*_duration (labeled by sink_id), and object_store_requests
+        // (labeled by operation) are NOT job-scoped — the previous `.clear()`
+        // here reset those global monotonic families whenever ANY job was
+        // removed, breaking Prometheus rate() on every dashboard reading
+        // them. They are small bounded families; leave them alone.
     }
 
     // Duration observation histograms
@@ -1744,6 +1745,33 @@ mod tests {
         // p50 falls in the sub-second bucket, p99 in the multi-minute bucket.
         assert_eq!(m.query_latency_quantile("batch", 0.5), Some(0.5));
         assert!(m.query_latency_quantile("batch", 0.99).unwrap() >= 120.0);
+    }
+
+    /// Regression (crate-16 audit, M2): removing a job must not reset metric
+    /// families that are not job-scoped — output-buffer flush reasons, sink
+    /// durations, and object-store request counters are global monotonic
+    /// series and a `.clear()` on job removal breaks Prometheus rate().
+    #[test]
+    fn remove_job_preserves_non_job_scoped_families() {
+        let m = KrishivMetrics::default();
+        m.inc_output_buffer_flush("rows");
+        m.inc_object_store_request("put");
+        m.observe_sink_commit_duration("iceberg-sink", 0.1);
+        m.set_checkpoint_epoch("job-a", 1);
+        m.remove_job("job-a");
+        let body = m.render_prometheus();
+        assert!(
+            body.contains("krishiv_output_buffer_flushes_total{reason=\"rows\"} 1"),
+            "flush-reason counter must survive job removal: {body}"
+        );
+        assert!(
+            body.contains("krishiv_object_store_requests_total{operation=\"put\"} 1"),
+            "object-store counter must survive job removal"
+        );
+        assert!(
+            body.contains("krishiv_sink_commit_duration_seconds_count{sink_id=\"iceberg-sink\"} 1"),
+            "sink histogram must survive job removal"
+        );
     }
 
     #[test]

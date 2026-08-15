@@ -48,9 +48,9 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 11 | krishiv-dataflow | 18,107 | 38 | COMPLETE | 6 defects fixed (D1–D6); see §11 |
 | 12 | krishiv-ivm | 7,019 | 10 | COMPLETE | 3 defects fixed (I1–I3) + 1 needs-decision (watch-channel delta coalescing); see §12 |
 | 13 | krishiv-delta | 7,098 | 20 | COMPLETE | 5 defects fixed (K1–K5) + cross-crate hash_row re-key; see §13 |
-| 14 | krishiv-flight-sql | 5,199 | 6 | 0 | |
-| 15 | krishiv-proto | 8,130 | 12 | 0 | 8k LOC, 3 test files |
-| 16 | krishiv-metrics | 3,731 | 6 | 0 | |
+| 14 | krishiv-flight-sql | 5,199 | 6 | COMPLETE | 2 defects fixed (F1–F2); see §14 |
+| 15 | krishiv-proto | 8,130 | 12 | COMPLETE | 0 defects — cleanest crate; 1 note (unaligned_buffers wire drop); see §15 |
+| 16 | krishiv-metrics | 3,731 | 6 | COMPLETE | 2 defects fixed (M1–M2); see §16 |
 | 17 | krishiv-engine-core | 3,146 | 11 | 0 | |
 | **Tier 4 — thin, tooling, structural smells** |
 | 18 | krishiv-python | 12,892 | 35 | 0 | excluded from CI clippy — breakage is invisible |
@@ -3208,4 +3208,116 @@ unreachable (keys always come from the same batch) — its comment overstates.
 
 Gates: `cargo test -p krishiv-delta` (121 lib + 8 proptest green),
 `cargo test -p krishiv-ivm` green on the re-keyed hash_row, `just lint`,
+`just test`, `cargo fmt` — green.
+
+## 14. krishiv-flight-sql — read end to end (2026-08-16)
+
+All 6 files read (service.rs 2.5k, host.rs 1.3k, lib.rs tests 1.1k,
+actions.rs, session_limits.rs, bin/krishiv_flight_server.rs). The front door
+is deeply incident-hardened: SEC-2 default-deny folded into a single
+`authenticate_request` enforcement point, #211 spool streaming (schema from
+the IPC header — no eager decode), the Phase 55/58 drain-ack put-back (both
+the oversized-do_action and mid-stream-death cases pinned by live-regression
+tests), G1/G12/G16/G17 JDBC-driver gaps all pinned, honest no-op transaction
+semantics with statement-count warnings, error taxonomy with opaque internal
+statuses. Coverage: 71.1% regions / 72.1% lines
+(`/tmp/claude-1000/flightsql_cov.txt`).
+
+**F1 (A) actions.rs — `$N` inside quotes was a parameter.**
+`count_sql_params` and `substitute_sql_params` scanned raw bytes with no
+quote awareness (the `?`→`$N` normalizer directly above them is
+quote-aware): `SELECT '$1' AS tag, $1 AS v` counted one param but substituted
+BOTH sites, silently rewriting the literal with the bound value. Fix: a
+shared `QuoteState` tracker; `$` inside `'…'`/`"…"` is text. Test
+`dollar_placeholders_inside_quotes_are_not_parameters`; revert-proven
+(`in_quotes() → false` → red).
+
+**F2 (A) actions.rs — unsupported bound-param types bound as SQL NULL.**
+`col_literal` rendered List/LargeList/FixedSizeList/Struct/Map/anything-else
+as the literal `NULL` — a client binding an array param got NULL silently
+substituted into its query. Fix: `substitute_sql_params` now returns
+`Result` and rejects with `invalid_argument` naming the parameter and type.
+Test `unsupported_param_type_errors_instead_of_null`; revert-proven
+(sentinel arm → `"NULL"` → red).
+
+Notes (not fixed, recorded): timestamp params render as `TIMESTAMP '<raw
+ticks>'`, which fails loudly at plan time rather than silently (E-minor —
+correct formatting is future work); the typed `BatchSql` do_action path does
+not take the per-session statement guard (only `do_get_statement` does) —
+the global semaphore still applies; `do_put_prepared_statement_update`
+ignores per-row bound params beyond returning -1 (documented honest
+unknown).
+
+Clean files: service.rs, host.rs (incl. the flavor-checked `run_blocking`
+and the DrainDeliveryGuard drop-path), session_limits.rs (RAII statement
+guard, sweep-on-access idle eviction, MAX_TRACKED_SESSIONS cap), bin
+(pre-tracing eprintln documented), lib.rs test suite (auth matrix, SEC-2
+asymmetry regression, declared-default guard).
+
+Gates: `cargo test -p krishiv-flight-sql` (94 green), clippy, `just lint`,
+`just test`, `cargo fmt` — green.
+
+## 15. krishiv-proto — read end to end (2026-08-16)
+
+All 12 src files + build.rs read (ids, lifecycle, checkpoint, io, job,
+executor, management, services, task at 2.2k, wire at 2.1k, tests at 1.4k,
+lib). **Zero fixes needed** — the cleanest crate so far. The contract layer
+is exactly what the A–G checklist wants to see everywhere else: typed
+validated IDs (empty/zero rejected at construction, saturation warnings on
+`next()`), explicit presence flags for every optional scalar (`has_*`) so
+zero and absent stay distinguishable across the wire (the P0.17 lesson,
+pinned), `live_jobs_authoritative` separating "no jobs" from "coordinator
+didn't report" (shuffle-GC safety, pinned with the three-state test),
+decoder-boundary invariants (zero-partition shuffle write cannot decode —
+the boundary makes the silent-green-task shape impossible), loud parse
+errors for malformed sink contracts, and proptest never-panics fuzz across
+all 17 `from_wire` decoders.
+
+One recorded note (no fix): `CheckpointAckRequest.unaligned_buffers` has no
+protobuf field — `to_wire` drops it and `from_wire` hardcodes `Vec::new()`.
+Consistent with the crate-11 §11 finding that Unaligned checkpointing has no
+production constructor; when it is wired, the proto field must be added or
+unaligned acks will silently lose their in-flight buffer refs across the
+wire. Also noted: `StreamingTaskStateWire.watermark_ms` is uint64 on the
+wire with a documented bit-pattern cast for negative sentinels (deliberate,
+commented on both sides).
+
+Gates: `cargo test -p krishiv-proto` green via the workspace suite; no code
+changes, so no new gates needed beyond the register entry.
+
+## 16. krishiv-metrics — read end to end (2026-08-16)
+
+All 6 files read (counters.rs 1.8k, lib.rs tests, observability_report.rs
+schema, grpc.rs, init.rs, system.rs). Strong overall: per-metric bucket sets
+with rationale (µs gRPC, µs stream-record, wide query-latency), label-value
+escaping with injection tests, error-ref opaque internal statuses with a
+leak test, exactly-one-HELP/TYPE discipline pinned. Coverage post-fix:
+61.6% regions / 62.2% lines (`/tmp/claude-1000/metrics_cov.txt`).
+
+**M1 (A) system.rs — CPU gauges always read ~0.**
+`refresh()` built a fresh `sysinfo::System` on every call, but sysinfo
+computes CPU usage as a delta between two refreshes of the SAME instance —
+so `krishiv_process_cpu_usage` and `krishiv_system_cpu_usage` were
+deltas-from-nothing, reporting ~0 forever on every dashboard. Fix: a
+persistent `Mutex<System>` sampler inside `SystemMetrics` (plus an explicit
+`refresh_processes` for the pid so process CPU/memory stay current). Test
+`cpu_gauges_read_nonzero_after_spaced_refreshes` (300ms busy-spin between
+refreshes); revert-proven (fresh `System::new_all()` per call → red).
+
+**M2 (A) counters.rs — `remove_job` wiped global metric families.**
+It called `.clear()` on `output_buffer_flushes` (labeled by reason),
+`sink_prepare/commit/abort_duration` (labeled by sink_id), and
+`object_store_requests` (labeled by operation) — none of which are
+job-scoped — so completing ANY job reset those global monotonic counters
+and histograms, breaking Prometheus `rate()` for every consumer. Fix:
+remove the clears (all five are small bounded families). Test
+`remove_job_preserves_non_job_scoped_families`; revert-proven (clears
+restored → red).
+
+Clean files: grpc.rs (trace propagation + error-ref taxonomy + duration
+layer), init.rs (OTLP/stdout/in-memory exporter wiring, honest re-init
+semantics), observability_report.rs (serialization-only schema), lib.rs
+(thorough counter/render/escaping/thread-safety tests).
+
+Gates: `cargo test -p krishiv-metrics` (83 green), clippy, `just lint`,
 `just test`, `cargo fmt` — green.
