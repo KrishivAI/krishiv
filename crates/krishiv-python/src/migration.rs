@@ -82,11 +82,6 @@ struct StateMigrationDecorator {
 impl StateMigrationDecorator {
     #[pyo3(signature = (migration_fn))]
     fn __call__(&self, py: Python<'_>, migration_fn: Py<PyAny>) -> PyResult<Py<PyAny>> {
-        let session = self.registry_target.as_ref().map(|_| {
-            // When decorator was created with session=, registry is already captured.
-            None::<&PySession>
-        });
-        let _ = session;
         let registry = self
             .registry_target
             .clone()

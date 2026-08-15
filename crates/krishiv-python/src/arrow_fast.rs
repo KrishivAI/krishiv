@@ -51,11 +51,13 @@ pub fn record_batch_to_py_fast<'py>(
     reader.call_method0("read_next_batch")
 }
 
-/// Deserialize a PyArrow RecordBatch into a Rust `RecordBatch` with minimal
-/// intermediate allocations.
+/// Deserialize a PyArrow RecordBatch into a Rust `RecordBatch`.
 ///
-/// Uses Arrow IPC stream reader directly instead of going through
-/// `pyarrow.Table.from_batches()` → `BufferOutputStream` → bytes → reader.
+/// Currently takes the same `pyarrow.Table.from_batches()` →
+/// `BufferOutputStream` → bytes → IPC-reader route as
+/// `arrow_compat::record_batch_from_py`; kept as a separate entry point so a
+/// genuinely zero-copy path (Arrow C data interface) can slot in later without
+/// changing callers.
 pub fn record_batch_from_py_fast(ob: &Bound<'_, PyAny>) -> PyResult<RecordBatch> {
     let py = ob.py();
     let pa = py.import("pyarrow")?;
@@ -99,10 +101,15 @@ pub fn record_batches_to_py_table<'py>(
     schema: &SchemaRef,
 ) -> PyResult<Bound<'py, PyAny>> {
     if batches.is_empty() {
+        // Build the empty table via Table.from_batches([], schema=...) so the
+        // caller-supplied schema is preserved; pa.table([]) would drop it.
         let pa = py.import("pyarrow")?;
-        let _empty_schema = super::arrow_compat::schema_to_py(py, schema)?;
-        let empty_array = pyo3::types::PyList::empty(py);
-        return pa.call_method1("table", (empty_array,));
+        let empty_schema = super::arrow_compat::schema_to_py(py, schema)?;
+        let table_cls = pa.getattr("Table")?;
+        let empty_list = pyo3::types::PyList::empty(py);
+        let kw = pyo3::types::PyDict::new(py);
+        kw.set_item("schema", empty_schema)?;
+        return table_cls.call_method("from_batches", (empty_list,), Some(&kw));
     }
 
     // Serialize all batches into a single IPC stream
@@ -228,13 +235,31 @@ mod tests {
         });
     }
 
+    /// Regression (crate-18 audit): the empty-input path built the PyArrow
+    /// schema object and then discarded it, returning `pa.table([])` — a table
+    /// with zero columns. The caller-supplied schema must survive.
     #[test]
-    fn test_record_batches_to_py_table_empty() {
+    fn test_record_batches_to_py_table_empty_preserves_schema() {
         pyo3::Python::initialize();
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         Python::attach(|py| {
             let result = record_batches_to_py_table(py, &[], &schema);
             assert!(result.is_ok(), "empty to_table failed: {:?}", result.err());
+            let table = result.unwrap();
+            let num_rows: usize = table.getattr("num_rows").unwrap().extract().unwrap();
+            assert_eq!(num_rows, 0);
+            let names: Vec<String> = table
+                .getattr("schema")
+                .unwrap()
+                .getattr("names")
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(
+                names,
+                vec!["id".to_string()],
+                "empty table must carry the caller-supplied schema"
+            );
         });
     }
 

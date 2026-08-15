@@ -95,6 +95,26 @@ impl AuthProvider for JwtAuth {
     }
 }
 
+/// Resolve a `Session.with_policy` policy name to a hook.
+///
+/// "role_based" used to be accepted here and silently mapped to
+/// `AllowAllPolicyHook` — a request for access control answered with no access
+/// control. It is rejected loudly until a real role-based hook exists on this
+/// surface.
+fn resolve_policy_hook(policy: &str) -> PyResult<Arc<dyn krishiv_plan::governance::PolicyHook>> {
+    match policy {
+        "allow_all" | "noop" => Ok(Arc::new(AllowAllPolicyHook)),
+        "role_based" => Err(PyRuntimeError::new_err(
+            "policy 'role_based' is not implemented on this surface; \
+             it previously granted allow_all silently. Use allow_all \
+             explicitly, or enforce roles via the platform's governance layer",
+        )),
+        other => Err(PyRuntimeError::new_err(format!(
+            "unknown policy '{other}'; use allow_all"
+        ))),
+    }
+}
+
 fn build_embedded_session() -> PyResult<PySession> {
     krishiv_api::SessionBuilder::new()
         .build()
@@ -367,14 +387,7 @@ impl PySession {
     ) -> PyResult<Self> {
         let keys: std::collections::HashMap<String, String> = api_keys.into_iter().collect();
         let auth = Arc::new(StaticApiKeyAuthProvider::new(keys));
-        let policy_hook: Arc<dyn krishiv_plan::governance::PolicyHook> = match policy {
-            "allow_all" | "noop" | "role_based" => Arc::new(AllowAllPolicyHook),
-            other => {
-                return Err(PyRuntimeError::new_err(format!(
-                    "unknown policy '{other}'; use allow_all"
-                )));
-            }
-        };
+        let policy_hook = resolve_policy_hook(policy)?;
         let mut builder = krishiv_api::SessionBuilder::new()
             .with_auth(auth)
             .with_policy(policy_hook);
@@ -1407,9 +1420,9 @@ impl PySession {
         #[cfg(not(feature = "kafka"))]
         {
             let _ = (name, brokers, topic, group_id, schema);
-            return Err(crate::errors::ConnectorError::new_err(
+            Err(crate::errors::ConnectorError::new_err(
                 "Kafka support requires the `kafka` feature (pip install krishiv[kafka])",
-            ));
+            ))
         }
         #[cfg(feature = "kafka")]
         {
@@ -1460,9 +1473,9 @@ impl PySession {
         #[cfg(not(feature = "kinesis"))]
         {
             let _ = (name, region, stream_name, shard_id);
-            return Err(crate::errors::ConnectorError::new_err(
+            Err(crate::errors::ConnectorError::new_err(
                 "Kinesis support requires the `kinesis` feature (pip install krishiv[kinesis])",
-            ));
+            ))
         }
         #[cfg(feature = "kinesis")]
         {
@@ -1561,9 +1574,9 @@ impl PySession {
         #[cfg(not(feature = "pulsar"))]
         {
             let _ = (name, broker_url, topic);
-            return Err(crate::errors::ConnectorError::new_err(
+            Err(crate::errors::ConnectorError::new_err(
                 "Pulsar support requires the `pulsar` feature (pip install krishiv[pulsar])",
-            ));
+            ))
         }
         #[cfg(feature = "pulsar")]
         {
@@ -1833,6 +1846,23 @@ mod tests {
         let empty_jwks = r#"{"keys":[]}"}"#;
         let result = JwtAuth::from_jwks_json(empty_jwks, "aud".into(), None);
         assert!(result.is_err(), "empty JWKS should error");
+    }
+
+    /// Regression (crate-18 audit): `with_policy(policy="role_based")` used to
+    /// silently return `AllowAllPolicyHook` — the caller asked for access
+    /// control and got none. It must now be rejected loudly.
+    #[test]
+    fn with_policy_role_based_is_rejected_not_silently_allow_all() {
+        pyo3::Python::initialize();
+        assert!(crate::session::resolve_policy_hook("allow_all").is_ok());
+        assert!(crate::session::resolve_policy_hook("noop").is_ok());
+        match crate::session::resolve_policy_hook("role_based") {
+            Ok(_) => panic!("role_based must be rejected, not silently mapped to allow_all"),
+            Err(err) => assert!(
+                err.to_string().contains("not implemented"),
+                "unexpected error: {err}"
+            ),
+        }
     }
 
     #[test]

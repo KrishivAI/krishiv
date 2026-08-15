@@ -106,33 +106,7 @@ impl PyInMemoryVectorSink {
         payloads: Option<Vec<Bound<'_, PyDict>>>,
         epoch: u64,
     ) -> PyResult<()> {
-        let payloads: Vec<HashMap<String, PayloadValue>> = match payloads {
-            None => vec![HashMap::new(); doc_ids.len()],
-            Some(dicts) => dicts
-                .iter()
-                .map(|d| {
-                    let mut m = HashMap::new();
-                    for (k, v) in d.iter() {
-                        let key: String = k.extract()?;
-                        let val: PayloadValue = if let Ok(b) = v.extract::<bool>() {
-                            PayloadValue::Bool(b)
-                        } else if let Ok(i) = v.extract::<i64>() {
-                            PayloadValue::Int(i)
-                        } else if let Ok(f) = v.extract::<f64>() {
-                            PayloadValue::Float(f)
-                        } else if let Ok(s) = v.extract::<String>() {
-                            PayloadValue::String(s)
-                        } else {
-                            return Err(PyRuntimeError::new_err(format!(
-                                "unsupported payload value type for key {key:?}"
-                            )));
-                        };
-                        m.insert(key, val);
-                    }
-                    Ok(m)
-                })
-                .collect::<PyResult<Vec<_>>>()?,
-        };
+        let payloads = parse_payloads(payloads, doc_ids.len())?;
         let batch = EmbeddingBatch::new(doc_ids, vectors, payloads, epoch);
         let sink = Arc::clone(&self.inner);
         py.detach(move || {
@@ -163,46 +137,13 @@ impl PyInMemoryVectorSink {
         top_k: usize,
         filter: Option<Bound<'_, PyDict>>,
     ) -> PyResult<Vec<PyScoredChunk>> {
-        let payload_filter = filter
-            .map(|d| {
-                let mut equals = HashMap::new();
-                for (k, v) in d.iter() {
-                    let key: String = k.extract()?;
-                    let val: PayloadValue = if let Ok(b) = v.extract::<bool>() {
-                        PayloadValue::Bool(b)
-                    } else if let Ok(i) = v.extract::<i64>() {
-                        PayloadValue::Int(i)
-                    } else if let Ok(f) = v.extract::<f64>() {
-                        PayloadValue::Float(f)
-                    } else if let Ok(s) = v.extract::<String>() {
-                        PayloadValue::String(s)
-                    } else {
-                        return Err(PyRuntimeError::new_err(
-                            "unsupported filter value type".to_string(),
-                        ));
-                    };
-                    equals.insert(key, val);
-                }
-                Ok(krishiv_connectors::vector::PayloadFilter { equals })
-            })
-            .transpose()?;
+        let payload_filter = parse_filter(filter)?;
         let sink = Arc::clone(&self.inner);
         py.detach(move || {
             crate::RUNTIME
                 .block_on(sink.query_nearest(&vector, top_k, payload_filter.as_ref()))
+                .map(chunks_to_py)
                 .map_err(map_sink_err)
-                .map(|chunks| {
-                    chunks
-                        .into_iter()
-                        .map(|c| PyScoredChunk {
-                            doc_id: c.doc_id,
-                            chunk_index: c.chunk_index,
-                            text: c.text,
-                            score: c.score,
-                            payload: c.payload,
-                        })
-                        .collect()
-                })
         })
     }
 

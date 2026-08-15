@@ -318,6 +318,7 @@ pub fn read_kinesis(
     #[cfg(not(feature = "kinesis"))]
     {
         let _ = (
+            py,
             session,
             stream_name,
             region,
@@ -326,9 +327,9 @@ pub fn read_kinesis(
             max_batches,
             batch_size,
         );
-        return Err(ConnectorError::new_err(
+        Err(ConnectorError::new_err(
             "Kinesis support requires the `kinesis` feature (pip install krishiv[kinesis])",
-        ));
+        ))
     }
     #[cfg(feature = "kinesis")]
     {
@@ -410,6 +411,7 @@ pub fn read_pulsar(
     #[cfg(not(feature = "pulsar"))]
     {
         let _ = (
+            py,
             session,
             broker_url,
             topic,
@@ -418,9 +420,9 @@ pub fn read_pulsar(
             batch_size,
             start_position,
         );
-        return Err(ConnectorError::new_err(
+        Err(ConnectorError::new_err(
             "Pulsar support requires the `pulsar` feature (pip install krishiv[pulsar])",
-        ));
+        ))
     }
     #[cfg(feature = "pulsar")]
     {

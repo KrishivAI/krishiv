@@ -23,8 +23,6 @@
 //! )
 //! ```
 
-use std::sync::Mutex;
-
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
@@ -53,21 +51,18 @@ enum RelationKind {
 #[pyclass(name = "Relation", unsendable)]
 pub struct PyRelation {
     kind: RelationKind,
-    _cached: Mutex<Option<PyQueryResult>>,
 }
 
 impl PyRelation {
     pub fn from_dataframe(df: krishiv_api::DataFrame) -> Self {
         Self {
             kind: RelationKind::Batch(df),
-            _cached: Mutex::new(None),
         }
     }
 
     pub fn from_pipeline(pipeline: StreamPipeline) -> Self {
         Self {
             kind: RelationKind::Stream(pipeline),
-            _cached: Mutex::new(None),
         }
     }
 

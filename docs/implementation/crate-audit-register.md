@@ -53,7 +53,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 16 | krishiv-metrics | 3,731 | 6 | COMPLETE | 2 defects fixed (M1–M2); see §16 |
 | 17 | krishiv-engine-core | 3,146 | 11 | COMPLETE | 0 functional defects; forbid(unsafe_code) added; see §17 |
 | **Tier 4 — thin, tooling, structural smells** |
-| 18 | krishiv-python | 12,892 | 35 | 0 | excluded from CI clippy — breakage is invisible |
+| 18 | krishiv-python | 13,101 | 35 | 35 | COMPLETE — PY1–PY7 fixed (§18); direct clippy now 0 |
 | 19 | krishiv-operator | 5,128 | 20 | 0 | |
 | 20 | krishiv-mcp | 3,296 | **1** | 0 | one 3,296-line file |
 | 21 | krishiv | 8,257 | 24 | 0 | binary/CLI |
@@ -3349,3 +3349,70 @@ is the third leg of that same open item.
 
 Gates: `cargo test -p krishiv-engine-core` (36 green), clippy, `just lint`,
 `just test`, `cargo fmt` — green.
+
+## 18. krishiv-python — read end to end (2026-08-16)
+
+All 35 Rust files read (13,101 LOC): session.rs 1847, udf.rs, dataframe.rs,
+vector_sinks.rs, lakehouse.rs, streaming.rs, process_api.rs,
+streaming_dataframe.rs, sources.rs, expression.rs, sinks.rs, incremental.rs,
+pipeline_api.rs + 22 smaller. CI-excluded crate — clippy run directly
+(10 warnings found, all fixed; now 0). No `tests/` dir, no `.rs.inc`.
+
+**Host-test unblock**: `cargo test -p krishiv-python --lib` previously failed
+to link (`mold: library not found: python3.14`). Fix: the shared object lives
+off the default search path — `RUSTFLAGS="-L /usr/lib/python3.14/config-3.14-\
+x86_64-linux-gnu" cargo test -p krishiv-python --lib` links and runs all
+tests (40 green). This crate's Rust tests are runnable on this host after all.
+
+Defects fixed (commit pending, this section's commit):
+
+- **PY1 (A, security surface)** session.rs `Session.with_policy(policy=
+  "role_based")` silently mapped to `AllowAllPolicyHook` — a request for
+  access control answered with none. Now extracted to `resolve_policy_hook`
+  and `role_based` is rejected loudly. Test
+  `with_policy_role_based_is_rejected_not_silently_allow_all`;
+  revert-proven (arm restored to the Ok side → red).
+- **PY2 (A)** arrow_fast.rs `record_batches_to_py_table` empty-input path
+  built the PyArrow schema object, discarded it (`_empty_schema`), and
+  returned `pa.table([])` — a zero-column table, losing the caller's schema.
+  Now `Table.from_batches([], schema=...)`. Test
+  `test_record_batches_to_py_table_empty_preserves_schema`;
+  revert-proven (old body restored → red).
+- **PY3 (G)** udf.rs: `KRISHIV_PYTHON_UDF_TIMEOUT_MS` is a registry-declared
+  flag and is named in the timeout error message, but nothing read it —
+  `call_python_udf` hardcoded 30 s. Now wired via `python_udf_timeout_ms()`
+  (LazyLock over `env_registry::env_u64`). Per the workspace's established
+  pattern (late_materialize.rs), the env read itself cannot be flipped from a
+  test (`set_var` unsafe under edition 2024); the pure resolution
+  `timeout_from` is pinned by `timeout_from_prefers_env_value_over_default`,
+  and `slow_udf_times_out_at_configured_ms` pins the timeout mechanism.
+- **PY4 (E)** arrow_fast.rs `record_batch_from_py_fast` doc claimed it skips
+  the `Table.from_batches` route; the body is identical to the slow path.
+  Doc corrected (kept as a seam for a future C-data-interface path).
+- **PY5 (B)** relation.rs dead `_cached: Mutex<Option<PyQueryResult>>` field
+  (never read) removed; migration.rs dead `let session = ...; let _ =
+  session;` construct removed; vector_sinks.rs `PyInMemoryVectorSink`
+  deduplicated onto the shared `parse_payloads`/`parse_filter`/`chunks_to_py`
+  helpers all other sinks use.
+- **PY6 (lint, CI-invisible)** 10 direct-clippy warnings fixed: unused `py`
+  under `#[cfg(not(feature))]` (sources.rs ×2 — added to the discard tuple),
+  dead-in-default-build `consistency` field (sinks.rs — now also shown in
+  `__repr__`, making it read in every build), unneeded `return`s in five
+  feature-gate error branches (session.rs ×3, sources.rs ×2).
+- **PY7 (E)** lakehouse.rs `write_delta` accepts `"merge"` but the docstring
+  advertised only append/overwrite — doc corrected.
+
+Notes (not defects): sinks/sources honestly document at-least-once semantics
+and feature gates; ConnectorSink/-Source flush failures fail the call;
+memo.rs documents its unused `_schema_json`; udf.rs cogroup/map_pandas_iter
+bridges are `#[allow(dead_code)]` with honest "not yet wired" docs (staged
+feature, recorded as a product decision, not deleted); Timestamp columns in
+the dict-based UDF path only support nanosecond arrays — non-ns units fail
+loudly with InvalidArgument (not silent). The `python/` package (~8.6k LOC
+.py + pytest suite + prebuilt .so) is out of this register's Rust scope; the
+prebuilt `.so` predates this session's fixes, so pytest was not used as a
+gate for them.
+
+Gates: direct clippy 0 warnings, `cargo test -p krishiv-python --lib`
+(40 green, via the RUSTFLAGS -L workaround), `just lint`, `just test`,
+`cargo fmt` — green.

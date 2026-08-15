@@ -38,7 +38,7 @@ pub fn read_delta(
 ///
 /// ``path``    — local filesystem path to the Delta table directory.
 /// ``batches`` — list of ``Batch`` objects to write.
-/// ``mode``    — ``"append"`` (default) or ``"overwrite"``.
+/// ``mode``    — ``"append"`` (default), ``"overwrite"``, or ``"merge"``.
 /// ``schema_evolution`` — whether to allow schema evolution (currently unused).
 #[pyfunction]
 #[pyo3(signature = (path, batches, *, mode = "append", schema_evolution = false))]

@@ -276,8 +276,8 @@ impl PyCassandraSink {
 
     pub fn __repr__(&self) -> String {
         format!(
-            "CassandraSink(node={:?}, keyspace={:?}, table={:?})",
-            self.node, self.keyspace, self.table
+            "CassandraSink(node={:?}, keyspace={:?}, table={:?}, consistency={:?})",
+            self.node, self.keyspace, self.table, self.consistency
         )
     }
 }

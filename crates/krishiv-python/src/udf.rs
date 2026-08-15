@@ -213,11 +213,32 @@ impl krishiv_plan::udf::ScalarUdf for PythonScalarUdf {
 /// Default Python UDF execution timeout (30 seconds).
 const PYTHON_UDF_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
+/// Effective per-call UDF timeout: `KRISHIV_PYTHON_UDF_TIMEOUT_MS` when set
+/// (the registry-declared flag the timeout error message points users at),
+/// else the 30 s default. Read once — the timeout is process-wide config, not
+/// something to re-parse per batch.
+fn python_udf_timeout_ms() -> u64 {
+    static TIMEOUT_MS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        timeout_from(krishiv_common::env_registry::env_u64(
+            "KRISHIV_PYTHON_UDF_TIMEOUT_MS",
+        ))
+    });
+    *TIMEOUT_MS
+}
+
+/// The timeout resolution, separated from reading the environment. Kept pure
+/// so it can be tested directly: mutating process environment from a test is
+/// unsound under a multi-threaded runner and `set_var` is unsafe since
+/// edition 2024, which this workspace denies.
+fn timeout_from(env_value: Option<u64>) -> u64 {
+    env_value.unwrap_or(PYTHON_UDF_DEFAULT_TIMEOUT_MS)
+}
+
 pub async fn call_python_udf(
     udf: Arc<dyn krishiv_plan::udf::ScalarUdf>,
     batch: RecordBatch,
 ) -> Result<ArrayRef, krishiv_plan::udf::UdfError> {
-    call_python_udf_with_timeout(udf, batch, PYTHON_UDF_DEFAULT_TIMEOUT_MS).await
+    call_python_udf_with_timeout(udf, batch, python_udf_timeout_ms()).await
 }
 
 /// Execute a Python scalar UDF with an explicit millisecond timeout.
@@ -1074,4 +1095,56 @@ pub(crate) fn build_python_map_pandas_iter_udf(
         input_schema,
         output_schema,
     }))
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    /// Regression (crate-18 audit): `KRISHIV_PYTHON_UDF_TIMEOUT_MS` was
+    /// registered in the env registry and named in the timeout error message,
+    /// but nothing read it — `call_python_udf` hardcoded 30 s. The env read
+    /// now flows through `timeout_from`; this pins its resolution.
+    #[test]
+    fn timeout_from_prefers_env_value_over_default() {
+        assert_eq!(timeout_from(Some(5)), 5);
+        assert_eq!(timeout_from(None), PYTHON_UDF_DEFAULT_TIMEOUT_MS);
+    }
+
+    #[derive(Debug)]
+    struct SlowUdf;
+
+    impl krishiv_plan::udf::ScalarUdf for SlowUdf {
+        fn name(&self) -> &str {
+            "slow"
+        }
+        fn input_schema(&self) -> &Schema {
+            static SCHEMA: std::sync::LazyLock<Schema> = std::sync::LazyLock::new(Schema::empty);
+            &SCHEMA
+        }
+        fn output_field(&self) -> &Field {
+            static FIELD: std::sync::LazyLock<Field> =
+                std::sync::LazyLock::new(|| Field::new("out", DataType::Null, true));
+            &FIELD
+        }
+        fn call(&self, _batch: &RecordBatch) -> Result<ArrayRef, krishiv_plan::udf::UdfError> {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            Ok(Arc::new(arrow::array::NullArray::new(0)))
+        }
+    }
+
+    /// A UDF slower than the configured timeout must fail with the timeout
+    /// message, not return its (late) result.
+    #[test]
+    fn slow_udf_times_out_at_configured_ms() {
+        let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        let result =
+            crate::RUNTIME.block_on(call_python_udf_with_timeout(Arc::new(SlowUdf), batch, 50));
+        match result {
+            Err(krishiv_plan::udf::UdfError::Execution { message }) => {
+                assert!(message.contains("timed out"), "unexpected error: {message}");
+            }
+            other => panic!("expected timeout error, got {other:?}"),
+        }
+    }
 }
