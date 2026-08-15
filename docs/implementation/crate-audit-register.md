@@ -51,7 +51,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 14 | krishiv-flight-sql | 5,199 | 6 | COMPLETE | 2 defects fixed (F1–F2); see §14 |
 | 15 | krishiv-proto | 8,130 | 12 | COMPLETE | 0 defects — cleanest crate; 1 note (unaligned_buffers wire drop); see §15 |
 | 16 | krishiv-metrics | 3,731 | 6 | COMPLETE | 2 defects fixed (M1–M2); see §16 |
-| 17 | krishiv-engine-core | 3,146 | 11 | 0 | |
+| 17 | krishiv-engine-core | 3,146 | 11 | COMPLETE | 0 functional defects; forbid(unsafe_code) added; see §17 |
 | **Tier 4 — thin, tooling, structural smells** |
 | 18 | krishiv-python | 12,892 | 35 | 0 | excluded from CI clippy — breakage is invisible |
 | 19 | krishiv-operator | 5,128 | 20 | 0 | |
@@ -3320,4 +3320,32 @@ semantics), observability_report.rs (serialization-only schema), lib.rs
 (thorough counter/render/escaping/thread-safety tests).
 
 Gates: `cargo test -p krishiv-metrics` (83 green), clippy, `just lint`,
+`just test`, `cargo fmt` — green.
+
+## 17. krishiv-engine-core — read end to end (2026-08-16)
+
+All 11 files read (mem.rs 819, consolidate.rs, runtime.rs, job.rs, upsert.rs,
+durable.rs, kind.rs, changelog.rs, engine.rs, error.rs, lib.rs). **Zero
+functional defects** — the three-engine spine is fresh, small, and already
+carries its own audit fixes with honest documentation: BATCH-1 (transient
+error classification no longer retries parse errors), B-5 (per-source
+in-flight persistence in CheckpointPayload with serde-default compat), B-6
+(binary keyed-state snapshot format), P-4 (cached RowConverter sort fields),
+crash-durable checkpoint publish (fsync-temp → rename → fsync-dir),
+value-based deterministic FNV shuffle partitioning, and the bounded
+unmatched-retraction consolidator with eviction + warn. Coverage: 86.1%
+regions / 81.9% lines (`/tmp/claude-1000/enginecore_cov.txt`); engine.rs and
+error.rs 0% are trait/type-only files exercised by the engine adapter crates.
+
+One hardening change (H): added the missing `#![forbid(unsafe_code)]` to
+lib.rs — this was one of the four crates without it (the plan's hotspot
+index); no unsafe existed, so this closes the door rather than fixing a
+live issue. No revert-proof needed (compile-time attribute, not behavior).
+
+Cross-references: `CheckpointPayload.in_flight` is the landing pad for the
+unaligned-checkpoint wiring gap recorded in §11 (dataflow D3) and §15
+(proto note) — the "once wired through the operator runtime" comment here
+is the third leg of that same open item.
+
+Gates: `cargo test -p krishiv-engine-core` (36 green), clippy, `just lint`,
 `just test`, `cargo fmt` — green.

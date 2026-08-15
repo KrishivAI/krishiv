@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Krishiv engine-core: the three-engine spine.
 //!
 //! Krishiv runs **three distinct compute engines** that share one execution
