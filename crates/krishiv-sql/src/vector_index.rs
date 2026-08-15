@@ -267,13 +267,29 @@ impl IvfIndex {
         if dim == 0 || nlist == 0 {
             return None;
         }
-        let mut centroids = Vec::with_capacity(nlist * dim);
-        for _ in 0..nlist * dim {
+        // Structural bound BEFORE any allocation: footer bytes are untrusted
+        // (a foreign Parquet file can claim nlist = dim = u32::MAX), and a
+        // `with_capacity` sized from those claims aborts the process on
+        // capacity overflow instead of degrading to None. Every centroid float
+        // and cell length costs at least 4 bytes, so a claim the remaining
+        // buffer cannot hold is corrupt by construction.
+        let centroid_count = nlist.checked_mul(dim)?;
+        let needed = centroid_count
+            .checked_add(nlist)? // one u32 length per cell, minimum
+            .checked_mul(4)?;
+        if r.remaining() < needed {
+            return None;
+        }
+        let mut centroids = Vec::with_capacity(centroid_count);
+        for _ in 0..centroid_count {
             centroids.push(r.f32()?);
         }
         let mut inverted = Vec::with_capacity(nlist);
         for _ in 0..nlist {
             let len = r.u32()? as usize;
+            if r.remaining() < len.checked_mul(4)? {
+                return None;
+            }
             let mut cell = Vec::with_capacity(len);
             for _ in 0..len {
                 cell.push(r.u32()?);
@@ -321,6 +337,9 @@ struct ByteReader<'a> {
 impl<'a> ByteReader<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, pos: 0 }
+    }
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
     }
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         let end = self.pos.checked_add(n)?;
@@ -423,6 +442,30 @@ mod tests {
     #[test]
     fn foreign_or_truncated_footer_is_none_not_panic() {
         assert!(IvfIndex::from_bytes(b"not an ivf footer").is_none());
+        // A crafted footer claiming absurd nlist/dim must return None, not
+        // abort the process on a capacity-overflow allocation — footer bytes
+        // come from files the engine merely reads.
+        let mut forged = Vec::new();
+        forged.extend_from_slice(&super::IVF_MAGIC.to_le_bytes());
+        forged.extend_from_slice(&1u32.to_le_bytes()); // metric: L2
+        forged.extend_from_slice(&u32::MAX.to_le_bytes()); // dim
+        forged.extend_from_slice(&u32::MAX.to_le_bytes()); // nlist
+        assert!(
+            IvfIndex::from_bytes(&forged).is_none(),
+            "forged nlist/dim must degrade to None"
+        );
+        // A plausible header whose per-cell length claims exceed the buffer.
+        let mut forged = Vec::new();
+        forged.extend_from_slice(&super::IVF_MAGIC.to_le_bytes());
+        forged.extend_from_slice(&1u32.to_le_bytes());
+        forged.extend_from_slice(&1u32.to_le_bytes()); // dim 1
+        forged.extend_from_slice(&1u32.to_le_bytes()); // nlist 1
+        forged.extend_from_slice(&1.0f32.to_le_bytes()); // one centroid
+        forged.extend_from_slice(&u32::MAX.to_le_bytes()); // cell len: absurd
+        assert!(
+            IvfIndex::from_bytes(&forged).is_none(),
+            "forged cell length must degrade to None"
+        );
         let (rows, dim) = fixture(4, 10);
         let good = IvfIndex::build(&rows, dim, 4, 5, VectorMetric::L2)
             .unwrap()

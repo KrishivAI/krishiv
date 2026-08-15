@@ -93,6 +93,9 @@ const Q18_SHAPE: &str = "\
     GROUP BY o.o_orderkey";
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "diagnostic report requiring KRISHIV_STAGE_REUSE=1 in the environment — \
+            run explicitly; in the default suite the flag is unset and the \
+            precondition assert failed EVERY plain `cargo test --tests` run"]
 async fn report_whether_the_duplicated_lineitem_scan_collapses() {
     // The rule reads its flag from the environment, and this workspace forbids
     // `unsafe`, so `set_var` is not available: the flag comes from the caller

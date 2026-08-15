@@ -33,7 +33,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | # | crate | LOC | files | read whole | why here |
 |---|---|---|---|---|---|
 | **Tier 1 — critical path** |
-| 1 | krishiv-sql | 46,632 | 61 | 38 | **34 live defects fixed**; 4 unreachable modules found; a crate-wide Unicode-folding bug class swept. Remaining are the big four: `distributed_plan` (8.5k), `spillable_join` (3.3k), `catalog/` (5.9k), `sql_tests` (2k) |
+| 1 | krishiv-sql | 46,632 | 61 | **61 (COMPLETE 2026-08-15)** | 34 live defects fixed in the first pass + 2 in the closing pass (untrusted-footer allocation abort in vector_index, an always-failing env-gated integration test); 4 unreachable modules found; Unicode-folding bug class swept. The big four read whole and found pristine — every guard carries a measured cluster incident and a revert-proven test |
 | 2 | krishiv-executor | 28,927 | 40 | **40 — COMPLETE 2026-08-02** | second crate fully read; 3 defects fixed |
 | 3 | krishiv-shuffle | 14,329 | 36 | **36 — COMPLETE 2026-08-02** | first crate fully read; 4 defects fixed |
 | 4 | krishiv-scheduler | **51,438** | **78** | **78 (COMPLETE)** | largest crate in the workspace; stage cutting, dispatch, single-task fallback, SC11 breaker |
@@ -2194,6 +2194,64 @@ Verification: krishiv-state 356 lib + 8 integration tests green (8 new
 regression tests added), `just lint` clean, `cargo clippy -p krishiv-state
 --all-targets --all-features` 0 warnings, `cargo fmt` clean, full `just test`
 workspace gate green.
+
+## 1b. krishiv-sql — closing pass: the last 25 files (COMPLETE, 2026-08-15)
+
+Read whole: `distributed_plan.rs` (8,467), `spillable_join.rs` (3,533),
+`grace_hash_join.rs`, `late_materialize.rs`, `grammar.rs`, `sql_tests.rs`,
+`statement_completion.rs`, `runtime_filter_exec.rs`, `python_udf.rs`,
+`ann_rewrite.rs`, `window_functions.rs`, `unspillable_headroom.rs`,
+`catalog/iceberg_rest.rs`, `catalog/iceberg_catalog_bridge.rs`, the vector
+stack (`vector_search`, `vector_index`, `vector_quantize`, `vector_functions`,
+`vector_footer`, `vector_metric`), and `tests/{comprehensive, memory_spill,
+sql_compat, broadcast_row_ceiling_is_width_blind, stage_reuse_duplicate_scan}`.
+That closes krishiv-sql at 61/61 files.
+
+**Overall verdict:** the "big four" are the best-audited code in the workspace
+— every guard in `distributed_plan`/`spillable_join`/`grace_hash_join` carries
+a measured SF100 incident, a named regression, and a revert-proven test. The
+closing pass found two defects, both fixed:
+
+**S1 — a crafted Parquet footer could abort the process**
+(`vector_index.rs::from_bytes`). The decoder called
+`Vec::with_capacity(nlist * dim)` and `with_capacity(len)` with counts read
+from untrusted footer bytes; a foreign file claiming `nlist = dim = u32::MAX`
+spun an unbounded push loop / capacity-overflow abort instead of the
+documented "degrades to None". Fixed with a structural byte-length bound
+(`checked_mul`, remaining-bytes check) before any allocation — the same class
+as krishiv-state's DFS `load_snapshot` fix. Regression tests in
+`foreign_or_truncated_footer_is_none_not_panic` (pre-fix: 60s timeout kill;
+post-fix: 0ms pass).
+
+**S2 — `tests/stage_reuse_duplicate_scan.rs` failed every plain
+`cargo test --tests` run.** Its precondition
+`assert!(stage_reuse_enabled())` requires `KRISHIV_STAGE_REUSE=1`, which the
+default environment does not set — so the standard `just test-integration`
+gate could never be green with this test compiled in. Now
+`#[ignore = "diagnostic report requiring KRISHIV_STAGE_REUSE=1"]`, matching
+the crate's convention for env-gated tests. (Revert-proof is the captured
+failing run itself.)
+
+**Recorded, not fixed (notes, no defect):**
+- `dfplan_body_is_split_safe` decodes on a bare `SessionContext::new()`, not
+  `fragment_decode_session_context()`: a body referencing an engine UDF fails
+  decode and is conservatively declared split-unsafe. Safe direction — a
+  missed AQE skew-split, never a wrong answer.
+- `python_udf::global_pool` never respawns a dead worker: after a `python3`
+  crash every Python UDF in the process fails until restart. Fail-loud, not
+  silent; a respawn path is a feature, recorded for the wire-up backlog.
+- `ann_search`/`build_vector_index` interpolate caller-supplied identifiers
+  into SQL text; callers already hold `engine.sql`, so no privilege boundary
+  is crossed (grants re-apply on the generated query).
+- The tests in this half are uniformly strong: staged TPC-H fixtures cover
+  all four broadcast x spill-conversion cells, the shuffle serve-permit
+  deadlock is pinned with a forced-ordering reader, memory_spill carries a
+  GreedyMemoryPool negative control, and broadcast_row_ceiling pins
+  DataFusion's mechanism before the fix that depends on it.
+
+Verification: krishiv-sql 775 lib tests green, all integration suites green
+(the S2 test now ignored-by-default), clippy --all-targets 0 warnings, fmt
+clean.
 
 ## Cross-cutting findings
 
