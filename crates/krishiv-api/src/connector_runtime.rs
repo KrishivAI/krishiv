@@ -48,7 +48,6 @@ use krishiv_engine_core::{
 use krishiv_runtime::{BatchTableRegistration, ExecutionRuntime};
 
 const MAX_CONNECTOR_DRAIN_BYTES: usize = 2 * 1024 * 1024 * 1024;
-const MAX_BATCH_RESULT_BYTES: usize = 2 * 1024 * 1024 * 1024;
 static SPILL_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Run a bounded **streaming** job through an [`ExecutionRuntime`]'s continuous
@@ -320,38 +319,27 @@ impl QueryExecutor for RuntimeQueryExecutor {
         if all_parquet {
             // Fast path: all sources are Parquet — route through the cluster's
             // native ListingTable registration for predicate/projection pushdown.
-            // The runtime collects all batches and we wrap them in a stream; a
-            // future Flight-streaming upgrade can replace this with a true lazy
-            // stream from the coordinator without changing the caller.
+            //
+            // BATCH-2, closed: this used to collect every batch into a `Vec`
+            // before the caller saw a row, so a job whose output exceeded the
+            // 2 GiB result cap failed distributed even though the identical job
+            // streams to its sink embedded — the cluster made it *less* capable.
+            // `stream_batch_sql` delivers over Flight `do_get`, a genuine
+            // streaming transport, so the engine writes each batch to its sinks
+            // as it lands and nothing is buffered on either side.
             let tables: Vec<BatchTableRegistration> = job
                 .sources
                 .iter()
                 .map(|s| BatchTableRegistration::new(s.name.clone(), PathBuf::from(&s.uri)))
                 .collect();
-            // BATCH-2: The runtime materializes the full result into a Vec
-            // before we wrap it in a stream. This is an architectural limitation
-            // — a true streaming path requires changing
-            // `collect_batch_sql_async` to return a stream. Until then, large
-            // results are fully buffered in coordinator/client memory.
-            let batches = self
+            let stream = self
                 .runtime
-                .collect_batch_sql_async(&job.query, &tables, false)
+                .stream_batch_sql(&job.query, &tables, false)
                 .await
                 .map_err(|e| EngineError::Runtime(e.to_string()))?;
-            let total_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
-            if total_bytes > 256 * 1024 * 1024 {
-                tracing::warn!(
-                    bytes = total_bytes,
-                    batches = batches.len(),
-                    "distributed batch query materialized {total_bytes} bytes in memory \
-                     before streaming; consider adding LIMIT or partitioning the query"
-                );
-            }
-
-            enforce_result_size_limit(&batches, "all-parquet batch query")?;
-
-            let stream = futures::stream::iter(batches.into_iter().map(Ok));
-            return Ok(Box::pin(stream));
+            return Ok(Box::pin(stream.map(|item| {
+                item.map_err(|e| EngineError::Runtime(e.to_string()))
+            })));
         }
 
         // Mixed-connector path: drain non-parquet sources locally via the
@@ -434,19 +422,24 @@ impl RuntimeQueryExecutor {
             spilled_tables.push(spilled);
         }
 
-        let batches = self
+        use futures::StreamExt as _;
+
+        let stream = self
             .runtime
-            .collect_batch_sql_async(&job.query, &tables, false)
+            .stream_batch_sql(&job.query, &tables, false)
             .await
             .map_err(|e| EngineError::Runtime(e.to_string()))?;
-        enforce_result_size_limit(&batches, "remote mixed-connector batch query")?;
 
-        // Keep spilled source directories alive until after the remote runtime
-        // has inlined/read the generated parquet registrations.
-        drop(spilled_tables);
-
-        let stream = futures::stream::iter(batches.into_iter().map(Ok));
-        Ok(Box::pin(stream))
+        // The spilled source directories delete themselves on drop, so they are
+        // moved into the stream's closure rather than dropped here: they must
+        // outlive the read, and the read is now lazy. Previously the whole
+        // result was collected first, which made a plain `drop` after the call
+        // correct — it no longer is.
+        let guarded = stream.map(move |item| {
+            let _keep_spills_alive = &spilled_tables;
+            item.map_err(|e| EngineError::Runtime(e.to_string()))
+        });
+        Ok(Box::pin(guarded))
     }
 }
 
@@ -571,18 +564,6 @@ fn unique_spill_dir(source_name: &str) -> EngineResult<PathBuf> {
         ))
     })?;
     Ok(dir)
-}
-
-fn enforce_result_size_limit(batches: &[RecordBatch], label: &str) -> EngineResult<()> {
-    let total_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
-    if total_bytes > MAX_BATCH_RESULT_BYTES {
-        return Err(EngineError::Runtime(format!(
-            "{label} result exceeded the 2 GiB in-memory limit ({total_bytes} bytes); \
-             use a LIMIT clause, add a WHERE predicate, or write results directly to a sink \
-             instead of collecting them"
-        )));
-    }
-    Ok(())
 }
 
 // ── Sources ──────────────────────────────────────────────────────────────────
@@ -1445,9 +1426,158 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].table_name, "t");
         assert_eq!(captured[0].rows, 3);
+
+        // The spill's lifetime is the *stream's*, not the dispatch call's.
+        // BATCH-2: the result used to be collected before this function
+        // returned, so dropping the spill right after dispatch was safe. The
+        // read is lazy now, so a spill deleted at dispatch would be pulled out
+        // from under a stream still reading it — this test caught exactly that
+        // when the streaming path landed.
+        assert!(
+            captured[0].path.exists(),
+            "the spill must outlive the stream that reads from it"
+        );
+        drop(stream);
         assert!(
             !captured[0].path.exists(),
-            "temporary spill parquet should be removed after remote dispatch"
+            "and must be removed once the stream is dropped"
+        );
+    }
+
+    /// BATCH-2: the remote batch path must deliver batches as they arrive, not
+    /// collect the whole result first.
+    ///
+    /// The difference is not cosmetic: collecting is what made a job that
+    /// streams 50 GB to a sink embedded fail at the 2 GiB result cap
+    /// distributed — the cluster made the job *less* capable than one process.
+    /// This double counts how many batches it has produced, so a consumer that
+    /// has taken one item can assert only one was ever produced.
+    #[tokio::test]
+    async fn remote_batch_results_stream_instead_of_materializing() {
+        use futures::stream::StreamExt as _;
+
+        #[derive(Clone, Default)]
+        struct CountingStreamRuntime {
+            produced: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl ExecutionRuntime for CountingStreamRuntime {
+            fn mode(&self) -> RuntimeMode {
+                RuntimeMode::Distributed
+            }
+            fn placement(&self) -> ExecutionPlacement {
+                ExecutionPlacement::RemoteClusterRequired
+            }
+            fn accept_plan(
+                &self,
+                _plan: &krishiv_plan::PhysicalPlan,
+            ) -> RuntimeResult<ExecutionReport> {
+                Err(RuntimeError::unsupported("unused"))
+            }
+            fn collect_bounded_window(
+                &self,
+                _topic: &str,
+                _input: Vec<RecordBatch>,
+                _spec: &LocalWindowExecutionSpec,
+            ) -> RuntimeResult<Vec<RecordBatch>> {
+                Err(RuntimeError::unsupported("unused"))
+            }
+            fn collect_batch_sql(
+                &self,
+                _query: &str,
+                _tables: &[BatchTableRegistration],
+                _is_streaming: bool,
+            ) -> RuntimeResult<Vec<RecordBatch>> {
+                Err(RuntimeError::unsupported("unused"))
+            }
+            fn collect_batch_sql_async<'a>(
+                &'a self,
+                _query: &'a str,
+                _tables: &'a [BatchTableRegistration],
+                _is_streaming: bool,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = RuntimeResult<Vec<RecordBatch>>> + Send + 'a>,
+            > {
+                // Deliberately unreachable: if the batch path ever falls back to
+                // collecting, this fires instead of silently buffering.
+                Box::pin(async move {
+                    Err(RuntimeError::unsupported(
+                        "the batch path must stream, not collect",
+                    ))
+                })
+            }
+            fn stream_batch_sql<'a>(
+                &'a self,
+                _query: &'a str,
+                _tables: &'a [BatchTableRegistration],
+                _is_streaming: bool,
+            ) -> krishiv_runtime::BatchSqlStreamFuture<'a> {
+                let produced = Arc::clone(&self.produced);
+                Box::pin(async move {
+                    let stream = futures::stream::iter(0..3).map(move |i| {
+                        produced.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(v_batch(&[i]))
+                    });
+                    Ok(stream.boxed())
+                })
+            }
+            fn explain_sql(&self, _query: &str) -> RuntimeResult<String> {
+                Err(RuntimeError::unsupported("unused"))
+            }
+            fn register_continuous_stream(
+                &self,
+                _job_id: &str,
+                _spec: &LocalWindowExecutionSpec,
+            ) -> RuntimeResult<()> {
+                Err(RuntimeError::unsupported("unused"))
+            }
+            fn push_continuous_stream_input(
+                &self,
+                _job_id: &str,
+                _batches: Vec<RecordBatch>,
+            ) -> RuntimeResult<()> {
+                Err(RuntimeError::unsupported("unused"))
+            }
+            fn drain_continuous_stream(&self, _job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
+                Err(RuntimeError::unsupported("unused"))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        write_v_parquet(&input, &[1, 2, 3]);
+
+        let runtime = CountingStreamRuntime::default();
+        let executor = RuntimeQueryExecutor {
+            runtime: Arc::new(runtime.clone()),
+        };
+        let job = CompiledJob::new(
+            "stream-proof",
+            "SELECT v FROM t",
+            vec![SourceSpec::bounded("t", "parquet", input.to_str().unwrap())],
+            vec![SinkSpec::new("out", "json", "")],
+            false,
+        );
+
+        let mut stream = krishiv_engine_core::QueryExecutor::execute_batch(&executor, &job)
+            .await
+            .unwrap();
+
+        let first = stream.next().await.expect("a first batch");
+        assert!(first.is_ok(), "first batch: {first:?}");
+        assert_eq!(
+            runtime.produced.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "taking one batch must have produced exactly one; a larger count \
+             means the result was materialized before the caller saw a row"
+        );
+
+        while let Some(batch) = stream.next().await {
+            batch.expect("remaining batches");
+        }
+        assert_eq!(
+            runtime.produced.load(std::sync::atomic::Ordering::SeqCst),
+            3
         );
     }
 
@@ -1554,6 +1684,16 @@ mod tests {
             written.contains("\"k\":\"b\"") && written.contains("\"total\":2"),
             "b=2: {written:?}"
         );
+    }
+
+    /// Write a one-column `v` parquet fixture — the all-parquet source shape
+    /// the remote batch fast path requires.
+    fn write_v_parquet(path: &std::path::Path, values: &[i64]) {
+        let batch = v_batch(values);
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
     }
 
     fn v_batch(values: &[i64]) -> RecordBatch {

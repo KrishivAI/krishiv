@@ -47,8 +47,9 @@ pub use coordinator_http_client::{
     execute_coordinator_restore_continuous_stream,
 };
 pub use execution_runtime::{
-    BatchTableRegistration, ClusterEndpoints, ExecutionPlacement, ExecutionRuntime,
-    InProcessExecutionRuntime, RemoteExecutionRuntime, RuntimeMode, build_execution_runtime,
+    BatchSqlStream, BatchSqlStreamFuture, BatchTableRegistration, ClusterEndpoints,
+    ExecutionPlacement, ExecutionRuntime, InProcessExecutionRuntime, RemoteExecutionRuntime,
+    RuntimeMode, build_execution_runtime,
 };
 pub use flight_action::{
     BatchSqlSinkBody, BoundedWindowBody, ContinuousDrainBody, ContinuousPushBody,

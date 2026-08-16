@@ -4101,15 +4101,42 @@ eligible. Small tables running single-task is the design.
 **Recorded, not fixed.** Two items are scoped rather than done, and both are
 substantial rather than deferred out of convenience:
 
-- **BATCH-2, remote result materialization.** Embedded streams to sinks
-  batch-by-batch; the remote path collects into a `Vec` first, so a job that
-  streams 50 GB embedded fails at the 2 GiB cap distributed. Closing it means
-  changing `collect_batch_sql_async` to return a stream and threading that
-  through the Flight `do_get` transport — a transport-level change, not a
-  call-site one.
 - **Table-generating function machinery.** One absent capability blocks
   `json_tuple`, `stack`, `posexplode`, `inline` and LATERAL VIEW together;
   building it once clears most of the SQL matrix's `planned` column. That is a
-  feature, not an audit fix.
+  feature build, not an audit fix.
+
+**A6 — BATCH-2, remote result materialization. FIXED (was scoped out, then
+found to be already half-built).** Embedded streams to sinks batch-by-batch
+while the remote path collected into a `Vec` first, so a job that streams 50 GB
+embedded failed at the 2 GiB result cap distributed — the cluster made the job
+*less* capable than one process. This was recorded as needing a transport-level
+change; it did not. `FlightClientPool::stream_sql` already delivers over
+`do_get`, a genuine streaming transport. Only the seam above it was missing.
+
+`ExecutionRuntime::stream_batch_sql` is new, with a default that collects and
+replays so no runtime implementation breaks, overridden by the remote runtime to
+stream. Both remote batch paths in `RuntimeQueryExecutor` use it: the
+all-parquet fast path and the mixed-connector path. The 2 GiB
+`enforce_result_size_limit` and its constant are deleted — nothing calls them
+now, which is the proof the limit is gone rather than relocated.
+
+One real lifetime change fell out, and the existing test caught it: the spilled
+source directories delete themselves on drop and were dropped straight after
+dispatch, which was correct while the result was collected first. With a lazy
+read that would pull the files out from under a stream still reading them, so
+the guard moved into the stream's closure. `remote_runtime_spills_csv_sources_to_parquet_registrations`
+now pins the stronger invariant — the spill exists while the stream is alive and
+is gone once it drops.
+
+`stream_sql` needed `use<>` precise capturing: it borrows neither `self` nor its
+`sql` argument at runtime (the tonic `Streaming` owns its channel), but Rust
+2024's `impl Trait` rules captured both, making the stream un-returnable.
+
+Test `remote_batch_results_stream_instead_of_materializing` counts produced
+batches: taking one item must have produced exactly one. Revert-proven — with
+the stream collected before return it fails `left: 3, right: 1`. Its runtime
+double also makes `collect_batch_sql_async` an error, so a silent fallback to
+collecting fails loudly instead of buffering unnoticed.
 
 Gates: `just lint`, `just test`, `cargo fmt --all` — green.

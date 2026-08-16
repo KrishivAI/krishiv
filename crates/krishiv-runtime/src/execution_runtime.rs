@@ -93,6 +93,14 @@ impl BatchTableRegistration {
     }
 }
 
+/// A lazily-delivered batch-SQL result: batches arrive as the transport
+/// produces them, with nothing buffered on either side.
+pub type BatchSqlStream = futures::stream::BoxStream<'static, RuntimeResult<RecordBatch>>;
+
+/// The future [`ExecutionRuntime::stream_batch_sql`] returns.
+pub type BatchSqlStreamFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeResult<BatchSqlStream>> + Send + 'a>>;
+
 /// Unified runtime API for batch plan acceptance and bounded streaming collect.
 pub trait ExecutionRuntime: Send + Sync {
     /// Execution mode label for telemetry.
@@ -156,6 +164,37 @@ pub trait ExecutionRuntime: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = RuntimeResult<Vec<RecordBatch>>> + Send + 'a>,
     >;
+
+    /// Stream batch SQL results instead of materializing them.
+    ///
+    /// `collect_batch_sql_async` buffers the whole result in a `Vec` before the
+    /// caller sees a single row (the BATCH-2 limitation). That is the difference
+    /// between the embedded batch engine, which writes to sinks batch-by-batch
+    /// and never materializes, and the remote one, which fails at the 2 GiB
+    /// result cap — so a job that streams 50 GB embedded could not run at all
+    /// distributed, on the cluster that was supposed to make it possible.
+    ///
+    /// The default implementation collects and replays, so every runtime keeps
+    /// working; runtimes with a real streaming transport override it. The
+    /// remote runtime does, over Flight `do_get`, which streams natively.
+    fn stream_batch_sql<'a>(
+        &'a self,
+        query: &'a str,
+        tables: &'a [BatchTableRegistration],
+        is_streaming: bool,
+    ) -> BatchSqlStreamFuture<'a> {
+        Box::pin(async move {
+            let batches = self
+                .collect_batch_sql_async(query, tables, is_streaming)
+                .await?;
+            let stream = futures::stream::iter(batches.into_iter().map(Ok));
+            Ok(Box::pin(stream)
+                as futures::stream::BoxStream<
+                    'static,
+                    RuntimeResult<RecordBatch>,
+                >)
+        })
+    }
 
     /// Execute a batch SQL write whose result is committed through a sink
     /// output contract (Phase 2.3 distributed writes) instead of being
@@ -748,6 +787,30 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
             sink_contract: sink_contract.to_owned(),
         });
         block_on(async { self.pool.do_action(&action).await.map(|_| ()) })
+    }
+
+    fn stream_batch_sql<'a>(
+        &'a self,
+        query: &'a str,
+        tables: &'a [BatchTableRegistration],
+        is_streaming: bool,
+    ) -> BatchSqlStreamFuture<'a> {
+        use crate::flight_protocol::encode_batch_sql;
+        use futures::StreamExt as _;
+
+        Box::pin(async move {
+            // Flight `do_get` is a genuine streaming transport, so the result
+            // never lands in one buffer on either side. The tables ride in the
+            // encoded SQL exactly as they do on the collect path, so this is the
+            // same query — only the delivery differs.
+            let batch_tables = tables_to_batch_sql_inline(tables);
+            let mut sql = encode_batch_sql(query, &batch_tables);
+            if is_streaming {
+                sql = format!("-- krishiv:streaming=true\n{sql}");
+            }
+            let stream = self.pool.stream_sql(&sql).await?;
+            Ok(stream.boxed())
+        })
     }
 
     fn explain_sql(&self, query: &str) -> RuntimeResult<String> {

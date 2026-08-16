@@ -742,11 +742,16 @@ impl FlightClientPool {
     /// Stream SQL results lazily — returns batches one at a time without
     /// buffering the full result set (R8). Useful for large result sets where
     /// `execute_sql` would exhaust coordinator memory.
+    /// `use<>` pins the returned stream to capture *no* lifetimes. It borrows
+    /// neither `self` nor `sql` at runtime — the tonic `Streaming` it wraps owns
+    /// its channel — but Rust 2024's `impl Trait` rules would otherwise capture
+    /// both, making the stream un-returnable from an owning caller.
     pub async fn stream_sql(
         &self,
         sql: &str,
-    ) -> RuntimeResult<impl futures::Stream<Item = RuntimeResult<arrow::record_batch::RecordBatch>>>
-    {
+    ) -> RuntimeResult<
+        impl futures::Stream<Item = RuntimeResult<arrow::record_batch::RecordBatch>> + use<>,
+    > {
         let channel = self.get_channel().await?;
         let mut client = flight_sql_client(channel);
         let flight_info = client
