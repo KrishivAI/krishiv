@@ -8445,3 +8445,40 @@ spikes (`krishiv-platform/tests/e2e/spikes/spike_a_*`). Crates touched:
   Coordinator backend — needs a remote plan/schema API.
 
 Next useful command: `cargo test -p krishiv-flight-sql --release`
+
+## 2026-08-16 — unaligned checkpointing removed (post-audit close-out)
+
+`AlignmentMode::Unaligned`, `BarrierAligner::unaligned()`,
+`unaligned_capture_inputs()`, the queue-side `UnalignedBuffer` /
+`CheckpointAlignment` pair, `UnalignedBufferRef` in all four crates that
+declared it, `CheckpointMetadata::unaligned_buffer_refs`,
+`CheckpointAckRequest::unaligned_buffers` (proto field 9, now `reserved`),
+`CheckpointPayload::in_flight`, and the `krishiv_unaligned_in_flight_bytes`
+gauge are all deleted. ~880 lines.
+
+Earlier entries in this file (H-12, "Lever 2 — unaligned checkpoints (DONE,
+core)") describe the feature as built. They are accurate about the barrier
+bookkeeping and wrong about the feature: **nothing ever captured a buffer.**
+`UnalignedBufferRef` was constructed in zero production sites — every one of
+its ~20 occurrences across 8 crates was `Vec::new()` — so `unaligned_buffers`
+was empty on every ack the engine ever sent, and `unaligned_buffer_refs` was
+absent from every `metadata.json` ever written.
+
+The decisive fact found while scoping the alternative (building the capture):
+unaligned checkpointing eliminates the stall where an operator blocks one input
+waiting for another's barrier, and **the engine has no such stall.** That
+alignment path exists only inside `execute_window_join_aligned`, which has zero
+callers outside its own file. The live path — `execute_window_join_fragment` —
+hands the operator whole partition sets per cycle with barriers arriving
+out-of-band through the barrier injector, so no input is ever blocked and there
+are no in-flight channel buffers to capture. Building the capture would have
+been machinery for an execution model the engine does not run.
+
+Nothing changed behaviourally: no production path selected the mode, so no
+checkpoint, ack, or restore differs. If the streaming path is later restructured
+to genuine per-channel streaming with in-stream barriers, unaligned checkpointing
+becomes worth building *then*, against that model.
+
+One real bug went out with it: the queue's `UnalignedBuffer` silently evicted
+the oldest record when its 64-entry cap was reached, counting the drop in a
+field nothing read.

@@ -127,7 +127,6 @@ mod phase3_recovery {
             savepoint_label: None,
             iceberg_snapshot_id: None,
             kafka_offsets: None,
-            unaligned_buffer_refs: Vec::new(),
             sink_transactions: Vec::new(),
             streaming_profile: None,
         };
@@ -261,7 +260,6 @@ mod phase3_recovery {
                     job_id: JobId::try_new(job).unwrap(),
                     epoch: 1,
                     fencing_token: FencingToken::initial(),
-                    alignment: CheckpointAlignment::default(),
                 },
                 fallback,
                 Arc::clone(&storage),
@@ -346,7 +344,6 @@ mod phase3_recovery {
                     job_id: JobId::try_new(job).unwrap(),
                     epoch: 1,
                     fencing_token: FencingToken::initial(),
-                    alignment: CheckpointAlignment::default(),
                 },
                 CheckpointStateHandle::from_backend(
                     krishiv_state::RocksDbStateBackend::ephemeral().unwrap(),
@@ -449,7 +446,6 @@ mod phase3_recovery {
                 .encode(),
             }],
             snapshot_path: None,
-            unaligned_buffers: Vec::new(),
             sink_transactions: Vec::new(),
         };
         seal_epoch_from_acks(storage.as_ref(), job, 2, &[ack]);
@@ -549,7 +545,6 @@ mod phase3_recovery {
                     job_id: JobId::try_new(job).unwrap(),
                     epoch: 1,
                     fencing_token: FencingToken::initial(),
-                    alignment: CheckpointAlignment::default(),
                 },
                 CheckpointStateHandle::from_backend(
                     krishiv_state::RocksDbStateBackend::ephemeral().unwrap(),
@@ -629,7 +624,6 @@ mod phase3_recovery {
             fencing_token: FencingToken::initial(),
             source_offsets: vec![],
             snapshot_path: None,
-            unaligned_buffers: Vec::new(),
             sink_transactions: Vec::new(),
         };
         seal_epoch_from_acks(storage.as_ref(), job, 1, &[ack]);
@@ -708,7 +702,6 @@ mod phase3_recovery {
                 fencing_token: FencingToken::initial(),
                 source_offsets: vec![],
                 snapshot_path: None,
-                unaligned_buffers: Vec::new(),
                 sink_transactions: vec![krishiv_proto::SinkTransactionRef {
                     sink_id: prepare_path.clone(),
                     epoch: 1,
@@ -811,7 +804,6 @@ mod phase3_recovery {
                 .encode(),
             }],
             snapshot_path: None,
-            unaligned_buffers: Vec::new(),
             sink_transactions: Vec::new(),
         };
         seal_epoch_from_acks(storage.as_ref(), job, 1, &[ack]);
@@ -947,7 +939,6 @@ mod phase3_recovery {
                     job_id: JobId::try_new(job).unwrap(),
                     epoch,
                     fencing_token: FencingToken::initial(),
-                    alignment: CheckpointAlignment::default(),
                 },
                     CheckpointStateHandle::from_backend(
                         krishiv_state::RocksDbStateBackend::ephemeral().unwrap(),

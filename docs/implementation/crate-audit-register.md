@@ -3780,3 +3780,42 @@ lost in practice today either way, because no production path selects the mode.
 
 Gates: `cargo test -p krishiv-proto` (91), `cargo test -p krishiv-scheduler
 --lib` (548), `just lint`, `just test`, `cargo fmt` — all green.
+
+## §29 — unaligned checkpointing deleted (2026-08-16)
+
+§28's open wire-or-delete decision, resolved: **delete**. The user chose it
+after the reachability finding below.
+
+Removed across 8 crates (~880 lines): `AlignmentMode` and
+`BarrierAligner::unaligned()`/`unaligned_capture_inputs()` (dataflow),
+`CheckpointAlignment` + `UnalignedBuffer` + the whole unaligned branch of
+`OperatorQueueReceiver::recv` (dataflow/queue.rs), `UnalignedBufferRef`
+(proto + state), `CheckpointMetadata::unaligned_buffer_refs`,
+`CheckpointAckRequest::unaligned_buffers` and proto field 9 (now `reserved 9`
+so the number is never reused), `InitiateCheckpointRequest::alignment`,
+`CheckpointPayload::in_flight`, and the `krishiv_unaligned_in_flight_bytes`
+gauge (metrics — zero callers).
+
+**Why delete and not build.** Unaligned checkpointing exists to remove the
+stall where an operator blocks one input while waiting for another's barrier.
+The engine has no such stall: that path lives only in
+`execute_window_join_aligned`, which has **zero callers outside its own file**.
+The live path `execute_window_join_fragment` hands the operator whole partition
+sets per cycle, with barriers arriving out-of-band via the barrier injector —
+nothing blocks, nothing buffers, so there is no in-flight data to capture.
+Building the capture would have been machinery for an execution model the
+engine does not run.
+
+**A-class bug removed with it:** `UnalignedBuffer::push` silently evicted the
+oldest record on hitting its 64-entry cap, bumping a `dropped` counter that no
+production code read — a silent record drop wearing a metric that never
+surfaced. Exactly the shape §1 of this register was opened to hunt, hiding
+inside a feature that never ran.
+
+No behavioural change: no production path selected the mode, so no checkpoint,
+ack or restore differs. Docs corrected rather than rewritten — status.md's
+H-12 and "Lever 2 (DONE, core)" entries stay as the historical record with a
+dated correction appended, and the design note is marked superseded.
+
+Gates: workspace build (all targets, python/chaos built separately),
+`just lint`, `just test`, `cargo fmt` — green.

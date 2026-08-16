@@ -89,9 +89,8 @@ pub trait SourceReader: Send {
     ///
     /// Persisted alongside operator state in a checkpoint so a restart
     /// restores both the operator window and the records that were "in
-    /// flight" at the barrier boundary — the property a distributed
-    /// **unaligned** checkpoint needs for exactly-once replay (see
-    /// [`crate::runtime::CheckpointPayload::in_flight`]).
+    /// flight" at the barrier boundary, so no record is lost or replayed
+    /// twice across the restart.
     ///
     /// The default returns `None` (no in-flight records to persist); sources
     /// that have already drained their internal prefetch buffer into the
@@ -215,15 +214,6 @@ pub struct CheckpointPayload {
     pub operator_state: Vec<u8>,
     /// Source name → encoded source offset at this epoch.
     pub source_offsets: Vec<(String, Vec<u8>)>,
-    /// **Unaligned-checkpoint** in-flight buffers: for each not-yet-barriered
-    /// input channel `(channel_index, arrow_ipc_bytes)`, the records that were
-    /// in flight when the barrier overtook them (the dataflow
-    /// `AlignmentMode::Unaligned` path, once wired through the operator
-    /// runtime). Replayed on recovery so an unaligned snapshot is exactly-once
-    /// without an alignment stall. Empty for aligned checkpoints.
-    /// `#[serde(default)]` keeps checkpoints written before this field readable.
-    #[serde(default)]
-    pub in_flight: Vec<(u32, Vec<u8>)>,
     /// **Per-source in-flight records** (B-5 fix). Carries the source's
     /// `snapshot_in_flight` opaque bytes — the records the source had
     /// internally prefetched but had not yet emitted to the engine. Restored

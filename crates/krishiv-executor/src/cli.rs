@@ -21,7 +21,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use dashmap::DashMap;
 use krishiv_common::durability::DurabilityProfile;
-use krishiv_proto::{CheckpointAlignment, InitiateCheckpointRequest, TaskAttemptRef};
+use krishiv_proto::{InitiateCheckpointRequest, TaskAttemptRef};
 use krishiv_shuffle::{
     InMemoryShuffleStore, LocalDiskShuffleStore, ShuffleBackend, open_shuffle_backend_from_uri,
     open_tiered_shuffle_backend,
@@ -768,7 +768,6 @@ async fn heartbeat_loop(
                         job_id: cmd.job_id.clone(),
                         epoch: cmd.epoch,
                         fencing_token: cmd.fencing_token,
-                        alignment: CheckpointAlignment::default(),
                     };
                     if let Err(error) = runner
                         .initiate_checkpoint_for_job(

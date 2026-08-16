@@ -111,7 +111,6 @@ fn commit_one_epoch(
                 encoded_offset: encoded_kafka_offset("events", 0, 42),
             }],
             snapshot_path: Some(snap_path),
-            unaligned_buffers: Vec::new(),
             sink_transactions: Vec::new(),
         };
         coordinator.handle_checkpoint_ack(ack);
@@ -339,7 +338,6 @@ fn savepoint_epoch_is_preserved_in_durable_savepoints_area() {
             &operator,
             task,
         )),
-        unaligned_buffers: Vec::new(),
         sink_transactions: Vec::new(),
     };
     assert_eq!(
@@ -412,7 +410,6 @@ fn stop_with_savepoint_cancels_job_after_durable_preserve() {
             &operator,
             task,
         )),
-        unaligned_buffers: Vec::new(),
         sink_transactions: Vec::new(),
     };
     assert_eq!(
@@ -486,7 +483,6 @@ fn rescaled_restore_redistributes_state_across_new_parallelism() {
         savepoint_label: None,
         iceberg_snapshot_id: None,
         kafka_offsets: None,
-        unaligned_buffer_refs: Vec::new(),
         sink_transactions: Vec::new(),
         streaming_profile: None,
     };

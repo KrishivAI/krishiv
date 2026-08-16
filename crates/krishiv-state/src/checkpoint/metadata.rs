@@ -36,9 +36,13 @@ pub type CheckpointResult<T> = Result<T, CheckpointError>;
 /// Versioned checkpoint metadata record written to `metadata.json`.
 ///
 /// Versions 1 and 2 are restore-compatible. Version 2 adds coordinator identity;
-/// version 3 adds unaligned buffer refs, durable sink transactions, and per-epoch
-/// runtime profile. Restore rejects versions outside the published compatibility
-/// window.
+/// version 3 adds durable sink transactions and a per-epoch runtime profile.
+/// Restore rejects versions outside the published compatibility window.
+///
+/// Version 3 also carried `unaligned_buffer_refs`, removed along with unaligned
+/// checkpointing itself: no path ever captured a buffer, so the field was absent
+/// from every metadata.json ever written (it was `skip_serializing_if` empty).
+/// Older files stay readable — serde ignores the unknown key if one exists.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CheckpointMetadata {
     /// Format version. New checkpoints use [`CheckpointMetadata::VERSION`].
@@ -73,12 +77,6 @@ pub struct CheckpointMetadata {
     pub iceberg_snapshot_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kafka_offsets: Option<std::collections::BTreeMap<String, i64>>,
-    /// In-flight buffer references for unaligned checkpoints (v3+).
-    ///
-    /// Each entry describes a buffer of post-barrier records that was captured
-    /// during an unaligned checkpoint and must be replayed on restore.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unaligned_buffer_refs: Vec<UnalignedBufferRef>,
     /// Durable prepared-sink transaction references (v3+).
     ///
     /// Each entry records a sink that prepared a write during this epoch.
@@ -128,25 +126,6 @@ pub struct OperatorSnapshotRef {
     pub task_id: String,
     /// Path to `state.bin` relative to the checkpoint storage base directory.
     pub snapshot_path: String,
-}
-
-/// Reference to an in-flight buffer captured during an unaligned checkpoint.
-///
-/// When a checkpoint barrier overtakes in-flight data (unaligned mode),
-/// the post-barrier records are buffered and their reference is stored in
-/// checkpoint metadata. On restore, these buffers must be replayed before
-/// the operator processes new data.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct UnalignedBufferRef {
-    /// Operator that owns this buffer.
-    pub operator_id: String,
-    /// Input channel index that received the buffered records.
-    pub channel_index: u32,
-    /// Number of records in the buffer.
-    pub record_count: u64,
-    /// Path to the serialized buffer data relative to the checkpoint base.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub buffer_path: String,
 }
 
 /// Reference to a durable prepared-sink transaction.

@@ -520,7 +520,6 @@ fn executor_checkpoint_takes_state_snapshot_and_writes_to_storage() {
         job_id: job_id.clone(),
         epoch: 1,
         fencing_token: FencingToken::initial(),
-        alignment: CheckpointAlignment::default(),
     };
 
     let ack = runner
@@ -558,7 +557,6 @@ fn executor_checkpoint_ack_includes_snapshot_path() {
         job_id: job_id.clone(),
         epoch: 2,
         fencing_token: FencingToken::initial(),
-        alignment: CheckpointAlignment::default(),
     };
     let ack = runner
         .handle_initiate_checkpoint(req, &state, &storage)
@@ -611,7 +609,6 @@ fn executor_checkpoint_ack_includes_source_offset() {
         job_id: job_id.clone(),
         epoch: 1,
         fencing_token: FencingToken::initial(),
-        alignment: CheckpointAlignment::default(),
     };
     let ack = runner
         .handle_initiate_checkpoint(req, &backend, &storage)
@@ -626,7 +623,6 @@ fn executor_checkpoint_ack_includes_source_offset() {
         job_id: job_id.clone(),
         epoch: 1,
         fencing_token: FencingToken::initial(),
-        alignment: CheckpointAlignment::default(),
     };
     let ack2 = runner2
         .handle_initiate_checkpoint(req2, &backend, &storage)
@@ -651,7 +647,6 @@ fn executor_rejects_stale_checkpoint_epoch() {
         job_id: job_id.clone(),
         epoch: 5,
         fencing_token: FencingToken::initial(),
-        alignment: CheckpointAlignment::default(),
     };
     let ack5 = runner
         .handle_initiate_checkpoint(req5, &backend, &storage)
@@ -663,7 +658,6 @@ fn executor_rejects_stale_checkpoint_epoch() {
         job_id: job_id.clone(),
         epoch: 3,
         fencing_token: FencingToken::initial(),
-        alignment: CheckpointAlignment::default(),
     };
     let stale_ack = runner
         .handle_initiate_checkpoint(req3, &backend, &storage)
@@ -693,7 +687,6 @@ fn executor_checkpoint_write_failure_does_not_ack_epoch() {
         job_id,
         epoch: 9,
         fencing_token: FencingToken::initial(),
-        alignment: CheckpointAlignment::default(),
     };
 
     let error = runner
@@ -802,7 +795,6 @@ async fn checkpoint_ack_delivered() {
         job_id: JobId::try_new("job-ack").unwrap(),
         epoch: 3,
         fencing_token: FencingToken::initial(),
-        alignment: CheckpointAlignment::default(),
     };
 
     let response = runner
@@ -925,7 +917,6 @@ async fn checkpoint_ack_delivery_retries_transient_failure() {
         job_id: JobId::try_new("job-ack-retry").unwrap(),
         epoch: 4,
         fencing_token: FencingToken::initial(),
-        alignment: CheckpointAlignment::default(),
     };
 
     let response = runner
@@ -1045,7 +1036,6 @@ async fn checkpoint_fanout_uses_running_attempts_without_preexisting_task_runner
         job_id,
         epoch: 7,
         fencing_token: FencingToken::initial(),
-        alignment: CheckpointAlignment::default(),
     };
 
     runner

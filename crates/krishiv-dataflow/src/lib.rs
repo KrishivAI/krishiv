@@ -87,7 +87,7 @@ pub use adaptive::{
     HotKeyReport, RateLimiter, SinkLatencyTracker, StreamingPartitionAdvisor, ThrottleCommand,
 };
 pub use aggregate::{AggExpr, AggFunction};
-pub use barrier_align::{AlignmentMode, BarrierAligner, BarrierEvent};
+pub use barrier_align::{BarrierAligner, BarrierEvent};
 pub use broadcast_state::{
     BroadcastContext, BroadcastProcessExecutor, BroadcastProcessFunction, BroadcastStateDescriptor,
 };

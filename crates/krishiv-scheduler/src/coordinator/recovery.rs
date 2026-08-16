@@ -585,7 +585,6 @@ mod recovery_tests {
                     encoded_offset: 1_i64.to_le_bytes().to_vec(),
                 }],
                 snapshot_path: None,
-                unaligned_buffers: Vec::new(),
                 sink_transactions: Vec::new(),
             };
             assert!(coord.receive_ack(ack).unwrap());

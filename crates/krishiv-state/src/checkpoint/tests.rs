@@ -33,7 +33,6 @@ fn sample_metadata_for_job(job_id: &str, epoch: u64) -> CheckpointMetadata {
         savepoint_label: None,
         iceberg_snapshot_id: None,
         kafka_offsets: None,
-        unaligned_buffer_refs: Vec::new(),
         sink_transactions: Vec::new(),
         streaming_profile: None,
     }
@@ -570,7 +569,6 @@ fn write_read_epoch_metadata_roundtrip_with_all_fields() {
             m.insert("topic-b".to_owned(), 600i64);
             m
         }),
-        unaligned_buffer_refs: Vec::new(),
         sink_transactions: Vec::new(),
         streaming_profile: None,
     };
@@ -1839,7 +1837,6 @@ fn savepoint_and_later_checkpoints_coexist() {
             savepoint_label: None,
             iceberg_snapshot_id: None,
             kafka_offsets: None,
-            unaligned_buffer_refs: Vec::new(),
             sink_transactions: Vec::new(),
             streaming_profile: None,
         };

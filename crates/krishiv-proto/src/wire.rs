@@ -2,7 +2,6 @@
 
 use crate::checkpoint::{
     CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset, SinkTransactionRef,
-    UnalignedBufferRef,
 };
 use crate::executor::TraceContext;
 use crate::executor::{
@@ -1764,22 +1763,6 @@ pub fn checkpoint_ack_request_to_wire(value: CheckpointAckRequest) -> v1::Checkp
                 committed: s.committed,
             })
             .collect(),
-        // Audit (unaligned-checkpoint leg 2 of 3): this used to have no wire
-        // field at all, so a task that captured in-flight buffers had them
-        // silently discarded on the way to the coordinator. No production path
-        // selects `AlignmentMode::Unaligned` today, so nothing was lost in
-        // practice — but the drop was silent, which is exactly the shape this
-        // audit exists to remove.
-        unaligned_buffers: value
-            .unaligned_buffers
-            .into_iter()
-            .map(|b| v1::UnalignedBufferRef {
-                operator_id: b.operator_id.as_str().to_owned(),
-                channel_index: b.channel_index,
-                record_count: b.record_count,
-                buffer_path: b.buffer_path,
-            })
-            .collect(),
     }
 }
 
@@ -1816,18 +1799,6 @@ pub fn checkpoint_ack_request_from_wire(
         fencing_token,
         source_offsets,
         snapshot_path,
-        unaligned_buffers: value
-            .unaligned_buffers
-            .into_iter()
-            .map(|b| {
-                Ok(UnalignedBufferRef {
-                    operator_id: OperatorId::try_new(b.operator_id).map_err(WireError::from_id)?,
-                    channel_index: b.channel_index,
-                    record_count: b.record_count,
-                    buffer_path: b.buffer_path,
-                })
-            })
-            .collect::<WireResult<Vec<_>>>()?,
         // DUR-2: recover prepared-sink transaction refs from the wire.
         sink_transactions: value
             .sink_transactions

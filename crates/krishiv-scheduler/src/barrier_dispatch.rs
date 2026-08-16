@@ -185,7 +185,6 @@ impl Coordinator {
                 fencing_token,
                 source_offsets: Vec::new(),
                 snapshot_path,
-                unaligned_buffers: Vec::new(),
                 sink_transactions: Vec::new(),
             };
             match self.handle_checkpoint_ack(request) {
@@ -243,7 +242,6 @@ impl Coordinator {
                 fencing_token,
                 source_offsets: Vec::new(),
                 snapshot_path,
-                unaligned_buffers: Vec::new(),
                 sink_transactions: Vec::new(),
             };
             let (response, post_commit) = self.handle_checkpoint_ack_deferred(request);
@@ -484,7 +482,6 @@ fn barrier_ack_to_checkpoint_ack(
         fencing_token,
         source_offsets: Vec::new(),
         snapshot_path,
-        unaligned_buffers: Vec::new(),
         sink_transactions: Vec::new(),
     })
 }

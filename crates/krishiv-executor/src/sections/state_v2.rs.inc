@@ -18,7 +18,6 @@ fn checkpoint_req(job: &str, epoch: u64) -> krishiv_proto::InitiateCheckpointReq
         job_id: JobId::try_new(job).unwrap(),
         epoch,
         fencing_token: krishiv_proto::FencingToken::initial(),
-        alignment: krishiv_proto::CheckpointAlignment::default(),
     }
 }
 
@@ -176,7 +175,6 @@ async fn restore_redistributes_run_loop_state_by_key_group() {
         savepoint_label: None,
         iceberg_snapshot_id: None,
         kafka_offsets: None,
-        unaligned_buffer_refs: Vec::new(),
         sink_transactions: Vec::new(),
         streaming_profile: None,
     };

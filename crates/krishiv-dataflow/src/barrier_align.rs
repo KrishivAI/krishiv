@@ -12,38 +12,6 @@
 //! operator degenerates correctly — its first barrier aligns immediately, so
 //! nothing ever blocks.
 
-/// How an operator reacts to checkpoint barriers across its inputs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AlignmentMode {
-    /// Chandy–Lamport **aligned**: block each input as its barrier arrives and
-    /// snapshot only once every input has delivered the epoch's barrier. No
-    /// in-flight data is captured, but the wait for the slowest input adds
-    /// latency proportional to inter-input skew — the source of p99 checkpoint
-    /// spikes under load.
-    Aligned,
-    /// **Unaligned**: snapshot immediately when the *first* barrier of an epoch
-    /// arrives and never block an input. The operator captures the in-flight
-    /// data on the not-yet-barriered inputs (see
-    /// [`BarrierAligner::unaligned_capture_inputs`]) into the checkpoint, so it
-    /// is replayed on recovery and exactly-once is preserved **without** the
-    /// alignment stall — the Flink `execution.checkpointing.unaligned` shape.
-    ///
-    /// **Not reachable in production, and only half-built.** The barrier
-    /// bookkeeping in this file is complete and tested, but *nothing
-    /// constructs an unaligned aligner*: the sole production caller
-    /// ([`crate::watermark_join`]) uses [`BarrierAligner::new`], i.e. aligned.
-    /// The missing half is the capture itself — no operator serializes the
-    /// buffered records that [`BarrierAligner::unaligned_capture_inputs`]
-    /// names, so `CheckpointAckRequest::unaligned_buffers` is empty on every
-    /// ack the engine sends. Selecting this mode today would therefore
-    /// snapshot without the in-flight data and **lose records on recovery**.
-    /// The transport and coordinator legs are now lossless (the ref survives
-    /// the wire and is persisted into `metadata.json`), so wiring the capture
-    /// is the one remaining step; until then this variant is for the tests
-    /// below, not for a running job.
-    Unaligned,
-}
-
 /// The outcome of recording a barrier on one input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BarrierEvent {
@@ -64,9 +32,7 @@ pub enum BarrierEvent {
 #[derive(Debug, Clone)]
 pub struct BarrierAligner {
     num_inputs: usize,
-    mode: AlignmentMode,
     /// The epoch currently aligning and, per input, whether its barrier arrived.
-    /// Always `None` in [`AlignmentMode::Unaligned`] (nothing ever blocks).
     current: Option<(u64, Vec<bool>)>,
     /// The highest epoch already aligned — used to ignore stale/duplicate barriers.
     last_aligned: Option<u64>,
@@ -78,38 +44,9 @@ impl BarrierAligner {
     pub fn new(num_inputs: usize) -> Self {
         Self {
             num_inputs: num_inputs.max(1),
-            mode: AlignmentMode::Aligned,
             current: None,
             last_aligned: None,
         }
-    }
-
-    /// Create an **unaligned** aligner: snapshots on the first barrier of each
-    /// epoch and never blocks an input.
-    pub fn unaligned(num_inputs: usize) -> Self {
-        Self {
-            num_inputs: num_inputs.max(1),
-            mode: AlignmentMode::Unaligned,
-            current: None,
-            last_aligned: None,
-        }
-    }
-
-    /// This aligner's mode.
-    pub fn mode(&self) -> AlignmentMode {
-        self.mode
-    }
-
-    /// In unaligned mode, the input indices whose in-flight data must be
-    /// captured into the checkpoint when a barrier on `triggering_input`
-    /// triggers the snapshot — every input *except* the one that just delivered
-    /// the barrier (its channel is already at the epoch boundary). The operator
-    /// serializes those channels' buffered records into the checkpoint so they
-    /// are replayed on recovery. Returns empty for a single-input operator.
-    pub fn unaligned_capture_inputs(&self, triggering_input: usize) -> Vec<usize> {
-        (0..self.num_inputs)
-            .filter(|&i| i != triggering_input)
-            .collect()
     }
 
     /// Number of input channels this aligner coordinates.
@@ -139,14 +76,6 @@ impl BarrierAligner {
         // Already snapshotted this (or a later) epoch ⇒ stale.
         if self.last_aligned.is_some_and(|done| epoch <= done) {
             return BarrierEvent::Ignored;
-        }
-
-        // Unaligned: the first barrier of a fresh epoch snapshots immediately and
-        // never blocks. Later barriers for the same epoch on other inputs are
-        // caught by the stale check above (epoch <= last_aligned) and Ignored.
-        if self.mode == AlignmentMode::Unaligned {
-            self.last_aligned = Some(epoch);
-            return BarrierEvent::Aligned;
         }
 
         match &mut self.current {
@@ -266,38 +195,6 @@ mod tests {
         assert_eq!(a.record_barrier(2, 0), BarrierEvent::Blocked);
         assert!(a.is_blocked(0) && a.is_blocked(2) && !a.is_blocked(1));
         assert_eq!(a.record_barrier(2, 1), BarrierEvent::Aligned);
-    }
-
-    #[test]
-    fn unaligned_snapshots_on_first_barrier_without_blocking() {
-        let mut a = BarrierAligner::unaligned(3);
-        assert_eq!(a.mode(), AlignmentMode::Unaligned);
-        // First barrier of the epoch snapshots immediately — no input blocks.
-        assert_eq!(a.record_barrier(9, 1), BarrierEvent::Aligned);
-        assert!(!a.is_blocked(0) && !a.is_blocked(1) && !a.is_blocked(2));
-        assert_eq!(a.aligning_epoch(), None);
-        // The other inputs' barriers for the same epoch are now stale/redundant.
-        assert_eq!(a.record_barrier(9, 0), BarrierEvent::Ignored);
-        assert_eq!(a.record_barrier(9, 2), BarrierEvent::Ignored);
-        // The next epoch snapshots immediately again.
-        assert_eq!(a.record_barrier(10, 2), BarrierEvent::Aligned);
-    }
-
-    #[test]
-    fn unaligned_capture_inputs_excludes_the_triggering_input() {
-        let a = BarrierAligner::unaligned(3);
-        assert_eq!(a.unaligned_capture_inputs(1), vec![0, 2]);
-        let single = BarrierAligner::unaligned(1);
-        assert!(single.unaligned_capture_inputs(0).is_empty());
-    }
-
-    #[test]
-    fn unaligned_ignores_stale_epoch() {
-        let mut a = BarrierAligner::unaligned(2);
-        assert_eq!(a.record_barrier(5, 0), BarrierEvent::Aligned);
-        // An epoch already snapshotted (or older) is stale.
-        assert_eq!(a.record_barrier(5, 1), BarrierEvent::Ignored);
-        assert_eq!(a.record_barrier(4, 0), BarrierEvent::Ignored);
     }
 
     #[test]

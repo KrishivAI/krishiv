@@ -44,7 +44,6 @@ fn fencing_token_rejects_stale_coordinator() {
         savepoint_label: None,
         iceberg_snapshot_id: None,
         kafka_offsets: None,
-        unaligned_buffer_refs: Vec::new(),
         sink_transactions: Vec::new(),
         streaming_profile: None,
     };
@@ -73,7 +72,6 @@ fn fencing_token_equal_token_is_accepted() {
         savepoint_label: None,
         iceberg_snapshot_id: None,
         kafka_offsets: None,
-        unaligned_buffer_refs: Vec::new(),
         sink_transactions: Vec::new(),
         streaming_profile: None,
     };
@@ -346,7 +344,6 @@ fn split_brain_second_coordinator_commit_rejected() {
         savepoint_label: None,
         iceberg_snapshot_id: None,
         kafka_offsets: None,
-        unaligned_buffer_refs: Vec::new(),
         sink_transactions: Vec::new(),
         streaming_profile: None,
     };
@@ -364,7 +361,6 @@ fn split_brain_second_coordinator_commit_rejected() {
         savepoint_label: None,
         iceberg_snapshot_id: None,
         kafka_offsets: None,
-        unaligned_buffer_refs: Vec::new(),
         sink_transactions: Vec::new(),
         streaming_profile: None,
     };
@@ -487,7 +483,6 @@ fn coordinator_restart_rejects_future_token_on_restore() {
         savepoint_label: None,
         iceberg_snapshot_id: None,
         kafka_offsets: None,
-        unaligned_buffer_refs: Vec::new(),
         sink_transactions: Vec::new(),
         streaming_profile: None,
     };
@@ -527,7 +522,6 @@ fn coordinator_restore_accepts_equal_token() {
         savepoint_label: None,
         iceberg_snapshot_id: None,
         kafka_offsets: None,
-        unaligned_buffer_refs: Vec::new(),
         sink_transactions: Vec::new(),
         streaming_profile: None,
     };

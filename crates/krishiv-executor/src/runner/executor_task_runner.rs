@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
 use krishiv_proto::{
-    CheckpointAckRequest, CheckpointAckResponse, CheckpointAlignment, CoordinatorExecutorService,
+    CheckpointAckRequest, CheckpointAckResponse, CoordinatorExecutorService,
     ExecutorTaskAssignment, FencingToken, InitiateCheckpointRequest, JobId,
     MissingShufflePartition, TaskAttemptRef, TaskId, TaskOutputMetadata, TaskState,
     TaskStatusRequest, TaskStatusResponse,
@@ -2038,7 +2038,6 @@ impl ExecutorTaskRunner {
                 job_id,
                 epoch: barrier.epoch,
                 fencing_token,
-                alignment: CheckpointAlignment::default(),
             };
 
             let s_clone = Arc::clone(&storage);

@@ -923,7 +923,6 @@ async fn persist_streaming_checkpoint(
                 operator_state,
                 source_offsets,
                 // Aligned single-input streaming checkpoint: no in-flight buffers.
-                in_flight: Vec::new(),
                 source_in_flight,
             },
         )
@@ -1216,7 +1215,6 @@ async fn run_streaming_continuous(
                             epoch: setup.next_epoch,
                             operator_state,
                             source_offsets,
-                            in_flight: Vec::new(),
                             // STREAM-5: Capture source in-flight data for
                             // exactly-once recovery, matching the final stop
                             // checkpoint path. Previously this was always empty,

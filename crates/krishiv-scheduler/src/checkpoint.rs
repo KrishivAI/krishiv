@@ -116,37 +116,6 @@ fn collect_sink_transactions<'a>(
     by_key.into_values().collect()
 }
 
-/// Collect the in-flight buffer refs the tasks captured for this epoch.
-///
-/// Audit (unaligned-checkpoint leg 3 of 3): both metadata builders below used
-/// to hard-code `unaligned_buffer_refs: Vec::new()` while their siblings
-/// (`source_offsets`, `sink_transactions`) were collected from the acks — so
-/// a task that captured in-flight buffers had them dropped a second time, at
-/// the coordinator, after surviving the wire. Empty in practice today: no
-/// production path selects `AlignmentMode::Unaligned`, so no task populates
-/// the field. Sorted for a deterministic metadata.json.
-fn collect_unaligned_buffers<'a>(
-    acks: impl Iterator<Item = &'a CheckpointAckRequest>,
-) -> Vec<krishiv_state::checkpoint::UnalignedBufferRef> {
-    let mut refs: Vec<krishiv_state::checkpoint::UnalignedBufferRef> = acks
-        .flat_map(|ack| ack.unaligned_buffers.iter())
-        .map(|b| krishiv_state::checkpoint::UnalignedBufferRef {
-            operator_id: b.operator_id.as_str().to_owned(),
-            channel_index: b.channel_index,
-            record_count: b.record_count,
-            buffer_path: b.buffer_path.clone(),
-        })
-        .collect();
-    refs.sort_by(|a, b| {
-        (&a.operator_id, a.channel_index, &a.buffer_path).cmp(&(
-            &b.operator_id,
-            b.channel_index,
-            &b.buffer_path,
-        ))
-    });
-    refs
-}
-
 impl CheckpointCoordinator {
     /// Create a new checkpoint coordinator for `job_id`.
     pub fn new(
@@ -433,7 +402,6 @@ impl CheckpointCoordinator {
         // so the durable checkpoint records participant identity + prepare
         // paths. Recovery uses these to commit-or-abort deterministically.
         let sink_transactions = collect_sink_transactions(self.pending_acks.values());
-        let unaligned_buffer_refs = collect_unaligned_buffers(self.pending_acks.values());
 
         let is_savepoint = self.pending_is_savepoint;
         let savepoint_label = self.pending_savepoint_label.clone();
@@ -450,7 +418,6 @@ impl CheckpointCoordinator {
             savepoint_label,
             iceberg_snapshot_id: None,
             kafka_offsets: None,
-            unaligned_buffer_refs,
             sink_transactions,
             streaming_profile: None,
         };
@@ -653,7 +620,6 @@ impl CheckpointCoordinator {
 
         // DUR-2: persist prepared-sink transaction refs acked this epoch.
         let sink_transactions = collect_sink_transactions(self.pending_acks.values());
-        let unaligned_buffer_refs = collect_unaligned_buffers(self.pending_acks.values());
 
         let is_savepoint = self.pending_is_savepoint;
         // Clone, do not take. Everything below this line can fail — the
@@ -680,7 +646,6 @@ impl CheckpointCoordinator {
             savepoint_label,
             iceberg_snapshot_id: None,
             kafka_offsets: None,
-            unaligned_buffer_refs,
             sink_transactions,
             streaming_profile: None,
         };
@@ -925,54 +890,8 @@ mod tests {
                 encoded_offset: 1_i64.to_le_bytes().to_vec(),
             }],
             snapshot_path: None,
-            unaligned_buffers: Vec::new(),
             sink_transactions: Vec::new(),
         }
-    }
-
-    /// Audit (unaligned-checkpoint leg 3): in-flight buffer refs reported by
-    /// the tasks reach the durable checkpoint metadata.
-    ///
-    /// Before the fix both metadata builders hard-coded
-    /// `unaligned_buffer_refs: Vec::new()`, so a task that captured in-flight
-    /// buffers had them dropped at the coordinator even after the wire carried
-    /// them — the checkpoint would then restore without the buffered records.
-    #[test]
-    fn unaligned_buffer_refs_reach_the_checkpoint_metadata() {
-        use krishiv_proto::UnalignedBufferRef;
-        let job_id = JobId::try_new("unaligned-job").unwrap();
-        let token = FencingToken::try_new(1).unwrap();
-
-        let mut ack_a = make_ack(&job_id, "task-a", 3, token);
-        ack_a.unaligned_buffers = vec![UnalignedBufferRef {
-            operator_id: OperatorId::try_new("join-1").unwrap(),
-            channel_index: 1,
-            record_count: 128,
-            buffer_path: "epoch-3/join-1.ch1.arrow".to_owned(),
-        }];
-        let mut ack_b = make_ack(&job_id, "task-b", 3, token);
-        ack_b.unaligned_buffers = vec![UnalignedBufferRef {
-            operator_id: OperatorId::try_new("join-0").unwrap(),
-            channel_index: 0,
-            record_count: 7,
-            buffer_path: "epoch-3/join-0.ch0.arrow".to_owned(),
-        }];
-
-        let acks = [ack_a, ack_b];
-        let collected = super::collect_unaligned_buffers(acks.iter());
-
-        assert_eq!(
-            collected.len(),
-            2,
-            "every task's captured buffers must survive into the metadata"
-        );
-        // Sorted by (operator_id, channel_index, buffer_path) so metadata.json
-        // is byte-stable regardless of ack arrival order.
-        assert_eq!(collected[0].operator_id, "join-0");
-        assert_eq!(collected[0].record_count, 7);
-        assert_eq!(collected[1].operator_id, "join-1");
-        assert_eq!(collected[1].channel_index, 1);
-        assert_eq!(collected[1].buffer_path, "epoch-3/join-1.ch1.arrow");
     }
 
     /// DUR-2: prepared-sink transaction refs reported by tasks are aggregated

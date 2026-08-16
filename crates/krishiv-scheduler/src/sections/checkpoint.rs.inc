@@ -20,7 +20,6 @@ fn make_ack(
             encoded_offset: 100_i64.to_le_bytes().to_vec(),
         }],
         snapshot_path,
-        unaligned_buffers: Vec::new(),
         sink_transactions: Vec::new(),
     }
 }
@@ -163,7 +162,6 @@ fn checkpoint_coordinator_recover_finds_latest_epoch() {
             savepoint_label: None,
             iceberg_snapshot_id: None,
             kafka_offsets: None,
-            unaligned_buffer_refs: Vec::new(),
             sink_transactions: Vec::new(),
             streaming_profile: None,
         };

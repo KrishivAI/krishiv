@@ -1053,7 +1053,6 @@ mod wire_fuzz {
                 encoded_offset: encoded_offset.clone(),
             }],
             snapshot_path: Some("job-encoded/checkpoints/000/state.bin".into()),
-            unaligned_buffers: Vec::new(),
             sink_transactions: Vec::new(),
         };
 
@@ -1076,7 +1075,6 @@ mod wire_fuzz {
             fencing_token: FencingToken::initial(),
             source_offsets: vec![],
             snapshot_path: None,
-            unaligned_buffers: Vec::new(),
             sink_transactions: vec![crate::SinkTransactionRef {
                 sink_id: "iceberg-sink".to_owned(),
                 epoch: 9,
@@ -1090,49 +1088,6 @@ mod wire_fuzz {
         assert_eq!(wire.sink_transactions[0].sink_id, "iceberg-sink");
         let restored = checkpoint_ack_request_from_wire(wire).unwrap();
         assert_eq!(restored, request);
-    }
-
-    /// Audit (unaligned-checkpoint leg 2): in-flight buffer refs captured
-    /// during an unaligned checkpoint must survive the wire round-trip.
-    ///
-    /// Before the fix there was no `unaligned_buffers` field in the
-    /// `CheckpointAckRequest` protobuf message at all, and `from_wire`
-    /// hard-coded `unaligned_buffers: Vec::new()` — so a task that captured
-    /// in-flight buffers had them silently discarded between the executor and
-    /// the coordinator, with no error and no log. Nothing populates them today
-    /// (no production path selects `AlignmentMode::Unaligned`), so this closes
-    /// a latent trap rather than a live data loss.
-    #[test]
-    fn checkpoint_ack_unaligned_buffers_roundtrip() {
-        let request = CheckpointAckRequest {
-            job_id: JobId::try_new("job-unaligned").unwrap(),
-            operator_id: OperatorId::try_new("operator-unaligned").unwrap(),
-            task_id: TaskId::try_new("task-unaligned").unwrap(),
-            epoch: 11,
-            fencing_token: FencingToken::initial(),
-            source_offsets: vec![],
-            snapshot_path: None,
-            unaligned_buffers: vec![crate::UnalignedBufferRef {
-                operator_id: OperatorId::try_new("join-3").unwrap(),
-                channel_index: 2,
-                record_count: 512,
-                buffer_path: "job-unaligned/checkpoints/011/join-3.ch2.arrow".to_owned(),
-            }],
-            sink_transactions: Vec::new(),
-        };
-
-        let wire = checkpoint_ack_request_to_wire(request.clone());
-        assert_eq!(
-            wire.unaligned_buffers.len(),
-            1,
-            "the captured buffer ref must reach the protobuf message"
-        );
-        assert_eq!(wire.unaligned_buffers[0].record_count, 512);
-        let restored = checkpoint_ack_request_from_wire(wire).unwrap();
-        assert_eq!(
-            restored, request,
-            "decoding must return the same buffer refs, not an empty Vec"
-        );
     }
 
     fn arb_descriptor() -> impl Strategy<Value = Option<v1::ExecutorDescriptor>> {
@@ -1412,7 +1367,6 @@ mod wire_fuzz {
                 source_offsets: vec![],
                 snapshot_path,
                 sink_transactions: vec![],
-                unaligned_buffers: vec![],
             };
             let _ = checkpoint_ack_request_from_wire(wire);
         }

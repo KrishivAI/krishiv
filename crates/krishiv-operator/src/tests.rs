@@ -800,7 +800,6 @@ mod operator_tests {
             savepoint_label: None,
             iceberg_snapshot_id: None,
             kafka_offsets: None,
-            unaligned_buffer_refs: Vec::new(),
             sink_transactions: Vec::new(),
             streaming_profile: None,
         };

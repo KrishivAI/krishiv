@@ -547,18 +547,6 @@ message SinkTransactionRef {
   bool committed = 4;
 }
 
-// Reference to an in-flight input buffer captured during an unaligned
-// checkpoint. Empty for aligned checkpoints, which is every checkpoint the
-// engine takes today (no production path selects AlignmentMode::Unaligned);
-// the field exists so that a task which DOES capture buffers has a lossless
-// path to the coordinator instead of having them dropped at the wire.
-message UnalignedBufferRef {
-  string operator_id = 1;
-  uint32 channel_index = 2;
-  uint64 record_count = 3;
-  string buffer_path = 4;
-}
-
 message CheckpointAckRequest {
   string job_id = 1;
   string operator_id = 2;
@@ -570,8 +558,11 @@ message CheckpointAckRequest {
   // DUR-2: prepared-sink transactions the task staged during this epoch, so
   // the durable checkpoint records participant identity + prepared-tx refs.
   repeated SinkTransactionRef sink_transactions = 8;
-  // In-flight buffers captured during an unaligned checkpoint.
-  repeated UnalignedBufferRef unaligned_buffers = 9;
+  // 9 held in-flight buffer refs for unaligned checkpointing, removed with
+  // that feature: the engine never selected the mode and never captured a
+  // buffer, so the field was empty on every ack ever sent. Reserved so the
+  // number is never reused.
+  reserved 9;
 }
 
 message CheckpointAckResponse {

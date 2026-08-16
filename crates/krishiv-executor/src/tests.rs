@@ -12,16 +12,15 @@ mod executor_tests {
     use tempfile::tempdir;
 
     use krishiv_proto::{
-        AttemptId, CheckpointAckRequest, CheckpointAckResponse, CheckpointAlignment,
-        CoordinatorExecutorService, CoordinatorId, DeregisterExecutorRequest,
-        DeregisterExecutorResponse, ExecutorHeartbeat, ExecutorHeartbeatRequest,
-        ExecutorHeartbeatResponse, ExecutorId, ExecutorState, ExecutorTaskAssignment,
-        ExecutorTaskService, FencingToken, InputPartition, InputPartitionDescriptor, JobId,
-        JobKind, JobSpec, JobState, LeaseGeneration, OutputContract, OutputContractDescriptor,
-        OutputContractKind, PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse,
-        StageId, StageSpec, StreamingTaskState, TaskAttemptRef, TaskCancellationRequest, TaskId,
-        TaskSpec, TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion,
-        wire,
+        AttemptId, CheckpointAckRequest, CheckpointAckResponse, CoordinatorExecutorService,
+        CoordinatorId, DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorHeartbeat,
+        ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorState,
+        ExecutorTaskAssignment, ExecutorTaskService, FencingToken, InputPartition,
+        InputPartitionDescriptor, JobId, JobKind, JobSpec, JobState, LeaseGeneration,
+        OutputContract, OutputContractDescriptor, OutputContractKind, PlanFragment,
+        RegisterExecutorRequest, RegisterExecutorResponse, StageId, StageSpec, StreamingTaskState,
+        TaskAttemptRef, TaskCancellationRequest, TaskId, TaskSpec, TaskStatusRequest,
+        TaskStatusResponse, TransportDisposition, TransportVersion, wire,
     };
 
     use crate::execution_model::ExecutionModel;

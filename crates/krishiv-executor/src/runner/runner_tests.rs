@@ -3,7 +3,6 @@ use std::sync::Arc;
 use super::partition::{TASK_FAILURE_MESSAGE_MAX_BYTES, format_failure_message};
 use super::*;
 use crate::ExecutorAssignmentInbox;
-use krishiv_proto::CheckpointAlignment;
 
 #[test]
 fn format_failure_message_basic() {
@@ -276,7 +275,6 @@ fn task_runner_handle_checkpoint_stale_epoch() {
         job_id: krishiv_proto::JobId::try_new("job-1").unwrap(),
         epoch: 3,
         fencing_token: krishiv_proto::FencingToken::initial(),
-        alignment: CheckpointAlignment::default(),
     };
     let state = CheckpointStateHandle::from_backend(
         krishiv_state::RocksDbStateBackend::ephemeral().unwrap(),
@@ -297,7 +295,6 @@ fn task_runner_handle_checkpoint_new_epoch() {
         job_id: krishiv_proto::JobId::try_new("job-1").unwrap(),
         epoch: 1,
         fencing_token: krishiv_proto::FencingToken::initial(),
-        alignment: CheckpointAlignment::default(),
     };
     let state = CheckpointStateHandle::from_backend(
         krishiv_state::RocksDbStateBackend::ephemeral().unwrap(),

@@ -799,7 +799,6 @@ mod tests {
             epoch: 4,
             operator_state: vec![1, 2, 3],
             source_offsets: vec![("t".to_string(), vec![9])],
-            in_flight: vec![],
             source_in_flight: vec![],
         };
         svc.persist(&job, &payload).await.unwrap();

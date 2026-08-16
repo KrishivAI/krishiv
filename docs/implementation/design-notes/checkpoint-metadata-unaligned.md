@@ -1,3 +1,8 @@
+> **Superseded (2026-08-16).** The unaligned-buffer half of this note was never
+> implemented — no path ever captured an in-flight buffer — and the scaffolding
+> was removed. See the 2026-08-16 entry in `../status.md`. The source-offset and
+> sink-transaction halves shipped and remain in `CheckpointMetadata`.
+
 # Design Note: Checkpoint Metadata for Unaligned Buffers
 
 ## Summary

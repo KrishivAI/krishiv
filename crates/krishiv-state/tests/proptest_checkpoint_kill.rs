@@ -48,7 +48,6 @@ fn metadata_for(epoch: u64, snapshots: &[Vec<u8>]) -> CheckpointMetadata {
         savepoint_label: None,
         iceberg_snapshot_id: None,
         kafka_offsets: None,
-        unaligned_buffer_refs: vec![],
         sink_transactions: vec![],
         streaming_profile: None,
     }

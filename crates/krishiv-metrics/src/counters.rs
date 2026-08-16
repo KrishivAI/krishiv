@@ -231,8 +231,6 @@ pub struct KrishivMetrics {
     output_buffer_flushes: dashmap::DashMap<String, AtomicU64>,
     /// Checkpoint alignment time histogram (labeled by alignment mode).
     checkpoint_alignment_duration: dashmap::DashMap<String, KrishivHistogram>,
-    /// Unaligned in-flight bytes gauge (labeled by job_id).
-    unaligned_in_flight_bytes: dashmap::DashMap<String, AtomicU64>,
     /// Checkpoint upload time histogram (labeled by job_id).
     checkpoint_upload_duration: dashmap::DashMap<String, KrishivHistogram>,
     /// Restore time histogram (labeled by job_id).
@@ -684,7 +682,6 @@ impl KrishivMetrics {
         self.operator_memory_bytes
             .retain(|k, _| !k.starts_with(&prefix));
         // Streaming metrics cleanup
-        self.unaligned_in_flight_bytes.remove(job_id);
         self.state_cache_hits.remove(job_id);
         self.state_cache_misses.remove(job_id);
         self.backpressure_duration_us.remove(job_id);
@@ -781,14 +778,6 @@ impl KrishivMetrics {
             .entry(alignment.to_string())
             .or_default()
             .observe(duration_secs);
-    }
-
-    /// Set unaligned in-flight bytes for a job.
-    pub fn set_unaligned_in_flight_bytes(&self, job_id: &str, bytes: u64) {
-        self.unaligned_in_flight_bytes
-            .entry(job_id.to_string())
-            .or_default()
-            .store(bytes, Ordering::Relaxed);
     }
 
     /// Record checkpoint upload duration in seconds.
@@ -1444,26 +1433,6 @@ impl KrishivMetrics {
             "alignment",
             &self.checkpoint_alignment_duration,
         )?;
-
-        let unaligned_entries: BTreeMap<String, u64> = self
-            .unaligned_in_flight_bytes
-            .iter()
-            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
-            .collect();
-        if !unaligned_entries.is_empty() {
-            writeln!(
-                out,
-                "# HELP krishiv_unaligned_in_flight_bytes Unaligned checkpoint in-flight bytes"
-            )?;
-            writeln!(out, "# TYPE krishiv_unaligned_in_flight_bytes gauge")?;
-            for (job, bytes) in &unaligned_entries {
-                writeln!(
-                    out,
-                    "krishiv_unaligned_in_flight_bytes{{job_id=\"{}\"}} {bytes}",
-                    escape_label_value(job)
-                )?;
-            }
-        }
 
         render_histogram(
             &mut out,

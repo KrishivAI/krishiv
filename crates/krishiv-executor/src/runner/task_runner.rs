@@ -170,7 +170,6 @@ impl TaskRunner {
                 fencing_token: req.fencing_token,
                 source_offsets: vec![],
                 snapshot_path: None,
-                unaligned_buffers: Vec::new(),
                 sink_transactions: Vec::new(),
             });
         }
@@ -281,7 +280,6 @@ impl TaskRunner {
             fencing_token: req.fencing_token,
             source_offsets,
             snapshot_path: snap_path,
-            unaligned_buffers: Vec::new(),
             sink_transactions: Vec::new(),
         })
     }
@@ -394,7 +392,6 @@ impl TaskRunner {
             fencing_token: req.fencing_token,
             source_offsets,
             snapshot_path: Some(path),
-            unaligned_buffers: Vec::new(),
             sink_transactions: Vec::new(),
         }))
     }
