@@ -41,6 +41,11 @@ pub use engine::{ComputeEngine, JobHandle, JobStatus};
 pub use error::{EngineError, EngineResult};
 pub use job::{CompiledJob, DeliveryContract, SinkSpec, SourceSpec, StatePolicy};
 pub use kind::{EngineKind, UnknownEngine};
+/// Re-exported because it appears in this crate's public trait signatures
+/// (`CheckpointService::persist`/`restore_latest`, `JobHandle::job_id`).
+/// Without it a downstream crate cannot implement `CheckpointService` without
+/// taking an otherwise-undeclared dependency on `krishiv-proto`.
+pub use krishiv_proto::JobId;
 pub use runtime::{
     BatchOutputStream, CheckpointPayload, CheckpointService, Clock, DataNotify, EngineRuntime,
     KeyedState, Placement, QueryExecutor, ShuffleService, SinkProvider, SinkWriter, SourceProvider,

@@ -57,7 +57,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 19 | krishiv-operator | 4,878 | 19 | 19 | COMPLETE — OP1 scale-down leak + OP2 lease-release clobber fixed (§19) |
 | 20 | krishiv-mcp | 3,296 | **1** | 1 | COMPLETE — zero functional defects; one E-class doc fix (§20) |
 | 21 | krishiv | 8,472 | 24 | 24 | COMPLETE — C1 --timeout no-op wired + 2 doc fixes (§21) |
-| 22 | krishiv-engines | 2,192 | **1** | 0 | one file |
+| 22 | krishiv-engines | 2,184 | **1** | 1 | COMPLETE — E1 cannot-fail test rewritten + E2/E3 (§22) |
 | 23 | krishiv-ui | 2,384 | 4 | 0 | |
 | 24 | krishiv-bench | 3,362 | 14 | 0 | |
 | 25 | krishiv-sql-gateway | 541 | 3 | 0 | |
@@ -3527,3 +3527,47 @@ primary-key answer-equivalence, watermark alignment); no tautologies.
 
 Gates: cargo test -p krishiv (120 green across bin+lib+integration),
 clippy 0, `just lint`, `just test`, `cargo fmt` — green.
+
+## 22. krishiv-engines — read end to end (2026-08-16)
+
+One file, lib.rs 2,184 lines, read fully: the three-engine dispatch
+(`run_job`), `BatchEngine`, `IncrementalEngine`, `StreamingEngine` (windowed
++ stateless paths), the continuous loop, and 19 tests.
+
+Defects fixed:
+
+- **E1 (C — a test that could not fail)** the test named
+  `streaming_loop_survives_transient_checkpoint_failure` claimed to inject an
+  I/O failure; its doc comment even narrated a plan to chmod-000 a durable
+  dir and then said "Actually, the simplest regression test is…". The body
+  used `InMemoryCheckpointService`, whose `persist` returns `Ok(())`
+  unconditionally — so it exercised the happy path and would have stayed
+  green if the loop died on the first checkpoint error, which is the exact
+  behaviour it was named for. Replaced with a `FlakyCheckpointService` that
+  fails the first persist, records every epoch attempted, and lets the second
+  (final, on-stop) persist succeed. The test now asserts both legs: the loop
+  survives (stop → Completed) **and** the failed epoch is retried with the
+  same number rather than skipped (the B-3 gapless-epoch property).
+  Revert-proven twice — reverting either the in-loop `next_epoch = prev_epoch`
+  retry or the conditional final advance turns it red.
+- **E2 (B)** `drain_changelog_source` was `#[allow(dead_code)]` with zero
+  callers (the incremental engine streams feed+step per batch instead of
+  buffering, per the A-6 note). Deleted.
+- **E3 (API)** `krishiv-engine-core` did not re-export `JobId`, which appears
+  in the public `CheckpointService::persist`/`restore_latest` signatures — a
+  downstream crate could not implement the trait without an otherwise
+  undeclared `krishiv-proto` dependency. Added `pub use krishiv_proto::JobId`
+  (this is what the new test needed, and it is a real published-surface gap).
+
+Notes (not defects): the batch engine's 2 GiB cumulative drain cap is checked
+*per source as it lands* with an honest comment about the prior parallel-drain
+OOM; the streaming continuous loop's B-3/S-3/STREAM-5/ST-4/H-14 fixes all
+carry why-comments and are now genuinely covered. Recorded open item: the
+incremental engine opens every source once for schema probing and then
+re-opens for the drain — safe for the bounded/rewindable CDC sources it
+targets, but a non-rewindable source would lose its first batch; the engine
+should probe from the drained stream instead. Needs a product decision on
+whether non-rewindable sources are in scope for the incremental engine.
+
+Gates: cargo test -p krishiv-engines (19 green), clippy 0 (both crates),
+`just lint`, `just test`, `cargo fmt` — green.

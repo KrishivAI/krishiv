@@ -117,25 +117,6 @@ async fn drain_source(
     Ok(batches)
 }
 
-/// Read every **changelog** a source produces into memory (bounded sources).
-///
-/// Append-only sources surface their rows as insertions via the default
-/// [`SourceReader::next_changelog`]; CDC connectors surface true deletes and
-/// updates. The incremental engine drains through this so a delete in the
-/// source becomes a retraction in the maintained view.
-#[allow(dead_code)]
-async fn drain_changelog_source(
-    rt: &EngineRuntime,
-    spec: &krishiv_engine_core::SourceSpec,
-) -> EngineResult<Vec<ChangelogBatch>> {
-    let mut reader = rt.sources.open(spec).await?;
-    let mut changes = Vec::new();
-    while let Some(changelog) = reader.next_changelog().await? {
-        changes.push(changelog);
-    }
-    Ok(changes)
-}
-
 /// Convert a [`ChangelogBatch`] into a weighted [`DeltaBatch`] for the
 /// incremental engine: each row's [`RowKind`] maps to a DBSP weight (`+1`
 /// insert/update-after, `-1` delete/update-before) appended as the `_weight`
@@ -1874,25 +1855,73 @@ mod tests {
         );
     }
 
-    /// Verify that a transient checkpoint failure (injected I/O error) does not
-    /// kill the streaming loop.  The job must continue processing and must be
-    /// stoppable cleanly after the transient clears.
+    /// A checkpoint service whose first `fail_first` persists return an error,
+    /// recording every epoch it was *asked* to persist.
     ///
-    /// Strategy: use a `DurableCheckpointService` rooted at a read-only path so
-    /// the first persist call fails.  Then, on `stop()`, the *final* checkpoint
-    /// is written to the original durable dir (after the service is replaced with
-    /// a writable one by rebuilding the runtime) to confirm the final-checkpoint
-    /// path is reachable.
+    /// Crate-22 audit (E1): the previous version of the test below claimed to
+    /// inject a transient failure but used `InMemoryCheckpointService`, whose
+    /// `persist` is infallible — so it exercised the happy path and would have
+    /// stayed green even if the loop died on the first checkpoint error.
+    #[derive(Clone)]
+    struct FlakyCheckpointService {
+        inner: InMemoryCheckpointService,
+        remaining_failures: Arc<std::sync::Mutex<u32>>,
+        attempted_epochs: Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
+    impl FlakyCheckpointService {
+        fn new(fail_first: u32) -> Self {
+            Self {
+                inner: InMemoryCheckpointService::new(),
+                remaining_failures: Arc::new(std::sync::Mutex::new(fail_first)),
+                attempted_epochs: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn attempted_epochs(&self) -> Vec<u64> {
+            self.attempted_epochs.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl CheckpointService for FlakyCheckpointService {
+        async fn persist(
+            &self,
+            job: &krishiv_engine_core::JobId,
+            payload: &CheckpointPayload,
+        ) -> EngineResult<()> {
+            self.attempted_epochs.lock().unwrap().push(payload.epoch);
+            let should_fail = {
+                let mut remaining = self.remaining_failures.lock().unwrap();
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_fail {
+                return Err(EngineError::Checkpoint("injected transient failure".into()));
+            }
+            self.inner.persist(job, payload).await
+        }
+
+        async fn restore_latest(
+            &self,
+            job: &krishiv_engine_core::JobId,
+        ) -> EngineResult<Option<CheckpointPayload>> {
+            self.inner.restore_latest(job).await
+        }
+    }
+
+    /// A transient checkpoint failure must not kill the streaming loop, and the
+    /// failed epoch must be **retried rather than skipped** (B-3): a gap in the
+    /// committed epoch sequence would make recovery re-process events.
     ///
-    /// Actually, the simplest regression test is: confirm the loop drains all
-    /// batches, continues beyond the (silent) checkpoint-failure point, and that
-    /// `stop()` returns `Completed` — as opposed to the pre-fix behavior where
-    /// the loop would die with `Err` at the first checkpoint failure.
+    /// The injected service fails the first persist (the in-loop background
+    /// checkpoint) and succeeds the second (the final checkpoint on stop).
     #[tokio::test]
     async fn streaming_loop_survives_transient_checkpoint_failure() {
-        // Use a real DurableCheckpointService on a tmpdir, then chmod 000 the
-        // dir so all persists fail.  After stop, confirm we get `Completed`
-        // (loop survived), not an Err propagated from the checkpoint call.
         // Pre-load enough batches to trigger at least one in-loop checkpoint:
         // STREAMING_CHECKPOINT_EVERY = 4, so we need 5 batches minimum.
         let sources = InMemorySourceProvider::new();
@@ -1903,15 +1932,15 @@ mod tests {
         batches.push(event_batch("a", 15_000, 1)); // advance watermark past window
         sources.insert("events", batches);
 
-        let checkpoint = InMemoryCheckpointService::new();
+        let checkpoint = FlakyCheckpointService::new(1);
         let sink = InMemorySinkProvider::new();
-        let rt = runtime_with_checkpoint(sources, sink.clone(), checkpoint.clone());
+        let mut rt = embedded_runtime(Arc::new(sources), Arc::new(sink.clone()));
+        rt.checkpoint = Arc::new(checkpoint.clone());
 
         let running = spawn_streaming_job(tumbling_job("fail-ckpt-job"), rt).unwrap();
 
-        // Drain all batches; checkpoint fires once in-loop.  Under the old code
-        // the loop would die when persist returned Err; under the new code it logs
-        // the failure and continues — so `stop()` must still return `Completed`.
+        // Drain all batches; the in-loop checkpoint fires once and FAILS. The
+        // loop must log and continue rather than propagating the error.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let final_handle = running.stop().await.unwrap();
@@ -1921,14 +1950,28 @@ mod tests {
             "a streaming job that hit a transient checkpoint failure must still stop cleanly"
         );
 
-        // The final checkpoint (written on stop to the in-memory service) must land.
+        // The final checkpoint (the second persist) succeeded and is readable.
         assert!(
             checkpoint
                 .restore_latest(final_handle.job_id())
                 .await
                 .unwrap()
                 .is_some(),
-            "the final checkpoint on stop must succeed"
+            "the final checkpoint on stop must succeed once the transient clears"
+        );
+
+        // B-3: the failed epoch is retried, not skipped. Every attempted epoch
+        // must be 1 (the first epoch), never jumping to 2 while epoch 1 was
+        // never committed.
+        let attempted = checkpoint.attempted_epochs();
+        assert!(
+            attempted.len() >= 2,
+            "expected an in-loop attempt and a final attempt, got {attempted:?}"
+        );
+        assert!(
+            attempted.iter().all(|e| *e == 1),
+            "a failed epoch must be retried with the SAME epoch number (gapless); \
+             attempted: {attempted:?}"
         );
     }
 
