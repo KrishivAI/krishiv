@@ -522,9 +522,14 @@ mod tests {
     #[test]
     fn sort_shuffle_writer_roundtrip_offsets() {
         let dir = tempfile::tempdir().unwrap();
-        let mut writer =
-            SortShuffleWriter::new("job1", "stage1", HashPartitioner::new("k", 4), "k", dir.path())
-                .unwrap();
+        let mut writer = SortShuffleWriter::new(
+            "job1",
+            "stage1",
+            HashPartitioner::new("k", 4),
+            "k",
+            dir.path(),
+        )
+        .unwrap();
 
         // Push rows across two batches so the concat+sort path is exercised.
         writer.push(make_batch(&[8, 1, 3, 0])).unwrap();
@@ -557,9 +562,14 @@ mod tests {
     #[test]
     fn sort_shuffle_writer_empty_push() {
         let dir = tempfile::tempdir().unwrap();
-        let mut writer =
-            SortShuffleWriter::new("job2", "stage1", HashPartitioner::new("k", 2), "k", dir.path())
-                .unwrap();
+        let mut writer = SortShuffleWriter::new(
+            "job2",
+            "stage1",
+            HashPartitioner::new("k", 2),
+            "k",
+            dir.path(),
+        )
+        .unwrap();
         // No rows pushed — flush should still produce valid (empty) files.
         writer.push(make_batch(&[])).unwrap();
         let files = writer.flush().unwrap();
@@ -573,7 +583,8 @@ mod tests {
     fn sort_shuffle_writer_rejects_zero_partitions() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
-            SortShuffleWriter::new("j", "s", HashPartitioner::new("k", 0), "k", dir.path()).is_err()
+            SortShuffleWriter::new("j", "s", HashPartitioner::new("k", 0), "k", dir.path())
+                .is_err()
         );
     }
 
@@ -818,16 +829,15 @@ mod tests {
         // Use the builder with an explicit spill threshold of 1 byte so that
         // every push triggers a spill without touching process-global env state.
         let dir = tempfile::tempdir().unwrap();
-        let mut writer =
-            SortShuffleWriter::new_with_spill_threshold(
-                "job3",
-                "stage1",
-                HashPartitioner::new("k", 2),
-                "k",
-                dir.path(),
-                1,
-            )
-            .unwrap();
+        let mut writer = SortShuffleWriter::new_with_spill_threshold(
+            "job3",
+            "stage1",
+            HashPartitioner::new("k", 2),
+            "k",
+            dir.path(),
+            1,
+        )
+        .unwrap();
 
         // Push two batches; each push will trigger a spill due to the tiny threshold.
         writer.push(make_batch(&[4, 2])).unwrap();

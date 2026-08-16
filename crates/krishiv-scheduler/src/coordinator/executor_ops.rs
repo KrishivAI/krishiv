@@ -1039,7 +1039,8 @@ impl Coordinator {
                 if partition.description().trim().starts_with(PREFIX)
                     && partition.description().trim() != payload
                 {
-                    *partition = krishiv_proto::InputPartition::new("stream-peers", payload.clone());
+                    *partition =
+                        krishiv_proto::InputPartition::new("stream-peers", payload.clone());
                     changed = true;
                 }
             }
@@ -1682,7 +1683,9 @@ mod rloop_peer_refresh_tests {
                 )],
             );
         }
-        coord.job_task_input_partitions.insert(job_id.clone(), per_task);
+        coord
+            .job_task_input_partitions
+            .insert(job_id.clone(), per_task);
 
         // Find which executor holds a task, then lose it.
         let lost = {
@@ -1753,7 +1756,9 @@ mod rloop_peer_refresh_tests {
             TaskId::try_new("rl-0").unwrap(),
             vec![krishiv_proto::InputPartition::new("stream-peers", stale)],
         );
-        coord.job_task_input_partitions.insert(job_id.clone(), per_task);
+        coord
+            .job_task_input_partitions
+            .insert(job_id.clone(), per_task);
 
         // Lose the ONLY executor: tasks reset to Pending with nowhere to go.
         // The loss-path refresh (and any direct call) must decline rather

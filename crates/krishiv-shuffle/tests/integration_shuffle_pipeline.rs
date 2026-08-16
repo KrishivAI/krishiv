@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-
 // Integration-test crate: helpers here run outside `#[test]` fns, so clippy's
 // `allow-unwrap-in-tests` (clippy.toml) does not reach them. A panic is still
 // the correct failure signal in a test.

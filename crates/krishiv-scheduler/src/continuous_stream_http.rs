@@ -1077,7 +1077,9 @@ pub async fn api_continuous_push(
         if let Err(e) = coord.ensure_active() {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("continuous push not served here: {e}; retry (routes to the active leader)"),
+                format!(
+                    "continuous push not served here: {e}; retry (routes to the active leader)"
+                ),
             ));
         }
     }
@@ -1926,8 +1928,7 @@ mod tests {
     /// an empty store (87k windowed rows reported as "0 rows", 2026-08-10).
     #[test]
     fn unshift_puts_payloads_back_ahead_of_newer_output() {
-        let mut coordinator =
-            Coordinator::active(CoordinatorId::try_new("unshift-coord").unwrap());
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("unshift-coord").unwrap());
         let job_id = krishiv_proto::JobId::try_new("unshift-job").unwrap();
 
         // Newer cycle output arrived between the take and the return.

@@ -252,7 +252,10 @@ mod tests {
             "s3:// with no bucket cannot be opened",
         );
         assert!(msg.contains("no bucket"), "must say what is wrong: {msg}");
-        assert!(msg.contains("shuffle"), "must say who is complaining: {msg}");
+        assert!(
+            msg.contains("shuffle"),
+            "must say who is complaining: {msg}"
+        );
     }
 
     /// Same refusal on the tiered path — the point of extracting the helper is
@@ -271,7 +274,11 @@ mod tests {
     fn the_tiered_remote_must_be_an_s3_uri() {
         let dir = tempfile::tempdir().unwrap();
         let err = expect_refused(
-            open_tiered_shuffle_backend(dir.path(), "file:///tmp/nope", DurabilityProfile::DevLocal),
+            open_tiered_shuffle_backend(
+                dir.path(),
+                "file:///tmp/nope",
+                DurabilityProfile::DevLocal,
+            ),
             "a tiered remote must be object storage",
         );
         assert!(err.contains("must be s3://"), "{err}");

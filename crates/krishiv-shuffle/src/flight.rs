@@ -540,8 +540,9 @@ impl<S: ShuffleStore + Send + Sync + 'static> FlightService for ShuffleFlightSer
         // available once a batch has been decoded, so exactly one batch is
         // buffered and then chained back onto the stream. One batch, not one
         // partition.
-        let mut decoder = FlightRecordBatchStream::new_from_flight_data(combined)
-            .map_err(|e| crate::ShuffleError::Io(std::io::Error::other(format!("flight decode: {e}"))));
+        let mut decoder = FlightRecordBatchStream::new_from_flight_data(combined).map_err(|e| {
+            crate::ShuffleError::Io(std::io::Error::other(format!("flight decode: {e}")))
+        });
         let first_batch = decoder
             .next()
             .await
@@ -806,12 +807,8 @@ impl Default for FetchRetryPolicy {
         Self {
             max_attempts: DEFAULT_FETCH_MAX_ATTEMPTS,
             base_delay_ms: DEFAULT_FETCH_RETRY_BASE_MS,
-            transport_grace: std::time::Duration::from_secs(
-                DEFAULT_FETCH_TRANSPORT_GRACE_SECS,
-            ),
-            open_attempt_timeout: std::time::Duration::from_secs(
-                DEFAULT_FETCH_OPEN_TIMEOUT_SECS,
-            ),
+            transport_grace: std::time::Duration::from_secs(DEFAULT_FETCH_TRANSPORT_GRACE_SECS),
+            open_attempt_timeout: std::time::Duration::from_secs(DEFAULT_FETCH_OPEN_TIMEOUT_SECS),
         }
     }
 }
@@ -845,9 +842,7 @@ impl FetchRetryPolicy {
             max_attempts,
             base_delay_ms,
             transport_grace,
-            open_attempt_timeout: std::time::Duration::from_secs(
-                DEFAULT_FETCH_OPEN_TIMEOUT_SECS,
-            ),
+            open_attempt_timeout: std::time::Duration::from_secs(DEFAULT_FETCH_OPEN_TIMEOUT_SECS),
         }
     }
 
@@ -884,9 +879,7 @@ impl FetchRetryPolicy {
             max_attempts,
             base_delay_ms,
             transport_grace: std::time::Duration::ZERO,
-            open_attempt_timeout: std::time::Duration::from_secs(
-                DEFAULT_FETCH_OPEN_TIMEOUT_SECS,
-            ),
+            open_attempt_timeout: std::time::Duration::from_secs(DEFAULT_FETCH_OPEN_TIMEOUT_SECS),
         }
     }
 
@@ -1269,7 +1262,8 @@ impl FlightShuffleClient {
             match attempt_result {
                 Ok(stream) => {
                     let open_elapsed_us = fetch_started.elapsed().as_micros() as u64;
-                    krishiv_metrics::global_metrics().add_shuffle_fetch_wait_time_us(open_elapsed_us);
+                    krishiv_metrics::global_metrics()
+                        .add_shuffle_fetch_wait_time_us(open_elapsed_us);
                     if is_local {
                         krishiv_metrics::global_metrics().add_shuffle_local_blocks_fetched(1);
                     } else {
@@ -1290,7 +1284,8 @@ impl FlightShuffleClient {
                         .inspect(|batch| {
                             if let Ok(batch) = batch {
                                 let metrics = krishiv_metrics::global_metrics();
-                                metrics.add_shuffle_read_bytes(batch.get_array_memory_size() as u64);
+                                metrics
+                                    .add_shuffle_read_bytes(batch.get_array_memory_size() as u64);
                                 metrics.add_shuffle_read_records(batch.num_rows() as u64);
                             }
                         })
@@ -1317,9 +1312,16 @@ impl FlightShuffleClient {
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                 }
-                Err(error) => return Err(exhausted_transport_error(
-                    error, job_id, stage_id, partition_id, attempt, fetch_started.elapsed(),
-                )),
+                Err(error) => {
+                    return Err(exhausted_transport_error(
+                        error,
+                        job_id,
+                        stage_id,
+                        partition_id,
+                        attempt,
+                        fetch_started.elapsed(),
+                    ));
+                }
             }
         }
     }
@@ -1858,10 +1860,7 @@ mod tests {
         let policy = FetchRetryPolicy::default();
         // Attempts exhausted, but well inside the grace: keep waiting.
         assert!(
-            policy.should_retry_transport(
-                policy.max_attempts,
-                std::time::Duration::from_secs(20)
-            ),
+            policy.should_retry_transport(policy.max_attempts, std::time::Duration::from_secs(20)),
             "a 20 s outage is a restart, not data loss"
         );
         // Past the grace with attempts exhausted: give up and regenerate.
@@ -1929,7 +1928,9 @@ mod tests {
         );
         assert_eq!(oversized.kind(), std::io::ErrorKind::InvalidInput);
         assert!(
-            oversized.to_string().contains(SHUFFLE_GRPC_MAX_MESSAGE_BYTES_ENV),
+            oversized
+                .to_string()
+                .contains(SHUFFLE_GRPC_MAX_MESSAGE_BYTES_ENV),
             "the error must name the knob that fixes it: {oversized}"
         );
 
@@ -2181,10 +2182,9 @@ mod tests {
     async fn do_put_round_trips_every_row_through_the_streaming_write() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
-        let (addr, handle) =
-            serve_with_token(([127, 0, 0, 1], 0).into(), Arc::clone(&store), None)
-                .await
-                .unwrap();
+        let (addr, handle) = serve_with_token(([127, 0, 0, 1], 0).into(), Arc::clone(&store), None)
+            .await
+            .unwrap();
 
         let batches: Vec<RecordBatch> = (0..5).map(|_| make_test_batch()).collect();
         let expected_rows: usize = batches.iter().map(|b| b.num_rows()).sum();

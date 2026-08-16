@@ -4884,6 +4884,7 @@ dependencies = [
  "krishiv-proto",
  "krishiv-scheduler",
  "krishiv-state",
+ "tempfile",
  "tokio",
 ]
 

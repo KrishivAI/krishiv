@@ -375,10 +375,7 @@ fn for_each_key(array: &dyn Array, f: &mut impl FnMut(&[u8])) -> ShuffleResult<(
 ///
 /// Integers widen to 8 bytes so that the same logical value encodes the same
 /// way regardless of the column's declared width.
-fn for_each_key_or_null(
-    array: &dyn Array,
-    f: &mut impl FnMut(Option<&[u8]>),
-) -> ShuffleResult<()> {
+fn for_each_key_or_null(array: &dyn Array, f: &mut impl FnMut(Option<&[u8]>)) -> ShuffleResult<()> {
     macro_rules! signed {
         ($ty:ty) => {{
             let typed = downcast::<$ty>(array)?;
@@ -521,7 +518,9 @@ mod tests {
         // The build side may be Int64 while the probe scan reads Int32. If
         // these encoded differently every row would be dropped.
         let filter = build(&[1, 2, 3, 999], 4);
-        let mask = filter.contains(&Int32Array::from(vec![1, 2, 3, 999])).unwrap();
+        let mask = filter
+            .contains(&Int32Array::from(vec![1, 2, 3, 999]))
+            .unwrap();
         assert!((0..4).all(|i| mask.value(i)));
     }
 

@@ -3714,3 +3714,69 @@ four including the CI-excluded chaos crate; `just lint`, `just test`,
 ---
 
 **Register complete.** All 27 crates have been read end to end.
+
+---
+
+## §28 — post-register close-out: the unaligned-checkpoint three-leg gap (2026-08-16)
+
+The register's only cross-crate open item, recorded in three places that each
+looked like a local note — §11 (dataflow D3), §15 (proto: "unaligned_buffers
+wire drop"), §17 (engine-core: "once wired through the operator runtime"). Read
+together they are one defect: **unaligned checkpointing is documented as a
+shipped Flink-parity feature and is not wired at any of its three legs.**
+
+`UnalignedBufferRef` is constructed in **zero** production sites — every one of
+the 20 occurrences across 8 crates is `Vec::new()`.
+
+**Leg 1 (dataflow) — the capture: absent, and the doc claimed otherwise.**
+`AlignmentMode::Unaligned` and `BarrierAligner::unaligned_capture_inputs` are
+complete and tested, but nothing constructs an unaligned aligner: the sole
+production caller (`watermark_join`) uses `BarrierAligner::new` — aligned. No
+operator serializes the buffered records the capture-inputs list names. The doc
+comment nonetheless read "exactly-once is preserved **without** the alignment
+stall. This is the Flink `execution.checkpointing.unaligned` behavior."
+Selecting the mode today would snapshot without in-flight data and **lose
+records on recovery**. Fixed as an E-class honesty correction: the variant now
+states it is unreachable, half-built, and lossy if selected. Not deleted — the
+bookkeeping half is correct and is the foundation the capture will sit on.
+
+**Leg 2 (proto) — a silent drop at the wire. FIXED.** The domain struct
+`CheckpointAckRequest` carries `unaligned_buffers`, but the protobuf message
+had **no such field**: `checkpoint_ack_request_to_wire` had nowhere to write it
+and `..._from_wire` hard-coded `unaligned_buffers: Vec::new()`. A task that
+captured buffers would have had them discarded between executor and
+coordinator with no error and no log. Fix: added `message UnalignedBufferRef`
+and field 9 to `CheckpointAckRequest` (backward-compatible addition), plus
+encode/decode. Test `checkpoint_ack_unaligned_buffers_roundtrip`;
+revert-proven — restoring `Vec::new()` in the decode turns it red on the
+round-trip equality.
+
+**Leg 3 (scheduler) — a second silent drop at the coordinator. FIXED.** Both
+`CheckpointMetadata` builders in `checkpoint.rs` hard-coded
+`unaligned_buffer_refs: Vec::new()` while their siblings `source_offsets` and
+`sink_transactions` were collected from the acks — so even a buffer ref that
+survived the wire died before `metadata.json`. Fix: `collect_unaligned_buffers`
+(the exact sibling of DUR-2's `collect_sink_transactions`), sorted for a
+byte-stable metadata. Test
+`unaligned_buffer_refs_reach_the_checkpoint_metadata`; revert-proven — making
+the collector yield nothing turns it red.
+
+**Deliberately NOT carried: the rescale path.** `checkpoint_ops.rs` rebuilds
+metadata for a rescaled epoch and still writes `Vec::new()`. This is now
+correct-by-comment rather than silent: a buffer ref is keyed by `(operator_id,
+channel_index)`, and rescaling changes the channel layout, so the source
+epoch's indices do not name the same channels under the new parallelism.
+Replaying in-flight buffers across a rescale needs them re-partitioned by key
+first.
+
+**Still open — needs a product decision (wire-or-delete).** The transport and
+coordinator legs are now lossless end to end; the capture itself is the one
+remaining step, and it is a feature build (spill in-flight channel buffers to
+durable storage on the first barrier; replay them into the channels before
+processing resumes on restore), not an audit fix. The alternative is to delete
+`AlignmentMode::Unaligned` and the four `UnalignedBufferRef` types outright.
+Recorded, not guessed at — matching the register's standing rule. Nothing is
+lost in practice today either way, because no production path selects the mode.
+
+Gates: `cargo test -p krishiv-proto` (91), `cargo test -p krishiv-scheduler
+--lib` (548), `just lint`, `just test`, `cargo fmt` — all green.

@@ -71,10 +71,7 @@ fn utf8view_partitions_each_report_the_whole_shared_data_buffer() {
         .partition(&batch)
         .expect("partition");
     let arrow_summed: usize = parts.iter().map(RecordBatch::get_array_memory_size).sum();
-    let summed: usize = parts
-        .iter()
-        .map(krishiv_shuffle::logical_batch_bytes)
-        .sum();
+    let summed: usize = parts.iter().map(krishiv_shuffle::logical_batch_bytes).sum();
     let ratio = summed as f64 / whole as f64;
     println!(
         "UTF8VIEW whole={whole} arrow_summed={arrow_summed} ({:.2}x) fixed_summed={summed} \
@@ -152,7 +149,9 @@ fn a_utf8view_bucket_owns_its_bytes_rather_than_the_whole_source_buffer() {
         .expect("partition");
     let summed: usize = parts.iter().map(RecordBatch::get_array_memory_size).sum();
     let ratio = summed as f64 / whole as f64;
-    println!("ARROW-MEASURED whole={whole} summed={summed} ratio={ratio:.2}x over {buckets} buckets");
+    println!(
+        "ARROW-MEASURED whole={whole} summed={summed} ratio={ratio:.2}x over {buckets} buckets"
+    );
 
     assert!(
         ratio < 1.5,

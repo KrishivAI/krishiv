@@ -142,8 +142,9 @@ pub async fn run_shuffle_svc(
     // unbounded behaviour, which is correct off a container.
     let capacity = krishiv_common::ExecutorCapacity::detect();
     let push_store = match capacity.shuffle_store_bytes {
-        Some(bytes) => PushShuffleStore::new()
-            .with_memory_limit(usize::try_from(bytes).unwrap_or(usize::MAX)),
+        Some(bytes) => {
+            PushShuffleStore::new().with_memory_limit(usize::try_from(bytes).unwrap_or(usize::MAX))
+        }
         None => PushShuffleStore::new(),
     };
     tracing::info!(
@@ -676,8 +677,14 @@ mod tests {
             .await
             .unwrap();
 
-        let (status, body) =
-            call(&state, "GET", "/shuffle/job/stage/0", Some(TOKEN), Body::empty()).await;
+        let (status, body) = call(
+            &state,
+            "GET",
+            "/shuffle/job/stage/0",
+            Some(TOKEN),
+            Body::empty(),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let reader =
             arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(body), None).unwrap();
@@ -699,8 +706,14 @@ mod tests {
     async fn a_partition_that_was_never_written_is_404() {
         let dir = tempfile::tempdir().unwrap();
         let state = state_with(dir.path());
-        let (status, _) =
-            call(&state, "GET", "/shuffle/job/stage/7", Some(TOKEN), Body::empty()).await;
+        let (status, _) = call(
+            &state,
+            "GET",
+            "/shuffle/job/stage/7",
+            Some(TOKEN),
+            Body::empty(),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -736,7 +749,14 @@ mod tests {
         let state = state_with(dir.path());
         // Partition 0 claims to run from byte 8 back to byte 0.
         register_ess(&state, dir.path(), b"AAAABBBB", &[8, 0, 8]);
-        let (status, _) = call(&state, "GET", "/ess/job/stage/0", Some(TOKEN), Body::empty()).await;
+        let (status, _) = call(
+            &state,
+            "GET",
+            "/ess/job/stage/0",
+            Some(TOKEN),
+            Body::empty(),
+        )
+        .await;
         assert_eq!(
             status,
             StatusCode::BAD_REQUEST,
@@ -752,7 +772,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = state_with(dir.path());
         register_ess(&state, dir.path(), b"AAAA", &[0, 4_000_000_000]);
-        let (status, _) = call(&state, "GET", "/ess/job/stage/0", Some(TOKEN), Body::empty()).await;
+        let (status, _) = call(
+            &state,
+            "GET",
+            "/ess/job/stage/0",
+            Some(TOKEN),
+            Body::empty(),
+        )
+        .await;
         assert_eq!(
             status,
             StatusCode::BAD_REQUEST,
@@ -765,7 +792,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = state_with(dir.path());
         register_ess(&state, dir.path(), b"AAAA", &[0, 4]);
-        let (status, _) = call(&state, "GET", "/ess/job/stage/9", Some(TOKEN), Body::empty()).await;
+        let (status, _) = call(
+            &state,
+            "GET",
+            "/ess/job/stage/9",
+            Some(TOKEN),
+            Body::empty(),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -823,8 +857,14 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
 
-        let (status, _) =
-            call(&state, "GET", "/ess/merged/job/stage/0", Some(TOKEN), Body::empty()).await;
+        let (status, _) = call(
+            &state,
+            "GET",
+            "/ess/merged/job/stage/0",
+            Some(TOKEN),
+            Body::empty(),
+        )
+        .await;
         assert_eq!(
             status,
             StatusCode::NOT_FOUND,
@@ -841,15 +881,38 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
 
-        let (status, body) =
-            call(&state, "GET", "/ess/merged/job/stage/0", Some(TOKEN), Body::empty()).await;
+        let (status, body) = call(
+            &state,
+            "GET",
+            "/ess/merged/job/stage/0",
+            Some(TOKEN),
+            Body::empty(),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body.len(), 8, "both pushes must appear in the merged stream");
+        assert_eq!(
+            body.len(),
+            8,
+            "both pushes must appear in the merged stream"
+        );
 
-        let (status, _) = call(&state, "POST", "/ess/push-gc/job", Some(TOKEN), Body::empty()).await;
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/ess/push-gc/job",
+            Some(TOKEN),
+            Body::empty(),
+        )
+        .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        let (status, _) =
-            call(&state, "GET", "/ess/merged/job/stage/0", Some(TOKEN), Body::empty()).await;
+        let (status, _) = call(
+            &state,
+            "GET",
+            "/ess/merged/job/stage/0",
+            Some(TOKEN),
+            Body::empty(),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "GC must drop pushed data");
     }
 
@@ -880,8 +943,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut state = state_with(dir.path());
         state.token = Arc::new(std::sync::RwLock::new(None));
-        let (status, _) =
-            call(&state, "GET", "/shuffle/job/stage/0", None, Body::empty()).await;
+        let (status, _) = call(&state, "GET", "/shuffle/job/stage/0", None, Body::empty()).await;
         assert_eq!(
             status,
             StatusCode::NOT_FOUND,

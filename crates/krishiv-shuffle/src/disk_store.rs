@@ -413,7 +413,11 @@ impl ShuffleStore for LocalDiskShuffleStore {
         partition: ShufflePartition,
         lease_token: u64,
     ) -> ShuffleResult<()> {
-        let ShufflePartition { id, schema, batches } = partition;
+        let ShufflePartition {
+            id,
+            schema,
+            batches,
+        } = partition;
         let stream = futures::stream::iter(batches.into_iter().map(Ok));
         self.write_partition_stream(id, schema, Box::pin(stream), lease_token)
             .await
@@ -476,7 +480,8 @@ impl ShuffleStore for LocalDiskShuffleStore {
         // stalls, small enough that "in flight" is a couple of batches rather
         // than a partition. This bound is the whole point of the streaming
         // path, so it must stay small.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<ShuffleResult<arrow::record_batch::RecordBatch>>(2);
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<ShuffleResult<arrow::record_batch::RecordBatch>>(2);
 
         // P0.4: Wrap all blocking filesystem I/O in spawn_blocking so the
         // async executor thread is never stalled by synchronous disk calls.
@@ -1157,9 +1162,19 @@ mod tests {
             .await
             .unwrap()
             .expect("streamed present");
-        let expected: Vec<i64> = (0..8).flat_map(|g: i64| [g * 10, g * 10 + 1, g * 10 + 2]).collect();
-        assert_eq!(values(&a), expected, "collecting write lost or reordered rows");
-        assert_eq!(values(&b), expected, "streaming write lost or reordered rows");
+        let expected: Vec<i64> = (0..8)
+            .flat_map(|g: i64| [g * 10, g * 10 + 1, g * 10 + 2])
+            .collect();
+        assert_eq!(
+            values(&a),
+            expected,
+            "collecting write lost or reordered rows"
+        );
+        assert_eq!(
+            values(&b),
+            expected,
+            "streaming write lost or reordered rows"
+        );
     }
 
     /// A partition whose source stream fails part-way must not commit, and must

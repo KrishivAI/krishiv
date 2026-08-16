@@ -132,7 +132,10 @@ fn views_bytes(views: &[u128]) -> usize {
         .filter(|len| *len > INLINE_MAX_LEN)
         .map(|len| len as usize)
         .sum();
-    views.len().saturating_mul(VIEW_WIDTH).saturating_add(referenced)
+    views
+        .len()
+        .saturating_mul(VIEW_WIDTH)
+        .saturating_add(referenced)
 }
 
 /// Make a `take`-produced array own its bytes instead of sharing the source's
@@ -189,10 +192,7 @@ fn views_bytes(views: &[u128]) -> usize {
 /// Offset-encoded `Utf8`/`Binary` need no compaction here: `take` allocates a
 /// fresh values buffer for them. Only the view encodings share.
 pub fn compact_shared_buffers(array: ArrayRef) -> ArrayRef {
-    if !matches!(
-        array.data_type(),
-        DataType::Utf8View | DataType::BinaryView
-    ) {
+    if !matches!(array.data_type(), DataType::Utf8View | DataType::BinaryView) {
         return array;
     }
     let charged = array.get_array_memory_size();
@@ -248,10 +248,8 @@ mod tests {
             Field::new("s", DataType::Utf8View, false),
         ]));
         let keys = Int64Array::from_iter_values(0..rows as i64);
-        let strings =
-            StringViewArray::from_iter_values((0..rows).map(|i| format!("{i:0>73}")));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(keys), Arc::new(strings)]).unwrap();
+        let strings = StringViewArray::from_iter_values((0..rows).map(|i| format!("{i:0>73}")));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(keys), Arc::new(strings)]).unwrap();
 
         let whole = logical_batch_bytes(&batch);
         let pieces = 16;
@@ -295,8 +293,7 @@ mod tests {
     /// Charging it `16 + length` counts those bytes twice.
     #[test]
     fn inline_view_values_are_not_charged_twice() {
-        let inline =
-            StringViewArray::from_iter_values((0..1_000).map(|i| format!("{i:0>8}")));
+        let inline = StringViewArray::from_iter_values((0..1_000).map(|i| format!("{i:0>8}")));
         assert!(
             inline.data_buffers().is_empty(),
             "test premise: 8-byte values must live inline, not in a data buffer"

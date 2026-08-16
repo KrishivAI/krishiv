@@ -26,9 +26,21 @@ pub enum AlignmentMode {
     /// data on the not-yet-barriered inputs (see
     /// [`BarrierAligner::unaligned_capture_inputs`]) into the checkpoint, so it
     /// is replayed on recovery and exactly-once is preserved **without** the
-    /// alignment stall. This is the Flink `execution.checkpointing.unaligned`
-    /// behavior and the key lever for keeping checkpoint latency off the
-    /// critical path.
+    /// alignment stall — the Flink `execution.checkpointing.unaligned` shape.
+    ///
+    /// **Not reachable in production, and only half-built.** The barrier
+    /// bookkeeping in this file is complete and tested, but *nothing
+    /// constructs an unaligned aligner*: the sole production caller
+    /// ([`crate::watermark_join`]) uses [`BarrierAligner::new`], i.e. aligned.
+    /// The missing half is the capture itself — no operator serializes the
+    /// buffered records that [`BarrierAligner::unaligned_capture_inputs`]
+    /// names, so `CheckpointAckRequest::unaligned_buffers` is empty on every
+    /// ack the engine sends. Selecting this mode today would therefore
+    /// snapshot without the in-flight data and **lose records on recovery**.
+    /// The transport and coordinator legs are now lossless (the ref survives
+    /// the wire and is persisted into `metadata.json`), so wiring the capture
+    /// is the one remaining step; until then this variant is for the tests
+    /// below, not for a running job.
     Unaligned,
 }
 

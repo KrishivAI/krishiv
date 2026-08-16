@@ -162,7 +162,9 @@ impl HashPartitioner {
     /// read-modify-writes to compute a constant. Callers now hoist it out of
     /// the row loop and account the nulls in one `null_count()` add.
     fn null_bucket(&self, sentinel: &[u8]) -> ShuffleBucket {
-        ShuffleBucket((twox_hash::XxHash64::oneshot(self.seed, sentinel) % self.buckets as u64) as u32)
+        ShuffleBucket(
+            (twox_hash::XxHash64::oneshot(self.seed, sentinel) % self.buckets as u64) as u32,
+        )
     }
 
     /// Record `count` null keys against the null-key counter in one add.
@@ -420,12 +422,11 @@ impl HashPartitioner {
         /// Fold a typed array, hashing each value's little-endian bytes.
         macro_rules! fold {
             ($ty:ty, $expected:literal, $sentinel:expr, $bytes:expr) => {{
-                let arr = column
-                    .as_any()
-                    .downcast_ref::<$ty>()
-                    .ok_or_else(|| ShuffleError::TypeMismatch {
+                let arr = column.as_any().downcast_ref::<$ty>().ok_or_else(|| {
+                    ShuffleError::TypeMismatch {
                         expected: $expected.into(),
-                    })?;
+                    }
+                })?;
                 let null_hash = twox_hash::XxHash64::oneshot(seed, $sentinel);
                 for row in 0..arr.len() {
                     let hash = if arr.is_null(row) {
@@ -443,29 +444,59 @@ impl HashPartitioner {
         // whatever width it arrived in — otherwise an Int32 key on one side of a
         // join and an Int64 key on the other would not co-locate.
         match column.data_type() {
-            DataType::Int8 => fold!(Int8Array, "Int8", NULL_SENTINEL_INT, |v: i8| (v as i64).to_le_bytes()),
-            DataType::Int16 => fold!(Int16Array, "Int16", NULL_SENTINEL_INT, |v: i16| (v as i64).to_le_bytes()),
-            DataType::Int32 => fold!(Int32Array, "Int32", NULL_SENTINEL_INT, |v: i32| (v as i64).to_le_bytes()),
-            DataType::Int64 => fold!(Int64Array, "Int64", NULL_SENTINEL_INT, |v: i64| v.to_le_bytes()),
-            DataType::UInt8 => fold!(UInt8Array, "UInt8", NULL_SENTINEL_INT, |v: u8| (v as i64).to_le_bytes()),
-            DataType::UInt16 => fold!(UInt16Array, "UInt16", NULL_SENTINEL_INT, |v: u16| (v as i64).to_le_bytes()),
-            DataType::UInt32 => fold!(U32, "UInt32", NULL_SENTINEL_INT, |v: u32| (v as i64).to_le_bytes()),
-            DataType::UInt64 => fold!(UInt64Array, "UInt64", NULL_SENTINEL_INT, |v: u64| v.to_le_bytes()),
+            DataType::Int8 => fold!(Int8Array, "Int8", NULL_SENTINEL_INT, |v: i8| (v as i64)
+                .to_le_bytes()),
+            DataType::Int16 => fold!(Int16Array, "Int16", NULL_SENTINEL_INT, |v: i16| (v as i64)
+                .to_le_bytes()),
+            DataType::Int32 => fold!(Int32Array, "Int32", NULL_SENTINEL_INT, |v: i32| (v as i64)
+                .to_le_bytes()),
+            DataType::Int64 => fold!(Int64Array, "Int64", NULL_SENTINEL_INT, |v: i64| v
+                .to_le_bytes()),
+            DataType::UInt8 => fold!(UInt8Array, "UInt8", NULL_SENTINEL_INT, |v: u8| (v as i64)
+                .to_le_bytes()),
+            DataType::UInt16 => fold!(UInt16Array, "UInt16", NULL_SENTINEL_INT, |v: u16| (v
+                as i64)
+                .to_le_bytes()),
+            DataType::UInt32 => fold!(U32, "UInt32", NULL_SENTINEL_INT, |v: u32| (v as i64)
+                .to_le_bytes()),
+            DataType::UInt64 => fold!(UInt64Array, "UInt64", NULL_SENTINEL_INT, |v: u64| v
+                .to_le_bytes()),
             // Dates are day/millisecond counts; hash them as the integers they
             // are. TPC-H shuffles on `o_orderdate` in several queries.
-            DataType::Date32 => fold!(Date32Array, "Date32", NULL_SENTINEL_INT, |v: i32| (v as i64).to_le_bytes()),
-            DataType::Date64 => fold!(Date64Array, "Date64", NULL_SENTINEL_INT, |v: i64| v.to_le_bytes()),
-            DataType::Boolean => fold!(BooleanArray, "Boolean", NULL_SENTINEL_INT, |v: bool| [u8::from(v)]),
+            DataType::Date32 => fold!(Date32Array, "Date32", NULL_SENTINEL_INT, |v: i32| (v
+                as i64)
+                .to_le_bytes()),
+            DataType::Date64 => fold!(Date64Array, "Date64", NULL_SENTINEL_INT, |v: i64| v
+                .to_le_bytes()),
+            DataType::Boolean => fold!(BooleanArray, "Boolean", NULL_SENTINEL_INT, |v: bool| [
+                u8::from(v)
+            ]),
             // The unscaled i128. Two decimals with the same value but different
             // scales hash differently, which is correct here: a shuffle key's
             // scale is fixed by the plan, so both sides of an exchange always
             // present the same one.
             DataType::Decimal128(_, _) => {
-                fold!(Decimal128Array, "Decimal128", NULL_SENTINEL_INT, |v: i128| v.to_le_bytes())
+                fold!(
+                    Decimal128Array,
+                    "Decimal128",
+                    NULL_SENTINEL_INT,
+                    |v: i128| v.to_le_bytes()
+                )
             }
-            DataType::Utf8 => fold!(StringArray, "Utf8", NULL_SENTINEL_STR, |v: &str| v.as_bytes().to_vec()),
-            DataType::Utf8View => fold!(StringViewArray, "Utf8View", NULL_SENTINEL_STR, |v: &str| v.as_bytes().to_vec()),
-            DataType::LargeUtf8 => fold!(LargeStringArray, "LargeUtf8", NULL_SENTINEL_STR, |v: &str| v.as_bytes().to_vec()),
+            DataType::Utf8 => fold!(StringArray, "Utf8", NULL_SENTINEL_STR, |v: &str| v
+                .as_bytes()
+                .to_vec()),
+            DataType::Utf8View => {
+                fold!(StringViewArray, "Utf8View", NULL_SENTINEL_STR, |v: &str| v
+                    .as_bytes()
+                    .to_vec())
+            }
+            DataType::LargeUtf8 => fold!(
+                LargeStringArray,
+                "LargeUtf8",
+                NULL_SENTINEL_STR,
+                |v: &str| v.as_bytes().to_vec()
+            ),
             // Everything else is skipped, not fatal.
             _ => Ok(None),
         }
@@ -688,8 +719,7 @@ mod tests {
             "a two-valued key cannot reach more than two buckets; got {leading_buckets}"
         );
 
-        let composite =
-            HashPartitioner::new_multi(vec!["status".into(), "id".into()], 8);
+        let composite = HashPartitioner::new_multi(vec!["status".into(), "id".into()], 8);
         let parts = composite.partition(&batch).unwrap();
         assert_eq!(parts.len(), 8);
         assert_eq!(
@@ -736,12 +766,9 @@ mod tests {
         )
         .unwrap();
 
-        let parts = HashPartitioner::new_multi(
-            vec!["c_custkey".into(), "c_acctbal".into()],
-            8,
-        )
-        .partition(&batch)
-        .expect("a Decimal key column must not fail the shuffle");
+        let parts = HashPartitioner::new_multi(vec!["c_custkey".into(), "c_acctbal".into()], 8)
+            .partition(&batch)
+            .expect("a Decimal key column must not fail the shuffle");
         assert_eq!(
             parts.iter().map(|b| b.num_rows()).sum::<usize>(),
             256,
@@ -766,11 +793,7 @@ mod tests {
     #[test]
     fn a_wholly_unhashable_key_is_an_error_not_a_single_bucket() {
         use arrow::array::Float64Array;
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "f",
-            DataType::Float64,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)]));
         let batch = RecordBatch::try_new(
             schema,
             vec![Arc::new(Float64Array::from_iter_values(

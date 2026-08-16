@@ -740,6 +740,14 @@ impl Coordinator {
             savepoint_label: None,
             iceberg_snapshot_id: source.iceberg_snapshot_id,
             kafka_offsets: source.kafka_offsets.clone(),
+            // Deliberately NOT carried across rescale, unlike the sibling
+            // fields below: a buffer ref is keyed by `(operator_id,
+            // channel_index)`, and rescaling changes the channel layout, so
+            // the source epoch's indices do not name the same channels under
+            // the new parallelism. Replaying in-flight buffers across a
+            // rescale requires re-partitioning them by key first — recorded as
+            // an open item, not guessed at here. Empty in practice today: no
+            // production path selects `AlignmentMode::Unaligned`.
             unaligned_buffer_refs: Vec::new(),
             // DUR-2: carry the prepared-sink transaction refs across rescale —
             // they belong to the epoch being redistributed.

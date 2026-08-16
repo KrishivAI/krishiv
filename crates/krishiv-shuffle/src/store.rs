@@ -198,13 +198,22 @@ impl ShuffleStore for ShuffleBackend {
         // would collect the partition first and quietly undo the point of the
         // call — the exact shape of bug this audit keeps finding.
         match self {
-            Self::Local(s) => s.write_partition_stream(id, schema, batches, lease_token).await,
+            Self::Local(s) => {
+                s.write_partition_stream(id, schema, batches, lease_token)
+                    .await
+            }
             Self::InMemory(s) => {
                 s.write_partition_stream(id, schema, batches, lease_token)
                     .await
             }
-            Self::Tiered(s) => s.write_partition_stream(id, schema, batches, lease_token).await,
-            Self::Object(s) => s.write_partition_stream(id, schema, batches, lease_token).await,
+            Self::Tiered(s) => {
+                s.write_partition_stream(id, schema, batches, lease_token)
+                    .await
+            }
+            Self::Object(s) => {
+                s.write_partition_stream(id, schema, batches, lease_token)
+                    .await
+            }
         }
     }
 

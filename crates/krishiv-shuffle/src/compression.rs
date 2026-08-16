@@ -324,7 +324,11 @@ mod wire_compression_tests {
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].num_rows(), batch.num_rows());
         assert_eq!(decoded[0].column(0), batch.column(0), "keys must survive");
-        assert_eq!(decoded[0].column(1), batch.column(1), "strings must survive");
+        assert_eq!(
+            decoded[0].column(1),
+            batch.column(1),
+            "strings must survive"
+        );
     }
 
     /// `none` must be a real escape hatch — on a fast fabric the CPU stops
