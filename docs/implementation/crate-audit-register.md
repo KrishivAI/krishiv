@@ -56,7 +56,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 18 | krishiv-python | 13,101 | 35 | 35 | COMPLETE — PY1–PY7 fixed (§18); direct clippy now 0 |
 | 19 | krishiv-operator | 4,878 | 19 | 19 | COMPLETE — OP1 scale-down leak + OP2 lease-release clobber fixed (§19) |
 | 20 | krishiv-mcp | 3,296 | **1** | 1 | COMPLETE — zero functional defects; one E-class doc fix (§20) |
-| 21 | krishiv | 8,257 | 24 | 0 | binary/CLI |
+| 21 | krishiv | 8,472 | 24 | 24 | COMPLETE — C1 --timeout no-op wired + 2 doc fixes (§21) |
 | 22 | krishiv-engines | 2,192 | **1** | 0 | one file |
 | 23 | krishiv-ui | 2,384 | 4 | 0 | |
 | 24 | krishiv-bench | 3,362 | 14 | 0 | |
@@ -3484,3 +3484,46 @@ LIMIT-wrap producing a parse error for embedded `;`; recorded, not a defect.
 The read-only default depends on `allow_write_sql=false` default (verified).
 
 Gates: cargo test -p krishiv-mcp (12 green), clippy 0, fmt — green.
+
+## 21. krishiv (CLI) — read end to end (2026-08-16)
+
+All 19 files read (6,445 LOC): cli.rs 1680, query_cli.rs, relation.rs,
+daemon_cmd.rs, local_cluster.rs, cluster_cmd.rs, stream_cmd.rs,
+doctor_cmd.rs, remote_client.rs, pipeline_cmd.rs, ivm_cmd.rs, table_cmd.rs,
+main.rs, lib.rs, capabilities.rs + 4 small. The tree's one real `unsafe`
+(process_util.rs pre_exec+setpgid) is sound: setpgid(0,0) is async-signal-
+safe and the closure captures nothing.
+
+Defects fixed:
+
+- **C1 (G)** query_cli.rs: `--timeout <SECS>` was parsed, documented in
+  `sql_help` ("Timeout in seconds for remote queries (default: 30)"), and
+  then dropped via `#[expect(dead_code, reason = "wired to session in
+  planned PR")]` — the register's "PR #XXX will plumb this through" marker.
+  A user setting a timeout got none, silently. Now applied via
+  `with_query_timeout` around each statement's planning+collection future in
+  both `run_sql` and `run_explain`, covering default/local/remote/api-key
+  paths uniformly; help text corrected. Tests
+  `zero_timeout_cancels_a_pending_future` and
+  `run_sql_honors_the_timeout_flag`; revert-proven (wiring reverted to
+  `with_query_timeout(None, …)` → red).
+- **C2 (E)** cluster_cmd.rs `executor_port_pair` doc claimed
+  `idx=0 → (50055, 50056)`; the code (and its own test) give 2005/2006.
+- **C3 (E)** relation.rs `key_by` doc claimed "Returns an error when called
+  on a batch relation"; it returns unchanged like its siblings.
+
+Notes (not defects): main.rs single-query declaration is tripwired by
+`every_pool_sharing_process_exits_through_the_daemon_dispatch` (the mcp
+trap); StreamHandle::completed() builds a throwaway Session with an
+`expect` — reachable only after a successful sink write, acceptable;
+relation.rs documents the R5.2 multi-source-watermark gap honestly;
+query_cli's S3-path-guard fix and NDJSON format carry excellent
+why-comments and revert-shaped tests already.
+
+The 5 tests/ files (r1 golden + contract, integration_batch_sql 15 tests,
+integration_streaming, streaming_architecture_test) were read/scanned too —
+all genuine behavior tests with real assertions (golden-file CLI contract,
+primary-key answer-equivalence, watermark alignment); no tautologies.
+
+Gates: cargo test -p krishiv (120 green across bin+lib+integration),
+clippy 0, `just lint`, `just test`, `cargo fmt` — green.

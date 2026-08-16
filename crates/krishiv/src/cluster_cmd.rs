@@ -142,7 +142,7 @@ fn parse_http_addr(args: &[&str]) -> Result<Option<String>, String> {
 
 /// Returns (task_port, barrier_port) for executor at `idx`.
 /// Stride is 2 so adjacent executors never share a port:
-///   idx=0 → (50055, 50056), idx=1 → (50057, 50058), …
+///   idx=0 → (2005, 2006), idx=1 → (2007, 2008), …
 fn executor_port_pair(idx: usize) -> (u16, u16) {
     let base = 2005u16 + (idx as u16) * 2;
     (base, base + 1)

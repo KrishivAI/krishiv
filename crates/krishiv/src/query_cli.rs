@@ -62,12 +62,9 @@ pub struct QueryCommand {
     pub parquet_tables: Vec<ParquetTableArg>,
     pub execution: QueryExecution,
     pub api_key: Option<String>,
-    /// Per-query session timeout, parsed from the CLI but not yet wired to
-    /// the session builder. PR #XXX will plumb this through.
-    #[expect(
-        dead_code,
-        reason = "parsed from --query-timeout; wired to session in planned PR"
-    )]
+    /// Per-query wall-clock timeout from `--timeout`. Applied around each
+    /// statement's planning+collection future in `run_sql`/`run_explain`, so
+    /// it covers every execution path (default/local/remote/api-key) alike.
     pub timeout_secs: Option<u64>,
     /// Remote coordinator (Flight) URL from the global `-c/--coordinator` flag.
     /// Takes precedence over `KRISHIV_COORDINATOR`; `None` ⇒ env fallback.
@@ -91,7 +88,7 @@ pub fn sql_help() -> String {
            --mode <embedded|single-node|distributed>  Execution mode (default: embedded)\n\
            --local                     Use Session::execute_local\n\
            --remote                    Use Session::execute_remote (requires coordinator)\n\
-           --timeout <SECS>            Timeout in seconds for remote queries (default: 30)\n\
+           --timeout <SECS>            Per-statement wall-clock timeout in seconds (default: none)\n\
            --api-key <KEY>             Policy-enforced sql_as (requires KRISHIV_API_KEYS)\n\
            --parquet <table=path>      Register a Parquet table (repeatable)\n\
            --primary-key <table=cols>  Declare a table's primary key, comma-separated\n\
@@ -182,9 +179,7 @@ pub fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
                     "table" => OutputFormat::Table,
                     "json" => OutputFormat::Json,
                     other => {
-                        return Err(format!(
-                            "--format must be 'table' or 'json', got '{other}'"
-                        ));
+                        return Err(format!("--format must be 'table' or 'json', got '{other}'"));
                     }
                 };
             }
@@ -333,7 +328,7 @@ pub fn run_sql(command: &QueryCommand) -> CliResponse {
     for (i, stmt) in statements.iter().enumerate() {
         let mut stmt_cmd = command.clone();
         stmt_cmd.query = stmt.clone();
-        match block_on(async {
+        match block_on(with_query_timeout(command.timeout_secs, async {
             let df = query_dataframe(&session, &stmt_cmd).await?;
             if i == last_idx {
                 let result = df.collect_async().await?;
@@ -346,7 +341,7 @@ pub fn run_sql(command: &QueryCommand) -> CliResponse {
                 let _ = df.collect_async().await?;
                 Ok(String::new())
             }
-        }) {
+        })) {
             Ok(output) => {
                 if i == last_idx {
                     last_output = output;
@@ -365,7 +360,7 @@ pub fn run_explain(command: &QueryCommand) -> CliResponse {
         Ok(session) => session,
         Err(message) => return CliResponse::err(format!("{message}\n"), 1),
     };
-    match block_on(async {
+    match block_on(with_query_timeout(command.timeout_secs, async {
         if command.analyze {
             let df = analyze_dataframe(&session, command).await?;
             df.explain_analyze_async().await
@@ -373,9 +368,28 @@ pub fn run_explain(command: &QueryCommand) -> CliResponse {
             let df = query_dataframe(&session, command).await?;
             df.explain_async().await
         }
-    }) {
+    })) {
         Ok(output) => CliResponse::ok(format!("{output}\n")),
         Err(error) => CliResponse::err(format!("{error}\n"), 1),
+    }
+}
+
+/// Wrap a query future in the `--timeout` deadline when one was given.
+///
+/// Regression (crate-21 audit, C1): `--timeout` was parsed, documented in
+/// `sql_help`, and then dropped (`#[expect(dead_code)]`) — a user setting it
+/// got no timeout at all. Applying it here covers every execution path.
+async fn with_query_timeout<T>(
+    timeout_secs: Option<u64>,
+    fut: impl Future<Output = Result<T, KrishivError>>,
+) -> Result<T, KrishivError> {
+    match timeout_secs {
+        None => fut.await,
+        Some(secs) => tokio::time::timeout(std::time::Duration::from_secs(secs), fut)
+            .await
+            .map_err(|_| KrishivError::Runtime {
+                message: format!("query timed out after {secs} s (--timeout)"),
+            })?,
     }
 }
 
@@ -572,5 +586,51 @@ mod object_store_path_tests {
             "the double slash must survive; the engine parses this as a URL"
         );
         assert!(is_object_store_uri(&arg.path));
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    /// The timeout mechanism itself: a pending future with a 0-second deadline
+    /// must fail with the timeout message; no deadline passes straight through.
+    #[tokio::test]
+    async fn zero_timeout_cancels_a_pending_future() {
+        let result: Result<(), KrishivError> =
+            with_query_timeout(Some(0), std::future::pending()).await;
+        match result {
+            Err(KrishivError::Runtime { message }) => {
+                assert!(message.contains("timed out"), "unexpected: {message}");
+            }
+            other => panic!("expected timeout error, got {other:?}"),
+        }
+        let ok = with_query_timeout(None, async { Ok::<_, KrishivError>(7) }).await;
+        assert_eq!(ok.ok(), Some(7));
+    }
+
+    /// Regression (crate-21 audit, C1): `--timeout` was parsed and dropped —
+    /// run_sql executed with no deadline no matter what the user passed. A
+    /// 0-second timeout on a non-trivial query must now fail the statement.
+    #[test]
+    fn run_sql_honors_the_timeout_flag() {
+        let command = QueryCommand {
+            query: "SELECT count(*) FROM (SELECT * FROM generate_series(1, 10000000))".into(),
+            format: OutputFormat::Table,
+            mode: ExecutionMode::Embedded,
+            parquet_tables: Vec::new(),
+            execution: QueryExecution::Default,
+            api_key: None,
+            timeout_secs: Some(0),
+            coordinator_url: None,
+            analyze: false,
+        };
+        let response = run_sql(&command);
+        assert_ne!(response.exit_code, 0, "0s timeout must fail the statement");
+        assert!(
+            response.stderr.contains("timed out"),
+            "stderr must name the timeout: {}",
+            response.stderr
+        );
     }
 }

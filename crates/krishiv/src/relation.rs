@@ -191,7 +191,7 @@ impl Relation {
 
     // ── Streaming builder methods ─────────────────────────────────────────────
 
-    /// Key the stream by `column`.  Returns an error when called on a batch relation.
+    /// Key the stream by `column`.  Returns unchanged when called on a batch relation.
     pub fn key_by(self, column: impl Into<String>) -> Self {
         match self.kind {
             RelationKind::Stream(mut chain) => {
