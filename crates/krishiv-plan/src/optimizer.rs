@@ -12,7 +12,6 @@ mod broadcast;
 mod broadcast_runtime;
 mod coalesce;
 mod constant_folding;
-mod dynamic_partition_pruning;
 mod join_reorder;
 mod predicate_pushdown;
 mod skew_join;
@@ -27,9 +26,6 @@ pub use broadcast::{BroadcastAutoRule, DEFAULT_BROADCAST_THRESHOLD_ROWS};
 pub use broadcast_runtime::{BroadcastRuntimeRule, DEFAULT_MAX_BROADCAST_BYTES};
 pub use coalesce::{CoalesceAdvice, CoalesceRule};
 pub use constant_folding::ConstantFoldingRule;
-pub use dynamic_partition_pruning::{
-    DPP_MAX_BUILD_ROWS, DPP_MAX_KEYS, DppAdvice, DynamicPartitionPruningRule,
-};
 pub use join_reorder::JoinReorderRule;
 pub use predicate_pushdown::PredicatePushdownRule;
 pub use skew_join::{DEFAULT_SALT_FACTOR, DEFAULT_SKEW_THRESHOLD, SkewAdvice, SkewJoinRule};

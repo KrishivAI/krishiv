@@ -1,5 +1,30 @@
 # Krishiv Implementation Status
 
+## 2026-08-16 — correction: P15 "Dynamic Partition Pruning" was never reachable; the rule is deleted
+
+The P15 row and its detail paragraph below stay as the historical record. What
+they describe was not true of any running query, and the audit found it while
+sweeping the last open items in `crate-audit-register.md` (§31).
+
+`DynamicPartitionPruningRule` was complete, tested against itself, and
+**registered in no pipeline** — zero callers repo-wide across `*.rs` and
+`*.rs.inc`. So the detail's claim that "the annotation flows through the
+executor's typed fragment envelope so the connector layer can prune file groups
+/ row groups / partitions" never happened: nothing produced the annotation. The
+"9 new tests" were real tests of an unreachable rule.
+
+Deleted 2026-08-16 on the maintainer's call (wire-or-delete), along with
+`DppAdvice`, `DPP_MAX_BUILD_ROWS`, `DPP_MAX_KEYS` and the `optimizer.rs`
+re-export. No behaviour changed, because none of it ran. DPP remains a
+legitimate optimisation to build; it is now honestly absent rather than
+dishonestly present.
+
+Note P14 (skew join) and P17 (unaligned checkpoints, deleted 2026-08-16) are the
+same shape — see the 2026-08-16 unaligned correction and the AUDIT comment above
+`default_aqe_optimizer_with_parallelism`, which records why the skew rule stays
+registered but must not be read as safe-because-registered.
+
+
 ## 2026-07-17 (later) — #217 root cause found in code: HTTP cancel never pushes CancelTask; prior "clean-path PASS" claim corrected
 
 Code-read of the cancel path (while the leg2a rebuild ran) overturned the

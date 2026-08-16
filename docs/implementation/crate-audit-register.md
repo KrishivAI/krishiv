@@ -3890,3 +3890,58 @@ executor comment that admitted the gap is replaced by one describing the fix.
 
 Gates: `cargo test -p krishiv-dataflow -p krishiv-executor`, `just lint`,
 `just test` (0 failures), `cargo fmt --all` — green.
+
+## §31 — the last four "needs a decision" items, resolved (2026-08-16)
+
+A sweep of every remaining `not fixed — needs a decision` entry in this
+register. **Three of the four were already closed by later sessions and the
+register never said so** — which is the register committing its own founding
+sin, a record that reads as current and is not. Each is re-verified against the
+code below, not against memory.
+
+**Already closed, entries were stale:**
+
+- **`EtcdLeaseElection::last_renewed_at` (§scheduler).** Recorded as
+  "three writes, zero reads — dead state shaped exactly like a liveness guard."
+  It now has a reader (`etcd_lease.rs:463`, returning the renewal age) and a
+  test, `is_leader_does_not_depend_on_renewal_age`, that pins the decision the
+  entry asked for: `is_leader` stays a plain flag, because safety comes from the
+  fencing token and self-demoting on a stale clock flaps the cluster. Decided
+  and tested, not open.
+- **`load_prefix` fails the whole load on one bad record (§scheduler).** Both
+  `load_prefix` and `load_json_prefix` now skip-and-log per record and funnel
+  through `admit_partial_prefix_load`, which logs the prefix, the decoded count
+  and the skipped count at `error!` — the asymmetry with `load_ivm_snapshots`
+  the entry flagged is gone.
+- **The MATCH_RECOGNIZE parser (§sql).** Both silent-wrong-answer cases are
+  gone. `extract_parenthesized_after` matches the *balanced* close paren (its
+  in-code comment names the exact old bug: `PATTERN ((A B) C)` yielded `(A B`,
+  "a different pattern that still parsed, so the query ran and matched the wrong
+  thing"), and keyword lookup goes through `find_keyword`, which requires
+  non-identifier bytes on both sides — so a `within_x` column can no longer be
+  read as `WITHIN`.
+
+**Decided and acted on now (user call, 2026-08-16):**
+
+- **Three dead krishiv-plan pub surfaces DELETED.** `DynamicPartitionPruningRule`
+  (the whole 424-line module, plus `DppAdvice` / `DPP_MAX_BUILD_ROWS` /
+  `DPP_MAX_KEYS` and the `optimizer.rs` re-export) — a complete `AqeRule` never
+  registered in any pipeline. `diff_plans` / `PlanDiff`, whose doc claimed
+  operators used it for adaptive-repartition diffs when only its own seven tests
+  called it. `PlanNode::with_exchange`, whose doc named `DataFrame::repartition()`
+  as the caller — that method does not call it. Zero callers repo-wide across
+  `*.rs` and `*.rs.inc`, so zero behaviour change; the workspace builds
+  all-targets clean with them gone. No test was added, because there is no
+  behaviour to pin: the deletions' proof is the build.
+- **`SkewJoinRule` / `BroadcastRuntimeRule` stay registered, guard debt stands
+  documented.** They are registered but cannot fire on any current path (both
+  production call sites are analysed in the AUDIT comment above
+  `default_aqe_optimizer_with_parallelism`), so there is no live bug. The block
+  already records the precondition for any future wiring — `SkewJoinRule` salts
+  ANY `JoinType`, outer/anti included, with no per-side guard, and
+  `BroadcastRuntimeRule` demotes a colocating Broadcast — and states plainly
+  that the registration must not be read as evidence the rewrites are safe. No
+  code change: the documentation the decision called for was already in place
+  and accurate.
+
+With §30 and this section, every item in this register is closed.

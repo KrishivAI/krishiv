@@ -409,23 +409,6 @@ impl PlanNode {
         self
     }
 
-    /// Attach an exchange (repartition) node to the plan.
-    ///
-    /// This is a convenience wrapper around `with_partitioning` that creates a
-    /// `Hash` partitioning on the given key columns with `num_partitions`
-    /// buckets.  Used by the `DataFrame::repartition()` API.
-    #[must_use]
-    pub fn with_exchange(
-        self,
-        key_columns: impl IntoIterator<Item = impl Into<String>>,
-        num_partitions: u32,
-    ) -> Self {
-        self.with_partitioning(Partitioning::Hash {
-            keys: key_columns.into_iter().map(Into::into).collect(),
-            buckets: num_partitions,
-        })
-    }
-
     /// Set the estimated output row count for this node.
     #[must_use]
     pub fn with_estimated_rows(mut self, estimated_rows: Option<u64>) -> Self {
@@ -754,78 +737,6 @@ fn describe_plan(plan_type: &str, name: &str, kind: ExecutionKind, nodes: &[Plan
     output
 }
 
-// ── Plan diffing ──────────────────────────────────────────────────────────────
-
-/// Summary of structural differences between two physical plans.
-///
-/// Used by operators to understand what changed between two versions of the same
-/// job's physical plan (e.g. after an adaptive repartitioning decision in R7/R9).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PlanDiff {
-    /// Node ids present in `after` but not in `before`.
-    pub added: Vec<String>,
-    /// Node ids present in `before` but not in `after`.
-    pub removed: Vec<String>,
-    /// Node ids present in both plans but with different labels or operators.
-    pub changed: Vec<String>,
-}
-
-impl PlanDiff {
-    /// Whether the two plans are structurally identical.
-    pub fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
-    }
-}
-
-/// Compute the structural diff between two physical plans.
-///
-/// Nodes are matched by id. A node is "changed" if any of its label, operator,
-/// inputs, partitioning, estimated row count, or output schema differs between
-/// `before` and `after`.
-#[must_use]
-pub fn diff_plans(before: &PhysicalPlan, after: &PhysicalPlan) -> PlanDiff {
-    use std::collections::HashMap;
-
-    let before_map: HashMap<&str, &PlanNode> = before.nodes().iter().map(|n| (n.id(), n)).collect();
-    let after_map: HashMap<&str, &PlanNode> = after.nodes().iter().map(|n| (n.id(), n)).collect();
-
-    let mut added = Vec::new();
-    let mut removed = Vec::new();
-    let mut changed = Vec::new();
-
-    for (id, after_node) in &after_map {
-        match before_map.get(id) {
-            None => added.push((*id).to_owned()),
-            Some(before_node) => {
-                let structurally_different = before_node.label() != after_node.label()
-                    || before_node.op() != after_node.op()
-                    || before_node.inputs() != after_node.inputs()
-                    || before_node.partitioning() != after_node.partitioning()
-                    || before_node.estimated_rows() != after_node.estimated_rows()
-                    || before_node.output_schema() != after_node.output_schema();
-                if structurally_different {
-                    changed.push((*id).to_owned());
-                }
-            }
-        }
-    }
-    for id in before_map.keys() {
-        if !after_map.contains_key(id) {
-            removed.push((*id).to_owned());
-        }
-    }
-
-    added.sort();
-    removed.sort();
-    changed.sort();
-
-    PlanDiff {
-        added,
-        removed,
-        changed,
-    }
-}
-
 #[cfg(test)]
 mod gap_tests;
 
@@ -1074,95 +985,6 @@ mod tests {
             "round-robin(buckets=2)"
         );
         assert_eq!(Partitioning::Broadcast.to_string(), "broadcast");
-    }
-
-    // ── PlanDiff ──────────────────────────────────────────────────────────
-
-    fn make_plan(nodes: &[(&str, &str)]) -> PhysicalPlan {
-        let mut plan = PhysicalPlan::new("test", ExecutionKind::Batch);
-        for (id, label) in nodes {
-            plan.add_node(PlanNode::new(*id, *label, ExecutionKind::Batch));
-        }
-        plan
-    }
-
-    #[test]
-    fn diff_plans_identical_is_empty() {
-        let p = make_plan(&[("scan", "Scan"), ("agg", "Aggregate")]);
-        let diff = super::diff_plans(&p, &p);
-        assert!(diff.is_empty());
-    }
-
-    #[test]
-    fn diff_plans_added_node() {
-        let before = make_plan(&[("scan", "Scan")]);
-        let after = make_plan(&[("scan", "Scan"), ("filter", "Filter")]);
-        let diff = super::diff_plans(&before, &after);
-        assert_eq!(diff.added, vec!["filter"]);
-        assert!(diff.removed.is_empty());
-        assert!(diff.changed.is_empty());
-    }
-
-    #[test]
-    fn diff_plans_removed_node() {
-        let before = make_plan(&[("scan", "Scan"), ("filter", "Filter")]);
-        let after = make_plan(&[("scan", "Scan")]);
-        let diff = super::diff_plans(&before, &after);
-        assert!(diff.added.is_empty());
-        assert_eq!(diff.removed, vec!["filter"]);
-        assert!(diff.changed.is_empty());
-    }
-
-    #[test]
-    fn diff_plans_changed_label() {
-        let before = make_plan(&[("n1", "OldLabel")]);
-        let after = make_plan(&[("n1", "NewLabel")]);
-        let diff = super::diff_plans(&before, &after);
-        assert!(diff.added.is_empty());
-        assert!(diff.removed.is_empty());
-        assert_eq!(diff.changed, vec!["n1"]);
-    }
-
-    #[test]
-    fn diff_plans_detects_changed_partitioning() {
-        let mut before = PhysicalPlan::new("test", ExecutionKind::Batch);
-        before.add_node(
-            PlanNode::new("n1", "label", ExecutionKind::Batch)
-                .with_partitioning(Partitioning::Unpartitioned),
-        );
-        let mut after = PhysicalPlan::new("test", ExecutionKind::Batch);
-        after.add_node(
-            PlanNode::new("n1", "label", ExecutionKind::Batch)
-                .with_partitioning(Partitioning::Broadcast),
-        );
-        let diff = super::diff_plans(&before, &after);
-        assert_eq!(diff.changed, vec!["n1"]);
-    }
-
-    #[test]
-    fn diff_plans_detects_changed_estimated_rows() {
-        let mut before = PhysicalPlan::new("test", ExecutionKind::Batch);
-        before.add_node(
-            PlanNode::new("n1", "label", ExecutionKind::Batch).with_estimated_rows(Some(100)),
-        );
-        let mut after = PhysicalPlan::new("test", ExecutionKind::Batch);
-        after.add_node(
-            PlanNode::new("n1", "label", ExecutionKind::Batch).with_estimated_rows(Some(200)),
-        );
-        let diff = super::diff_plans(&before, &after);
-        assert_eq!(diff.changed, vec!["n1"]);
-    }
-
-    #[test]
-    fn diff_plans_detects_changed_inputs() {
-        let mut before = PhysicalPlan::new("test", ExecutionKind::Batch);
-        before.add_node(PlanNode::new("src", "source", ExecutionKind::Batch));
-        before.add_node(PlanNode::new("n1", "label", ExecutionKind::Batch).with_inputs(["src"]));
-        let mut after = PhysicalPlan::new("test", ExecutionKind::Batch);
-        after.add_node(PlanNode::new("src", "source", ExecutionKind::Batch));
-        after.add_node(PlanNode::new("n1", "label", ExecutionKind::Batch)); // no inputs
-        let diff = super::diff_plans(&before, &after);
-        assert_eq!(diff.changed, vec!["n1"]);
     }
 
     #[test]
