@@ -380,16 +380,75 @@ impl K8sLeaseElection {
     }
 
     /// Release the lease via live K8s API calls.
+    ///
+    /// Only clears `holderIdentity` when we still hold the lease, with
+    /// optimistic concurrency via `resourceVersion`. The old code patched
+    /// unconditionally, so a pod releasing after its lease expired clobbered
+    /// the NEW holder's lease — that holder's next renew saw a holder
+    /// mismatch and dropped leadership, leaving the cluster leaderless until
+    /// the next acquire cycle.
     async fn k8s_release(&self, client: &kube::Client) {
         let api = self.lease_api(client);
+        let current = match api.get_opt(&self.lease_name).await {
+            Ok(Some(l)) => l,
+            Ok(None) => {
+                self.state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_leader = false;
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    lease = %self.lease_name,
+                    error = %e,
+                    "k8s_lease: GET failed during release (ignoring)"
+                );
+                self.state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_leader = false;
+                return;
+            }
+        };
+        let holder = current
+            .spec
+            .as_ref()
+            .and_then(|s| s.holder_identity.as_deref())
+            .unwrap_or("");
+        if !release_patch_allowed(holder, &self.holder_identity) {
+            tracing::info!(
+                lease = %self.lease_name,
+                current_holder = %holder,
+                "k8s_lease: lease already held by another identity; skipping release patch"
+            );
+            self.state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_leader = false;
+            return;
+        }
+        let resource_version = current
+            .metadata
+            .resource_version
+            .clone()
+            .filter(|v| !v.is_empty());
         // Use null (not "") so the API server treats the lease as unowned.
+        let metadata = match resource_version {
+            Some(rv) => serde_json::json!({
+                "name": self.lease_name,
+                "namespace": self.namespace,
+                "resourceVersion": rv,
+            }),
+            None => serde_json::json!({
+                "name": self.lease_name,
+                "namespace": self.namespace,
+            }),
+        };
         let patch_value = serde_json::json!({
             "apiVersion": "coordination.k8s.io/v1",
             "kind": "Lease",
-            "metadata": {
-                "name": self.lease_name,
-                "namespace": self.namespace,
-            },
+            "metadata": metadata,
             "spec": {
                 "holderIdentity": serde_json::Value::Null,
             }
@@ -410,6 +469,13 @@ impl K8sLeaseElection {
             .unwrap_or_else(|p| p.into_inner())
             .is_leader = false;
     }
+}
+
+/// Whether a voluntary release may clear `holderIdentity`: only when the
+/// lease's current holder is still us. Separated from the K8s I/O so the rule
+/// is unit-testable without a cluster (same pattern as the S7 checks).
+pub(crate) fn release_patch_allowed(current_holder: &str, our_identity: &str) -> bool {
+    current_holder == our_identity
 }
 
 #[async_trait::async_trait]
@@ -497,5 +563,20 @@ impl LeaderElection for K8sLeaseElection {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .fencing_token
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::release_patch_allowed;
+
+    /// Regression (crate-19 audit, OP2): a voluntary release must not clear
+    /// `holderIdentity` when another identity already holds the lease — the
+    /// old unconditional patch clobbered the new leader's lease.
+    #[test]
+    fn release_patch_only_allowed_for_current_holder() {
+        assert!(release_patch_allowed("pod-a", "pod-a"));
+        assert!(!release_patch_allowed("pod-b", "pod-a"));
+        assert!(!release_patch_allowed("", "pod-a"));
     }
 }

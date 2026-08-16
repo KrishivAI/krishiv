@@ -72,6 +72,11 @@ pub struct KubernetesClusterManager {
     max_workers: usize,
     /// Rolling index used to generate unique pod names.
     next_idx: std::sync::Mutex<usize>,
+    /// Names of pods whose Create has been enqueued and not yet released, in
+    /// creation order. `release_workers` pops from this LIFO — the old code
+    /// called `next_pod_name()` instead, minting a fresh never-created name,
+    /// so scale-down deleted nothing (404) while decrementing the counter.
+    enqueued: std::sync::Mutex<Vec<String>>,
     pool_name: String,
 }
 
@@ -94,6 +99,7 @@ impl KubernetesClusterManager {
             current,
             max_workers: config.max_workers,
             next_idx: std::sync::Mutex::new(0),
+            enqueued: std::sync::Mutex::new(Vec::new()),
             pool_name: config.pool_name,
         }
     }
@@ -123,11 +129,15 @@ impl ClusterManager for KubernetesClusterManager {
             if self
                 .tx
                 .try_send(AllocRequest::Create {
-                    pod_name,
+                    pod_name: pod_name.clone(),
                     executor_id,
                 })
                 .is_ok()
             {
+                self.enqueued
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(pod_name);
                 granted += 1;
             }
         }
@@ -135,11 +145,31 @@ impl ClusterManager for KubernetesClusterManager {
     }
 
     fn release_workers(&self, n: usize) {
-        let current = self.current.load(Ordering::Relaxed);
-        let releasable = n.min(current);
-        for _ in 0..releasable {
-            let (pod_name, _) = self.next_pod_name();
-            let _ = self.tx.try_send(AllocRequest::Delete { pod_name });
+        // Delete the most recently created pods by their real names. The old
+        // code generated a *fresh* name via `next_pod_name()` here, so the
+        // Delete targeted a pod that never existed (404) while the actor still
+        // decremented the worker counter — scale-down silently leaked pods.
+        for _ in 0..n {
+            let popped = self
+                .enqueued
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop();
+            let Some(pod_name) = popped else { break };
+            if self
+                .tx
+                .try_send(AllocRequest::Delete {
+                    pod_name: pod_name.clone(),
+                })
+                .is_err()
+            {
+                // Channel full — put the name back so a later release retries.
+                self.enqueued
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(pod_name);
+                break;
+            }
         }
     }
 
@@ -304,6 +334,7 @@ mod tests {
             current,
             max_workers: 5,
             next_idx: std::sync::Mutex::new(0),
+            enqueued: std::sync::Mutex::new(Vec::new()),
             pool_name: "test-pool".to_owned(),
         };
 
@@ -333,9 +364,44 @@ mod tests {
             current,
             max_workers: 10,
             next_idx: std::sync::Mutex::new(0),
+            enqueued: std::sync::Mutex::new(Vec::new()),
             pool_name: "noop-pool".to_owned(),
         };
         mgr.release_workers(5); // Should not panic.
         assert_eq!(mgr.current_workers(), 0);
+    }
+
+    /// Regression (crate-19 audit, OP1): `release_workers` must delete a pod
+    /// that was actually created. The old code called `next_pod_name()` in the
+    /// release path, minting a fresh never-created name — the Delete hit 404
+    /// while the real pods leaked and the worker counter drifted down.
+    #[tokio::test]
+    async fn release_workers_deletes_a_created_pod_name() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mgr = KubernetesClusterManager {
+            tx,
+            current: Arc::new(AtomicUsize::new(0)),
+            max_workers: 10,
+            next_idx: std::sync::Mutex::new(0),
+            enqueued: std::sync::Mutex::new(Vec::new()),
+            pool_name: "rel-pool".to_owned(),
+        };
+        assert_eq!(mgr.request_workers(2), 2);
+        let mut created = Vec::new();
+        for _ in 0..2 {
+            match rx.try_recv().expect("create request enqueued") {
+                AllocRequest::Create { pod_name, .. } => created.push(pod_name),
+                AllocRequest::Delete { .. } => panic!("unexpected delete"),
+            }
+        }
+        mgr.release_workers(1);
+        match rx.try_recv().expect("delete request enqueued") {
+            AllocRequest::Delete { pod_name } => assert!(
+                created.contains(&pod_name),
+                "release must target a created pod, got fresh name {pod_name:?} \
+                 (created: {created:?})"
+            ),
+            AllocRequest::Create { .. } => panic!("unexpected create"),
+        }
     }
 }

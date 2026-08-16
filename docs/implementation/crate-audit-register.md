@@ -54,7 +54,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 17 | krishiv-engine-core | 3,146 | 11 | COMPLETE | 0 functional defects; forbid(unsafe_code) added; see §17 |
 | **Tier 4 — thin, tooling, structural smells** |
 | 18 | krishiv-python | 13,101 | 35 | 35 | COMPLETE — PY1–PY7 fixed (§18); direct clippy now 0 |
-| 19 | krishiv-operator | 5,128 | 20 | 0 | |
+| 19 | krishiv-operator | 4,878 | 19 | 19 | COMPLETE — OP1 scale-down leak + OP2 lease-release clobber fixed (§19) |
 | 20 | krishiv-mcp | 3,296 | **1** | 0 | one 3,296-line file |
 | 21 | krishiv | 8,257 | 24 | 0 | binary/CLI |
 | 22 | krishiv-engines | 2,192 | **1** | 0 | one file |
@@ -3416,3 +3416,46 @@ gate for them.
 Gates: direct clippy 0 warnings, `cargo test -p krishiv-python --lib`
 (40 green, via the RUSTFLAGS -L workaround), `just lint`, `just test`,
 `cargo fmt` — green.
+
+## 19. krishiv-operator — read end to end (2026-08-16)
+
+All 19 files read (4,878 LOC incl. crd/): main.rs, controller.rs, lease.rs,
+pod_manager.rs, cluster_manager.rs, reconciler.rs, webhook.rs, crd/job.rs,
+tests.rs 882 + 10 smaller. Feature-gated k8s modules audited with
+`--features k8s` (default `just test` compiles them via the workspace).
+
+Defects fixed:
+
+- **OP1 (A)** cluster_manager.rs `release_workers` called `next_pod_name()` —
+  minting a fresh, never-created pod name (and burning the index) — then sent
+  Delete for it. Scale-down deleted nothing (the actor's 404 arm decremented
+  the worker counter anyway), so real pool pods leaked while
+  `current_workers()` drifted down. Fixed with an `enqueued` LIFO of actually
+  created pod names; release pops real names (channel-full pushes back). Test
+  `release_workers_deletes_a_created_pod_name`; revert-proven (old fresh-name
+  body restored → red).
+- **OP2 (D)** lease.rs `k8s_release` patched `holderIdentity: null`
+  unconditionally — no holder check, no resourceVersion. A pod releasing
+  after its lease expired clobbered the NEW leader's lease; that leader's
+  next renew saw a holder mismatch and self-demoted, leaving the cluster
+  leaderless until the next acquire tick. Now GETs the lease, skips the patch
+  when the holder is no longer us (`release_patch_allowed`, unit-tested), and
+  carries resourceVersion when present. The k8s I/O leg needs a live API
+  server; the decision rule is pinned by
+  `release_patch_only_allowed_for_current_holder` (same pattern as the S7
+  resourceVersion checks and PY3).
+
+Notes (not defects): controller.rs `event?` exits the watch loop on a watcher
+stream error — acceptable because Kubernetes restarts the operator pod, but
+worth revisiting if operator restarts show up in soak logs. request_workers
+reserves no capacity between the atomic read and the actor's increment, so a
+burst of concurrent callers can briefly overshoot max_workers — single-caller
+(scheduler tick) today. jcp_pod/webhook/pod_failure/pod_manager/reconciler/
+main are defensively written (S7 fencing, env allow-list, secret-ref-only
+tokens, owner refs gated on UID, DUR-1 Committing→Running). tests.rs is
+genuine behavior coverage incl. failover fencing-token rejection.
+
+Gates: cargo test -p krishiv-operator --features k8s (54 green incl. 2 new),
+Coverage: 49.4% regions crate-wide (live-k8s I/O paths uncovered by design;
+reconciler 82%, webhook 92%).
+clippy 0, `just lint`, `just test`, `cargo fmt` — green.
