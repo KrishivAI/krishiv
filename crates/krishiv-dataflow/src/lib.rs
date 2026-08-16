@@ -96,8 +96,8 @@ pub use continuous::ContinuousWindowExecutor;
 pub use group_state::{GroupState, GroupStateExecutor, GroupStateFn};
 pub use operator_config::{OperatorConfig, OperatorUid};
 pub use operator_runtime::{
-    AlignedJoinOutput, JoinStreamEvent, execute_bounded_window, execute_streaming_window,
-    execute_window_join, execute_window_join_aligned,
+    AlignedJoinOutput, JoinStreamEvent, execute_bounded_window, execute_bounded_window_seeded,
+    execute_streaming_window, execute_window_join, execute_window_join_aligned,
 };
 pub use process_fn::{
     ProcessContext, ProcessFunction, ProcessFunctionExecutor, TimerEntry, TimerKind,

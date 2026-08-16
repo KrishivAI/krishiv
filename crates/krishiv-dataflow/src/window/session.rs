@@ -101,6 +101,19 @@ impl SessionWindowOperator {
         }
     }
 
+    /// Seed the late-event threshold from an upstream stage's output watermark
+    /// (GAP-WATERMARK).
+    ///
+    /// Audit: `prev_watermark_ms` starts at `i64::MIN`, so a stage that is not
+    /// the first in its job accepted events the upstream stage had already
+    /// declared late — it reported "no late events" by construction and
+    /// `allowed_lateness` never engaged. Takes the `max` so a watermark
+    /// restored from a checkpoint is never walked backwards, and `i64::MIN`
+    /// (no hint) is a no-op.
+    pub fn seed_initial_watermark(&mut self, watermark_ms: i64) {
+        self.prev_watermark_ms = self.prev_watermark_ms.max(watermark_ms);
+    }
+
     /// Attach a shared memory budget.  Each new session entry reserves ~128 bytes;
     /// the reservation is released when the session closes.
     #[must_use]

@@ -50,6 +50,14 @@ macro_rules! state_backed_window_op {
                 self.inner.process_batch(batch, new_watermark_ms)
             }
 
+            /// Seed the late-event threshold from an upstream stage's output
+            /// watermark (GAP-WATERMARK). Applied after `new()` has restored
+            /// from state, and takes the `max`, so a restored watermark is
+            /// never walked backwards.
+            pub fn seed_initial_watermark(&mut self, watermark_ms: i64) {
+                self.inner.seed_initial_watermark(watermark_ms);
+            }
+
             pub fn $count_method(&self) -> usize {
                 self.inner.$count_method()
             }

@@ -168,6 +168,25 @@ pub fn execute_bounded_window(
     spec: &WindowExecutionSpec,
     state_dir: Option<&std::path::Path>,
 ) -> ExecResult<Vec<RecordBatch>> {
+    execute_bounded_window_seeded(input_batches, spec, state_dir, i64::MIN)
+}
+
+/// [`execute_bounded_window`], seeded with an upstream stage's output watermark
+/// (GAP-WATERMARK).
+///
+/// A stage that is not the first in its job receives the upstream watermark
+/// out-of-band as an `InputPartitionDescriptor::WatermarkHint`. Without it the
+/// stage's trackers start at `i64::MIN` and every upstream event scores as
+/// in-order however late it is, so lateness handling never engages past the
+/// first stage. `initial_watermark_ms` is a floor, not a replacement: the
+/// event-derived watermark still wins once it passes the hint, and `i64::MIN`
+/// reproduces the un-seeded behaviour exactly.
+pub fn execute_bounded_window_seeded(
+    input_batches: Vec<RecordBatch>,
+    spec: &WindowExecutionSpec,
+    state_dir: Option<&std::path::Path>,
+    initial_watermark_ms: i64,
+) -> ExecResult<Vec<RecordBatch>> {
     validate_window_execution_spec(spec)
         .map_err(|error| ExecError::InvalidWindowConfig(error.to_string()))?;
     if input_batches.is_empty() {
@@ -202,9 +221,11 @@ pub fn execute_bounded_window(
         None => vec![false; agg_exprs.len()],
     };
 
-    let mut single_watermark = WatermarkState::new(spec.watermark_lag_ms);
-    let mut multi_watermark =
-        MultiSourceWatermarkState::new().with_idle_source_policy(60_000, i64::MAX);
+    let mut single_watermark =
+        WatermarkState::new(spec.watermark_lag_ms).with_initial_watermark(initial_watermark_ms);
+    let mut multi_watermark = MultiSourceWatermarkState::new()
+        .with_idle_source_policy(60_000, i64::MAX)
+        .with_initial_watermark(initial_watermark_ms);
     let mut output = Vec::new();
 
     // Clone the shared spec fields once; only the arm matching `window_kind`
@@ -230,6 +251,7 @@ pub fn execute_bounded_window(
             let mut op =
                 StateBackedTumblingWindowOperator::new(tw_spec, state, "window-exec", "tumbling")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            op.seed_initial_watermark(initial_watermark_ms);
             for batch in &input_batches {
                 multi_watermark.apply_idle_source_policy();
                 let wm = advance_effective_watermark(
@@ -259,6 +281,7 @@ pub fn execute_bounded_window(
             let mut op =
                 StateBackedSlidingWindowOperator::new(sw_spec, state, "window-exec", "sliding")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            op.seed_initial_watermark(initial_watermark_ms);
             for batch in &input_batches {
                 multi_watermark.apply_idle_source_policy();
                 let wm = advance_effective_watermark(
@@ -287,6 +310,7 @@ pub fn execute_bounded_window(
             let mut op =
                 StateBackedSessionWindowOperator::new(sess_spec, state, "window-exec", "session")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            op.seed_initial_watermark(initial_watermark_ms);
             for batch in &input_batches {
                 multi_watermark.apply_idle_source_policy();
                 let wm = advance_effective_watermark(
@@ -838,6 +862,68 @@ mod tests {
         .unwrap();
         let out = execute_bounded_window(vec![batch], &spec, None).expect("execute");
         assert!(!out.is_empty());
+    }
+
+    /// GAP-WATERMARK: a stage that is not the first in its job must start from
+    /// the upstream stage's watermark, not from `i64::MIN`.
+    ///
+    /// Without the seed the downstream stage scores an event the upstream stage
+    /// had already declared late as perfectly in-order — it reports "no late
+    /// events" by construction. The two halves of this test run the *same*
+    /// batch through the *same* spec and differ only in the seed, so the
+    /// assertion cannot pass by accident.
+    #[test]
+    fn seeded_stage_treats_pre_watermark_events_as_late() {
+        use std::collections::HashMap;
+        let spec = WindowExecutionSpec {
+            key_column: "user_id".into(),
+            key_column_type: String::from("utf8"),
+            event_time_column: "ts".into(),
+            watermark_lag_ms: 0,
+            window_kind: WindowKind::Tumbling,
+            window_size_ms: 1_000,
+            slide_ms: None,
+            session_gap_ms: None,
+            agg_exprs: WindowExecutionSpec::default_count_agg(),
+            state_ttl_ms: None,
+            allowed_lateness_ms: None,
+            source_watermark_lags: HashMap::new(),
+            source_id_column: None,
+            window_timezone: None,
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        // ts=500 is far below the upstream watermark of 50_000; ts=60_000 is
+        // ahead of it and must survive in both runs.
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a"])) as _,
+                Arc::new(Int64Array::from(vec![500, 60_000])) as _,
+            ],
+        )
+        .unwrap();
+        let rows = |out: Vec<RecordBatch>| -> usize { out.iter().map(|b| b.num_rows()).sum() };
+
+        let unseeded = rows(
+            execute_bounded_window(vec![batch.clone()], &spec, None).expect("unseeded execute"),
+        );
+        assert_eq!(
+            unseeded, 2,
+            "a first stage has no upstream watermark, so both windows must emit"
+        );
+
+        let seeded = rows(
+            execute_bounded_window_seeded(vec![batch], &spec, None, 50_000)
+                .expect("seeded execute"),
+        );
+        assert_eq!(
+            seeded, 1,
+            "the event below the upstream stage's watermark must be dropped as \
+             late; emitting it is the stage reporting in-order data by construction"
+        );
     }
 
     #[test]

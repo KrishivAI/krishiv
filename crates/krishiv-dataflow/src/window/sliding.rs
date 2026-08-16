@@ -105,6 +105,19 @@ impl SlidingWindowOperator {
         })
     }
 
+    /// Seed the late-event threshold from an upstream stage's output watermark
+    /// (GAP-WATERMARK).
+    ///
+    /// Audit: `prev_watermark_ms` starts at `i64::MIN`, so a stage that is not
+    /// the first in its job accepted events the upstream stage had already
+    /// declared late — it reported "no late events" by construction and
+    /// `allowed_lateness` never engaged. Takes the `max` so a watermark
+    /// restored from a checkpoint is never walked backwards, and `i64::MIN`
+    /// (no hint) is a no-op.
+    pub fn seed_initial_watermark(&mut self, watermark_ms: i64) {
+        self.prev_watermark_ms = self.prev_watermark_ms.max(watermark_ms);
+    }
+
     /// Number of open (not yet flushed) window buckets.
     pub fn open_window_count(&self) -> usize {
         self.accumulators.len()

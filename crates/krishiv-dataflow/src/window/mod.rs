@@ -83,6 +83,17 @@ pub struct WatermarkState {
     /// max so the public API stays O(1).
     cached_watermark_ms: i64,
     lag_ms: u64,
+    /// Lower bound the watermark may never fall below, seeded from an upstream
+    /// stage's output watermark (GAP-WATERMARK).
+    ///
+    /// Audit: without this, every stage after the first started at `i64::MIN`,
+    /// so an event that the upstream stage had already declared late scored as
+    /// in-order here — the stage reported "no late events" by construction and
+    /// `allowed_lateness_ms` / late-firing never engaged past stage one. The
+    /// watermark is monotonic by contract, so a floor is the whole fix: it is
+    /// `max`ed with the event-derived watermark rather than replacing it, and
+    /// `i64::MIN` (the default) leaves single-stage behaviour untouched.
+    floor_ms: i64,
     /// Cumulative count of events dropped because their event time was strictly
     /// below the current watermark. Exposed for observability; callers should
     /// surface this in metrics so operators can detect misconfigured lag windows.
@@ -96,8 +107,19 @@ impl WatermarkState {
             max_event_time_ms: i64::MIN,
             cached_watermark_ms: i64::MIN,
             lag_ms,
+            floor_ms: i64::MIN,
             late_events_dropped: 0,
         }
+    }
+
+    /// Seed the watermark with an upstream stage's output watermark.
+    ///
+    /// See [`WatermarkState::floor_ms`]. Passing `i64::MIN` is a no-op, so
+    /// callers with no hint can pass it unconditionally.
+    pub fn with_initial_watermark(mut self, watermark_ms: i64) -> Self {
+        self.floor_ms = watermark_ms;
+        self.recompute_cached_watermark();
+        self
     }
 
     /// Record a single late-event drop. Callers MUST call this whenever they
@@ -129,13 +151,13 @@ impl WatermarkState {
     /// invariant is "cache reflects max and lag at all times") can keep the
     /// invariant when the lag changes at runtime.
     fn recompute_cached_watermark(&mut self) {
-        if self.max_event_time_ms == i64::MIN {
-            self.cached_watermark_ms = i64::MIN;
+        let from_events = if self.max_event_time_ms == i64::MIN {
+            i64::MIN
         } else {
             let watermark = i128::from(self.max_event_time_ms) - i128::from(self.lag_ms);
-            self.cached_watermark_ms =
-                watermark.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
-        }
+            watermark.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+        };
+        self.cached_watermark_ms = from_events.max(self.floor_ms);
     }
 
     /// Whether `event_time_ms` is strictly less than the current watermark
@@ -164,6 +186,10 @@ pub struct MultiSourceWatermarkState {
     /// Effective watermark at the time of the last advance, used to detect
     /// whether the watermark actually moved on the next `update()` call.
     prev_effective_watermark_ms: i64,
+    /// Lower bound on the effective watermark, seeded from an upstream stage's
+    /// output watermark. Same GAP-WATERMARK rationale as
+    /// [`WatermarkState::floor_ms`]; `i64::MIN` is the inert default.
+    floor_ms: i64,
 }
 
 impl Default for MultiSourceWatermarkState {
@@ -182,7 +208,17 @@ impl MultiSourceWatermarkState {
             idle_watermark_ms: i64::MAX,
             last_advance_instant: None,
             prev_effective_watermark_ms: i64::MIN,
+            floor_ms: i64::MIN,
         }
+    }
+
+    /// Seed the effective watermark with an upstream stage's output watermark.
+    ///
+    /// Passing `i64::MIN` is a no-op, so callers with no hint can pass it
+    /// unconditionally.
+    pub fn with_initial_watermark(mut self, watermark_ms: i64) -> Self {
+        self.floor_ms = watermark_ms;
+        self
     }
 
     /// Advance idle sources to `idle_watermark_ms` after `timeout_ms` without updates (ADR-DIST-17).
@@ -275,13 +311,15 @@ impl MultiSourceWatermarkState {
     }
 
     /// Effective watermark across all registered sources.  Returns `i64::MIN`
-    /// if no source has reported a watermark yet.
+    /// if no source has reported a watermark yet and no initial watermark was
+    /// seeded.
     pub fn effective_watermark_ms(&self) -> i64 {
         self.source_watermarks
             .values()
             .copied()
             .min()
             .unwrap_or(i64::MIN)
+            .max(self.floor_ms)
     }
 
     /// Number of sources registered.
@@ -335,6 +373,59 @@ fn elapsed_ms() -> u64 {
 #[cfg(test)]
 mod watermark_tests {
     use super::*;
+
+    /// GAP-WATERMARK: a seeded watermark is a floor, not a starting value that
+    /// events overwrite.
+    ///
+    /// Both directions matter. An event *below* the seed must not walk the
+    /// watermark backwards — that is exactly how a downstream stage came to
+    /// treat already-late data as in-order. An event *above* it must still win,
+    /// or the stage would freeze at the upstream watermark forever.
+    #[test]
+    fn seeded_watermark_is_a_floor_in_both_directions() {
+        let mut w = WatermarkState::new(0).with_initial_watermark(500);
+        assert_eq!(
+            w.current_watermark_ms(),
+            500,
+            "the seed applies immediately"
+        );
+        w.advance(200);
+        assert_eq!(
+            w.current_watermark_ms(),
+            500,
+            "an event below the seed must not walk the watermark backwards"
+        );
+        assert!(w.is_late(200), "that event is late relative to the seed");
+        w.advance(9_000);
+        assert_eq!(
+            w.current_watermark_ms(),
+            9_000,
+            "an event past the seed must still advance the watermark"
+        );
+    }
+
+    /// The multi-source tracker carries the same floor. Without it a
+    /// downstream stage whose sources have not yet reported reads `i64::MIN`
+    /// as its effective watermark and closes nothing.
+    #[test]
+    fn seeded_multi_source_watermark_is_a_floor() {
+        let mut m = MultiSourceWatermarkState::new().with_initial_watermark(500);
+        m.register_source("a");
+        assert_eq!(
+            m.effective_watermark_ms(),
+            500,
+            "a registered-but-silent source must not drag the effective \
+             watermark below the upstream stage's"
+        );
+        m.update("a", 200);
+        assert_eq!(m.effective_watermark_ms(), 500, "still floored");
+        m.update("a", 9_000);
+        assert_eq!(
+            m.effective_watermark_ms(),
+            9_000,
+            "a source past the seed still moves the effective watermark"
+        );
+    }
 
     #[test]
     fn watermark_state_returns_min_before_any_event() {

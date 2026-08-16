@@ -614,6 +614,9 @@ Three defects fixed, two recorded with reasons (below).
 
 ### Found, NOT fixed — needs a decision first
 
+- [x] **GAP-WATERMARK — CLOSED 2026-08-16 (§30 below).** Left here verbatim as
+      the original finding; the close-out records what the scoping got wrong.
+
 - [ ] **GAP-WATERMARK is open, and three places say it is closed.** The
       coordinator injects a `WatermarkHint` input partition for downstream
       stages; `fragment/streaming.rs` decodes it, logs it, and **discards it**.
@@ -3819,3 +3822,71 @@ dated correction appended, and the design note is marked superseded.
 
 Gates: workspace build (all targets, python/chaos built separately),
 `just lint`, `just test`, `cargo fmt` — green.
+
+
+## §30 — GAP-WATERMARK closed: downstream stages no longer start at `i64::MIN` (2026-08-16)
+
+The last A-class open item in the register (§executor, "found, NOT fixed —
+needs a decision first"). The coordinator injected a `WatermarkHint` input
+partition carrying the upstream stage's output watermark; `fragment/streaming.rs`
+decoded it, logged it, and discarded it. Every stage after the first therefore
+started at `i64::MIN` and scored an event the upstream stage had *already*
+declared late as perfectly in-order — the stage reported "no late events" by
+construction, and `allowed_lateness_ms` / late-firing never engaged past stage
+one.
+
+**The original scoping was wrong in one way that made it cheaper, and wrong in
+one way that made the first attempt fail.**
+
+Cheaper: it called for a `prev_watermark_ms` field on `WindowExecutionSpec` and
+therefore a krishiv-plan change plus 80 struct-literal sites. But the hint is
+*per-assignment*, not part of the plan — the same compiled spec runs on every
+stage, so putting it in the spec would have been wrong as well as expensive. It
+is threaded as a parameter instead: `execute_bounded_window_seeded(batches,
+spec, state_dir, initial_watermark_ms)`, with the existing
+`execute_bounded_window` delegating with `i64::MIN`. No serialized format
+changed and no existing caller moved.
+
+Harder: seeding the `WatermarkState` / `MultiSourceWatermarkState` trackers is
+*not sufficient*, and the first version of the fix was green-by-accident until
+the test said otherwise. The late threshold an operator actually enforces is
+its own `prev_watermark_ms` field (`tumbling.rs:233`, and the same shape in
+`sliding.rs` / `session.rs`), not the tracker's — the tracker only supplies the
+`new_watermark_ms` argument. Both halves are needed and both are now seeded:
+
+- `WatermarkState::with_initial_watermark` / `MultiSourceWatermarkState::
+  with_initial_watermark` install a **floor**, `max`ed with the event-derived
+  watermark rather than replacing it, so an event past the hint still advances
+  and an event below it cannot walk the watermark backwards.
+- `{Tumbling,Sliding,Session}WindowOperator::seed_initial_watermark` (exposed
+  through the `state_backed_window_op!` wrapper) raises `prev_watermark_ms`.
+  Applied *after* `new()` has restored from state and taking the `max`, so a
+  watermark restored from a checkpoint is never walked backwards.
+
+Count windows are untouched: they are not event-time based and have no
+watermark.
+
+`i64::MIN` — no hint, a first stage, every embedded/single-stage path — is a
+no-op by construction, so nothing outside multi-stage streaming changes
+behaviour. `execute_streaming_window` is deliberately *not* seeded: its only
+callers are local/embedded single-stage paths where there is no upstream stage.
+
+**Tests, all three revert-proven behaviourally (not by a compile break):**
+
+- `seeded_stage_treats_pre_watermark_events_as_late` (operator_runtime) runs the
+  *same* batch through the *same* spec twice, differing only in the seed:
+  unseeded emits both windows, seeded drops the pre-watermark event. Red at
+  `left: 2, right: 1` with `TumblingWindowOperator::seed_initial_watermark`
+  reverted to a no-op — this is also what caught the trackers-only version of
+  the fix.
+- `seeded_watermark_is_a_floor_in_both_directions` and
+  `seeded_multi_source_watermark_is_a_floor` pin both directions of the floor.
+  Both red at `left: -9223372036854775808, right: 500` with the `.max(floor_ms)`
+  reverted.
+
+`WatermarkHint`'s doc in `krishiv-proto/src/task.rs` — one of the three places
+that claimed this was done — is now accurate as written and needed no edit; the
+executor comment that admitted the gap is replaced by one describing the fix.
+
+Gates: `cargo test -p krishiv-dataflow -p krishiv-executor`, `just lint`,
+`just test` (0 failures), `cargo fmt --all` — green.

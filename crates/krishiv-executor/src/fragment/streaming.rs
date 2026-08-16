@@ -12,7 +12,7 @@ use crate::fragment::common::{
 };
 use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner};
 use crate::{ExecutorError, ExecutorResult};
-use krishiv_dataflow::execute_bounded_window;
+use krishiv_dataflow::execute_bounded_window_seeded;
 use krishiv_plan::window::{WindowAggKind, WindowExecutionSpec, decode_window_execution_spec};
 use krishiv_proto::ExecutorTaskAssignment;
 
@@ -1192,29 +1192,25 @@ pub(crate) async fn execute_streaming_fragment(
             message: e.to_string(),
         })?;
 
-    // GAP-WATERMARK is NOT closed: the hint is decoded and logged, never applied.
+    // GAP-WATERMARK, closed: the upstream stage's output watermark seeds this
+    // stage's watermark trackers instead of being decoded and discarded.
     //
-    // The intent — carried in this comment, and in `WatermarkHint`'s own doc at
-    // `krishiv-proto/src/task.rs` — is to seed this stage's window operators
-    // with the upstream stage's output watermark, so stage 2 does not start from
-    // `i64::MIN` and score every stage-1 event as in-order (a false "no late
-    // events" report). Nothing does that. `WindowExecutionSpec` has no
-    // `prev_watermark_ms` field to carry it; the value lives inside
-    // krishiv-dataflow's operators, initialised to `i64::MIN` (`window/session.rs`),
-    // with no path in from the spec.
-    //
-    // Closing it means adding the field in krishiv-plan, threading it through
-    // `execute_bounded_window` into each window operator, and re-baselining
-    // late-event counts — a three-crate change that alters lateness semantics,
-    // not a line here. Logged rather than silently dropped so the gap is at
-    // least visible in a trace; do not read this block as the fix.
-    if let Some(upstream_wm) =
+    // Before this, every stage after the first started at `i64::MIN`, so an
+    // event the upstream stage had already declared late scored as in-order
+    // here — the stage reported "no late events" by construction and
+    // `allowed_lateness_ms` / late-firing never engaged past stage one. The hint
+    // is a *floor*: the event-derived watermark still wins once it passes the
+    // hint, and `i64::MIN` (no hint) reproduces the old behaviour exactly. It
+    // is threaded as a parameter rather than a `WindowExecutionSpec` field
+    // because it is per-assignment, not part of the plan — the same compiled
+    // spec runs on every stage.
+    let initial_watermark_ms =
         crate::fragment::common::read_watermark_hint(assignment.input_partitions())
-    {
+            .unwrap_or(i64::MIN);
+    if initial_watermark_ms != i64::MIN {
         tracing::debug!(
-            upstream_watermark_ms = upstream_wm,
-            "upstream watermark hint received but NOT applied (GAP-WATERMARK open); \
-             this stage's operators still start from i64::MIN"
+            upstream_watermark_ms = initial_watermark_ms,
+            "seeding this stage's window watermark from the upstream stage"
         );
     }
 
@@ -1231,6 +1227,7 @@ pub(crate) async fn execute_streaming_fragment(
             assignment.stage_id(),
             inmem_batches,
             plan_spec,
+            initial_watermark_ms,
         ))
         .await;
     }
@@ -1264,8 +1261,13 @@ pub(crate) async fn execute_streaming_fragment(
 
     let job_state_dir = runner.state_dir.as_ref().map(|d| d.join(job_id));
 
-    let collected_batches = execute_bounded_window(batches, &plan_spec, job_state_dir.as_deref())
-        .map_err(|e| ExecutorError::LocalExecution {
+    let collected_batches = execute_bounded_window_seeded(
+        batches,
+        &plan_spec,
+        job_state_dir.as_deref(),
+        initial_watermark_ms,
+    )
+    .map_err(|e| ExecutorError::LocalExecution {
         message: e.to_string(),
     })?;
 
@@ -1330,6 +1332,7 @@ async fn execute_streaming_with_batches(
     stage_id: &krishiv_proto::StageId,
     batches: Vec<arrow::record_batch::RecordBatch>,
     spec: WindowExecutionSpec,
+    initial_watermark_ms: i64,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     let observed_watermark_ms = compute_input_watermark(&batches, &spec);
 
@@ -1338,12 +1341,15 @@ async fn execute_streaming_with_batches(
     let advisory_buckets = advise_streaming_buckets(runner, job_id.as_str(), &batches);
 
     let job_state_dir = runner.state_dir.as_ref().map(|d| d.join(job_id.as_str()));
-    let collected =
-        execute_bounded_window(batches, &spec, job_state_dir.as_deref()).map_err(|e| {
-            ExecutorError::LocalExecution {
-                message: e.to_string(),
-            }
-        })?;
+    let collected = execute_bounded_window_seeded(
+        batches,
+        &spec,
+        job_state_dir.as_deref(),
+        initial_watermark_ms,
+    )
+    .map_err(|e| ExecutorError::LocalExecution {
+        message: e.to_string(),
+    })?;
     let total_rows: usize = collected.iter().map(|b| b.num_rows()).sum();
     let total_batches = collected.len();
     let column_count = collected.first().map(|b| b.num_columns()).unwrap_or(0);
