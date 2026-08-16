@@ -22,37 +22,71 @@ pub(crate) fn ui_auth_token(state: &UiState) -> Option<String> {
 }
 
 pub(crate) fn resolve_ui_token() -> Option<String> {
-    if let Ok(value) = std::env::var("KRISHIV_UI_TOKEN") {
+    let file_contents = std::env::var("KRISHIV_UI_TOKEN_FILE")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| {
+            let read = std::fs::read_to_string(&path);
+            if let Err(e) = &read {
+                tracing::warn!(path = %path, error = %e, "krishiv-ui: token file could not be read");
+            }
+            read.map_err(|e| e.to_string())
+        });
+    resolve_ui_token_from(
+        std::env::var("KRISHIV_UI_TOKEN").ok(),
+        file_contents,
+        krishiv_common::profile_requires_authenticated_ui(
+            krishiv_common::resolve_durability_profile(),
+        ),
+    )
+}
+
+/// Resolve the UI bearer token from already-read inputs.
+///
+/// `token_file` is `None` when `KRISHIV_UI_TOKEN_FILE` is unset **or set to an
+/// empty/blank path**, `Some(Ok(contents))` when the file was read, and
+/// `Some(Err(_))` when it could not be.
+///
+/// `Some("")` means **deny everything** (`require_bearer` rejects an empty
+/// expected token); `None` means run the router anonymously.
+///
+/// Crate-23 audit (U1): the previous implementation early-returned `None` when
+/// `KRISHIV_UI_TOKEN_FILE` was set to an empty string, jumping over the
+/// production fail-closed check below. A deployment that renders that variable
+/// empty (an unset Helm value, `FOO=${MISSING}`) therefore served every
+/// `/api/v1/*` and `/ui/*` route anonymously in production. The empty path is
+/// now treated as "no file configured", which falls through to the guard.
+///
+/// Split from the environment reads so the matrix is testable: mutating process
+/// environment is unsound under a multi-threaded test runner and `set_var` is
+/// unsafe since edition 2024, which this workspace denies.
+pub(crate) fn resolve_ui_token_from(
+    inline: Option<String>,
+    token_file: Option<Result<String, String>>,
+    production_requires_auth: bool,
+) -> Option<String> {
+    if let Some(value) = inline {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
             return Some(trimmed.to_owned());
         }
     }
-    if let Ok(path) = std::env::var("KRISHIV_UI_TOKEN_FILE") {
-        if path.is_empty() {
-            return None;
-        }
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => {
-                let trimmed = contents.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_owned());
-                }
-            }
-            Err(e) => {
-                if krishiv_common::profile_requires_authenticated_ui(
-                    krishiv_common::resolve_durability_profile(),
-                ) {
-                    tracing::error!(path = %path, error = %e, "krishiv-ui: token file could not be read; denying all protected routes (production fail-closed)");
-                    return Some(String::new());
-                }
-                tracing::warn!(path = %path, error = %e, "krishiv-ui: token file could not be read; falling back to anonymous router");
+    match token_file {
+        Some(Ok(contents)) => {
+            let trimmed = contents.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_owned());
             }
         }
+        Some(Err(_)) if production_requires_auth => {
+            tracing::error!(
+                "krishiv-ui: token file could not be read; denying all protected routes (production fail-closed)"
+            );
+            return Some(String::new());
+        }
+        Some(Err(_)) | None => {}
     }
-    if krishiv_common::profile_requires_authenticated_ui(
-        krishiv_common::resolve_durability_profile(),
-    ) {
+    if production_requires_auth {
         tracing::warn!(
             "krishiv-ui: no UI token configured; denying all protected routes (production fail-closed)"
         );
@@ -294,4 +328,55 @@ pub fn demo_state() -> UiResult<UiState> {
     coordinator.launch_assigned_tasks(&job_id)?;
 
     Ok(UiState::new(coordinator))
+}
+
+#[cfg(test)]
+mod token_resolution_tests {
+    use super::resolve_ui_token_from;
+
+    /// Regression (crate-23 audit, U1): an **empty** `KRISHIV_UI_TOKEN_FILE`
+    /// used to early-return `None`, skipping the production fail-closed check
+    /// and serving every protected route anonymously. An empty/blank path must
+    /// mean "no file configured" and still deny in production.
+    #[test]
+    fn empty_token_file_path_still_fails_closed_in_production() {
+        // Empty path is normalised to `None` by the caller.
+        assert_eq!(
+            resolve_ui_token_from(None, None, true),
+            Some(String::new()),
+            "production with no token configured must deny (empty expected token)"
+        );
+        // Dev profile stays anonymous.
+        assert_eq!(resolve_ui_token_from(None, None, false), None);
+    }
+
+    #[test]
+    fn inline_token_wins_and_is_trimmed() {
+        assert_eq!(
+            resolve_ui_token_from(Some("  s3cret \n".into()), None, true),
+            Some("s3cret".to_string())
+        );
+        // A blank inline token is not a token; production still denies.
+        assert_eq!(
+            resolve_ui_token_from(Some("   ".into()), None, true),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn token_file_contents_are_used_and_unreadable_file_denies_in_production() {
+        assert_eq!(
+            resolve_ui_token_from(None, Some(Ok("from-file\n".into())), false),
+            Some("from-file".to_string())
+        );
+        // Unreadable file: deny in production, anonymous in dev.
+        assert_eq!(
+            resolve_ui_token_from(None, Some(Err("ENOENT".into())), true),
+            Some(String::new())
+        );
+        assert_eq!(
+            resolve_ui_token_from(None, Some(Err("ENOENT".into())), false),
+            None
+        );
+    }
 }

@@ -669,11 +669,12 @@ fn extract_columns_and_rows(
 
 fn scalar_array_to_json(array: &dyn arrow::array::Array, idx: usize) -> serde_json::Value {
     use arrow::array::{
-        BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-        LargeStringArray, StringArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-        UInt64Array,
+        BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array, Int16Array,
+        Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, TimeUnit};
     match array.data_type() {
         DataType::Int8 => array
             .as_any()
@@ -750,12 +751,55 @@ fn scalar_array_to_json(array: &dyn arrow::array::Array, idx: usize) -> serde_js
             .downcast_ref::<LargeStringArray>()
             .map(|a| serde_json::Value::String(a.value(idx).to_string()))
             .unwrap_or(serde_json::Value::Null),
-        DataType::Timestamp(_, _) => array
+        DataType::Utf8View => array
             .as_any()
-            .downcast_ref::<TimestampSecondArray>()
+            .downcast_ref::<StringViewArray>()
+            .map(|a| serde_json::Value::String(a.value(idx).to_string()))
+            .unwrap_or(serde_json::Value::Null),
+        // Crate-23 audit (U2): this arm used to downcast EVERY timestamp to
+        // `TimestampSecondArray` regardless of unit. DataFusion's timestamps are
+        // normally microseconds or nanoseconds, so the downcast failed and the
+        // `unwrap_or(Null)` rendered every timestamp cell as `null` in the SQL
+        // editor — a silent wrong answer for the common case, not an edge case.
+        DataType::Timestamp(unit, _) => {
+            let raw = match unit {
+                TimeUnit::Second => array
+                    .as_any()
+                    .downcast_ref::<TimestampSecondArray>()
+                    .map(|a| a.value(idx)),
+                TimeUnit::Millisecond => array
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .map(|a| a.value(idx)),
+                TimeUnit::Microsecond => array
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .map(|a| a.value(idx)),
+                TimeUnit::Nanosecond => array
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .map(|a| a.value(idx)),
+            };
+            raw.map(|v| serde_json::Value::Number(v.into()))
+                .unwrap_or(serde_json::Value::Null)
+        }
+        // Dates fell through to the catch-all below, which renders the *type
+        // name* ("Date32") in place of the value.
+        DataType::Date32 => array
+            .as_any()
+            .downcast_ref::<Date32Array>()
             .map(|a| serde_json::Value::Number(a.value(idx).into()))
             .unwrap_or(serde_json::Value::Null),
-        _ => serde_json::Value::String(format!("{:?}", array.data_type())),
+        DataType::Date64 => array
+            .as_any()
+            .downcast_ref::<Date64Array>()
+            .map(|a| serde_json::Value::Number(a.value(idx).into()))
+            .unwrap_or(serde_json::Value::Null),
+        // Anything still unhandled renders through Arrow's own display so the
+        // cell shows the VALUE, not the column's type name.
+        other => arrow::util::display::array_value_to_string(array, idx)
+            .map(serde_json::Value::String)
+            .unwrap_or_else(|_| serde_json::Value::String(format!("<unrenderable {other:?}>"))),
     }
 }
 
@@ -922,4 +966,45 @@ pub(crate) fn demo_job(job_id: JobId) -> UiResult<JobSpec> {
     ));
 
     Ok(JobSpec::new(job_id, "demo-status-job", JobKind::Batch).with_stage(stage))
+}
+
+#[cfg(test)]
+mod scalar_json_tests {
+    use super::scalar_array_to_json;
+    use arrow::array::{
+        Date32Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
+    };
+
+    /// Regression (crate-23 audit, U2): every `Timestamp(_, _)` was downcast to
+    /// `TimestampSecondArray`, so micro/nano/milli timestamps — DataFusion's
+    /// normal units — failed the downcast and rendered as `null` in the SQL
+    /// editor. Each unit must round-trip its raw value.
+    #[test]
+    fn every_timestamp_unit_renders_its_value_not_null() {
+        let s = TimestampSecondArray::from(vec![7_i64]);
+        assert_eq!(scalar_array_to_json(&s, 0), serde_json::json!(7));
+
+        let ms = TimestampMillisecondArray::from(vec![7_000_i64]);
+        assert_eq!(scalar_array_to_json(&ms, 0), serde_json::json!(7_000));
+
+        let us = TimestampMicrosecondArray::from(vec![7_000_000_i64]);
+        assert_eq!(scalar_array_to_json(&us, 0), serde_json::json!(7_000_000));
+
+        let ns = TimestampNanosecondArray::from(vec![7_000_000_000_i64]);
+        assert_eq!(
+            scalar_array_to_json(&ns, 0),
+            serde_json::json!(7_000_000_000_i64)
+        );
+    }
+
+    /// Dates used to fall through to the catch-all, which rendered the *type
+    /// name* ("Date32") in the cell instead of the value.
+    #[test]
+    fn dates_render_their_value_not_the_type_name() {
+        let d = Date32Array::from(vec![19_000_i32]);
+        let rendered = scalar_array_to_json(&d, 0);
+        assert_ne!(rendered, serde_json::json!("Date32"));
+        assert_eq!(rendered, serde_json::json!(19_000));
+    }
 }

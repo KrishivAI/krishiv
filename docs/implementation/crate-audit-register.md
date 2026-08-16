@@ -58,7 +58,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 20 | krishiv-mcp | 3,296 | **1** | 1 | COMPLETE — zero functional defects; one E-class doc fix (§20) |
 | 21 | krishiv | 8,472 | 24 | 24 | COMPLETE — C1 --timeout no-op wired + 2 doc fixes (§21) |
 | 22 | krishiv-engines | 2,184 | **1** | 1 | COMPLETE — E1 cannot-fail test rewritten + E2/E3 (§22) |
-| 23 | krishiv-ui | 2,384 | 4 | 0 | |
+| 23 | krishiv-ui | 2,384 | 4 | 4 | COMPLETE — U1 fail-open UI auth + U2 null timestamps (§23) |
 | 24 | krishiv-bench | 3,362 | 14 | 0 | |
 | 25 | krishiv-sql-gateway | 541 | 3 | 0 | |
 | 26 | krishiv-conformance | 353 | 3 | 0 | no tests at all |
@@ -3571,3 +3571,47 @@ whether non-rewindable sources are in scope for the incremental engine.
 
 Gates: cargo test -p krishiv-engines (19 green), clippy 0 (both crates),
 `just lint`, `just test`, `cargo fmt` — green.
+
+## 23. krishiv-ui — read end to end (2026-08-16)
+
+All 4 files read (2,384 LOC): lib.rs 640 (state + 27 route tests), handlers.rs
+925, views.rs 522, router.rs 297. Static assets (`style.css`,
+`krishiv-auth.js`, `krishiv-live.js`, `krishiv-sql.js`, `openapi.json`) are
+served via `include_str!` and are vendored — the CDN-free property is tested.
+
+Defects fixed:
+
+- **U1 (A / security — fail-open)** `resolve_ui_token` early-returned `None`
+  when `KRISHIV_UI_TOKEN_FILE` was set to an **empty string**, jumping over
+  the production fail-closed check immediately below it. A deployment that
+  renders that variable empty — an unset Helm value, `FOO=${MISSING}` in a
+  manifest — therefore built the router with **no bearer middleware at all**,
+  serving every `/api/v1/*` and `/ui/*` route anonymously in production while
+  the operator believed auth was configured. The empty/blank path is now
+  normalised to "no file configured" so it falls through to the guard, and the
+  decision matrix moved into a pure `resolve_ui_token_from(inline, file,
+  production_requires_auth)` (the env reads cannot be flipped from a test —
+  `set_var` is unsafe under edition 2024, the same constraint as PY3/C1).
+  Three tests pin the matrix; revert-proven (restoring the early return turns
+  two of them red).
+- **U2 (A — silent wrong answer)** `scalar_array_to_json` downcast **every**
+  `Timestamp(_, _)` to `TimestampSecondArray`. DataFusion's timestamps are
+  normally microseconds or nanoseconds, so the downcast failed and the
+  `unwrap_or(Null)` rendered every timestamp cell in the UI SQL editor as
+  `null` — the common case silently wrong, not an edge case. This is the same
+  incomplete-Arrow-type-coverage family as §13 K2 (trace.rs) and §11 D1.
+  Now matches on `TimeUnit`; `Date32`/`Date64` (which fell to a catch-all that
+  printed the *type name* in place of the value) are handled; `Utf8View` is
+  handled; and the remaining catch-all renders through
+  `arrow::util::display::array_value_to_string` so an unhandled type shows its
+  VALUE rather than its type name. Test
+  `every_timestamp_unit_renders_its_value_not_null`; revert-proven.
+
+Notes (not defects): `require_bearer` is genuinely hardened — constant-time
+compare, `str::get` instead of indexing (a multi-byte UTF-8 cut point cannot
+panic the server), empty expected token denies everything; the CSP is
+`script-src 'self'` with the scripts vendored, and both are tested. The
+metrics handler's poisoned-lock recovery has a real poisoning test.
+
+Gates: cargo test -p krishiv-ui (29 green incl. 5 new), clippy 0,
+`just lint`, `just test`, `cargo fmt` — green. Coverage 54.2% regions.
