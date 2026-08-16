@@ -1017,6 +1017,7 @@ impl SessionBuilder {
             auth: self.auth,
             policy: self.policy,
             ivm_registry: Arc::new(krishiv_runtime::IvmJobRegistry::new()),
+            table_spill_dir: Arc::new(Mutex::new(None)),
         })
     }
 }
@@ -1055,6 +1056,35 @@ impl RegisteredParquet {
     pub(crate) fn to_registration(&self, table_name: &str) -> BatchTableRegistration {
         BatchTableRegistration::new(table_name.to_owned(), self.path.clone())
             .with_primary_key(self.primary_key.iter().cloned())
+    }
+}
+
+/// Owns the temporary directory holding parquet spills of in-memory tables
+/// registered in a remote session (see
+/// [`Session::register_record_batches_async`]).
+///
+/// Held behind an `Arc` in [`Session`], which is `Clone`, so the directory
+/// outlives every clone and is removed when the last one drops. A spill must
+/// live as long as the registration — unlike the per-query spills in
+/// `connector_runtime`, which are dropped when the query ends.
+/// Distinguishes concurrent sessions' spill directories in one process.
+static SESSION_SPILL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct SessionSpillDir {
+    dir: PathBuf,
+}
+
+impl Drop for SessionSpillDir {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.dir) {
+            // Nothing actionable at drop time, and the directory lives under
+            // the system temp root; log rather than fail a session teardown.
+            tracing::debug!(
+                path = %self.dir.display(),
+                error = %error,
+                "failed to remove session table-spill directory"
+            );
+        }
     }
 }
 
@@ -1098,6 +1128,10 @@ pub struct Session {
     policy: Option<Arc<dyn PolicyHook>>,
     /// Per-session registry of embedded IVM jobs created via [`Session::ivm`].
     ivm_registry: krishiv_runtime::SharedIvmJobRegistry,
+    /// Lazily-created temp directory for parquet spills of in-memory tables
+    /// registered in a remote session. `None` until the first such
+    /// registration, so embedded sessions never create a directory.
+    table_spill_dir: Arc<Mutex<Option<Arc<SessionSpillDir>>>>,
 }
 
 impl fmt::Debug for Session {
@@ -2422,7 +2456,28 @@ impl Session {
         &self,
         sql_dataframe: impl krishiv_sql::KrishivDataFrameOps + 'static,
     ) -> DataFrame {
-        let sql_query = sql_dataframe.query().map(str::to_owned);
+        // Audit: `sql_query` is the text a remote session ships to the
+        // coordinator, and it used to travel bare. `execute_remote_async`
+        // prepended the registered Python UDF directives; this path — the one
+        // `session.sql(q).collect()` takes — did not, so the same UDF worked
+        // through one entry point and failed with "unknown function" on the
+        // other. The directives are SQL comments the executors decode to
+        // reconstruct the worker-backed UDF, so they belong on every query
+        // that leaves the process.
+        //
+        // Applied only when the session actually executes remotely: the
+        // embedded path resolves UDFs in-process and never reads this field,
+        // and prepending comments there would change the text of the query
+        // shown in diagnostics for no gain. The DataFrame plans against
+        // `sql_dataframe` (built from the plain query), so this affects
+        // submission only, never planning.
+        let sql_query = sql_dataframe.query().map(|q| {
+            if self.runtime.uses_remote_execution() {
+                self.prepend_python_udfs(q)
+            } else {
+                q.to_owned()
+            }
+        });
         DataFrame::from_sql_dataframe(
             self.mode,
             sql_dataframe,
@@ -3582,6 +3637,12 @@ impl Session {
     /// Register in-memory record batches as a named table in this session.
     ///
     /// Used by [`DataFrame::cache`] to materialize query results into memory.
+    ///
+    /// Works in every execution mode. An embedded session keeps the batches in
+    /// process; a session that executes remotely also spills them to a
+    /// temporary parquet file so the table travels with the query and resolves
+    /// on the cluster. The spill lives as long as the session and is removed
+    /// when the last clone of it drops.
     pub fn register_record_batches(
         &self,
         name: &str,
@@ -3601,10 +3662,103 @@ impl Session {
         name: &str,
         batches: Vec<arrow::record_batch::RecordBatch>,
     ) -> Result<()> {
+        // Audit: this used to register on the local `SqlEngine` only. In a
+        // remote session that plans locally and executes on a coordinator,
+        // `sql()` therefore succeeded and `collect()` failed at the cluster with
+        // an unresolved table — while its sibling `register_parquet` registers
+        // both locally and in `registered_parquet` (the set shipped with the
+        // query) and works in every mode. Two registration methods that read as
+        // interchangeable and were not.
+        //
+        // A remote session now also spills the batches to parquet and registers
+        // the path, so the table travels the same road a `register_parquet`
+        // table does: the Flight client inlines it as Arrow IPC, which means it
+        // reaches executors in other pods with no shared filesystem. Embedded
+        // sessions skip the spill entirely — the local registration is all they
+        // ever consult, and writing a file for them would be pure cost.
+        if self.runtime.uses_remote_execution() {
+            let path = self.spill_table_to_parquet(name, &batches)?;
+            self.registered_parquet.insert(
+                name.to_owned(),
+                RegisteredParquet::new(path, &[] as &[String]),
+            );
+        }
         self.sql_engine
             .register_record_batches(name, batches)
             .await
             .map_err(KrishivError::from)
+    }
+
+    /// Write `batches` to a parquet file under this session's spill directory
+    /// and return its path. Creates the directory on first use.
+    fn spill_table_to_parquet(
+        &self,
+        name: &str,
+        batches: &[arrow::record_batch::RecordBatch],
+    ) -> Result<PathBuf> {
+        let Some(first) = batches.first() else {
+            return Err(KrishivError::unsupported(format!(
+                "cannot register table '{name}' from an empty batch list in a remote session: \
+                 there is no schema to ship to the cluster"
+            )));
+        };
+        let dir = self.ensure_table_spill_dir()?;
+        // One file per table name; re-registering the same name overwrites it,
+        // matching the local registry's replace-in-place semantics.
+        let safe: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let path = dir.join(format!("{safe}.parquet"));
+        let file = std::fs::File::create(&path).map_err(|e| KrishivError::Runtime {
+            message: format!("create spill parquet '{}': {e}", path.display()),
+        })?;
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(file, first.schema(), None).map_err(|e| {
+                KrishivError::Runtime {
+                    message: format!("create spill parquet writer for '{name}': {e}"),
+                }
+            })?;
+        for batch in batches {
+            writer.write(batch).map_err(|e| KrishivError::Runtime {
+                message: format!("write spill parquet batch for '{name}': {e}"),
+            })?;
+        }
+        writer.close().map_err(|e| KrishivError::Runtime {
+            message: format!("close spill parquet writer for '{name}': {e}"),
+        })?;
+        Ok(path)
+    }
+
+    /// This session's spill directory, created on first use. The guard is
+    /// shared across clones so the directory is removed when the last one drops.
+    fn ensure_table_spill_dir(&self) -> Result<PathBuf> {
+        let mut slot = self
+            .table_spill_dir
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = slot.as_ref() {
+            return Ok(existing.dir.clone());
+        }
+        // Unique per session: the pid alone collides across sessions in one
+        // process, which would let one session's teardown delete another's
+        // registered tables.
+        let unique = SESSION_SPILL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "krishiv-session-tables-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).map_err(|e| KrishivError::Runtime {
+            message: format!("create session spill dir '{}': {e}", dir.display()),
+        })?;
+        *slot = Some(Arc::new(SessionSpillDir { dir: dir.clone() }));
+        Ok(dir)
     }
 
     /// Create a **live table** `name` defined by `query`, choosing the compute
@@ -3947,5 +4101,116 @@ mod udf_registration_tests {
                 if message.contains("must not be empty")
         ));
         assert!(session.scalar_udf_names().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod remote_session_parity_tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn batch(vals: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let arr: Int64Array = vals.iter().copied().collect();
+        RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("batch")
+    }
+
+    /// A Distributed session that needs no live coordinator: nothing here
+    /// executes, it only checks what the session *would* ship.
+    fn remote_session() -> Session {
+        Session::builder()
+            .with_coordinator("http://coord.invalid:50051")
+            .build()
+            .expect("distributed session")
+    }
+
+    fn embedded_session() -> Session {
+        Session::builder()
+            .with_execution_mode(ExecutionMode::Embedded)
+            .build()
+            .expect("embedded session")
+    }
+
+    /// A Python UDF registered on a remote session must ride along with the
+    /// query text that `session.sql(..)` produces.
+    ///
+    /// Before the fix, `prepend_python_udfs` had exactly one caller —
+    /// `execute_remote_async` — so `session.sql(q).collect()` shipped the bare
+    /// query and executors failed with "unknown function", while
+    /// `session.execute_remote(q)` on the same session worked. Two entry points
+    /// that read as interchangeable, one of which silently dropped the UDF.
+    #[test]
+    fn remote_sql_dataframe_ships_registered_python_udfs() {
+        let session = remote_session();
+        session.register_python_udf_bytes("triple", b"fake-pickle", &["Int64".into()], "Int64");
+
+        let df = session.sql("SELECT 1 AS v").expect("sql");
+        let shipped = df.sql_query_for_test().expect("a SQL query to ship");
+
+        assert!(
+            shipped.contains("register-python-udf") && shipped.contains("triple"),
+            "the query shipped to the cluster must carry the UDF directive, \
+             or the executor cannot reconstruct the function; got: {shipped}"
+        );
+    }
+
+    /// The embedded path resolves UDFs in process and never ships the text, so
+    /// it must stay byte-identical to what the user wrote. This is the other
+    /// half of the fix: the directive is submission-only, not a planning input.
+    #[test]
+    fn embedded_sql_dataframe_query_is_unchanged() {
+        let session = embedded_session();
+        session.register_python_udf_bytes("triple", b"fake-pickle", &["Int64".into()], "Int64");
+
+        let df = session.sql("SELECT 1 AS v").expect("sql");
+        let query = df.sql_query_for_test().expect("a SQL query");
+
+        assert!(
+            !query.contains("register-python-udf"),
+            "embedded execution never ships the query; prepending directives \
+             there only corrupts diagnostics; got: {query}"
+        );
+    }
+
+    /// In a remote session, an in-memory table must become something the
+    /// cluster can actually read.
+    ///
+    /// Before the fix this registered on the local `SqlEngine` only, so the
+    /// query planned locally and then failed at the coordinator with an
+    /// unresolved table — while the sibling `register_parquet` registered in
+    /// both places and worked in every mode.
+    #[test]
+    fn remote_register_record_batches_is_shipped_to_the_cluster() {
+        let session = remote_session();
+        session
+            .register_record_batches("nums", vec![batch(&[1, 2, 3])])
+            .expect("register");
+
+        let registration = session
+            .registered_parquet
+            .get("nums")
+            .map(|entry| entry.value().clone())
+            .expect("an in-memory table registered remotely must be shipped");
+        assert!(
+            registration.path.exists(),
+            "the spilled parquet must exist on disk at {}",
+            registration.path.display()
+        );
+    }
+
+    /// Embedded sessions must not pay for a spill they never read.
+    #[test]
+    fn embedded_register_record_batches_writes_no_spill() {
+        let session = embedded_session();
+        session
+            .register_record_batches("nums", vec![batch(&[1, 2, 3])])
+            .expect("register");
+
+        assert!(
+            session.registered_parquet.get("nums").is_none(),
+            "embedded execution resolves the table in process; spilling it to \
+             parquet is pure cost"
+        );
     }
 }

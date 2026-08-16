@@ -255,6 +255,32 @@ async fn poll_batch_sql_outcome(
     }
 }
 
+/// Why partition-parallel staging was declined, or `None` when every gate
+/// passed and the stage builder gets to decide.
+///
+/// Split out as a pure function so the decision is testable: the gates are
+/// checked in this order and the *first* failure is what gets reported, so a
+/// streaming query over inline tables reports "streaming query" rather than an
+/// arbitrary one of the two.
+pub(crate) fn staged_decline_reason(
+    is_streaming: bool,
+    has_sink_contract: bool,
+    has_inline_tables: bool,
+    has_path_tables: bool,
+) -> Option<&'static str> {
+    if is_streaming {
+        Some("streaming query")
+    } else if has_sink_contract {
+        Some("sink-contract write")
+    } else if has_inline_tables {
+        Some("inline-IPC tables cannot be stage-split")
+    } else if !has_path_tables {
+        Some("no path-registered parquet tables")
+    } else {
+        None
+    }
+}
+
 /// Execute a batch SQL write job whose terminal task writes through a sink
 /// contract (Phase 2.3 distributed writes) instead of returning rows inline.
 ///
@@ -501,8 +527,20 @@ async fn submit_batch_sql_job_inner(
     // the bucket's object store on its planning context, so the coordinator
     // can infer their schemas (it previously could not, and every
     // object-store-backed query quietly ran on one executor).
-    let staged_stages =
-        if !is_streaming && sink_contract.is_none() && tables.is_empty() && !path_tables.is_empty()
+    // Why the decision is reported: staging is what makes a batch SELECT
+    // partition-parallel. Declining it is correct for every reason below, but
+    // the fallback runs the WHOLE query on one executor, and until now nothing
+    // said so — a distributed query that ran serially was indistinguishable
+    // from one that scaled, which is the difference an operator sizing a
+    // cluster most needs to see. `decline` names the first gate that failed, in
+    // check order, so the log answers "why one task?" without a code read.
+    let decline = staged_decline_reason(
+        is_streaming,
+        sink_contract.is_some(),
+        !tables.is_empty(),
+        !path_tables.is_empty(),
+    );
+    let staged_stages = if decline.is_none() {
         {
             // Plan against the capacity that will actually run the query. The
             // target partition count used to be a constant regardless of the
@@ -516,9 +554,31 @@ async fn submit_batch_sql_job_inner(
                     .then_some(krishiv_sql::distributed_plan::ClusterCapacity { total_slots })
             };
             crate::distributed_batch::plan_staged_batch_stages(query, path_tables, cluster).await
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
+
+    match (&staged_stages, decline) {
+        (Some(stages), _) => tracing::info!(
+            job_id = %job_id,
+            stages = stages.len(),
+            "batch SQL staged: partition-parallel across {} stages",
+            stages.len()
+        ),
+        // Gates passed but the stage builder itself declined the query shape
+        // (an unsupported plan node, a Python AGGREGATE UDF, …).
+        (None, None) => tracing::info!(
+            job_id = %job_id,
+            reason = "stage builder declined the query shape",
+            "batch SQL NOT staged: the whole query runs on a single executor"
+        ),
+        (None, Some(reason)) => tracing::info!(
+            job_id = %job_id,
+            reason,
+            "batch SQL NOT staged: the whole query runs on a single executor"
+        ),
+    }
 
     let job_kind = if is_streaming {
         JobKind::Streaming
@@ -657,6 +717,45 @@ pub fn decode_inline_record_batches(
 
 #[cfg(test)]
 mod tests {
+    // ── staged-vs-single-task decision ────────────────────────────────────
+
+    /// Declining to stage is correct in every case below, but the fallback runs
+    /// the WHOLE query on one executor — so the reason has to be reportable,
+    /// not just implied by control flow. A caller sizing a cluster otherwise
+    /// cannot tell a distributed query that scaled from one that did not.
+    #[test]
+    fn staged_decline_reason_names_the_first_failing_gate() {
+        use super::staged_decline_reason;
+
+        // All gates pass → the stage builder decides, not this function.
+        assert_eq!(staged_decline_reason(false, false, false, true), None);
+
+        assert_eq!(
+            staged_decline_reason(true, false, false, true),
+            Some("streaming query")
+        );
+        assert_eq!(
+            staged_decline_reason(false, true, false, true),
+            Some("sink-contract write")
+        );
+        assert_eq!(
+            staged_decline_reason(false, false, true, true),
+            Some("inline-IPC tables cannot be stage-split")
+        );
+        assert_eq!(
+            staged_decline_reason(false, false, false, false),
+            Some("no path-registered parquet tables")
+        );
+
+        // Order matters: with several gates failing the report must be stable
+        // and name the first one checked, not an arbitrary one.
+        assert_eq!(
+            staged_decline_reason(true, true, true, false),
+            Some("streaming query"),
+            "a multi-gate decline must report deterministically"
+        );
+    }
+
     use super::*;
     use crate::coordinator::{Coordinator, SharedCoordinator};
     use arrow::array::{Int64Array, RecordBatch, StringArray};

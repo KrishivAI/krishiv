@@ -338,6 +338,16 @@ impl DataFrame {
     /// bound to the local catalog). Previously this expression was
     /// repeated at 5+ call sites; a single source of truth makes
     /// future changes (e.g. a new local-only DataFrame type) one-line.
+    /// The exact query text this DataFrame would ship to a coordinator.
+    ///
+    /// Test-only accessor: the difference between what is planned locally and
+    /// what is submitted remotely is precisely where the Python-UDF directive
+    /// was being dropped, so it needs to be assertable.
+    #[cfg(test)]
+    pub(crate) fn sql_query_for_test(&self) -> Option<&str> {
+        self.sql_query.as_deref()
+    }
+
     pub(crate) fn is_locally_evaluated(&self) -> bool {
         !self.runtime.uses_remote_execution() || self.force_local
     }

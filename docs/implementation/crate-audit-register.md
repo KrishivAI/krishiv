@@ -3945,3 +3945,79 @@ code below, not against memory.
   and accurate.
 
 With §30 and this section, every item in this register is closed.
+
+## §32 — batch-mode API parity across embedded / single-node / distributed (2026-08-16)
+
+Not a crate read: an end-to-end trace of the **batch** surface through all
+three placements, prompted by the question "how do these actually differ?"
+Three defects, each the register's house shape — a divergence between two paths
+that read as equivalent, with nothing that could tell them apart.
+
+**The placement seam itself is sound.** `ComputeEngine::run(job, rt)` takes an
+`EngineRuntime` of trait objects and `BatchEngine::run` branches exactly once,
+on `rt.query_executor`: `None` runs the query in-process, `Some` hands it off.
+`build_execution_runtime` rejects every mismatched (mode, placement) pair, and
+Distributed has no local fallback by construction. What follows are leaks
+around that seam, not flaws in it.
+
+**1. Python UDFs shipped on one remote path and not the other. FIXED.**
+`prepend_python_udfs` had exactly one caller, `execute_remote_async`. The path
+`session.sql(q).collect()` takes shipped the query text bare, so a registered
+UDF reached executors through one entry point and failed with "unknown
+function" through the other — on the same session, same query. The directives
+are now attached in `dataframe_from_sql`, and only when the session actually
+executes remotely: embedded resolves UDFs in process, never reads the field,
+and prepending comments there would only corrupt diagnostics. Planning is
+unaffected either way — the `DataFrame` plans against `sql_dataframe`, built
+from the plain query. Tests both directions; the remote one is revert-proven.
+
+**2. `register_record_batches` was invisible to the cluster. FIXED.** It wrote
+to the local `SqlEngine` only, while its sibling `register_parquet` writes to
+both the engine and `registered_parquet` — the set that actually ships. So in a
+remote session the query planned locally and then failed at the coordinator
+with an unresolved table. A remote session now also spills the batches to
+parquet and registers the path, which puts the table on the road a
+`register_parquet` table already travels: the Flight client inlines it as Arrow
+IPC, so it reaches executors in other pods with no shared filesystem. The spill
+directory is owned by an `Arc<SessionSpillDir>`, so it survives every `Session`
+clone and is removed when the last drops. Embedded sessions write nothing.
+Both directions tested, the remote one revert-proven.
+
+**3. The staged-vs-single-task decision was invisible. FIXED (observability).**
+`plan_staged_batch_stages` either returns stages (partition-parallel) or `None`
+(the whole query on one executor), and nothing reported which. A distributed
+query that ran serially was indistinguishable from one that scaled — the single
+fact an operator sizing a cluster most needs. The gate is now a pure
+`staged_decline_reason` function, unit-tested including its *ordering* (a
+multi-gate decline must report deterministically), and the coordinator logs the
+outcome with its reason. No behaviour change: every decline was and remains
+correct.
+
+**Corrected while tracing this:** the earlier reading that "distributed usually
+means one executor" was wrong. The Rust Flight client inlines parquet only up
+to `inline_ipc_max_bytes`; past the cap inlining fails, the table becomes a
+path table, and staging becomes eligible. Small tables running single-task is
+the design, not a defect.
+
+**Recorded, not fixed — the honest gap.** `mode_conformance.rs` opens with "The
+same query run through `Embedded` must produce byte-for-byte identical results;
+mode selection is purely about where data-plane work executes." Every executing
+test in it builds an *embedded* session. The one single-node test is
+`#[ignore]`d and there are no distributed tests; the only other cross-mode
+assertions in the tree compare `session.mode()` to a label.
+`differential_corpus.rs` is genuine differential testing, but across engines
+(batch vs IVM), not placements. So the parity claim is asserted in a doc
+comment and verified by nothing that runs in CI — which is exactly how all
+three defects above survived. A cross-mode harness (Embedded vs a live
+in-process-cluster daemon, canonical row-set comparison) is the next piece of
+work this points to; it needs a daemon fixture, so it is scoped rather than
+smuggled into this change.
+
+Also recorded, no defect: embedded batch streams to sinks batch-by-batch while
+the remote path materializes the full result before streaming (the `BATCH-2`
+comment says so in place), with a 256 MiB warn and a 2 GiB hard error. A job
+that streams a 50 GB result embedded fails at 2 GB distributed. Honest in code,
+absent from user-facing docs.
+
+Gates: `cargo test -p krishiv-api -p krishiv-scheduler`, `just lint`,
+`just test`, `cargo fmt --all` — green.
