@@ -15,7 +15,12 @@
 //! Any wall-clock length works (default 24h); the verdict rule is the
 //! same. Warm-up (first 10 minutes) is excluded from the verdict.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout, clippy::print_stderr)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 
 use std::io::Write;
 use std::sync::Arc;
@@ -132,7 +137,9 @@ fn main() {
             .expect("push");
         pushed += EVENTS_PER_TICK as u64;
 
-        let drained = runtime.drain_continuous_job("lateness-soak").expect("drain");
+        let drained = runtime
+            .drain_continuous_job("lateness-soak")
+            .expect("drain");
         emitted += drained.iter().map(|b| b.num_rows() as u64).sum::<u64>();
 
         if last_sample.elapsed() >= SAMPLE_EVERY {
@@ -155,12 +162,7 @@ fn main() {
         .unwrap_or_default()
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter_map(|v| {
-            Some((
-                v.get("elapsed_s")?.as_u64()?,
-                v.get("rss_kib")?.as_u64()?,
-            ))
-        })
+        .filter_map(|v| Some((v.get("elapsed_s")?.as_u64()?, v.get("rss_kib")?.as_u64()?)))
         .collect();
     let median = |xs: &mut Vec<u64>| -> u64 {
         xs.sort_unstable();
@@ -191,7 +193,11 @@ fn main() {
     println!(
         "SOAK VERDICT: {} — first-hour median RSS {first_med} KiB, last-hour median \
          {last_med} KiB (tolerance {FLAT_TOLERANCE}x); events={pushed} windows={emitted}",
-        if flat { "FLAT (PASS)" } else { "GROWING (FAIL)" },
+        if flat {
+            "FLAT (PASS)"
+        } else {
+            "GROWING (FAIL)"
+        },
     );
     std::process::exit(if flat { 0 } else { 1 });
 }

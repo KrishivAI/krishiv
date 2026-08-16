@@ -57,20 +57,38 @@ fn width_of(col: &str) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn q10_shuffle_payload_is_dominated_by_columns_custkey_determines() {
+async fn q10_stage_shape_dump_and_sf100_must_stage() {
     // `(Some(0), Some(0))` = the SF100 configuration: no build side may be
     // collected, so every join hash-shuffles both inputs. The default options
     // broadcast on this tiny fixture and collapse q10 to two stages, which is
     // not the shape the cluster runs (6 stages / 91 tasks).
-    for (label, jt, bb) in [
-        ("SF100 (no-broadcast, converted)", Some(0u64), Some(0usize)),
-        ("default (broadcast allowed)", None, None),
+    //
+    // Crate-24 audit (B1): this was named
+    // `q10_shuffle_payload_is_dominated_by_columns_custkey_determines` — a name
+    // asserting a claim the body never checked — and its staging arm was
+    // `_ => { println!("declined to stage"); return; }`, so if the cutter ever
+    // stopped staging q10 the diagnostic silently produced nothing and the test
+    // still passed. The name now says what it does, and the SF100 arm (the
+    // shape the cluster actually runs) asserts that staging happened.
+    for (label, jt, bb, must_stage) in [
+        (
+            "SF100 (no-broadcast, converted)",
+            Some(0u64),
+            Some(0usize),
+            true,
+        ),
+        ("default (broadcast allowed)", None, None, false),
     ] {
-        dump(label, jt, bb).await;
+        dump(label, jt, bb, must_stage).await;
     }
 }
 
-async fn dump(label: &str, join_threshold: Option<u64>, broadcast_bytes: Option<usize>) {
+async fn dump(
+    label: &str,
+    join_threshold: Option<u64>,
+    broadcast_bytes: Option<usize>,
+    must_stage: bool,
+) {
     let ctx: SessionContext =
         planning_session_context_with_options(4, join_threshold, broadcast_bytes);
     for ddl in fixture_ddl() {
@@ -93,8 +111,26 @@ async fn dump(label: &str, join_threshold: Option<u64>, broadcast_bytes: Option<
 
     let staged = match build_distributed_stages(plan) {
         Ok(Some(s)) => s,
-        _ => { println!("declined to stage"); return; }
+        other => {
+            assert!(
+                !must_stage,
+                "{label}: q10 must produce a staged plan under the SF100 \
+                 (no-broadcast) options — this is the shape the cluster runs, and \
+                 without it this diagnostic reports nothing. Got: {}",
+                match other {
+                    Ok(None) => "cutter declined to stage".to_string(),
+                    Err(e) => format!("cutter error: {e}"),
+                    Ok(Some(_)) => unreachable!("matched by the arm above"),
+                }
+            );
+            println!("declined to stage");
+            return;
+        }
     };
+    assert!(
+        !staged.stages.is_empty(),
+        "{label}: a staged plan with zero stages is not a plan"
+    );
 
     println!("\n=== q10: {} stages ===", staged.stages.len());
     for (i, stage) in staged.stages.iter().enumerate() {
@@ -109,8 +145,7 @@ async fn dump(label: &str, join_threshold: Option<u64>, broadcast_bytes: Option<
 
         let (ncols, width, cols) = match &declared {
             Some(s) => {
-                let cols: Vec<String> =
-                    s.fields().iter().map(|f| f.name().to_string()).collect();
+                let cols: Vec<String> = s.fields().iter().map(|f| f.name().to_string()).collect();
                 let w: usize = cols.iter().map(|c| width_of(c)).sum();
                 (cols.len(), w, cols)
             }

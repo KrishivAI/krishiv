@@ -35,14 +35,12 @@ pub fn fixture_ddl() -> Vec<&'static str> {
         "CREATE TABLE region(r_regionkey BIGINT, r_name VARCHAR, r_comment VARCHAR) AS VALUES \
          (0, 'AFRICA', 'a'), (1, 'AMERICA', 'b'), (2, 'ASIA', 'c'), \
          (3, 'EUROPE', 'd'), (4, 'MIDDLE EAST', 'e')",
-
         "CREATE TABLE nation(n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, \
          n_comment VARCHAR) AS VALUES \
          (0, 'ALGERIA', 0, 'a'), (1, 'ARGENTINA', 1, 'b'), (2, 'BRAZIL', 1, 'c'), \
          (3, 'CANADA', 1, 'd'), (7, 'GERMANY', 3, 'e'), (6, 'FRANCE', 3, 'f'), \
          (8, 'INDIA', 2, 'g'), (9, 'INDONESIA', 2, 'h'), \
          (18, 'CHINA', 2, 'i'), (24, 'UNITED STATES', 1, 'j')",
-
         "CREATE TABLE supplier(s_suppkey BIGINT, s_name VARCHAR, s_address VARCHAR, \
          s_nationkey BIGINT, s_phone VARCHAR, s_acctbal DECIMAL(15,2), s_comment VARCHAR) AS VALUES \
          (1, 'Supplier#000000001', 'addr1', 7, '27-918-335-1736', 5755.94, 'ordinary'), \
@@ -52,7 +50,6 @@ pub fn fixture_ddl() -> Vec<&'static str> {
          (5, 'Supplier#000000005', 'addr5', 8, '21-151-690-3663', -283.84, 'regular'), \
          (6, 'Supplier#000000006', 'addr6', 24, '34-627-449-5959', 1365.79, 'quickly'), \
          (7, 'Supplier#000000007', 'addr7', 18, '28-101-101-1010', 2000.00, 'even')",
-
         "CREATE TABLE part(p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, \
          p_type VARCHAR, p_size INT, p_container VARCHAR, p_retailprice DECIMAL(15,2), \
          p_comment VARCHAR) AS VALUES \
@@ -72,14 +69,12 @@ pub fn fixture_ddl() -> Vec<&'static str> {
           'MED BAG', 907.00, 'g'), \
          (8, 'ivory olive', 'Manufacturer#4', 'Brand#34', 'ECONOMY BRUSHED NICKEL', 15, \
           'LG BOX', 908.00, 'h')",
-
         "CREATE TABLE partsupp(ps_partkey BIGINT, ps_suppkey BIGINT, ps_availqty INT, \
          ps_supplycost DECIMAL(15,2), ps_comment VARCHAR) AS VALUES \
          (1, 1, 3325, 771.64, 'a'), (2, 1, 8895, 378.49, 'b'), (2, 2, 4969, 915.27, 'c'), \
          (3, 2, 8539, 438.37, 'd'), (4, 3, 3956, 920.92, 'e'), (4, 4, 4069, 100.43, 'f'), \
          (5, 4, 8895, 336.42, 'g'), (6, 5, 4297, 137.85, 'h'), (7, 5, 3325, 771.64, 'i'), \
          (8, 6, 1287, 771.64, 'j'), (1, 2, 2222, 500.00, 'k'), (3, 1, 1111, 250.00, 'l')",
-
         "CREATE TABLE customer(c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, \
          c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL(15,2), c_mktsegment VARCHAR, \
          c_comment VARCHAR) AS VALUES \
@@ -91,7 +86,6 @@ pub fn fixture_ddl() -> Vec<&'static str> {
          (6, 'Customer#000000006', 'addr6', 24, '30-114-968-4951', 7638.57, 'BUILDING', 'f'), \
          (7, 'Customer#000000007', 'addr7', 18, '29-345-227-5993', 9561.95, 'BUILDING', 'g'), \
          (8, 'Customer#000000008', 'addr8', 8, '17-750-942-6364', 6819.74, 'BUILDING', 'h')",
-
         "CREATE TABLE orders(o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, \
          o_totalprice DECIMAL(15,2), o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, \
          o_shippriority INT, o_comment VARCHAR) AS VALUES \
@@ -105,7 +99,6 @@ pub fn fixture_ddl() -> Vec<&'static str> {
          (32, 4, 'O', 208660.75, DATE '1995-07-16', '2-HIGH', 'Clerk#000000616', 0, 'h'), \
          (33, 6, 'F', 163243.98, DATE '1993-10-27', '3-MEDIUM', 'Clerk#000000409', 0, 'i'), \
          (34, 7, 'O', 58949.67, DATE '1998-07-21', '3-MEDIUM', 'Clerk#000000223', 0, 'j')",
-
         // Two lines per order for most orders, so the multi-line predicates
         // (q18's quantity sum, q21's multi-supplier EXISTS/NOT EXISTS) have
         // something to find rather than trivially failing.

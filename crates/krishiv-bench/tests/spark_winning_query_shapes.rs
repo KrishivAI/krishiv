@@ -57,8 +57,15 @@ fn width_of(col: &str) -> usize {
         _ if c.contains("type") || c.contains("mfgr") => 20,
         _ if c.contains("flag") || c.contains("status") || c.contains("priority") => 8,
         _ if c.ends_with("key") => 8,
-        _ if c.contains("price") || c.contains("bal") || c.contains("discount")
-            || c.contains("tax") || c.contains("cost") || c.contains("revenue") => 16,
+        _ if c.contains("price")
+            || c.contains("bal")
+            || c.contains("discount")
+            || c.contains("tax")
+            || c.contains("cost")
+            || c.contains("revenue") =>
+        {
+            16
+        }
         _ if c.contains("date") => 4,
         _ => 8,
     }
@@ -110,12 +117,16 @@ async fn print_stage_shape_for_every_query_spark_wins() {
             }
         };
 
-        println!("\n### {name} — Spark {ratio}x faster — {} stages", staged.stages.len());
+        println!(
+            "\n### {name} — Spark {ratio}x faster — {} stages",
+            staged.stages.len()
+        );
         let mut widest = 0usize;
         for (i, stage) in staged.stages.iter().enumerate() {
-            let declared = stage.task_bodies.first().and_then(|b| {
-                execute_dfplan_body(b, &ctx, None).ok().map(|(s, _)| s)
-            });
+            let declared = stage
+                .task_bodies
+                .first()
+                .and_then(|b| execute_dfplan_body(b, &ctx, None).ok().map(|(s, _)| s));
             let (ncols, width, cols) = match &declared {
                 Some(s) => {
                     let cols: Vec<String> =
@@ -126,7 +137,11 @@ async fn print_stage_shape_for_every_query_spark_wins() {
                 None => (0, 0, Vec::new()),
             };
             widest = widest.max(width);
-            let flag = if width > WIDE_ROW_BYTES { "  <-- WIDE" } else { "" };
+            let flag = if width > WIDE_ROW_BYTES {
+                "  <-- WIDE"
+            } else {
+                ""
+            };
             match &stage.shuffle {
                 Some(sh) => println!(
                     "  s{i}: {:>3} tasks  key={:?} -> {} parts   {ncols} cols ~{width} B/row{flag}\n       {cols:?}",

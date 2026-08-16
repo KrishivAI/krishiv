@@ -173,7 +173,10 @@ fn run_round(
             .map(|h| h.join().expect("query worker panicked"))
             .collect();
         if let Some(samples) = samples {
-            samples.lock().expect("samples mutex poisoned").extend(times);
+            samples
+                .lock()
+                .expect("samples mutex poisoned")
+                .extend(times);
         }
     });
     round_start.elapsed()

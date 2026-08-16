@@ -33,7 +33,9 @@
 )]
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
-use krishiv_bench::tpch_fixture::{declare_fixture_primary_keys, fixture_ddl, row_producing_queries};
+use krishiv_bench::tpch_fixture::{
+    declare_fixture_primary_keys, fixture_ddl, row_producing_queries,
+};
 use krishiv_bench::tpch_queries::TPCH_QUERIES;
 use krishiv_sql::distributed_plan::{
     ShuffleFragmentStream, ShufflePartitionReader, build_distributed_stages, execute_dfplan_body,
@@ -134,8 +136,7 @@ async fn run_staged(ctx: &SessionContext, sql: &str) -> Result<Vec<RecordBatch>,
     let mut result = Vec::new();
     for (stage_index, stage) in staged.stages.iter().enumerate() {
         for (task_index, body) in stage.task_bodies.iter().enumerate() {
-            let reader: Arc<dyn ShufflePartitionReader> =
-                Arc::new(StoreReader(Arc::clone(&store)));
+            let reader: Arc<dyn ShufflePartitionReader> = Arc::new(StoreReader(Arc::clone(&store)));
             let (declared, mut stream) = execute_dfplan_body(body, &exec_ctx, Some(reader))
                 .map_err(|e| format!("stage {stage_index} task {task_index} start: {e}"))?;
             while let Some(batch) = futures::StreamExt::next(&mut stream).await {
@@ -251,9 +252,8 @@ async fn every_tpch_query_stages_to_the_same_answer_in_every_configuration() {
     let mut failures: Vec<String> = Vec::new();
     let mut checked = 0usize;
 
-    for ((label, threshold, broadcast), keys) in MATRIX
-        .iter()
-        .flat_map(|cell| [(cell, false), (cell, true)])
+    for ((label, threshold, broadcast), keys) in
+        MATRIX.iter().flat_map(|cell| [(cell, false), (cell, true)])
     {
         let label = if keys {
             format!("{label} + declared keys")
@@ -266,7 +266,10 @@ async fn every_tpch_query_stages_to_the_same_answer_in_every_configuration() {
                 Ok(df) => match df.collect().await {
                     Ok(batches) => cells(&batches),
                     Err(e) => {
-                        failures.push(format!("{label}/{}: direct execution failed: {e}", query.id));
+                        failures.push(format!(
+                            "{label}/{}: direct execution failed: {e}",
+                            query.id
+                        ));
                         continue;
                     }
                 },
@@ -434,6 +437,10 @@ async fn every_query_plans_against_the_fixture_schema() {
             broken.push(format!("{}: {e}", query.id));
         }
     }
-    assert!(broken.is_empty(), "queries do not plan:\n{}", broken.join("\n"));
+    assert!(
+        broken.is_empty(),
+        "queries do not plan:\n{}",
+        broken.join("\n")
+    );
     assert_eq!(TPCH_QUERIES.len(), 22);
 }

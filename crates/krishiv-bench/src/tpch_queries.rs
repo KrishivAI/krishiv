@@ -129,7 +129,9 @@ pub static TPCH_QUERIES: &[TpchQuery] = &[
     TpchQuery {
         id: "q5",
         name: "local_supplier_volume",
-        tables: &["customer", "orders", "lineitem", "supplier", "nation", "region"],
+        tables: &[
+            "customer", "orders", "lineitem", "supplier", "nation", "region",
+        ],
         sql_template: "SELECT n_name, sum(l_extendedprice * (1 - l_discount)) AS revenue \
               FROM customer, orders, lineitem, supplier, nation, region \
               WHERE c_custkey = o_custkey AND l_orderkey = o_orderkey \
@@ -168,7 +170,9 @@ pub static TPCH_QUERIES: &[TpchQuery] = &[
     TpchQuery {
         id: "q8",
         name: "national_market_share",
-        tables: &["part", "supplier", "lineitem", "orders", "customer", "nation", "region"],
+        tables: &[
+            "part", "supplier", "lineitem", "orders", "customer", "nation", "region",
+        ],
         sql_template: "SELECT o_year, sum(CASE WHEN nation = 'BRAZIL' THEN volume ELSE 0 END) / sum(volume) AS mkt_share \
               FROM ( \
                 SELECT EXTRACT(YEAR FROM o_orderdate) AS o_year, \
@@ -185,7 +189,9 @@ pub static TPCH_QUERIES: &[TpchQuery] = &[
     TpchQuery {
         id: "q9",
         name: "product_type_profit_measure",
-        tables: &["part", "supplier", "lineitem", "partsupp", "orders", "nation"],
+        tables: &[
+            "part", "supplier", "lineitem", "partsupp", "orders", "nation",
+        ],
         sql_template: "SELECT nation, o_year, sum(amount) AS sum_profit FROM ( \
                 SELECT n_name AS nation, EXTRACT(YEAR FROM o_orderdate) AS o_year, \
                 l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity AS amount \
@@ -375,8 +381,10 @@ pub static TPCH_QUERIES: &[TpchQuery] = &[
 
 /// Every distinct table referenced across the corpus.
 pub fn all_tables() -> Vec<&'static str> {
-    let mut tables: Vec<&'static str> =
-        TPCH_QUERIES.iter().flat_map(|q| q.tables.iter().copied()).collect();
+    let mut tables: Vec<&'static str> = TPCH_QUERIES
+        .iter()
+        .flat_map(|q| q.tables.iter().copied())
+        .collect();
     tables.sort_unstable();
     tables.dedup();
     tables
@@ -491,11 +499,9 @@ mod tests {
     fn names_table(sql: &str, table: &str) -> bool {
         let boundary = |c: char| !c.is_ascii_alphanumeric() && c != '_';
         sql.match_indices(table).any(|(index, _)| {
-            let before_ok = index == 0
-                || sql[..index].chars().next_back().is_some_and(boundary);
+            let before_ok = index == 0 || sql[..index].chars().next_back().is_some_and(boundary);
             let after = index + table.len();
-            let after_ok = after >= sql.len()
-                || sql[after..].chars().next().is_some_and(boundary);
+            let after_ok = after >= sql.len() || sql[after..].chars().next().is_some_and(boundary);
             before_ok && after_ok
         })
     }

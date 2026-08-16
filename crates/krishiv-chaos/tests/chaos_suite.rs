@@ -84,19 +84,36 @@ fn fencing_token_equal_token_is_accepted() {
     );
 }
 
-/// Simulation: a failed checkpoint prepare must leave no committed state.
+/// A checkpoint epoch whose metadata was never written must not be readable,
+/// and must not be reported as a valid epoch.
 ///
-/// This models the prepare/commit atomicity invariant with a plain `Result`
-/// until a lightweight in-process checkpoint storage expose a hookable
-/// prepare-failure path.
+/// Crate-27 audit (X1): this replaces a test of the same name whose body was
+/// `let r: Result<(),String> = Err(..); if r.is_ok() { committed = true }` —
+/// a tautology over a locally-constructed `Err` that exercised no production
+/// code and that no change to the engine could have made fail. This version
+/// drives the real `LocalFsCheckpointStorage`: a never-committed epoch must be
+/// absent from `list_valid_epochs` and read back as `None`.
 #[test]
 fn checkpoint_prepare_failure_leaves_no_committed_state() {
-    let mut committed = false;
-    let prepare_result: Result<(), String> = Err("disk full".into());
-    if prepare_result.is_ok() {
-        committed = true;
-    }
-    assert!(!committed, "commit must not happen after failed prepare");
+    use krishiv_state::checkpoint::{
+        LocalFsCheckpointStorage, list_valid_epochs, read_epoch_metadata,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = LocalFsCheckpointStorage::new(dir.path()).unwrap();
+
+    // No prepare/commit ever ran for this job.
+    let epochs = list_valid_epochs(&storage, "job-prepare-failed").unwrap();
+    assert!(
+        epochs.is_empty(),
+        "a job with no committed checkpoint must expose no valid epochs, got {epochs:?}"
+    );
+    assert!(
+        read_epoch_metadata(&storage, "job-prepare-failed", 1)
+            .unwrap()
+            .is_none(),
+        "an uncommitted epoch must not be readable"
+    );
 }
 
 /// A `Fail` data-quality violation returns an error with no partial write.
@@ -203,36 +220,37 @@ async fn dead_letter_sink_clean_batch_passes_through() {
     assert!(rejected.is_empty());
 }
 
-/// Policy hook denies table access for a deny-all policy.
+/// The shipped [`AllowAllPolicyHook`] admits every table, and a hook is
+/// consulted through `dyn PolicyHook` (the shape the engine actually holds).
+///
+/// Crate-27 audit (X2): the two tests this replaces each defined a local
+/// `DenyAllPolicy` / `AllowAllPolicy` returning a constant and then asserted
+/// that constant back. They asserted on the test double's own body — no
+/// production line existed whose deletion could fail them. This version
+/// exercises the real exported hook plus the trait-object dispatch, and keeps
+/// a deny case that is explicit about being a caller-supplied policy.
 #[test]
-fn policy_hook_denies_table_access() {
-    use krishiv_plan::governance::PolicyHook;
+fn policy_hook_allow_all_admits_tables_and_deny_hook_is_honoured() {
+    use krishiv_plan::governance::{AllowAllPolicyHook, PolicyHook};
 
-    struct DenyAllPolicy;
-    impl PolicyHook for DenyAllPolicy {
-        fn check_table_access(&self, _table: &str) -> bool {
-            false
+    // The shipped default really is allow-all, held as the engine holds it.
+    let allow: std::sync::Arc<dyn PolicyHook> = std::sync::Arc::new(AllowAllPolicyHook);
+    assert!(allow.check_table_access("public_table"));
+    assert!(allow.check_table_access("secret_table"));
+
+    /// A caller-supplied deny policy — the extension point operators use.
+    struct DenyNamed(&'static str);
+    impl PolicyHook for DenyNamed {
+        fn check_table_access(&self, table: &str) -> bool {
+            table != self.0
         }
     }
-
-    let policy = DenyAllPolicy;
-    assert!(!policy.check_table_access("secret_table"));
-}
-
-/// Policy hook allows table access for an allow-all policy (positive case).
-#[test]
-fn policy_hook_allows_table_access() {
-    use krishiv_plan::governance::PolicyHook;
-
-    struct AllowAllPolicy;
-    impl PolicyHook for AllowAllPolicy {
-        fn check_table_access(&self, _table: &str) -> bool {
-            true
-        }
-    }
-
-    let policy = AllowAllPolicy;
-    assert!(policy.check_table_access("public_table"));
+    let deny: std::sync::Arc<dyn PolicyHook> = std::sync::Arc::new(DenyNamed("secret_table"));
+    assert!(!deny.check_table_access("secret_table"));
+    assert!(
+        deny.check_table_access("public_table"),
+        "a targeted deny must not deny everything"
+    );
 }
 
 /// Fault injector cycles deterministically through its fault list.

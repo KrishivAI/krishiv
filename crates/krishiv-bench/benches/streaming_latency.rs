@@ -108,7 +108,9 @@ fn make_events_batch(n: usize, ts_base: i64) -> RecordBatch {
 /// stays below the window's end, so none of them closes it. Drained (untimed)
 /// in benchmark setup to warm up per-key state before the timed batch below.
 fn warm_up_batches() -> Vec<RecordBatch> {
-    (0..9).map(|i| make_events_batch(1_000, i * 1_000)).collect()
+    (0..9)
+        .map(|i| make_events_batch(1_000, i * 1_000))
+        .collect()
 }
 
 /// The timed batch: one more 1k-row, 1000ms-wide slice at `[9_000, 10_000)`,

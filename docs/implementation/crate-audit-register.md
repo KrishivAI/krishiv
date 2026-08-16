@@ -59,10 +59,10 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | 21 | krishiv | 8,472 | 24 | 24 | COMPLETE — C1 --timeout no-op wired + 2 doc fixes (§21) |
 | 22 | krishiv-engines | 2,184 | **1** | 1 | COMPLETE — E1 cannot-fail test rewritten + E2/E3 (§22) |
 | 23 | krishiv-ui | 2,384 | 4 | 4 | COMPLETE — U1 fail-open UI auth + U2 null timestamps (§23) |
-| 24 | krishiv-bench | 3,362 | 14 | 0 | |
-| 25 | krishiv-sql-gateway | 541 | 3 | 0 | |
-| 26 | krishiv-conformance | 353 | 3 | 0 | no tests at all |
-| 27 | krishiv-chaos | **0** | 0 | — | empty crate — delete or fill |
+| 24 | krishiv-bench | 4,942 | 23 | 23 | COMPLETE — B1 name-asserts-X/silent-skip test fixed (§24) |
+| 25 | krishiv-sql-gateway | 541 | 3 | 3 | COMPLETE — zero defects; honest not-a-wire-protocol doc (§25) |
+| 26 | krishiv-conformance | 353 | 3 | 3 | COMPLETE — zero defects; prior "no tests at all" was WRONG (§26) |
+| 27 | krishiv-chaos | 829 | 1 | 1 | COMPLETE — KEEP (not empty: 25-test suite); X1+X2 cannot-fail tests fixed (§27) |
 
 ---
 
@@ -3615,3 +3615,102 @@ metrics handler's poisoned-lock recovery has a real poisoning test.
 
 Gates: cargo test -p krishiv-ui (29 green incl. 5 new), clippy 0,
 `just lint`, `just test`, `cargo fmt` — green. Coverage 54.2% regions.
+
+## 24. krishiv-bench — read end to end (2026-08-16)
+
+23 files, 4,942 LOC: lib.rs (TPC-H query texts + scale ladder), tpch_queries,
+phase_i, comparison, tpch_fixture, tpcds, 4 bins, 8 benches, 5 integration
+tests. 35 tests green.
+
+One fix:
+
+- **B1 (C — name asserts X, body tests Y + silent skip)** the test named
+  `q10_shuffle_payload_is_dominated_by_columns_custkey_determines` never
+  checked that claim — it is a diagnostic that prints a per-stage byte
+  breakdown — and its staging arm was
+  `_ => { println!("declined to stage"); return; }`, so if the stage cutter
+  ever stopped staging q10 the diagnostic silently emitted nothing and the
+  test still passed. Renamed to `q10_stage_shape_dump_and_sf100_must_stage`
+  and the SF100 arm (the no-broadcast options that match the shape the
+  cluster actually runs) now asserts staging happened, with the cutter's own
+  reason in the message; a zero-stage plan is also rejected. This is a
+  test-hygiene fix: the thing it replaces could not fail by construction, so
+  there is no pre-fix red to demonstrate — that is precisely the defect.
+
+Notes: `scale_dirs()` skips unset scale factors with an eprintln so
+`cargo bench` still runs on machines without the datasets — deliberate and
+documented. Heavy benches remain gated behind the Tranche G date (task #74).
+
+## 25. krishiv-sql-gateway — read end to end (2026-08-16)
+
+All 3 files read (541 LOC): lib.rs, error.rs, session.rs. **Zero defects.**
+20 genuine tests. The crate-level doc is unusually honest: it states in the
+first paragraph that despite the "JDBC/ODBC gateway" name this is **not** a
+wire-protocol server, and points at `krishiv-flight-sql` as the real ingress
+— exactly the kind of published-surface honesty the register's E checklist
+asks for. `SessionPool` recovers from a poisoned mutex rather than
+propagating the poison, respects `capacity` on return (dropping the excess),
+and creates on demand when empty; all three properties are tested, including
+the capacity-0 edge. SQLSTATE mapping is covered per `KrishivError` variant.
+
+Recorded, not changed: `InvalidConfig` maps to `0A000`
+(feature_not_supported) rather than a configuration-error SQLSTATE. It is
+deliberate and tested; changing it is a product decision about the published
+error taxonomy, not a bug fix.
+
+## 26. krishiv-conformance — read end to end (2026-08-16)
+
+All 3 files read (353 LOC): lib.rs (sqllogictest drivers for the three
+placements), tests/corpus.rs, tests/corpus_dual_run.rs. **Zero defects.**
+
+**The register's own summary row was wrong**: it recorded "no tests at all".
+The crate has 4 test entry points over a 7-file `.slt` corpus (scalar +
+stateful tiers), run against embedded, single-node, and distributed-in-process
+placements, plus a dual-run binary that replays the whole embedded corpus with
+runtime filters OFF and requires identical results — the corpus-neutrality
+rule that catches an "optimization" which changes an answer. `corpus_files`
+asserts the corpus is non-empty, so an empty/missing corpus dir fails loudly
+instead of vacuously passing. Row corrected.
+
+Note: `KRISHIV_BLESS_CORPUS=1` rewrites expectations instead of checking them.
+That is the documented regeneration path, but it means the gate is only a gate
+when that variable is unset — worth keeping out of any CI environment.
+
+## 27. krishiv-chaos — read end to end (2026-08-16)
+
+One file, tests/chaos_suite.rs (829 lines, 25 tests after this section's
+merge). **The register's summary row was wrong here too**: it recorded
+"empty crate — delete or fill, decide first". The crate is a test-only
+package (no `src/`, only a `[[test]]` target — which is why it looked empty)
+carrying a real 25-test chaos suite: fencing-token rejection, split-brain,
+dead-letter sink actions, barrier-ack idempotence, leader election, IVM
+restart convergence. It is also one of the two CI-excluded crates, so clippy
+was run directly against it (0 warnings). **Decision recorded: keep, do not
+delete.** Row corrected.
+
+Defects fixed (both C-class — tests that could not fail):
+
+- **X1** `checkpoint_prepare_failure_leaves_no_committed_state` was
+  `let r: Result<(),String> = Err(..); if r.is_ok() { committed = true }`
+  followed by `assert!(!committed)` — a tautology over a locally-constructed
+  `Err`. It exercised no production code; no engine change could make it
+  fail. Rewritten against the real `LocalFsCheckpointStorage`: a
+  never-committed epoch must be absent from `list_valid_epochs` and read back
+  as `None`. Revert-proven (stubbing the epoch list red).
+- **X2** `policy_hook_denies_table_access` and `policy_hook_allows_table_access`
+  each defined a local `DenyAllPolicy`/`AllowAllPolicy` returning a constant
+  and asserted that same constant back — assertions on the test double's own
+  body, the exact shape the register's C checklist names. Merged into one
+  test that exercises the **shipped** `AllowAllPolicyHook` through
+  `Arc<dyn PolicyHook>` (the form the engine holds) and keeps a targeted deny
+  policy that must deny only its named table — so a deny hook that denied
+  everything would now fail.
+
+Gates (24–27): cargo test -p krishiv-bench (35), -p krishiv-sql-gateway (20),
+-p krishiv-conformance, -p krishiv-chaos (25) — all green; clippy 0 on all
+four including the CI-excluded chaos crate; `just lint`, `just test`,
+`cargo fmt` — green.
+
+---
+
+**Register complete.** All 27 crates have been read end to end.

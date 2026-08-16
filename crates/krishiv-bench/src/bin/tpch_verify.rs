@@ -78,7 +78,9 @@ async fn main() -> std::process::ExitCode {
         let engine = krishiv_sql::SqlEngine::new();
         let mut setup_failed = None;
         for table in query.tables {
-            if let Err(error) = engine.register_parquet(*table, table_path(&dir, table)).await
+            if let Err(error) = engine
+                .register_parquet(*table, table_path(&dir, table))
+                .await
             {
                 setup_failed = Some(format!("register {table}: {error}"));
                 break;
