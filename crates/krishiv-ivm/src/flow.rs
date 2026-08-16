@@ -32,7 +32,7 @@ use arrow::compute::cast;
 use arrow::datatypes::SchemaRef;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 use krishiv_delta::{
     DeltaBatch, DeltaError, IncrementalView, IncrementalViewRegistry, IncrementalViewSpec,
@@ -1502,7 +1502,24 @@ impl IncrementalFlow {
 
     // ── Subscriptions / snapshots ─────────────────────────────────────────────
 
-    pub fn view_output_stream(&self, name: &str) -> IvmResult<watch::Receiver<Option<DeltaBatch>>> {
+    /// Subscribe to every output delta of `name`, in order.
+    ///
+    /// Audit: this used to hand back the view's `watch` receiver, which retains
+    /// only the latest value — a subscriber slower than the step engine skipped
+    /// deltas outright, so a vector sink could permanently miss an upsert or a
+    /// delete with nothing logged. The broadcast stream reports a lagging
+    /// subscriber explicitly instead of dropping silently.
+    pub fn view_output_stream(&self, name: &str) -> IvmResult<broadcast::Receiver<DeltaBatch>> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        let view = inner.view_registry.get(name).map_err(delta_err)?;
+        Ok(view.subscribe_deltas())
+    }
+
+    /// Subscribe to the *latest* output delta of `name` (coalescing).
+    ///
+    /// For readers that only want current state; see [`Self::view_output_stream`]
+    /// when every delta matters.
+    pub fn view_output_latest(&self, name: &str) -> IvmResult<watch::Receiver<Option<DeltaBatch>>> {
         let inner = self.inner.lock().map_err(lock_err)?;
         let view = inner.view_registry.get(name).map_err(delta_err)?;
         Ok(view.subscribe())

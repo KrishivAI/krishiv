@@ -34,6 +34,7 @@ use std::sync::Arc;
 use arrow::array::{Array, FixedSizeListArray, Float32Array, StringArray};
 
 use krishiv_delta::DeltaBatch;
+use tokio::sync::broadcast;
 
 use crate::error::{IvmError, IvmResult};
 use crate::flow::IncrementalFlow;
@@ -82,14 +83,28 @@ pub fn spawn_vector_view(
     let id_col = spec.id_column;
     let vec_col = spec.vector_column;
 
+    let view_name = spec.view_name;
+
     Ok(tokio::spawn(async move {
         loop {
-            if rx.changed().await.is_err() {
-                break;
-            }
-            let delta = match rx.borrow_and_update().clone() {
-                Some(d) => d,
-                None => continue,
+            // Audit: this used to read a `watch` receiver, which keeps only the
+            // latest value — every delta published while this task was awaiting
+            // the sink was skipped outright, so an upsert or a delete could
+            // never reach the vector index and nothing reported it. The
+            // broadcast stream delivers each delta; overflow is `Lagged`, which
+            // is loud rather than silent.
+            let delta = match rx.recv().await {
+                Ok(d) => d,
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::error!(
+                        view = %view_name,
+                        skipped = n,
+                        "vector view fell behind the delta stream; the index is now \
+                         missing {n} deltas and must be rebuilt"
+                    );
+                    continue;
+                }
             };
             if let Err(e) = apply_delta_to_sink(sink.as_ref(), &delta, &id_col, &vec_col).await {
                 tracing::warn!("IvmVectorSink error: {e}");
@@ -231,6 +246,106 @@ mod extract_tests {
         let arr = arrow::array::Int64Array::from(vec![Some(7), None]);
         assert_eq!(extract_string_at(&arr, 0).unwrap(), "7");
         assert!(extract_string_at(&arr, 1).is_err(), "null id must error");
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use krishiv_delta::{DeltaBatch, IncrementalViewSpec};
+
+    use super::testing::InMemoryVectorSink;
+    use super::{VectorViewSpec, spawn_vector_view};
+    use crate::flow::IncrementalFlow;
+
+    fn vec_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(
+                "v",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                false,
+            ),
+        ]))
+    }
+
+    fn row(id: &str, v: [f32; 2]) -> DeltaBatch {
+        let vectors = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            2,
+            Arc::new(Float32Array::from(v.to_vec())),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            vec_schema(),
+            vec![
+                Arc::new(StringArray::from(vec![id])),
+                Arc::new(vectors) as _,
+            ],
+        )
+        .unwrap();
+        DeltaBatch::from_inserts(batch).unwrap()
+    }
+
+    /// Regression (post-register audit): every delta must reach the vector sink.
+    ///
+    /// Two ticks are applied back to back, so both are published before the sink
+    /// task gets a chance to poll. The view's `watch` channel retains only the
+    /// latest value, so the pre-fix loop saw only the second delta and `a` was
+    /// never indexed — silently, with no error on any path. The lossless
+    /// broadcast stream delivers both.
+    #[tokio::test]
+    async fn every_delta_reaches_the_vector_sink_even_when_ticks_outpace_it() {
+        let flow = IncrementalFlow::new();
+        flow.register_view(IncrementalViewSpec {
+            name: "docs".into(),
+            body_sql: "SELECT * FROM src".into(),
+            output_schema: vec_schema(),
+            is_materialized: false,
+            is_recursive: false,
+            lateness: Vec::new(),
+        })
+        .unwrap();
+
+        let sink = InMemoryVectorSink::new();
+        let handle = spawn_vector_view(
+            &flow,
+            VectorViewSpec {
+                view_name: "docs".into(),
+                id_column: "id".into(),
+                vector_column: "v".into(),
+                sink: Arc::clone(&sink) as Arc<dyn super::IvmVectorSink>,
+            },
+        )
+        .unwrap();
+
+        for (id, v) in [("a", [1.0, 2.0]), ("b", [3.0, 4.0])] {
+            flow.apply_remote_tick(
+                HashMap::new(),
+                HashMap::from([("docs".to_string(), row(id, v))]),
+            )
+            .unwrap();
+        }
+
+        // Let the sink task drain both deltas.
+        for _ in 0..50 {
+            if sink.len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        handle.abort();
+
+        assert_eq!(
+            sink.get("a"),
+            Some(vec![1.0, 2.0]),
+            "the first delta must not be coalesced away by the second"
+        );
+        assert_eq!(sink.get("b"), Some(vec![3.0, 4.0]));
     }
 }
 

@@ -10,7 +10,17 @@ use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
+
+/// Buffer depth of the per-view lossless delta stream.
+///
+/// Audit: the watch channel below retains only the *latest* value, so a
+/// subscriber that is slower than the step engine silently skips every delta
+/// but the last one — for a vector sink that means an upsert or a delete that
+/// never reaches the index and never reports an error. The broadcast channel
+/// carries every delta; if a subscriber falls this far behind it receives an
+/// explicit `Lagged(n)` instead of a silent gap.
+pub const VIEW_DELTA_STREAM_CAPACITY: usize = 1024;
 
 use crate::delta_batch::DeltaBatch;
 use crate::error::{DeltaError, DeltaResult};
@@ -33,8 +43,15 @@ pub struct IncrementalView {
     pub spec: IncrementalViewSpec,
     /// Latest output DeltaBatch from the last `step()`. None if never stepped.
     last_output: Arc<Mutex<Option<DeltaBatch>>>,
-    /// Watch channel so `view_output_stream` can receive each new output.
+    /// Watch channel carrying the *latest* output, for peek-style readers.
     sender: watch::Sender<Option<DeltaBatch>>,
+    /// Lossless delta stream: every published delta, in order.
+    ///
+    /// Audit: subscribers that must see *every* delta (a vector index sink
+    /// applying upserts and deletes, say) cannot use `sender` — a watch channel
+    /// coalesces, so a subscriber slower than the step engine skips deltas with
+    /// no error anywhere. See [`VIEW_DELTA_STREAM_CAPACITY`].
+    delta_tx: broadcast::Sender<DeltaBatch>,
     /// Snapshot accumulation for materialized views.
     snapshot: Arc<Mutex<Option<RecordBatch>>>,
     /// Previous full materialized output used for diff-based IVM.
@@ -45,10 +62,12 @@ pub struct IncrementalView {
 impl IncrementalView {
     pub fn new(spec: IncrementalViewSpec) -> (Self, watch::Receiver<Option<DeltaBatch>>) {
         let (sender, receiver) = watch::channel(None);
+        let (delta_tx, _) = broadcast::channel(VIEW_DELTA_STREAM_CAPACITY);
         let view = Self {
             spec,
             last_output: Arc::new(Mutex::new(None)),
             sender,
+            delta_tx,
             snapshot: Arc::new(Mutex::new(None)),
             full_output: Arc::new(Mutex::new(None)),
         };
@@ -115,8 +134,18 @@ impl IncrementalView {
                 "publish_output: not materialized, snapshot skipped"
             );
         }
-        let _ = self.sender.send(Some(output));
+        self.emit(output);
         Ok(())
+    }
+
+    /// Publish `delta` to both output channels.
+    ///
+    /// The watch channel keeps the latest-value semantics `view_output_peek`
+    /// depends on; the broadcast channel is the lossless stream. Both sends are
+    /// best-effort in the same sense: no subscribers is not an error.
+    fn emit(&self, delta: DeltaBatch) {
+        let _ = self.delta_tx.send(delta.clone());
+        let _ = self.sender.send(Some(delta));
     }
 
     /// Return the last output, or an empty batch.
@@ -146,8 +175,23 @@ impl IncrementalView {
             .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))
     }
 
+    /// Subscribe to the *latest* output delta (coalescing).
+    ///
+    /// Correct for peek-style readers that only want current state. A consumer
+    /// that must act on every delta wants [`Self::subscribe_deltas`] instead —
+    /// this channel silently drops intermediate values.
     pub fn subscribe(&self) -> watch::Receiver<Option<DeltaBatch>> {
         self.sender.subscribe()
+    }
+
+    /// Subscribe to the lossless stream of every published delta.
+    ///
+    /// Deltas published *before* this call are not replayed; from this point on
+    /// the subscriber sees each one in order, or an explicit
+    /// `RecvError::Lagged(n)` if it falls more than
+    /// [`VIEW_DELTA_STREAM_CAPACITY`] behind.
+    pub fn subscribe_deltas(&self) -> broadcast::Receiver<DeltaBatch> {
+        self.delta_tx.subscribe()
     }
 
     /// Compute the delta between the previous full output and `new_full`, store
@@ -212,7 +256,7 @@ impl IncrementalView {
                 .map_err(|_| DeltaError::Operator("view output lock poisoned".into()))?;
             *lo = Some(delta.clone());
         }
-        let _ = self.sender.send(Some(delta.clone()));
+        self.emit(delta.clone());
         Ok(delta)
     }
 
@@ -247,7 +291,7 @@ impl IncrementalView {
                 .map_err(|_| DeltaError::Operator("view output lock poisoned".into()))?;
             *lo = Some(delta.clone());
         }
-        let _ = self.sender.send(Some(delta.clone()));
+        self.emit(delta.clone());
         Ok(())
     }
 

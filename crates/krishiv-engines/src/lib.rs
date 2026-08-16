@@ -392,7 +392,16 @@ impl ComputeEngine for IncrementalEngine {
         // (which reference multiple tables) can be planned. Previously only
         // the first source's schema was seeded, making multi-source views
         // unreachable via the unified spine.
+        //
+        // Audit: the probe used to drop its reader and the batch it had already
+        // consumed, then re-open the source for the drain. That is only correct
+        // for a rewindable source — a non-rewindable one (a queue, a socket, a
+        // cursor-based CDC feed) resumes *after* the probed batch, so its first
+        // batch was consumed for its schema and then silently never processed:
+        // a data loss with no error anywhere. The reader and its first batch are
+        // now carried into the drain below instead.
         let mut source_schemas: Vec<(String, SchemaRef)> = Vec::with_capacity(job.sources.len());
+        let mut opened = Vec::with_capacity(job.sources.len());
         for spec in &job.sources {
             let mut reader = rt.sources.open(spec).await?;
             let first = reader.next_changelog().await?.ok_or_else(|| {
@@ -403,6 +412,7 @@ impl ComputeEngine for IncrementalEngine {
                 ))
             })?;
             source_schemas.push((spec.name.clone(), first.batch().schema()));
+            opened.push((spec, reader, first));
         }
         let output_schema = infer_output_schema(&source_schemas, &job.query).await?;
 
@@ -456,11 +466,11 @@ impl ComputeEngine for IncrementalEngine {
             Ok(())
         };
 
-        // Drive ALL sources to EOF with the same streaming path.
-        // (IVM-8: the schema-seeding loop above opened and consumed one batch
-        // from each source; re-open for the full drain.)
-        for spec in &job.sources {
-            let mut reader = rt.sources.open(spec).await?;
+        // Drive ALL sources to EOF with the same streaming path, continuing the
+        // readers the schema probe already opened (see the audit note above) and
+        // processing the batch it consumed for the schema before reading on.
+        for (spec, mut reader, first) in opened {
+            step_and_emit(&flow, &spec.name, &first, &mut writers).await?;
             while let Some(changelog) = reader.next_changelog().await? {
                 if let Some(first) = source_schemas.iter_mut().find(|(n, _)| n == &spec.name) {
                     if first.1.as_ref() != changelog.batch().schema().as_ref() {
@@ -1382,6 +1392,97 @@ mod tests {
         let rows: usize = out.iter().map(ChangelogBatch::num_rows).sum();
         assert_eq!(rows, 3, "all input rows stream through to the sink");
         assert!(out.iter().all(ChangelogBatch::is_append_only));
+    }
+
+    /// A source that cannot be rewound: every `open` returns a reader that
+    /// continues from the shared cursor, the way a queue or a cursor-based CDC
+    /// feed behaves. Re-opening it does *not* replay what was already read.
+    #[derive(Clone)]
+    struct NonRewindableSourceProvider {
+        remaining: Arc<std::sync::Mutex<std::collections::VecDeque<RecordBatch>>>,
+        opens: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct NonRewindableReader {
+        remaining: Arc<std::sync::Mutex<std::collections::VecDeque<RecordBatch>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SourceReader for NonRewindableReader {
+        async fn next(&mut self) -> EngineResult<Option<RecordBatch>> {
+            Ok(self
+                .remaining
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pop_front())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl krishiv_engine_core::SourceProvider for NonRewindableSourceProvider {
+        async fn open(&self, _spec: &SourceSpec) -> EngineResult<Box<dyn SourceReader>> {
+            self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(NonRewindableReader {
+                remaining: Arc::clone(&self.remaining),
+            }))
+        }
+    }
+
+    /// Regression (post-register audit): the incremental engine's schema probe
+    /// must not consume a batch it then never processes.
+    ///
+    /// The probe used to read the first batch for its schema, drop the reader,
+    /// and re-open the source for the drain. A rewindable source replays, so
+    /// this was invisible; a non-rewindable one resumes *after* the probed
+    /// batch, so row `a` was read, used for the schema, and silently dropped —
+    /// the aggregate came out as 2 instead of 3 with no error anywhere.
+    #[tokio::test]
+    async fn incremental_engine_does_not_lose_the_probed_batch_of_a_non_rewindable_source() {
+        let sources = NonRewindableSourceProvider {
+            remaining: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+                vec![kv_batch(&["a"], &[1]), kv_batch(&["b"], &[2])],
+            ))),
+            opens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let sink = InMemorySinkProvider::new();
+        let rt = embedded_runtime(Arc::new(sources.clone()), Arc::new(sink.clone()));
+
+        let job = CompiledJob::new(
+            "count-job",
+            "SELECT COUNT(*) AS n FROM t",
+            vec![SourceSpec::cdc("t", "memory", "")],
+            vec![SinkSpec::new("out", "memory", "")],
+            false,
+        );
+        assert_eq!(job.engine, EngineKind::Incremental);
+        run_job(job, rt).await.unwrap();
+
+        assert_eq!(
+            sources.opens.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the source must be opened once, not re-opened for the drain"
+        );
+
+        // The final emitted count must see both rows. Take the last positive
+        // count row across the emitted changelogs.
+        let out = sink.take("out");
+        let last = out
+            .iter()
+            .flat_map(|cl| {
+                let n = cl
+                    .batch()
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                (0..cl.num_rows())
+                    .filter(|i| cl.row_kind(*i) == Some(RowKind::Insert))
+                    .map(|i| n.value(i))
+                    .collect::<Vec<_>>()
+            })
+            .next_back()
+            .expect("at least one count row");
+        assert_eq!(last, 2, "the probed first batch must still be processed");
     }
 
     #[tokio::test]
