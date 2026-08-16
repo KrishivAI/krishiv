@@ -4021,3 +4021,95 @@ absent from user-facing docs.
 
 Gates: `cargo test -p krishiv-api -p krishiv-scheduler`, `just lint`,
 `just test`, `cargo fmt --all` — green.
+
+## §33 — batch API review: SQL, Rust, Python (2026-08-16)
+
+A review of the three front doors onto the batch engine, and the fixes it
+produced. Findings graded by how they fail rather than by a generic severity
+scale: none of these were silent wrong answers.
+
+**A1 — the DataFrame API stopped at the process boundary. FIXED.** A
+`DataFrame` carries both an `Arc<dyn KrishivDataFrameOps>` (the real plan) and
+an `Option<String>` of originating SQL, and remote execution shipped *only the
+string*. Every transform routes through `with_new_ops`, which sets
+`sql_query: None`, so `select` / `filter` / `join` / `group_by` / `union` /
+`limit` / `distinct` — roughly forty methods — produced a DataFrame that could
+not be collected in any session that executes remotely. Python inherited it
+exactly. Verified by execution, not reading: a filtered DataFrame on a
+Distributed session returned `remote execution requires a SQL query`.
+
+The fix was smaller than the finding: `KrishivDataFrameOps::to_sql` already
+unparses the *current* DataFusion logical plan via
+`datafusion::sql::unparser::plan_to_sql` — the DataFrame layer simply never
+called it. `DataFrame::query_for_remote` now prefers `sql_query` when present
+(keeping the user's own text, comments and formatting intact for the
+untransformed case) and falls back to the unparser otherwise. Plans that
+genuinely cannot be unparsed still fail, but with a message that names the
+mode and the two workarounds instead of naming a missing input.
+
+The Python UDF prelude moved to its own `remote_prelude` field in the same
+change. It had been prepended into `sql_query` (§32), which a transform
+discards — so directives would have been silently lost exactly when the
+unparser path started being used. Held apart, it survives.
+
+**A2 — inline tables were dropped by the single-node backend. FIXED, and found
+by the new harness on its first run.** `FlightExecutionHost::execute_batch_sql_with_paths`
+accepted `inline_tables` and, on the `InProcess` arm, never read it: only the
+path catalog reached the cluster. The Rust Flight client inlines any parquet
+table under the inline-IPC cap, so **every such client hitting a single-node
+daemon failed with "table not found" for a table it had just registered.**
+Inline tables now travel alongside the catalog tables, and
+`in_process::execute_inline_sql` registers their decoded batches instead of
+canonicalizing an empty path. This is a field that was accepted and ignored —
+the same shape as the Phase 68/69 defect class.
+
+**A3 — three Python `_async` methods were not. FIXED.**
+`DataFrame.collect_async`, `DataFrame.execute_stream_async` and
+`Session.sql_with_timeout_async` blocked despite their names (the last was a
+literal alias for the sync method), while `Session.sql_async` and
+`QueryHandle.collect_async` on the same objects were genuine coroutines. So
+`await df.collect_async()` raised `TypeError` and calling it without `await`
+stalled the caller's event loop. All three are now `future_into_py` coroutines;
+the synchronous forms (`collect`, `sql_with_timeout`) already existed, so no
+capability was lost. GIL handling underneath was already correct — 124
+`py.detach` sites — this was naming, not concurrency.
+
+**A4 — Arrow PyCapsule interface. ADDED.** `QueryResult.__arrow_c_stream__`
+exposes an `FFI_ArrowArrayStream`, the protocol pyarrow / Polars / DuckDB /
+pandas 2.x negotiate zero-copy handoff through, so `pa.table(result)` and
+`pl.DataFrame(result)` work without the `to_arrow()` round-trip. `arrow`'s
+`ffi` feature is enabled on krishiv-python only, keeping the C-ABI surface out
+of the engine's build graph.
+
+**A5 — the cross-mode gate that was missing. BUILT.** `mode_conformance.rs`
+claimed "the same query run through Embedded must produce byte-for-byte
+identical results" and every executing test in it built an *embedded* session;
+the one single-node test was `#[ignore]`d and there were no distributed tests.
+That absent gate is how §32's three defects and A1/A2 above all survived.
+`live_conformance` now stands up a real in-process Flight SQL server, points a
+remote session at it, and runs a ten-query corpus (aggregation, ordering,
+grouping, joins, DISTINCT, NULL handling, HAVING) through both modes comparing
+rendered row sets, plus a transformed-DataFrame case. It needs no external
+daemon, so it runs in CI with everything else. It failed 9 of 10 on its first
+run, which is what surfaced A2.
+
+**Corrected from the earlier reading:** distributed batch is not "usually one
+executor". The client inlines parquet only up to `inline_ipc_max_bytes`; past
+the cap inlining fails, the table becomes a path table, and staging becomes
+eligible. Small tables running single-task is the design.
+
+**Recorded, not fixed.** Two items are scoped rather than done, and both are
+substantial rather than deferred out of convenience:
+
+- **BATCH-2, remote result materialization.** Embedded streams to sinks
+  batch-by-batch; the remote path collects into a `Vec` first, so a job that
+  streams 50 GB embedded fails at the 2 GiB cap distributed. Closing it means
+  changing `collect_batch_sql_async` to return a stream and threading that
+  through the Flight `do_get` transport — a transport-level change, not a
+  call-site one.
+- **Table-generating function machinery.** One absent capability blocks
+  `json_tuple`, `stack`, `posexplode`, `inline` and LATERAL VIEW together;
+  building it once clears most of the SQL matrix's `planned` column. That is a
+  feature, not an audit fix.
+
+Gates: `just lint`, `just test`, `cargo fmt --all` — green.

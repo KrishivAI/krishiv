@@ -225,6 +225,14 @@ pub struct DataFrame {
     /// live only in the local DataFusion context and cannot be forwarded to a
     /// remote executor.
     force_local: bool,
+    /// Directives (Python UDF registrations) that must precede any query text
+    /// this DataFrame ships to a coordinator.
+    ///
+    /// Held apart from `sql_query` rather than baked into it: a transform
+    /// discards `sql_query` and re-derives the text from the plan, and the
+    /// directives have to survive that. Empty for embedded sessions, which
+    /// resolve UDFs in process and never ship anything.
+    remote_prelude: Option<String>,
 }
 
 impl fmt::Debug for DataFrame {
@@ -322,6 +330,7 @@ impl DataFrame {
             registered_parquet: Arc::new(DashMap::new()),
             force_local: false,
             _cache_name: None,
+            remote_prelude: None,
         })
     }
 
@@ -338,14 +347,50 @@ impl DataFrame {
     /// bound to the local catalog). Previously this expression was
     /// repeated at 5+ call sites; a single source of truth makes
     /// future changes (e.g. a new local-only DataFrame type) one-line.
-    /// The exact query text this DataFrame would ship to a coordinator.
+    /// The exact text to submit to a coordinator for this DataFrame.
     ///
-    /// Test-only accessor: the difference between what is planned locally and
-    /// what is submitted remotely is precisely where the Python-UDF directive
-    /// was being dropped, so it needs to be assertable.
-    #[cfg(test)]
-    pub(crate) fn sql_query_for_test(&self) -> Option<&str> {
-        self.sql_query.as_deref()
+    /// Audit: remote execution used to require `sql_query`, which every
+    /// transform discards (`with_new_ops` sets it to `None`). That made the
+    /// whole DataFrame transform API — select, filter, join, group_by, union,
+    /// and the rest — embedded-only in both the Rust and Python surfaces: a
+    /// program that worked locally failed the moment the session pointed at a
+    /// cluster, with an error naming a missing input rather than an
+    /// unsupported mode.
+    ///
+    /// The plan can be rendered back to SQL, so it is. `to_sql` unparses the
+    /// *current* DataFusion logical plan, which reflects every applied
+    /// transform, and falls back to the originating query when the plan cannot
+    /// be unparsed. Preferring `sql_query` when it is present keeps the
+    /// user's own text — comments, hints and formatting intact — for the
+    /// untransformed case, and only reaches for the unparser when there is no
+    /// alternative.
+    ///
+    /// Some plans genuinely cannot be unparsed. Those still fail, but now with
+    /// a message that says what happened and what to do about it.
+    pub(crate) fn query_for_remote(&self) -> Result<String> {
+        let base = match self.sql_query.as_deref() {
+            Some(query) => query.to_owned(),
+            None => {
+                let ops = self.sql_dataframe.as_ref().ok_or_else(|| {
+                    KrishivError::unsupported(
+                        "this DataFrame carries neither a SQL query nor a plan, so there is \
+                         nothing to send to the cluster",
+                    )
+                })?;
+                ops.to_sql().map_err(|error| {
+                    KrishivError::unsupported(format!(
+                        "this DataFrame's transforms cannot be rendered back to SQL, and a \
+                         remote session can only execute SQL ({error}). Either express the \
+                         query in SQL and pass it to session.sql(), or call \
+                         session.execute_local() to run it in this process against local data"
+                    ))
+                })?
+            }
+        };
+        Ok(match self.remote_prelude.as_deref() {
+            Some(prelude) if !prelude.is_empty() => format!("{prelude}\n{base}"),
+            _ => base,
+        })
     }
 
     pub(crate) fn is_locally_evaluated(&self) -> bool {
@@ -363,6 +408,7 @@ impl DataFrame {
         coordinator_http_url: Option<String>,
         runtime: Arc<dyn ExecutionRuntime>,
         registered_parquet: Arc<DashMap<String, RegisteredParquet>>,
+        remote_prelude: Option<String>,
     ) -> Self {
         let logical_plan = sql_dataframe.krishiv_logical_plan();
         Self {
@@ -380,6 +426,7 @@ impl DataFrame {
             registered_parquet,
             force_local: false,
             _cache_name: None,
+            remote_prelude,
         }
     }
 
@@ -410,6 +457,7 @@ impl DataFrame {
             registered_parquet,
             force_local: false,
             _cache_name: None,
+            remote_prelude: None,
         }
     }
 
@@ -707,24 +755,23 @@ Execution statistics:
         let uses_remote = !self.is_locally_evaluated();
 
         let result = if uses_remote {
-            if let Some(query) = self.sql_query.as_deref() {
-                let tables = self
-                    .registered_parquet
-                    .iter()
-                    .map(|entry| entry.value().to_registration(entry.key()))
-                    .collect::<Vec<_>>();
-                crate::session::runtime_collect_batch_sql(
-                    Arc::clone(&self.runtime),
-                    query,
-                    &tables,
-                    false,
-                )
-                .await
-                .map(QueryResult::new)
-            } else {
-                Err(KrishivError::unsupported(
-                    "remote execution requires a SQL query",
-                ))
+            match self.query_for_remote() {
+                Ok(query) => {
+                    let tables = self
+                        .registered_parquet
+                        .iter()
+                        .map(|entry| entry.value().to_registration(entry.key()))
+                        .collect::<Vec<_>>();
+                    crate::session::runtime_collect_batch_sql(
+                        Arc::clone(&self.runtime),
+                        &query,
+                        &tables,
+                        false,
+                    )
+                    .await
+                    .map(QueryResult::new)
+                }
+                Err(error) => Err(error),
             }
         } else if let Some(dataframe) = &self.sql_dataframe {
             dataframe
@@ -760,26 +807,25 @@ Execution statistics:
         let uses_remote = !self.is_locally_evaluated();
 
         let result = if uses_remote {
-            if let Some(query) = self.sql_query.as_deref() {
-                let tables = self
-                    .registered_parquet
-                    .iter()
-                    .map(|entry| entry.value().to_registration(entry.key()))
-                    .collect::<Vec<_>>();
-                let is_streaming = self.logical_plan.kind() == ExecutionKind::Streaming;
-                let batches = crate::session::runtime_collect_batch_sql(
-                    Arc::clone(&self.runtime),
-                    query,
-                    &tables,
-                    is_streaming,
-                )
-                .await?;
-                let stream = futures::stream::iter(batches.into_iter().map(Ok));
-                Ok(Box::pin(stream) as crate::streaming_dataframe::KrishivStream)
-            } else {
-                Err(KrishivError::unsupported(
-                    "remote execution requires a SQL query",
-                ))
+            match self.query_for_remote() {
+                Ok(query) => {
+                    let tables = self
+                        .registered_parquet
+                        .iter()
+                        .map(|entry| entry.value().to_registration(entry.key()))
+                        .collect::<Vec<_>>();
+                    let is_streaming = self.logical_plan.kind() == ExecutionKind::Streaming;
+                    let batches = crate::session::runtime_collect_batch_sql(
+                        Arc::clone(&self.runtime),
+                        &query,
+                        &tables,
+                        is_streaming,
+                    )
+                    .await?;
+                    let stream = futures::stream::iter(batches.into_iter().map(Ok));
+                    Ok(Box::pin(stream) as crate::streaming_dataframe::KrishivStream)
+                }
+                Err(error) => Err(error),
             }
         } else if let Some(dataframe) = &self.sql_dataframe {
             if !self.force_local {
@@ -886,6 +932,7 @@ Execution statistics:
             registered_parquet: self.registered_parquet.clone(),
             force_local: self.force_local,
             _cache_name: None,
+            remote_prelude: self.remote_prelude.clone(),
         }
     }
 
@@ -947,6 +994,7 @@ Execution statistics:
             registered_parquet: self.registered_parquet.clone(),
             force_local: self.force_local,
             _cache_name: None,
+            remote_prelude: self.remote_prelude.clone(),
         }
     }
 
@@ -1875,6 +1923,7 @@ Execution statistics:
             _coordinator_url: self._coordinator_url.clone(),
             coordinator_http_url: self.coordinator_http_url.clone(),
             ivm_parent: self.ivm_parent.clone(),
+            remote_prelude: self.remote_prelude.clone(),
             runtime: self.runtime.clone(),
             registered_parquet: self.registered_parquet.clone(),
             force_local: self.force_local,

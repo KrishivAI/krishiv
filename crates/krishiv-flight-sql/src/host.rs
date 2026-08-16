@@ -242,7 +242,22 @@ impl FlightExecutionHost {
                 for t in path_tables {
                     self.register_parquet(&t.table_name, t.path.clone());
                 }
-                let tables = self.catalog_tables();
+                // Audit: inline tables used to be dropped on this arm entirely
+                // — the parameter was accepted and never read, and only the
+                // path catalog reached the cluster. The Rust Flight client
+                // inlines any parquet table under the inline-IPC cap, so every
+                // such client hitting a single-node daemon failed with
+                // "table not found" for a table it had just registered. They
+                // now travel alongside the catalog tables, carrying their IPC
+                // payload instead of a path.
+                let mut tables = self.catalog_tables();
+                tables.extend(inline_tables.iter().map(|t| {
+                    krishiv_runtime::in_process::BatchSqlTable {
+                        table_name: t.table_name.clone(),
+                        ipc_b64: t.ipc_b64.clone(),
+                        ..Default::default()
+                    }
+                }));
                 let sql = query.to_string();
                 let cluster = Arc::clone(cluster);
                 let is_streaming = match cluster.is_streaming_query(&sql) {

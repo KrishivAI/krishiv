@@ -359,6 +359,19 @@ impl InProcessStreamingRuntime {
             // Skip tables already registered in a previous inline call to avoid
             // redundant DataFusion re-registration (file footer re-read).
             for table in &tables {
+                // Inline tables carry their data as base64 Arrow IPC rather
+                // than a path. Register the decoded batches directly: the
+                // path-based branch below would canonicalize an empty path and
+                // then fail to open it, which is how an inlined table reached
+                // the planner as "not found".
+                if !table.ipc_b64.is_empty() {
+                    let batches = decode_ipc_b64_batches(&table.ipc_b64)?;
+                    engine
+                        .register_record_batches(&table.table_name, batches)
+                        .await
+                        .map_err(|e| RuntimeError::transport(e.to_string()))?;
+                    continue;
+                }
                 let canonical_path = table
                     .path
                     .canonicalize()
@@ -1117,6 +1130,22 @@ pub fn execute_windowed_in_process_ephemeral(
 ) -> RuntimeResult<Vec<RecordBatch>> {
     let cluster = crate::InProcessCluster::new()?;
     cluster.collect_bounded_window(topic, input_batches, spec)
+}
+
+/// Decode a base64 Arrow-IPC stream into its record batches.
+///
+/// The inline transport for a batch-SQL table: the client encodes a parquet
+/// table this way so executors need no shared filesystem.
+fn decode_ipc_b64_batches(ipc_b64: &str) -> RuntimeResult<Vec<RecordBatch>> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(ipc_b64.as_bytes())
+        .map_err(|e| RuntimeError::transport(format!("inline table base64 decode: {e}")))?;
+    let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+        .map_err(|e| RuntimeError::transport(format!("inline table ipc reader: {e}")))?;
+    reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| RuntimeError::transport(format!("inline table ipc read: {e}")))
 }
 
 #[cfg(test)]

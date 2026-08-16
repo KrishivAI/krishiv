@@ -78,6 +78,45 @@ impl PyQueryResult {
             .map(|o| o.unbind())
     }
 
+    /// Arrow PyCapsule stream interface (`__arrow_c_stream__`).
+    ///
+    /// This is how pyarrow, Polars, DuckDB and pandas 2.x negotiate a zero-copy
+    /// handoff: any consumer that understands the capsule protocol can read the
+    /// result directly, without going through `to_arrow()` and its intermediate
+    /// Python objects. `pa.table(result)`, `pl.DataFrame(result)` and
+    /// `duckdb.sql("SELECT * FROM result")` all work off this one method.
+    ///
+    /// `requested_schema` is part of the protocol and is accepted for
+    /// conformance; a cast is not attempted, and the consumer is free to cast
+    /// what it receives. That is the behaviour the protocol permits when a
+    /// producer cannot honour the request, and it is preferable to silently
+    /// returning data in a schema the caller did not ask for.
+    #[pyo3(signature = (requested_schema=None))]
+    pub fn __arrow_c_stream__<'py>(
+        &self,
+        py: Python<'py>,
+        requested_schema: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
+        use arrow::ffi_stream::FFI_ArrowArrayStream;
+        use arrow::record_batch::RecordBatchIterator;
+        use std::ffi::CStr;
+
+        // The capsule name must outlive the capsule, so it is a 'static CStr
+        // rather than a local CString. "arrow_array_stream" is the name the
+        // PyCapsule protocol requires — consumers match on it exactly.
+        const CAPSULE_NAME: &CStr = c"arrow_array_stream";
+
+        let _ = requested_schema;
+        let batches = self.inner.batches().to_vec();
+        let schema = batches
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let stream = FFI_ArrowArrayStream::new(Box::new(reader));
+        pyo3::types::PyCapsule::new_with_value(py, stream, CAPSULE_NAME)
+    }
+
     /// Convert to a pandas DataFrame.
     pub fn to_pandas(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.to_arrow(py)?

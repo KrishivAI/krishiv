@@ -41,30 +41,38 @@ impl PyDataFrame {
         self.collect(py)
     }
 
-    pub fn collect_async(&self, py: Python<'_>) -> PyResult<PyQueryResult> {
+    /// Collect asynchronously — returns an awaitable.
+    ///
+    /// Audit: this used to block on the future and hand back a result, so
+    /// `await df.collect_async()` raised `TypeError` and calling it without
+    /// `await` stalled the caller's event loop for the length of the query —
+    /// while `Session.sql_async` and `QueryHandle.collect_async`, sitting right
+    /// beside it, were genuine coroutines. The name now means what it says.
+    /// Use [`collect`](Self::collect) for the synchronous form.
+    pub fn collect_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        py.detach(move || {
-            crate::session::block_on_async(inner.collect_async())
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner
+                .collect_async()
+                .await
                 .map(PyQueryResult::new)
                 .map_err(map_krishiv_error)
         })
     }
 
-    pub fn execute_stream_async(&self, py: Python<'_>) -> PyResult<PyDataFrameStream> {
+    /// Execute and return an awaitable resolving to a `DataFrameStream`.
+    ///
+    /// Was blocking despite the name; see [`collect_async`](Self::collect_async).
+    pub fn execute_stream_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        let stream = py
-            .detach(move || {
-                crate::session::block_on_async(async move {
-                    inner.execute_stream_async().await.map_err(|e| {
-                        krishiv_api::KrishivError::Runtime {
-                            message: e.to_string(),
-                        }
-                    })
-                })
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let stream = inner
+                .execute_stream_async()
+                .await
+                .map_err(map_krishiv_error)?;
+            Ok(PyDataFrameStream {
+                stream: std::sync::Arc::new(tokio::sync::Mutex::new(stream)),
             })
-            .map_err(map_krishiv_error)?;
-        Ok(PyDataFrameStream {
-            stream: std::sync::Arc::new(tokio::sync::Mutex::new(stream)),
         })
     }
 

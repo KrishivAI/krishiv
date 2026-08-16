@@ -884,13 +884,25 @@ impl PySession {
     /// the public Python package wraps in a coroutine, rather than a PyO3 native
     /// `async fn` (whose future would have to be `Send`). It runs the query
     /// off-GIL via [`sql_with_timeout`](Self::sql_with_timeout).
-    pub fn sql_with_timeout_async(
+    /// Awaitable variant of [`sql_with_timeout`](Self::sql_with_timeout).
+    ///
+    /// Audit: this was a literal alias for the synchronous method — the `_async`
+    /// suffix promised a coroutine and delivered a blocking call, next to
+    /// `sql_async` which is genuinely awaitable.
+    pub fn sql_with_timeout_async<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
         query: String,
         timeout_ms: u64,
-    ) -> PyResult<PyDataFrame> {
-        self.sql_with_timeout(py, query, timeout_ms)
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner
+                .sql_with_timeout_async(&query, timeout_ms)
+                .await
+                .map(|df| PyDataFrame { inner: df })
+                .map_err(map_krishiv_error)
+        })
     }
 
     /// Create an :class:`OperationRegistry` tied to this session for operation-level cancellation.

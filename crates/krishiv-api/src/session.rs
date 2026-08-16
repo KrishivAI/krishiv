@@ -1932,8 +1932,21 @@ impl Session {
     /// for every registered Python scalar/aggregate UDF, so they travel with a
     /// distributed query to the executors.
     fn prepend_python_udfs(&self, query: &str) -> String {
-        if self.python_udfs.is_empty() && self.python_udafs.is_empty() {
+        let directives = self.python_udf_directives();
+        if directives.is_empty() {
             return query.to_string();
+        }
+        format!("{directives}\n{query}")
+    }
+
+    /// The registered Python UDF/UDAF registration directives, newline-joined.
+    ///
+    /// Executors decode these SQL comments to reconstruct the worker-backed
+    /// function, so they must precede any query text that leaves the process.
+    /// Returns an empty string when nothing is registered.
+    fn python_udf_directives(&self) -> String {
+        if self.python_udfs.is_empty() && self.python_udafs.is_empty() {
+            return String::new();
         }
         let mut comments: Vec<String> = self
             .python_udfs
@@ -1957,7 +1970,6 @@ impl Session {
                 pickle_b64,
             )
         }));
-        comments.push(query.to_string());
         comments.join("\n")
     }
 
@@ -2471,13 +2483,17 @@ impl Session {
         // shown in diagnostics for no gain. The DataFrame plans against
         // `sql_dataframe` (built from the plain query), so this affects
         // submission only, never planning.
-        let sql_query = sql_dataframe.query().map(|q| {
-            if self.runtime.uses_remote_execution() {
-                self.prepend_python_udfs(q)
-            } else {
-                q.to_owned()
-            }
-        });
+        let sql_query = sql_dataframe.query().map(str::to_owned);
+        // The prelude travels as its own field rather than baked into
+        // `sql_query`: a DataFrame transform discards `sql_query` and re-derives
+        // the text from the plan (see `DataFrame::query_for_remote`), and the
+        // directives have to survive that. Empty for embedded sessions, which
+        // resolve UDFs in process and ship nothing.
+        let remote_prelude = self
+            .runtime
+            .uses_remote_execution()
+            .then(|| self.python_udf_directives())
+            .filter(|prelude| !prelude.is_empty());
         DataFrame::from_sql_dataframe(
             self.mode,
             sql_dataframe,
@@ -2488,6 +2504,7 @@ impl Session {
             self.coordinator_http_url.clone(),
             self.runtime.clone(),
             self.registered_parquet.clone(),
+            remote_prelude,
         )
     }
 
@@ -4146,7 +4163,7 @@ mod remote_session_parity_tests {
         session.register_python_udf_bytes("triple", b"fake-pickle", &["Int64".into()], "Int64");
 
         let df = session.sql("SELECT 1 AS v").expect("sql");
-        let shipped = df.sql_query_for_test().expect("a SQL query to ship");
+        let shipped = df.query_for_remote().expect("a query to ship");
 
         assert!(
             shipped.contains("register-python-udf") && shipped.contains("triple"),
@@ -4164,7 +4181,7 @@ mod remote_session_parity_tests {
         session.register_python_udf_bytes("triple", b"fake-pickle", &["Int64".into()], "Int64");
 
         let df = session.sql("SELECT 1 AS v").expect("sql");
-        let query = df.sql_query_for_test().expect("a SQL query");
+        let query = df.query_for_remote().expect("a query");
 
         assert!(
             !query.contains("register-python-udf"),
@@ -4196,6 +4213,62 @@ mod remote_session_parity_tests {
             registration.path.exists(),
             "the spilled parquet must exist on disk at {}",
             registration.path.display()
+        );
+    }
+
+    /// A transformed DataFrame must still execute in a remote session.
+    ///
+    /// Audit: every transform routes through `with_new_ops`, which drops
+    /// `sql_query`, and remote execution used to require it — so `select`,
+    /// `filter`, `join`, `group_by` and the rest were embedded-only in both the
+    /// Rust and Python surfaces. A program that worked locally stopped working
+    /// the moment its session pointed at a cluster. The plan is now rendered
+    /// back to SQL through the DataFusion unparser.
+    #[test]
+    fn transformed_dataframe_is_shippable_in_a_remote_session() {
+        let session = remote_session();
+        session
+            .register_record_batches("nums", vec![batch(&[1, 2, 3])])
+            .expect("register");
+
+        let filtered = session
+            .sql("SELECT v FROM nums")
+            .expect("sql")
+            .filter("v > 1")
+            .expect("filter");
+
+        let shipped = filtered
+            .query_for_remote()
+            .expect("a transformed DataFrame must be shippable");
+        assert!(
+            shipped.to_ascii_uppercase().contains("WHERE"),
+            "the unparsed SQL must carry the filter, or the cluster would run \
+             the unfiltered query and return the wrong rows; got: {shipped}"
+        );
+    }
+
+    /// The UDF prelude must survive a transform.
+    ///
+    /// It is held apart from `sql_query` precisely because a transform discards
+    /// that field; baking the directives into it would lose them here.
+    #[test]
+    fn udf_prelude_survives_a_transform() {
+        let session = remote_session();
+        session.register_python_udf_bytes("triple", b"fake-pickle", &["Int64".into()], "Int64");
+        session
+            .register_record_batches("nums", vec![batch(&[1, 2, 3])])
+            .expect("register");
+
+        let filtered = session
+            .sql("SELECT v FROM nums")
+            .expect("sql")
+            .filter("v > 1")
+            .expect("filter");
+
+        let shipped = filtered.query_for_remote().expect("shippable");
+        assert!(
+            shipped.contains("register-python-udf"),
+            "a transform must not strip the UDF directives; got: {shipped}"
         );
     }
 

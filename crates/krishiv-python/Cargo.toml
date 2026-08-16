@@ -23,7 +23,11 @@ krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
 krishiv-state = { path = "../krishiv-state", version = "0.1.0" }
 krishiv-metrics = { path = "../krishiv-metrics", version = "0.1.0" }
 krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
-arrow = { workspace = true }
+# `ffi` powers the Arrow PyCapsule stream interface (`__arrow_c_stream__`) on
+# QueryResult — the zero-copy handoff pyarrow / Polars / DuckDB negotiate
+# through. Enabled here rather than workspace-wide: this leaf crate is the only
+# consumer, so the C-ABI surface stays out of the engine's build graph.
+arrow = { workspace = true, features = ["ffi"] }
 parquet = { workspace = true }
 pyo3 = { workspace = true }
 # B-1 fix: turn `sql_async` into a real Python awaitable (not a blocking
