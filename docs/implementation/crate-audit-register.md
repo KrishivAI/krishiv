@@ -55,7 +55,7 @@ largest crate in the workspace, not the second. Counts are `find src tests -name
 | **Tier 4 — thin, tooling, structural smells** |
 | 18 | krishiv-python | 13,101 | 35 | 35 | COMPLETE — PY1–PY7 fixed (§18); direct clippy now 0 |
 | 19 | krishiv-operator | 4,878 | 19 | 19 | COMPLETE — OP1 scale-down leak + OP2 lease-release clobber fixed (§19) |
-| 20 | krishiv-mcp | 3,296 | **1** | 0 | one 3,296-line file |
+| 20 | krishiv-mcp | 3,296 | **1** | 1 | COMPLETE — zero functional defects; one E-class doc fix (§20) |
 | 21 | krishiv | 8,257 | 24 | 0 | binary/CLI |
 | 22 | krishiv-engines | 2,192 | **1** | 0 | one file |
 | 23 | krishiv-ui | 2,384 | 4 | 0 | |
@@ -3459,3 +3459,28 @@ Gates: cargo test -p krishiv-operator --features k8s (54 green incl. 2 new),
 Coverage: 49.4% regions crate-wide (live-k8s I/O paths uncovered by design;
 reconciler 82%, webhook 92%).
 clippy 0, `just lint`, `just test`, `cargo fmt` — green.
+
+## 20. krishiv-mcp — read end to end (2026-08-16)
+
+One file, lib.rs 3,296 lines, read fully. **Zero functional defects.** The MCP
+frontend is a disciplined typed facade over `krishiv_api::Session`: read-only
+SQL gate (first-token check + `KRISHIV_MCP_ALLOW_WRITE_SQL` opt-in), row caps
+via `capped_limit` everywhere rows are materialized, LIMIT-wrapping of
+SELECT/WITH before execution, identifier quoting, base64 validation with
+loud errors, and the distributed-vs-local fallback policy is both implemented
+and *self-described* in `deployment_capabilities`. 12 genuine behavior tests
+incl. continuous-stream and IVM checkpoint/restore base64 round-trips (the
+restore test proves checkpoint3 == checkpoint1 after restore).
+
+One fix (E): `explain_sql mode=analyze` printed `output_rows` and
+`result_rows` as two stats that were the same value by construction; now one
+honest `result_rows` line with a comment on why per-operator stats aren't
+available at this surface. Cosmetic — no revert-proof needed beyond the
+existing explain test coverage.
+
+Notes: `looks_read_only_sql` is a first-token filter — multi-statement
+bypass is closed by the engine (single-statement SQL parse) and by the
+LIMIT-wrap producing a parse error for embedded `;`; recorded, not a defect.
+The read-only default depends on `allow_write_sql=false` default (verified).
+
+Gates: cargo test -p krishiv-mcp (12 green), clippy 0, fmt — green.

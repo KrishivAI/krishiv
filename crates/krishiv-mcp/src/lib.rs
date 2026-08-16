@@ -1002,9 +1002,11 @@ impl KrishivMcpServer {
             "analyze" => {
                 let explain = dataframe.explain_async().await?;
                 let result = dataframe.collect_async().await?;
+                // One honest stat: this surface only knows the final result
+                // row count (per-operator stats live in EXPLAIN ANALYZE
+                // inside the engine, not here).
                 format!(
-                    "{explain}\n\nExecution statistics:\n  output_rows={}\n  result_rows={}",
-                    result.row_count(),
+                    "{explain}\n\nExecution statistics:\n  result_rows={}",
                     result.row_count()
                 )
             }
