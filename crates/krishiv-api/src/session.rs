@@ -3085,10 +3085,37 @@ impl Session {
         name: impl Into<String>,
         spec: LocalWindowExecutionSpec,
     ) -> Result<crate::StreamJob> {
+        self.stream_with_options_async(name, spec, &Default::default())
+            .await
+    }
+
+    /// Submit a continuous windowed streaming job, choosing its distributed
+    /// execution model.
+    ///
+    /// [`stream`](Self::stream) takes the coordinator's defaults, which are the
+    /// single-subtask cycle model — one task, input hand-fed from this client,
+    /// no barrier checkpointing. Pass
+    /// [`ContinuousRegisterOptions::run_loop`](krishiv_runtime::ContinuousRegisterOptions::run_loop)
+    /// to get the parallel, key-grouped, barrier-checkpointed run-loop engine,
+    /// whose subtasks own their own sources.
+    ///
+    /// Options are ignored outside distributed mode: embedded and single-node
+    /// run the in-process cluster, which has no run-loop implementation. Asking
+    /// for one there is an error rather than a silent downgrade.
+    pub async fn stream_with_options_async(
+        &self,
+        name: impl Into<String>,
+        spec: LocalWindowExecutionSpec,
+        options: &krishiv_runtime::ContinuousRegisterOptions,
+    ) -> Result<crate::StreamJob> {
         let name = name.into();
         match self.mode {
             ExecutionMode::Distributed => {
-                let url = self.coordinator_grpc_url().ok_or_else(|| {
+                // The management endpoints are HTTP; `coordinator_grpc_url()`
+                // was being handed to a function that treats its argument as an
+                // HTTP base, which breaks any deployment whose gRPC and HTTP
+                // authorities differ.
+                let url = self.coordinator_http_url().ok_or_else(|| {
                     KrishivError::unsupported(
                         "distributed streaming needs a coordinator URL; \
                          call with_coordinator() or Session::from_env with KRISHIV_COORDINATOR_URL set",
@@ -3099,13 +3126,27 @@ impl Session {
                 // The conversion is lossless — both are the same windowed-
                 // aggregation spec represented at different layers.
                 let plan_spec = spec.to_plan_spec();
-                let remote = krishiv_runtime::RemoteStreamingJob::create(url, &plan_spec, &name)
-                    .await
-                    .map_err(KrishivError::from)?;
+                let remote = krishiv_runtime::RemoteStreamingJob::create_with_options(
+                    url, &plan_spec, &name, options,
+                )
+                .await
+                .map_err(KrishivError::from)?;
                 self.remember_stream_job(&name, None, spec);
                 Ok(crate::StreamJob::Remote(remote))
             }
             ExecutionMode::Embedded | ExecutionMode::SingleNode => {
+                // Fail closed rather than ignore. The in-process cluster has no
+                // run-loop implementation, so accepting `mode: "run-loop"` here
+                // and quietly running the single-executor loop would be the
+                // exact silent-downgrade this option exists to end.
+                if options.mode.is_some() || options.parallelism.is_some_and(|p| p > 1) {
+                    return Err(KrishivError::unsupported(format!(
+                        "continuous run-loop options are only available in distributed mode; \
+                         this session is {}. The in-process cluster runs a single-subtask \
+                         continuous loop and cannot honour mode/parallelism.",
+                        self.mode
+                    )));
+                }
                 let job_id = self.submit_stream_job(name, spec)?;
                 Ok(crate::StreamJob::Embedded(Box::new(
                     crate::compute::EmbeddedStreamJob::new(self.clone(), job_id),

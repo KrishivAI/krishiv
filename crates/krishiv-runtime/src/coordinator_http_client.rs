@@ -462,10 +462,84 @@ pub async fn execute_coordinator_bounded_window(
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchSqlResponseBody, CoordinatorBatchSqlJobResult, batch_sql_job_result_from_payload,
-        normalize_http_base,
+        BatchSqlResponseBody, ContinuousRegisterOptions, CoordinatorBatchSqlJobResult,
+        batch_sql_job_result_from_payload, normalize_http_base,
     };
     use std::sync::Arc;
+
+    /// Serialise the request body exactly as `execute_coordinator_continuous_register`
+    /// builds it, so these tests pin the bytes that actually go on the wire.
+    fn register_body_json(options: &ContinuousRegisterOptions) -> serde_json::Value {
+        #[derive(serde::Serialize)]
+        struct Body<'a> {
+            job_id: &'a str,
+            spec: &'a krishiv_plan::window::WindowExecutionSpec,
+            #[serde(flatten)]
+            options: &'a ContinuousRegisterOptions,
+        }
+        let spec = krishiv_plan::window::WindowExecutionSpec::tumbling("k", "ts", 1_000);
+        serde_json::to_value(Body {
+            job_id: "j",
+            spec: &spec,
+            options,
+        })
+        .expect("register body serialises")
+    }
+
+    /// Default options must produce a body byte-identical to the old two-field
+    /// one, so threading options through cannot change behaviour for any
+    /// existing caller or against any older coordinator.
+    #[test]
+    fn default_options_add_no_fields_to_the_register_body() {
+        let body = register_body_json(&ContinuousRegisterOptions::default());
+        let object = body.as_object().expect("object body");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["job_id", "spec"],
+            "a default-constructed options value must serialise to nothing"
+        );
+    }
+
+    /// The run-loop request must actually carry mode and parallelism. Before
+    /// this existed the client declared a two-field struct, so the coordinator
+    /// -- whose handler has accepted these since Phase 55 -- filled in
+    /// `mode: cycle, parallelism: 1` from serde defaults and every Rust caller
+    /// silently got the single-subtask model.
+    #[test]
+    fn run_loop_options_reach_the_wire() {
+        let options = ContinuousRegisterOptions::run_loop(4)
+            .with_checkpointing(30_000, "file:///var/lib/krishiv/ckpt");
+        let body = register_body_json(&options);
+        assert_eq!(body["mode"], "run-loop");
+        assert_eq!(body["parallelism"], 4);
+        assert_eq!(body["checkpoint_interval_ms"], 30_000);
+        assert_eq!(
+            body["checkpoint_storage_path"],
+            "file:///var/lib/krishiv/ckpt"
+        );
+    }
+
+    /// The coordinator rejects a run-loop job that has one half of the
+    /// checkpoint pair, so the builder sets both together and never emits a
+    /// half-configured body.
+    #[test]
+    fn checkpointing_is_all_or_nothing_on_the_wire() {
+        let body = register_body_json(&ContinuousRegisterOptions::run_loop(2));
+        assert!(
+            body.get("checkpoint_interval_ms").is_none()
+                && body.get("checkpoint_storage_path").is_none(),
+            "no checkpoint fields unless both were set: {body}"
+        );
+        let both = register_body_json(
+            &ContinuousRegisterOptions::run_loop(2).with_checkpointing(1_000, "file:///ckpt"),
+        );
+        assert!(
+            both.get("checkpoint_interval_ms").is_some()
+                && both.get("checkpoint_storage_path").is_some()
+        );
+    }
 
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -585,20 +659,85 @@ mod tests {
 
 // ── Continuous Streaming ───────────────────────────────────────────────────────
 
+/// Execution-model options for a continuous streaming registration.
+///
+/// The coordinator's `/api/v1/continuous-register` handler has accepted these
+/// since Phase 55, but the client body declared only `{job_id, spec}` — so
+/// every registration made through this crate silently took the defaults
+/// (`mode: "cycle"`, `parallelism: 1`, no executor-owned sources, no barrier
+/// checkpointing). The parallel run-loop engine was unreachable from Rust not
+/// because the server lacked it, but because the client never asked.
+///
+/// Every field is skipped when unset, so a default-constructed value serialises
+/// to a byte-identical body and cannot change behaviour for existing callers.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ContinuousRegisterOptions {
+    /// `"cycle"` (default) or `"run-loop"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Run-loop subtask count. Values > 1 require `mode: "run-loop"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallelism: Option<u32>,
+    /// Registry connector sources the run-loop subtasks own directly.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<krishiv_scheduler::continuous_stream_http::ContinuousRegistrySource>,
+    /// Barrier checkpoint interval for run-loop jobs (ms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_interval_ms: Option<u64>,
+    /// Checkpoint storage path for run-loop jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_storage_path: Option<String>,
+}
+
+impl ContinuousRegisterOptions {
+    /// Ask for the parallel run-loop model at `parallelism` subtasks.
+    pub fn run_loop(parallelism: u32) -> Self {
+        Self {
+            mode: Some(String::from("run-loop")),
+            parallelism: Some(parallelism),
+            ..Self::default()
+        }
+    }
+
+    /// Attach barrier checkpointing. The coordinator requires both halves or
+    /// neither, so they are set together.
+    pub fn with_checkpointing(mut self, interval_ms: u64, storage_path: impl Into<String>) -> Self {
+        self.checkpoint_interval_ms = Some(interval_ms);
+        self.checkpoint_storage_path = Some(storage_path.into());
+        self
+    }
+
+    /// Add a registry connector source owned by the run-loop subtasks.
+    pub fn with_source(
+        mut self,
+        source: krishiv_scheduler::continuous_stream_http::ContinuousRegistrySource,
+    ) -> Self {
+        self.sources.push(source);
+        self
+    }
+}
+
 pub async fn execute_coordinator_continuous_register(
     coordinator_http: &str,
     job_id: &str,
     spec: &krishiv_plan::window::WindowExecutionSpec,
+    options: &ContinuousRegisterOptions,
 ) -> RuntimeResult<()> {
     #[derive(serde::Serialize)]
     struct ContinuousRegisterRequest<'a> {
         job_id: &'a str,
         spec: &'a krishiv_plan::window::WindowExecutionSpec,
+        #[serde(flatten)]
+        options: &'a ContinuousRegisterOptions,
     }
 
     let base = normalize_http_base(coordinator_http)?;
     let url = format!("{base}/api/v1/continuous-register");
-    let body = ContinuousRegisterRequest { job_id, spec };
+    let body = ContinuousRegisterRequest {
+        job_id,
+        spec,
+        options,
+    };
 
     let client = coordinator_http_client()?;
     let response = apply_coordinator_bearer(client.post(&url).json(&body))
@@ -892,6 +1031,7 @@ pub async fn execute_coordinator_physical_plan(
                 coordinator_http,
                 plan.name(),
                 &spec.to_plan_spec(),
+                &ContinuousRegisterOptions::default(),
             )
             .await
         }

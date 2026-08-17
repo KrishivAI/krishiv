@@ -32,7 +32,28 @@ impl RemoteStreamingJob {
         spec: &WindowExecutionSpec,
         job_id: &str,
     ) -> RuntimeResult<Self> {
-        execute_coordinator_continuous_register(coordinator_http, job_id, spec).await?;
+        Self::create_with_options(
+            coordinator_http,
+            spec,
+            job_id,
+            &crate::coordinator_http_client::ContinuousRegisterOptions::default(),
+        )
+        .await
+    }
+
+    /// Register a continuous streaming job, choosing its execution model.
+    ///
+    /// [`Self::create`] takes the coordinator's defaults, which are the
+    /// single-subtask cycle model. Pass
+    /// [`ContinuousRegisterOptions::run_loop`] to get the parallel,
+    /// key-grouped, barrier-checkpointed run-loop engine instead.
+    pub async fn create_with_options(
+        coordinator_http: &str,
+        spec: &WindowExecutionSpec,
+        job_id: &str,
+        options: &crate::coordinator_http_client::ContinuousRegisterOptions,
+    ) -> RuntimeResult<Self> {
+        execute_coordinator_continuous_register(coordinator_http, job_id, spec, options).await?;
         Ok(Self {
             coordinator_http: coordinator_http.to_owned(),
             job_id: job_id.to_owned(),
