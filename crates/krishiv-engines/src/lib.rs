@@ -23,6 +23,7 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::config::SessionConfig;
 use datafusion::prelude::SessionContext;
 use krishiv_dataflow::ContinuousWindowExecutor;
+use krishiv_dataflow::stream_driver::{StopOutcome, StopReason, StreamDriver, StreamingLoop};
 use krishiv_delta::DeltaBatch;
 use krishiv_engine_core::{
     ChangelogBatch, CheckpointPayload, CompiledJob, ComputeEngine, EngineError, EngineKind,
@@ -624,13 +625,21 @@ impl ComputeEngine for StreamingEngine {
         let mut setup = streaming_setup(&job, &rt).await?;
         let mut writers = open_writers(&rt, &job.sinks).await?;
 
+        // The driver owns the when-to-step decisions for this loop; the loop
+        // still owns its source, its writers and its checkpoint. Naming the loop
+        // in the constructor is the gate: `StreamingLoop::EmbeddedBounded` only
+        // exists because it has answered every axis in `DriverPolicy`.
+        let mut driver = StreamDriver::new(StreamingLoop::EmbeddedBounded);
+
         while let Some(batch) = setup.reader.next().await? {
-            let outputs = setup.executor.drain(vec![batch]).map_err(exec_err)?;
+            let outputs = driver
+                .on_input(&mut setup.executor, vec![batch])
+                .map_err(exec_err)?;
             emit_to_writers(&mut writers, &outputs).await?;
         }
         // B-4 fix: a bounded source that ends with event times well below the
         // current watermark leaves any "in-flight" windows unclosed unless we
-        // close them explicitly here. `flush_all` emits every remaining window
+        // close them explicitly here. The flush emits every remaining window
         // and its final aggregate. The watermark of the checkpoint that follows
         // remains at whatever the source reported, so restore is consistent.
         //
@@ -639,9 +648,34 @@ impl ComputeEngine for StreamingEngine {
         // design (STREAM-1) and flushes against the last event-time watermark,
         // which the trailing window's own events set — so it could never close
         // itself. Every bounded tumbling job silently dropped its last window.
-        let final_flush = setup.executor.flush_all().map_err(exec_err)?;
-        if !final_flush.is_empty() {
-            emit_to_writers(&mut writers, &final_flush).await?;
+        //
+        // The flush is now conditioned on `StopReason::SourceExhausted` rather
+        // than performed unconditionally. Same behaviour here — the loop above
+        // only exits when the reader is done — but it states *why* the flush is
+        // legitimate, which is what distinguishes this from the run-loop, where
+        // an identical-looking flush would publish a partial aggregate as final.
+        match driver
+            .on_stop(&mut setup.executor, StopReason::SourceExhausted)
+            .map_err(exec_err)?
+        {
+            StopOutcome::Flushed(final_flush) => {
+                if !final_flush.is_empty() {
+                    emit_to_writers(&mut writers, &final_flush).await?;
+                }
+            }
+            StopOutcome::NotFlushed {
+                open_windows,
+                because,
+            } => {
+                if open_windows {
+                    tracing::warn!(
+                        job = %job.name,
+                        because,
+                        "bounded streaming run ended with open windows that were not \
+                         flushed; its trailing window is NOT in the output",
+                    );
+                }
+            }
         }
         let source_offset = setup.reader.checkpoint_offset();
 
@@ -677,7 +711,7 @@ const STREAMING_IDLE_TICK_MS: u64 = 5;
 // the embedded loop and the distributed run-loop cannot disagree about what
 // they mean. Each crate used to carry its own copy — same default, same
 // `"throughput"` comparison, written out twice.
-use krishiv_common::streaming_dials::{StreamProfile, idle_tick_interval};
+use krishiv_common::streaming_dials::StreamProfile;
 
 /// Interval (milliseconds) between speculative early-fire emissions of
 /// currently-open tumbling windows. Set `KRISHIV_STREAM_EARLY_FIRE_MS=0`
@@ -1140,8 +1174,8 @@ async fn run_streaming_continuous(
     let mut bg_checkpoint: Option<(tokio::task::JoinHandle<bool>, u64)> = None;
     // ST-4: idle watermark tick — advance with wall-clock every IDLE_TICK_INTERVAL
     // of source-idle time so session windows whose gap has elapsed can close.
-    let idle_tick_period = idle_tick_interval();
-    let mut last_idle_tick = std::time::Instant::now();
+    // The period and the elapsed gate both live in the driver.
+    let mut driver = StreamDriver::new(StreamingLoop::EmbeddedContinuous);
     // H-14 (audit): speculative early-fire wiring. When enabled, the
     // continuous loop periodically emits a snapshot of every open
     // tumbling window so downstream upsert sinks can see a result before
@@ -1160,16 +1194,21 @@ async fn run_streaming_continuous(
             // ST-4: once per IDLE_TICK_INTERVAL, advance the watermark to
             // wall-clock time so session windows whose inactivity gap has
             // elapsed can close even when the source is quiet.
-            if last_idle_tick.elapsed() >= idle_tick_period {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
-                let idle_outputs = setup.executor.tick(now_ms).map_err(exec_err)?;
-                if !idle_outputs.is_empty() {
-                    emit_to_writers(&mut writers, &idle_outputs).await?;
-                }
-                last_idle_tick = std::time::Instant::now();
+            //
+            // The interval gate lives in the driver now. It used to be written
+            // out here and again in the run-loop, and to be absent from the
+            // cycle and the seam, with nothing recording which of those was a
+            // decision and which an omission — `StreamingLoop::Cycle`'s
+            // `IdleTick::None` is now that record.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let idle_outputs = driver
+                .on_idle(&mut setup.executor, now_ms)
+                .map_err(exec_err)?;
+            if !idle_outputs.is_empty() {
+                emit_to_writers(&mut writers, &idle_outputs).await?;
             }
             // H-14 (audit): speculative early-fire of currently-open
             // tumbling windows. Emits a non-mutating snapshot of every
@@ -1195,7 +1234,9 @@ async fn run_streaming_continuous(
             continue;
         };
 
-        let outputs = setup.executor.drain(vec![batch]).map_err(exec_err)?;
+        let outputs = driver
+            .on_input(&mut setup.executor, vec![batch])
+            .map_err(exec_err)?;
         emit_to_writers(&mut writers, &outputs).await?;
         batches_since_checkpoint = batches_since_checkpoint.saturating_add(1);
         if batches_since_checkpoint >= checkpoint_every {

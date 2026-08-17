@@ -75,6 +75,7 @@ pub mod queue;
 pub mod schema_normalize;
 pub mod side_output;
 pub mod state_descriptor;
+pub mod stream_driver;
 pub mod streaming_corpus;
 pub mod temporal_join;
 #[cfg(test)]
