@@ -495,6 +495,35 @@ impl FlightExecutionHost {
     }
 
     /// Drain completed results from a continuous streaming job.
+    /// Close every window `job_id` still holds open, because its source is over.
+    ///
+    /// Only the in-process backend can service this today. A coordinator-backed
+    /// cluster has no registry entry and no local operator — the operator lives
+    /// inside the executor — so reaching it needs a scheduled final cycle
+    /// carrying an end-of-stream directive. That is step 5; until it lands this
+    /// branch returns `Unimplemented`, which the client translates to
+    /// `RuntimeError::Unsupported` and the bounded seam reports rather than
+    /// swallowing.
+    ///
+    /// Returning an error here rather than `Ok(vec![])` is the whole point: an
+    /// empty success is indistinguishable from "there was nothing to flush",
+    /// and that ambiguity is what let this defect live.
+    pub async fn flush_continuous_stream(&self, job_id: &str) -> Result<Vec<RecordBatch>, Status> {
+        match self.backend.as_ref() {
+            FlightHostBackend::InProcess(cluster) => {
+                let job_id = job_id.to_string();
+                let cluster = Arc::clone(cluster);
+                run_blocking(move || cluster.flush_continuous_job(&job_id))
+            }
+            FlightHostBackend::Coordinator(_) => Err(Status::unimplemented(format!(
+                "continuous.flush is not yet routed to a coordinator-backed cluster, so \
+                 job '{job_id}' cannot close the windows its watermark never reached; \
+                 the operator lives in the executor and needs a scheduled end-of-stream \
+                 cycle to reach it"
+            ))),
+        }
+    }
+
     pub async fn drain_continuous_stream(&self, job_id: &str) -> Result<Vec<RecordBatch>, Status> {
         // Batches returned by an earlier taker that could not deliver them
         // (see `return_drained_batches`) are re-served first, ahead of any

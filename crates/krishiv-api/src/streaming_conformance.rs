@@ -181,13 +181,32 @@ mod streaming_conformance_tests {
             self.inner.drain_continuous_stream(job_id)
         }
 
-        // NO `flush_continuous_stream`. This omission IS the test fixture.
-        //
-        // Proven discriminating: adding a delegating `flush_continuous_stream`
-        // here makes `a_runtime_without_flush_silently_drops_its_trailing_windows`
-        // fail with `flush-less arm should emit 0 row(s) and lose 2` and print
-        // the two recovered windows. The assertions below are therefore about
-        // the missing method, not about anything incidental to the double.
+        /// Declines to flush. This refusal IS the test fixture.
+        ///
+        /// Until step 4 this method was simply ABSENT here, and the trait's
+        /// default supplied exactly this error. That default is now gone — a
+        /// runtime cannot answer by saying nothing — so the refusal is written
+        /// out, which is precisely the improvement: the decision is at the impl
+        /// site where it can be grepped and reviewed.
+        ///
+        /// The behaviour is unchanged, so the assertions below still hold. What
+        /// changed is that `RemoteExecutionRuntime` no longer shares it: it
+        /// implements a real flush now, and this double stands in for an
+        /// old server that cannot.
+        ///
+        /// Proven discriminating: make this delegate to `self.inner` and
+        /// `a_runtime_without_flush_silently_drops_its_trailing_windows` fails
+        /// with `flush-less arm should emit 0 row(s) and lose 2`, printing both
+        /// recovered windows.
+        fn flush_continuous_stream(
+            &self,
+            job_id: &str,
+        ) -> krishiv_runtime::RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
+            Err(krishiv_runtime::RuntimeError::unsupported(format!(
+                "this runtime cannot flush job '{job_id}'; a bounded run against it \
+                 omits any window the watermark never passed"
+            )))
+        }
     }
 
     fn job_for(name: &str, input: &std::path::Path, output: &std::path::Path) -> CompiledJob {

@@ -37,6 +37,10 @@ pub mod tags {
     pub const CONTINUOUS_REGISTER: &str = "continuous.register";
     pub const CONTINUOUS_PUSH: &str = "continuous.push";
     pub const CONTINUOUS_DRAIN: &str = "continuous.drain";
+    /// Close every window a continuous job still holds open, because its source
+    /// is over. Distinct from `continuous.drain`, which only emits what the
+    /// watermark already closed.
+    pub const CONTINUOUS_FLUSH: &str = "continuous.flush";
     pub const BOUNDED_WINDOW: &str = "bounded_window";
     pub const EXPLAIN: &str = "explain";
     pub const EXECUTE_PLAN: &str = "execute_plan";
@@ -115,6 +119,16 @@ pub struct ContinuousPushBody {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContinuousDrainBody {
+    pub job_id: String,
+}
+
+/// Ask the server to close every window `job_id` still holds open.
+///
+/// Sent once, at end-of-stream, by a bounded run. A drain returns only what the
+/// watermark has already closed, so a bounded source whose final events fall
+/// inside a window nothing later closes needs this to get a whole answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContinuousFlushBody {
     pub job_id: String,
 }
 
@@ -265,6 +279,7 @@ pub enum KrishivFlightAction {
     ContinuousRegister(ContinuousRegisterBody),
     ContinuousPush(ContinuousPushBody),
     ContinuousDrain(ContinuousDrainBody),
+    ContinuousFlush(ContinuousFlushBody),
     BoundedWindow(BoundedWindowBody),
     Explain(ExplainBody),
     ExecutePlan(ExecutePlanBody),
@@ -283,6 +298,7 @@ impl KrishivFlightAction {
             Self::ContinuousRegister(_) => tags::CONTINUOUS_REGISTER,
             Self::ContinuousPush(_) => tags::CONTINUOUS_PUSH,
             Self::ContinuousDrain(_) => tags::CONTINUOUS_DRAIN,
+            Self::ContinuousFlush(_) => tags::CONTINUOUS_FLUSH,
             Self::BoundedWindow(_) => tags::BOUNDED_WINDOW,
             Self::Explain(_) => tags::EXPLAIN,
             Self::ExecutePlan(_) => tags::EXECUTE_PLAN,
@@ -851,6 +867,39 @@ mod tests {
             let at = v.action_type();
             assert!(at.starts_with(ACTION_TYPE_PREFIX));
         }
+    }
+
+    /// Flush must not be routed as a drain.
+    ///
+    /// The failure this guards is a copy-paste: `ContinuousFlush` mapped to
+    /// `tags::CONTINUOUS_DRAIN`, which compiles, round-trips, and quietly turns
+    /// every end-of-stream flush into a drain — reinstating exactly the silent
+    /// truncation the verb was added to fix, with a wire verb that looks
+    /// present. So this asserts the two tags DIFFER, not merely that flush has
+    /// one.
+    #[test]
+    fn continuous_flush_is_a_distinct_verb_from_continuous_drain() {
+        let flush =
+            KrishivFlightAction::ContinuousFlush(ContinuousFlushBody { job_id: "j".into() });
+        let drain =
+            KrishivFlightAction::ContinuousDrain(ContinuousDrainBody { job_id: "j".into() });
+
+        assert_eq!(flush.action_type(), "krishiv.v1.continuous.flush");
+        assert_ne!(
+            flush.action_type(),
+            drain.action_type(),
+            "a flush routed as a drain emits only what the watermark already \
+             closed, which is the defect the flush verb exists to fix"
+        );
+
+        let decoded =
+            KrishivFlightAction::from_action_body(&flush.to_action_body().unwrap()).unwrap();
+        assert_eq!(decoded, flush);
+        assert_ne!(
+            decoded, drain,
+            "the encoded form must also distinguish the two, or the server \
+             dispatches on the wrong arm"
+        );
     }
 
     #[test]

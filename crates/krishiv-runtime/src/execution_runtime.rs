@@ -273,17 +273,25 @@ pub trait ExecutionRuntime: Send + Sync {
     /// reports success. That is the same defect `flush_all` fixed for the
     /// embedded engine; this is its route for everything driving the runtime.
     ///
-    /// The default is an ERROR, deliberately, not `Ok(Vec::new())`. A defaulted
-    /// no-op would reproduce the original bug in every runtime that forgot to
-    /// override it, and reproduce it silently — which is exactly the shape this
-    /// audit exists to remove. Callers that can tolerate an unflushable runtime
-    /// must handle the error explicitly and say what they are giving up.
-    fn flush_continuous_stream(&self, _job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
-        Err(RuntimeError::unsupported(
-            "this execution runtime cannot flush a continuous job's open windows at \
-             end-of-stream; a bounded run against it may omit its trailing window",
-        ))
-    }
+    /// There is deliberately NO default body.
+    ///
+    /// The previous default returned `RuntimeError::unsupported`, which was
+    /// already better than `Ok(Vec::new())` — but it still let a runtime answer
+    /// this question by saying nothing. `RemoteExecutionRuntime` inherited it,
+    /// and since `ExecutionMode::Distributed` can only construct that runtime,
+    /// every distributed bounded windowed job silently omitted its trailing
+    /// window while reporting success.
+    ///
+    /// Requiring the method makes that unrepresentable: a runtime that cannot
+    /// flush must now say so at its own impl site, where the decision is
+    /// greppable and reviewable, rather than inheriting silence.
+    ///
+    /// # Errors
+    ///
+    /// Implementations that genuinely cannot flush return
+    /// [`RuntimeError::Unsupported`]; callers must handle that explicitly and
+    /// state what they are giving up.
+    fn flush_continuous_stream(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>>;
 
     /// Drain newly emitted batches from a continuous streaming job.
     fn drain_continuous_stream(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>>;
@@ -990,6 +998,37 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
                     let sql = encode_continuous_drain(job_id);
                     self.pool.execute_sql(&sql).await
                 }
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    /// Ask the server to close every window this job still holds open.
+    ///
+    /// This method exists because the trait stopped having a default. Inheriting
+    /// one is how `ExecutionMode::Distributed` came to drop the trailing window
+    /// of every bounded windowed job while reporting success — the runtime never
+    /// declined to flush, it simply never mentioned flushing.
+    ///
+    /// A server too old to know the verb answers `Unimplemented`, which is
+    /// translated to `RuntimeError::Unsupported` rather than propagated as a
+    /// hard error: in a mixed-version cluster a partial answer must stay a
+    /// partial answer that the caller can reason about, not a failed job.
+    fn flush_continuous_stream(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
+        use crate::flight_action::{ContinuousFlushBody, KrishivFlightAction};
+        use crate::flight_client::decode_ipc_response;
+        use krishiv_common::async_util::block_on;
+        let action = KrishivFlightAction::ContinuousFlush(ContinuousFlushBody {
+            job_id: job_id.to_string(),
+        });
+        block_on(async {
+            match self.pool.do_action(&action).await {
+                Ok(body) => decode_ipc_response(&body),
+                Err(e) if is_server_unimplemented(&e) => Err(RuntimeError::unsupported(format!(
+                    "the remote server does not implement continuous.flush, so job \
+                     '{job_id}' cannot close the windows its watermark never reached; \
+                     its trailing window will be missing from the output ({e})"
+                ))),
                 Err(e) => Err(e),
             }
         })

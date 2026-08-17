@@ -1318,6 +1318,21 @@ mod tests {
     }
 
     impl ExecutionRuntime for CapturingRemoteRuntime {
+        /// Declines, explicitly.
+        ///
+        /// The trait used to default this to exactly this error, which is how a
+        /// real runtime came to omit it silently. Now every implementor states
+        /// its answer at its own site; this double's answer is "I cannot", and
+        /// that is what it is for.
+        fn flush_continuous_stream(
+            &self,
+            _job_id: &str,
+        ) -> krishiv_runtime::RuntimeResult<Vec<RecordBatch>> {
+            Err(krishiv_runtime::RuntimeError::unsupported(
+                "test double does not flush",
+            ))
+        }
+
         fn mode(&self) -> RuntimeMode {
             RuntimeMode::Distributed
         }
@@ -1575,6 +1590,21 @@ mod tests {
         }
 
         impl ExecutionRuntime for CountingStreamRuntime {
+            /// Declines, explicitly.
+            ///
+            /// The trait used to default this to exactly this error, which is how a
+            /// real runtime came to omit it silently. Now every implementor states
+            /// its answer at its own site; this double's answer is "I cannot", and
+            /// that is what it is for.
+            fn flush_continuous_stream(
+                &self,
+                _job_id: &str,
+            ) -> krishiv_runtime::RuntimeResult<Vec<RecordBatch>> {
+                Err(krishiv_runtime::RuntimeError::unsupported(
+                    "test double does not flush",
+                ))
+            }
+
             fn mode(&self) -> RuntimeMode {
                 RuntimeMode::Distributed
             }
@@ -2150,6 +2180,21 @@ mod tests {
     }
 
     impl ExecutionRuntime for RecordingContinuousRuntime {
+        /// Declines, explicitly.
+        ///
+        /// The trait used to default this to exactly this error, which is how a
+        /// real runtime came to omit it silently. Now every implementor states
+        /// its answer at its own site; this double's answer is "I cannot", and
+        /// that is what it is for.
+        fn flush_continuous_stream(
+            &self,
+            _job_id: &str,
+        ) -> krishiv_runtime::RuntimeResult<Vec<RecordBatch>> {
+            Err(krishiv_runtime::RuntimeError::unsupported(
+                "test double does not flush",
+            ))
+        }
+
         fn mode(&self) -> RuntimeMode {
             RuntimeMode::Distributed
         }

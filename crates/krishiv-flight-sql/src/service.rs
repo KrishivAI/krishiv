@@ -1322,13 +1322,14 @@ impl FlightSqlService for KrishivFlightSqlService {
         // service handles them. Standards-compliant Flight-SQL clients
         // discover server actions via `list_actions`; clients that rely
         // on that discoverability could not find these three. We now
-        // advertise all eleven.
+        // advertise all of them.
         Some(
             [
                 tags::REGISTER_PARQUET,
                 tags::CONTINUOUS_REGISTER,
                 tags::CONTINUOUS_PUSH,
                 tags::CONTINUOUS_DRAIN,
+                tags::CONTINUOUS_FLUSH,
                 tags::BOUNDED_WINDOW,
                 tags::EXPLAIN,
                 tags::EXECUTE_PLAN,
@@ -1625,6 +1626,19 @@ impl KrishivFlightSqlService {
                     .await
                     .map_err(KrishivActionError::Status)?;
                 Ok(Vec::new())
+            }
+            A::ContinuousFlush(body) => {
+                // End-of-stream: close every window the watermark never
+                // reached. Distinct from a drain, which only emits what the
+                // watermark already closed — a bounded source whose final
+                // events fall inside an unclosed window needs this or its
+                // answer is silently short.
+                let batches = self
+                    .host
+                    .flush_continuous_stream(&body.job_id)
+                    .await
+                    .map_err(KrishivActionError::Status)?;
+                encode_batches_ipc(&batches)
             }
             A::ContinuousDrain(body) => {
                 let batches = self
