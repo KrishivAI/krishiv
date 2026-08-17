@@ -4315,3 +4315,106 @@ to end". It passes while doing exactly that. A real harness needs
 krishiv-executor dependency).
 
 Gates on every commit: `just lint`, per-crate `cargo test`, `cargo fmt --all`.
+
+---
+
+## §35 — the streaming remainder, with run-loop now reachable (2026-08-17)
+
+Continuation of §34 after confirmation that **nothing is in production**, which
+removed two constraints: the run-loop engine's latent defects could be fixed
+directly (they become live the moment run-loop is reachable), and DUR-5's
+fail-closed admission no longer had to wait behind the Flight seam.
+
+Four commits: `b72579f`, `7dbcd52`, `388e4fd`, `5b74102`.
+
+### Fixed
+
+- [x] **Two run-loop idle dials that did not do what they said** (`b72579f`).
+      The loop slept `idle_floor.max(fallback_tick)` — 50 µs vs 5 ms, so the max
+      was *always* 5 ms and `RLOOP_IDLE_FLOOR_US` had no other use, while the
+      module doc advertised a microsecond floor. The embedded loop it mirrors
+      uses its 5 ms fallback only when a source has no notify; a run-loop
+      subtask always has both, so the fallback had no role and is deleted. And
+      the ST-4 idle tick was gated on `input.is_empty()`, tying a wall-clock
+      obligation to whether that iteration found input — under sustained
+      arrival it never fires. Hoisted to elapsed-wall-clock alone.
+
+      **No regression test, deliberately.** I wrote one and deleted it: it went
+      green against the reverted line, because any fixture pushing at a
+      test-reasonable rate lets the input empty between batches. A test that
+      cannot tell correct from broken is worse than none — the standing rule
+      applies to my own work.
+
+- [x] **Two DUR-5 put-back bugs** (`7dbcd52`), both inside the machinery built
+      to stop consume-once loss. `return_continuous_stream_payloads` was
+      mode-blind: it unshifted into `job_inline_results` while the drain path
+      returns early for run-loop jobs and serves executor egress — so a
+      run-loop put-back wrote into a map no drain would read. Now refuses,
+      because there is no put-back RPC to egress and pretending otherwise is
+      what lost the data. And `drain_run_loop_output` `?`d on each executor,
+      discarding everything already collected — but `drain_continuous_output`
+      CLEARS egress as it reads, so failing on executor N+1 deleted N's output
+      rather than retrying it. Now partial-with-warning; the error surfaces
+      only when nothing was collected.
+
+- [x] **Routing hashed different bytes than persistence** (`388e4fd`). Live
+      routing hashed `i64::to_be_bytes`; the operator persists
+      `extract_agg_key(..).to_string()` — ASCII decimal — and redistribution
+      re-hashes the persisted form. For parallelism P each Int64 key had a
+      (P-1)/P chance of being redistributed to a subtask that never sees its
+      rows: owner restarts from zero, wrong subtask flushes a stale partial
+      anyway, and re-persists it at the next barrier. Invisible while running
+      (all subtasks route identically); Utf8 agreed by coincidence, and the
+      only routing test was Utf8. Fixed by deriving routing bytes from the same
+      call persistence uses, so agreement is structural. Same edit makes
+      Int32/Float64/Bool/LargeUtf8/Utf8View routable — they are declared-legal
+      key types that fell into an "unroutable, process locally" fallback, which
+      with index-partitioned splits meant overlapping key sets and one output
+      row per subtask for the same window. No savepoint migration note needed:
+      `key_group_for_key` and the persisted bytes are untouched.
+
+- [x] **Restore gave one subtask the whole job's state** (`5b74102`), at two
+      sites. The **live** path had a `rloop_execs.len() == 1` fast path that
+      applied every snapshot to the single local subtask — and one subtask per
+      process is the normal deployment, so every node loaded full job state and
+      each re-emitted the full pre-checkpoint aggregate. Deleted; redistribution
+      at parallelism 1 is an identity union. The **fresh-process** path did a
+      job-keyed `pending_restores.remove` inside a (job, subtask)-keyed
+      constructor, so the first sibling to construct took everything and the
+      rest started empty. Now redistributes and reads rather than removes, with
+      a teardown removal so a re-created job cannot inherit a dead
+      incarnation's checkpoint. Also retires a watermark bug in the old merge
+      loop: `wm:` appears in every snapshot and merge order let the LAST win,
+      where redistribution deliberately keeps the MINIMUM. And publishes
+      `rloop_parallelism` before the executor becomes visible, closing a window
+      where a restore redistributed into the wrong bucket count.
+
+### Found, NOT fixed — needs a decision
+
+- [ ] **The run-loop egress ring drops the oldest batch on overflow.** 512
+      batches, warn + metric, no fault required — sustained backpressure alone
+      loses computed output. This is the worst shape in this register (a
+      streaming operator silently discarding results), but every fix is a
+      contract change and I am not choosing one unilaterally:
+      **backpressure** (stall the loop until drained) risks wedging a
+      sink-attached job forever, because output is copied to egress *and* the
+      sink, so a job whose real consumer is the sink and which nobody drains
+      would stop; **fail closed** turns a documented best-effort API into a
+      hard error; **persist** puts unbounded data in the coordinator, which
+      §34 already rejected for DUR-5 on store-size grounds. The cheap
+      strictly-better step, if the full decision waits: track a cumulative
+      dropped-batch count per job and return it on drain, so a consumer can
+      *detect* the gap instead of silently receiving one. Related and probably
+      a prerequisite: stop double-shipping to egress when a sink is attached.
+
+### Still open from §34
+
+The Flight `ContinuousRegister` options seam (and its required server echo —
+without it a new client asking for parallelism 8 against an old coordinator
+gets a success that registered Cycle/1), `Session::submit_streaming`
+distributed routing which depends on it, `unified_jobs_http.rs:217` as a third
+optionless seam, the failed-launch job-id wedge, and the
+`mode_conformance.rs` harness that compares embedded against embedded while
+asserting it does not.
+
+Gates on every commit: `just lint`, per-crate `cargo test`, `cargo fmt --all`.
