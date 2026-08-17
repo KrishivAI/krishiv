@@ -50,16 +50,34 @@ use krishiv_runtime::{BatchTableRegistration, ExecutionRuntime};
 const MAX_CONNECTOR_DRAIN_BYTES: usize = 2 * 1024 * 1024 * 1024;
 static SPILL_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Largest number of input batches pushed in one cycle.
+///
+/// Derived from the drain cap rather than written as a literal: a cycle that
+/// pushes more batches than one drain can consume leaves the remainder queued,
+/// and the caller has no signal that it happened. Keeping the two bound to the
+/// same constant makes that impossible by construction.
+const MAX_PUSH_BATCHES: usize =
+    krishiv_runtime::ContinuousStreamRegistry::DEFAULT_MAX_DRAIN_BATCHES;
+
+/// Byte budget for one pushed cycle. The remote seam base64-encodes the whole
+/// chunk into a single `do_action` body, so an unbounded chunk overruns the
+/// gRPC receive limit. Conservative on purpose — `get_array_memory_size`
+/// over-counts shared buffers, which errs toward smaller cycles.
+const MAX_PUSH_BYTES: usize = 2 * 1024 * 1024;
+
 /// Run a bounded **streaming** job through an [`ExecutionRuntime`]'s continuous
 /// seam — the distributed-stateful path behind the unified `Session::submit`.
 ///
 /// I/O stays local (connector source drain + sink write); the windowed
 /// computation runs on the runtime: in-process for embedded/single-node, and on
 /// the remote coordinator's executors in distributed mode (the
-/// `register_continuous_stream` → `push` → `drain` Flight seam). This is the
-/// honest run-once shape — drain the bounded source, push one input cycle, drain
-/// the closed windows — so it composes with the same `ContinuousWindowExecutor`
-/// the dedicated streaming API uses, just reached through `submit`.
+/// `register_continuous_stream` → `push` → `drain` Flight seam).
+///
+/// Input is pushed and drained in bounded cycles rather than as one buffered
+/// shot. That is a correctness requirement, not a memory optimisation: a drain
+/// consumes at most [`MAX_PUSH_BATCHES`] input batches, so a single push of the
+/// whole source left everything past that cap queued forever while the job
+/// still reported `Completed`.
 pub async fn run_streaming_job_via_runtime(
     runtime: &Arc<dyn ExecutionRuntime>,
     job: &CompiledJob,
@@ -72,37 +90,68 @@ pub async fn run_streaming_job_via_runtime(
     })?;
     let local_spec = krishiv_runtime::plan_spec_to_local(&plan.spec);
 
-    // Drain the bounded source(s) locally via the file connectors.
-    let source_provider = ConnectorSourceProvider;
-    let mut input = Vec::new();
-    for spec in &job.sources {
-        let mut reader = source_provider.open(spec).await?;
-        while let Some(batch) = reader.next().await? {
-            input.push(batch);
-        }
-    }
-
-    // Run the window on the runtime: in-process locally, on executors remotely.
+    // Register before opening any source: the window operator infers its Arrow
+    // schema from the first pushed batch, so there is nothing to probe and the
+    // sources are opened exactly once.
     runtime
         .register_continuous_stream(&job.name, &local_spec)
         .map_err(|e| EngineError::Runtime(e.to_string()))?;
-    runtime
-        .push_continuous_stream_input(&job.name, input)
-        .map_err(|e| EngineError::Runtime(e.to_string()))?;
-    let outputs = runtime
-        .drain_continuous_stream(&job.name)
-        .map_err(|e| EngineError::Runtime(e.to_string()))?;
 
-    // Write the closed windows to the job's sink(s). Streaming output is
-    // insert-only, so no consolidation is needed.
+    // Open the sinks up front, matching the batch engine's ordering, so a
+    // cycle's output has somewhere to go the moment it is produced.
     let sink_provider = connector_sink_provider(false);
+    let mut writers = Vec::with_capacity(job.sinks.len());
     for spec in &job.sinks {
-        let mut writer = sink_provider.open(spec).await?;
+        writers.push(sink_provider.open(spec).await?);
+    }
+
+    // Push and drain in bounded cycles. Never push an empty chunk: the
+    // coordinator backend rejects one outright.
+    let push_drain_write = async |chunk: Vec<RecordBatch>,
+                                  writers: &mut Vec<Box<dyn SinkWriter>>|
+           -> EngineResult<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        runtime
+            .push_continuous_stream_input(&job.name, chunk)
+            .map_err(|e| EngineError::Runtime(e.to_string()))?;
+        let outputs = runtime
+            .drain_continuous_stream(&job.name)
+            .map_err(|e| EngineError::Runtime(e.to_string()))?;
         for batch in &outputs {
-            if batch.num_rows() > 0 {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            for writer in writers.iter_mut() {
                 writer.write(ChangelogBatch::inserts(batch.clone())).await?;
             }
         }
+        Ok(())
+    };
+
+    let source_provider = ConnectorSourceProvider;
+    let mut chunk: Vec<RecordBatch> = Vec::new();
+    let mut chunk_bytes = 0usize;
+    for spec in &job.sources {
+        let mut reader = source_provider.open(spec).await?;
+        while let Some(batch) = reader.next().await? {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            chunk_bytes += batch.get_array_memory_size();
+            chunk.push(batch);
+            if chunk.len() >= MAX_PUSH_BATCHES || chunk_bytes >= MAX_PUSH_BYTES {
+                push_drain_write(std::mem::take(&mut chunk), &mut writers).await?;
+                chunk_bytes = 0;
+            }
+        }
+    }
+    // The residual. Dropping the drain here is the classic trap: the last
+    // partial chunk gets pushed and its closed windows never collected.
+    push_drain_write(std::mem::take(&mut chunk), &mut writers).await?;
+
+    for writer in &mut writers {
         writer.flush().await?;
     }
 
@@ -2018,6 +2067,197 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(total, 60);
+    }
+
+    /// What the continuous seam was asked to do, in order.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum SeamEvent {
+        Push(usize),
+        Drain,
+    }
+
+    /// Records the push/drain call sequence so a test can assert on the *shape*
+    /// of the interaction, not just the final numbers. A test that only checks
+    /// sink contents cannot tell chunked draining from one buffered shot; this
+    /// can.
+    #[derive(Default)]
+    struct RecordingContinuousRuntime {
+        log: Arc<Mutex<Vec<SeamEvent>>>,
+    }
+
+    impl RecordingContinuousRuntime {
+        fn log(&self) -> Vec<SeamEvent> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    impl ExecutionRuntime for RecordingContinuousRuntime {
+        fn mode(&self) -> RuntimeMode {
+            RuntimeMode::Distributed
+        }
+
+        fn placement(&self) -> ExecutionPlacement {
+            ExecutionPlacement::RemoteClusterRequired
+        }
+
+        fn accept_plan(
+            &self,
+            _plan: &krishiv_plan::PhysicalPlan,
+        ) -> RuntimeResult<ExecutionReport> {
+            Err(RuntimeError::unsupported("not used by this test"))
+        }
+
+        fn collect_bounded_window(
+            &self,
+            _topic: &str,
+            _input_batches: Vec<RecordBatch>,
+            _spec: &LocalWindowExecutionSpec,
+        ) -> RuntimeResult<Vec<RecordBatch>> {
+            Err(RuntimeError::unsupported("not used by this test"))
+        }
+
+        fn collect_batch_sql(
+            &self,
+            _query: &str,
+            _tables: &[BatchTableRegistration],
+            _is_streaming: bool,
+        ) -> RuntimeResult<Vec<RecordBatch>> {
+            Err(RuntimeError::unsupported("not used by this test"))
+        }
+
+        fn collect_batch_sql_async<'a>(
+            &'a self,
+            _query: &'a str,
+            _tables: &'a [BatchTableRegistration],
+            _is_streaming: bool,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = RuntimeResult<Vec<RecordBatch>>> + Send + 'a>,
+        > {
+            Box::pin(async { Err(RuntimeError::unsupported("not used by this test")) })
+        }
+
+        fn explain_sql(&self, _query: &str) -> RuntimeResult<String> {
+            Err(RuntimeError::unsupported("not used by this test"))
+        }
+
+        fn register_continuous_stream(
+            &self,
+            _job_id: &str,
+            _spec: &LocalWindowExecutionSpec,
+        ) -> RuntimeResult<()> {
+            Ok(())
+        }
+
+        fn push_continuous_stream_input(
+            &self,
+            _job_id: &str,
+            batches: Vec<RecordBatch>,
+        ) -> RuntimeResult<()> {
+            // The real coordinator backend rejects an empty push outright, so
+            // emitting one is a defect this double must surface, not tolerate.
+            if batches.is_empty() {
+                return Err(RuntimeError::transport(
+                    "empty continuous push: the coordinator backend rejects these",
+                ));
+            }
+            self.log
+                .lock()
+                .unwrap()
+                .push(SeamEvent::Push(batches.len()));
+            Ok(())
+        }
+
+        fn drain_continuous_stream(&self, _job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
+            self.log.lock().unwrap().push(SeamEvent::Drain);
+            Ok(Vec::new())
+        }
+    }
+
+    /// The bounded distributed streaming path must push and drain in bounded
+    /// cycles, not buffer the whole source and drain once.
+    ///
+    /// This is a data-loss regression, not a memory one. A drain consumes at
+    /// most `DEFAULT_MAX_DRAIN_BATCHES` (256) input batches, so a single push of
+    /// N > 256 batches left every batch past the cap queued forever while the
+    /// job reported `Completed`.
+    ///
+    /// The assertions below are unsatisfiable by the buffering shape: it
+    /// produces exactly `[Push(N), Drain]` for N far over the cap.
+    #[tokio::test]
+    async fn streaming_via_runtime_pushes_in_bounded_cycles_not_one_buffered_shot() {
+        // The CSV connector emits 1024-row batches, and a drain consumes at
+        // most 256 of them, so the bug needs a fixture larger than
+        // 256 * 1024 = 262,144 rows to show itself at all. That is why no
+        // existing test caught it: they are all a handful of rows, i.e. one
+        // batch. 300,000 rows is ~293 batches — past the cap, and deliberately
+        // not a multiple of it, so the residual chunk is non-empty and the
+        // pushed-but-never-drained trap would fire.
+        const ROWS: usize = 300_000;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("events.csv");
+        let mut body = String::with_capacity(ROWS * 20);
+        body.push_str("user_id,ts,amount\n");
+        for i in 0..ROWS {
+            body.push_str("a,");
+            body.push_str(&(i * 1000).to_string());
+            body.push_str(",1\n");
+        }
+        std::fs::write(&input, body).unwrap();
+
+        let log_handle = Arc::new(Mutex::new(Vec::new()));
+        let runtime: Arc<dyn ExecutionRuntime> = Arc::new(RecordingContinuousRuntime {
+            log: Arc::clone(&log_handle),
+        });
+        let job = CompiledJob::new(
+            "cycles",
+            "SELECT user_id, SUM(amount) AS total \
+             FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 10000) \
+             GROUP BY user_id, window_start, window_end",
+            vec![SourceSpec::unbounded(
+                "events",
+                "csv",
+                input.to_str().unwrap(),
+            )],
+            vec![],
+            true,
+        )
+        .with_engine(EngineKind::Streaming);
+
+        run_streaming_job_via_runtime(&runtime, &job).await.unwrap();
+
+        let log = log_handle.lock().unwrap().clone();
+        let pushes: Vec<usize> = log
+            .iter()
+            .filter_map(|e| match e {
+                SeamEvent::Push(n) => Some(*n),
+                SeamEvent::Drain => None,
+            })
+            .collect();
+        let drains = log.iter().filter(|e| **e == SeamEvent::Drain).count();
+
+        assert!(!pushes.is_empty(), "the source must be pushed at all");
+        assert!(
+            pushes.iter().all(|n| *n <= super::MAX_PUSH_BATCHES),
+            "no cycle may push more batches than one drain can consume \
+             ({}); saw {pushes:?}",
+            super::MAX_PUSH_BATCHES
+        );
+        assert!(
+            log.len() > 2,
+            "push and drain must interleave; a single [Push, Drain] pair is the \
+             buffering shape that truncated at the drain cap: {log:?}"
+        );
+        assert_eq!(
+            drains,
+            pushes.len(),
+            "every push must be followed by a drain, including the residual \
+             chunk — otherwise its closed windows are never collected"
+        );
+        assert_eq!(
+            log.last(),
+            Some(&SeamEvent::Drain),
+            "the run must end on a drain, not a push"
+        );
     }
 
     #[tokio::test]

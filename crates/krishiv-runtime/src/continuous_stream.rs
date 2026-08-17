@@ -361,7 +361,12 @@ impl ContinuousStreamRegistry {
 
     /// Drain up to [`DEFAULT_MAX_DRAIN_BATCHES`] batches through the operator.
     ///
-    /// For draining all pending batches, loop until this returns empty results.
+    /// To drain everything pending, loop until [`Self::pending_batch_depth`]
+    /// reports 0 — **not** until this returns an empty vec. An empty return
+    /// means "no window closed", which happens both when the queue is empty and
+    /// when input was consumed that closed nothing. Looping on the output
+    /// therefore stops with input still queued, which is precisely how a caller
+    /// silently truncates its own source.
     pub fn drain_job(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
         self.drain_job_up_to(job_id, Self::DEFAULT_MAX_DRAIN_BATCHES)
     }
