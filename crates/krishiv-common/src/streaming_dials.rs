@@ -219,3 +219,73 @@ mod tests {
         }
     }
 }
+
+/// Accounting for output a run-loop egress buffer dropped.
+///
+/// One place owning the counter, the operator-facing warning, and the question
+/// of whether a drop actually lost anything. Before this, the count lived in a
+/// map on the runner, the warning text next to it, and the "is this job's output
+/// incomplete?" judgement three crates away in the coordinator — so the three
+/// could disagree about what a nonzero count meant, and did.
+///
+/// The buffers themselves stay per-loop and are NOT unified: the embedded loop
+/// awaits sink writes, the seam writes inline, the coordinator holds an inline
+/// result store, and the run-loop keeps this capped staging buffer. Those are
+/// four genuinely different mechanisms. Only the accounting is shared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EgressLoss {
+    dropped_batches: u64,
+}
+
+impl EgressLoss {
+    /// No loss recorded.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self { dropped_batches: 0 }
+    }
+
+    /// Record `batches` dropped from an egress buffer.
+    pub const fn record(&mut self, batches: u64) {
+        self.dropped_batches = self.dropped_batches.saturating_add(batches);
+    }
+
+    /// How many batches have been dropped.
+    #[must_use]
+    pub const fn dropped_batches(&self) -> u64 {
+        self.dropped_batches
+    }
+
+    /// Did anything get dropped?
+    #[must_use]
+    pub const fn is_lossless(&self) -> bool {
+        self.dropped_batches == 0
+    }
+
+    /// The operator-facing explanation of a drop that genuinely lost output.
+    ///
+    /// Deliberately a function rather than a `Display` impl: this text is only
+    /// correct when the dropped batches were the job's ONLY delivery path. A
+    /// job whose real output is a durable sink loses nothing when this buffer
+    /// overflows, and telling its operator otherwise is a false alarm — see
+    /// [`EgressLoss::drop_lost_output`].
+    #[must_use]
+    pub const fn lost_output_advice() -> &'static str {
+        "run-loop egress buffer overflowed; oldest batches dropped (drain is best-effort \
+         — consume durably via the sink or queryable state, or raise \
+         KRISHIV_RLOOP_EGRESS_CAP)"
+    }
+
+    /// Did dropping from the egress buffer actually lose output?
+    ///
+    /// Only when the buffer is the job's sole delivery path. A run-loop job
+    /// writing to a durable Iceberg or Kafka sink fills this buffer too — it is
+    /// populated unconditionally, before the sink dispatch — so its overflow
+    /// counter climbs forever while its output is in fact complete. Reporting
+    /// that as lost output is a false alarm sitting on top of a real defect,
+    /// which is the worst place for one: it trains the reader to ignore the
+    /// signal that matters.
+    #[must_use]
+    pub const fn drop_lost_output(has_durable_sink: bool) -> bool {
+        !has_durable_sink
+    }
+}

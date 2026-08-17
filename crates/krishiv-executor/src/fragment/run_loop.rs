@@ -78,7 +78,7 @@ fn watermark_idleness() -> Duration {
 // them agree, and a dial that means one thing embedded and another distributed
 // is invisible: both engines run, both look configured, and only a side-by-side
 // benchmark shows it. See `krishiv_common::streaming_dials`.
-use krishiv_common::streaming_dials::{idle_tick_interval, rloop_egress_cap, stream_linger};
+use krishiv_common::streaming_dials::{rloop_egress_cap, stream_linger};
 
 /// Parsed identity of one `stream:rloop:` fragment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -724,10 +724,16 @@ pub(crate) async fn execute_run_loop_fragment(
     let source_cache = runner.shared_continuous_connector_sources();
 
     let idle_floor = Duration::from_micros(RLOOP_IDLE_FLOOR_US);
-    let idle_tick_period = idle_tick_interval();
+    // The idle-tick interval and its elapsed gate both live in the driver now.
+    // `StreamingLoop::RunLoop` declares `IdleTick::WallClock`, which is the
+    // record of what used to be an unwritten agreement between this loop and
+    // the embedded one — and an unwritten agreement the cycle and the seam did
+    // not share.
+    let mut driver = krishiv_dataflow::stream_driver::StreamDriver::new(
+        krishiv_dataflow::stream_driver::StreamingLoop::RunLoop,
+    );
     let linger = stream_linger();
     let idleness = watermark_idleness();
-    let mut last_idle_tick = Instant::now();
     let mut split_watermarks = SplitWatermarks::default();
     let mut rows_emitted: u64 = 0;
     let mut batches_emitted: u64 = 0;
@@ -905,35 +911,30 @@ pub(crate) async fn execute_run_loop_fragment(
         // The change is justified by construction instead: it matches the
         // embedded loop, which ticks on elapsed wall clock regardless of input.
         {
-            if last_idle_tick.elapsed() >= idle_tick_period {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
-                let idle_outputs = {
-                    let mut exec =
-                        executor_arc
-                            .lock()
-                            .map_err(|_| ExecutorError::LocalExecution {
-                                message: format!(
-                                    "stream:rloop job '{job_id}' executor lock poisoned"
-                                ),
-                            })?;
-                    exec.tick(now_ms)
-                        .map_err(|e| ExecutorError::LocalExecution {
-                            message: format!("stream:rloop idle tick failed: {e}"),
-                        })?
-                };
-                if !idle_outputs.is_empty() {
-                    rows_emitted += idle_outputs
-                        .iter()
-                        .map(|b| b.num_rows() as u64)
-                        .sum::<u64>();
-                    batches_emitted += idle_outputs.len() as u64;
-                    crate::erased(runner.stage_rloop_outputs(job_id, assignment, &idle_outputs))
-                        .await?;
-                }
-                last_idle_tick = Instant::now();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let idle_outputs = {
+                let mut exec = executor_arc
+                    .lock()
+                    .map_err(|_| ExecutorError::LocalExecution {
+                        message: format!("stream:rloop job '{job_id}' executor lock poisoned"),
+                    })?;
+                driver
+                    .on_idle(&mut *exec, now_ms)
+                    .map_err(|e| ExecutorError::LocalExecution {
+                        message: format!("stream:rloop idle tick failed: {e}"),
+                    })?
+            };
+            if !idle_outputs.is_empty() {
+                rows_emitted += idle_outputs
+                    .iter()
+                    .map(|b| b.num_rows() as u64)
+                    .sum::<u64>();
+                batches_emitted += idle_outputs.len() as u64;
+                crate::erased(runner.stage_rloop_outputs(job_id, assignment, &idle_outputs))
+                    .await?;
             }
         }
 
@@ -1028,11 +1029,17 @@ pub(crate) async fn execute_run_loop_fragment(
                          window state is inconsistent — restart the job"
                     ),
                 })?;
-            let outputs = exec
-                .drain(owned_batches)
-                .map_err(|e| ExecutorError::LocalExecution {
+            // Routing runs BEFORE this, so the driver only ever sees rows this
+            // subtask owns. `StreamingLoop::RunLoop` declares
+            // `InputTyping::PreCoerced` because the cast already happened at
+            // the read site — routing reads the key column and must read it at
+            // its final type, so coercing again here would be a second pass
+            // over every batch on the hot path for no change in result.
+            let outputs = driver.on_input(&mut *exec, owned_batches).map_err(|e| {
+                ExecutorError::LocalExecution {
                     message: format!("stream:rloop drain error: {e}"),
-                })?;
+                }
+            })?;
             (outputs, exec.last_watermark_ms())
         };
 
@@ -1123,21 +1130,47 @@ pub(crate) async fn execute_run_loop_fragment(
     // Either way the loss was silent. `flush_all` and the bounded connector
     // path both warn when they give something up; this path is the larger loss
     // of the three and said nothing.
-    let has_open_state = executor_arc
-        .lock()
-        .ok()
-        .map(|exec| exec.has_open_windows())
-        .unwrap_or(false);
-    if has_open_state {
-        tracing::warn!(
-            job_id,
-            subtask = parsed.subtask,
-            "stream:rloop stopped with window state still open: it is neither flushed (a \
-             forced flush would emit partial aggregates as complete) nor snapshotted here. A \
-             checkpointed job resumes from its last committed epoch and loses only what came \
-             after; a job registered without checkpointing has no resume point and loses all \
-             of it."
-        );
+    //
+    // The decision not to flush is `StreamingLoop::RunLoop`'s
+    // `EndOfStream::NoFlush`, and `on_stop` is what reads it. Routing that
+    // through the driver rather than checking `has_open_windows` inline means
+    // this loop's refusal and the embedded bounded loop's flush are the same
+    // decision answered differently, in one place, rather than two unrelated
+    // pieces of code that happen to disagree.
+    if let Ok(mut exec) = executor_arc.lock() {
+        match driver.on_stop(
+            &mut *exec,
+            krishiv_dataflow::stream_driver::StopReason::Cancelled,
+        ) {
+            Ok(krishiv_dataflow::stream_driver::StopOutcome::NotFlushed {
+                open_windows: true,
+                because,
+            }) => {
+                tracing::warn!(
+                    job_id,
+                    subtask = parsed.subtask,
+                    because,
+                    "stream:rloop stopped with window state still open: it is neither \
+                     flushed (a forced flush would emit partial aggregates as complete) nor \
+                     snapshotted here. A checkpointed job resumes from its last committed \
+                     epoch and loses only what came after; a job registered without \
+                     checkpointing has no resume point and loses all of it."
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // Never fail a cancellation over the stop report. The task is
+                // already going away and the caller asked for that; turning a
+                // clean cancel into an error would be a worse outcome than a
+                // missing warn line.
+                tracing::warn!(
+                    job_id,
+                    subtask = parsed.subtask,
+                    %error,
+                    "stream:rloop could not determine whether window state was left open",
+                );
+            }
+        }
     }
     tracing::info!(
         job_id,
@@ -1158,6 +1191,25 @@ impl ExecutorTaskRunner {
     /// checkpoint-complete notification). Sink visibility latency is the
     /// checkpoint interval, never the push cadence, and nothing here calls
     /// `commit_cycle`.
+    /// Does this assignment deliver through a sink that already durably holds
+    /// its rows?
+    ///
+    /// Mirrors the dispatch below exactly — Iceberg or Kafka — because the two
+    /// answering differently is what would resurrect the false alarm.
+    fn has_durable_sink_contract(contract: &krishiv_proto::OutputContract) -> ExecutorResult<bool> {
+        if crate::fragment::common::iceberg_sink_descriptor(contract)?.is_some() {
+            return Ok(true);
+        }
+        Ok(
+            krishiv_proto::OutputContractDescriptor::parse_kafka_sink(contract.description())
+                .is_some()
+                || matches!(
+                    contract.descriptor(),
+                    Some(krishiv_proto::OutputContractDescriptor::KafkaSink { .. })
+                ),
+        )
+    }
+
     pub(crate) async fn stage_rloop_outputs(
         &self,
         job_id: &str,
@@ -1167,6 +1219,13 @@ impl ExecutorTaskRunner {
         if outputs.is_empty() {
             return Ok(());
         }
+        // Whether this buffer IS the job's delivery path, or merely a staging
+        // area beside a durable sink. Computed before the buffer block because
+        // the buffer is filled unconditionally — including for jobs whose real
+        // output goes to Iceberg or Kafka — and that is precisely what made its
+        // drop counter a false alarm.
+        let has_durable_sink = Self::has_durable_sink_contract(assignment.output_contract())?;
+
         {
             let mut egress = self
                 .continuous_outputs
@@ -1188,18 +1247,38 @@ impl ExecutorTaskRunner {
                 // largest.
                 krishiv_metrics::global_metrics()
                     .add_output_buffer_flush("rloop-egress-drop", overflow as u64);
-                *self
-                    .continuous_egress_dropped
-                    .entry(job_id.to_owned())
-                    .or_insert(0) += overflow as u64;
-                tracing::warn!(
-                    job_id,
-                    dropped_batches = overflow,
-                    cap,
-                    "run-loop egress buffer overflowed; oldest batches dropped (drain is \
-                     best-effort — consume durably via the sink or queryable state, or raise \
-                     KRISHIV_RLOOP_EGRESS_CAP)"
-                );
+
+                if krishiv_common::streaming_dials::EgressLoss::drop_lost_output(has_durable_sink) {
+                    // The buffer was the only way out, so this is real loss and
+                    // the coordinator is right to escalate it.
+                    let mut loss = krishiv_common::streaming_dials::EgressLoss::none();
+                    loss.record(overflow as u64);
+                    *self
+                        .continuous_egress_dropped
+                        .entry(job_id.to_owned())
+                        .or_insert(0) += loss.dropped_batches();
+                    tracing::warn!(
+                        job_id,
+                        dropped_batches = overflow,
+                        cap,
+                        "{}",
+                        krishiv_common::streaming_dials::EgressLoss::lost_output_advice()
+                    );
+                } else {
+                    // A durable sink already has these rows. Counting them as
+                    // dropped made the coordinator report "this job's output is
+                    // incomplete" for a job whose output was complete — a false
+                    // alarm on top of a real one, which is the worst place for
+                    // it: it teaches the reader to discount the signal that
+                    // matters. Debug, not warn, and NOT counted.
+                    tracing::debug!(
+                        job_id,
+                        trimmed_batches = overflow,
+                        cap,
+                        "run-loop egress staging buffer trimmed; this job delivers through a \
+                         durable sink, so nothing was lost"
+                    );
+                }
             }
         }
 

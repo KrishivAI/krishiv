@@ -4680,3 +4680,112 @@ shape-building or convergence regressed.
 
 The in-code comment at the launch site now carries this evidence, so the next
 attempt starts from it.
+
+---
+
+## §39 — Streaming duplication: the architecture, in eight steps
+
+A deep review of duplicated streaming implementations, then the eight-step
+procedure it produced. Commits `a22240f`, `79aa93d`, `9f02293`, `95a866b`,
+`e95af21`, and the steps 6–8 commit.
+
+### What the review actually found
+
+Four independent end-to-end reads of the driver loops against one fixed
+twelve-axis rubric. Of twelve decision axes, **exactly one — operator stepping
+— was shared across all four loops.** That is the axis people point at when
+calling this a single streaming core. Meanwhile `egress` and `error_handling`
+were local implementations four times over.
+
+Three confirmed silent wrong answers, each verified by a skeptic instructed to
+refute it by default:
+
+1. **`eos-flush-missing-on-both-distributed-loops`.** `ExecutionMode::Distributed`
+   can only construct `RemoteExecutionRuntime`, which inherited the trait's
+   defaulted flush. `connector_runtime.rs` caught the resulting `Unsupported`,
+   logged a warn, and returned `Completed`. A bounded windowed job was short one
+   row per group with no other sign.
+2. **`cycle-has-no-idle-watermark-tick`.** Session windows can never close on
+   the DEFAULT registration mode. Task #120 had closed the embedded/run-loop
+   pair; the cycle model still had the gap.
+3. **`run-loop-egress-drops-oldest`.** The only loop whose egress is lossy, plus
+   a false alarm on top: the buffer is filled unconditionally *before* the sink
+   dispatch, so a durable-sink job reported permanently nonzero drops and the
+   coordinator escalated a complete output to "incomplete".
+
+Plus one behavioural split — `coercion-only-on-run-loop` — where the same job
+ran on one placement and aborted with `ts must be Int64` on the others.
+
+### The correction that matters most
+
+I had previously reported the flush seam as "fails closed rather than silently
+truncating", on the strength of the trait default being an error. That was
+wrong at the system level: the trait failed closed and the caller converted it
+straight back to `Completed`. **Naming a loss in a log line the caller never
+reads is not reporting it** — the same defect F15 found, wearing different
+clothes. Worth remembering as a review habit: tracing a guard to its definition
+is not the same as tracing it to its caller.
+
+### The mechanism, and its honest ceiling
+
+`StreamingLoop` is a closed enum; `policy()` and `ordinal()` and `name()` are
+exhaustive matches; `DriverPolicy` has no `Default`, no `#[non_exhaustive]`, no
+builder, and deliberately no `Test` variant. Both halves were run against rustc:
+an incoherent policy fails with `E0080` naming the rule, a sixth variant fails
+with three separate `E0004`s.
+
+**It gates adding LOOPS, not inventing DECISIONS.** Someone who implements a
+genuinely new axis in one loop and never adds a `DriverPolicy` field is not
+caught. The only counterweight is the cross-loop corpus: a new decision that
+changes output shows up there, and one that does not change output was arguably
+not an axis. There is also a smaller residual hole documented on
+`VARIANT_COUNT` — a variant added to the enum and all three matches but to
+neither `ALL` nor the count is never coherence-checked. Closing it needs a
+derive macro and is not worth one.
+
+### Proofs, all executed rather than asserted
+
+| What was reverted | What went red | What stayed green |
+|---|---|---|
+| Cycle `idle_tick` → `WallClock` | build, `E0080` | — |
+| A sixth `StreamingLoop` variant | build, 3× `E0004` | — |
+| `on_stop` flush arm (in krishiv-dataflow) | driver unit test **and** the krishiv-api conformance arm | — |
+| `Timestamp` coercion arms → `None` | `Timestamp(Millisecond) != Int64` | — |
+| Flush tag → `CONTINUOUS_DRAIN` | tag identity test | — |
+| `stream-eos:` read → `if false` | the EOS test, `left: [] right: [(a,30),(b,5)]` | both no-directive tests |
+| `on_idle` → early return | the run-loop session test | the cycle half |
+| `requires_wall_clock` → not Session | the cycle-refusal test | the scope test |
+| `has_durable_sink_contract` → false | the durable-sink test | the egress-cap test |
+
+The third row is the one that matters structurally: a one-line change in
+`krishiv-dataflow` turned a test red in `krishiv-api`. That cross-crate link is
+exactly what did not exist when `dd47d50` and `8756b41` fixed the same bug weeks
+apart.
+
+### What this did NOT fix
+
+- **The loops are not unified, and were never going to be.** Source polling,
+  checkpoint cadence, barrier alignment, key-group routing, peer forwarding and
+  restore handling stay per-loop and untyped. Roughly two thirds of each loop
+  body is untouched and can still drift.
+- **No end-to-end coordinator arm.** The `stream-eos:` executor half is proven
+  and the coordinator half is routed, but the two have never run together
+  against a live coordinator with a real gRPC executor — the push path rejects
+  an in-process task endpoint, so that arm cannot be stood up in-tree as things
+  are. The coordinator fix is reasoned-and-unit-tested, **not demonstrated**.
+- **Cycle mode still has no wall clock.** Step 7 refuses session-in-cycle
+  rather than fixing it. Inherent: a cycle task exists for one invocation, so
+  adding a timer means putting wall clock in the control plane.
+- **Egress buffers remain four different things.** Only the accounting is
+  shared; the buffers are genuinely different mechanisms.
+- **Four leads were raised and never verified** (the fan-out was capped at
+  four): null-key poison policy, the four checkpoint models,
+  `KRISHIV_STREAM_PROFILE`'s disjoint halves, and the run-loop's second
+  watermark implementation. They are leads, not findings.
+
+### Behaviour break
+
+A Distributed bounded streaming job that reported `Completed` with a short
+answer now **fails**. Correct direction, but it needs a release note.
+`KRISHIV_ALLOW_UNFLUSHED_BOUNDED=1` opts back in, and the error names the flag
+so an operator has a move rather than just a refusal.

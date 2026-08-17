@@ -1543,6 +1543,33 @@ pub async fn register_continuous_stream_with_options(
     let parallelism = options.parallelism.unwrap_or(1).max(1);
     let mode = ContinuousJobMode::parse(options.mode.as_deref(), parallelism)
         .map_err(invalid_registration)?;
+
+    // A cycle task exists for exactly one push-triggered invocation, so between
+    // pushes no live thread owns wall clock for it — that is why
+    // `StreamingLoop::Cycle` declares `IdleTick::None`, and why declaring
+    // otherwise fails the build.
+    //
+    // A session window closes on inactivity, and inactivity is by definition
+    // the absence of the events that would advance the watermark. So a session
+    // job in cycle mode can never close its windows: it is accepted, it runs,
+    // it reports healthy, and it emits nothing until some later push happens to
+    // carry an event past the gap. Refusing it at registration turns a silent
+    // wrong answer into a message naming the mode that works.
+    //
+    // This is the DEFAULT path, not an edge case: `ContinuousJobMode::parse`
+    // maps `None | "" | "cycle"` to Cycle, so a caller who never thought about
+    // execution mode lands here.
+    if mode == ContinuousJobMode::Cycle
+        && krishiv_plan::window::requires_wall_clock(&spec.window_kind)
+    {
+        return Err(invalid_registration(
+            "session windows close on inactivity, which needs a wall clock; a cycle task \
+             exists only for one push-triggered invocation and owns no thread between \
+             pushes, so this job would accept events and never emit a session. Register \
+             with mode: \"run-loop\", which is long-lived and ticks on elapsed time.",
+        ));
+    }
+
     if mode == ContinuousJobMode::RunLoop
         && options.checkpoint_interval_ms.is_some() != options.checkpoint_storage_path.is_some()
     {
@@ -2392,6 +2419,98 @@ mod tests {
             .with_task_endpoint(crate::IN_PROCESS_TASK_ENDPOINT);
         coordinator.write().await.register_executor(desc).unwrap();
         coordinator
+    }
+
+    /// A session-window spec: the one kind that cannot close without a clock.
+    fn session_spec() -> WindowExecutionSpec {
+        WindowExecutionSpec {
+            window_kind: WindowKind::Session,
+            session_gap_ms: Some(30_000),
+            ..tumbling_spec()
+        }
+    }
+
+    /// Cycle mode must refuse a session window instead of accepting one it can
+    /// never close.
+    ///
+    /// Cycle is the DEFAULT — `ContinuousJobMode::parse` maps `None`, `""` and
+    /// `"cycle"` to it — so this is the path a caller who never thought about
+    /// execution mode takes. Before the guard, such a job registered cleanly,
+    /// ran, reported healthy, and emitted nothing.
+    ///
+    /// The message must name the mode that works. A refusal that says only
+    /// "unsupported" converts a silent wrong answer into a dead end.
+    #[tokio::test]
+    async fn cycle_mode_refuses_a_session_window_it_could_never_close() {
+        for mode in [None, Some(String::new()), Some(String::from("cycle"))] {
+            let coordinator = make_coordinator_with_executor("cycle-session").await;
+            let options = ContinuousRegistrationOptions {
+                mode: mode.clone(),
+                ..Default::default()
+            };
+            let error = register_continuous_stream_with_options(
+                &coordinator,
+                "cycle-session-job",
+                &session_spec(),
+                &options,
+            )
+            .await
+            .expect_err("a session window in cycle mode must be refused");
+
+            let text = error.to_string();
+            assert!(
+                text.contains("run-loop"),
+                "the refusal must name the mode that works, or the caller has no move: \
+                 {text}"
+            );
+            assert!(
+                text.contains("wall clock") || text.contains("inactivity"),
+                "the refusal must say WHY, so it reads as a design limit rather than an \
+                 arbitrary block: {text}"
+            );
+        }
+    }
+
+    /// The guard is scoped to session windows and to cycle mode.
+    ///
+    /// Without this, `requires_wall_clock` could return `true` for everything
+    /// and the test above would still pass while the guard refused every job in
+    /// the default mode — a far worse outcome than the defect it fixes.
+    #[tokio::test]
+    async fn the_session_guard_refuses_nothing_else() {
+        let coordinator = make_coordinator_with_executor("cycle-tumbling").await;
+        register_continuous_stream_with_options(
+            &coordinator,
+            "cycle-tumbling-job",
+            &tumbling_spec(),
+            &ContinuousRegistrationOptions::default(),
+        )
+        .await
+        .expect("a tumbling window in cycle mode closes on data and must be accepted");
+
+        // And a session window is fine on the loop that owns a wall clock.
+        let coordinator = make_coordinator_with_executor("rloop-session").await;
+        let options = ContinuousRegistrationOptions {
+            mode: Some(String::from("run-loop")),
+            ..Default::default()
+        };
+        let outcome = register_continuous_stream_with_options(
+            &coordinator,
+            "rloop-session-job",
+            &session_spec(),
+            &options,
+        )
+        .await;
+        assert!(
+            !matches!(
+                outcome.as_ref().err(),
+                Some(ContinuousStreamError::Scheduler(
+                    crate::SchedulerError::InvalidJob { .. }
+                ))
+            ),
+            "run-loop mode owns a wall clock, so a session window must not be refused \
+             as invalid there; got {outcome:?}"
+        );
     }
 
     fn tumbling_spec() -> WindowExecutionSpec {

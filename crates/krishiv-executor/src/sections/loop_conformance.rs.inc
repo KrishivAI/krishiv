@@ -273,6 +273,334 @@ async fn a_cycle_told_the_stream_ended_closes_its_open_windows() {
     }
 }
 
+/// A session-window spec with a 1s inactivity gap.
+///
+/// Session is the window kind that *requires* a wall clock: it closes on
+/// inactivity, and inactivity is by definition the absence of the events that
+/// would otherwise advance the watermark.
+fn session_window_spec() -> String {
+    use krishiv_plan::window::{WindowAgg, WindowAggKind, WindowExecutionSpec, WindowKind};
+
+    let mut spec = WindowExecutionSpec::tumbling(KEY_COLUMN, TIME_COLUMN, 10_000);
+    spec.window_kind = WindowKind::Session;
+    spec.session_gap_ms = Some(1_000);
+    spec.watermark_lag_ms = 0;
+    spec.agg_exprs = vec![WindowAgg {
+        kind: WindowAggKind::Sum,
+        input_column: AGG_INPUT.to_owned(),
+        output_column: AGG_OUTPUT.to_owned(),
+        filter: None,
+    }];
+    krishiv_plan::window::encode_window_execution_spec(&spec).expect("encode session spec")
+}
+
+/// A single event whose timestamp is already well past its own session gap.
+///
+/// Nothing further will arrive, so no event-time watermark advance can ever
+/// close this session — only a wall-clock tick can.
+fn stale_session_batch() -> RecordBatch {
+    use arrow::array::{Int64Array, StringArray};
+    use std::sync::Arc as StdArc;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let schema = krishiv_dataflow::streaming_corpus::schema();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            StdArc::new(StringArray::from(vec!["s"])),
+            StdArc::new(Int64Array::from(vec![now_ms - 5_000])),
+            StdArc::new(Int64Array::from(vec![42_i64])),
+        ],
+    )
+    .expect("session fixture batch")
+}
+
+/// The run-loop closes a quiet session on wall clock; the cycle cannot.
+///
+/// This is the one behaviour the corpus above cannot reach, because every
+/// corpus fixture closes its windows by event-time advance. Without it the
+/// run-loop's idle tick is exercised only by `StreamDriver`'s own unit tests,
+/// and nothing would notice if this loop stopped calling `on_idle` at all —
+/// which is exactly the "shared function only some loops reach" shape the
+/// driver exists to eliminate.
+///
+/// Verified discriminating: making `StreamDriver::on_idle` return early
+/// unconditionally turns the run-loop half red. The cycle half is not a bug
+/// being pinned — a cycle task exists for one invocation and owns no thread
+/// between invocations, so it has no wall clock to tick by construction. Step 7
+/// makes that refusal explicit at registration instead of silent at runtime.
+#[tokio::test]
+async fn the_run_loop_closes_a_quiet_session_on_wall_clock_and_the_cycle_cannot() {
+    // ── run-loop: has a wall clock ────────────────────────────────────────
+    let job_id = "rloop-session-idle";
+    let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new())
+        .with_own_task_endpoint(RLOOP_LOCAL_ENDPOINT);
+    let peers = rloop_peers_partition(1);
+    let ids = TaskAttemptRef::new(
+        JobId::try_new(job_id).unwrap(),
+        StageId::try_new("stage-streaming").unwrap(),
+        TaskId::try_new("task-streaming-0").unwrap(),
+        AttemptId::initial(),
+    );
+    let assignment = ExecutorTaskAssignment::new(
+        ids,
+        ExecutorId::try_new("exec-1").unwrap(),
+        LeaseGeneration::initial(),
+        PlanFragment::new(format!(
+            "{STREAM_RLOOP_PREFIX}{job_id}|0/1|{}",
+            session_window_spec()
+        ))
+        .with_streaming(true),
+        OutputContract::new(
+            krishiv_proto::OutputContractKind::InlineRecordBatches,
+            "rloop output",
+        ),
+    )
+    .with_key_group_range(rloop_key_group_range(0, 1))
+    .with_requires_reattach(true)
+    .with_input_partitions(vec![krishiv_proto::InputPartition::new(
+        "stream-peers",
+        peers.as_str(),
+    )]);
+
+    let task_runner = runner.clone();
+    let handle = tokio::spawn(async move { task_runner.execute_streaming_fragment(&assignment).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    runner
+        .continuous_inputs
+        .entry(job_id.to_owned())
+        .or_default()
+        .push(stale_session_batch());
+    runner.notify_continuous_input(job_id);
+
+    // The default idle-tick interval is 500 ms, so ~1.5 s is three chances to
+    // fire. Deliberately not env-tuned: KRISHIV_IDLE_TICK_MS is process-global
+    // and this suite runs in parallel, so a test that set it could change the
+    // cadence of an unrelated one.
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+
+    runner
+        .inbox()
+        .cancel_task(
+            &JobId::try_new(job_id).unwrap(),
+            &TaskId::try_new("task-streaming-0").unwrap(),
+        )
+        .unwrap();
+    runner.notify_continuous_input(&format!("{job_id}#task-streaming-0"));
+    runner.notify_continuous_input(job_id);
+    handle
+        .await
+        .expect("run-loop must not panic")
+        .expect("run-loop exits cleanly on cancel");
+
+    let rloop_rows: usize = runner
+        .continuous_outputs
+        .get(job_id)
+        .map(|e| e.value().iter().map(|b| b.num_rows()).sum())
+        .unwrap_or(0);
+    assert!(
+        rloop_rows > 0,
+        "the run-loop must close a session whose gap elapsed while the source was \
+         quiet; no further event will ever arrive to advance the watermark for it"
+    );
+
+    // ── cycle: owns no thread between invocations ─────────────────────────
+    let cycle_runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+    let cycle_assignment = make_loop_assignment_with_batches(
+        &format!("stream:loop:cycle-session|{}", session_window_spec()),
+        &[stale_session_batch()],
+    );
+    let cycle_out = cycle_runner
+        .execute_streaming_fragment(&cycle_assignment)
+        .await
+        .expect("cycle session fragment");
+    assert_eq!(
+        cycle_out.row_count(),
+        0,
+        "a cycle invocation has no wall clock, so a quiet session cannot close in it \
+         — this is a real functional limit of Cycle mode, not a transient"
+    );
+}
+
+/// A one-row batch carrying `marker` as its amount, so survivors are
+/// identifiable after a drop.
+fn marked_batch(marker: i64) -> RecordBatch {
+    use arrow::array::{Int64Array, StringArray};
+    use std::sync::Arc as StdArc;
+
+    RecordBatch::try_new(
+        krishiv_dataflow::streaming_corpus::schema(),
+        vec![
+            StdArc::new(StringArray::from(vec!["k"])),
+            StdArc::new(Int64Array::from(vec![marker])),
+            StdArc::new(Int64Array::from(vec![marker])),
+        ],
+    )
+    .expect("marked batch")
+}
+
+/// The run-loop egress buffer drops its OLDEST batches, and says so.
+///
+/// Asserting WHICH batches survive is the whole test. A cap that dropped the
+/// newest would leave the same count and the same drop total, so a length-only
+/// assertion would pass against the opposite policy — and drop-newest versus
+/// drop-oldest are meaningfully different failures for a consumer trying to
+/// catch up.
+///
+/// Reads the effective cap rather than setting it: `KRISHIV_RLOOP_EGRESS_CAP`
+/// is process-global, this suite runs in parallel, and `krishiv-executor`
+/// forbids `unsafe`, which `std::env::set_var` now requires. Deriving the
+/// expectation from the cap is not a tautology — the assertions are about which
+/// markers survive and how many were counted, neither of which the cap decides.
+///
+/// Verified discriminating: changing `egress.drain(..overflow)` to
+/// `egress.truncate(cap)` keeps the surviving COUNT identical and flips the
+/// surviving markers to the oldest, failing on identity alone.
+#[tokio::test]
+async fn the_egress_cap_drops_oldest_and_counts_every_lost_batch() {
+    let cap = krishiv_common::streaming_dials::rloop_egress_cap();
+    let overflow_by = 6_i64;
+    let total = cap as i64 + overflow_by;
+
+    let job_id = "egress-cap-job";
+    let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+    // No sink contract: this buffer IS the delivery path, so drops are real
+    // loss and must be counted.
+    let assignment = make_loop_assignment("stream:loop:egress-cap|noop");
+
+    for marker in 0..total {
+        runner
+            .stage_rloop_outputs(job_id, &assignment, &[marked_batch(marker)])
+            .await
+            .expect("stage");
+    }
+
+    let survivors: Vec<i64> = runner
+        .continuous_outputs
+        .get(job_id)
+        .map(|e| {
+            e.value()
+                .iter()
+                .filter_map(|b| {
+                    b.column(2)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .map(|a| a.value(0))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    assert_eq!(survivors.len(), cap, "the buffer must stay at its cap");
+    assert_eq!(
+        survivors.first().copied(),
+        Some(overflow_by),
+        "the cap must keep the NEWEST batches; a drop-newest policy would leave the \
+         same COUNT starting at marker 0, which is why this asserts identity"
+    );
+    assert_eq!(
+        survivors.last().copied(),
+        Some(total - 1),
+        "the most recent batch must always survive"
+    );
+
+    let dropped = runner
+        .continuous_egress_dropped
+        .get(job_id)
+        .map(|e| *e.value())
+        .unwrap_or(0);
+    assert_eq!(
+        dropped, overflow_by as u64,
+        "every dropped BATCH must be counted, not one per overflow event — \
+         under-counting is worst exactly when the loss is largest"
+    );
+}
+
+/// A job delivering through a durable sink does NOT report dropped output.
+///
+/// The staging buffer is filled unconditionally, before the sink dispatch, so a
+/// run-loop job writing to Kafka or Iceberg overflows it exactly like any other
+/// — and nobody drains it, because the sink is the real delivery path. Counting
+/// those trims as dropped output made the coordinator log
+///
+///     "This job's output is incomplete by these counts."
+///
+/// permanently, for a job whose output was complete. That is a false alarm
+/// stacked on a real one, which is the worst possible place for it: it teaches
+/// whoever reads the log to discount the signal that actually matters.
+///
+/// Verified discriminating: making `has_durable_sink_contract` return
+/// `Ok(false)` unconditionally turns this red with a nonzero count, while
+/// `the_egress_cap_drops_oldest_and_counts_every_lost_batch` stays green —
+/// that split is what proves the gate keys on the CONTRACT and not on
+/// something incidental to the fixture.
+#[tokio::test]
+async fn a_durable_sink_job_does_not_report_its_staging_trims_as_lost_output() {
+    let cap = krishiv_common::streaming_dials::rloop_egress_cap();
+    let job_id = "durable-sink-job";
+    let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+
+    let ids = TaskAttemptRef::new(
+        JobId::try_new(job_id).unwrap(),
+        StageId::try_new("stage-1").unwrap(),
+        TaskId::try_new("task-1").unwrap(),
+        AttemptId::initial(),
+    );
+    let assignment = ExecutorTaskAssignment::new(
+        ids,
+        ExecutorId::try_new("exec-1").unwrap(),
+        LeaseGeneration::initial(),
+        PlanFragment::new("stream:loop:durable-sink|noop"),
+        OutputContract::new(
+            krishiv_proto::OutputContractKind::InlineRecordBatches,
+            "kafka sink",
+        )
+        .with_descriptor(krishiv_proto::OutputContractDescriptor::KafkaSink {
+            bootstrap_servers: String::from("localhost:9092"),
+            topic: String::from("out"),
+            transactional_id_prefix: String::from("krishiv"),
+        }),
+    );
+
+    for marker in 0..(cap as i64 + 6) {
+        // The sink DISPATCH is expected to fail here: this build has no `kafka`
+        // feature, so the contract is honoured as a contract but not as a
+        // connection. That is fine and deliberate — the dispatch runs AFTER the
+        // buffer block, so everything under test has already happened, and what
+        // matters is that the contract was READ. The `buffered == cap`
+        // assertion below is what keeps this from passing vacuously: it can
+        // only hold if the buffer block ran to completion.
+        let _ = runner
+            .stage_rloop_outputs(job_id, &assignment, &[marked_batch(marker)])
+            .await;
+    }
+
+    // The buffer is still bounded — that part must not regress.
+    let buffered = runner
+        .continuous_outputs
+        .get(job_id)
+        .map(|e| e.value().len())
+        .unwrap_or(0);
+    assert_eq!(
+        buffered, cap,
+        "the staging buffer must stay bounded regardless of the sink contract"
+    );
+
+    let dropped = runner
+        .continuous_egress_dropped
+        .get(job_id)
+        .map(|e| *e.value())
+        .unwrap_or(0);
+    assert_eq!(
+        dropped, 0,
+        "a job whose rows are durably in its sink has lost nothing; reporting {dropped} \
+         dropped batches would make the coordinator call a complete output incomplete"
+    );
+}
+
 /// The two executor loops agree with each other, whatever they do.
 ///
 /// Separate from the assertion above on purpose: that one pins them to a

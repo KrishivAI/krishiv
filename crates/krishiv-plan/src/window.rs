@@ -17,6 +17,25 @@ pub enum WindowKind {
     },
 }
 
+/// Does this window kind need a wall clock to close?
+///
+/// A session window closes on *inactivity*, and inactivity is by definition the
+/// absence of the events that would otherwise advance the watermark. Nothing in
+/// the data can ever close it — only a driver loop that ticks on elapsed wall
+/// clock can.
+///
+/// Every other kind closes on data: a tumbling or sliding window closes when an
+/// event past its end arrives, and a count window when enough rows arrive. Those
+/// are all reachable without a clock, though a quiet stream simply holds them
+/// open, which is correct event-time semantics rather than a defect.
+///
+/// This exists so a placement that owns no wall clock can refuse such a job at
+/// registration instead of accepting one it can never close.
+#[must_use]
+pub const fn requires_wall_clock(kind: &WindowKind) -> bool {
+    matches!(kind, WindowKind::Session)
+}
+
 /// Aggregate function in a streaming window plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowAggKind {
