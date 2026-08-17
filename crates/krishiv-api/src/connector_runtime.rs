@@ -997,6 +997,24 @@ fn connector_config_from_source_spec(spec: &SourceSpec) -> ConnectorConfig {
     connector_config_from_spec(&spec.name, &spec.connector, &spec.uri, &spec.options)
 }
 
+/// The connector properties a [`SourceSpec`] resolves to, as a plain map.
+///
+/// The distributed continuous path ships these to executors, which rebuild a
+/// `ConnectorConfig` from them. It goes through the same
+/// [`connector_config_from_spec`] the embedded path uses — including its
+/// deliberate refusal to invent a locator key for endpoint-addressed
+/// connectors — so a source means the same thing wherever the job lands. A
+/// second mapping here would be free to drift, and its drift would show up as
+/// a job that reads the wrong data rather than as an error.
+pub(crate) fn connector_properties_for_source(
+    spec: &SourceSpec,
+) -> std::collections::BTreeMap<String, String> {
+    connector_config_from_source_spec(spec)
+        .properties()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect()
+}
+
 fn connector_config_from_sink_spec(spec: &SinkSpec) -> ConnectorConfig {
     connector_config_from_spec(&spec.view, &spec.connector, &spec.uri, &spec.options)
 }

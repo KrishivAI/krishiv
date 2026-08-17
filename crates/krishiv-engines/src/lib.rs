@@ -962,6 +962,27 @@ pub struct RunningJob {
 }
 
 impl RunningJob {
+    /// Build a handle for a job whose data plane runs **elsewhere**.
+    ///
+    /// The local task supervises rather than executes: it waits on `stop` and
+    /// then performs whatever teardown the owner needs (for a distributed
+    /// continuous job, deregistering it on the coordinator and waiting for the
+    /// coordinator to confirm the job is gone).
+    ///
+    /// The contract of [`stop`](Self::stop) is unchanged and that is the point:
+    /// it returns only once the supervising task has finished, so a
+    /// [`JobStatus::Completed`] still means the job really is stopped — not
+    /// that a request to stop it was sent. A remote variant that returned
+    /// `Completed` as soon as the RPC was accepted would be the same shape of
+    /// lie this audit exists to remove.
+    pub fn supervised(
+        handle: JobHandle,
+        stop: tokio::sync::watch::Sender<bool>,
+        task: tokio::task::JoinHandle<EngineResult<JobHandle>>,
+    ) -> Self {
+        Self { handle, stop, task }
+    }
+
     /// The job handle as of spawn (status [`JobStatus::Running`]).
     pub fn handle(&self) -> &JobHandle {
         &self.handle

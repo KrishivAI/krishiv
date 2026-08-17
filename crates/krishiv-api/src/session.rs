@@ -3007,15 +3007,118 @@ impl Session {
                 .map_err(KrishivError::from)?;
                 crate::spawn_streaming_job(job, runtime).map_err(KrishivError::from)
             }
-            // Distributed continuous streaming is owned by the dedicated
-            // continuous-stream API, which routes to the remote coordinator.
-            ExecutionMode::Distributed => Err(KrishivError::unsupported(
-                "distributed continuous streaming is reached through Session::stream(name, spec) \
-                 with push_stream_job_input/poll_stream_job, which route to the remote \
-                 coordinator; submit_streaming() runs the in-process continuous loop \
-                 (embedded / single-node).",
-            )),
+            // Distributed: the subtasks own the source, so this is the
+            // run-loop engine — not the cycle model, whose input is hand-fed
+            // by the client and which therefore cannot express "the engine
+            // reads this Kafka topic", which is exactly what a CompiledJob says.
+            ExecutionMode::Distributed => block_on(self.submit_streaming_distributed(job)),
         }
+    }
+
+    /// Register `job` as a parallel run-loop continuous job on the coordinator
+    /// and return a handle that supervises it.
+    ///
+    /// This used to be an error pointing at `Session::stream`, which is a
+    /// different contract: `stream` hands the client a push/drain pair and the
+    /// client feeds the input. A [`CompiledJob`](crate::CompiledJob) names its
+    /// own sources, so the honest distributed shape is the one where the
+    /// subtasks open those sources themselves — the run-loop engine with
+    /// `ContinuousRegistrySource` descriptors.
+    async fn submit_streaming_distributed(
+        &self,
+        job: crate::CompiledJob,
+    ) -> Result<crate::RunningJob> {
+        use krishiv_engine_core::{JobHandle, JobStatus};
+
+        let url = self
+            .coordinator_http_url()
+            .ok_or_else(|| {
+                KrishivError::unsupported(
+                    "distributed streaming needs a coordinator URL; call with_coordinator() or \
+                     Session::from_env with KRISHIV_COORDINATOR_URL set",
+                )
+            })?
+            .to_owned();
+
+        // The coordinator compiles the same windowed SQL its own
+        // `/continuous-register-sql` endpoint accepts, so a job that runs
+        // embedded and the same job submitted here are planned by one compiler
+        // rather than two that can disagree.
+        let plan = krishiv_sql::streaming_window_plan::compile_streaming_window_sql(&job.query)
+            .map_err(|error| {
+                KrishivError::unsupported(format!(
+                    "distributed streaming needs a windowed query the coordinator can plan \
+                     (TUMBLE / HOP / SESSION over a source with GROUP BY); this job's query did \
+                     not compile: {error}"
+                ))
+            })?;
+
+        // Every source must be one the *subtasks* can open. A bounded source
+        // has no place in an unbounded run-loop, and refusing it here is better
+        // than registering a job that reads its input once and then idles
+        // forever looking healthy.
+        let mut sources = Vec::with_capacity(job.sources.len());
+        for source in &job.sources {
+            if source.is_bounded {
+                return Err(KrishivError::unsupported(format!(
+                    "source '{}' ({}) is bounded, so it cannot drive a distributed continuous \
+                     job: the run-loop would drain it once and then idle forever while reporting \
+                     Running. Use submit() for a bounded run.",
+                    source.name, source.connector
+                )));
+            }
+            sources.push(krishiv_scheduler::ContinuousRegistrySource {
+                kind: source.connector.clone(),
+                table: source.name.clone(),
+                // Reuse the embedded path's locator mapping rather than a
+                // second copy: whatever `connector` means when this job runs
+                // in-process, it must mean the same on an executor.
+                config: crate::connector_runtime::connector_properties_for_source(source),
+            });
+        }
+        if sources.is_empty() {
+            return Err(KrishivError::unsupported(
+                "a distributed continuous job needs at least one unbounded source for its \
+                 subtasks to own; a job with no sources has nothing to read",
+            ));
+        }
+
+        let parallelism = sources.len().max(1) as u32;
+        let mut options = krishiv_runtime::ContinuousRegisterOptions::run_loop(parallelism);
+        options.sources = sources;
+        let checkpoint_dir = self.checkpoint_dir();
+        options =
+            options.with_checkpointing(30_000, format!("file://{}", checkpoint_dir.display()));
+
+        krishiv_runtime::execute_coordinator_continuous_register(
+            &url, &job.name, &plan.spec, &options,
+        )
+        .await
+        .map_err(KrishivError::from)?;
+
+        let handle = JobHandle::from_name(&job.name, JobStatus::Running)
+            .map_err(|e| KrishivError::unsupported(e.to_string()))?;
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let job_name = job.name.clone();
+        let task = tokio::spawn(async move {
+            // Supervise: wait for the stop signal, then tear the job down on
+            // the coordinator and confirm it is really gone before reporting
+            // Completed.
+            while !*stop_rx.borrow() {
+                if stop_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            krishiv_runtime::execute_coordinator_cancel_job(&url, &job_name)
+                .await
+                .map_err(|e| {
+                    krishiv_engine_core::EngineError::Runtime(format!(
+                        "cancelling distributed continuous job '{job_name}': {e}"
+                    ))
+                })?;
+            JobHandle::from_name(&job_name, JobStatus::Completed)
+        });
+        Ok(crate::RunningJob::supervised(handle, stop_tx, task))
     }
 
     /// Run a one-shot batch SQL query, returning a [`DataFrame`].
@@ -4310,6 +4413,122 @@ mod remote_session_parity_tests {
         assert!(
             shipped.contains("register-python-udf"),
             "a transform must not strip the UDF directives; got: {shipped}"
+        );
+    }
+
+    /// `submit_streaming` in Distributed mode used to be a flat error telling
+    /// the caller to use `Session::stream` — a different contract, in which the
+    /// CLIENT feeds the input. A `CompiledJob` names its own sources, so the
+    /// honest distributed shape is the run-loop engine, whose subtasks open
+    /// those sources themselves. These guards run before any coordinator RPC,
+    /// so they need no live cluster.
+    #[test]
+    fn distributed_streaming_refuses_a_bounded_source_instead_of_idling_on_it() {
+        let session = remote_session();
+        let job = crate::CompiledJob::new(
+            "bounded-stream",
+            "SELECT k, COUNT(*) FROM TUMBLE(TABLE src, DESCRIPTOR(ts), 60000) GROUP BY k",
+            vec![crate::SourceSpec::bounded(
+                "src",
+                "parquet",
+                "/tmp/x.parquet",
+            )],
+            vec![],
+            true,
+        );
+
+        let error = session
+            .submit_streaming(job)
+            .expect_err("a bounded source cannot drive an unbounded run-loop");
+        let message = error.to_string();
+        assert!(
+            message.contains("bounded") && message.contains("idle"),
+            "the refusal must say WHY a bounded source is wrong here — the job would \
+             read it once and then look healthy forever; got: {message}"
+        );
+    }
+
+    /// A job with no sources has nothing for its subtasks to read. Registering
+    /// it would produce a run-loop that idles forever reporting Running.
+    #[test]
+    fn distributed_streaming_refuses_a_job_with_no_sources() {
+        let session = remote_session();
+        let job = crate::CompiledJob::new(
+            "sourceless",
+            "SELECT k, COUNT(*) FROM TUMBLE(TABLE src, DESCRIPTOR(ts), 60000) GROUP BY k",
+            vec![],
+            vec![],
+            true,
+        );
+
+        let message = session
+            .submit_streaming(job)
+            .expect_err("a sourceless continuous job must be refused")
+            .to_string();
+        assert!(
+            message.contains("at least one unbounded source"),
+            "the refusal must name what is missing: {message}"
+        );
+    }
+
+    /// The positive half, and the one that actually proves the feature exists:
+    /// a valid windowed job over an unbounded source must get PAST every local
+    /// guard and attempt the coordinator RPC.
+    ///
+    /// Before this, the Distributed arm was a flat `unsupported` for every
+    /// input — so a test that only checked refusals would have passed against
+    /// the old code too. Here the session points at an unroutable host, so
+    /// reaching the network is exactly what "the guards let it through" looks
+    /// like: the error must be a transport failure, never `unsupported`.
+    #[test]
+    fn a_valid_windowed_job_over_an_unbounded_source_reaches_the_coordinator() {
+        let session = remote_session();
+        let job = crate::CompiledJob::new(
+            "live-stream",
+            "SELECT k, COUNT(*) FROM TUMBLE(TABLE src, DESCRIPTOR(ts), 60000) GROUP BY k",
+            vec![crate::SourceSpec::unbounded("src", "kafka", "events")],
+            vec![],
+            true,
+        );
+
+        let error = session
+            .submit_streaming(job)
+            .expect_err("coord.invalid does not resolve, so the RPC must fail");
+        assert!(
+            !matches!(error, KrishivError::Unsupported { .. }),
+            "a well-formed distributed streaming job must no longer be refused as \
+             unsupported — it must be attempted; got: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("continuous-register") || message.contains("transport"),
+            "the failure must come from the registration RPC, which means every local \
+             guard passed: {message}"
+        );
+    }
+
+    /// The distributed path must ship the SAME connector properties the
+    /// embedded path resolves. Two mappings would be free to drift, and drift
+    /// here means a job that reads the wrong data rather than one that errors.
+    #[test]
+    fn distributed_source_properties_match_what_the_embedded_path_resolves() {
+        let spec = crate::SourceSpec::unbounded("events", "csv", "/data/events.csv");
+        let props = crate::connector_runtime::connector_properties_for_source(&spec);
+        assert_eq!(
+            props.get("path").map(String::as_str),
+            Some("/data/events.csv"),
+            "a path-addressed connector's uri must resolve to the same `path` \
+             property the embedded driver reads; got {props:?}"
+        );
+
+        // And the mapping's deliberate refusal survives: an endpoint-addressed
+        // connector gets no invented locator key.
+        let kafka = crate::SourceSpec::unbounded("events", "kafka", "some-topic");
+        let kafka_props = crate::connector_runtime::connector_properties_for_source(&kafka);
+        assert!(
+            !kafka_props.contains_key("path"),
+            "kafka carries its locator in options; inventing `path` for it would be a \
+             guess shipped to an executor: {kafka_props:?}"
         );
     }
 
