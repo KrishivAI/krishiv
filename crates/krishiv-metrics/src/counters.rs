@@ -766,10 +766,21 @@ impl KrishivMetrics {
 
     /// Record an output buffer flush with a reason.
     pub fn inc_output_buffer_flush(&self, reason: &str) {
+        self.add_output_buffer_flush(reason, 1);
+    }
+
+    /// Add `n` to the output-buffer flush counter for `reason`.
+    ///
+    /// Callers that drop a variable number of batches at once must use this
+    /// rather than [`inc_output_buffer_flush`](Self::inc_output_buffer_flush):
+    /// counting one per overflow *event* under-reports the loss the counter
+    /// exists to measure, and under-reports it worst exactly when the loss is
+    /// largest.
+    pub fn add_output_buffer_flush(&self, reason: &str, n: u64) {
         self.output_buffer_flushes
             .entry(reason.to_string())
             .or_default()
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(n, Ordering::Relaxed);
     }
 
     /// Record checkpoint alignment time in seconds.

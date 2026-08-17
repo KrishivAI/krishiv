@@ -1550,6 +1550,24 @@ pub async fn register_continuous_stream_with_options(
             "run-loop checkpointing requires BOTH checkpoint_interval_ms and checkpoint_storage_path (or neither)",
         ));
     }
+    // A run-loop job without checkpointing has no CheckpointCoordinator, so it
+    // has no savepoint — and therefore NO non-lossy stop at all. Its teardown
+    // does bookkeeping only: the open window and everything accumulated since
+    // the job started are discarded, and a restart begins from empty. That is a
+    // legitimate choice for a test or a job whose real output is its sink, but
+    // it is a choice, and registration is the moment it is made. Warning here
+    // rather than erroring, because the cycle model has always worked this way
+    // and turning it into a hard failure would break callers who know.
+    if mode == ContinuousJobMode::RunLoop && options.checkpoint_interval_ms.is_none() {
+        tracing::warn!(
+            job_id,
+            parallelism,
+            "run-loop job registered WITHOUT checkpointing: it has no savepoint and therefore no \
+             non-lossy stop — a stop, cancel, or executor loss discards all window state since \
+             the job started, and a restart resumes from empty. Pass checkpoint_interval_ms + \
+             checkpoint_storage_path to make the state recoverable."
+        );
+    }
     let job_id_typed = JobId::try_new(job_id).map_err(|e| invalid_registration(e.to_string()))?;
     let job_spec = build_continuous_job_spec(&job_id_typed, spec, mode, parallelism, options)?;
 

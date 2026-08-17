@@ -650,6 +650,21 @@ impl ContinuousWindowExecutor {
                 .is_some_and(|bytes| !bytes.is_empty())
     }
 
+    /// True when this operator is holding window state that a stop would
+    /// discard — accumulated windows, or a restore that was never consumed.
+    ///
+    /// Used to tell an ordinary quiet shutdown from one that loses work, so the
+    /// run-loop can say which it is. Deliberately built on
+    /// [`peek_snapshot_bytes`], which already handles the lazy-init hazard
+    /// ("no operator" is not "no state"); asking `self.operator` directly would
+    /// report "nothing to lose" for exactly the job that restored a checkpoint
+    /// and stopped before its first batch.
+    pub fn has_open_windows(&self) -> bool {
+        self.peek_snapshot_bytes()
+            .map(|bytes| !bytes.is_empty())
+            .unwrap_or(false)
+    }
+
     pub fn flush_all(&mut self) -> ExecResult<Vec<RecordBatch>> {
         let Some(op) = &mut self.operator else {
             // "No operator" does NOT mean "no state". The operator initialises
@@ -978,6 +993,49 @@ mod tests {
         assert!(
             !restored.has_unflushed_restored_state(),
             "after the first batch the restored state has been applied"
+        );
+    }
+
+    /// `has_open_windows` is what lets a stop say whether it lost anything.
+    ///
+    /// The run-loop's teardown neither flushes nor snapshots (a forced flush
+    /// would emit partial aggregates as complete), so a stop with state open is
+    /// a real loss and a stop with nothing open is not. Reporting them the same
+    /// way makes the warning noise, which is how a warning stops being read.
+    ///
+    /// The lazy-init hazard is the reason this delegates to
+    /// `peek_snapshot_bytes` rather than testing `self.operator`: a job that
+    /// restored a checkpoint and stopped before its first batch has NO operator
+    /// and its entire state to lose.
+    #[test]
+    fn open_windows_are_reported_including_before_the_first_batch() {
+        let mut spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+        spec.watermark_lag_ms = 0;
+
+        // Nothing has happened: a stop here costs nothing.
+        let fresh = ContinuousWindowExecutor::new(spec.clone()).expect("create");
+        assert!(
+            !fresh.has_open_windows(),
+            "an untouched executor must not claim a stop would lose state"
+        );
+
+        // Data accumulated into an open window: a stop here loses it.
+        let mut live = ContinuousWindowExecutor::new(spec.clone()).expect("create");
+        let _ = live.drain(vec![events_batch(1_000)]).expect("drain");
+        assert!(
+            live.has_open_windows(),
+            "an accumulated window must be reported as at risk on stop"
+        );
+
+        // Restored but not yet applied — no operator, full state. Asking
+        // `self.operator` here would answer "nothing to lose" for the job with
+        // the most to lose.
+        let bytes = live.snapshot().expect("snapshot");
+        let mut restored = ContinuousWindowExecutor::new(spec).expect("create");
+        restored.restore_from_snapshot(&bytes).expect("restore");
+        assert!(
+            restored.has_open_windows(),
+            "restored-but-unapplied state is still state a stop would discard"
         );
     }
 

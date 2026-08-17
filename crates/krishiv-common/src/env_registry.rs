@@ -1124,6 +1124,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "Watchdog timeout for streaming task cycles. NOT disabled when unset: the compiled-in default is 300 s. A per-task task_timeout_secs still wins.",
     ),
     rt(
+        "KRISHIV_RLOOP_EGRESS_CAP",
+        FlagKind::UInt,
+        "512",
+        "Run-loop egress buffer cap in batches. The buffer drops its OLDEST batch on overflow, so this bounds how much computed output a slow drain consumer may lose before catching up; it is a per-JOB budget shared by co-located subtasks. 0 and unparseable values fall back to the default (a 0 cap would discard every batch).",
+    ),
+    rt(
         "KRISHIV_STREAM_EARLY_FIRE_MS",
         FlagKind::UInt,
         "unset",

@@ -39,6 +39,34 @@ pub const DEFAULT_IDLE_TICK_MS: u64 = 500;
 /// draining, trading latency for amortised per-drain overhead.
 pub const THROUGHPUT_LINGER_MS: u64 = 5;
 
+/// Environment variable overriding the run-loop egress buffer cap.
+pub const RLOOP_EGRESS_CAP_ENV: &str = "KRISHIV_RLOOP_EGRESS_CAP";
+
+/// Run-loop egress buffer cap, in batches.
+///
+/// The buffer drops its OLDEST batch on overflow, so this is the amount of
+/// computed output a slow drain consumer may lose before it catches up — a
+/// durability dial in everything but name. It was a hard-coded `const` with no
+/// override while every neighbouring streaming dial had one, which meant the
+/// only way to trade memory for less loss was to recompile.
+pub const DEFAULT_RLOOP_EGRESS_CAP: usize = 512;
+
+/// Parse an egress cap, falling back to [`DEFAULT_RLOOP_EGRESS_CAP`].
+///
+/// Zero is rejected along with unparseable values: a cap of 0 drops every batch
+/// the moment it is staged, which is not a configuration anyone means, and
+/// would silently turn the job into a no-op.
+pub fn parse_rloop_egress_cap(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_RLOOP_EGRESS_CAP)
+}
+
+/// The configured run-loop egress buffer cap.
+pub fn rloop_egress_cap() -> usize {
+    parse_rloop_egress_cap(std::env::var(RLOOP_EGRESS_CAP_ENV).ok().as_deref())
+}
+
 /// Parse an idle-tick interval, falling back to [`DEFAULT_IDLE_TICK_MS`].
 ///
 /// Unset, blank, or unparseable all mean "use the default" rather than "0",
@@ -167,5 +195,27 @@ mod tests {
             Duration::from_millis(THROUGHPUT_LINGER_MS)
         );
         assert!(StreamProfile::Throughput.linger() > StreamProfile::LowLatency.linger());
+    }
+
+    /// The egress cap is a durability dial — it is how much computed output a
+    /// slow drain consumer may lose before catching up — and it was the one
+    /// streaming dial with no override, so trading memory for less loss meant
+    /// recompiling.
+    ///
+    /// Zero is rejected along with garbage: a cap of 0 drops every batch the
+    /// instant it is staged, turning the job into a silent no-op. That is never
+    /// what a `0` in an env var means, so it must not be honoured as a value.
+    #[test]
+    fn the_egress_cap_is_overridable_but_never_zero() {
+        assert_eq!(parse_rloop_egress_cap(Some("4096")), 4096);
+        assert_eq!(parse_rloop_egress_cap(Some("  64  ")), 64);
+
+        for refused in [None, Some(""), Some("0"), Some("-1"), Some("lots")] {
+            assert_eq!(
+                parse_rloop_egress_cap(refused),
+                DEFAULT_RLOOP_EGRESS_CAP,
+                "{refused:?} must fall back to the default, not disable buffering"
+            );
+        }
     }
 }

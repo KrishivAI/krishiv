@@ -218,10 +218,27 @@ mod live_conformance {
 
     /// Queries that must agree across modes.
     ///
-    /// Chosen for the shapes where a placement difference would actually show:
-    /// aggregation (partial/final split), ordering (a cross-task sort),
-    /// grouping, joins, DISTINCT, and NULL handling. Every one reads the same
-    /// fixture table so both modes resolve the same data.
+    /// Chosen for the shapes where a mode difference would show: aggregation,
+    /// ordering, grouping, joins, DISTINCT, and NULL handling. Every one reads
+    /// the same fixture table so both modes resolve the same data.
+    ///
+    /// **What this actually covers, stated exactly.** The remote side is a real
+    /// Flight round-trip over a TCP socket, so the transport, the SQL-text
+    /// encoding, inline-IPC table shipping, and the DataFrame unparser are all
+    /// genuinely exercised — a divergence in any of them fails this test.
+    ///
+    /// It does **not** exercise staged distributed placement. The server is
+    /// built by `make_flight_sql_server()` → `FlightExecutionHost::from_env()`,
+    /// which is embedded, and every corpus query is a bare `SELECT` that takes
+    /// `InProcessCluster`'s inline fast path. So the partial/final aggregate
+    /// split and the cross-task sort merge run on NEITHER side. This comment
+    /// used to claim those shapes as the reason for the corpus, which read as
+    /// coverage that does not exist.
+    ///
+    /// Closing that gap means standing the server on the coordinator backend
+    /// (`FlightExecutionHost::with_coordinator`) so queries route through
+    /// `execute_batch_sql_coordinated_with_paths`; it is a real multi-executor
+    /// harness, not a corpus change.
     const CORPUS: &[(&str, &str)] = &[
         ("literal", "SELECT 2 + 2 AS v"),
         ("projection", "SELECT id, name FROM t ORDER BY id"),

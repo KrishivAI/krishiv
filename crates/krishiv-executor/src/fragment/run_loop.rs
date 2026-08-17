@@ -59,10 +59,6 @@ pub const STREAM_RLOOP_PREFIX: &str = "stream:rloop:";
 
 /// Idle safety floor for the notify wake path (µs), mirroring the embedded loop.
 const RLOOP_IDLE_FLOOR_US: u64 = 50;
-/// Egress buffer cap (batches). Overflow drops the oldest batch — the drain
-/// API is best-effort by contract (DUR-5); durable consumption goes through
-/// the transactional sink or queryable state.
-const RLOOP_EGRESS_CAP: usize = 512;
 
 /// How long a source split may stay silent before it is treated as idle for
 /// watermark min-combining (`KRISHIV_WATERMARK_IDLE_MS`, default 30 000).
@@ -82,7 +78,7 @@ fn watermark_idleness() -> Duration {
 // them agree, and a dial that means one thing embedded and another distributed
 // is invisible: both engines run, both look configured, and only a side-by-side
 // benchmark shows it. See `krishiv_common::streaming_dials`.
-use krishiv_common::streaming_dials::{idle_tick_interval, stream_linger};
+use krishiv_common::streaming_dials::{idle_tick_interval, rloop_egress_cap, stream_linger};
 
 /// Parsed identity of one `stream:rloop:` fragment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1113,6 +1109,36 @@ pub(crate) async fn execute_run_loop_fragment(
     let _ = runner
         .inbox
         .clear_cancelled_task(assignment.job_id(), assignment.task_id());
+    // What a stop costs, stated at the moment it costs it.
+    //
+    // The teardown above is bookkeeping: it does NOT flush open windows and
+    // does NOT snapshot. Not force-flushing is right — `flush_all` is scoped to
+    // an exhausted bounded source, and forcing it on an unbounded stop would
+    // emit partial aggregates as if they were complete. The recoverable
+    // alternative is a snapshot, and that only exists for a job with barrier
+    // checkpointing: its state survives to the last committed epoch, and only
+    // what came after is lost. A job registered without checkpointing has no
+    // resume point at all, so the whole window is gone.
+    //
+    // Either way the loss was silent. `flush_all` and the bounded connector
+    // path both warn when they give something up; this path is the larger loss
+    // of the three and said nothing.
+    let has_open_state = executor_arc
+        .lock()
+        .ok()
+        .map(|exec| exec.has_open_windows())
+        .unwrap_or(false);
+    if has_open_state {
+        tracing::warn!(
+            job_id,
+            subtask = parsed.subtask,
+            "stream:rloop stopped with window state still open: it is neither flushed (a \
+             forced flush would emit partial aggregates as complete) nor snapshotted here. A \
+             checkpointed job resumes from its last committed epoch and loses only what came \
+             after; a job registered without checkpointing has no resume point and loses all \
+             of it."
+        );
+    }
     tracing::info!(
         job_id,
         subtask = parsed.subtask,
@@ -1147,10 +1173,21 @@ impl ExecutorTaskRunner {
                 .entry(job_id.to_owned())
                 .or_default();
             egress.extend(outputs.iter().cloned());
-            if egress.len() > RLOOP_EGRESS_CAP {
-                let overflow = egress.len() - RLOOP_EGRESS_CAP;
+            // The cap is a durability dial: it is how much computed output a
+            // slow consumer may lose before catching up. It is also a per-JOB
+            // budget shared by every co-located subtask, so effective headroom
+            // is cap/parallelism — which is why it needs an override.
+            let cap = rloop_egress_cap();
+            if egress.len() > cap {
+                let overflow = egress.len() - cap;
                 egress.drain(..overflow);
-                krishiv_metrics::global_metrics().inc_output_buffer_flush("rloop-egress-drop");
+                // Count BATCHES, not overflow events. This used to add 1 per
+                // overflow regardless of how many batches went, so the metric
+                // systematically under-reported the loss it exists to measure
+                // — and under-reported it worst exactly when the loss was
+                // largest.
+                krishiv_metrics::global_metrics()
+                    .add_output_buffer_flush("rloop-egress-drop", overflow as u64);
                 *self
                     .continuous_egress_dropped
                     .entry(job_id.to_owned())
@@ -1158,7 +1195,10 @@ impl ExecutorTaskRunner {
                 tracing::warn!(
                     job_id,
                     dropped_batches = overflow,
-                    "run-loop egress buffer overflowed; oldest batches dropped                      (drain is best-effort — consume durably via the sink or queryable state)"
+                    cap,
+                    "run-loop egress buffer overflowed; oldest batches dropped (drain is \
+                     best-effort — consume durably via the sink or queryable state, or raise \
+                     KRISHIV_RLOOP_EGRESS_CAP)"
                 );
             }
         }
