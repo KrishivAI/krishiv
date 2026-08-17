@@ -319,10 +319,65 @@ pub(crate) fn batch_max_event_time(batch: &RecordBatch, column: &str) -> Option<
     }
 }
 
-/// Result of routing a batch by key group: `(owned_rows, per_peer_rows)` where
-/// `owned_rows` are the local subtask's rows and each `(subtask, batch)` pair in
-/// `per_peer_rows` is destined for a co-located peer subtask.
-type RoutedBatch = (Option<RecordBatch>, Vec<(usize, RecordBatch)>);
+/// Result of routing a batch by key group.
+pub(crate) struct RoutedBatch {
+    /// Rows this subtask owns and will process locally.
+    pub owned: Option<RecordBatch>,
+    /// Rows destined for a peer subtask, keyed by that peer's subtask index.
+    pub routed: Vec<(usize, RecordBatch)>,
+    /// Rows dropped because their group key is NULL — see
+    /// [`split_null_key_rows`].
+    pub null_key_rows: usize,
+}
+
+/// Split off rows whose group key is NULL.
+///
+/// The engine's group-key policy is fail-closed: `extract_agg_key` rejects a
+/// NULL key rather than inventing a null group, and every window operator
+/// propagates that rejection. That policy is fine — but its **blast radius**
+/// was not.
+///
+/// Routing called `extract_agg_key(..)?` per row inside the run-loop's own
+/// `for batch in &input` loop, so one NULL key in one row of one batch returned
+/// `Err` out of `execute_run_loop_fragment` and **terminated the long-lived
+/// streaming job**. Worse, `input` is a loop-local `Vec` filled by destructive
+/// `remove` from the shared input map, so the error took every other buffered
+/// row in that cycle down with it — rows that were perfectly well-formed and
+/// had already been removed from the only place they existed.
+///
+/// For a batch query "reject the query" is a reasonable answer to bad input.
+/// For an unbounded stream reading a source you do not control, one malformed
+/// row is a permanent outage plus silent loss of its neighbours. So the rows
+/// are quarantined and counted instead, and the job stays up.
+///
+/// Type errors are deliberately still fatal: `coerce_batch_for_window` casts
+/// into the legal key types, so an unsupported key type is a plan or coercion
+/// fault that is uniform across the whole job, not bad data in one row.
+fn split_null_key_rows(
+    batch: &RecordBatch,
+    key_idx: usize,
+) -> ExecutorResult<(Option<RecordBatch>, usize)> {
+    let null_count = batch.column(key_idx).null_count();
+    if null_count == 0 {
+        // The overwhelmingly common case, and O(1) on Arrow — no per-row work
+        // is added to the hot path to buy this guarantee.
+        return Ok((Some(batch.clone()), 0));
+    }
+    if null_count == batch.num_rows() {
+        return Ok((None, null_count));
+    }
+    let keep = arrow::compute::is_not_null(batch.column(key_idx).as_ref()).map_err(|e| {
+        ExecutorError::LocalExecution {
+            message: format!("null-key mask failed: {e}"),
+        }
+    })?;
+    let kept = arrow::compute::filter_record_batch(batch, &keep).map_err(|e| {
+        ExecutorError::LocalExecution {
+            message: format!("null-key filter failed: {e}"),
+        }
+    })?;
+    Ok((Some(kept), null_count))
+}
 
 /// Split one batch's rows by owning subtask (via the shared keyed hash →
 /// key-group mapping). Returns `(owned_rows, per_peer_rows)`; batches whose
@@ -335,12 +390,35 @@ pub(crate) fn route_batch_by_key_group(
 ) -> ExecutorResult<RoutedBatch> {
     use arrow::array::BooleanArray;
 
-    if parallelism <= 1 {
-        return Ok((Some(batch.clone()), Vec::new()));
-    }
     let Ok(key_idx) = batch.schema().index_of(key_column) else {
-        return Ok((Some(batch.clone()), Vec::new()));
+        return Ok(RoutedBatch {
+            owned: Some(batch.clone()),
+            routed: Vec::new(),
+            null_key_rows: 0,
+        });
     };
+    // Quarantine NULL-key rows BEFORE the parallelism check, not after: at
+    // parallelism 1 routing short-circuits entirely, so a NULL key would sail
+    // past here and kill the job one layer down inside the window operator
+    // instead. The guard has to sit above the short-circuit to hold for every
+    // shape of run-loop job.
+    let (batch, null_key_rows) = split_null_key_rows(batch, key_idx)?;
+    let Some(batch) = batch else {
+        return Ok(RoutedBatch {
+            owned: None,
+            routed: Vec::new(),
+            null_key_rows,
+        });
+    };
+    let batch = &batch;
+
+    if parallelism <= 1 {
+        return Ok(RoutedBatch {
+            owned: Some(batch.clone()),
+            routed: Vec::new(),
+            null_key_rows,
+        });
+    }
     // ROUTING/PERSISTENCE CONTRACT.
     //
     // These bytes MUST be byte-identical to the group key the window operators
@@ -398,7 +476,11 @@ pub(crate) fn route_batch_by_key_group(
         }
     }
     if peer_rows.is_empty() {
-        return Ok((Some(batch.clone()), Vec::new()));
+        return Ok(RoutedBatch {
+            owned: Some(batch.clone()),
+            routed: Vec::new(),
+            null_key_rows,
+        });
     }
     for (peer, mask) in peer_rows.iter_mut() {
         *mask = row_groups
@@ -426,7 +508,11 @@ pub(crate) fn route_batch_by_key_group(
             routed.push((*peer, slice));
         }
     }
-    Ok((owned, routed))
+    Ok(RoutedBatch {
+        owned,
+        routed,
+        null_key_rows,
+    })
 }
 
 /// Deliver exchanged rows to a peer subtask: same-process peers append to the
@@ -888,15 +974,37 @@ pub(crate) async fn execute_run_loop_fragment(
         // Keyed exchange: keep owned rows, forward the rest to their owners.
         let mut owned_batches: Vec<RecordBatch> = Vec::new();
         let mut outbound: std::collections::BTreeMap<usize, Vec<RecordBatch>> = Default::default();
+        let mut null_key_rows = 0usize;
         for batch in &input {
-            let (owned, routed) =
+            let routed =
                 route_batch_by_key_group(batch, &key_column, parsed.parallelism, parsed.subtask)?;
-            if let Some(own) = owned {
+            null_key_rows += routed.null_key_rows;
+            if let Some(own) = routed.owned {
                 owned_batches.push(own);
             }
-            for (peer_subtask, slice) in routed {
+            for (peer_subtask, slice) in routed.routed {
                 outbound.entry(peer_subtask).or_default().push(slice);
             }
+        }
+        if null_key_rows > 0 {
+            // Quarantined, not fatal — see `split_null_key_rows`. Counted so
+            // the loss is discoverable: a job that drops rows and says nothing
+            // is the same silent-wrong-answer shape as one that returns the
+            // wrong number.
+            let total = runner
+                .continuous_null_key_rows
+                .entry(job_id.to_string())
+                .and_modify(|n| *n += null_key_rows as u64)
+                .or_insert(null_key_rows as u64);
+            tracing::warn!(
+                job_id = %job_id,
+                subtask = parsed.subtask,
+                dropped = null_key_rows,
+                total = *total,
+                key_column = %key_column,
+                "stream:rloop dropped rows whose group key is NULL; they cannot be \
+                 aggregated and are excluded rather than failing the job"
+            );
         }
         for (peer_subtask, batches) in outbound {
             let Some(peer) = peers.iter().find(|p| p.subtask == peer_subtask) else {
@@ -958,6 +1066,11 @@ pub(crate) async fn execute_run_loop_fragment(
                 .get(job_id)
                 .map(|e| *e.value())
                 .unwrap_or(0),
+            null_key_rows_dropped: runner
+                .continuous_null_key_rows
+                .get(job_id)
+                .map(|e| *e.value())
+                .unwrap_or(0),
             state_bytes: 0,
             source_offset: None,
             timestamp_ms: std::time::SystemTime::now()
@@ -991,6 +1104,11 @@ pub(crate) async fn execute_run_loop_fragment(
     });
     if !siblings_still_running {
         runner.pending_restores.remove(job_id);
+        // The same last-subtask rule governs every other JOB-keyed entry: the
+        // source read positions, the shared registry sink, and the per-job loss
+        // counters are all shared by the siblings, so retiring them on the
+        // first subtask to stop would pull them out from under the others.
+        runner.retire_continuous_job_state(job_id);
     }
     let _ = runner
         .inbox
@@ -1582,7 +1700,9 @@ mod tests {
             // What routing must compute for the same row.
             let mut found = None;
             for subtask in 0..4 {
-                let (owned, _) = route_batch_by_key_group(&batch, "k", 4, subtask).unwrap();
+                let owned = route_batch_by_key_group(&batch, "k", 4, subtask)
+                    .unwrap()
+                    .owned;
                 if let Some(b) = owned {
                     let col = b.column(0);
                     let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
@@ -1646,7 +1766,7 @@ mod tests {
             let mut owned_total = 0usize;
             let mut routed_total = 0usize;
             for subtask in 0..parallelism {
-                let (owned, routed) =
+                let RoutedBatch { owned, routed, .. } =
                     route_batch_by_key_group(&batch, "k", parallelism, subtask).unwrap();
                 owned_total += owned.map(|b| b.num_rows()).unwrap_or(0);
                 routed_total += routed.iter().map(|(_, b)| b.num_rows()).sum::<usize>();
@@ -1690,7 +1810,7 @@ mod tests {
         let parallelism = 3;
         let mut total = 0usize;
         for subtask in 0..parallelism {
-            let (owned, routed) =
+            let RoutedBatch { owned, routed, .. } =
                 route_batch_by_key_group(&batch, "k", parallelism, subtask).unwrap();
             let own_rows = owned.map(|b| b.num_rows()).unwrap_or(0);
             total += own_rows;
@@ -1700,5 +1820,95 @@ mod tests {
         }
         // Each row is owned by exactly one subtask.
         assert_eq!(total, 200);
+    }
+
+    /// A NULL group key must not be able to kill a long-lived streaming job.
+    ///
+    /// `extract_agg_key` rejects NULL keys by design, and routing called it
+    /// per row with `?` *inside* the run-loop's own input loop — so one NULL
+    /// key in one row returned `Err` out of `execute_run_loop_fragment` and
+    /// ended the job. NULL is legal data in every source the engine reads;
+    /// this made a single such row a permanent outage.
+    ///
+    /// The rows are excluded (they genuinely cannot be aggregated) and counted
+    /// (so the exclusion is not a silent wrong answer), and the surviving rows
+    /// route exactly as before.
+    #[test]
+    fn a_null_group_key_is_quarantined_not_fatal() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc as StdArc;
+
+        let schema = StdArc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                StdArc::new(StringArray::from(vec![
+                    Some("a"),
+                    None,
+                    Some("b"),
+                    None,
+                    Some("c"),
+                ])) as _,
+                StdArc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5])) as _,
+            ],
+        )
+        .unwrap();
+
+        // Parallelism 1 short-circuits routing entirely, which is exactly why
+        // the guard has to sit above that short-circuit: this shape would
+        // otherwise carry the NULL row into the window operator and die there.
+        let single = route_batch_by_key_group(&batch, "k", 1, 0).unwrap();
+        assert_eq!(single.null_key_rows, 2, "both NULL rows counted");
+        assert_eq!(
+            single.owned.as_ref().map(|b| b.num_rows()),
+            Some(3),
+            "the three keyed rows survive"
+        );
+
+        // And across a real exchange: every keyed row lands on exactly one
+        // subtask, and the NULL rows are reported by each.
+        let parallelism = 3;
+        let mut owned_total = 0usize;
+        for subtask in 0..parallelism {
+            let routed = route_batch_by_key_group(&batch, "k", parallelism, subtask).unwrap();
+            assert_eq!(routed.null_key_rows, 2);
+            owned_total += routed.owned.map(|b| b.num_rows()).unwrap_or(0);
+        }
+        assert_eq!(
+            owned_total, 3,
+            "the keyed rows are partitioned exactly once across subtasks"
+        );
+    }
+
+    /// A batch that is *entirely* NULL-keyed must also be survivable — and must
+    /// not be reported as "nothing arrived", which is what an untracked empty
+    /// result would look like from the outside.
+    #[test]
+    fn an_all_null_key_batch_yields_no_rows_and_a_full_count() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc as StdArc;
+
+        let schema = StdArc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                StdArc::new(StringArray::from(vec![None::<&str>, None, None])) as _,
+                StdArc::new(Int64Array::from(vec![1_i64, 2, 3])) as _,
+            ],
+        )
+        .unwrap();
+
+        let routed = route_batch_by_key_group(&batch, "k", 2, 0).unwrap();
+        assert!(routed.owned.is_none());
+        assert!(routed.routed.is_empty());
+        assert_eq!(routed.null_key_rows, 3);
     }
 }

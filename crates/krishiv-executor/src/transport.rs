@@ -803,6 +803,7 @@ pub async fn serve_executor_task_grpc_with_run_loop(
     continuous_inputs: SharedContinuousInputs,
     continuous_outputs: crate::runner::SharedContinuousOutputs,
     input_notify: crate::runner::SharedContinuousNotify,
+    continuous_connector_sources: crate::runner::SharedContinuousConnectorSources,
 ) -> Result<(), tonic::transport::Error> {
     tonic::transport::Server::builder()
         .layer(krishiv_metrics::grpc::GrpcDurationLayer)
@@ -813,6 +814,7 @@ pub async fn serve_executor_task_grpc_with_run_loop(
                 continuous_inputs,
                 continuous_outputs,
                 input_notify,
+                continuous_connector_sources,
                 None,
             ),
             krishiv_metrics::grpc::extract_trace_context,

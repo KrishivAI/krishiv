@@ -33,7 +33,7 @@ use super::task_runner::{
     TaskRunner,
 };
 
-pub(crate) type SharedContinuousConnectorSources =
+pub type SharedContinuousConnectorSources =
     Arc<DashMap<String, Arc<tokio::sync::Mutex<Box<dyn krishiv_connectors::DynSource>>>>>;
 
 use crate::erased;
@@ -298,6 +298,13 @@ pub struct ExecutorTaskRunner {
     /// Cumulative run-loop egress-buffer drops per job, so the loss can be
     /// reported upward instead of only warned about locally.
     pub(crate) continuous_egress_dropped: Arc<DashMap<String, u64>>,
+    /// Cumulative rows dropped because their group key was NULL, per job.
+    ///
+    /// A NULL group key is not aggregable under the engine's fail-closed key
+    /// policy, so the rows are excluded. They used to take the whole streaming
+    /// job down with them; excluding them silently would just trade an outage
+    /// for a wrong answer, so the count is kept and reported.
+    pub(crate) continuous_null_key_rows: Arc<DashMap<String, u64>>,
 
     /// Phase 55: per-job stateful two-input join operators (`window-join:`
     /// fragments retain state across cycles — closes G5/#88 state loss).
@@ -434,6 +441,7 @@ impl ExecutorTaskRunner {
             continuous_input_notify: Arc::new(DashMap::new()),
             task_state_bindings: Arc::new(DashMap::new()),
             continuous_egress_dropped: Arc::new(DashMap::new()),
+            continuous_null_key_rows: Arc::new(DashMap::new()),
             join_executors: Arc::new(DashMap::new()),
             stream_exchange: crate::stream_exchange::StreamExchange::default(),
             own_task_endpoint: None,
@@ -592,6 +600,19 @@ impl ExecutorTaskRunner {
         self
     }
 
+    /// Share the connector-source cache with the task gRPC service, so a
+    /// cancelled CYCLE job's source read positions are retired with its window
+    /// state. Run-loop jobs retire theirs in their own fragment teardown; the
+    /// cycle model has no long-lived loop, so `CancelTask` is its only seam.
+    #[must_use]
+    pub fn with_shared_continuous_connector_sources(
+        mut self,
+        sources: SharedContinuousConnectorSources,
+    ) -> Self {
+        self.continuous_connector_sources = sources;
+        self
+    }
+
     fn clear_continuous_connector_sources_for_job(&self, job_id: &str) {
         // Cycle-model sources key by `{job}|…`; run-loop subtasks key by
         // `{job}#<subtask>|…` — clear both families on restore/teardown.
@@ -608,6 +629,36 @@ impl ExecutorTaskRunner {
         for key in keys {
             self.continuous_connector_sources.remove(&key);
         }
+    }
+
+    /// Retire everything a finished continuous job owned on this executor,
+    /// beyond the window executors and buffers the gRPC service drops itself.
+    ///
+    /// Called from each continuous fragment's own teardown — deliberately not
+    /// from the `CancelTask` RPC handler, which races a loop that has not yet
+    /// observed its cancellation tombstone and is still reading these maps.
+    ///
+    /// Retiring the source positions *with* the window state is the load-
+    /// bearing part. Cancel dropped `loop_executors` (the state) but left
+    /// `continuous_connector_sources` in place, and only the restore path ever
+    /// cleared them. Those entries hold each source's **advanced read
+    /// position**, so a same-process re-register of the same job id resumed
+    /// reading where the dead incarnation stopped — against empty window state.
+    /// Every event between the last checkpoint and the cancel was skipped, with
+    /// no error and a job that looked healthy. State and position have to be
+    /// retired together, or each makes the other lie.
+    pub(crate) fn retire_continuous_job_state(&self, job_id: &str) {
+        self.clear_continuous_connector_sources_for_job(job_id);
+        // The registry-dispatched streaming sink handle is owned by the job, so
+        // it dies with the job. Leaving it behind leaked an open sink for the
+        // process lifetime and handed a re-registered job the dead
+        // incarnation's writer.
+        self.rloop_connector_sinks.remove(job_id);
+        // Loss counters are per-INCARNATION facts. Job ids are deliberately
+        // reusable, so leaving these behind makes a fresh job inherit a dead
+        // one's drop count and report loss that never happened to it.
+        self.continuous_egress_dropped.remove(job_id);
+        self.continuous_null_key_rows.remove(job_id);
     }
 
     /// Access the registered-parquet cache (keyed by `"table_name:path"`).

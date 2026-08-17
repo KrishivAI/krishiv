@@ -29,7 +29,10 @@ pub type SharedLoopExecutors = Arc<DashMap<String, Arc<Mutex<ContinuousWindowExe
 pub type SharedContinuousInputs = Arc<DashMap<String, Vec<RecordBatch>>>;
 
 /// Executor-side task assignment service backed by an in-memory inbox.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written rather than derived: `SharedContinuousConnectorSources`
+/// holds `dyn DynSource`, which is not `Debug`.
+#[derive(Clone)]
 pub struct ExecutorTaskInboxService {
     inbox: ExecutorAssignmentInbox,
     /// Per-job stateful window executors — shared with the task runner.
@@ -41,6 +44,24 @@ pub struct ExecutorTaskInboxService {
     /// Phase 55: per-buffer-key input notifies — shared with the task runner
     /// so a push wakes a blocked run-loop within microseconds.
     pub(crate) input_notify: crate::runner::SharedContinuousNotify,
+    /// Connector-source cache — shared with the task runner so a cancelled
+    /// job's source READ POSITIONS die with its window state.
+    pub(crate) continuous_connector_sources: crate::runner::SharedContinuousConnectorSources,
+}
+
+impl std::fmt::Debug for ExecutorTaskInboxService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutorTaskInboxService")
+            .field("loop_executors", &self.loop_executors.len())
+            .field("continuous_inputs", &self.continuous_inputs.len())
+            .field("continuous_outputs", &self.continuous_outputs.len())
+            .field("input_notify", &self.input_notify.len())
+            .field(
+                "continuous_connector_sources",
+                &self.continuous_connector_sources.len(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl ExecutorTaskInboxService {
@@ -52,6 +73,7 @@ impl ExecutorTaskInboxService {
             continuous_inputs: Arc::new(DashMap::new()),
             continuous_outputs: Arc::new(DashMap::new()),
             input_notify: Arc::new(DashMap::new()),
+            continuous_connector_sources: Arc::new(DashMap::new()),
         }
     }
 
@@ -67,6 +89,7 @@ impl ExecutorTaskInboxService {
             continuous_inputs,
             continuous_outputs: Arc::new(DashMap::new()),
             input_notify: Arc::new(DashMap::new()),
+            continuous_connector_sources: Arc::new(DashMap::new()),
         }
     }
 
@@ -80,6 +103,17 @@ impl ExecutorTaskInboxService {
     ) -> Self {
         self.continuous_outputs = continuous_outputs;
         self.input_notify = input_notify;
+        self
+    }
+
+    /// Share the connector-source cache with the runner — see
+    /// [`ExecutorTaskRunner::with_shared_continuous_connector_sources`].
+    #[must_use]
+    pub fn with_continuous_connector_sources(
+        mut self,
+        sources: crate::runner::SharedContinuousConnectorSources,
+    ) -> Self {
+        self.continuous_connector_sources = sources;
         self
     }
 
@@ -237,7 +271,47 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
             self.continuous_inputs.remove(job_id.as_str());
             self.continuous_inputs
                 .retain(|k, _| !k.starts_with(&rloop_prefix));
-            self.continuous_outputs.remove(job_id.as_str());
+            // Undrained egress is computed output that no consumer ever saw.
+            // Destroying it is the right call — the job is gone and nothing
+            // will ever drain it — but it used to be destroyed *silently*,
+            // which is the same shape as the ring's drop-oldest overflow that
+            // `continuous_egress_dropped` exists to make visible. Count it on
+            // the same meter so teardown loss is not the one path the counter
+            // cannot see.
+            let undrained = self
+                .continuous_outputs
+                .remove(job_id.as_str())
+                .map(|(_, batches)| batches.len())
+                .unwrap_or(0);
+            if undrained > 0 {
+                tracing::warn!(
+                    job_id = %job_id,
+                    undrained_batches = undrained,
+                    "continuous job cancelled with output still buffered; those batches were \
+                     computed but never drained and are now discarded"
+                );
+            }
+            // Retire the source read positions with the window state.
+            //
+            // Cancel dropped `loop_executors` (the state) but left the
+            // connector-source cache alone, and only the RESTORE path ever
+            // cleared it. Those entries hold each source's ADVANCED read
+            // position, so a same-process re-register of the same job id
+            // resumed reading where the dead incarnation stopped — against
+            // empty window state. Every event between the last checkpoint and
+            // the cancel was skipped, with no error and a job that looked
+            // healthy. State and position have to be retired together, or each
+            // makes the other lie.
+            //
+            // Run-loop jobs additionally retire their sink handle and loss
+            // counters in their own fragment teardown, which runs after the
+            // loop has stopped touching them (see
+            // `ExecutorTaskRunner::retire_continuous_job_state`). Doing that
+            // here would race a loop that has not yet observed its tombstone.
+            let cycle_prefix = format!("{job_id}|");
+            let source_prefix = format!("{job_id}#");
+            self.continuous_connector_sources
+                .retain(|k, _| !k.starts_with(&cycle_prefix) && !k.starts_with(&source_prefix));
             // Wake any run-loop blocked in its idle wait so it observes the
             // cancellation immediately instead of on the fallback tick, then
             // drop the notify entries.
@@ -617,6 +691,7 @@ pub fn executor_task_grpc_server_with_continuous(
         continuous_inputs,
         Arc::new(DashMap::new()),
         Arc::new(DashMap::new()),
+        Arc::new(DashMap::new()),
         auth,
     )
 }
@@ -630,11 +705,13 @@ pub fn executor_task_grpc_server_with_run_loop(
     continuous_inputs: SharedContinuousInputs,
     continuous_outputs: crate::runner::SharedContinuousOutputs,
     input_notify: crate::runner::SharedContinuousNotify,
+    continuous_connector_sources: crate::runner::SharedContinuousConnectorSources,
     auth: Option<ExecutorTaskAuthConfig>,
 ) -> wire::v1::executor_task_server::ExecutorTaskServer<ExecutorTaskGrpcService> {
     let inner =
         ExecutorTaskInboxService::new_with_continuous(inbox, loop_executors, continuous_inputs)
-            .with_run_loop_state(continuous_outputs, input_notify);
+            .with_run_loop_state(continuous_outputs, input_notify)
+            .with_continuous_connector_sources(continuous_connector_sources);
     let auth = auth.unwrap_or_else(ExecutorTaskAuthConfig::from_env);
     let auth_misconfiguration = (auth.require_auth() && !auth.has_bearer_token()).then(|| {
         format!(
@@ -771,6 +848,100 @@ mod tests {
         assert!(
             service.inbox().pop_next().unwrap().is_none(),
             "the rejected assignment must never reach the inbox"
+        );
+    }
+
+    /// Cancelling a continuous job must retire its source READ POSITIONS along
+    /// with its window state.
+    ///
+    /// It used to drop `loop_executors` (the state) and leave the connector
+    /// source cache alone — only the *restore* path ever cleared it. Those
+    /// entries hold each source's advanced offset, so re-registering the same
+    /// job id in the same process resumed reading where the dead incarnation
+    /// stopped, against **empty** window state. Everything between the last
+    /// checkpoint and the cancel was skipped, with no error and a job that
+    /// looked healthy from every angle.
+    /// Minimal `Source` so the cache holds something of the right shape. The
+    /// cancel path only keys on the map, never reads the source.
+    struct ExhaustedSource;
+
+    impl krishiv_connectors::Source for ExhaustedSource {
+        fn capabilities(&self) -> krishiv_connectors::ConnectorCapabilities {
+            krishiv_connectors::ConnectorCapabilities::default()
+        }
+        async fn read_batch(&mut self) -> krishiv_connectors::ConnectorResult<Option<RecordBatch>> {
+            Ok(None)
+        }
+        fn current_offset(&self) -> Option<Box<dyn std::any::Any + Send>> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_continuous_job_retires_its_source_read_positions() {
+        use krishiv_proto::task::TaskCancellationRequest;
+
+        let inbox = ExecutorAssignmentInbox::new();
+        let service = ExecutorTaskInboxService::new(inbox);
+
+        // A registered continuous executor is what marks this cancel as a
+        // continuous-job teardown rather than an ordinary task cancel.
+        service.loop_executors.insert(
+            "job-src".to_owned(),
+            Arc::new(Mutex::new(
+                ContinuousWindowExecutor::new(krishiv_plan::window::WindowExecutionSpec::tumbling(
+                    "k", "ts", 1_000,
+                ))
+                .unwrap(),
+            )),
+        );
+        // Two source-cache families: cycle (`{job}|…`) and run-loop
+        // (`{job}#<subtask>|…`). Both belong to this job and both must go.
+        for key in ["job-src|kafka:topic-a", "job-src#0|kafka:topic-a"] {
+            service.continuous_connector_sources.insert(
+                key.to_owned(),
+                Arc::new(tokio::sync::Mutex::new(
+                    Box::new(ExhaustedSource) as Box<dyn krishiv_connectors::DynSource>
+                )),
+            );
+        }
+        // A different job's entry must survive — the prefix match has to be
+        // scoped, not a substring sweep.
+        service.continuous_connector_sources.insert(
+            "job-src-other|kafka:topic-b".to_owned(),
+            Arc::new(tokio::sync::Mutex::new(
+                Box::new(ExhaustedSource) as Box<dyn krishiv_connectors::DynSource>
+            )),
+        );
+
+        let request = TaskCancellationRequest::new(krishiv_proto::TaskAttemptRef::new(
+            krishiv_proto::JobId::try_new("job-src").unwrap(),
+            krishiv_proto::StageId::try_new("stage-src").unwrap(),
+            krishiv_proto::TaskId::try_new("task-src").unwrap(),
+            krishiv_proto::AttemptId::initial(),
+        ));
+        service
+            .cancel_task(tonic::Request::new(request))
+            .await
+            .expect("cancel succeeds");
+
+        assert!(
+            !service
+                .continuous_connector_sources
+                .contains_key("job-src|kafka:topic-a"),
+            "the cycle-model source position must die with the job"
+        );
+        assert!(
+            !service
+                .continuous_connector_sources
+                .contains_key("job-src#0|kafka:topic-a"),
+            "the run-loop subtask source position must die with the job"
+        );
+        assert!(
+            service
+                .continuous_connector_sources
+                .contains_key("job-src-other|kafka:topic-b"),
+            "a different job's source must be untouched"
         );
     }
 }

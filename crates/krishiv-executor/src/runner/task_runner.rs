@@ -472,6 +472,14 @@ pub struct StreamingProgressSnapshot {
     /// reading the job, which is the difference between a known lossy buffer
     /// and a silent wrong answer.
     pub egress_dropped_batches: u64,
+    /// Rows DROPPED because their group key was NULL, since task start.
+    ///
+    /// Same reasoning as `egress_dropped_batches`: the rows genuinely cannot be
+    /// aggregated under the fail-closed key policy, and dropping them is the
+    /// right call now that the alternative (killing the job) is gone — but a
+    /// job that quietly excludes input is indistinguishable from one whose
+    /// source sent less data. The count is what makes the exclusion visible.
+    pub null_key_rows_dropped: u64,
     /// Approximate state backend byte size.
     pub state_bytes: u64,
     /// Current source offset (connector-specific encoding).

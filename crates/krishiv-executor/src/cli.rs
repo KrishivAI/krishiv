@@ -442,6 +442,12 @@ async fn heartbeat_loop(
     let shared_continuous_outputs: crate::runner::SharedContinuousOutputs =
         Arc::new(DashMap::new());
     let shared_input_notify: crate::runner::SharedContinuousNotify = Arc::new(DashMap::new());
+    // Shared with the gRPC service so `CancelTask` retires a job's source READ
+    // POSITIONS along with its window state — otherwise a re-registered job id
+    // resumes at the dead incarnation's offset against empty state and silently
+    // skips everything in between.
+    let shared_connector_sources: crate::runner::SharedContinuousConnectorSources =
+        Arc::new(DashMap::new());
 
     // Now spawn the task and barrier servers.  No more re-registers required.
     if let Some(listener) = task_listener {
@@ -450,6 +456,7 @@ async fn heartbeat_loop(
         let grpc_continuous_inputs = Arc::clone(&shared_continuous_inputs);
         let grpc_continuous_outputs = Arc::clone(&shared_continuous_outputs);
         let grpc_input_notify = Arc::clone(&shared_input_notify);
+        let grpc_connector_sources = Arc::clone(&shared_connector_sources);
         tokio::spawn(async move {
             use crate::transport::serve_executor_task_grpc_with_run_loop;
             if let Err(e) = serve_executor_task_grpc_with_run_loop(
@@ -459,6 +466,7 @@ async fn heartbeat_loop(
                 grpc_continuous_inputs,
                 grpc_continuous_outputs,
                 grpc_input_notify,
+                grpc_connector_sources,
             )
             .await
             {
@@ -551,7 +559,8 @@ async fn heartbeat_loop(
         .with_shared_loop_executors(shared_loop_executors)
         .with_shared_continuous_inputs(shared_continuous_inputs)
         .with_shared_continuous_outputs(shared_continuous_outputs)
-        .with_shared_continuous_notify(shared_input_notify);
+        .with_shared_continuous_notify(shared_input_notify)
+        .with_shared_continuous_connector_sources(shared_connector_sources);
     // The run-loop short-circuits exchange deliveries to co-located peers by
     // matching the advertised task endpoint.
     if let Some(endpoint) = runtime.config().task_endpoint() {
