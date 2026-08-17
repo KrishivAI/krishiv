@@ -36,12 +36,15 @@
 //! divergence there, and one that does not change output was arguably not an
 //! axis.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
+use krishiv_plan::window::WindowExecutionSpec;
 
-use crate::ExecResult;
 use crate::continuous::ContinuousWindowExecutor;
+use crate::{ExecError, ExecResult};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The axes
@@ -391,6 +394,13 @@ pub trait WindowStep {
 
     /// Is there state that a flush would emit?
     fn has_open_windows(&self) -> bool;
+
+    /// The window spec this operator validates input against.
+    ///
+    /// On the trait rather than the driver on purpose: it is the operator's own
+    /// spec, so [`InputTyping::CoerceToSpec`] cannot coerce toward something the
+    /// operator will then reject.
+    fn spec(&self) -> &WindowExecutionSpec;
 }
 
 impl WindowStep for ContinuousWindowExecutor {
@@ -409,6 +419,171 @@ impl WindowStep for ContinuousWindowExecutor {
     fn has_open_windows(&self) -> bool {
         ContinuousWindowExecutor::has_open_windows(self)
     }
+
+    fn spec(&self) -> &WindowExecutionSpec {
+        ContinuousWindowExecutor::spec(self)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Input typing
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Arrow type for a `key_column_type` tag, or `None` for an unknown tag.
+fn arrow_type_for_key_tag(tag: &str) -> Option<DataType> {
+    match tag.trim().to_ascii_lowercase().as_str() {
+        "int32" => Some(DataType::Int32),
+        "int64" => Some(DataType::Int64),
+        "float64" => Some(DataType::Float64),
+        "bool" | "boolean" => Some(DataType::Boolean),
+        "utf8" | "string" => Some(DataType::Utf8),
+        _ => None,
+    }
+}
+
+/// True for Arrow types the windowed aggregate operators accept directly as a
+/// numeric aggregate input (no coercion needed).
+fn is_numeric_agg_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+    )
+}
+
+/// Cast a source batch's key, event-time and aggregate-input columns to the
+/// types the window operators require.
+///
+/// A JSON or CSV source with no declared column types delivers everything as
+/// `Utf8`. The operators require an `Int64` event-time column, a
+/// `key_column_type`-typed key and numeric aggregate inputs, so a raw all-`Utf8`
+/// batch fails their type checks and its watermark never advances.
+///
+/// Only incompatible columns are cast, so an already-typed batch — anything fed
+/// through the coordinator push path, for instance — returns a clone with no
+/// per-column work. Casts are strict (`safe = false`): a value that cannot be
+/// parsed fails loudly rather than nulling silently and dropping the row.
+///
+/// # `Timestamp` is cast, and used not to be
+///
+/// This function previously left a `Timestamp(_, _)` event-time column alone, on
+/// the reasoning that a timestamp is already a time. But
+/// [`crate::watermark_util::max_event_time_ms`] and the tumbling operator both
+/// reach for the column with `downcast_ref::<Int64Array>()` and fail with
+/// `"<col> must be Int64"` on anything else — so "leave it alone" meant "let it
+/// fail one layer down". Timestamps are now cast to Int64 epoch milliseconds.
+///
+/// # Errors
+///
+/// Returns [`ExecError::UnsupportedType`] when a strict cast fails, naming the
+/// column and both types.
+pub fn coerce_batch_for_window(
+    batch: &RecordBatch,
+    spec: &WindowExecutionSpec,
+) -> ExecResult<RecordBatch> {
+    use arrow::array::ArrayRef;
+    use arrow::compute::{CastOptions, cast_with_options};
+    use arrow::datatypes::{Field, Schema, TimeUnit};
+
+    let schema = batch.schema();
+    let key_target = arrow_type_for_key_tag(&spec.key_column_type);
+    let cast_opts = CastOptions {
+        safe: false,
+        ..Default::default()
+    };
+
+    let mut new_fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
+    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    let mut changed = false;
+
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let column = batch.column(idx);
+        let name = field.name();
+        let current = field.data_type();
+
+        let desired: Option<DataType> = if name == &spec.event_time_column {
+            match current {
+                DataType::Int64 => None,
+                // Millisecond timestamps are Int64 millis already, so the cast
+                // is a reinterpret. Other units go through Millisecond first so
+                // the result is epoch MILLIS, which is the unit every window
+                // operator and the watermark comparison assume.
+                DataType::Timestamp(TimeUnit::Millisecond, _) => Some(DataType::Int64),
+                DataType::Timestamp(_, tz) => {
+                    Some(DataType::Timestamp(TimeUnit::Millisecond, tz.clone()))
+                }
+                _ => Some(DataType::Int64),
+            }
+        } else if name == &spec.key_column {
+            key_target
+                .as_ref()
+                .filter(|target| *target != current)
+                .cloned()
+        } else if spec
+            .agg_exprs
+            .iter()
+            .any(|agg| !agg.input_column.is_empty() && &agg.input_column == name)
+        {
+            if is_numeric_agg_type(current) {
+                None
+            } else {
+                Some(DataType::Float64)
+            }
+        } else {
+            None
+        };
+
+        match desired {
+            Some(target) => {
+                let casted = cast_with_options(column, &target, &cast_opts).map_err(|error| {
+                    ExecError::UnsupportedType(format!(
+                        "failed to coerce column '{name}' from {current:?} to {target:?} \
+                             for the window operator: {error}"
+                    ))
+                })?;
+                // A non-millisecond timestamp needs a second hop to Int64; the
+                // first hop only normalised its unit.
+                let (casted, target) = if matches!(target, DataType::Timestamp(_, _)) {
+                    let millis = cast_with_options(&casted, &DataType::Int64, &cast_opts).map_err(
+                        |error| {
+                            ExecError::UnsupportedType(format!(
+                                "failed to coerce column '{name}' from {target:?} to Int64 \
+                                 epoch millis for the window operator: {error}"
+                            ))
+                        },
+                    )?;
+                    (millis, DataType::Int64)
+                } else {
+                    (casted, target)
+                };
+                new_fields.push(Field::new(name, target, field.is_nullable()));
+                new_columns.push(casted);
+                changed = true;
+            }
+            None => {
+                new_fields.push(field.as_ref().clone());
+                new_columns.push(Arc::clone(column));
+            }
+        }
+    }
+
+    if !changed {
+        return Ok(batch.clone());
+    }
+
+    RecordBatch::try_new(Arc::new(Schema::new(new_fields)), new_columns)
+        .map_err(|error| ExecError::Arrow(format!("rebuilt coerced batch is invalid: {error}")))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -468,6 +643,10 @@ impl StreamDriver {
     /// The `loop_id` argument is the gate: there is no way to construct a driver
     /// without naming which loop it belongs to, and naming one requires that
     /// loop to already have answered every axis.
+    ///
+    /// The driver holds no spec: [`InputTyping::CoerceToSpec`] reads it from the
+    /// operator through [`WindowStep::spec`], so the driver cannot possibly
+    /// coerce toward a different spec than the operator validates against.
     #[must_use]
     pub fn new(loop_id: StreamingLoop) -> Self {
         Self {
@@ -510,6 +689,23 @@ impl StreamDriver {
         exec: &mut W,
         batches: Vec<RecordBatch>,
     ) -> ExecResult<Vec<RecordBatch>> {
+        let batches = match self.policy().input_typing {
+            InputTyping::CoerceToSpec => {
+                // Scoped so the immutable borrow of `exec` ends before `step`
+                // takes it mutably — which is also why the spec is read rather
+                // than cloned: no per-batch clone on the hot path.
+                let spec = exec.spec();
+                batches
+                    .iter()
+                    .map(|batch| coerce_batch_for_window(batch, spec))
+                    .collect::<ExecResult<Vec<_>>>()?
+            }
+            // The run-loop coerces before routing, because routing reads the key
+            // column and must read it at its final type. Casting again here
+            // would be a second pass over every batch on the hot path for no
+            // change in result.
+            InputTyping::PreCoerced => batches,
+        };
         exec.step(batches)
     }
 
@@ -586,17 +782,35 @@ mod tests {
     use super::*;
     use crate::ExecError;
 
+    /// A spec the driver can coerce toward. The stub operator ignores batches,
+    /// so only the column names matter for the policy tests.
+    fn test_spec() -> WindowExecutionSpec {
+        WindowExecutionSpec::tumbling("key", "ts", 10_000)
+    }
+
     /// A stub that records which operator calls the driver made.
     ///
     /// The point of driving a stub rather than a real operator: it distinguishes
     /// "the policy gate works" from "the operator happened to return nothing",
     /// which a real executor cannot.
-    #[derive(Default)]
     struct RecordingStep {
         steps: usize,
         ticks: usize,
         flushes: usize,
         open: bool,
+        spec: WindowExecutionSpec,
+    }
+
+    impl Default for RecordingStep {
+        fn default() -> Self {
+            Self {
+                steps: 0,
+                ticks: 0,
+                flushes: 0,
+                open: false,
+                spec: test_spec(),
+            }
+        }
     }
 
     impl WindowStep for RecordingStep {
@@ -614,6 +828,9 @@ mod tests {
         }
         fn has_open_windows(&self) -> bool {
             self.open
+        }
+        fn spec(&self) -> &WindowExecutionSpec {
+            &self.spec
         }
     }
 
@@ -824,12 +1041,236 @@ mod tests {
         );
     }
 
+    fn sum_spec() -> WindowExecutionSpec {
+        use krishiv_plan::window::{WindowAgg, WindowAggKind};
+        let mut spec = WindowExecutionSpec::tumbling("k", "ts", 60_000);
+        spec.agg_exprs = vec![WindowAgg {
+            kind: WindowAggKind::Sum,
+            input_column: "v".to_owned(),
+            output_column: "total".to_owned(),
+            filter: None,
+        }];
+        spec
+    }
+
+    /// An all-`Utf8` batch — the shape a Kafka JSON source produces when
+    /// `decode.columns` is unset — is cast to the types the operators require.
+    ///
+    /// Reproduces the Kafka case with no broker: `payloads_to_batch` builds
+    /// every field as `Utf8`, and both the watermark helper and the tumbling
+    /// operator reach for the event-time column with
+    /// `downcast_ref::<Int64Array>()`.
+    #[test]
+    fn an_all_utf8_batch_is_coerced_to_the_types_the_operators_require() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Utf8, false),
+            Field::new("v", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(StringArray::from(vec!["1000"])),
+                Arc::new(StringArray::from(vec!["7"])),
+            ],
+        )
+        .expect("utf8 batch");
+
+        let coerced = coerce_batch_for_window(&batch, &sum_spec()).expect("coerce");
+        assert_eq!(coerced.schema().field(1).data_type(), &DataType::Int64);
+        assert_eq!(coerced.schema().field(2).data_type(), &DataType::Float64);
+        assert_eq!(
+            coerced.schema().field(0).data_type(),
+            &DataType::Utf8,
+            "the key column's declared type is utf8, so it must be left alone"
+        );
+    }
+
+    /// A `Timestamp` event-time column is cast to Int64 epoch millis.
+    ///
+    /// This is the hole found while moving the helper. It used to return `None`
+    /// for `Timestamp(_, _)` — "a timestamp is already a time" — but
+    /// `watermark_util::max_event_time_ms` and the tumbling operator both do
+    /// `downcast_ref::<Int64Array>()` and fail with `"ts must be Int64"`. So
+    /// declining to cast meant failing one layer down instead.
+    ///
+    /// Revert the `Timestamp` match arms to `None` and this test goes red with
+    /// exactly that message coming from the operator.
+    #[test]
+    fn a_timestamp_event_time_column_becomes_int64_epoch_millis() {
+        use arrow::array::{TimestampMillisecondArray, TimestampSecondArray};
+        use arrow::datatypes::{Field, Schema, TimeUnit};
+
+        // Millisecond: a straight reinterpret.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(TimestampMillisecondArray::from(vec![1_500_i64]))],
+        )
+        .expect("ts batch");
+        let coerced = coerce_batch_for_window(&batch, &sum_spec()).expect("coerce millis");
+        assert_eq!(coerced.schema().field(0).data_type(), &DataType::Int64);
+        let col = coerced
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("Int64 after coercion");
+        assert_eq!(col.value(0), 1_500);
+
+        // Second: must be rescaled to millis, not merely reinterpreted. A
+        // reinterpret would yield 2, three orders of magnitude wrong, and every
+        // window boundary with it.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Second, None),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(TimestampSecondArray::from(vec![2_i64]))],
+        )
+        .expect("ts batch");
+        let coerced = coerce_batch_for_window(&batch, &sum_spec()).expect("coerce seconds");
+        let col = coerced
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("Int64 after coercion");
+        assert_eq!(
+            col.value(0),
+            2_000,
+            "seconds must be rescaled to epoch millis, which is the unit every \
+             window operator and the watermark comparison assume"
+        );
+    }
+
+    /// An already-typed batch comes back untouched.
+    ///
+    /// The `changed` short-circuit is what keeps `CoerceToSpec` free for the
+    /// coordinator push path, which already delivers typed batches. Without it
+    /// this step would put a per-column pass on every batch of every loop.
+    #[test]
+    fn an_already_typed_batch_is_returned_unchanged() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(Int64Array::from(vec![1_000_i64])),
+                Arc::new(Int64Array::from(vec![7_i64])),
+            ],
+        )
+        .expect("typed batch");
+
+        let coerced = coerce_batch_for_window(&batch, &sum_spec()).expect("coerce");
+        assert_eq!(coerced.schema(), schema, "schema must be identical");
+        assert_eq!(coerced.num_rows(), 1);
+    }
+
+    /// A strict cast failure is loud, and names the column.
+    ///
+    /// `safe = false` is deliberate: a value that cannot be parsed must fail
+    /// rather than null silently, because a nulled event-time column drops the
+    /// row from its window and produces a quietly short answer.
+    #[test]
+    fn an_unparseable_value_fails_loudly_rather_than_nulling() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["not-a-timestamp"]))],
+        )
+        .expect("bad batch");
+
+        let err = coerce_batch_for_window(&batch, &sum_spec()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'ts'"),
+            "the error must name the offending column: {msg}"
+        );
+    }
+
+    /// The run-loop's `PreCoerced` policy skips the cast entirely.
+    ///
+    /// Asserts the batch arrives at the operator with its ORIGINAL types, which
+    /// is the only way to tell "skipped" from "cast to something identical".
+    #[test]
+    fn a_precoerced_loop_hands_the_operator_its_input_untouched() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{Field, Schema};
+
+        struct Capturing {
+            seen: Option<RecordBatch>,
+            spec: WindowExecutionSpec,
+        }
+        impl WindowStep for Capturing {
+            fn step(&mut self, batches: Vec<RecordBatch>) -> ExecResult<Vec<RecordBatch>> {
+                self.seen = batches.into_iter().next();
+                Ok(Vec::new())
+            }
+            fn tick(&mut self, _w: i64) -> ExecResult<Vec<RecordBatch>> {
+                Ok(Vec::new())
+            }
+            fn flush(&mut self) -> ExecResult<Vec<RecordBatch>> {
+                Ok(Vec::new())
+            }
+            fn has_open_windows(&self) -> bool {
+                false
+            }
+            fn spec(&self) -> &WindowExecutionSpec {
+                &self.spec
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["1000"]))])
+            .expect("batch");
+
+        let mut exec = Capturing {
+            seen: None,
+            spec: sum_spec(),
+        };
+        let mut driver = StreamDriver::new(StreamingLoop::RunLoop);
+        assert_eq!(driver.policy().input_typing, InputTyping::PreCoerced);
+        driver
+            .on_input(&mut exec, vec![batch])
+            .expect("run-loop on_input");
+        assert_eq!(
+            exec.seen
+                .expect("operator saw a batch")
+                .schema()
+                .field(0)
+                .data_type(),
+            &DataType::Utf8,
+            "PreCoerced must not cast; the run-loop already did it before routing"
+        );
+    }
+
     /// `ExecError` is reachable from here — pins the error type the driver
     /// propagates so a change to it surfaces as a compile failure in this module
     /// rather than at every call site.
     #[test]
     fn driver_errors_are_operator_errors() {
-        struct Failing;
+        struct Failing {
+            spec: WindowExecutionSpec,
+        }
         impl WindowStep for Failing {
             fn step(&mut self, _b: Vec<RecordBatch>) -> ExecResult<Vec<RecordBatch>> {
                 Err(ExecError::InvalidInput("boom".into()))
@@ -843,9 +1284,14 @@ mod tests {
             fn has_open_windows(&self) -> bool {
                 false
             }
+            fn spec(&self) -> &WindowExecutionSpec {
+                &self.spec
+            }
         }
         let mut driver = StreamDriver::new(StreamingLoop::EmbeddedBounded);
-        let err = driver.on_input(&mut Failing, Vec::new()).unwrap_err();
+        let err = driver
+            .on_input(&mut Failing { spec: test_spec() }, Vec::new())
+            .unwrap_err();
         assert!(matches!(err, ExecError::InvalidInput(_)));
     }
 }

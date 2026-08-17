@@ -113,6 +113,21 @@ pub async fn run_streaming_job_via_runtime(
         if chunk.is_empty() {
             return Ok(());
         }
+        // `StreamingLoop::RuntimeSeam` declares `InputTyping::CoerceToSpec`.
+        // This loop holds no local operator to lend the driver, so it applies
+        // the same shared cast directly against the spec it compiled — one
+        // implementation, reached from here as well as from the driver.
+        //
+        // Without it a CSV or JSON source delivering Utf8 columns fails the
+        // operator's type check inside the runtime, which the run-loop would
+        // have survived because it coerces before routing.
+        let chunk = chunk
+            .iter()
+            .map(|batch| {
+                krishiv_dataflow::stream_driver::coerce_batch_for_window(batch, &plan.spec)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| EngineError::Runtime(e.to_string()))?;
         runtime
             .push_continuous_stream_input(&job.name, chunk)
             .map_err(|e| EngineError::Runtime(e.to_string()))?;

@@ -659,6 +659,15 @@ impl ContinuousWindowExecutor {
     /// ("no operator" is not "no state"); asking `self.operator` directly would
     /// report "nothing to lose" for exactly the job that restored a checkpoint
     /// and stopped before its first batch.
+    /// The window spec this executor validates and aggregates against.
+    ///
+    /// Exposed so a driver can coerce input toward exactly this spec rather than
+    /// a separately-threaded copy that could drift from it.
+    #[must_use]
+    pub fn spec(&self) -> &WindowExecutionSpec {
+        &self.spec
+    }
+
     pub fn has_open_windows(&self) -> bool {
         self.peek_snapshot_bytes()
             .map(|bytes| !bytes.is_empty())

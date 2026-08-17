@@ -293,37 +293,6 @@ pub(crate) fn parse_registry_partition_specs(
     Ok(specs)
 }
 
-/// Map a [`WindowExecutionSpec::key_column_type`] string tag to its Arrow type.
-fn arrow_type_for_key_tag(tag: &str) -> Option<DataType> {
-    match tag.trim().to_ascii_lowercase().as_str() {
-        "int32" => Some(DataType::Int32),
-        "int64" => Some(DataType::Int64),
-        "float64" => Some(DataType::Float64),
-        "bool" | "boolean" => Some(DataType::Boolean),
-        "utf8" | "string" => Some(DataType::Utf8),
-        _ => None,
-    }
-}
-
-/// True for Arrow types the windowed aggregate operators accept directly as a
-/// numeric aggregate input (no coercion needed).
-fn is_numeric_agg_type(dt: &DataType) -> bool {
-    matches!(
-        dt,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float16
-            | DataType::Float32
-            | DataType::Float64
-    )
-}
-
 /// Coerce a source-read batch to the column types the windowed operator
 /// requires. Kafka JSON sources (`registry-connector:kafka`) decode every field
 /// as `Utf8` (see `RdkafkaKafkaSource::payload_to_batch`), but the windowed
@@ -339,79 +308,11 @@ pub(crate) fn coerce_batch_for_window(
     batch: &arrow::record_batch::RecordBatch,
     spec: &krishiv_plan::window::WindowExecutionSpec,
 ) -> ExecutorResult<arrow::record_batch::RecordBatch> {
-    use arrow::array::ArrayRef;
-    use arrow::compute::{CastOptions, cast_with_options};
-    use arrow::datatypes::{Field, Schema};
-
-    let schema = batch.schema();
-    let key_target = arrow_type_for_key_tag(&spec.key_column_type);
-    let cast_opts = CastOptions {
-        safe: false,
-        ..Default::default()
-    };
-
-    let mut new_fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
-    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
-    let mut changed = false;
-
-    for (idx, field) in schema.fields().iter().enumerate() {
-        let column = batch.column(idx);
-        let name = field.name();
-        let current = field.data_type();
-
-        let desired: Option<DataType> = if name == &spec.event_time_column {
-            match current {
-                DataType::Int64 | DataType::Timestamp(_, _) => None,
-                _ => Some(DataType::Int64),
-            }
-        } else if name == &spec.key_column {
-            key_target
-                .as_ref()
-                .filter(|target| *target != current)
-                .cloned()
-        } else if spec
-            .agg_exprs
-            .iter()
-            .any(|agg| !agg.input_column.is_empty() && &agg.input_column == name)
-        {
-            if is_numeric_agg_type(current) {
-                None
-            } else {
-                Some(DataType::Float64)
-            }
-        } else {
-            None
-        };
-
-        match desired {
-            Some(target) => {
-                let casted = cast_with_options(column, &target, &cast_opts).map_err(|error| {
-                    ExecutorError::LocalExecution {
-                        message: format!(
-                            "stream:rloop failed to coerce column '{name}' from {current:?} to \
-                             {target:?} for the window operator: {error}"
-                        ),
-                    }
-                })?;
-                new_fields.push(Field::new(name, target, field.is_nullable()));
-                new_columns.push(casted);
-                changed = true;
-            }
-            None => {
-                new_fields.push(field.as_ref().clone());
-                new_columns.push(Arc::clone(column));
-            }
+    krishiv_dataflow::stream_driver::coerce_batch_for_window(batch, spec).map_err(|error| {
+        ExecutorError::LocalExecution {
+            message: error.to_string(),
         }
-    }
-
-    if !changed {
-        return Ok(batch.clone());
-    }
-
-    arrow::record_batch::RecordBatch::try_new(Arc::new(Schema::new(new_fields)), new_columns)
-        .map_err(|error| ExecutorError::LocalExecution {
-            message: format!("stream:rloop rebuilt coerced batch is invalid: {error}"),
-        })
+    })
 }
 
 /// Read input partitions of the form `registry-connector:<kind>:<table_name>:<config_json>`

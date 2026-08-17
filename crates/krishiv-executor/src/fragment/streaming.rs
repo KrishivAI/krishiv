@@ -538,11 +538,19 @@ async fn execute_loop_fragment(
                      window state is inconsistent — restart the job",
                 ),
             })?;
-        let batches = exec
-            .drain(input_batches)
-            .map_err(|e| ExecutorError::LocalExecution {
+        // `StreamingLoop::Cycle` declares `InputTyping::CoerceToSpec`, so the
+        // driver casts source columns to the operator's own spec before
+        // stepping it. Before this the cycle handed raw batches straight to
+        // `drain`, so a Utf8 event-time column failed here and succeeded on the
+        // run-loop — the same job, two answers, decided by placement.
+        let mut driver = krishiv_dataflow::stream_driver::StreamDriver::new(
+            krishiv_dataflow::stream_driver::StreamingLoop::Cycle,
+        );
+        let batches = driver.on_input(&mut *exec, input_batches).map_err(|e| {
+            ExecutorError::LocalExecution {
                 message: format!("stream:loop drain error: {e}"),
-            })?;
+            }
+        })?;
         // H2: propagate watermark so the coordinator can advance the global
         // streaming watermark and trigger late-data handling downstream.
         let wm = exec.last_watermark_ms();
