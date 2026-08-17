@@ -331,6 +331,7 @@ fn progress_callback_invoked_with_snapshot() {
         watermark_ms: 1000,
         rows_emitted: 42,
         batches_emitted: 7,
+        egress_dropped_batches: 0,
         state_bytes: 4096,
         source_offset: Some(vec![0, 1, 2]),
         timestamp_ms: 5000,

@@ -295,6 +295,9 @@ pub struct ExecutorTaskRunner {
     /// Phase 55: which stateful operator each running task's barrier snapshot
     /// must capture (per-subtask window executors, continuous join operators).
     pub(crate) task_state_bindings: Arc<DashMap<String, TaskStateBinding>>,
+    /// Cumulative run-loop egress-buffer drops per job, so the loss can be
+    /// reported upward instead of only warned about locally.
+    pub(crate) continuous_egress_dropped: Arc<DashMap<String, u64>>,
 
     /// Phase 55: per-job stateful two-input join operators (`window-join:`
     /// fragments retain state across cycles — closes G5/#88 state loss).
@@ -430,6 +433,7 @@ impl ExecutorTaskRunner {
             continuous_outputs: Arc::new(DashMap::new()),
             continuous_input_notify: Arc::new(DashMap::new()),
             task_state_bindings: Arc::new(DashMap::new()),
+            continuous_egress_dropped: Arc::new(DashMap::new()),
             join_executors: Arc::new(DashMap::new()),
             stream_exchange: crate::stream_exchange::StreamExchange::default(),
             own_task_endpoint: None,

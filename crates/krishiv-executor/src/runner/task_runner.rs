@@ -462,6 +462,16 @@ pub struct StreamingProgressSnapshot {
     pub rows_emitted: u64,
     /// Total batches emitted since task start.
     pub batches_emitted: u64,
+    /// Batches DROPPED from the job's bounded egress buffer since task start.
+    ///
+    /// The run-loop egress ring drops its oldest batch on overflow, so a slow
+    /// or absent drain consumer loses computed output under backpressure alone
+    /// — no fault required. A warn and a counter metric fired, but the consumer
+    /// received a gap with nothing in the data path telling it so. Reporting
+    /// the cumulative count upward makes the loss *detectable* by whoever is
+    /// reading the job, which is the difference between a known lossy buffer
+    /// and a silent wrong answer.
+    pub egress_dropped_batches: u64,
     /// Approximate state backend byte size.
     pub state_bytes: u64,
     /// Current source offset (connector-specific encoding).

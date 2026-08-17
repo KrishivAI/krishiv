@@ -439,6 +439,20 @@ pub struct ContinuousCheckpointResponse {
     pub watermark_ms: Option<i64>,
     pub snapshot_available: bool,
     pub spec: WindowExecutionSpec,
+    /// Execution model this job runs (`"cycle"` or `"run-loop"`).
+    ///
+    /// This endpoint reads the **cycle** model's coordinator-side snapshot
+    /// store. A run-loop job checkpoints through the barrier pipeline into its
+    /// `checkpoint_storage_path` instead, so it returns
+    /// `snapshot_available: false` here no matter how many barrier checkpoints
+    /// have committed. Without this field a caller cannot tell "no checkpoint
+    /// has been taken yet" from "this endpoint does not serve your job's
+    /// execution model" — the two look identical, and the second is not a
+    /// state that will ever change by waiting.
+    pub model: String,
+    /// Set for run-loop jobs: what the caller should use instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -769,6 +783,11 @@ pub async fn api_continuous_checkpoint(
         let view = continuous_job_view(&coord, &job_id)
             .map_err(|error| scheduler_error_response(&error))?;
         let persisted = coord.load_continuous_snapshot(job_id.as_str());
+        // Name the execution model so a run-loop caller is not left staring at
+        // `snapshot_available: false` wondering whether to keep polling. This
+        // endpoint reads the cycle store; run-loop snapshots live in the job's
+        // checkpoint storage, written by the barrier pipeline.
+        let is_run_loop = run_loop_targets(&coord, &job_id).ok().flatten().is_some();
         ContinuousCheckpointResponse {
             job_id: view.job_id,
             snapshot_b64: persisted.as_ref().map(|snapshot| {
@@ -777,6 +796,12 @@ pub async fn api_continuous_checkpoint(
             watermark_ms: persisted.as_ref().map(|snapshot| snapshot.watermark_ms),
             snapshot_available: persisted.is_some(),
             spec: view.spec,
+            model: if is_run_loop { "run-loop" } else { "cycle" }.to_owned(),
+            snapshot_source: is_run_loop.then(|| {
+                String::from(
+                    "run-loop jobs checkpoint through the barrier pipeline into                      checkpoint_storage_path; this endpoint reads the cycle model's                      coordinator snapshot store and will always report                      snapshot_available=false for them",
+                )
+            }),
         }
     };
     Ok(Json(response))

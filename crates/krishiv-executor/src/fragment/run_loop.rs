@@ -953,6 +953,11 @@ pub(crate) async fn execute_run_loop_fragment(
             watermark_ms: reported_wm,
             rows_emitted,
             batches_emitted,
+            egress_dropped_batches: runner
+                .continuous_egress_dropped
+                .get(job_id)
+                .map(|e| *e.value())
+                .unwrap_or(0),
             state_bytes: 0,
             source_offset: None,
             timestamp_ms: std::time::SystemTime::now()
@@ -1028,6 +1033,10 @@ impl ExecutorTaskRunner {
                 let overflow = egress.len() - RLOOP_EGRESS_CAP;
                 egress.drain(..overflow);
                 krishiv_metrics::global_metrics().inc_output_buffer_flush("rloop-egress-drop");
+                *self
+                    .continuous_egress_dropped
+                    .entry(job_id.to_owned())
+                    .or_insert(0) += overflow as u64;
                 tracing::warn!(
                     job_id,
                     dropped_batches = overflow,
