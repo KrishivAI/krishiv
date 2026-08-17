@@ -964,10 +964,29 @@ pub(crate) async fn execute_run_loop_fragment(
 
     runner.task_state_bindings.remove(&task_id);
     // The restore entry is read, not consumed, by the executor constructor
-    // (every sibling subtask needs it), so drop it at teardown. Otherwise a
-    // job re-created with the same deterministic id would be silently seeded
-    // from the dead incarnation's checkpoint.
-    runner.pending_restores.remove(job_id);
+    // (every sibling subtask needs the same entry), so it is dropped at
+    // teardown — otherwise a job re-created with the same deterministic id
+    // would be silently seeded from the dead incarnation's checkpoint.
+    //
+    // But `pending_restores` is keyed by JOB while this teardown runs per
+    // SUBTASK, so removing it unconditionally would let the first subtask to
+    // stop delete an entry a sibling that has not yet constructed its executor
+    // still needs — reintroducing, in a narrower window, exactly the starvation
+    // this file was just fixed for. Only the last subtask of this job in this
+    // process clears it.
+    //
+    // `task_state_bindings` is the right thing to count: it is keyed by task
+    // and this task's own binding was removed on the line above, so what
+    // remains is the live siblings. (`loop_executors` cannot be used — the
+    // run-loop deliberately keeps executors cached across reattach, so its
+    // entries never go away.)
+    let job_binding_prefix = format!("{job_id}#");
+    let siblings_still_running = runner.task_state_bindings.iter().any(|entry| {
+        matches!(entry.value(), TaskStateBinding::Window(key) if key.starts_with(&job_binding_prefix))
+    });
+    if !siblings_still_running {
+        runner.pending_restores.remove(job_id);
+    }
     let _ = runner
         .inbox
         .clear_cancelled_task(assignment.job_id(), assignment.task_id());
