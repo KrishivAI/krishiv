@@ -229,6 +229,34 @@ pub trait ExecutionRuntime: Send + Sync {
         spec: &LocalWindowExecutionSpec,
     ) -> RuntimeResult<()>;
 
+    /// Register a continuous streaming job, naming its execution model.
+    ///
+    /// [`register_continuous_stream`](Self::register_continuous_stream) takes
+    /// the defaults — the single-subtask cycle model. This is the seam that can
+    /// ask for the parallel, key-grouped, barrier-checkpointed run-loop engine.
+    ///
+    /// The default implementation **rejects** any non-default options rather
+    /// than dropping them into the plain call below. A runtime that cannot
+    /// honour `parallelism: 8` and registers one subtask anyway is the silent
+    /// downgrade this seam exists to end; the in-process cluster has no
+    /// run-loop implementation at all, so for it the honest answer is an error.
+    fn register_continuous_stream_with_options(
+        &self,
+        job_id: &str,
+        spec: &LocalWindowExecutionSpec,
+        options: &crate::coordinator_http_client::ContinuousRegisterOptions,
+    ) -> RuntimeResult<()> {
+        if !options.is_default() {
+            return Err(RuntimeError::unsupported(format!(
+                "this execution runtime ({:?} placement) runs a single-subtask continuous loop \
+                 and cannot honour run-loop registration options; registering anyway would \
+                 silently give you a different job than you asked for",
+                self.placement()
+            )));
+        }
+        self.register_continuous_stream(job_id, spec)
+    }
+
     /// Push input batches to a continuous streaming job.
     fn push_continuous_stream_input(
         &self,
@@ -852,19 +880,55 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         job_id: &str,
         spec: &LocalWindowExecutionSpec,
     ) -> RuntimeResult<()> {
+        self.register_continuous_stream_with_options(job_id, spec, &Default::default())
+    }
+
+    fn register_continuous_stream_with_options(
+        &self,
+        job_id: &str,
+        spec: &LocalWindowExecutionSpec,
+        options: &crate::coordinator_http_client::ContinuousRegisterOptions,
+    ) -> RuntimeResult<()> {
+        use crate::coordinator_http_client::ContinuousRegisterAck;
         use crate::flight_action::{ContinuousRegisterBody, KrishivFlightAction};
         use crate::flight_protocol::encode_continuous_register;
         use krishiv_common::async_util::block_on;
-        let action = KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody {
-            job_id: job_id.to_string(),
-            spec: spec.to_plan_spec(),
-        });
+
+        // Reject locally what the coordinator would reject anyway (e.g.
+        // parallelism > 1 without mode "run-loop"), so the caller gets the
+        // real message instead of a transport-level one.
+        options.expected_shape()?;
+
+        let action = KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody::with_options(
+            job_id,
+            spec.to_plan_spec(),
+            options.clone(),
+        ));
         block_on(async {
             match self.pool.do_action(&action).await {
-                Ok(_) => Ok(()),
+                Ok(response) => {
+                    // An old server answers an empty body; a new one answers the
+                    // shape it actually registered. `verify_ack` treats a missing
+                    // echo as "the options were dropped" — which for a non-default
+                    // request is exactly what happened.
+                    let ack = ContinuousRegisterAck::from_action_body(&response);
+                    options.verify_ack(&ack, "the Flight continuous-register action")
+                }
                 Err(e) if is_server_unimplemented(&e) => {
                     if !allow_remote_sql_comment_fallback() {
                         return Err(e);
+                    }
+                    // The SQL-comment fallback encodes only {job_id, spec} — it
+                    // has no room for an execution model and no echo to check.
+                    // Falling through with non-default options would register a
+                    // cycle job and report success, so it is closed here.
+                    if !options.is_default() {
+                        return Err(RuntimeError::unsupported(
+                            "this coordinator does not implement the typed continuous-register \
+                             action, and the legacy SQL-comment fallback cannot carry run-loop \
+                             registration options; it would register a single-subtask cycle job \
+                             instead. Upgrade the coordinator, or register without options.",
+                        ));
                     }
                     let sql = encode_continuous_register(job_id, spec)?;
                     self.pool.execute_sql(&sql).await.map(|_| ())

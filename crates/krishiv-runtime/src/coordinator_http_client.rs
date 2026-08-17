@@ -2,7 +2,7 @@
 
 use krishiv_scheduler::configured_coordinator_bearer_token;
 use krishiv_scheduler::decode_inline_record_batches;
-use krishiv_scheduler::{LiveExecutorView, LiveJobView};
+use krishiv_scheduler::{ContinuousJobMode, LiveExecutorView, LiveJobView};
 
 use crate::flight_protocol::parquet_file_to_ipc_b64;
 use crate::in_process::BatchSqlTable;
@@ -462,8 +462,8 @@ pub async fn execute_coordinator_bounded_window(
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchSqlResponseBody, ContinuousRegisterOptions, CoordinatorBatchSqlJobResult,
-        batch_sql_job_result_from_payload, normalize_http_base,
+        BatchSqlResponseBody, ContinuousRegisterAck, ContinuousRegisterOptions,
+        CoordinatorBatchSqlJobResult, batch_sql_job_result_from_payload, normalize_http_base,
     };
     use std::sync::Arc;
 
@@ -538,6 +538,146 @@ mod tests {
         assert!(
             both.get("checkpoint_interval_ms").is_some()
                 && both.get("checkpoint_storage_path").is_some()
+        );
+    }
+
+    /// THE defect this whole seam exists to close.
+    ///
+    /// Neither wire body sets `deny_unknown_fields`, so a coordinator older
+    /// than Phase 55 deserialises `{job_id, spec, mode, parallelism, ...}`
+    /// happily, throws the options away, registers a single-subtask cycle job,
+    /// and answers `{"success": true}` / an empty action body. Without this
+    /// check the client reports success for a job that is not the job it asked
+    /// for, and the divergence only surfaces later as "why is my 8-way
+    /// parallel stream doing 1/8 the throughput".
+    #[test]
+    fn a_coordinator_that_dropped_the_options_is_not_reported_as_success() {
+        let silent_old_server = ContinuousRegisterAck::default();
+
+        // Default request: an old coordinator's bare success IS the truth.
+        ContinuousRegisterOptions::default()
+            .verify_ack(&silent_old_server, "test seam")
+            .expect("a default registration is honoured by every coordinator");
+
+        // Run-loop request: the same bare success is a lie.
+        let error = ContinuousRegisterOptions::run_loop(8)
+            .verify_ack(&silent_old_server, "test seam")
+            .expect_err("an unacknowledged run-loop request must not report success");
+        let message = error.to_string();
+        assert!(
+            message.contains("predates") && message.contains("cycle"),
+            "the error must name the cause (an old coordinator registered a cycle job), got: \
+             {message}"
+        );
+    }
+
+    /// A coordinator that answers, but answers with a *different* shape, is the
+    /// other half: it is not old, it just applied something else (a clamp, a
+    /// policy, a rescale). Reporting success there is the same lie.
+    #[test]
+    fn an_echo_that_disagrees_with_the_request_is_an_error() {
+        let requested = ContinuousRegisterOptions::run_loop(8);
+        let downgraded = ContinuousRegisterAck {
+            mode: Some(String::from("cycle-push")),
+            parallelism: Some(1),
+            checkpointing: Some(false),
+            sources: Some(0),
+        };
+        let message = requested
+            .verify_ack(&downgraded, "test seam")
+            .expect_err("a downgraded registration must not report success")
+            .to_string();
+        assert!(
+            message.contains("asked for run-loop, registered cycle-push"),
+            "the error must show both sides, got: {message}"
+        );
+        assert!(
+            message.contains("asked for 8, got 1"),
+            "the error must show both parallelisms, got: {message}"
+        );
+
+        // The matching echo is accepted — otherwise the check would be a
+        // blanket refusal rather than a comparison.
+        let honoured = ContinuousRegisterAck {
+            mode: Some(String::from("run-loop")),
+            parallelism: Some(8),
+            checkpointing: Some(false),
+            sources: Some(0),
+        };
+        requested
+            .verify_ack(&honoured, "test seam")
+            .expect("an echo matching the request is accepted");
+    }
+
+    /// Sources are the quietest of the four: a coordinator that drops them
+    /// registers run-loop subtasks at the right parallelism that own no source
+    /// and therefore read nothing. From the outside that is indistinguishable
+    /// from a healthy job idling on an empty topic — it never errors, it just
+    /// never produces a row.
+    #[test]
+    fn dropped_sources_are_caught_even_when_mode_and_parallelism_match() {
+        let requested = ContinuousRegisterOptions::run_loop(2).with_source(
+            krishiv_scheduler::continuous_stream_http::ContinuousRegistrySource {
+                kind: String::from("kafka"),
+                table: String::from("events"),
+                config: Default::default(),
+            },
+        );
+        let mode_and_parallelism_honoured = ContinuousRegisterAck {
+            mode: Some(String::from("run-loop")),
+            parallelism: Some(2),
+            checkpointing: Some(false),
+            sources: Some(0),
+        };
+        let message = requested
+            .verify_ack(&mode_and_parallelism_honoured, "test seam")
+            .expect_err("a job whose subtasks own no source must not report success")
+            .to_string();
+        assert!(
+            message.contains("sources: sent 1, coordinator took ownership of 0"),
+            "the error must name the dropped sources, got: {message}"
+        );
+    }
+
+    /// The client resolves the requested mode with the coordinator's own
+    /// parser, so aliases the server accepts are not read as a disagreement by
+    /// the client. Two parsers would make the verification itself the liar.
+    #[test]
+    fn mode_aliases_resolve_the_same_way_on_both_sides() {
+        for alias in ["run-loop", "barrier-loop", "rloop"] {
+            let options = ContinuousRegisterOptions {
+                mode: Some(String::from(alias)),
+                parallelism: Some(3),
+                ..Default::default()
+            };
+            let server_echo = ContinuousRegisterAck {
+                mode: Some(String::from("run-loop")),
+                parallelism: Some(3),
+                checkpointing: Some(false),
+                sources: Some(0),
+            };
+            options
+                .verify_ack(&server_echo, "test seam")
+                .unwrap_or_else(|e| panic!("alias {alias} must resolve to run-loop: {e}"));
+        }
+    }
+
+    /// `parallelism > 1` without run-loop is rejected by the coordinator. The
+    /// client resolves the same shape locally, so the caller gets that message
+    /// instead of a confusing transport error after a round trip.
+    #[test]
+    fn an_impossible_request_is_rejected_before_it_leaves_the_client() {
+        let options = ContinuousRegisterOptions {
+            parallelism: Some(4),
+            ..Default::default()
+        };
+        let message = options
+            .expected_shape()
+            .expect_err("parallelism 4 on the cycle model is not a registerable shape")
+            .to_string();
+        assert!(
+            message.contains("run-loop"),
+            "the error must point at the mode that supports parallelism, got: {message}"
         );
     }
 
@@ -670,7 +810,7 @@ mod tests {
 ///
 /// Every field is skipped when unset, so a default-constructed value serialises
 /// to a byte-identical body and cannot change behaviour for existing callers.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContinuousRegisterOptions {
     /// `"cycle"` (default) or `"run-loop"`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -715,6 +855,156 @@ impl ContinuousRegisterOptions {
         self.sources.push(source);
         self
     }
+
+    /// True when this asks for exactly the coordinator's defaults, so an
+    /// acknowledgement carries no information a caller could act on.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The shape this request *should* produce: `(mode, parallelism,
+    /// checkpointing, sources)`.
+    ///
+    /// Resolved with the coordinator's own [`ContinuousJobMode::parse`] rather
+    /// than a second copy of the alias table — a client-side parser that drifts
+    /// from the server's would turn the verification below into another thing
+    /// that lies.
+    pub fn expected_shape(&self) -> RuntimeResult<(ContinuousJobMode, u32, bool, usize)> {
+        let parallelism = self.parallelism.unwrap_or(1).max(1);
+        let mode = ContinuousJobMode::parse(self.mode.as_deref(), parallelism)
+            .map_err(RuntimeError::plan_rejected)?;
+        let checkpointing =
+            self.checkpoint_interval_ms.is_some() && self.checkpoint_storage_path.is_some();
+        Ok((mode, parallelism, checkpointing, self.sources.len()))
+    }
+
+    /// Check the coordinator's echo against what was asked for.
+    ///
+    /// This is the load-bearing half of the options seam, not the field itself.
+    /// Neither the HTTP body nor the Flight action body uses
+    /// `deny_unknown_fields`, so a coordinator that predates these options
+    /// **silently discards them** and answers success — a client asking for
+    /// run-loop parallelism 8 would get a single-subtask cycle job and no
+    /// indication anything was ignored. Shipping the field without this check
+    /// would be a feature that lies.
+    ///
+    /// Default-shaped requests skip the comparison: an old coordinator's bare
+    /// `{"success": true}` is a truthful answer when the defaults are exactly
+    /// what was asked for.
+    pub fn verify_ack(&self, ack: &ContinuousRegisterAck, seam: &str) -> RuntimeResult<()> {
+        if self.is_default() {
+            return Ok(());
+        }
+        let (mode, parallelism, checkpointing, sources) = self.expected_shape()?;
+
+        let Some(applied_mode) = ack.mode.as_deref() else {
+            return Err(RuntimeError::transport(format!(
+                "{seam} accepted the registration but did not report which execution model it \
+                 registered. This coordinator predates the run-loop registration options, so it \
+                 discarded them and registered a single-subtask cycle job — it did not run the \
+                 mode={} parallelism={parallelism} job that was requested. Upgrade the \
+                 coordinator, or register without run-loop options.",
+                mode.as_str(),
+            )));
+        };
+        let mut disagreements = Vec::new();
+        if applied_mode != mode.as_str() {
+            disagreements.push(format!(
+                "mode: asked for {}, registered {applied_mode}",
+                mode.as_str()
+            ));
+        }
+        match ack.parallelism {
+            Some(applied) if applied == parallelism => {}
+            Some(applied) => disagreements.push(format!(
+                "parallelism: asked for {parallelism}, got {applied}"
+            )),
+            None => disagreements.push(format!(
+                "parallelism: asked for {parallelism}, not reported"
+            )),
+        }
+        match ack.checkpointing {
+            Some(applied) if applied == checkpointing => {}
+            Some(applied) => disagreements.push(format!(
+                "checkpointing: asked for {checkpointing}, got {applied}"
+            )),
+            None if checkpointing => {
+                disagreements.push(String::from("checkpointing: asked for true, not reported"))
+            }
+            None => {}
+        }
+        match ack.sources {
+            Some(applied) if applied == sources => {}
+            Some(applied) => disagreements.push(format!(
+                "sources: sent {sources}, coordinator took ownership of {applied}"
+            )),
+            None if sources > 0 => disagreements.push(format!(
+                "sources: sent {sources}, not reported — the subtasks may own no source at all"
+            )),
+            None => {}
+        }
+
+        if disagreements.is_empty() {
+            Ok(())
+        } else {
+            Err(RuntimeError::transport(format!(
+                "{seam} registered a different job than was requested ({}). The job IS registered \
+                 under this id in the shape the coordinator reported; deregister it before \
+                 retrying.",
+                disagreements.join("; ")
+            )))
+        }
+    }
+}
+
+/// What the coordinator says it **actually** registered.
+///
+/// Every field is optional so the type also decodes an older coordinator's
+/// `{"success": true}` — absence is the signal that the options were dropped,
+/// and [`ContinuousRegisterOptions::verify_ack`] treats it as such rather than
+/// as a default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContinuousRegisterAck {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallelism: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpointing: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<usize>,
+}
+
+impl ContinuousRegisterAck {
+    /// Build an acknowledgement from what a coordinator actually applied.
+    pub fn applied(applied: &krishiv_scheduler::AppliedContinuousRegistration) -> Self {
+        Self {
+            mode: Some(applied.mode.as_str().to_string()),
+            parallelism: Some(applied.parallelism),
+            checkpointing: Some(applied.checkpointing),
+            sources: Some(applied.sources),
+        }
+    }
+
+    /// Encode for a Flight `do_action` response body.
+    pub fn to_action_body(&self) -> RuntimeResult<Vec<u8>> {
+        serde_json::to_vec(self)
+            .map_err(|e| RuntimeError::transport(format!("encode continuous-register ack: {e}")))
+    }
+
+    /// Decode a Flight `do_action` response body.
+    ///
+    /// An empty or unparseable body decodes to the all-`None` acknowledgement
+    /// — the shape an older server produces. That is not silently treated as
+    /// "defaults were applied": [`ContinuousRegisterOptions::verify_ack`] reads
+    /// the absent fields as "the options were dropped" and errors for any
+    /// non-default request.
+    pub fn from_action_body(bytes: &[u8]) -> Self {
+        if bytes.is_empty() {
+            return Self::default();
+        }
+        serde_json::from_slice(bytes).unwrap_or_default()
+    }
 }
 
 pub async fn execute_coordinator_continuous_register(
@@ -751,6 +1041,15 @@ pub async fn execute_coordinator_continuous_register(
             response.status()
         )));
     }
+    // Fail fast on an unparseable body only when we actually need the echo:
+    // a default registration against any coordinator, old or new, is already
+    // correct, and refusing it over a response-shape change would break
+    // callers that asked for nothing unusual.
+    let ack = response
+        .json::<ContinuousRegisterAck>()
+        .await
+        .unwrap_or_default();
+    options.verify_ack(&ack, "the coordinator HTTP continuous-register endpoint")?;
     Ok(())
 }
 

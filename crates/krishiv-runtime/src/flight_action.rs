@@ -14,6 +14,7 @@
 //! the JSON (still Arrow-native, no SQL involvement).  Comments are accepted
 //! as a deprecated fallback for old clients.
 
+use crate::coordinator_http_client::ContinuousRegisterOptions;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -68,6 +69,39 @@ pub struct RegisterParquetBody {
 pub struct ContinuousRegisterBody {
     pub job_id: String,
     pub spec: WindowExecutionSpec,
+    /// Execution-model options (Phase 55): run-loop vs cycle, subtask count,
+    /// executor-owned sources, barrier checkpointing.
+    ///
+    /// Additive and skipped when default, so a default registration serialises
+    /// byte-identically to the two-field body every existing deployment sends.
+    /// A server that predates the field ignores it — which is precisely why the
+    /// response carries a [`ContinuousRegisterAck`] the client verifies.
+    #[serde(default, skip_serializing_if = "ContinuousRegisterOptions::is_default")]
+    pub options: ContinuousRegisterOptions,
+}
+
+impl ContinuousRegisterBody {
+    /// A registration taking the coordinator's defaults (cycle, one subtask).
+    pub fn new(job_id: impl Into<String>, spec: WindowExecutionSpec) -> Self {
+        Self {
+            job_id: job_id.into(),
+            spec,
+            options: ContinuousRegisterOptions::default(),
+        }
+    }
+
+    /// A registration that names its execution model.
+    pub fn with_options(
+        job_id: impl Into<String>,
+        spec: WindowExecutionSpec,
+        options: ContinuousRegisterOptions,
+    ) -> Self {
+        Self {
+            job_id: job_id.into(),
+            spec,
+            options,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -381,10 +415,10 @@ mod tests {
 
     #[test]
     fn round_trip_continuous_register() {
-        let action = KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody {
-            job_id: "j1".into(),
-            spec: WindowExecutionSpec::tumbling("k", "ts", 10_000),
-        });
+        let action = KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody::new(
+            "j1",
+            WindowExecutionSpec::tumbling("k", "ts", 10_000),
+        ));
         let bytes = action.to_action_body().unwrap();
         let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
         assert_eq!(decoded, action);
@@ -551,10 +585,10 @@ mod tests {
         });
         assert_eq!(register.action_type(), "krishiv.v1.register_parquet");
 
-        let continuous_reg = KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody {
-            job_id: "j".into(),
-            spec: WindowExecutionSpec::tumbling("k", "ts", 1_000),
-        });
+        let continuous_reg = KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody::new(
+            "j",
+            WindowExecutionSpec::tumbling("k", "ts", 1_000),
+        ));
         assert_eq!(
             continuous_reg.action_type(),
             "krishiv.v1.continuous.register"
@@ -649,10 +683,10 @@ mod tests {
             source_id_column: None,
             window_timezone: None,
         };
-        let action = KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody {
-            job_id: "sliding-job".into(),
+        let action = KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody::new(
+            "sliding-job",
             spec,
-        });
+        ));
         let bytes = action.to_action_body().unwrap();
         let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
         match decoded {
@@ -789,10 +823,10 @@ mod tests {
                 table: "t".into(),
                 path: "/t.parquet".into(),
             }),
-            KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody {
-                job_id: "j".into(),
-                spec: WindowExecutionSpec::tumbling("k", "ts", 1_000),
-            }),
+            KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody::new(
+                "j",
+                WindowExecutionSpec::tumbling("k", "ts", 1_000),
+            )),
             KrishivFlightAction::ContinuousPush(ContinuousPushBody {
                 job_id: "j".into(),
                 batches_b64: String::new(),

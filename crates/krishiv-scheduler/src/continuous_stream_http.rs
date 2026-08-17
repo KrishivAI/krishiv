@@ -92,7 +92,7 @@ pub struct ContinuousRegisterRequest {
 }
 
 /// One registry connector source owned by run-loop subtasks (Phase 55).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContinuousRegistrySource {
     /// Connector kind (e.g. `kafka`, `parquet-dir`).
     pub kind: String,
@@ -113,7 +113,14 @@ pub enum ContinuousJobMode {
 }
 
 impl ContinuousJobMode {
-    fn parse(mode: Option<&str>, parallelism: u32) -> Result<Self, String> {
+    /// Resolve a wire `mode` string + `parallelism` into the model that will
+    /// actually run.
+    ///
+    /// Public because remote clients verify the coordinator's echo against what
+    /// they asked for, and that comparison must use *this* function rather than
+    /// a second copy of the alias list — two parsers that disagree would make
+    /// the verification itself the thing that lies.
+    pub fn parse(mode: Option<&str>, parallelism: u32) -> Result<Self, String> {
         match mode.map(str::trim) {
             None | Some("") | Some("cycle") | Some("cycle-push") => {
                 if parallelism > 1 {
@@ -296,6 +303,23 @@ impl ContinuousSinkSpec {
 #[derive(Debug, Serialize)]
 pub struct ContinuousRegisterResponse {
     pub success: bool,
+    /// The execution model actually registered (`"cycle-push"` / `"run-loop"`).
+    ///
+    /// A bare `success: true` cannot tell a caller whether the coordinator
+    /// honoured `mode`/`parallelism` or fell back to the single-subtask cycle
+    /// model — an older coordinator ignores unknown request fields and answers
+    /// success either way. These three fields are the applied shape, so a
+    /// client can compare what it asked for against what runs.
+    pub mode: String,
+    /// The subtask count actually registered.
+    pub parallelism: u32,
+    /// Whether barrier checkpointing was armed.
+    pub checkpointing: bool,
+    /// How many registry connector sources the subtasks took ownership of. A
+    /// coordinator that drops the `sources` field registers a run-loop job
+    /// whose subtasks read nothing at all — which looks identical, from the
+    /// outside, to a healthy job that simply has not seen input yet.
+    pub sources: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -618,16 +642,23 @@ pub async fn api_continuous_register(
         checkpoint_interval_ms: body.checkpoint_interval_ms,
         checkpoint_storage_path: body.checkpoint_storage_path.clone(),
     };
-    register_continuous_stream_with_options(&coordinator, &body.job_id, &body.spec, &options)
-        .await
-        .map_err(|error| match error {
-            ContinuousStreamError::Scheduler(e) => scheduler_error_response(&e),
-            other @ ContinuousStreamError::Unavailable(_) => {
-                (StatusCode::SERVICE_UNAVAILABLE, other.to_string())
-            }
-            other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
-    Ok(Json(ContinuousRegisterResponse { success: true }))
+    let applied =
+        register_continuous_stream_with_options(&coordinator, &body.job_id, &body.spec, &options)
+            .await
+            .map_err(|error| match error {
+                ContinuousStreamError::Scheduler(e) => scheduler_error_response(&e),
+                other @ ContinuousStreamError::Unavailable(_) => {
+                    (StatusCode::SERVICE_UNAVAILABLE, other.to_string())
+                }
+                other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            })?;
+    Ok(Json(ContinuousRegisterResponse {
+        success: true,
+        mode: applied.mode.as_str().to_string(),
+        parallelism: applied.parallelism,
+        checkpointing: applied.checkpointing,
+        sources: applied.sources,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -659,6 +690,18 @@ pub struct ContinuousRegisterSqlResponse {
     pub success: bool,
     /// The source table the window reads from (feed pushes target it).
     pub source: String,
+    /// The execution model actually registered — see
+    /// [`ContinuousRegisterResponse::mode`].
+    pub mode: String,
+    /// The subtask count actually registered.
+    pub parallelism: u32,
+    /// Whether barrier checkpointing was armed.
+    pub checkpointing: bool,
+    /// How many registry connector sources the subtasks took ownership of. A
+    /// coordinator that drops the `sources` field registers a run-loop job
+    /// whose subtasks read nothing at all — which looks identical, from the
+    /// outside, to a healthy job that simply has not seen input yet.
+    pub sources: usize,
 }
 
 /// Register a continuous streaming job from **SQL**: the coordinator compiles
@@ -685,18 +728,23 @@ pub async fn api_continuous_register_sql(
         checkpoint_interval_ms: body.checkpoint_interval_ms,
         checkpoint_storage_path: body.checkpoint_storage_path.clone(),
     };
-    register_continuous_stream_with_options(&coordinator, &body.job_id, &plan.spec, &options)
-        .await
-        .map_err(|error| match error {
-            ContinuousStreamError::Scheduler(e) => scheduler_error_response(&e),
-            other @ ContinuousStreamError::Unavailable(_) => {
-                (StatusCode::SERVICE_UNAVAILABLE, other.to_string())
-            }
-            other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
+    let applied =
+        register_continuous_stream_with_options(&coordinator, &body.job_id, &plan.spec, &options)
+            .await
+            .map_err(|error| match error {
+                ContinuousStreamError::Scheduler(e) => scheduler_error_response(&e),
+                other @ ContinuousStreamError::Unavailable(_) => {
+                    (StatusCode::SERVICE_UNAVAILABLE, other.to_string())
+                }
+                other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            })?;
     Ok(Json(ContinuousRegisterSqlResponse {
         success: true,
         source: plan.source,
+        mode: applied.mode.as_str().to_string(),
+        parallelism: applied.parallelism,
+        checkpointing: applied.checkpointing,
+        sources: applied.sources,
     }))
 }
 
@@ -1379,7 +1427,9 @@ pub async fn register_continuous_stream_with_sink(
         sink: sink.cloned(),
         ..Default::default()
     };
-    register_continuous_stream_with_options(coordinator, job_id, spec, &options).await
+    register_continuous_stream_with_options(coordinator, job_id, spec, &options)
+        .await
+        .map(|_| ())
 }
 
 /// Full registration options for a continuous streaming job (Phase 55).
@@ -1487,7 +1537,7 @@ pub async fn register_continuous_stream_with_options(
     job_id: &str,
     spec: &krishiv_plan::window::WindowExecutionSpec,
     options: &ContinuousRegistrationOptions,
-) -> Result<(), ContinuousStreamError> {
+) -> Result<AppliedContinuousRegistration, ContinuousStreamError> {
     use krishiv_proto::JobId;
 
     let parallelism = options.parallelism.unwrap_or(1).max(1);
@@ -1534,7 +1584,36 @@ pub async fn register_continuous_stream_with_options(
     if mode == ContinuousJobMode::RunLoop && freshly_submitted {
         launch_run_loop_job(coordinator, &job_id_typed, &options.sources).await?;
     }
-    Ok(())
+    Ok(AppliedContinuousRegistration {
+        mode,
+        parallelism,
+        sources: options.sources.len(),
+        checkpointing: options.checkpoint_interval_ms.is_some()
+            && options.checkpoint_storage_path.is_some(),
+    })
+}
+
+/// What a registration **actually** applied, as decided by
+/// [`register_continuous_stream_with_options`].
+///
+/// This exists so remote callers can be told the truth. The registration
+/// request is a set of *options*; the shape that ends up running is derived
+/// here — `parallelism` is clamped, `mode` is parsed from a string, and
+/// checkpointing is armed only when both knobs are present. A caller that
+/// asked for run-loop parallelism 8 and reached a coordinator that ignored the
+/// request (because it predates the field, or because it took a different
+/// branch) would otherwise see a bare success and believe it got what it asked
+/// for. Every seam that can be driven from another process echoes this back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppliedContinuousRegistration {
+    /// The execution model actually registered.
+    pub mode: ContinuousJobMode,
+    /// The subtask count actually registered (post-clamp).
+    pub parallelism: u32,
+    /// How many registry connector sources the subtasks took ownership of.
+    pub sources: usize,
+    /// Whether barrier checkpointing was armed (needs BOTH knobs).
+    pub checkpointing: bool,
 }
 
 /// Assign, wire, and launch a freshly registered run-loop job's subtasks.
@@ -2295,7 +2374,9 @@ mod tests {
     /// Spelled out rather than swallowed with `let _ =`: the launch outcome is
     /// incidental to what these upsert tests are about, but silently discarding
     /// it would hide a real regression in the launch guard.
-    fn assert_launch_refused_for_in_process(result: Result<(), ContinuousStreamError>) {
+    fn assert_launch_refused_for_in_process(
+        result: Result<AppliedContinuousRegistration, ContinuousStreamError>,
+    ) {
         match result {
             Err(ContinuousStreamError::Unavailable(message)) => assert!(
                 message.contains("in-process executor endpoint"),

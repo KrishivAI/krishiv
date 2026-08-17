@@ -1602,11 +1602,20 @@ impl KrishivFlightSqlService {
                 Ok(Vec::new())
             }
             A::ContinuousRegister(body) => {
-                self.host
-                    .register_continuous_stream(&body.job_id, &body.spec)
+                let ack = self
+                    .host
+                    .register_continuous_stream_with_options(
+                        &body.job_id,
+                        &body.spec,
+                        &body.options,
+                    )
                     .await
                     .map_err(KrishivActionError::Status)?;
-                Ok(Vec::new())
+                // The response body is the contract, not decoration: an empty
+                // body is indistinguishable from an old server that dropped the
+                // options, and the client treats it as exactly that.
+                ack.to_action_body()
+                    .map_err(|e| KrishivActionError::Other(e.to_string()))
             }
             A::ContinuousPush(body) => {
                 let batches = krishiv_runtime::decode_batches(&body.batches_b64)

@@ -10,7 +10,7 @@ use tonic::transport::{Channel, Endpoint};
 
 use crate::flight_protocol::{
     encode_batch_sql, encode_bounded_window, encode_continuous_drain, encode_continuous_push,
-    encode_continuous_register, encode_explain_sql,
+    encode_explain_sql,
 };
 use crate::in_process::BatchSqlTable;
 use crate::local_streaming::LocalWindowExecutionSpec;
@@ -864,36 +864,6 @@ pub fn flight_explain_from_batches(batches: &[arrow::record_batch::RecordBatch])
         String::from("(no explain output)")
     } else {
         lines.join("\n")
-    }
-}
-
-/// Register a continuous streaming job on the remote Flight host via the pool.
-///
-/// Prefers the typed [`KrishivFlightAction::ContinuousRegister`] payload sent
-/// over `do_action`.  Falls back to the legacy SQL-comment protocol when the
-/// server does not understand the action type — preserves backward compat for
-/// older deployments.
-pub async fn execute_remote_continuous_register(
-    pool: &FlightClientPool,
-    job_id: &str,
-    spec: &LocalWindowExecutionSpec,
-) -> RuntimeResult<()> {
-    use crate::flight_action::{ContinuousRegisterBody, KrishivFlightAction};
-    let action = KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody {
-        job_id: job_id.to_string(),
-        spec: spec.to_plan_spec(),
-    });
-    match pool.do_action(&action).await {
-        Ok(_) => Ok(()),
-        Err(e) if is_unimplemented(&e) => {
-            if !krishiv_common::allows_remote_sql_comment_fallback() {
-                return Err(e);
-            }
-            let sql = encode_continuous_register(job_id, spec)?;
-            let _ = execute_remote_sql(pool, &sql).await?;
-            Ok(())
-        }
-        Err(e) => Err(e),
     }
 }
 

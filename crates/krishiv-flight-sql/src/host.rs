@@ -360,25 +360,79 @@ impl FlightExecutionHost {
         }
     }
 
-    /// Register a continuous streaming job.
+    /// Register a continuous streaming job with the coordinator's defaults
+    /// (single-subtask cycle model).
     pub async fn register_continuous_stream(
         &self,
         job_id: &str,
         spec: &krishiv_plan::window::WindowExecutionSpec,
     ) -> Result<(), Status> {
+        self.register_continuous_stream_with_options(job_id, spec, &Default::default())
+            .await
+            .map(|_| ())
+    }
+
+    /// Register a continuous streaming job, naming its execution model, and
+    /// return the shape that was **actually** registered.
+    ///
+    /// The acknowledgement is the point. Neither wire body rejects unknown
+    /// fields, so a client asking a coordinator that predates these options for
+    /// `parallelism: 8` gets a plain success and a one-subtask cycle job. The
+    /// only way a client can tell is if the server states what it did.
+    pub async fn register_continuous_stream_with_options(
+        &self,
+        job_id: &str,
+        spec: &krishiv_plan::window::WindowExecutionSpec,
+        options: &krishiv_runtime::ContinuousRegisterOptions,
+    ) -> Result<krishiv_runtime::ContinuousRegisterAck, Status> {
         match self.backend.as_ref() {
             FlightHostBackend::InProcess(cluster) => {
+                // The in-process cluster has no run-loop implementation: no
+                // subtasks, no keyed exchange, no barrier checkpointing. It can
+                // only run the single-subtask loop. Accepting the options and
+                // running that anyway is the silent downgrade this seam exists
+                // to end, so a non-default request is refused outright.
+                if !options.is_default() {
+                    return Err(Status::unimplemented(
+                        "this Flight server is backed by an in-process cluster, which runs a \
+                         single-subtask continuous loop and has no run-loop engine; it cannot \
+                         honour mode/parallelism/sources/checkpointing. Point the client at a \
+                         coordinator-backed server.",
+                    ));
+                }
                 let local = plan_spec_to_local(spec);
                 let job_id = job_id.to_string();
                 let cluster = Arc::clone(cluster);
-                run_blocking(move || cluster.register_continuous_job(&job_id, &local))
+                run_blocking(move || cluster.register_continuous_job(&job_id, &local))?;
+                Ok(krishiv_runtime::ContinuousRegisterAck {
+                    mode: Some(String::from("cycle-push")),
+                    parallelism: Some(1),
+                    checkpointing: Some(false),
+                    sources: Some(0),
+                })
             }
             FlightHostBackend::Coordinator(coordinator) => {
                 // Delegate to the public helper in krishiv-scheduler which
-                // accesses coordinator internals within the same crate.
-                krishiv_scheduler::register_continuous_stream_coordinated(coordinator, job_id, spec)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))
+                // accesses coordinator internals within the same crate. The
+                // applied shape comes back from the one function that decides
+                // it, rather than being re-derived here where it could drift.
+                let scheduler_options = krishiv_scheduler::ContinuousRegistrationOptions {
+                    sink: None,
+                    parallelism: options.parallelism,
+                    mode: options.mode.clone(),
+                    sources: options.sources.clone(),
+                    checkpoint_interval_ms: options.checkpoint_interval_ms,
+                    checkpoint_storage_path: options.checkpoint_storage_path.clone(),
+                };
+                let applied = krishiv_scheduler::register_continuous_stream_with_options(
+                    coordinator,
+                    job_id,
+                    spec,
+                    &scheduler_options,
+                )
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+                Ok(krishiv_runtime::ContinuousRegisterAck::applied(&applied))
             }
         }
     }
@@ -1274,6 +1328,80 @@ mod tests {
         assert!(
             matches!(host.backend.as_ref(), FlightHostBackend::InProcess(_)),
             "from_env must produce an InProcess backend"
+        );
+    }
+
+    /// An in-process-backed Flight server has no run-loop engine: no subtasks,
+    /// no keyed exchange, no barrier checkpointing. Registering the
+    /// single-subtask loop and answering success would hand the client a
+    /// different job than it asked for, with nothing on the wire to say so —
+    /// and `from_env()` above means this is the *default* server, so it is the
+    /// backend a stray client is most likely to hit.
+    #[tokio::test]
+    async fn in_process_backend_refuses_run_loop_options_instead_of_downgrading() {
+        let host = FlightExecutionHost::embedded().unwrap();
+        let spec = krishiv_plan::window::WindowExecutionSpec::tumbling("k", "ts", 1_000);
+
+        let status = host
+            .register_continuous_stream_with_options(
+                "rloop-on-inprocess",
+                &spec,
+                &krishiv_runtime::ContinuousRegisterOptions::run_loop(4),
+            )
+            .await
+            .expect_err("an in-process backend must refuse run-loop options");
+        assert_eq!(
+            status.code(),
+            tonic::Code::Unimplemented,
+            "the refusal must be Unimplemented (the feature is absent, not the request invalid), \
+             got {:?}: {}",
+            status.code(),
+            status.message()
+        );
+        assert!(
+            status.message().contains("in-process"),
+            "the refusal must name what is missing: {}",
+            status.message()
+        );
+
+        // A default registration still works, and still acknowledges the shape
+        // it ran — a bare success would be indistinguishable from a server that
+        // silently dropped options.
+        let ack = host
+            .register_continuous_stream_with_options(
+                "cycle-on-inprocess",
+                &spec,
+                &Default::default(),
+            )
+            .await
+            .expect("a default registration is within what this backend can do");
+        assert_eq!(ack.mode.as_deref(), Some("cycle-push"));
+        assert_eq!(ack.parallelism, Some(1));
+    }
+
+    /// The acknowledgement must survive the wire, because it is the only thing
+    /// standing between a client and a silently-downgraded job. An ack that
+    /// encodes to something the client decodes as "no fields reported" is read
+    /// as an old server and rejected — so a round-trip failure here would
+    /// break every non-default registration rather than fail open.
+    #[test]
+    fn the_register_ack_survives_the_action_body_round_trip() {
+        let ack = krishiv_runtime::ContinuousRegisterAck {
+            mode: Some(String::from("run-loop")),
+            parallelism: Some(6),
+            checkpointing: Some(true),
+            sources: Some(2),
+        };
+        let bytes = ack.to_action_body().expect("ack encodes");
+        assert_eq!(
+            krishiv_runtime::ContinuousRegisterAck::from_action_body(&bytes),
+            ack
+        );
+
+        // And the client's read of an old server: empty body, nothing reported.
+        assert_eq!(
+            krishiv_runtime::ContinuousRegisterAck::from_action_body(&[]),
+            krishiv_runtime::ContinuousRegisterAck::default()
         );
     }
 }
