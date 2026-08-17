@@ -4409,12 +4409,138 @@ Four commits: `b72579f`, `7dbcd52`, `388e4fd`, `5b74102`.
 
 ### Still open from §34
 
-The Flight `ContinuousRegister` options seam (and its required server echo —
-without it a new client asking for parallelism 8 against an old coordinator
-gets a success that registered Cycle/1), `Session::submit_streaming`
-distributed routing which depends on it, `unified_jobs_http.rs:217` as a third
-optionless seam, the failed-launch job-id wedge, and the
-`mode_conformance.rs` harness that compares embedded against embedded while
-asserting it does not.
+**Superseded by §36**, which closed the Flight options seam and its echo,
+`Session::submit_streaming` distributed routing, and `unified_jobs_http.rs` as
+a third optionless seam — and **retracted** the `mode_conformance.rs` claim as
+false. The failed-launch job-id wedge remains open; see §36 for the current
+list.
+
+Gates on every commit: `just lint`, per-crate `cargo test`, `cargo fmt --all`.
+
+---
+
+## §36 — streaming residuals closed, and one recorded claim retracted
+
+Continues §34/§35. Five commits: `e26055f` (F12), `7944146` (F13), `8c224de`
+(F14), `64147ee` (F15), `7540dd5` (F16). Every fix carries a test proven red
+against the reverted production line; three tests were written and then
+**deleted** for failing that bar.
+
+### The retraction first
+
+§34 recorded that `mode_conformance.rs` "compares embedded against embedded
+while asserting it does not". **That is false against the current file and is
+withdrawn.** An adversarial re-read falsified it two ways: structurally, the
+two sides use different constructors (`with_execution_mode(Embedded)` vs
+`with_coordinator(..) + with_remote_execution(true)`), land on different
+`ExecutionPlacement`s, and build different `ExecutionRuntime` impls, with
+`session.rs` failing the build closed rather than degrading; and empirically,
+enabling server-side auth (`KRISHIV_API_KEYS=k1=alice`) makes all 10 corpus
+queries diverge and both live tests fail, so the remote side is a real socket
+round-trip whose assertion can and does fail. The claim described the
+pre-2026-08-16 state that `live_conformance` already closed.
+
+Two narrower defects in that file were real and are fixed in F14.
+
+### F12 `e26055f` — the options seam, and the echo that makes it honest
+
+Three seams could accept run-loop options; one could ask for them; none could
+tell you whether the answer was real. Neither wire body sets
+`deny_unknown_fields`, so a coordinator predating Phase 55 discards the options
+and answers success.
+
+`AppliedContinuousRegistration` is the fix: the shape a registration actually
+applied, returned by the one function that decides it, carried out through both
+wire surfaces, and compared against the request by `verify_ack`. Absent fields
+read as "options dropped", never as defaults. Default requests skip the check.
+`sources` is in the echo because it is the quietest failure — right
+parallelism, no source, reads nothing, looks like an idle topic.
+
+Closed rather than plumbed: the SQL-comment fallback and the in-process Flight
+backend (which `from_env()` makes the *default* server). Deleted the dead
+`flight_client::execute_remote_continuous_register`.
+
+### F13 `7944146` — a NULL key was a poison pill; cancel kept the read position
+
+1. `extract_agg_key` rejects NULL keys by design and routing called it per row
+   with `?` **inside the run-loop's own input loop** — one NULL row ended the
+   job, and took the whole in-flight buffer with it (`input` is filled by
+   destructive `remove`). NULL is legal data in every source the engine reads.
+   Rows are now quarantined and counted; the guard sits **above** the
+   `parallelism <= 1` short-circuit, or it would miss the single-subtask shape
+   entirely. Type errors stay fatal: those are plan faults, not bad rows.
+2. `CancelTask` dropped the window state and kept `continuous_connector_sources`
+   — the **advanced read offsets**. Only the restore path cleared them. A
+   same-process re-register resumed at the dead incarnation's offset against
+   empty state and silently skipped everything since the last checkpoint. State
+   and position are now retired together. Run-loop jobs also retire their sink
+   handle and loss counters in their own fragment teardown, under the same
+   last-subtask rule that guards `pending_restores`.
+
+### F14 `8c224de` — the third seam, and a sort that disarmed the harness
+
+`POST /api/v1/jobs {"kind":"streaming"}` documented itself as delegating to
+`/continuous-register` while accepting a strict subset of its body, and does
+not deny unknown fields — so a copied body was silently eaten. Sharper edge:
+because the derived shape (cycle/1) mismatched a *running* run-loop job's
+shape, re-submitting a live job's id made the upsert cancel its subtasks, evict
+it, drop its snapshot and re-register it single-subtask. A duplicate submit
+that destroyed a running job.
+
+`render()` in the conformance harness sorted unconditionally, contradicting its
+own docstring and disarming the 7 corpus queries that pin an order — exactly
+the cross-task-sort divergence the corpus comment says it exists to catch.
+
+### F15 `64147ee` — the drop counters reach someone (a defect in my own F9)
+
+`egress_dropped_batches` carried a doc comment *I wrote* saying the count is
+reported upward and makes the loss detectable. It was not: `on_progress` never
+copied it to the report and the wire had no field. Two additive proto fields
+now carry it (and `null_key_rows_dropped`) to `record_streaming_progress`,
+which **warns** — everything else in a progress report is a gauge you go
+looking for; loss has to come find you. Guarded on non-zero so an older
+executor's absent field (proto3 → 0) reads as "no report", not "nothing lost".
+
+### F16 `7540dd5` — submit_streaming distributed
+
+Routes to the run-loop engine, whose subtasks own the sources. Refuses a
+bounded source, a sourceless job, and an unplannable query — each would
+otherwise produce a job that idles forever reporting Running. Connector
+properties go through the embedded path's own mapping, exposed not copied, so
+a source means the same thing wherever the job lands. `RunningJob::supervised`
+keeps `stop()`'s contract: `Completed` means stopped, not "stop requested".
+
+### Tests deleted for being untestable-by-reversion
+
+- proto: one asserting the drop fields default to 0 — asserts a derive.
+- api: one asserting the non-window error contains "TUMBLE" — the raw SQL
+  error already says TUMBLE, so it could not tell the guard from its absence.
+
+### Still open
+
+- **Run-loop clean stop takes no final checkpoint.** The loop breaks on
+  cancellation and its teardown is bookkeeping only, so a stop loses everything
+  accumulated since the last barrier epoch. Not force-flushing is *correct*
+  (`flush_all` is scoped to exhausted bounded sources; forcing it would emit
+  partial aggregates) — the missing piece is the snapshot that would let a
+  restart resume. A run-loop job registered without checkpointing, which
+  registration permits, has **no non-lossy stop at all**.
+- **`CancelTask` destroys the egress buffer before the loop observes the
+  cancel.** F13 added a warn naming the discarded batch count; moving the
+  teardown into the loop's own path is the real fix and is a lifecycle change.
+- **Egress ring dials.** `RLOOP_EGRESS_CAP = 512` is a hard-coded const with no
+  env override — unlike every neighbouring streaming dial — and is a per-JOB
+  budget shared by co-located subtasks, so headroom is 512/parallelism. The
+  Prometheus counter also increments by 1 per overflow *event*, not by the
+  number of batches dropped.
+- **Conformance staged coverage.** The "remote" server is built by
+  `make_flight_sql_server()` → `FlightExecutionHost::from_env()` → *embedded*,
+  and every corpus query takes `InProcessCluster`'s inline fast path. The
+  transport, unparser and table-shipping seams are genuinely covered; the
+  partial/final aggregate split and cross-task sort merge named in the CORPUS
+  comment are **not**. Either soften that comment or stand the server on the
+  coordinator backend.
+- **Not re-run this session:** pod-kill proof of the F8/`70b535c` restore
+  redistribution, and a live Kafka `registry-connector:` run-loop test.
 
 Gates on every commit: `just lint`, per-crate `cargo test`, `cargo fmt --all`.
