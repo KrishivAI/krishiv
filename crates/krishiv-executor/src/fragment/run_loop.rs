@@ -333,7 +333,7 @@ pub(crate) fn route_batch_by_key_group(
     parallelism: usize,
     own_subtask: usize,
 ) -> ExecutorResult<RoutedBatch> {
-    use arrow::array::{Array, BooleanArray, Int64Array, StringArray};
+    use arrow::array::BooleanArray;
 
     if parallelism <= 1 {
         return Ok((Some(batch.clone()), Vec::new()));
@@ -341,30 +341,41 @@ pub(crate) fn route_batch_by_key_group(
     let Ok(key_idx) = batch.schema().index_of(key_column) else {
         return Ok((Some(batch.clone()), Vec::new()));
     };
-    let col = batch.column(key_idx);
-    // Key bytes per row, matching krishiv-state's keyed hash input.
+    // ROUTING/PERSISTENCE CONTRACT.
+    //
+    // These bytes MUST be byte-identical to the group key the window operators
+    // persist — `extract_agg_key(..).to_string()` (krishiv-dataflow
+    // window/tumbling.rs, sliding.rs, session.rs) — because restore-time
+    // key-group redistribution re-hashes the *persisted* form. Deriving them
+    // from the same call is what keeps the two in agreement; hashing anything
+    // else here reintroduces the divergence below.
+    //
+    // This used to hash `arr.value(i).as_bytes()` for Utf8 and
+    // `v.to_be_bytes()` for Int64. Utf8 agreed with persistence by coincidence
+    // (same characters); Int64 did not — persistence writes ASCII decimal, so
+    // routing and redistribution hashed different byte strings and landed in
+    // unrelated key groups. Invisible while a job runs, because every subtask
+    // routes identically; it bit on a redistributing restore, where each Int64
+    // key had a (P-1)/P chance of being handed to a subtask that would never
+    // receive its rows. Utf8-only routing tests is why nothing noticed.
+    //
+    // Using `extract_agg_key` also makes Int32 / Float64 / Bool / LargeUtf8 /
+    // Utf8View routable. They are declared-legal key types and
+    // `coerce_batch_for_window` casts into them, but they previously fell into
+    // an "unroutable, process locally" fallback — which meant no exchange at
+    // all: index-partitioned splits gave each subtask a disjoint row subset but
+    // an OVERLAPPING key set, so every shared key accumulated an independent
+    // partial aggregate per subtask and emitted one output row each.
     let mut row_groups: Vec<u32> = Vec::with_capacity(batch.num_rows());
-    if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-        for i in 0..arr.len() {
-            let bytes: &[u8] = if arr.is_null(i) {
-                &[]
-            } else {
-                arr.value(i).as_bytes()
-            };
-            row_groups.push(u32::from(krishiv_state::key_group::key_group_for_key(
-                bytes,
-            )));
-        }
-    } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-        for i in 0..arr.len() {
-            let v = if arr.is_null(i) { 0 } else { arr.value(i) };
-            row_groups.push(u32::from(krishiv_state::key_group::key_group_for_key(
-                &v.to_be_bytes(),
-            )));
-        }
-    } else {
-        // Unroutable key type: process locally rather than dropping rows.
-        return Ok((Some(batch.clone()), Vec::new()));
+    for row in 0..batch.num_rows() {
+        let key = krishiv_dataflow::join::extract_agg_key(batch, key_idx, row)
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!("stream:rloop cannot derive a routing key: {e}"),
+            })?
+            .to_string();
+        row_groups.push(u32::from(krishiv_state::key_group::key_group_for_key(
+            key.as_bytes(),
+        )));
     }
 
     let ranges: Vec<KeyGroupRange> = (0..parallelism)
@@ -1457,6 +1468,126 @@ mod tests {
         assert_eq!(wm.combined(Duration::from_secs(60)), Some(1_000));
         // Idleness zero → both idle → fall back to the min over all splits.
         assert_eq!(wm.combined(Duration::ZERO), Some(1_000));
+    }
+
+    /// Routing MUST hash the same bytes the operator persists, because
+    /// restore-time key-group redistribution re-hashes the persisted form.
+    ///
+    /// Routing used to hash `i64::to_be_bytes` while the operator persists
+    /// `extract_agg_key(..).to_string()` — ASCII decimal. Two different byte
+    /// strings, so a key routed live to subtask A was redistributed on restore
+    /// to whichever subtask owns the hash of its *text*. Invisible while
+    /// running (every subtask routes identically) and a silent split on
+    /// restore. Utf8 keys agreed by coincidence, which is why the only routing
+    /// test — Utf8 — never caught it.
+    #[test]
+    fn int64_routing_agrees_with_the_persisted_group_key() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc as StdArc;
+
+        let schema = StdArc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![StdArc::new(Int64Array::from((0..64).collect::<Vec<i64>>())) as _],
+        )
+        .unwrap();
+
+        for row in 0..batch.num_rows() {
+            // What the operator writes into its state key, and therefore what
+            // redistribution hashes.
+            let persisted = krishiv_dataflow::join::extract_agg_key(&batch, 0, row)
+                .unwrap()
+                .to_string();
+            let expected = u32::from(krishiv_state::key_group::key_group_for_key(
+                persisted.as_bytes(),
+            ));
+
+            // What routing must compute for the same row.
+            let mut found = None;
+            for subtask in 0..4 {
+                let (owned, _) = route_batch_by_key_group(&batch, "k", 4, subtask).unwrap();
+                if let Some(b) = owned {
+                    let col = b.column(0);
+                    let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                    if (0..b.num_rows()).any(|i| arr.value(i) == row as i64) {
+                        found = Some(subtask);
+                    }
+                }
+            }
+            let owner = found.expect("every row must be owned by exactly one subtask");
+            let expected_owner = (0..4)
+                .find(|s| {
+                    let r = rloop_key_group_range(*s, 4);
+                    expected >= r.start() && expected <= r.end()
+                })
+                .expect("key group falls in some range");
+            assert_eq!(
+                owner, expected_owner,
+                "row {row}: routing sent it to subtask {owner}, but the persisted group \
+                 key hashes into subtask {expected_owner}'s range — a restore would move it"
+            );
+        }
+    }
+
+    /// Int32 / Float64 / Bool are declared-legal key types and
+    /// `coerce_batch_for_window` casts into them, but routing used to treat
+    /// them as unroutable and return "fully owned". With index-partitioned
+    /// splits that means each subtask keeps an overlapping key set and
+    /// accumulates its own partial aggregate for shared keys.
+    #[test]
+    fn non_int64_non_utf8_key_types_are_routable() {
+        use arrow::array::{BooleanArray, Float64Array, Int32Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc as StdArc;
+
+        let cases: Vec<(&str, DataType, arrow::array::ArrayRef)> = vec![
+            (
+                "int32",
+                DataType::Int32,
+                StdArc::new(Int32Array::from((0..64).collect::<Vec<i32>>())) as _,
+            ),
+            (
+                "float64",
+                DataType::Float64,
+                StdArc::new(Float64Array::from(
+                    (0..64).map(|i| i as f64 + 0.5).collect::<Vec<f64>>(),
+                )) as _,
+            ),
+            (
+                "bool",
+                DataType::Boolean,
+                StdArc::new(BooleanArray::from(
+                    (0..64).map(|i| i % 2 == 0).collect::<Vec<bool>>(),
+                )) as _,
+            ),
+        ];
+
+        for (label, dtype, array) in cases {
+            let schema = StdArc::new(Schema::new(vec![Field::new("k", dtype, false)]));
+            let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+            let parallelism = 3;
+            let mut owned_total = 0usize;
+            let mut routed_total = 0usize;
+            for subtask in 0..parallelism {
+                let (owned, routed) =
+                    route_batch_by_key_group(&batch, "k", parallelism, subtask).unwrap();
+                owned_total += owned.map(|b| b.num_rows()).unwrap_or(0);
+                routed_total += routed.iter().map(|(_, b)| b.num_rows()).sum::<usize>();
+            }
+            // Every subtask sees the whole batch, so across all of them each
+            // row is owned exactly once and forwarded by the other P-1.
+            assert_eq!(
+                owned_total,
+                batch.num_rows(),
+                "{label}: each row must be owned by exactly one subtask"
+            );
+            assert!(
+                routed_total > 0,
+                "{label}: rows outside a subtask's range must be forwarded, not \
+                 silently kept — 0 forwarded means the unroutable fallback fired"
+            );
+        }
     }
 
     #[test]
