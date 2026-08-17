@@ -290,16 +290,68 @@ mod live_conformance {
         path
     }
 
-    /// Render a result as sorted lines so the comparison is order-independent
-    /// where the query does not pin an order, and value-exact everywhere.
-    fn render(result: &crate::QueryResult) -> String {
+    /// Render a result for comparison: value-exact always, and order-exact
+    /// when the query pins an order.
+    ///
+    /// The sort used to be unconditional, which contradicted this function's
+    /// own docstring ("where the query does not pin an order") and quietly
+    /// disarmed the harness for its most order-sensitive cases: 7 of the 10
+    /// corpus queries carry `ORDER BY`, and "ordering (a cross-task sort)" is
+    /// one of the shapes the corpus comment says it was chosen to catch. A
+    /// placement difference that returned every right value in the wrong order
+    /// — precisely what a broken cross-task sort merge produces — passed.
+    fn render(result: &crate::QueryResult, ordered: bool) -> String {
         let batches = result.batches();
         let text = arrow::util::pretty::pretty_format_batches(batches)
             .expect("format")
             .to_string();
+        if ordered {
+            return text;
+        }
         let mut lines: Vec<&str> = text.lines().collect();
         lines.sort_unstable();
         lines.join("\n")
+    }
+
+    /// Whether a query pins its own row order, and therefore whether a
+    /// divergence in order is a real divergence.
+    fn pins_an_order(query: &str) -> bool {
+        query.to_ascii_uppercase().contains(" ORDER BY ")
+    }
+
+    /// The harness's own gate: with the sort applied unconditionally, two
+    /// results holding the SAME rows in a DIFFERENT order rendered identically,
+    /// so an order divergence could not fail any comparison. 7 of the 10 corpus
+    /// queries pin an order with `ORDER BY`, and a broken cross-task sort merge
+    /// is exactly a right-values-wrong-order result.
+    #[test]
+    fn an_order_only_divergence_is_caught_when_the_query_pins_an_order() {
+        fn rows(vals: &[i64]) -> crate::QueryResult {
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+            let arr: Int64Array = vals.iter().copied().collect();
+            crate::QueryResult::new(vec![
+                RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("batch"),
+            ])
+        }
+        let ascending = rows(&[1, 2, 3]);
+        let descending = rows(&[3, 2, 1]);
+
+        assert_ne!(
+            render(&ascending, true),
+            render(&descending, true),
+            "an ORDER BY query must not treat a reordered result as equal"
+        );
+        // And the order-independent mode still is order-independent, so
+        // unordered corpus queries do not become flaky.
+        assert_eq!(
+            render(&ascending, false),
+            render(&descending, false),
+            "without a pinned order the comparison stays order-independent"
+        );
+
+        assert!(pins_an_order("SELECT id, name FROM t ORDER BY id"));
+        assert!(pins_an_order("select v from t order by v desc"));
+        assert!(!pins_an_order("SELECT COUNT(*) FROM t"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -367,7 +419,8 @@ mod live_conformance {
                     continue;
                 }
             };
-            let (want, got) = (render(&want), render(&got));
+            let ordered = pins_an_order(query);
+            let (want, got) = (render(&want, ordered), render(&got, ordered));
             if want != got {
                 divergences.push(format!(
                     "[{label}] {query}\n  embedded:\n{want}\n  remote:\n{got}"
@@ -440,8 +493,10 @@ mod live_conformance {
              pass this failed with \"remote execution requires a SQL query\"",
         );
         assert_eq!(
-            render(&want),
-            render(&got),
+            // No ORDER BY in this builder, so row order is not part of the
+            // contract and the comparison stays order-independent.
+            render(&want, false),
+            render(&got, false),
             "a filtered DataFrame must return the same rows in both modes"
         );
     }

@@ -30,10 +30,18 @@
 //! { "kind": "streaming", "job_id": "etl-job", "spec": { ... } }
 //! ```
 //!
+//! Streaming bodies also accept the full run-loop option set
+//! (`mode`, `parallelism`, `sources`, `checkpoint_interval_ms`,
+//! `checkpoint_storage_path`) with the same meaning as on
+//! `/api/v1/continuous-register`, so the delegation in the table above is now
+//! true of the body as well as the destination.
+//!
 //! # Response
 //!
 //! All responses include `job_id` and `kind`. Batch-SQL responses additionally
-//! include `state: "Submitted"` and `poll_url` for polling results.
+//! include `state: "Submitted"` and `poll_url` for polling results. Streaming
+//! responses include the shape actually registered (`mode`, `parallelism`,
+//! `checkpointing`) so a caller can tell whether its options were honoured.
 
 use axum::Json;
 use axum::extract::State;
@@ -41,7 +49,6 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::batch_sql::{BatchSqlInlineTable, submit_batch_sql_job};
-use crate::continuous_stream_http::register_continuous_stream_coordinated;
 use crate::ivm_http::IvmRouterState;
 
 // ── request body ─────────────────────────────────────────────────────────────
@@ -68,6 +75,30 @@ pub struct UnifiedJobRequest {
     /// Window execution spec (required for `kind = "streaming"`).
     #[serde(default)]
     pub spec: Option<serde_json::Value>,
+    /// `"cycle"` (default) or `"run-loop"` — same meaning as on
+    /// `POST /api/v1/continuous-register`.
+    ///
+    /// These five fields exist because this endpoint documented itself as
+    /// delegating to `/api/v1/continuous-register` while accepting a strict
+    /// subset of its body. `UnifiedJobRequest` does not deny unknown fields, so
+    /// a caller who copied the sibling endpoint's body had all five silently
+    /// discarded and got a single-subtask cycle job while believing it had
+    /// asked for parallelism. Accept-and-ignore was the one behaviour that had
+    /// to go.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Run-loop subtask count. Values > 1 require `mode: "run-loop"`.
+    #[serde(default)]
+    pub parallelism: Option<u32>,
+    /// Registry connector sources the run-loop subtasks own directly.
+    #[serde(default)]
+    pub sources: Vec<crate::continuous_stream_http::ContinuousRegistrySource>,
+    /// Barrier checkpoint interval for run-loop jobs (ms).
+    #[serde(default)]
+    pub checkpoint_interval_ms: Option<u64>,
+    /// Checkpoint storage path for run-loop jobs.
+    #[serde(default)]
+    pub checkpoint_storage_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -88,6 +119,21 @@ pub struct UnifiedJobResponse {
     /// URL to poll for results (batch_sql only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poll_url: Option<String>,
+    /// The execution model actually registered (streaming only).
+    ///
+    /// A bare `201 CREATED` with `{job_id, kind}` cannot tell a caller which
+    /// model runs, which is exactly the ambiguity that let this endpoint report
+    /// success for a downgraded job. The registration path already computes the
+    /// applied shape so remote callers can compare it against what they asked
+    /// for; this reports it here too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// The subtask count actually registered (streaming only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallelism: Option<u32>,
+    /// Whether barrier checkpointing was armed (streaming only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpointing: Option<bool>,
 }
 
 // ── handler ───────────────────────────────────────────────────────────────────
@@ -143,6 +189,9 @@ async fn handle_batch_sql(
             poll_url: Some(format!("/api/v1/batch-sql/{job_id_str}")),
             job_id: job_id_str,
             kind: "batch_sql".to_string(),
+            mode: None,
+            parallelism: None,
+            checkpointing: None,
             state: Some("Submitted".to_string()),
         }),
     ))
@@ -185,6 +234,9 @@ async fn handle_ivm(
         Json(UnifiedJobResponse {
             job_id,
             kind: "ivm".to_string(),
+            mode: None,
+            parallelism: None,
+            checkpointing: None,
             state: None,
             poll_url: None,
         }),
@@ -214,9 +266,22 @@ async fn handle_streaming(
     let spec: krishiv_plan::window::WindowExecutionSpec = serde_json::from_value(spec_value)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid spec: {e}")))?;
 
-    register_continuous_stream_coordinated(&state.coordinator, &job_id, &spec)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let options = crate::continuous_stream_http::ContinuousRegistrationOptions {
+        sink: None,
+        parallelism: body.parallelism,
+        mode: body.mode,
+        sources: body.sources,
+        checkpoint_interval_ms: body.checkpoint_interval_ms,
+        checkpoint_storage_path: body.checkpoint_storage_path,
+    };
+    let applied = crate::continuous_stream_http::register_continuous_stream_with_options(
+        &state.coordinator,
+        &job_id,
+        &spec,
+        &options,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok((
         StatusCode::CREATED,
@@ -225,6 +290,9 @@ async fn handle_streaming(
             kind: "streaming".to_string(),
             state: None,
             poll_url: None,
+            mode: Some(applied.mode.as_str().to_string()),
+            parallelism: Some(applied.parallelism),
+            checkpointing: Some(applied.checkpointing),
         }),
     ))
 }
@@ -260,6 +328,11 @@ mod tests {
             tables: Vec::new(),
             job_id: None,
             spec: None,
+            mode: None,
+            parallelism: None,
+            sources: Vec::new(),
+            checkpoint_interval_ms: None,
+            checkpoint_storage_path: None,
         }
     }
 
@@ -411,6 +484,9 @@ mod tests {
             kind: "ivm".to_owned(),
             state: None,
             poll_url: None,
+            mode: None,
+            parallelism: None,
+            checkpointing: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         let obj = json.as_object().unwrap();
@@ -422,5 +498,73 @@ mod tests {
             !obj.contains_key("poll_url"),
             "None poll_url must be omitted, not serialized as null: {json}"
         );
+        for streaming_only in ["mode", "parallelism", "checkpointing"] {
+            assert!(
+                !obj.contains_key(streaming_only),
+                "the streaming-only field '{streaming_only}' must be omitted on a \
+                 non-streaming response, not serialized as null: {json}"
+            );
+        }
+    }
+
+    /// The third registration seam used to accept run-loop options and throw
+    /// them away.
+    ///
+    /// `UnifiedJobRequest` declared only `{kind, job_id, spec}` and does not
+    /// deny unknown fields, so a caller who copied the sibling
+    /// `/api/v1/continuous-register` body — which does accept all five — had
+    /// them silently dropped by serde and got the default single-subtask cycle
+    /// job. It never errored. It just ran an eighth of the engine that was
+    /// asked for.
+    ///
+    /// Worse, `job_id` reuse: because the derived shape (cycle/1) mismatched a
+    /// *running* run-loop job's shape, re-submitting a live job's id through
+    /// this endpoint made the upsert cancel its subtasks, evict it, drop its
+    /// snapshot, and re-register it single-subtask. A "duplicate submit" that
+    /// destroyed a running job.
+    #[test]
+    fn the_unified_body_carries_the_run_loop_options_it_used_to_discard() {
+        let body: UnifiedJobRequest = serde_json::from_str(
+            r#"{
+                "kind": "streaming",
+                "job_id": "etl",
+                "spec": {},
+                "mode": "run-loop",
+                "parallelism": 8,
+                "sources": [{"kind": "kafka", "table": "events"}],
+                "checkpoint_interval_ms": 30000,
+                "checkpoint_storage_path": "file:///ckpt"
+            }"#,
+        )
+        .expect("the streaming body deserialises");
+
+        assert_eq!(body.mode.as_deref(), Some("run-loop"));
+        assert_eq!(body.parallelism, Some(8));
+        assert_eq!(body.sources.len(), 1);
+        assert_eq!(body.sources[0].table, "events");
+        assert_eq!(body.checkpoint_interval_ms, Some(30_000));
+        assert_eq!(
+            body.checkpoint_storage_path.as_deref(),
+            Some("file:///ckpt")
+        );
+    }
+
+    /// And the response says which model actually runs, so a caller can tell a
+    /// honoured request from a downgraded one without polling the job.
+    #[test]
+    fn the_streaming_response_reports_the_shape_that_was_registered() {
+        let resp = UnifiedJobResponse {
+            job_id: "etl".to_owned(),
+            kind: "streaming".to_owned(),
+            state: None,
+            poll_url: None,
+            mode: Some("run-loop".to_owned()),
+            parallelism: Some(8),
+            checkpointing: Some(true),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["mode"], "run-loop");
+        assert_eq!(json["parallelism"], 8);
+        assert_eq!(json["checkpointing"], true);
     }
 }
