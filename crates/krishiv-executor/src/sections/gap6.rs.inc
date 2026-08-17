@@ -68,7 +68,67 @@ fn make_loop_assignment_with_batches(
     )])
 }
 
-fn make_streaming_assignment(fragment: &str, partitions: Vec<&str>) -> ExecutorTaskAssignment {
+/// Build a `(key, ts, val)` batch — the shape the streaming window fragments in
+/// this section aggregate over.
+///
+/// These tests used to hand the executor `stream-kafka:` ASCII partition
+/// descriptors, a format nothing in the tree ever produced. They now ship real
+/// Arrow batches over `InlineIpc`, which is what a coordinator actually sends.
+fn key_ts_val_batch(rows: &[(&str, i64, i64)]) -> RecordBatch {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("val", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|(k, _, _)| *k).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(_, t, _)| *t).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(_, _, v)| *v).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .expect("key/ts/val batch")
+}
+
+/// One `InlineIpc` input partition carrying a single `(key, ts, val)` batch.
+fn inline_ipc_partition(id: &str, rows: &[(&str, i64, i64)]) -> krishiv_proto::InputPartition {
+    use arrow::ipc::writer::StreamWriter;
+
+    let batch = key_ts_val_batch(rows);
+    let mut ipc_bytes = Vec::new();
+    {
+        let mut writer =
+            StreamWriter::try_new(&mut ipc_bytes, &batch.schema()).expect("ipc writer");
+        writer.write(&batch).expect("ipc batch");
+        writer.finish().expect("ipc finish");
+    }
+    krishiv_proto::InputPartition::typed(
+        id,
+        InputPartitionDescriptor::InlineIpc {
+            table_name: "input".into(),
+            ipc_bytes,
+        },
+    )
+}
+
+/// Encode one batch per input partition as `InlineIpc`.
+fn make_streaming_assignment_with_rows(
+    fragment: &str,
+    partitions: Vec<Vec<(&str, i64, i64)>>,
+) -> ExecutorTaskAssignment {
+    use arrow::ipc::writer::StreamWriter;
+
     let ids = TaskAttemptRef::new(
         JobId::try_new("stream-job-1").unwrap(),
         StageId::try_new("stage-1").unwrap(),
@@ -88,7 +148,23 @@ fn make_streaming_assignment(fragment: &str, partitions: Vec<&str>) -> ExecutorT
     let input_partitions: Vec<krishiv_proto::InputPartition> = partitions
         .iter()
         .enumerate()
-        .map(|(i, desc)| krishiv_proto::InputPartition::new(format!("p{i}"), *desc))
+        .map(|(i, rows)| {
+            let batch = key_ts_val_batch(rows);
+            let mut ipc_bytes = Vec::new();
+            {
+                let mut writer =
+                    StreamWriter::try_new(&mut ipc_bytes, &batch.schema()).expect("ipc writer");
+                writer.write(&batch).expect("ipc batch");
+                writer.finish().expect("ipc finish");
+            }
+            krishiv_proto::InputPartition::typed(
+                format!("p{i}"),
+                InputPartitionDescriptor::InlineIpc {
+                    table_name: "input".into(),
+                    ipc_bytes,
+                },
+            )
+        })
         .collect();
     assignment.with_input_partitions(input_partitions)
 }
@@ -96,10 +172,10 @@ fn make_streaming_assignment(fragment: &str, partitions: Vec<&str>) -> ExecutorT
 #[tokio::test]
 async fn streaming_tumbling_window_count_produces_correct_output() {
     let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
-    let assignment = make_streaming_assignment(
+    let assignment = make_streaming_assignment_with_rows(
         "stream:tw:key=key:time=ts:win=1000:lag=0:agg=count",
         vec![
-            "stream-kafka:events:0:0:key=a,ts=100,val=1|key=b,ts=200,val=1|key=a,ts=300,val=1",
+            vec![("a", 100, 1), ("b", 200, 1), ("a", 300, 1)],
         ],
     );
     let output = runner
@@ -124,10 +200,10 @@ async fn executor_runs_typed_streaming_fragment_body() {
     )
     .encode()
     .unwrap();
-    let assignment = make_streaming_assignment(
+    let assignment = make_streaming_assignment_with_rows(
         &fragment,
         vec![
-            "stream-kafka:events:0:0:key=a,ts=100,val=1|key=b,ts=200,val=1|key=a,ts=300,val=1",
+            vec![("a", 100, 1), ("b", 200, 1), ("a", 300, 1)],
         ],
     );
     let output = runner
@@ -145,10 +221,10 @@ async fn executor_runs_typed_streaming_fragment_body() {
 #[tokio::test]
 async fn streaming_tumbling_window_sum_produces_correct_output() {
     let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
-    let assignment = make_streaming_assignment(
+    let assignment = make_streaming_assignment_with_rows(
         "stream:tw:key=key:time=ts:win=1000:lag=0:agg=sum:col=val",
         vec![
-            "stream-kafka:events:0:0:key=x,ts=100,val=10|key=x,ts=200,val=20|key=x,ts=300,val=30",
+            vec![("x", 100, 10), ("x", 200, 20), ("x", 300, 30)],
         ],
     );
     let output = runner
@@ -167,11 +243,11 @@ async fn streaming_tumbling_window_sum_produces_correct_output() {
 #[tokio::test]
 async fn streaming_fragment_with_multiple_partitions() {
     let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
-    let assignment = make_streaming_assignment(
+    let assignment = make_streaming_assignment_with_rows(
         "stream:tw:key=key:time=ts:win=1000:lag=0:agg=count",
         vec![
-            "stream-kafka:events:0:0:key=a,ts=100,val=0",
-            "stream-kafka:events:1:0:key=a,ts=200,val=0|key=b,ts=300,val=0",
+            vec![("a", 100, 0)],
+            vec![("a", 200, 0), ("b", 300, 0)],
         ],
     );
     let output = runner
@@ -184,9 +260,9 @@ async fn streaming_fragment_with_multiple_partitions() {
 #[tokio::test]
 async fn streaming_fragment_invalid_fragment_returns_error() {
     let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
-    let assignment = make_streaming_assignment(
+    let assignment = make_streaming_assignment_with_rows(
         "stream:unknown-operator",
-        vec!["stream-kafka:t:0:0:key=a,ts=100,val=1"],
+        vec![vec![("a", 100, 1)]],
     );
     let err = runner
         .execute_streaming_fragment(&assignment)
@@ -201,10 +277,10 @@ async fn streaming_fragment_invalid_fragment_returns_error() {
 #[tokio::test]
 async fn streaming_fragment_routes_data_through_operator_queue() {
     let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
-    let assignment = make_streaming_assignment(
+    let assignment = make_streaming_assignment_with_rows(
         "stream:tw:key=key:time=ts:win=1000:lag=0:agg=count",
         vec![
-            "stream-kafka:events:0:0:key=a,ts=100,val=1|key=b,ts=200,val=1|key=a,ts=300,val=1",
+            vec![("a", 100, 1), ("b", 200, 1), ("a", 300, 1)],
         ],
     );
     let output = runner
@@ -223,12 +299,11 @@ async fn streaming_fragment_routes_data_through_operator_queue() {
 #[tokio::test]
 async fn deterministic_replay_end_to_end() {
     let fragment = "stream:tw:key=key:time=ts:win=1000:lag=0:agg=count";
-    let partition = "stream-kafka:events:0:0:key=a,ts=100,val=0|key=b,ts=150,val=0|key=a,ts=200,val=0\
-         |key=c,ts=500,val=0|key=a,ts=800,val=0|key=b,ts=900,val=0";
+    let partition = vec![("a", 100, 0), ("b", 150, 0), ("a", 200, 0), ("c", 500, 0), ("a", 800, 0), ("b", 900, 0)];
 
     let run = || async {
         let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
-        let assignment = make_streaming_assignment(fragment, vec![partition]);
+        let assignment = make_streaming_assignment_with_rows(fragment, vec![partition.clone()]);
         runner
             .execute_streaming_fragment(&assignment)
             .await
@@ -313,9 +388,9 @@ async fn streaming_e2e_full_stack_job_stays_running() {
         PlanFragment::new("stream:tw:key=key:time=ts:win=1000:lag=0:agg=count"),
         OutputContract::new(OutputContractKind::InlineRecordBatches, "streaming output"),
     )
-    .with_input_partitions(vec![InputPartition::new(
+    .with_input_partitions(vec![inline_ipc_partition(
         "p0",
-        "stream-kafka:events:0:0:key=a,ts=100,val=1|key=b,ts=200,val=1|key=a,ts=300,val=1",
+        &[("a", 100, 1), ("b", 200, 1), ("a", 300, 1)],
     )]);
     inbox.push(assignment).unwrap();
 

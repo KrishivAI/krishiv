@@ -24,7 +24,6 @@ pub mod in_process_cluster;
 pub mod ivm_job;
 pub mod local_streaming;
 mod plan;
-pub mod stream_kafka;
 pub mod streaming_job;
 pub mod vector_sink_bridge;
 

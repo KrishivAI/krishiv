@@ -2085,12 +2085,6 @@ mod tests {
         log: Arc<Mutex<Vec<SeamEvent>>>,
     }
 
-    impl RecordingContinuousRuntime {
-        fn log(&self) -> Vec<SeamEvent> {
-            self.log.lock().unwrap().clone()
-        }
-    }
-
     impl ExecutionRuntime for RecordingContinuousRuntime {
         fn mode(&self) -> RuntimeMode {
             RuntimeMode::Distributed

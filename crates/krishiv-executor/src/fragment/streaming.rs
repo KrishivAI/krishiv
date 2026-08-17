@@ -13,10 +13,8 @@ use crate::fragment::common::{
 use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner};
 use crate::{ExecutorError, ExecutorResult};
 use krishiv_dataflow::execute_bounded_window_seeded;
-use krishiv_plan::window::{WindowAggKind, WindowExecutionSpec, decode_window_execution_spec};
+use krishiv_plan::window::{WindowExecutionSpec, decode_window_execution_spec};
 use krishiv_proto::ExecutorTaskAssignment;
-
-const STREAM_KAFKA_PARTITION_PREFIX: &str = "stream-kafka:";
 
 /// Fragment prefix for CEP sequential pattern execution — re-exported from `krishiv_plan`.
 const STREAM_CEP_PREFIX: &str = krishiv_plan::cep::STREAM_CEP_PREFIX;
@@ -43,125 +41,6 @@ const STREAM_LOOP_PREFIX: &str = "stream:loop:";
 /// Format: `window-join:<json>` where `<json>` is a serialised
 /// [`WatermarkWindowJoinSpec`][krishiv_dataflow::WatermarkWindowJoinSpec].
 const WINDOW_JOIN_PREFIX: &str = "window-join:";
-
-/// Parse `stream-kafka:` partitions into batches with schema `(key, ts, val)`.
-fn parse_stream_kafka_partitions(
-    partitions: &[krishiv_proto::InputPartition],
-) -> ExecutorResult<Vec<arrow::record_batch::RecordBatch>> {
-    use std::sync::Arc;
-
-    use arrow::array::{Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("key", DataType::Utf8, false),
-        Field::new("ts", DataType::Int64, false),
-        Field::new("val", DataType::Int64, false),
-    ]));
-
-    let mut batches = Vec::new();
-
-    for partition in partitions {
-        let desc = partition.description().trim();
-        let Some(payload) = desc.strip_prefix(STREAM_KAFKA_PARTITION_PREFIX) else {
-            continue;
-        };
-
-        let parts: Vec<&str> = payload.splitn(4, ':').collect();
-        if parts.len() != 4 {
-            return Err(ExecutorError::InvalidAssignment {
-                message: format!(
-                    "stream-kafka partition {} must use \
-                     stream-kafka:<topic>:<partition>:<start_offset>:<records>",
-                    partition.partition_id()
-                ),
-            });
-        }
-
-        let records_str = parts.get(3).copied().unwrap_or("").trim();
-        let mut keys: Vec<String> = Vec::new();
-        let mut timestamps: Vec<i64> = Vec::new();
-        let mut values: Vec<i64> = Vec::new();
-
-        for record in records_str.split('|') {
-            let record = record.trim();
-            if record.is_empty() {
-                continue;
-            }
-
-            let mut key: Option<String> = None;
-            let mut ts: Option<i64> = None;
-            let mut val: Option<i64> = None;
-
-            for kv in record.split(',') {
-                let kv = kv.trim();
-                let (k, v) =
-                    kv.split_once('=')
-                        .ok_or_else(|| ExecutorError::InvalidAssignment {
-                            message: format!("invalid stream-kafka field '{kv}', expected k=v"),
-                        })?;
-                match k.trim() {
-                    "key" => key = Some(v.trim().to_owned()),
-                    "ts" => {
-                        ts = Some(v.trim().parse::<i64>().map_err(|e| {
-                            ExecutorError::InvalidAssignment {
-                                message: format!("invalid ts '{v}': {e}"),
-                            }
-                        })?)
-                    }
-                    "val" => {
-                        val = Some(v.trim().parse::<i64>().map_err(|e| {
-                            ExecutorError::InvalidAssignment {
-                                message: format!("invalid val '{v}': {e}"),
-                            }
-                        })?)
-                    }
-                    other => {
-                        return Err(ExecutorError::InvalidAssignment {
-                            message: format!("unknown stream-kafka record field '{other}'"),
-                        });
-                    }
-                }
-            }
-
-            keys.push(key.ok_or_else(|| ExecutorError::InvalidAssignment {
-                message: String::from("stream-kafka record missing 'key' field"),
-            })?);
-            timestamps.push(ts.ok_or_else(|| ExecutorError::InvalidAssignment {
-                message: String::from("stream-kafka record missing 'ts' field"),
-            })?);
-            values.push(val.ok_or_else(|| ExecutorError::InvalidAssignment {
-                message: String::from("stream-kafka record missing 'val' field"),
-            })?);
-        }
-
-        if keys.is_empty() {
-            return Err(ExecutorError::InvalidAssignment {
-                message: format!(
-                    "stream-kafka partition {} contains no records",
-                    partition.partition_id()
-                ),
-            });
-        }
-
-        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-        let batch = arrow::record_batch::RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(key_refs)) as _,
-                Arc::new(Int64Array::from(timestamps)) as _,
-                Arc::new(Int64Array::from(values)) as _,
-            ],
-        )
-        .map_err(|e| ExecutorError::LocalExecution {
-            message: format!("failed to build stream-kafka RecordBatch: {e}"),
-        })?;
-
-        batches.push(batch);
-    }
-
-    Ok(batches)
-}
 
 /// Wire format for a `stream:cep:` task fragment.
 #[derive(serde::Deserialize)]
@@ -1187,7 +1066,9 @@ pub(crate) async fn execute_streaming_fragment(
         return execute_window_join_fragment(runner, assignment, fragment);
     }
 
-    let mut plan_spec =
+    // No longer `mut`: the only mutation was the deleted `stream-kafka:` column
+    // clobber. The compiled spec now runs exactly as compiled.
+    let plan_spec =
         decode_window_execution_spec(fragment).map_err(|e| ExecutorError::InvalidAssignment {
             message: e.to_string(),
         })?;
@@ -1232,27 +1113,22 @@ pub(crate) async fn execute_streaming_fragment(
         .await;
     }
 
-    let batches = parse_stream_kafka_partitions(assignment.input_partitions())?;
+    // `InlineIpc` is the only input descriptor that survives the wire, so it is
+    // what a coordinator actually delivers to a bare window fragment.
+    //
+    // This used to parse `stream-kafka:` ASCII partition descriptors and, when
+    // it found any, overwrite `key_column`/`event_time_column` with the literals
+    // "key"/"ts" — i.e. silently run a different query than the one compiled.
+    // Nothing in the tree ever produced such a descriptor (the sole encoder had
+    // no callers outside its own tests), so the rewrite was armed and unreached.
+    // Both are gone together: deleting the parser while leaving the rewrite
+    // would have made the clobber unconditional.
+    let batches: Vec<arrow::record_batch::RecordBatch> =
+        crate::fragment::common::read_inline_ipc_partitions(assignment.input_partitions())?
+            .into_iter()
+            .flat_map(|(_, batches)| batches)
+            .collect();
 
-    // Only override column names for stream-kafka partitions.  Overriding
-    // unconditionally would clobber user-specified column names for non-kafka
-    // streaming fragments (e.g. in-process or file-backed streams).
-    if !batches.is_empty() {
-        plan_spec.key_column = String::from("key");
-        plan_spec.event_time_column = String::from("ts");
-        if plan_spec
-            .agg_exprs
-            .first()
-            .is_some_and(|a| a.kind == WindowAggKind::Sum)
-            && plan_spec
-                .agg_exprs
-                .first()
-                .is_some_and(|a| a.input_column.is_empty())
-            && let Some(agg) = plan_spec.agg_exprs.first_mut()
-        {
-            agg.input_column = String::from("val");
-        }
-    }
     // GAP-2: compute the observed event-time watermark from input batches BEFORE
     // executing the window so we can attach it to the output and let the coordinator
     // track global low-watermark across all executor tasks.
