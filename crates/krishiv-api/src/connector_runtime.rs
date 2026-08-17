@@ -65,6 +65,22 @@ const MAX_PUSH_BATCHES: usize =
 /// over-counts shared buffers, which errs toward smaller cycles.
 const MAX_PUSH_BYTES: usize = 2 * 1024 * 1024;
 
+/// Has the operator explicitly accepted a bounded run that cannot flush?
+///
+/// Off by default. A bounded job whose runtime has no flush route omits every
+/// window the watermark never passed — one row per group — and until now
+/// reported `Completed` with a warn line the caller never saw. Failing is the
+/// correct default; this flag exists so someone who genuinely wants the partial
+/// answer can say so, rather than having it chosen for them.
+fn allow_unflushed_bounded() -> bool {
+    matches!(
+        std::env::var("KRISHIV_ALLOW_UNFLUSHED_BOUNDED")
+            .unwrap_or_default()
+            .trim(),
+        "1" | "true" | "TRUE" | "yes" | "on"
+    )
+}
+
 /// Run a bounded **streaming** job through an [`ExecutionRuntime`]'s continuous
 /// seam — the distributed-stateful path behind the unified `Session::submit`.
 ///
@@ -185,14 +201,33 @@ pub async fn run_streaming_job_via_runtime(
             }
         }
         Err(error) if matches!(error, krishiv_runtime::RuntimeError::Unsupported { .. }) => {
-            // Named, not swallowed: this runtime has no flush route, so the
-            // trailing window is genuinely omitted and the operator should know
-            // rather than read a clean Completed and assume the output is whole.
-            tracing::warn!(
-                job = %job.name,
-                %error,
-                "bounded streaming finished without an end-of-stream flush; any window                  the watermark never passed is NOT in the output"
-            );
+            // A warn line is not a report. This used to log and return
+            // Completed, which from the caller's side is indistinguishable from
+            // a whole answer — the log goes to the engine's stderr, not to
+            // whoever ran the query. Reporting upward through a channel nobody
+            // reads is the same defect in a different place.
+            //
+            // So an unflushable bounded run now FAILS. A silent wrong answer
+            // becomes a loud error, which is the correct direction: the caller
+            // can retry against a runtime that can flush, or opt in to the old
+            // behaviour deliberately.
+            if allow_unflushed_bounded() {
+                tracing::warn!(
+                    job = %job.name,
+                    %error,
+                    "bounded streaming finished without an end-of-stream flush; any window \
+                     the watermark never passed is NOT in the output \
+                     (KRISHIV_ALLOW_UNFLUSHED_BOUNDED=1)",
+                );
+            } else {
+                return Err(EngineError::Runtime(format!(
+                    "bounded streaming job '{}' could not close the windows its watermark \
+                     never reached, so its output would be short by one row per group with \
+                     no other sign: {error}. Set KRISHIV_ALLOW_UNFLUSHED_BOUNDED=1 to accept \
+                     the partial answer instead.",
+                    job.name
+                )));
+            }
         }
         Err(error) => return Err(EngineError::Runtime(error.to_string())),
     }
@@ -2180,19 +2215,17 @@ mod tests {
     }
 
     impl ExecutionRuntime for RecordingContinuousRuntime {
-        /// Declines, explicitly.
+        /// Nothing to close.
         ///
-        /// The trait used to default this to exactly this error, which is how a
-        /// real runtime came to omit it silently. Now every implementor states
-        /// its answer at its own site; this double's answer is "I cannot", and
-        /// that is what it is for.
+        /// This double counts pushes and drains; it holds no window operator, so
+        /// "no open windows" is the truthful answer rather than an evasive one.
+        /// `Ok(empty)` is only dangerous when it stands in for a flush that was
+        /// never performed — here there is genuinely nothing to perform.
         fn flush_continuous_stream(
             &self,
             _job_id: &str,
         ) -> krishiv_runtime::RuntimeResult<Vec<RecordBatch>> {
-            Err(krishiv_runtime::RuntimeError::unsupported(
-                "test double does not flush",
-            ))
+            Ok(Vec::new())
         }
 
         fn mode(&self) -> RuntimeMode {

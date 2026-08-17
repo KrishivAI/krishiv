@@ -2021,6 +2021,181 @@ pub async fn push_continuous_input_coordinated(
 /// transactional Iceberg sink or queryable-state snapshots (both durable), not
 /// this drain endpoint. (The Phase 55 streamed-results work is the structural
 /// retirement of this in-RAM path.)
+/// Close every window a coordinator-backed continuous job still holds open.
+///
+/// # Why this needs its own machinery
+///
+/// A drain returns what the watermark already closed, so a bounded source whose
+/// final events land inside a window nothing later closes leaves that window
+/// unemitted. On a single node the fix is one call to the operator. In a
+/// coordinator-backed cluster there is no registry entry and no local operator
+/// at all — the operator lives inside the executor, built at
+/// `fragment/streaming.rs`. The only way to reach it is to schedule work.
+///
+/// So this schedules one final cycle carrying a `stream-eos:` input partition,
+/// a direct sibling of `stream-peers:`. `execute_streaming_fragment` reads it
+/// and calls `StreamDriver::on_stop(CoordinatorDirective)`, which is legitimate
+/// precisely because the control plane is the only party that can know a cycle
+/// task's stream is over — a cycle exists for one invocation and cannot observe
+/// its own source running out.
+///
+/// # Errors
+///
+/// Returns an error if the job is unknown, is not a streaming job, runs in
+/// run-loop mode (which does not flush on stop — its source is never exhausted),
+/// or if the final cycle cannot be launched or does not complete in time.
+pub async fn flush_continuous_stream_coordinated(
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+) -> Result<Vec<Vec<u8>>, ContinuousStreamError> {
+    use krishiv_proto::JobId;
+
+    let invalid = |message: String| {
+        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob { message })
+    };
+
+    let job_id_typed =
+        JobId::try_new(job_id).map_err(|e| invalid(format!("invalid job_id: {e}")))?;
+
+    // A run-loop job is long-lived and its source is never exhausted, so
+    // `StreamingLoop::RunLoop` declares `EndOfStream::NoFlush`. Forcing one
+    // would publish partial aggregates as final — a wrong answer in place of a
+    // missing one, which is worse. Registration already refuses bounded sources
+    // for run-loop jobs, so reaching here means the caller asked for something
+    // incoherent; say so rather than silently doing nothing.
+    let run_loop = {
+        let coord = coordinator.read().await;
+        run_loop_targets(&coord, &job_id_typed).map_err(ContinuousStreamError::Scheduler)?
+    };
+    if run_loop.is_some() {
+        return Err(invalid(format!(
+            "job {job_id} runs in run-loop mode, whose source is never exhausted; it does \
+             not flush on stop, and forcing one would emit partial aggregates as final"
+        )));
+    }
+
+    {
+        let coord = coordinator.read().await;
+        let snapshot = coord
+            .job_snapshot(&job_id_typed)
+            .map_err(ContinuousStreamError::Scheduler)?;
+        if snapshot.kind() != krishiv_proto::JobKind::Streaming {
+            return Err(invalid(format!("job {job_id} is not a streaming job")));
+        }
+    }
+
+    let partition = InputPartition::new("stream-eos", END_OF_STREAM_PARTITION);
+
+    let (targets, channels, target_count) = {
+        let mut coord = coordinator.write().await;
+        coord
+            .prepare_continuous_input_cycle(&job_id_typed, vec![partition])
+            .map_err(ContinuousStreamError::Scheduler)?;
+        let assignments = match coord.launch_assigned_task_assignments(&job_id_typed) {
+            Ok(assignments) if !assignments.is_empty() => assignments,
+            Ok(_) => {
+                coord.abort_continuous_input_cycle(&job_id_typed);
+                return Err(invalid(format!(
+                    "no task assignments were launched for job {job_id}'s end-of-stream cycle"
+                )));
+            }
+            Err(error) => {
+                coord.abort_continuous_input_cycle(&job_id_typed);
+                return Err(ContinuousStreamError::Scheduler(error));
+            }
+        };
+        let targets = match coord.resolve_assignment_targets(assignments) {
+            Ok(targets) => targets,
+            Err(error) => {
+                coord.abort_continuous_input_cycle(&job_id_typed);
+                return Err(ContinuousStreamError::Scheduler(error));
+            }
+        };
+        if targets
+            .iter()
+            .any(|(endpoint, _)| crate::is_in_process_task_endpoint(endpoint))
+        {
+            coord.abort_continuous_input_cycle(&job_id_typed);
+            return Err(invalid(format!(
+                "job {job_id}'s end-of-stream cycle resolved to an in-process task \
+                 endpoint, which cannot be dispatched"
+            )));
+        }
+        let target_count = targets.len();
+        (targets, coord.executor_channels.clone(), target_count)
+    };
+
+    let responses =
+        match Coordinator::deliver_assignment_targets_with_channels(channels, targets).await {
+            Ok(responses) => responses,
+            Err(error) => {
+                coordinator
+                    .write()
+                    .await
+                    .abort_continuous_input_cycle(&job_id_typed);
+                return Err(invalid(format!(
+                    "job {job_id}'s end-of-stream cycle could not be delivered: {error}"
+                )));
+            }
+        };
+    {
+        let mut coord = coordinator.write().await;
+        let accepted = coord.apply_assignment_dispatch_responses(&job_id_typed, &responses);
+        if accepted != target_count {
+            coord.abort_continuous_input_cycle(&job_id_typed);
+            return Err(invalid(format!(
+                "job {job_id}'s end-of-stream cycle was accepted by {accepted}/{target_count} \
+                 executors; its trailing windows would be incomplete"
+            )));
+        }
+    }
+
+    // Unlike a push, this call must not return before the cycle's output is
+    // available: its caller is a bounded run about to close its sinks, and a
+    // flush whose rows arrive after that is a flush that did nothing. The cycle
+    // fence clears when the task result lands, so that is the completion
+    // signal.
+    let deadline = std::time::Instant::now() + END_OF_STREAM_CYCLE_TIMEOUT;
+    loop {
+        {
+            let coord = coordinator.read().await;
+            if !coord.continuous_input_cycles.contains(&job_id_typed) {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            coordinator
+                .write()
+                .await
+                .abort_continuous_input_cycle(&job_id_typed);
+            return Err(invalid(format!(
+                "job {job_id}'s end-of-stream cycle did not complete within \
+                 {END_OF_STREAM_CYCLE_TIMEOUT:?}; its trailing windows are not in the output"
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let mut coord = coordinator.write().await;
+    Ok(coord
+        .take_job_inline_results(&job_id_typed)
+        .unwrap_or_default())
+}
+
+/// The `stream-eos:` partition description the executor matches on.
+///
+/// Kept as a constant next to its only producer so the string the coordinator
+/// writes and the prefix `read_end_of_stream_directive` looks for cannot drift
+/// apart silently — they live in different crates.
+const END_OF_STREAM_PARTITION: &str = "stream-eos:1";
+
+/// How long a final end-of-stream cycle may take before the flush is reported
+/// as failed.
+///
+/// Generous: this runs once per bounded job, and the alternative to waiting is
+/// returning an incomplete answer that looks complete.
+const END_OF_STREAM_CYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub async fn drain_continuous_stream_coordinated(
     coordinator: &SharedCoordinator,
     job_id: &str,

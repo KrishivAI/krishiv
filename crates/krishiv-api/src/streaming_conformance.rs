@@ -279,12 +279,13 @@ mod streaming_conformance_tests {
     /// flush — the method set `RemoteExecutionRuntime` actually has, and
     /// therefore the placement `ExecutionMode::Distributed` actually produces.
     ///
-    /// Returns `(sink_contents, status)`: the status matters as much as the
-    /// contents, because reporting `Completed` over a short answer is the defect.
+    /// Returns the job's `Result`. Since step 5 that result carries the verdict:
+    /// a bounded run whose windows cannot be closed FAILS rather than reporting
+    /// `Completed` over an answer short by one row per group.
     async fn via_runtime_seam_without_flush(
         entry: &CorpusEntry,
         dir: &std::path::Path,
-    ) -> (String, JobStatus) {
+    ) -> Result<(String, JobStatus), String> {
         let input = write_fixture(entry, dir, "noflush");
         let output = dir.join(format!("{}-noflush.json", entry.name));
 
@@ -292,14 +293,14 @@ mod streaming_conformance_tests {
         let flushless: Arc<dyn ExecutionRuntime> = Arc::new(FlushlessRuntime {
             inner: session.execution_runtime(),
         });
-        let handle =
-            run_streaming_job_via_runtime(&flushless, &job_for(entry.name, &input, &output))
-                .await
-                .unwrap_or_else(|e| panic!("[{}] flush-less seam loop failed: {e}", entry.name));
-        (
-            render_sorted(&std::fs::read_to_string(&output).unwrap_or_default()),
-            handle.status(),
-        )
+        match run_streaming_job_via_runtime(&flushless, &job_for(entry.name, &input, &output)).await
+        {
+            Ok(handle) => Ok((
+                render_sorted(&std::fs::read_to_string(&output).unwrap_or_default()),
+                handle.status(),
+            )),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     /// The gate: every corpus entry must produce the same closed windows on the
@@ -347,40 +348,26 @@ mod streaming_conformance_tests {
         );
     }
 
-    /// A runtime with no flush loses exactly the windows the watermark never
-    /// closed — and still reports success.
+    /// A bounded run that cannot close its windows FAILS.
     ///
-    /// This asserts **today's broken behaviour on purpose**. Every assertion
-    /// carries a `BUG(...)` marker and is flipped by the step that fixes the
-    /// defect; until then it is the regression guard that keeps the defect from
-    /// being described as anything other than what it is.
+    /// This assertion was inverted by step 5, and the inversion is the fix.
+    /// Before it, the same arm asserted `JobStatus::Completed` under a
+    /// `BUG(eos-flush-missing-on-both-distributed-loops)` marker: the job
+    /// reported success over an answer short by one row per group, and the only
+    /// trace was a `tracing::warn!` going to the engine's stderr rather than to
+    /// whoever ran the query. Reporting a loss through a channel nobody reads is
+    /// not reporting it.
     ///
-    /// Asserting the broken *values* rather than `flushing != flushless` is what
-    /// makes this test self-checking. Inequality would pass vacuously if the
-    /// harness were miswired so that neither arm produced anything — the classic
-    /// miswiring being to build both arms from `SessionBuilder::new().build()`,
-    /// which yields the one runtime where flush works.
+    /// The error must NAME the loss and the escape hatch, because an error that
+    /// says only "unsupported" tells an operator nothing about what to do.
     #[tokio::test]
-    async fn a_runtime_without_flush_silently_drops_its_trailing_windows() {
+    async fn a_bounded_run_that_cannot_flush_fails_instead_of_reporting_success() {
         let dir = tempfile::tempdir().expect("tempdir");
 
         for entry in CORPUS {
-            let flushing = via_runtime_seam(entry, dir.path()).await;
-            let (flushless, status) = via_runtime_seam_without_flush(entry, dir.path()).await;
-
-            // BUG(eos-flush-missing-on-both-distributed-loops): the job reports
-            // success over a short answer. The only trace in production is a
-            // tracing::warn! the caller never sees. Flipping this to an error is
-            // step 5; until then, pin it.
-            assert_eq!(
-                status,
-                JobStatus::Completed,
-                "[{}] a flush-less runtime still reports Completed today",
-                entry.name
-            );
-
             // The flushing arm is the reference: it must be correct, or this
             // test is measuring against a broken baseline.
+            let flushing = via_runtime_seam(entry, dir.path()).await;
             for want in entry.expected_json_fragments() {
                 assert!(
                     flushing.contains(&want),
@@ -390,32 +377,34 @@ mod streaming_conformance_tests {
                 );
             }
 
-            // BUG(eos-flush-missing-on-both-distributed-loops): exactly the
-            // windows the watermark never closed are missing. Entry
-            // `closed_window_plus_trailing_window` loses only PART of its
-            // output — that partial loss is what distinguishes "no flush" from
-            // "the loop never ran", and is why the corpus carries it.
-            let survived: Vec<String> = entry
-                .expected_without_flush
-                .iter()
-                .map(|(_, total)| format!("\"total\":{total}"))
-                .collect();
-            for want in &survived {
-                assert!(
-                    flushless.contains(want),
-                    "[{}] a window the watermark DID close must survive without a flush: \
-                     expected {want} in\n{flushless}",
-                    entry.name
-                );
+            // Only fixtures where the flush actually changes the answer can
+            // demonstrate the refusal. One that the watermark closes on its own
+            // has nothing to lose and nothing to refuse over.
+            if !entry.flush_is_observable() {
+                continue;
             }
-            let lost = entry.expected.len() - entry.expected_without_flush.len();
-            let flushless_rows = flushless.lines().filter(|l| !l.trim().is_empty()).count();
-            assert_eq!(
-                flushless_rows,
-                entry.expected_without_flush.len(),
-                "[{}] flush-less arm should emit {} row(s) and lose {lost}; got:\n{flushless}",
-                entry.name,
-                entry.expected_without_flush.len()
+
+            let outcome = via_runtime_seam_without_flush(entry, dir.path()).await;
+            let error = match outcome {
+                Ok((sink, status)) => panic!(
+                    "[{}] a bounded run whose windows cannot be closed reported {status:?} \
+                     with sink:\n{sink}\nThat is the silent-truncation signature this \
+                     whole effort exists to remove.",
+                    entry.name
+                ),
+                Err(error) => error,
+            };
+
+            assert!(
+                error.contains(entry.name),
+                "[{}] the error must name the job it lost output for: {error}",
+                entry.name
+            );
+            assert!(
+                error.contains("KRISHIV_ALLOW_UNFLUSHED_BOUNDED"),
+                "[{}] the error must name the way to accept a partial answer \
+                 deliberately, or an operator has no move: {error}",
+                entry.name
             );
         }
     }

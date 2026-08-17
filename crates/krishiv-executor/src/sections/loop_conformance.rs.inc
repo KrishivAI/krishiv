@@ -212,6 +212,67 @@ async fn executor_loops_emit_only_what_the_watermark_closed() {
     }
 }
 
+/// Drive one corpus entry through the cycle WITH an end-of-stream directive.
+///
+/// Same fragment, same fixture, one extra input partition — which is exactly
+/// what `flush_continuous_stream_coordinated` schedules as a job's final cycle.
+async fn via_cycle_fragment_at_end_of_stream(entry: &CorpusEntry) -> Vec<(String, i64)> {
+    let fragment = format!("stream:loop:eos-{}|{}", entry.name, corpus_window_spec());
+    let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+    let assignment = make_loop_assignment_with_batches(
+        &fragment,
+        &[entry.batch().expect("corpus batch")],
+    );
+    // Append the directive alongside the inline input the helper built.
+    let mut partitions = assignment.input_partitions().to_vec();
+    partitions.push(krishiv_proto::InputPartition::new("stream-eos", "stream-eos:1"));
+    let assignment = assignment.with_input_partitions(partitions);
+
+    let output = runner
+        .execute_streaming_fragment(&assignment)
+        .await
+        .unwrap_or_else(|e| panic!("[{}] cycle eos fragment failed: {e}", entry.name));
+
+    totals_from_batches(output.record_batches())
+        .unwrap_or_else(|e| panic!("[{}] cycle eos output unreadable: {e}", entry.name))
+}
+
+/// A cycle told the stream has ended closes every window it holds open.
+///
+/// This is the executor half of the coordinator-side fix, and it is provable
+/// with no cluster: the directive is an input partition, and delivering one by
+/// hand exercises the same read the scheduled final cycle triggers.
+///
+/// Deleting the `read_end_of_stream_directive` branch in
+/// `execute_streaming_fragment` turns this red — while
+/// `executor_loops_emit_only_what_the_watermark_closed` stays green, because
+/// that one drives the cycle WITHOUT the directive. That red/green split is the
+/// proof the flush is reached by the directive and not by something incidental.
+#[tokio::test]
+async fn a_cycle_told_the_stream_ended_closes_its_open_windows() {
+    for entry in CORPUS {
+        let without = via_cycle_fragment(entry).await;
+        let with = via_cycle_fragment_at_end_of_stream(entry).await;
+
+        assert_eq!(
+            with,
+            sorted_expectation(entry.expected),
+            "[{}] a cycle at end-of-stream must emit every window a correct \
+             bounded run produces",
+            entry.name
+        );
+
+        if entry.flush_is_observable() {
+            assert_ne!(
+                with, without,
+                "[{}] the directive must change the outcome, or this test is \
+                 passing for a reason unrelated to the flush",
+                entry.name
+            );
+        }
+    }
+}
+
 /// The two executor loops agree with each other, whatever they do.
 ///
 /// Separate from the assertion above on purpose: that one pins them to a

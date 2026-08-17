@@ -1135,6 +1135,27 @@ pub(crate) fn read_continuous_restore_hint(
     })
 }
 
+/// Input-partition prefix marking "the stream has ended".
+///
+/// A direct sibling of `stream-peers:`. A cycle task exists for exactly one
+/// invocation, so it cannot observe its own source running out — the control
+/// plane is the only thing that can know, and this is how it says so.
+pub(crate) const STREAM_EOS_PARTITION_PREFIX: &str = "stream-eos:";
+
+/// Did the coordinator mark this invocation as the end of the stream?
+///
+/// When true, the cycle must close every window it still holds open. Without
+/// this, a bounded job on a coordinator-backed cluster emits only what the
+/// watermark closed on its own and reports success — a silently short answer.
+pub(crate) fn read_end_of_stream_directive(partitions: &[krishiv_proto::InputPartition]) -> bool {
+    partitions.iter().any(|partition| {
+        partition
+            .description()
+            .trim()
+            .starts_with(STREAM_EOS_PARTITION_PREFIX)
+    })
+}
+
 pub(crate) fn read_inline_ipc_partitions(
     partitions: &[krishiv_proto::InputPartition],
 ) -> ExecutorResult<Vec<(String, Vec<arrow::record_batch::RecordBatch>)>> {

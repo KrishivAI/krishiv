@@ -515,12 +515,19 @@ impl FlightExecutionHost {
                 let cluster = Arc::clone(cluster);
                 run_blocking(move || cluster.flush_continuous_job(&job_id))
             }
-            FlightHostBackend::Coordinator(_) => Err(Status::unimplemented(format!(
-                "continuous.flush is not yet routed to a coordinator-backed cluster, so \
-                 job '{job_id}' cannot close the windows its watermark never reached; \
-                 the operator lives in the executor and needs a scheduled end-of-stream \
-                 cycle to reach it"
-            ))),
+            FlightHostBackend::Coordinator(coordinator) => {
+                // The operator lives inside the executor, so the only way to
+                // reach it is to schedule work: one final cycle carrying a
+                // `stream-eos:` partition, which `execute_streaming_fragment`
+                // reads and turns into `on_stop(CoordinatorDirective)`.
+                let ipc_payloads =
+                    krishiv_scheduler::flush_continuous_stream_coordinated(coordinator, job_id)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?;
+
+                krishiv_scheduler::decode_inline_record_batches(&ipc_payloads)
+                    .map_err(|e| Status::internal(e.to_string()))
+            }
         }
     }
 

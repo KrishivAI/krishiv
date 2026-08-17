@@ -546,11 +546,47 @@ async fn execute_loop_fragment(
         let mut driver = krishiv_dataflow::stream_driver::StreamDriver::new(
             krishiv_dataflow::stream_driver::StreamingLoop::Cycle,
         );
-        let batches = driver.on_input(&mut *exec, input_batches).map_err(|e| {
+        let mut batches = driver.on_input(&mut *exec, input_batches).map_err(|e| {
             ExecutorError::LocalExecution {
                 message: format!("stream:loop drain error: {e}"),
             }
         })?;
+
+        // End of stream. A cycle task exists for one invocation and cannot see
+        // its own source run out, so `StreamingLoop::Cycle` declares
+        // `EndOfStream::FlushOnDirective` and the control plane sends this
+        // partition on the final cycle. Without it a bounded job on a
+        // coordinator-backed cluster emits only the windows the watermark
+        // closed by itself and reports success — one row short per group, with
+        // nothing anywhere saying so.
+        if crate::fragment::common::read_end_of_stream_directive(assignment.input_partitions()) {
+            match driver
+                .on_stop(
+                    &mut *exec,
+                    krishiv_dataflow::stream_driver::StopReason::CoordinatorDirective,
+                )
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: format!("stream:loop end-of-stream flush error: {e}"),
+                })? {
+                krishiv_dataflow::stream_driver::StopOutcome::Flushed(final_windows) => {
+                    batches.extend(final_windows);
+                }
+                krishiv_dataflow::stream_driver::StopOutcome::NotFlushed {
+                    open_windows,
+                    because,
+                } => {
+                    if open_windows {
+                        tracing::warn!(
+                            job = %job_id,
+                            because,
+                            "stream:loop received an end-of-stream directive but did not \
+                             flush; windows this job still holds open are NOT in its output",
+                        );
+                    }
+                }
+            }
+        }
+
         // H2: propagate watermark so the coordinator can advance the global
         // streaming watermark and trigger late-data handling downstream.
         let wm = exec.last_watermark_ms();
