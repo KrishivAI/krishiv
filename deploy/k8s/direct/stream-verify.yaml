@@ -1,0 +1,146 @@
+# Isolated run-loop verification cluster: 1 coordinator + 3 executors.
+#
+# Deliberately its OWN namespace. `krishiv-cert` hosts an active soak whose
+# chaos cronjobs kill pods on a schedule, and `krishiv` carries the
+# cp.cppprograms.com tunnel on 18086/32010 — neither may be disturbed to run a
+# verification. Nothing here binds a NodePort; reach the coordinator with
+# `kubectl port-forward`.
+#
+# Three executors because that is the smallest topology where key-group
+# parallelism is real: with parallelism 3 each subtask owns a distinct
+# key-group range and rows outside it cross the executor→executor exchange.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: krishiv-stream
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stream-coordinator
+  namespace: krishiv-stream
+spec:
+  selector:
+    app: stream-coordinator
+  ports:
+    - { name: grpc, port: 2001, targetPort: 2001 }
+    - { name: http, port: 2002, targetPort: 2002 }
+    - { name: flight, port: 2003, targetPort: 2003 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stream-coordinator
+  namespace: krishiv-stream
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: stream-coordinator }
+  template:
+    metadata:
+      labels: { app: stream-coordinator }
+    spec:
+      containers:
+        - name: coordinator
+          image: localhost/krishiv:stream-verify
+          imagePullPolicy: Never
+          command: ["/usr/local/bin/krishiv"]
+          args:
+            - clusterd
+            - --grpc-addr
+            - 0.0.0.0:2001
+            - --http-addr
+            - 0.0.0.0:2002
+            - --flight-addr
+            - 0.0.0.0:2003
+            - --durability-profile
+            - dev-local
+            - --leader-backend
+            - single
+            # No bearer-token files in this namespace; it is reachable only
+            # through port-forward and exists to exercise the data plane.
+            - --insecure
+          env:
+            - name: KRISHIV_SERVICE_NAME
+              value: krishiv
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: KRISHIV_COORDINATOR_ID
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+          ports:
+            - { name: grpc, containerPort: 2001 }
+            - { name: http, containerPort: 2002 }
+            - { name: flight, containerPort: 2003 }
+          readinessProbe:
+            tcpSocket: { port: 2002 }
+            initialDelaySeconds: 3
+            periodSeconds: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stream-executor
+  namespace: krishiv-stream
+spec:
+  clusterIP: None
+  selector:
+    app: stream-executor
+  ports:
+    - { name: task, port: 7071, targetPort: 7071 }
+    - { name: barrier, port: 7072, targetPort: 7072 }
+    - { name: shuffle, port: 7074, targetPort: 7074 }
+    - { name: http, port: 8080, targetPort: 8080 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stream-executor
+  namespace: krishiv-stream
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: stream-executor }
+  template:
+    metadata:
+      labels: { app: stream-executor }
+    spec:
+      containers:
+        - name: executor
+          image: localhost/krishiv:stream-verify
+          imagePullPolicy: Never
+          command: ["/usr/local/bin/krishiv"]
+          args:
+            - executor
+            - --coordinator
+            - http://stream-coordinator:2001
+            - --connect
+            - --task-grpc-addr
+            - 0.0.0.0:7071
+            - --barrier-grpc-addr
+            - 0.0.0.0:7072
+            - --http-addr
+            - 0.0.0.0:8080
+            - --shuffle-flight-addr
+            - 0.0.0.0:7074
+            - --durability-profile
+            - dev-local
+            - --shuffle-dir
+            - /tmp/krishiv-shuffle
+          env:
+            - name: KRISHIV_SERVICE_NAME
+              value: krishiv
+            # Auth off: this namespace is reachable only via port-forward and
+            # exists to exercise the streaming data plane, not the auth path.
+            - name: KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH
+              value: "false"
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            - name: KRISHIV_EXECUTOR_ID
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+          ports:
+            - { name: task, containerPort: 7071 }
+            - { name: barrier, containerPort: 7072 }
+            - { name: shuffle, containerPort: 7074 }
+            - { name: http, containerPort: 8080 }
