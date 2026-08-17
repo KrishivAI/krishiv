@@ -649,6 +649,19 @@ impl ExecutorTaskRunner {
     /// retired together, or each makes the other lie.
     pub(crate) fn retire_continuous_job_state(&self, job_id: &str) {
         self.clear_continuous_connector_sources_for_job(job_id);
+        // NOT the egress buffer. I tried removing it here, on the theory that
+        // the `CancelTask` handler's removal races the loop it is cancelling
+        // (it does) and that the re-created entry then leaks (it can). The
+        // existing `run_loop_parallel_three_matches_parallel_one` test caught
+        // the cure being worse than the disease: it drains a stopped job's
+        // already-emitted windows and got 0 instead of 60.
+        //
+        // That test is right. A run-loop only ever stops via cancellation, so
+        // this teardown IS the stop path, and output the job genuinely produced
+        // and staged is output a consumer is entitled to read. Whether a drain
+        // may follow a stop at all is the DUR-5 contract question §34 deferred;
+        // deciding it as a side effect of a leak fix would be settling a
+        // product question by accident.
         // The registry-dispatched streaming sink handle is owned by the job, so
         // it dies with the job. Leaving it behind leaked an open sink for the
         // process lifetime and handed a re-registered job the dead
@@ -2123,6 +2136,71 @@ impl ExecutorTaskRunner {
             }
         }
         processed
+    }
+}
+
+#[cfg(test)]
+mod continuous_job_retirement {
+    use super::*;
+
+    fn one_row_batch() -> RecordBatch {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64]))]).expect("batch")
+    }
+
+    /// Retirement must clear the per-INCARNATION facts and nothing else.
+    ///
+    /// Job ids are deliberately reusable, so a dead job's drop counters left in
+    /// place become the next job's — it reports loss that never happened to it.
+    ///
+    /// The egress buffer is deliberately NOT retired here, and that is a
+    /// decision rather than an omission: a run-loop only stops via
+    /// cancellation, so this teardown IS the stop path, and windows the job
+    /// genuinely emitted before stopping are output a consumer may still drain.
+    /// Removing them made `run_loop_parallel_three_matches_parallel_one` read 0
+    /// instead of 60. Whether a drain may follow a stop at all is the DUR-5
+    /// contract question §34 deferred.
+    #[test]
+    fn retirement_clears_per_incarnation_counters_but_not_drainable_output() {
+        let runner = ExecutorTaskRunner::new(crate::ExecutorAssignmentInbox::new());
+
+        runner
+            .continuous_egress_dropped
+            .insert("job-retire".to_owned(), 9);
+        runner
+            .continuous_null_key_rows
+            .insert("job-retire".to_owned(), 4);
+        runner
+            .continuous_outputs
+            .insert("job-retire".to_owned(), vec![one_row_batch()]);
+        // A different job must survive: retirement is scoped, not a sweep.
+        runner
+            .continuous_egress_dropped
+            .insert("job-other".to_owned(), 1);
+
+        runner.retire_continuous_job_state("job-retire");
+
+        assert!(
+            !runner.continuous_egress_dropped.contains_key("job-retire"),
+            "a per-incarnation loss counter must not be inherited by the next job \
+             to reuse this id"
+        );
+        assert!(!runner.continuous_null_key_rows.contains_key("job-retire"));
+        assert!(
+            runner.continuous_outputs.contains_key("job-retire"),
+            "already-emitted output must stay drainable; retiring it here destroys \
+             windows the job really produced"
+        );
+        assert_eq!(
+            runner
+                .continuous_egress_dropped
+                .get("job-other")
+                .map(|e| *e.value()),
+            Some(1),
+            "a different job's counter must be untouched"
+        );
     }
 }
 
