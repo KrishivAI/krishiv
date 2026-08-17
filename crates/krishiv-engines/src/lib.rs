@@ -629,13 +629,17 @@ impl ComputeEngine for StreamingEngine {
             emit_to_writers(&mut writers, &outputs).await?;
         }
         // B-4 fix: a bounded source that ends with event times well below the
-        // current watermark leaves any "in-flight" windows unclosed if we don't
-        // drive the watermark to i64::MAX here. Flushing with an unbounded
-        // watermark closes every window whose end is ≤ i64::MAX (i.e. all of
-        // them) and emits their final aggregate. The watermark of the
-        // checkpoint that follows remains at whatever the source reported, so
-        // restore is consistent.
-        let final_flush = setup.executor.tick(i64::MAX).map_err(exec_err)?;
+        // current watermark leaves any "in-flight" windows unclosed unless we
+        // close them explicitly here. `flush_all` emits every remaining window
+        // and its final aggregate. The watermark of the checkpoint that follows
+        // remains at whatever the source reported, so restore is consistent.
+        //
+        // This used to call `tick(i64::MAX)`, which did nothing for tumbling
+        // and sliding windows: `tick` ignores its argument for those kinds by
+        // design (STREAM-1) and flushes against the last event-time watermark,
+        // which the trailing window's own events set — so it could never close
+        // itself. Every bounded tumbling job silently dropped its last window.
+        let final_flush = setup.executor.flush_all().map_err(exec_err)?;
         if !final_flush.is_empty() {
             emit_to_writers(&mut writers, &final_flush).await?;
         }
@@ -1758,9 +1762,75 @@ mod tests {
         let handle = run_job(job, rt).await.unwrap();
         assert_eq!(handle.status(), JobStatus::Completed);
 
-        let out = sink.take("out");
-        let rows: usize = out.iter().map(ChangelogBatch::num_rows).sum();
-        assert!(rows > 0, "expected the first closed window to emit a row");
+        // Assert the exact per-window totals, not `rows > 0`: the loose form
+        // passed while the trailing [10000,20000) window was being dropped
+        // entirely (see `bounded_tumbling_emits_the_trailing_window`).
+        let totals = emitted_window_totals(&sink.take("out"));
+        assert_eq!(totals, vec![5, 7], "both tumbling windows emit their sum");
+    }
+
+    /// Sum the `total` column across every emitted window, keyed by the window
+    /// each row belongs to, so a test can assert on *which* windows closed
+    /// rather than merely that something did.
+    fn emitted_window_totals(out: &[ChangelogBatch]) -> Vec<i64> {
+        let mut totals = Vec::new();
+        for cl in out {
+            let batch = cl.batch();
+            let idx = batch
+                .schema()
+                .index_of("total")
+                .expect("window output carries a `total` column");
+            let col = batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("`total` is Int64");
+            for row in 0..batch.num_rows() {
+                totals.push(col.value(row));
+            }
+        }
+        totals.sort_unstable();
+        totals
+    }
+
+    /// A bounded source whose last events fall inside a window that no later
+    /// event closes must still emit that window when the source ends.
+    ///
+    /// This is the regression test for the dead B-4 flush. `tick(i64::MAX)`
+    /// looks like it closes everything but ignores its argument for tumbling
+    /// windows by design (STREAM-1), flushing against the last *event-time*
+    /// watermark instead — which the trailing window's own events set, so it
+    /// could never close itself. The window's rows were silently dropped and
+    /// the job still reported `Completed`.
+    ///
+    /// It must be a **tumbling** fixture: a session window advances its
+    /// watermark to wall-clock inside `tick`, so a session fixture passes
+    /// against the broken code and proves nothing.
+    #[tokio::test]
+    async fn bounded_tumbling_emits_the_trailing_window() {
+        // Events at ts=1000 (window [0,10000)) and ts=12000 (window
+        // [10000,20000)). The ts=12000 event closes the first window. Nothing
+        // closes the second one except the end of the source.
+        let sources = InMemorySourceProvider::new();
+        sources.insert(
+            "events",
+            vec![event_batch("a", 1000, 5), event_batch("a", 12000, 7)],
+        );
+        let sink = InMemorySinkProvider::new();
+        let rt = embedded_runtime(Arc::new(sources), Arc::new(sink.clone()));
+
+        let handle = run_job(tumbling_job("trailing-window"), rt).await.unwrap();
+        assert_eq!(handle.status(), JobStatus::Completed);
+
+        let totals = emitted_window_totals(&sink.take("out"));
+        assert_eq!(
+            totals,
+            vec![5, 7],
+            "both windows must emit: [0,10000) closed by the watermark and \
+             [10000,20000) closed by the end of the bounded source. Getting \
+             only [5] means the trailing window was silently dropped while the \
+             job still reported Completed."
+        );
     }
 
     fn tumbling_job(name: &str) -> CompiledJob {

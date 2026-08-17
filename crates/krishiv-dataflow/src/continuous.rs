@@ -214,6 +214,30 @@ impl WindowOperatorState {
         }
     }
 
+    /// Emit **every** open window, whatever the watermark — the end-of-stream
+    /// close for a bounded source.
+    ///
+    /// Distinct from [`Self::flush_due`] because the two callers want opposite
+    /// things from the same operator. An *idle tick* must not close a
+    /// tumbling/sliding window on wall-clock, since more events may still
+    /// arrive and closing early would silently drop them as late (STREAM-1).
+    /// An *end-of-stream flush* knows no more events are coming, so every
+    /// remaining window is final.
+    ///
+    /// This mirrors `operator_runtime::WindowOperator::flush`, which is the
+    /// bounded path's equivalent and the reason `execute_bounded_window`
+    /// already emits trailing windows correctly.
+    fn flush_end_of_stream(&mut self) -> ExecResult<Vec<RecordBatch>> {
+        match self {
+            Self::Tumbling(op) => op.flush_closed_windows(i64::MAX),
+            Self::Sliding(op) => op.flush_closed_windows(i64::MAX),
+            Self::Session(op) => op.flush_closed_sessions(i64::MAX),
+            // A count window's trailing partial window has a well-defined
+            // aggregate, and `flush` is documented as the end-of-stream emit.
+            Self::Count(op) => op.flush(),
+        }
+    }
+
     /// C3: Persist operator state so crash recovery can restore open windows.
     fn checkpoint(&mut self) -> ExecResult<()> {
         match self {
@@ -597,6 +621,27 @@ impl ContinuousWindowExecutor {
         op.flush_due(wm)
     }
 
+    /// Close every open window because the source is exhausted (bounded runs).
+    ///
+    /// `tick(i64::MAX)` cannot express this. `tick` deliberately ignores its
+    /// argument for tumbling/sliding windows and flushes against the last
+    /// *event-time* watermark instead (STREAM-1, see [`Self::tick`]) — which is
+    /// correct for an idle tick and wrong for an end-of-stream flush, because
+    /// the final window's own events are what set that watermark, so it can
+    /// never close itself. A bounded tumbling job therefore dropped its
+    /// trailing window entirely.
+    ///
+    /// `last_watermark_ms` is deliberately left untouched: the checkpoint that
+    /// follows a bounded run should still record the watermark the source
+    /// actually reported, so a restore resumes consistently.
+    pub fn flush_all(&mut self) -> ExecResult<Vec<RecordBatch>> {
+        let Some(op) = &mut self.operator else {
+            return Ok(Vec::new()); // operator not yet initialised; no open windows
+        };
+        op.purge_expired()?;
+        op.flush_end_of_stream()
+    }
+
     /// H-14 (audit): speculatively emit currently-open tumbling windows
     /// without mutating the operator state. Returns `None` when the
     /// active operator is not a tumbling window (e.g. session or sliding
@@ -805,6 +850,68 @@ mod tests {
         let second = exec.drain(vec![events_batch(12_000)]).expect("drain2");
         // First window [0, 10000) should be emitted (at least one row).
         assert!(!second.is_empty(), "expected first window to be emitted");
+    }
+
+    /// `tick` must not close a tumbling window on wall-clock (STREAM-1) but
+    /// `flush_all` must, because the source is over. Pinning both halves in one
+    /// test keeps a future "simplification" from collapsing them back together.
+    #[test]
+    fn flush_all_closes_a_trailing_tumbling_window_that_tick_leaves_open() {
+        let mut spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+        spec.watermark_lag_ms = 0;
+        let mut exec = ContinuousWindowExecutor::new(spec).expect("create");
+
+        // One event in [0,10000). Nothing else arrives, so no event-time
+        // watermark ever passes the window's end.
+        let emitted = exec.drain(vec![events_batch(1_000)]).expect("drain");
+        assert!(emitted.is_empty(), "no window closes from one event");
+
+        // An idle tick, even at i64::MAX, must leave it open: more events could
+        // still arrive and closing early would drop them as late.
+        let ticked = exec.tick(i64::MAX).expect("tick");
+        assert!(
+            ticked.is_empty(),
+            "tick must not close a tumbling window on wall-clock (STREAM-1); \
+             this is exactly why the bounded final flush could not use it"
+        );
+
+        // End of stream: the window is final and must emit.
+        let flushed = exec.flush_all().expect("flush_all");
+        let rows: usize = flushed.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 1, "flush_all closes the trailing tumbling window");
+    }
+
+    /// Count windows returned nothing from the idle-tick flush path, so a
+    /// bounded count-windowed job dropped its trailing partial window too.
+    /// `CountWindowOperator::flush` is documented as the end-of-stream emit and
+    /// is what `flush_all` routes to.
+    #[test]
+    fn flush_all_emits_a_partial_count_window() {
+        let mut spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+        spec.watermark_lag_ms = 0;
+        spec.window_kind = krishiv_plan::window::WindowKind::Count {
+            size: 10,
+            slide: 10,
+        };
+        let mut exec = ContinuousWindowExecutor::new(spec).expect("create");
+
+        // Three rows against a size-10 count window: the window never fills, so
+        // nothing closes on its own.
+        let emitted = exec
+            .drain(vec![
+                events_batch(1_000),
+                events_batch(2_000),
+                events_batch(3_000),
+            ])
+            .expect("drain");
+        assert!(
+            emitted.is_empty(),
+            "a partial count window does not self-close"
+        );
+
+        let flushed = exec.flush_all().expect("flush_all");
+        let rows: usize = flushed.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 1, "the partial count window emits at end of stream");
     }
 
     #[test]
