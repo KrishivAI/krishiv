@@ -13,7 +13,7 @@
 //!   restore = `RestoreFromCheckpointCommand`).
 //! - The subtask **owns its source splits** (registry connector sources,
 //!   filtered by subtask index) and wakes on pushed-input notifies with a
-//!   microsecond floor and a millisecond fallback tick.
+//!   microsecond safety floor.
 //! - **Key-group parallelism**: a job registers N subtasks; each owns a
 //!   contiguous key-group range. Rows outside the owned range are forwarded to
 //!   the owning peer over the executor→executor `push_continuous_input` RPC
@@ -59,8 +59,6 @@ pub const STREAM_RLOOP_PREFIX: &str = "stream:rloop:";
 
 /// Idle safety floor for the notify wake path (µs), mirroring the embedded loop.
 const RLOOP_IDLE_FLOOR_US: u64 = 50;
-/// Fallback wake tick when no notify fires (ms), mirroring the embedded loop.
-const RLOOP_IDLE_TICK_MS: u64 = 5;
 /// Egress buffer cap (batches). Overflow drops the oldest batch — the drain
 /// API is best-effort by contract (DUR-5); durable consumption goes through
 /// the transactional sink or queryable state.
@@ -590,7 +588,6 @@ pub(crate) async fn execute_run_loop_fragment(
     let source_cache = runner.shared_continuous_connector_sources();
 
     let idle_floor = Duration::from_micros(RLOOP_IDLE_FLOOR_US);
-    let fallback_tick = Duration::from_millis(RLOOP_IDLE_TICK_MS);
     let idle_tick_period = idle_tick_interval();
     let linger = stream_linger();
     let idleness = watermark_idleness();
@@ -751,9 +748,27 @@ pub(crate) async fn execute_run_loop_fragment(
             }
         }
 
-        if input.is_empty() {
-            // ST-4 idle tick: close session windows whose gap elapsed even
-            // when every source is quiet (now proven distributed).
+        // ST-4 idle tick: close session windows whose inactivity gap elapsed.
+        //
+        // Gated on wall-clock elapsed only — deliberately NOT on `input`. It
+        // used to sit inside the `input.is_empty()` branch below, which ties a
+        // wall-clock obligation to whether this iteration happened to find
+        // input. Under sustained arrival — the backpressure case, i.e. exactly
+        // when it matters — the combined input never goes empty and the tick
+        // never fires, so a quiet split's session windows stay open while a
+        // chatty split keeps the loop busy. With per-source watermarks the
+        // effective watermark is the min across sources, so the quiet source
+        // holds every window open until `apply_idle_source_policy` runs, which
+        // is what `tick` does.
+        //
+        // NOT covered by a regression test, deliberately: reproducing it needs
+        // arrival to outpace drain for a whole tick period, and every fixture
+        // that pushes at a test-reasonable rate lets the input empty between
+        // batches, so the tick fires and the test passes against the broken
+        // code too. A test that cannot tell the two apart is worse than none.
+        // The change is justified by construction instead: it matches the
+        // embedded loop, which ticks on elapsed wall clock regardless of input.
+        {
             if last_idle_tick.elapsed() >= idle_tick_period {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -784,13 +799,22 @@ pub(crate) async fn execute_run_loop_fragment(
                 }
                 last_idle_tick = Instant::now();
             }
-            // Wake on push notify (own key or the job's shared key), the µs
-            // safety floor, or the ms fallback tick — the embedded loop's
-            // wake discipline, promoted.
+        }
+
+        if input.is_empty() {
+            // Wake on push notify (own key or the job's shared key) or the µs
+            // safety floor — the embedded loop's wake discipline, promoted.
+            //
+            // This used to sleep `idle_floor.max(fallback_tick)`. The floor is
+            // 50 µs and the fallback 5 ms, so the max was *always* 5 ms and the
+            // floor never applied — a 100x slower re-poll than the constant and
+            // the module doc both advertise. The embedded loop only reaches for
+            // its 5 ms fallback when a source has no notify at all; a run-loop
+            // subtask always has both notifies, so there is no such case here.
             tokio::select! {
                 _ = own_notify.notified() => {}
                 _ = shared_notify.notified() => {}
-                _ = tokio::time::sleep(idle_floor.max(fallback_tick)) => {}
+                _ = tokio::time::sleep(idle_floor) => {}
             }
             continue;
         }
