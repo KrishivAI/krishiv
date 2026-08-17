@@ -1452,6 +1452,17 @@ pub async fn register_continuous_stream_with_options(
         .map_err(ContinuousStreamError::Scheduler)?
     };
 
+    // KNOWN GAP (recorded, not fixed here): every failure path in
+    // `launch_run_loop_job` runs *after* the job spec was upserted, so a failed
+    // launch leaves the job registered with its subtasks assigned to executors
+    // that never received them. Because re-registering an identical shape is a
+    // deliberate no-op (not `freshly_submitted`), a retry cannot launch it
+    // either — the id stays wedged until an explicit deregister. Rolling the
+    // registration back here is not obviously right either: it would leave the
+    // run-loop registration path with no positive test in this crate, and
+    // "how does a failed launch become retryable" is a design question about
+    // the upsert contract, not something to settle as a side effect of fixing
+    // the acceptance guard below.
     if mode == ContinuousJobMode::RunLoop && freshly_submitted {
         launch_run_loop_job(coordinator, &job_id_typed, &options.sources).await?;
     }
@@ -1571,6 +1582,20 @@ async fn launch_run_loop_job(
         let targets = coord
             .resolve_assignment_targets(assignments)
             .map_err(ContinuousStreamError::Scheduler)?;
+        // An in-process endpoint cannot host a run-loop subtask: the push and
+        // drain paths both fail closed on one, so a job launched here would be
+        // permanently unreachable. Reject at launch, exactly as the cycle-push
+        // path does before dispatching its own targets.
+        if targets
+            .iter()
+            .any(|(endpoint, _)| crate::is_in_process_task_endpoint(endpoint))
+        {
+            return Err(ContinuousStreamError::Unavailable(format!(
+                "run-loop job {job_id} was assigned an in-process executor endpoint, \
+                 which cannot receive continuous push or serve drain; register a \
+                 remote executor"
+            )));
+        }
         let count = targets.len();
         (targets, coord.executor_channels.clone(), count)
     };
@@ -1580,9 +1605,14 @@ async fn launch_run_loop_job(
         .map_err(ContinuousStreamError::Scheduler)?;
     let mut coord = coordinator.write().await;
     let accepted = coord.apply_assignment_dispatch_responses(job_id, &responses);
-    // In-process targets are filtered before delivery (tests drive their
-    // inboxes directly), so only remote responses are counted here.
-    if accepted < responses.len() {
+    // Compare against the number of targets we RESOLVED, not the number of
+    // responses we got back. `deliver_assignment_targets_with_channels`
+    // partitions undeliverable targets out before producing responses, so
+    // `accepted < responses.len()` compared two numbers that shrink together:
+    // with every target undeliverable it read `0 < 0`, and registration
+    // returned Ok having launched no subtasks at all. The two sibling call
+    // sites in this file (`:1174`, `:1778`) both use `!= target_count`.
+    if accepted != target_count {
         return Err(ContinuousStreamError::Unavailable(format!(
             "run-loop job {job_id}: {accepted}/{target_count} subtask launches accepted"
         )));
@@ -2080,8 +2110,15 @@ mod tests {
             &options,
         )
         .await
-        .expect("run-loop registration must succeed");
+        .expect_err(
+            "the only executor here has an in-process task endpoint, which cannot host a \
+             run-loop subtask; launch must refuse rather than report success",
+        );
 
+        // The job spec is recorded by `upsert_continuous_streaming_job` before
+        // launch is attempted, so the shape assertions below still hold — and
+        // they now describe a job that provably did NOT start, which is what
+        // this coordinator can actually produce.
         let coord = coordinator.read().await;
         let job_id = krishiv_proto::JobId::try_new("rloop-reg-job").unwrap();
         let jc = coord.job_coordinator(&job_id).unwrap();
@@ -2111,6 +2148,75 @@ mod tests {
         assert_eq!(view.task_count, 3);
     }
 
+    /// A run-loop launch that dispatched nothing must not report success.
+    ///
+    /// The guard read `accepted < responses.len()`, comparing two numbers that
+    /// shrink together: undeliverable targets are partitioned out *before*
+    /// responses are produced, so a launch where every target was undeliverable
+    /// evaluated `0 < 0` and returned `Ok(())` having started no subtasks. Every
+    /// run-loop test on such a coordinator was green while launching nothing.
+    ///
+    /// An all-in-process executor set is exactly that case: every target is
+    /// partitioned out before delivery, so `responses` is empty and the old
+    /// comparison could not fire. It is also the fixture every run-loop test in
+    /// this file uses, which is why none of them noticed.
+    #[tokio::test]
+    async fn run_loop_launch_rejects_when_no_subtask_was_actually_dispatched() {
+        let coordinator = make_coordinator_with_executor("rloop-nolaunch").await;
+        let options = ContinuousRegistrationOptions {
+            parallelism: Some(3),
+            mode: Some(String::from("run-loop")),
+            ..Default::default()
+        };
+        let error = register_continuous_stream_with_options(
+            &coordinator,
+            "rloop-nolaunch-job",
+            &tumbling_spec(),
+            &options,
+        )
+        .await
+        .expect_err("a launch that dispatched no subtask must not return Ok");
+        assert!(
+            matches!(error, ContinuousStreamError::Unavailable(_)),
+            "expected Unavailable, got {error:?}"
+        );
+
+        // Pin the known gap rather than leaving it undescribed: the refused
+        // launch leaves the job registered with its subtasks still assigned.
+        // That is a wedge (an identical re-registration is a no-op, so it can
+        // never launch on retry) and is recorded as follow-up work at the
+        // `launch_run_loop_job` call site. If a later change adds rollback,
+        // this assertion is the one to update — deliberately, not silently.
+        let coord = coordinator.read().await;
+        let job_id = krishiv_proto::JobId::try_new("rloop-nolaunch-job").unwrap();
+        let jc = coord
+            .job_coordinator(&job_id)
+            .expect("the job record outlives the failed launch (known gap)");
+        let record = jc.read_record();
+        assert_eq!(
+            record.spec.task_count(),
+            3,
+            "the spec was recorded before launch was attempted"
+        );
+    }
+
+    /// Assert a registration got as far as recording its job spec and then
+    /// refused to launch, because this test coordinator's only executor has an
+    /// in-process endpoint that cannot host a run-loop subtask.
+    ///
+    /// Spelled out rather than swallowed with `let _ =`: the launch outcome is
+    /// incidental to what these upsert tests are about, but silently discarding
+    /// it would hide a real regression in the launch guard.
+    fn assert_launch_refused_for_in_process(result: Result<(), ContinuousStreamError>) {
+        match result {
+            Err(ContinuousStreamError::Unavailable(message)) => assert!(
+                message.contains("in-process executor endpoint"),
+                "expected the in-process launch refusal, got: {message}"
+            ),
+            other => panic!("expected an in-process launch refusal, got {other:?}"),
+        }
+    }
+
     /// Phase 55: re-registering the same shape is an idempotent no-op, while
     /// a parallelism change retires the old incarnation and resubmits.
     #[tokio::test]
@@ -2121,6 +2227,19 @@ mod tests {
             mode: Some(String::from("run-loop")),
             ..Default::default()
         };
+        // Fresh submit → launch attempted → refused (in-process endpoint). The
+        // job spec is recorded first, so the convergence assertions still hold.
+        assert_launch_refused_for_in_process(
+            register_continuous_stream_with_options(
+                &coordinator,
+                "rloop-upsert-job",
+                &tumbling_spec(),
+                &options,
+            )
+            .await,
+        );
+        // Same shape → no-op: not freshly submitted, so no launch is attempted
+        // and this must succeed outright.
         register_continuous_stream_with_options(
             &coordinator,
             "rloop-upsert-job",
@@ -2128,16 +2247,7 @@ mod tests {
             &options,
         )
         .await
-        .unwrap();
-        // Same shape → no-op (must not error, must keep 2 tasks).
-        register_continuous_stream_with_options(
-            &coordinator,
-            "rloop-upsert-job",
-            &tumbling_spec(),
-            &options,
-        )
-        .await
-        .unwrap();
+        .expect("re-registering an identical shape is a no-op and cannot fail");
         {
             let coord = coordinator.read().await;
             let job_id = krishiv_proto::JobId::try_new("rloop-upsert-job").unwrap();
@@ -2151,14 +2261,17 @@ mod tests {
             mode: Some(String::from("run-loop")),
             ..Default::default()
         };
-        register_continuous_stream_with_options(
-            &coordinator,
-            "rloop-upsert-job",
-            &tumbling_spec(),
-            &rescaled,
-        )
-        .await
-        .unwrap();
+        // Rescale retires the old incarnation and submits fresh, so launch is
+        // attempted again and refused again for the same reason.
+        assert_launch_refused_for_in_process(
+            register_continuous_stream_with_options(
+                &coordinator,
+                "rloop-upsert-job",
+                &tumbling_spec(),
+                &rescaled,
+            )
+            .await,
+        );
         let coord = coordinator.read().await;
         let job_id = krishiv_proto::JobId::try_new("rloop-upsert-job").unwrap();
         let jc = coord.job_coordinator(&job_id).unwrap();
