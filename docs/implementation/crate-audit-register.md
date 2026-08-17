@@ -4617,7 +4617,17 @@ what catches it.
   snapshot bytes nobody reads would reproduce F15's exact failure.
 - **Drain-after-stop contract (DUR-5).** Now load-bearing: F18 shows a real
   test depends on the current permissive behaviour.
-- **The failed-launch job-id wedge** (§34), unchanged.
+- **The failed-launch job-id wedge** (§34) — still open, but no longer a
+  guess. Both obvious fixes were built and measured (§38): keying the launch on
+  "already launched" is necessary and insufficient (the retry re-enters the
+  launch, then fails with "produced no launchable assignments", because the
+  first attempt already moved its tasks out of Assigned); rolling the
+  registration back works but breaks four tests, two of which are this crate's
+  ONLY coverage of run-loop shape-building and convergence — they read the job
+  record after a launch that necessarily fails, because the fixture registers
+  `IN_PROCESS_TASK_ENDPOINT` and a launch against it can never succeed. The
+  real requirement is a coordinator primitive returning tasks to Assigned, or a
+  fixture with a dispatchable executor. The in-code comment now records this.
 - **Conformance staged coverage** — needs the coordinator backend, i.e. a real
   multi-executor harness.
 - **Not run this session:** pod-kill proof of the F8/`70b535c` restore
@@ -4625,3 +4635,48 @@ what catches it.
 
 Gates on every commit: `cargo clippy -D warnings`, per-crate `cargo test`,
 `cargo fmt --all`.
+
+
+---
+
+## §38 — the failed-launch wedge: two candidate fixes, both measured, neither shipped
+
+No commit changes behaviour. The value here is that the §34 note stopped being
+a guess: I built both obvious fixes, ran them, and recorded what each does.
+
+**Candidate 1 — key the launch on "has this job actually been LAUNCHED".**
+Added a `run_loop_launched` set on the coordinator, cleared on both retirement
+paths, so a retry is not swallowed by the "already running what you asked for"
+no-op. It is necessary and it is not sufficient: the retry *does* re-enter the
+launch, and then fails differently — `produced no launchable assignments` —
+because the first attempt had already transitioned its tasks out of Assigned
+before dispatch failed. **Retryability needs a clean slate, not permission to
+try.** That is the fact the original note was missing.
+
+**Candidate 2 — roll the registration back on failure.** Cancel, evict, drop
+the snapshot, clear the mark, so the next attempt is a genuine fresh submit.
+This works, and it broke four existing tests. Two of them —
+`run_loop_registration_builds_parallel_subtasks` and
+`run_loop_reregistration_is_convergent` — are this crate's only coverage of
+run-loop shape-building and convergence, and they work by inspecting the job
+record *after* a launch that necessarily fails:
+`make_coordinator_with_executor` registers `IN_PROCESS_TASK_ENDPOINT`, and a
+launch against it can never succeed. Rollback deletes the record they read.
+
+So candidate 2 trades a rare, recorded wedge for permanently losing the only
+test coverage of the registration path. That is the objection the original
+note raised, and it turns out to be right for a sharper reason than it stated.
+
+**Reverted both.** What this actually needs is one of:
+- a coordinator primitive returning a job's tasks to Assigned, after which
+  candidate 1 works and the job record survives for the tests; or
+- a test fixture with a dispatchable executor, so a launch can succeed and the
+  coverage stops depending on the failure path.
+
+Both are real work. Shipping candidate 2 to close the item would have been
+trading a known bug for an unknown one — the tests would have been "fixed" by
+rewriting them around the missing record, and nothing would then notice if
+shape-building or convergence regressed.
+
+The in-code comment at the launch site now carries this evidence, so the next
+attempt starts from it.

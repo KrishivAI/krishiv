@@ -1588,17 +1588,40 @@ pub async fn register_continuous_stream_with_options(
         .map_err(ContinuousStreamError::Scheduler)?
     };
 
-    // KNOWN GAP (recorded, not fixed here): every failure path in
-    // `launch_run_loop_job` runs *after* the job spec was upserted, so a failed
-    // launch leaves the job registered with its subtasks assigned to executors
-    // that never received them. Because re-registering an identical shape is a
-    // deliberate no-op (not `freshly_submitted`), a retry cannot launch it
-    // either — the id stays wedged until an explicit deregister. Rolling the
-    // registration back here is not obviously right either: it would leave the
-    // run-loop registration path with no positive test in this crate, and
-    // "how does a failed launch become retryable" is a design question about
-    // the upsert contract, not something to settle as a side effect of fixing
-    // the acceptance guard below.
+    // KNOWN GAP (still open, but no longer a guess — both obvious fixes were
+    // built and measured, 2026-08-17):
+    //
+    // Every failure path in `launch_run_loop_job` runs *after* the job spec was
+    // upserted, so a failed launch leaves the job registered with its subtasks
+    // assigned to executors that never received them. Re-registering an
+    // identical shape is a deliberate no-op (not `freshly_submitted`), so a
+    // retry cannot launch it either — the id stays wedged until an explicit
+    // deregister.
+    //
+    // Candidate 1, key the launch on "has this job actually been LAUNCHED"
+    // rather than on `freshly_submitted`. Necessary, and insufficient: the
+    // retry does re-enter the launch, then fails differently with "produced no
+    // launchable assignments", because the first attempt already transitioned
+    // its tasks out of Assigned before dispatch failed. Retryability needs a
+    // clean slate, not permission to try.
+    //
+    // Candidate 2, roll the registration back on failure (cancel + evict +
+    // drop snapshot). This works, and it broke FOUR existing tests — including
+    // `run_loop_registration_builds_parallel_subtasks` and
+    // `run_loop_reregistration_is_convergent`, which are this crate's only
+    // coverage of run-loop shape-building and convergence. They inspect the
+    // job record *after* a launch that necessarily fails, because
+    // `make_coordinator_with_executor` registers `IN_PROCESS_TASK_ENDPOINT`
+    // and a launch against it can never succeed. Rollback deletes the record
+    // they read, so it trades a rare recorded wedge for permanently losing
+    // that coverage.
+    //
+    // What this actually needs is one of: a coordinator primitive that returns
+    // a job's tasks to Assigned so a retry can re-dispatch them (candidate 1
+    // then works and the record survives), or a test fixture with a
+    // dispatchable executor so a launch can succeed and the coverage stops
+    // depending on the failure path. Both are real work; neither is a patch to
+    // this function.
     if mode == ContinuousJobMode::RunLoop && freshly_submitted {
         launch_run_loop_job(coordinator, &job_id_typed, &options.sources).await?;
     }
