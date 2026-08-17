@@ -4140,3 +4140,178 @@ double also makes `collect_batch_sql_async` an error, so a silent fallback to
 collecting fails loudly instead of buffering unnoticed.
 
 Gates: `just lint`, `just test`, `cargo fmt --all` — green.
+
+---
+
+## §34 — streaming execution, source to sink, across three placements (2026-08-17)
+
+Read the whole streaming path — three API entry points, two distributed
+execution models, the executor fragments, the continuous registry — against
+the A–H checklist. Six parallel read-only audits plus a synthesis pass;
+every load-bearing claim re-verified by hand before acting.
+
+**One correction to my own earlier analysis, recorded because it changed what
+got edited.** I reported that `Session::stream` was capped at Cycle mode by
+the Flight `ContinuousRegister` seam. It is not: `Session::stream` never
+touches Flight. Its distributed arm goes `session.rs` →
+`RemoteStreamingJob::create` → `coordinator_http_client.rs` → POST
+`/api/v1/continuous-register`, which is the **full-options** handler. It
+yielded Cycle/1 because the *client* declared a two-field request body
+against a seven-field API. There are in fact three optionless seams funnelling
+into Cycle/1 (HTTP client, Flight action, `unified_jobs_http.rs:217`), not one.
+
+### Fixed
+
+- [x] **The bounded final flush was a guard that did nothing** (`dd47d50`).
+      `run_streaming_bounded` ended with `executor.tick(i64::MAX)` under a
+      comment claiming it closed every window. `ContinuousWindowExecutor::tick`
+      deliberately ignores its argument for tumbling/sliding (STREAM-1) and
+      flushes against the last *event-time* watermark — which the trailing
+      window's own events set, so it could never close itself. **Every bounded
+      tumbling or sliding job silently dropped its last window and reported
+      `Completed`.** Count windows were a second leg (`flush_due` returned empty
+      for them). STREAM-1 and B-4 landed at different times against one method
+      with opposite requirements; the later neutered the earlier. Added
+      `flush_all`, distinct from `tick` so they cannot be conflated again.
+      Revert-proven `left: [5], right: [5, 7]`. **Not distributed-only — this
+      was the embedded path, the most-used one.** No audit caught it; it came
+      out of the synthesis pass.
+
+- [x] **A run-loop launch that dispatched nothing reported success** (`aa4c5e1`).
+      `if accepted < responses.len()` compared two numbers that shrink together
+      — undeliverable targets are partitioned out *before* responses exist — so
+      an all-in-process executor set evaluated `0 < 0` and returned `Ok(())`
+      having launched no subtasks. Both siblings in the same file use
+      `!= target_count`. The comment above it recorded that a test drove the
+      relaxation, and then every run-loop test in the file inherited the hole,
+      because they all build in-process coordinators. Fixed both legs (count
+      comparison + in-process rejection). All three tests report `got Ok(())`
+      against the pre-fix code.
+
+- [x] **Bounded distributed streaming truncated at 256 batches** (`b5d840f`).
+      `run_streaming_job_via_runtime` buffered the whole source, pushed once,
+      drained once — but a drain consumes at most `DEFAULT_MAX_DRAIN_BATCHES`.
+      Everything past it stayed queued forever with the job `Completed`. With
+      CSV's 1024-row batches that is **silent data loss from row 262,145**,
+      silent up to ~1M rows where QueueFull finally fires. Framed as a memory
+      problem; it was a correctness one. Now pushes/drains in bounded cycles
+      with the bound *derived from* the drain cap so they cannot drift.
+      Revert-proven `saw [293]` against a cap of 256. Also corrected
+      `drain_job`'s doc comment, which told callers to loop until the output is
+      empty — that terminates early and is how a caller silently truncates its
+      own source.
+
+- [x] **The `stream-kafka:` path was dead and armed** (`ed54bf5`). Sole encoder
+      had zero callers outside its own tests, across every file type. The
+      executor branch was therefore unreachable — but when it fired it
+      **overwrote the compiled plan's `key_column`/`event_time_column` with the
+      literals "key"/"ts"**, i.e. ran a different query than the one compiled.
+      Deleted parser, rewrite, and encoder together: removing the parser alone
+      would have made the clobber unconditional; removing it without a
+      replacement reader would have produced `Ok(0 rows)/Succeeded`. Branch now
+      reads `InlineIpc`. The 9 fixture tests are ported to real Arrow batches
+      rather than deleted — they had been asserting on a format no coordinator
+      produces, using the very column names the rewrite wrote.
+
+- [x] **`Session::stream` could not ask for the run-loop engine** (`054a064`).
+      Client body declared `{job_id, spec}` against a seven-field handler.
+      Added `ContinuousRegisterOptions` (`run_loop`/`with_checkpointing`/
+      `with_source`), all `skip_serializing_if` so defaults serialise to a
+      byte-identical body. Fails closed outside distributed mode rather than
+      quietly running the single-subtask loop. Revert-proven
+      `left: Null, right: "run-loop"`. Also fixed `stream_async` resolving the
+      coordinator URL with `coordinator_grpc_url()` and handing it to a
+      function that treats it as an HTTP base.
+
+### Found, NOT fixed — recorded with what each needs
+
+- [ ] **The Flight `ContinuousRegister` seam is still optionless.** Reached from
+      `Session::submit` (not `stream`). Needs the additive `options` field on
+      `ContinuousRegisterBody`, all four `FlightHost::register_continuous_stream`
+      call sites, and — critically — **a non-empty server response the client
+      verifies**. There is no `deny_unknown_fields` anywhere in the repo, so a
+      new client asking for parallelism 8 against an old coordinator gets a
+      success that registered Cycle/1, and the register arm currently returns
+      `Ok(Vec::new())` unconditionally, so there is no echo to check. Without
+      the echo this is a feature that lies. A new action *variant* does not help:
+      `do_action_fallback` dispatches on the body's `kind`, and an unknown
+      variant fails as `invalid_argument`, which `is_server_unimplemented` does
+      not match. `unified_jobs_http.rs:217` is a third optionless seam.
+
+- [ ] **`Session::submit_streaming` still rejects distributed placement.**
+      Should route to run-loop when every source maps to an executor-owned
+      `ContinuousRegistrySource` and every sink to a `ContinuousSinkSpec`, and
+      fail naming the offending source otherwise. Blocked on the Flight leg.
+      Validate that neither `kind` nor `table` contains `':'` — sources are
+      flattened to `registry-connector:<kind>:<table>:<json>` and re-parsed by
+      splitting on `':'`. Keep the H-22 policy check above the mode dispatch.
+
+- [ ] **A failed run-loop launch wedges the job id.** Every failure path runs
+      after the spec is upserted, so the job stays registered with subtasks
+      assigned, and an identical re-registration is a deliberate no-op — so it
+      can never launch on retry. Rolling back is not obviously right (it would
+      leave run-loop registration with no positive test in this crate); making a
+      failed launch retryable is a design question about the upsert contract.
+      Pinned by an assertion so a later fix must update it deliberately.
+
+- [ ] **Two run-loop dial divergences.** `run_loop.rs` computes
+      `idle_floor.max(fallback_tick)` where the floor is 50 µs and the tick 5 ms,
+      so the max is *always* 5 ms and `RLOOP_IDLE_FLOOR_US` has no other use,
+      while the module doc claims a microsecond floor. And the idle tick fires
+      only when the *combined* input is empty, so a subtask with one chatty and
+      one silent split never ticks — the embedded loop ticks whenever its reader
+      yields `None`.
+
+- [ ] **DUR-5 remains open, plus two confirmed bugs beside it.**
+      `return_continuous_stream_payloads` is mode-blind: for a run-loop job it
+      unshifts into `job_inline_results`, which no drain of that job reads — the
+      exact loss the unshift machinery exists to prevent, plus a RAM leak. And
+      `drain_run_loop_output` `?`s on executor N+1 and discards everything
+      already collected from N, with no put-back RPC. Persisting inline results
+      before ack is *rejected*: the obvious store is a single un-chunked etcd
+      value against a ~1.5 MiB ceiling while the drain budget is 48 MiB, the
+      handle drops writes on a full channel, and the map is shared with IVM,
+      which stuffs a non-Arrow blob down it. Fail-closed admission is right but
+      must land *after* the Flight leg, or it takes Flight streaming from lossy
+      to non-functional (100% of Flight-registered jobs are Cycle-with-no-sink).
+
+- [ ] **Cycle's missing idle watermark tick is inherent, not a bug to close.**
+      Each push launches a fresh task assignment round, so between pushes there
+      is no live thread to own wall clock. Adding one means putting wall clock
+      in the control plane. Run-loop already ticks through the same shared dial
+      as the embedded loop. The answer to Cycle's gap is to make run-loop
+      reachable and demote Cycle, not to fake a tick.
+
+### Known-broken in run-loop, deliberately untouched — schedule before pointing traffic at it
+
+Making run-loop reachable promotes a less-tested path. These are verified and
+must not be read as covered by a green suite: fresh-process restore does a
+job-keyed `pending_restores.remove`, so the first subtask to construct its
+executor consumes the whole entry and siblings start empty; key-group routing
+hashes `to_be_bytes` while the operator persists the key as ASCII decimal, so
+a redistributing restore leaves subtasks holding state for keys they will
+never see; `route_batch_by_key_group` handles only Utf8/Int64 while
+Int32/Float64/Bool are declared-legal key types, and the rest are treated as
+"fully owned" by whichever subtask wins the race; egress is a 512-batch
+drop-oldest ring — silent loss under backpressure alone.
+
+**Also unverified and important:** whether the out-of-repo platform pipeline
+reconciler posts `mode: "run-loop"` today. If it does, run-loop is already
+live in production while every in-repo Rust caller got Cycle — which makes the
+list above urgent rather than pre-emptive. Nothing in this repo can answer it.
+
+### Test-harness honesty problem found while working
+
+`mode_conformance.rs`'s `make_flight_sql_server` builds
+`FlightExecutionHost::from_env()`, which is hardcoded to `Self::embedded()`.
+So the "distributed" conformance harness compares in-process DataFusion
+against in-process DataFusion over a socket. Its own guard asserts
+`remote.execution_runtime().uses_remote_execution()` — the *client's*
+placement, not the server's backend — under a message saying "or this harness
+silently compares embedded against embedded — the exact failure it was written
+to end". It passes while doing exactly that. A real harness needs
+`FlightExecutionHost::with_coordinator` over a live `Coordinator` +
+`ExecutorTaskRunner`, and belongs in krishiv-runtime (krishiv-api has no
+krishiv-executor dependency).
+
+Gates on every commit: `just lint`, per-crate `cargo test`, `cargo fmt --all`.
