@@ -260,4 +260,5 @@ mod executor_tests {
     include!("sections/run_loop_v2.rs.inc");
     include!("sections/state_v2.rs.inc");
     include!("sections/recovery.rs.inc");
+    include!("sections/loop_conformance.rs.inc");
 }
