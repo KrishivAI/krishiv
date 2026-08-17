@@ -506,6 +506,18 @@ pub(crate) async fn execute_run_loop_fragment(
     let key_column = window_spec.key_column.clone();
     let event_time_column = window_spec.event_time_column.clone();
 
+    // Phase 56: restore-time key-group redistribution routes by the job's
+    // declared parallelism, not by however many subtasks this process hosts.
+    //
+    // Published BEFORE the executor becomes visible in `loop_executors`. It
+    // used to be set afterwards, so a RestoreFromCheckpointCommand landing in
+    // that window found the executor but not the parallelism, and fell back to
+    // the local subtask count — redistributing into the wrong number of
+    // buckets and scattering state to subtasks that do not own it.
+    runner
+        .rloop_parallelism
+        .insert(job_id.to_owned(), parsed.parallelism);
+
     // Build (or reattach to) this subtask's stateful window executor. Keyed by
     // (job, subtask) — the H-6 fix: sibling subtasks never collide.
     let executor_arc = {
@@ -521,10 +533,56 @@ pub(crate) async fn execute_run_loop_fragment(
                 .map_err(|e| ExecutorError::InvalidAssignment {
                     message: format!("stream:rloop failed to create window executor: {e}"),
                 })?;
-                if let Some((_, restored)) = runner.pending_restores.remove(job_id) {
-                    let mut non_empty = restored.snapshots.iter().filter(|b| !b.is_empty());
-                    if let Some(first) = non_empty.next() {
-                        exec.restore_from_snapshot(first).map_err(|e| {
+                // The coordinator stashes the WHOLE job's per-task snapshots
+                // under the bare job id, but this closure runs once per
+                // (job, subtask). A job-keyed `remove` therefore handed the
+                // entire checkpoint to whichever sibling constructed first —
+                // which loaded snapshot[0] into itself and merged every other
+                // subtask's state into itself too — and left every sibling
+                // with nothing.
+                //
+                // The result was a silent wrong answer, not a crash: the
+                // greedy subtask holds accumulators for key groups it does not
+                // own, so no post-restore row for those keys ever reaches it,
+                // yet it still flushes them when its own watermark passes.
+                // Meanwhile the true owner restarts those keys from zero. Each
+                // affected (key, window) emits twice, both values wrong, and
+                // the greedy subtask re-persists the foreign key groups at its
+                // next barrier, making the corruption durable.
+                //
+                // Route by key group at the job's DECLARED parallelism and load
+                // only this subtask's share — the same contract the live
+                // restore path uses. `get` rather than `remove`: every sibling
+                // in this process needs the same entry.
+                if let Some(restored) = runner
+                    .pending_restores
+                    .get(job_id)
+                    .map(|entry| entry.value().clone())
+                {
+                    let shares = krishiv_state::redistribute_snapshots(
+                        &restored.snapshots,
+                        parsed.parallelism as u32,
+                        krishiv_state::EntryRouting::WindowGroupKey,
+                    )
+                    .map_err(|e| ExecutorError::LocalExecution {
+                        message: format!(
+                            "stream:rloop key-group redistribution of epoch {} failed: {e}",
+                            restored.epoch
+                        ),
+                    })?;
+                    let share = shares.get(parsed.subtask).ok_or_else(|| {
+                        ExecutorError::LocalExecution {
+                            message: format!(
+                                "stream:rloop subtask {} is outside the redistribution range \
+                                 for parallelism {}",
+                                parsed.subtask, parsed.parallelism
+                            ),
+                        }
+                    })?;
+                    // An empty share means this subtask owns no checkpointed
+                    // key group; the decoder rejects empty bytes, so skip it.
+                    if !share.is_empty() {
+                        exec.restore_from_snapshot(share).map_err(|e| {
                             ExecutorError::LocalExecution {
                                 message: format!(
                                     "stream:rloop restore from epoch {} failed: {e}",
@@ -532,16 +590,6 @@ pub(crate) async fn execute_run_loop_fragment(
                                 ),
                             }
                         })?;
-                        for rest in non_empty {
-                            exec.merge_snapshot(rest).map_err(|e| {
-                                ExecutorError::LocalExecution {
-                                    message: format!(
-                                        "stream:rloop merge restore from epoch {} failed: {e}",
-                                        restored.epoch
-                                    ),
-                                }
-                            })?;
-                        }
                     }
                 }
                 Ok::<_, ExecutorError>(Arc::new(Mutex::new(exec)))
@@ -565,11 +613,6 @@ pub(crate) async fn execute_run_loop_fragment(
     runner
         .task_state_bindings
         .insert(task_id.clone(), TaskStateBinding::Window(state_key.clone()));
-    // Phase 56: restore-time key-group redistribution routes by the job's
-    // declared parallelism, not by however many subtasks this process hosts.
-    runner
-        .rloop_parallelism
-        .insert(job_id.to_owned(), parsed.parallelism);
     // Egress buffer + input notifies must exist before the first push races us.
     runner
         .continuous_outputs
@@ -920,6 +963,11 @@ pub(crate) async fn execute_run_loop_fragment(
     }
 
     runner.task_state_bindings.remove(&task_id);
+    // The restore entry is read, not consumed, by the executor constructor
+    // (every sibling subtask needs it), so drop it at teardown. Otherwise a
+    // job re-created with the same deterministic id would be silently seeded
+    // from the dead incarnation's checkpoint.
+    runner.pending_restores.remove(job_id);
     let _ = runner
         .inbox
         .clear_cancelled_task(assignment.job_id(), assignment.task_id());

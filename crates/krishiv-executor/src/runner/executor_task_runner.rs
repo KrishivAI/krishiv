@@ -1810,11 +1810,24 @@ impl ExecutorTaskRunner {
         let snapshots =
             crate::runner::task_runner::materialize_portable_snapshots(snapshots, storage)?;
 
-        // Run-loop subtask executors key by `{job}#<subtask>`. With exactly
-        // one local subtask the restore applies directly; with several, the
-        // per-subtask snapshot↔key-group redistribution is Phase 56 scope
-        // (rescaling) — stash the snapshots and surface the gap loudly
-        // instead of merging sibling key-groups into the wrong operator.
+        // Run-loop subtask executors key by `{job}#<subtask>`. Every restore
+        // goes through key-group redistribution, however many subtasks this
+        // process happens to host.
+        //
+        // There used to be a `rloop_execs.len() == 1` fast path that applied
+        // the WHOLE job's snapshot set to the single local subtask, on the
+        // reasoning that one local subtask means the restore "applies
+        // directly". That is only true when the JOB's parallelism is 1 — and
+        // the normal deployment is one subtask per executor process, which is
+        // exactly when the fast path fired. Every node then loaded the full
+        // job state, so after a restore all N subtasks held all key groups and
+        // each re-emitted the full pre-checkpoint aggregate: N duplicated
+        // window rows, and the duplication persisted at the next barrier.
+        // `rloop_parallelism` was already available three lines below but the
+        // branch never consulted it.
+        //
+        // Redistribution at parallelism 1 is an identity union, so genuinely
+        // single-subtask jobs are unaffected by routing everything through it.
         let rloop_prefix = format!("{job_id}#");
         let rloop_execs: Vec<_> = self
             .loop_executors
@@ -1834,17 +1847,7 @@ impl ExecutorTaskRunner {
             )
             .map_err(|e| restore_err(format!("restore window state for {job_id}: {e}")))?;
             self.pending_restores.remove(job_id);
-        } else if rloop_execs.len() == 1 {
-            let Some(loop_exec) = rloop_execs.into_iter().next() else {
-                unreachable!("len checked above");
-            };
-            apply_snapshots_to_state(
-                &CheckpointStateHandle::ContinuousWindow(loop_exec),
-                &snapshots,
-            )
-            .map_err(|e| restore_err(format!("restore run-loop state for {job_id}: {e}")))?;
-            self.pending_restores.remove(job_id);
-        } else if rloop_execs.len() > 1 {
+        } else if !rloop_execs.is_empty() {
             // Phase 56: key-group redistribution — every checkpointed entry
             // is routed to the subtask that owns its key group at the JOB's
             // parallelism, then each locally hosted subtask loads its share.
