@@ -945,6 +945,17 @@ async fn push_run_loop_input(
 
 /// Drain a run-loop job's egress: fan `drain_continuous_output` out to each
 /// distinct executor hosting a subtask and concatenate the IPC payloads.
+///
+/// **Partial success is success.** `drain_continuous_output` CLEARS the
+/// executor's egress buffer as it reads it, so a payload collected from
+/// executor N no longer exists anywhere else. Failing the whole call because
+/// executor N+1 timed out therefore does not retry N -- it destroys N's output.
+/// This used to `?` on each RPC and drop everything already collected.
+///
+/// So: return what was collected and log the endpoints that failed; the caller
+/// drains again and picks up the rest. Only a drain that collected *nothing*
+/// surfaces the error, since there is no data to lose and the caller needs to
+/// know the cluster is unreachable.
 async fn drain_run_loop_output(
     coordinator: &SharedCoordinator,
     job_id: &JobId,
@@ -954,6 +965,8 @@ async fn drain_run_loop_output(
     let channels = coordinator.read().await.executor_channels.clone();
     let mut seen_endpoints = std::collections::BTreeSet::new();
     let mut payloads = Vec::new();
+    let mut first_error: Option<ContinuousStreamError> = None;
+    let mut failed_endpoints: Vec<String> = Vec::new();
     for (task_id, endpoint) in targets {
         if !seen_endpoints.insert(endpoint.clone()) {
             continue;
@@ -961,9 +974,14 @@ async fn drain_run_loop_output(
         if crate::is_in_process_task_endpoint(&endpoint) {
             continue;
         }
-        let channel = Coordinator::get_or_connect_channel_on_map(&channels, &endpoint)
-            .await
-            .map_err(ContinuousStreamError::Scheduler)?;
+        let channel = match Coordinator::get_or_connect_channel_on_map(&channels, &endpoint).await {
+            Ok(channel) => channel,
+            Err(error) => {
+                first_error.get_or_insert(ContinuousStreamError::Scheduler(error));
+                failed_endpoints.push(endpoint.clone());
+                continue;
+            }
+        };
         let max = krishiv_proto::max_grpc_message_bytes();
         let mut client = wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
             channel,
@@ -977,7 +995,7 @@ async fn drain_run_loop_output(
             job_id: job_id.clone(),
             task_id: TaskId::try_new(&task_id).map_err(|e| invalid_registration(e.to_string()))?,
         };
-        let response = tokio::time::timeout(
+        let rpc = tokio::time::timeout(
             RUN_LOOP_RPC_TIMEOUT,
             client.drain_continuous_output(wire::drain_continuous_output_request_to_wire(request)),
         )
@@ -987,18 +1005,43 @@ async fn drain_run_loop_output(
                 "run-loop drain from {endpoint} timed out after {}s",
                 RUN_LOOP_RPC_TIMEOUT.as_secs()
             ))
-        })?
-        .map_err(|status| {
-            ContinuousStreamError::Unavailable(format!(
-                "run-loop drain from {endpoint} failed: {status}"
-            ))
-        })?
-        .into_inner();
-        let decoded = wire::drain_continuous_output_response_from_wire(response)
-            .map_err(|e| invalid_registration(e.to_string()))?;
-        if !decoded.ipc_bytes.is_empty() {
-            payloads.push(decoded.ipc_bytes);
+        })
+        .and_then(|result| {
+            result.map_err(|status| {
+                ContinuousStreamError::Unavailable(format!(
+                    "run-loop drain from {endpoint} failed: {status}"
+                ))
+            })
+        })
+        .and_then(|response| {
+            wire::drain_continuous_output_response_from_wire(response.into_inner())
+                .map_err(|e| invalid_registration(e.to_string()))
+        });
+        match rpc {
+            Ok(decoded) => {
+                if !decoded.ipc_bytes.is_empty() {
+                    payloads.push(decoded.ipc_bytes);
+                }
+            }
+            Err(error) => {
+                first_error.get_or_insert(error);
+                failed_endpoints.push(endpoint.clone());
+            }
         }
+    }
+    if let Some(error) = first_error {
+        if payloads.is_empty() {
+            return Err(error);
+        }
+        // Data in hand outranks the error: these payloads exist nowhere else.
+        tracing::warn!(
+            job_id = %job_id,
+            failed_endpoints = ?failed_endpoints,
+            collected = payloads.len(),
+            %error,
+            "run-loop drain was partial; returning what was collected because the \
+             executors' egress buffers were already cleared. Re-drain for the rest."
+        );
     }
     Ok(payloads)
 }
@@ -1890,6 +1933,26 @@ pub async fn return_continuous_stream_payloads(
         })
     })?;
     let mut coord = coordinator.write().await;
+    // Refuse for run-loop jobs rather than write somewhere nothing reads.
+    //
+    // `drain_continuous_stream_coordinated` returns early for a run-loop job
+    // and serves its executors' egress buffers; `job_inline_results` is the
+    // *cycle* model's store. This function had no mode check, so a run-loop
+    // put-back landed in a map no drain of that job would ever consult — the
+    // exact consume-once loss the unshift machinery exists to prevent, plus a
+    // map that grows until job teardown. Failing loudly is the honest answer:
+    // there is no put-back RPC to executor egress, so the payloads genuinely
+    // cannot be returned, and pretending otherwise loses them silently.
+    if run_loop_targets(&coord, &job_id_typed)
+        .map_err(ContinuousStreamError::Scheduler)?
+        .is_some()
+    {
+        return Err(ContinuousStreamError::Unavailable(format!(
+            "continuous job {job_id} runs the run-loop model, whose output is served from \
+             executor egress rather than the coordinator's inline result store; drained \
+             payloads cannot be returned to it. Re-drain instead."
+        )));
+    }
     coord.unshift_job_inline_results(&job_id_typed, payloads);
     Ok(())
 }
@@ -2215,6 +2278,59 @@ mod tests {
             ),
             other => panic!("expected an in-process launch refusal, got {other:?}"),
         }
+    }
+
+    /// A run-loop job's drained payloads must never be "returned" into the
+    /// cycle model's inline result store.
+    ///
+    /// `drain_continuous_stream_coordinated` serves run-loop output from
+    /// executor egress and never reads `job_inline_results`, but
+    /// `return_continuous_stream_payloads` unshifted into that map with no mode
+    /// check. A put-back for a run-loop job therefore wrote data into a
+    /// structure no drain of that job would ever consult: the consume-once loss
+    /// the unshift machinery exists to prevent, plus a map that grows until
+    /// teardown. Refusing is the honest answer — there is no put-back RPC to
+    /// executor egress, so the payloads genuinely cannot be returned.
+    #[tokio::test]
+    async fn run_loop_payloads_are_not_returned_into_the_cycle_inline_store() {
+        let coordinator = make_coordinator_with_executor("rloop-putback").await;
+        let options = ContinuousRegistrationOptions {
+            parallelism: Some(2),
+            mode: Some(String::from("run-loop")),
+            ..Default::default()
+        };
+        assert_launch_refused_for_in_process(
+            register_continuous_stream_with_options(
+                &coordinator,
+                "rloop-putback-job",
+                &tumbling_spec(),
+                &options,
+            )
+            .await,
+        );
+
+        let error = return_continuous_stream_payloads(
+            &coordinator,
+            "rloop-putback-job",
+            vec![b"some-drained-ipc".to_vec()],
+        )
+        .await
+        .expect_err("a run-loop put-back must be refused, not silently misfiled");
+        assert!(
+            matches!(error, ContinuousStreamError::Unavailable(_)),
+            "expected Unavailable, got {error:?}"
+        );
+
+        // And nothing was written: the store the cycle model drains stays empty.
+        let job_id = krishiv_proto::JobId::try_new("rloop-putback-job").unwrap();
+        let mut coord = coordinator.write().await;
+        assert!(
+            coord
+                .take_job_inline_results(&job_id)
+                .unwrap_or_default()
+                .is_empty(),
+            "the refused put-back must leave the inline result store untouched"
+        );
     }
 
     /// Phase 55: re-registering the same shape is an idempotent no-op, while
