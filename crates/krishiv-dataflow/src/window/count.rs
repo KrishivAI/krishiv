@@ -62,6 +62,15 @@ struct KeyState {
     buf: VecDeque<RowContrib>,
     /// Global row index of the first row in the buffer.
     window_start_row: u64,
+    /// Exclusive global row index through which some emitted window already
+    /// covered this key's rows.
+    ///
+    /// With `slide == size` the buffer is empty after each emit, so an
+    /// end-of-stream flush can only ever see fresh rows. With `slide < size`
+    /// the windows OVERLAP and the buffer deliberately retains `size - slide`
+    /// rows that were already emitted as part of the last full window —
+    /// flushing the buffer wholesale counts them a second time.
+    emitted_through_row: u64,
 }
 
 /// Count-based window operator.
@@ -123,6 +132,7 @@ impl CountWindowOperator {
                 .or_insert_with(|| KeyState {
                     buf: VecDeque::new(),
                     window_start_row: global_row,
+                    emitted_through_row: global_row,
                 });
 
             // Compute the single-row contribution and push it.
@@ -157,6 +167,7 @@ impl CountWindowOperator {
                     state.buf.pop_front();
                 }
                 state.window_start_row = window_start + self.spec.slide;
+                state.emitted_through_row = state.emitted_through_row.max(window_end);
             }
         }
 
@@ -176,6 +187,14 @@ impl CountWindowOperator {
             }
             let window_start = state.window_start_row;
             let window_end = window_start.saturating_add(state.buf.len() as u64);
+            // Emit only if the buffer reaches PAST what an emitted window
+            // already covered. For `slide == size` this is always true (the
+            // buffer holds only fresh rows). For `slide < size` the retained
+            // overlap has already been counted, and re-emitting it double-counts
+            // every row in the tail.
+            if window_end <= state.emitted_through_row {
+                continue;
+            }
             let merged = fold_agg_states(state.buf.iter().map(|c| &c.agg), &self.spec.agg_exprs)?;
             output.push(build_count_window_record_batch(
                 &self.output_schema,
@@ -320,6 +339,58 @@ fn build_count_window_record_batch(
     }
     RecordBatch::try_new(schema.clone(), columns)
         .map_err(|e| ExecError::Arrow(format!("build count window batch: {e}")))
+}
+
+#[cfg(test)]
+mod slide_overlap_tests {
+    use super::*;
+
+    /// An end-of-stream flush must not re-emit rows an earlier window already
+    /// counted.
+    ///
+    /// With `slide < size` the windows overlap and the buffer deliberately
+    /// retains `size - slide` ALREADY-EMITTED rows so the next window can
+    /// include them. Flushing the buffer wholesale counts those rows twice.
+    /// Every existing count test uses `slide == size`, where the buffer is
+    /// empty after an emit — so none of them could see this.
+    #[test]
+    fn end_of_stream_flush_does_not_recount_the_overlapping_tail() {
+        let spec = CountWindowSpec {
+            key_column: String::from("k"),
+            key_column_type: String::from("utf8"),
+            size: 3,
+            slide: 1,
+            agg_exprs: vec![crate::AggExpr {
+                filter: None,
+                function: crate::AggFunction::Count,
+                input_column: String::new(),
+                output_column: String::from("n"),
+            }],
+            agg_is_float: vec![false],
+        };
+        let mut op = CountWindowOperator::new(spec).expect("operator");
+
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["a", "a", "a"])) as _],
+        )
+        .expect("batch");
+
+        let emitted = op.process_batch(&batch).expect("process");
+        assert_eq!(emitted.len(), 1, "3 rows at size=3 emit exactly one window");
+
+        let flushed = op.flush().expect("flush");
+        assert!(
+            flushed.is_empty(),
+            "the 2 rows still buffered were already counted by window [0,3); \
+             re-emitting them double-counts the tail (got {} extra window(s))",
+            flushed.len()
+        );
+    }
 }
 
 #[cfg(test)]

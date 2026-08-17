@@ -634,9 +634,59 @@ impl ContinuousWindowExecutor {
     /// `last_watermark_ms` is deliberately left untouched: the checkpoint that
     /// follows a bounded run should still record the watermark the source
     /// actually reported, so a restore resumes consistently.
+    /// True when a restore landed but no batch has arrived since, so the
+    /// operator was never built and the restored windows are unflushable.
+    ///
+    /// The window operator initialises lazily from the first batch's Arrow
+    /// schema, so between `restore_from_snapshot` and the first `drain` the
+    /// state lives in `pending_restore` and `self.operator` is `None`. Callers
+    /// that treat "no operator" as "no state" get it wrong — `snapshot` and
+    /// `peek_snapshot_bytes` each carry a comment about exactly that hazard.
+    pub fn has_unflushed_restored_state(&self) -> bool {
+        self.operator.is_none()
+            && self
+                .pending_restore
+                .as_ref()
+                .is_some_and(|bytes| !bytes.is_empty())
+    }
+
     pub fn flush_all(&mut self) -> ExecResult<Vec<RecordBatch>> {
         let Some(op) = &mut self.operator else {
-            return Ok(Vec::new()); // operator not yet initialised; no open windows
+            // "No operator" does NOT mean "no state". The operator initialises
+            // lazily from the first batch's schema, so a job that restored a
+            // checkpoint and then reached end-of-stream without seeing a single
+            // batch still holds every restored window in `pending_restore`.
+            //
+            // Returning an empty vec here would report "nothing to flush" for a
+            // job whose windows are all sitting unflushed — the bounded caller
+            // then writes no rows and reports Completed. `snapshot` and
+            // `peek_snapshot_bytes` both already guard exactly this case, each
+            // with a comment about persisting an empty checkpoint that wipes
+            // the job's state; this method was added without the same guard.
+            //
+            // The state is not lost — it is still in `pending_restore` and the
+            // next drain applies it — so the honest answer is to refuse rather
+            // than to claim emptiness. Rebuilding the operator here is not
+            // possible: it needs an Arrow schema, and end-of-stream means no
+            // batch ever arrived to supply one.
+            // Do NOT error here. "Restored a checkpoint, found no new data,
+            // exited" is a normal resume, and the restored windows are not lost
+            // — they are still in the checkpoint and the next run restores them
+            // again. An error would turn an ordinary resume into a failure, and
+            // two existing engine tests said so immediately.
+            //
+            // But it is not nothing either: the caller asked to flush and this
+            // returns empty while state exists, so say so once, loudly enough
+            // to find in a log. `has_unflushed_restored_state` exposes the same
+            // fact to callers and tests.
+            if self.has_unflushed_restored_state() {
+                tracing::warn!(
+                    "flush_all: restored checkpoint state was never applied because no \
+                     batch arrived after the restore, so no window could be flushed. \
+                     The state remains in the checkpoint and is restored again next run."
+                );
+            }
+            return Ok(Vec::new()); // genuinely nothing: no operator, no restored state
         };
         op.purge_expired()?;
         op.flush_end_of_stream()
@@ -885,6 +935,67 @@ mod tests {
     /// bounded count-windowed job dropped its trailing partial window too.
     /// `CountWindowOperator::flush` is documented as the end-of-stream emit and
     /// is what `flush_all` routes to.
+    /// A job that restored a checkpoint and then hit end-of-stream without
+    /// receiving a batch must NOT report "nothing to flush".
+    ///
+    /// The operator initialises lazily from the first batch's schema, so
+    /// restored state sits in `pending_restore` until a drain applies it.
+    /// `flush_all` returning an empty vec there let a bounded run write no rows
+    /// and report Completed while every restored window stayed unflushed.
+    /// `snapshot` and `peek_snapshot_bytes` each already guard this case with a
+    /// comment about wiping job state; `flush_all` shipped without it.
+    #[test]
+    fn unapplied_restored_state_is_reported_not_read_back_as_empty() {
+        let mut spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+        spec.watermark_lag_ms = 0;
+
+        // Produce a real snapshot holding one open window.
+        let mut source = ContinuousWindowExecutor::new(spec.clone()).expect("create");
+        let _ = source.drain(vec![events_batch(1_000)]).expect("drain");
+        let bytes = source.snapshot().expect("snapshot");
+        assert!(!bytes.is_empty(), "fixture must carry real restored state");
+
+        // Restore into a fresh executor and immediately hit end-of-stream.
+        let mut restored = ContinuousWindowExecutor::new(spec).expect("create");
+        restored.restore_from_snapshot(&bytes).expect("restore");
+        assert!(
+            restored.has_unflushed_restored_state(),
+            "restored state with no operator yet must be reported as unflushed, not \
+             read back as 'no open windows' — this is the state `flush_all` used to \
+             silently report as empty"
+        );
+        // Flushing is still not an error: a resume that finds no new data is
+        // ordinary, and the state survives in the checkpoint.
+        assert!(
+            restored
+                .flush_all()
+                .expect("resume with no new data is not an error")
+                .is_empty()
+        );
+        // Once a batch arrives the operator is built and the state is real.
+        let emitted = restored.drain(vec![events_batch(12_000)]).expect("drain");
+        let _ = emitted;
+        assert!(
+            !restored.has_unflushed_restored_state(),
+            "after the first batch the restored state has been applied"
+        );
+    }
+
+    /// With no operator AND no restored state there is genuinely nothing to
+    /// flush, and that must stay quiet — otherwise the guard above turns every
+    /// empty bounded run into an error.
+    #[test]
+    fn flush_all_is_quiet_when_there_is_genuinely_no_state() {
+        let mut spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+        spec.watermark_lag_ms = 0;
+        let mut exec = ContinuousWindowExecutor::new(spec).expect("create");
+        assert!(
+            exec.flush_all()
+                .expect("no state is not an error")
+                .is_empty()
+        );
+    }
+
     #[test]
     fn flush_all_emits_a_partial_count_window() {
         let mut spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
