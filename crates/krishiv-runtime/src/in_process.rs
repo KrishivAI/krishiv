@@ -528,6 +528,11 @@ impl InProcessStreamingRuntime {
     /// persist is fire-and-forget and does not block the caller; a missing store
     /// or a snapshot failure is silently ignored so drain is never degraded by
     /// persistence failures.
+    /// Close every open window because the bounded source is exhausted.
+    pub fn flush_continuous_job(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
+        self.continuous_registry.flush_job(job_id)
+    }
+
     pub fn drain_continuous_job(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
         let batches = self.continuous_registry.drain_job(job_id)?;
         // Snapshot and persist window state after each successful drain.

@@ -88,6 +88,11 @@ impl InProcessCluster {
         self.inner.drain_continuous_job(job_id)
     }
 
+    /// Close every open window on a continuous job (bounded end-of-stream).
+    pub fn flush_continuous_job(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
+        self.inner.flush_continuous_job(job_id)
+    }
+
     /// List registered continuous job ids.
     pub fn list_continuous_jobs(&self) -> Vec<String> {
         self.inner.list_continuous_jobs()

@@ -371,6 +371,38 @@ impl ContinuousStreamRegistry {
         self.drain_job_up_to(job_id, Self::DEFAULT_MAX_DRAIN_BATCHES)
     }
 
+    /// Close every open window because the source is exhausted.
+    ///
+    /// `drain_job` only emits windows the watermark has passed, so a bounded
+    /// source whose final events fall inside a window nothing later closes
+    /// leaves that window unflushed — the job writes a partial answer and
+    /// reports success. This is the registry-level counterpart of
+    /// `ContinuousWindowExecutor::flush_all`, which until now had exactly one
+    /// caller (the embedded engine) and no route for anything driving the
+    /// registry.
+    pub fn flush_job(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
+        let entry = self
+            .jobs
+            .get(job_id)
+            .ok_or_else(|| ContinuousStreamError::JobNotFound {
+                job_id: job_id.to_owned(),
+            })?;
+        let mut exec = entry
+            .executor
+            .lock()
+            .map_err(|_| ContinuousStreamError::LockPoisoned {
+                job_id: job_id.to_owned(),
+                component: "executor",
+                operation: "flush_job",
+            })?;
+        exec.flush_all()
+            .map_err(|error| ContinuousStreamError::Execution {
+                job_id: job_id.to_owned(),
+                message: error.to_string(),
+            })
+            .map_err(Into::into)
+    }
+
     /// Borrow the window spec for coordinator fragment encoding.
     pub fn job_spec(&self, job_id: &str) -> RuntimeResult<WindowExecutionSpec> {
         let entry = self

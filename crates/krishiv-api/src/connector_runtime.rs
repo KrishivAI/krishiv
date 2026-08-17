@@ -151,6 +151,37 @@ pub async fn run_streaming_job_via_runtime(
     // partial chunk gets pushed and its closed windows never collected.
     push_drain_write(std::mem::take(&mut chunk), &mut writers).await?;
 
+    // End of stream: close every window the watermark never reached.
+    //
+    // A drain only emits windows the watermark has passed, so a bounded source
+    // whose final events fall inside a window nothing later closes leaves that
+    // window unflushed and this job writes a partial answer while reporting
+    // Completed. The embedded engine got this fix (`flush_all`); this path is
+    // its sibling and did not, so the same silent truncation lived on here.
+    match runtime.flush_continuous_stream(&job.name) {
+        Ok(final_windows) => {
+            for batch in &final_windows {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                for writer in writers.iter_mut() {
+                    writer.write(ChangelogBatch::inserts(batch.clone())).await?;
+                }
+            }
+        }
+        Err(error) if matches!(error, krishiv_runtime::RuntimeError::Unsupported { .. }) => {
+            // Named, not swallowed: this runtime has no flush route, so the
+            // trailing window is genuinely omitted and the operator should know
+            // rather than read a clean Completed and assume the output is whole.
+            tracing::warn!(
+                job = %job.name,
+                %error,
+                "bounded streaming finished without an end-of-stream flush; any window                  the watermark never passed is NOT in the output"
+            );
+        }
+        Err(error) => return Err(EngineError::Runtime(error.to_string())),
+    }
+
     for writer in &mut writers {
         writer.flush().await?;
     }
@@ -2251,6 +2282,59 @@ mod tests {
             log.last(),
             Some(&SeamEvent::Drain),
             "the run must end on a drain, not a push"
+        );
+    }
+
+    /// A bounded source whose events all fall in ONE window, with nothing later
+    /// to advance the watermark past it, must still emit that window.
+    ///
+    /// `dd47d50` fixed this for the embedded engine (`StreamingEngine::run`).
+    /// This is the second bounded path and had no end-of-stream flush at all —
+    /// `b5d840f` rewrote this very function hours later without adding one, and
+    /// `flush_all` had exactly one caller in the whole tree. The job wrote zero
+    /// rows and reported Completed.
+    #[tokio::test]
+    async fn bounded_runtime_path_emits_the_window_the_watermark_never_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("events.csv");
+        let output = dir.path().join("windows.json");
+        // Every event inside [0,10000). Nothing later, so no watermark ever
+        // passes the window end — only an end-of-stream flush can close it.
+        std::fs::write(
+            &input,
+            "user_id,ts,amount\na,1000,10\na,5000,20\nb,6000,5\n",
+        )
+        .unwrap();
+
+        let session = crate::SessionBuilder::new().build().unwrap();
+        let runtime = session.execution_runtime();
+        let job = CompiledJob::new(
+            "trailing",
+            "SELECT user_id, SUM(amount) AS total \
+             FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 10000) \
+             GROUP BY user_id, window_start, window_end",
+            vec![SourceSpec::unbounded(
+                "events",
+                "csv",
+                input.to_str().unwrap(),
+            )],
+            vec![SinkSpec::new("out", "json", output.to_str().unwrap())],
+            true,
+        )
+        .with_engine(EngineKind::Streaming);
+
+        let handle = run_streaming_job_via_runtime(&runtime, &job).await.unwrap();
+        assert_eq!(handle.status(), JobStatus::Completed);
+
+        let written = std::fs::read_to_string(&output).unwrap_or_default();
+        assert!(
+            written.contains("\"total\":30"),
+            "a=10+20=30 must be emitted at end-of-stream; an empty sink with a \
+             Completed job is the silent-truncation signature: {written}"
+        );
+        assert!(
+            written.contains("\"total\":5"),
+            "b=5 must be emitted at end-of-stream: {written}"
         );
     }
 

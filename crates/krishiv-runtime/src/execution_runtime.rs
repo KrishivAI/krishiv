@@ -236,6 +236,27 @@ pub trait ExecutionRuntime: Send + Sync {
         batches: Vec<RecordBatch>,
     ) -> RuntimeResult<()>;
 
+    /// Close every open window on a continuous job because its bounded source
+    /// is exhausted.
+    ///
+    /// `drain_continuous_stream` only emits windows the watermark has passed, so
+    /// a bounded source whose final events fall in a window nothing later closes
+    /// leaves that window unflushed — the job writes a partial answer and
+    /// reports success. That is the same defect `flush_all` fixed for the
+    /// embedded engine; this is its route for everything driving the runtime.
+    ///
+    /// The default is an ERROR, deliberately, not `Ok(Vec::new())`. A defaulted
+    /// no-op would reproduce the original bug in every runtime that forgot to
+    /// override it, and reproduce it silently — which is exactly the shape this
+    /// audit exists to remove. Callers that can tolerate an unflushable runtime
+    /// must handle the error explicitly and say what they are giving up.
+    fn flush_continuous_stream(&self, _job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
+        Err(RuntimeError::unsupported(
+            "this execution runtime cannot flush a continuous job's open windows at \
+             end-of-stream; a bounded run against it may omit its trailing window",
+        ))
+    }
+
     /// Drain newly emitted batches from a continuous streaming job.
     fn drain_continuous_stream(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>>;
 
@@ -514,6 +535,10 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
         batches: Vec<RecordBatch>,
     ) -> RuntimeResult<()> {
         self.cluster.push_continuous_input(job_id, batches)
+    }
+
+    fn flush_continuous_stream(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
+        self.cluster.flush_continuous_job(job_id)
     }
 
     fn drain_continuous_stream(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
