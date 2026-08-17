@@ -43,6 +43,7 @@ mod delivery_cert;
 mod differential_corpus;
 #[cfg(test)]
 mod mode_conformance;
+mod streaming_conformance;
 #[cfg(test)]
 mod tests;
 
