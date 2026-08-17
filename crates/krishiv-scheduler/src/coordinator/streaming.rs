@@ -80,6 +80,26 @@ impl Coordinator {
             report.rows_emitted,
         );
         metrics.set_state_bytes(report.job_id.as_str(), report.state_bytes);
+
+        // Discarded input/output is the one thing in a progress report that a
+        // human has to see. Everything else above is a gauge you go looking
+        // for; loss is a fact that has to come find you, so it warns.
+        //
+        // Guarded on non-zero so the common case stays silent, and because an
+        // older executor omits these fields entirely — proto3 decodes the
+        // absence as 0, which must read as "no report", never as "nothing was
+        // dropped".
+        if report.egress_dropped_batches > 0 || report.null_key_rows_dropped > 0 {
+            tracing::warn!(
+                job_id = %report.job_id,
+                task_id = %report.task_id,
+                egress_dropped_batches = report.egress_dropped_batches,
+                null_key_rows_dropped = report.null_key_rows_dropped,
+                "streaming task has DISCARDED input or output: the egress ring dropped its \
+                 oldest batches under backpressure, and/or rows arrived with a NULL group key. \
+                 This job's output is incomplete by these counts."
+            );
+        }
     }
 
     /// Populate `streaming_task_index` for all tasks in a job after assignment.

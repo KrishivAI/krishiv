@@ -519,6 +519,48 @@ mod proto_tests {
         assert_eq!(round_trip_resp.llm_throttles(), response.llm_throttles());
     }
 
+    /// The drop counts must survive the heartbeat, because reaching the
+    /// coordinator is the entire point of counting them.
+    ///
+    /// The executor computed `egress_dropped_batches`, put it in its local
+    /// progress snapshot, and there it stopped: `on_progress` never copied it
+    /// onto the report and the wire message had no field for it. So the
+    /// counter's own doc comment — "reporting the cumulative count upward makes
+    /// the loss detectable by whoever is reading the job" — described something
+    /// that did not happen. The ring still dropped its oldest batch under
+    /// backpressure, and nobody outside that one process could ever find out.
+    #[test]
+    fn streaming_progress_drop_counts_survive_the_heartbeat_wire() {
+        use crate::wire::{
+            executor_heartbeat_request_from_wire, executor_heartbeat_request_to_wire,
+        };
+
+        let report = StreamingProgressReport::new(
+            JobId::try_new("job-lossy").unwrap(),
+            TaskId::try_new("task-lossy").unwrap(),
+        )
+        .with_batches_emitted(1_000)
+        .with_dropped(37, 5);
+
+        let request = ExecutorHeartbeatRequest::new(
+            ExecutorId::try_new("exec-lossy").unwrap(),
+            LeaseGeneration::initial(),
+            ExecutorState::Healthy,
+        )
+        .with_streaming_progress(vec![report]);
+
+        let round_trip =
+            executor_heartbeat_request_from_wire(executor_heartbeat_request_to_wire(request))
+                .unwrap();
+        let got = &round_trip.streaming_progress()[0];
+        assert_eq!(
+            got.egress_dropped_batches, 37,
+            "the egress drop count must reach the coordinator, not stop at the executor"
+        );
+        assert_eq!(got.null_key_rows_dropped, 5);
+        assert_eq!(got.batches_emitted, 1_000, "and the rest still round-trips");
+    }
+
     /// The executor deletes shuffle scratch for every job outside this set, so
     /// the three states must stay distinguishable across the wire: an absent
     /// set (reclaim nothing), an empty set (reclaim everything), and a

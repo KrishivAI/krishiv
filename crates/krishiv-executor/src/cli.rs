@@ -1652,6 +1652,10 @@ impl crate::runner::StreamingProgressCallback for ProgressBufferCallback {
             .with_rows_emitted(snapshot.rows_emitted)
             .with_batches_emitted(snapshot.batches_emitted)
             .with_state_bytes(snapshot.state_bytes)
+            .with_dropped(
+                snapshot.egress_dropped_batches,
+                snapshot.null_key_rows_dropped,
+            )
             .with_source_offset(snapshot.source_offset.clone().unwrap_or_default())
             .with_timestamp_ms(snapshot.timestamp_ms);
         self.buffer.insert(key, report);

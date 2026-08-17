@@ -522,6 +522,8 @@ fn streaming_progress_report_to_wire(
         state_bytes: value.state_bytes,
         source_offset: value.source_offset.clone(),
         timestamp_ms: value.timestamp_ms,
+        egress_dropped_batches: value.egress_dropped_batches,
+        null_key_rows_dropped: value.null_key_rows_dropped,
     }
 }
 
@@ -539,6 +541,8 @@ fn streaming_progress_report_from_wire(
         state_bytes: value.state_bytes,
         source_offset: value.source_offset,
         timestamp_ms: value.timestamp_ms,
+        egress_dropped_batches: value.egress_dropped_batches,
+        null_key_rows_dropped: value.null_key_rows_dropped,
     })
 }
 

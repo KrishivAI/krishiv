@@ -649,6 +649,16 @@ pub struct StreamingProgressReport {
     pub source_offset: Vec<u8>,
     /// Wall-clock timestamp of this snapshot in milliseconds since epoch.
     pub timestamp_ms: u64,
+    /// Batches discarded from the task's bounded egress buffer (cumulative).
+    ///
+    /// The run-loop egress ring drops its OLDEST batch on overflow, so a slow
+    /// drain consumer loses computed output under backpressure alone — no fault
+    /// required. Without this field the count stopped at the executor process
+    /// boundary and only a local warn recorded it, which meant the loss was
+    /// undetectable by anyone reading the job.
+    pub egress_dropped_batches: u64,
+    /// Rows discarded because their group key was NULL (cumulative).
+    pub null_key_rows_dropped: u64,
 }
 
 impl StreamingProgressReport {
@@ -662,6 +672,8 @@ impl StreamingProgressReport {
             state_bytes: 0,
             source_offset: Vec::new(),
             timestamp_ms: 0,
+            egress_dropped_batches: 0,
+            null_key_rows_dropped: 0,
         }
     }
 
@@ -686,6 +698,18 @@ impl StreamingProgressReport {
     #[must_use]
     pub fn with_state_bytes(mut self, bytes: u64) -> Self {
         self.state_bytes = bytes;
+        self
+    }
+
+    /// Report the cumulative counts of input/output this task DISCARDED.
+    ///
+    /// Set together because they answer one question — "did this task quietly
+    /// lose anything?" — and a caller that remembers one and forgets the other
+    /// gets a half-answer that reads like a whole one.
+    #[must_use]
+    pub fn with_dropped(mut self, egress_batches: u64, null_key_rows: u64) -> Self {
+        self.egress_dropped_batches = egress_batches;
+        self.null_key_rows_dropped = null_key_rows;
         self
     }
 
