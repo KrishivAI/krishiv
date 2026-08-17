@@ -4516,7 +4516,13 @@ keeps `stop()`'s contract: `Completed` means stopped, not "stop requested".
 - api: one asserting the non-window error contains "TUMBLE" — the raw SQL
   error already says TUMBLE, so it could not tell the guard from its absence.
 
-### Still open
+### Closed in §37 (F17, F18)
+
+The egress dials, the stop-cost honesty gap, the CORPUS overclaim, and the
+per-incarnation counter leak. What remains after those is listed at the end of
+§37, not here.
+
+### Was open after §36
 
 - **Run-loop clean stop takes no final checkpoint.** The loop breaks on
   cancellation and its teardown is bookkeeping only, so a stop loses everything
@@ -4544,3 +4550,78 @@ keeps `stop()`'s contract: `Completed` means stopped, not "stop requested".
   redistribution, and a live Kafka `registry-connector:` run-loop test.
 
 Gates on every commit: `just lint`, per-crate `cargo test`, `cargo fmt --all`.
+
+
+---
+
+## §37 — the §36 residuals, and one fix an existing test refused
+
+Two commits: `5ab3565` (F17), `d98e432` (F18).
+
+### F17 — the egress dials, and saying what a stop costs
+
+- **`KRISHIV_RLOOP_EGRESS_CAP`.** The cap was a hard-coded `const` while every
+  neighbouring streaming dial took an env override. It is a durability dial in
+  everything but name — it bounds how much computed output a slow drain
+  consumer loses before catching up — and it is a per-JOB budget shared by
+  co-located subtasks, so real headroom is cap/parallelism. Zero is refused
+  along with garbage: a 0 cap discards every batch on staging, silently turning
+  the job into a no-op. The env-registry and reference-doc guards both caught
+  the declaration being missing, which is exactly what they are for.
+- **The drop metric counted events, not batches.** `inc_output_buffer_flush`
+  added 1 per overflow regardless of size, so it under-reported worst exactly
+  when the loss was largest. Added `add_output_buffer_flush(reason, n)`.
+- **A stop said nothing about what it discarded.** The teardown neither flushes
+  nor snapshots. Not force-flushing is *correct* — `flush_all` is scoped to an
+  exhausted bounded source and forcing it would emit partial aggregates as
+  complete — so the fix is to say so: at registration (a run-loop job without
+  checkpointing has no savepoint and therefore no non-lossy stop at all) and at
+  stop (only when state is actually open). `has_open_windows` is built on
+  `peek_snapshot_bytes`, not `self.operator`, because a job that restored a
+  checkpoint and stopped before its first batch has no operator and its entire
+  state to lose — the same lazy-init hazard behind two of F10's defects.
+- **The conformance CORPUS comment claimed coverage that does not exist.** It
+  named the partial/final aggregate split and the cross-task sort merge as its
+  rationale, but the server is `from_env()` → embedded and every corpus query
+  takes the inline fast path, so those run on neither side. The transport,
+  SQL-text encoding, inline-IPC shipping and unparser *are* covered; the
+  comment now says exactly that and names what closing the gap needs.
+
+### F18 — and one fix backed out, by a test that was right
+
+Per-incarnation counters are retired on teardown (reusable job ids otherwise
+hand a dead job's drop count to its successor).
+
+The egress buffer is **deliberately not**. I removed it too, reasoning that the
+`CancelTask` handler's removal races the loop it is cancelling — which is true,
+and the re-created entry can outlive the job.
+`run_loop_parallel_three_matches_parallel_one` then read 0 windows where it
+expected 60. **The test was right.** A run-loop only stops via cancellation, so
+that teardown IS the stop path, and windows the job genuinely emitted are
+output a consumer may still drain; the cure destroyed real data. Whether a
+drain may follow a stop is the DUR-5 contract question §34 deferred, and
+settling it as a side effect of a leak fix would be deciding it by accident.
+Code and test both record the rejected idea and why.
+
+Second time this session an existing test refused a change of mine and was
+right (F10 was the first). Running the full suite, not just the new tests, is
+what catches it.
+
+### Still open
+
+- **No final checkpoint on a clean run-loop stop.** The loss is now stated at
+  both registration and stop, but a job registered without checkpointing still
+  has no recoverable stop. The real fix is a self-initiated final checkpoint
+  delivered through the existing ack path — which needs an epoch the
+  coordinator will accept, i.e. a protocol contract, not a patch. Writing
+  snapshot bytes nobody reads would reproduce F15's exact failure.
+- **Drain-after-stop contract (DUR-5).** Now load-bearing: F18 shows a real
+  test depends on the current permissive behaviour.
+- **The failed-launch job-id wedge** (§34), unchanged.
+- **Conformance staged coverage** — needs the coordinator backend, i.e. a real
+  multi-executor harness.
+- **Not run this session:** pod-kill proof of the F8/`70b535c` restore
+  redistribution, and a live Kafka `registry-connector:` run-loop test.
+
+Gates on every commit: `cargo clippy -D warnings`, per-crate `cargo test`,
+`cargo fmt --all`.
