@@ -1010,7 +1010,34 @@ pub fn temporal_join(
     version_col: &str,
     lookback_ms: i64,
 ) -> Result<Vec<(RecordBatch, Option<RecordBatch>)>> {
-    let mut state = VersionedTableState::new(lookback_ms);
+    // One versioned state PER JOIN KEY.
+    //
+    // This used to be a single unkeyed `VersionedTableState`: `spec.join_keys`
+    // was accepted and never read, so every stream row matched whatever table
+    // version was current at time `t` regardless of key — a customer's event
+    // joined against another customer's row, silently. The interval join
+    // immediately below carries an `H-1 (audit)` comment for the identical
+    // defect, already fixed there; this was the remaining instance.
+    //
+    // Keys are encoded with krishiv-dataflow's `build_join_key`, not a local
+    // copy: two encoders that disagree about NULL or type tagging produce keys
+    // that compare equal and are not.
+    let key_indices_for = |batch: &RecordBatch| -> Result<Vec<usize>> {
+        spec.join_keys
+            .iter()
+            .map(|name| {
+                batch
+                    .schema()
+                    .index_of(name)
+                    .map_err(|e| KrishivError::Runtime {
+                        message: format!("temporal join key '{name}': {e}"),
+                    })
+            })
+            .collect()
+    };
+
+    let mut states: std::collections::HashMap<String, VersionedTableState> =
+        std::collections::HashMap::new();
     for snap in table_snapshots {
         let ver_idx = snap
             .schema()
@@ -1025,9 +1052,14 @@ pub fn temporal_join(
             .ok_or_else(|| KrishivError::Runtime {
                 message: format!("version_col '{version_col}' must be Int64"),
             })?;
+        let key_indices = key_indices_for(snap)?;
         for i in 0..snap.num_rows() {
             if !ver_col.is_null(i) {
-                state.upsert_version(ver_col.value(i), snap.slice(i, 1));
+                let key = krishiv_dataflow::temporal_join::build_join_key(snap, &key_indices, i);
+                states
+                    .entry(key)
+                    .or_insert_with(|| VersionedTableState::new(lookback_ms))
+                    .upsert_version(ver_col.value(i), snap.slice(i, 1));
             }
         }
     }
@@ -1047,12 +1079,21 @@ pub fn temporal_join(
             .ok_or_else(|| KrishivError::Runtime {
                 message: format!("stream_time_col '{}' must be Int64", spec.stream_time_col),
             })?;
+        let stream_key_indices = key_indices_for(stream_batch)?;
         for i in 0..stream_batch.num_rows() {
             if time_col.is_null(i) {
                 continue;
             }
             let t = time_col.value(i);
-            let matched = state.lookup_as_of(t).cloned();
+            let key = krishiv_dataflow::temporal_join::build_join_key(
+                stream_batch,
+                &stream_key_indices,
+                i,
+            );
+            let matched = states
+                .get(&key)
+                .and_then(|state| state.lookup_as_of(t))
+                .cloned();
             if spec.inner_join && matched.is_none() {
                 continue;
             }
@@ -1939,6 +1980,76 @@ mod tests {
             "the duplicate input row must be removed BEFORE aggregation; \
              3 means dedup ran on the window output, where `stream_ts` does not \
              exist and nothing was removed"
+        );
+    }
+
+    /// A temporal join matches only the table row with the SAME key.
+    ///
+    /// `TemporalJoinSpec.join_keys` was accepted and never read: the state was
+    /// a single unkeyed `VersionedTableState`, so every stream row matched
+    /// whatever table version was current at time `t` regardless of key. One
+    /// customer's event joined against another customer's row, with no error.
+    ///
+    /// Asserts the joined row's IDENTITY, not that a match happened. Both the
+    /// keyed and the unkeyed implementation return a match for every stream
+    /// row here; only the unkeyed one returns the wrong one, so any assertion
+    /// weaker than "which row came back" passes against the bug.
+    #[test]
+    fn temporal_join_matches_only_the_same_key() {
+        use arrow::array::{Int64Array as I64, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc as StdArc;
+
+        // Two customers, each with a table version at t=0 carrying a distinct
+        // rate. Anything that ignores the key will hand back whichever version
+        // it saw last.
+        let table_schema = StdArc::new(Schema::new(vec![
+            Field::new("cust", DataType::Utf8, false),
+            Field::new("ver", DataType::Int64, false),
+            Field::new("rate", DataType::Int64, false),
+        ]));
+        let snapshot = RecordBatch::try_new(
+            table_schema,
+            vec![
+                StdArc::new(StringArray::from(vec!["a", "b"])),
+                StdArc::new(I64::from(vec![0_i64, 0])),
+                StdArc::new(I64::from(vec![10_i64, 99])),
+            ],
+        )
+        .expect("snapshot");
+
+        let stream_schema = StdArc::new(Schema::new(vec![
+            Field::new("cust", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let stream = RecordBatch::try_new(
+            stream_schema,
+            vec![
+                StdArc::new(StringArray::from(vec!["a"])),
+                StdArc::new(I64::from(vec![100_i64])),
+            ],
+        )
+        .expect("stream");
+
+        let spec = TemporalJoinSpec {
+            stream_time_col: String::from("ts"),
+            join_keys: vec![String::from("cust")],
+            inner_join: true,
+        };
+
+        let out = temporal_join(&[stream], &[snapshot], &spec, "ver", 10_000).expect("join");
+        assert_eq!(out.len(), 1, "customer a's event must match exactly once");
+        let matched = out[0].1.as_ref().expect("inner join produced a match");
+        let rate = matched
+            .column(2)
+            .as_any()
+            .downcast_ref::<I64>()
+            .expect("rate is Int64");
+        assert_eq!(
+            rate.value(0),
+            10,
+            "customer a must join against customer a's rate; 99 means the join \
+             ignored its keys and handed back customer b's row"
         );
     }
 }

@@ -262,7 +262,11 @@ impl TemporalJoinOperator {
 
 /// Build a composite join key using ASCII record separator `\x1c` to avoid
 /// ambiguity with user data that may contain `|` or other printable characters.
-fn build_join_key(batch: &RecordBatch, key_indices: &[usize], row: usize) -> String {
+///
+/// Public so callers outside this module encode a join key the SAME way rather
+/// than growing a second `format_column_value`. Two encoders that disagree on
+/// NULL or on type tagging produce keys that look equal and are not.
+pub fn build_join_key(batch: &RecordBatch, key_indices: &[usize], row: usize) -> String {
     key_indices
         .iter()
         .map(|&idx| format_column_value(batch.column(idx), row))
