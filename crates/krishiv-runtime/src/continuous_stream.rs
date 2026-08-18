@@ -162,6 +162,33 @@ impl ContinuousStreamRegistry {
         if job_id.trim().is_empty() {
             return Err(ContinuousStreamError::InvalidJobId.into());
         }
+
+        // This registry has no wall clock: it steps the operator only on drain,
+        // so nothing here can ever advance a watermark on elapsed time. A
+        // session window closes on INACTIVITY — the absence of the events that
+        // would advance the watermark — so registering one here accepts a job
+        // that reports healthy and can never emit a session.
+        //
+        // The coordinator refuses this already (S7, continuous_stream_http.rs).
+        // That guard was applied at one site and this is the other, which is
+        // why the same spec was accepted embedded and refused distributed. This
+        // is the shared funnel: it covers Rust `stream()`/`submit_stream_job`,
+        // Python `submit_stream_job`, `register_stream_job_sql`, and the Flight
+        // in-process backend.
+        if krishiv_plan::window::requires_wall_clock(&spec.window_kind) {
+            return Err(ContinuousStreamError::Execution {
+                job_id: job_id.clone(),
+                message: String::from(
+                    "session windows close on inactivity, which needs a wall clock; this \
+                     in-process continuous registry advances its watermark only when a \
+                     drain is called, so this job would accept events and never emit a \
+                     session. Run it as a long-lived streaming job (Session::submit_streaming), \
+                     or register it on a coordinator with mode: \"run-loop\"",
+                ),
+            }
+            .into());
+        }
+
         let executor = ContinuousWindowExecutor::new(spec.clone()).map_err(|error| {
             ContinuousStreamError::Execution {
                 job_id: job_id.clone(),
@@ -1067,5 +1094,56 @@ mod tests {
             error,
             RuntimeError::ContinuousStream(ContinuousStreamError::InvalidJobId)
         ));
+    }
+
+    /// A session window is refused here, because this registry cannot close one.
+    ///
+    /// The defect this pins: S7 landed the "session needs a wall clock" decision
+    /// at the coordinator's registration path and NOWHERE ELSE, so the identical
+    /// spec was refused distributed and accepted embedded — where it registered,
+    /// reported healthy, and never emitted a session. Two registration
+    /// implementations, one guard.
+    ///
+    /// Asserts the message names the alternatives, because a refusal that only
+    /// says "unsupported" converts a silent wrong answer into a dead end.
+    #[test]
+    fn a_session_window_is_refused_because_this_registry_has_no_wall_clock() {
+        let registry = ContinuousStreamRegistry::new();
+        let mut spec = WindowExecutionSpec::tumbling("k", "ts", 10_000);
+        spec.window_kind = krishiv_plan::window::WindowKind::Session;
+        spec.session_gap_ms = Some(30_000);
+
+        let err = registry
+            .register_job("sess", spec)
+            .expect_err("a session window must be refused by a registry with no clock")
+            .to_string();
+        assert!(
+            err.contains("wall clock") || err.contains("inactivity"),
+            "the refusal must say WHY, so it reads as a design limit: {err}"
+        );
+        assert!(
+            err.contains("run-loop") || err.contains("submit_streaming"),
+            "the refusal must name a placement that works: {err}"
+        );
+    }
+
+    /// The guard is scoped: every window kind that closes on DATA is accepted.
+    ///
+    /// Without this, `requires_wall_clock` could return true for everything and
+    /// the test above would still pass while this registry refused every job —
+    /// far worse than the defect it fixes.
+    #[test]
+    fn window_kinds_that_close_on_data_are_still_accepted() {
+        let registry = ContinuousStreamRegistry::new();
+        registry
+            .register_job("tumbling", WindowExecutionSpec::tumbling("k", "ts", 10_000))
+            .expect("a tumbling window closes on data and must be accepted");
+
+        let mut sliding = WindowExecutionSpec::tumbling("k", "ts", 10_000);
+        sliding.window_kind = krishiv_plan::window::WindowKind::Sliding;
+        sliding.slide_ms = Some(5_000);
+        registry
+            .register_job("sliding", sliding)
+            .expect("a sliding window closes on data and must be accepted");
     }
 }

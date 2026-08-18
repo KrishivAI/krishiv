@@ -1265,6 +1265,37 @@ impl PySession {
         })
     }
 
+    /// Close every window a continuous job still holds open, because its source
+    /// is exhausted.
+    ///
+    /// ``poll_stream_job`` returns only the windows the watermark has already
+    /// passed, so a bounded feed whose last events land inside an unclosed
+    /// window leaves that window unemitted — you poll, get nothing back, and
+    /// reasonably conclude the job is finished.
+    ///
+    /// Call this once after the final push::
+    ///
+    ///     session.push_stream_job_input("j", batches)
+    ///     rows = session.poll_stream_job("j")
+    ///     rows += session.flush_stream_job("j")   # the trailing window
+    ///
+    /// Raises if this session's runtime cannot flush, because in that case the
+    /// answer is genuinely incomplete and you need to know.
+    pub fn flush_stream_job(&self, py: Python<'_>, job_id: String) -> PyResult<Vec<PyBatch>> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            inner
+                .flush_stream_job(&job_id)
+                .map(|batches| {
+                    batches
+                        .into_iter()
+                        .map(PyBatch::from_record_batch)
+                        .collect()
+                })
+                .map_err(map_krishiv_error)
+        })
+    }
+
     /// Return all registered table and view names.
     pub fn list_tables(&self) -> PyResult<Vec<String>> {
         self.inner.list_tables().map_err(map_krishiv_error)

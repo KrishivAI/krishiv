@@ -1576,6 +1576,31 @@ impl Session {
             .map_err(KrishivError::from)
     }
 
+    /// Close every window a continuous job still holds open, because its source
+    /// is exhausted.
+    ///
+    /// [`Session::poll_stream_job`] returns only the windows the watermark has
+    /// already passed. A bounded feed whose final events land inside a window
+    /// nothing later closes therefore leaves that window unemitted — the caller
+    /// polls, gets nothing, and reasonably concludes the job is done.
+    ///
+    /// The flush verb existed end-to-end through the runtime trait, both
+    /// runtimes, the Flight host and the coordinator, and was reachable from
+    /// none of them here — this façade is the door Python and user Rust go
+    /// through, so a complete machine below was unusable above.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KrishivError`] if the job is unknown, or if this session's
+    /// runtime cannot flush — in which case the answer is genuinely
+    /// incomplete and the caller must decide what to do, rather than being told
+    /// nothing.
+    pub fn flush_stream_job(&self, job_id: &str) -> Result<Vec<RecordBatch>> {
+        self.runtime
+            .flush_continuous_stream(job_id)
+            .map_err(KrishivError::from)
+    }
+
     fn remember_stream_job(
         &self,
         name: &str,
@@ -3057,6 +3082,28 @@ impl Session {
         // has no place in an unbounded run-loop, and refusing it here is better
         // than registering a job that reads its input once and then idles
         // forever looking healthy.
+        //
+        // The same reasoning applies to sinks, and this path does not carry
+        // them. `ContinuousRegisterOptions` has no sink field, so a job with a
+        // declared sink registered cleanly, ran, reported Running, and wrote
+        // its output only into the cluster's egress ring — where it is dropped
+        // past the cap. The identical job submitted embedded opens the sink and
+        // writes to it. Nothing said the sink had been discarded.
+        //
+        // Refusing is the smaller half of the fix and is deliberately the half
+        // taken here: the coordinator and executor HAVE honoured registry sinks
+        // since #197 (`ContinuousRegisterRequest.sink`, and run_loop.rs opens a
+        // `registry-sink:` contract), so the capability exists and only this
+        // client leg cannot express it. Wiring it through is the better answer
+        // and is recorded as follow-up; until then the user gets a message
+        // naming the sink instead of a job that quietly writes nowhere.
+        if let Some(sink) = job.sinks.first() {
+            return Err(KrishivError::unsupported(format!(
+                "distributed continuous streaming does not yet carry this job's sink                  '{}' ({} -> {}): the registration wire has no sink field, so the job's                  output would stay on the cluster's egress buffer — and be dropped past                  its cap — while the job reported Running. Use submit() for a bounded                  run, or register the sink on the coordinator directly, which has                  supported registry sinks since #197.",
+                sink.view, sink.connector, sink.uri
+            )));
+        }
+
         let mut sources = Vec::with_capacity(job.sources.len());
         for source in &job.sources {
             if source.is_bounded {
@@ -4445,6 +4492,44 @@ mod remote_session_parity_tests {
             message.contains("bounded") && message.contains("idle"),
             "the refusal must say WHY a bounded source is wrong here — the job would \
              read it once and then look healthy forever; got: {message}"
+        );
+    }
+
+    /// A declared sink is refused rather than silently discarded.
+    ///
+    /// The registration wire has no sink field, so this path used to register
+    /// the job, run it, report Running, and write the output only into the
+    /// cluster's egress ring — where it is dropped past the cap. The identical
+    /// job submitted embedded opens the sink and writes to it. Nothing anywhere
+    /// said the sink had been dropped.
+    ///
+    /// The message must name the sink and the alternative, because "unsupported"
+    /// alone turns a silent wrong answer into a dead end. The coordinator has
+    /// honoured registry sinks since #197, so the capability exists — only this
+    /// client leg cannot express it, and the error says so.
+    #[test]
+    fn distributed_streaming_refuses_a_declared_sink_instead_of_dropping_it() {
+        let session = remote_session();
+        let job = crate::CompiledJob::new(
+            "sinking-stream",
+            "SELECT k, COUNT(*) FROM TUMBLE(TABLE src, DESCRIPTOR(ts), 60000) GROUP BY k",
+            vec![crate::SourceSpec::unbounded("src", "kafka", "events")],
+            vec![crate::SinkSpec::new("out", "parquet", "/tmp/out.parquet")],
+            true,
+        );
+
+        let error = session
+            .submit_streaming(job)
+            .expect_err("a declared sink must be refused, not silently discarded");
+        let message = error.to_string();
+        assert!(
+            message.contains("parquet") && message.contains("/tmp/out.parquet"),
+            "the refusal must name the sink whose output would vanish; got: {message}"
+        );
+        assert!(
+            message.contains("egress") || message.contains("coordinator"),
+            "and must say where the output would have gone, or how to get it there; \
+             got: {message}"
         );
     }
 

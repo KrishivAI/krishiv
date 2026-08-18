@@ -38,8 +38,8 @@
 use std::collections::HashMap;
 
 use datafusion::sql::sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select, SelectItem,
-    SetExpr, Statement, TableFactor, Value,
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Query, Select,
+    SelectItem, SetExpr, Statement, TableFactor, Value,
 };
 use datafusion::sql::sqlparser::dialect::DuckDbDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -130,10 +130,88 @@ fn parse_single_select(sql: &str) -> SqlResult<Select> {
             _ => None,
         })
         .ok_or_else(|| unsupported("streaming window query must be a SELECT"))?;
+    reject_unsupported_query_clauses(&query)?;
     match *query.body {
-        SetExpr::Select(select) => Ok(*select),
+        SetExpr::Select(select) => {
+            reject_unsupported_select_clauses(&select)?;
+            Ok(*select)
+        }
         _ => Err(unsupported("streaming window query must be a plain SELECT")),
     }
+}
+
+/// Refuse the `Query`-level clauses this compiler cannot honour.
+///
+/// # Why refuse rather than implement
+///
+/// The streaming compiler builds a `WindowExecutionSpec` — a key column, a
+/// window, and a list of aggregates — and the engine then reads the raw source
+/// directly. The query text is never executed as SQL, so a clause this function
+/// does not reject has no second chance downstream: it is simply gone.
+///
+/// Until this existed, every clause below parsed, compiled, registered, and was
+/// silently discarded. `WHERE amount > 100` counted every row. That is the
+/// worst failure a query engine can have — a larger number and no message — so
+/// the rule here is that anything not understood is refused by name.
+///
+/// Implementing them is a feature and may well be worth doing. Ignoring them
+/// never was.
+fn reject_unsupported_query_clauses(query: &Query) -> SqlResult<()> {
+    if query.with.is_some() {
+        return Err(unsupported(
+            "streaming window queries do not support WITH / common table expressions; \
+             inline the subquery, or run the CTE as a separate job",
+        ));
+    }
+    if query.order_by.is_some() {
+        return Err(unsupported(
+            "streaming window queries do not support ORDER BY: a stream has no final \
+             order to sort. Order the output downstream of the sink",
+        ));
+    }
+    if query.limit_clause.is_some() {
+        return Err(unsupported(
+            "streaming window queries do not support LIMIT / OFFSET: a continuous job \
+             has no last row. Apply the limit to the sink's consumer",
+        ));
+    }
+    if query.fetch.is_some() {
+        return Err(unsupported(
+            "streaming window queries do not support FETCH; see the LIMIT note",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse the `Select`-level clauses this compiler cannot honour.
+///
+/// `GROUP BY` is deliberately NOT rejected here — the canonical streaming shape
+/// is `GROUP BY <key>, window_start, window_end`, and rejecting it would refuse
+/// every correct query. It is validated in [`extract_key_and_aggs`] instead,
+/// once the key column is known, so that a grouping list which disagrees with
+/// the inferred key is caught rather than silently collapsed.
+fn reject_unsupported_select_clauses(select: &Select) -> SqlResult<()> {
+    if select.selection.is_some() {
+        return Err(unsupported(
+            "streaming window queries do not support WHERE: the predicate would be \
+             silently dropped, so it is refused instead. Filter upstream — in the source \
+             connector's query or view — or use a FILTER (WHERE …) clause on an \
+             individual aggregate, which IS supported",
+        ));
+    }
+    if select.having.is_some() {
+        return Err(unsupported(
+            "streaming window queries do not support HAVING: a closed window is emitted \
+             as computed, with no post-aggregate filter. Filter the sink's consumer",
+        ));
+    }
+    if select.distinct.is_some() {
+        return Err(unsupported(
+            "streaming window queries do not support SELECT DISTINCT; deduplicate \
+             downstream, or use the DataFrame surface's drop_duplicates",
+        ));
+    }
+    Ok(())
 }
 
 /// The window parameters recovered structurally from the parsed plan.
@@ -386,10 +464,77 @@ fn extract_key_and_aggs(select: &Select) -> SqlResult<(String, Vec<WindowAgg>)> 
     let key_column = key_column.ok_or_else(|| {
         unsupported("streaming window query needs a grouping key column in the SELECT list")
     })?;
+    validate_group_by(select, &key_column)?;
     if aggs.is_empty() {
         aggs.push(WindowAgg::count("count"));
     }
     Ok((key_column, aggs))
+}
+
+/// Check that an explicit `GROUP BY` agrees with the key this compiler inferred.
+///
+/// `WindowExecutionSpec::key_column` is a SINGLE column, and the key is inferred
+/// from the first non-boundary identifier in the projection. A `GROUP BY a, b`
+/// therefore cannot be honoured: `b` is silently dropped and the aggregate is
+/// computed across it, which reads as a plain wrong number.
+///
+/// The canonical shape `GROUP BY <key>, window_start, window_end` is accepted,
+/// as are the boundary columns in any order and a bare `GROUP BY <key>`.
+/// Anything naming a second real column is refused by name.
+fn validate_group_by(select: &Select, key_column: &str) -> SqlResult<()> {
+    let exprs = match &select.group_by {
+        GroupByExpr::Expressions(exprs, modifiers) => {
+            if !modifiers.is_empty() {
+                return Err(unsupported(
+                    "streaming window queries do not support GROUP BY modifiers \
+                     (ROLLUP / CUBE / GROUPING SETS)",
+                ));
+            }
+            exprs
+        }
+        // `GROUP BY ALL` cannot be resolved without full schema binding, which
+        // this compiler deliberately does not do.
+        GroupByExpr::All(_) => {
+            return Err(unsupported(
+                "streaming window queries do not support GROUP BY ALL; name the \
+                 grouping key explicitly",
+            ));
+        }
+    };
+    if exprs.is_empty() {
+        return Ok(());
+    }
+
+    let mut extra: Vec<String> = Vec::new();
+    for expr in exprs {
+        let name = match expr {
+            Expr::Identifier(id) => id.value.clone(),
+            Expr::CompoundIdentifier(parts) => match parts.last() {
+                Some(last) => last.value.clone(),
+                None => continue,
+            },
+            other => {
+                return Err(unsupported(format!(
+                    "streaming window queries support GROUP BY over plain columns only; \
+                     got the expression `{other}`"
+                )));
+            }
+        };
+        if name == key_column || WINDOW_BOUNDARY_COLS.contains(&name.as_str()) {
+            continue;
+        }
+        extra.push(name);
+    }
+
+    if !extra.is_empty() {
+        return Err(unsupported(format!(
+            "streaming windows group by a SINGLE key column, and `{key_column}` was \
+             inferred from the SELECT list; GROUP BY also names {extra:?}, which would be \
+             silently dropped and aggregated across. Combine the columns into one key \
+             upstream (e.g. a concatenated or struct column), or run one job per key"
+        )));
+    }
+    Ok(())
 }
 
 fn maybe_set_key(key: &mut Option<String>, name: &str) {
@@ -922,5 +1067,120 @@ mod tests {
             "SELECT k FROM TUMBLE(TABLE t, DESCRIPTOR(ts), 1000) GROUP BY k"
         ));
         assert!(!is_windowed_streaming_sql("SELECT k FROM t"));
+    }
+}
+
+#[cfg(test)]
+mod fail_closed_tests {
+    use super::compile_streaming_window_sql;
+
+    /// The canonical streaming shape must still compile.
+    ///
+    /// First, because refusing it would be a far worse regression than the bug
+    /// being fixed; and second, because every rejection test below is only
+    /// meaningful if the baseline is accepted — otherwise they would all pass
+    /// against a compiler that refused everything.
+    #[test]
+    fn the_canonical_windowed_query_still_compiles() {
+        let plan = compile_streaming_window_sql(
+            "SELECT user_id, SUM(amount) AS total \
+             FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 10000) \
+             GROUP BY user_id, window_start, window_end",
+        )
+        .expect("the canonical shape must compile");
+        assert_eq!(plan.spec.key_column, "user_id");
+    }
+
+    /// A bare `GROUP BY <key>` and boundary columns in any order are fine.
+    #[test]
+    fn group_by_variants_that_agree_with_the_inferred_key_are_accepted() {
+        for sql in [
+            "SELECT user_id, SUM(amount) AS total FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 10000) GROUP BY user_id",
+            "SELECT user_id, SUM(amount) AS total FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 10000) GROUP BY window_end, user_id, window_start",
+        ] {
+            compile_streaming_window_sql(sql)
+                .unwrap_or_else(|e| panic!("must compile: {sql}\n{e}"));
+        }
+    }
+
+    /// Every clause this compiler cannot honour is refused BY NAME.
+    ///
+    /// Until this existed, all of these parsed, compiled, registered and were
+    /// silently discarded — `WHERE amount > 100` counted every row. The engine
+    /// reads the raw source directly and never executes the query text, so a
+    /// clause not rejected here has no second chance downstream.
+    ///
+    /// Each case asserts the message names the offending clause, because an
+    /// error saying only "unsupported" leaves the user guessing which of five
+    /// clauses to remove.
+    #[test]
+    fn every_silently_dropped_clause_is_now_refused_by_name() {
+        let base = "SELECT user_id, SUM(amount) AS total \
+                    FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 10000)";
+        let cases: &[(&str, &str)] = &[
+            (&format!("{base} WHERE amount > 100"), "WHERE"),
+            (
+                &format!("{base} GROUP BY user_id HAVING SUM(amount) > 5"),
+                "HAVING",
+            ),
+            (
+                "SELECT DISTINCT user_id, SUM(amount) AS total \
+                 FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 10000) GROUP BY user_id",
+                "DISTINCT",
+            ),
+            (
+                &format!("{base} GROUP BY user_id ORDER BY total"),
+                "ORDER BY",
+            ),
+            (&format!("{base} GROUP BY user_id LIMIT 10"), "LIMIT"),
+        ];
+        for (sql, clause) in cases {
+            let err = compile_streaming_window_sql(sql)
+                .expect_err(&format!("`{clause}` must be refused, not silently dropped"))
+                .to_string();
+            assert!(
+                err.contains(clause),
+                "the error must name `{clause}` so the user knows what to remove; got: {err}"
+            );
+        }
+    }
+
+    /// A second grouping column is refused, naming the column that would have
+    /// been dropped.
+    ///
+    /// This is the subtlest half of the defect: `GROUP BY region, product`
+    /// collapsed to `key_column = "region"` and aggregated across products, so
+    /// the user got a larger number with no error and no clue which column
+    /// vanished.
+    #[test]
+    fn a_second_grouping_column_is_refused_and_named() {
+        let err = compile_streaming_window_sql(
+            "SELECT region, COUNT(*) AS c \
+             FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 60000) \
+             GROUP BY region, product, window_start, window_end",
+        )
+        .expect_err("a multi-column grouping key must be refused")
+        .to_string();
+        assert!(
+            err.contains("product"),
+            "the error must name the column that would have been dropped: {err}"
+        );
+        assert!(
+            err.contains("region"),
+            "and the key it inferred, so the mismatch is legible: {err}"
+        );
+    }
+
+    /// CTEs are refused rather than silently ignored.
+    #[test]
+    fn a_with_clause_is_refused() {
+        let err = compile_streaming_window_sql(
+            "WITH src AS (SELECT * FROM events) \
+             SELECT user_id, COUNT(*) AS c \
+             FROM TUMBLE(TABLE src, DESCRIPTOR(ts), 10000) GROUP BY user_id",
+        )
+        .expect_err("a CTE must be refused")
+        .to_string();
+        assert!(err.contains("WITH"), "must name the clause: {err}");
     }
 }

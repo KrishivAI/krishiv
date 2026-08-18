@@ -410,6 +410,76 @@ mod streaming_conformance_tests {
         }
     }
 
+    /// `Session::flush_stream_job` recovers the window `poll_stream_job` cannot.
+    ///
+    /// The push/drain surface is the one users drive by hand, and until this
+    /// existed it had no flush at all: the verb was complete through the runtime
+    /// trait, both runtimes, the Flight host and the coordinator, and reachable
+    /// from none of them at the Session façade — the single door Python and user
+    /// Rust go through. A caller pushed the last batch, polled, got nothing, and
+    /// had no way to learn a window was still open.
+    ///
+    /// Uses the partial-loss fixture on purpose: its poll returns ONE row and
+    /// its flush returns the other, so "poll already had everything" and "flush
+    /// returned nothing" are both distinguishable from success. With an
+    /// all-or-nothing fixture an empty poll plus an empty flush would look the
+    /// same as a broken harness.
+    #[tokio::test]
+    async fn flush_stream_job_recovers_the_window_poll_cannot() {
+        let entry = CORPUS
+            .iter()
+            .find(|e| e.name == "closed_window_plus_trailing_window")
+            .expect("the partial-loss fixture");
+
+        let session = crate::SessionBuilder::new().build().expect("session");
+        let spec = krishiv_runtime::local_streaming::LocalWindowExecutionSpec::windowed(
+            krishiv_dataflow::streaming_corpus::KEY_COLUMN,
+            krishiv_dataflow::streaming_corpus::TIME_COLUMN,
+            krishiv_runtime::local_streaming::LocalWindowKind::Tumbling,
+            u64::try_from(krishiv_dataflow::streaming_corpus::WINDOW_SIZE_MS).expect("size"),
+        )
+        .with_aggs(vec![krishiv_dataflow::AggExpr {
+            function: krishiv_dataflow::AggFunction::Sum,
+            input_column: krishiv_dataflow::streaming_corpus::AGG_INPUT.to_owned(),
+            output_column: krishiv_dataflow::streaming_corpus::AGG_OUTPUT.to_owned(),
+            filter: None,
+        }]);
+
+        session
+            .submit_stream_job("flushable", spec)
+            .expect("register");
+        session
+            .push_stream_job_input("flushable", vec![entry.batch().expect("fixture")])
+            .expect("push");
+
+        let polled = session.poll_stream_job("flushable").await.expect("poll");
+        let polled_totals =
+            krishiv_dataflow::streaming_corpus::totals_from_batches(&polled).expect("totals");
+        assert_eq!(
+            polled_totals,
+            krishiv_dataflow::streaming_corpus::sorted_expectation(entry.expected_without_flush),
+            "a poll returns only what the watermark closed — if it already had \
+             everything, the flush below would prove nothing"
+        );
+
+        let flushed = session.flush_stream_job("flushable").expect("flush");
+        let flushed_totals =
+            krishiv_dataflow::streaming_corpus::totals_from_batches(&flushed).expect("totals");
+        assert!(
+            !flushed_totals.is_empty(),
+            "the flush must return the window the watermark never reached"
+        );
+
+        let mut whole = polled_totals;
+        whole.extend(flushed_totals);
+        whole.sort();
+        assert_eq!(
+            whole,
+            krishiv_dataflow::streaming_corpus::sorted_expectation(entry.expected),
+            "poll + flush must together be the complete answer"
+        );
+    }
+
     /// The corpus must contain a fixture where the flush actually matters, or
     /// the arm above proves nothing.
     ///
