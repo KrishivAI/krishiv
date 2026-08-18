@@ -618,9 +618,25 @@ impl ComputeEngine for StreamingEngine {
                 "streaming job query cannot be empty".into(),
             ));
         }
-        if compile_streaming_window_sql(&job.query).is_err() {
+        // Route on whether the query IS windowed, not on whether it compiles.
+        //
+        // This used to be `if compile_streaming_window_sql(..).is_err()`, which
+        // conflated two very different things: "this is a stateless query, run
+        // it per batch" and "this is a windowed query and something about it is
+        // wrong". The second fell through to the stateless path, discarding the
+        // planner's reason — so a user whose windowed query named two grouping
+        // columns saw a DataFusion parse error about TUMBLE instead of the
+        // message naming the column that would have been dropped.
+        //
+        // Every precise refusal the streaming compiler produces reaches the
+        // caller only because of this split.
+        if krishiv_sql::streaming_tvf::find_window_tvf(&job.query).is_none() {
             return run_stateless_bounded(&job, &rt).await;
         }
+        // It IS windowed: a compile failure is the user's answer, not a reason
+        // to silently run a different query.
+        compile_streaming_window_sql(&job.query)
+            .map_err(|e| EngineError::InvalidJob(e.to_string()))?;
 
         let mut setup = streaming_setup(&job, &rt).await?;
         let mut writers = open_writers(&rt, &job.sinks).await?;
@@ -1066,7 +1082,14 @@ pub fn spawn_streaming_job(job: CompiledJob, rt: EngineRuntime) -> EngineResult<
     let handle = JobHandle::from_name(&job.name, JobStatus::Running)?;
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
-    let task = if compile_streaming_window_sql(&job.query).is_ok() {
+    // Same split as the bounded path: route on whether the query IS windowed,
+    // and let a windowed query's compile failure be the caller's answer.
+    // Routing on `is_ok()` sent every invalid windowed query to the stateless
+    // loop, which then ran a DIFFERENT query per batch — no windows, no state,
+    // no checkpoints — while reporting Running.
+    let task = if krishiv_sql::streaming_tvf::find_window_tvf(&job.query).is_some() {
+        compile_streaming_window_sql(&job.query)
+            .map_err(|e| EngineError::InvalidJob(e.to_string()))?;
         tokio::spawn(run_streaming_continuous(job, rt, stop_rx))
     } else {
         tokio::spawn(run_stateless_continuous(job, rt, stop_rx))
@@ -2453,6 +2476,53 @@ mod tests {
             out.first().unwrap().batch().num_columns(),
             1,
             "projected output has one column"
+        );
+    }
+
+    /// An invalid WINDOWED query reports the planner's reason, not a fallback.
+    ///
+    /// Routing used to be `if compile_streaming_window_sql(..).is_err() { run
+    /// stateless }`, which conflated "stateless query" with "windowed query
+    /// that is wrong". The second silently ran a DIFFERENT query — per batch,
+    /// no windows, no state — and the user saw a DataFusion parse error about
+    /// TUMBLE rather than the reason the planner actually had.
+    ///
+    /// Asserts the message reaches the caller, which is the whole point: the
+    /// planner's refusals were already precise and were being thrown away.
+    #[tokio::test]
+    async fn an_invalid_windowed_query_reports_the_planners_reason() {
+        let sources = InMemorySourceProvider::new();
+        sources.insert("events", vec![kv_batch(&["x"], &[10])]);
+        let sink = InMemorySinkProvider::new();
+        let rt = embedded_runtime(Arc::new(sources), Arc::new(sink));
+
+        let job = CompiledJob::new(
+            "bad-window",
+            // Two grouping columns: the planner refuses this by name.
+            "SELECT region, COUNT(*) AS c \
+             FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 60000) \
+             GROUP BY region, product, window_start, window_end",
+            vec![SourceSpec::unbounded("events", "memory", "events")],
+            vec![],
+            true,
+        )
+        .with_engine(EngineKind::Streaming);
+
+        let err = StreamingEngine
+            .run(job, rt)
+            .await
+            .expect_err("an invalid windowed query must not silently run stateless")
+            .to_string();
+
+        assert!(
+            err.contains("product"),
+            "the planner names the column that would have been dropped, and that \
+             message must survive the routing decision; got: {err}"
+        );
+        assert!(
+            !err.to_ascii_lowercase().contains("parse error"),
+            "a DataFusion parse error here means the query fell through to the \
+             stateless path and the planner's reason was discarded; got: {err}"
         );
     }
 }
