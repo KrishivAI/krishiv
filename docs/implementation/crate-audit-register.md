@@ -4879,3 +4879,92 @@ One semantic the test records: the coordinator's inline result store is
 consume-once, so a drain that already took the watermark-closed window leaves
 the flush returning only the trailing one. The job's whole answer is the union,
 which is what a caller must assemble.
+
+---
+
+## §40 — The streaming API surface: SQL, Python, Rust
+
+A three-surface audit against one fixed ten-axis rubric, then the fixes.
+Commits `808da36`, `fe99ae5`, `0021e01`.
+
+### The structural finding
+
+The three surfaces are **not three streaming implementations**. They are three
+lossy translators into one 14-field `WindowExecutionSpec`, which is the sole
+contract between "what the user asked for" and "what any loop runs". Exactly
+three production sites build it from user intent — one per surface. Everything
+below them is genuinely single.
+
+Every confirmed defect reduces to one sentence: **a field of the request never
+reached the spec.**
+
+That is a different axis from the eight-step rework, which de-duplicated the
+*when-to-step* decisions behind the driver loops. This is *what-to-run*.
+
+### Eight confirmed, two refuted
+
+| id | what | fixed |
+|---|---|---|
+| f1 | SQL compiler dropped WHERE / GROUP BY / HAVING / LIMIT / DISTINCT | ✅ fail closed |
+| f2 | two registration paths, one wall-clock guard | ✅ guard at the shared funnel |
+| f6 | distributed streaming dropped the job's sink | ✅ fail closed |
+| f9 | flush verb complete and unreachable from Session | ✅ surfaced + bound in Python |
+| f4 | `write_stream()` discarded the whole pipeline | ✅ writer carries it |
+| f5 | `drop_duplicates` on output, and skipped under a side output | ✅ source-side, one helper |
+| f7 | `temporal_join` accepted `join_keys` and ignored them | ✅ keyed via shared encoder |
+| f3 | `key_column_type` hardcoded `"utf8"`, no setter anywhere | ❌ **open** |
+| f8 | `output_rows` fabricated | REFUTED — inverted: `input_rows` is the liar |
+| f10 | no SQL reaches the run-loop | REFUTED — a different compiler is its front door |
+
+### Three things worth remembering
+
+**f1's failure output is the argument.** With the guards off, the test prints
+the spec that would have run: no trace of the predicate, and
+`key_column: "region"` with `product` gone. `WHERE amount > 100` counted every
+row. The engine reads the raw source directly and never executes the query
+text, so a clause not rejected at compile time has no second chance.
+
+**f7 was already fixed twenty lines away.** The interval join carries an
+`H-1 (audit)` comment describing the identical unkeyed-state defect, repaired
+then. The temporal join was the remaining instance, in the same file. Same
+shape as dd47d50/8756b41.
+
+**Two of my own tests passed against the bug before they caught it.** The f5
+test deduped on the window key and asserted a row count — both the fixed and
+broken code produce one row there. The f7 revert simulated the bug as "two
+states, pick any", which HashMap order happened to answer correctly; the
+accurate revert (one unkeyed state, second customer overwriting the first)
+fails with `left: 99, right: 10`. A revert that does not reproduce the original
+mechanism proves nothing.
+
+### The corpus's missing axis — my own gap
+
+`streaming_corpus.rs` varies event **timing** across arms over ONE fixed query:
+a string key, no `WHERE`, one grouping column. Its axis is the loop. Every
+finding above is on the orthogonal axis — query shape → spec — so the repo's
+strongest test asset is **structurally blind to f1 and f3**, not by oversight
+but because it has no second dimension.
+
+Adding one (BIGINT key, top-level `WHERE`, multi-column `GROUP BY`, session
+window) is cheap and is the highest-value remaining work, because it makes this
+class visible to the arms that already exist.
+
+### Open
+
+- **f3** — the last confirmed finding. `key_column_type` is `"utf8"` at all
+  three spec sites with no setter, and drives both the operator's output schema
+  and the input cast: a `BIGINT` key emits a Utf8 column and a bigint-declared
+  sink receives strings. Fix is to infer from the source schema with the
+  declared value as an override.
+- **The corpus query-shape axis**, above.
+- **f6's better half.** The refusal shipped; forwarding the sink is the real
+  answer, and the coordinator and executor have accepted registry sinks since
+  #197 — only the client leg cannot express it.
+- **`windowed()` as a partial constructor.** It takes 4 of 14 fields and leaves
+  10 to optional setters, so both callers independently picked the same 4 and
+  both omit `with_allowed_lateness_ms` (zero non-test callers repo-wide). A
+  helper everyone reaches that still lets each caller be incomplete — the
+  codebase's own defect shape, inverted.
+- **Five user-facing loops outside the `StreamingLoop` gate**: three writer
+  loops and two PyO3 loops written in the binding layer, choosing their policy
+  implicitly by the order of two for-loops.
