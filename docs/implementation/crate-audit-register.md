@@ -4768,20 +4768,15 @@ apart.
   checkpoint cadence, barrier alignment, key-group routing, peer forwarding and
   restore handling stay per-loop and untyped. Roughly two thirds of each loop
   body is untouched and can still drift.
-- **No end-to-end coordinator arm.** The `stream-eos:` executor half is proven
-  and the coordinator half is routed, but the two have never run together
-  against a live coordinator with a real gRPC executor — the push path rejects
-  an in-process task endpoint, so that arm cannot be stood up in-tree as things
-  are. The coordinator fix is reasoned-and-unit-tested, **not demonstrated**.
+- ~~**No end-to-end coordinator arm.**~~ **CLOSED** — see §39a.
 - **Cycle mode still has no wall clock.** Step 7 refuses session-in-cycle
   rather than fixing it. Inherent: a cycle task exists for one invocation, so
   adding a timer means putting wall clock in the control plane.
 - **Egress buffers remain four different things.** Only the accounting is
   shared; the buffers are genuinely different mechanisms.
-- **Four leads were raised and never verified** (the fan-out was capped at
-  four): null-key poison policy, the four checkpoint models,
-  `KRISHIV_STREAM_PROFILE`'s disjoint halves, and the run-loop's second
-  watermark implementation. They are leads, not findings.
+- ~~**Four leads were raised and never verified.**~~ **CLOSED** — all four
+  resolved in §39a: two real defects fixed, one recorded as an axis, one
+  refuted.
 
 ### Behaviour break
 
@@ -4789,3 +4784,98 @@ A Distributed bounded streaming job that reported `Completed` with a short
 answer now **fails**. Correct direction, but it needs a release note.
 `KRISHIV_ALLOW_UNFLUSHED_BOUNDED=1` opts back in, and the error names the flag
 so an operator has a move rather than just a refusal.
+
+---
+
+## §39a — Closing the two things §39 left open
+
+### The four capped leads, resolved
+
+The audit's verification fan-out was capped at four, leaving four claims
+unverified. All four were taken to the code.
+
+**`checkpoint-model-four-ways` — CONFIRMED, real defect, fixed.** Not the
+"four models" framing, which is a legitimate lifecycle difference, but the
+swallow buried inside it. Two sites wrote
+
+```rust
+.ok().filter(|bytes| !bytes.is_empty())
+```
+
+which maps `Err(..)` and `Ok(vec![])` to the same `None`. Downstream `None`
+means "ship no checkpoint", so a task whose state capture FAILED reported
+success, shipped nothing, and left the job's restore point stale — a recovery
+then replays from an older epoch and reprocesses, with nothing anywhere having
+said so. Empty and failed are now distinct (`classify_snapshot` →
+`SnapshotOutcome`), the failure carries its cause, and the classification lives
+in one place instead of two. Revert-proven: collapsing `Failed` into `Empty`
+fails `a_failed_snapshot_is_distinguishable_from_an_empty_one`.
+
+**`stream-profile-disjoint-halves` — CONFIRMED, honesty defect, fixed.**
+`StreamProfile`'s doc claimed `Throughput` means "micro-batch before draining
+AND checkpoint less often". Measured: `stream_linger()` is reached only by the
+run-loop, `checkpoint_every` only by the embedded continuous loop. **No single
+placement applies both halves**, so `KRISHIV_STREAM_PROFILE=throughput` does
+something materially different depending on where the job landed. The doc now
+carries the measured table, and
+`each_profile_half_is_reached_by_exactly_one_placement` pins it by scanning the
+workspace — brittle on purpose, so wiring either half into the other loop forces
+the table to be revisited.
+
+**`null-key-poison-policy` — CONFIRMED as a divergence, recorded as an axis.**
+`extract_agg_key` returns `InvalidInput` on a NULL key and every operator
+propagates it, so "fatal" is the operator's default and the run-loop is the only
+loop that intercepts (`split_null_key_rows` + a counted drop). Neither side was
+a decision anyone wrote down — one loop grew an interceptor and the rest
+inherited the default. Now a `NullKey` axis on `DriverPolicy`, behaviour
+unchanged, with a coherence rule that a transient loop may NOT declare
+`QuarantineAndCount` because it cannot accumulate a count across invocations —
+and an uncounted quarantine is the one thing quarantining must never be.
+
+**`run-loop-second-watermark-implementation` — REFUTED.** `SplitWatermarks`
+feeds `report_streaming_progress` only: the watermark *reported to the
+coordinator* for cross-subtask min-combining. It never reaches the operator,
+whose watermark still comes from the shared `advance_effective_watermark` via
+`ContinuousWindowExecutor::drain`. Different purpose, not a duplicate — and the
+run-loop is the only loop with multiple subtasks, so it is the only one that
+needs a cross-split combine at all. Residual: `batch_max_event_time` and
+`watermark_util::max_event_time_ms` are two implementations of "max event time
+in a column" differing only in `Timestamp` support. Minor, recorded, not fixed.
+
+### The coordinator arm now exists
+
+`crates/krishiv-executor/tests/coordinator_eos_conformance.rs` stands up **two
+real gRPC servers** in one process — the coordinator's executor-facing server
+and the executor's task server on real TCP ports — plus a runner drive loop, and
+drives register → push → drain → flush end to end.
+
+It had to live in `krishiv-executor`: that crate already dev-depends on
+`krishiv-scheduler`, and adding the reverse dev-dep would be a cycle.
+
+Three things it taught, all of which had been invisible:
+
+1. `ExecutorDescriptor`'s registration endpoint and its **task** endpoint are
+   separate fields. Omitting the second gives "has no task endpoint for
+   assignment push".
+2. The coordinator's executor gRPC **denies anonymous by default**, so every
+   task-status report failed `UNAUTHENTICATED` — and a runner that cannot report
+   is indistinguishable from one that never ran. The drive loop now surfaces
+   that error instead of sleeping through it.
+3. **The first version of this test passed vacuously**, and caught itself only
+   because the corpus carries a partial-loss fixture. Written against
+   `trailing_window_never_closed_by_watermark`, whose `expected_without_flush`
+   is empty, the drain assertion could not tell "the cycle ran and closed
+   nothing" from "the cycle never ran" — and the cycle had in fact never run.
+   Switching to `closed_window_plus_trailing_window`, whose
+   `expected_without_flush` is `[("a",30)]`, made the failure immediate. That
+   entry exists in the corpus for exactly this reason, and it earned its keep on
+   the first test that needed it.
+
+Revert-proven: replacing the `stream-eos:` read with `if false` fails this test
+with `left: [] right: [("a", 7)]`. **Step 5's coordinator fix is now
+demonstrated rather than reasoned.**
+
+One semantic the test records: the coordinator's inline result store is
+consume-once, so a drain that already took the watermark-closed window leaves
+the flush returning only the trailing one. The job's whole answer is the union,
+which is what a caller must assemble.

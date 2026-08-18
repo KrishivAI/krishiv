@@ -620,3 +620,51 @@ async fn the_two_executor_loops_agree_with_each_other() {
         );
     }
 }
+
+/// A failed snapshot must not look like an empty one.
+///
+/// Both cycle and bounded paths used to write
+/// `.ok().filter(|b| !b.is_empty())`, which maps `Err(..)` and `Ok(vec![])` to
+/// the same `None`. Downstream, `None` means "ship no checkpoint" — so a task
+/// whose state capture FAILED reported success, shipped nothing, and left the
+/// job's restore point stale. A recovery then replays from an older epoch and
+/// reprocesses, with nothing anywhere having said so.
+///
+/// The two cases are now distinct, and the failure carries its error text so
+/// the warning can name what went wrong rather than that something did.
+///
+/// Verified discriminating: collapsing `Failed` into `Empty` inside
+/// `classify_snapshot` fails the third assertion here.
+#[test]
+fn a_failed_snapshot_is_distinguishable_from_an_empty_one() {
+    use crate::fragment::common::{SnapshotOutcome, classify_snapshot};
+
+    assert_eq!(
+        classify_snapshot(Ok::<_, String>(Vec::new())),
+        SnapshotOutcome::Empty,
+        "no accumulated state is benign and common"
+    );
+    assert_eq!(
+        classify_snapshot(Ok::<_, String>(vec![1, 2, 3])),
+        SnapshotOutcome::Captured(vec![1, 2, 3]),
+        "captured state ships as the job's restore point"
+    );
+    assert_eq!(
+        classify_snapshot(Err::<Vec<u8>, _>(String::from("backend unavailable"))),
+        SnapshotOutcome::Failed(String::from("backend unavailable")),
+        "a failure must stay a failure, carrying its cause — collapsing it into Empty \
+         is what made a stale restore point invisible"
+    );
+
+    // Both non-Captured outcomes ship nothing, which is why the distinction has
+    // to live in the type rather than in the shipped value.
+    assert_eq!(SnapshotOutcome::Empty.into_bytes(), None);
+    assert_eq!(
+        SnapshotOutcome::Failed(String::from("x")).into_bytes(),
+        None
+    );
+    assert_eq!(
+        SnapshotOutcome::Captured(vec![7]).into_bytes(),
+        Some(vec![7])
+    );
+}

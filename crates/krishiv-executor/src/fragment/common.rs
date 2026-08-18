@@ -1135,6 +1135,45 @@ pub(crate) fn read_continuous_restore_hint(
     })
 }
 
+/// What a snapshot attempt produced.
+///
+/// Exists because `Option<Vec<u8>>` cannot tell "nothing had accumulated" from
+/// "capturing it failed", and both call sites used to collapse them with
+/// `.ok().filter(|b| !b.is_empty())`. The second case means the task ships no
+/// checkpoint, so the job's restore point does not advance and a recovery
+/// replays from an older epoch — a durability loss that looked exactly like the
+/// benign case from every angle downstream.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SnapshotOutcome {
+    /// State was captured and is non-empty.
+    Captured(Vec<u8>),
+    /// The operator had nothing to capture. Benign and common.
+    Empty,
+    /// Capture failed. The restore point does not advance.
+    Failed(String),
+}
+
+impl SnapshotOutcome {
+    /// The bytes to ship, if any.
+    pub(crate) fn into_bytes(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Captured(bytes) => Some(bytes),
+            Self::Empty | Self::Failed(_) => None,
+        }
+    }
+}
+
+/// Classify a snapshot attempt, keeping failure distinguishable from emptiness.
+pub(crate) fn classify_snapshot<E: std::fmt::Display>(
+    result: Result<Vec<u8>, E>,
+) -> SnapshotOutcome {
+    match result {
+        Ok(bytes) if bytes.is_empty() => SnapshotOutcome::Empty,
+        Ok(bytes) => SnapshotOutcome::Captured(bytes),
+        Err(error) => SnapshotOutcome::Failed(error.to_string()),
+    }
+}
+
 /// Input-partition prefix marking "the stream has ended".
 ///
 /// A direct sibling of `stream-peers:`. A cycle task exists for exactly one

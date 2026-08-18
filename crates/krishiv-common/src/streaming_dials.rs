@@ -90,6 +90,27 @@ pub fn idle_tick_interval() -> Duration {
 /// * `Throughput` — micro-batch before draining and checkpoint less often,
 ///   trading a longer latency tail and a larger recovery-replay bound for
 ///   sustained rows/sec.
+///
+/// # No loop applies both halves, and the doc above used to imply otherwise
+///
+/// Those two sentences describe an intent, not any single placement's
+/// behaviour. Measured:
+///
+/// | half | reached via | applied by |
+/// |---|---|---|
+/// | micro-batch linger | [`stream_linger`] → [`StreamProfile::linger`] | the run-loop only |
+/// | checkpoint cadence | `krishiv-engines::checkpoint_every` | the embedded continuous loop only |
+///
+/// So `KRISHIV_STREAM_PROFILE=throughput` gives a run-loop job a longer linger
+/// and its ORIGINAL checkpoint cadence (barrier checkpoints are driven by the
+/// coordinator's interval, not by this profile), and gives an embedded job
+/// fewer checkpoints and NO linger. Setting it does something different
+/// depending on where the job landed.
+///
+/// That is not necessarily wrong — the two loops have genuinely different
+/// checkpoint machinery, and a barrier cadence is the coordinator's to set —
+/// but it was undocumented, which made the profile read as one dial with one
+/// meaning. Pinned by `each_profile_half_is_reached_by_exactly_one_placement`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamProfile {
     LowLatency,
@@ -139,6 +160,90 @@ pub fn stream_linger() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Walk `crates/` and collect files containing `needle`, skipping this file.
+    fn crates_containing(needle: &str) -> Vec<String> {
+        fn walk(
+            root: &std::path::Path,
+            dir: &std::path::Path,
+            needle: &str,
+            out: &mut Vec<String>,
+        ) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    walk(root, &path, needle, out);
+                } else if path.extension().is_some_and(|e| e == "rs" || e == "inc")
+                    && path.file_name().is_some_and(|n| n != "streaming_dials.rs")
+                    && std::fs::read_to_string(&path).is_ok_and(|text| text.contains(needle))
+                {
+                    // Record the crate name, which is what the claim is about.
+                    let name = path
+                        .strip_prefix(root)
+                        .ok()
+                        .and_then(|r| r.components().next().map(|c| c.as_os_str().to_owned()))
+                        .and_then(|c| c.into_string().ok());
+                    if let Some(name) = name
+                        && !out.contains(&name)
+                    {
+                        out.push(name);
+                    }
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates dir")
+            .to_path_buf();
+        let mut out = Vec::new();
+        walk(&root, &root, needle, &mut out);
+        out.sort();
+        out
+    }
+
+    /// `KRISHIV_STREAM_PROFILE` does two different things in two places, and the
+    /// doc on [`StreamProfile`] now says so.
+    ///
+    /// This pins the measurement behind that doc. Source-scanning is brittle by
+    /// nature — and here that is the feature: wiring linger into the embedded
+    /// loop, or profile-driven checkpoint cadence into the run-loop, would make
+    /// the documented table wrong, and this is what forces it to be revisited
+    /// rather than silently drifting.
+    ///
+    /// Precedent: `env_registry` already scans the workspace this way.
+    #[test]
+    fn each_profile_half_is_reached_by_exactly_one_placement() {
+        let linger = crates_containing("stream_linger()");
+        let cadence = crates_containing("checkpoint_every(");
+
+        assert!(
+            linger.contains(&String::from("krishiv-executor")),
+            "the micro-batch linger half is applied by the run-loop; found in {linger:?}"
+        );
+        assert!(
+            !linger.contains(&String::from("krishiv-engines")),
+            "krishiv-engines does NOT apply the linger half — if that changed, the table \
+             on StreamProfile is now wrong and must be updated; found in {linger:?}"
+        );
+
+        assert!(
+            cadence.contains(&String::from("krishiv-engines")),
+            "the checkpoint-cadence half is applied by the embedded continuous loop; \
+             found in {cadence:?}"
+        );
+        assert!(
+            !cadence.contains(&String::from("krishiv-executor")),
+            "the run-loop's checkpoints are barrier-driven by the coordinator, not by this \
+             profile — if that changed, the table on StreamProfile is now wrong; found in \
+             {cadence:?}"
+        );
+    }
 
     #[test]
     fn an_unset_or_unparseable_idle_tick_uses_the_default() {

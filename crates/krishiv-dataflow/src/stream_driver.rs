@@ -117,6 +117,27 @@ pub enum Egress {
     CappedDropOldest,
 }
 
+/// What this loop does with a row whose grouping key is NULL.
+///
+/// `join::extract_agg_key` returns `ExecError::InvalidInput` for a NULL key and
+/// every window operator propagates it, so the operator's answer is "fatal"
+/// unless a loop intercepts first. Exactly one does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullKey {
+    /// Let the operator's error propagate and kill the job.
+    ///
+    /// Defensible: a NULL group key usually means the upstream projection is
+    /// wrong, and failing loudly beats silently bucketing those rows nowhere.
+    Fatal,
+    /// Mask NULL-key rows out before the operator sees them, and count them.
+    ///
+    /// Defensible too, for a long-lived job: one malformed row should not take
+    /// down a stream that has been running for days. Only safe when the drop is
+    /// *counted and reported*, which is why the two are one variant rather than
+    /// a bare "skip".
+    QuarantineAndCount,
+}
+
 /// Every decision a driver loop must answer, as one value.
 ///
 /// Deliberately has no `Default`, no `#[non_exhaustive]` and no builder. Each of
@@ -134,6 +155,8 @@ pub struct DriverPolicy {
     pub lifecycle: Lifecycle,
     /// See [`Egress`].
     pub egress: Egress,
+    /// See [`NullKey`].
+    pub null_key: NullKey,
 }
 
 impl DriverPolicy {
@@ -159,6 +182,15 @@ impl DriverPolicy {
             return Some(
                 "a long-lived loop's source is never exhausted, so a flush conditioned \
                  on exhaustion can never fire",
+            );
+        }
+        if matches!(self.null_key, NullKey::QuarantineAndCount)
+            && matches!(self.lifecycle, Lifecycle::TransientPerInvocation)
+        {
+            return Some(
+                "a transient per-invocation loop cannot accumulate a quarantine count \
+                 across invocations, so the drop would be silent — which is the one thing \
+                 quarantining must never be",
             );
         }
         if matches!(self.end_of_stream, EndOfStream::DelegatedToRuntime)
@@ -247,6 +279,7 @@ impl StreamingLoop {
                 input_typing: InputTyping::CoerceToSpec,
                 lifecycle: Lifecycle::OwnsWholeJob,
                 egress: Egress::Backpressure,
+                null_key: NullKey::Fatal,
             },
             // Long-lived embedded loop: ticks on idle so session windows can
             // close, and does NOT flush on stop — its source is never over, so a
@@ -257,6 +290,7 @@ impl StreamingLoop {
                 input_typing: InputTyping::CoerceToSpec,
                 lifecycle: Lifecycle::LongLived,
                 egress: Egress::Backpressure,
+                null_key: NullKey::Fatal,
             },
             // Holds no operator; register/push/drain go through the runtime, and
             // so must the flush.
@@ -266,6 +300,7 @@ impl StreamingLoop {
                 input_typing: InputTyping::CoerceToSpec,
                 lifecycle: Lifecycle::OwnsWholeJob,
                 egress: Egress::Backpressure,
+                null_key: NullKey::Fatal,
             },
             // Exists for one invocation, so it cannot observe source exhaustion
             // and cannot own a wall clock. Its flush has to be told to it.
@@ -275,6 +310,7 @@ impl StreamingLoop {
                 input_typing: InputTyping::CoerceToSpec,
                 lifecycle: Lifecycle::TransientPerInvocation,
                 egress: Egress::Backpressure,
+                null_key: NullKey::Fatal,
             },
             // Long-lived and cancelled rather than completed. Coerces its own
             // input before routing, so the driver must not cast a second time.
@@ -284,6 +320,7 @@ impl StreamingLoop {
                 input_typing: InputTyping::PreCoerced,
                 lifecycle: Lifecycle::LongLived,
                 egress: Egress::CappedDropOldest,
+                null_key: NullKey::QuarantineAndCount,
             },
         }
     }
@@ -1008,6 +1045,56 @@ mod tests {
         }
     }
 
+    /// The NULL-key axis records a divergence that already existed.
+    ///
+    /// Behaviour-preserving by design: the run-loop quarantines and counts
+    /// (`split_null_key_rows` + `continuous_null_key_rows`), and every other
+    /// loop lets `extract_agg_key`'s error kill the job. Neither was a decision
+    /// anyone wrote down — one loop grew an interceptor and the rest inherited
+    /// the operator's default. This asserts the split so that changing it is a
+    /// deliberate edit here rather than a side effect somewhere else.
+    #[test]
+    fn only_the_run_loop_quarantines_a_null_grouping_key() {
+        assert_eq!(
+            StreamingLoop::RunLoop.policy().null_key,
+            NullKey::QuarantineAndCount,
+            "the run-loop masks NULL-key rows out and counts them for the heartbeat"
+        );
+        for loop_id in StreamingLoop::ALL
+            .iter()
+            .filter(|l| **l != StreamingLoop::RunLoop)
+        {
+            assert_eq!(
+                loop_id.policy().null_key,
+                NullKey::Fatal,
+                "{} lets the operator's NULL-key error propagate",
+                loop_id.name()
+            );
+        }
+    }
+
+    /// Quarantining is only safe when the drop is counted, and a transient loop
+    /// cannot count across invocations.
+    ///
+    /// Without this rule a future Cycle-like loop could declare
+    /// `QuarantineAndCount`, drop rows on every invocation, and report zero —
+    /// silently, which is the single thing quarantining must never be.
+    #[test]
+    fn a_transient_loop_may_not_quarantine_because_it_cannot_count() {
+        let transient_quarantine = DriverPolicy {
+            idle_tick: IdleTick::None,
+            end_of_stream: EndOfStream::FlushOnDirective,
+            input_typing: InputTyping::CoerceToSpec,
+            lifecycle: Lifecycle::TransientPerInvocation,
+            egress: Egress::Backpressure,
+            null_key: NullKey::QuarantineAndCount,
+        };
+        assert!(
+            transient_quarantine.incoherence().is_some(),
+            "a loop that cannot accumulate a count must not claim to quarantine"
+        );
+    }
+
     /// The coherence rules reject the combinations they claim to reject.
     ///
     /// Without this, `incoherence` could return `None` unconditionally and every
@@ -1022,6 +1109,7 @@ mod tests {
             input_typing: InputTyping::CoerceToSpec,
             lifecycle: Lifecycle::TransientPerInvocation,
             egress: Egress::Backpressure,
+            null_key: NullKey::Fatal,
         };
         assert!(
             transient_with_clock.incoherence().is_some(),
@@ -1034,6 +1122,7 @@ mod tests {
             input_typing: InputTyping::PreCoerced,
             lifecycle: Lifecycle::LongLived,
             egress: Egress::CappedDropOldest,
+            null_key: NullKey::QuarantineAndCount,
         };
         assert!(
             long_lived_exhaustion.incoherence().is_some(),

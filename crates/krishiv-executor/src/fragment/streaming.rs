@@ -355,7 +355,18 @@ fn execute_window_join_fragment(
         } else {
             None
         };
-        let state_snapshot = op.snapshot_bytes().ok().filter(|bytes| !bytes.is_empty());
+        // Same distinction as the cycle path below: empty means "nothing
+        // accumulated", failure means "this task's restore point does not
+        // advance". Collapsing both to None hid the second behind the first.
+        let outcome = crate::fragment::common::classify_snapshot(op.snapshot_bytes());
+        if let crate::fragment::common::SnapshotOutcome::Failed(error) = &outcome {
+            tracing::warn!(
+                %error,
+                "bounded window task could not snapshot its operator state; it ships NO \
+                 checkpoint, so a recovery replays from an older epoch",
+            );
+        }
+        let state_snapshot = outcome.into_bytes();
         (out, state_snapshot, watermark_ms)
     };
 
@@ -600,11 +611,39 @@ async fn execute_loop_fragment(
     // cycle just completed, so this is a consistent boundary. The bytes feed
     // the queryable-state store below AND travel to the coordinator in the
     // task output as the job's restorable checkpoint (G5).
-    let state_snapshot = executor_arc
-        .lock()
-        .ok()
-        .and_then(|mut exec| exec.snapshot().ok())
-        .filter(|bytes| !bytes.is_empty());
+    // A failed snapshot and an empty one used to collapse into the same `None`
+    // here — `.ok().and_then(|e| e.snapshot().ok())` — so a cycle whose state
+    // could not be captured reported success, shipped no checkpoint, and left
+    // the job's restore point silently stale. On recovery that job replays from
+    // an older epoch and reprocesses, with nothing anywhere having said so.
+    //
+    // Empty is fine and common (nothing accumulated yet). Failure is not, and
+    // the two must be distinguishable. The cycle still succeeds — its output is
+    // already computed and discarding it would turn a durability problem into a
+    // correctness one — but the failure is named, with the error.
+    let state_snapshot = match executor_arc.lock() {
+        Ok(mut exec) => {
+            let outcome = crate::fragment::common::classify_snapshot(exec.snapshot());
+            if let crate::fragment::common::SnapshotOutcome::Failed(error) = &outcome {
+                tracing::warn!(
+                    job_id,
+                    %error,
+                    "stream:loop cycle could not snapshot its operator state; this cycle \
+                     ships NO checkpoint, so the job's restore point does not advance and \
+                     a recovery will replay from an older epoch and reprocess",
+                );
+            }
+            outcome.into_bytes()
+        }
+        Err(_) => {
+            tracing::warn!(
+                job_id,
+                "stream:loop cycle could not lock its executor to snapshot; this cycle \
+                 ships NO checkpoint and the job's restore point does not advance",
+            );
+            None
+        }
+    };
 
     // Fix #2: after each drain cycle, push a read-only snapshot into the
     // queryable-state store so REST point-lookups can serve the latest state

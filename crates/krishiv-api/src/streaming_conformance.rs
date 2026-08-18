@@ -31,7 +31,7 @@
 //! [`krishiv_dataflow::streaming_corpus`], because `krishiv-api` cannot see
 //! `krishiv-executor` and the executor-side arms need the same expectations.
 //! `krishiv-dataflow` is the deepest crate both depend on. The executor arms
-//! live in `crates/krishiv-executor/tests/streaming_loop_conformance.rs`.
+//! live in `crates/krishiv-executor/src/sections/loop_conformance.rs.inc`.
 //!
 //! ## What the runtime seam actually proves, and what it does not
 //!
@@ -54,12 +54,13 @@
 //!
 //! ## Scope, stated honestly
 //!
-//! Still not covered here: a **coordinator-backed** host. `FlightSqlHost`
-//! routes `Coordinator` drains to `krishiv_scheduler::drain_continuous_stream_coordinated`
-//! and never touches `ContinuousStreamRegistry`, and its push path rejects an
-//! in-process task endpoint outright, so that arm needs a live coordinator plus
-//! a real gRPC executor. It is recorded as open rather than quietly skipped —
-//! it is the only arm that observes the full production path end to end.
+//! The **coordinator-backed** arm is not here, because it cannot be: it needs a
+//! live coordinator and a real gRPC executor, and `krishiv-api` can reach
+//! neither. It does exist — `crates/krishiv-executor/tests/coordinator_eos_conformance.rs`
+//! stands up both servers on real ports and drives register → push → drain →
+//! flush end to end. That is the arm that observes the full production path,
+//! and it is what turned step 5's coordinator fix from reasoned into
+//! demonstrated.
 
 #[cfg(test)]
 mod streaming_conformance_tests {

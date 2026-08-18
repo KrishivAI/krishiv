@@ -497,13 +497,11 @@ impl FlightExecutionHost {
     /// Drain completed results from a continuous streaming job.
     /// Close every window `job_id` still holds open, because its source is over.
     ///
-    /// Only the in-process backend can service this today. A coordinator-backed
-    /// cluster has no registry entry and no local operator — the operator lives
-    /// inside the executor — so reaching it needs a scheduled final cycle
-    /// carrying an end-of-stream directive. That is step 5; until it lands this
-    /// branch returns `Unimplemented`, which the client translates to
-    /// `RuntimeError::Unsupported` and the bounded seam reports rather than
-    /// swallowing.
+    /// A coordinator-backed cluster has no registry entry and no local operator
+    /// — the operator lives inside the executor — so reaching it means
+    /// scheduling a final cycle carrying an end-of-stream directive. Both
+    /// backends now service this, and the coordinator path is covered end to
+    /// end by `krishiv-executor/tests/coordinator_eos_conformance.rs`.
     ///
     /// Returning an error here rather than `Ok(vec![])` is the whole point: an
     /// empty success is indistinguishable from "there was nothing to flush",
