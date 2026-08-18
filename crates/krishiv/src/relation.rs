@@ -104,6 +104,7 @@ impl StreamingChain {
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         })
     }
 

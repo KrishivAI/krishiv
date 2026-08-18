@@ -762,6 +762,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let sql = encode_continuous_register("job-abc", &local).unwrap();
         let (directives, _) = parse_sql(&sql);
@@ -835,6 +836,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let batch = test_batch();
         let sql = encode_bounded_window("events", &local, &[batch]).unwrap();
@@ -1195,6 +1197,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let sql = encode_bounded_window("topic", &local, &[]).unwrap();
         let (directives, _) = parse_sql(&sql);

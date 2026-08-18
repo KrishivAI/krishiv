@@ -209,6 +209,7 @@ fn build_tumbling_spec(
         source_watermark_lags: HashMap::new(),
         source_id_column: None,
         window_timezone: None,
+        row_filter: None,
     };
     apply_multi_source_watermark(keyed, &mut spec)?;
     Ok(spec)
@@ -391,6 +392,7 @@ impl SessionWindowedStream {
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         apply_multi_source_watermark(&self.keyed, &mut spec)?;
         execute_windowed_inner(&self.keyed.inner, spec)
@@ -426,6 +428,7 @@ impl SlidingWindowedStream {
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         apply_multi_source_watermark(&self.keyed, &mut spec)?;
         execute_windowed_inner(&self.keyed.inner, spec)

@@ -698,6 +698,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let action = KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody::new(
             "sliding-job",
@@ -736,6 +737,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let batch = test_batch();
         let action = KrishivFlightAction::BoundedWindow(BoundedWindowBody {

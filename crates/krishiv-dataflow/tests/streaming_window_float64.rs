@@ -62,6 +62,7 @@ fn streaming_window_preserves_float64_sum() {
         source_watermark_lags: std::collections::HashMap::new(),
         source_id_column: None,
         window_timezone: None,
+        row_filter: None,
     };
 
     let input: Pin<Box<dyn Stream<Item = ExecResult<RecordBatch>> + Send>> =

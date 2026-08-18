@@ -195,6 +195,17 @@ pub struct WindowExecutionSpec {
     /// affected by this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_timezone: Option<String>,
+    /// Row predicate applied to the input BEFORE grouping — a streaming
+    /// `WHERE`.
+    ///
+    /// Distinct from [`WindowAgg::filter`], which is per-aggregate and runs
+    /// after the row has already joined its key group. That difference is
+    /// load-bearing: a `WHERE` that removes every row of a group must remove
+    /// the GROUP, and a per-aggregate filter would instead emit it with a zero
+    /// count. So this is applied where the operator receives input, not where
+    /// it accumulates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_filter: Option<WindowAggFilter>,
 }
 
 fn default_key_type() -> String {
@@ -226,6 +237,7 @@ impl WindowExecutionSpec {
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         }
     }
 }
@@ -280,6 +292,7 @@ pub fn decode_window_execution_spec(encoded: &str) -> Result<WindowExecutionSpec
         source_watermark_lags: parsed.source_watermark_lags,
         source_id_column: parsed.source_id_column,
         window_timezone: None,
+        row_filter: None,
     };
     validate_window_execution_spec(&spec)?;
     Ok(spec)
@@ -853,6 +866,7 @@ mod tests {
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         super::validate_window_execution_spec(&make(Some(10_000)))
             .expect("session window with window_size_ms == 0 must validate");
@@ -915,6 +929,7 @@ mod tests {
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let frag = encode_stream_fragment(&spec).unwrap();
         let parsed = parse_stream_fragment(&frag).expect("parse");
@@ -952,6 +967,7 @@ mod tests {
             source_watermark_lags,
             source_id_column: Some(String::from("source")),
             window_timezone: None,
+            row_filter: None,
         };
 
         let encoded = encode_window_execution_spec(&spec).unwrap();
@@ -1017,6 +1033,7 @@ mod tests {
             source_watermark_lags,
             source_id_column: Some("source_id".into()),
             window_timezone: None,
+            row_filter: None,
         };
 
         let fragment = encode_stream_fragment(&spec).unwrap();
@@ -1068,6 +1085,7 @@ mod tests {
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let frag = encode_stream_fragment(&spec).unwrap();
         let parsed = parse_stream_fragment(&frag).expect("parse escaped fragment");
@@ -1092,6 +1110,7 @@ mod tests {
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let frag = encode_stream_fragment(&spec).unwrap();
         let parsed = parse_stream_fragment(&frag).expect("parse escaped backslash");
@@ -1117,6 +1136,7 @@ mod tests {
             source_watermark_lags,
             source_id_column: Some("src:col".into()),
             window_timezone: None,
+            row_filter: None,
         };
         let frag = encode_stream_fragment(&spec).unwrap();
         let parsed = parse_stream_fragment(&frag).expect("parse escaped multi-source");
@@ -1203,6 +1223,7 @@ mod tests {
                         source_watermark_lags: HashMap::new(),
                         source_id_column: None,
                         window_timezone: None,
+                        row_filter: None,
                     },
                 )
         }

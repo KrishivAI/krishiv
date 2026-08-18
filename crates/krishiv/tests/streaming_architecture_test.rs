@@ -257,6 +257,7 @@ async fn test_continuous_job_lifecycle() {
         source_id_column: None,
         allowed_lateness_ms: None,
         window_timezone: None,
+        row_filter: None,
     };
     let job_name = session
         .submit_stream_job("continuous-test", spec)
@@ -302,6 +303,7 @@ async fn test_state_across_drain_cycles() {
         source_id_column: None,
         allowed_lateness_ms: None,
         window_timezone: None,
+        row_filter: None,
     };
     session
         .submit_stream_job("state-test", spec)

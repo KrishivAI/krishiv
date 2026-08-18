@@ -55,6 +55,14 @@ pub struct LocalWindowExecutionSpec {
     /// Optional timezone for SQL civil-time window bucketing (e.g. "America/New_York").
     /// Only affects SQL window TVFs; watermark comparison is always UTC.
     pub window_timezone: Option<String>,
+    /// Row predicate applied before grouping — a streaming `WHERE`.
+    ///
+    /// Present here as well as on the plan spec because the two convert into
+    /// each other, and a field that exists on only one side is silently
+    /// dropped by the conversion. That is the exact defect shape this engine's
+    /// API audit found repeatedly: a field of the request that never reached
+    /// the spec.
+    pub row_filter: Option<krishiv_plan::window::WindowAggFilter>,
 }
 
 impl LocalWindowExecutionSpec {
@@ -92,6 +100,7 @@ impl LocalWindowExecutionSpec {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         }
     }
 
@@ -147,6 +156,7 @@ impl LocalWindowExecutionSpec {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         }
     }
 
@@ -220,6 +230,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let out =
             execute_windowed_stream(vec![events_batch()], &spec).expect("execute_windowed_stream");
@@ -241,6 +252,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let out = execute_windowed_stream(vec![events_batch()], &spec).expect("session");
         assert!(!out.is_empty());
@@ -261,6 +273,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let out = execute_windowed_stream(vec![], &spec).expect("empty");
         assert!(out.is_empty());
@@ -281,6 +294,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let out = execute_windowed_stream(vec![events_batch()], &spec).expect("sliding");
         assert!(!out.is_empty());
@@ -309,6 +323,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let plan = spec.to_plan_spec();
         assert_eq!(plan.key_column, "k");
@@ -361,6 +376,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let out = execute_windowed_stream(vec![batch], &spec).unwrap();
         assert!(!out.is_empty());

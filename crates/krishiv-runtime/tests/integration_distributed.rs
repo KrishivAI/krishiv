@@ -87,6 +87,7 @@ fn tumbling_spec() -> LocalWindowExecutionSpec {
         source_watermark_lags: std::collections::HashMap::new(),
         source_id_column: None,
         window_timezone: None,
+        row_filter: None,
     }
 }
 
@@ -533,6 +534,7 @@ async fn flight_sql_continuous_stream_register_push_drain() {
         source_watermark_lags: std::collections::HashMap::new(),
         source_id_column: None,
         window_timezone: None,
+        row_filter: None,
     };
 
     rt.register_continuous_stream("flight-cs-1", &spec)

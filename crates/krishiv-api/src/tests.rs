@@ -961,6 +961,7 @@ async fn stream_async_embedded_push_and_drain() {
         source_watermark_lags: HashMap::new(),
         source_id_column: None,
         window_timezone: None,
+        row_filter: None,
     };
     let job = session
         .stream_async("stream-async-test", spec)
@@ -1057,6 +1058,7 @@ async fn continuous_stream_job_poll_drains_via_coordinator() {
         source_watermark_lags: HashMap::new(),
         source_id_column: None,
         window_timezone: None,
+        row_filter: None,
     };
     session.submit_stream_job("events", spec).expect("submit");
     let schema = Arc::new(Schema::new(vec![
@@ -1095,6 +1097,7 @@ async fn local_continuous_stream_status_and_checkpoint_are_mode_aware() {
         source_watermark_lags: HashMap::new(),
         source_id_column: None,
         window_timezone: None,
+        row_filter: None,
     };
     session
         .submit_stream_job("status-job", spec)
@@ -1162,6 +1165,7 @@ async fn local_continuous_stream_restore_rolls_back_exported_state() {
         source_watermark_lags: HashMap::new(),
         source_id_column: None,
         window_timezone: None,
+        row_filter: None,
     };
     session
         .submit_stream_job("restore-job", spec)
@@ -1284,6 +1288,7 @@ async fn continuous_job_id_takes_precedence_over_unbounded_table_name() {
         source_watermark_lags: HashMap::new(),
         source_id_column: None,
         window_timezone: None,
+        row_filter: None,
     };
     session
         .submit_stream_job("shared-name", spec)
@@ -1328,6 +1333,7 @@ fn duplicate_continuous_job_registration_is_rejected() {
         source_watermark_lags: HashMap::new(),
         source_id_column: None,
         window_timezone: None,
+        row_filter: None,
     };
     session
         .submit_stream_job("duplicate-job", spec.clone())

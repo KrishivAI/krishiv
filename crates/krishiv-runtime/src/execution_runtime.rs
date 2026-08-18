@@ -1442,6 +1442,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         rt.register_continuous_stream("j1", &spec).unwrap();
         let schema = Arc::new(arrow::datatypes::Schema::new(vec![
@@ -1635,6 +1636,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         rt.register_continuous_stream("durable-j1", &spec).unwrap();
 

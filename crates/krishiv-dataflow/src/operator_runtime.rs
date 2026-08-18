@@ -675,6 +675,7 @@ pub fn local_spec_to_window_execution(params: LocalWindowParams) -> WindowExecut
         source_watermark_lags: std::collections::HashMap::new(),
         source_id_column: None,
         window_timezone: None,
+        row_filter: None,
     }
 }
 
@@ -845,6 +846,7 @@ mod tests {
             source_watermark_lags: HashMap::from([("src-a".into(), 0), ("src-b".into(), 0)]),
             source_id_column: Some("source_id".into()),
             window_timezone: None,
+            row_filter: None,
         };
         let schema = Arc::new(Schema::new(vec![
             Field::new("user_id", DataType::Utf8, false),
@@ -890,6 +892,7 @@ mod tests {
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let schema = Arc::new(Schema::new(vec![
             Field::new("user_id", DataType::Utf8, false),
@@ -949,6 +952,7 @@ mod tests {
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let one = |ts: i64| -> RecordBatch {
             let schema = Arc::new(Schema::new(vec![

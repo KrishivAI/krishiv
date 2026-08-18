@@ -97,6 +97,17 @@ pub fn compile_streaming_window_sql(sql: &str) -> SqlResult<StreamingWindowPlan>
     let (window, source) = extract_window(&select)?;
     let (key_column, agg_exprs) = extract_key_and_aggs(&select)?;
 
+    // A top-level WHERE becomes a row filter applied BEFORE grouping, using the
+    // same predicate AST and the same lowering as a per-aggregate
+    // `FILTER (WHERE …)`. It deliberately does NOT become a per-aggregate
+    // filter: those run after a row has joined its key group, so a predicate
+    // that removes every row of a group would leave the group emitting a zero
+    // count instead of vanishing. `WHERE` must remove the group.
+    let row_filter = match &select.selection {
+        Some(expr) => Some(lower_filter_expr(expr)?),
+        None => None,
+    };
+
     let spec = WindowExecutionSpec {
         key_column,
         key_column_type: String::from("utf8"),
@@ -112,6 +123,7 @@ pub fn compile_streaming_window_sql(sql: &str) -> SqlResult<StreamingWindowPlan>
         source_watermark_lags: HashMap::new(),
         source_id_column: None,
         window_timezone: None,
+        row_filter,
     };
     Ok(StreamingWindowPlan { spec, source })
 }
@@ -191,14 +203,6 @@ fn reject_unsupported_query_clauses(query: &Query) -> SqlResult<()> {
 /// once the key column is known, so that a grouping list which disagrees with
 /// the inferred key is caught rather than silently collapsed.
 fn reject_unsupported_select_clauses(select: &Select) -> SqlResult<()> {
-    if select.selection.is_some() {
-        return Err(unsupported(
-            "streaming window queries do not support WHERE: the predicate would be \
-             silently dropped, so it is refused instead. Filter upstream — in the source \
-             connector's query or view — or use a FILTER (WHERE …) clause on an \
-             individual aggregate, which IS supported",
-        ));
-    }
     if select.having.is_some() {
         return Err(unsupported(
             "streaming window queries do not support HAVING: a closed window is emitted \
@@ -1118,7 +1122,6 @@ mod fail_closed_tests {
         let base = "SELECT user_id, SUM(amount) AS total \
                     FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 10000)";
         let cases: &[(&str, &str)] = &[
-            (&format!("{base} WHERE amount > 100"), "WHERE"),
             (
                 &format!("{base} GROUP BY user_id HAVING SUM(amount) > 5"),
                 "HAVING",
@@ -1143,6 +1146,57 @@ mod fail_closed_tests {
                 "the error must name `{clause}` so the user knows what to remove; got: {err}"
             );
         }
+    }
+
+    /// A top-level `WHERE` is now COMPILED, not refused.
+    ///
+    /// It was refused when the compiler could only drop it. It now lowers to a
+    /// `row_filter` on the spec — the same predicate AST and the same lowering
+    /// as a per-aggregate `FILTER (WHERE …)` — applied before grouping.
+    ///
+    /// Asserts the predicate actually reached the spec, not merely that
+    /// compilation succeeded: "compiles" was exactly the state the original
+    /// defect was in.
+    #[test]
+    fn a_top_level_where_lowers_into_the_spec_row_filter() {
+        let plan = compile_streaming_window_sql(
+            "SELECT user_id, SUM(amount) AS total \
+             FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 10000) \
+             WHERE amount > 100 \
+             GROUP BY user_id, window_start, window_end",
+        )
+        .expect("a WHERE must now compile");
+
+        let filter = plan
+            .spec
+            .row_filter
+            .as_ref()
+            .expect("the predicate must reach the spec, not vanish");
+        match filter {
+            krishiv_plan::window::WindowAggFilter::Compare { column, .. } => {
+                assert_eq!(column, "amount", "the predicate must name its column");
+            }
+            other => panic!("expected a Compare predicate, got {other:?}"),
+        }
+    }
+
+    /// Boolean combinators survive the lowering too.
+    #[test]
+    fn a_compound_where_lowers_whole() {
+        let plan = compile_streaming_window_sql(
+            "SELECT user_id, COUNT(*) AS c \
+             FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 10000) \
+             WHERE amount > 100 AND user_id IS NOT NULL \
+             GROUP BY user_id",
+        )
+        .expect("a compound WHERE must compile");
+        assert!(
+            matches!(
+                plan.spec.row_filter,
+                Some(krishiv_plan::window::WindowAggFilter::And(_, _))
+            ),
+            "AND must survive as an And node, not collapse to one side"
+        );
     }
 
     /// A second grouping column is refused, naming the column that would have

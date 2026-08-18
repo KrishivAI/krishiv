@@ -1044,6 +1044,7 @@ mod output_mode_compat_tests {
                             source_watermark_lags: Default::default(),
                             source_id_column: None,
                             window_timezone: None,
+                            row_filter: None,
                         }),
                     }),
             )

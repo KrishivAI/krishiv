@@ -387,7 +387,49 @@ impl ContinuousWindowExecutor {
     /// rather than wall-clock time even for keys that were never read again after
     /// expiry.  Within the batch loop, `set_watermark` is called again after each
     /// watermark advance so that lazy read-time expiry also reflects event time.
+    /// Apply the spec's row filter (a streaming `WHERE`), if any.
+    ///
+    /// Reuses `eval_agg_filter` — the same evaluator the per-aggregate
+    /// `FILTER (WHERE …)` clause uses — so the two cannot disagree about NULL
+    /// handling or comparison semantics. Batches that filter down to nothing
+    /// are dropped rather than passed on empty.
+    fn apply_row_filter(&self, batches: Vec<RecordBatch>) -> ExecResult<Vec<RecordBatch>> {
+        let Some(filter) = self.spec.row_filter.as_ref() else {
+            return Ok(batches);
+        };
+        let mut kept = Vec::with_capacity(batches.len());
+        for batch in batches {
+            // NULL in the mask means "row excluded", which is what
+            // `filter_record_batch` does with a null predicate and what SQL
+            // `WHERE` requires — a row whose predicate is unknown is not
+            // selected.
+            let mask = crate::aggregate::eval_agg_filter(filter, &batch)?;
+            let filtered = arrow::compute::filter_record_batch(&batch, &mask)
+                .map_err(|e| crate::ExecError::Arrow(format!("row filter: {e}")))?;
+            if filtered.num_rows() > 0 {
+                kept.push(filtered);
+            }
+        }
+        Ok(kept)
+    }
+
     pub fn drain(&mut self, input_batches: Vec<RecordBatch>) -> ExecResult<Vec<RecordBatch>> {
+        // A streaming `WHERE` runs HERE — before grouping, before the watermark
+        // advance, before the operator exists.
+        //
+        // Placement is the whole design. Every driver loop reaches the operator
+        // through this method, so one application covers all five; and applying
+        // it before grouping is what makes it a `WHERE` rather than a
+        // per-aggregate filter. A predicate that removes every row of a key
+        // group must remove the GROUP — a per-aggregate filter would leave the
+        // group emitting a zero count, which is a different query.
+        //
+        // Filtering before the watermark advance is also deliberate: a row the
+        // predicate rejects is not part of this query's stream at all, so it
+        // must not move the watermark and close a window on the strength of an
+        // event the query never sees.
+        let input_batches = self.apply_row_filter(input_batches)?;
+
         // Lazy-init: build the window operator from the first batch's schema so
         // that `agg_is_float` reflects the actual aggregate input types instead
         // of hardcoding `false` (which silently truncates Float64 to Int64).
@@ -888,6 +930,30 @@ mod tests {
 
     use super::*;
 
+    /// `(key, ts, v)` rows — the shape the row-filter tests aggregate over.
+    fn key_ts_val_batch(rows: &[(&str, i64, i64)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(k, _, _)| *k).collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, t, _)| *t).collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, _, v)| *v).collect::<Vec<_>>(),
+                )) as _,
+            ],
+        )
+        .unwrap()
+    }
+
     fn events_batch(ts: i64) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("user_id", DataType::Utf8, false),
@@ -1225,5 +1291,78 @@ mod tests {
                 .to_string()
                 .contains("aggregate input column 'amount' not found")
         );
+    }
+
+    /// A `row_filter` removes rows BEFORE grouping, so an excluded key's group
+    /// does not exist at all.
+    ///
+    /// This is the property that separates a streaming `WHERE` from a
+    /// per-aggregate `FILTER (WHERE …)`. Both suppress the row's contribution;
+    /// only the former suppresses the GROUP. Asserting "key b is absent" rather
+    /// than "b's count is 0" is what makes this test about the right thing —
+    /// a per-aggregate filter would emit b with 0 and pass a count-based check.
+    #[test]
+    fn a_row_filter_removes_the_group_not_just_the_rows() {
+        use krishiv_plan::window::{AggFilterCompareOp, AggFilterValue, WindowAggFilter};
+
+        let mut spec = WindowExecutionSpec::tumbling("k", "ts", 10_000);
+        spec.watermark_lag_ms = 0;
+        // WHERE v > 100 — key "b" has only a row that fails it.
+        spec.row_filter = Some(WindowAggFilter::Compare {
+            column: String::from("v"),
+            op: AggFilterCompareOp::Gt,
+            value: AggFilterValue::Int(100),
+        });
+
+        let mut exec = ContinuousWindowExecutor::new(spec).expect("executor");
+        let batch = key_ts_val_batch(&[("a", 1_000, 500), ("b", 2_000, 5)]);
+        // A later event closes the window.
+        let closer = key_ts_val_batch(&[("a", 25_000, 900)]);
+
+        let mut out = exec.drain(vec![batch]).expect("drain");
+        out.extend(exec.drain(vec![closer]).expect("drain closer"));
+
+        let keys: Vec<String> = out
+            .iter()
+            .flat_map(|b| {
+                let col = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .expect("key column is Utf8");
+                (0..b.num_rows())
+                    .map(|i| col.value(i).to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert!(
+            keys.iter().any(|k| k == "a"),
+            "key a had a row passing the predicate and must appear; got {keys:?}"
+        );
+        assert!(
+            !keys.iter().any(|k| k == "b"),
+            "key b's only row failed the predicate, so its GROUP must not exist — \
+             emitting b with a zero count is what a per-aggregate filter would do, \
+             and is a different query; got {keys:?}"
+        );
+    }
+
+    /// With no filter configured, nothing is removed.
+    ///
+    /// Guards the other direction: an `apply_row_filter` that dropped rows
+    /// unconditionally would pass the test above while silently breaking every
+    /// query in the engine.
+    #[test]
+    fn no_row_filter_passes_every_row_through() {
+        let spec = WindowExecutionSpec::tumbling("k", "ts", 10_000);
+        let mut exec = ContinuousWindowExecutor::new(spec).expect("executor");
+        exec.drain(vec![key_ts_val_batch(&[("a", 1_000, 5), ("b", 2_000, 5)])])
+            .expect("drain");
+        // Nothing closed yet, but the rows must have been accepted — a flush
+        // proves they are in state.
+        let flushed = exec.flush_all().expect("flush");
+        let rows: usize = flushed.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2, "both keys must survive when no filter is set");
     }
 }

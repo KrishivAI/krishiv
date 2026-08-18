@@ -279,6 +279,7 @@ impl From<&LocalWindowExecutionSpec> for WindowExecutionSpec {
             source_watermark_lags: spec.source_watermark_lags.clone(),
             source_id_column: spec.source_id_column.clone(),
             window_timezone: spec.window_timezone.clone(),
+            row_filter: spec.row_filter.clone(),
         }
     }
 }
@@ -337,6 +338,7 @@ impl From<&WindowExecutionSpec> for LocalWindowExecutionSpec {
             source_watermark_lags: spec.source_watermark_lags.clone(),
             source_id_column: spec.source_id_column.clone(),
             window_timezone: spec.window_timezone.clone(),
+            row_filter: spec.row_filter.clone(),
         }
     }
 }
@@ -392,6 +394,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         }
     }
 
@@ -502,6 +505,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let cluster = InProcessCluster::new().expect("cluster");
         let out = cluster
@@ -556,6 +560,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let plan = local_spec_to_plan_spec(&local);
         assert_eq!(plan.key_column, "k");
@@ -583,6 +588,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let local = plan_spec_to_local(&plan);
         assert_eq!(local.key_column, "k");
@@ -615,6 +621,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let plan = local_spec_to_plan_spec(&local);
         assert_eq!(plan.window_kind, krishiv_plan::window::WindowKind::Tumbling);
@@ -638,6 +645,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let plan = local_spec_to_plan_spec(&local);
         assert_eq!(plan.window_kind, krishiv_plan::window::WindowKind::Session);
@@ -661,6 +669,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let local = plan_spec_to_local(&plan);
         assert_eq!(
@@ -687,6 +696,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let local = plan_spec_to_local(&plan);
         assert_eq!(
@@ -712,6 +722,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let local = plan_spec_to_local(&plan);
         assert_eq!(
@@ -737,6 +748,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let local = plan_spec_to_local(&plan);
         assert_eq!(
@@ -760,6 +772,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let fragment = fragment_from_local_spec(&spec).unwrap();
         assert!(fragment.contains("stream:sw"));
@@ -780,6 +793,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
             window_timezone: None,
+            row_filter: None,
         };
         let fragment = fragment_from_local_spec(&spec).unwrap();
         assert!(fragment.contains("stream:ses"));
