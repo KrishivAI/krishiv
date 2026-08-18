@@ -346,8 +346,17 @@ impl StreamingDataFrame {
 
     /// Build a [`crate::streaming_builder::DataStreamWriter`] for writing this
     /// streaming pipeline to a sink.
+    /// The source DataFrame this pipeline was built from.
+    ///
+    /// Exposed for [`crate::streaming_builder::DataStreamWriter::for_streaming`],
+    /// which needs it for the writer's non-streaming fallback path — not as a
+    /// way to bypass the configured pipeline.
+    pub(crate) fn source_dataframe(&self) -> DataFrame {
+        self.df.clone()
+    }
+
     pub fn write_stream(self) -> crate::streaming_builder::DataStreamWriter {
-        crate::streaming_builder::DataStreamWriter::new(self.df.clone())
+        crate::streaming_builder::DataStreamWriter::for_streaming(self)
     }
 
     /// Execute the configured streaming pipeline and return a lazy, asynchronous stream of RecordBatches.
@@ -365,22 +374,43 @@ impl StreamingDataFrame {
         let window_spec = self.window_spec()?;
         let df_stream = self.df.execute_stream_async().await?;
 
-        // Apply window pipeline first.
-        let base: KrishivStream = match window_spec.as_ref() {
-            Some(spec) => execute_window_pipeline(source_exec_stream(df_stream), Some(spec))?,
-            None => df_stream,
-        };
+        // Dedup the SOURCE, then window it.
+        //
+        // This used to run the other way round — window first, dedup the
+        // output — which is a different operation wearing the same name. On the
+        // output of a keyed window, "keep the first row per key" keeps the
+        // FIRST WINDOW per key and discards every later one, so a job emitted
+        // one row per key for its entire lifetime. The documented behaviour
+        // ("keep the first occurrence per key") is an input-side operation and
+        // now happens on the input.
+        let deduped = Self::apply_dedup(df_stream, dedup_columns, dedup_state)?;
 
-        // Apply deduplication adapter if columns were configured.
-        if let Some(cols) = dedup_columns {
-            match dedup_state {
-                DedupStateMode::InMemory => Ok(Box::pin(DeduplicatingStream::new(base, cols))),
-                DedupStateMode::StateBacked => {
-                    Ok(Box::pin(StateBackedDeduplicatingStream::new(base, cols)?))
-                }
+        match window_spec.as_ref() {
+            Some(spec) => execute_window_pipeline(source_exec_stream(deduped), Some(spec)),
+            None => Ok(deduped),
+        }
+    }
+
+    /// Wrap a stream in the configured dedup adapter, if any.
+    ///
+    /// Shared by both execute paths deliberately. The side-output path did not
+    /// read `dedup_columns` at all, so configuring a side output — which then
+    /// FORCES that path, because `execute_stream_async` refuses when one is set
+    /// — silently restored every duplicate the user had asked to remove. One
+    /// helper called from both places is what makes that unrepresentable.
+    fn apply_dedup(
+        stream: KrishivStream,
+        dedup_columns: Option<Vec<String>>,
+        dedup_state: DedupStateMode,
+    ) -> Result<KrishivStream> {
+        let Some(cols) = dedup_columns else {
+            return Ok(stream);
+        };
+        match dedup_state {
+            DedupStateMode::InMemory => Ok(Box::pin(DeduplicatingStream::new(stream, cols))),
+            DedupStateMode::StateBacked => {
+                Ok(Box::pin(StateBackedDeduplicatingStream::new(stream, cols)?))
             }
-        } else {
-            Ok(base)
         }
     }
 
@@ -416,6 +446,10 @@ impl StreamingDataFrame {
                 .saturating_add(side_output.lateness_threshold_ms);
         }
         let df_stream = self.df.execute_stream_async().await?;
+        // Same source-side dedup as execute_stream_async. This path used to
+        // ignore dedup_columns entirely, so adding a side output — which forces
+        // this path — silently undid drop_duplicates.
+        let df_stream = Self::apply_dedup(df_stream, self.dedup_columns.clone(), self.dedup_state)?;
         let side_output_name = side_output.name.clone();
         let router = SideOutputRouter::new(side_output, event_time_column);
         let (main_input, side_input, _router_task) =
@@ -1806,6 +1840,105 @@ mod tests {
         assert_eq!(
             after_second, 5,
             "second query must have processed 3 more rows (2+3=5)"
+        );
+    }
+
+    /// `write_stream()` runs the CONFIGURED pipeline, not the raw source.
+    ///
+    /// The writer used to be built from `self.df` — the source DataFrame — so
+    /// every stateful thing on the StreamingDataFrame was discarded and the
+    /// sink received raw ungrouped rows while the query reported healthy. Only
+    /// stateless select/filter/with_column survived, because those mutate `df`.
+    ///
+    /// Asserts the SHAPE of what reaches the sink, not just that something
+    /// arrived: a windowed pipeline emits `window_start_ms`/`window_end_ms` and
+    /// the aggregate's output column, none of which exist on the source. A row
+    /// count alone would pass against the bug, since the raw source also
+    /// produces rows.
+    #[tokio::test]
+    async fn write_stream_carries_the_window_pipeline_to_the_sink() {
+        let df = dataframe_from_batches(vec![stream_batch(&["a", "a", "b"], &[0, 1_000, 2_000])]);
+        let sdf = df
+            .stream()
+            .with_event_time("stream_ts")
+            .key_by("user_id")
+            .tumbling_window(60_000);
+
+        let out = collect_stream(sdf.execute_stream_async().await.expect("stream"))
+            .await
+            .expect("collect");
+        let schema = out.first().expect("at least one batch").schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(
+            names.iter().any(|n| n.contains("window")),
+            "the configured pipeline must produce window columns; got {names:?}"
+        );
+
+        // The writer must reach the same pipeline. Building it and asserting it
+        // captured the StreamingDataFrame is the structural half; the schema
+        // above is the behavioural half of the same claim.
+        let writer = df
+            .stream()
+            .with_event_time("stream_ts")
+            .key_by("user_id")
+            .tumbling_window(60_000)
+            .write_stream();
+        assert!(
+            writer.carries_streaming_pipeline(),
+            "write_stream() must carry the configured pipeline, or the sink receives \
+             raw ungrouped source rows while the query reports healthy"
+        );
+    }
+
+    /// `drop_duplicates` dedups the SOURCE, and does so on both execute paths.
+    ///
+    /// Two bugs in one place. Applied to window OUTPUT, "keep the first row per
+    /// key" keeps the first WINDOW per key and discards every later one — a job
+    /// emitting one row per key for its lifetime. And the side-output path
+    /// never read `dedup_columns` at all, so adding a side output (which FORCES
+    /// that path) silently restored every duplicate.
+    ///
+    /// Discriminating by construction: it dedups on `stream_ts`, a column that
+    /// exists on the SOURCE and NOT on the window output. Source-side dedup
+    /// therefore removes the duplicate row and the aggregate counts 2; applied
+    /// to the output the column is absent and nothing is removed, so the
+    /// aggregate counts 3. Row count alone would not separate them — both
+    /// produce one output row for one key in one window.
+    #[tokio::test]
+    async fn drop_duplicates_dedups_the_source_before_aggregation() {
+        // a@0 twice (an exact duplicate) plus a@1000 — all in window0.
+        let df = dataframe_from_batches(vec![stream_batch(&["a", "a", "a"], &[0, 0, 1_000])]);
+        let out = collect_stream(
+            df.stream()
+                .with_event_time("stream_ts")
+                .key_by("user_id")
+                .tumbling_window(60_000)
+                .drop_duplicates(["stream_ts"])
+                .execute_stream_async()
+                .await
+                .expect("stream"),
+        )
+        .await
+        .expect("collect");
+
+        let batch = out.first().expect("one closed window");
+        let idx = batch
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() != "user_id" && !f.name().contains("window"))
+            .expect("an aggregate column");
+        let agg = batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 aggregate");
+        assert_eq!(
+            agg.value(0),
+            2,
+            "the duplicate input row must be removed BEFORE aggregation; \
+             3 means dedup ran on the window output, where `stream_ts` does not \
+             exist and nothing was removed"
         );
     }
 }

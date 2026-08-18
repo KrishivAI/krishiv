@@ -433,6 +433,20 @@ impl StreamSinkFormat {
 /// Obtain one from [`crate::streaming_dataframe::StreamingDataFrame::write_stream`].
 pub struct DataStreamWriter {
     df: crate::DataFrame,
+    /// The configured streaming pipeline, when this writer came from
+    /// [`StreamingDataFrame::write_stream`].
+    ///
+    /// The writer used to hold only `df` — the SOURCE DataFrame — so every
+    /// stateful thing configured on the StreamingDataFrame (event-time column,
+    /// window kind and size, aggregates, watermark lag, state TTL, per-source
+    /// watermarks, dedup, side output) was silently discarded and the sink
+    /// received raw ungrouped rows while the query reported healthy. Only
+    /// stateless select/filter/with_column survived, because those mutate `df`
+    /// in place.
+    ///
+    /// When this is `Some`, `start()` executes ITS pipeline. `df` is retained
+    /// for the plain-DataFrame constructor, which has no window to run.
+    sdf: Option<crate::streaming_dataframe::StreamingDataFrame>,
     output_mode: StreamingOutputMode,
     trigger: StreamingTrigger,
     query_name: Option<String>,
@@ -492,9 +506,32 @@ impl KafkaTransactionalConfig {
 }
 
 impl DataStreamWriter {
+    /// Build a writer that executes a configured streaming pipeline.
+    ///
+    /// The counterpart to [`DataStreamWriter::new`], which takes a bare
+    /// DataFrame and has no window to run.
+    pub fn for_streaming(sdf: crate::streaming_dataframe::StreamingDataFrame) -> Self {
+        let df = sdf.source_dataframe();
+        Self {
+            sdf: Some(sdf),
+            ..Self::new(df)
+        }
+    }
+
+    /// Does this writer carry a configured streaming pipeline?
+    ///
+    /// Exists so a test can assert the pipeline was captured rather than
+    /// inferring it from output shape alone — the failure being fixed was
+    /// exactly a writer that looked fine and ran the wrong thing.
+    #[must_use]
+    pub fn carries_streaming_pipeline(&self) -> bool {
+        self.sdf.is_some()
+    }
+
     pub fn new(df: crate::DataFrame) -> Self {
         Self {
             df,
+            sdf: None,
             output_mode: StreamingOutputMode::Append,
             trigger: StreamingTrigger::AvailableNow,
             query_name: None,
@@ -629,8 +666,14 @@ impl DataStreamWriter {
         let trigger = self.trigger;
         let options = self.options.clone();
 
-        // Materialise the DataFrame's stream once.
-        let base_stream: KrishivStream = self.df.execute_stream_async().await?;
+        // Materialise the stream once — from the CONFIGURED pipeline when this
+        // writer came from a StreamingDataFrame, and only otherwise from the
+        // bare DataFrame. Reading `self.df` unconditionally is what silently
+        // dropped the window.
+        let base_stream: KrishivStream = match self.sdf {
+            Some(sdf) => sdf.execute_stream_async().await?,
+            None => self.df.execute_stream_async().await?,
+        };
 
         let cancel_rx_task = cancel_rx;
 
