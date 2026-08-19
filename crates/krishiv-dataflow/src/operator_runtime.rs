@@ -234,6 +234,13 @@ pub fn execute_bounded_window_seeded(
     // gets constructed below.
     let key_column = spec.key_column.clone();
     let key_column_type = spec.key_column_type.clone();
+    let key_parts = spec.key_parts.clone();
+    if !key_parts.is_empty() && matches!(spec.window_kind, WindowKind::Count { .. }) {
+        return Err(ExecError::InvalidWindowConfig(String::from(
+            "count windows do not support a composite grouping key: the operator emits one key \
+             column and would publish the encoded key instead of the columns the query named",
+        )));
+    }
     let event_time_column = spec.event_time_column.clone();
 
     match spec.window_kind {
@@ -241,6 +248,7 @@ pub fn execute_bounded_window_seeded(
             let tw_spec = TumblingWindowSpec {
                 key_column,
                 key_column_type,
+                key_parts: key_parts.clone(),
                 event_time_column,
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.clone(),
@@ -272,6 +280,7 @@ pub fn execute_bounded_window_seeded(
             let sw_spec = SlidingWindowSpec {
                 key_column,
                 key_column_type,
+                key_parts: key_parts.clone(),
                 event_time_column,
                 window_size_ms: spec.window_size_ms,
                 slide_ms,
@@ -302,6 +311,7 @@ pub fn execute_bounded_window_seeded(
             let sess_spec = SessionWindowSpec {
                 key_column,
                 key_column_type,
+                key_parts: key_parts.clone(),
                 event_time_column,
                 session_gap_ms: gap_ms,
                 agg_exprs,
@@ -408,6 +418,13 @@ fn build_streaming_window_op(
 ) -> ExecResult<StreamingWindowOp> {
     let key_column = spec.key_column.clone();
     let key_column_type = spec.key_column_type.clone();
+    let key_parts = spec.key_parts.clone();
+    if !key_parts.is_empty() && matches!(spec.window_kind, WindowKind::Count { .. }) {
+        return Err(ExecError::InvalidWindowConfig(String::from(
+            "count windows do not support a composite grouping key: the operator emits one key \
+             column and would publish the encoded key instead of the columns the query named",
+        )));
+    }
     let event_time_column = spec.event_time_column.clone();
     let agg_exprs = agg_exprs.to_vec();
     let agg_is_float = agg_is_float.to_vec();
@@ -417,6 +434,7 @@ fn build_streaming_window_op(
             let tw_spec = TumblingWindowSpec {
                 key_column,
                 key_column_type,
+                key_parts: key_parts.clone(),
                 event_time_column,
                 window_size_ms: spec.window_size_ms,
                 agg_exprs,
@@ -435,6 +453,7 @@ fn build_streaming_window_op(
             let sw_spec = SlidingWindowSpec {
                 key_column,
                 key_column_type,
+                key_parts: key_parts.clone(),
                 event_time_column,
                 window_size_ms: spec.window_size_ms,
                 slide_ms,
@@ -452,6 +471,7 @@ fn build_streaming_window_op(
             let sess_spec = SessionWindowSpec {
                 key_column,
                 key_column_type,
+                key_parts: key_parts.clone(),
                 event_time_column,
                 session_gap_ms,
                 agg_exprs,
@@ -676,6 +696,7 @@ pub fn local_spec_to_window_execution(params: LocalWindowParams) -> WindowExecut
         allowed_lateness_ms: None,
         source_watermark_lags: std::collections::HashMap::new(),
         source_id_column: None,
+        key_parts: Vec::new(),
         derived_columns: Vec::new(),
         window_timezone: None,
         row_filter: None,
@@ -848,6 +869,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::from([("src-a".into(), 0), ("src-b".into(), 0)]),
             source_id_column: Some("source_id".into()),
+            key_parts: Vec::new(),
             derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
@@ -895,6 +917,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            key_parts: Vec::new(),
             derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
@@ -956,6 +979,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            key_parts: Vec::new(),
             derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,

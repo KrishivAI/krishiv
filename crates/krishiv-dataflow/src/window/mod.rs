@@ -571,6 +571,7 @@ mod watermark_tests {
         let spec = TumblingWindowSpec {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
+            key_parts: Vec::new(),
             event_time_column: "ts".into(),
             window_size_ms: 10_000,
             agg_exprs: vec![AggExpr {
@@ -623,6 +624,7 @@ mod watermark_tests {
         let spec = TumblingWindowSpec {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
+            key_parts: Vec::new(),
             event_time_column: "ts".into(),
             window_size_ms: 10_000,
             agg_exprs: vec![AggExpr {
@@ -834,6 +836,7 @@ mod window_props {
             let spec = SlidingWindowSpec {
                 key_column: "k".into(),
                 key_column_type: "utf8".into(),
+                key_parts: Vec::new(),
                 event_time_column: "ts".into(),
                 window_size_ms: 1000,
                 slide_ms: 250,
@@ -872,6 +875,7 @@ mod window_props {
             let spec = SlidingWindowSpec {
                 key_column: "k".into(),
                 key_column_type: "utf8".into(),
+                key_parts: Vec::new(),
                 event_time_column: "ts".into(),
                 window_size_ms: size_ms,
                 slide_ms,

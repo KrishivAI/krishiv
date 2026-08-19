@@ -24,6 +24,8 @@ pub struct SlidingWindowSpec {
     /// Arrow type of the key column: `"int32"`, `"int64"`, `"float64"`, `"utf8"`, `"bool"`.
     /// Defaults to `"utf8"`.
     pub key_column_type: String,
+    /// Source columns behind a composite key; empty for a single-column key.
+    pub key_parts: Vec<krishiv_plan::window::KeyPart>,
     /// Int64 column carrying event time in milliseconds.
     pub event_time_column: String,
     /// Total window duration in milliseconds.
@@ -93,6 +95,7 @@ impl SlidingWindowOperator {
             &spec.key_column_type,
             &spec.agg_exprs,
             &spec.agg_is_float,
+            &spec.key_parts,
         );
         Ok(Self {
             spec,
@@ -323,6 +326,7 @@ impl SlidingWindowOperator {
         build_window_record_batch(WindowRecordBatchInput {
             schema: &self.output_schema,
             key_type: &self.spec.key_column_type,
+            key_parts: &self.spec.key_parts,
             key_value,
             window_start_ms,
             window_end_ms,
@@ -372,6 +376,7 @@ mod sliding_state_tests {
         let spec = SlidingWindowSpec {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
+            key_parts: Vec::new(),
             event_time_column: "ts".into(),
             window_size_ms: 2000,
             slide_ms: 1000,
@@ -438,6 +443,7 @@ mod sliding_state_tests {
         let spec = SlidingWindowSpec {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
+            key_parts: Vec::new(),
             event_time_column: "ts".into(),
             window_size_ms: 2000,
             slide_ms: 1000,
@@ -474,6 +480,7 @@ mod sliding_state_tests {
         let mut restored = SlidingWindowOperator::new(SlidingWindowSpec {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
+            key_parts: Vec::new(),
             event_time_column: "ts".into(),
             window_size_ms: 2000,
             slide_ms: 1000,
@@ -560,6 +567,7 @@ mod sliding_state_tests {
         let base = SlidingWindowSpec {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
+            key_parts: Vec::new(),
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             slide_ms: 0,

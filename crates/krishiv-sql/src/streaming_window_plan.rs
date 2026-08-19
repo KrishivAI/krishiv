@@ -45,8 +45,8 @@ use datafusion::sql::sqlparser::ast::{
 use datafusion::sql::sqlparser::dialect::DuckDbDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use krishiv_plan::window::{
-    AggFilterCompareOp, AggFilterValue, DerivedColumn, FloatLiteral, ScalarBinaryOp, WindowAgg,
-    WindowAggFilter, WindowAggKind, WindowExecutionSpec, WindowKind, WindowScalarExpr,
+    AggFilterCompareOp, AggFilterValue, DerivedColumn, FloatLiteral, KeyPart, ScalarBinaryOp,
+    WindowAgg, WindowAggFilter, WindowAggKind, WindowExecutionSpec, WindowKind, WindowScalarExpr,
 };
 
 use crate::streaming_tvf::{find_window_tvf, rewrite_window_tvfs};
@@ -96,7 +96,12 @@ pub fn compile_streaming_window_sql(sql: &str) -> SqlResult<StreamingWindowPlan>
     let select = parse_single_select(&rewritten)?;
 
     let (window, source) = extract_window(&select)?;
-    let (key_column, agg_exprs, derived_columns) = extract_key_and_aggs(&select)?;
+    let KeyAndAggs {
+        key_column,
+        aggs: agg_exprs,
+        derived: derived_columns,
+        key_parts,
+    } = extract_key_and_aggs(&select)?;
 
     // A top-level WHERE becomes a row filter applied BEFORE grouping, using the
     // same predicate AST and the same lowering as a per-aggregate
@@ -133,6 +138,7 @@ pub fn compile_streaming_window_sql(sql: &str) -> SqlResult<StreamingWindowPlan>
         allowed_lateness_ms: None,
         source_watermark_lags: HashMap::new(),
         source_id_column: None,
+        key_parts,
         derived_columns,
         window_timezone: None,
         row_filter,
@@ -455,9 +461,19 @@ fn number_literal(expr: &Expr) -> Option<String> {
 
 const WINDOW_BOUNDARY_COLS: [&str; 2] = ["window_start", "window_end"];
 
-fn extract_key_and_aggs(
-    select: &Select,
-) -> SqlResult<(String, Vec<WindowAgg>, Vec<DerivedColumn>)> {
+/// What the SELECT list and GROUP BY together determine about the window.
+///
+/// A named struct rather than a tuple: these four grew together as the surface
+/// gained expression aggregates and composite keys, and a 4-tuple stops saying
+/// which is which at the call site.
+struct KeyAndAggs {
+    key_column: String,
+    aggs: Vec<WindowAgg>,
+    derived: Vec<DerivedColumn>,
+    key_parts: Vec<KeyPart>,
+}
+
+fn extract_key_and_aggs(select: &Select) -> SqlResult<KeyAndAggs> {
     let mut key_column: Option<String> = None;
     let mut aggs: Vec<WindowAgg> = Vec::new();
     let mut derived: Vec<DerivedColumn> = Vec::new();
@@ -483,11 +499,41 @@ fn extract_key_and_aggs(
     let key_column = key_column.ok_or_else(|| {
         unsupported("streaming window query needs a grouping key column in the SELECT list")
     })?;
-    validate_group_by(select, &key_column)?;
+    let extra_keys = collect_extra_group_by(select, &key_column)?;
     if aggs.is_empty() {
         aggs.push(WindowAgg::count("count"));
     }
-    Ok((key_column, aggs, derived))
+
+    // A multi-column GROUP BY becomes ONE synthetic key column holding the
+    // encoded composite, plus the parts needed to expand it back on output.
+    // The operators keep grouping on a single key; the user still gets the
+    // columns they named.
+    let (key_column, key_parts) = if extra_keys.is_empty() {
+        (key_column, Vec::new())
+    } else {
+        let mut names = vec![key_column];
+        names.extend(extra_keys);
+        let parts = names
+            .iter()
+            .map(|n| KeyPart {
+                name: n.clone(),
+                type_tag: String::from(krishiv_dataflow_key_type_auto()),
+            })
+            .collect();
+        let composite = String::from("__krishiv_key");
+        derived.push(DerivedColumn {
+            name: composite.clone(),
+            expr: WindowScalarExpr::CompositeKey(names),
+        });
+        (composite, parts)
+    };
+
+    Ok(KeyAndAggs {
+        key_column,
+        aggs,
+        derived,
+        key_parts,
+    })
 }
 
 /// Check that an explicit `GROUP BY` agrees with the key this compiler inferred.
@@ -500,7 +546,12 @@ fn extract_key_and_aggs(
 /// The canonical shape `GROUP BY <key>, window_start, window_end` is accepted,
 /// as are the boundary columns in any order and a bare `GROUP BY <key>`.
 /// Anything naming a second real column is refused by name.
-fn validate_group_by(select: &Select, key_column: &str) -> SqlResult<()> {
+/// Collect the grouping columns beyond the one inferred from the SELECT list.
+///
+/// Returns them in `GROUP BY` order. Previously any extra column was an error,
+/// because the spec carried a single key and dropping the rest would have
+/// aggregated across them silently. They are now lowered into a composite key.
+fn collect_extra_group_by(select: &Select, key_column: &str) -> SqlResult<Vec<String>> {
     let exprs = match &select.group_by {
         GroupByExpr::Expressions(exprs, modifiers) => {
             if !modifiers.is_empty() {
@@ -521,7 +572,7 @@ fn validate_group_by(select: &Select, key_column: &str) -> SqlResult<()> {
         }
     };
     if exprs.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let mut extra: Vec<String> = Vec::new();
@@ -545,15 +596,7 @@ fn validate_group_by(select: &Select, key_column: &str) -> SqlResult<()> {
         extra.push(name);
     }
 
-    if !extra.is_empty() {
-        return Err(unsupported(format!(
-            "streaming windows group by a SINGLE key column, and `{key_column}` was \
-             inferred from the SELECT list; GROUP BY also names {extra:?}, which would be \
-             silently dropped and aggregated across. Combine the columns into one key \
-             upstream (e.g. a concatenated or struct column), or run one job per key"
-        )));
-    }
-    Ok(())
+    Ok(extra)
 }
 
 fn maybe_set_key(key: &mut Option<String>, name: &str) {
@@ -1435,33 +1478,69 @@ mod fail_closed_tests {
         );
     }
 
-    /// A second grouping column is refused, naming the column that would have
-    /// been dropped.
+    /// A second grouping column becomes a composite key, in GROUP BY order.
     ///
-    /// This is the subtlest half of the defect: `GROUP BY region, product`
-    /// collapsed to `key_column = "region"` and aggregated across products, so
-    /// the user got a larger number with no error and no clue which column
-    /// vanished.
+    /// This used to collapse to `key_column = "region"` and aggregate across
+    /// products — a larger number with no error and no clue which column
+    /// vanished — and was then refused outright. It is now lowered: one
+    /// synthetic key column carries the encoding, and `key_parts` says how to
+    /// expand it back into the columns the user actually named.
     #[test]
-    fn a_second_grouping_column_is_refused_and_named() {
-        let err = compile_streaming_window_sql(
+    fn a_second_grouping_column_becomes_a_composite_key() {
+        let plan = compile_streaming_window_sql(
             "SELECT region, COUNT(*) AS c \
              FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 60000) \
              GROUP BY region, product, window_start, window_end",
         )
-        .expect_err("a multi-column grouping key must be refused")
-        .to_string();
-        assert!(
-            err.contains("product"),
-            "the error must name the column that would have been dropped: {err}"
+        .expect("a multi-column grouping key must compile");
+
+        assert_eq!(
+            plan.spec.key_parts.len(),
+            2,
+            "both grouping columns must be carried, not just the inferred one"
+        );
+        let names: Vec<&str> = plan
+            .spec
+            .key_parts
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["region", "product"],
+            "parts must keep GROUP BY order, since that is the output column order"
+        );
+        assert_ne!(
+            plan.spec.key_column, "region",
+            "the grouping key is now the synthetic composite, not the first column"
         );
         assert!(
-            err.contains("region"),
-            "and the key it inferred, so the mismatch is legible: {err}"
+            plan.spec
+                .derived_columns
+                .iter()
+                .any(|d| d.name == plan.spec.key_column),
+            "the composite key must be materialised as a derived column"
         );
     }
 
-    /// CTEs are refused rather than silently ignored.
+    /// A single-column GROUP BY is untouched: no composite, no derived column.
+    #[test]
+    fn a_single_grouping_column_stays_a_plain_key() {
+        let plan = compile_streaming_window_sql(
+            "SELECT region, COUNT(*) AS c \
+             FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 60000) \
+             GROUP BY region, window_start, window_end",
+        )
+        .expect("compiles");
+        assert_eq!(plan.spec.key_column, "region");
+        assert!(
+            plan.spec.key_parts.is_empty(),
+            "no composite machinery for the ordinary case"
+        );
+        assert!(plan.spec.derived_columns.is_empty());
+    }
+
+    /// CTEs are refused rather than silently ignored.    /// CTEs are refused rather than silently ignored.
     #[test]
     fn a_with_clause_is_refused() {
         let err = compile_streaming_window_sql(

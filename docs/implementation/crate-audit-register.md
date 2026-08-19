@@ -5429,3 +5429,74 @@ per-batch implementation (`left: 4, right: 3`).
 This is the standing rule earning its place for the fourth time this session:
 the test was written to catch a specific defect, ran green against that defect,
 and only the revert exposed it.
+
+## §48 — Multi-column `GROUP BY` (task #138, NEXMark Q15/16/17)
+
+§46 said the shortcut of keeping `key_column` and adding
+`additional_key_columns` is the two-representations-of-one-fact shape and must
+be refused. It was, and this is the design that avoids it.
+
+**There is still exactly one grouping key.** `GROUP BY auction, channel` lowers
+to a *synthetic* key column, `__krishiv_key`, holding the encoded pair — built
+by the derived-column machinery §45 added — plus `key_parts`, which says how to
+expand it back on output. `key_parts` is a **presentation description**, not a
+second key: every operator, state key and hash still sees one key column.
+Single-column queries produce no composite and no derived column at all, so the
+ordinary path is untouched.
+
+**The encoding is length-prefixed, not delimiter-joined**, and that is the
+difference between working and silently wrong. With a `:` separator,
+`("a:b", "c")` and `("a", "b:c")` encode identically and two distinct groups
+merge into one — with no error, which is this register's defining defect shape.
+`"{byte_len}:{value}"` per part cannot collide, whatever the data contains.
+There is a test for exactly that pair, and it is proven red by switching the
+encoder to a delimiter join.
+
+**Types resolve per part.** The synthetic key column is always `Utf8` (it holds
+the encoding), so resolving only `key_column_type` would leave every part
+`"auto"` and emit every grouping column as a string — the §42/§43 defect one
+level down. Each part resolves from its own source column at operator build.
+
+**Count windows fail closed.** They emit a single key column and cannot expand
+a composite, so a composite key reaching one is an error rather than a window
+publishing the encoded key nobody asked for.
+
+### Proven red, twice, against two different defects
+
+- Collapsing to the first key column (the original defect): `left: 2,
+  right: 3` — `(auction, channel)` has three combinations where `auction` alone
+  has two.
+- Delimiter-joined encoding: the separator test fails, the length-prefixed one
+  passes.
+
+The first revert did **not** fail the separator test — grouping by `auction`
+alone happens to give 2 rows there too. Each test needed the revert that
+targets its own claim. That is the second time this session a test passed
+against a revert aimed at a different line.
+
+### Coverage
+
+**8 of 22**, up from 5. Q16 and Q17 needed `COUNT(DISTINCT)` (§47) plus
+min/max/avg in one query; Q15 needs the composite key. Pinned medians:
+
+| query | ev/sec | rows out | p50 µs |
+|---|---|---|---|
+| q1_currency_conversion | 3.6M | 1481 | 238 |
+| q2_filtered_bids | 6.1M | 898 | 142 |
+| q5_hot_items | 11.7M | 7361 | 28 |
+| q7_highest_bid_keyed | 4.1M | 1481 | 200 |
+| q16_channel_statistics | 11.5M | 8 | 64 |
+| q17_auction_statistics | 3.7M | 1481 | 200 |
+| q15_bidding_statistics | 2.7M | 1777 | 272 |
+| q11_user_sessions | 21.4M | 1403 | 35 |
+
+q15 emitting 1777 rows against q17's 1481 is the composite key doing its job:
+the same window split into more groups.
+
+### A gap this surfaced
+
+NEXMark Q15's canonical form groups by the reporting period *only* — no other
+key. This compiler requires a grouping key in the SELECT list, so a
+**window-only (global) aggregation** is not expressible; the variant above adds
+`(auction, channel)`. The same gap blocks a global Q7. Recorded as its own item
+rather than papered over.

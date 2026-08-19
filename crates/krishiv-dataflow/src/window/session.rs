@@ -23,6 +23,8 @@ pub struct SessionWindowSpec {
     /// Arrow type of the key column: `"int32"`, `"int64"`, `"float64"`, `"utf8"`, `"bool"`.
     /// Defaults to `"utf8"`.
     pub key_column_type: String,
+    /// Source columns behind a composite key; empty for a single-column key.
+    pub key_parts: Vec<krishiv_plan::window::KeyPart>,
     /// Int64 column carrying event time in milliseconds.
     pub event_time_column: String,
     /// Inactivity gap that closes the session in milliseconds.
@@ -68,12 +70,22 @@ pub struct SessionWindowOperator {
 }
 
 fn build_session_output_schema(spec: &SessionWindowSpec) -> Arc<Schema> {
-    let key_dtype = key_type_to_data_type(&spec.key_column_type);
-    let mut fields = vec![
-        Field::new(&spec.key_column, key_dtype, false),
+    let mut fields: Vec<Field> = if spec.key_parts.is_empty() {
+        vec![Field::new(
+            &spec.key_column,
+            key_type_to_data_type(&spec.key_column_type),
+            false,
+        )]
+    } else {
+        spec.key_parts
+            .iter()
+            .map(|p| Field::new(&p.name, key_type_to_data_type(&p.type_tag), false))
+            .collect()
+    };
+    fields.extend([
         Field::new("session_start_ms", DataType::Int64, false),
         Field::new("session_end_ms", DataType::Int64, false),
-    ];
+    ]);
     for (i, agg) in spec.agg_exprs.iter().enumerate() {
         let dtype = match agg.function {
             AggFunction::Avg | AggFunction::Stddev => DataType::Float64,
@@ -479,10 +491,26 @@ impl SessionWindowOperator {
         let mut columns: Vec<Arc<dyn arrow::array::Array>> =
             Vec::with_capacity(3 + self.spec.agg_exprs.len());
 
-        columns.push(key_values_to_typed_column(
-            &self.spec.key_column_type,
-            keys,
-        )?);
+        if self.spec.key_parts.is_empty() {
+            columns.push(key_values_to_typed_column(
+                &self.spec.key_column_type,
+                keys,
+            )?);
+        } else {
+            // One encoded key per row becomes N typed columns, transposed.
+            let parts = self.spec.key_parts.len();
+            let mut per_part: Vec<Vec<String>> = vec![Vec::with_capacity(keys.len()); parts];
+            for k in keys {
+                let decoded = crate::scalar_expr::split_composite_key(k, parts)?;
+                for (slot, v) in per_part.iter_mut().zip(decoded) {
+                    slot.push(v);
+                }
+            }
+            for (p, vals) in self.spec.key_parts.iter().zip(per_part) {
+                let refs: Vec<&str> = vals.iter().map(String::as_str).collect();
+                columns.push(key_values_to_typed_column(&p.type_tag, &refs)?);
+            }
+        }
         columns.push(Arc::new(Int64Array::from(session_starts.to_vec())));
         columns.push(Arc::new(Int64Array::from(session_ends.to_vec())));
 
@@ -615,6 +643,7 @@ mod session_state_tests {
         let spec = SessionWindowSpec {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
+            key_parts: Vec::new(),
             event_time_column: "ts".into(),
             session_gap_ms: 500,
             agg_exprs: vec![AggExpr {
@@ -650,6 +679,7 @@ mod session_state_tests {
         let mut restored = SessionWindowOperator::new(SessionWindowSpec {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
+            key_parts: Vec::new(),
             event_time_column: "ts".into(),
             session_gap_ms: 500,
             agg_exprs: vec![AggExpr {
@@ -704,6 +734,7 @@ mod session_state_tests {
         let spec = SessionWindowSpec {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
+            key_parts: Vec::new(),
             event_time_column: "ts".into(),
             session_gap_ms: u64::MAX,
             agg_exprs: vec![AggExpr {
@@ -761,6 +792,7 @@ mod session_state_tests {
         let spec = SessionWindowSpec {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
+            key_parts: Vec::new(),
             event_time_column: "ts".into(),
             session_gap_ms: 1000,
             agg_exprs: vec![AggExpr {

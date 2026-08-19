@@ -76,6 +76,7 @@ fn build_operator(
             let tw_spec = TumblingWindowSpec {
                 key_column: spec.key_column.clone(),
                 key_column_type: spec.key_column_type.clone(),
+                key_parts: spec.key_parts.clone(),
                 event_time_column: spec.event_time_column.clone(),
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.to_vec(),
@@ -96,6 +97,7 @@ fn build_operator(
             let sw_spec = SlidingWindowSpec {
                 key_column: spec.key_column.clone(),
                 key_column_type: spec.key_column_type.clone(),
+                key_parts: spec.key_parts.clone(),
                 event_time_column: spec.event_time_column.clone(),
                 window_size_ms: spec.window_size_ms,
                 slide_ms,
@@ -117,6 +119,7 @@ fn build_operator(
             let sess_spec = SessionWindowSpec {
                 key_column: spec.key_column.clone(),
                 key_column_type: spec.key_column_type.clone(),
+                key_parts: spec.key_parts.clone(),
                 event_time_column: spec.event_time_column.clone(),
                 session_gap_ms: gap_ms,
                 agg_exprs: agg_exprs.to_vec(),
@@ -466,6 +469,29 @@ impl ContinuousWindowExecutor {
     /// type has no tag, so the operator falls back to the historical `Utf8`
     /// rather than failing a query that used to run.
     fn resolve_key_column_type(&mut self, first: &RecordBatch) {
+        // Composite key parts resolve from their own source columns. The
+        // synthetic key column is always Utf8 (it holds the encoding), so
+        // resolving only that would leave every part declared "auto" and every
+        // output column emitted as a string — the §42/§43 defect, one level in.
+        let resolved: Vec<(usize, String)> = self
+            .spec
+            .key_parts
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.type_tag == crate::stream_driver::KEY_TYPE_AUTO)
+            .filter_map(|(i, p)| {
+                let idx = first.schema().index_of(&p.name).ok()?;
+                let tag =
+                    crate::stream_driver::key_tag_for_arrow_type(first.column(idx).data_type())?;
+                Some((i, tag.to_owned()))
+            })
+            .collect();
+        for (i, tag) in resolved {
+            if let Some(part) = self.spec.key_parts.get_mut(i) {
+                part.type_tag = tag;
+            }
+        }
+
         if self.spec.key_column_type != crate::stream_driver::KEY_TYPE_AUTO {
             return;
         }

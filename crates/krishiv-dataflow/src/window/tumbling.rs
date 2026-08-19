@@ -20,6 +20,8 @@ pub struct TumblingWindowSpec {
     /// Arrow type of the key column: `"int32"`, `"int64"`, `"float64"`, `"utf8"`, `"bool"`.
     /// Defaults to `"utf8"`.
     pub key_column_type: String,
+    /// Source columns behind a composite key; empty for a single-column key.
+    pub key_parts: Vec<krishiv_plan::window::KeyPart>,
     /// Name of the Int64 column carrying event time in milliseconds.
     pub event_time_column: String,
     /// Window duration in milliseconds.
@@ -84,6 +86,7 @@ impl TumblingWindowOperator {
             &spec.key_column_type,
             &spec.agg_exprs,
             &spec.agg_is_float,
+            &spec.key_parts,
         );
         Self {
             spec,
@@ -360,6 +363,7 @@ impl TumblingWindowOperator {
         build_window_record_batch(WindowRecordBatchInput {
             schema: &self.output_schema,
             key_type: &self.spec.key_column_type,
+            key_parts: &self.spec.key_parts,
             key_value,
             window_start_ms,
             window_end_ms,
@@ -389,13 +393,27 @@ pub(crate) fn build_window_output_schema(
     key_type: &str,
     agg_exprs: &[AggExpr],
     agg_is_float: &[bool],
+    key_parts: &[krishiv_plan::window::KeyPart],
 ) -> Arc<Schema> {
-    let key_dtype = key_type_to_arrow_data_type(key_type);
-    let mut fields = vec![
-        Field::new(key_column, key_dtype, false),
+    // A composite key is ONE grouping key internally and N columns on the way
+    // out: the user wrote `GROUP BY auction, channel` and must get `auction`
+    // and `channel` back, not the encoded key they never mentioned.
+    let mut fields: Vec<Field> = if key_parts.is_empty() {
+        vec![Field::new(
+            key_column,
+            key_type_to_arrow_data_type(key_type),
+            false,
+        )]
+    } else {
+        key_parts
+            .iter()
+            .map(|p| Field::new(&p.name, key_type_to_arrow_data_type(&p.type_tag), false))
+            .collect()
+    };
+    fields.extend([
         Field::new("window_start_ms", DataType::Int64, false),
         Field::new("window_end_ms", DataType::Int64, false),
-    ];
+    ]);
     for (i, agg) in agg_exprs.iter().enumerate() {
         let dtype = match agg.function {
             AggFunction::Avg | AggFunction::Stddev => DataType::Float64,
@@ -411,6 +429,7 @@ pub(crate) struct WindowRecordBatchInput<'a> {
     pub(crate) schema: &'a Arc<Schema>,
     pub(crate) key_type: &'a str,
     pub(crate) key_value: &'a str,
+    pub(crate) key_parts: &'a [krishiv_plan::window::KeyPart],
     pub(crate) window_start_ms: i64,
     pub(crate) window_end_ms: i64,
     pub(crate) agg_exprs: &'a [AggExpr],
@@ -425,6 +444,7 @@ pub(crate) fn build_window_record_batch(
         schema,
         key_type,
         key_value,
+        key_parts,
         window_start_ms,
         window_end_ms,
         agg_exprs,
@@ -432,11 +452,18 @@ pub(crate) fn build_window_record_batch(
         agg_is_float,
     } = input;
     let schema = Arc::clone(schema);
-    let mut columns: Vec<std::sync::Arc<dyn arrow::array::Array>> = vec![
-        key_value_to_typed_array(key_type, key_value)?,
-        Arc::new(Int64Array::from(vec![window_start_ms])),
-        Arc::new(Int64Array::from(vec![window_end_ms])),
-    ];
+    let mut columns: Vec<std::sync::Arc<dyn arrow::array::Array>> = if key_parts.is_empty() {
+        vec![key_value_to_typed_array(key_type, key_value)?]
+    } else {
+        let decoded = crate::scalar_expr::split_composite_key(key_value, key_parts.len())?;
+        key_parts
+            .iter()
+            .zip(decoded.iter())
+            .map(|(p, v)| key_value_to_typed_array(&p.type_tag, v))
+            .collect::<ExecResult<Vec<_>>>()?
+    };
+    columns.push(Arc::new(Int64Array::from(vec![window_start_ms])));
+    columns.push(Arc::new(Int64Array::from(vec![window_end_ms])));
     for (i, agg) in agg_exprs.iter().enumerate() {
         let is_float = agg_is_float.get(i).copied().unwrap_or(false);
         match agg.function {
@@ -529,6 +556,7 @@ mod state_tests {
         let spec = TumblingWindowSpec {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
+            key_parts: Vec::new(),
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             agg_exprs: vec![AggExpr {
@@ -564,6 +592,7 @@ mod state_tests {
         let mut restored = TumblingWindowOperator::new(TumblingWindowSpec {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
+            key_parts: Vec::new(),
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             agg_exprs: vec![AggExpr {
@@ -587,6 +616,7 @@ mod state_tests {
         let base = TumblingWindowSpec {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
+            key_parts: Vec::new(),
             event_time_column: "ts".into(),
             window_size_ms: 0,
             agg_exprs: vec![AggExpr {
@@ -623,6 +653,7 @@ mod state_tests {
         let spec = TumblingWindowSpec {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
+            key_parts: Vec::new(),
             event_time_column: "ts".into(),
             window_size_ms: 10_000,
             agg_exprs: vec![AggExpr {
@@ -781,6 +812,7 @@ mod aggregation_proptests {
         TumblingWindowSpec {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
+            key_parts: Vec::new(),
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             agg_exprs: vec![
@@ -890,6 +922,7 @@ mod aggregation_proptests {
             let min_spec = TumblingWindowSpec {
                 key_column: "k".into(),
                 key_column_type: "utf8".into(),
+                key_parts: Vec::new(),
                 event_time_column: "ts".into(),
                 window_size_ms: 1000,
                 agg_exprs: vec![
@@ -926,6 +959,7 @@ mod aggregation_proptests {
             let spec = TumblingWindowSpec {
                 key_column: "k".into(),
                 key_column_type: "utf8".into(),
+                key_parts: Vec::new(),
                 event_time_column: "ts".into(),
                 window_size_ms: 1000,
                 agg_exprs: vec![AggExpr { filter: None,
@@ -999,6 +1033,7 @@ mod filter_tests {
         let spec = TumblingWindowSpec {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
+            key_parts: Vec::new(),
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             agg_exprs: vec![

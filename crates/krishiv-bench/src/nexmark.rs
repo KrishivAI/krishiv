@@ -269,6 +269,34 @@ pub const SUPPORTED_QUERIES: &[(&str, &str)] = &[
          GROUP BY auction, window_start, window_end",
     ),
     (
+        // Q16: channel statistics. Needs COUNT(DISTINCT) over two columns plus
+        // min/max/avg in one query — the window IS the reporting period, so
+        // NEXMark's GROUP BY day becomes GROUP BY channel + window.
+        "q16_channel_statistics",
+        "SELECT channel, COUNT(*) AS total_bids, COUNT(DISTINCT bidder) AS bidders, \
+         COUNT(DISTINCT auction) AS auctions, MIN(price) AS lo, MAX(price) AS hi, \
+         AVG(price) AS mean \
+         FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
+         GROUP BY channel, window_start, window_end",
+    ),
+    (
+        // Q17: auction statistics, same shape keyed by auction.
+        "q17_auction_statistics",
+        "SELECT auction, COUNT(*) AS total_bids, COUNT(DISTINCT bidder) AS bidders, \
+         MIN(price) AS lo, MAX(price) AS hi, AVG(price) AS mean \
+         FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
+         GROUP BY auction, window_start, window_end",
+    ),
+    (
+        // A composite grouping key: (auction, channel) is two columns, encoded
+        // into one internal key and expanded back on output.
+        "q15_bidding_statistics",
+        "SELECT auction, channel, COUNT(*) AS total_bids, \
+         COUNT(DISTINCT bidder) AS bidders \
+         FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
+         GROUP BY auction, channel, window_start, window_end",
+    ),
+    (
         "q11_user_sessions",
         "SELECT bidder, COUNT(*) AS c \
          FROM SESSION(TABLE bid, DESCRIPTOR(dateTime), 10000) \

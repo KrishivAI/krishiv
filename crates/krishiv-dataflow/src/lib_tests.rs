@@ -310,6 +310,7 @@ fn make_stream_batch(keys: Vec<&str>, timestamps: Vec<i64>, vals: Vec<i64>) -> R
 
 fn count_window_spec() -> TumblingWindowSpec {
     TumblingWindowSpec {
+        key_parts: Vec::new(),
         key_column: "key".into(),
         key_column_type: "utf8".into(),
         event_time_column: "ts".into(),
@@ -409,6 +410,7 @@ fn window_sum_aggregation() {
     let spec = TumblingWindowSpec {
         key_column: "key".into(),
         key_column_type: "utf8".into(),
+        key_parts: Vec::new(),
         event_time_column: "ts".into(),
         window_size_ms: 1000,
         agg_exprs: vec![AggExpr {
@@ -437,6 +439,7 @@ fn window_avg_aggregation() {
     let spec = TumblingWindowSpec {
         key_column: "key".into(),
         key_column_type: "utf8".into(),
+        key_parts: Vec::new(),
         event_time_column: "ts".into(),
         window_size_ms: 1000,
         agg_exprs: vec![AggExpr {
@@ -575,6 +578,7 @@ fn multi_source_watermark_ignores_decrease() {
 
 fn sliding_spec() -> SlidingWindowSpec {
     SlidingWindowSpec {
+        key_parts: Vec::new(),
         key_column: "key".into(),
         key_column_type: "utf8".into(),
         event_time_column: "ts".into(),
@@ -665,6 +669,7 @@ fn sliding_window_avg_aggregation() {
     let spec = SlidingWindowSpec {
         key_column: "key".into(),
         key_column_type: "utf8".into(),
+        key_parts: Vec::new(),
         event_time_column: "ts".into(),
         window_size_ms: 1000,
         slide_ms: 500,
@@ -693,6 +698,7 @@ fn sliding_window_avg_aggregation() {
 
 fn session_spec() -> SessionWindowSpec {
     SessionWindowSpec {
+        key_parts: Vec::new(),
         key_column: "key".into(),
         key_column_type: "utf8".into(),
         event_time_column: "ts".into(),
@@ -749,6 +755,7 @@ fn session_window_separate_keys_independent() {
 #[test]
 fn session_window_avg_aggregation() {
     let spec = SessionWindowSpec {
+        key_parts: Vec::new(),
         key_column: "key".into(),
         key_column_type: "utf8".into(),
         event_time_column: "ts".into(),
@@ -957,6 +964,7 @@ fn sliding_window_zero_slide_returns_error() {
     let bad_spec = SlidingWindowSpec {
         key_column: "key".into(),
         key_column_type: "utf8".into(),
+        key_parts: Vec::new(),
         event_time_column: "ts".into(),
         window_size_ms: 1000,
         slide_ms: 0, // invalid — would cause infinite loop

@@ -2498,10 +2498,14 @@ mod tests {
 
         let job = CompiledJob::new(
             "bad-window",
-            // Two grouping columns: the planner refuses this by name.
+            // HAVING: the planner refuses this by name. (This was a
+            // two-column GROUP BY until composite keys shipped — the subject of
+            // this test is the ROUTING decision, so it needs a query the
+            // planner still rejects, not a particular rejected feature.)
             "SELECT region, COUNT(*) AS c \
              FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 60000) \
-             GROUP BY region, product, window_start, window_end",
+             GROUP BY region, window_start, window_end \
+             HAVING COUNT(*) > 5",
             vec![SourceSpec::unbounded("events", "memory", "events")],
             vec![],
             true,
@@ -2515,9 +2519,10 @@ mod tests {
             .to_string();
 
         assert!(
-            err.contains("product"),
-            "the planner names the column that would have been dropped, and that \
-             message must survive the routing decision; got: {err}"
+            err.contains("HAVING"),
+            "the planner names what it refused, and that message must survive the \
+             routing decision rather than being replaced by a stateless-path \
+             error; got: {err}"
         );
         assert!(
             !err.to_ascii_lowercase().contains("parse error"),

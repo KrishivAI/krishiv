@@ -120,6 +120,16 @@ pub enum WindowScalarExpr {
         op: ScalarBinaryOp,
         right: Box<WindowScalarExpr>,
     },
+    /// A composite grouping key built from several source columns.
+    ///
+    /// Encodes as a single `Utf8` column so the operators keep grouping on ONE
+    /// key — the alternative, teaching every operator, state key and output
+    /// schema about N keys, is a far larger change for the same result. The
+    /// encoding is length-prefixed (`"{byte_len}:{value}"` per part) rather
+    /// than delimiter-joined, because **any** separator can legitimately occur
+    /// inside a Utf8 value and a delimiter would silently merge two distinct
+    /// keys into one group.
+    CompositeKey(Vec<String>),
 }
 
 impl WindowScalarExpr {
@@ -128,6 +138,7 @@ impl WindowScalarExpr {
     pub fn columns(&self) -> Vec<&str> {
         match self {
             Self::Column(c) => vec![c.as_str()],
+            Self::CompositeKey(parts) => parts.iter().map(String::as_str).collect(),
             Self::Int(_) | Self::Float(_) => Vec::new(),
             Self::Binary { left, right, .. } => {
                 let mut cols = left.columns();
@@ -153,8 +164,21 @@ impl std::fmt::Display for WindowScalarExpr {
             Self::Binary { left, op, right } => {
                 write!(f, "({left} {} {right})", op.symbol())
             }
+            Self::CompositeKey(parts) => write!(f, "({})", parts.join(", ")),
         }
     }
+}
+
+/// One source column inside a composite grouping key.
+///
+/// `type_tag` follows the same vocabulary and the same `"auto"` convention as
+/// [`WindowExecutionSpec::key_column_type`]: unresolved until the first batch
+/// names the column's real type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyPart {
+    pub name: String,
+    #[serde(default = "default_key_type")]
+    pub type_tag: String,
 }
 
 /// A column computed from the source batch before the window sees it.
@@ -273,6 +297,17 @@ pub struct WindowExecutionSpec {
     pub session_gap_ms: Option<u64>,
     pub agg_exprs: Vec<WindowAgg>,
     pub state_ttl_ms: Option<u64>,
+    /// Source columns behind a composite grouping key, in `GROUP BY` order.
+    ///
+    /// Empty for the ordinary single-column case, where `key_column` names a
+    /// real source column and is emitted as one output column.
+    ///
+    /// When non-empty, `key_column` names a *synthetic* column holding the
+    /// encoded composite and these parts say how to expand it back into N
+    /// output columns. There is still exactly one grouping key — this is a
+    /// presentation description, not a second key representation.
+    #[serde(default)]
+    pub key_parts: Vec<KeyPart>,
     /// Columns computed from the source batch before grouping, in order.
     ///
     /// Empty for every query that aggregates plain columns. Populated by the
@@ -344,6 +379,7 @@ impl WindowExecutionSpec {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            key_parts: Vec::new(),
             derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
@@ -403,6 +439,7 @@ pub fn decode_window_execution_spec(encoded: &str) -> Result<WindowExecutionSpec
         allowed_lateness_ms: None,
         source_watermark_lags: parsed.source_watermark_lags,
         source_id_column: parsed.source_id_column,
+        key_parts: Vec::new(),
         derived_columns: Vec::new(),
         window_timezone: None,
         row_filter: None,
@@ -992,6 +1029,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            key_parts: Vec::new(),
             derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
@@ -1056,6 +1094,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            key_parts: Vec::new(),
             derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
@@ -1095,6 +1134,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags,
             source_id_column: Some(String::from("source")),
+            key_parts: Vec::new(),
             derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
@@ -1162,6 +1202,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags,
             source_id_column: Some("source_id".into()),
+            key_parts: Vec::new(),
             derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
@@ -1215,6 +1256,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            key_parts: Vec::new(),
             derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
@@ -1241,6 +1283,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            key_parts: Vec::new(),
             derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
@@ -1268,6 +1311,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags,
             source_id_column: Some("src:col".into()),
+            key_parts: Vec::new(),
             derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
@@ -1356,6 +1400,7 @@ mod tests {
                         allowed_lateness_ms: None,
                         source_watermark_lags: HashMap::new(),
                         source_id_column: None,
+                        key_parts: Vec::new(),
                         derived_columns: Vec::new(),
                         window_timezone: None,
                         row_filter: None,

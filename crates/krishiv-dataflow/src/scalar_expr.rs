@@ -63,6 +63,37 @@ pub fn eval_scalar_expr(expr: &WindowScalarExpr, batch: &RecordBatch) -> ExecRes
         }
         WindowScalarExpr::Int(v) => Ok(Arc::new(Int64Array::from(vec![*v; rows])) as ArrayRef),
         WindowScalarExpr::Float(v) => Ok(Arc::new(Float64Array::from(vec![v.0; rows])) as ArrayRef),
+        WindowScalarExpr::CompositeKey(parts) => {
+            let mut cols = Vec::with_capacity(parts.len());
+            for name in parts {
+                let idx = batch.schema().index_of(name).map_err(|_| {
+                    ExecError::InvalidInput(format!(
+                        "composite grouping key references '{name}', which the source batch does \
+                         not have"
+                    ))
+                })?;
+                cols.push(Arc::clone(batch.column(idx)));
+            }
+            let mut values = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let mut encoded = String::new();
+                for (name, col) in parts.iter().zip(cols.iter()) {
+                    if col.is_null(row) {
+                        return Err(ExecError::InvalidInput(format!(
+                            "composite grouping key column '{name}' contains null at row {row}"
+                        )));
+                    }
+                    let part = canonical_key_text(col, row)?;
+                    // Length-prefixed, so a value containing ':' or any other
+                    // byte cannot be mistaken for a part boundary.
+                    encoded.push_str(&part.len().to_string());
+                    encoded.push(':');
+                    encoded.push_str(&part);
+                }
+                values.push(encoded);
+            }
+            Ok(Arc::new(arrow::array::StringArray::from(values)) as ArrayRef)
+        }
         WindowScalarExpr::Binary { left, op, right } => {
             let l = eval_scalar_expr(left, batch)?;
             let r = eval_scalar_expr(right, batch)?;
@@ -90,6 +121,115 @@ pub fn eval_scalar_expr(expr: &WindowScalarExpr, batch: &RecordBatch) -> ExecRes
             })
         }
     }
+}
+
+/// The canonical text for one key part.
+///
+/// Must round-trip through [`split_composite_key`] and must be injective: two
+/// values that are not equal may never produce the same text, or two groups
+/// silently merge. Floats therefore encode their IEEE-754 bits rather than a
+/// decimal rendering.
+fn canonical_key_text(col: &ArrayRef, row: usize) -> ExecResult<String> {
+    use arrow::array::{
+        BooleanArray, Int8Array, Int16Array, Int32Array, LargeStringArray, StringArray,
+        StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    };
+    macro_rules! prim {
+        ($ty:ty) => {{
+            let a = col.as_any().downcast_ref::<$ty>().ok_or_else(|| {
+                ExecError::UnsupportedType("composite key part failed downcast".into())
+            })?;
+            return Ok(a.value(row).to_string());
+        }};
+    }
+    match col.data_type() {
+        DataType::Int8 => prim!(Int8Array),
+        DataType::Int16 => prim!(Int16Array),
+        DataType::Int32 => prim!(Int32Array),
+        DataType::Int64 => prim!(Int64Array),
+        DataType::UInt8 => prim!(UInt8Array),
+        DataType::UInt16 => prim!(UInt16Array),
+        DataType::UInt32 => prim!(UInt32Array),
+        DataType::UInt64 => prim!(UInt64Array),
+        DataType::Boolean => prim!(BooleanArray),
+        DataType::Float32 | DataType::Float64 => {
+            let cast = cast(col, &DataType::Float64)
+                .map_err(|e| ExecError::Arrow(format!("composite key float cast: {e}")))?;
+            let a = cast
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| ExecError::UnsupportedType("float key failed downcast".into()))?;
+            Ok(a.value(row).to_bits().to_string())
+        }
+        DataType::Utf8 => {
+            let a = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                ExecError::UnsupportedType("Utf8 key part failed downcast".into())
+            })?;
+            Ok(a.value(row).to_owned())
+        }
+        DataType::Utf8View => {
+            let a = col
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| {
+                    ExecError::UnsupportedType("Utf8View key part failed downcast".into())
+                })?;
+            Ok(a.value(row).to_owned())
+        }
+        DataType::LargeUtf8 => {
+            let a = col
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| {
+                    ExecError::UnsupportedType("LargeUtf8 key part failed downcast".into())
+                })?;
+            Ok(a.value(row).to_owned())
+        }
+        other => Err(ExecError::UnsupportedType(format!(
+            "unsupported composite grouping key column type: {other}"
+        ))),
+    }
+}
+
+/// Split an encoded composite key back into its parts.
+///
+/// # Errors
+/// Returns an error on a malformed encoding rather than guessing a split — a
+/// mis-split key would attribute a window's aggregate to the wrong group.
+pub fn split_composite_key(encoded: &str, expected_parts: usize) -> ExecResult<Vec<String>> {
+    let mut out = Vec::with_capacity(expected_parts);
+    let mut rest = encoded;
+    while !rest.is_empty() {
+        let colon = rest.find(':').ok_or_else(|| {
+            ExecError::InvalidInput(format!(
+                "composite key '{encoded}' is missing a length prefix"
+            ))
+        })?;
+        let len: usize = rest[..colon].parse().map_err(|_| {
+            ExecError::InvalidInput(format!("composite key '{encoded}' has a bad length prefix"))
+        })?;
+        let start = colon + 1;
+        let end = start
+            .checked_add(len)
+            .filter(|e| *e <= rest.len())
+            .ok_or_else(|| {
+                ExecError::InvalidInput(format!("composite key '{encoded}' is truncated"))
+            })?;
+        if !rest.is_char_boundary(start) || !rest.is_char_boundary(end) {
+            return Err(ExecError::InvalidInput(format!(
+                "composite key '{encoded}' splits inside a character"
+            )));
+        }
+        out.push(rest[start..end].to_owned());
+        rest = &rest[end..];
+    }
+    if out.len() != expected_parts {
+        return Err(ExecError::InvalidInput(format!(
+            "composite key '{encoded}' decoded to {} parts, expected {expected_parts}",
+            out.len()
+        )));
+    }
+    Ok(out)
 }
 
 /// Append every derived column to a batch, in order.
