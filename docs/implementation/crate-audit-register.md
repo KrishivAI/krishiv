@@ -5500,3 +5500,65 @@ key. This compiler requires a grouping key in the SELECT list, so a
 **window-only (global) aggregation** is not expressible; the variant above adds
 `(auction, channel)`. The same gap blocks a global Q7. Recorded as its own item
 rather than papered over.
+
+## §49 — Streaming joins reach SQL (task #139)
+
+§46 called this "wiring, not a new operator", and that was right. The operators
+existed — `interval_join.rs`, `watermark_join.rs` wrapping it, and an executor
+path in `aligned_join.rs`. **Nothing in `krishiv-sql` or `krishiv-plan` could
+name one**, so the whole family was unreachable from a query.
+
+**Syntax is the one users already write** — an equi-key plus an event-time band
+in the `ON` clause, as in Flink and Spark:
+
+```sql
+FROM bid b JOIN auction a
+  ON b.auction = a.id
+ AND b.dateTime BETWEEN a.dateTime - 5000 AND a.dateTime + 5000
+```
+
+No new keyword was invented. `ON` terms are flattened, so their order does not
+matter — a query that works should not stop working because two conjuncts were
+swapped.
+
+**`StreamingJoinSpec` lives in krishiv-plan**, beside `WindowExecutionSpec`, for
+the reason that one lives there: `krishiv-sql` cannot depend on
+`krishiv-dataflow`, and a spec is the only thing the two must agree on. The
+`From` conversion to `WatermarkWindowJoinSpec` is the single place the
+vocabularies meet, so they cannot drift into two descriptions of one join.
+
+**What it refuses, and why each refusal is not a limitation being hidden:**
+
+| shape | refused because |
+|---|---|
+| asymmetric band | the operator's window is symmetric; using one side runs a join the query did not describe, and only near the window edge |
+| no time band | join state would be unbounded |
+| no equi-key | every left row matches every right row in the window |
+| `LEFT`/`RIGHT`/`FULL` | requires emitting rows whose partner may still arrive, which a bounded window cannot promise |
+| 3+ streams | says how many it saw |
+| `USING` / `NATURAL` | carries no time bound |
+
+**Routing recognises the shape, not the validity.** `looks_like_streaming_join`
+answers "is this a join" and deliberately not "is this join valid", so a
+malformed join reaches *this* compiler and produces *its* error. Routing on
+validity is precisely the f022220 defect, where a planner's reason was
+discarded and replaced by a stateless-path parse error about something else.
+There is a test asserting the router claims a query it will then refuse.
+
+**Proven red** by making the conversion ignore the compiled window: the two
+band-dependent tests fail `left: 1, right: 0`. The band test also asserts that
+the *same* key *inside* the band does join — so a failure means the band, not a
+broken key comparison.
+
+### Not done, and not implied
+
+The SQL surface, the plan spec, the conversion and the operator are wired and
+tested end to end. **Job-level routing of a two-source streaming job through
+`StreamingEngine` is not.** That engine builds one `ContinuousWindowExecutor`
+from one source; a join needs the two-input path in `aligned_join.rs`, which is
+a separate change with its own barrier-alignment and checkpoint questions. A
+NEXMark Q3 harness arm also needs person/auction generators, which the current
+generator does not produce — it emits bids only.
+
+So: joins are expressible and executable, and are **not** yet runnable as a
+submitted job or counted in NEXMark coverage, which stays at **8 of 22**.

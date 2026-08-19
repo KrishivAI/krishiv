@@ -43,6 +43,22 @@ pub struct WatermarkWindowJoinSpec {
     pub window_ms: u64,
 }
 
+impl From<&krishiv_plan::stream_join::StreamingJoinSpec> for WatermarkWindowJoinSpec {
+    /// Adopt a plan-level join spec.
+    ///
+    /// The plan crate owns the spec because `krishiv-sql` cannot depend on this
+    /// one; this is the single place the two vocabularies meet, so they cannot
+    /// drift into two descriptions of the same join.
+    fn from(plan: &krishiv_plan::stream_join::StreamingJoinSpec) -> Self {
+        Self {
+            time_column: plan.time_column.clone(),
+            left_key_column: plan.left_key_column.clone(),
+            right_key_column: plan.right_key_column.clone(),
+            window_ms: plan.window_ms,
+        }
+    }
+}
+
 // ── Operator ──────────────────────────────────────────────────────────────────
 
 /// Stream-to-stream equi-join bounded by a sliding event-time window.

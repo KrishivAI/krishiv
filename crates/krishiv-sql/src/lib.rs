@@ -133,6 +133,7 @@ mod json_functions;
 mod spark_functions;
 pub mod statement_completion;
 pub mod streaming;
+pub mod streaming_join_plan;
 pub mod streaming_table_ddl;
 pub mod streaming_tvf;
 pub mod streaming_window_plan;
