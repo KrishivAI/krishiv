@@ -4968,3 +4968,82 @@ class visible to the arms that already exist.
 - **Five user-facing loops outside the `StreamingLoop` gate**: three writer
   loops and two PyO3 loops written in the binding layer, choosing their policy
   implicitly by the order of two for-loops.
+
+## §41 — The NEXMark harness, and the three bugs it found before its first number
+
+The streaming benchmark was built to measure, and it did — but it earned its
+keep before printing a single figure. Three defects fell out of it, all one
+shape: **the engine had only ever been fed `Int64`.**
+
+Every fixture in the tree, including my own conformance corpus, builds its
+columns as `Int64` and `Utf8`. NEXMark's standard `Bid` schema does not: ids
+and prices are `UInt64`. That single change of source type broke three separate
+places in sequence, each surfacing only once the previous was fixed.
+
+| # | Site | Symptom | Fix |
+|---|---|---|---|
+| 1 | `aggregate.rs::eval_compare` | `WHERE price > 5000` → "cannot compare column 'price' of type UInt64 against literal Int(5000)" | widened the numeric arm to all int/uint/float widths |
+| 2 | `join.rs::extract_agg_key` | `GROUP BY auction` → "unsupported group key type: UInt64" | new `AggKey::UInt64` variant |
+| 3 | `stream_driver.rs::is_numeric_agg_type` | `MAX(price)` → "unsupported column type for pre-downcast: UInt64" | removed unsigned from the "no coercion needed" set; coerce to `Int64` |
+
+**#3 is the interesting one**, for two reasons.
+
+First, it was an *internal contradiction*: `is_numeric_agg_type` said `UInt64`
+was an acceptable aggregate input, and the operators' pre-downcast said it was
+not. Two statements of the same fact, disagreeing — this register's most
+frequent defect shape, found again in code I wrote three sections ago.
+
+Second, the obvious repair is wrong. The default coercion target is `Float64`,
+which is exact only below 2^53. A `u64` price above that would have been
+**silently rounded** — and the cast does not error, because `cast_with_options`
+considers u64→f64 a valid conversion regardless of precision loss. So unsigned
+coerces to `Int64` (exact below 2^63) instead. The regression test asserts the
+value `2^53 + 1` survives, not merely that the type changed; reverting the
+target to `Float64` fails it with `left: Float64, right: Int64`, and reverting
+the exactness check alone would have left the bug invisible.
+
+The same reasoning applies to #2: casting unsigned keys to `Int64` would send
+`u64::MAX` and `u64::MAX - 1` to distinct negative values (safe), but casting to
+`Float64` would round **both to 2^64 — merging two groups into one.** Hence a
+dedicated key variant rather than a cast. The test asserts non-aliasing.
+
+**What this says about the corpus.** §40 recorded that my conformance corpus
+varies event *timing* over one fixed query shape, so it was blind to query-shape
+defects (f1, f3). This is the second blind axis: it also varies only over one
+fixed *column type set*. Neither axis was chosen; both were inherited from the
+first fixture written. A corpus fixed on two axes at once is a corpus that
+proves the engine works on exactly one workload.
+
+None of these three were found by 5,448 passing tests. They were found by the
+first workload from outside the codebase.
+
+### The harness itself
+
+`crates/krishiv-bench/src/{nexmark.rs, bin/nexmark_stream.rs}`. Faithful
+generator (splitmix64, standard schema, the canonical 1:3:46 person/auction/bid
+proportions, configurable out-of-orderness). It drives through
+`StreamDriver::on_input`, **not** `ContinuousWindowExecutor::drain` — the first
+draft called `drain` directly and thereby skipped input typing entirely, which
+is both how bug #3 hid and a reminder that `drain` alone is not the production
+path.
+
+Coverage is **4 of 22 queries** and the harness says so on every run rather than
+implying completeness. First numbers, single-node, operator-level:
+
+| query | events/sec | p50 µs | p99 µs | p99.9 µs |
+|---|---|---|---|---|
+| q2_filtered_bids | 9.9M | 64 | 219 | 728 |
+| q5_hot_items | 9.7M | 37 | 392 | 804 |
+| q7_highest_bid_keyed | 10.0M | 66 | 266 | 286 |
+| q11_user_sessions | 15.1M | 48 | 111 | 200 |
+
+**A completeness gate is not optional here** and runs on every query: this
+engine's run-loop egress buffer drops its *oldest* batches at a cap, so a
+throughput benchmark that ignores output would measure how fast the engine can
+discard data and would score *better* the more it lost.
+
+These numbers are not comparable to published Flink/Spark NEXMark results and
+must not be quoted as if they were — those measure a distributed system end to
+end through a source connector, sustainable-rate-searched per Karimov et al.
+(ICDE 2018). This is one in-process operator chain fed from memory. What it is
+good for is regression detection and relative comparison against itself.

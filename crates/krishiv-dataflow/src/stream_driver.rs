@@ -481,22 +481,45 @@ fn arrow_type_for_key_tag(tag: &str) -> Option<DataType> {
 /// True for Arrow types the windowed aggregate operators accept directly as a
 /// numeric aggregate input (no coercion needed).
 fn is_numeric_agg_type(dt: &DataType) -> bool {
+    // UNSIGNED TYPES ARE DELIBERATELY ABSENT.
+    //
+    // They are numeric, but the aggregate operators cannot consume them: their
+    // pre-downcast handles Int32/Int64/Float64/Utf8/Bool and rejects anything
+    // else. Listing unsigned here said "no coercion needed" and then the
+    // operator failed with "unsupported column type for pre-downcast: UInt64".
+    // Two statements of the same fact — which types an aggregate accepts —
+    // disagreeing, which is this codebase's recurring defect shape.
+    //
+    // They are now coerced instead, to Int64 rather than Float64 (see
+    // `agg_target_type`) so a SUM over u64 stays exact.
+    //
+    // Found by the NEXMark harness on realistic source types; no fixture in the
+    // tree used an unsigned column.
     matches!(
         dt,
         DataType::Int8
             | DataType::Int16
             | DataType::Int32
             | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
             | DataType::Float16
             | DataType::Float32
             | DataType::Float64
             | DataType::Decimal128(_, _)
             | DataType::Decimal256(_, _)
     )
+}
+
+/// What an unacceptable aggregate-input column should be cast to.
+///
+/// Unsigned integers go to `Int64`, not `Float64`: `f64` is exact only below
+/// 2^53, so routing a `u64` count or price through it would silently round.
+/// `Int64` is exact for every `u64` below 2^63, which covers every id and
+/// price a source realistically produces.
+fn agg_target_type(current: &DataType) -> DataType {
+    match current {
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => DataType::Int64,
+        _ => DataType::Float64,
+    }
 }
 
 /// Cast a source batch's key, event-time and aggregate-input columns to the
@@ -575,7 +598,7 @@ pub fn coerce_batch_for_window(
             if is_numeric_agg_type(current) {
                 None
             } else {
-                Some(DataType::Float64)
+                Some(agg_target_type(current))
             }
         } else {
             None
@@ -1140,6 +1163,66 @@ mod tests {
             filter: None,
         }];
         spec
+    }
+
+    /// An unsigned aggregate input is coerced to `Int64`, and exactly.
+    ///
+    /// Two bugs meet here. First, `is_numeric_agg_type` used to claim unsigned
+    /// needed no coercion while the operators' pre-downcast rejected it, so the
+    /// batch reached the operator untouched and failed with "unsupported column
+    /// type for pre-downcast: UInt64" — found by the NEXMark harness, whose bid
+    /// prices are `UInt64`.
+    ///
+    /// Second, the default coercion target is `Float64`, which is exact only
+    /// below 2^53. The value below is 2^53 + 1: the smallest integer `f64`
+    /// cannot represent. If the target reverts to `Float64` it rounds down to
+    /// 2^53 and a SUM over prices is quietly wrong, so this asserts the VALUE,
+    /// not just the type.
+    #[test]
+    fn an_unsigned_aggregate_input_is_coerced_to_int64_without_rounding() {
+        use arrow::array::{ArrayRef, Int64Array as I64, StringArray, UInt64Array};
+        use arrow::datatypes::{Field, Schema};
+
+        // 2^53 + 1 — representable in i64 and u64, NOT in f64.
+        let unrepresentable_in_f64: u64 = 9_007_199_254_740_993;
+        assert_eq!(
+            unrepresentable_in_f64 as f64 as u64,
+            unrepresentable_in_f64 - 1,
+            "premise: f64 cannot hold this value"
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("v", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
+                Arc::new(I64::from(vec![1_000_i64])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![unrepresentable_in_f64])) as ArrayRef,
+            ],
+        )
+        .expect("unsigned batch");
+
+        let coerced = coerce_batch_for_window(&batch, &sum_spec()).expect("coerce unsigned");
+        assert_eq!(
+            coerced.schema().field(2).data_type(),
+            &DataType::Int64,
+            "unsigned aggregate input must be coerced, and to Int64 not Float64"
+        );
+        let got = coerced
+            .column(2)
+            .as_any()
+            .downcast_ref::<I64>()
+            .expect("Int64 column")
+            .value(0);
+        assert_eq!(
+            u64::try_from(got).expect("non-negative"),
+            unrepresentable_in_f64,
+            "coercion must be exact; Float64 would round this down by one"
+        );
     }
 
     /// An all-`Utf8` batch — the shape a Kafka JSON source produces when

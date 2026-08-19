@@ -211,8 +211,46 @@ Findings tracked from this entry:
    The 10 M tick costs 9× the 1 M tick for the same 5 000-row delta — the
    step still has a state-size-dependent component. Tracked for the
    Phase 57 delta-batch tick mechanics work (task #196).
-4. **Nexmark (embedded SQL, 100 k-row in-memory batch)**: Q1 1.61 ms,
-   Q2 4.86 ms, Q5 3.80 ms, Q8 1.66 ms per batch.
+4. **`bench nexmark` — NOT comparable to Flink/Spark NEXMark, despite the
+   name.** Historic figures (Q1 1.61 ms, Q2 4.86 ms, Q5 3.80 ms, Q8 1.66 ms
+   per 100 k-row in-memory batch) are retained for internal
+   regression-tracking only, and must not be quoted as NEXMark results.
+
+   Two reasons, both structural:
+   - It runs the queries as **batch** DataFusion over a fixed in-memory
+     table. NEXMark is a *streaming* benchmark; run as a batch query it
+     measures the query engine and none of the streaming behaviour —
+     watermarks, out-of-order arrival, window closing — that the benchmark
+     exists to exercise.
+   - Its tables are **not the NEXMark schemas**. `Bid` is `(auction, price)`
+     against a spec of `(auction, bidder, price, channel, url, dateTime,
+     extra)`, and `Person` is absent entirely.
+
+   For streaming NEXMark use the harness described below, which generates
+   the standard entities and reports its coverage honestly.
+
+5. **NEXMark streaming harness (`--bin nexmark_stream`)**: sustainable
+   throughput, event-time latency percentiles, and a completeness gate,
+   over a faithful generator (standard Person/Auction/Bid schemas, the
+   1 : 3 : 46 event mix, seeded and reproducible, with injected
+   out-of-orderness).
+
+   **Coverage is 4 of 22 queries** — Q2, Q5, Q7-keyed and Q11 — and the
+   harness prints that ratio on every run. The engine's streaming SQL path
+   expresses single-column keyed windowed aggregation only: no stateless
+   projection (Q0/Q1), no global aggregates (Q7 standard form), no
+   composite grouping keys (Q15), no joins (Q3/Q4/Q8). A cross-engine
+   comparison on this subset is legitimate **provided the subset is
+   stated**; reporting it as "NEXMark" without that is not.
+
+   The completeness gate is load-bearing rather than decorative: the
+   run-loop egress buffer drops its OLDEST batches at a cap, so a
+   throughput number taken without verifying output would measure how fast
+   the engine can discard data, and would improve as it lost more.
+
+```bash
+cargo run --release -p krishiv-bench --bin nexmark_stream
+```
 
 Reproduce: generate the datasets, then
 

@@ -379,3 +379,89 @@ mod tests {
         assert_eq!(render_sorted("b\n\na\n"), "a\nb");
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The second axis: query SHAPE
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One query shape, and the spec property compiling it must produce.
+///
+/// # Why this exists as a separate axis
+///
+/// [`CORPUS`] varies event **timing** — watermark advance, flush behaviour —
+/// over ONE fixed query: a string key, no `WHERE`, one grouping column. Its
+/// axis is the driver loop, and it is excellent at that.
+///
+/// It is therefore structurally blind to everything that goes wrong between a
+/// user's query and the spec. An API audit found five silent wrong answers on
+/// that axis — a dropped `WHERE`, a hardcoded key type, a discarded pipeline —
+/// and the loop corpus could not have caught any of them, not by oversight but
+/// because it has no second dimension.
+///
+/// This is that dimension. The assertion lives in `krishiv-sql`, which can
+/// reach the compiler; the data lives here beside the timing corpus so the two
+/// axes are visibly siblings.
+#[derive(Debug, Clone, Copy)]
+pub struct QueryShape {
+    /// Stable identifier.
+    pub name: &'static str,
+    /// The SQL to compile.
+    pub sql: &'static str,
+    /// Must this compile at all?
+    pub compiles: bool,
+    /// If it compiles, a substring the resulting spec's debug form must contain.
+    ///
+    /// Deliberately a property of the SPEC rather than of the output: these
+    /// shapes exist to catch fields lost between the query and the spec, and a
+    /// field that never arrives cannot be observed downstream.
+    pub spec_must_contain: Option<&'static str>,
+    /// If it does not compile, a substring the error must contain — so a
+    /// refusal is checked for being *informative*, not merely for happening.
+    pub error_must_contain: Option<&'static str>,
+    /// What this shape catches.
+    pub why: &'static str,
+}
+
+/// Query shapes every streaming compiler change is checked against.
+pub const QUERY_SHAPES: &[QueryShape] = &[
+    QueryShape {
+        name: "baseline_keyed_tumbling",
+        sql: "SELECT k, SUM(v) AS total FROM TUMBLE(TABLE e, DESCRIPTOR(ts), 10000)               GROUP BY k, window_start, window_end",
+        compiles: true,
+        spec_must_contain: Some("key_column: \"k\""),
+        error_must_contain: None,
+        why: "The canonical shape. Every rejection below is only meaningful if               this is accepted — otherwise they would all pass against a               compiler that refused everything.",
+    },
+    QueryShape {
+        name: "top_level_where",
+        sql: "SELECT k, SUM(v) AS total FROM TUMBLE(TABLE e, DESCRIPTOR(ts), 10000)               WHERE v > 100 GROUP BY k, window_start, window_end",
+        compiles: true,
+        spec_must_contain: Some("row_filter: Some"),
+        error_must_contain: None,
+        why: "The predicate was silently discarded for the lifetime of the               compiler: `WHERE v > 100` compiled, registered, and counted every               row. Asserts it REACHES the spec, because 'it compiles' was               exactly the state the defect was in.",
+    },
+    QueryShape {
+        name: "multi_column_group_by",
+        sql: "SELECT k, k2, COUNT(*) AS c FROM TUMBLE(TABLE e, DESCRIPTOR(ts), 10000)               GROUP BY k, k2, window_start, window_end",
+        compiles: false,
+        spec_must_contain: None,
+        error_must_contain: Some("k2"),
+        why: "A composite key silently collapsed to the first column and               aggregated across the second. Refused until multi-key lands; the               error must NAME the dropped column.",
+    },
+    QueryShape {
+        name: "global_aggregate_no_key",
+        sql: "SELECT MAX(v) AS mx FROM TUMBLE(TABLE e, DESCRIPTOR(ts), 10000)               GROUP BY window_start, window_end",
+        compiles: false,
+        spec_must_contain: None,
+        error_must_contain: Some("grouping key"),
+        why: "Global aggregates are not expressible yet. Pinned as a refusal so               the day they are supported, this line has to change deliberately.",
+    },
+    QueryShape {
+        name: "windowless_projection",
+        sql: "SELECT k, v * 2 AS doubled FROM e",
+        compiles: false,
+        spec_must_contain: None,
+        error_must_contain: Some("window"),
+        why: "A stateless query is not a windowed one. It must be refused HERE               and routed to the stateless path by the caller — the routing               decision that used to swallow every other error on this list.",
+    },
+];

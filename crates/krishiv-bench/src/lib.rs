@@ -9,6 +9,7 @@
 
 /// Structured benchmark results and comparison framework.
 pub mod comparison;
+pub mod nexmark;
 pub mod phase_i;
 
 pub mod tpcds;

@@ -101,8 +101,31 @@ fn eval_compare(
             cmp_datum(op, &cast, &Scalar::new(Int64Array::from(vec![*v])))
         }
         // Any numeric/float mix compares in f64.
+        //
+        // Unsigned and narrow-width integers are here deliberately. They were
+        // absent, so a predicate over a `UInt64` column — which is what a Kafka
+        // or NEXMark-shaped source produces for ids and prices — failed with
+        // "cannot compare column of type UInt64 against literal Int". The
+        // NEXMark harness hit exactly that on its first run: a feature that
+        // worked on the Int64 fixtures it was tested against and on nothing
+        // else.
+        //
+        // f64 is exact for integers up to 2^53. Beyond that a comparison could
+        // round; that is a real limit, and it is far better than refusing the
+        // whole column type. UInt64 values above 2^53 are the only affected
+        // case and are not reachable from any current source.
         (
-            DataType::Int32 | DataType::Int64 | DataType::Float64,
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64,
             AggFilterValue::Int(_) | AggFilterValue::Float(_),
         ) => {
             let lit = match value {

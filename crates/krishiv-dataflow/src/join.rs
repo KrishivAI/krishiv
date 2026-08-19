@@ -14,6 +14,13 @@ use crate::{ExecError, ExecResult};
 pub enum AggKey {
     Int32(i32),
     Int64(i64),
+    /// Unsigned integer keys.
+    ///
+    /// Absent until the NEXMark harness hit it: ids and prices arrive as
+    /// `UInt64` from realistic sources, and a `UInt64` grouping key failed with
+    /// "unsupported group key type". Widened rather than cast to `Int64` so a
+    /// key above `i64::MAX` cannot silently alias onto a negative one.
+    UInt64(u64),
     /// `f64` stored as IEEE-754 bits for total-order hashing.
     Float64(u64),
     Utf8(String),
@@ -24,6 +31,7 @@ impl fmt::Display for AggKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Int32(v) => write!(f, "{v}"),
+            Self::UInt64(v) => write!(f, "{v}"),
             Self::Int64(v) => write!(f, "{v}"),
             Self::Float64(bits) => write!(f, "{}", f64::from_bits(*bits)),
             Self::Utf8(s) => f.write_str(s),
@@ -40,6 +48,7 @@ impl AggKey {
             (Self::Float64(a), Self::Float64(b)) => a.cmp(b),
             (Self::Utf8(a), Self::Utf8(b)) => a.cmp(b),
             (Self::Bool(a), Self::Bool(b)) => a.cmp(b),
+            (Self::UInt64(a), Self::UInt64(b)) => a.cmp(b),
             (a, b) => a.discriminant().cmp(&b.discriminant()),
         }
     }
@@ -51,6 +60,7 @@ impl AggKey {
             Self::Float64(_) => 2,
             Self::Utf8(_) => 3,
             Self::Bool(_) => 4,
+            Self::UInt64(_) => 5,
         }
     }
 }
@@ -133,6 +143,15 @@ pub fn extract_agg_key(batch: &RecordBatch, col_idx: usize, row: usize) -> ExecR
             })?;
             Ok(AggKey::Bool(arr.value(row)))
         }
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+            let cast = arrow::compute::cast(col, &DataType::UInt64)
+                .map_err(|e| ExecError::Arrow(format!("group key cast to UInt64: {e}")))?;
+            let arr = cast
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .ok_or_else(|| ExecError::UnsupportedType("unsigned key failed downcast".into()))?;
+            Ok(AggKey::UInt64(arr.value(row)))
+        }
         other => Err(ExecError::UnsupportedType(format!(
             "unsupported group key type: {other}"
         ))),
@@ -178,6 +197,58 @@ mod tests {
         let row_err = extract_agg_key(&batch, 0, 1).unwrap_err();
         assert!(matches!(row_err, ExecError::InvalidInput(_)));
         assert!(row_err.to_string().contains("row index 1"));
+    }
+
+    /// Unsigned grouping keys work, and a key above `i64::MAX` keeps its
+    /// identity.
+    ///
+    /// The NEXMark harness hit "unsupported group key type: UInt64" grouping
+    /// bids by `auction`. The obvious repair — cast unsigned to `Int64` — is
+    /// what this test rejects: `u64::MAX` and `u64::MAX - 1` both map to
+    /// negative `i64`s, and a *distinct* key pair must stay distinct. Hence the
+    /// dedicated `AggKey::UInt64` variant.
+    #[test]
+    fn extract_agg_key_supports_unsigned_keys_without_aliasing() {
+        use arrow::array::{ArrayRef, UInt32Array, UInt64Array};
+        use arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+
+        let wide = Arc::new(UInt64Array::from(vec![7_u64, u64::MAX, u64::MAX - 1])) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "auction",
+            DataType::UInt64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![wide]).unwrap();
+
+        let small = extract_agg_key(&batch, 0, 0).expect("UInt64 key must extract");
+        assert_eq!(small, AggKey::UInt64(7));
+
+        // Above i64::MAX, and distinct from its neighbour. Casting to i64 would
+        // make both negative; casting to f64 would make them EQUAL (neither is
+        // representable, both round to 2^64), silently merging two groups.
+        let top = extract_agg_key(&batch, 0, 1).expect("u64::MAX key must extract");
+        let below = extract_agg_key(&batch, 0, 2).expect("u64::MAX-1 key must extract");
+        assert_eq!(top, AggKey::UInt64(u64::MAX));
+        assert_ne!(top, below, "distinct u64 keys must not alias onto one group");
+
+        // Narrow unsigned widens into the same variant, so UInt32(7) and
+        // UInt64(7) land in one group rather than two.
+        let narrow_schema = Arc::new(Schema::new(vec![Field::new(
+            "auction",
+            DataType::UInt32,
+            false,
+        )]));
+        let narrow_batch = RecordBatch::try_new(
+            narrow_schema,
+            vec![Arc::new(UInt32Array::from(vec![7_u32])) as ArrayRef],
+        )
+        .unwrap();
+        assert_eq!(
+            extract_agg_key(&narrow_batch, 0, 0).expect("UInt32 key must extract"),
+            AggKey::UInt64(7),
+            "narrow unsigned must widen into the same key variant"
+        );
     }
 
     #[test]

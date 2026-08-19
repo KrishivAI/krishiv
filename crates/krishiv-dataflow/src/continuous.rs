@@ -1365,4 +1365,50 @@ mod tests {
         let rows: usize = flushed.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 2, "both keys must survive when no filter is set");
     }
+
+    /// A row filter works over unsigned and narrow integer columns, not just
+    /// `Int64`.
+    ///
+    /// The NEXMark harness found this on its first run: `WHERE price > 5000`
+    /// over a `UInt64` column failed with "cannot compare column of type
+    /// UInt64 against literal Int". The feature worked on the Int64 fixtures it
+    /// had been tested against and on nothing else — a source-shaped hole that
+    /// no unit test using the corpus schema could have exposed, because the
+    /// corpus is all Int64.
+    #[test]
+    fn a_row_filter_compares_unsigned_and_narrow_integer_columns() {
+        use arrow::array::{ArrayRef, UInt32Array, UInt64Array};
+        use krishiv_plan::window::{AggFilterCompareOp, AggFilterValue, WindowAggFilter};
+
+        let cols: Vec<(&str, ArrayRef)> = vec![
+            ("UInt64", Arc::new(UInt64Array::from(vec![10_u64, 9_000]))),
+            ("UInt32", Arc::new(UInt32Array::from(vec![10_u32, 9_000]))),
+        ];
+        for (name, col) in cols {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Utf8, false),
+                Field::new("ts", DataType::Int64, false),
+                Field::new("v", col.data_type().clone(), false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+                    Arc::new(Int64Array::from(vec![1_000_i64, 2_000])) as ArrayRef,
+                    col,
+                ],
+            )
+            .unwrap();
+
+            let filter = WindowAggFilter::Compare {
+                column: String::from("v"),
+                op: AggFilterCompareOp::Gt,
+                value: AggFilterValue::Int(5_000),
+            };
+            let mask = crate::aggregate::eval_agg_filter(&filter, &batch)
+                .unwrap_or_else(|e| panic!("{name} column must be comparable: {e}"));
+            assert!(!mask.value(0), "{name}: 10 > 5000 is false");
+            assert!(mask.value(1), "{name}: 9000 > 5000 is true");
+        }
+    }
 }
