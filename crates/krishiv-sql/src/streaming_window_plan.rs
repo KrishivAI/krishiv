@@ -38,8 +38,8 @@
 use std::collections::HashMap;
 
 use datafusion::sql::sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Query, Select,
-    SelectItem, SetExpr, Statement, TableFactor, Value,
+    DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    GroupByExpr, Query, Select, SelectItem, SetExpr, Statement, TableFactor, Value,
 };
 use datafusion::sql::sqlparser::dialect::DuckDbDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -110,7 +110,17 @@ pub fn compile_streaming_window_sql(sql: &str) -> SqlResult<StreamingWindowPlan>
 
     let spec = WindowExecutionSpec {
         key_column,
-        key_column_type: String::from("utf8"),
+        // "auto": the SQL text carries no type information, so the key type is
+        // resolved from the source batch when the operator is built. Hardcoding
+        // "utf8" here made every SQL-planned key a string column of digits.
+        //
+        // This is the SECOND of two sites that built this field. The other, in
+        // krishiv-plan, was fixed first and its test went through
+        // `WindowExecutionSpec::tumbling` — the constructor, not this compiler —
+        // so it passed while the path every SQL user actually takes stayed
+        // broken. The test below goes through `compile_streaming_window_sql`
+        // for exactly that reason.
+        key_column_type: String::from(krishiv_dataflow_key_type_auto()),
         event_time_column: window.event_time_column,
         watermark_lag_ms: 0,
         window_kind: window.kind,
@@ -547,6 +557,15 @@ fn maybe_set_key(key: &mut Option<String>, name: &str) {
     }
 }
 
+/// The "resolve from the source" sentinel, spelled once.
+///
+/// krishiv-sql does not depend on krishiv-dataflow (where the constant lives),
+/// so this names the same value in one place rather than scattering the
+/// literal — the field's own default in krishiv-plan is the other definition.
+fn krishiv_dataflow_key_type_auto() -> &'static str {
+    "auto"
+}
+
 fn function_to_agg(f: &Function, alias: Option<String>) -> SqlResult<WindowAgg> {
     let fname = f.name.to_string().to_ascii_lowercase();
     let mut kind = match fname.as_str() {
@@ -563,6 +582,29 @@ fn function_to_agg(f: &Function, alias: Option<String>) -> SqlResult<WindowAgg> 
             )));
         }
     };
+
+    // `COUNT(DISTINCT x)` — reject rather than silently count duplicates.
+    //
+    // This compiled to a plain `Count` and dropped the DISTINCT on the floor:
+    // three bids from one bidder returned 3 where the answer is 1. No error, no
+    // warning, just a wrong number in a column the user named `distinct_users`.
+    //
+    // Deduplicating inside a window needs per-window per-key set state with its
+    // own memory bound and its own checkpoint format — a real feature, not a
+    // parser tweak. Until it exists, refusing is the only honest answer: this
+    // compiler's rule (§39 A1) is that a clause it cannot honour is an error,
+    // never a silent omission.
+    if let FunctionArguments::List(list) = &f.args
+        && list.duplicate_treatment == Some(DuplicateTreatment::Distinct)
+    {
+        return Err(unsupported(format!(
+            "{fname}(DISTINCT …) is not supported in streaming windows: \
+                 deduplication inside a window needs per-window key-set state, \
+                 which this operator does not keep. It would otherwise count \
+                 every row and silently return duplicates as distinct values. \
+             Deduplicate upstream, or aggregate without DISTINCT"
+        )));
+    }
 
     // `AGG(x) FILTER (WHERE …)`.
     let mut filter = match &f.filter {
@@ -590,8 +632,25 @@ fn function_to_agg(f: &Function, alias: Option<String>) -> SqlResult<WindowAgg> 
                     None => lowered.filter,
                 });
             }
-            // COUNT(*) and other wildcard forms fall through with no column.
-            _ => {}
+            // COUNT(*) reaches here as a wildcard, not an Expr, so it never
+            // enters this match at all — anything that DOES land here is a real
+            // expression the spec cannot carry.
+            //
+            // `WindowAgg::input_column` is a column NAME. An expression like
+            // `SUM(price * 908 / 1000)` has no name, so this arm used to drop
+            // it and leave `input_column` empty. The operator then failed at
+            // construction with "Sum window aggregate requires a non-empty
+            // input_column" — a message about a field the user never wrote,
+            // raised long after the compiler had already seen the real problem.
+            other => {
+                return Err(unsupported(format!(
+                    "{fname}(…) over the expression `{other}` is not supported \
+                     in streaming windows: an aggregate input must be a plain \
+                     column, because the window spec carries a column name and \
+                     not an expression. Compute the expression into its own \
+                     column upstream of the window, then aggregate that column"
+                )));
+            }
         }
     }
 
@@ -1031,6 +1090,68 @@ mod tests {
             matches!(agg.filter, Some(WindowAggFilter::And(_, _))),
             "FILTER clause and CASE condition must both apply: {:?}",
             agg.filter
+        );
+    }
+
+    /// `COUNT(DISTINCT x)` is refused, not silently counted with duplicates.
+    ///
+    /// This is the highest-severity shape this compiler can produce: it used to
+    /// compile to a plain `Count`, so a window fed three bids from one bidder
+    /// returned **3** for a column the user had named for distinct bidders. No
+    /// error, no warning — just a wrong number. Verified against the running
+    /// operator before the fix, not reasoned about.
+    ///
+    /// The assertion names DISTINCT so that some unrelated future error cannot
+    /// satisfy this test by accident.
+    #[test]
+    fn rejects_count_distinct_rather_than_counting_duplicates() {
+        let err = compile_streaming_window_sql(
+            "SELECT auction, COUNT(DISTINCT bidder) AS c \
+             FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
+             GROUP BY auction, window_start, window_end",
+        )
+        .expect_err("COUNT(DISTINCT ..) must be refused, not silently counted");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("DISTINCT"),
+            "the error must name DISTINCT as the unsupported thing, got: {msg}"
+        );
+
+        // The same query without DISTINCT still compiles — the guard rejects the
+        // clause it cannot honour, not the whole aggregate.
+        compile_streaming_window_sql(
+            "SELECT auction, COUNT(bidder) AS c \
+             FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
+             GROUP BY auction, window_start, window_end",
+        )
+        .expect("COUNT without DISTINCT must still compile");
+    }
+
+    /// An aggregate over an expression is refused at compile time, naming the
+    /// expression.
+    ///
+    /// `SUM(price * 908 / 1000)` (NEXMark Q1's currency conversion) used to
+    /// compile with an EMPTY `input_column`, because the spec carries a column
+    /// name and an expression has none. It then failed at operator
+    /// construction with "Sum window aggregate requires a non-empty
+    /// input_column" — a complaint about an internal field, raised long after
+    /// the compiler had already seen the actual problem and discarded it.
+    #[test]
+    fn rejects_an_aggregate_over_an_expression_naming_the_expression() {
+        let err = compile_streaming_window_sql(
+            "SELECT auction, SUM(price * 908 / 1000) AS m \
+             FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
+             GROUP BY auction, window_start, window_end",
+        )
+        .expect_err("an aggregate over an expression must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("price * 908 / 1000"),
+            "the error must quote the expression it cannot carry, got: {msg}"
+        );
+        assert!(
+            !msg.contains("input_column"),
+            "the error must describe the user's SQL, not an internal field: {msg}"
         );
     }
 

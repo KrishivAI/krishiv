@@ -5124,3 +5124,80 @@ the four I reported in §41 — should be read as indicative only.
 Row counts were **identical before and after the key-type fix** (898 / 7361 /
 1481 / 1403), which is the real evidence that the change corrected output types
 without disturbing grouping.
+
+## §43 — Correction to §42, and two more dropped clauses
+
+### Correction: §42 fixed one of two sites
+
+§42 claimed the SQL-planned key type was now inferred. **It was not.**
+`key_column_type` is built in two places, and I fixed the wrong one first:
+
+| site | fixed in | reached by |
+|---|---|---|
+| `krishiv-plan/src/window.rs` (constructor + serde default) | §42 | hand-built specs, tests |
+| `krishiv-sql/src/streaming_window_plan.rs:114` | **§43, here** | **every SQL query a user writes** |
+
+The §42 test passed because it built its spec with
+`WindowExecutionSpec::tumbling(...)` — the constructor — and never called
+`compile_streaming_window_sql`. It proved the half I had fixed.
+
+This is the sibling-defect shape this register has now recorded five times
+(dd47d50/8756b41, interval vs temporal join, S7, both engine routing sites,
+and the two lazy-init blocks in §42 itself). I wrote that paragraph in §42 and
+then committed an instance of it in the same change. Worth stating plainly:
+knowing the pattern does not detect it. Only a test that crosses the seam does.
+
+**Why no unit test could have caught it.** `krishiv-sql` compiles specs but
+never runs an operator; `krishiv-dataflow` runs operators but builds specs by
+hand. The defect lives precisely in the seam between them, so the regression
+test now lives in `krishiv-bench/tests/streaming_sql_key_type.rs`, which
+depends on both: SQL text in, emitted Arrow type out. Proven red — the
+end-to-end case fails `left: Utf8, right: Int64`.
+
+### Two more clauses the compiler dropped (found by probing, not reading)
+
+Rather than guess which NEXMark queries the engine supports, I compiled eleven
+candidate shapes and looked at the resulting spec. Multi-key `GROUP BY` and
+`HAVING` already failed closed with good messages (the A1 work). Two did not:
+
+**1. `COUNT(DISTINCT bidder)` — a silent wrong answer.** It compiled to a plain
+`Count` with the DISTINCT discarded. Verified against the running operator:
+three bids from **one** bidder returned **3**. A user aggregating distinct
+users got a total event count, in a column they had named for distinct users,
+with no error. Refused now: real deduplication needs per-window key-set state
+with its own memory bound and checkpoint format, and until that exists,
+refusing is the only honest answer.
+
+**2. `SUM(price * 908 / 1000)` — NEXMark Q1's currency conversion.** The
+aggregate argument match had a `_ => {}` arm that swallowed any expression,
+leaving `input_column` empty. It then failed at *operator construction* with
+"Sum window aggregate requires a non-empty input_column" — a complaint about an
+internal field, raised long after the compiler had seen the real problem and
+thrown it away. Now refused at compile time, quoting the expression, and the
+test asserts the message does **not** contain `input_column`: an error about
+the user's SQL, not about our struct.
+
+Both are the A1 class (§39: a clause the compiler cannot honour is an error,
+never a silent omission). A1 fixed the clauses I had thought to look for;
+these two needed the engine to be pointed at a workload from outside.
+
+### The current, measured streaming SQL surface
+
+| shape | status |
+|---|---|
+| `TUMBLE` / `HOP` / `SESSION` TVF | supported |
+| single-column `GROUP BY` + window bounds | supported |
+| multiple aggregates in one query | supported (2+ verified) |
+| `COUNT` / `SUM` / `MIN` / `MAX` / `AVG` / `STDDEV` | supported |
+| `WHERE col <op> literal`, `AND`/`OR` | supported |
+| `AGG(x) FILTER (WHERE …)`, `CASE WHEN` idiom | supported |
+| multi-column `GROUP BY` | refused, names the dropped columns |
+| `HAVING` | refused |
+| `COUNT(DISTINCT x)` | refused (**was a silent wrong answer**) |
+| aggregate over an expression | refused (**was a late internal error**) |
+| `WHERE MOD(auction, 123) = 0` (expression predicate) | refused |
+| joins, top-N / rank, dedup | not supported |
+
+That table is what bounds NEXMark coverage at 4 of 22 — the remainder need
+joins (Q3/4/8/9/20), multi-key grouping (Q15/16/17), rank (Q19), or dedup
+(Q18), each a real feature rather than a parser gap.
