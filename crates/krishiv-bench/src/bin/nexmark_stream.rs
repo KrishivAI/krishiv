@@ -1,7 +1,15 @@
 //! NEXMark streaming harness: sustainable throughput, event-time latency,
 //! and a completeness gate.
 //!
-//! Run: `cargo run --release -p krishiv-bench --bin nexmark_stream`
+//! Run: `taskset -c 8-11 ./target/release/nexmark_stream` (after
+//! `cargo build --release -p krishiv-bench --bin nexmark_stream`).
+//!
+//! **Pin the CPUs.** This was measured, not assumed: on a host also running the
+//! soak and two clusters (load average ~7 of 12 cores), unpinned medians for q7
+//! swung 3.5M–9.6M events/sec BETWEEN invocations — wider than the spread
+//! within any single invocation, which means unpinned runs are not comparable
+//! to each other at all. Pinned to four cores, q11 reproduced at 22.7M twice
+//! and q7 at 4.6M/4.9M. Without pinning this harness measures the host.
 //!
 //! # What this measures, and why those things
 //!

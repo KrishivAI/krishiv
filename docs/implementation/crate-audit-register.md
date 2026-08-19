@@ -5201,3 +5201,54 @@ these two needed the engine to be pointed at a workload from outside.
 That table is what bounds NEXMark coverage at 4 of 22 — the remainder need
 joins (Q3/4/8/9/20), multi-key grouping (Q15/16/17), rank (Q19), or dedup
 (Q18), each a real feature rather than a parser gap.
+
+## §44 — Pin the CPUs, or measure the host
+
+The §42/§43 numbers were unstable enough to be useless for comparison, and the
+cause was not the engine. This host runs the Phase-62 soak and two clusters:
+load average ~7 of 12 cores, three `krishiv` processes at ~50% CPU each.
+
+The evidence that unpinned runs cannot be compared at all is that the variation
+**between** invocations exceeded the spread **within** one:
+
+| query | unpinned medians (2 invocations) | pinned to 4 cores (2 invocations) |
+|---|---|---|
+| q2_filtered_bids | 11.2M, 5.8M | 7.4M, 5.8M |
+| q5_hot_items | 6.1M, 11.9M | 10.9M, 12.3M |
+| q7_highest_bid_keyed | 9.6M, 3.5M | **4.9M, 4.6M** |
+| q11_user_sessions | 11.5M, 16.2M | **22.7M, 22.7M** |
+
+Unpinned, q7 moved 2.7× and q5 moved 2× between invocations of the identical
+binary. Pinned, q11 reproduces exactly and q7 to within 6%. q11 is also 40%
+*faster* pinned (22.7M vs 16.2M) — the contention was costing throughput, not
+just adding variance.
+
+`taskset -c 8-11` is now the documented invocation. The harness says so in its
+own header, with the measurement behind it, because "run it pinned" without the
+evidence is the kind of advice that gets dropped the first time someone is in a
+hurry.
+
+**Reference numbers (pinned, median of 5, 1 warm-up):**
+
+| query | ev/sec | p50 µs | p99 µs |
+|---|---|---|---|
+| q2_filtered_bids | 5.8M–7.4M | 125–137 | 277–360 |
+| q5_hot_items | 10.9M–12.3M | 25–26 | 334–373 |
+| q7_highest_bid_keyed | 4.6M–4.9M | 170–188 | 446–502 |
+| q11_user_sessions | 22.7M | 34 | 62 |
+
+Ranges, not points: two pinned invocations, and the honest summary is the
+interval they fall in.
+
+### Open, deliberately not claimed
+
+q7's p50 rose from ~81 µs (measured before the key-type fix, **unpinned**) to
+~180 µs (after, **pinned**). Those two numbers are not comparable — different
+method — so this is not evidence of a regression, and I am not recording one.
+
+There is a plausible mechanism worth testing: the window operators key on a
+`&str` internally, so a now-correctly-typed `UInt64` key must be formatted to a
+string per row, where before it was cast once per batch by a vectorized Arrow
+kernel and read as `&str`. Against that, q11 has the same key type and got
+*faster*. Settling it needs a pinned A/B across the two commits, which is
+task #135 — not a paragraph of reasoning.
