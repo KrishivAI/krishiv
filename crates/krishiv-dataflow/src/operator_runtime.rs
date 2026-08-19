@@ -674,6 +674,7 @@ pub fn local_spec_to_window_execution(params: LocalWindowParams) -> WindowExecut
         allowed_lateness_ms: None,
         source_watermark_lags: std::collections::HashMap::new(),
         source_id_column: None,
+        derived_columns: Vec::new(),
         window_timezone: None,
         row_filter: None,
     }
@@ -845,6 +846,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::from([("src-a".into(), 0), ("src-b".into(), 0)]),
             source_id_column: Some("source_id".into()),
+            derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
         };
@@ -891,6 +893,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
         };
@@ -951,6 +954,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
         };

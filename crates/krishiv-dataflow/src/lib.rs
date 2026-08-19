@@ -72,6 +72,7 @@ pub mod operator_config;
 pub mod operator_runtime;
 pub mod process_fn;
 pub mod queue;
+pub mod scalar_expr;
 pub mod schema_normalize;
 pub mod side_output;
 pub mod state_descriptor;

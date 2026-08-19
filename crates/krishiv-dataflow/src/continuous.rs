@@ -412,6 +412,16 @@ impl ContinuousWindowExecutor {
         if self.operator.is_some() {
             return Ok(());
         }
+        // Build from the schema the WINDOW sees, which includes derived
+        // columns — an aggregate may name one, and `infer_agg_is_float` would
+        // otherwise fail to find it.
+        //
+        // The enrichment happens HERE rather than at the call sites because
+        // there are two of them (`drain` and `drain_transactional`), and this
+        // function exists precisely because those two drifted apart once
+        // already. A caller passes the raw batch and cannot get the order
+        // wrong.
+        let first = &crate::scalar_expr::append_derived_columns(first, &self.spec.derived_columns)?;
         self.resolve_key_column_type(first);
         let agg_is_float = infer_agg_is_float(first, &self.agg_exprs)?;
         let mut op = build_operator(
@@ -431,6 +441,21 @@ impl ContinuousWindowExecutor {
         }
         self.operator = Some(op);
         Ok(())
+    }
+
+    /// Materialise every derived column onto each batch.
+    ///
+    /// Cheap and exact when there are none, which is every query that
+    /// aggregates plain columns: the spec's list is empty and the batches pass
+    /// through untouched.
+    fn apply_derived_columns(&self, batches: Vec<RecordBatch>) -> ExecResult<Vec<RecordBatch>> {
+        if self.spec.derived_columns.is_empty() {
+            return Ok(batches);
+        }
+        batches
+            .into_iter()
+            .map(|b| crate::scalar_expr::append_derived_columns(&b, &self.spec.derived_columns))
+            .collect()
     }
 
     /// Replace an unresolved (`"auto"`) key type with the source column's own.
@@ -489,15 +514,22 @@ impl ContinuousWindowExecutor {
         // predicate rejects is not part of this query's stream at all, so it
         // must not move the watermark and close a window on the strength of an
         // event the query never sees.
+        // Derived columns FIRST: an aggregate may name one, the operator is
+        // built from this batch's schema, and a WHERE may yet come to reference
+        // one. Materialising them before anything else reads the batch keeps
+        // that order true no matter which of those grows next.
+        // Operator init reads the raw batch and enriches its own probe; doing it
+        // before the derived columns are appended keeps `ensure_operator`'s
+        // contract identical for both callers.
+        if let Some(first) = input_batches.first() {
+            self.ensure_operator(first)?;
+        }
+        let input_batches = self.apply_derived_columns(input_batches)?;
         let input_batches = self.apply_row_filter(input_batches)?;
 
         // Lazy-init: build the window operator from the first batch's schema so
         // that `agg_is_float` reflects the actual aggregate input types instead
         // of hardcoding `false` (which silently truncates Float64 to Int64).
-        if let Some(first) = input_batches.first() {
-            self.ensure_operator(first)?;
-        }
-
         let Some(op) = &mut self.operator else {
             return Ok(Vec::new());
         };

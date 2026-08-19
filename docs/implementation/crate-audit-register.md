@@ -5252,3 +5252,50 @@ string per row, where before it was cast once per batch by a vectorized Arrow
 kernel and read as `&str`. Against that, q11 has the same key type and got
 *faster*. Settling it needs a pinned A/B across the two commits, which is
 task #135 — not a paragraph of reasoning.
+
+## §45 — Aggregates over expressions (task #137, NEXMark Q1)
+
+§43 refused `SUM(price * 908 / 1000)` because `WindowAgg::input_column` is a
+column *name* and an expression has none. Refusing stopped the silent
+omission; it did not make the query work. This implements it.
+
+**The shape of the fix is a pre-window projection.** A new tiny, serializable
+scalar IR (`WindowScalarExpr`: columns, int/float literals, `+ - * / %`) lives
+in krishiv-plan beside `WindowAggFilter`, for the same stated reason — the
+dataflow crate has no SQL parser and must not grow one. The SQL compiler lowers
+an expression argument into a `DerivedColumn` named `__krishiv_expr_N`; the
+operator materialises it before grouping; the aggregate names that column. The
+spec's contract is unchanged: a window still only ever aggregates a named
+column.
+
+**Integer semantics are deliberate.** `common_type` promotes to `Float64` only
+when an operand is already float; otherwise the computation is `Int64` and
+division truncates. That is SQL's behaviour for integer operands and is what
+Q1 expects — `2500 * 908 / 1000 = 2270`, not 2270.0.
+
+**Where the sibling defect would have been.** `ensure_operator` is called from
+both `drain` and `drain_transactional`. `drain` applies derived columns before
+grouping; `drain_transactional` calls `ensure_operator` on the *raw* batch, so
+an aggregate naming a derived column would have failed there while working in
+`drain` — the same two-callers-drift shape as §42 and §43. Rather than patch
+the second caller, `ensure_operator` now enriches its own probe batch, so a
+caller passes the raw batch and *cannot* get the order wrong. Both call sites
+are correct by construction, and a third would be too.
+
+**The test that matters asserts a value, not a compile.** Q1 over prices
+1000/2000/3000 must total **5448** (converted), where the old dropped-expression
+behaviour totalled **6000** (raw). Proven red by simulating exactly that
+regression — aggregate the expression's first column instead of the expression
+— which fails `left: 6000, right: 5448`. A test that only checked "the query
+compiles" or "a column came out" would have passed against the bug.
+
+A second test asserts `__krishiv_expr_0` does **not** appear in the output
+schema: an internal column that leaks is a wire-format change.
+
+Only arithmetic lowers. `SUM(price || 'x')` is still refused by name — the A1
+rule holds, and the surface grew by exactly what was implemented.
+
+**Coverage is now 5 of 22** (q1, q2, q5, q7, q11), completeness gate PASS.
+Pinned, Q1 runs at 4.1M events/sec (16% spread), the slowest of the five — it
+computes two arithmetic kernels per batch before the window, which is real work
+the others do not do.

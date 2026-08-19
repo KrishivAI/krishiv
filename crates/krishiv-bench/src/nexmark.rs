@@ -241,6 +241,15 @@ impl NexmarkGenerator {
 /// Q4, Q8 and most of the rest).
 pub const SUPPORTED_QUERIES: &[(&str, &str)] = &[
     (
+        // Q1: currency conversion. Aggregates an EXPRESSION, which needs the
+        // pre-window derived-column path — the aggregate argument is not a
+        // column name.
+        "q1_currency_conversion",
+        "SELECT auction, SUM(price * 908 / 1000) AS total_euro \
+         FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
+         GROUP BY auction, window_start, window_end",
+    ),
+    (
         "q2_filtered_bids",
         "SELECT auction, COUNT(*) AS c \
          FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \

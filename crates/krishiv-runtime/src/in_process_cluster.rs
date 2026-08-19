@@ -278,6 +278,7 @@ impl From<&LocalWindowExecutionSpec> for WindowExecutionSpec {
             allowed_lateness_ms: spec.allowed_lateness_ms,
             source_watermark_lags: spec.source_watermark_lags.clone(),
             source_id_column: spec.source_id_column.clone(),
+            derived_columns: Vec::new(),
             window_timezone: spec.window_timezone.clone(),
             row_filter: spec.row_filter.clone(),
         }
@@ -587,6 +588,7 @@ mod tests {
             allowed_lateness_ms: Some(2_000),
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
         };
@@ -668,6 +670,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
         };
@@ -695,6 +698,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
         };
@@ -721,6 +725,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
         };
@@ -747,6 +752,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
         };

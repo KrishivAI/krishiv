@@ -80,6 +80,94 @@ pub enum AggFilterValue {
     Bool(bool),
 }
 
+/// Binary arithmetic operator in a pre-window scalar expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScalarBinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+impl ScalarBinaryOp {
+    #[must_use]
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Self::Add => "+",
+            Self::Sub => "-",
+            Self::Mul => "*",
+            Self::Div => "/",
+            Self::Mod => "%",
+        }
+    }
+}
+
+/// Arithmetic over source columns, evaluated once per batch before grouping.
+///
+/// Deliberately tiny and serializable, for the same reason [`WindowAggFilter`]
+/// is: the dataflow crate has no SQL parser and must not grow one. The SQL
+/// compiler lowers into this; the operators evaluate it with Arrow kernels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowScalarExpr {
+    Column(String),
+    Int(i64),
+    Float(FloatLiteral),
+    Binary {
+        left: Box<WindowScalarExpr>,
+        op: ScalarBinaryOp,
+        right: Box<WindowScalarExpr>,
+    },
+}
+
+impl WindowScalarExpr {
+    /// Every source column the expression reads (for validation).
+    #[must_use]
+    pub fn columns(&self) -> Vec<&str> {
+        match self {
+            Self::Column(c) => vec![c.as_str()],
+            Self::Int(_) | Self::Float(_) => Vec::new(),
+            Self::Binary { left, right, .. } => {
+                let mut cols = left.columns();
+                cols.extend(right.columns());
+                cols
+            }
+        }
+    }
+
+    /// True when the expression is a bare column reference.
+    #[must_use]
+    pub fn is_bare_column(&self) -> bool {
+        matches!(self, Self::Column(_))
+    }
+}
+
+impl std::fmt::Display for WindowScalarExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Column(c) => f.write_str(c),
+            Self::Int(v) => write!(f, "{v}"),
+            Self::Float(v) => write!(f, "{}", v.0),
+            Self::Binary { left, op, right } => {
+                write!(f, "({left} {} {right})", op.symbol())
+            }
+        }
+    }
+}
+
+/// A column computed from the source batch before the window sees it.
+///
+/// This is how an aggregate over an expression is supported without teaching
+/// `WindowAgg::input_column` to be anything other than a column NAME:
+/// `SUM(price * 908 / 1000)` becomes a derived column plus `SUM` over it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedColumn {
+    /// Name the derived column is materialised under. Generated names use the
+    /// `__krishiv_expr_N` form so they cannot collide with a source column.
+    pub name: String,
+    pub expr: WindowScalarExpr,
+}
+
 /// Typed per-aggregate row predicate for streaming windows.
 ///
 /// This is the engine-internal lowering target for SQL
@@ -183,6 +271,13 @@ pub struct WindowExecutionSpec {
     pub session_gap_ms: Option<u64>,
     pub agg_exprs: Vec<WindowAgg>,
     pub state_ttl_ms: Option<u64>,
+    /// Columns computed from the source batch before grouping, in order.
+    ///
+    /// Empty for every query that aggregates plain columns. Populated by the
+    /// SQL compiler when an aggregate names an expression, so the window still
+    /// only ever aggregates a named column.
+    #[serde(default)]
+    pub derived_columns: Vec<DerivedColumn>,
     /// ST11: events arriving within `[watermark, watermark + allowed_lateness_ms)`
     /// are kept for late-firing instead of being dropped. Defaults to
     /// `None` (no lateness — events past the watermark are dropped).
@@ -247,6 +342,7 @@ impl WindowExecutionSpec {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
         }
@@ -305,6 +401,7 @@ pub fn decode_window_execution_spec(encoded: &str) -> Result<WindowExecutionSpec
         allowed_lateness_ms: None,
         source_watermark_lags: parsed.source_watermark_lags,
         source_id_column: parsed.source_id_column,
+        derived_columns: Vec::new(),
         window_timezone: None,
         row_filter: None,
     };
@@ -879,6 +976,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
         };
@@ -942,6 +1040,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
         };
@@ -980,6 +1079,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags,
             source_id_column: Some(String::from("source")),
+            derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
         };
@@ -1046,6 +1146,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags,
             source_id_column: Some("source_id".into()),
+            derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
         };
@@ -1098,6 +1199,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
         };
@@ -1123,6 +1225,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
         };
@@ -1149,6 +1252,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags,
             source_id_column: Some("src:col".into()),
+            derived_columns: Vec::new(),
             window_timezone: None,
             row_filter: None,
         };
@@ -1236,6 +1340,7 @@ mod tests {
                         allowed_lateness_ms: None,
                         source_watermark_lags: HashMap::new(),
                         source_id_column: None,
+                        derived_columns: Vec::new(),
                         window_timezone: None,
                         row_filter: None,
                     },

@@ -38,14 +38,15 @@
 use std::collections::HashMap;
 
 use datafusion::sql::sqlparser::ast::{
-    DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, Query, Select, SelectItem, SetExpr, Statement, TableFactor, Value,
+    BinaryOperator, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    UnaryOperator, Value,
 };
 use datafusion::sql::sqlparser::dialect::DuckDbDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use krishiv_plan::window::{
-    AggFilterCompareOp, AggFilterValue, FloatLiteral, WindowAgg, WindowAggFilter, WindowAggKind,
-    WindowExecutionSpec, WindowKind,
+    AggFilterCompareOp, AggFilterValue, DerivedColumn, FloatLiteral, ScalarBinaryOp, WindowAgg,
+    WindowAggFilter, WindowAggKind, WindowExecutionSpec, WindowKind, WindowScalarExpr,
 };
 
 use crate::streaming_tvf::{find_window_tvf, rewrite_window_tvfs};
@@ -95,7 +96,7 @@ pub fn compile_streaming_window_sql(sql: &str) -> SqlResult<StreamingWindowPlan>
     let select = parse_single_select(&rewritten)?;
 
     let (window, source) = extract_window(&select)?;
-    let (key_column, agg_exprs) = extract_key_and_aggs(&select)?;
+    let (key_column, agg_exprs, derived_columns) = extract_key_and_aggs(&select)?;
 
     // A top-level WHERE becomes a row filter applied BEFORE grouping, using the
     // same predicate AST and the same lowering as a per-aggregate
@@ -132,6 +133,7 @@ pub fn compile_streaming_window_sql(sql: &str) -> SqlResult<StreamingWindowPlan>
         allowed_lateness_ms: None,
         source_watermark_lags: HashMap::new(),
         source_id_column: None,
+        derived_columns,
         window_timezone: None,
         row_filter,
     };
@@ -453,9 +455,12 @@ fn number_literal(expr: &Expr) -> Option<String> {
 
 const WINDOW_BOUNDARY_COLS: [&str; 2] = ["window_start", "window_end"];
 
-fn extract_key_and_aggs(select: &Select) -> SqlResult<(String, Vec<WindowAgg>)> {
+fn extract_key_and_aggs(
+    select: &Select,
+) -> SqlResult<(String, Vec<WindowAgg>, Vec<DerivedColumn>)> {
     let mut key_column: Option<String> = None;
     let mut aggs: Vec<WindowAgg> = Vec::new();
+    let mut derived: Vec<DerivedColumn> = Vec::new();
 
     for item in &select.projection {
         let (expr, alias) = match item {
@@ -464,7 +469,7 @@ fn extract_key_and_aggs(select: &Select) -> SqlResult<(String, Vec<WindowAgg>)> 
             _ => continue,
         };
         match expr {
-            Expr::Function(f) => aggs.push(function_to_agg(f, alias)?),
+            Expr::Function(f) => aggs.push(function_to_agg(f, alias, &mut derived)?),
             Expr::Identifier(id) => maybe_set_key(&mut key_column, &id.value),
             Expr::CompoundIdentifier(parts) => {
                 if let Some(last) = parts.last() {
@@ -482,7 +487,7 @@ fn extract_key_and_aggs(select: &Select) -> SqlResult<(String, Vec<WindowAgg>)> 
     if aggs.is_empty() {
         aggs.push(WindowAgg::count("count"));
     }
-    Ok((key_column, aggs))
+    Ok((key_column, aggs, derived))
 }
 
 /// Check that an explicit `GROUP BY` agrees with the key this compiler inferred.
@@ -557,6 +562,73 @@ fn maybe_set_key(key: &mut Option<String>, name: &str) {
     }
 }
 
+/// Lower an arithmetic SQL expression into the serializable scalar IR.
+///
+/// Deliberately narrow: columns, integer and float literals, and the five
+/// binary arithmetic operators. Anything else is refused by name rather than
+/// approximated — this compiler's rule is that what it cannot honour is an
+/// error, never a silent omission (§39 A1).
+fn lower_scalar_expr(expr: &Expr, fname: &str) -> SqlResult<WindowScalarExpr> {
+    match expr {
+        Expr::Identifier(id) => Ok(WindowScalarExpr::Column(id.value.clone())),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|p| WindowScalarExpr::Column(p.value.clone()))
+            .ok_or_else(|| unsupported("empty compound identifier in aggregate expression")),
+        Expr::Nested(inner) => lower_scalar_expr(inner, fname),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: inner,
+        } => Ok(WindowScalarExpr::Binary {
+            left: Box::new(WindowScalarExpr::Int(0)),
+            op: ScalarBinaryOp::Sub,
+            right: Box::new(lower_scalar_expr(inner, fname)?),
+        }),
+        Expr::Value(v) => match &v.value {
+            Value::Number(n, _) => {
+                if let Ok(i) = n.parse::<i64>() {
+                    Ok(WindowScalarExpr::Int(i))
+                } else if let Ok(f) = n.parse::<f64>() {
+                    Ok(WindowScalarExpr::Float(FloatLiteral(f)))
+                } else {
+                    Err(unsupported(format!(
+                        "numeric literal `{n}` in {fname}(…) is not representable"
+                    )))
+                }
+            }
+            other => Err(unsupported(format!(
+                "literal `{other}` is not supported inside {fname}(…); streaming \
+                 window aggregates compute over numbers"
+            ))),
+        },
+        Expr::BinaryOp { left, op, right } => {
+            let lowered_op = match op {
+                BinaryOperator::Plus => ScalarBinaryOp::Add,
+                BinaryOperator::Minus => ScalarBinaryOp::Sub,
+                BinaryOperator::Multiply => ScalarBinaryOp::Mul,
+                BinaryOperator::Divide => ScalarBinaryOp::Div,
+                BinaryOperator::Modulo => ScalarBinaryOp::Mod,
+                other => {
+                    return Err(unsupported(format!(
+                        "operator `{other}` is not supported inside {fname}(…); \
+                         streaming window aggregates support + - * / %"
+                    )));
+                }
+            };
+            Ok(WindowScalarExpr::Binary {
+                left: Box::new(lower_scalar_expr(left, fname)?),
+                op: lowered_op,
+                right: Box::new(lower_scalar_expr(right, fname)?),
+            })
+        }
+        other => Err(unsupported(format!(
+            "expression `{other}` is not supported inside {fname}(…); a streaming \
+             window aggregate computes over columns, numeric literals and the \
+             arithmetic operators + - * / %"
+        ))),
+    }
+}
+
 /// The "resolve from the source" sentinel, spelled once.
 ///
 /// krishiv-sql does not depend on krishiv-dataflow (where the constant lives),
@@ -566,7 +638,11 @@ fn krishiv_dataflow_key_type_auto() -> &'static str {
     "auto"
 }
 
-fn function_to_agg(f: &Function, alias: Option<String>) -> SqlResult<WindowAgg> {
+fn function_to_agg(
+    f: &Function,
+    alias: Option<String>,
+    derived: &mut Vec<DerivedColumn>,
+) -> SqlResult<WindowAgg> {
     let fname = f.name.to_string().to_ascii_lowercase();
     let mut kind = match fname.as_str() {
         "count" => WindowAggKind::Count,
@@ -642,14 +718,23 @@ fn function_to_agg(f: &Function, alias: Option<String>) -> SqlResult<WindowAgg> 
             // construction with "Sum window aggregate requires a non-empty
             // input_column" — a message about a field the user never wrote,
             // raised long after the compiler had already seen the real problem.
+            // An arithmetic expression — `SUM(price * 908 / 1000)`, NEXMark
+            // Q1's currency conversion.
+            //
+            // `WindowAgg::input_column` is a column NAME, so the expression is
+            // lowered into a derived column the operator materialises before
+            // grouping, and the aggregate names that. This arm used to be
+            // `_ => {}`, which dropped the expression and left `input_column`
+            // empty; the operator then failed at construction complaining about
+            // an internal field the user had never written.
             other => {
-                return Err(unsupported(format!(
-                    "{fname}(…) over the expression `{other}` is not supported \
-                     in streaming windows: an aggregate input must be a plain \
-                     column, because the window spec carries a column name and \
-                     not an expression. Compute the expression into its own \
-                     column upstream of the window, then aggregate that column"
-                )));
+                let expr = lower_scalar_expr(other, &fname)?;
+                let name = format!("__krishiv_expr_{}", derived.len());
+                derived.push(DerivedColumn {
+                    name: name.clone(),
+                    expr,
+                });
+                input_column = Some(name);
             }
         }
     }
@@ -1127,32 +1212,47 @@ mod tests {
         .expect("COUNT without DISTINCT must still compile");
     }
 
-    /// An aggregate over an expression is refused at compile time, naming the
-    /// expression.
+    /// An aggregate over an expression lowers to a derived column.
     ///
-    /// `SUM(price * 908 / 1000)` (NEXMark Q1's currency conversion) used to
-    /// compile with an EMPTY `input_column`, because the spec carries a column
-    /// name and an expression has none. It then failed at operator
-    /// construction with "Sum window aggregate requires a non-empty
-    /// input_column" — a complaint about an internal field, raised long after
-    /// the compiler had already seen the actual problem and discarded it.
+    /// `SUM(price * 908 / 1000)` is NEXMark Q1's currency conversion. It used
+    /// to compile with an EMPTY `input_column` — the spec carries a column name
+    /// and an expression has none — and then failed at operator construction
+    /// complaining about that internal field. It is now materialised into a
+    /// derived column that the operator computes before grouping, and the
+    /// aggregate names that column.
     #[test]
-    fn rejects_an_aggregate_over_an_expression_naming_the_expression() {
-        let err = compile_streaming_window_sql(
+    fn lowers_an_aggregate_over_an_expression_into_a_derived_column() {
+        let plan = compile_streaming_window_sql(
             "SELECT auction, SUM(price * 908 / 1000) AS m \
              FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
              GROUP BY auction, window_start, window_end",
         )
-        .expect_err("an aggregate over an expression must be refused");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("price * 908 / 1000"),
-            "the error must quote the expression it cannot carry, got: {msg}"
+        .expect("an aggregate over an expression must compile");
+
+        assert_eq!(plan.spec.derived_columns.len(), 1, "one derived column");
+        let derived = &plan.spec.derived_columns[0];
+        assert_eq!(
+            plan.spec.agg_exprs[0].input_column, derived.name,
+            "the aggregate must name the derived column, not an empty string"
         );
         assert!(
-            !msg.contains("input_column"),
-            "the error must describe the user's SQL, not an internal field: {msg}"
+            !plan.spec.agg_exprs[0].input_column.is_empty(),
+            "an empty input_column is the bug this replaced"
         );
+        // The expression is carried whole, not flattened to its first column.
+        assert_eq!(derived.expr.to_string(), "((price * 908) / 1000)");
+    }
+
+    /// Only arithmetic lowers; anything else is still refused by name.
+    #[test]
+    fn refuses_a_non_arithmetic_expression_inside_an_aggregate() {
+        let err = compile_streaming_window_sql(
+            "SELECT auction, SUM(price || 'x') AS m \
+             FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
+             GROUP BY auction, window_start, window_end",
+        )
+        .expect_err("string concatenation must not silently lower");
+        assert!(err.to_string().contains("not supported"), "got: {err}");
     }
 
     #[test]
