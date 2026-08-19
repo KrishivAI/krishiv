@@ -467,8 +467,12 @@ pub(crate) fn key_type_to_arrow_data_type(key_type: &str) -> DataType {
     match key_type {
         "int32" => DataType::Int32,
         "int64" => DataType::Int64,
+        "uint64" => DataType::UInt64,
         "float64" => DataType::Float64,
         "bool" => DataType::Boolean,
+        // Includes the unresolved "auto" tag. Reaching emit still unresolved
+        // means no batch ever named the key's type, and Utf8 is the historical
+        // behaviour — not silently wrong, just unrefined.
         _ => DataType::Utf8,
     }
 }
@@ -489,6 +493,12 @@ pub(crate) fn key_value_to_typed_array(
                 ExecError::InvalidInput(format!("failed to parse key '{key_value}' as int64: {e}"))
             })?;
             Ok(Arc::new(Int64Array::from(vec![v])))
+        }
+        "uint64" => {
+            let v = key_value.parse::<u64>().map_err(|e| {
+                ExecError::InvalidInput(format!("failed to parse key '{key_value}' as uint64: {e}"))
+            })?;
+            Ok(Arc::new(arrow::array::UInt64Array::from(vec![v])))
         }
         "float64" => {
             let v = key_value.parse::<f64>().map_err(|e| {

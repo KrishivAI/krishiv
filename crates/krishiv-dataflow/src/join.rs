@@ -230,7 +230,10 @@ mod tests {
         let top = extract_agg_key(&batch, 0, 1).expect("u64::MAX key must extract");
         let below = extract_agg_key(&batch, 0, 2).expect("u64::MAX-1 key must extract");
         assert_eq!(top, AggKey::UInt64(u64::MAX));
-        assert_ne!(top, below, "distinct u64 keys must not alias onto one group");
+        assert_ne!(
+            top, below,
+            "distinct u64 keys must not alias onto one group"
+        );
 
         // Narrow unsigned widens into the same variant, so UInt32(7) and
         // UInt64(7) land in one group rather than two.

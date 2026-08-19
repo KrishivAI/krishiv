@@ -471,12 +471,40 @@ fn arrow_type_for_key_tag(tag: &str) -> Option<DataType> {
     match tag.trim().to_ascii_lowercase().as_str() {
         "int32" => Some(DataType::Int32),
         "int64" => Some(DataType::Int64),
+        "uint64" => Some(DataType::UInt64),
         "float64" => Some(DataType::Float64),
         "bool" | "boolean" => Some(DataType::Boolean),
         "utf8" | "string" => Some(DataType::Utf8),
+        // "auto" lands here on purpose: an unresolved key type must not cast
+        // the column toward anything. It is resolved from the source batch
+        // before the operator is built (`ContinuousWindowExecutor`), so by the
+        // time this runs on a spec that reached an operator, it is concrete.
         _ => None,
     }
 }
+
+/// The tag for an observed Arrow key column — the inverse of
+/// [`arrow_type_for_key_tag`], kept beside it so the two cannot drift.
+///
+/// Narrow widths widen (`Int8`/`Int16` → `"int32"`, every unsigned →
+/// `"uint64"`), which is lossless and keeps the tag vocabulary small enough to
+/// round-trip through the string form the operators key on. Types with no tag
+/// return `None` and leave the spec unresolved rather than guessing.
+#[must_use]
+pub fn key_tag_for_arrow_type(dt: &DataType) -> Option<&'static str> {
+    match dt {
+        DataType::Int8 | DataType::Int16 | DataType::Int32 => Some("int32"),
+        DataType::Int64 => Some("int64"),
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => Some("uint64"),
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => Some("float64"),
+        DataType::Boolean => Some("bool"),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Some("utf8"),
+        _ => None,
+    }
+}
+
+/// The tag meaning "not yet resolved; infer from the source column".
+pub const KEY_TYPE_AUTO: &str = "auto";
 
 /// True for Arrow types the windowed aggregate operators accept directly as a
 /// numeric aggregate input (no coercion needed).

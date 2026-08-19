@@ -159,7 +159,18 @@ impl WindowAgg {
 pub struct WindowExecutionSpec {
     pub key_column: String,
     /// Arrow type of the key column as a simple string tag: `"int32"`,
-    /// `"int64"`, `"float64"`, `"utf8"`, or `"bool"`.  Defaults to `"utf8"`.
+    /// `"int64"`, `"uint64"`, `"float64"`, `"utf8"`, or `"bool"`.
+    ///
+    /// Defaults to `"auto"`, meaning **infer from the source column** when the
+    /// operator is built. A concrete tag is an explicit override and is always
+    /// honoured.
+    ///
+    /// This used to default to `"utf8"` and be hardcoded to `"utf8"` by the SQL
+    /// compiler, which made the declaration meaningless: a `BIGINT` key was
+    /// emitted as a string, and a downstream sink declared bigint received
+    /// digits. `"utf8"` could not be distinguished from "nobody said", which is
+    /// this codebase's recurring defect shape — one representation carrying two
+    /// meanings. `"auto"` gives absence its own spelling.
     #[serde(default = "default_key_type")]
     pub key_column_type: String,
     pub event_time_column: String,
@@ -209,7 +220,7 @@ pub struct WindowExecutionSpec {
 }
 
 fn default_key_type() -> String {
-    String::from("utf8")
+    String::from("auto")
 }
 
 impl WindowExecutionSpec {
@@ -279,7 +290,10 @@ pub fn decode_window_execution_spec(encoded: &str) -> Result<WindowExecutionSpec
     };
     let spec = WindowExecutionSpec {
         key_column: parsed.key_col,
-        key_column_type: String::from("utf8"),
+        // "auto": the SQL text carries no type information, so the key type is
+        // resolved from the source batch when the operator is built. Hardcoding
+        // "utf8" here is what made every SQL-planned key a string.
+        key_column_type: default_key_type(),
         event_time_column: parsed.time_col,
         watermark_lag_ms: parsed.lag_ms,
         window_kind: parsed.window_kind,

@@ -393,6 +393,67 @@ impl ContinuousWindowExecutor {
     /// `FILTER (WHERE …)` clause uses — so the two cannot disagree about NULL
     /// handling or comparison semantics. Batches that filter down to nothing
     /// are dropped rather than passed on empty.
+    /// Build the window operator from the first batch's schema, once.
+    ///
+    /// Two things are inferred here rather than declared, and for the same
+    /// reason: the SQL text does not carry types, so anything hardcoded is a
+    /// guess that silently produces the wrong output type.
+    ///
+    /// * `agg_is_float` — hardcoding `false` truncates `Float64` to `Int64`.
+    /// * `key_column_type` — hardcoding `"utf8"` emits a `BIGINT` key as digits
+    ///   in a string column. This one was hardcoded for far longer, next door to
+    ///   the inference that already existed for aggregates.
+    ///
+    /// This was two near-identical blocks in `drain` and the checkpointing
+    /// path. The key-type inference is added once, here, because adding it to
+    /// one copy and not the other is exactly how this codebase's sibling
+    /// defects are born.
+    fn ensure_operator(&mut self, first: &RecordBatch) -> ExecResult<()> {
+        if self.operator.is_some() {
+            return Ok(());
+        }
+        self.resolve_key_column_type(first);
+        let agg_is_float = infer_agg_is_float(first, &self.agg_exprs)?;
+        let mut op = build_operator(
+            &self.spec,
+            &self.agg_exprs,
+            self.state_dir.as_deref(),
+            &agg_is_float,
+        )?;
+        if let Some(bytes) = self.pending_restore.take() {
+            op.load_snapshot_bytes(&bytes)
+                .map_err(|e| ExecError::InvalidWindowConfig(format!("restore failed: {e}")))?;
+        }
+        for bytes in std::mem::take(&mut self.pending_merges) {
+            op.merge_snapshot_bytes(&bytes).map_err(|e| {
+                ExecError::InvalidWindowConfig(format!("merge restore failed: {e}"))
+            })?;
+        }
+        self.operator = Some(op);
+        Ok(())
+    }
+
+    /// Replace an unresolved (`"auto"`) key type with the source column's own.
+    ///
+    /// Leaves a concrete tag untouched — a declared type is an override, and
+    /// overriding it here would make the declaration unusable in the other
+    /// direction. Leaves `"auto"` in place when the column is absent or its
+    /// type has no tag, so the operator falls back to the historical `Utf8`
+    /// rather than failing a query that used to run.
+    fn resolve_key_column_type(&mut self, first: &RecordBatch) {
+        if self.spec.key_column_type != crate::stream_driver::KEY_TYPE_AUTO {
+            return;
+        }
+        let Ok(idx) = first.schema().index_of(&self.spec.key_column) else {
+            return;
+        };
+        if let Some(tag) =
+            crate::stream_driver::key_tag_for_arrow_type(first.column(idx).data_type())
+        {
+            self.spec.key_column_type = tag.to_owned();
+        }
+    }
+
     fn apply_row_filter(&self, batches: Vec<RecordBatch>) -> ExecResult<Vec<RecordBatch>> {
         let Some(filter) = self.spec.row_filter.as_ref() else {
             return Ok(batches);
@@ -433,27 +494,8 @@ impl ContinuousWindowExecutor {
         // Lazy-init: build the window operator from the first batch's schema so
         // that `agg_is_float` reflects the actual aggregate input types instead
         // of hardcoding `false` (which silently truncates Float64 to Int64).
-        if self.operator.is_none() && !input_batches.is_empty() {
-            let first = input_batches
-                .first()
-                .ok_or_else(|| crate::ExecError::InvalidInput("empty input_batches".into()))?;
-            let agg_is_float = infer_agg_is_float(first, &self.agg_exprs)?;
-            let mut op = build_operator(
-                &self.spec,
-                &self.agg_exprs,
-                self.state_dir.as_deref(),
-                &agg_is_float,
-            )?;
-            if let Some(bytes) = self.pending_restore.take() {
-                op.load_snapshot_bytes(&bytes)
-                    .map_err(|e| ExecError::InvalidWindowConfig(format!("restore failed: {e}")))?;
-            }
-            for bytes in std::mem::take(&mut self.pending_merges) {
-                op.merge_snapshot_bytes(&bytes).map_err(|e| {
-                    ExecError::InvalidWindowConfig(format!("merge restore failed: {e}"))
-                })?;
-            }
-            self.operator = Some(op);
+        if let Some(first) = input_batches.first() {
+            self.ensure_operator(first)?;
         }
 
         let Some(op) = &mut self.operator else {
@@ -548,27 +590,11 @@ impl ContinuousWindowExecutor {
         }
 
         // Lazy-init operator from first batch's schema (Float64 awareness).
-        if self.operator.is_none() {
+        {
             let first = input_batches.first().ok_or_else(|| {
                 crate::ExecError::InvalidInput("empty input_batches in lazy-init".into())
             })?;
-            let agg_is_float = infer_agg_is_float(first, &self.agg_exprs)?;
-            let mut op = build_operator(
-                &self.spec,
-                &self.agg_exprs,
-                self.state_dir.as_deref(),
-                &agg_is_float,
-            )?;
-            if let Some(bytes) = self.pending_restore.take() {
-                op.load_snapshot_bytes(&bytes)
-                    .map_err(|e| ExecError::InvalidWindowConfig(format!("restore failed: {e}")))?;
-            }
-            for bytes in std::mem::take(&mut self.pending_merges) {
-                op.merge_snapshot_bytes(&bytes).map_err(|e| {
-                    ExecError::InvalidWindowConfig(format!("merge restore failed: {e}"))
-                })?;
-            }
-            self.operator = Some(op);
+            self.ensure_operator(first)?;
         }
 
         // Eagerly purge TTL-expired entries BEFORE taking the snapshot so that
@@ -1364,6 +1390,82 @@ mod tests {
         let flushed = exec.flush_all().expect("flush");
         let rows: usize = flushed.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 2, "both keys must survive when no filter is set");
+    }
+
+    /// A numeric key comes out numeric — the key type is inferred from the
+    /// source, not declared `"utf8"` by every SQL-planned spec.
+    ///
+    /// Before this, `compile_streaming_window_sql` hardcoded
+    /// `key_column_type: "utf8"` and the field defaulted to `"utf8"`, so
+    /// `GROUP BY auction` over a `BIGINT` column emitted a **string** column of
+    /// digits. A sink declared `BIGINT` received text; a consumer sorting the
+    /// key got lexicographic order, in which 100 precedes 20.
+    ///
+    /// The NEXMark harness runs entirely on numeric keys, which is what made
+    /// this worth chasing: all four of its queries were emitting stringified
+    /// auction and bidder ids.
+    #[test]
+    fn a_numeric_key_is_emitted_with_its_own_type_not_as_a_string() {
+        use arrow::array::{ArrayRef, UInt64Array};
+
+        // (source key type, expected output key type)
+        let cases: Vec<(ArrayRef, DataType)> = vec![
+            (
+                Arc::new(Int64Array::from(vec![100_i64, 20])) as ArrayRef,
+                DataType::Int64,
+            ),
+            (
+                Arc::new(UInt64Array::from(vec![100_u64, 20])) as ArrayRef,
+                DataType::UInt64,
+            ),
+            (
+                Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+                DataType::Utf8,
+            ),
+        ];
+
+        for (key_col, expected) in cases {
+            let source_type = key_col.data_type().clone();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", source_type.clone(), false),
+                Field::new("ts", DataType::Int64, false),
+                Field::new("v", DataType::Int64, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    key_col,
+                    Arc::new(Int64Array::from(vec![1_000_i64, 1_100])) as ArrayRef,
+                    Arc::new(Int64Array::from(vec![1_i64, 2])) as ArrayRef,
+                ],
+            )
+            .unwrap();
+
+            // A spec exactly as the SQL compiler produces one: no declared key
+            // type at all.
+            let mut spec = WindowExecutionSpec::tumbling("k", "ts", 60_000);
+            spec.agg_exprs = vec![krishiv_plan::window::WindowAgg {
+                kind: krishiv_plan::window::WindowAggKind::Sum,
+                input_column: "v".to_owned(),
+                output_column: "total".to_owned(),
+                filter: None,
+            }];
+            assert_eq!(
+                spec.key_column_type, "auto",
+                "premise: an undeclared key type is 'auto', not 'utf8'"
+            );
+
+            let mut exec = ContinuousWindowExecutor::new(spec).expect("create");
+            exec.drain(vec![batch]).expect("drain");
+            let closed = exec.flush_all().expect("flush");
+            let out = closed.first().expect("one output batch");
+
+            assert_eq!(
+                out.schema().field(0).data_type(),
+                &expected,
+                "key of source type {source_type} must be emitted as {expected}"
+            );
+        }
     }
 
     /// A row filter works over unsigned and narrow integer columns, not just

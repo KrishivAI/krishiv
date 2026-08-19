@@ -5047,3 +5047,80 @@ must not be quoted as if they were — those measure a distributed system end to
 end through a source connector, sustainable-rate-searched per Karimov et al.
 (ICDE 2018). This is one in-process operator chain fed from memory. What it is
 good for is regression detection and relative comparison against itself.
+
+## §42 — A3/f3: the key type nobody declared, and the benchmark that could not measure
+
+### The fix (task #134)
+
+`key_column_type` defaulted to `"utf8"` and the SQL compiler hardcoded
+`"utf8"`, so **every SQL-planned streaming query emitted its key as a string.**
+`GROUP BY auction` over a `BIGINT` produced a Utf8 column of digits: a sink
+declared bigint received text, and anything sorting the key got lexicographic
+order, where `100` precedes `20`.
+
+The defect is representational, and it is this register's most frequent shape:
+`"utf8"` meant both *"the user declared utf8"* and *"nobody said"*. One
+spelling, two meanings, so the declaration could never be acted on. The fix
+gives absence its own spelling — `"auto"` — and resolves it from the source.
+
+**Where it resolves is the whole point.** `ContinuousWindowExecutor` builds its
+operator lazily, on the first batch, and already inferred `agg_is_float` there
+with this comment:
+
+> *"so that `agg_is_float` reflects the actual aggregate input types instead of
+> hardcoding `false` (which silently truncates Float64 to Int64)"*
+
+The identical inference, for the identical reason, sitting three lines from a
+key type that stayed hardcoded. The lesson has been learned once already in
+this exact function and not generalised.
+
+That block existed **twice** — in `drain` and in the checkpointing path,
+near-identically. Rather than add the inference to one copy (this register's
+recurring sibling-defect shape: dd47d50/8756b41, interval vs temporal join, S7,
+both engine routing sites), both were replaced by one `ensure_operator`.
+
+Resolution is conservative on purpose: an explicitly declared tag is an
+override and is never touched, and an unresolvable column (absent, or a type
+with no tag) stays `"auto"` and falls back to the historical `Utf8` — so no
+query that ran before fails now.
+
+Proven red by neutering the single line that adopts the source tag:
+`left: Utf8, right: Int64`. Reverting the *default* instead only tripped the
+test's premise assertion — a weaker proof, and worth recording as the
+difference between reverting the fix and reverting near the fix.
+
+### The benchmark could not have told me whether this helped
+
+Rerunning NEXMark after the fix showed throughput apparently dropping. It had
+not. Five back-to-back runs of the *identical binary* gave q7 anywhere from
+6.7M to 11.7M events/sec — a **74% spread**. The harness reported one run and
+no variance, so its numbers could not distinguish a regression from noise, and
+the first before/after comparison I drew from them was meaningless.
+
+This is the failure Karimov et al. (ICDE 2018) name directly, and it is the
+same class as everything else in this register: **a measurement that cannot
+fail is worth no more than a test that cannot fail.** A benchmark reporting one
+run is asserting reproducibility it never checked.
+
+The harness now runs 1 warm-up + 5 measured repetitions, reports the **median**
+(a mean lets one descheduled run vanish into the average), prints the observed
+**min–max spread on every row**, and pools per-batch latencies across
+repetitions rather than averaging per-run percentiles — the average of five
+p99s is not a p99 of anything. It also **asserts every repetition emits the
+same row count**: identical input must give an identical answer, and if it does
+not, no throughput number from the run means anything.
+
+Measured spreads on this machine are 6%–68%, which is itself the finding: this
+host runs other workloads, and any single-run number taken from it — including
+the four I reported in §41 — should be read as indicative only.
+
+| query | ev/sec (median of 5) | min–max | spread | p50 µs | p99 µs |
+|---|---|---|---|---|---|
+| q2_filtered_bids | 11.2M | 6.5M–12.2M | 51% | 79 | 297 |
+| q5_hot_items | 6.1M | 4.9M–9.1M | 68% | 67 | 582 |
+| q7_highest_bid_keyed | 9.6M | 8.9M–10.7M | 19% | 81 | 261 |
+| q11_user_sessions | 11.5M | 10.9M–11.6M | 6% | 69 | 161 |
+
+Row counts were **identical before and after the key-type fix** (898 / 7361 /
+1481 / 1403), which is the real evidence that the change corrected output types
+without disturbing grouping.

@@ -60,18 +60,36 @@ const BATCHES: usize = 200;
 /// one describes the easy case.
 const MAX_LATENESS_MS: i64 = 200;
 
+/// One query's result over all measured repetitions.
 struct RunResult {
     query: String,
     rows_in: usize,
     rows_out: usize,
-    events_per_sec: f64,
+    /// Median of the per-repetition throughputs, not the mean: one descheduled
+    /// run drags a mean down and leaves no sign it happened.
+    events_per_sec_median: f64,
+    events_per_sec_min: f64,
+    events_per_sec_max: f64,
+    /// Percentiles over per-batch latencies POOLED across repetitions. Pooling
+    /// rather than averaging per-run percentiles: the average of five p99s is
+    /// not a p99 of anything.
     p50_us: u128,
     p99_us: u128,
     p999_us: u128,
 }
 
+/// Repetitions actually measured, plus one discarded warm-up.
+///
+/// Not optional. Measured on this machine, back-to-back runs of the identical
+/// binary ranged 6.7M–11.7M events/sec on q7 — a 74% spread. A single run is
+/// therefore not a measurement, and a before/after comparison of two single
+/// runs is noise with a sign attached. The warm-up absorbs cold caches, lazy
+/// operator construction, and first-touch page faults.
+const WARMUP_REPS: usize = 1;
+const MEASURED_REPS: usize = 5;
+
 /// Drive one query through the operator and measure it.
-fn measure(query_name: &str, sql: &str) -> RunResult {
+fn measure(query_name: &str, sql: &str) -> RepResult {
     let plan = compile_streaming_window_sql(sql)
         .unwrap_or_else(|e| panic!("{query_name} must compile: {e}"));
     let mut exec = ContinuousWindowExecutor::new(plan.spec)
@@ -119,17 +137,65 @@ fn measure(query_name: &str, sql: &str) -> RunResult {
         .sum::<usize>();
     let elapsed = started.elapsed();
 
-    per_batch_us.sort_unstable();
-    let pct = |p: f64| -> u128 {
-        let idx = ((per_batch_us.len() as f64 - 1.0) * p).round() as usize;
-        per_batch_us.get(idx).copied().unwrap_or(0)
-    };
-
-    RunResult {
-        query: query_name.to_owned(),
+    RepResult {
         rows_in,
         rows_out,
         events_per_sec: rows_in as f64 / elapsed.as_secs_f64(),
+        per_batch_us,
+    }
+}
+
+/// One repetition's raw numbers, before aggregation across repetitions.
+struct RepResult {
+    rows_in: usize,
+    rows_out: usize,
+    events_per_sec: f64,
+    per_batch_us: Vec<u128>,
+}
+
+/// Run one query `WARMUP_REPS + MEASURED_REPS` times and aggregate.
+fn measure_repeated(query_name: &str, sql: &str) -> RunResult {
+    for _ in 0..WARMUP_REPS {
+        let _ = measure(query_name, sql);
+    }
+
+    let reps: Vec<RepResult> = (0..MEASURED_REPS)
+        .map(|_| measure(query_name, sql))
+        .collect();
+
+    let mut rates: Vec<f64> = reps.iter().map(|r| r.events_per_sec).collect();
+    rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut pooled: Vec<u128> = reps.iter().flat_map(|r| r.per_batch_us.clone()).collect();
+    pooled.sort_unstable();
+    let pct = |p: f64| -> u128 {
+        if pooled.is_empty() {
+            return 0;
+        }
+        let idx = ((pooled.len() as f64 - 1.0) * p).round() as usize;
+        pooled.get(idx).copied().unwrap_or(0)
+    };
+
+    // Every repetition must produce the same answer. If they do not, the engine
+    // is nondeterministic across identical inputs and no throughput number from
+    // this harness means anything.
+    let rows_out = reps.first().map_or(0, |r| r.rows_out);
+    for (i, r) in reps.iter().enumerate() {
+        assert_eq!(
+            r.rows_out, rows_out,
+            "{query_name}: repetition {i} emitted {} rows but repetition 0 emitted {rows_out} — \
+             identical input must give an identical answer",
+            r.rows_out
+        );
+    }
+
+    RunResult {
+        query: query_name.to_owned(),
+        rows_in: reps.first().map_or(0, |r| r.rows_in),
+        rows_out,
+        events_per_sec_median: rates.get(rates.len() / 2).copied().unwrap_or(0.0),
+        events_per_sec_min: rates.first().copied().unwrap_or(0.0),
+        events_per_sec_max: rates.last().copied().unwrap_or(0.0),
         p50_us: pct(0.50),
         p99_us: pct(0.99),
         p999_us: pct(0.999),
@@ -139,27 +205,52 @@ fn measure(query_name: &str, sql: &str) -> RunResult {
 fn main() {
     println!("NEXMark streaming harness — krishiv");
     println!(
-        "coverage: {} of {} queries ({} rows/batch x {} batches, lateness {} ms)\n",
+        "coverage: {} of {} queries ({} rows/batch x {} batches, lateness {} ms)",
         SUPPORTED_QUERIES.len(),
         NEXMARK_TOTAL_QUERIES,
         BATCH_ROWS,
         BATCHES,
         MAX_LATENESS_MS
     );
+    println!(
+        "method: {WARMUP_REPS} warm-up + {MEASURED_REPS} measured reps; throughput is the \
+         MEDIAN rep, latency percentiles are pooled across reps\n"
+    );
 
     let mut results = Vec::new();
     for (name, sql) in SUPPORTED_QUERIES {
-        results.push(measure(name, sql));
+        results.push(measure_repeated(name, sql));
     }
 
     println!(
-        "{:<24} {:>12} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "query", "events/sec", "rows in", "rows out", "p50 us", "p99 us", "p99.9 us"
+        "{:<24} {:>12} {:>21} {:>9} {:>9} {:>8} {:>8} {:>9}",
+        "query",
+        "ev/sec med",
+        "ev/sec min-max",
+        "rows in",
+        "rows out",
+        "p50 us",
+        "p99 us",
+        "p99.9 us"
     );
     for r in &results {
+        let spread_pct = if r.events_per_sec_median > 0.0 {
+            (r.events_per_sec_max - r.events_per_sec_min) / r.events_per_sec_median * 100.0
+        } else {
+            0.0
+        };
         println!(
-            "{:<24} {:>12.0} {:>10} {:>10} {:>10} {:>10} {:>10}",
-            r.query, r.events_per_sec, r.rows_in, r.rows_out, r.p50_us, r.p99_us, r.p999_us
+            "{:<24} {:>12.0} {:>9.0}-{:>9.0} {:>9} {:>9} {:>8} {:>8} {:>9}   (spread {:.0}%)",
+            r.query,
+            r.events_per_sec_median,
+            r.events_per_sec_min,
+            r.events_per_sec_max,
+            r.rows_in,
+            r.rows_out,
+            r.p50_us,
+            r.p99_us,
+            r.p999_us,
+            spread_pct
         );
     }
 
