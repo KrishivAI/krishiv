@@ -101,6 +101,7 @@ use std::pin::Pin;
 pub(crate) fn window_agg_to_expr(agg: &WindowAgg) -> AggExpr {
     let function = match agg.kind {
         WindowAggKind::Count => AggFunction::Count,
+        WindowAggKind::CountDistinct => AggFunction::CountDistinct,
         WindowAggKind::Sum => AggFunction::Sum,
         WindowAggKind::Min => AggFunction::Min,
         WindowAggKind::Max => AggFunction::Max,
@@ -656,6 +657,7 @@ pub fn local_spec_to_window_execution(params: LocalWindowParams) -> WindowExecut
             .map(|a| {
                 let kind = match a.function {
                     AggFunction::Count => WindowAggKind::Count,
+                    AggFunction::CountDistinct => WindowAggKind::CountDistinct,
                     AggFunction::Sum => WindowAggKind::Sum,
                     AggFunction::Min => WindowAggKind::Min,
                     AggFunction::Max => WindowAggKind::Max,

@@ -219,12 +219,39 @@ fn fold_agg_states<'a>(
 ) -> ExecResult<AggState> {
     let mut merged = AggState::new(agg_exprs);
     for contrib in iter {
+        // COUNT(DISTINCT …) merges by UNION, never by addition: two partial
+        // states that each saw bidder 7 contribute one distinct value between
+        // them, not two. Adding the counts would over-count every value seen in
+        // more than one contribution, and would do it silently.
+        for (i, agg) in agg_exprs.iter().enumerate() {
+            if agg.function != AggFunction::CountDistinct {
+                continue;
+            }
+            let Some(from) = contrib.distinct.get(i) else {
+                continue;
+            };
+            let values: Vec<String> = from.iter().cloned().collect();
+            let Some(into) = merged.distinct.get_mut(i) else {
+                continue;
+            };
+            into.extend(values);
+            let n = into.len();
+            if let Some(entry) = merged.entries.get_mut(i) {
+                entry.value = i64::try_from(n).map_err(|_| {
+                    ExecError::InvalidInput("distinct cardinality exceeds i64".into())
+                })?;
+                entry.has_value = n > 0;
+            }
+        }
+
         for (m, (c, agg)) in merged
             .entries
             .iter_mut()
             .zip(contrib.entries.iter().zip(agg_exprs.iter()))
         {
             match agg.function {
+                // Already merged by union above; adding here would double it.
+                AggFunction::CountDistinct => {}
                 AggFunction::Count => {
                     m.value = m.value.checked_add(c.value).ok_or_else(|| {
                         ExecError::InvalidInput("count overflow in fold_agg_states".into())

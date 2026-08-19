@@ -117,6 +117,7 @@ fn window_aggs_to_exec(aggs: &[krishiv_plan::window::WindowAgg]) -> Vec<AggExpr>
     aggs.iter()
         .map(|agg| {
             let function = match agg.kind {
+                WindowAggKind::CountDistinct => AggFunction::CountDistinct,
                 WindowAggKind::Count => AggFunction::Count,
                 WindowAggKind::Sum => AggFunction::Sum,
                 WindowAggKind::Min => AggFunction::Min,

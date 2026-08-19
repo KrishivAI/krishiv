@@ -264,7 +264,7 @@ impl SessionWindowOperator {
                     SessionState {
                         session_start_ms,
                         last_event_time_ms,
-                        agg: AggState { entries },
+                        agg: AggState::from_entries(entries),
                     },
                 );
             }

@@ -40,6 +40,8 @@ pub const fn requires_wall_clock(kind: &WindowKind) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowAggKind {
     Count,
+    /// `COUNT(DISTINCT col)` — counts distinct non-null values in the window.
+    CountDistinct,
     Sum,
     Min,
     Max,
@@ -654,6 +656,9 @@ pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> Result<String, Plan
 fn encode_agg(agg: &WindowAgg) -> String {
     match agg.kind {
         WindowAggKind::Count => "agg=count".to_string(),
+        WindowAggKind::CountDistinct => {
+            format!("agg=count_distinct:col={}", agg.input_column)
+        }
         WindowAggKind::Sum => format!("agg=sum:col={}", agg.input_column),
         WindowAggKind::Min => format!("agg=min:col={}", agg.input_column),
         WindowAggKind::Max => format!("agg=max:col={}", agg.input_column),
@@ -843,6 +848,16 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
             })?,
             output_column: format!("avg_{}", agg_col.as_deref().unwrap_or("val")),
         },
+        Some("count_distinct") => WindowAgg {
+            filter: None,
+            kind: WindowAggKind::CountDistinct,
+            input_column: agg_col.clone().ok_or_else(|| {
+                PlanError::Parse(String::from(
+                    "stream fragment with agg=count_distinct requires col=<column>",
+                ))
+            })?,
+            output_column: format!("count_distinct_{}", agg_col.as_deref().unwrap_or("val")),
+        },
         Some("stddev") => WindowAgg {
             filter: None,
             kind: WindowAggKind::Stddev,
@@ -855,7 +870,8 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
         },
         Some(other) => {
             return Err(PlanError::Parse(format!(
-                "unknown streaming aggregate '{other}', expected count|sum|min|max|avg|stddev"
+                "unknown streaming aggregate '{other}', expected \
+                 count|count_distinct|sum|min|max|avg|stddev"
             )));
         }
     };

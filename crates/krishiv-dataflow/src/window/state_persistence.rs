@@ -14,6 +14,14 @@ use crate::aggregate::{AggEntry, AggState};
 /// the ASCII byte `{` = `0x7B`), so a backend persisted by an older build is
 /// still readable after upgrade.
 const AGG_STATE_BINARY_V1: u8 = 0x01;
+/// Version 2 appends `COUNT(DISTINCT …)` value sets after the fixed-width
+/// entries.
+///
+/// **Written only when a distinct set is non-empty.** Every other query keeps
+/// producing byte-identical v1 checkpoints, so an upgrade does not rewrite
+/// state it did not change and a downgrade can still read it. v2 is emitted
+/// exactly when v1 would lose information.
+const AGG_STATE_BINARY_V2: u8 = 0x02;
 /// Bytes per encoded `AggEntry`: i64 value + u8 has_value + f64 avg_sum +
 /// u64 avg_count + f64 float_value + f64 sq_sum.
 const AGG_ENTRY_LEN: usize = 8 + 1 + 8 + 8 + 8 + 8;
@@ -25,8 +33,13 @@ const AGG_ENTRY_LEN: usize = 8 + 1 + 8 + 8 + 8 + 8;
 /// little-endian layout is a single `extend_from_slice` per field.
 fn encode_agg_state(agg: &AggState) -> Vec<u8> {
     let n = agg.entries.len();
+    let needs_v2 = agg.distinct.iter().any(|s| !s.is_empty());
     let mut out = Vec::with_capacity(1 + 4 + n * AGG_ENTRY_LEN);
-    out.push(AGG_STATE_BINARY_V1);
+    out.push(if needs_v2 {
+        AGG_STATE_BINARY_V2
+    } else {
+        AGG_STATE_BINARY_V1
+    });
     out.extend_from_slice(&(n as u32).to_le_bytes());
     for e in &agg.entries {
         out.extend_from_slice(&e.value.to_le_bytes());
@@ -36,6 +49,20 @@ fn encode_agg_state(agg: &AggState) -> Vec<u8> {
         out.extend_from_slice(&e.float_value.to_le_bytes());
         out.extend_from_slice(&e.sq_sum.to_le_bytes());
     }
+    if needs_v2 {
+        // `[u32 set_count][per set: u32 len][per value: u32 byte_len, bytes]`.
+        // BTreeSet iteration is ordered, so two snapshots of identical state are
+        // byte-identical — which is what lets a snapshot be compared at all.
+        out.extend_from_slice(&(agg.distinct.len() as u32).to_le_bytes());
+        for set in &agg.distinct {
+            out.extend_from_slice(&(set.len() as u32).to_le_bytes());
+            for v in set {
+                let b = v.as_bytes();
+                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.extend_from_slice(b);
+            }
+        }
+    }
     out
 }
 
@@ -44,7 +71,7 @@ fn encode_agg_state(agg: &AggState) -> Vec<u8> {
 /// `serde_json` object produced by older builds.
 fn decode_agg_state(bytes: &[u8]) -> StateResult<AggState> {
     match bytes.first() {
-        Some(&AGG_STATE_BINARY_V1) => decode_agg_state_binary(bytes),
+        Some(&AGG_STATE_BINARY_V1 | &AGG_STATE_BINARY_V2) => decode_agg_state_binary(bytes),
         Some(&b'{') => decode_agg_state_legacy_json(bytes),
         _ => Err(StateError::CorruptEntry {
             message: "agg state: unrecognized encoding tag".into(),
@@ -91,7 +118,41 @@ fn decode_agg_state_binary(bytes: &[u8]) -> StateResult<AggState> {
         });
         off += AGG_ENTRY_LEN;
     }
-    Ok(AggState { entries })
+
+    let mut state = AggState::from_entries(entries);
+    // A v1 payload simply has no trailing section, and empty sets are the
+    // correct reading of state written before COUNT(DISTINCT) existed.
+    if bytes.first() == Some(&AGG_STATE_BINARY_V2) {
+        let rd_u32 = |s: &[u8]| -> Option<u32> { s.try_into().ok().map(u32::from_le_bytes) };
+        let set_count = rd_u32(body.get(off..off + 4).unwrap_or_default())
+            .ok_or_else(|| corrupt("missing distinct set count"))? as usize;
+        off += 4;
+        let mut sets = Vec::with_capacity(set_count);
+        for _ in 0..set_count {
+            let len = rd_u32(body.get(off..off + 4).unwrap_or_default())
+                .ok_or_else(|| corrupt("missing distinct set length"))?
+                as usize;
+            off += 4;
+            let mut set = std::collections::BTreeSet::new();
+            for _ in 0..len {
+                let vlen = rd_u32(body.get(off..off + 4).unwrap_or_default())
+                    .ok_or_else(|| corrupt("missing distinct value length"))?
+                    as usize;
+                off += 4;
+                let raw = body
+                    .get(off..off + vlen)
+                    .ok_or_else(|| corrupt("distinct value truncated"))?;
+                set.insert(
+                    String::from_utf8(raw.to_vec())
+                        .map_err(|_| corrupt("distinct value is not valid utf8"))?,
+                );
+                off += vlen;
+            }
+            sets.push(set);
+        }
+        state.distinct = sets;
+    }
+    Ok(state)
 }
 
 /// Legacy decoder for state persisted by builds that used `serde_json`.
@@ -145,7 +206,7 @@ fn decode_agg_state_legacy_json(payload: &[u8]) -> StateResult<AggState> {
             sq_sum: sq_sums.get(i).copied().unwrap_or(0.0),
         })
         .collect();
-    Ok(AggState { entries })
+    Ok(AggState::from_entries(entries))
 }
 
 /// Persist window accumulators to a state backend.
@@ -321,26 +382,107 @@ mod tests {
     use super::*;
 
     fn sample_agg_state() -> AggState {
-        AggState {
-            entries: vec![
-                AggEntry {
-                    value: 42,
-                    has_value: true,
-                    avg_sum: 12.5,
-                    avg_count: 3,
-                    float_value: -7.25,
-                    sq_sum: 99.0,
-                },
-                AggEntry {
-                    value: i64::MIN,
-                    has_value: false,
-                    avg_sum: 0.0,
-                    avg_count: 0,
-                    float_value: f64::NEG_INFINITY,
-                    sq_sum: 0.0,
-                },
-            ],
+        AggState::from_entries(vec![
+            AggEntry {
+                value: 42,
+                has_value: true,
+                avg_sum: 12.5,
+                avg_count: 3,
+                float_value: -7.25,
+                sq_sum: 99.0,
+            },
+            AggEntry {
+                value: i64::MIN,
+                has_value: false,
+                avg_sum: 0.0,
+                avg_count: 0,
+                float_value: f64::NEG_INFINITY,
+                sq_sum: 0.0,
+            },
+        ])
+    }
+
+    /// A state with no distinct values still encodes as v1, byte for byte.
+    ///
+    /// This is the compatibility promise: adding `COUNT(DISTINCT)` must not
+    /// rewrite the checkpoints of queries that do not use it. The Phase-62 soak
+    /// is running against v1 state right now, and a version bump that applied
+    /// to everything would make a downgrade unreadable for no benefit.
+    #[test]
+    fn state_without_distinct_values_still_encodes_as_v1() {
+        let bytes = encode_agg_state(&sample_agg_state());
+        assert_eq!(
+            bytes.first(),
+            Some(&AGG_STATE_BINARY_V1),
+            "v2 must be emitted only when v1 would lose information"
+        );
+    }
+
+    /// Distinct sets survive a round trip, and only then is v2 written.
+    #[test]
+    fn distinct_sets_roundtrip_and_only_then_bump_the_version() {
+        let mut original = sample_agg_state();
+        original.distinct[0].insert("bidder-7".to_owned());
+        original.distinct[0].insert("bidder-9".to_owned());
+
+        let bytes = encode_agg_state(&original);
+        assert_eq!(
+            bytes.first(),
+            Some(&AGG_STATE_BINARY_V2),
+            "a non-empty distinct set requires v2"
+        );
+
+        let decoded = decode_agg_state(&bytes).expect("decode v2");
+        assert_eq!(decoded.distinct.len(), original.distinct.len());
+        assert_eq!(decoded.distinct[0], original.distinct[0]);
+        assert!(
+            decoded.distinct[1].is_empty(),
+            "an aggregate with no distinct state stays empty"
+        );
+        // The fixed-width entries must be unharmed by the appended section.
+        for (d, o) in decoded.entries.iter().zip(original.entries.iter()) {
+            assert_eq!(d.value, o.value);
+            assert_eq!(d.sq_sum.to_bits(), o.sq_sum.to_bits());
         }
+    }
+
+    /// A v1 checkpoint written before `COUNT(DISTINCT)` existed still restores.
+    ///
+    /// Decoded with empty sets, which is the correct reading of state that
+    /// tracked no distinct values. Without this, upgrading the binary would
+    /// make every existing checkpoint unreadable.
+    #[test]
+    fn a_v1_checkpoint_still_restores_after_the_format_gained_v2() {
+        let mut v1 = encode_agg_state(&sample_agg_state());
+        assert_eq!(v1.first(), Some(&AGG_STATE_BINARY_V1));
+        // Prove the payload is genuinely v1 and carries no trailing section.
+        let expected_len = 1 + 4 + sample_agg_state().entries.len() * AGG_ENTRY_LEN;
+        assert_eq!(
+            v1.len(),
+            expected_len,
+            "v1 payload must have no set section"
+        );
+
+        let decoded = decode_agg_state(&v1).expect("v1 must still decode");
+        assert_eq!(decoded.entries.len(), sample_agg_state().entries.len());
+        assert!(
+            decoded.distinct.iter().all(|s| s.is_empty()),
+            "v1 state has no distinct values"
+        );
+
+        // Truncating the v2 trailer must be an error, not a silent empty set.
+        let mut v2 = {
+            let mut st = sample_agg_state();
+            st.distinct[0].insert("x".to_owned());
+            encode_agg_state(&st)
+        };
+        v2.truncate(v2.len() - 1);
+        assert!(
+            decode_agg_state(&v2).is_err(),
+            "a truncated distinct section must be reported, not read as empty"
+        );
+
+        v1.clear();
     }
 
     #[test]

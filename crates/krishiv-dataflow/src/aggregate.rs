@@ -156,6 +156,21 @@ pub(crate) enum PreDowncastCol<'a> {
 }
 
 impl<'a> PreDowncastCol<'a> {
+    /// A canonical string for the value at `row`, or `None` when it is null.
+    ///
+    /// NULL is excluded deliberately: SQL's `COUNT(DISTINCT x)` does not count
+    /// nulls. Floats key on their IEEE-754 bits rather than their decimal
+    /// rendering so that two values which are `==` cannot produce two keys.
+    fn distinct_key(&self, row: usize) -> Option<String> {
+        match self {
+            Self::Int32(a) => (!a.is_null(row)).then(|| a.value(row).to_string()),
+            Self::Int64(a) => (!a.is_null(row)).then(|| a.value(row).to_string()),
+            Self::Float64(a) => (!a.is_null(row)).then(|| a.value(row).to_bits().to_string()),
+            Self::Utf8(a) => (!a.is_null(row)).then(|| a.value(row).to_owned()),
+            Self::Bool(a) => (!a.is_null(row)).then(|| a.value(row).to_string()),
+        }
+    }
+
     fn downcast(col: &'a ArrayRef) -> ExecResult<Self> {
         match col.data_type() {
             DataType::Int32 => {
@@ -246,6 +261,13 @@ impl<'a> PreDowncastCol<'a> {
 pub enum AggFunction {
     /// Count all rows in the group.
     Count,
+    /// Count DISTINCT values of the input column within the group.
+    ///
+    /// Unlike the other functions this needs unbounded auxiliary state — the
+    /// set of values seen — which lives in [`AggState::distinct`] rather than
+    /// in [`AggEntry`], so `AggEntry` stays `Copy` and the hot loop is
+    /// unchanged for every other aggregate.
+    CountDistinct,
     /// Sum of an `Int32` or `Int64` column.
     Sum,
     /// Minimum of an `Int32` or `Int64` column.
@@ -297,9 +319,38 @@ pub(crate) struct AggEntry {
 #[derive(Debug, Clone)]
 pub struct AggState {
     pub(crate) entries: Vec<AggEntry>,
+    /// Values seen per aggregate, for `COUNT(DISTINCT …)` only.
+    ///
+    /// Parallel to `entries` and empty for every other aggregate, so the cost
+    /// is one empty `BTreeSet` per expression. `BTreeSet` rather than `HashSet`
+    /// because the checkpoint encoding iterates it: a deterministic order makes
+    /// two snapshots of identical state byte-identical, which is what makes a
+    /// snapshot comparable at all.
+    pub(crate) distinct: Vec<std::collections::BTreeSet<String>>,
 }
 
+/// Distinct values one group may track before the query fails.
+///
+/// `COUNT(DISTINCT …)` is the one aggregate whose state grows with the DATA
+/// rather than with the number of groups, so it needs a bound. Exceeding it is
+/// an error and not a silent truncation: a count that quietly stops counting is
+/// the exact defect class this engine's audit exists to remove.
+pub const MAX_DISTINCT_VALUES_PER_GROUP: usize = 1_000_000;
+
 impl AggState {
+    /// Build from decoded entries with empty distinct sets.
+    ///
+    /// Used by every decoder and restore path: a snapshot written before
+    /// `COUNT(DISTINCT)` existed has no sets, and an empty set is the correct
+    /// reading of "this state tracked no distinct values".
+    pub(crate) fn from_entries(entries: Vec<AggEntry>) -> Self {
+        let distinct = entries
+            .iter()
+            .map(|_| std::collections::BTreeSet::new())
+            .collect();
+        Self { entries, distinct }
+    }
+
     pub(crate) fn new(agg_exprs: &[AggExpr]) -> Self {
         let entries = agg_exprs
             .iter()
@@ -320,7 +371,11 @@ impl AggState {
                 sq_sum: 0.0,
             })
             .collect();
-        Self { entries }
+        let distinct = agg_exprs
+            .iter()
+            .map(|_| std::collections::BTreeSet::new())
+            .collect();
+        Self { entries, distinct }
     }
 
     /// Test-only reference path: extract a numeric value with a per-call
@@ -370,7 +425,7 @@ impl AggState {
         batch: &RecordBatch,
         row: usize,
     ) -> ExecResult<()> {
-        for (entry, expr) in self.entries.iter_mut().zip(agg_exprs.iter()) {
+        for (i, expr) in agg_exprs.iter().enumerate() {
             if let Some(filter) = &expr.filter {
                 // Reference path: evaluate the mask per call (tests only).
                 let mask = eval_agg_filter(filter, batch)?;
@@ -378,7 +433,35 @@ impl AggState {
                     continue;
                 }
             }
+            // Mirrors the production fast path: the distinct set is auxiliary
+            // state, so it is updated before the `entry` borrow is taken. If
+            // this diverges from `update_agg_state_pre`, the cross-check this
+            // function exists to provide is worthless.
+            if expr.function == AggFunction::CountDistinct {
+                let idx = batch
+                    .schema()
+                    .index_of(&expr.input_column)
+                    .map_err(|_| ExecError::ColumnNotFound(expr.input_column.clone()))?;
+                let col = PreDowncastCol::downcast(batch.column(idx))?;
+                if let Some(key) = col.distinct_key(row)
+                    && let Some(set) = self.distinct.get_mut(i)
+                {
+                    set.insert(key);
+                    let n = set.len();
+                    if let Some(entry) = self.entries.get_mut(i) {
+                        entry.value = i64::try_from(n).map_err(|_| {
+                            ExecError::InvalidInput("distinct cardinality exceeds i64".into())
+                        })?;
+                        entry.has_value = true;
+                    }
+                }
+                continue;
+            }
+            let Some(entry) = self.entries.get_mut(i) else {
+                continue;
+            };
             match expr.function {
+                AggFunction::CountDistinct => unreachable!("handled above"),
                 AggFunction::Count => {
                     entry.value = entry.value.checked_add(1).ok_or_else(|| {
                         ExecError::InvalidInput("count overflow: i64::MAX reached".into())
@@ -439,6 +522,9 @@ impl AggState {
                                 }
                             };
                             match expr.function {
+                                AggFunction::CountDistinct => {
+                                    unreachable!("CountDistinct never reaches the numeric arm")
+                                }
                                 AggFunction::Sum => {
                                     entry.value = entry.value.checked_add(v).ok_or_else(|| {
                                         ExecError::InvalidInput(format!(
@@ -640,12 +726,52 @@ fn update_agg_state_pre(
     pre: &PreparedAggInputs,
     row: usize,
 ) -> ExecResult<()> {
-    for (i, (entry, expr)) in state.entries.iter_mut().zip(agg_exprs.iter()).enumerate() {
+    for (i, expr) in agg_exprs.iter().enumerate() {
         if !pre.row_included(i, row) {
             continue;
         }
         let pre_col = pre.cols.get(i).and_then(|c| c.as_ref());
+
+        // COUNT(DISTINCT …) touches the auxiliary set, so it is handled before
+        // the `entry` borrow is taken.
+        if expr.function == AggFunction::CountDistinct {
+            let col = pre_col.ok_or_else(|| {
+                ExecError::Arrow(format!(
+                    "CountDistinct aggregate expr {i} missing input column"
+                ))
+            })?;
+            if let Some(key) = col.distinct_key(row) {
+                let set = state.distinct.get_mut(i).ok_or_else(|| {
+                    ExecError::InvalidInput(format!("distinct set {i} missing from agg state"))
+                })?;
+                if set.len() >= MAX_DISTINCT_VALUES_PER_GROUP && !set.contains(&key) {
+                    return Err(ExecError::InvalidInput(format!(
+                        "COUNT(DISTINCT {}) exceeded {MAX_DISTINCT_VALUES_PER_GROUP} distinct \
+                         values in one window; refusing rather than under-counting. Narrow the \
+                         window, add a key, or aggregate approximately upstream",
+                        expr.input_column
+                    )));
+                }
+                set.insert(key);
+                let n = set.len();
+                let entry = state.entries.get_mut(i).ok_or_else(|| {
+                    ExecError::InvalidInput(format!("agg entry {i} missing from agg state"))
+                })?;
+                // Keeping `value` in step with the set means every emit path
+                // reads the distinct count with no change at all.
+                entry.value = i64::try_from(n).map_err(|_| {
+                    ExecError::InvalidInput("distinct cardinality exceeds i64".into())
+                })?;
+                entry.has_value = true;
+            }
+            continue;
+        }
+
+        let entry = state.entries.get_mut(i).ok_or_else(|| {
+            ExecError::InvalidInput(format!("agg entry {i} missing from agg state"))
+        })?;
         match expr.function {
+            AggFunction::CountDistinct => unreachable!("handled above"),
             AggFunction::Count => {
                 entry.value = entry.value.checked_add(1).ok_or_else(|| {
                     ExecError::InvalidInput("count overflow: i64::MAX reached".into())

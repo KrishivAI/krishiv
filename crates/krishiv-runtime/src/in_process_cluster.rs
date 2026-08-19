@@ -259,6 +259,7 @@ impl From<&LocalWindowExecutionSpec> for WindowExecutionSpec {
                 .iter()
                 .map(|a| {
                     let kind = match a.function {
+                        AggFunction::CountDistinct => WindowAggKind::CountDistinct,
                         AggFunction::Count => WindowAggKind::Count,
                         AggFunction::Sum => WindowAggKind::Sum,
                         AggFunction::Min => WindowAggKind::Min,
@@ -319,6 +320,7 @@ impl From<&WindowExecutionSpec> for LocalWindowExecutionSpec {
                 .iter()
                 .map(|a| {
                     let function = match a.kind {
+                        WindowAggKind::CountDistinct => AggFunction::CountDistinct,
                         WindowAggKind::Count => AggFunction::Count,
                         WindowAggKind::Sum => AggFunction::Sum,
                         WindowAggKind::Min => AggFunction::Min,

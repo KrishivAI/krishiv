@@ -5366,3 +5366,66 @@ NEXMark coverage is **5 of 22** and the harness prints that on every run. The
 | Q19 | top-N / rank operator |
 | Q18 | dedup / row_number |
 | Q0, Q10, Q12–Q14, Q21, Q22 | stateless or processing-time paths outside the window compiler |
+
+## §47 — `COUNT(DISTINCT …)` implemented (task #136)
+
+§43 refused it after proving it returned a wrong number; §46 recorded why it
+was a checkpoint-format change rather than a parser change. Both were right,
+and it is now implemented.
+
+**The state lives beside `AggEntry`, not inside it.** `AggEntry` is `Copy` and
+the hot loop depends on that. `AggState` gains `distinct: Vec<BTreeSet<String>>`
+parallel to `entries` — empty for every other aggregate, so the cost is one
+empty set per expression and the hot path for `COUNT`/`SUM`/`MIN`/`MAX`/`AVG`
+is byte-for-byte what it was. `BTreeSet` rather than `HashSet` because the
+encoder iterates it: ordered iteration makes two snapshots of identical state
+byte-identical, which is what makes a snapshot comparable at all.
+
+`entry.value` is kept in step with `set.len()` on every insert, so **every emit
+path reads the distinct count with no change whatsoever** — no operator, schema
+builder or array constructor needed touching.
+
+**The format bumps only when it must.** v2 appends the sets after the
+fixed-width entries and is written *only when a distinct set is non-empty*.
+Every other query keeps producing byte-identical v1 checkpoints, so upgrading
+does not rewrite state it did not change and a downgrade can still read it.
+Three tests hold that line: v1 stays v1 (asserted on the exact payload length,
+so a stray trailer would fail), v2 round-trips, and a truncated v2 trailer is
+an **error** rather than a silently empty set.
+
+**Merging is by union, never addition.** `fold_agg_states` combines partial
+states; two contributions that each saw bidder 7 hold one distinct value
+between them, not two. Adding the counts would over-count every value seen in
+more than one contribution — silently. That arm is explicit, and the numeric
+arm carries `unreachable!` for the same variant so a future edit cannot let it
+fall through to addition.
+
+**Cardinality is bounded and fails closed.** `COUNT(DISTINCT)` is the one
+aggregate whose state grows with the *data* rather than the number of groups.
+`MAX_DISTINCT_VALUES_PER_GROUP` errors on exceed. A count that quietly stops
+counting is the defect class this register exists to remove; refusing to answer
+is strictly better than answering wrongly.
+
+Only `COUNT` takes `DISTINCT`. `SUM(DISTINCT x)` is a different aggregate over
+a different multiset and is refused by name — inferring one from the other is
+exactly the silent substitution this compiler does not make.
+
+### The test that nearly passed against the bug
+
+Four end-to-end tests assert the *number*, on fixtures where distinct-count and
+row-count differ. Three failed correctly against the reverted mapping
+(`left: 3, right: 1`). The fourth — distinctness across batches — **passed**,
+and the reason is worth recording.
+
+Its two batches reused the same timestamps. With `watermark_lag_ms = 0` the
+watermark advances to the highest event time seen, so the second batch was
+*late* and one row was dropped. A 4-row fixture silently became 3 rows, which
+is exactly the number the test expected. Two unrelated bugs cancelled.
+
+The fixture now gives later batches later timestamps, with the reason written
+next to it, and fails against both the plain-count defect and a hypothetical
+per-batch implementation (`left: 4, right: 3`).
+
+This is the standing rule earning its place for the fourth time this session:
+the test was written to catch a specific defect, ran green against that defect,
+and only the revert exposed it.

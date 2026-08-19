@@ -659,27 +659,29 @@ fn function_to_agg(
         }
     };
 
-    // `COUNT(DISTINCT x)` — reject rather than silently count duplicates.
+    // `COUNT(DISTINCT x)`.
     //
-    // This compiled to a plain `Count` and dropped the DISTINCT on the floor:
-    // three bids from one bidder returned 3 where the answer is 1. No error, no
-    // warning, just a wrong number in a column the user named `distinct_users`.
+    // This used to compile to a plain `Count` with the DISTINCT dropped, so
+    // three bids from one bidder returned 3 where the answer is 1 — no error,
+    // just a wrong number in a column the user had named for distinct values.
+    // §43 refused it; it is now implemented, backed by a per-window value set
+    // with a hard cardinality cap that errors rather than under-counting.
     //
-    // Deduplicating inside a window needs per-window per-key set state with its
-    // own memory bound and its own checkpoint format — a real feature, not a
-    // parser tweak. Until it exists, refusing is the only honest answer: this
-    // compiler's rule (§39 A1) is that a clause it cannot honour is an error,
-    // never a silent omission.
+    // Only COUNT takes DISTINCT: SUM(DISTINCT x) and friends are a different
+    // aggregate over a different multiset, and inferring one from the other is
+    // exactly the silent substitution this compiler refuses to make.
     if let FunctionArguments::List(list) = &f.args
         && list.duplicate_treatment == Some(DuplicateTreatment::Distinct)
     {
-        return Err(unsupported(format!(
-            "{fname}(DISTINCT …) is not supported in streaming windows: \
-                 deduplication inside a window needs per-window key-set state, \
-                 which this operator does not keep. It would otherwise count \
-                 every row and silently return duplicates as distinct values. \
-             Deduplicate upstream, or aggregate without DISTINCT"
-        )));
+        if kind == WindowAggKind::Count {
+            kind = WindowAggKind::CountDistinct;
+        } else {
+            return Err(unsupported(format!(
+                "{fname}(DISTINCT …) is not supported in streaming windows; \
+                 only COUNT(DISTINCT …) is. Deduplicate upstream, or aggregate \
+                 without DISTINCT"
+            )));
+        }
     }
 
     // `AGG(x) FILTER (WHERE …)`.
@@ -1178,41 +1180,54 @@ mod tests {
         );
     }
 
-    /// `COUNT(DISTINCT x)` is refused, not silently counted with duplicates.
+    /// `COUNT(DISTINCT x)` compiles to the distinct aggregate, not a plain
+    /// count.
     ///
-    /// This is the highest-severity shape this compiler can produce: it used to
-    /// compile to a plain `Count`, so a window fed three bids from one bidder
-    /// returned **3** for a column the user had named for distinct bidders. No
-    /// error, no warning — just a wrong number. Verified against the running
-    /// operator before the fix, not reasoned about.
-    ///
-    /// The assertion names DISTINCT so that some unrelated future error cannot
-    /// satisfy this test by accident.
+    /// It used to compile to `Count` with the DISTINCT discarded — verified
+    /// against the running operator, three bids from one bidder returned 3.
+    /// The kind assertion is what makes this test able to fail: a test that
+    /// only checked the query compiles passed against the bug.
     #[test]
-    fn rejects_count_distinct_rather_than_counting_duplicates() {
-        let err = compile_streaming_window_sql(
+    fn count_distinct_compiles_to_the_distinct_aggregate() {
+        let plan = compile_streaming_window_sql(
             "SELECT auction, COUNT(DISTINCT bidder) AS c \
              FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
              GROUP BY auction, window_start, window_end",
         )
-        .expect_err("COUNT(DISTINCT ..) must be refused, not silently counted");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("DISTINCT"),
-            "the error must name DISTINCT as the unsupported thing, got: {msg}"
+        .expect("COUNT(DISTINCT ..) must compile");
+        assert_eq!(
+            plan.spec.agg_exprs[0].kind,
+            WindowAggKind::CountDistinct,
+            "DISTINCT must survive into the plan, not be dropped into a plain Count"
+        );
+        assert_eq!(
+            plan.spec.agg_exprs[0].input_column, "bidder",
+            "the distinct aggregate must carry the column it deduplicates on"
         );
 
-        // The same query without DISTINCT still compiles — the guard rejects the
-        // clause it cannot honour, not the whole aggregate.
-        compile_streaming_window_sql(
+        // Without DISTINCT it stays a plain count.
+        let plain = compile_streaming_window_sql(
             "SELECT auction, COUNT(bidder) AS c \
              FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
              GROUP BY auction, window_start, window_end",
         )
-        .expect("COUNT without DISTINCT must still compile");
+        .expect("COUNT without DISTINCT compiles");
+        assert_eq!(plain.spec.agg_exprs[0].kind, WindowAggKind::Count);
     }
 
-    /// An aggregate over an expression lowers to a derived column.
+    /// Only COUNT takes DISTINCT; the others are still refused by name.
+    #[test]
+    fn refuses_distinct_on_aggregates_other_than_count() {
+        let err = compile_streaming_window_sql(
+            "SELECT auction, SUM(DISTINCT price) AS s \
+             FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
+             GROUP BY auction, window_start, window_end",
+        )
+        .expect_err("SUM(DISTINCT ..) must be refused, not silently summed");
+        assert!(err.to_string().contains("DISTINCT"), "got: {err}");
+    }
+
+    /// An aggregate over an expression lowers to a derived column.    /// An aggregate over an expression lowers to a derived column.
     ///
     /// `SUM(price * 908 / 1000)` is NEXMark Q1's currency conversion. It used
     /// to compile with an EMPTY `input_column` — the spec carries a column name
