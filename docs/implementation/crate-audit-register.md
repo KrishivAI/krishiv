@@ -5299,3 +5299,70 @@ rule holds, and the surface grew by exactly what was implemented.
 Pinned, Q1 runs at 4.1M events/sec (16% spread), the slowest of the five — it
 computes two arithmetic kernels per batch before the window, which is real work
 the others do not do.
+
+## §46 — Why the last three features are not parser work
+
+§45 landed #137 because it was genuinely a compiler change: lower an
+expression, materialise a column, aggregate it. The remaining three refusals
+look similar from the SQL surface and are not, and the difference is worth
+recording so the next session does not mistake scope.
+
+### #136 `COUNT(DISTINCT x)` — a checkpoint-format change
+
+The obvious reading is "add a `WindowAggKind::CountDistinct` and a `HashSet`".
+The obstruction is two levels down:
+
+* `AggEntry` is `#[derive(Debug, Clone, Copy)]`. A `HashSet` removes `Copy`,
+  which ripples through every operator that moves entries by value.
+* `window/state_persistence.rs` encodes each `AggEntry` at a **fixed byte
+  width** (`i64` + `u8` + `f64` + … , with the size named in a constant). A
+  distinct-set is variable length, so this needs a format version and a restore
+  path for checkpoints written by the current format.
+
+That last point is the reason not to rush it: the Phase-62 soak (#41) is
+running now with live checkpoints, and a format change that cannot restore them
+turns a feature into an outage. The refusal shipped in §43 is correct in the
+meantime — it returns an error rather than the wrong number it used to return.
+
+Design when taken up: version the snapshot header; `distinct: Option<HashSet>`
+behind `#[serde(default)]`; a per-window cardinality cap that **errors** rather
+than silently under-counting; and a decision, recorded, on exact vs HLL.
+
+### #138 multi-column `GROUP BY` — a key-representation change
+
+`key_column: String` is singular through the spec, the operators, the output
+schema, and the state key. The internal key is a `String`, so a composite needs
+an unambiguous encoding (length-prefixed, not delimiter-joined — any separator
+can occur in Utf8 data) plus `key_column_types: Vec<String>` to split it back
+into N typed output columns.
+
+The tempting shortcut — keep `key_column` and add `additional_key_columns` — is
+the two-representations-of-one-fact shape this register keeps finding, and
+should be refused. It is `key_columns: Vec<String>` or nothing.
+
+Note also that ~39 spec literals would need updating. Three scripted sweeps
+have mis-edited files in this session alone (§43's collateral, and twice here);
+that tax is real and argues for a constructor rather than another sweep.
+
+### #139 streaming joins — a wiring change, not a new operator
+
+The operators already exist: `interval_join.rs`, `delta_join.rs`, and a
+temporal join. What is missing is the streaming SQL surface reaching them —
+`compile_streaming_window_sql` accepts a single `TABLE` source. **When wiring
+these, check both siblings**: this register records interval-join and
+temporal-join carrying the identical bug, fixed in one and left in the other,
+with a comment in the second describing the defect it still had.
+
+### Honest coverage statement
+
+NEXMark coverage is **5 of 22** and the harness prints that on every run. The
+17 remaining are not blocked on parsing:
+
+| queries | blocked on |
+|---|---|
+| Q3, Q4, Q8, Q9, Q20 | #139 joins |
+| Q15, Q16, Q17 | #138 multi-key |
+| Q15 (also) | #136 COUNT(DISTINCT) |
+| Q19 | top-N / rank operator |
+| Q18 | dedup / row_number |
+| Q0, Q10, Q12–Q14, Q21, Q22 | stateless or processing-time paths outside the window compiler |
