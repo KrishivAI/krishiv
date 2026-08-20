@@ -578,6 +578,7 @@ mod tests {
     fn an_echo_that_disagrees_with_the_request_is_an_error() {
         let requested = ContinuousRegisterOptions::run_loop(8);
         let downgraded = ContinuousRegisterAck {
+            class: Some(String::from("window")),
             mode: Some(String::from("cycle-push")),
             parallelism: Some(1),
             checkpointing: Some(false),
@@ -599,6 +600,7 @@ mod tests {
         // The matching echo is accepted — otherwise the check would be a
         // blanket refusal rather than a comparison.
         let honoured = ContinuousRegisterAck {
+            class: Some(String::from("window")),
             mode: Some(String::from("run-loop")),
             parallelism: Some(8),
             checkpointing: Some(false),
@@ -624,6 +626,7 @@ mod tests {
             },
         );
         let mode_and_parallelism_honoured = ContinuousRegisterAck {
+            class: Some(String::from("window")),
             mode: Some(String::from("run-loop")),
             parallelism: Some(2),
             checkpointing: Some(false),
@@ -651,6 +654,7 @@ mod tests {
                 ..Default::default()
             };
             let server_echo = ContinuousRegisterAck {
+                class: Some(String::from("window")),
                 mode: Some(String::from("run-loop")),
                 parallelism: Some(3),
                 checkpointing: Some(false),
@@ -965,6 +969,10 @@ impl ContinuousRegisterOptions {
 /// as a default.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContinuousRegisterAck {
+    /// Class echo (task #147). A non-window registration whose ack lacks the
+    /// class was handled by a coordinator that silently dropped stream_spec.
+    #[serde(default)]
+    pub class: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -979,6 +987,7 @@ impl ContinuousRegisterAck {
     /// Build an acknowledgement from what a coordinator actually applied.
     pub fn applied(applied: &krishiv_scheduler::AppliedContinuousRegistration) -> Self {
         Self {
+            class: None,
             mode: Some(applied.mode.as_str().to_string()),
             parallelism: Some(applied.parallelism),
             checkpointing: Some(applied.checkpointing),
@@ -1005,6 +1014,69 @@ impl ContinuousRegisterAck {
         }
         serde_json::from_slice(bytes).unwrap_or_default()
     }
+}
+
+/// Class-routed registration (task #147). Window tasks serialize the legacy
+/// `spec` field byte-identically (old coordinators keep working); every
+/// other class sends ONLY `stream_spec` — an old coordinator then fails the
+/// request on the missing `spec`, which is fail-closed, and a new one echoes
+/// the class, which is verified.
+pub async fn execute_coordinator_continuous_register_task(
+    coordinator_http: &str,
+    job_id: &str,
+    task: &krishiv_plan::stream_task::StreamingTaskSpec,
+    options: &ContinuousRegisterOptions,
+) -> RuntimeResult<()> {
+    use krishiv_plan::stream_task::StreamingTaskSpec;
+    if let StreamingTaskSpec::Window(w) = task {
+        return execute_coordinator_continuous_register(coordinator_http, job_id, w, options).await;
+    }
+
+    #[derive(serde::Serialize)]
+    struct ClassedRegisterRequest<'a> {
+        job_id: &'a str,
+        stream_spec: &'a krishiv_plan::stream_task::StreamingTaskSpec,
+        #[serde(flatten)]
+        options: &'a ContinuousRegisterOptions,
+    }
+    let base = normalize_http_base(coordinator_http)?;
+    let url = format!("{base}/api/v1/continuous-register");
+    let body = ClassedRegisterRequest {
+        job_id,
+        stream_spec: task,
+        options,
+    };
+    let client = coordinator_http_client()?;
+    let response = apply_coordinator_bearer(client.post(&url).json(&body))
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("continuous-register request failed: {e}")))?;
+    if !response.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "continuous-register HTTP {} from {url}",
+            response.status()
+        )));
+    }
+    let ack = response
+        .json::<ContinuousRegisterAck>()
+        .await
+        .unwrap_or_default();
+    // Non-window classes ALWAYS verify the class echo — there is no
+    // "default-shaped" classed request an old coordinator could truthfully
+    // ack, so a missing echo means the class was silently dropped.
+    match ack.class.as_deref() {
+        Some(c) if c == task.class_name() => {}
+        other => {
+            return Err(RuntimeError::plan_rejected(format!(
+                "coordinator did not echo the '{}' class (got {:?}): it either dropped \
+                 stream_spec silently or planned a different job class",
+                task.class_name(),
+                other
+            )));
+        }
+    }
+    options.verify_ack(&ack, "the coordinator HTTP continuous-register endpoint")?;
+    Ok(())
 }
 
 pub async fn execute_coordinator_continuous_register(

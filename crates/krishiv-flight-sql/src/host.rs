@@ -405,6 +405,7 @@ impl FlightExecutionHost {
                 let cluster = Arc::clone(cluster);
                 run_blocking(move || cluster.register_continuous_job(&job_id, &local))?;
                 Ok(krishiv_runtime::ContinuousRegisterAck {
+                    class: Some(String::from("window")),
                     mode: Some(String::from("cycle-push")),
                     parallelism: Some(1),
                     checkpointing: Some(false),
@@ -1421,6 +1422,7 @@ mod tests {
     #[test]
     fn the_register_ack_survives_the_action_body_round_trip() {
         let ack = krishiv_runtime::ContinuousRegisterAck {
+            class: Some(String::from("window")),
             mode: Some(String::from("run-loop")),
             parallelism: Some(6),
             checkpointing: Some(true),
