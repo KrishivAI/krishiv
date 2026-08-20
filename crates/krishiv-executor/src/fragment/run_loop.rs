@@ -867,6 +867,20 @@ pub(crate) async fn execute_run_loop_fragment(
         {
             break;
         }
+        // Liveness: the cancel handler retires this subtask's state entry and
+        // then purges the job's inbox identity — INCLUDING the cancel
+        // tombstone above, usually before this loop wakes to observe it. The
+        // entry's Arc identity is the race-free signal: gone (cancelled) or
+        // replaced (a recreated incarnation took the key) both mean this loop
+        // must exit. Without this every deregistered job left its loop running
+        // and leaked the runner slot it occupied (the 3-node k3s wedge).
+        let state_alive = runner
+            .loop_executors
+            .get(&state_key)
+            .is_some_and(|entry| Arc::ptr_eq(entry.value(), &executor_arc));
+        if !state_alive {
+            break;
+        }
 
         // Leg C: barriers align at iteration boundaries. Snapshots happen
         // ONLY here (barrier epochs) — never per iteration.

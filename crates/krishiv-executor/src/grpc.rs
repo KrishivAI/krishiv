@@ -28,6 +28,29 @@ pub type SharedLoopExecutors = Arc<DashMap<String, Arc<Mutex<ContinuousWindowExe
 /// drains and processes them through the matching loop executor.
 pub type SharedContinuousInputs = Arc<DashMap<String, Vec<RecordBatch>>>;
 
+/// The three class-specific run-loop state maps (task #147): two-source
+/// joins, join→agg pipelines, and stateless SQL executors. Bundled into one
+/// value so every seam that shares run-loop state shares ALL of it: the
+/// cancel path must retire state for every class, and a class whose map is
+/// not shared with the gRPC service keeps its loop alive after deregister —
+/// the executor slot then leaks forever (the 3-node k3s wedge, 2026-08-21,
+/// where each executor ran exactly `slots` jobs and then never another).
+#[derive(Clone, Default)]
+pub struct SharedClassExecutors {
+    /// `stream:rjoin:` two-source join operators, keyed by `rloop_state_key`.
+    pub join: Arc<DashMap<String, Arc<Mutex<krishiv_dataflow::WatermarkWindowJoinOperator>>>>,
+    /// `stream:rpipe:` join→agg pipelines, keyed by `rloop_state_key`.
+    pub pipeline:
+        Arc<DashMap<String, Arc<tokio::sync::Mutex<krishiv_dataflow::pipeline::JoinAggPipeline>>>>,
+    /// `stream:rbatch:` stateless executors, keyed by `rloop_state_key`.
+    pub stateless: Arc<
+        DashMap<
+            String,
+            Arc<tokio::sync::Mutex<krishiv_sql::stateless_exec::StatelessBatchExecutor>>,
+        >,
+    >,
+}
+
 /// Executor-side task assignment service backed by an in-memory inbox.
 ///
 /// `Debug` is hand-written rather than derived: `SharedContinuousConnectorSources`
@@ -47,6 +70,10 @@ pub struct ExecutorTaskInboxService {
     /// Connector-source cache — shared with the task runner so a cancelled
     /// job's source READ POSITIONS die with its window state.
     pub(crate) continuous_connector_sources: crate::runner::SharedContinuousConnectorSources,
+    /// Class-specific run-loop state (join/pipeline/stateless) — shared with
+    /// the task runner so cancel retires EVERY class's state, not just
+    /// windows.
+    pub(crate) class_executors: SharedClassExecutors,
 }
 
 impl std::fmt::Debug for ExecutorTaskInboxService {
@@ -60,6 +87,7 @@ impl std::fmt::Debug for ExecutorTaskInboxService {
                 "continuous_connector_sources",
                 &self.continuous_connector_sources.len(),
             )
+            .field("class_join_executors", &self.class_executors.join.len())
             .finish_non_exhaustive()
     }
 }
@@ -74,6 +102,7 @@ impl ExecutorTaskInboxService {
             continuous_outputs: Arc::new(DashMap::new()),
             input_notify: Arc::new(DashMap::new()),
             continuous_connector_sources: Arc::new(DashMap::new()),
+            class_executors: SharedClassExecutors::default(),
         }
     }
 
@@ -90,6 +119,7 @@ impl ExecutorTaskInboxService {
             continuous_outputs: Arc::new(DashMap::new()),
             input_notify: Arc::new(DashMap::new()),
             continuous_connector_sources: Arc::new(DashMap::new()),
+            class_executors: SharedClassExecutors::default(),
         }
     }
 
@@ -114,6 +144,15 @@ impl ExecutorTaskInboxService {
         sources: crate::runner::SharedContinuousConnectorSources,
     ) -> Self {
         self.continuous_connector_sources = sources;
+        self
+    }
+
+    /// Share the class-specific run-loop state maps with the runner — see
+    /// [`SharedClassExecutors`]. Without this, cancelling a join/pipeline/
+    /// stateless job cannot retire its state or stop its loop.
+    #[must_use]
+    pub fn with_class_executors(mut self, class_executors: SharedClassExecutors) -> Self {
+        self.class_executors = class_executors;
         self
     }
 
@@ -263,7 +302,30 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
             .map(|e| e.key().clone())
             .collect();
         let had_cycle_executor = self.loop_executors.remove(job_id.as_str()).is_some();
-        let had_rloop = !composite_keys.is_empty();
+        // The classed run-loop families (join/pipeline/stateless) key their
+        // state by the SAME `{job}#{subtask}` scheme. Retire all of them: a
+        // class left out of this purge keeps its state across incarnations
+        // AND keeps its loop alive after deregister (each loop exits by
+        // observing its own state entry disappear), leaking the runner slot
+        // it occupies forever.
+        let mut classed_subtasks = 0usize;
+        macro_rules! purge_class_map {
+            ($map:expr) => {{
+                let keys: Vec<String> = $map
+                    .iter()
+                    .filter(|e| e.key().starts_with(&rloop_prefix))
+                    .map(|e| e.key().clone())
+                    .collect();
+                classed_subtasks += keys.len();
+                for key in &keys {
+                    $map.remove(key);
+                }
+            }};
+        }
+        purge_class_map!(self.class_executors.join);
+        purge_class_map!(self.class_executors.pipeline);
+        purge_class_map!(self.class_executors.stateless);
+        let had_rloop = !composite_keys.is_empty() || classed_subtasks > 0;
         for key in &composite_keys {
             self.loop_executors.remove(key);
         }
@@ -341,7 +403,7 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
             tracing::debug!(
                 job_id = %job_id,
                 purged_dedupe_entries = purged,
-                run_loop_subtasks = composite_keys.len(),
+                run_loop_subtasks = composite_keys.len() + classed_subtasks,
                 "continuous job cancelled — stateful executors dropped and inbox identity retired"
             );
         }
@@ -692,6 +754,7 @@ pub fn executor_task_grpc_server_with_continuous(
         Arc::new(DashMap::new()),
         Arc::new(DashMap::new()),
         Arc::new(DashMap::new()),
+        SharedClassExecutors::default(),
         auth,
     )
 }
@@ -699,6 +762,7 @@ pub fn executor_task_grpc_server_with_continuous(
 /// Build the generated tonic server sharing the FULL continuous-streaming
 /// state with a runner, including the Phase 55 run-loop egress buffers and
 /// input notifies (so pushes wake run-loops and drains serve their egress).
+#[allow(clippy::too_many_arguments)]
 pub fn executor_task_grpc_server_with_run_loop(
     inbox: ExecutorAssignmentInbox,
     loop_executors: SharedLoopExecutors,
@@ -706,12 +770,14 @@ pub fn executor_task_grpc_server_with_run_loop(
     continuous_outputs: crate::runner::SharedContinuousOutputs,
     input_notify: crate::runner::SharedContinuousNotify,
     continuous_connector_sources: crate::runner::SharedContinuousConnectorSources,
+    class_executors: SharedClassExecutors,
     auth: Option<ExecutorTaskAuthConfig>,
 ) -> wire::v1::executor_task_server::ExecutorTaskServer<ExecutorTaskGrpcService> {
     let inner =
         ExecutorTaskInboxService::new_with_continuous(inbox, loop_executors, continuous_inputs)
             .with_run_loop_state(continuous_outputs, input_notify)
-            .with_continuous_connector_sources(continuous_connector_sources);
+            .with_continuous_connector_sources(continuous_connector_sources)
+            .with_class_executors(class_executors);
     let auth = auth.unwrap_or_else(ExecutorTaskAuthConfig::from_env);
     let auth_misconfiguration = (auth.require_auth() && !auth.has_bearer_token()).then(|| {
         format!(

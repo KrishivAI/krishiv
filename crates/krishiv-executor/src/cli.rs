@@ -448,6 +448,10 @@ async fn heartbeat_loop(
     // skips everything in between.
     let shared_connector_sources: crate::runner::SharedContinuousConnectorSources =
         Arc::new(DashMap::new());
+    // Class-specific run-loop state (join/pipeline/stateless), shared between
+    // the gRPC service (cancel retirement) and the runner (fragment state) —
+    // the same discipline as the maps above, extended to task #147's classes.
+    let shared_class_executors = crate::grpc::SharedClassExecutors::default();
 
     // Now spawn the task and barrier servers.  No more re-registers required.
     if let Some(listener) = task_listener {
@@ -457,6 +461,7 @@ async fn heartbeat_loop(
         let grpc_continuous_outputs = Arc::clone(&shared_continuous_outputs);
         let grpc_input_notify = Arc::clone(&shared_input_notify);
         let grpc_connector_sources = Arc::clone(&shared_connector_sources);
+        let grpc_class_executors = shared_class_executors.clone();
         tokio::spawn(async move {
             use crate::transport::serve_executor_task_grpc_with_run_loop;
             if let Err(e) = serve_executor_task_grpc_with_run_loop(
@@ -467,6 +472,7 @@ async fn heartbeat_loop(
                 grpc_continuous_outputs,
                 grpc_input_notify,
                 grpc_connector_sources,
+                grpc_class_executors,
             )
             .await
             {
@@ -560,7 +566,8 @@ async fn heartbeat_loop(
         .with_shared_continuous_inputs(shared_continuous_inputs)
         .with_shared_continuous_outputs(shared_continuous_outputs)
         .with_shared_continuous_notify(shared_input_notify)
-        .with_shared_continuous_connector_sources(shared_connector_sources);
+        .with_shared_continuous_connector_sources(shared_connector_sources)
+        .with_shared_class_executors(shared_class_executors);
     // The run-loop short-circuits exchange deliveries to co-located peers by
     // matching the advertised task endpoint.
     if let Some(endpoint) = runtime.config().task_endpoint() {

@@ -824,6 +824,21 @@ impl ExecutorTaskRunner {
         self
     }
 
+    /// Share the class-specific run-loop state maps (join/pipeline/stateless)
+    /// with the gRPC service — see [`crate::grpc::SharedClassExecutors`].
+    /// Cancel retires state through these maps; a runner whose maps are not
+    /// the service's maps keeps cancelled loops alive forever.
+    #[must_use]
+    pub fn with_shared_class_executors(
+        mut self,
+        class_executors: crate::grpc::SharedClassExecutors,
+    ) -> Self {
+        self.join_executors = class_executors.join;
+        self.pipeline_executors = class_executors.pipeline;
+        self.stateless_executors = class_executors.stateless;
+        self
+    }
+
     /// Assignment inbox consumed by this runner.
     pub fn inbox(&self) -> &ExecutorAssignmentInbox {
         &self.inbox

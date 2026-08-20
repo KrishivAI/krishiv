@@ -35,6 +35,9 @@ fn ipc_bytes(batch: &arrow::record_batch::RecordBatch) -> Vec<u8> {
 /// A coordinator plus a dispatchable executor, both on real ports.
 struct Rig {
     coordinator: SharedCoordinator,
+    /// The class-state maps shared between the gRPC service and the runner —
+    /// exposed so tests can assert cancel retires them.
+    class_executors: krishiv_executor::grpc::SharedClassExecutors,
 }
 
 async fn start_rig(name: &str) -> Rig {
@@ -84,6 +87,7 @@ async fn start_rig(name: &str) -> Rig {
     let input_notify: krishiv_executor::runner::SharedContinuousNotify = Arc::new(DashMap::new());
     let connector_sources: krishiv_executor::runner::SharedContinuousConnectorSources =
         Arc::new(DashMap::new());
+    let class_executors = krishiv_executor::grpc::SharedClassExecutors::default();
 
     {
         let inbox = inbox.clone();
@@ -92,6 +96,7 @@ async fn start_rig(name: &str) -> Rig {
         let continuous_outputs = Arc::clone(&continuous_outputs);
         let input_notify = Arc::clone(&input_notify);
         let connector_sources = Arc::clone(&connector_sources);
+        let class_executors = class_executors.clone();
         tokio::spawn(async move {
             // The run-loop server: shares egress buffers and input notifies
             // with the runner, which is what run-loop drain/push need — the
@@ -105,6 +110,7 @@ async fn start_rig(name: &str) -> Rig {
                 continuous_outputs,
                 input_notify,
                 connector_sources,
+                class_executors,
             )
             .await;
         });
@@ -116,7 +122,8 @@ async fn start_rig(name: &str) -> Rig {
         .with_shared_continuous_inputs(Arc::clone(&continuous_inputs))
         .with_shared_continuous_outputs(Arc::clone(&continuous_outputs))
         .with_shared_continuous_notify(Arc::clone(&input_notify))
-        .with_shared_continuous_connector_sources(Arc::clone(&connector_sources));
+        .with_shared_continuous_connector_sources(Arc::clone(&connector_sources))
+        .with_shared_class_executors(class_executors.clone());
     let coord_endpoint = format!("http://{coord_addr}");
     tokio::spawn(async move {
         let service = GrpcCoordinatorService::new(coord_endpoint, LeaseGeneration::initial());
@@ -153,7 +160,10 @@ async fn start_rig(name: &str) -> Rig {
 
     // Let both servers accept before anything dials them.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    Rig { coordinator }
+    Rig {
+        coordinator,
+        class_executors,
+    }
 }
 
 async fn wait_drain(
@@ -416,5 +426,98 @@ async fn rpipe_fragment_runs_a_pipeline_across_the_real_wire() {
     assert!(
         winners.contains(&(1, 900)),
         "auction 1's winning bid (900) must emerge from the distributed pipeline: {winners:?}"
+    );
+}
+
+/// Deregister must actually STOP the run-loop fragment and free the runner
+/// slot it occupies. The rig's runner is a single sequential slot — exactly
+/// the production shape scaled down: on the 3-node k3s rig every executor ran
+/// `slots` jobs and then never another, because cancel dropped the job's
+/// state maps but the loop never exited (forget_job purges the cancel
+/// tombstone before the loop can observe it). Job B here only ever runs if
+/// job A's loop exits on deregister.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deregister_stops_the_loop_and_frees_the_slot_for_the_next_job() {
+    use krishiv_plan::stream_task::{StatelessQuerySpec, StreamingTaskSpec};
+    let rig = start_rig("slotfree").await;
+    let stateless_task = || {
+        StreamingTaskSpec::Stateless(Box::new(StatelessQuerySpec {
+            sql: "SELECT v * 2 AS doubled FROM src WHERE v > 10".into(),
+            source: "src".into(),
+            side_tables: vec![],
+        }))
+    };
+    let mut options = ContinuousRegistrationOptions::default();
+    options.mode = Some("run-loop".into());
+    options.parallelism = Some(1);
+
+    // Job A occupies the rig's only runner slot and demonstrably runs.
+    krishiv_scheduler::register_continuous_task_with_options(
+        &rig.coordinator,
+        "slot-a",
+        &stateless_task(),
+        &options,
+    )
+    .await
+    .expect("job A registers");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    krishiv_scheduler::push_continuous_input_coordinated(
+        &rig.coordinator,
+        "slot-a",
+        ipc_bytes(&two_col("v", "unused", vec![20, 30], vec![0, 0])),
+    )
+    .await
+    .expect("push A");
+    let out_a = wait_drain(&rig, "slot-a", 2, Duration::from_secs(10)).await;
+    assert_eq!(
+        out_a.iter().map(|b| b.num_rows()).sum::<usize>(),
+        2,
+        "job A's loop must be running before the deregister is meaningful"
+    );
+
+    // Deregister job A — the teardown the HTTP DELETE performs.
+    rig.coordinator
+        .write()
+        .await
+        .push_cancel_job(&krishiv_proto::JobId::try_new("slot-a").unwrap())
+        .await
+        .expect("cancel job A");
+
+    // Cancel retires the classed state, not just windows.
+    let leftover: Vec<String> = rig
+        .class_executors
+        .stateless
+        .iter()
+        .map(|e| e.key().clone())
+        .filter(|k| k.starts_with("slot-a#"))
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "cancel must retire job A's stateless executors, found {leftover:?}"
+    );
+
+    // Job B can only run if job A's loop exited and freed the slot.
+    krishiv_scheduler::register_continuous_task_with_options(
+        &rig.coordinator,
+        "slot-b",
+        &stateless_task(),
+        &options,
+    )
+    .await
+    .expect("job B registers");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    krishiv_scheduler::push_continuous_input_coordinated(
+        &rig.coordinator,
+        "slot-b",
+        ipc_bytes(&two_col("v", "unused", vec![50], vec![0])),
+    )
+    .await
+    .expect("push B");
+    let out_b = wait_drain(&rig, "slot-b", 1, Duration::from_secs(10)).await;
+    let doubled: Vec<i64> = out_b.iter().flat_map(|b| i64_col(b, "doubled")).collect();
+    assert_eq!(
+        doubled,
+        vec![100],
+        "job B never ran: job A's cancelled loop is still holding the runner slot"
     );
 }

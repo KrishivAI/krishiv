@@ -193,6 +193,17 @@ pub(crate) async fn execute_rbatch_fragment(
         {
             break;
         }
+        // Liveness: cancel retires this subtask's state entry and then purges
+        // the inbox identity — including the tombstone above, usually before
+        // this loop observes it. Arc identity on the state entry is the
+        // race-free exit signal (see the rloop loop for the full account).
+        let state_alive = runner
+            .stateless_executors
+            .get(&state_key)
+            .is_some_and(|entry| Arc::ptr_eq(entry.value(), &executor_arc));
+        if !state_alive {
+            break;
+        }
         let mut input: Vec<RecordBatch> = Vec::new();
         input.extend(take_pushed(runner, &input_key));
         input.extend(take_pushed(runner, job_id));
@@ -365,6 +376,17 @@ pub(crate) async fn execute_rjoin_fragment(
             .is_task_cancelled(assignment.job_id(), assignment.task_id())
             .unwrap_or(false)
         {
+            break;
+        }
+        // Liveness: cancel retires this subtask's state entry and then purges
+        // the inbox identity — including the tombstone above, usually before
+        // this loop observes it. Arc identity on the state entry is the
+        // race-free exit signal (see the rloop loop for the full account).
+        let state_alive = runner
+            .join_executors
+            .get(&state_key)
+            .is_some_and(|entry| Arc::ptr_eq(entry.value(), &op_arc));
+        if !state_alive {
             break;
         }
         let _ = crate::erased(runner.drain_barriers_via_context()).await;
@@ -627,6 +649,17 @@ pub(crate) async fn execute_rpipe_fragment(
             .is_task_cancelled(assignment.job_id(), assignment.task_id())
             .unwrap_or(false)
         {
+            break;
+        }
+        // Liveness: cancel retires this subtask's state entry and then purges
+        // the inbox identity — including the tombstone above, usually before
+        // this loop observes it. Arc identity on the state entry is the
+        // race-free exit signal (see the rloop loop for the full account).
+        let state_alive = runner
+            .pipeline_executors
+            .get(&state_key)
+            .is_some_and(|entry| Arc::ptr_eq(entry.value(), &pipe_arc));
+        if !state_alive {
             break;
         }
         let mut left_in: Vec<RecordBatch> = take_pushed(runner, &left_key);
