@@ -77,14 +77,16 @@ fn a_bid_joins_the_auction_it_names_within_the_band() {
     let mut op = operator();
 
     // Two auctions buffered first.
-    let pre = op.process_right(&auctions(vec![
-        (7, "electronics", 1_000),
-        (9, "books", 1_000),
-    ]));
+    let pre = op
+        .process_right(&auctions(vec![
+            (7, "electronics", 1_000),
+            (9, "books", 1_000),
+        ]))
+        .expect("join");
     assert_eq!(joined_rows(&pre), 0, "no bids yet, so nothing can match");
 
     // One bid on auction 7, inside the band.
-    let out = op.process_left(&bids(vec![(7, 2_000)]));
+    let out = op.process_left(&bids(vec![(7, 2_000)])).expect("join");
     assert_eq!(
         joined_rows(&out),
         1,
@@ -100,10 +102,11 @@ fn a_bid_joins_the_auction_it_names_within_the_band() {
 #[test]
 fn a_bid_outside_the_band_does_not_match_its_auction() {
     let mut op = operator();
-    op.process_right(&auctions(vec![(7, "electronics", 1_000)]));
+    op.process_right(&auctions(vec![(7, "electronics", 1_000)]))
+        .expect("join");
 
     // 5000 ms band: 1_000 + 5_000 = 6_000 is the edge; 20_000 is far outside.
-    let outside = op.process_left(&bids(vec![(7, 20_000)]));
+    let outside = op.process_left(&bids(vec![(7, 20_000)])).expect("join");
     assert_eq!(
         joined_rows(&outside),
         0,
@@ -112,7 +115,7 @@ fn a_bid_outside_the_band_does_not_match_its_auction() {
 
     // Same key, inside the band, does join — so the miss above is the band and
     // not a broken key comparison.
-    let inside = op.process_left(&bids(vec![(7, 3_000)]));
+    let inside = op.process_left(&bids(vec![(7, 3_000)])).expect("join");
     assert_eq!(
         joined_rows(&inside),
         1,
@@ -124,8 +127,9 @@ fn a_bid_outside_the_band_does_not_match_its_auction() {
 #[test]
 fn a_bid_with_no_matching_auction_produces_nothing() {
     let mut op = operator();
-    op.process_right(&auctions(vec![(7, "electronics", 1_000)]));
-    let out = op.process_left(&bids(vec![(999, 1_500)]));
+    op.process_right(&auctions(vec![(7, "electronics", 1_000)]))
+        .expect("join");
+    let out = op.process_left(&bids(vec![(999, 1_500)])).expect("join");
     assert_eq!(joined_rows(&out), 0, "no auction 999 exists");
 }
 
@@ -133,8 +137,9 @@ fn a_bid_with_no_matching_auction_produces_nothing() {
 #[test]
 fn the_joined_row_carries_columns_from_both_sides() {
     let mut op = operator();
-    op.process_right(&auctions(vec![(7, "electronics", 1_000)]));
-    let out = op.process_left(&bids(vec![(7, 1_500)]));
+    op.process_right(&auctions(vec![(7, "electronics", 1_000)]))
+        .expect("join");
+    let out = op.process_left(&bids(vec![(7, 1_500)])).expect("join");
 
     let batch = out.first().expect("one joined batch");
     let names: Vec<String> = batch
@@ -157,12 +162,13 @@ fn the_joined_row_carries_columns_from_both_sides() {
 #[test]
 fn advancing_the_watermark_evicts_state_beyond_the_window() {
     let mut op = operator();
-    op.process_right(&auctions(vec![(7, "electronics", 1_000)]));
+    op.process_right(&auctions(vec![(7, "electronics", 1_000)]))
+        .expect("join");
 
     // Push the watermark far past the auction's window.
     op.advance_watermark(1_000_000);
 
-    let out = op.process_left(&bids(vec![(7, 1_500)]));
+    let out = op.process_left(&bids(vec![(7, 1_500)])).expect("join");
     assert_eq!(
         joined_rows(&out),
         0,

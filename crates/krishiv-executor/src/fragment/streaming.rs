@@ -338,7 +338,12 @@ fn execute_window_join_fragment(
             {
                 max_event_time = max_event_time.max(ts);
             }
-            out.extend(op.process_left(batch));
+            out.extend(
+                op.process_left(batch)
+                    .map_err(|e| ExecutorError::LocalExecution {
+                        message: format!("window join left input: {e}"),
+                    })?,
+            );
         }
         for batch in &right {
             if let Some(ts) =
@@ -346,7 +351,12 @@ fn execute_window_join_fragment(
             {
                 max_event_time = max_event_time.max(ts);
             }
-            out.extend(op.process_right(batch));
+            out.extend(
+                op.process_right(batch)
+                    .map_err(|e| ExecutorError::LocalExecution {
+                        message: format!("window join right input: {e}"),
+                    })?,
+            );
         }
         let watermark_ms = if max_event_time > i64::MIN {
             let wm = max_event_time;

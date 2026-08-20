@@ -5806,3 +5806,54 @@ the exact-input join contract holding (200000 == 200000; the side table
 covers every `auction % 1000`). 5506 tests, clippy and fmt clean. What
 remains is ONE capability: job-level two-source streaming joins plus
 person/auction generation (Q3/Q4/Q8/Q9/Q20) — task #144.
+
+## §58 — #144: two-source streaming jobs end to end — and the join defect the completeness gate caught twice
+
+The wiring (the scout's Path B, built): `TwoInputStep` beside `WindowStep`
+(deliberately NOT WindowStep — spec()/tick/flush are window vocabulary a
+join cannot honestly answer); `StreamingLoop::EmbeddedJoinBounded` answering
+all six policy axes (NoFlush because an interval join's residue is unmatched
+events that will never match — publishing them would fabricate output);
+`on_join_input` policy-gated so a CoerceToSpec loop cannot claim a typing
+step it can't perform; `run_join_bounded` in the engine routing FIRST on
+shape (a banded join gets the join compiler's error, never a stateless-path
+unknown-table error — revert-proven: without the branch the e2e job dies
+with "table 'auction' not found"); watermark = min across sides, the
+existing multi-source rule; no checkpoint on the bounded run, same recorded
+precedent as run_stateless_bounded. The shape discriminator for routing is
+the event-time BETWEEN band: a band-less join is the side-input shape (§57)
+and must NOT be claimed. The join compiler now fails closed on WHERE/ORDER
+BY/LIMIT/CTE — WHERE was silently dropped before.
+
+THE DEFECT (sibling instance FIVE of UInt64 blindness, and the worst):
+`watermark_join::extract_key` knew Utf8 and Int64 only, and on extraction
+failure fell back to a POSITIONAL pseudo-key `__row_{n}`. A UInt64-keyed
+stream therefore joined row i of one side to row i of EVERY batch of the
+other, regardless of keys: q20 emitted exactly 40,000,000 rows (200k bids x
+200 right batches) from 400k inputs — all fabricated. The completeness
+gate's absurd rows_out is what surfaced it; a rows_out>0 gate would have
+BLESSED it. First probe was a trap: 3 expected matches "passed" because row
+positions coincidentally aligned — the second probe (a key matching nothing
+still "matched") broke the coincidence. Fix: typed extract_agg_key, and
+extraction failure is now an ERROR naming the column — never a fallback key.
+process_left/right became fallible; every caller updated; executor fragment
+sites propagate instead of expect. Revert-proven: restoring the old
+extraction fails the new test with one fabricated match where zero is the
+answer.
+
+Generator defects the gate then caught in sequence: (a) auction events
+reused the bid-side HOT-AUCTION SAMPLER for their ids — thousands of
+auctions shared an id; auction (and person) events now emit unique ids from
+their own ordinal counters, aligned with the reference's sampler space;
+(b) one shared generator put the second side millions of ordinals after the
+first, making id spaces and times disjoint — every join emitted ZERO, the
+gate failed, and each side now gets a same-seed generator (the
+entity-filtered view of one logical stream).
+
+Coverage 17 → 20 of 22, all joins verified non-degenerate: q3 114,781 /
+q8 113,087 / q20 103,286 joined rows. Join throughput is honestly low
+(3.6K–6.2K ev/sec): the operator slices and concats per matched ROW —
+real cost, reported as such, with batch-at-a-time joining as the obvious
+lever. Q4/Q9 remain: both halves exist (interval join, windowed aggregate);
+the SQL surface cannot yet pipe one into the other. 5508 tests, clippy and
+fmt clean.

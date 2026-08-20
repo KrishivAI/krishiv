@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, Int64Array, StringArray};
+use arrow::array::{Array, Int64Array};
 use arrow::datatypes::Schema;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
@@ -116,19 +116,28 @@ impl WatermarkWindowJoinOperator {
     /// the left input is barrier-blocked (it has delivered an epoch's barrier the
     /// right input has not yet matched), the batch is held for replay after the
     /// snapshot rather than folded into the in-progress epoch.
-    pub fn process_left(&mut self, batch: &RecordBatch) -> Vec<RecordBatch> {
+    /// # Errors
+    /// When the key or time column is missing or of an unsupported type. The
+    /// predecessor silently substituted a POSITIONAL pseudo-key
+    /// (`__row_{n}`) on extraction failure, which made row i of one side
+    /// "join" row i of every batch on the other — a UInt64-keyed benchmark
+    /// emitted 40M rows from 400k inputs, all fabricated (register §58).
+    pub fn process_left(&mut self, batch: &RecordBatch) -> crate::ExecResult<Vec<RecordBatch>> {
         if self.aligner.is_blocked(JOIN_LEFT_INPUT) {
             self.left_buffer.push(batch.clone());
-            return Vec::new();
+            return Ok(Vec::new());
         }
         self.process_side(batch, &self.spec.left_key_column.clone(), true)
     }
 
     /// Process a batch from the right stream.
-    pub fn process_right(&mut self, batch: &RecordBatch) -> Vec<RecordBatch> {
+    ///
+    /// # Errors
+    /// See [`Self::process_left`].
+    pub fn process_right(&mut self, batch: &RecordBatch) -> crate::ExecResult<Vec<RecordBatch>> {
         if self.aligner.is_blocked(JOIN_RIGHT_INPUT) {
             self.right_buffer.push(batch.clone());
-            return Vec::new();
+            return Ok(Vec::new());
         }
         self.process_side(batch, &self.spec.right_key_column.clone(), false)
     }
@@ -235,15 +244,33 @@ impl WatermarkWindowJoinOperator {
         batch: &RecordBatch,
         key_col: &str,
         is_left: bool,
-    ) -> Vec<RecordBatch> {
+    ) -> crate::ExecResult<Vec<RecordBatch>> {
         let n = batch.num_rows();
-        let time_idx = batch.schema().index_of(&self.spec.time_column).ok();
-        let key_idx = batch.schema().index_of(key_col).ok();
+        let time_idx = batch
+            .schema()
+            .index_of(&self.spec.time_column)
+            .map_err(|_| {
+                crate::ExecError::ColumnNotFound(format!(
+                    "join time column '{}'",
+                    self.spec.time_column
+                ))
+            })?;
+        let key_idx = batch.schema().index_of(key_col).map_err(|_| {
+            crate::ExecError::ColumnNotFound(format!("join key column '{key_col}'"))
+        })?;
 
         let mut out = Vec::new();
         for row in 0..n {
-            let time_ms = extract_i64(batch, time_idx, row).unwrap_or(0);
-            let key = extract_key(batch, key_idx, row).unwrap_or_else(|| format!("__row_{row}"));
+            let time_ms = extract_i64(batch, time_idx, row).ok_or_else(|| {
+                crate::ExecError::UnsupportedType(format!(
+                    "join time column '{}' must be Int64",
+                    self.spec.time_column
+                ))
+            })?;
+            // Typed key extraction (all integer widths, strings, bools).
+            // NEVER a fallback: a row whose key cannot be read must fail the
+            // batch, not silently become a positional pseudo-key that joins.
+            let key = crate::join::extract_agg_key(batch, key_idx, row)?.to_string();
             let row_batch = slice_batch(batch, row);
             let matches = if is_left {
                 self.join.push_left(&key, time_ms, row_batch)
@@ -251,31 +278,18 @@ impl WatermarkWindowJoinOperator {
                 self.join.push_right(&key, time_ms, row_batch)
             };
             for (l, r) in matches {
-                if let Ok(joined) = concat_row_batches(l.as_ref(), r.as_ref()) {
-                    out.push(joined);
-                }
+                out.push(concat_row_batches(l.as_ref(), r.as_ref())?);
             }
         }
-        out
+        Ok(out)
     }
 }
 
 // ── Arrow helpers ─────────────────────────────────────────────────────────────
 
-fn extract_i64(batch: &RecordBatch, col_idx: Option<usize>, row: usize) -> Option<i64> {
-    let col = batch.column(col_idx?);
+fn extract_i64(batch: &RecordBatch, col_idx: usize, row: usize) -> Option<i64> {
+    let col = batch.column(col_idx);
     col.as_any().downcast_ref::<Int64Array>()?.value(row).into()
-}
-
-fn extract_key(batch: &RecordBatch, col_idx: Option<usize>, row: usize) -> Option<String> {
-    let col = batch.column(col_idx?);
-    if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-        return Some(arr.value(row).to_owned());
-    }
-    if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-        return Some(arr.value(row).to_string());
-    }
-    None
 }
 
 fn slice_batch(batch: &RecordBatch, row: usize) -> RecordBatch {
@@ -386,9 +400,12 @@ mod tests {
         let mut op = WatermarkWindowJoinOperator::new(make_spec(500));
         assert!(
             op.process_left(&batch_with_key_and_ts("k", 1000, 1))
+                .expect("join")
                 .is_empty()
         );
-        let out = op.process_right(&batch_with_key_and_ts("k", 1300, 2));
+        let out = op
+            .process_right(&batch_with_key_and_ts("k", 1300, 2))
+            .expect("join");
         assert_eq!(out.len(), 1, "right event within 500ms should match left");
         // Joined batch must have columns from both sides (id, ts, val from left + id, ts, val from right = 6 cols).
         assert_eq!(out[0].num_columns(), 6);
@@ -406,12 +423,16 @@ mod tests {
 
         // A left batch arriving after its barrier is held for the next epoch,
         // not folded into the in-progress (about-to-snapshot) one.
-        let held = op.process_left(&batch_with_key_and_ts("k", 1000, 1));
+        let held = op
+            .process_left(&batch_with_key_and_ts("k", 1000, 1))
+            .expect("join");
         assert!(
             held.is_empty(),
             "post-barrier left input is buffered, not joined"
         );
-        let r = op.process_right(&batch_with_key_and_ts("k", 1100, 2));
+        let r = op
+            .process_right(&batch_with_key_and_ts("k", 1100, 2))
+            .expect("join");
         assert!(r.is_empty(), "no left state this epoch — it was buffered");
 
         // Right delivers its barrier → the epoch aligns: snapshot now.
@@ -425,7 +446,7 @@ mod tests {
 
         // Replaying the held left event now joins against the right event that
         // was processed (unblocked) during alignment — proving no data was lost.
-        let joined = op.process_left(&left_replay[0]);
+        let joined = op.process_left(&left_replay[0]).expect("join");
         assert_eq!(
             joined.len(),
             1,
@@ -436,8 +457,11 @@ mod tests {
     #[test]
     fn outside_window_no_match() {
         let mut op = WatermarkWindowJoinOperator::new(make_spec(100));
-        op.process_left(&batch_with_key_and_ts("k", 1000, 1));
-        let out = op.process_right(&batch_with_key_and_ts("k", 2000, 2));
+        op.process_left(&batch_with_key_and_ts("k", 1000, 1))
+            .expect("join");
+        let out = op
+            .process_right(&batch_with_key_and_ts("k", 2000, 2))
+            .expect("join");
         assert!(
             out.is_empty(),
             "right event 1000ms away from left (window=100ms) must not match"
@@ -447,8 +471,11 @@ mod tests {
     #[test]
     fn different_keys_do_not_match() {
         let mut op = WatermarkWindowJoinOperator::new(make_spec(1000));
-        op.process_left(&batch_with_key_and_ts("a", 1000, 1));
-        let out = op.process_right(&batch_with_key_and_ts("b", 1000, 2));
+        op.process_left(&batch_with_key_and_ts("a", 1000, 1))
+            .expect("join");
+        let out = op
+            .process_right(&batch_with_key_and_ts("b", 1000, 2))
+            .expect("join");
         assert!(out.is_empty(), "different keys must not match");
     }
 
@@ -457,7 +484,8 @@ mod tests {
     #[test]
     fn watermark_evicts_stale_state() {
         let mut op = WatermarkWindowJoinOperator::new(make_spec(200));
-        op.process_left(&batch_with_key_and_ts("k", 1000, 1));
+        op.process_left(&batch_with_key_and_ts("k", 1000, 1))
+            .expect("join");
         assert_eq!(op.active_key_count(), 1);
 
         // Advance watermark past the event; evict_before removes state
@@ -472,7 +500,8 @@ mod tests {
     #[test]
     fn watermark_monotonic_advance_only() {
         let mut op = WatermarkWindowJoinOperator::new(make_spec(500));
-        op.process_left(&batch_with_key_and_ts("k", 1000, 1));
+        op.process_left(&batch_with_key_and_ts("k", 1000, 1))
+            .expect("join");
         op.advance_watermark(2000);
         assert_eq!(op.active_key_count(), 0);
 
@@ -485,7 +514,8 @@ mod tests {
     fn watermark_does_not_evict_live_state() {
         let mut op = WatermarkWindowJoinOperator::new(make_spec(500));
         // event at 1000ms, watermark advances to 800ms — event is within [800-500, 800+500]
-        op.process_left(&batch_with_key_and_ts("k", 1000, 1));
+        op.process_left(&batch_with_key_and_ts("k", 1000, 1))
+            .expect("join");
         op.advance_watermark(800);
         assert_eq!(
             op.active_key_count(),
@@ -500,11 +530,11 @@ mod tests {
     fn multi_row_batch_all_rows_processed() {
         let mut op = WatermarkWindowJoinOperator::new(make_spec(500));
         let left = multi_row_batch(&["a", "b", "c"], &[1000, 2000, 3000]);
-        assert!(op.process_left(&left).is_empty());
+        assert!(op.process_left(&left).expect("join").is_empty());
 
         // Each right row matches the left row for the same key within 500ms.
         let right = multi_row_batch(&["a", "b", "c"], &[1200, 2300, 3400]);
-        let out = op.process_right(&right);
+        let out = op.process_right(&right).expect("join");
         assert_eq!(out.len(), 3, "each of the 3 keys should produce 1 match");
     }
 
@@ -512,11 +542,11 @@ mod tests {
     fn multi_row_batch_only_matching_rows_emitted() {
         let mut op = WatermarkWindowJoinOperator::new(make_spec(100));
         let left = multi_row_batch(&["x", "x"], &[1000, 2000]);
-        op.process_left(&left);
+        op.process_left(&left).expect("join");
 
         // right at 1050 matches left at 1000; right at 3000 does not match either.
         let right = multi_row_batch(&["x", "x"], &[1050, 3000]);
-        let out = op.process_right(&right);
+        let out = op.process_right(&right).expect("join");
         assert_eq!(out.len(), 1, "only the in-window row should match");
     }
 
@@ -528,9 +558,12 @@ mod tests {
         // Push right first, then left — the interval is symmetric.
         assert!(
             op.process_right(&batch_with_key_and_ts("k", 1000, 2))
+                .expect("join")
                 .is_empty()
         );
-        let out = op.process_left(&batch_with_key_and_ts("k", 1200, 1));
+        let out = op
+            .process_left(&batch_with_key_and_ts("k", 1200, 1))
+            .expect("join");
         assert_eq!(out.len(), 1, "right-before-left within window must match");
     }
 
@@ -541,8 +574,8 @@ mod tests {
         let mut op = WatermarkWindowJoinOperator::new(make_spec(1000));
         let l = batch_with_key_and_ts("k", 500, 1);
         let r = batch_with_key_and_ts("k", 700, 2);
-        op.process_left(&l);
-        let out = op.process_right(&r);
+        op.process_left(&l).expect("join");
+        let out = op.process_right(&r).expect("join");
         assert_eq!(out.len(), 1);
         // Left has 3 cols + right has 3 cols = 6 joined cols.
         assert_eq!(out[0].num_columns(), l.num_columns() + r.num_columns());
@@ -554,8 +587,11 @@ mod tests {
     #[test]
     fn joined_schema_renames_colliding_columns() {
         let mut op = WatermarkWindowJoinOperator::new(make_spec(1000));
-        op.process_left(&batch_with_key_and_ts("k", 500, 1));
-        let out = op.process_right(&batch_with_key_and_ts("k", 600, 2));
+        op.process_left(&batch_with_key_and_ts("k", 500, 1))
+            .expect("join");
+        let out = op
+            .process_right(&batch_with_key_and_ts("k", 600, 2))
+            .expect("join");
         assert_eq!(out.len(), 1);
         let schema = out[0].schema();
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
@@ -591,12 +627,82 @@ mod tests {
         // Left event at ts=0 — with restored watermark 3000 the event is already
         // within the eviction zone (3000 − 500 = 2500 > 0), so no match expected
         // for a right event at ts=100.
-        op2.process_left(&batch_with_key_and_ts("k", 0, 1));
-        let out = op2.process_right(&batch_with_key_and_ts("k", 100, 2));
+        op2.process_left(&batch_with_key_and_ts("k", 0, 1))
+            .expect("join");
+        let out = op2
+            .process_right(&batch_with_key_and_ts("k", 100, 2))
+            .expect("join");
         // Even if the interval contains the left event, the watermark already
         // passed — state is cleared on restore so match should be zero.
         // (We don't assert a specific count here because state GC timing may
         //  vary; we just assert the round-trip doesn't panic.)
         let _ = out;
+    }
+
+    /// UInt64 keys join by VALUE, and a key that matches nothing matches
+    /// nothing (register §58).
+    ///
+    /// The defect: `extract_key` knew only Utf8 and Int64, and extraction
+    /// failure fell back to a POSITIONAL pseudo-key `__row_{n}` — so row i of
+    /// one side "joined" row i of every batch on the other side regardless of
+    /// the actual keys. Four bids and one unrelated auction produced a match
+    /// purely because both had a row 0. Against the reverted fallback this
+    /// test fails with 1 fabricated match where 0 is the answer.
+    #[test]
+    fn uint64_keys_join_by_value_not_by_row_position() {
+        use arrow::array::UInt64Array;
+        let spec = WatermarkWindowJoinSpec {
+            time_column: "ts".into(),
+            left_key_column: "k".into(),
+            right_key_column: "id".into(),
+            window_ms: 10_000,
+        };
+        let mut op = WatermarkWindowJoinOperator::new(spec);
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::UInt64, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let left = RecordBatch::try_new(
+            left_schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![1_u64, 2])),
+                Arc::new(Int64Array::from(vec![1_000_i64, 1_001])),
+            ],
+        )
+        .unwrap();
+        let miss = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![99_u64])),
+                Arc::new(Int64Array::from(vec![1_002_i64])),
+            ],
+        )
+        .unwrap();
+        let hit = RecordBatch::try_new(
+            right_schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![2_u64])),
+                Arc::new(Int64Array::from(vec![1_003_i64])),
+            ],
+        )
+        .unwrap();
+
+        assert!(op.process_left(&left).expect("left").is_empty());
+        let fabricated = op.process_right(&miss).expect("miss");
+        assert!(
+            fabricated.is_empty(),
+            "auction 99 matches no bid; a match here is joined BY ROW POSITION"
+        );
+        let real: usize = op
+            .process_right(&hit)
+            .expect("hit")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(real, 1, "auction 2 matches exactly the bid on key 2");
     }
 }

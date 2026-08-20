@@ -71,6 +71,21 @@ pub struct NexmarkGenerator {
     base_time_ms: i64,
     /// Maximum out-of-orderness injected into event time, in ms.
     max_lateness_ms: i64,
+    /// Person events emitted so far — the source of UNIQUE person ids.
+    ///
+    /// One person event arrives per 50-event epoch, so person #k is emitted
+    /// at epoch ~k — which is exactly the `[base - active, base]` window the
+    /// `person_id()` REFERENCE sampler draws sellers and bidders from. Ids
+    /// emitted and ids referenced share a space by construction.
+    persons_emitted: u64,
+    /// Auction events emitted so far — the source of UNIQUE auction ids.
+    ///
+    /// The bid-side `auction_id()` SAMPLES recent ids (skewed to the hot
+    /// auction); auction events must EMIT each id exactly once. Reusing the
+    /// sampler for emission gave thousands of auction events the same id and
+    /// made every band join quadratic — q20 emitted 40M rows from 400k
+    /// inputs, measuring the generator's defect rather than the join.
+    auctions_emitted: u64,
 }
 
 impl NexmarkGenerator {
@@ -89,6 +104,8 @@ impl NexmarkGenerator {
             event_time_step_us: 1_000_000 / eps,
             base_time_ms,
             max_lateness_ms: max_lateness_ms.max(0),
+            auctions_emitted: 0,
+            persons_emitted: 0,
         }
     }
 
@@ -231,6 +248,115 @@ impl NexmarkGenerator {
         )
     }
 
+    /// Generate the next `n` AUCTION events (task #144).
+    ///
+    /// Same ordinal discipline as `next_bid_batch`: only auction ordinals
+    /// yield auctions, so event time advances at the full mixed-stream rate.
+    /// Schema: `(id, seller, category, dateTime, expires)`.
+    pub fn next_auction_batch(
+        &mut self,
+        n: usize,
+    ) -> Result<RecordBatch, arrow::error::ArrowError> {
+        let mut id = Vec::with_capacity(n);
+        let mut seller = Vec::with_capacity(n);
+        let mut category = Vec::with_capacity(n);
+        let mut date_time = Vec::with_capacity(n);
+        let mut expires = Vec::with_capacity(n);
+        let mut produced = 0;
+        while produced < n {
+            if Self::kind_for(self.event_id) != EventKind::Auction {
+                self.event_id += 1;
+                continue;
+            }
+            let eid = self.event_id;
+            id.push(self.auctions_emitted);
+            self.auctions_emitted += 1;
+            seller.push(self.person_id());
+            category.push(self.next_in(5) + 10);
+            let t = self.event_time(eid);
+            date_time.push(t);
+            // Auctions stay open 1-20 seconds — long enough that bids from
+            // the same stream segment land inside the auction's lifetime.
+            expires.push(t + 1_000 + i64::try_from(self.next_in(19_000)).unwrap_or(0));
+            self.event_id += 1;
+            produced += 1;
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("seller", DataType::UInt64, false),
+            Field::new("category", DataType::UInt64, false),
+            Field::new("dateTime", DataType::Int64, false),
+            Field::new("expires", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(id)),
+                Arc::new(UInt64Array::from(seller)),
+                Arc::new(UInt64Array::from(category)),
+                Arc::new(Int64Array::from(date_time)),
+                Arc::new(Int64Array::from(expires)),
+            ],
+        )
+    }
+
+    /// Generate the next `n` PERSON events (task #144).
+    ///
+    /// Schema: `(id, name, city, state, dateTime)`.
+    pub fn next_person_batch(&mut self, n: usize) -> Result<RecordBatch, arrow::error::ArrowError> {
+        const CITIES: [&str; 4] = ["Portland", "Seattle", "Boise", "Eugene"];
+        const STATES: [&str; 4] = ["OR", "WA", "ID", "CA"];
+        let mut id = Vec::with_capacity(n);
+        let mut name = Vec::with_capacity(n);
+        let mut city = Vec::with_capacity(n);
+        let mut state = Vec::with_capacity(n);
+        let mut date_time = Vec::with_capacity(n);
+        let mut produced = 0;
+        while produced < n {
+            if Self::kind_for(self.event_id) != EventKind::Person {
+                self.event_id += 1;
+                continue;
+            }
+            let eid = self.event_id;
+            let pid = self.persons_emitted;
+            self.persons_emitted += 1;
+            id.push(pid);
+            name.push(format!("person-{pid}"));
+            city.push(
+                CITIES
+                    .get(self.next_in(4) as usize)
+                    .copied()
+                    .unwrap_or("Portland"),
+            );
+            state.push(
+                STATES
+                    .get(self.next_in(4) as usize)
+                    .copied()
+                    .unwrap_or("OR"),
+            );
+            date_time.push(self.event_time(eid));
+            self.event_id += 1;
+            produced += 1;
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("city", DataType::Utf8, false),
+            Field::new("state", DataType::Utf8, false),
+            Field::new("dateTime", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(id)),
+                Arc::new(StringArray::from(name)),
+                Arc::new(StringArray::from(city)),
+                Arc::new(StringArray::from(state)),
+                Arc::new(Int64Array::from(date_time)),
+            ],
+        )
+    }
+
     /// How many events of ALL kinds have been generated so far.
     #[must_use]
     pub fn events_generated(&self) -> u64 {
@@ -259,12 +385,14 @@ pub struct BenchQuery {
 
 /// The NEXMark queries this engine's streaming path can currently express.
 ///
-/// Seventeen of twenty-two. Stated as data rather than prose so a report
+/// Twenty of twenty-two. Stated as data rather than prose so a report
 /// cannot quietly imply full coverage — the number is read from here.
 ///
-/// The other five need one capability that does not exist yet: job-level
-/// routing of two-source streaming joins plus person/auction event
-/// generation (Q3/Q4/Q8/Q9/Q20). Q7 and Q15 run in their canonical global forms
+/// The remaining two — Q4 (average price per category) and Q9 (winning
+/// bids) — need JOIN output feeding a windowed aggregation in one SQL
+/// statement, a composition the streaming compilers do not express yet.
+/// Both halves exist (the interval join and the windowed aggregate);
+/// what is missing is the pipe between them at the SQL surface. Q7 and Q15 run in their canonical global forms
 /// (task #140); Q0/Q10/Q14/Q21/Q22 run through the stateless per-batch path
 /// (task #141). Documented deviations: Q10 measures the projection, not the
 /// partitioned file sink; Q14's bid-time classification is a price-band CASE
@@ -364,6 +492,36 @@ pub const SUPPORTED_QUERIES: &[BenchQuery] = &[
         sql: "SELECT bidder, auction, price FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
               GROUP BY bidder, auction, window_start, window_end \
               ORDER BY \"dateTime\" DESC LIMIT 1",
+        expect: RowsOut::NonZero,
+    },
+    // ── two-source interval joins (task #144) ──
+    BenchQuery {
+        // Q3: local item suggestion — auctions joined to their sellers.
+        // DEVIATION: the reference filters by state/category; the streaming
+        // join compiler refuses WHERE (it would be silently dropped), so the
+        // unfiltered join is measured and the filter belongs upstream or
+        // downstream.
+        name: "q3_local_items",
+        sql: "SELECT p.name, p.city, p.state, a.id FROM auction a JOIN person p \
+              ON a.seller = p.id \
+              AND a.\"dateTime\" BETWEEN p.\"dateTime\" - 10000 AND p.\"dateTime\" + 10000",
+        expect: RowsOut::NonZero,
+    },
+    BenchQuery {
+        // Q8: monitor new users — persons who opened auctions inside the
+        // window.
+        name: "q8_monitor_new_users",
+        sql: "SELECT p.id, p.name, a.id FROM person p JOIN auction a \
+              ON p.id = a.seller \
+              AND p.\"dateTime\" BETWEEN a.\"dateTime\" - 10000 AND a.\"dateTime\" + 10000",
+        expect: RowsOut::NonZero,
+    },
+    BenchQuery {
+        // Q20: expand bids with their auction's category.
+        name: "q20_expand_bid",
+        sql: "SELECT b.auction, b.bidder, b.price, a.category FROM bid b JOIN auction a \
+              ON b.auction = a.id \
+              AND b.\"dateTime\" BETWEEN a.\"dateTime\" - 10000 AND a.\"dateTime\" + 10000",
         expect: RowsOut::NonZero,
     },
     BenchQuery {
@@ -557,7 +715,16 @@ mod tests {
             .build()
             .expect("runtime");
         for q in SUPPORTED_QUERIES {
-            if krishiv_sql::streaming_tvf::find_window_tvf(q.sql).is_some() {
+            if krishiv_sql::streaming_join_plan::looks_like_streaming_join(q.sql) {
+                krishiv_sql::streaming_join_plan::compile_streaming_join_sql(q.sql).unwrap_or_else(
+                    |e| {
+                        panic!(
+                            "{} is listed as supported but does not compile: {e}",
+                            q.name
+                        )
+                    },
+                );
+            } else if krishiv_sql::streaming_tvf::find_window_tvf(q.sql).is_some() {
                 krishiv_sql::streaming_window_plan::compile_streaming_window_sql(q.sql)
                     .unwrap_or_else(|e| {
                         panic!(

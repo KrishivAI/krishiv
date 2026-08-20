@@ -623,6 +623,99 @@ impl StatelessBatchExecutor {
     }
 }
 
+/// Bounded two-source streaming join run (task #144).
+///
+/// Reads BOTH sources to exhaustion, feeding each batch through the
+/// policy-gated driver into the watermark interval join; matches emit on
+/// arrival. The watermark advances to the MINIMUM of the two sides' maximum
+/// event times — the same min-across-sources rule the multi-source window
+/// watermark uses — so neither side's state is evicted while the other side
+/// can still reach it. Like the bounded stateless run, this does not
+/// checkpoint: a bounded run completes or is rerun.
+async fn run_join_bounded(job: &CompiledJob, rt: &EngineRuntime) -> EngineResult<JobHandle> {
+    use krishiv_dataflow::stream_driver::{JoinSide, StreamDriver, StreamingLoop};
+    use krishiv_dataflow::{WatermarkWindowJoinOperator, WatermarkWindowJoinSpec};
+
+    let plan = krishiv_sql::streaming_join_plan::compile_streaming_join_sql(&job.query)
+        .map_err(|e| EngineError::InvalidJob(format!("streaming join: {e}")))?;
+    let source_named = |name: &str| {
+        job.sources.iter().find(|s| s.name == name).ok_or_else(|| {
+            EngineError::InvalidJob(format!(
+                "join source '{name}' is not among the job's sources"
+            ))
+        })
+    };
+    let left_source = source_named(&plan.spec.left_source)?;
+    let right_source = source_named(&plan.spec.right_source)?;
+    let time_column = plan.spec.time_column.clone();
+    let mut left = rt.sources.open(left_source).await?;
+    let mut right = rt.sources.open(right_source).await?;
+    let mut writers = open_writers(rt, &job.sinks).await?;
+    let mut op = WatermarkWindowJoinOperator::new(WatermarkWindowJoinSpec::from(&plan.spec));
+    let mut driver = StreamDriver::new(StreamingLoop::EmbeddedJoinBounded);
+
+    let mut left_done = false;
+    let mut right_done = false;
+    let mut left_max = i64::MIN;
+    let mut right_max = i64::MIN;
+    while !(left_done && right_done) {
+        if !left_done {
+            match left.next().await? {
+                Some(batch) if batch.num_rows() > 0 => {
+                    left_max = left_max.max(batch_max_event_time(&batch, &time_column)?);
+                    let out = driver
+                        .on_join_input(&mut op, JoinSide::Left, &batch)
+                        .map_err(|e| EngineError::Runtime(e.to_string()))?;
+                    emit_to_writers(&mut writers, &out).await?;
+                }
+                Some(_) => {}
+                None => left_done = true,
+            }
+        }
+        if !right_done {
+            match right.next().await? {
+                Some(batch) if batch.num_rows() > 0 => {
+                    right_max = right_max.max(batch_max_event_time(&batch, &time_column)?);
+                    let out = driver
+                        .on_join_input(&mut op, JoinSide::Right, &batch)
+                        .map_err(|e| EngineError::Runtime(e.to_string()))?;
+                    emit_to_writers(&mut writers, &out).await?;
+                }
+                Some(_) => {}
+                None => right_done = true,
+            }
+        }
+        if left_max > i64::MIN && right_max > i64::MIN {
+            driver.on_join_watermark(&mut op, left_max.min(right_max));
+        }
+    }
+    for writer in &mut writers {
+        writer.flush().await?;
+    }
+    JobHandle::from_name(&job.name, JobStatus::Completed)
+}
+
+/// Maximum event time in `column` over one batch (join watermark input).
+fn batch_max_event_time(
+    batch: &arrow::record_batch::RecordBatch,
+    column: &str,
+) -> EngineResult<i64> {
+    let idx = batch.schema().index_of(column).map_err(|_| {
+        EngineError::Runtime(format!("join time column '{column}' missing from batch"))
+    })?;
+    let arr = batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .ok_or_else(|| {
+            EngineError::Runtime(format!("join time column '{column}' must be Int64"))
+        })?;
+    Ok((0..arr.len())
+        .map(|i| arr.value(i))
+        .max()
+        .unwrap_or(i64::MIN))
+}
+
 /// Bounded stateless streaming run: applies the query per-batch over the source,
 /// emitting transformed output immediately. No window state, no checkpointing.
 async fn run_stateless_bounded(job: &CompiledJob, rt: &EngineRuntime) -> EngineResult<JobHandle> {
@@ -691,6 +784,13 @@ impl ComputeEngine for StreamingEngine {
         //
         // Every precise refusal the streaming compiler produces reaches the
         // caller only because of this split.
+        // Two-source joins route FIRST, on shape not validity (the same rule
+        // as the windowed branch): a query that LOOKS like a streaming join
+        // gets the join compiler's error, not a stateless-path error about a
+        // table DataFusion cannot find.
+        if krishiv_sql::streaming_join_plan::looks_like_streaming_join(&job.query) {
+            return run_join_bounded(&job, &rt).await;
+        }
         if krishiv_sql::streaming_tvf::find_window_tvf(&job.query).is_none() {
             return run_stateless_bounded(&job, &rt).await;
         }
@@ -1448,6 +1548,76 @@ async fn run_streaming_continuous(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    /// A two-source streaming join runs END TO END through
+    /// `StreamingEngine::run` (task #144): source resolution by the names the
+    /// join plan carries, the policy-gated driver, and the sink.
+    ///
+    /// Before the routing branch landed, this exact job fell through to the
+    /// stateless path, which registers ONE MemTable and dies inside
+    /// DataFusion with an unknown-table error — reverting the branch
+    /// reproduces that, which is this test's red state.
+    #[tokio::test]
+    async fn two_source_join_job_runs_end_to_end() {
+        let bid_schema = Arc::new(Schema::new(vec![
+            Field::new("auction", DataType::Int64, false),
+            Field::new("dateTime", DataType::Int64, false),
+        ]));
+        let auction_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("dateTime", DataType::Int64, false),
+        ]));
+        let bids = RecordBatch::try_new(
+            bid_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 1, 2, 9])),
+                Arc::new(Int64Array::from(vec![1_000_i64, 2_000, 1_500, 1_000])),
+            ],
+        )
+        .unwrap();
+        let auctions = RecordBatch::try_new(
+            auction_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(StringArray::from(vec!["cat-a", "cat-b"])),
+                Arc::new(Int64Array::from(vec![1_200_i64, 1_400])),
+            ],
+        )
+        .unwrap();
+
+        let sources = InMemorySourceProvider::new();
+        sources.insert("bid", vec![bids]);
+        sources.insert("auction", vec![auctions]);
+        let sink = InMemorySinkProvider::new();
+        let rt = embedded_runtime(Arc::new(sources), Arc::new(sink.clone()));
+
+        let job = CompiledJob::new(
+            "q3-join",
+            "SELECT b.auction, a.category FROM bid b JOIN auction a \
+             ON b.auction = a.id \
+             AND b.dateTime BETWEEN a.dateTime - 5000 AND a.dateTime + 5000",
+            vec![
+                SourceSpec::bounded("bid", "memory", ""),
+                SourceSpec::bounded("auction", "memory", ""),
+            ],
+            vec![SinkSpec::new("out", "memory", "")],
+            false,
+        )
+        .with_engine(EngineKind::Streaming);
+
+        let handle = StreamingEngine.run(job, rt).await.unwrap();
+        assert_eq!(handle.status(), JobStatus::Completed);
+
+        let out = sink.take("out");
+        let rows: usize = out.iter().map(ChangelogBatch::num_rows).sum();
+        // Bids on auctions 1, 1 and 2 all land inside the ±5s band; the bid
+        // on auction 9 has no auction and must NOT appear.
+        assert_eq!(
+            rows, 3,
+            "three of four bids join their auctions; the orphan bid must not"
+        );
+    }
 
     /// A side table registered once must survive every per-batch
     /// replace-register of the streaming input (NEXMark Q13's shape).

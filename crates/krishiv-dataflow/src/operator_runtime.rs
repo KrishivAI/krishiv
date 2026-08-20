@@ -765,10 +765,10 @@ pub fn execute_window_join(
     let max_side = left_batches.len().max(right_batches.len());
     for i in 0..max_side {
         if let Some(lb) = left_batches.get(i) {
-            out.extend(op.process_left(lb));
+            out.extend(op.process_left(lb)?);
         }
         if let Some(rb) = right_batches.get(i) {
-            out.extend(op.process_right(rb));
+            out.extend(op.process_right(rb)?);
         }
     }
     op.advance_watermark(final_watermark_ms);
@@ -820,8 +820,8 @@ pub fn execute_window_join_aligned(
     let mut out = AlignedJoinOutput::default();
     for ev in events {
         match ev {
-            JoinStreamEvent::Left(b) => out.joined.extend(op.process_left(&b)),
-            JoinStreamEvent::Right(b) => out.joined.extend(op.process_right(&b)),
+            JoinStreamEvent::Left(b) => out.joined.extend(op.process_left(&b)?),
+            JoinStreamEvent::Right(b) => out.joined.extend(op.process_right(&b)?),
             JoinStreamEvent::Watermark(w) => op.advance_watermark(w),
             JoinStreamEvent::LeftBarrier(epoch) => {
                 if op.record_left_barrier(epoch) == BarrierEvent::Aligned {
@@ -852,10 +852,10 @@ fn snapshot_and_replay_join(
     out.snapshots.push((epoch, bytes));
     let (left, right) = op.take_realigned_input();
     for b in &left {
-        out.joined.extend(op.process_left(b));
+        out.joined.extend(op.process_left(b)?);
     }
     for b in &right {
-        out.joined.extend(op.process_right(b));
+        out.joined.extend(op.process_right(b)?);
     }
     Ok(())
 }

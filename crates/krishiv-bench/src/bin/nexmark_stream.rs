@@ -144,10 +144,98 @@ fn generate_input(query_name: &str) -> (Vec<arrow::record_batch::RecordBatch>, u
 /// stateless per-batch path, exactly as `StreamingEngine::run` would send it
 /// to `run_stateless_bounded`.
 fn measure(query_name: &str, sql: &str) -> RepResult {
+    if krishiv_sql::streaming_join_plan::looks_like_streaming_join(sql) {
+        return measure_join(query_name, sql);
+    }
     if krishiv_sql::streaming_tvf::find_window_tvf(sql).is_none() {
         return measure_stateless(query_name, sql);
     }
     measure_windowed(query_name, sql)
+}
+
+/// Two-source interval-join arm (task #144): both sides pre-generated, fed
+/// alternately through the policy-gated driver, watermark advanced to the
+/// minimum of the two sides' maxima after each round — the same discipline
+/// as the engine's `run_join_bounded`.
+fn measure_join(query_name: &str, sql: &str) -> RepResult {
+    use krishiv_dataflow::stream_driver::JoinSide;
+    use krishiv_dataflow::{WatermarkWindowJoinOperator, WatermarkWindowJoinSpec};
+
+    let plan = krishiv_sql::streaming_join_plan::compile_streaming_join_sql(sql)
+        .unwrap_or_else(|e| panic!("{query_name} must compile: {e}"));
+    let time_column = plan.spec.time_column.clone();
+    let mut op = WatermarkWindowJoinOperator::new(WatermarkWindowJoinSpec::from(&plan.spec));
+    let mut driver = StreamDriver::new(StreamingLoop::EmbeddedJoinBounded);
+
+    // One generator PER SIDE, same seed: each side is the entity-filtered
+    // view of the SAME logical event stream, both starting at ordinal zero —
+    // the way a real source splits one NEXMark stream by entity. A single
+    // shared generator would put the second side's events (and its sampled
+    // id references) millions of ordinals after the first side's, making the
+    // two sides' id spaces and event times disjoint and every join empty.
+    let side_batches = |source: &str| -> Vec<arrow::record_batch::RecordBatch> {
+        let mut generator = NexmarkGenerator::new(0x4E45_584D, 1_000_000, 0, MAX_LATENESS_MS);
+        (0..BATCHES)
+            .map(|_| match source {
+                "bid" => generator.next_bid_batch(BATCH_ROWS),
+                "auction" => generator.next_auction_batch(BATCH_ROWS),
+                "person" => generator.next_person_batch(BATCH_ROWS),
+                other => panic!("{query_name}: no generator for join source '{other}'"),
+            })
+            .map(|r| r.unwrap_or_else(|e| panic!("{query_name} generator: {e}")))
+            .collect()
+    };
+    let left = side_batches(&plan.spec.left_source);
+    let right = side_batches(&plan.spec.right_source);
+    let rows_in: usize = left.iter().chain(right.iter()).map(|b| b.num_rows()).sum();
+
+    let max_ts = |b: &arrow::record_batch::RecordBatch| -> i64 {
+        let idx = b
+            .schema()
+            .index_of(&time_column)
+            .unwrap_or_else(|_| panic!("{query_name}: time column missing"));
+        let arr = b
+            .column(idx)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap_or_else(|| panic!("{query_name}: time column not Int64"));
+        (0..arr.len())
+            .map(|i| arr.value(i))
+            .max()
+            .unwrap_or(i64::MIN)
+    };
+
+    let mut per_batch_us: Vec<u128> = Vec::with_capacity(BATCHES * 2);
+    let mut rows_out = 0usize;
+    let (mut left_max, mut right_max) = (i64::MIN, i64::MIN);
+    let started = Instant::now();
+    for (l, r) in left.into_iter().zip(right) {
+        let t0 = Instant::now();
+        left_max = left_max.max(max_ts(&l));
+        let out = driver
+            .on_join_input(&mut op, JoinSide::Left, &l)
+            .unwrap_or_else(|e| panic!("{query_name} left: {e}"));
+        rows_out += out.iter().map(|b| b.num_rows()).sum::<usize>();
+        per_batch_us.push(t0.elapsed().as_micros());
+
+        let t1 = Instant::now();
+        right_max = right_max.max(max_ts(&r));
+        let out = driver
+            .on_join_input(&mut op, JoinSide::Right, &r)
+            .unwrap_or_else(|e| panic!("{query_name} right: {e}"));
+        rows_out += out.iter().map(|b| b.num_rows()).sum::<usize>();
+        per_batch_us.push(t1.elapsed().as_micros());
+
+        driver.on_join_watermark(&mut op, left_max.min(right_max));
+    }
+    let elapsed = started.elapsed();
+
+    RepResult {
+        rows_in,
+        rows_out,
+        events_per_sec: rows_in as f64 / elapsed.as_secs_f64(),
+        per_batch_us,
+    }
 }
 
 /// Stateless arm: the cached-context executor the production stateless loops

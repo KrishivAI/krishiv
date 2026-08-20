@@ -233,6 +233,12 @@ pub enum StreamingLoop {
     /// `execute_run_loop_fragment` — long-lived run-loop (`stream:rloop:`), with
     /// key-group routing across peers and barrier checkpoints.
     RunLoop,
+    /// `run_join_bounded` — embedded, bounded, two-input interval join (task
+    /// #144). Reads both sources to exhaustion; matches emit on arrival, so
+    /// end-of-stream has nothing to flush — an interval join's residue is
+    /// unmatched buffered events that will never produce output, which is not
+    /// an open window.
+    EmbeddedJoinBounded,
 }
 
 impl StreamingLoop {
@@ -251,7 +257,7 @@ impl StreamingLoop {
     /// The residual exposure is a policy that contradicts itself in a loop
     /// nobody listed, which the cross-loop corpus would still catch the moment
     /// it changed output.
-    pub const VARIANT_COUNT: usize = 5;
+    pub const VARIANT_COUNT: usize = 6;
 
     /// Every variant, in [`StreamingLoop::ordinal`] order.
     pub const ALL: &'static [StreamingLoop] = &[
@@ -260,6 +266,7 @@ impl StreamingLoop {
         StreamingLoop::RuntimeSeam,
         StreamingLoop::Cycle,
         StreamingLoop::RunLoop,
+        StreamingLoop::EmbeddedJoinBounded,
     ];
 
     /// This loop's answers.
@@ -322,6 +329,20 @@ impl StreamingLoop {
                 egress: Egress::CappedDropOldest,
                 null_key: NullKey::QuarantineAndCount,
             },
+            // Bounded two-input join: reads both sources to exhaustion.
+            // NoFlush because matches emit on ARRIVAL — the buffered residue
+            // is unmatched events that will never match, not open windows,
+            // and publishing them would fabricate output. Input arrives
+            // pre-typed from the join sources (there is no WindowExecutionSpec
+            // to coerce against — a join has no window vocabulary).
+            StreamingLoop::EmbeddedJoinBounded => DriverPolicy {
+                idle_tick: IdleTick::None,
+                end_of_stream: EndOfStream::NoFlush,
+                input_typing: InputTyping::PreCoerced,
+                lifecycle: Lifecycle::OwnsWholeJob,
+                egress: Egress::Backpressure,
+                null_key: NullKey::Fatal,
+            },
         }
     }
 
@@ -337,6 +358,7 @@ impl StreamingLoop {
             StreamingLoop::RuntimeSeam => 2,
             StreamingLoop::Cycle => 3,
             StreamingLoop::RunLoop => 4,
+            StreamingLoop::EmbeddedJoinBounded => 5,
         }
     }
 
@@ -349,6 +371,7 @@ impl StreamingLoop {
             StreamingLoop::RuntimeSeam => "runtime-seam",
             StreamingLoop::Cycle => "cycle",
             StreamingLoop::RunLoop => "run-loop",
+            StreamingLoop::EmbeddedJoinBounded => "embedded-join-bounded",
         }
     }
 }
@@ -712,6 +735,80 @@ pub enum StopOutcome {
 // ─────────────────────────────────────────────────────────────────────────────
 // The driver
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// The two-input seam a joining operator exposes to [`StreamDriver`]
+/// (task #144).
+///
+/// Deliberately NOT [`WindowStep`]: `spec()`, `tick`, `flush`, and
+/// `has_open_windows` are window vocabulary with no join meaning, and forcing
+/// a join through them would require a fake `WindowExecutionSpec` that
+/// `coerce_batch_for_window` would then apply to the wrong columns.
+pub trait TwoInputStep {
+    /// Feed one batch from the LEFT source; matches emit immediately.
+    fn step_left(&mut self, batch: &RecordBatch) -> ExecResult<Vec<RecordBatch>>;
+    /// Feed one batch from the RIGHT source; matches emit immediately.
+    fn step_right(&mut self, batch: &RecordBatch) -> ExecResult<Vec<RecordBatch>>;
+    /// Advance the join watermark, evicting state the band can no longer
+    /// reach.
+    fn advance_watermark(&mut self, watermark_ms: i64);
+    /// Buffered rows on both sides — observability, not a flush precondition.
+    fn buffered_rows(&self) -> usize;
+}
+
+/// Which side of a two-input join a batch belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinSide {
+    Left,
+    Right,
+}
+
+impl StreamDriver {
+    /// Feed one batch into one SIDE of a two-input join operator.
+    ///
+    /// The policy gate: only a loop whose declared `InputTyping` is
+    /// `PreCoerced` may drive a join — there is no `WindowExecutionSpec` to
+    /// coerce against, so a `CoerceToSpec` loop calling this would be
+    /// claiming a typing step it cannot perform.
+    pub fn on_join_input<W: TwoInputStep + ?Sized>(
+        &mut self,
+        exec: &mut W,
+        side: JoinSide,
+        batch: &RecordBatch,
+    ) -> ExecResult<Vec<RecordBatch>> {
+        if !matches!(self.loop_id.policy().input_typing, InputTyping::PreCoerced) {
+            return Err(ExecError::InvalidInput(format!(
+                "loop '{}' declares InputTyping::CoerceToSpec and cannot drive a join: a join \
+                 has no window spec to coerce against",
+                self.loop_id.name()
+            )));
+        }
+        match side {
+            JoinSide::Left => exec.step_left(batch),
+            JoinSide::Right => exec.step_right(batch),
+        }
+    }
+
+    /// Advance the join watermark through the driver, keeping the eviction
+    /// call on the same policy-checked surface as input.
+    pub fn on_join_watermark<W: TwoInputStep + ?Sized>(&mut self, exec: &mut W, watermark_ms: i64) {
+        exec.advance_watermark(watermark_ms);
+    }
+}
+
+impl TwoInputStep for crate::watermark_join::WatermarkWindowJoinOperator {
+    fn step_left(&mut self, batch: &RecordBatch) -> ExecResult<Vec<RecordBatch>> {
+        self.process_left(batch)
+    }
+    fn step_right(&mut self, batch: &RecordBatch) -> ExecResult<Vec<RecordBatch>> {
+        self.process_right(batch)
+    }
+    fn advance_watermark(&mut self, watermark_ms: i64) {
+        crate::watermark_join::WatermarkWindowJoinOperator::advance_watermark(self, watermark_ms);
+    }
+    fn buffered_rows(&self) -> usize {
+        self.active_key_count()
+    }
+}
 
 /// The per-loop policy kernel.
 ///

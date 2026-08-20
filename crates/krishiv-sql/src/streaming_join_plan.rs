@@ -56,7 +56,55 @@ pub fn looks_like_streaming_join(sql: &str) -> bool {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
-    select.from.len() == 1 && select.from.first().is_some_and(|f| !f.joins.is_empty())
+    let has_join =
+        select.from.len() == 1 && select.from.first().is_some_and(|f| !f.joins.is_empty());
+    if !has_join {
+        return false;
+    }
+    // The event-time BETWEEN band is what makes a join a STREAM-STREAM
+    // interval join. A join without one is a different shape — a side-input
+    // join against bounded reference data, which the stateless per-batch path
+    // handles (task #143) — and routing it here would refuse a query that
+    // runs fine elsewhere. Still shape, not validity: a malformed band gets
+    // THIS compiler's error about the band, not another engine's error about
+    // an unknown table.
+    select
+        .from
+        .first()
+        .map(|f| &f.joins)
+        .into_iter()
+        .flatten()
+        .any(|j| match &j.join_operator {
+            // ANY join kind counts: a banded LEFT JOIN must be claimed so the
+            // "INNER only" refusal a user sees is THIS compiler's, not a
+            // stateless-path error about an unknown table.
+            JoinOperator::Inner(JoinConstraint::On(expr))
+            | JoinOperator::Join(JoinConstraint::On(expr))
+            | JoinOperator::Left(JoinConstraint::On(expr))
+            | JoinOperator::Right(JoinConstraint::On(expr))
+            | JoinOperator::Semi(JoinConstraint::On(expr))
+            | JoinOperator::Anti(JoinConstraint::On(expr))
+            | JoinOperator::LeftOuter(JoinConstraint::On(expr))
+            | JoinOperator::RightOuter(JoinConstraint::On(expr))
+            | JoinOperator::FullOuter(JoinConstraint::On(expr))
+            | JoinOperator::LeftSemi(JoinConstraint::On(expr))
+            | JoinOperator::RightSemi(JoinConstraint::On(expr))
+            | JoinOperator::LeftAnti(JoinConstraint::On(expr))
+            | JoinOperator::RightAnti(JoinConstraint::On(expr)) => expr_contains_between(expr),
+            _ => false,
+        })
+}
+
+/// Does the expression tree contain a BETWEEN anywhere?
+fn expr_contains_between(expr: &Expr) -> bool {
+    match expr {
+        Expr::Between { .. } => true,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_between(left) || expr_contains_between(right)
+        }
+        Expr::Nested(inner) => expr_contains_between(inner),
+        _ => false,
+    }
 }
 
 /// Compile the join form.
@@ -71,6 +119,25 @@ pub fn compile_streaming_join_sql(sql: &str) -> SqlResult<StreamingJoinPlan> {
         return Err(unsupported("streaming join expects a single SELECT query"));
     };
     let select = extract_select(query.as_ref())?;
+
+    // Fail closed on clauses this compiler does not lower (§39 A1): a clause
+    // accepted-but-ignored is a silent wrong answer, the defect class the
+    // register exists to remove.
+    if select.selection.is_some() {
+        return Err(unsupported(
+            "streaming joins do not apply WHERE yet: the predicate would be silently \
+             dropped and every non-matching row would join anyway. Filter the stream \
+             before the join (stateless path) or filter the join output",
+        ));
+    }
+    if query.order_by.is_some() || query.limit_clause.is_some() || query.fetch.is_some() {
+        return Err(unsupported(
+            "streaming joins do not support ORDER BY / LIMIT / FETCH",
+        ));
+    }
+    if query.with.is_some() {
+        return Err(unsupported("streaming joins do not support WITH / CTEs"));
+    }
 
     if select.from.len() != 1 {
         return Err(unsupported(
@@ -437,14 +504,30 @@ mod tests {
     /// A malformed join must still reach this compiler and produce ITS error;
     /// routing on validity would send it to another engine whose message would
     /// describe a different problem. That is the f022220 lesson.
+    ///
+    /// The shape discriminator is the event-time BETWEEN band (task #144): a
+    /// join WITHOUT one is the side-input shape the stateless path handles
+    /// (task #143), so it must NOT be claimed here — that is asserted below,
+    /// not merely tolerated.
     #[test]
     fn routing_recognises_a_join_it_would_refuse() {
-        let malformed = "SELECT * FROM bid b LEFT JOIN auction a ON b.auction = a.id";
+        // Malformed for THIS compiler (LEFT is refused), but it carries the
+        // band, so the shape is a streaming join and the refusal must be ours.
+        let malformed = "SELECT * FROM bid b LEFT JOIN auction a ON b.auction = a.id \
+                         AND b.ts BETWEEN a.ts - 1000 AND a.ts + 1000";
         assert!(
             looks_like_streaming_join(malformed),
             "routing must claim this query so its own error is the one the user sees"
         );
         assert!(compile_streaming_join_sql(malformed).is_err());
+
+        // A band-less join is the SIDE-INPUT shape and belongs to the
+        // stateless path; claiming it here would refuse a query that runs
+        // fine there.
+        assert!(
+            !looks_like_streaming_join("SELECT b.v, s.label FROM bid b JOIN side s ON b.v = s.k"),
+            "a join with no event-time band is not a stream-stream join"
+        );
 
         assert!(
             !looks_like_streaming_join(
