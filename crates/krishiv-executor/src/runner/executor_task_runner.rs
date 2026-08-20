@@ -331,6 +331,15 @@ pub struct ExecutorTaskRunner {
     /// job-wide ranges.
     pub(crate) rloop_parallelism: Arc<DashMap<String, usize>>,
 
+    /// `stream:rbatch:` stateless executors, keyed by `rloop_state_key`
+    /// (task #147).
+    pub(crate) stateless_executors: Arc<
+        DashMap<
+            String,
+            Arc<tokio::sync::Mutex<krishiv_sql::stateless_exec::StatelessBatchExecutor>>,
+        >,
+    >,
+
     /// Phase 57 (AUD-6): executor-resident IVM flows, keyed by IVM job id.
     /// State attaches once; every tick afterwards feeds deltas into the same
     /// warm flow (cached ctx + compiled plans + operator accumulators) and
@@ -443,6 +452,7 @@ impl ExecutorTaskRunner {
             continuous_egress_dropped: Arc::new(DashMap::new()),
             continuous_null_key_rows: Arc::new(DashMap::new()),
             join_executors: Arc::new(DashMap::new()),
+            stateless_executors: Arc::new(DashMap::new()),
             stream_exchange: crate::stream_exchange::StreamExchange::default(),
             own_task_endpoint: None,
             barrier_context: None,

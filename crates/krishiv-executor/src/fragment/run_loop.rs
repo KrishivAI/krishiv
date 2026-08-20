@@ -58,11 +58,11 @@ use krishiv_plan::window::decode_window_execution_spec;
 pub const STREAM_RLOOP_PREFIX: &str = "stream:rloop:";
 
 /// Idle safety floor for the notify wake path (µs), mirroring the embedded loop.
-const RLOOP_IDLE_FLOOR_US: u64 = 50;
+pub(crate) const RLOOP_IDLE_FLOOR_US: u64 = 50;
 
 /// How long a source split may stay silent before it is treated as idle for
 /// watermark min-combining (`KRISHIV_WATERMARK_IDLE_MS`, default 30 000).
-fn watermark_idleness() -> Duration {
+pub(crate) fn watermark_idleness() -> Duration {
     let ms = std::env::var("KRISHIV_WATERMARK_IDLE_MS")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -520,10 +520,23 @@ async fn deliver_to_peer(
     peer: &RloopPeer,
     batches: Vec<RecordBatch>,
 ) -> ExecutorResult<()> {
+    deliver_to_peer_suffixed(runner, job_id, peer, batches, "").await
+}
+
+/// Peer delivery with a side suffix on the input key (task #147): a join
+/// exchange must land rows on the peer's `#L` / `#R` buffer so side
+/// identity survives the hop. The window exchange passes `""`.
+pub(crate) async fn deliver_to_peer_suffixed(
+    runner: &ExecutorTaskRunner,
+    job_id: &str,
+    peer: &RloopPeer,
+    batches: Vec<RecordBatch>,
+    suffix: &str,
+) -> ExecutorResult<()> {
     if batches.is_empty() {
         return Ok(());
     }
-    let peer_key = format!("{job_id}#{}", peer.task_id);
+    let peer_key = format!("{job_id}#{}{suffix}", peer.task_id);
     let is_local = runner
         .own_task_endpoint
         .as_deref()
@@ -537,10 +550,107 @@ async fn deliver_to_peer(
         runner.notify_continuous_input(&peer_key);
         return Ok(());
     }
+    // The remote leg must carry the suffix IN the task id: the receiving
+    // executor rebuilds the buffer key as `{job}#{request.task_id}`, so a
+    // bare task id here would land side-tagged rows on the untagged buffer
+    // and silently erase the side.
+    let target_task = format!("{}{suffix}", peer.task_id);
     runner
         .stream_exchange
-        .send(job_id, &peer.task_id, &peer.endpoint, batches)
+        .send(job_id, &target_task, &peer.endpoint, batches)
         .await
+}
+
+/// Open-or-reattach one owned registry split, read every ready batch through
+/// `on_batch`, and upsert its checkpoint offset. Factored from the rloop body
+/// so the classed loops (`stream:rjoin:`/`stream:rbatch:`) share the exact
+/// open/restore/read/offset discipline instead of a drifting copy.
+pub(crate) async fn read_owned_split(
+    runner: &ExecutorTaskRunner,
+    job_id: &str,
+    state_key: &str,
+    spec: &crate::fragment::common::RegistryPartitionSpec,
+    source_cache: &crate::runner::SharedContinuousConnectorSources,
+    assignment: &ExecutorTaskAssignment,
+    mut on_batch: impl FnMut(RecordBatch) -> ExecutorResult<()>,
+) -> ExecutorResult<()> {
+    let source_key = spec.continuous_source_key(state_key);
+    let source_arc = if let Some(entry) = source_cache.get(&source_key) {
+        Arc::clone(entry.value())
+    } else {
+        let mut source = runner
+            .connector_registry
+            .open_source(&spec.connector_config)
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!(
+                    "stream:rloop source open failed for kind '{}' table '{}' \
+                     partition '{}': {e}",
+                    spec.kind, spec.table_name, spec.partition_id
+                ),
+            })?;
+        // Read the restore table HERE, not once before the loop.
+        //
+        // A `RestoreFromCheckpointCommand` arriving mid-run rewrites
+        // `runner.source_restore_offsets` and then calls
+        // `clear_continuous_connector_sources_for_job`, which evicts this
+        // subtask's cached sources (they key on `{job}#{subtask}`). The
+        // next iteration therefore lands right here and reopens them — so
+        // a snapshot taken at loop start would re-apply the *pre-restore*
+        // offsets and resume the subtask from the wrong position, quietly
+        // replaying or skipping records. The cycle model never had this:
+        // `read_continuous_registry_sources` is called per cycle and so
+        // reads the table fresh every time.
+        let restored_source_offsets = runner
+            .source_restore_offsets
+            .get(job_id)
+            .map(|entry| entry.clone())
+            .unwrap_or_default();
+        let restored =
+            (!restored_source_offsets.is_empty()).then_some(restored_source_offsets.as_slice());
+        if let Some(offset) = spec.restored_offset(restored) {
+            source
+                .restore_encoded_checkpoint_offset_dyn(&offset.encoded_offset)
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: format!(
+                        "stream:rloop source restore failed for partition '{}': {e}",
+                        spec.partition_id
+                    ),
+                })?;
+        }
+        let opened = Arc::new(tokio::sync::Mutex::new(source));
+        let entry = source_cache
+            .entry(source_key)
+            .or_insert_with(|| Arc::clone(&opened));
+        Arc::clone(entry.value())
+    };
+    let mut source = source_arc.lock().await;
+    while let Some(batch) =
+        source
+            .read_batch_dyn()
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!(
+                    "stream:rloop source read failed for partition '{}': {e}",
+                    spec.partition_id
+                ),
+            })?
+    {
+        on_batch(batch)?;
+    }
+    if let Some(offset) = checkpoint_offset_from_dyn_source(spec, source.as_ref())? {
+        let task_id_typed = assignment.task_id().clone();
+        runner
+            .checkpoint_runners
+            .entry(task_id_typed.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(crate::runner::TaskRunner::new(task_id_typed))))
+            .lock()
+            .map_err(|_| ExecutorError::LocalExecution {
+                message: "stream:rloop checkpoint runner lock poisoned".into(),
+            })?
+            .upsert_source_offset(offset);
+    }
+    Ok(())
 }
 
 /// Execute one `stream:rloop:` fragment: the long-lived promoted run-loop.
@@ -799,95 +909,27 @@ pub(crate) async fn execute_run_loop_fragment(
             }
         }
 
-        // Owned registry connector splits (the source-owning seam).
+        // Owned registry connector splits (the source-owning seam), through the
+        // ONE shared reader (task #147 factored it so the classed loops cannot
+        // drift from this one — the sibling-defect rule).
         for spec in &owned_specs {
-            let source_key = spec.continuous_source_key(&state_key);
-            let source_arc = if let Some(entry) = source_cache.get(&source_key) {
-                Arc::clone(entry.value())
-            } else {
-                let mut source = runner
-                    .connector_registry
-                    .open_source(&spec.connector_config)
-                    .await
-                    .map_err(|e| ExecutorError::LocalExecution {
-                        message: format!(
-                            "stream:rloop source open failed for kind '{}' table '{}' \
-                             partition '{}': {e}",
-                            spec.kind, spec.table_name, spec.partition_id
-                        ),
-                    })?;
-                // Read the restore table HERE, not once before the loop.
-                //
-                // A `RestoreFromCheckpointCommand` arriving mid-run rewrites
-                // `runner.source_restore_offsets` and then calls
-                // `clear_continuous_connector_sources_for_job`, which evicts this
-                // subtask's cached sources (they key on `{job}#{subtask}`). The
-                // next iteration therefore lands right here and reopens them — so
-                // a snapshot taken at loop start would re-apply the *pre-restore*
-                // offsets and resume the subtask from the wrong position, quietly
-                // replaying or skipping records. The cycle model never had this:
-                // `read_continuous_registry_sources` is called per cycle and so
-                // reads the table fresh every time.
-                let restored_source_offsets = runner
-                    .source_restore_offsets
-                    .get(job_id)
-                    .map(|entry| entry.clone())
-                    .unwrap_or_default();
-                let restored = (!restored_source_offsets.is_empty())
-                    .then_some(restored_source_offsets.as_slice());
-                if let Some(offset) = spec.restored_offset(restored) {
-                    source
-                        .restore_encoded_checkpoint_offset_dyn(&offset.encoded_offset)
-                        .map_err(|e| ExecutorError::LocalExecution {
-                            message: format!(
-                                "stream:rloop source restore failed for partition '{}': {e}",
-                                spec.partition_id
-                            ),
-                        })?;
-                }
-                let opened = Arc::new(tokio::sync::Mutex::new(source));
-                let entry = source_cache
-                    .entry(source_key)
-                    .or_insert_with(|| Arc::clone(&opened));
-                Arc::clone(entry.value())
-            };
-            let mut source = source_arc.lock().await;
-            while let Some(batch) =
-                source
-                    .read_batch_dyn()
-                    .await
-                    .map_err(|e| ExecutorError::LocalExecution {
-                        message: format!(
-                            "stream:rloop source read failed for partition '{}': {e}",
-                            spec.partition_id
-                        ),
-                    })?
-            {
-                // Registry connector sources (notably Kafka JSON) decode every
-                // field as Utf8; the windowed operator requires an Int64/Timestamp
-                // event time and numeric aggregate inputs. Coerce to the spec's
-                // column types before watermark extraction and the drain — a
-                // no-op for already-typed sources.
-                let batch = coerce_batch_for_window(&batch, &window_spec)?;
-                if let Some(ts) = batch_max_event_time(&batch, &event_time_column) {
-                    split_watermarks.observe(&spec.partition_id, ts);
-                }
-                input.push(batch);
-            }
-            if let Some(offset) = checkpoint_offset_from_dyn_source(spec, source.as_ref())? {
-                let task_id_typed = assignment.task_id().clone();
-                runner
-                    .checkpoint_runners
-                    .entry(task_id_typed.clone())
-                    .or_insert_with(|| {
-                        Arc::new(Mutex::new(crate::runner::TaskRunner::new(task_id_typed)))
-                    })
-                    .lock()
-                    .map_err(|_| ExecutorError::LocalExecution {
-                        message: "stream:rloop checkpoint runner lock poisoned".into(),
-                    })?
-                    .upsert_source_offset(offset);
-            }
+            read_owned_split(
+                runner,
+                job_id,
+                &state_key,
+                spec,
+                &source_cache,
+                assignment,
+                |batch| {
+                    let batch = coerce_batch_for_window(&batch, &window_spec)?;
+                    if let Some(ts) = batch_max_event_time(&batch, &event_time_column) {
+                        split_watermarks.observe(&spec.partition_id, ts);
+                    }
+                    input.push(batch);
+                    Ok(())
+                },
+            )
+            .await?;
         }
 
         // ST-4 idle tick: close session windows whose inactivity gap elapsed.

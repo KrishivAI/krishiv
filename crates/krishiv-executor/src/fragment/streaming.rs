@@ -1139,6 +1139,18 @@ pub(crate) async fn execute_streaming_fragment(
 
     // Phase 55: stream:rloop: fragments run the promoted long-lived loop —
     // the task launches once, owns its splits, and exits only on cancel.
+    if fragment.starts_with(crate::fragment::run_loop_classes::STREAM_RJOIN_PREFIX) {
+        return crate::erased(crate::fragment::run_loop_classes::execute_rjoin_fragment(
+            runner, assignment, fragment,
+        ))
+        .await;
+    }
+    if fragment.starts_with(crate::fragment::run_loop_classes::STREAM_RBATCH_PREFIX) {
+        return crate::erased(crate::fragment::run_loop_classes::execute_rbatch_fragment(
+            runner, assignment, fragment,
+        ))
+        .await;
+    }
     if fragment.starts_with(crate::fragment::run_loop::STREAM_RLOOP_PREFIX) {
         return crate::erased(crate::fragment::run_loop::execute_run_loop_fragment(
             runner, assignment, fragment,
