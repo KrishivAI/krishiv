@@ -1120,7 +1120,16 @@ async fn push_run_loop_input(
         ))
     })?
     .map_err(|status| {
-        ContinuousStreamError::Unavailable(format!("run-loop push to {endpoint} failed: {status}"))
+        if status.code() == tonic::Code::ResourceExhausted {
+            ContinuousStreamError::Backpressure(format!(
+                "run-loop push to {endpoint} rejected: {}",
+                status.message()
+            ))
+        } else {
+            ContinuousStreamError::Unavailable(format!(
+                "run-loop push to {endpoint} failed: {status}"
+            ))
+        }
     })?;
     Ok(())
 }
@@ -1333,6 +1342,9 @@ pub async fn api_continuous_push(
             .await
             .map_err(|error| match error {
                 ContinuousStreamError::Scheduler(e) => scheduler_error_response(&e),
+                backpressure @ ContinuousStreamError::Backpressure(_) => {
+                    (StatusCode::TOO_MANY_REQUESTS, backpressure.to_string())
+                }
                 other => (StatusCode::SERVICE_UNAVAILABLE, other.to_string()),
             })?;
         return Ok(Json(ContinuousPushResponse { success: true }));
@@ -1504,6 +1516,11 @@ pub enum ContinuousStreamError {
     Scheduler(crate::SchedulerError),
     /// The push cycle was aborted (e.g., no executor available).
     Unavailable(String),
+    /// The target executor's continuous input buffer is full: flow control,
+    /// not failure. Maps to HTTP 429 so producers back off and retry instead
+    /// of treating the push as dead (a plain 503 is indistinguishable from
+    /// "no executors" and turns ordinary backpressure into a hard error).
+    Backpressure(String),
     /// A cycle was aborted because it conflicted with the current state.
     Aborted(String),
 }
@@ -1513,6 +1530,7 @@ impl std::fmt::Display for ContinuousStreamError {
         match self {
             Self::Scheduler(e) => write!(f, "scheduler error: {e}"),
             Self::Unavailable(msg) => write!(f, "unavailable: {msg}"),
+            Self::Backpressure(msg) => write!(f, "backpressure: {msg}"),
             Self::Aborted(msg) => write!(f, "aborted: {msg}"),
         }
     }

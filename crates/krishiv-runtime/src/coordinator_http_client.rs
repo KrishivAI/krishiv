@@ -67,6 +67,23 @@ fn seg(value: &str) -> String {
     urlencoding::encode(value).into_owned()
 }
 
+/// Fold a non-success coordinator HTTP response into a transport error that
+/// carries the response body. The coordinator puts the actual refusal reason
+/// in the body ("run-loop job X has no launched subtasks to push to",
+/// "unknown job ..."); an error that reports only the status code turns a
+/// one-line diagnosis into a cluster-side log hunt.
+async fn transport_error_with_body(prefix: String, response: reqwest::Response) -> RuntimeError {
+    const MAX_BODY_CHARS: usize = 600;
+    let body = response.text().await.unwrap_or_default();
+    let body = body.trim();
+    if body.is_empty() {
+        RuntimeError::transport(prefix)
+    } else {
+        let snippet: String = body.chars().take(MAX_BODY_CHARS).collect();
+        RuntimeError::transport(format!("{prefix}: {snippet}"))
+    }
+}
+
 fn normalize_http_base(url: &str) -> RuntimeResult<String> {
     let trimmed = url.trim().trim_end_matches('/');
     if trimmed.is_empty() {
@@ -198,10 +215,11 @@ async fn poll_batch_sql_job(
             .await
             .map_err(|e| RuntimeError::transport(format!("batch-sql poll failed: {e}")))?;
         if !poll_resp.status().is_success() {
-            return Err(RuntimeError::transport(format!(
-                "batch-sql poll HTTP {} from {poll_url}",
-                poll_resp.status()
-            )));
+            return Err(transport_error_with_body(
+                format!("batch-sql poll HTTP {} from {poll_url}", poll_resp.status()),
+                poll_resp,
+            )
+            .await);
         }
         let resp_bytes = poll_resp
             .bytes()
@@ -283,10 +301,14 @@ pub async fn execute_coordinator_batch_sql(
         .map_err(|e| RuntimeError::transport(format!("batch-sql submit failed: {e}")))?;
 
     if !submit_resp.status().is_success() {
-        return Err(RuntimeError::transport(format!(
-            "transport error: batch-sql HTTP {} from {submit_url}",
-            submit_resp.status()
-        )));
+        return Err(transport_error_with_body(
+            format!(
+                "transport error: batch-sql HTTP {} from {submit_url}",
+                submit_resp.status()
+            ),
+            submit_resp,
+        )
+        .await);
     }
 
     #[derive(serde::Deserialize)]
@@ -322,10 +344,14 @@ pub async fn execute_coordinator_batch_sql_result(
         .await
         .map_err(|e| RuntimeError::transport(format!("batch-sql result poll failed: {e}")))?;
     if !poll_resp.status().is_success() {
-        return Err(RuntimeError::transport(format!(
-            "batch-sql result poll HTTP {} from {poll_url}",
-            poll_resp.status()
-        )));
+        return Err(transport_error_with_body(
+            format!(
+                "batch-sql result poll HTTP {} from {poll_url}",
+                poll_resp.status()
+            ),
+            poll_resp,
+        )
+        .await);
     }
     let resp_bytes = poll_resp
         .bytes()
@@ -376,10 +402,14 @@ pub async fn execute_coordinator_batch_sql_inline(
         .map_err(|e| RuntimeError::transport(format!("batch-sql submit failed: {e}")))?;
 
     if !submit_resp.status().is_success() {
-        return Err(RuntimeError::transport(format!(
-            "transport error: batch-sql HTTP {} from {submit_url}",
-            submit_resp.status()
-        )));
+        return Err(transport_error_with_body(
+            format!(
+                "transport error: batch-sql HTTP {} from {submit_url}",
+                submit_resp.status()
+            ),
+            submit_resp,
+        )
+        .await);
     }
 
     #[derive(serde::Deserialize)]
@@ -437,10 +467,11 @@ pub async fn execute_coordinator_bounded_window(
         .map_err(|e| RuntimeError::transport(format!("bounded-window HTTP request failed: {e}")))?;
 
     if !response.status().is_success() {
-        return Err(RuntimeError::transport(format!(
-            "bounded-window HTTP {} from {url}",
-            response.status()
-        )));
+        return Err(transport_error_with_body(
+            format!("bounded-window HTTP {} from {url}", response.status()),
+            response,
+        )
+        .await);
     }
 
     let resp_bytes = response
@@ -799,6 +830,134 @@ mod tests {
             other => panic!("expected succeeded result, got {other:?}"),
         }
     }
+
+    /// One-shot HTTP server: accepts a single connection, captures the request
+    /// head, answers with the given status line and body, and closes.
+    async fn one_shot_http(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 65536];
+            let mut request = Vec::new();
+            loop {
+                let n = stream.read(&mut buf).await.expect("read");
+                request.extend_from_slice(&buf[..n]);
+                if n == 0 || request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.expect("write");
+            stream.shutdown().await.ok();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn one_row_batch() -> arrow::record_batch::RecordBatch {
+        use std::sync::Arc as SArc;
+        let schema = SArc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, false),
+        ]));
+        arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![SArc::new(arrow::array::Int64Array::from(vec![1_i64]))],
+        )
+        .expect("batch")
+    }
+
+    /// The coordinator's refusal reason travels in the HTTP body ("run-loop
+    /// job X has no launched subtasks to push to"). A push error that reports
+    /// only "HTTP 503" sends the operator on a cluster-side log hunt — the
+    /// live k3s benchmark run died exactly this way. The client must fold the
+    /// body into the error.
+    #[tokio::test]
+    async fn push_error_carries_the_coordinator_refusal_body() {
+        let (url, _server) = one_shot_http(
+            "503 Service Unavailable",
+            "run-loop job j has no launched subtasks to push to",
+        )
+        .await;
+        let error = super::execute_coordinator_continuous_push(&url, "j", &[one_row_batch()])
+            .await
+            .expect_err("503 must fail the push")
+            .to_string();
+        assert!(
+            error.contains("no launched subtasks to push to"),
+            "the error must carry the coordinator body, got: {error}"
+        );
+        assert!(error.contains("503"), "and still name the status: {error}");
+    }
+
+    /// 429 is the coordinator's backpressure signal — the run loop's input
+    /// buffer is full and will drain. A producer that treats it as fatal
+    /// (the pre-fix client) kills a healthy benchmark/ingest run the moment
+    /// the loop falls one buffer behind; the client must back off and retry.
+    #[tokio::test]
+    async fn push_backs_off_and_retries_on_429_backpressure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let scripted = [
+                ("429 Too Many Requests", "backpressure: input buffer full"),
+                ("429 Too Many Requests", "backpressure: input buffer full"),
+                ("200 OK", "{\"success\":true}"),
+            ];
+            for (status_line, body) in scripted {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = vec![0u8; 65536];
+                let mut request = Vec::new();
+                loop {
+                    let n = stream.read(&mut buf).await.expect("read");
+                    request.extend_from_slice(&buf[..n]);
+                    if n == 0 || request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.expect("write");
+                stream.shutdown().await.ok();
+            }
+        });
+        super::execute_coordinator_continuous_push(&url, "j", &[one_row_batch()])
+            .await
+            .expect("push must ride out transient backpressure");
+        server.await.expect("server served all three exchanges");
+    }
+
+    /// Deregister must issue DELETE against the job resource — the teardown
+    /// that frees the job's executor slots. (A benchmark loop that never
+    /// deregisters exhausts a 3x3-slot cluster after three parallelism-3
+    /// jobs; this client call is what makes the loop lifecycle possible.)
+    #[tokio::test]
+    async fn deregister_sends_delete_to_the_job_resource() {
+        let (url, server) = one_shot_http("200 OK", "{\"cancelled\":true}").await;
+        super::execute_coordinator_continuous_deregister(&url, "nexd-q1-0")
+            .await
+            .expect("deregister succeeds");
+        let request = server.await.expect("server");
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(
+            request_line.starts_with("DELETE /api/v1/continuous/nexd-q1-0 "),
+            "expected DELETE on the job resource, got: {request_line}"
+        );
+    }
 }
 
 // ── Continuous Streaming ───────────────────────────────────────────────────────
@@ -1052,10 +1211,11 @@ pub async fn execute_coordinator_continuous_register_task(
         .await
         .map_err(|e| RuntimeError::transport(format!("continuous-register request failed: {e}")))?;
     if !response.status().is_success() {
-        return Err(RuntimeError::transport(format!(
-            "continuous-register HTTP {} from {url}",
-            response.status()
-        )));
+        return Err(transport_error_with_body(
+            format!("continuous-register HTTP {} from {url}", response.status()),
+            response,
+        )
+        .await);
     }
     let ack = response
         .json::<ContinuousRegisterAck>()
@@ -1108,10 +1268,11 @@ pub async fn execute_coordinator_continuous_register(
         .map_err(|e| RuntimeError::transport(format!("continuous-register request failed: {e}")))?;
 
     if !response.status().is_success() {
-        return Err(RuntimeError::transport(format!(
-            "continuous-register HTTP {} from {url}",
-            response.status()
-        )));
+        return Err(transport_error_with_body(
+            format!("continuous-register HTTP {} from {url}", response.status()),
+            response,
+        )
+        .await);
     }
     // Fail fast on an unparseable body only when we actually need the echo:
     // a default registration against any coordinator, old or new, is already
@@ -1126,6 +1287,44 @@ pub async fn execute_coordinator_continuous_register(
 }
 
 /// Side-tagged push for two-source run-loop jobs (task #147).
+/// POST a continuous push with backpressure-aware retry. HTTP 429 from the
+/// coordinator means the target run loop's input buffer is full — flow
+/// control, not failure — so the producer's only correct move is to wait for
+/// the loop to drain and try again. Retries with capped exponential backoff
+/// and gives up (returning the coordinator's reason) once the deadline is
+/// spent: a loop that never drains must still surface as an error, not hang.
+async fn post_push_with_backpressure<B: serde::Serialize>(
+    url: &str,
+    body: &B,
+) -> RuntimeResult<()> {
+    const BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(100);
+    const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(3_200);
+    const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+    let client = coordinator_http_client()?;
+    let started = std::time::Instant::now();
+    let mut backoff = BACKOFF_START;
+    loop {
+        let response = apply_coordinator_bearer(client.post(url).json(body))
+            .send()
+            .await
+            .map_err(|e| RuntimeError::transport(format!("continuous-push request failed: {e}")))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS && started.elapsed() < RETRY_BUDGET {
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(BACKOFF_CAP);
+            continue;
+        }
+        return Err(transport_error_with_body(
+            format!("continuous-push HTTP {status} from {url}"),
+            response,
+        )
+        .await);
+    }
+}
+
 pub async fn execute_coordinator_continuous_push_side(
     coordinator_http: &str,
     job_id: &str,
@@ -1146,18 +1345,7 @@ pub async fn execute_coordinator_continuous_push_side(
         input_batches_b64: encode_batches(input_batches)?,
         side,
     };
-    let client = coordinator_http_client()?;
-    let response = apply_coordinator_bearer(client.post(&url).json(&body))
-        .send()
-        .await
-        .map_err(|e| RuntimeError::transport(format!("continuous-push request failed: {e}")))?;
-    if !response.status().is_success() {
-        return Err(RuntimeError::transport(format!(
-            "continuous-push HTTP {} from {url}",
-            response.status()
-        )));
-    }
-    Ok(())
+    post_push_with_backpressure(&url, &body).await
 }
 
 pub async fn execute_coordinator_continuous_push(
@@ -1181,19 +1369,7 @@ pub async fn execute_coordinator_continuous_push(
         input_batches_b64,
     };
 
-    let client = coordinator_http_client()?;
-    let response = apply_coordinator_bearer(client.post(&url).json(&body))
-        .send()
-        .await
-        .map_err(|e| RuntimeError::transport(format!("continuous-push request failed: {e}")))?;
-
-    if !response.status().is_success() {
-        return Err(RuntimeError::transport(format!(
-            "continuous-push HTTP {} from {url}",
-            response.status()
-        )));
-    }
-    Ok(())
+    post_push_with_backpressure(&url, &body).await
 }
 
 pub async fn execute_coordinator_continuous_drain(
@@ -1221,10 +1397,11 @@ pub async fn execute_coordinator_continuous_drain(
         .map_err(|e| RuntimeError::transport(format!("continuous-drain request failed: {e}")))?;
 
     if !response.status().is_success() {
-        return Err(RuntimeError::transport(format!(
-            "continuous-drain HTTP {} from {url}",
-            response.status()
-        )));
+        return Err(transport_error_with_body(
+            format!("continuous-drain HTTP {} from {url}", response.status()),
+            response,
+        )
+        .await);
     }
 
     let payload: ContinuousDrainResponse = response.json().await.map_err(|e| {
@@ -1245,6 +1422,38 @@ pub async fn execute_coordinator_continuous_drain(
             }
             Ok(batches)
         })
+}
+
+/// Deregister (tear down) a continuous job: cancels its tasks on their
+/// executors, frees their slots, and clears the job's persisted snapshot so
+/// the id can be reused. Callers that register short-lived jobs in a loop
+/// (benchmark reps, tests) MUST call this between jobs — registered jobs hold
+/// their executor slots until deregistered, and a cluster with all slots held
+/// refuses the next job's pushes with "no launched subtasks".
+pub async fn execute_coordinator_continuous_deregister(
+    coordinator_http: &str,
+    job_id: &str,
+) -> RuntimeResult<()> {
+    let base = normalize_http_base(coordinator_http)?;
+    let url = format!("{base}/api/v1/continuous/{job_id}");
+    let client = coordinator_http_client()?;
+    let response = apply_coordinator_bearer(client.delete(&url))
+        .send()
+        .await
+        .map_err(|e| {
+            RuntimeError::transport(format!("continuous-deregister request failed: {e}"))
+        })?;
+    if !response.status().is_success() {
+        return Err(transport_error_with_body(
+            format!(
+                "continuous-deregister HTTP {} from {url}",
+                response.status()
+            ),
+            response,
+        )
+        .await);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

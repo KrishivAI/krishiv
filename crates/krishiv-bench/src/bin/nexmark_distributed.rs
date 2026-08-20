@@ -172,6 +172,13 @@ async fn measure_rep(url: &str, name: &str, sql: &str, rep: usize) -> RepResult 
     }
     let rows_out = drain_until_stable(url, &job).await;
     let elapsed = started.elapsed();
+    // Tear the job down before the next rep registers: a registered run-loop
+    // job holds its executor slots until deregistered, and 3 leftover jobs at
+    // parallelism 3 exhaust a 3x3-slot cluster — the next rep's pushes then
+    // fail with "no launched subtasks to push to".
+    krishiv_runtime::execute_coordinator_continuous_deregister(url, &job)
+        .await
+        .unwrap_or_else(|e| panic!("{name}: deregister: {e}"));
     RepResult {
         rows_in,
         rows_out,
