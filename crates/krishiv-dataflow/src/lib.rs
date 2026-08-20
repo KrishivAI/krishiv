@@ -70,6 +70,7 @@ pub mod live_table;
 pub mod memo;
 pub mod operator_config;
 pub mod operator_runtime;
+pub mod pipeline;
 pub mod process_fn;
 pub mod queue;
 pub mod scalar_expr;

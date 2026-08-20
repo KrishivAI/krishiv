@@ -37,16 +37,14 @@
 //!
 //! # Scope, stated up front
 //!
-//! Eight of NEXMark's twenty-two queries. The streaming SQL path expresses
-//! keyed windowed aggregation with expression arguments, COUNT(DISTINCT),
-//! multi-column keys, global no-key aggregation (Q7/Q15 run in canonical
-//! form), and (at the SQL surface) equi-key time-band joins. What
-//! the harness still cannot drive: two-source jobs end to end (Q3/Q4/Q8/Q9/Q20
-//! need job-level join routing plus person/auction generators — this generator
-//! emits bids only), top-N/rank (Q19), dedup/row_number (Q18), and stateless or
-//! processing-time paths outside the window compiler (Q0/Q10/Q12–Q14/Q21/Q22).
-//! Coverage is printed on every run so a reader cannot mistake this for full
-//! NEXMark.
+//! ALL twenty-two NEXMark queries run: windowed aggregation (expression
+//! arguments, COUNT(DISTINCT), multi-column keys, global no-key forms),
+//! per-key top-N and keep-last dedup, processing-time windows, side-input
+//! joins, stateless projection, two-source interval joins, and WITH-chained
+//! join-to-aggregation pipelines (Q4/Q9). Several queries carry DOCUMENTED
+//! deviations from the reference SQL (stated on each entry in
+//! `SUPPORTED_QUERIES`); "22 of 22" means every query has a faithful-or-
+//! documented streaming form. Coverage is printed on every run.
 
 #![allow(
     clippy::unwrap_used,
@@ -144,6 +142,9 @@ fn generate_input(query_name: &str) -> (Vec<arrow::record_batch::RecordBatch>, u
 /// stateless per-batch path, exactly as `StreamingEngine::run` would send it
 /// to `run_stateless_bounded`.
 fn measure(query_name: &str, sql: &str) -> RepResult {
+    if krishiv_sql::streaming_pipeline_plan::looks_like_streaming_pipeline(sql) {
+        return measure_pipeline(query_name, sql);
+    }
     if krishiv_sql::streaming_join_plan::looks_like_streaming_join(sql) {
         return measure_join(query_name, sql);
     }
@@ -151,6 +152,89 @@ fn measure(query_name: &str, sql: &str) -> RepResult {
         return measure_stateless(query_name, sql);
     }
     measure_windowed(query_name, sql)
+}
+
+/// Join-to-aggregation pipeline arm (task #146): the same two-side feed as
+/// the join arm, through `JoinAggPipeline`, with the cascade flush closing
+/// every stage at end of stream.
+fn measure_pipeline(query_name: &str, sql: &str) -> RepResult {
+    use krishiv_dataflow::pipeline::JoinAggPipeline;
+
+    let plan = krishiv_sql::streaming_pipeline_plan::compile_streaming_pipeline_sql(sql)
+        .unwrap_or_else(|e| panic!("{query_name} must compile: {e}"));
+    let time_column = plan.spec.join.time_column.clone();
+    let mut pipe =
+        JoinAggPipeline::new(&plan.spec).unwrap_or_else(|e| panic!("{query_name} pipeline: {e}"));
+
+    let side_batches = |source: &str| -> Vec<arrow::record_batch::RecordBatch> {
+        let mut generator = NexmarkGenerator::new(0x4E45_584D, 1_000_000, 0, MAX_LATENESS_MS);
+        (0..BATCHES)
+            .map(|_| match source {
+                "bid" => generator.next_bid_batch(BATCH_ROWS),
+                "auction" => generator.next_auction_batch(BATCH_ROWS),
+                "person" => generator.next_person_batch(BATCH_ROWS),
+                other => panic!("{query_name}: no generator for pipeline source '{other}'"),
+            })
+            .map(|r| r.unwrap_or_else(|e| panic!("{query_name} generator: {e}")))
+            .collect()
+    };
+    let left = side_batches(&plan.spec.join.left_source);
+    let right = side_batches(&plan.spec.join.right_source);
+    let rows_in: usize = left.iter().chain(right.iter()).map(|b| b.num_rows()).sum();
+
+    let max_ts = |b: &arrow::record_batch::RecordBatch| -> i64 {
+        let idx = b
+            .schema()
+            .index_of(&time_column)
+            .unwrap_or_else(|_| panic!("{query_name}: time column missing"));
+        let arr = b
+            .column(idx)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap_or_else(|| panic!("{query_name}: time column not Int64"));
+        (0..arr.len())
+            .map(|i| arr.value(i))
+            .max()
+            .unwrap_or(i64::MIN)
+    };
+
+    let mut per_batch_us: Vec<u128> = Vec::with_capacity(BATCHES * 2);
+    let mut rows_out = 0usize;
+    let (mut left_max, mut right_max) = (i64::MIN, i64::MIN);
+    let started = Instant::now();
+    for (l, r) in left.into_iter().zip(right) {
+        let t0 = Instant::now();
+        left_max = left_max.max(max_ts(&l));
+        let out = pipe
+            .on_left(&l)
+            .unwrap_or_else(|e| panic!("{query_name} left: {e}"));
+        rows_out += out.iter().map(|b| b.num_rows()).sum::<usize>();
+        per_batch_us.push(t0.elapsed().as_micros());
+
+        let t1 = Instant::now();
+        right_max = right_max.max(max_ts(&r));
+        let out = pipe
+            .on_right(&r)
+            .unwrap_or_else(|e| panic!("{query_name} right: {e}"));
+        rows_out += out.iter().map(|b| b.num_rows()).sum::<usize>();
+        per_batch_us.push(t1.elapsed().as_micros());
+
+        pipe.advance_watermark(left_max.min(right_max));
+    }
+    rows_out += pipe
+        .flush_all()
+        .unwrap_or_else(|e| panic!("{query_name} flush: {e}"))
+        .iter()
+        .map(|b| b.num_rows())
+        .sum::<usize>();
+    let elapsed = started.elapsed();
+
+    RepResult {
+        rows_in,
+        rows_out,
+        events_per_sec: rows_in as f64 / elapsed.as_secs_f64(),
+        per_batch_us,
+    }
 }
 
 /// Two-source interval-join arm (task #144): both sides pre-generated, fed

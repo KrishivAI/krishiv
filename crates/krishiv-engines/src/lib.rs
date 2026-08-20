@@ -623,6 +623,77 @@ impl StatelessBatchExecutor {
     }
 }
 
+/// Bounded join-to-aggregation pipeline run (task #146, NEXMark Q4/Q9).
+///
+/// The same two-reader loop as [`run_join_bounded`], through
+/// [`JoinAggPipeline`](krishiv_dataflow::pipeline::JoinAggPipeline), with the
+/// cascade flush closing every stage after both sources are exhausted.
+async fn run_pipeline_bounded(job: &CompiledJob, rt: &EngineRuntime) -> EngineResult<JobHandle> {
+    use krishiv_dataflow::pipeline::JoinAggPipeline;
+
+    let plan = krishiv_sql::streaming_pipeline_plan::compile_streaming_pipeline_sql(&job.query)
+        .map_err(|e| EngineError::InvalidJob(format!("streaming pipeline: {e}")))?;
+    let source_named = |name: &str| {
+        job.sources.iter().find(|s| s.name == name).ok_or_else(|| {
+            EngineError::InvalidJob(format!(
+                "pipeline source '{name}' is not among the job's sources"
+            ))
+        })
+    };
+    let left_source = source_named(&plan.spec.join.left_source)?;
+    let right_source = source_named(&plan.spec.join.right_source)?;
+    let time_column = plan.spec.join.time_column.clone();
+    let mut left = rt.sources.open(left_source).await?;
+    let mut right = rt.sources.open(right_source).await?;
+    let mut writers = open_writers(rt, &job.sinks).await?;
+    let mut pipe = JoinAggPipeline::new(&plan.spec)
+        .map_err(|e| EngineError::Runtime(format!("pipeline build: {e}")))?;
+
+    let mut left_done = false;
+    let mut right_done = false;
+    let mut left_max = i64::MIN;
+    let mut right_max = i64::MIN;
+    while !(left_done && right_done) {
+        if !left_done {
+            match left.next().await? {
+                Some(batch) if batch.num_rows() > 0 => {
+                    left_max = left_max.max(batch_max_event_time(&batch, &time_column)?);
+                    let out = pipe
+                        .on_left(&batch)
+                        .map_err(|e| EngineError::Runtime(e.to_string()))?;
+                    emit_to_writers(&mut writers, &out).await?;
+                }
+                Some(_) => {}
+                None => left_done = true,
+            }
+        }
+        if !right_done {
+            match right.next().await? {
+                Some(batch) if batch.num_rows() > 0 => {
+                    right_max = right_max.max(batch_max_event_time(&batch, &time_column)?);
+                    let out = pipe
+                        .on_right(&batch)
+                        .map_err(|e| EngineError::Runtime(e.to_string()))?;
+                    emit_to_writers(&mut writers, &out).await?;
+                }
+                Some(_) => {}
+                None => right_done = true,
+            }
+        }
+        if left_max > i64::MIN && right_max > i64::MIN {
+            pipe.advance_watermark(left_max.min(right_max));
+        }
+    }
+    let out = pipe
+        .flush_all()
+        .map_err(|e| EngineError::Runtime(e.to_string()))?;
+    emit_to_writers(&mut writers, &out).await?;
+    for writer in &mut writers {
+        writer.flush().await?;
+    }
+    JobHandle::from_name(&job.name, JobStatus::Completed)
+}
+
 /// Bounded two-source streaming join run (task #144).
 ///
 /// Reads BOTH sources to exhaustion, feeding each batch through the
@@ -784,10 +855,14 @@ impl ComputeEngine for StreamingEngine {
         //
         // Every precise refusal the streaming compiler produces reaches the
         // caller only because of this split.
-        // Two-source joins route FIRST, on shape not validity (the same rule
-        // as the windowed branch): a query that LOOKS like a streaming join
-        // gets the join compiler's error, not a stateless-path error about a
-        // table DataFusion cannot find.
+        // Pipelines route before everything (their final SELECT carries a
+        // window TVF that would otherwise pull them into the windowed branch,
+        // whose WITH refusal describes the wrong problem), then two-source
+        // joins — both on shape, not validity, so a malformed query gets its
+        // own compiler's error.
+        if krishiv_sql::streaming_pipeline_plan::looks_like_streaming_pipeline(&job.query) {
+            return run_pipeline_bounded(&job, &rt).await;
+        }
         if krishiv_sql::streaming_join_plan::looks_like_streaming_join(&job.query) {
             return run_join_bounded(&job, &rt).await;
         }
@@ -1548,6 +1623,76 @@ async fn run_streaming_continuous(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    /// A Q9-shape pipeline job (join then windowed top-1) runs END TO END
+    /// through `StreamingEngine::run`: routing, two readers, the stage
+    /// cascade, and the sink. Reverting the pipeline routing branch sends
+    /// this job to the WINDOWED branch (its final SELECT has a TVF), whose
+    /// WITH refusal is the red state.
+    #[tokio::test]
+    async fn pipeline_job_runs_end_to_end() {
+        let bid_schema = Arc::new(Schema::new(vec![
+            Field::new("auction", DataType::Int64, false),
+            Field::new("bidder", DataType::Int64, false),
+            Field::new("price", DataType::Int64, false),
+            Field::new("dateTime", DataType::Int64, false),
+        ]));
+        let auction_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("dateTime", DataType::Int64, false),
+        ]));
+        let bids = RecordBatch::try_new(
+            bid_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 1, 2])),
+                Arc::new(Int64Array::from(vec![91_i64, 92, 93])),
+                Arc::new(Int64Array::from(vec![100_i64, 900, 50])),
+                Arc::new(Int64Array::from(vec![1_000_i64, 1_100, 1_200])),
+            ],
+        )
+        .unwrap();
+        let auctions = RecordBatch::try_new(
+            auction_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(Int64Array::from(vec![1_000_i64, 1_000])),
+            ],
+        )
+        .unwrap();
+
+        let sources = InMemorySourceProvider::new();
+        sources.insert("bid", vec![bids]);
+        sources.insert("auction", vec![auctions]);
+        let sink = InMemorySinkProvider::new();
+        let rt = embedded_runtime(Arc::new(sources), Arc::new(sink.clone()));
+
+        let job = CompiledJob::new(
+            "q9-pipeline",
+            "WITH joined AS (SELECT b.auction, b.bidder, b.price FROM bid b \
+             JOIN auction a ON b.auction = a.id \
+             AND b.\"dateTime\" BETWEEN a.\"dateTime\" - 10000 AND a.\"dateTime\" + 10000) \
+             SELECT auction, bidder, price \
+             FROM TUMBLE(TABLE joined, DESCRIPTOR(left_dateTime), 10000) \
+             GROUP BY auction, window_start, window_end ORDER BY price DESC LIMIT 1",
+            vec![
+                SourceSpec::bounded("bid", "memory", ""),
+                SourceSpec::bounded("auction", "memory", ""),
+            ],
+            vec![SinkSpec::new("out", "memory", "")],
+            false,
+        )
+        .with_engine(EngineKind::Streaming);
+
+        let handle = StreamingEngine.run(job, rt).await.unwrap();
+        assert_eq!(handle.status(), JobStatus::Completed);
+
+        let out = sink.take("out");
+        let rows: usize = out.iter().map(ChangelogBatch::num_rows).sum();
+        assert_eq!(
+            rows, 2,
+            "one winning bid per auction: auction 1's 900 and auction 2's 50"
+        );
+    }
 
     /// A two-source streaming join runs END TO END through
     /// `StreamingEngine::run` (task #144): source resolution by the names the

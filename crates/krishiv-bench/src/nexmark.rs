@@ -385,14 +385,12 @@ pub struct BenchQuery {
 
 /// The NEXMark queries this engine's streaming path can currently express.
 ///
-/// Twenty of twenty-two. Stated as data rather than prose so a report
-/// cannot quietly imply full coverage — the number is read from here.
-///
-/// The remaining two — Q4 (average price per category) and Q9 (winning
-/// bids) — need JOIN output feeding a windowed aggregation in one SQL
-/// statement, a composition the streaming compilers do not express yet.
-/// Both halves exist (the interval join and the windowed aggregate);
-/// what is missing is the pipe between them at the SQL surface. Q7 and Q15 run in their canonical global forms
+/// ALL twenty-two, as of task #146 (Q4/Q9 landed via the WITH-chained
+/// join-to-aggregation pipeline). Stated as data rather than prose — the
+/// number is read from here — and several queries carry DOCUMENTED
+/// deviations from the reference (see individual entries), so "22 of 22"
+/// means every query has a faithful-or-documented streaming form, not that
+/// every clause of the reference SQL is reproduced. Q7 and Q15 run in their canonical global forms
 /// (task #140); Q0/Q10/Q14/Q21/Q22 run through the stateless per-batch path
 /// (task #141). Documented deviations: Q10 measures the projection, not the
 /// partitioned file sink; Q14's bid-time classification is a price-band CASE
@@ -492,6 +490,35 @@ pub const SUPPORTED_QUERIES: &[BenchQuery] = &[
         sql: "SELECT bidder, auction, price FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
               GROUP BY bidder, auction, window_start, window_end \
               ORDER BY \"dateTime\" DESC LIMIT 1",
+        expect: RowsOut::NonZero,
+    },
+    // ── join → windowed-aggregation pipelines (task #146) ──
+    BenchQuery {
+        // Q9: winning bids — the banded join feeding a per-auction top-1 by
+        // price. The WITH chain is the pipeline surface: first CTE is the
+        // join, the final SELECT is the windowed stage.
+        name: "q9_winning_bids",
+        sql: "WITH joined AS (SELECT b.auction, b.bidder, b.price FROM bid b \
+              JOIN auction a ON b.auction = a.id \
+              AND b.\"dateTime\" BETWEEN a.\"dateTime\" - 10000 AND a.\"dateTime\" + 10000) \
+              SELECT auction, bidder, price \
+              FROM TUMBLE(TABLE joined, DESCRIPTOR(left_dateTime), 10000) \
+              GROUP BY auction, window_start, window_end ORDER BY price DESC LIMIT 1",
+        expect: RowsOut::NonZero,
+    },
+    BenchQuery {
+        // Q4: average winning-bid price per category — TWO stages after the
+        // join: MAX per (auction, category), then AVG per category.
+        name: "q4_avg_winning_price",
+        sql: "WITH joined AS (SELECT b.auction, b.price, a.category FROM bid b \
+              JOIN auction a ON b.auction = a.id \
+              AND b.\"dateTime\" BETWEEN a.\"dateTime\" - 10000 AND a.\"dateTime\" + 10000), \
+              winning AS (SELECT auction, category, MAX(price) AS final \
+              FROM TUMBLE(TABLE joined, DESCRIPTOR(left_dateTime), 10000) \
+              GROUP BY auction, category, window_start, window_end) \
+              SELECT category, AVG(final) AS avg_final \
+              FROM TUMBLE(TABLE winning, DESCRIPTOR(window_start_ms), 10000) \
+              GROUP BY category, window_start, window_end",
         expect: RowsOut::NonZero,
     },
     // ── two-source interval joins (task #144) ──
@@ -715,7 +742,15 @@ mod tests {
             .build()
             .expect("runtime");
         for q in SUPPORTED_QUERIES {
-            if krishiv_sql::streaming_join_plan::looks_like_streaming_join(q.sql) {
+            if krishiv_sql::streaming_pipeline_plan::looks_like_streaming_pipeline(q.sql) {
+                krishiv_sql::streaming_pipeline_plan::compile_streaming_pipeline_sql(q.sql)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{} is listed as supported but does not compile: {e}",
+                            q.name
+                        )
+                    });
+            } else if krishiv_sql::streaming_join_plan::looks_like_streaming_join(q.sql) {
                 krishiv_sql::streaming_join_plan::compile_streaming_join_sql(q.sql).unwrap_or_else(
                     |e| {
                         panic!(
@@ -772,10 +807,13 @@ mod tests {
                 }
             }
         }
-        assert!(
-            SUPPORTED_QUERIES.len() < NEXMARK_TOTAL_QUERIES,
-            "if coverage ever reaches all 22, this assertion and the report's \
-             wording both need revisiting"
+        // The old assertion here demanded a deliberate revisit "if coverage
+        // ever reaches all 22" — this is that revisit (task #146). Pinned as
+        // equality so a silently DROPPED query is as loud as an overcount.
+        assert_eq!(
+            SUPPORTED_QUERIES.len(),
+            NEXMARK_TOTAL_QUERIES,
+            "coverage is full; a missing or extra entry is a defect either way"
         );
     }
 }

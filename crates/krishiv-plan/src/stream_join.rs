@@ -113,3 +113,52 @@ mod tests {
         assert!(err.to_string().contains("right_key_column"), "got: {err}");
     }
 }
+
+/// A streaming pipeline: a banded two-source join feeding a chain of
+/// windowed stages (task #146, NEXMark Q4/Q9).
+///
+/// Stage 0 consumes the join's output; stage N consumes stage N-1's output.
+/// Both halves existed before this type (the interval join and the windowed
+/// aggregate); this is the pipe between them. The SQL surface is a WITH
+/// chain: the first CTE is the join, each later CTE (and the final SELECT)
+/// is a windowed query over the previous name.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StreamingPipelineSpec {
+    pub join: StreamingJoinSpec,
+    /// Windowed stages in execution order. Never empty — a pipeline with no
+    /// stage is just a join and must be planned as one.
+    pub stages: Vec<crate::window::WindowExecutionSpec>,
+}
+
+impl StreamingPipelineSpec {
+    /// # Errors
+    /// When the join is invalid, the stage list is empty, or a stage fails
+    /// window validation.
+    pub fn validate(&self) -> Result<(), crate::PlanError> {
+        self.join.validate()?;
+        if self.stages.is_empty() {
+            return Err(crate::PlanError::Validation(String::from(
+                "a streaming pipeline needs at least one windowed stage; a bare join must be \
+                 planned as a join",
+            )));
+        }
+        for stage in &self.stages {
+            crate::window::validate_window_execution_spec(stage)?;
+        }
+        // Enforced here so hand-built specs fail closed too, not only the
+        // SQL compiler's: join matches arrive up to `window_ms` out of
+        // event-time order, and a first stage with less lateness tolerance
+        // silently drops them.
+        if let Some(first) = self.stages.first()
+            && first.watermark_lag_ms < self.join.window_ms
+        {
+            return Err(crate::PlanError::Validation(format!(
+                "pipeline stage 0 has watermark_lag_ms {} but the join band is {} ms: \
+                 matches can arrive that far out of event-time order and would be \
+                 silently dropped as late",
+                first.watermark_lag_ms, self.join.window_ms
+            )));
+        }
+        Ok(())
+    }
+}

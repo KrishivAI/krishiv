@@ -241,8 +241,10 @@ struct RawTopN {
 fn reject_unsupported_query_clauses(query: &Query) -> SqlResult<Option<RawTopN>> {
     if query.with.is_some() {
         return Err(unsupported(
-            "streaming window queries do not support WITH / common table expressions; \
-             inline the subquery, or run the CTE as a separate job",
+            "streaming window queries do not support WITH / common table expressions — \
+             UNLESS the first CTE is a banded stream join, which is the streaming \
+             pipeline form (compile_streaming_pipeline_sql). Otherwise inline the \
+             subquery or run the CTE as a separate job",
         ));
     }
     // ORDER BY + LIMIT together are the per-group top-N shape (task #142):

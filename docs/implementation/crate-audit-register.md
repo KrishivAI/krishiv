@@ -5857,3 +5857,46 @@ real cost, reported as such, with batch-at-a-time joining as the obvious
 lever. Q4/Q9 remain: both halves exist (interval join, windowed aggregate);
 the SQL surface cannot yet pipe one into the other. 5508 tests, clippy and
 fmt clean.
+
+## §59 — #146: join → windowed-aggregation composition (Q4/Q9) — full NEXMark coverage
+
+The SQL surface is the WITH chain: the first CTE is the banded join, each
+later CTE and the final SELECT is a windowed stage over the PREVIOUS name.
+`compile_streaming_pipeline_sql` owns only the chain — the join CTE goes
+through the join compiler, each stage through the windowed compiler — and a
+stage reading anything but the previous stage is refused naming BOTH names.
+The window compiler's WITH refusal (§39 A1) now cross-references the
+pipeline form instead of dead-ending. `JoinAggPipeline` runs it: matches
+flow through the stage chain on arrival; at end of stream stages flush in
+CASCADE (stage i's flushed windows pass through stage i+1 before i+1
+flushes). Routed in the engine ahead of everything — the final SELECT
+carries a TVF that would otherwise pull the query into the windowed branch,
+whose WITH refusal describes the wrong problem (revert-proven: without the
+branch, the e2e job dies on exactly that refusal).
+
+Two composition lessons, both caught by fixtures built to distinguish:
+(1) join matches arrive up to `window_ms` out of event-time order, so stage
+0 needs `watermark_lag_ms >= join.window_ms` or it silently drops every
+match whose partner arrived late in the band — the Q9 fixture lost one
+auction of two; set by the compiler AND enforced by `validate()` so
+hand-built specs fail closed. (2) The pipeline drives stage executors
+directly, skipping the driver's typing step — the EXACT defect the NEXMark
+harness itself had at the top level (§41 era) — so `run_stages` applies
+`coerce_batch_for_window` per stage, and Q4's UInt64 price no longer dies
+in pre-downcast. The Q4 fixture pins TRUE two-stage composition: AVG of
+winning bids = 650 where a single-stage collapse gives 375 (raw AVG) or
+900 (raw MAX). Revert proofs: lag line → dropped auction; cascade → empty
+final output; routing → the WITH refusal.
+
+Naming, stated not hidden: the join emits all left+right columns and
+prefixes colliding names `left_`/`right_`, so stages window on
+`left_dateTime` — never a silently-ambiguous bare name.
+
+Coverage 20 → 22 of 22. The §52-era tripwire "if coverage ever reaches all
+22, this assertion needs revisiting" fired and was revisited: it is now
+EQUALITY, so a silently dropped query is as loud as an overcount. "22 of
+22" means every query has a faithful-or-documented streaming form —
+deviations are stated on the entries themselves. Pinned: q9 5.3K ev/sec
+(4,347 winning bids), q4 5.9K (10 category averages), both real composed
+output through two operators and up to three stages. 5512 tests, clippy
+and fmt clean.
