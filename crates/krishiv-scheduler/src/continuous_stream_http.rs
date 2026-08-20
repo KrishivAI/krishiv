@@ -62,7 +62,16 @@ fn scheduler_status(error: &SchedulerError) -> StatusCode {
 #[derive(Debug, Deserialize)]
 pub struct ContinuousRegisterRequest {
     pub job_id: String,
-    pub spec: WindowExecutionSpec,
+    /// Legacy windowed spec. Exactly ONE of `spec` / `stream_spec` must be
+    /// present; both or neither is refused rather than guessed at.
+    #[serde(default)]
+    pub spec: Option<WindowExecutionSpec>,
+    /// Task #147: class-tagged spec for the non-window streaming classes
+    /// (and, optionally, windows). New clients send this; old coordinators
+    /// that do not know the field fail the request on the missing `spec`,
+    /// which is fail-closed rather than silently window-planning a join.
+    #[serde(default)]
+    pub stream_spec: Option<krishiv_plan::stream_task::StreamingTaskSpec>,
     /// Optional streaming Iceberg sink (G7): cycle output is staged under
     /// checkpoint epochs and committed by the checkpoint lifecycle.
     #[serde(default)]
@@ -302,6 +311,11 @@ impl ContinuousSinkSpec {
 
 #[derive(Debug, Serialize)]
 pub struct ContinuousRegisterResponse {
+    /// Echo of the registered class (task #147): a client that sent a
+    /// non-window class and gets no echo is talking to a coordinator that
+    /// silently dropped the field — verify_ack turns that into a hard error.
+    #[serde(default)]
+    pub class: String,
     pub success: bool,
     /// The execution model actually registered (`"cycle-push"` / `"run-loop"`).
     ///
@@ -339,7 +353,12 @@ pub struct ContinuousJobView {
     /// the connector capability registry (#92) — the platform surfaces this
     /// as delivery-guarantee labels instead of hardcoding claims.
     pub delivery: ContinuousDeliveryView,
-    pub spec: WindowExecutionSpec,
+    /// Streaming class of the job (task #147): window / join / pipeline /
+    /// stateless.
+    pub class: String,
+    /// The window spec — present for window-class jobs only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec: Option<WindowExecutionSpec>,
 }
 
 /// Delivery-guarantee metadata for one continuous job.
@@ -462,7 +481,9 @@ pub struct ContinuousCheckpointResponse {
     pub snapshot_b64: Option<String>,
     pub watermark_ms: Option<i64>,
     pub snapshot_available: bool,
-    pub spec: WindowExecutionSpec,
+    /// The window spec — present for window-class jobs only (task #147).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec: Option<WindowExecutionSpec>,
     /// Execution model this job runs (`"cycle"` or `"run-loop"`).
     ///
     /// This endpoint reads the **cycle** model's coordinator-side snapshot
@@ -497,19 +518,30 @@ fn invalid_continuous_job(job_id: &JobId, message: impl Into<String>) -> Schedul
     }
 }
 
-fn decode_continuous_job_spec(
+fn decode_continuous_job_task(
     record: &crate::JobRecord,
-) -> crate::SchedulerResult<WindowExecutionSpec> {
-    decode_continuous_job_shape(record).map(|shape| shape.spec)
+) -> crate::SchedulerResult<krishiv_plan::stream_task::StreamingTaskSpec> {
+    decode_continuous_job_shape(record).map(|shape| shape.task)
 }
 
 /// Decoded identity of a continuous job: its window spec plus the Phase 55
 /// execution model and parallelism.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ContinuousJobShape {
-    pub spec: WindowExecutionSpec,
+    pub task: krishiv_plan::stream_task::StreamingTaskSpec,
     pub mode: ContinuousJobMode,
     pub parallelism: u32,
+}
+
+impl ContinuousJobShape {
+    /// The window spec, when this is a window job; `None` means "not a
+    /// window job", never an error to hide.
+    pub(crate) fn window_spec(&self) -> Option<&WindowExecutionSpec> {
+        match &self.task {
+            krishiv_plan::stream_task::StreamingTaskSpec::Window(w) => Some(w),
+            _ => None,
+        }
+    }
 }
 
 fn decode_continuous_job_shape(
@@ -532,10 +564,54 @@ fn decode_continuous_job_shape(
             invalid_continuous_job(job_id, format!("window spec decode failed: {error}"))
         })?;
         return Ok(ContinuousJobShape {
-            spec,
+            task: krishiv_plan::stream_task::StreamingTaskSpec::Window(Box::new(spec)),
             mode: ContinuousJobMode::Cycle,
             parallelism: 1,
         });
+    }
+    // Task #147 classed run-loop fragments: `<prefix><job>|<sub>/<par>|<json>`.
+    for (prefix, class) in [
+        ("stream:rjoin:", "join"),
+        ("stream:rpipe:", "pipeline"),
+        ("stream:rbatch:", "stateless"),
+    ] {
+        let classed_prefix = format!("{prefix}{}|", job_id.as_str());
+        if let Some(rest) = typed.body.strip_prefix(&classed_prefix) {
+            let (subtask_segment, json) = rest.split_once('|').ok_or_else(|| {
+                invalid_continuous_job(job_id, format!("{class} fragment missing subtask segment"))
+            })?;
+            let parallelism = subtask_segment
+                .split_once('/')
+                .and_then(|(_, p)| p.trim().parse::<u32>().ok())
+                .ok_or_else(|| {
+                    invalid_continuous_job(
+                        job_id,
+                        format!("{class} fragment has a malformed subtask segment"),
+                    )
+                })?;
+            let task = match class {
+                "join" => krishiv_plan::stream_task::StreamingTaskSpec::Join(
+                    serde_json::from_str(json).map_err(|e| {
+                        invalid_continuous_job(job_id, format!("join spec decode failed: {e}"))
+                    })?,
+                ),
+                "pipeline" => krishiv_plan::stream_task::StreamingTaskSpec::Pipeline(
+                    serde_json::from_str(json).map_err(|e| {
+                        invalid_continuous_job(job_id, format!("pipeline spec decode failed: {e}"))
+                    })?,
+                ),
+                _ => krishiv_plan::stream_task::StreamingTaskSpec::Stateless(
+                    serde_json::from_str(json).map_err(|e| {
+                        invalid_continuous_job(job_id, format!("stateless spec decode failed: {e}"))
+                    })?,
+                ),
+            };
+            return Ok(ContinuousJobShape {
+                task,
+                mode: ContinuousJobMode::RunLoop,
+                parallelism,
+            });
+        }
     }
     if let Some(rest) = typed.body.strip_prefix(&rloop_prefix) {
         // `<subtask>/<parallelism>|<window_spec>`
@@ -552,14 +628,15 @@ fn decode_continuous_job_shape(
             invalid_continuous_job(job_id, format!("window spec decode failed: {error}"))
         })?;
         return Ok(ContinuousJobShape {
-            spec,
+            task: krishiv_plan::stream_task::StreamingTaskSpec::Window(Box::new(spec)),
             mode: ContinuousJobMode::RunLoop,
             parallelism,
         });
     }
     Err(invalid_continuous_job(
         job_id,
-        "does not use a stream:loop or stream:rloop fragment",
+        "does not use a stream:loop / stream:rloop / stream:rjoin / stream:rpipe / \
+         stream:rbatch fragment",
     ))
 }
 
@@ -576,7 +653,7 @@ fn continuous_job_view(
     if record.spec.kind() != JobKind::Streaming {
         return Err(invalid_continuous_job(job_id, "is not a streaming job"));
     }
-    let spec = decode_continuous_job_spec(&record)?;
+    let task = decode_continuous_job_task(&record)?;
     let detail = record.detail_snapshot();
     let shape = decode_continuous_job_shape(&record).ok();
     let subtask_watermarks = detail
@@ -612,7 +689,14 @@ fn continuous_job_view(
         snapshot_available: persisted.is_some(),
         cycle_in_flight: coordinator.continuous_input_cycles.contains(job_id),
         delivery: continuous_delivery_view(&record),
-        spec,
+        class: task.class_name().to_string(),
+        spec: ContinuousJobShape {
+            task,
+            mode: ContinuousJobMode::Cycle,
+            parallelism: 1,
+        }
+        .window_spec()
+        .cloned(),
     })
 }
 
@@ -628,12 +712,32 @@ pub async fn api_continuous_register(
             format!("invalid job_id '{}': {error}", body.job_id),
         ));
     }
-    if let Err(error) = krishiv_plan::window::encode_window_execution_spec(&body.spec) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("window spec is not encodable: {error}"),
-        ));
-    }
+    let task = match (&body.spec, &body.stream_spec) {
+        (Some(w), None) => {
+            if let Err(error) = krishiv_plan::window::encode_window_execution_spec(w) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("window spec is not encodable: {error}"),
+                ));
+            }
+            krishiv_plan::stream_task::StreamingTaskSpec::Window(Box::new(w.clone()))
+        }
+        (None, Some(t)) => t.clone(),
+        (Some(_), Some(_)) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "send exactly one of `spec` (legacy window) or `stream_spec` (classed), \
+                 not both — two specs is an ambiguity, not a fallback"
+                    .into(),
+            ));
+        }
+        (None, None) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "send exactly one of `spec` or `stream_spec`".into(),
+            ));
+        }
+    };
     let options = ContinuousRegistrationOptions {
         sink: body.sink.clone(),
         parallelism: body.parallelism,
@@ -643,7 +747,7 @@ pub async fn api_continuous_register(
         checkpoint_storage_path: body.checkpoint_storage_path.clone(),
     };
     let applied =
-        register_continuous_stream_with_options(&coordinator, &body.job_id, &body.spec, &options)
+        register_continuous_task_with_options(&coordinator, &body.job_id, &task, &options)
             .await
             .map_err(|error| match error {
                 ContinuousStreamError::Scheduler(e) => scheduler_error_response(&e),
@@ -653,6 +757,7 @@ pub async fn api_continuous_register(
                 other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
             })?;
     Ok(Json(ContinuousRegisterResponse {
+        class: task.class_name().to_string(),
         success: true,
         mode: applied.mode.as_str().to_string(),
         parallelism: applied.parallelism,
@@ -1462,19 +1567,39 @@ fn invalid_registration(message: impl Into<String>) -> ContinuousStreamError {
 /// the range the run-loop's exchange routes by.
 fn build_continuous_job_spec(
     job_id: &krishiv_proto::JobId,
-    spec: &WindowExecutionSpec,
+    task: &krishiv_plan::stream_task::StreamingTaskSpec,
     mode: ContinuousJobMode,
     parallelism: u32,
     options: &ContinuousRegistrationOptions,
 ) -> Result<krishiv_proto::JobSpec, ContinuousStreamError> {
     use krishiv_plan::ExecutionKind;
+    use krishiv_plan::stream_task::StreamingTaskSpec;
     use krishiv_plan::window::encode_window_execution_spec;
     use krishiv_proto::{JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
 
     let stage_id =
         StageId::try_new("stage-streaming").map_err(|e| invalid_registration(e.to_string()))?;
-    let encoded_spec =
-        encode_window_execution_spec(spec).map_err(|e| invalid_registration(e.to_string()))?;
+    // Per-class run-loop fragment payload: windows keep the compact codec
+    // (wire compatibility); the other classes are raw JSON, matching the
+    // executor's parsers. `(prefix, payload)`.
+    let (rl_prefix, encoded_spec) = match task {
+        StreamingTaskSpec::Window(w) => (
+            "stream:rloop:",
+            encode_window_execution_spec(w).map_err(|e| invalid_registration(e.to_string()))?,
+        ),
+        StreamingTaskSpec::Join(j) => (
+            "stream:rjoin:",
+            serde_json::to_string(j).map_err(|e| invalid_registration(e.to_string()))?,
+        ),
+        StreamingTaskSpec::Pipeline(pl) => (
+            "stream:rpipe:",
+            serde_json::to_string(pl).map_err(|e| invalid_registration(e.to_string()))?,
+        ),
+        StreamingTaskSpec::Stateless(st) => (
+            "stream:rbatch:",
+            serde_json::to_string(st).map_err(|e| invalid_registration(e.to_string()))?,
+        ),
+    };
     let sink_contract = match &options.sink {
         Some(sink) => Some(
             sink.contract_string()
@@ -1486,6 +1611,12 @@ fn build_continuous_job_spec(
     let mut stage = StageSpec::new(stage_id, "continuous-streaming");
     match mode {
         ContinuousJobMode::Cycle => {
+            if !matches!(task, StreamingTaskSpec::Window(_)) {
+                return Err(invalid_registration(
+                    "non-window classes cannot build a cycle fragment (guarded at \
+                     registration; reaching this is a routing bug)",
+                ));
+            }
             let task_id = TaskId::try_new("task-streaming")
                 .map_err(|e| invalid_registration(e.to_string()))?;
             let body = format!("stream:loop:{}|{encoded_spec}", job_id.as_str());
@@ -1503,7 +1634,7 @@ fn build_continuous_job_spec(
                 let task_id = TaskId::try_new(format!("task-streaming-{subtask}"))
                     .map_err(|e| invalid_registration(e.to_string()))?;
                 let body = format!(
-                    "stream:rloop:{}|{subtask}/{parallelism}|{encoded_spec}",
+                    "{rl_prefix}{}|{subtask}/{parallelism}|{encoded_spec}",
                     job_id.as_str()
                 );
                 let fragment = TypedTaskFragment::new(ExecutionKind::Streaming, body)
@@ -1538,11 +1669,52 @@ pub async fn register_continuous_stream_with_options(
     spec: &krishiv_plan::window::WindowExecutionSpec,
     options: &ContinuousRegistrationOptions,
 ) -> Result<AppliedContinuousRegistration, ContinuousStreamError> {
+    register_continuous_task_with_options(
+        coordinator,
+        job_id,
+        &krishiv_plan::stream_task::StreamingTaskSpec::Window(Box::new(spec.clone())),
+        options,
+    )
+    .await
+}
+
+/// Class-routed registration (task #147): windows keep every existing rule;
+/// the join/pipeline/stateless classes are RUN-LOOP ONLY (a cycle task
+/// exists for one push-triggered invocation — a two-sided join or a pipeline
+/// cannot express its input discipline there, and refusing names the mode
+/// that works), and pipelines are parallelism-1 (stage re-keying; see the
+/// executor's refusal).
+pub async fn register_continuous_task_with_options(
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+    task: &krishiv_plan::stream_task::StreamingTaskSpec,
+    options: &ContinuousRegistrationOptions,
+) -> Result<AppliedContinuousRegistration, ContinuousStreamError> {
+    use krishiv_plan::stream_task::StreamingTaskSpec;
     use krishiv_proto::JobId;
 
+    task.validate()
+        .map_err(|e| invalid_registration(e.to_string()))?;
     let parallelism = options.parallelism.unwrap_or(1).max(1);
     let mode = ContinuousJobMode::parse(options.mode.as_deref(), parallelism)
         .map_err(invalid_registration)?;
+
+    if !matches!(task, StreamingTaskSpec::Window(_)) && mode == ContinuousJobMode::Cycle {
+        return Err(invalid_registration(format!(
+            "the '{}' streaming class is run-loop only: a cycle task exists for one \
+             push-triggered invocation and cannot own a join's two-sided input or a \
+             pipeline's stage chain. Register with mode: \"run-loop\"",
+            task.class_name()
+        )));
+    }
+    if matches!(task, StreamingTaskSpec::Pipeline(_)) && parallelism != 1 {
+        return Err(invalid_registration(format!(
+            "pipeline parallelism {parallelism} is not supported: stages re-key between \
+             stages, so parallel subtask-local pipelines silently compute wrong per-key \
+             answers; register with parallelism 1 (the inter-stage exchange is the \
+             tracked follow-up)"
+        )));
+    }
 
     // A cycle task exists for exactly one push-triggered invocation, so between
     // pushes no live thread owns wall clock for it — that is why
@@ -1559,8 +1731,9 @@ pub async fn register_continuous_stream_with_options(
     // This is the DEFAULT path, not an edge case: `ContinuousJobMode::parse`
     // maps `None | "" | "cycle"` to Cycle, so a caller who never thought about
     // execution mode lands here.
-    if mode == ContinuousJobMode::Cycle
-        && krishiv_plan::window::requires_wall_clock(&spec.window_kind)
+    if let StreamingTaskSpec::Window(w) = task
+        && mode == ContinuousJobMode::Cycle
+        && krishiv_plan::window::requires_wall_clock(&w.window_kind)
     {
         return Err(invalid_registration(
             "session windows close on inactivity, which needs a wall clock; a cycle task \
@@ -1596,7 +1769,7 @@ pub async fn register_continuous_stream_with_options(
         );
     }
     let job_id_typed = JobId::try_new(job_id).map_err(|e| invalid_registration(e.to_string()))?;
-    let job_spec = build_continuous_job_spec(&job_id_typed, spec, mode, parallelism, options)?;
+    let job_spec = build_continuous_job_spec(&job_id_typed, task, mode, parallelism, options)?;
 
     let freshly_submitted = {
         let mut coord = coordinator.write().await;
@@ -1606,7 +1779,7 @@ pub async fn register_continuous_stream_with_options(
         upsert_continuous_streaming_job(
             &mut coord,
             &job_id_typed,
-            spec,
+            task,
             mode,
             parallelism,
             job_spec,
@@ -1716,9 +1889,18 @@ async fn launch_run_loop_job(
             for stage in job.spec.stages() {
                 for (index, task) in stage.tasks().iter().enumerate() {
                     let typed = TypedTaskFragment::decode(task.description());
-                    let is_rloop = typed
-                        .as_ref()
-                        .is_some_and(|t| t.body.starts_with("stream:rloop:"));
+                    // The whole run-loop FAMILY launches the same way (task
+                    // #147): windows, joins, pipelines, stateless.
+                    let is_rloop = typed.as_ref().is_some_and(|t| {
+                        [
+                            "stream:rloop:",
+                            "stream:rjoin:",
+                            "stream:rpipe:",
+                            "stream:rbatch:",
+                        ]
+                        .iter()
+                        .any(|p| t.body.starts_with(p))
+                    });
                     if !is_rloop {
                         continue;
                     }
@@ -1744,7 +1926,7 @@ async fn launch_run_loop_job(
         }
         if peers.is_empty() {
             return Err(invalid_registration(format!(
-                "job {job_id} has no stream:rloop tasks to launch"
+                "job {job_id} has no run-loop-family tasks to launch"
             )));
         }
 
@@ -1857,7 +2039,7 @@ async fn launch_run_loop_job(
 async fn upsert_continuous_streaming_job(
     coord: &mut Coordinator,
     job_id: &JobId,
-    desired_spec: &WindowExecutionSpec,
+    desired_task: &krishiv_plan::stream_task::StreamingTaskSpec,
     desired_mode: ContinuousJobMode,
     desired_parallelism: u32,
     job_spec: krishiv_proto::JobSpec,
@@ -1877,7 +2059,7 @@ async fn upsert_continuous_streaming_job(
         }
         let healthy = !terminal && decoded.is_some();
         let desired_shape = ContinuousJobShape {
-            spec: desired_spec.clone(),
+            task: desired_task.clone(),
             mode: desired_mode,
             parallelism: desired_parallelism,
         };
@@ -2648,7 +2830,7 @@ mod tests {
         let shape = decode_continuous_job_shape(&record).unwrap();
         assert_eq!(shape.mode, ContinuousJobMode::RunLoop);
         assert_eq!(shape.parallelism, 3);
-        assert_eq!(shape.spec, tumbling_spec());
+        assert_eq!(shape.window_spec().cloned(), Some(tumbling_spec()));
 
         let view = continuous_job_view(&coord, &job_id).unwrap();
         assert_eq!(view.delivery.model, "run-loop");
@@ -2868,7 +3050,8 @@ mod tests {
 
         let register_req = ContinuousRegisterRequest {
             job_id: "cs-test-job".to_string(),
-            spec: tumbling_spec(),
+            spec: Some(tumbling_spec()),
+            stream_spec: None,
             sink: None,
             parallelism: None,
             mode: None,
@@ -2925,7 +3108,8 @@ mod tests {
             State(coordinator.clone()),
             Json(ContinuousRegisterRequest {
                 job_id: "cs-list-job".into(),
-                spec: tumbling_spec(),
+                spec: Some(tumbling_spec()),
+                stream_spec: None,
                 sink: None,
                 parallelism: None,
                 mode: None,
@@ -2971,7 +3155,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(get.0.job_id, "cs-list-job");
-        assert_eq!(get.0.spec, tumbling_spec());
+        assert_eq!(get.0.spec, Some(tumbling_spec()));
 
         let checkpoint =
             api_continuous_checkpoint(State(coordinator), Path(String::from("cs-list-job")))
@@ -2995,7 +3179,8 @@ mod tests {
             State(coordinator.clone()),
             Json(ContinuousRegisterRequest {
                 job_id: "cs-delivery-drain".into(),
-                spec: tumbling_spec(),
+                spec: Some(tumbling_spec()),
+                stream_spec: None,
                 sink: None,
                 parallelism: None,
                 mode: None,
@@ -3059,7 +3244,8 @@ mod tests {
             State(coordinator.clone()),
             Json(ContinuousRegisterRequest {
                 job_id: "cs-delivery-iceberg".into(),
-                spec: tumbling_spec(),
+                spec: Some(tumbling_spec()),
+                stream_spec: None,
                 sink: Some(ContinuousSinkSpec {
                     connector: None,
                     options: Default::default(),
@@ -3113,7 +3299,8 @@ mod tests {
         // Register the job first.
         let register_req = ContinuousRegisterRequest {
             job_id: "cs-push-job".to_string(),
-            spec: tumbling_spec(),
+            spec: Some(tumbling_spec()),
+            stream_spec: None,
             sink: None,
             parallelism: None,
             mode: None,
@@ -3147,7 +3334,8 @@ mod tests {
             State(coordinator.clone()),
             Json(ContinuousRegisterRequest {
                 job_id: "cs-restore-job".into(),
-                spec: tumbling_spec(),
+                spec: Some(tumbling_spec()),
+                stream_spec: None,
                 sink: None,
                 parallelism: None,
                 mode: None,
@@ -3229,7 +3417,8 @@ mod tests {
             State(coordinator.clone()),
             Json(ContinuousRegisterRequest {
                 job_id: "cs-in-process-job".into(),
-                spec: tumbling_spec(),
+                spec: Some(tumbling_spec()),
+                stream_spec: None,
                 sink: None,
                 parallelism: None,
                 mode: None,
@@ -3264,7 +3453,8 @@ mod tests {
 
         let req = ContinuousRegisterRequest {
             job_id: "".to_string(), // empty id is invalid
-            spec: tumbling_spec(),
+            spec: Some(tumbling_spec()),
+            stream_spec: None,
             sink: None,
             parallelism: None,
             mode: None,
@@ -3286,7 +3476,8 @@ mod tests {
             State(coordinator.clone()),
             Json(ContinuousRegisterRequest {
                 job_id: "cs-invalid-window".into(),
-                spec,
+                spec: Some(spec),
+                stream_spec: None,
                 sink: None,
                 parallelism: None,
                 mode: None,
@@ -3315,7 +3506,8 @@ mod tests {
         let coordinator = make_coordinator_with_executor("idempotent").await;
         let request = || ContinuousRegisterRequest {
             job_id: "cs-idempotent-job".to_string(),
-            spec: tumbling_spec(),
+            spec: Some(tumbling_spec()),
+            stream_spec: None,
             sink: None,
             parallelism: None,
             mode: None,
@@ -3351,7 +3543,8 @@ mod tests {
         let coordinator = make_coordinator_with_executor("replace").await;
         let first = ContinuousRegisterRequest {
             job_id: "cs-replace-job".to_string(),
-            spec: tumbling_spec(),
+            spec: Some(tumbling_spec()),
+            stream_spec: None,
             sink: None,
             parallelism: None,
             mode: None,
@@ -3367,7 +3560,8 @@ mod tests {
         changed.window_size_ms = 30_000; // different desired spec
         let second = ContinuousRegisterRequest {
             job_id: "cs-replace-job".to_string(),
-            spec: changed.clone(),
+            spec: Some(changed.clone()),
+            stream_spec: None,
             sink: None,
             parallelism: None,
             mode: None,
@@ -3385,7 +3579,8 @@ mod tests {
         let job_id = krishiv_proto::JobId::try_new("cs-replace-job").unwrap();
         let view = continuous_job_view(&coord, &job_id).expect("job present and renderable");
         assert_eq!(
-            view.spec, changed,
+            view.spec,
+            Some(changed),
             "replaced job must carry the new window spec"
         );
     }
@@ -3414,7 +3609,8 @@ mod tests {
             State(coordinator),
             Json(ContinuousRegisterRequest {
                 job_id: "cs-collision-id".to_string(),
-                spec: tumbling_spec(),
+                spec: Some(tumbling_spec()),
+                stream_spec: None,
                 sink: None,
                 parallelism: None,
                 mode: None,
@@ -3439,7 +3635,8 @@ mod tests {
             State(coordinator.clone()),
             Json(ContinuousRegisterRequest {
                 job_id: "cs-dereg-fresh".into(),
-                spec: tumbling_spec(),
+                spec: Some(tumbling_spec()),
+                stream_spec: None,
                 sink: None,
                 parallelism: None,
                 mode: None,
@@ -3499,7 +3696,8 @@ mod tests {
             State(coordinator.clone()),
             Json(ContinuousRegisterRequest {
                 job_id: "cs-busy-job".into(),
-                spec: tumbling_spec(),
+                spec: Some(tumbling_spec()),
+                stream_spec: None,
                 sink: None,
                 parallelism: None,
                 mode: None,
@@ -3533,7 +3731,8 @@ mod tests {
             State(coordinator.clone()),
             Json(ContinuousRegisterRequest {
                 job_id: "cs-cycle-job".into(),
-                spec: tumbling_spec(),
+                spec: Some(tumbling_spec()),
+                stream_spec: None,
                 sink: None,
                 parallelism: None,
                 mode: None,
@@ -3644,7 +3843,8 @@ mod tests {
             State(coordinator.clone()),
             Json(ContinuousRegisterRequest {
                 job_id: "cs-recycle-stamp-job".into(),
-                spec: tumbling_spec(),
+                spec: Some(tumbling_spec()),
+                stream_spec: None,
                 sink: None,
                 parallelism: None,
                 mode: None,
@@ -3737,7 +3937,8 @@ mod tests {
             State(coordinator.clone()),
             Json(ContinuousRegisterRequest {
                 job_id: "cs-lost-job".into(),
-                spec: tumbling_spec(),
+                spec: Some(tumbling_spec()),
+                stream_spec: None,
                 sink: None,
                 parallelism: None,
                 mode: None,
@@ -3808,7 +4009,8 @@ mod tests {
             State(coordinator.clone()),
             Json(ContinuousRegisterRequest {
                 job_id: "cs-reassign-job".into(),
-                spec: tumbling_spec(),
+                spec: Some(tumbling_spec()),
+                stream_spec: None,
                 sink: None,
                 parallelism: None,
                 mode: None,
@@ -3971,7 +4173,8 @@ mod tests {
             State(coordinator.clone()),
             Json(ContinuousRegisterRequest {
                 job_id: String::new(),
-                spec: tumbling_spec(),
+                spec: Some(tumbling_spec()),
+                stream_spec: None,
                 sink: None,
                 parallelism: None,
                 mode: None,
@@ -3993,7 +4196,8 @@ mod tests {
             State(coordinator.clone()),
             Json(ContinuousRegisterRequest {
                 job_id: "cs-explains-job".into(),
-                spec: tumbling_spec(),
+                spec: Some(tumbling_spec()),
+                stream_spec: None,
                 sink: None,
                 parallelism: None,
                 mode: None,
@@ -4050,5 +4254,69 @@ mod tests {
                  (an UnknownJob here is the unfenced bug)"
             ),
         }
+    }
+
+    /// Task #147: a JOIN registered through `stream_spec` builds a
+    /// stream:rjoin: run-loop fragment whose decode round-trips the class —
+    /// the tripwire that catches a coordinator silently window-planning a
+    /// join. Cycle mode for a non-window class is refused by name.
+    #[tokio::test]
+    async fn classed_join_registration_round_trips_and_cycle_is_refused() {
+        use krishiv_plan::stream_join::StreamingJoinSpec;
+        use krishiv_plan::stream_task::StreamingTaskSpec;
+
+        let join = StreamingJoinSpec {
+            left_source: "bid".into(),
+            right_source: "auction".into(),
+            time_column: "ts".into(),
+            left_key_column: "auction".into(),
+            right_key_column: "id".into(),
+            window_ms: 10_000,
+        };
+        let task = StreamingTaskSpec::Join(Box::new(join));
+        let coordinator = make_coordinator_with_executor("classed-join").await;
+
+        // Cycle (the default mode) is refused BY NAME for non-window classes.
+        let cycle_err = register_continuous_task_with_options(
+            &coordinator,
+            "classed-join-cycle",
+            &task,
+            &ContinuousRegistrationOptions::default(),
+        )
+        .await
+        .expect_err("cycle must be refused");
+        assert!(
+            cycle_err.to_string().contains("run-loop only"),
+            "{cycle_err}"
+        );
+
+        let options = ContinuousRegistrationOptions {
+            mode: Some("run-loop".into()),
+            parallelism: Some(2),
+            ..Default::default()
+        };
+        // The in-process fixture cannot host run-loop pushes; reaching THAT
+        // refusal proves routing, validation, fragment build, submission and
+        // launch-target discovery all succeeded for the classed job — the
+        // same dependence the rloop registration tests document.
+        let err =
+            register_continuous_task_with_options(&coordinator, "classed-join", &task, &options)
+                .await
+                .expect_err("in-process endpoints cannot serve run-loops");
+        assert!(
+            err.to_string().contains("in-process executor endpoint"),
+            "{err}"
+        );
+
+        // The submitted record is decodable and class-faithful even though
+        // launch was refused.
+        let coord = coordinator.read().await;
+        let job_id = JobId::try_new("classed-join").unwrap();
+        let jc = coord.job_coordinator(&job_id).unwrap();
+        let record = jc.read_record();
+        let shape = decode_continuous_job_shape(&record).expect("decodable");
+        assert_eq!(shape.task.class_name(), "join", "class survives the wire");
+        assert_eq!(shape.parallelism, 2);
+        assert_eq!(shape.mode, ContinuousJobMode::RunLoop);
     }
 }
