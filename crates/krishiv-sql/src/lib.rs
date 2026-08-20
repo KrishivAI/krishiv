@@ -131,6 +131,7 @@ pub mod coverage;
 mod higher_order_functions;
 mod json_functions;
 mod spark_functions;
+pub mod stateless_exec;
 pub mod statement_completion;
 pub mod streaming;
 pub mod streaming_join_plan;
