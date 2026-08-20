@@ -37,11 +37,16 @@
 //!
 //! # Scope, stated up front
 //!
-//! Four of NEXMark's twenty-two queries. The engine's streaming SQL path can
-//! express single-column keyed windowed aggregation and nothing else yet: no
-//! stateless projection (Q0/Q1), no global aggregates (Q7 standard form), no
-//! composite keys (Q15), no joins (Q3/Q4/Q8). Reported as "4 of 22" everywhere
-//! so a reader cannot mistake this for full NEXMark.
+//! Eight of NEXMark's twenty-two queries. The streaming SQL path expresses
+//! keyed windowed aggregation with expression arguments, COUNT(DISTINCT),
+//! multi-column keys, and (at the SQL surface) equi-key time-band joins. What
+//! the harness still cannot drive: two-source jobs end to end (Q3/Q4/Q8/Q9/Q20
+//! need job-level join routing plus person/auction generators — this generator
+//! emits bids only), global no-key aggregation (Q7 standard form, Q15
+//! canonical form), top-N/rank (Q19), dedup/row_number (Q18), and stateless or
+//! processing-time paths outside the window compiler (Q0/Q10/Q12–Q14/Q21/Q22).
+//! Coverage is printed on every run so a reader cannot mistake this for full
+//! NEXMark.
 
 #![allow(
     clippy::unwrap_used,

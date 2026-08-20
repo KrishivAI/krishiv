@@ -232,13 +232,15 @@ impl NexmarkGenerator {
 
 /// The NEXMark queries this engine's streaming path can currently express.
 ///
-/// Four of twenty-two. Stated as data rather than prose so a report cannot
+/// Eight of twenty-two. Stated as data rather than prose so a report cannot
 /// quietly imply full coverage — the number is read from here.
 ///
-/// The other eighteen need capabilities the streaming compiler does not have
-/// yet: stateless projection (Q0/Q1), global aggregates with no grouping key
-/// (Q7 in its standard form), composite grouping keys (Q15), and joins (Q3,
-/// Q4, Q8 and most of the rest).
+/// The other fourteen need capabilities that do not exist yet: job-level
+/// routing of two-source joins plus person/auction generators (Q3/Q4/Q8/Q9/
+/// Q20), global aggregation with no grouping key (Q7 standard form, Q15
+/// canonical form), top-N/rank (Q19), dedup/row_number (Q18), and stateless
+/// or processing-time paths outside the window compiler (Q0/Q10/Q12–Q14/
+/// Q21/Q22).
 pub const SUPPORTED_QUERIES: &[(&str, &str)] = &[
     (
         // Q1: currency conversion. Aggregates an EXPRESSION, which needs the
