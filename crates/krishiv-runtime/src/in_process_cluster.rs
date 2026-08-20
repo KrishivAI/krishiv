@@ -282,6 +282,7 @@ impl From<&LocalWindowExecutionSpec> for WindowExecutionSpec {
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             window_timezone: spec.window_timezone.clone(),
             row_filter: spec.row_filter.clone(),
         }
@@ -595,6 +596,7 @@ mod tests {
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             window_timezone: None,
             row_filter: None,
         };
@@ -692,6 +694,7 @@ mod tests {
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             window_timezone: None,
             row_filter: None,
         };
@@ -722,6 +725,7 @@ mod tests {
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             window_timezone: None,
             row_filter: None,
         };
@@ -751,6 +755,7 @@ mod tests {
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             window_timezone: None,
             row_filter: None,
         };
@@ -780,6 +785,7 @@ mod tests {
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             window_timezone: None,
             row_filter: None,
         };

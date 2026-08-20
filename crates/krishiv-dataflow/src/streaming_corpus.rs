@@ -459,6 +459,22 @@ pub const QUERY_SHAPES: &[QueryShape] = &[
         why: "Global aggregation landed (task #140): the compiler injects a               constant key and marks it synthetic so the emit path suppresses               it. The assertion pins the MARK, not just compilation — a spec               that compiles with key_is_synthetic false would publish a               __krishiv_global column the user never named.",
     },
     QueryShape {
+        name: "per_key_top_n",
+        sql: "SELECT k, v FROM TUMBLE(TABLE e, DESCRIPTOR(ts), 10000)               GROUP BY k, window_start, window_end ORDER BY v DESC LIMIT 3",
+        compiles: true,
+        spec_must_contain: Some("top_n: Some"),
+        error_must_contain: None,
+        why: "ORDER BY + LIMIT on a windowed query is the per-key top-N shape               (task #142). The assertion pins that the clause REACHES the spec               — ORDER BY was refused outright before, and a compiler that               starts accepting it while dropping it would emit every row.",
+    },
+    QueryShape {
+        name: "ungrouped_bare_column",
+        sql: "SELECT k, v, COUNT(*) AS c FROM TUMBLE(TABLE e, DESCRIPTOR(ts), 10000)               GROUP BY k, window_start, window_end",
+        compiles: false,
+        spec_must_contain: None,
+        error_must_contain: Some("v"),
+        why: "A bare selected column that is neither grouped nor aggregated was               SILENTLY DROPPED from output for the lifetime of the compiler.               Refused since task #142; the error must NAME the column.",
+    },
+    QueryShape {
         name: "windowless_projection",
         sql: "SELECT k, v * 2 AS doubled FROM e",
         compiles: false,

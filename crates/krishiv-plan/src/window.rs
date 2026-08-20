@@ -268,6 +268,26 @@ impl WindowAgg {
     }
 }
 
+/// Per-group bounded top-N over raw rows within each window (task #142).
+///
+/// `SELECT auction, price, bidder ... ORDER BY price DESC LIMIT 10` keeps,
+/// per grouping key per window, the `limit` rows with the greatest (or
+/// least) `order_column`, and emits them with the key and window bounds.
+/// This is the streaming shape behind NEXMark Q19 (top-10 bids per auction)
+/// and Q18 (`LIMIT 1` by event time = keep-last dedup).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopNSpec {
+    /// Column the ranking orders by.
+    pub order_column: String,
+    /// `true` for `DESC` (greatest first) — the common top-N direction.
+    pub descending: bool,
+    /// Rows kept per group per window. Bounded state by construction.
+    pub limit: u32,
+    /// Raw columns each emitted row carries, in SELECT order (the grouping
+    /// key and window bounds are emitted separately, as for aggregates).
+    pub carry_columns: Vec<String>,
+}
+
 /// Full specification for a keyed, windowed streaming operator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowExecutionSpec {
@@ -326,6 +346,12 @@ pub struct WindowExecutionSpec {
     /// representation, this codebase's recurring defect shape.
     #[serde(default)]
     pub key_is_synthetic: bool,
+    /// Bounded per-group top-N over raw rows instead of (not beside)
+    /// aggregates: when set, `agg_exprs` must be empty — ranking raw rows
+    /// and folding aggregates are different output shapes and combining
+    /// them silently would emit a cross-product nobody asked for.
+    #[serde(default)]
+    pub top_n: Option<TopNSpec>,
     /// ST11: events arriving within `[watermark, watermark + allowed_lateness_ms)`
     /// are kept for late-firing instead of being dropped. Defaults to
     /// `None` (no lateness — events past the watermark are dropped).
@@ -393,6 +419,7 @@ impl WindowExecutionSpec {
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             window_timezone: None,
             row_filter: None,
         }
@@ -454,6 +481,7 @@ pub fn decode_window_execution_spec(encoded: &str) -> Result<WindowExecutionSpec
         key_parts: Vec::new(),
         derived_columns: Vec::new(),
         key_is_synthetic: false,
+        top_n: None,
         window_timezone: None,
         row_filter: None,
     };
@@ -463,6 +491,24 @@ pub fn decode_window_execution_spec(encoded: &str) -> Result<WindowExecutionSpec
 
 /// Validate invariants required by all continuous window executors.
 pub fn validate_window_execution_spec(spec: &WindowExecutionSpec) -> Result<(), PlanError> {
+    if let Some(top_n) = &spec.top_n {
+        if top_n.limit == 0 {
+            return Err(PlanError::Validation(String::from(
+                "top-N limit must be at least 1",
+            )));
+        }
+        if top_n.order_column.trim().is_empty() {
+            return Err(PlanError::Validation(String::from(
+                "top-N order column must not be empty",
+            )));
+        }
+        if !spec.agg_exprs.is_empty() {
+            return Err(PlanError::Validation(String::from(
+                "top-N and aggregates cannot be combined in one window query: ranking raw rows \
+                 and folding aggregates are different output shapes",
+            )));
+        }
+    }
     if spec.key_column.trim().is_empty() {
         return Err(PlanError::Validation(String::from(
             "window key_column must not be empty",
@@ -549,7 +595,9 @@ pub fn validate_window_execution_spec(spec: &WindowExecutionSpec) -> Result<(), 
             "window allowed_lateness_ms is implausibly large",
         )));
     }
-    if spec.agg_exprs.is_empty() {
+    // A top-N spec emits ranked raw rows and carries no aggregates; every
+    // other window shape still requires at least one.
+    if spec.agg_exprs.is_empty() && spec.top_n.is_none() {
         return Err(PlanError::Validation(String::from(
             "window execution requires at least one aggregate",
         )));
@@ -656,6 +704,7 @@ pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> Result<String, Plan
         || spec.allowed_lateness_ms.is_some()
         || spec.window_timezone.is_some()
         || spec.key_is_synthetic
+        || spec.top_n.is_some()
         || spec.key_column_type != default_key_type();
     if compact_cannot_represent {
         return encode_window_execution_spec(spec);
@@ -1061,6 +1110,7 @@ mod tests {
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             window_timezone: None,
             row_filter: None,
         };
@@ -1171,6 +1221,7 @@ mod tests {
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             window_timezone: None,
             row_filter: None,
         };
@@ -1212,6 +1263,7 @@ mod tests {
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             window_timezone: None,
             row_filter: None,
         };
@@ -1281,6 +1333,7 @@ mod tests {
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             window_timezone: None,
             row_filter: None,
         };
@@ -1336,6 +1389,7 @@ mod tests {
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             window_timezone: None,
             row_filter: None,
         };
@@ -1364,6 +1418,7 @@ mod tests {
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             window_timezone: None,
             row_filter: None,
         };
@@ -1393,6 +1448,7 @@ mod tests {
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             window_timezone: None,
             row_filter: None,
         };
@@ -1483,6 +1539,7 @@ mod tests {
                         key_parts: Vec::new(),
                         derived_columns: Vec::new(),
                         key_is_synthetic: false,
+                        top_n: None,
                         window_timezone: None,
                         row_filter: None,
                     },

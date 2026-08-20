@@ -25,6 +25,10 @@ pub struct TumblingWindowSpec {
     /// Suppress the key in output: the key exists only to satisfy the keyed
     /// machinery (global aggregation, task #140) and the user never named it.
     pub key_is_synthetic: bool,
+    /// Per-group bounded top-N over raw rows (task #142). When set,
+    /// `agg_exprs` is empty and closed windows emit up to `limit` raw rows
+    /// per key instead of one aggregate row.
+    pub top_n: Option<krishiv_plan::window::TopNSpec>,
     /// Name of the Int64 column carrying event time in milliseconds.
     pub event_time_column: String,
     /// Window duration in milliseconds.
@@ -79,6 +83,33 @@ pub struct TumblingWindowOperator {
     /// Cached column index for the event-time column. Same semantics as
     /// `cached_key_idx`.
     cached_time_idx: Option<usize>,
+    /// Top-N mode state: per `(key, window_start)` the best rows so far,
+    /// kept sorted best-first and capped at `limit` on every insert, so
+    /// state is bounded by construction. Disjoint from `accumulators` — a
+    /// spec has aggregates or a top-N, never both (validated in the plan).
+    topn: HashMap<(String, i64), Vec<TopNRow>>,
+    /// Arrival tie-break: equal ordering values keep arrival order, which
+    /// makes output deterministic for a deterministic input stream.
+    topn_seq: u64,
+    /// Column indices, type tags and output schema for top-N mode, resolved
+    /// from the first batch (carry-column types are not in the spec).
+    topn_runtime: Option<TopNRuntime>,
+}
+
+/// One buffered row in top-N mode.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TopNRow {
+    order: crate::join::AggKey,
+    seq: u64,
+    payload: Vec<crate::join::AggKey>,
+}
+
+/// Resolved-per-schema half of top-N mode.
+struct TopNRuntime {
+    order_idx: usize,
+    carry_idxs: Vec<usize>,
+    carry_tags: Vec<String>,
+    output_schema: Arc<Schema>,
 }
 
 impl TumblingWindowOperator {
@@ -101,6 +132,9 @@ impl TumblingWindowOperator {
             output_schema,
             cached_key_idx: None,
             cached_time_idx: None,
+            topn: HashMap::new(),
+            topn_seq: 0,
+            topn_runtime: None,
         }
     }
 
@@ -164,6 +198,200 @@ impl TumblingWindowOperator {
     /// already been flushed (closed) are removed.  Without this, closed windows
     /// would accumulate in the backend across checkpoint cycles and be
     /// incorrectly re-opened on restore, causing double-emission.
+    /// Resolve top-N column indices, carry type tags, and the output schema
+    /// from the first observed batch.
+    fn ensure_topn_runtime(
+        &mut self,
+        batch: &RecordBatch,
+        top_n: &krishiv_plan::window::TopNSpec,
+    ) -> ExecResult<()> {
+        if self.topn_runtime.is_some() {
+            return Ok(());
+        }
+        let schema = batch.schema();
+        let order_idx = schema
+            .index_of(&top_n.order_column)
+            .map_err(|_| ExecError::ColumnNotFound(top_n.order_column.clone()))?;
+        let mut carry_idxs = Vec::with_capacity(top_n.carry_columns.len());
+        let mut carry_tags = Vec::with_capacity(top_n.carry_columns.len());
+        let mut carry_fields = Vec::with_capacity(top_n.carry_columns.len());
+        for name in &top_n.carry_columns {
+            let idx = schema
+                .index_of(name)
+                .map_err(|_| ExecError::ColumnNotFound(name.clone()))?;
+            let dt = schema.field(idx).data_type();
+            let tag = crate::stream_driver::key_tag_for_arrow_type(dt).ok_or_else(|| {
+                ExecError::UnsupportedType(format!(
+                    "top-N carry column '{name}' has unsupported type {dt}"
+                ))
+            })?;
+            carry_idxs.push(idx);
+            carry_tags.push(tag.to_string());
+            carry_fields.push(Field::new(name, dt.clone(), false));
+        }
+
+        let mut fields: Vec<Field> = if self.spec.key_is_synthetic {
+            Vec::new()
+        } else if self.spec.key_parts.is_empty() {
+            vec![Field::new(
+                &self.spec.key_column,
+                key_type_to_arrow_data_type(&self.spec.key_column_type),
+                false,
+            )]
+        } else {
+            self.spec
+                .key_parts
+                .iter()
+                .map(|p| Field::new(&p.name, key_type_to_arrow_data_type(&p.type_tag), false))
+                .collect()
+        };
+        fields.extend([
+            Field::new("window_start_ms", DataType::Int64, false),
+            Field::new("window_end_ms", DataType::Int64, false),
+        ]);
+        fields.extend(carry_fields);
+        self.topn_runtime = Some(TopNRuntime {
+            order_idx,
+            carry_idxs,
+            carry_tags,
+            output_schema: Arc::new(Schema::new(fields)),
+        });
+        Ok(())
+    }
+
+    /// Insert one row into its group's bounded buffer.
+    ///
+    /// The buffer is kept sorted best-first and truncated to `limit` on every
+    /// insert, so per-group state never exceeds `limit` rows — the bound is
+    /// structural, not a cap that something must remember to enforce.
+    fn insert_topn_row(
+        &mut self,
+        batch: &RecordBatch,
+        row: usize,
+        key: String,
+        win_start: i64,
+        top_n: &krishiv_plan::window::TopNSpec,
+    ) -> ExecResult<()> {
+        let rt = self
+            .topn_runtime
+            .as_ref()
+            .ok_or_else(|| ExecError::InvalidInput("top-N runtime not resolved".into()))?;
+        let order = extract_agg_key(batch, rt.order_idx, row)?;
+        let payload = rt
+            .carry_idxs
+            .iter()
+            .map(|&idx| extract_agg_key(batch, idx, row))
+            .collect::<ExecResult<Vec<_>>>()?;
+        let descending = top_n.descending;
+        let limit = top_n.limit as usize;
+        let seq = self.topn_seq;
+        self.topn_seq = self.topn_seq.wrapping_add(1);
+        let entry = TopNRow {
+            order,
+            seq,
+            payload,
+        };
+        let rows = self.topn.entry((key, win_start)).or_default();
+        // Best-first comparison: DESC = greater order value first; ties keep
+        // arrival order.
+        let better = |a: &TopNRow, b: &TopNRow| -> std::cmp::Ordering {
+            let ord = if descending {
+                b.order.cmp(&a.order)
+            } else {
+                a.order.cmp(&b.order)
+            };
+            ord.then(a.seq.cmp(&b.seq))
+        };
+        let pos = rows
+            .binary_search_by(|probe| better(probe, &entry))
+            .unwrap_or_else(|p| p);
+        if pos < limit {
+            rows.insert(pos, entry);
+            rows.truncate(limit);
+        }
+        Ok(())
+    }
+
+    /// Close and emit top-N buckets whose window end passed the watermark.
+    fn flush_closed_topn_windows(
+        &mut self,
+        watermark_ms: i64,
+        size: i64,
+    ) -> ExecResult<Vec<RecordBatch>> {
+        let mut closed: Vec<(String, i64)> = self
+            .topn
+            .keys()
+            .filter(|(_, win_start)| win_start.saturating_add(size) <= watermark_ms)
+            .cloned()
+            .collect();
+        if closed.is_empty() {
+            return Ok(vec![]);
+        }
+        closed.sort_by(|(ka, wa), (kb, wb)| wa.cmp(wb).then(ka.cmp(kb)));
+        let mut out = Vec::with_capacity(closed.len());
+        for bucket in closed {
+            if let Some(rows) = self.topn.remove(&bucket) {
+                out.push(self.build_topn_batch(&bucket.0, bucket.1, &rows)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Build the multi-row output batch for one closed top-N bucket.
+    fn build_topn_batch(
+        &self,
+        key_value: &str,
+        window_start_ms: i64,
+        rows: &[TopNRow],
+    ) -> ExecResult<RecordBatch> {
+        let rt = self
+            .topn_runtime
+            .as_ref()
+            .ok_or_else(|| ExecError::InvalidInput("top-N runtime not resolved".into()))?;
+        let n = rows.len();
+        let window_end_ms = window_start_ms.saturating_add(self.spec.window_size_ms as i64);
+        let mut columns: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
+
+        if self.spec.key_is_synthetic {
+            // No key columns.
+        } else if self.spec.key_parts.is_empty() {
+            let keys: Vec<&str> = std::iter::repeat_n(key_value, n).collect();
+            columns.push(key_values_to_typed_column_tumbling(
+                &self.spec.key_column_type,
+                &keys,
+            )?);
+        } else {
+            let parts = self.spec.key_parts.len();
+            let decoded = crate::scalar_expr::split_composite_key(key_value, parts)?;
+            for (p, v) in self.spec.key_parts.iter().zip(decoded.iter()) {
+                let vals: Vec<&str> = std::iter::repeat_n(v.as_str(), n).collect();
+                columns.push(key_values_to_typed_column_tumbling(&p.type_tag, &vals)?);
+            }
+        }
+        columns.push(Arc::new(Int64Array::from(vec![window_start_ms; n])));
+        columns.push(Arc::new(Int64Array::from(vec![window_end_ms; n])));
+
+        for (col_pos, tag) in rt.carry_tags.iter().enumerate() {
+            let vals: Vec<&crate::join::AggKey> = rows
+                .iter()
+                .map(|r| {
+                    r.payload.get(col_pos).ok_or_else(|| {
+                        ExecError::InvalidInput(format!(
+                            "top-N buffer corrupt: row has {} payload values, column {col_pos} \
+                             requested",
+                            r.payload.len()
+                        ))
+                    })
+                })
+                .collect::<ExecResult<Vec<_>>>()?;
+            columns.push(agg_keys_to_typed_array(tag, &vals)?);
+        }
+        Ok(RecordBatch::try_new(
+            Arc::clone(&rt.output_schema),
+            columns,
+        )?)
+    }
+
     pub fn persist_to_state(
         &self,
         backend: &mut dyn krishiv_state::StateBackend,
@@ -175,6 +403,22 @@ impl TumblingWindowOperator {
             &self.accumulators,
             b"tw:",
         )?;
+        // Top-N buffers, written ONLY when present — the same opt-in rule as
+        // AGG_STATE_BINARY_V2 and the session `distinct` field (register §51:
+        // every persistence path must carry every state field, BY HAND).
+        for ((key, win_start), rows) in &self.topn {
+            let payload =
+                serde_json::to_vec(rows).map_err(|e| krishiv_state::StateError::CorruptEntry {
+                    message: e.to_string(),
+                })?;
+            let key_bytes = key.as_bytes();
+            let mut state_key = Vec::with_capacity(3 + 4 + key_bytes.len() + 8);
+            state_key.extend_from_slice(b"tn:");
+            state_key.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+            state_key.extend_from_slice(key_bytes);
+            state_key.extend_from_slice(&win_start.to_le_bytes());
+            backend.put(namespace, state_key, payload)?;
+        }
         super::state_persistence::persist_operator_watermark_ms(
             backend,
             namespace,
@@ -190,6 +434,50 @@ impl TumblingWindowOperator {
     ) -> krishiv_state::StateResult<()> {
         self.accumulators =
             super::state_persistence::restore_window_accumulators(backend, namespace, b"tw:")?;
+        self.topn.clear();
+        for key_bytes in backend.list_keys(namespace)? {
+            if key_bytes.get(..3) != Some(b"tn:".as_slice()) {
+                continue;
+            }
+            let Some(payload) = backend.get(namespace, &key_bytes)? else {
+                continue;
+            };
+            let rest = key_bytes.get(3..).unwrap_or_default();
+            let (len_bytes, rest) = rest.split_at_checked(4).ok_or_else(|| {
+                krishiv_state::StateError::CorruptEntry {
+                    message: "truncated top-N state key".into(),
+                }
+            })?;
+            let len_arr: [u8; 4] =
+                len_bytes
+                    .try_into()
+                    .map_err(|_| krishiv_state::StateError::CorruptEntry {
+                        message: "top-N state key length prefix malformed".into(),
+                    })?;
+            let key_len = u32::from_le_bytes(len_arr) as usize;
+            let (key_raw, win_bytes) = rest.split_at_checked(key_len).ok_or_else(|| {
+                krishiv_state::StateError::CorruptEntry {
+                    message: "top-N state key shorter than its declared key length".into(),
+                }
+            })?;
+            let win_arr: [u8; 8] =
+                win_bytes
+                    .try_into()
+                    .map_err(|_| krishiv_state::StateError::CorruptEntry {
+                        message: "top-N state key missing window start".into(),
+                    })?;
+            let key = String::from_utf8(key_raw.to_vec()).map_err(|e| {
+                krishiv_state::StateError::CorruptEntry {
+                    message: format!("top-N state key not utf8: {e}"),
+                }
+            })?;
+            let rows: Vec<TopNRow> = serde_json::from_slice(&payload).map_err(|e| {
+                krishiv_state::StateError::CorruptEntry {
+                    message: format!("invalid top-N rows: {e}"),
+                }
+            })?;
+            self.topn.insert((key, i64::from_le_bytes(win_arr)), rows);
+        }
         if let Some(wm) =
             super::state_persistence::restore_operator_watermark_ms(backend, namespace)?
         {
@@ -252,29 +540,50 @@ impl TumblingWindowOperator {
         // Use the watermark from the PREVIOUS batch as the late threshold.
         let late_threshold = self.prev_watermark_ms;
 
-        // Pre-downcast the aggregate input columns once for the whole batch so
-        // the per-row update avoids a `schema().index_of()` + `downcast_ref()`.
-        let pre_cols = crate::aggregate::downcast_agg_input_cols(batch, &self.spec.agg_exprs)?;
-
-        for row in 0..batch.num_rows() {
-            let event_time_ms = time_arr.value(row);
-            if event_time_ms < late_threshold {
-                self.late_events_dropped = self.late_events_dropped.saturating_add(1);
-                let key = extract_agg_key(batch, key_idx, row)
-                    .map(|k| k.to_string())
-                    .unwrap_or_default();
-                if let Some(ref handler) = self.late_event_handler {
-                    handler.on_late_event(&key, event_time_ms, row);
+        if let Some(top_n) = self.spec.top_n.clone() {
+            self.ensure_topn_runtime(batch, &top_n)?;
+            for row in 0..batch.num_rows() {
+                let event_time_ms = time_arr.value(row);
+                if event_time_ms < late_threshold {
+                    self.late_events_dropped = self.late_events_dropped.saturating_add(1);
+                    let key = extract_agg_key(batch, key_idx, row)
+                        .map(|k| k.to_string())
+                        .unwrap_or_default();
+                    if let Some(ref handler) = self.late_event_handler {
+                        handler.on_late_event(&key, event_time_ms, row);
+                    }
+                    continue;
                 }
-                continue;
+                let key = extract_agg_key(batch, key_idx, row)?.to_string();
+                let win_start = Self::window_start(event_time_ms, self.spec.window_size_ms);
+                self.insert_topn_row(batch, row, key, win_start, &top_n)?;
             }
-            let key = extract_agg_key(batch, key_idx, row)?.to_string();
-            let win_start = Self::window_start(event_time_ms, self.spec.window_size_ms);
-            let state = self
-                .accumulators
-                .entry((key, win_start))
-                .or_insert_with(|| AggState::new(&self.spec.agg_exprs));
-            state.update_pre(&self.spec.agg_exprs, &pre_cols, row)?;
+        } else {
+            // Pre-downcast the aggregate input columns once for the whole
+            // batch so the per-row update avoids a `schema().index_of()` +
+            // `downcast_ref()`.
+            let pre_cols = crate::aggregate::downcast_agg_input_cols(batch, &self.spec.agg_exprs)?;
+
+            for row in 0..batch.num_rows() {
+                let event_time_ms = time_arr.value(row);
+                if event_time_ms < late_threshold {
+                    self.late_events_dropped = self.late_events_dropped.saturating_add(1);
+                    let key = extract_agg_key(batch, key_idx, row)
+                        .map(|k| k.to_string())
+                        .unwrap_or_default();
+                    if let Some(ref handler) = self.late_event_handler {
+                        handler.on_late_event(&key, event_time_ms, row);
+                    }
+                    continue;
+                }
+                let key = extract_agg_key(batch, key_idx, row)?.to_string();
+                let win_start = Self::window_start(event_time_ms, self.spec.window_size_ms);
+                let state = self
+                    .accumulators
+                    .entry((key, win_start))
+                    .or_insert_with(|| AggState::new(&self.spec.agg_exprs));
+                state.update_pre(&self.spec.agg_exprs, &pre_cols, row)?;
+            }
         }
 
         // Advance internal watermark AFTER accumulating this batch.
@@ -291,6 +600,10 @@ impl TumblingWindowOperator {
     /// `(window_start_ms, key)` for deterministic output.
     pub fn flush_closed_windows(&mut self, watermark_ms: i64) -> ExecResult<Vec<RecordBatch>> {
         let size = self.spec.window_size_ms as i64;
+
+        if self.spec.top_n.is_some() {
+            return self.flush_closed_topn_windows(watermark_ms, size);
+        }
 
         let mut closed: Vec<(String, i64)> = self
             .accumulators
@@ -559,11 +872,237 @@ pub(crate) fn key_value_to_typed_array(
     }
 }
 
+/// Build a typed column from repeated string key values (top-N emission).
+fn key_values_to_typed_column_tumbling(
+    key_type: &str,
+    values: &[&str],
+) -> ExecResult<Arc<dyn arrow::array::Array>> {
+    match key_type {
+        "int64" => {
+            let vals = values
+                .iter()
+                .map(|v| {
+                    v.parse::<i64>().map_err(|_| {
+                        ExecError::InvalidInput(format!("key '{v}' cannot be parsed as int64"))
+                    })
+                })
+                .collect::<ExecResult<Vec<i64>>>()?;
+            Ok(Arc::new(Int64Array::from(vals)))
+        }
+        "uint64" => {
+            let vals = values
+                .iter()
+                .map(|v| {
+                    v.parse::<u64>().map_err(|_| {
+                        ExecError::InvalidInput(format!("key '{v}' cannot be parsed as uint64"))
+                    })
+                })
+                .collect::<ExecResult<Vec<u64>>>()?;
+            Ok(Arc::new(arrow::array::UInt64Array::from(vals)))
+        }
+        "int32" => {
+            let vals = values
+                .iter()
+                .map(|v| {
+                    v.parse::<i32>().map_err(|_| {
+                        ExecError::InvalidInput(format!("key '{v}' cannot be parsed as int32"))
+                    })
+                })
+                .collect::<ExecResult<Vec<i32>>>()?;
+            Ok(Arc::new(Int32Array::from(vals)))
+        }
+        "float64" => {
+            let vals = values
+                .iter()
+                .map(|v| {
+                    v.parse::<f64>().map_err(|_| {
+                        ExecError::InvalidInput(format!("key '{v}' cannot be parsed as float64"))
+                    })
+                })
+                .collect::<ExecResult<Vec<f64>>>()?;
+            Ok(Arc::new(Float64Array::from(vals)))
+        }
+        "bool" => {
+            let vals = values
+                .iter()
+                .map(|v| {
+                    v.parse::<bool>().map_err(|_| {
+                        ExecError::InvalidInput(format!("key '{v}' cannot be parsed as bool"))
+                    })
+                })
+                .collect::<ExecResult<Vec<bool>>>()?;
+            Ok(Arc::new(BooleanArray::from(vals)))
+        }
+        _ => Ok(Arc::new(StringArray::from(values.to_vec()))),
+    }
+}
+
+/// Build a typed array from `AggKey` values whose declared tag is `tag`.
+///
+/// A value whose variant disagrees with the tag is an error, not a cast: the
+/// tag came from the SAME schema the values were extracted from, so a
+/// mismatch means the buffer is corrupt.
+fn agg_keys_to_typed_array(
+    tag: &str,
+    values: &[&crate::join::AggKey],
+) -> ExecResult<Arc<dyn arrow::array::Array>> {
+    use crate::join::AggKey;
+    fn bad(tag: &str, got: &AggKey) -> ExecError {
+        ExecError::InvalidInput(format!(
+            "top-N buffer corrupt: declared column tag '{tag}' but stored value {got:?}"
+        ))
+    }
+    match tag {
+        "int64" => {
+            let vals = values
+                .iter()
+                .map(|k| match k {
+                    AggKey::Int64(v) => Ok(*v),
+                    AggKey::Int32(v) => Ok(i64::from(*v)),
+                    other => Err(bad(tag, other)),
+                })
+                .collect::<ExecResult<Vec<i64>>>()?;
+            Ok(Arc::new(Int64Array::from(vals)))
+        }
+        "uint64" => {
+            let vals = values
+                .iter()
+                .map(|k| match k {
+                    AggKey::UInt64(v) => Ok(*v),
+                    other => Err(bad(tag, other)),
+                })
+                .collect::<ExecResult<Vec<u64>>>()?;
+            Ok(Arc::new(arrow::array::UInt64Array::from(vals)))
+        }
+        "int32" => {
+            let vals = values
+                .iter()
+                .map(|k| match k {
+                    AggKey::Int32(v) => Ok(*v),
+                    other => Err(bad(tag, other)),
+                })
+                .collect::<ExecResult<Vec<i32>>>()?;
+            Ok(Arc::new(Int32Array::from(vals)))
+        }
+        "float64" => {
+            let vals = values
+                .iter()
+                .map(|k| match k {
+                    AggKey::Float64(bits) => Ok(f64::from_bits(*bits)),
+                    other => Err(bad(tag, other)),
+                })
+                .collect::<ExecResult<Vec<f64>>>()?;
+            Ok(Arc::new(Float64Array::from(vals)))
+        }
+        "bool" => {
+            let vals = values
+                .iter()
+                .map(|k| match k {
+                    AggKey::Bool(v) => Ok(*v),
+                    other => Err(bad(tag, other)),
+                })
+                .collect::<ExecResult<Vec<bool>>>()?;
+            Ok(Arc::new(BooleanArray::from(vals)))
+        }
+        _ => {
+            let vals = values
+                .iter()
+                .map(|k| match k {
+                    AggKey::Utf8(v) => Ok(v.clone()),
+                    other => Err(bad(tag, other)),
+                })
+                .collect::<ExecResult<Vec<String>>>()?;
+            Ok(Arc::new(StringArray::from(vals)))
+        }
+    }
+}
+
 #[cfg(test)]
 mod state_tests {
     use super::*;
     use crate::aggregate::AggFunction;
     use krishiv_state::{Namespace, RocksDbStateBackend};
+
+    /// Top-N buffers must survive checkpoint/restore, and a pre-checkpoint
+    /// row that is still among the best must beat a worse post-restore row.
+    ///
+    /// Register §51's standing observation applies: top-N state is a NEW
+    /// state field, and every persistence path must carry it by hand. With
+    /// the persist hunk reverted, the restored operator has an empty buffer
+    /// and the post-restore row (price 50) wrongly wins a top-2 slot that
+    /// the checkpointed 900 and 500 should hold.
+    #[test]
+    fn top_n_buffers_survive_checkpoint_restore() {
+        let make_spec = || TumblingWindowSpec {
+            key_column: "k".into(),
+            key_column_type: "utf8".into(),
+            key_parts: Vec::new(),
+            key_is_synthetic: false,
+            top_n: Some(krishiv_plan::window::TopNSpec {
+                order_column: "price".into(),
+                descending: true,
+                limit: 2,
+                carry_columns: vec![String::from("price")],
+            }),
+            event_time_column: "ts".into(),
+            window_size_ms: 1000,
+            agg_exprs: vec![],
+            agg_is_float: vec![],
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("price", DataType::Int64, false),
+        ]));
+        let batch = |ts: Vec<i64>, price: Vec<i64>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["a"; ts.len()])),
+                    Arc::new(Int64Array::from(ts)),
+                    Arc::new(Int64Array::from(price)),
+                ],
+            )
+            .unwrap()
+        };
+
+        let mut op = TumblingWindowOperator::new(make_spec());
+        op.process_batch(&batch(vec![100, 200], vec![900, 500]), 200)
+            .expect("process");
+
+        let mut backend = RocksDbStateBackend::ephemeral().unwrap();
+        let ns = Namespace::new("op-topn", "windows");
+        op.persist_to_state(&mut backend, &ns).expect("persist");
+
+        let mut restored = TumblingWindowOperator::new(make_spec());
+        restored.restore_from_state(&backend, &ns).expect("restore");
+
+        // A worse bid after restore, then close the window.
+        restored
+            .process_batch(&batch(vec![300], vec![50]), 300)
+            .expect("post-restore bid");
+        let out = restored.flush_closed_windows(5_000).expect("close");
+        let prices: Vec<i64> = out
+            .iter()
+            .flat_map(|b| {
+                let idx = b.schema().index_of("price").expect("price col");
+                let arr = b
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64")
+                    .clone();
+                (0..b.num_rows())
+                    .map(move |i| arr.value(i))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            prices,
+            vec![900, 500],
+            "the checkpointed 900/500 must survive and the post-restore 50 must lose"
+        );
+    }
 
     #[test]
     fn tumbling_state_persist_and_restore_roundtrip() {
@@ -572,6 +1111,7 @@ mod state_tests {
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             agg_exprs: vec![AggExpr {
@@ -609,6 +1149,7 @@ mod state_tests {
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             agg_exprs: vec![AggExpr {
@@ -634,6 +1175,7 @@ mod state_tests {
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             event_time_column: "ts".into(),
             window_size_ms: 0,
             agg_exprs: vec![AggExpr {
@@ -672,6 +1214,7 @@ mod state_tests {
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             event_time_column: "ts".into(),
             window_size_ms: 10_000,
             agg_exprs: vec![AggExpr {
@@ -832,6 +1375,7 @@ mod aggregation_proptests {
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             agg_exprs: vec![
@@ -943,6 +1487,7 @@ mod aggregation_proptests {
                 key_column_type: "utf8".into(),
                 key_parts: Vec::new(),
                 key_is_synthetic: false,
+                top_n: None,
                 event_time_column: "ts".into(),
                 window_size_ms: 1000,
                 agg_exprs: vec![
@@ -981,6 +1526,7 @@ mod aggregation_proptests {
                 key_column_type: "utf8".into(),
                 key_parts: Vec::new(),
                 key_is_synthetic: false,
+                top_n: None,
                 event_time_column: "ts".into(),
                 window_size_ms: 1000,
                 agg_exprs: vec![AggExpr { filter: None,
@@ -1056,6 +1602,7 @@ mod filter_tests {
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             agg_exprs: vec![

@@ -1046,6 +1046,7 @@ mod output_mode_compat_tests {
                             key_parts: Vec::new(),
                             derived_columns: Vec::new(),
                             key_is_synthetic: false,
+                            top_n: None,
                             window_timezone: None,
                             row_filter: None,
                         }),

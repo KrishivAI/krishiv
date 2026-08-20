@@ -39,8 +39,8 @@ use std::collections::HashMap;
 
 use datafusion::sql::sqlparser::ast::{
     BinaryOperator, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
-    UnaryOperator, Value,
+    FunctionArguments, GroupByExpr, LimitClause, OrderBy, OrderByKind, Query, Select, SelectItem,
+    SetExpr, Statement, TableFactor, UnaryOperator, Value,
 };
 use datafusion::sql::sqlparser::dialect::DuckDbDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -93,7 +93,7 @@ pub fn is_windowed_streaming_sql(sql: &str) -> bool {
 /// single parsed plan.
 pub fn compile_streaming_window_sql(sql: &str) -> SqlResult<StreamingWindowPlan> {
     let rewritten = rewrite_window_tvfs(sql);
-    let select = parse_single_select(&rewritten)?;
+    let (select, raw_top_n) = parse_single_select(&rewritten)?;
 
     let (window, source) = extract_window(&select)?;
     let KeyAndAggs {
@@ -102,7 +102,39 @@ pub fn compile_streaming_window_sql(sql: &str) -> SqlResult<StreamingWindowPlan>
         derived: derived_columns,
         key_parts,
         key_is_synthetic,
-    } = extract_key_and_aggs(&select)?;
+        carry_columns,
+    } = extract_key_and_aggs(&select, raw_top_n.is_some())?;
+
+    // Raw selected columns are only meaningful with a top-N (they become the
+    // emitted row payload). With aggregates they were silently DROPPED for
+    // the lifetime of this compiler — `SELECT k, v, COUNT(*)` compiled and v
+    // simply never appeared in output. Fail closed and name the column.
+    let top_n = match raw_top_n {
+        Some(raw) => {
+            if !agg_exprs.is_empty() {
+                return Err(unsupported(
+                    "top-N (ORDER BY ... LIMIT) and aggregate functions cannot be combined \
+                     in one streaming window query: ranking raw rows and folding aggregates \
+                     are different output shapes",
+                ));
+            }
+            Some(krishiv_plan::window::TopNSpec {
+                order_column: raw.order_column,
+                descending: raw.descending,
+                limit: raw.limit,
+                carry_columns,
+            })
+        }
+        None => {
+            if let Some(stray) = carry_columns.first() {
+                return Err(unsupported(format!(
+                    "column '{stray}' is selected but neither grouped nor aggregated; \
+                     it would be silently dropped from the window output"
+                )));
+            }
+            None
+        }
+    };
 
     // A top-level WHERE becomes a row filter applied BEFORE grouping, using the
     // same predicate AST and the same lowering as a per-aggregate
@@ -148,6 +180,7 @@ pub fn compile_streaming_window_sql(sql: &str) -> SqlResult<StreamingWindowPlan>
         key_parts,
         derived_columns,
         key_is_synthetic,
+        top_n,
         window_timezone: None,
         row_filter,
     };
@@ -157,7 +190,7 @@ pub fn compile_streaming_window_sql(sql: &str) -> SqlResult<StreamingWindowPlan>
 /// Parse the (already TVF-rewritten) SQL once with the front-door dialect and
 /// return its single top-level `SELECT`. This is the *only* parse in the
 /// streaming compile path, and it uses the same dialect as the batch front door.
-fn parse_single_select(sql: &str) -> SqlResult<Select> {
+fn parse_single_select(sql: &str) -> SqlResult<(Select, Option<RawTopN>)> {
     let dialect = DuckDbDialect {};
     let stmts = Parser::parse_sql(&dialect, sql)
         .map_err(|e| unsupported(format!("streaming window query parse error: {e}")))?;
@@ -168,14 +201,21 @@ fn parse_single_select(sql: &str) -> SqlResult<Select> {
             _ => None,
         })
         .ok_or_else(|| unsupported("streaming window query must be a SELECT"))?;
-    reject_unsupported_query_clauses(&query)?;
+    let top_n = reject_unsupported_query_clauses(&query)?;
     match *query.body {
         SetExpr::Select(select) => {
             reject_unsupported_select_clauses(&select)?;
-            Ok(*select)
+            Ok((*select, top_n))
         }
         _ => Err(unsupported("streaming window query must be a plain SELECT")),
     }
+}
+
+/// `ORDER BY <col> [DESC] LIMIT <n>` before lowering to a `TopNSpec`.
+struct RawTopN {
+    order_column: String,
+    descending: bool,
+    limit: u32,
 }
 
 /// Refuse the `Query`-level clauses this compiler cannot honour.
@@ -194,31 +234,114 @@ fn parse_single_select(sql: &str) -> SqlResult<Select> {
 ///
 /// Implementing them is a feature and may well be worth doing. Ignoring them
 /// never was.
-fn reject_unsupported_query_clauses(query: &Query) -> SqlResult<()> {
+fn reject_unsupported_query_clauses(query: &Query) -> SqlResult<Option<RawTopN>> {
     if query.with.is_some() {
         return Err(unsupported(
             "streaming window queries do not support WITH / common table expressions; \
              inline the subquery, or run the CTE as a separate job",
         ));
     }
-    if query.order_by.is_some() {
-        return Err(unsupported(
-            "streaming window queries do not support ORDER BY: a stream has no final \
-             order to sort. Order the output downstream of the sink",
-        ));
-    }
-    if query.limit_clause.is_some() {
-        return Err(unsupported(
-            "streaming window queries do not support LIMIT / OFFSET: a continuous job \
-             has no last row. Apply the limit to the sink's consumer",
-        ));
-    }
+    // ORDER BY + LIMIT together are the per-group top-N shape (task #142):
+    // within each window, each grouping key keeps its `LIMIT` best rows by
+    // the ordering column. Either clause ALONE keeps its refusal — a global
+    // sort of an unbounded stream and a nondeterministic row sample both
+    // stay meaningless.
+    let top_n = match (&query.order_by, &query.limit_clause) {
+        (None, None) => None,
+        (Some(order_by), Some(limit_clause)) => Some(lower_top_n(order_by, limit_clause)?),
+        (Some(_), None) => {
+            return Err(unsupported(
+                "streaming window queries do not support ORDER BY without LIMIT: a stream \
+                 has no final order to sort. Add LIMIT <n> for a per-key top-N per window, \
+                 or order the output downstream of the sink",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(unsupported(
+                "streaming window queries do not support LIMIT without ORDER BY: which rows \
+                 survive would be nondeterministic. Add ORDER BY <col> for a per-key top-N \
+                 per window",
+            ));
+        }
+    };
     if query.fetch.is_some() {
         return Err(unsupported(
             "streaming window queries do not support FETCH; see the LIMIT note",
         ));
     }
-    Ok(())
+    Ok(top_n)
+}
+
+/// Lower `ORDER BY <col> [ASC|DESC] LIMIT <n>` to a [`RawTopN`], refusing by
+/// name everything the streaming top-N cannot honour.
+fn lower_top_n(order_by: &OrderBy, limit_clause: &LimitClause) -> SqlResult<RawTopN> {
+    let exprs = match &order_by.kind {
+        OrderByKind::Expressions(exprs) => exprs,
+        OrderByKind::All(_) => {
+            return Err(unsupported(
+                "streaming top-N does not support ORDER BY ALL; name one ordering column",
+            ));
+        }
+    };
+    let [order_expr] = exprs.as_slice() else {
+        return Err(unsupported(format!(
+            "streaming top-N supports exactly one ORDER BY column, got {}",
+            exprs.len()
+        )));
+    };
+    if order_expr.with_fill.is_some() || order_by.interpolate.is_some() {
+        return Err(unsupported(
+            "streaming top-N does not support WITH FILL / INTERPOLATE",
+        ));
+    }
+    let order_column = match &order_expr.expr {
+        Expr::Identifier(id) => id.value.clone(),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|p| p.value.clone())
+            .ok_or_else(|| unsupported("empty ORDER BY column"))?,
+        other => {
+            return Err(unsupported(format!(
+                "streaming top-N orders by a plain column, not an expression: {other}"
+            )));
+        }
+    };
+    let LimitClause::LimitOffset {
+        limit: Some(limit_expr),
+        offset: None,
+        limit_by,
+    } = limit_clause
+    else {
+        return Err(unsupported(
+            "streaming top-N supports plain LIMIT <n> only — no OFFSET, no LIMIT BY, \
+             no MySQL comma form",
+        ));
+    };
+    if !limit_by.is_empty() {
+        return Err(unsupported("streaming top-N does not support LIMIT BY"));
+    }
+    let limit: u32 = match limit_expr {
+        Expr::Value(v) => v
+            .value
+            .to_string()
+            .parse()
+            .map_err(|_| unsupported(format!("LIMIT must be a positive integer: {v}")))?,
+        other => {
+            return Err(unsupported(format!(
+                "LIMIT must be a literal integer, not {other}"
+            )));
+        }
+    };
+    if limit == 0 {
+        return Err(unsupported("LIMIT 0 keeps nothing; a top-N needs n >= 1"));
+    }
+    Ok(RawTopN {
+        order_column,
+        // ASC unless DESC was written; NULLS ordering is refused rather than
+        // silently picked because the operator rejects NULL ordering values.
+        descending: order_expr.options.asc == Some(false),
+        limit,
+    })
 }
 
 /// Refuse the `Select`-level clauses this compiler cannot honour.
@@ -482,12 +605,20 @@ struct KeyAndAggs {
     /// True when the query named no grouping key and `key_column` is a
     /// compiler-injected constant that must not appear in output.
     key_is_synthetic: bool,
+    /// Bare selected columns that are not part of the grouping key, in
+    /// SELECT order. With a top-N these are the emitted row payload; without
+    /// one the caller refuses them by name rather than dropping them.
+    carry_columns: Vec<String>,
 }
 
-fn extract_key_and_aggs(select: &Select) -> SqlResult<KeyAndAggs> {
+fn extract_key_and_aggs(select: &Select, has_top_n: bool) -> SqlResult<KeyAndAggs> {
     let mut key_column: Option<String> = None;
     let mut aggs: Vec<WindowAgg> = Vec::new();
     let mut derived: Vec<DerivedColumn> = Vec::new();
+    // Every bare column in SELECT order; the grouping key(s) are removed
+    // below and the remainder is the top-N carry payload (or, without a
+    // top-N, a by-name refusal in the caller — never a silent drop).
+    let mut bare_columns: Vec<String> = Vec::new();
 
     for item in &select.projection {
         let (expr, alias) = match item {
@@ -497,9 +628,19 @@ fn extract_key_and_aggs(select: &Select) -> SqlResult<KeyAndAggs> {
         };
         match expr {
             Expr::Function(f) => aggs.push(function_to_agg(f, alias, &mut derived)?),
-            Expr::Identifier(id) => maybe_set_key(&mut key_column, &id.value),
+            Expr::Identifier(id) => {
+                // window_start / window_end are re-emitted as the window
+                // bounds, not carried rows — selecting them is always fine.
+                if !WINDOW_BOUNDARY_COLS.contains(&id.value.as_str()) {
+                    bare_columns.push(id.value.clone());
+                }
+                maybe_set_key(&mut key_column, &id.value);
+            }
             Expr::CompoundIdentifier(parts) => {
                 if let Some(last) = parts.last() {
+                    if !WINDOW_BOUNDARY_COLS.contains(&last.value.as_str()) {
+                        bare_columns.push(last.value.clone());
+                    }
                     maybe_set_key(&mut key_column, &last.value);
                 }
             }
@@ -522,7 +663,7 @@ fn extract_key_and_aggs(select: &Select) -> SqlResult<KeyAndAggs> {
                  window query's grouping key must be selected so the output can carry it"
             )));
         }
-        if aggs.is_empty() {
+        if aggs.is_empty() && !has_top_n {
             aggs.push(WindowAgg::count("count"));
         }
         derived.push(DerivedColumn {
@@ -535,10 +676,11 @@ fn extract_key_and_aggs(select: &Select) -> SqlResult<KeyAndAggs> {
             derived,
             key_parts: Vec::new(),
             key_is_synthetic: true,
+            carry_columns: bare_columns,
         });
     };
     let extra_keys = collect_extra_group_by(select, &key_column)?;
-    if aggs.is_empty() {
+    if aggs.is_empty() && !has_top_n {
         aggs.push(WindowAgg::count("count"));
     }
 
@@ -566,12 +708,24 @@ fn extract_key_and_aggs(select: &Select) -> SqlResult<KeyAndAggs> {
         (composite, parts)
     };
 
+    let key_names: Vec<&str> = if key_parts.is_empty() {
+        vec![key_column.as_str()]
+    } else {
+        key_parts.iter().map(|p| p.name.as_str()).collect()
+    };
+    let carry_columns: Vec<String> = bare_columns
+        .iter()
+        .filter(|c| !key_names.contains(&c.as_str()))
+        .cloned()
+        .collect();
+
     Ok(KeyAndAggs {
         key_column,
         aggs,
         derived,
         key_parts,
         key_is_synthetic: false,
+        carry_columns,
     })
 }
 

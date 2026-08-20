@@ -312,6 +312,7 @@ fn count_window_spec() -> TumblingWindowSpec {
     TumblingWindowSpec {
         key_parts: Vec::new(),
         key_is_synthetic: false,
+        top_n: None,
         key_column: "key".into(),
         key_column_type: "utf8".into(),
         event_time_column: "ts".into(),
@@ -413,6 +414,7 @@ fn window_sum_aggregation() {
         key_column_type: "utf8".into(),
         key_parts: Vec::new(),
         key_is_synthetic: false,
+        top_n: None,
         event_time_column: "ts".into(),
         window_size_ms: 1000,
         agg_exprs: vec![AggExpr {
@@ -443,6 +445,7 @@ fn window_avg_aggregation() {
         key_column_type: "utf8".into(),
         key_parts: Vec::new(),
         key_is_synthetic: false,
+        top_n: None,
         event_time_column: "ts".into(),
         window_size_ms: 1000,
         agg_exprs: vec![AggExpr {

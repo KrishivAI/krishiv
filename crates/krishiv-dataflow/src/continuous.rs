@@ -78,6 +78,7 @@ fn build_operator(
                 key_column_type: spec.key_column_type.clone(),
                 key_parts: spec.key_parts.clone(),
                 key_is_synthetic: spec.key_is_synthetic,
+                top_n: spec.top_n.clone(),
                 event_time_column: spec.event_time_column.clone(),
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.to_vec(),

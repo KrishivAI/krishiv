@@ -242,6 +242,15 @@ pub fn execute_bounded_window_seeded(
              column and would publish the encoded key instead of the columns the query named",
         )));
     }
+    if spec.top_n.is_some() && !matches!(spec.window_kind, WindowKind::Tumbling) {
+        return Err(ExecError::InvalidWindowConfig(format!(
+            "top-N is supported on tumbling windows only, not {:?}: sliding windows would \
+             need per-pane row buffers and session windows a merge rule for ranked rows — \
+             both are real designs nobody has written, and guessing one silently is worse \
+             than refusing",
+            spec.window_kind
+        )));
+    }
     if key_is_synthetic && matches!(spec.window_kind, WindowKind::Count { .. }) {
         return Err(ExecError::InvalidWindowConfig(String::from(
             "count windows do not support global (no-key) aggregation: the operator emits one \
@@ -257,6 +266,7 @@ pub fn execute_bounded_window_seeded(
                 key_column_type,
                 key_parts: key_parts.clone(),
                 key_is_synthetic,
+                top_n: spec.top_n.clone(),
                 event_time_column,
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.clone(),
@@ -436,6 +446,15 @@ fn build_streaming_window_op(
              column and would publish the encoded key instead of the columns the query named",
         )));
     }
+    if spec.top_n.is_some() && !matches!(spec.window_kind, WindowKind::Tumbling) {
+        return Err(ExecError::InvalidWindowConfig(format!(
+            "top-N is supported on tumbling windows only, not {:?}: sliding windows would \
+             need per-pane row buffers and session windows a merge rule for ranked rows — \
+             both are real designs nobody has written, and guessing one silently is worse \
+             than refusing",
+            spec.window_kind
+        )));
+    }
     if key_is_synthetic && matches!(spec.window_kind, WindowKind::Count { .. }) {
         return Err(ExecError::InvalidWindowConfig(String::from(
             "count windows do not support global (no-key) aggregation: the operator emits one \
@@ -453,6 +472,7 @@ fn build_streaming_window_op(
                 key_column_type,
                 key_parts: key_parts.clone(),
                 key_is_synthetic,
+                top_n: spec.top_n.clone(),
                 event_time_column,
                 window_size_ms: spec.window_size_ms,
                 agg_exprs,
@@ -527,7 +547,7 @@ pub fn execute_streaming_window(
     spec: WindowExecutionSpec,
     state_dir: Option<&std::path::Path>,
 ) -> ExecResult<Pin<Box<dyn Stream<Item = ExecResult<RecordBatch>> + Send>>> {
-    if spec.agg_exprs.is_empty() {
+    if spec.agg_exprs.is_empty() && spec.top_n.is_none() {
         return Err(ExecError::InvalidWindowConfig(
             "window execution requires at least one aggregate".into(),
         ));
@@ -719,6 +739,7 @@ pub fn local_spec_to_window_execution(params: LocalWindowParams) -> WindowExecut
         key_parts: Vec::new(),
         derived_columns: Vec::new(),
         key_is_synthetic: false,
+        top_n: None,
         window_timezone: None,
         row_filter: None,
     }
@@ -893,6 +914,7 @@ mod tests {
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             window_timezone: None,
             row_filter: None,
         };
@@ -942,6 +964,7 @@ mod tests {
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             window_timezone: None,
             row_filter: None,
         };
@@ -1005,6 +1028,7 @@ mod tests {
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             window_timezone: None,
             row_filter: None,
         };

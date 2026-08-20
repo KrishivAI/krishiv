@@ -5736,3 +5736,42 @@ context removed context construction, but ctx.sql() still parses and plans
 per batch. A cached-logical-plan step is the next lever if these numbers
 matter; it changes observable behavior not at all and was not smuggled into
 this change.
+
+## §56 — #142: per-key top-N and keep-last dedup (NEXMark Q19/Q18)
+
+The SQL shape is `ORDER BY <col> [DESC] LIMIT <n>` on a windowed query —
+previously refused fail-closed by §39/#132, now the deliberate flip: within
+each window, each grouping key keeps its n best rows. Q18 is the degenerate
+case (`LIMIT 1` by event time = keep-last dedup). Either clause ALONE keeps
+its refusal; so do OFFSET, LIMIT BY, multi-column ORDER BY, expression
+ordering, and top-N combined with aggregates — every one refused by name.
+
+Design decisions, recorded: state lives in its own per-(key, window) buffer
+capped at `limit` ON EVERY INSERT — the bound is structural, not a cap
+something must remember to enforce; NOT in AggState (which would have to
+visit both serialization encoders — §51's trap); tumbling-only, with sliding
+/session/count refusing BY NAME (per-pane buffers and ranked-row merge are
+real designs nobody has written; guessing one silently is worse). Payloads
+are typed AggKey values; a tag/variant mismatch at emit is an error naming
+corruption, never a cast. Checkpointing uses a separate `tn:` prefix written
+only when buffers exist, so every non-top-N checkpoint stays byte-identical.
+
+Revert proofs, one per claim: cap revert → auction 1 emits 3 rows not 2;
+direction revert → [100, 500] survives instead of [900, 500]; persist-hunk
+revert → the post-restore worst row wins a slot the checkpointed best rows
+held (left: [50], right: [900, 500]); compiler-acceptance revert → the old
+refusal. Corpus gains two pinned shapes: per_key_top_n (asserting the clause
+REACHES the spec) and ungrouped_bare_column.
+
+Defect fixed en route: a bare selected column that was neither grouped nor
+aggregated was SILENTLY DROPPED from windowed output for the lifetime of the
+compiler — `SELECT k, v, COUNT(*) ... GROUP BY k, ...` compiled and v never
+appeared. Now refused naming the column (f1 shape, instance four at this
+seam). And one honest embarrassment for the record: the first dedup test
+run "failed" with transposed key columns, and the defect was in the TEST
+fixture (tuple order), not the engine — the debugging that proved the engine
+right is exactly the discipline the register demands before "fixing" code
+that isn't broken.
+
+Coverage 13 → 15 of 22. Pinned medians: q19_auction_top10 9.1M ev/sec,
+q18_last_bid_dedup 2.9M. 5503 workspace tests, clippy and fmt clean.

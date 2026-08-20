@@ -259,13 +259,12 @@ pub struct BenchQuery {
 
 /// The NEXMark queries this engine's streaming path can currently express.
 ///
-/// Thirteen of twenty-two. Stated as data rather than prose so a report
+/// Fifteen of twenty-two. Stated as data rather than prose so a report
 /// cannot quietly imply full coverage — the number is read from here.
 ///
-/// The other nine need capabilities that do not exist yet: job-level routing
-/// of two-source joins plus person/auction generators (Q3/Q4/Q8/Q9/Q20),
-/// top-N/rank (Q19), dedup/row_number (Q18), and processing-time / side-input
-/// semantics (Q12/Q13). Q7 and Q15 run in their canonical global forms
+/// The other seven need capabilities that do not exist yet: job-level routing
+/// of two-source joins plus person/auction generators (Q3/Q4/Q8/Q9/Q20) and
+/// processing-time / side-input semantics (Q12/Q13). Q7 and Q15 run in their canonical global forms
 /// (task #140); Q0/Q10/Q14/Q21/Q22 run through the stateless per-batch path
 /// (task #141). Documented deviations: Q10 measures the projection, not the
 /// partitioned file sink; Q14's bid-time classification is a price-band CASE
@@ -346,6 +345,25 @@ pub const SUPPORTED_QUERIES: &[BenchQuery] = &[
         sql: "SELECT bidder, COUNT(*) AS c \
          FROM SESSION(TABLE bid, DESCRIPTOR(dateTime), 10000) \
          GROUP BY bidder, window_start, window_end",
+        expect: RowsOut::NonZero,
+    },
+    BenchQuery {
+        // Q19: auction top-10 by price (task #142). The reference expresses
+        // this as ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price
+        // DESC) <= 10; this engine's streaming SQL spells the same shape
+        // ORDER BY price DESC LIMIT 10 per grouping key per window.
+        name: "q19_auction_top10",
+        sql: "SELECT auction, bidder, price FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
+              GROUP BY auction, window_start, window_end ORDER BY price DESC LIMIT 10",
+        expect: RowsOut::NonZero,
+    },
+    BenchQuery {
+        // Q18: last bid per (bidder, auction) — LIMIT 1 by event time is
+        // keep-last dedup (task #142).
+        name: "q18_last_bid_dedup",
+        sql: "SELECT bidder, auction, price FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
+              GROUP BY bidder, auction, window_start, window_end \
+              ORDER BY \"dateTime\" DESC LIMIT 1",
         expect: RowsOut::NonZero,
     },
     // ── stateless queries (task #141): per-batch, no window state ──

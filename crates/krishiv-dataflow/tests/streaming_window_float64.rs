@@ -64,6 +64,7 @@ fn streaming_window_preserves_float64_sum() {
         key_parts: Vec::new(),
         derived_columns: Vec::new(),
         key_is_synthetic: false,
+        top_n: None,
         window_timezone: None,
         row_filter: None,
     };

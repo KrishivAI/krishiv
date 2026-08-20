@@ -573,6 +573,7 @@ mod watermark_tests {
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             event_time_column: "ts".into(),
             window_size_ms: 10_000,
             agg_exprs: vec![AggExpr {
@@ -627,6 +628,7 @@ mod watermark_tests {
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
             key_is_synthetic: false,
+            top_n: None,
             event_time_column: "ts".into(),
             window_size_ms: 10_000,
             agg_exprs: vec![AggExpr {

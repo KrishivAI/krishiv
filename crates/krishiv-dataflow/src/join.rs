@@ -10,7 +10,7 @@ use arrow::record_batch::RecordBatch;
 use crate::{ExecError, ExecResult};
 
 /// Typed group-by / join key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AggKey {
     Int32(i32),
     Int64(i64),
