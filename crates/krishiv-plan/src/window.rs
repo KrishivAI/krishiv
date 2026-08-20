@@ -626,9 +626,24 @@ fn unescape_compact_value(s: &str) -> String {
 /// format because the compact format's `:` field delimiter conflicts with
 /// agg parameter syntax (`agg=sum:col=amount`).
 pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> Result<String, PlanError> {
-    // Filtered aggregates also need the lossless JSON format: the compact
-    // text format has no filter syntax.
-    if spec.agg_exprs.len() > 1 || spec.agg_exprs.iter().any(|a| a.filter.is_some()) {
+    // Any spec the compact text format cannot represent MUST take the
+    // lossless JSON format. The original condition covered only multi-agg and
+    // filtered specs; every field added since (composite key_parts, derived
+    // columns, row_filter, allowed lateness, timezone, an explicit key type)
+    // was silently DROPPED here — encode succeeded, decode rebuilt the field
+    // as empty, and a multi-column GROUP BY on the distributed fragment path
+    // collapsed back to one key. The condition below must grow with the spec:
+    // if you add a field the compact format does not carry, add it here or
+    // the fragment codec will erase it.
+    let compact_cannot_represent = spec.agg_exprs.len() > 1
+        || spec.agg_exprs.iter().any(|a| a.filter.is_some())
+        || !spec.key_parts.is_empty()
+        || !spec.derived_columns.is_empty()
+        || spec.row_filter.is_some()
+        || spec.allowed_lateness_ms.is_some()
+        || spec.window_timezone.is_some()
+        || spec.key_column_type != default_key_type();
+    if compact_cannot_represent {
         return encode_window_execution_spec(spec);
     }
     let agg = if spec.agg_exprs.is_empty() {
@@ -1077,6 +1092,50 @@ mod tests {
         );
     }
     use super::*;
+
+    /// Every field the compact fragment format cannot carry must force the
+    /// lossless JSON encoding — otherwise the codec ERASES it: encode
+    /// succeeds, decode rebuilds the field empty, and a multi-column GROUP BY
+    /// on the distributed fragment path silently collapses to one key. This
+    /// encodes a spec with composite key_parts, a derived column, a row
+    /// filter, and an explicit key type — all post-compact-format fields with
+    /// a single unfiltered aggregate, the exact shape that used to take the
+    /// lossy compact path — and demands full equality after decode.
+    #[test]
+    fn fragment_codec_must_not_erase_fields_the_compact_format_cannot_carry() {
+        let mut spec = WindowExecutionSpec::tumbling("__krishiv_key", "ts", 60_000);
+        spec.key_column_type = String::from("utf8");
+        spec.key_parts = vec![
+            KeyPart {
+                name: String::from("auction"),
+                type_tag: String::from("int64"),
+            },
+            KeyPart {
+                name: String::from("channel"),
+                type_tag: String::from("utf8"),
+            },
+        ];
+        spec.derived_columns = vec![DerivedColumn {
+            name: String::from("__krishiv_key"),
+            expr: WindowScalarExpr::CompositeKey(vec![
+                String::from("auction"),
+                String::from("channel"),
+            ]),
+        }];
+        spec.row_filter = Some(WindowAggFilter::Compare {
+            column: String::from("price"),
+            op: AggFilterCompareOp::Gt,
+            value: AggFilterValue::Int(5000),
+        });
+        spec.agg_exprs = vec![WindowAgg::count("c")];
+
+        let encoded = encode_stream_fragment(&spec).expect("encode");
+        let decoded = decode_window_execution_spec(&encoded).expect("decode");
+        assert_eq!(
+            decoded, spec,
+            "the fragment codec dropped a field the compact format cannot represent"
+        );
+    }
 
     #[test]
     fn roundtrip_tumbling_fragment() {

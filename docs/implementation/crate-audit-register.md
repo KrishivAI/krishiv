@@ -5645,3 +5645,25 @@ host (krishiv-bench — krishiv-sql cannot depend on krishiv-dataflow).
 Remaining blind axis from §41, still open under #133's original writ: the
 corpus is fixed on one column-type set (all Int64/Utf8 sources). Recorded,
 not silently dropped.
+
+## §53 — The fragment codec erased every spec field added since the compact format was designed
+
+Found reading the codec to add #140's flag, before writing it: `encode_stream_
+fragment` falls back to the lossless JSON encoding only for multi-aggregate or
+filtered specs. Every WindowExecutionSpec field added since — composite
+`key_parts` (§48), `derived_columns` (§46-era), `row_filter`, allowed
+lateness, timezone, an explicit `key_column_type` — took the compact path,
+which encodes none of them, and the decode side rebuilt them as empty/None/
+auto. Concretely: a multi-column GROUP BY crossing the distributed fragment
+seam silently collapsed back to a single key; an expression aggregate lost its
+derived column. The embedded path (which passes the spec as a struct) was
+unaffected, which is why the NEXMark work never saw it.
+
+This is §41's f1 shape (a clause dropped between surfaces) living one layer
+below the SQL compiler that #132 fixed: the compiler now fails closed, but
+the CODEC behind it didn't. Fix: the fallback condition enumerates every
+field the compact format cannot carry, with a comment binding future field
+additions to it. Test encodes the exact previously-lossy shape (key_parts +
+derived column + row_filter + explicit type, single unfiltered agg) and
+demands decode equality; against the reverted condition it fails on the
+first dropped field. All four fragment-consuming crates green.
