@@ -150,12 +150,13 @@ impl StreamingPipelineSpec {
         // event-time order, and a first stage with less lateness tolerance
         // silently drops them.
         if let Some(first) = self.stages.first()
-            && first.watermark_lag_ms < self.join.window_ms
+            && first.watermark_lag_ms < self.join.window_ms.saturating_mul(2)
         {
             return Err(crate::PlanError::Validation(format!(
-                "pipeline stage 0 has watermark_lag_ms {} but the join band is {} ms: \
-                 matches can arrive that far out of event-time order and would be \
-                 silently dropped as late",
+                "pipeline stage 0 has watermark_lag_ms {} but the join band is {} ms: an \
+                 emitted match's event time can trail the watermark by TWICE the band (its \
+                 surviving partner by one band, the band itself by another), and a smaller \
+                 lag silently drops those matches as late",
                 first.watermark_lag_ms, self.join.window_ms
             )));
         }

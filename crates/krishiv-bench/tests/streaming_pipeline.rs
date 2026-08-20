@@ -204,3 +204,43 @@ fn stage_reading_the_wrong_source_is_refused_by_name() {
         "the refusal must name both the wrong and the required source: {msg}"
     );
 }
+
+/// The stage-0 lateness bound is TWICE the band. A bid whose own time trails
+/// the watermark by 1.5 bands can still legitimately match an auction that
+/// survived eviction (0.6 bands behind); with only 1x lag the stage drops
+/// that match as late and one winner silently vanishes.
+#[test]
+fn a_match_deep_in_the_band_survives_the_stage() {
+    // Band 10_000. Watermark will reach 20_000 via the late auction batch.
+    let plan = compile_streaming_pipeline_sql(Q9).expect("compiles");
+    assert!(
+        plan.spec.stages[0].watermark_lag_ms >= 20_000,
+        "premise: stage 0 lag must be at least 2x the 10s band"
+    );
+    let mut pipe = JoinAggPipeline::new(&plan.spec).expect("pipeline");
+
+    let mut out = Vec::new();
+    // Auction at 14_000 (0.6 bands behind the eventual 20_000 watermark).
+    out.extend(pipe.on_right(&auctions(&[(1, 10, 14_000)])).expect("a1"));
+    // Advance the join watermark to 20_000 with an unrelated pair.
+    out.extend(pipe.on_right(&auctions(&[(9, 10, 20_000)])).expect("a2"));
+    out.extend(pipe.on_left(&bids(&[(9, 90, 1, 20_000)])).expect("b-adv"));
+    pipe.advance_watermark(20_000);
+    // The deep-in-band bid: own time 5_000 = wm - 1.5 bands, matching the
+    // auction at 14_000 (|5_000 - 14_000| = 9_000 < 10_000, in band).
+    out.extend(
+        pipe.on_left(&bids(&[(1, 91, 700, 5_000)]))
+            .expect("deep bid"),
+    );
+    out.extend(pipe.flush_all().expect("flush"));
+
+    let winners: Vec<i64> = out
+        .iter()
+        .filter(|b| b.num_rows() > 0)
+        .flat_map(|b| column_i64(b, "price"))
+        .collect();
+    assert!(
+        winners.contains(&700),
+        "the deep-in-band match must reach the stage, not be dropped as late: {winners:?}"
+    );
+}

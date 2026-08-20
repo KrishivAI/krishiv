@@ -132,14 +132,17 @@ pub fn compile_streaming_pipeline_sql(sql: &str) -> SqlResult<StreamingPipelineP
     }
     stages.push(final_stage.spec);
 
-    // The join emits a match when its SECOND side arrives, so match event
-    // times are out of order by up to the band width relative to arrival.
-    // Stage 0 must therefore tolerate at least `window_ms` of lateness or it
-    // silently drops every match whose partner arrived late in the band —
-    // the fixture that caught this lost one auction of two. Later stages
-    // consume closed-window output, which is emitted in window order.
+    // The join emits a match when its SECOND side arrives, and the bound on
+    // how old a match's event time can be is TWICE the band, not once: an
+    // emitted match's partner survived eviction, so the partner's time is at
+    // least `watermark - window_ms`, and the band lets the match's own time
+    // trail the partner by another `window_ms`. Stage 0 with only 1x lag
+    // drops a legitimately-matched row whose own side lagged deep in the
+    // band — the revert fixture pairs a bid at wm - 1.5*window with an
+    // auction at wm - 0.6*window. Later stages consume closed-window output,
+    // which is emitted in window order.
     if let Some(first) = stages.first_mut() {
-        first.watermark_lag_ms = first.watermark_lag_ms.max(join.window_ms);
+        first.watermark_lag_ms = first.watermark_lag_ms.max(join.window_ms.saturating_mul(2));
     }
     let spec = StreamingPipelineSpec { join, stages };
     spec.validate()

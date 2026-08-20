@@ -472,6 +472,13 @@ impl ContinuousWindowExecutor {
                     .as_millis(),
             )
             .map_err(|_| ExecError::InvalidInput("system clock overflows i64 ms".into()))?;
+            // Restored state (or a stepped-back clock) can put the operator
+            // watermark AHEAD of the wall clock; stamping below it would mark
+            // every arriving row late and silently drop the whole stream
+            // until the clock catches up. Stamps are therefore clamped to the
+            // watermark: monotonic by construction, exactly the property that
+            // makes processing-time rows unable to be late.
+            let now_ms = clamp_proctime_stamp(now_ms, self.last_watermark_ms);
             batches
                 .into_iter()
                 .map(|b| stamp_processing_time(&b, &self.spec.event_time_column, now_ms))
@@ -1033,6 +1040,11 @@ impl std::fmt::Debug for ContinuousWindowExecutor {
             )
             .finish_non_exhaustive()
     }
+}
+
+/// Processing-time stamps never regress behind the operator watermark.
+fn clamp_proctime_stamp(now_ms: i64, last_watermark_ms: Option<i64>) -> i64 {
+    now_ms.max(last_watermark_ms.unwrap_or(i64::MIN))
 }
 
 /// Append (or overwrite is deliberately NOT done — the column must not
@@ -1638,5 +1650,16 @@ mod tests {
             assert!(!mask.value(0), "{name}: 10 > 5000 is false");
             assert!(mask.value(1), "{name}: 9000 > 5000 is true");
         }
+    }
+
+    /// A restored proc-time operator whose persisted watermark is ahead of
+    /// the wall clock must not mark every arriving row late: stamps clamp to
+    /// the watermark. Reverting the clamp makes the stamp regress and the
+    /// row would be dropped by the late threshold.
+    #[test]
+    fn proctime_stamp_never_regresses_behind_the_watermark() {
+        assert_eq!(super::clamp_proctime_stamp(1_000, Some(5_000)), 5_000);
+        assert_eq!(super::clamp_proctime_stamp(9_000, Some(5_000)), 9_000);
+        assert_eq!(super::clamp_proctime_stamp(1_000, None), 1_000);
     }
 }

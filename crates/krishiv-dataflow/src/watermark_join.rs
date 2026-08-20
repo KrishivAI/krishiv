@@ -281,6 +281,20 @@ impl WatermarkWindowJoinOperator {
                 out.push(concat_row_batches(l.as_ref(), r.as_ref())?);
             }
         }
+        // Coalesce the per-match single-row batches into ONE batch per input
+        // batch. Every match in a call shares the joined schema (each side's
+        // batches share a schema), and emitting thousands of one-row batches
+        // made every downstream consumer — pipeline stages especially — pay
+        // full per-batch overhead per matched ROW.
+        if out.len() > 1 {
+            let schema = out
+                .first()
+                .map(RecordBatch::schema)
+                .ok_or_else(|| crate::ExecError::InvalidInput("empty coalesce".into()))?;
+            let merged = arrow::compute::concat_batches(&schema, out.iter())
+                .map_err(|e| crate::ExecError::Arrow(e.to_string()))?;
+            out = vec![merged];
+        }
         Ok(out)
     }
 }
@@ -535,7 +549,10 @@ mod tests {
         // Each right row matches the left row for the same key within 500ms.
         let right = multi_row_batch(&["a", "b", "c"], &[1200, 2300, 3400]);
         let out = op.process_right(&right).expect("join");
-        assert_eq!(out.len(), 3, "each of the 3 keys should produce 1 match");
+        // Matches within one call coalesce into one batch; the claim is the
+        // ROW count, not the batch shape.
+        let rows: usize = out.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 3, "each of the 3 keys should produce 1 match");
     }
 
     #[test]

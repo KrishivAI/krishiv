@@ -5900,3 +5900,28 @@ deviations are stated on the entries themselves. Pinned: q9 5.3K ev/sec
 (4,347 winning bids), q4 5.9K (10 category averages), both real composed
 output through two operators and up to three stages. 5512 tests, clippy
 and fmt clean.
+
+## §60 — #146: streaming gap-closure pass
+
+Five gaps from the known-gaps review, closed: (1) continuous mode now routes
+joins and pipelines (`run_two_source_continuous`; compile failures surface at
+SUBMISSION, not per-batch inside a Running task) — e2e proves a spawned
+continuous join drains to the sink and stops cleanly. (2) The stage-0
+lateness bound was UNDER-DERIVED at 1x band: an emitted match's partner
+survived eviction (≥ wm − window) and the band adds another window, so match
+event times reach wm − 2·window — compiler sets 2x, validate() enforces it,
+and the fixture pairs a bid at wm − 1.5 bands with a surviving auction
+(revert to 1x drops it). (3) Processing-time stamps clamp to the operator
+watermark, so restored state or a stepped-back clock cannot mark the whole
+stream late. (4) Join matches within one call coalesce into ONE output batch
+(they share the joined schema); the multi-row test was repointed at ROW
+count — its claim — rather than batch shape. (5) The §41 column-type blind
+axis is closed by an EXECUTION sweep: 5 key types × 4 value types through
+the full driver path, identical answers demanded — passing on first run is
+the residue of the five UInt64 fixes that preceded it.
+
+Still open and now the active front, at the user's direction: DISTRIBUTED
+streaming for every query class (stateless/join/pipeline fragments,
+registration wire, coordinator routing), then NEXMark on the k3s rig. Join
+column projection (the CTE SELECT list is still ignored; collisions prefix
+left_/right_) remains a named cosmetic debt.

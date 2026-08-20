@@ -1323,7 +1323,19 @@ pub fn spawn_streaming_job(job: CompiledJob, rt: EngineRuntime) -> EngineResult<
     // Routing on `is_ok()` sent every invalid windowed query to the stateless
     // loop, which then ran a DIFFERENT query per batch — no windows, no state,
     // no checkpoints — while reporting Running.
-    let task = if krishiv_sql::streaming_tvf::find_window_tvf(&job.query).is_some() {
+    // Pipelines and joins route ahead of the window check for the same
+    // reason as the bounded path (their shapes would otherwise land in a
+    // branch whose error describes a different problem), and their compile
+    // failures surface HERE, at submission, not per-batch inside the task.
+    let task = if krishiv_sql::streaming_pipeline_plan::looks_like_streaming_pipeline(&job.query) {
+        krishiv_sql::streaming_pipeline_plan::compile_streaming_pipeline_sql(&job.query)
+            .map_err(|e| EngineError::InvalidJob(e.to_string()))?;
+        tokio::spawn(run_two_source_continuous(job, rt, stop_rx))
+    } else if krishiv_sql::streaming_join_plan::looks_like_streaming_join(&job.query) {
+        krishiv_sql::streaming_join_plan::compile_streaming_join_sql(&job.query)
+            .map_err(|e| EngineError::InvalidJob(e.to_string()))?;
+        tokio::spawn(run_two_source_continuous(job, rt, stop_rx))
+    } else if krishiv_sql::streaming_tvf::find_window_tvf(&job.query).is_some() {
         compile_streaming_window_sql(&job.query)
             .map_err(|e| EngineError::InvalidJob(e.to_string()))?;
         tokio::spawn(run_streaming_continuous(job, rt, stop_rx))
@@ -1336,6 +1348,138 @@ pub fn spawn_streaming_job(job: CompiledJob, rt: EngineRuntime) -> EngineResult<
         stop: stop_tx,
         task,
     })
+}
+
+/// Continuously-running two-source loop (task #146): serves both bare
+/// interval joins and join-to-aggregation pipelines until stopped. Like the
+/// stateless continuous loop, no checkpointing — recorded, not implied
+/// otherwise.
+async fn run_two_source_continuous(
+    job: CompiledJob,
+    rt: EngineRuntime,
+    mut stop_rx: tokio::sync::watch::Receiver<bool>,
+) -> EngineResult<JobHandle> {
+    use krishiv_dataflow::pipeline::JoinAggPipeline;
+    use krishiv_dataflow::stream_driver::{JoinSide, StreamDriver, StreamingLoop};
+    use krishiv_dataflow::{WatermarkWindowJoinOperator, WatermarkWindowJoinSpec};
+
+    enum TwoSource {
+        Join(Box<WatermarkWindowJoinOperator>, StreamDriver),
+        Pipeline(Box<JoinAggPipeline>),
+    }
+    impl TwoSource {
+        fn feed(
+            &mut self,
+            side: JoinSide,
+            batch: &arrow::record_batch::RecordBatch,
+        ) -> Result<Vec<arrow::record_batch::RecordBatch>, krishiv_dataflow::ExecError> {
+            match self {
+                TwoSource::Join(op, driver) => driver.on_join_input(op.as_mut(), side, batch),
+                TwoSource::Pipeline(p) => match side {
+                    JoinSide::Left => p.on_left(batch),
+                    JoinSide::Right => p.on_right(batch),
+                },
+            }
+        }
+        fn advance(&mut self, wm: i64) {
+            match self {
+                TwoSource::Join(op, driver) => driver.on_join_watermark(op.as_mut(), wm),
+                TwoSource::Pipeline(p) => p.advance_watermark(wm),
+            }
+        }
+    }
+
+    let (mut runner, join_spec) =
+        if krishiv_sql::streaming_pipeline_plan::looks_like_streaming_pipeline(&job.query) {
+            let plan =
+                krishiv_sql::streaming_pipeline_plan::compile_streaming_pipeline_sql(&job.query)
+                    .map_err(|e| EngineError::InvalidJob(e.to_string()))?;
+            let join = plan.spec.join.clone();
+            let pipe = JoinAggPipeline::new(&plan.spec)
+                .map_err(|e| EngineError::Runtime(e.to_string()))?;
+            (TwoSource::Pipeline(Box::new(pipe)), join)
+        } else {
+            let plan = krishiv_sql::streaming_join_plan::compile_streaming_join_sql(&job.query)
+                .map_err(|e| EngineError::InvalidJob(e.to_string()))?;
+            let op = WatermarkWindowJoinOperator::new(WatermarkWindowJoinSpec::from(&plan.spec));
+            (
+                TwoSource::Join(
+                    Box::new(op),
+                    StreamDriver::new(StreamingLoop::EmbeddedJoinBounded),
+                ),
+                plan.spec,
+            )
+        };
+    let source_named = |name: &str| {
+        job.sources.iter().find(|s| s.name == name).ok_or_else(|| {
+            EngineError::InvalidJob(format!(
+                "join source '{name}' is not among the job's sources"
+            ))
+        })
+    };
+    let mut left = rt
+        .sources
+        .open(source_named(&join_spec.left_source)?)
+        .await?;
+    let mut right = rt
+        .sources
+        .open(source_named(&join_spec.right_source)?)
+        .await?;
+    let mut writers = open_writers(&rt, &job.sinks).await?;
+    let time_column = join_spec.time_column.clone();
+    let idle_floor = std::time::Duration::from_micros(STREAMING_IDLE_FLOOR_US);
+    let left_notify = left.data_notify();
+
+    let (mut left_max, mut right_max) = (i64::MIN, i64::MIN);
+    loop {
+        if *stop_rx.borrow() {
+            break;
+        }
+        let mut progressed = false;
+        if let Some(batch) = left.next().await?
+            && batch.num_rows() > 0
+        {
+            left_max = left_max.max(batch_max_event_time(&batch, &time_column)?);
+            let out = runner
+                .feed(JoinSide::Left, &batch)
+                .map_err(|e| EngineError::Runtime(e.to_string()))?;
+            emit_to_writers(&mut writers, &out).await?;
+            progressed = true;
+        }
+        if let Some(batch) = right.next().await?
+            && batch.num_rows() > 0
+        {
+            right_max = right_max.max(batch_max_event_time(&batch, &time_column)?);
+            let out = runner
+                .feed(JoinSide::Right, &batch)
+                .map_err(|e| EngineError::Runtime(e.to_string()))?;
+            emit_to_writers(&mut writers, &out).await?;
+            progressed = true;
+        }
+        if left_max > i64::MIN && right_max > i64::MIN {
+            runner.advance(left_max.min(right_max));
+        }
+        if !progressed
+            && wait_for_data_or_stop(left_notify.as_ref(), &mut stop_rx, idle_floor).await
+        {
+            break;
+        }
+    }
+    if let TwoSource::Pipeline(p) = &mut runner {
+        let out = p
+            .flush_all()
+            .map_err(|e| EngineError::Runtime(e.to_string()))?;
+        emit_to_writers(&mut writers, &out).await?;
+    }
+    for writer in &mut writers {
+        writer.flush().await?;
+    }
+    Ok(JobHandle::new(
+        JobHandle::from_name(&job.name, JobStatus::Running)?
+            .job_id()
+            .clone(),
+        JobStatus::Completed,
+    ))
 }
 
 /// Continuously-running stateless streaming loop: applies the query per-batch
@@ -1623,6 +1767,65 @@ async fn run_streaming_continuous(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    /// A CONTINUOUS two-source join job routes and runs: spawn, let it
+    /// drain, stop, and the sink holds the joined rows. Before this routing
+    /// landed, a continuous join job fell into the stateless loop and died
+    /// per-batch on an unknown table while reporting Running.
+    #[tokio::test]
+    async fn continuous_join_job_routes_and_joins() {
+        let bid_schema = Arc::new(Schema::new(vec![
+            Field::new("auction", DataType::Int64, false),
+            Field::new("dateTime", DataType::Int64, false),
+        ]));
+        let auction_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("dateTime", DataType::Int64, false),
+        ]));
+        let bids = RecordBatch::try_new(
+            bid_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 9])),
+                Arc::new(Int64Array::from(vec![1_000_i64, 1_100, 1_200])),
+            ],
+        )
+        .unwrap();
+        let aucts = RecordBatch::try_new(
+            auction_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(Int64Array::from(vec![1_050_i64, 1_150])),
+            ],
+        )
+        .unwrap();
+        let sources = InMemorySourceProvider::new();
+        sources.insert("bid", vec![bids]);
+        sources.insert("auction", vec![aucts]);
+        let sink = InMemorySinkProvider::new();
+        let rt = embedded_runtime(Arc::new(sources), Arc::new(sink.clone()));
+
+        let job = CompiledJob::new(
+            "cont-join",
+            "SELECT b.auction FROM bid b JOIN auction a ON b.auction = a.id \
+             AND b.\"dateTime\" BETWEEN a.\"dateTime\" - 5000 AND a.\"dateTime\" + 5000",
+            vec![
+                SourceSpec::unbounded("bid", "memory", ""),
+                SourceSpec::unbounded("auction", "memory", ""),
+            ],
+            vec![SinkSpec::new("out", "memory", "")],
+            false,
+        )
+        .with_engine(EngineKind::Streaming);
+
+        let running = spawn_streaming_job(job, rt).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let handle = running.stop().await.unwrap();
+        assert_eq!(handle.status(), JobStatus::Completed);
+
+        let out = sink.take("out");
+        let rows: usize = out.iter().map(ChangelogBatch::num_rows).sum();
+        assert_eq!(rows, 2, "bids 1 and 2 join their auctions; bid 9 has none");
+    }
 
     /// A Q9-shape pipeline job (join then windowed top-1) runs END TO END
     /// through `StreamingEngine::run`: routing, two readers, the stage
