@@ -701,6 +701,7 @@ mod tests {
             derived_columns: Vec::new(),
             key_is_synthetic: false,
             top_n: None,
+            processing_time: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -744,6 +745,7 @@ mod tests {
             derived_columns: Vec::new(),
             key_is_synthetic: false,
             top_n: None,
+            processing_time: false,
             window_timezone: None,
             row_filter: None,
         };

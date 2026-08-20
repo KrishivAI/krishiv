@@ -259,12 +259,12 @@ pub struct BenchQuery {
 
 /// The NEXMark queries this engine's streaming path can currently express.
 ///
-/// Fifteen of twenty-two. Stated as data rather than prose so a report
+/// Seventeen of twenty-two. Stated as data rather than prose so a report
 /// cannot quietly imply full coverage — the number is read from here.
 ///
-/// The other seven need capabilities that do not exist yet: job-level routing
-/// of two-source joins plus person/auction generators (Q3/Q4/Q8/Q9/Q20) and
-/// processing-time / side-input semantics (Q12/Q13). Q7 and Q15 run in their canonical global forms
+/// The other five need one capability that does not exist yet: job-level
+/// routing of two-source streaming joins plus person/auction event
+/// generation (Q3/Q4/Q8/Q9/Q20). Q7 and Q15 run in their canonical global forms
 /// (task #140); Q0/Q10/Q14/Q21/Q22 run through the stateless per-batch path
 /// (task #141). Documented deviations: Q10 measures the projection, not the
 /// partitioned file sink; Q14's bid-time classification is a price-band CASE
@@ -365,6 +365,27 @@ pub const SUPPORTED_QUERIES: &[BenchQuery] = &[
               GROUP BY bidder, auction, window_start, window_end \
               ORDER BY \"dateTime\" DESC LIMIT 1",
         expect: RowsOut::NonZero,
+    },
+    BenchQuery {
+        // Q12: processing-time tumbling count (task #143). PROCTIME() stamps
+        // arrival wall-clock time; the window is 60s so a benchmark rep
+        // (~100ms) rarely straddles a boundary — and when it does, differing
+        // rows_out across reps is the SEMANTICS of processing time, which is
+        // why the harness exempts PROCTIME queries from its determinism
+        // assertion.
+        name: "q12_proctime_count",
+        sql: "SELECT bidder, COUNT(*) AS c FROM TUMBLE(TABLE bid, PROCTIME(), 60000) \
+              GROUP BY bidder, window_start, window_end",
+        expect: RowsOut::NonZero,
+    },
+    BenchQuery {
+        // Q13: side-input join (task #143). The side table maps auction ids
+        // to labels and is registered once, before the stream starts —
+        // bounded reference data, exactly the reference query's shape.
+        name: "q13_side_input_join",
+        sql: "SELECT b.auction, b.bidder, b.price, s.label FROM bid b \
+              JOIN side s ON b.auction % 1000 = s.k",
+        expect: RowsOut::ExactInput,
     },
     // ── stateless queries (task #141): per-batch, no window state ──
     BenchQuery {
@@ -546,6 +567,25 @@ mod tests {
                     });
             } else {
                 let exec = krishiv_engines::StatelessBatchExecutor::new(q.sql, "bid");
+                if q.sql.contains("JOIN side") {
+                    use arrow::array::{StringArray, UInt64Array};
+                    let keys: Vec<u64> = (0..1000).collect();
+                    let labels: Vec<String> = keys.iter().map(|k| format!("cat-{k}")).collect();
+                    let side_schema = Arc::new(Schema::new(vec![
+                        Field::new("k", DataType::UInt64, false),
+                        Field::new("label", DataType::Utf8, false),
+                    ]));
+                    let side = RecordBatch::try_new(
+                        side_schema,
+                        vec![
+                            Arc::new(UInt64Array::from(keys)),
+                            Arc::new(StringArray::from(labels)),
+                        ],
+                    )
+                    .expect("side table");
+                    exec.register_side_table("side", vec![side])
+                        .expect("register side table");
+                }
                 let out = rt
                     .block_on(exec.on_batch(batch.clone()))
                     .unwrap_or_else(|e| {

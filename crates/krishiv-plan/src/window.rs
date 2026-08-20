@@ -352,6 +352,14 @@ pub struct WindowExecutionSpec {
     /// them silently would emit a cross-product nobody asked for.
     #[serde(default)]
     pub top_n: Option<TopNSpec>,
+    /// Processing-time semantics (task #143, NEXMark Q12): the executor
+    /// stamps each row with its arrival wall-clock time into
+    /// `event_time_column` and windows on the stamps. No event can be late
+    /// by construction (stamps are monotonic), which is why the wall-clock
+    /// tick may close these windows without violating STREAM-1 — the
+    /// late-drop hazard that decision guards against cannot exist here.
+    #[serde(default)]
+    pub processing_time: bool,
     /// ST11: events arriving within `[watermark, watermark + allowed_lateness_ms)`
     /// are kept for late-firing instead of being dropped. Defaults to
     /// `None` (no lateness — events past the watermark are dropped).
@@ -420,6 +428,7 @@ impl WindowExecutionSpec {
             derived_columns: Vec::new(),
             key_is_synthetic: false,
             top_n: None,
+            processing_time: false,
             window_timezone: None,
             row_filter: None,
         }
@@ -482,6 +491,7 @@ pub fn decode_window_execution_spec(encoded: &str) -> Result<WindowExecutionSpec
         derived_columns: Vec::new(),
         key_is_synthetic: false,
         top_n: None,
+        processing_time: false,
         window_timezone: None,
         row_filter: None,
     };
@@ -705,6 +715,7 @@ pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> Result<String, Plan
         || spec.window_timezone.is_some()
         || spec.key_is_synthetic
         || spec.top_n.is_some()
+        || spec.processing_time
         || spec.key_column_type != default_key_type();
     if compact_cannot_represent {
         return encode_window_execution_spec(spec);
@@ -1111,6 +1122,7 @@ mod tests {
             derived_columns: Vec::new(),
             key_is_synthetic: false,
             top_n: None,
+            processing_time: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -1222,6 +1234,7 @@ mod tests {
             derived_columns: Vec::new(),
             key_is_synthetic: false,
             top_n: None,
+            processing_time: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -1264,6 +1277,7 @@ mod tests {
             derived_columns: Vec::new(),
             key_is_synthetic: false,
             top_n: None,
+            processing_time: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -1334,6 +1348,7 @@ mod tests {
             derived_columns: Vec::new(),
             key_is_synthetic: false,
             top_n: None,
+            processing_time: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -1390,6 +1405,7 @@ mod tests {
             derived_columns: Vec::new(),
             key_is_synthetic: false,
             top_n: None,
+            processing_time: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -1419,6 +1435,7 @@ mod tests {
             derived_columns: Vec::new(),
             key_is_synthetic: false,
             top_n: None,
+            processing_time: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -1449,6 +1466,7 @@ mod tests {
             derived_columns: Vec::new(),
             key_is_synthetic: false,
             top_n: None,
+            processing_time: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -1540,6 +1558,7 @@ mod tests {
                         derived_columns: Vec::new(),
                         key_is_synthetic: false,
                         top_n: None,
+                        processing_time: false,
                         window_timezone: None,
                         row_filter: None,
                     },

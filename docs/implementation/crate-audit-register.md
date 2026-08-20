@@ -5775,3 +5775,34 @@ that isn't broken.
 
 Coverage 13 → 15 of 22. Pinned medians: q19_auction_top10 9.1M ev/sec,
 q18_last_bid_dedup 2.9M. 5503 workspace tests, clippy and fmt clean.
+
+## §57 — #143: processing-time windows (Q12) and side-input joins (Q13)
+
+Q12: `PROCTIME()` in the descriptor slot. The executor stamps each row with
+its arrival wall-clock time under an engine-owned column and windows on the
+stamps. The STREAM-1 interaction is the design's center: STREAM-1 forbids
+wall-clock watermark advancement for tumbling/sliding because it silently
+drops late events — but under processing time no event CAN be late (stamps
+are monotonic), so proc-time specs join session windows as the second tick
+exemption, with the reasoning recorded at the gate. A source column
+colliding with the stamp name is refused by name — silently shadowing user
+data is the alternative. The sentinel column name travels exactly two
+adjacent functions before becoming the typed `processing_time: bool`; the
+codec routes the flag to lossless JSON. The distinguishing test feeds
+events with 1970 event times and demands they land in TODAY'S window —
+arrival, not payload, is the time axis. Revert of the stamping line fails
+with ColumnNotFound. The harness exempts PROCTIME queries from its
+determinism assertion, with the reason in the code: boundary-dependent
+output under processing time is the semantics, not a defect.
+
+Q13: `StatelessBatchExecutor::register_side_table` — bounded reference data
+registered ONCE in the cached context, never replace-registered (refusing
+overwrite rather than silently swapping reference data mid-stream). The test
+pins that the side table survives per-batch replace-registration of the
+stream table across three batches.
+
+Coverage 15 → 17 of 22. Pinned: q12 5.1M ev/sec (spread 6%), q13 0.95M with
+the exact-input join contract holding (200000 == 200000; the side table
+covers every `auction % 1000`). 5506 tests, clippy and fmt clean. What
+remains is ONE capability: job-level two-source streaming joins plus
+person/auction generation (Q3/Q4/Q8/Q9/Q20) — task #144.

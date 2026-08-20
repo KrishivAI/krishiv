@@ -456,6 +456,29 @@ impl ContinuousWindowExecutor {
     /// aggregates plain columns: the spec's list is empty and the batches pass
     /// through untouched.
     fn apply_derived_columns(&self, batches: Vec<RecordBatch>) -> ExecResult<Vec<RecordBatch>> {
+        let batches = if self.spec.processing_time {
+            // Processing-time semantics (task #143): stamp every row with its
+            // arrival wall-clock time under the spec's event-time column and
+            // window on the stamps. Stamps are monotonic non-decreasing, so
+            // no stamped event can ever be late — the property that makes
+            // processing-time windows exempt from STREAM-1's late-drop
+            // hazard.
+            let now_ms = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| {
+                        ExecError::InvalidInput(format!("system clock before epoch: {e}"))
+                    })?
+                    .as_millis(),
+            )
+            .map_err(|_| ExecError::InvalidInput("system clock overflows i64 ms".into()))?;
+            batches
+                .into_iter()
+                .map(|b| stamp_processing_time(&b, &self.spec.event_time_column, now_ms))
+                .collect::<ExecResult<Vec<_>>>()?
+        } else {
+            batches
+        };
         if self.spec.derived_columns.is_empty() {
             return Ok(batches);
         }
@@ -726,7 +749,12 @@ impl ContinuousWindowExecutor {
     pub fn tick(&mut self, wall_clock_ms: i64) -> ExecResult<Vec<RecordBatch>> {
         // STREAM-1: Only session windows should advance the watermark to
         // wall-clock on idle (inactivity = close is correct for sessions).
-        let is_session = matches!(self.operator, Some(WindowOperatorState::Session(_)));
+        // Processing-time windows are the second exemption (task #143): their
+        // event times ARE wall-clock stamps, so no event can arrive behind
+        // the wall clock and the late-drop hazard STREAM-1 guards against
+        // cannot exist.
+        let is_session = matches!(self.operator, Some(WindowOperatorState::Session(_)))
+            || self.spec.processing_time;
         let Some(op) = &mut self.operator else {
             return Ok(Vec::new()); // operator not yet initialised; no open windows
         };
@@ -1005,6 +1033,42 @@ impl std::fmt::Debug for ContinuousWindowExecutor {
             )
             .finish_non_exhaustive()
     }
+}
+
+/// Append (or overwrite is deliberately NOT done — the column must not
+/// already exist) the processing-time stamp column.
+fn stamp_processing_time(
+    batch: &RecordBatch,
+    column: &str,
+    now_ms: i64,
+) -> ExecResult<RecordBatch> {
+    use arrow::array::Int64Array;
+    if batch.schema().index_of(column).is_ok() {
+        return Err(ExecError::InvalidInput(format!(
+            "processing-time column '{column}' already exists in the source batch; the stamp \
+             is engine-owned and a source column with the same name would be silently shadowed"
+        )));
+    }
+    let mut fields: Vec<arrow::datatypes::Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    fields.push(arrow::datatypes::Field::new(
+        column,
+        arrow::datatypes::DataType::Int64,
+        false,
+    ));
+    let mut columns = batch.columns().to_vec();
+    columns.push(std::sync::Arc::new(Int64Array::from(vec![
+        now_ms;
+        batch.num_rows()
+    ])));
+    Ok(RecordBatch::try_new(
+        std::sync::Arc::new(arrow::datatypes::Schema::new(fields)),
+        columns,
+    )?)
 }
 
 #[cfg(test)]

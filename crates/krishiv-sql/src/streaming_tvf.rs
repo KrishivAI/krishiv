@@ -169,10 +169,22 @@ pub enum WindowTvf<'a> {
     },
 }
 
-/// Try to parse `DESCRIPTOR(col_name)` and return `col_name`.
+/// The engine-owned column name processing-time stamps land under.
+///
+/// `PROCTIME()` in the descriptor slot resolves to this name; the compiler
+/// turns the name back into the typed `processing_time: bool` on the spec
+/// immediately, so the sentinel never travels further than these two
+/// adjacent functions.
+pub const PROCTIME_COLUMN: &str = "__krishiv_proc_time";
+
+/// Try to parse `DESCRIPTOR(col_name)` or `PROCTIME()` and return the
+/// event-time column name.
 fn parse_descriptor(s: &str) -> Option<&str> {
     let s = s.trim();
     let lower = s.to_ascii_lowercase();
+    if lower == "proctime()" {
+        return Some(PROCTIME_COLUMN);
+    }
     let inner = lower.strip_prefix("descriptor(")?;
     let inner = inner.strip_suffix(')')?;
     // Map back to original-case span by offset.

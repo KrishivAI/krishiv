@@ -102,6 +102,28 @@ struct RunResult {
 const WARMUP_REPS: usize = 1;
 const MEASURED_REPS: usize = 5;
 
+/// The Q13 side input: 1000 labels covering every value of `auction % 1000`,
+/// so the join is total and the ExactInput completeness contract holds.
+fn side_table_batch() -> arrow::record_batch::RecordBatch {
+    use arrow::array::{StringArray, UInt64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+    let keys: Vec<u64> = (0..1000).collect();
+    let labels: Vec<String> = keys.iter().map(|k| format!("cat-{k}")).collect();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::UInt64, false),
+        Field::new("label", DataType::Utf8, false),
+    ]));
+    arrow::record_batch::RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(UInt64Array::from(keys)),
+            Arc::new(StringArray::from(labels)),
+        ],
+    )
+    .expect("side table")
+}
+
 /// Generate the whole input ahead of time (generation cost must not land in
 /// the timed region) and hand back the batches plus total rows.
 fn generate_input(query_name: &str) -> (Vec<arrow::record_batch::RecordBatch>, usize) {
@@ -136,6 +158,12 @@ fn measure_stateless(query_name: &str, sql: &str) -> RepResult {
         .build()
         .unwrap_or_else(|e| panic!("{query_name} runtime: {e}"));
     let exec = StatelessBatchExecutor::new(sql, "bid");
+    // Q13's bounded side input: registered ONCE before the stream starts, so
+    // per-batch replace-registration of `bid` never touches it.
+    if sql.contains("JOIN side") {
+        exec.register_side_table("side", vec![side_table_batch()])
+            .unwrap_or_else(|e| panic!("{query_name} side table: {e}"));
+    }
     let (batches, rows_in) = generate_input(query_name);
 
     let mut per_batch_us: Vec<u128> = Vec::with_capacity(BATCHES);
@@ -239,15 +267,19 @@ fn measure_repeated(query_name: &str, sql: &str) -> RunResult {
 
     // Every repetition must produce the same answer. If they do not, the engine
     // is nondeterministic across identical inputs and no throughput number from
-    // this harness means anything.
+    // this harness means anything. EXEMPTION: PROCTIME queries window on
+    // arrival wall-clock time, so identical input legitimately produces
+    // boundary-dependent output — that is the semantics, not a defect.
     let rows_out = reps.first().map_or(0, |r| r.rows_out);
-    for (i, r) in reps.iter().enumerate() {
-        assert_eq!(
-            r.rows_out, rows_out,
-            "{query_name}: repetition {i} emitted {} rows but repetition 0 emitted {rows_out} — \
-             identical input must give an identical answer",
-            r.rows_out
-        );
+    if !sql.contains("PROCTIME()") {
+        for (i, r) in reps.iter().enumerate() {
+            assert_eq!(
+                r.rows_out, rows_out,
+                "{query_name}: repetition {i} emitted {} rows but repetition 0 emitted {rows_out} \
+                 — identical input must give an identical answer",
+                r.rows_out
+            );
+        }
     }
 
     RunResult {

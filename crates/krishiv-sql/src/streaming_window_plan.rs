@@ -147,6 +147,7 @@ pub fn compile_streaming_window_sql(sql: &str) -> SqlResult<StreamingWindowPlan>
         None => None,
     };
 
+    let processing_time = window.event_time_column == crate::streaming_tvf::PROCTIME_COLUMN;
     let spec = WindowExecutionSpec {
         key_column,
         // "auto": the SQL text carries no type information, so the key type is
@@ -181,6 +182,9 @@ pub fn compile_streaming_window_sql(sql: &str) -> SqlResult<StreamingWindowPlan>
         derived_columns,
         key_is_synthetic,
         top_n,
+        // PROCTIME() in the descriptor slot resolved to the engine-owned
+        // stamp column; the flag is what the executor and codec key off.
+        processing_time,
         window_timezone: None,
         row_filter,
     };

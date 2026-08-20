@@ -559,6 +559,31 @@ impl StatelessBatchExecutor {
         }
     }
 
+    /// Register a STATIC side table, available to every subsequent
+    /// `on_batch` (task #143, NEXMark Q13's side-input join).
+    ///
+    /// Registered once and never replace-registered: the side input is bounded
+    /// reference data by definition, and this method refuses to overwrite an
+    /// existing table rather than silently swapping reference data mid-stream.
+    pub fn register_side_table(
+        &self,
+        name: &str,
+        batches: Vec<arrow::record_batch::RecordBatch>,
+    ) -> EngineResult<()> {
+        let schema = batches
+            .first()
+            .map(arrow::record_batch::RecordBatch::schema)
+            .ok_or_else(|| {
+                EngineError::InvalidJob(format!("side table '{name}' needs at least one batch"))
+            })?;
+        let table =
+            datafusion::datasource::MemTable::try_new(schema, vec![batches]).map_err(df_err)?;
+        self.ctx
+            .register_table(name, Arc::new(table))
+            .map_err(df_err)?;
+        Ok(())
+    }
+
     /// Run the query over exactly this batch.
     ///
     /// Output derives from THIS batch alone: the input table is
@@ -1423,6 +1448,46 @@ async fn run_streaming_continuous(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    /// A side table registered once must survive every per-batch
+    /// replace-register of the streaming input (NEXMark Q13's shape).
+    #[tokio::test]
+    async fn side_table_survives_across_batches() {
+        let exec = StatelessBatchExecutor::new(
+            "SELECT b.v, s.label FROM src b JOIN side s ON b.v = s.k",
+            "src",
+        );
+        let side_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, false),
+        ]));
+        let side = RecordBatch::try_new(
+            side_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(StringArray::from(vec!["one", "two"])),
+            ],
+        )
+        .unwrap();
+        exec.register_side_table("side", vec![side])
+            .expect("side table");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = |vals: Vec<i64>| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vals))]).unwrap()
+        };
+        for (input, expected_rows) in [(vec![1_i64], 1_usize), (vec![2, 3], 1), (vec![1, 2], 2)] {
+            let out = exec
+                .on_batch(batch(input.clone()))
+                .await
+                .expect("join batch");
+            let rows: usize = out.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(
+                rows, expected_rows,
+                "batch {input:?} must join against the side table registered before batch 1"
+            );
+        }
+    }
 
     /// Output of batch N+1 must derive from batch N+1 ALONE.
     ///
