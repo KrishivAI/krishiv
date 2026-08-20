@@ -15,6 +15,7 @@ mod graph;
 mod lowering;
 pub mod optimizer;
 pub mod stream_join;
+pub mod stream_task;
 pub mod task_fragment;
 pub mod udf;
 pub mod window;
