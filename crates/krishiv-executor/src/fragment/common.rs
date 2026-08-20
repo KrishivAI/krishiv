@@ -48,6 +48,13 @@ pub(crate) fn ensure_status_accepted_or_duplicate(
 ) -> Result<(), tonic::Status> {
     match disposition {
         TransportDisposition::Accepted | TransportDisposition::Duplicate => Ok(()),
+        // A cancelled-status report answered with "unknown job" means the
+        // coordinator already evicted the job (deregister evicts before the
+        // executor's loop finishes exiting). The report's purpose — the
+        // teardown being observed — is already served; failing it invalidated
+        // the coordinator channel and burned a retry backoff per cancelled
+        // subtask, for a job that is gone either way.
+        TransportDisposition::UnknownJob if state == TaskState::Cancelled => Ok(()),
         _ => Err(tonic::Status::failed_precondition(format!(
             "coordinator returned {disposition} for {state} status"
         ))),

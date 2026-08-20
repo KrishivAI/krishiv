@@ -909,11 +909,22 @@ pub(crate) async fn execute_run_loop_fragment(
         // Gather this iteration's input.
         let read_started = Instant::now();
         let mut input: Vec<RecordBatch> = Vec::new();
-        if let Some((_, pushed)) = runner.continuous_inputs.remove(&input_key) {
-            input.extend(pushed);
-        }
-        if let Some((_, pushed)) = runner.continuous_inputs.remove(job_id) {
-            input.extend(pushed);
+        // Pushed input (external producers AND peer-exchange deliveries) gets
+        // the same coercion as the owned-split path below. It used to be
+        // extended raw, so an unsigned source column (NEXMark's u64 price)
+        // reached the aggregate uncoerced and killed the fragment with
+        // "unsupported column type for pre-downcast: UInt64" — the embedded
+        // loop coerces every batch, and the two paths must not disagree.
+        for (_, pushed) in [
+            runner.continuous_inputs.remove(&input_key),
+            runner.continuous_inputs.remove(job_id),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for batch in pushed {
+                input.push(coerce_batch_for_window(&batch, &window_spec)?);
+            }
         }
         if !input.is_empty() {
             for batch in &input {

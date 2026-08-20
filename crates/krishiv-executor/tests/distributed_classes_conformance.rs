@@ -521,3 +521,73 @@ async fn deregister_stops_the_loop_and_frees_the_slot_for_the_next_job() {
         "job B never ran: job A's cancelled loop is still holding the runner slot"
     );
 }
+
+/// stream:rloop must coerce PUSHED input exactly as it coerces owned-split
+/// reads. NEXMark's `price` is u64; the aggregate pre-downcast refuses
+/// unsigned columns, and the pushed path used to skip the coercion the
+/// owned-split path applies — every window fragment aggregating a pushed
+/// unsigned column died with "unsupported column type for pre-downcast:
+/// UInt64" on its first batch (q7/q16 on the live k3s run).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rloop_window_aggregates_a_pushed_unsigned_column() {
+    use krishiv_plan::stream_task::StreamingTaskSpec;
+    use krishiv_plan::window::{WindowAgg, WindowAggKind, WindowExecutionSpec};
+    let rig = start_rig("upush").await;
+    let job = "upush-w";
+    let spec = WindowExecutionSpec {
+        agg_exprs: vec![WindowAgg {
+            kind: WindowAggKind::Max,
+            input_column: "price".into(),
+            output_column: "max_price".into(),
+            filter: None,
+        }],
+        watermark_lag_ms: 0,
+        window_size_ms: 10_000,
+        ..WindowExecutionSpec::tumbling("k", "ts", 10_000)
+    };
+    let task = StreamingTaskSpec::Window(Box::new(spec));
+    let mut options = ContinuousRegistrationOptions::default();
+    options.mode = Some("run-loop".into());
+    options.parallelism = Some(1);
+    krishiv_scheduler::register_continuous_task_with_options(
+        &rig.coordinator,
+        job,
+        &task,
+        &options,
+    )
+    .await
+    .expect("window job registers");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Two windows of data; the second window's rows advance the watermark past
+    // the first window's end so it closes and emits.
+    let batch = {
+        use arrow::array::{Int64Array, StringArray, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("price", DataType::UInt64, false),
+        ]));
+        arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a", "a"])),
+                Arc::new(Int64Array::from(vec![1_000, 2_000, 15_000])),
+                Arc::new(UInt64Array::from(vec![7u64, 900u64, 3u64])),
+            ],
+        )
+        .unwrap()
+    };
+    krishiv_scheduler::push_continuous_input_coordinated(&rig.coordinator, job, ipc_bytes(&batch))
+        .await
+        .expect("push u64 rows");
+
+    let out = wait_drain(&rig, job, 1, Duration::from_secs(10)).await;
+    let max: Vec<i64> = out.iter().flat_map(|b| i64_col(b, "max_price")).collect();
+    assert_eq!(
+        max,
+        vec![900],
+        "the first window must close and report MAX over the coerced u64 column"
+    );
+}
