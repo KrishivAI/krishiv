@@ -1136,6 +1136,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "Accept a bounded streaming job whose runtime cannot flush its open windows at end-of-stream. Off by default: such a run omits one row per group with no other sign, so it now fails instead of reporting success. Set to 1 only when a partial answer is genuinely acceptable.",
     ),
     rt(
+        "KRISHIV_BENCH_PARALLELISM",
+        FlagKind::UInt,
+        "3",
+        "Run-loop subtask parallelism the distributed NEXMark harness (nexmark_distributed) requests per non-pipeline job. Pipelines are always registered at 1 (stage re-keying).",
+    ),
+    rt(
         "KRISHIV_STREAM_EARLY_FIRE_MS",
         FlagKind::UInt,
         "unset",

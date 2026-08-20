@@ -1014,6 +1014,10 @@ pub async fn api_continuous_restore(
 pub struct ContinuousPushRequest {
     pub job_id: String,
     pub input_batches_b64: String,
+    /// Task #147: `"L"` / `"R"` targets one side of a two-source run-loop
+    /// job. Absent for window/stateless jobs.
+    #[serde(default)]
+    pub side: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1313,6 +1317,18 @@ pub async fn api_continuous_push(
         run_loop_targets(&coord, &job_id).map_err(|error| scheduler_error_response(&error))?
     };
     if let Some(targets) = run_loop {
+        let targets = match body.side.as_deref() {
+            None => targets,
+            Some(side @ ("L" | "R")) => targets
+                .into_iter()
+                .map(|(task, endpoint)| (format!("{task}#{side}"), endpoint))
+                .collect(),
+            Some(other) => {
+                return Err(bad(&format!(
+                    "push side must be \"L\" or \"R\", got '{other}'"
+                )));
+            }
+        };
         push_run_loop_input(&coordinator, &job_id, targets, ipc_bytes)
             .await
             .map_err(|error| match error {
@@ -1320,6 +1336,11 @@ pub async fn api_continuous_push(
                 other => (StatusCode::SERVICE_UNAVAILABLE, other.to_string()),
             })?;
         return Ok(Json(ContinuousPushResponse { success: true }));
+    }
+    if body.side.is_some() {
+        return Err(bad(
+            "side-tagged pushes are only meaningful for run-loop two-source jobs",
+        ));
     }
 
     let partition = InputPartition::typed(
@@ -3480,6 +3501,7 @@ mod tests {
             Json(ContinuousPushRequest {
                 job_id: "cs-in-process-job".into(),
                 input_batches_b64: encoded_input(),
+                side: None,
             }),
         )
         .await
@@ -3717,6 +3739,7 @@ mod tests {
             Json(ContinuousPushRequest {
                 job_id: "missing-job".into(),
                 input_batches_b64: encoded_input(),
+                side: None,
             }),
         )
         .await
@@ -3759,6 +3782,7 @@ mod tests {
             Json(ContinuousPushRequest {
                 job_id: "cs-busy-job".into(),
                 input_batches_b64: encoded_input(),
+                side: None,
             }),
         )
         .await
@@ -3841,6 +3865,7 @@ mod tests {
             Json(ContinuousPushRequest {
                 job_id: "cs-cycle-job".into(),
                 input_batches_b64: encoded_input(),
+                side: None,
             }),
         )
         .await

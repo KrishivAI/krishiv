@@ -1125,6 +1125,41 @@ pub async fn execute_coordinator_continuous_register(
     Ok(())
 }
 
+/// Side-tagged push for two-source run-loop jobs (task #147).
+pub async fn execute_coordinator_continuous_push_side(
+    coordinator_http: &str,
+    job_id: &str,
+    side: &str,
+    input_batches: &[arrow::record_batch::RecordBatch],
+) -> RuntimeResult<()> {
+    use crate::flight_action::encode_batches;
+    #[derive(serde::Serialize)]
+    struct SidePushRequest<'a> {
+        job_id: &'a str,
+        input_batches_b64: String,
+        side: &'a str,
+    }
+    let base = normalize_http_base(coordinator_http)?;
+    let url = format!("{base}/api/v1/continuous-push");
+    let body = SidePushRequest {
+        job_id,
+        input_batches_b64: encode_batches(input_batches)?,
+        side,
+    };
+    let client = coordinator_http_client()?;
+    let response = apply_coordinator_bearer(client.post(&url).json(&body))
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("continuous-push request failed: {e}")))?;
+    if !response.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "continuous-push HTTP {} from {url}",
+            response.status()
+        )));
+    }
+    Ok(())
+}
+
 pub async fn execute_coordinator_continuous_push(
     coordinator_http: &str,
     job_id: &str,
