@@ -237,10 +237,10 @@ impl NexmarkGenerator {
 ///
 /// The other fourteen need capabilities that do not exist yet: job-level
 /// routing of two-source joins plus person/auction generators (Q3/Q4/Q8/Q9/
-/// Q20), global aggregation with no grouping key (Q7 standard form, Q15
-/// canonical form), top-N/rank (Q19), dedup/row_number (Q18), and stateless
-/// or processing-time paths outside the window compiler (Q0/Q10/Q12–Q14/
-/// Q21/Q22).
+/// Q20), top-N/rank (Q19), dedup/row_number (Q18), and stateless or
+/// processing-time paths outside the window compiler (Q0/Q10/Q12–Q14/
+/// Q21/Q22). Q7 and Q15 run in their canonical global forms since global
+/// no-key aggregation landed (task #140).
 pub const SUPPORTED_QUERIES: &[(&str, &str)] = &[
     (
         // Q1: currency conversion. Aggregates an EXPRESSION, which needs the
@@ -265,10 +265,13 @@ pub const SUPPORTED_QUERIES: &[(&str, &str)] = &[
          GROUP BY auction, window_start, window_end",
     ),
     (
-        "q7_highest_bid_keyed",
-        "SELECT auction, MAX(price) AS mx \
+        // Q7: highest bid — the CANONICAL form, a global max with no
+        // grouping key (task #140). The earlier keyed variant (`GROUP BY
+        // auction`) was a stand-in from before global aggregation existed.
+        "q7_highest_bid",
+        "SELECT MAX(price) AS final \
          FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
-         GROUP BY auction, window_start, window_end",
+         GROUP BY window_start, window_end",
     ),
     (
         // Q16: channel statistics. Needs COUNT(DISTINCT) over two columns plus
@@ -292,11 +295,14 @@ pub const SUPPORTED_QUERIES: &[(&str, &str)] = &[
     (
         // A composite grouping key: (auction, channel) is two columns, encoded
         // into one internal key and expanded back on output.
+        // Q15: bidding statistics — the CANONICAL form counts bids and
+        // distinct bidders per reporting period with NO other key (the window
+        // IS the day). Global aggregation (task #140) made this expressible;
+        // the earlier variant added auction+channel keys as a stand-in.
         "q15_bidding_statistics",
-        "SELECT auction, channel, COUNT(*) AS total_bids, \
-         COUNT(DISTINCT bidder) AS bidders \
+        "SELECT COUNT(*) AS total_bids, COUNT(DISTINCT bidder) AS bidders \
          FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
-         GROUP BY auction, channel, window_start, window_end",
+         GROUP BY window_start, window_end",
     ),
     (
         "q11_user_sessions",

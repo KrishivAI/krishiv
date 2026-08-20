@@ -572,6 +572,7 @@ mod watermark_tests {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
+            key_is_synthetic: false,
             event_time_column: "ts".into(),
             window_size_ms: 10_000,
             agg_exprs: vec![AggExpr {
@@ -625,6 +626,7 @@ mod watermark_tests {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
+            key_is_synthetic: false,
             event_time_column: "ts".into(),
             window_size_ms: 10_000,
             agg_exprs: vec![AggExpr {
@@ -837,6 +839,7 @@ mod window_props {
                 key_column: "k".into(),
                 key_column_type: "utf8".into(),
                 key_parts: Vec::new(),
+                key_is_synthetic: false,
                 event_time_column: "ts".into(),
                 window_size_ms: 1000,
                 slide_ms: 250,
@@ -876,6 +879,7 @@ mod window_props {
                 key_column: "k".into(),
                 key_column_type: "utf8".into(),
                 key_parts: Vec::new(),
+                key_is_synthetic: false,
                 event_time_column: "ts".into(),
                 window_size_ms: size_ms,
                 slide_ms,

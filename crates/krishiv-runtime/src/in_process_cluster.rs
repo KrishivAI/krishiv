@@ -281,6 +281,7 @@ impl From<&LocalWindowExecutionSpec> for WindowExecutionSpec {
             source_id_column: spec.source_id_column.clone(),
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
+            key_is_synthetic: false,
             window_timezone: spec.window_timezone.clone(),
             row_filter: spec.row_filter.clone(),
         }
@@ -593,6 +594,7 @@ mod tests {
             source_id_column: None,
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
+            key_is_synthetic: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -609,7 +611,20 @@ mod tests {
     fn fragment_from_local_spec_returns_nonempty() {
         let fragment = fragment_from_local_spec(&tumbling_spec()).unwrap();
         assert!(!fragment.is_empty());
-        assert!(fragment.contains("stream:tw"));
+        // Decode rather than sniff the format prefix: these specs declare an
+        // explicit key type, which the compact format cannot carry, so they
+        // take the lossless JSON encoding (register §53). The old prefix
+        // assertion blessed an encoding that silently reset the declared
+        // type to "auto".
+        let decoded = krishiv_plan::window::decode_window_execution_spec(&fragment).unwrap();
+        assert_eq!(
+            decoded.window_kind,
+            krishiv_plan::window::WindowKind::Tumbling
+        );
+        assert_eq!(
+            decoded.key_column_type, "utf8",
+            "the declared key type must survive the fragment codec"
+        );
     }
 
     #[test]
@@ -676,6 +691,7 @@ mod tests {
             source_id_column: None,
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
+            key_is_synthetic: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -705,6 +721,7 @@ mod tests {
             source_id_column: None,
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
+            key_is_synthetic: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -733,6 +750,7 @@ mod tests {
             source_id_column: None,
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
+            key_is_synthetic: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -761,6 +779,7 @@ mod tests {
             source_id_column: None,
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
+            key_is_synthetic: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -789,7 +808,13 @@ mod tests {
             row_filter: None,
         };
         let fragment = fragment_from_local_spec(&spec).unwrap();
-        assert!(fragment.contains("stream:sw"));
+        let decoded = krishiv_plan::window::decode_window_execution_spec(&fragment).unwrap();
+        assert_eq!(
+            decoded.window_kind,
+            krishiv_plan::window::WindowKind::Sliding
+        );
+        assert_eq!(decoded.slide_ms, Some(5_000));
+        assert_eq!(decoded.key_column_type, "utf8");
     }
 
     #[test]
@@ -810,7 +835,13 @@ mod tests {
             row_filter: None,
         };
         let fragment = fragment_from_local_spec(&spec).unwrap();
-        assert!(fragment.contains("stream:ses"));
+        let decoded = krishiv_plan::window::decode_window_execution_spec(&fragment).unwrap();
+        assert_eq!(
+            decoded.window_kind,
+            krishiv_plan::window::WindowKind::Session
+        );
+        assert_eq!(decoded.session_gap_ms, Some(3_000));
+        assert_eq!(decoded.key_column_type, "utf8");
     }
 
     #[test]

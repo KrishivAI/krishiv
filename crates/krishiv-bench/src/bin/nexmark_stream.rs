@@ -39,11 +39,11 @@
 //!
 //! Eight of NEXMark's twenty-two queries. The streaming SQL path expresses
 //! keyed windowed aggregation with expression arguments, COUNT(DISTINCT),
-//! multi-column keys, and (at the SQL surface) equi-key time-band joins. What
+//! multi-column keys, global no-key aggregation (Q7/Q15 run in canonical
+//! form), and (at the SQL surface) equi-key time-band joins. What
 //! the harness still cannot drive: two-source jobs end to end (Q3/Q4/Q8/Q9/Q20
 //! need job-level join routing plus person/auction generators — this generator
-//! emits bids only), global no-key aggregation (Q7 standard form, Q15
-//! canonical form), top-N/rank (Q19), dedup/row_number (Q18), and stateless or
+//! emits bids only), top-N/rank (Q19), dedup/row_number (Q18), and stateless or
 //! processing-time paths outside the window compiler (Q0/Q10/Q12–Q14/Q21/Q22).
 //! Coverage is printed on every run so a reader cannot mistake this for full
 //! NEXMark.

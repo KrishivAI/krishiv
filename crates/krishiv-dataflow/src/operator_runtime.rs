@@ -235,10 +235,17 @@ pub fn execute_bounded_window_seeded(
     let key_column = spec.key_column.clone();
     let key_column_type = spec.key_column_type.clone();
     let key_parts = spec.key_parts.clone();
+    let key_is_synthetic = spec.key_is_synthetic;
     if !key_parts.is_empty() && matches!(spec.window_kind, WindowKind::Count { .. }) {
         return Err(ExecError::InvalidWindowConfig(String::from(
             "count windows do not support a composite grouping key: the operator emits one key \
              column and would publish the encoded key instead of the columns the query named",
+        )));
+    }
+    if key_is_synthetic && matches!(spec.window_kind, WindowKind::Count { .. }) {
+        return Err(ExecError::InvalidWindowConfig(String::from(
+            "count windows do not support global (no-key) aggregation: the operator emits one \
+             key column and would publish the synthetic key the query never named",
         )));
     }
     let event_time_column = spec.event_time_column.clone();
@@ -249,6 +256,7 @@ pub fn execute_bounded_window_seeded(
                 key_column,
                 key_column_type,
                 key_parts: key_parts.clone(),
+                key_is_synthetic,
                 event_time_column,
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.clone(),
@@ -281,6 +289,7 @@ pub fn execute_bounded_window_seeded(
                 key_column,
                 key_column_type,
                 key_parts: key_parts.clone(),
+                key_is_synthetic,
                 event_time_column,
                 window_size_ms: spec.window_size_ms,
                 slide_ms,
@@ -312,6 +321,7 @@ pub fn execute_bounded_window_seeded(
                 key_column,
                 key_column_type,
                 key_parts: key_parts.clone(),
+                key_is_synthetic,
                 event_time_column,
                 session_gap_ms: gap_ms,
                 agg_exprs,
@@ -419,10 +429,17 @@ fn build_streaming_window_op(
     let key_column = spec.key_column.clone();
     let key_column_type = spec.key_column_type.clone();
     let key_parts = spec.key_parts.clone();
+    let key_is_synthetic = spec.key_is_synthetic;
     if !key_parts.is_empty() && matches!(spec.window_kind, WindowKind::Count { .. }) {
         return Err(ExecError::InvalidWindowConfig(String::from(
             "count windows do not support a composite grouping key: the operator emits one key \
              column and would publish the encoded key instead of the columns the query named",
+        )));
+    }
+    if key_is_synthetic && matches!(spec.window_kind, WindowKind::Count { .. }) {
+        return Err(ExecError::InvalidWindowConfig(String::from(
+            "count windows do not support global (no-key) aggregation: the operator emits one \
+             key column and would publish the synthetic key the query never named",
         )));
     }
     let event_time_column = spec.event_time_column.clone();
@@ -435,6 +452,7 @@ fn build_streaming_window_op(
                 key_column,
                 key_column_type,
                 key_parts: key_parts.clone(),
+                key_is_synthetic,
                 event_time_column,
                 window_size_ms: spec.window_size_ms,
                 agg_exprs,
@@ -454,6 +472,7 @@ fn build_streaming_window_op(
                 key_column,
                 key_column_type,
                 key_parts: key_parts.clone(),
+                key_is_synthetic,
                 event_time_column,
                 window_size_ms: spec.window_size_ms,
                 slide_ms,
@@ -472,6 +491,7 @@ fn build_streaming_window_op(
                 key_column,
                 key_column_type,
                 key_parts: key_parts.clone(),
+                key_is_synthetic,
                 event_time_column,
                 session_gap_ms,
                 agg_exprs,
@@ -698,6 +718,7 @@ pub fn local_spec_to_window_execution(params: LocalWindowParams) -> WindowExecut
         source_id_column: None,
         key_parts: Vec::new(),
         derived_columns: Vec::new(),
+        key_is_synthetic: false,
         window_timezone: None,
         row_filter: None,
     }
@@ -871,6 +892,7 @@ mod tests {
             source_id_column: Some("source_id".into()),
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
+            key_is_synthetic: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -919,6 +941,7 @@ mod tests {
             source_id_column: None,
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
+            key_is_synthetic: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -981,6 +1004,7 @@ mod tests {
             source_id_column: None,
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
+            key_is_synthetic: false,
             window_timezone: None,
             row_filter: None,
         };

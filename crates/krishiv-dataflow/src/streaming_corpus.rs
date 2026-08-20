@@ -453,10 +453,10 @@ pub const QUERY_SHAPES: &[QueryShape] = &[
     QueryShape {
         name: "global_aggregate_no_key",
         sql: "SELECT MAX(v) AS mx FROM TUMBLE(TABLE e, DESCRIPTOR(ts), 10000)               GROUP BY window_start, window_end",
-        compiles: false,
-        spec_must_contain: None,
-        error_must_contain: Some("grouping key"),
-        why: "Global aggregates are not expressible yet. Pinned as a refusal so               the day they are supported, this line has to change deliberately.",
+        compiles: true,
+        spec_must_contain: Some("key_is_synthetic: true"),
+        error_must_contain: None,
+        why: "Global aggregation landed (task #140): the compiler injects a               constant key and marks it synthetic so the emit path suppresses               it. The assertion pins the MARK, not just compilation — a spec               that compiles with key_is_synthetic false would publish a               __krishiv_global column the user never named.",
     },
     QueryShape {
         name: "windowless_projection",

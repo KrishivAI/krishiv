@@ -315,6 +315,17 @@ pub struct WindowExecutionSpec {
     /// only ever aggregates a named column.
     #[serde(default)]
     pub derived_columns: Vec<DerivedColumn>,
+    /// The grouping key exists only to satisfy the keyed operator machinery
+    /// and must NOT appear in the output (task #140, global aggregation).
+    ///
+    /// A query like `SELECT MAX(v) ... GROUP BY window_start, window_end`
+    /// has no user key; the compiler injects a constant derived column so
+    /// there is still exactly one grouping key internally, and this flag
+    /// tells the emit path to suppress it. A bool rather than a reserved
+    /// key-column name: a name would carry two meanings in one
+    /// representation, this codebase's recurring defect shape.
+    #[serde(default)]
+    pub key_is_synthetic: bool,
     /// ST11: events arriving within `[watermark, watermark + allowed_lateness_ms)`
     /// are kept for late-firing instead of being dropped. Defaults to
     /// `None` (no lateness — events past the watermark are dropped).
@@ -381,6 +392,7 @@ impl WindowExecutionSpec {
             source_id_column: None,
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
+            key_is_synthetic: false,
             window_timezone: None,
             row_filter: None,
         }
@@ -441,6 +453,7 @@ pub fn decode_window_execution_spec(encoded: &str) -> Result<WindowExecutionSpec
         source_id_column: parsed.source_id_column,
         key_parts: Vec::new(),
         derived_columns: Vec::new(),
+        key_is_synthetic: false,
         window_timezone: None,
         row_filter: None,
     };
@@ -642,6 +655,7 @@ pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> Result<String, Plan
         || spec.row_filter.is_some()
         || spec.allowed_lateness_ms.is_some()
         || spec.window_timezone.is_some()
+        || spec.key_is_synthetic
         || spec.key_column_type != default_key_type();
     if compact_cannot_represent {
         return encode_window_execution_spec(spec);
@@ -1046,6 +1060,7 @@ mod tests {
             source_id_column: None,
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
+            key_is_synthetic: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -1155,6 +1170,7 @@ mod tests {
             source_id_column: None,
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
+            key_is_synthetic: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -1195,6 +1211,7 @@ mod tests {
             source_id_column: Some(String::from("source")),
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
+            key_is_synthetic: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -1263,6 +1280,7 @@ mod tests {
             source_id_column: Some("source_id".into()),
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
+            key_is_synthetic: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -1317,6 +1335,7 @@ mod tests {
             source_id_column: None,
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
+            key_is_synthetic: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -1344,6 +1363,7 @@ mod tests {
             source_id_column: None,
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
+            key_is_synthetic: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -1372,6 +1392,7 @@ mod tests {
             source_id_column: Some("src:col".into()),
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
+            key_is_synthetic: false,
             window_timezone: None,
             row_filter: None,
         };
@@ -1461,6 +1482,7 @@ mod tests {
                         source_id_column: None,
                         key_parts: Vec::new(),
                         derived_columns: Vec::new(),
+                        key_is_synthetic: false,
                         window_timezone: None,
                         row_filter: None,
                     },

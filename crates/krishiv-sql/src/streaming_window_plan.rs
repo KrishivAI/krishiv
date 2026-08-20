@@ -101,6 +101,7 @@ pub fn compile_streaming_window_sql(sql: &str) -> SqlResult<StreamingWindowPlan>
         aggs: agg_exprs,
         derived: derived_columns,
         key_parts,
+        key_is_synthetic,
     } = extract_key_and_aggs(&select)?;
 
     // A top-level WHERE becomes a row filter applied BEFORE grouping, using the
@@ -126,7 +127,13 @@ pub fn compile_streaming_window_sql(sql: &str) -> SqlResult<StreamingWindowPlan>
         // so it passed while the path every SQL user actually takes stayed
         // broken. The test below goes through `compile_streaming_window_sql`
         // for exactly that reason.
-        key_column_type: String::from(krishiv_dataflow_key_type_auto()),
+        key_column_type: if key_is_synthetic {
+            // The synthetic key is a compiler-made Int64 constant; there is
+            // no source column to infer from, so "auto" would be a lie here.
+            String::from("int64")
+        } else {
+            String::from(krishiv_dataflow_key_type_auto())
+        },
         event_time_column: window.event_time_column,
         watermark_lag_ms: 0,
         window_kind: window.kind,
@@ -140,6 +147,7 @@ pub fn compile_streaming_window_sql(sql: &str) -> SqlResult<StreamingWindowPlan>
         source_id_column: None,
         key_parts,
         derived_columns,
+        key_is_synthetic,
         window_timezone: None,
         row_filter,
     };
@@ -471,6 +479,9 @@ struct KeyAndAggs {
     aggs: Vec<WindowAgg>,
     derived: Vec<DerivedColumn>,
     key_parts: Vec<KeyPart>,
+    /// True when the query named no grouping key and `key_column` is a
+    /// compiler-injected constant that must not appear in output.
+    key_is_synthetic: bool,
 }
 
 fn extract_key_and_aggs(select: &Select) -> SqlResult<KeyAndAggs> {
@@ -496,9 +507,36 @@ fn extract_key_and_aggs(select: &Select) -> SqlResult<KeyAndAggs> {
         }
     }
 
-    let key_column = key_column.ok_or_else(|| {
-        unsupported("streaming window query needs a grouping key column in the SELECT list")
-    })?;
+    // No bare column in the SELECT list = a GLOBAL aggregate (task #140):
+    // `SELECT MAX(v) ... GROUP BY window_start, window_end`. The keyed
+    // operator machinery still needs one grouping key, so the compiler
+    // injects a constant derived column and marks it synthetic; the emit
+    // path suppresses it. A GROUP BY column that is absent from the SELECT
+    // list is still refused — accepting it would group by a column the
+    // output cannot show.
+    let Some(key_column) = key_column else {
+        let strays = collect_extra_group_by(select, "__krishiv_global")?;
+        if let Some(stray) = strays.first() {
+            return Err(unsupported(format!(
+                "GROUP BY column '{stray}' does not appear in the SELECT list; a streaming \
+                 window query's grouping key must be selected so the output can carry it"
+            )));
+        }
+        if aggs.is_empty() {
+            aggs.push(WindowAgg::count("count"));
+        }
+        derived.push(DerivedColumn {
+            name: String::from("__krishiv_global"),
+            expr: WindowScalarExpr::Int(0),
+        });
+        return Ok(KeyAndAggs {
+            key_column: String::from("__krishiv_global"),
+            aggs,
+            derived,
+            key_parts: Vec::new(),
+            key_is_synthetic: true,
+        });
+    };
     let extra_keys = collect_extra_group_by(select, &key_column)?;
     if aggs.is_empty() {
         aggs.push(WindowAgg::count("count"));
@@ -533,6 +571,7 @@ fn extract_key_and_aggs(select: &Select) -> SqlResult<KeyAndAggs> {
         aggs,
         derived,
         key_parts,
+        key_is_synthetic: false,
     })
 }
 

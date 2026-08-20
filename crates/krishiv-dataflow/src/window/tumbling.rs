@@ -22,6 +22,9 @@ pub struct TumblingWindowSpec {
     pub key_column_type: String,
     /// Source columns behind a composite key; empty for a single-column key.
     pub key_parts: Vec<krishiv_plan::window::KeyPart>,
+    /// Suppress the key in output: the key exists only to satisfy the keyed
+    /// machinery (global aggregation, task #140) and the user never named it.
+    pub key_is_synthetic: bool,
     /// Name of the Int64 column carrying event time in milliseconds.
     pub event_time_column: String,
     /// Window duration in milliseconds.
@@ -87,6 +90,7 @@ impl TumblingWindowOperator {
             &spec.agg_exprs,
             &spec.agg_is_float,
             &spec.key_parts,
+            spec.key_is_synthetic,
         );
         Self {
             spec,
@@ -362,6 +366,7 @@ impl TumblingWindowOperator {
         let window_end_ms = window_start_ms.saturating_add(self.spec.window_size_ms as i64);
         build_window_record_batch(WindowRecordBatchInput {
             schema: &self.output_schema,
+            key_is_synthetic: self.spec.key_is_synthetic,
             key_type: &self.spec.key_column_type,
             key_parts: &self.spec.key_parts,
             key_value,
@@ -394,11 +399,16 @@ pub(crate) fn build_window_output_schema(
     agg_exprs: &[AggExpr],
     agg_is_float: &[bool],
     key_parts: &[krishiv_plan::window::KeyPart],
+    key_is_synthetic: bool,
 ) -> Arc<Schema> {
     // A composite key is ONE grouping key internally and N columns on the way
     // out: the user wrote `GROUP BY auction, channel` and must get `auction`
-    // and `channel` back, not the encoded key they never mentioned.
-    let mut fields: Vec<Field> = if key_parts.is_empty() {
+    // and `channel` back, not the encoded key they never mentioned. The same
+    // rule inverted: a SYNTHETIC key was named by nobody and must appear
+    // nowhere — a global aggregate emits window bounds and aggregates only.
+    let mut fields: Vec<Field> = if key_is_synthetic {
+        Vec::new()
+    } else if key_parts.is_empty() {
         vec![Field::new(
             key_column,
             key_type_to_arrow_data_type(key_type),
@@ -427,6 +437,7 @@ pub(crate) fn build_window_output_schema(
 
 pub(crate) struct WindowRecordBatchInput<'a> {
     pub(crate) schema: &'a Arc<Schema>,
+    pub(crate) key_is_synthetic: bool,
     pub(crate) key_type: &'a str,
     pub(crate) key_value: &'a str,
     pub(crate) key_parts: &'a [krishiv_plan::window::KeyPart],
@@ -442,6 +453,7 @@ pub(crate) fn build_window_record_batch(
 ) -> ExecResult<RecordBatch> {
     let WindowRecordBatchInput {
         schema,
+        key_is_synthetic,
         key_type,
         key_value,
         key_parts,
@@ -452,7 +464,9 @@ pub(crate) fn build_window_record_batch(
         agg_is_float,
     } = input;
     let schema = Arc::clone(schema);
-    let mut columns: Vec<std::sync::Arc<dyn arrow::array::Array>> = if key_parts.is_empty() {
+    let mut columns: Vec<std::sync::Arc<dyn arrow::array::Array>> = if key_is_synthetic {
+        Vec::new()
+    } else if key_parts.is_empty() {
         vec![key_value_to_typed_array(key_type, key_value)?]
     } else {
         let decoded = crate::scalar_expr::split_composite_key(key_value, key_parts.len())?;
@@ -557,6 +571,7 @@ mod state_tests {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
+            key_is_synthetic: false,
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             agg_exprs: vec![AggExpr {
@@ -593,6 +608,7 @@ mod state_tests {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
+            key_is_synthetic: false,
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             agg_exprs: vec![AggExpr {
@@ -617,6 +633,7 @@ mod state_tests {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
+            key_is_synthetic: false,
             event_time_column: "ts".into(),
             window_size_ms: 0,
             agg_exprs: vec![AggExpr {
@@ -654,6 +671,7 @@ mod state_tests {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
+            key_is_synthetic: false,
             event_time_column: "ts".into(),
             window_size_ms: 10_000,
             agg_exprs: vec![AggExpr {
@@ -813,6 +831,7 @@ mod aggregation_proptests {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
+            key_is_synthetic: false,
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             agg_exprs: vec![
@@ -923,6 +942,7 @@ mod aggregation_proptests {
                 key_column: "k".into(),
                 key_column_type: "utf8".into(),
                 key_parts: Vec::new(),
+                key_is_synthetic: false,
                 event_time_column: "ts".into(),
                 window_size_ms: 1000,
                 agg_exprs: vec![
@@ -960,6 +980,7 @@ mod aggregation_proptests {
                 key_column: "k".into(),
                 key_column_type: "utf8".into(),
                 key_parts: Vec::new(),
+                key_is_synthetic: false,
                 event_time_column: "ts".into(),
                 window_size_ms: 1000,
                 agg_exprs: vec![AggExpr { filter: None,
@@ -1034,6 +1055,7 @@ mod filter_tests {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
+            key_is_synthetic: false,
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             agg_exprs: vec![

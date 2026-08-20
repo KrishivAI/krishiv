@@ -5667,3 +5667,36 @@ additions to it. Test encodes the exact previously-lossy shape (key_parts +
 derived column + row_filter + explicit type, single unfiltered agg) and
 demands decode equality; against the reverted condition it fails on the
 first dropped field. All four fragment-consuming crates green.
+
+## §54 — #140: global (no-key) windowed aggregation
+
+`SELECT MAX(v) ... GROUP BY window_start, window_end` now compiles: the
+compiler injects a constant Int64 derived column as the grouping key and
+marks the spec `key_is_synthetic`; the emit path suppresses it. A bool on
+the spec rather than a reserved key-name convention — a magic name would be
+one representation carrying two meanings, and the register has five entries
+that started that way. The flag is threaded to the three keyed operator
+specs; count windows refuse it by name (they emit their key unconditionally,
+same rule as their composite-key refusal). The synthetic key's type is
+declared "int64" explicitly — "auto" would claim there is a source column to
+infer from, and there isn't.
+
+Revert proofs, one per claim: reverting the compiler acceptance fails all
+three tests with the old refusal; reverting only the emit suppression keeps
+the query compiling AND computing the right max while the schema test fails
+with `["__krishiv_global", ...]` leaking — the half a compile test cannot
+see. The GROUP-BY-column-absent-from-SELECT case stays refused and the error
+names the column. The corpus tripwire from §52 fired as designed: wiring
+QUERY_SHAPES forced `global_aggregate_no_key` to be flipped deliberately,
+and it now pins `key_is_synthetic: true` in the spec debug form.
+
+Fallout fixed along the way: three krishiv-runtime fragment tests asserted
+the compact `stream:tw` prefix on specs declaring an explicit key type —
+blessing the exact type-erasure §53 fixed. Repointed at decode round-trips
+that assert the declared type survives.
+
+Benchmark: Q7 and Q15 now run in their CANONICAL NEXMark forms (global max;
+global count + count-distinct). Pinned medians: q7 11.8M ev/sec (keyed
+stand-in was 10.0M), q15 12.1M (multi-key stand-in was 3.2M — one group
+instead of thousands). Coverage stays 8 of 22, but two of the eight are no
+longer approximations.

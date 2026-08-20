@@ -2530,6 +2530,7 @@ mod tests {
             source_id_column: None,
             key_parts: Vec::new(),
             derived_columns: Vec::new(),
+            key_is_synthetic: false,
             window_timezone: None,
             row_filter: None,
         }

@@ -26,6 +26,9 @@ pub struct SlidingWindowSpec {
     pub key_column_type: String,
     /// Source columns behind a composite key; empty for a single-column key.
     pub key_parts: Vec<krishiv_plan::window::KeyPart>,
+    /// Suppress the key in output: the key exists only to satisfy the keyed
+    /// machinery (global aggregation, task #140) and the user never named it.
+    pub key_is_synthetic: bool,
     /// Int64 column carrying event time in milliseconds.
     pub event_time_column: String,
     /// Total window duration in milliseconds.
@@ -96,6 +99,7 @@ impl SlidingWindowOperator {
             &spec.agg_exprs,
             &spec.agg_is_float,
             &spec.key_parts,
+            spec.key_is_synthetic,
         );
         Ok(Self {
             spec,
@@ -325,6 +329,7 @@ impl SlidingWindowOperator {
         let window_end_ms = window_start_ms.saturating_add(self.spec.window_size_ms as i64);
         build_window_record_batch(WindowRecordBatchInput {
             schema: &self.output_schema,
+            key_is_synthetic: self.spec.key_is_synthetic,
             key_type: &self.spec.key_column_type,
             key_parts: &self.spec.key_parts,
             key_value,
@@ -377,6 +382,7 @@ mod sliding_state_tests {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
+            key_is_synthetic: false,
             event_time_column: "ts".into(),
             window_size_ms: 2000,
             slide_ms: 1000,
@@ -444,6 +450,7 @@ mod sliding_state_tests {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
+            key_is_synthetic: false,
             event_time_column: "ts".into(),
             window_size_ms: 2000,
             slide_ms: 1000,
@@ -481,6 +488,7 @@ mod sliding_state_tests {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
+            key_is_synthetic: false,
             event_time_column: "ts".into(),
             window_size_ms: 2000,
             slide_ms: 1000,
@@ -568,6 +576,7 @@ mod sliding_state_tests {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
+            key_is_synthetic: false,
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             slide_ms: 0,

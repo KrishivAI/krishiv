@@ -25,6 +25,9 @@ pub struct SessionWindowSpec {
     pub key_column_type: String,
     /// Source columns behind a composite key; empty for a single-column key.
     pub key_parts: Vec<krishiv_plan::window::KeyPart>,
+    /// Suppress the key in output: the key exists only to satisfy the keyed
+    /// machinery (global aggregation, task #140) and the user never named it.
+    pub key_is_synthetic: bool,
     /// Int64 column carrying event time in milliseconds.
     pub event_time_column: String,
     /// Inactivity gap that closes the session in milliseconds.
@@ -70,7 +73,11 @@ pub struct SessionWindowOperator {
 }
 
 fn build_session_output_schema(spec: &SessionWindowSpec) -> Arc<Schema> {
-    let mut fields: Vec<Field> = if spec.key_parts.is_empty() {
+    // A synthetic key was named by nobody and must appear nowhere: a global
+    // session aggregate emits session bounds and aggregates only.
+    let mut fields: Vec<Field> = if spec.key_is_synthetic {
+        Vec::new()
+    } else if spec.key_parts.is_empty() {
         vec![Field::new(
             &spec.key_column,
             key_type_to_data_type(&spec.key_column_type),
@@ -538,7 +545,10 @@ impl SessionWindowOperator {
         let mut columns: Vec<Arc<dyn arrow::array::Array>> =
             Vec::with_capacity(3 + self.spec.agg_exprs.len());
 
-        if self.spec.key_parts.is_empty() {
+        if self.spec.key_is_synthetic {
+            // No key columns: the synthetic key exists only inside the
+            // accumulator map.
+        } else if self.spec.key_parts.is_empty() {
             columns.push(key_values_to_typed_column(
                 &self.spec.key_column_type,
                 keys,
@@ -691,6 +701,7 @@ mod session_state_tests {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
+            key_is_synthetic: false,
             event_time_column: "ts".into(),
             session_gap_ms: 500,
             agg_exprs: vec![AggExpr {
@@ -727,6 +738,7 @@ mod session_state_tests {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
+            key_is_synthetic: false,
             event_time_column: "ts".into(),
             session_gap_ms: 500,
             agg_exprs: vec![AggExpr {
@@ -757,6 +769,7 @@ mod session_state_tests {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
+            key_is_synthetic: false,
             event_time_column: "ts".into(),
             session_gap_ms: 500,
             agg_exprs: vec![AggExpr {
@@ -868,6 +881,7 @@ mod session_state_tests {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
+            key_is_synthetic: false,
             event_time_column: "ts".into(),
             session_gap_ms: u64::MAX,
             agg_exprs: vec![AggExpr {
@@ -926,6 +940,7 @@ mod session_state_tests {
             key_column: "k".into(),
             key_column_type: "utf8".into(),
             key_parts: Vec::new(),
+            key_is_synthetic: false,
             event_time_column: "ts".into(),
             session_gap_ms: 1000,
             agg_exprs: vec![AggExpr {
