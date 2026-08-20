@@ -5601,3 +5601,28 @@ sibling-defect shape, instance six; task #145); (b) `streaming_corpus::
 QUERY_SHAPES` is dead — no assertion references it, and its
 `multi_column_group_by` entry still claims `compiles: false`, stale since
 §48 (task #133).
+
+## §51 — Session-window COUNT(DISTINCT) lost its sets across checkpoint/restore (sibling-defect instance six)
+
+Found by the feature-mapping sweep, not by a failing test — because no test
+could fail: session windows persist through their own JSON encoder in
+session.rs (`persist_to_state`/`restore_from_state`), a SECOND encoder that
+the §47 V2 versioning in state_persistence.rs never touched. It serialized
+the six AggEntry vectors and nothing else, so `AggState::distinct` restored
+empty while the count restored as N. The failure is worse than under-counting:
+the next already-seen value re-derived `value = set.len()` and RESET the
+count to 1. The test feeds {x, y}, checkpoints, restores, feeds a duplicate
+x, closes the session, and demands 2; against the reverted persist hunk it
+fails `left: 1, right: 2` — the duplicate genuinely reset the count.
+
+Fix mirrors the V2 rule in the JSON dialect: the `distinct` field is written
+only when a set is non-empty, so non-DISTINCT session checkpoints stay
+byte-identical (the running soak restores them); absent field = empty sets
+(correct for old snapshots); present-but-malformed or wrong-cardinality =
+CorruptEntry, failing loudly rather than degrading to empty sets.
+
+Standing observation, now three encoders deep: state has TWO serialization
+paths (binary state_persistence.rs for tumbling/sliding/count, JSON in
+session.rs for sessions), and every field added to AggState must be added to
+BOTH BY HAND. Any future auxiliary state (the top-N heap task #142 is the
+next one) must touch both or repeat this defect exactly.

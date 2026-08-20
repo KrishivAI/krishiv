@@ -161,7 +161,7 @@ impl SessionWindowOperator {
         let mut state_keys = Vec::with_capacity(self.sessions.len());
         let mut values = Vec::with_capacity(self.sessions.len());
         for (key, session) in &self.sessions {
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "session_start_ms": session.session_start_ms,
                 "last_event_time_ms": session.last_event_time_ms,
                 "values":       session.agg.entries.iter().map(|e| e.value).collect::<Vec<_>>(),
@@ -171,6 +171,30 @@ impl SessionWindowOperator {
                 "float_values": session.agg.entries.iter().map(|e| e.float_value).collect::<Vec<_>>(),
                 "sq_sums":      session.agg.entries.iter().map(|e| e.sq_sum).collect::<Vec<_>>(),
             });
+            // COUNT(DISTINCT) sets, written ONLY when one is non-empty — the
+            // same opt-in rule as AGG_STATE_BINARY_V2 in state_persistence.rs,
+            // and for the same reason: queries that never use DISTINCT keep
+            // producing byte-identical checkpoints. Omitting this field was a
+            // real defect (register §50): after restore the set came back
+            // empty, so the count both under-counted the restored window and
+            // re-counted values it had already seen.
+            if session.agg.distinct.iter().any(|set| !set.is_empty()) {
+                // `payload` is the object literal built just above; the if-let
+                // is for clippy's indexing lint, not a reachable branch.
+                if let serde_json::Value::Object(map) = &mut payload {
+                    map.insert(
+                        "distinct".into(),
+                        serde_json::json!(
+                            session
+                                .agg
+                                .distinct
+                                .iter()
+                                .map(|set| set.iter().collect::<Vec<_>>())
+                                .collect::<Vec<_>>()
+                        ),
+                    );
+                }
+            }
             let bytes = serde_json::to_vec(&payload).map_err(|e| StateError::CorruptEntry {
                 message: e.to_string(),
             })?;
@@ -261,7 +285,7 @@ impl SessionWindowOperator {
                 .unwrap_or_default();
             if let Some(key) = parse_session_state_key(&key_bytes) {
                 let n = values.len();
-                let entries = (0..n)
+                let entries: Vec<AggEntry> = (0..n)
                     .map(|i| AggEntry {
                         value: values.get(i).copied().unwrap_or(0),
                         has_value: has_value.get(i).copied().unwrap_or(false),
@@ -271,12 +295,35 @@ impl SessionWindowOperator {
                         sq_sum: sq_sums.get(i).copied().unwrap_or(0.0),
                     })
                     .collect();
+                let mut agg = AggState::from_entries(entries);
+                // Absent field = a snapshot from a query with no DISTINCT (or
+                // written before the field existed); empty sets are the
+                // correct reading. Present-but-malformed is corruption and
+                // must fail loudly, not silently degrade to empty sets.
+                if let Some(raw) = parsed.get("distinct") {
+                    let sets: Vec<std::collections::BTreeSet<String>> =
+                        serde_json::from_value(raw.clone()).map_err(|e| {
+                            StateError::CorruptEntry {
+                                message: format!("invalid distinct sets: {e}"),
+                            }
+                        })?;
+                    if sets.len() != n {
+                        return Err(StateError::CorruptEntry {
+                            message: format!(
+                                "distinct set count {} does not match {} aggregates",
+                                sets.len(),
+                                n
+                            ),
+                        });
+                    }
+                    agg.distinct = sets;
+                }
                 restored.insert(
                     key,
                     SessionState {
                         session_start_ms,
                         last_event_time_ms,
-                        agg: AggState::from_entries(entries),
+                        agg,
                     },
                 );
             }
@@ -692,6 +739,92 @@ mod session_state_tests {
         });
         restored.restore_from_state(&backend, &ns).expect("restore");
         assert_eq!(restored.open_session_count(), 1);
+    }
+
+    /// COUNT(DISTINCT) must survive checkpoint/restore with its SET, not just
+    /// its count.
+    ///
+    /// Session windows persist through their own JSON encoder, which predates
+    /// the distinct sets and silently dropped them (register §50): the count
+    /// restored as N but the set restored empty, so the next already-seen
+    /// value RESET the count to 1 — `value` is re-derived as `set.len()` on
+    /// every update. This test feeds {x, y}, checkpoints mid-session,
+    /// restores, feeds a duplicate x, and demands the final count still be 2.
+    /// Against the pre-fix persist path it fails with 1.
+    #[test]
+    fn session_count_distinct_survives_checkpoint_restore() {
+        let make_spec = || SessionWindowSpec {
+            key_column: "k".into(),
+            key_column_type: "utf8".into(),
+            key_parts: Vec::new(),
+            event_time_column: "ts".into(),
+            session_gap_ms: 500,
+            agg_exprs: vec![AggExpr {
+                filter: None,
+                input_column: "v".into(),
+                output_column: "distinct_vals".into(),
+                function: AggFunction::CountDistinct,
+            }],
+            agg_is_float: vec![false],
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("v", DataType::Utf8, false),
+        ]));
+        let batch = |keys: &[&str], ts: &[i64], vals: &[&str]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(keys.to_vec())),
+                    Arc::new(Int64Array::from(ts.to_vec())),
+                    Arc::new(StringArray::from(vals.to_vec())),
+                ],
+            )
+            .unwrap()
+        };
+
+        let mut op = SessionWindowOperator::new(make_spec());
+        op.process_batch(&batch(&["a", "a"], &[100, 200], &["x", "y"]), 200)
+            .expect("process");
+
+        let mut backend = RocksDbStateBackend::ephemeral().unwrap();
+        let ns = Namespace::new("op-session-distinct", "windows");
+        op.persist_to_state(&mut backend, &ns).expect("persist");
+
+        let mut restored = SessionWindowOperator::new(make_spec());
+        restored.restore_from_state(&backend, &ns).expect("restore");
+
+        // The duplicate: x was already counted before the checkpoint.
+        restored
+            .process_batch(&batch(&["a"], &[400], &["x"]), 400)
+            .expect("duplicate after restore");
+
+        // Advance the watermark past the gap so the session closes and emits.
+        let out = restored
+            .process_batch(&batch(&["b"], &[5000], &["z"]), 5000)
+            .expect("close session");
+        let closed: Vec<&RecordBatch> = out.iter().filter(|b| b.num_rows() > 0).collect();
+        assert!(
+            !closed.is_empty(),
+            "advancing the watermark to 5000 must close session 'a'"
+        );
+        let emitted = closed[0];
+        let agg_col_idx = emitted
+            .schema()
+            .index_of("distinct_vals")
+            .expect("output must carry the aggregate column");
+        let counts = emitted
+            .column(agg_col_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count column is Int64");
+        assert_eq!(
+            counts.value(0),
+            2,
+            "{{x, y}} then a duplicate x is 2 distinct values; 1 means the \
+             restored set came back empty and the duplicate reset the count"
+        );
     }
 
     #[test]
