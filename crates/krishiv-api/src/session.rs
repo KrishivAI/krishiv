@@ -3065,18 +3065,49 @@ impl Session {
             })?
             .to_owned();
 
-        // The coordinator compiles the same windowed SQL its own
-        // `/continuous-register-sql` endpoint accepts, so a job that runs
-        // embedded and the same job submitted here are planned by one compiler
-        // rather than two that can disagree.
-        let plan = krishiv_sql::streaming_window_plan::compile_streaming_window_sql(&job.query)
-            .map_err(|error| {
-                KrishivError::unsupported(format!(
-                    "distributed streaming needs a windowed query the coordinator can plan \
-                     (TUMBLE / HOP / SESSION over a source with GROUP BY); this job's query did \
-                     not compile: {error}"
+        // Task #147: the SAME routing ladder the embedded engine and the
+        // bench harness use — pipeline, then join, then window, then
+        // stateless — so a job's class is decided once, by shape, and the
+        // failing class's own compiler produces the error the user sees.
+        let stream_spec: krishiv_plan::stream_task::StreamingTaskSpec =
+            if krishiv_sql::streaming_pipeline_plan::looks_like_streaming_pipeline(&job.query) {
+                krishiv_plan::stream_task::StreamingTaskSpec::Pipeline(Box::new(
+                    krishiv_sql::streaming_pipeline_plan::compile_streaming_pipeline_sql(
+                        &job.query,
+                    )
+                    .map_err(|e| KrishivError::unsupported(e.to_string()))?
+                    .spec,
                 ))
-            })?;
+            } else if krishiv_sql::streaming_join_plan::looks_like_streaming_join(&job.query) {
+                krishiv_plan::stream_task::StreamingTaskSpec::Join(Box::new(
+                    krishiv_sql::streaming_join_plan::compile_streaming_join_sql(&job.query)
+                        .map_err(|e| KrishivError::unsupported(e.to_string()))?
+                        .spec,
+                ))
+            } else if krishiv_sql::streaming_tvf::find_window_tvf(&job.query).is_some() {
+                krishiv_plan::stream_task::StreamingTaskSpec::Window(Box::new(
+                    krishiv_sql::streaming_window_plan::compile_streaming_window_sql(&job.query)
+                        .map_err(|error| {
+                            KrishivError::unsupported(format!(
+                                "distributed streaming window query did not compile: {error}"
+                            ))
+                        })?
+                        .spec,
+                ))
+            } else {
+                let source = job.sources.first().ok_or_else(|| {
+                    KrishivError::unsupported(
+                        "a stateless distributed job needs a source to name its input table",
+                    )
+                })?;
+                krishiv_plan::stream_task::StreamingTaskSpec::Stateless(Box::new(
+                    krishiv_plan::stream_task::StatelessQuerySpec {
+                        sql: job.query.clone(),
+                        source: source.name.clone(),
+                        side_tables: vec![],
+                    },
+                ))
+            };
 
         // Every source must be one the *subtasks* can open. A bounded source
         // has no place in an unbounded run-loop, and refusing it here is better
@@ -3130,15 +3161,37 @@ impl Session {
             ));
         }
 
-        let parallelism = sources.len().max(1) as u32;
+        // Per-class parallelism: windows and stateless scale with sources;
+        // joins with the larger side; pipelines are pinned to 1 (stage
+        // re-keying — the coordinator refuses anything else by name).
+        let parallelism = match &stream_spec {
+            krishiv_plan::stream_task::StreamingTaskSpec::Pipeline(_) => 1,
+            krishiv_plan::stream_task::StreamingTaskSpec::Join(j) => {
+                let left = job
+                    .sources
+                    .iter()
+                    .filter(|s| s.name == j.left_source)
+                    .count();
+                let right = job
+                    .sources
+                    .iter()
+                    .filter(|s| s.name == j.right_source)
+                    .count();
+                left.max(right).max(1) as u32
+            }
+            _ => sources.len().max(1) as u32,
+        };
         let mut options = krishiv_runtime::ContinuousRegisterOptions::run_loop(parallelism);
         options.sources = sources;
         let checkpoint_dir = self.checkpoint_dir();
         options =
             options.with_checkpointing(30_000, format!("file://{}", checkpoint_dir.display()));
 
-        krishiv_runtime::execute_coordinator_continuous_register(
-            &url, &job.name, &plan.spec, &options,
+        krishiv_runtime::execute_coordinator_continuous_register_task(
+            &url,
+            &job.name,
+            &stream_spec,
+            &options,
         )
         .await
         .map_err(KrishivError::from)?;
