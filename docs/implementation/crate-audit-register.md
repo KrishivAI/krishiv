@@ -5562,3 +5562,42 @@ generator does not produce — it emits bids only.
 
 So: joins are expressible and executable, and are **not** yet runnable as a
 submitted job or counted in NEXMark coverage, which stays at **8 of 22**.
+
+## §50 — #135 settled: the typed key DID cost throughput, but the mechanism was a per-row cast kernel, not string formatting
+
+The pinned A/B (one variable: `krishiv_dataflow_key_type_auto()` toggled to
+`"utf8"`, the exact revert that proved §43's test red; identical harness,
+taskset -c 8-11, median of 5) measured the typed key at **2–2.5x slower** on
+every UInt64-keyed tumbling query: q7 4.1M vs 10.4M, q2 4.9M vs 10.8M, q1 3.7M
+vs 7.2M, q17 4.0M vs 8.4M ev/sec — far outside the run spreads. The suspected
+mechanism (per-row integer-to-string formatting) was wrong. The real one:
+`extract_agg_key`'s unsigned arm called `arrow::compute::cast(col, UInt64)` —
+on the WHOLE COLUMN, once PER ROW. Even arrow's same-type fast path allocates
+a fresh ArrayData wrapper per call; ~135ns x 1000 rows/batch matched the
+observed p50 delta (206us vs 71us) almost exactly. The old utf8 world never
+hit that arm because the driver had already cast the key column once,
+vectorized.
+
+Fix: direct per-width downcasts (UInt8/16/32/64 each widening `as u64`), no
+cast kernel in the per-row path. Re-measured: typed+fix is at parity or ahead
+of the old utf8 world on every query — q1 10.8M (utf8: 7.2M), q2 15.7M
+(10.8M), q7 10.0M (10.4M, within spread), q17 9.8M (8.4M), q11 20.5M (10.9M).
+The register's answer to "should operators key on typed AggKey instead of
+String?" is therefore NO for now — the string keying was never the cost.
+
+Honesty note on the standing rule: this fix changes no observable semantics,
+so no unit test can go red against the pre-fix line. The revert proof is the
+A/B itself (reverting to the cast arm reproduces the 2.5x). The unsigned-key
+test was extended to cover all four new match arms individually, since four
+independent arms replaced one shared one and a broken UInt16 arm must not
+hide behind a passing UInt32 case — that is coverage for the new shape, not a
+regression proof, and is recorded as such.
+
+Also recorded here, found by the same session's feature-mapping sweep and
+filed as tasks rather than guessed at: (a) session-window COUNT(DISTINCT)
+loses `AggState::distinct` across checkpoint/restore — session.rs has a
+second, JSON persistence encoder that the V2 work in §47 never covered (the
+sibling-defect shape, instance six; task #145); (b) `streaming_corpus::
+QUERY_SHAPES` is dead — no assertion references it, and its
+`multi_column_group_by` entry still claims `compiles: false`, stale since
+§48 (task #133).

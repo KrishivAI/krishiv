@@ -143,13 +143,46 @@ pub fn extract_agg_key(batch: &RecordBatch, col_idx: usize, row: usize) -> ExecR
             })?;
             Ok(AggKey::Bool(arr.value(row)))
         }
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-            let cast = arrow::compute::cast(col, &DataType::UInt64)
-                .map_err(|e| ExecError::Arrow(format!("group key cast to UInt64: {e}")))?;
-            let arr = cast
+        // Direct per-width downcasts, NOT `arrow::compute::cast` to UInt64.
+        // This function runs once PER ROW; the cast kernel allocates a fresh
+        // array wrapper on every call even on its same-type fast path, and the
+        // pinned NEXMark A/B measured that overhead at 2-2.5x whole-query
+        // throughput on UInt64-keyed tumbling windows (q7: 4.1M vs 10.4M
+        // ev/sec). Widening `as u64` is lossless for every unsigned width.
+        DataType::UInt8 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow::array::UInt8Array>()
+                .ok_or_else(|| {
+                    ExecError::UnsupportedType("declared UInt8 key failed downcast".into())
+                })?;
+            Ok(AggKey::UInt64(u64::from(arr.value(row))))
+        }
+        DataType::UInt16 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow::array::UInt16Array>()
+                .ok_or_else(|| {
+                    ExecError::UnsupportedType("declared UInt16 key failed downcast".into())
+                })?;
+            Ok(AggKey::UInt64(u64::from(arr.value(row))))
+        }
+        DataType::UInt32 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow::array::UInt32Array>()
+                .ok_or_else(|| {
+                    ExecError::UnsupportedType("declared UInt32 key failed downcast".into())
+                })?;
+            Ok(AggKey::UInt64(u64::from(arr.value(row))))
+        }
+        DataType::UInt64 => {
+            let arr = col
                 .as_any()
                 .downcast_ref::<arrow::array::UInt64Array>()
-                .ok_or_else(|| ExecError::UnsupportedType("unsigned key failed downcast".into()))?;
+                .ok_or_else(|| {
+                    ExecError::UnsupportedType("declared UInt64 key failed downcast".into())
+                })?;
             Ok(AggKey::UInt64(arr.value(row)))
         }
         other => Err(ExecError::UnsupportedType(format!(
@@ -235,23 +268,29 @@ mod tests {
             "distinct u64 keys must not alias onto one group"
         );
 
-        // Narrow unsigned widens into the same variant, so UInt32(7) and
-        // UInt64(7) land in one group rather than two.
-        let narrow_schema = Arc::new(Schema::new(vec![Field::new(
-            "auction",
-            DataType::UInt32,
-            false,
-        )]));
-        let narrow_batch = RecordBatch::try_new(
-            narrow_schema,
-            vec![Arc::new(UInt32Array::from(vec![7_u32])) as ArrayRef],
-        )
-        .unwrap();
-        assert_eq!(
-            extract_agg_key(&narrow_batch, 0, 0).expect("UInt32 key must extract"),
-            AggKey::UInt64(7),
-            "narrow unsigned must widen into the same key variant"
-        );
+        // Every narrow unsigned width widens into the same variant, so
+        // UInt8(7)/UInt16(7)/UInt32(7)/UInt64(7) land in one group rather than
+        // four. Each width is its own match arm since the per-row cast kernel
+        // was removed (it cost 2-2.5x whole-query throughput), so each arm
+        // needs its own row here — a broken UInt16 arm must not hide behind a
+        // passing UInt32 case.
+        use arrow::array::{UInt8Array, UInt16Array};
+        let narrow_cases: [(DataType, ArrayRef); 3] = [
+            (DataType::UInt8, Arc::new(UInt8Array::from(vec![7_u8]))),
+            (DataType::UInt16, Arc::new(UInt16Array::from(vec![7_u16]))),
+            (DataType::UInt32, Arc::new(UInt32Array::from(vec![7_u32]))),
+        ];
+        for (dt, arr) in narrow_cases {
+            let narrow_schema =
+                Arc::new(Schema::new(vec![Field::new("auction", dt.clone(), false)]));
+            let narrow_batch = RecordBatch::try_new(narrow_schema, vec![arr]).unwrap();
+            assert_eq!(
+                extract_agg_key(&narrow_batch, 0, 0)
+                    .unwrap_or_else(|e| panic!("{dt} key must extract: {e}")),
+                AggKey::UInt64(7),
+                "{dt} must widen into the same key variant"
+            );
+        }
     }
 
     #[test]
