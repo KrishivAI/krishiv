@@ -33,6 +33,8 @@ coordinator:
     caPem: ""
 
 executor:
+  # Spread executor pods one-per-node (topologySpreadConstraints, maxSkew 1).
+  spreadAcrossNodes: true
   replicas: 3
   port: 7071
   barrierPort: 7072

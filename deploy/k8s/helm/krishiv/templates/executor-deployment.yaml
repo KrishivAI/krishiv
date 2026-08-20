@@ -23,6 +23,20 @@ spec:
     spec:
       serviceAccountName: {{ include "krishiv.serviceAccountName" . }}
       terminationGracePeriodSeconds: 60
+      {{- if .Values.executor.spreadAcrossNodes }}
+      # One executor per node wherever capacity allows: a "distributed"
+      # deployment whose executors co-schedule onto one node measures that
+      # node, not the cluster. maxSkew 1 + ScheduleAnyway keeps the spread
+      # strict when nodes have room but never blocks scale-up past the node
+      # count.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "krishiv.executorSelectorLabels" . | nindent 14 }}
+      {{- end }}
       containers:
         - name: executor
           image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
