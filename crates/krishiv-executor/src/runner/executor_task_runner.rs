@@ -331,6 +331,10 @@ pub struct ExecutorTaskRunner {
     /// job-wide ranges.
     pub(crate) rloop_parallelism: Arc<DashMap<String, usize>>,
 
+    /// `stream:rpipe:` pipelines, keyed by `rloop_state_key` (task #147).
+    pub(crate) pipeline_executors:
+        Arc<DashMap<String, Arc<tokio::sync::Mutex<krishiv_dataflow::pipeline::JoinAggPipeline>>>>,
+
     /// `stream:rbatch:` stateless executors, keyed by `rloop_state_key`
     /// (task #147).
     pub(crate) stateless_executors: Arc<
@@ -453,6 +457,7 @@ impl ExecutorTaskRunner {
             continuous_null_key_rows: Arc::new(DashMap::new()),
             join_executors: Arc::new(DashMap::new()),
             stateless_executors: Arc::new(DashMap::new()),
+            pipeline_executors: Arc::new(DashMap::new()),
             stream_exchange: crate::stream_exchange::StreamExchange::default(),
             own_task_endpoint: None,
             barrier_context: None,

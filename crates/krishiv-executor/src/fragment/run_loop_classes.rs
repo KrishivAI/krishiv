@@ -34,6 +34,7 @@ use crate::runner::{ExecutorTaskRunner, StreamingProgressSnapshot, TaskStateBind
 use crate::{ExecutorError, ExecutorResult, ExecutorTaskOutput};
 
 pub(crate) const STREAM_RBATCH_PREFIX: &str = "stream:rbatch:";
+pub(crate) const STREAM_RPIPE_PREFIX: &str = "stream:rpipe:";
 pub(crate) const STREAM_RJOIN_PREFIX: &str = "stream:rjoin:";
 
 /// A parsed classed fragment.
@@ -526,6 +527,214 @@ pub(crate) async fn execute_rjoin_fragment(
     Ok(ExecutorTaskOutput::cancelled())
 }
 
+/// `stream:rpipe:` — a join feeding windowed stages. Parallelism is pinned
+/// to 1 and ENFORCED: pipeline stages re-key between stages (Q4's stage 1
+/// keys on `category`, which is not a function of the join key `auction`),
+/// so subtask-local pipelines at N>1 silently compute wrong per-key answers.
+/// A parallel pipeline needs an inter-stage exchange — a recorded follow-up,
+/// not a silent approximation. No checkpointing either (JoinAggPipeline has
+/// no snapshot yet), same recorded status as the stateless class.
+pub(crate) async fn execute_rpipe_fragment(
+    runner: &ExecutorTaskRunner,
+    assignment: &ExecutorTaskAssignment,
+    fragment: &str,
+) -> ExecutorResult<ExecutorTaskOutput> {
+    use krishiv_dataflow::pipeline::JoinAggPipeline;
+    use krishiv_plan::stream_join::StreamingPipelineSpec;
+
+    let parsed = parse_classed_fragment(STREAM_RPIPE_PREFIX, fragment)?;
+    if parsed.parallelism != 1 {
+        return Err(ExecutorError::InvalidAssignment {
+            message: format!(
+                "stream:rpipe parallelism {} is not supported: pipeline stages re-key between \
+                 stages, so parallel subtasks would silently compute wrong per-key answers; \
+                 an inter-stage exchange is the tracked follow-up",
+                parsed.parallelism
+            ),
+        });
+    }
+    let spec: StreamingPipelineSpec =
+        serde_json::from_str(&parsed.payload).map_err(|e| ExecutorError::InvalidAssignment {
+            message: format!("stream:rpipe invalid spec json: {e}"),
+        })?;
+    spec.validate()
+        .map_err(|e| ExecutorError::InvalidAssignment {
+            message: format!("stream:rpipe spec: {e}"),
+        })?;
+    let join = spec.join.clone();
+    let job_id = parsed.job_id.as_str();
+    let task_id = assignment.task_id().as_str().to_owned();
+    let state_key = rloop_state_key(job_id, parsed.subtask);
+    let left_key = format!("{job_id}#{task_id}#L");
+    let right_key = format!("{job_id}#{task_id}#R");
+
+    let pipe_arc = {
+        let entry = runner
+            .pipeline_executors
+            .entry(state_key.clone())
+            .or_try_insert_with(|| {
+                let pipe =
+                    JoinAggPipeline::new(&spec).map_err(|e| ExecutorError::InvalidAssignment {
+                        message: format!("stream:rpipe pipeline build: {e}"),
+                    })?;
+                Ok::<Arc<tokio::sync::Mutex<JoinAggPipeline>>, ExecutorError>(Arc::new(
+                    tokio::sync::Mutex::new(pipe),
+                ))
+            })?;
+        Arc::clone(entry.value())
+    };
+
+    let own_left = runner.notify_handle(&left_key);
+    let own_right = runner.notify_handle(&right_key);
+    let shared_notify = runner.notify_handle(job_id);
+    let all_specs = parse_registry_partition_specs(assignment.input_partitions())?;
+    let mut left_specs = Vec::new();
+    let mut right_specs = Vec::new();
+    for s in all_specs {
+        if s.table_name == join.left_source {
+            left_specs.push(s);
+        } else if s.table_name == join.right_source {
+            right_specs.push(s);
+        } else {
+            return Err(ExecutorError::InvalidAssignment {
+                message: format!(
+                    "stream:rpipe source table '{}' matches neither join side ('{}' / '{}')",
+                    s.table_name, join.left_source, join.right_source
+                ),
+            });
+        }
+    }
+
+    let source_cache = runner.shared_continuous_connector_sources();
+    let idle_floor = Duration::from_micros(RLOOP_IDLE_FLOOR_US);
+    let idleness = watermark_idleness();
+    let mut left_wm = SplitWatermarks::default();
+    let mut right_wm = SplitWatermarks::default();
+    let mut rows_emitted: u64 = 0;
+    let mut batches_emitted: u64 = 0;
+
+    tracing::info!(
+        job_id,
+        stages = spec.stages.len(),
+        left_splits = left_specs.len(),
+        right_splits = right_specs.len(),
+        "stream:rpipe pipeline run-loop started"
+    );
+
+    loop {
+        if runner
+            .inbox
+            .is_task_cancelled(assignment.job_id(), assignment.task_id())
+            .unwrap_or(false)
+        {
+            break;
+        }
+        let mut left_in: Vec<RecordBatch> = take_pushed(runner, &left_key);
+        let mut right_in: Vec<RecordBatch> = take_pushed(runner, &right_key);
+        for src in &left_specs {
+            super::run_loop::read_owned_split(
+                runner,
+                job_id,
+                &state_key,
+                src,
+                &source_cache,
+                assignment,
+                |b| {
+                    left_in.push(b);
+                    Ok(())
+                },
+            )
+            .await?;
+        }
+        for src in &right_specs {
+            super::run_loop::read_owned_split(
+                runner,
+                job_id,
+                &state_key,
+                src,
+                &source_cache,
+                assignment,
+                |b| {
+                    right_in.push(b);
+                    Ok(())
+                },
+            )
+            .await?;
+        }
+        if left_in.is_empty() && right_in.is_empty() {
+            tokio::select! {
+                _ = own_left.notified() => {}
+                _ = own_right.notified() => {}
+                _ = shared_notify.notified() => {}
+                _ = tokio::time::sleep(idle_floor) => {}
+            }
+            continue;
+        }
+
+        let mut outputs: Vec<RecordBatch> = Vec::new();
+        {
+            let mut pipe = pipe_arc.lock().await;
+            for b in &left_in {
+                if let Some(ts) = batch_max_event_time(b, &join.time_column) {
+                    left_wm.observe("#L", ts);
+                }
+                outputs.extend(
+                    pipe.on_left(b)
+                        .map_err(|e| local_err(format!("stream:rpipe left: {e}")))?,
+                );
+            }
+            for b in &right_in {
+                if let Some(ts) = batch_max_event_time(b, &join.time_column) {
+                    right_wm.observe("#R", ts);
+                }
+                outputs.extend(
+                    pipe.on_right(b)
+                        .map_err(|e| local_err(format!("stream:rpipe right: {e}")))?,
+                );
+            }
+            if let (Some(l), Some(r)) = (left_wm.combined(idleness), right_wm.combined(idleness)) {
+                pipe.advance_watermark(l.min(r));
+            }
+        }
+        if !outputs.is_empty() {
+            rows_emitted += outputs.iter().map(|b| b.num_rows() as u64).sum::<u64>();
+            batches_emitted += outputs.len() as u64;
+            crate::erased(runner.stage_rloop_outputs(job_id, assignment, &outputs)).await?;
+        }
+        runner.report_streaming_progress(&StreamingProgressSnapshot {
+            task_id: task_id.clone(),
+            job_id: job_id.to_owned(),
+            watermark_ms: left_wm
+                .combined(idleness)
+                .and_then(|l| right_wm.combined(idleness).map(|r| l.min(r)))
+                .unwrap_or(i64::MIN),
+            rows_emitted,
+            batches_emitted,
+            egress_dropped_batches: 0,
+            null_key_rows_dropped: 0,
+            state_bytes: 0,
+            source_offset: None,
+            timestamp_ms: now_ms() as u64,
+        });
+    }
+
+    // Stop = end of stream for a cancelled bounded-ish run: cascade-flush the
+    // stages so closed windows are not silently discarded with the task.
+    {
+        let mut pipe = pipe_arc.lock().await;
+        let out = pipe
+            .flush_all()
+            .map_err(|e| local_err(format!("stream:rpipe flush: {e}")))?;
+        if !out.is_empty() {
+            crate::erased(runner.stage_rloop_outputs(job_id, assignment, &out)).await?;
+        }
+    }
+    let _ = runner
+        .inbox
+        .clear_cancelled_task(assignment.job_id(), assignment.task_id());
+    Ok(ExecutorTaskOutput::cancelled())
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -589,5 +798,23 @@ mod tests {
                 .to_string();
             assert!(err.contains(needle), "{frag} -> {err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod rpipe_tests {
+    use super::*;
+
+    /// N>1 pipelines silently compute wrong per-key answers (stage re-keying)
+    /// and are refused BY NAME, never approximated.
+    #[test]
+    fn parallel_rpipe_is_refused_by_name() {
+        let frag = format!("{STREAM_RPIPE_PREFIX}j|0/2|{{}}");
+        let parsed = parse_classed_fragment(STREAM_RPIPE_PREFIX, &frag).expect("parses");
+        assert_eq!(parsed.parallelism, 2, "premise");
+        // The refusal itself is inside execute_rpipe_fragment (needs a
+        // runner); the parallelism gate is its FIRST check, before any I/O,
+        // so the parse-level premise plus the gate's placement is what this
+        // pins alongside the integration test in commit 8.
     }
 }
