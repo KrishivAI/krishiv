@@ -107,8 +107,9 @@ pub use continuous_stream_http::{
     AppliedContinuousRegistration, ContinuousJobMode, ContinuousRegistrationOptions,
     ContinuousRegistrySource, ContinuousSinkSpec, ContinuousStreamError,
     drain_continuous_stream_coordinated, flush_continuous_stream_coordinated,
-    push_continuous_input_coordinated, register_continuous_stream_coordinated,
-    register_continuous_stream_with_options, register_continuous_stream_with_sink,
+    push_continuous_input_coordinated, push_continuous_input_side_coordinated,
+    register_continuous_stream_coordinated, register_continuous_stream_with_options,
+    register_continuous_stream_with_sink, register_continuous_task_with_options,
     restore_continuous_stream_coordinated, return_continuous_stream_payloads,
 };
 pub use grpc::{

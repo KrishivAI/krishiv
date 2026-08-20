@@ -5079,6 +5079,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
+ "tracing-subscriber",
  "twox-hash",
  "uuid",
 ]

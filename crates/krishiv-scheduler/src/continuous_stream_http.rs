@@ -2094,6 +2094,51 @@ async fn upsert_continuous_streaming_job(
 /// same coordinator methods without serialising to HTTP.
 ///
 /// `ipc_bytes` must be a valid Arrow IPC stream (non-empty).
+/// Side-tagged run-loop push (task #147): the two-source classes read input
+/// from `{job}#{task}#L` / `#R` buffers, so a push for one join side targets
+/// the subtask's side-suffixed task id. Window/stateless jobs use the
+/// untagged [`push_continuous_input_coordinated`].
+pub async fn push_continuous_input_side_coordinated(
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+    side: &str,
+    ipc_bytes: Vec<u8>,
+) -> Result<(), ContinuousStreamError> {
+    use krishiv_proto::JobId;
+    if side != "L" && side != "R" {
+        return Err(invalid_registration(format!(
+            "push side must be \"L\" or \"R\", got '{side}'"
+        )));
+    }
+    let job_id_typed = JobId::try_new(job_id).map_err(|e| {
+        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
+            message: e.to_string(),
+        })
+    })?;
+    {
+        let coord = coordinator.read().await;
+        if let Err(e) = coord.ensure_active() {
+            return Err(ContinuousStreamError::Unavailable(format!(
+                "continuous push not served here: {e}; retry (routes to the active leader)"
+            )));
+        }
+    }
+    let run_loop = {
+        let coord = coordinator.read().await;
+        run_loop_targets(&coord, &job_id_typed).map_err(ContinuousStreamError::Scheduler)?
+    };
+    let Some(targets) = run_loop else {
+        return Err(invalid_registration(
+            "side-tagged pushes are only meaningful for run-loop two-source jobs",
+        ));
+    };
+    let targets: Vec<(String, String)> = targets
+        .into_iter()
+        .map(|(task, endpoint)| (format!("{task}#{side}"), endpoint))
+        .collect();
+    push_run_loop_input(coordinator, &job_id_typed, targets, ipc_bytes).await
+}
+
 pub async fn push_continuous_input_coordinated(
     coordinator: &SharedCoordinator,
     job_id: &str,
