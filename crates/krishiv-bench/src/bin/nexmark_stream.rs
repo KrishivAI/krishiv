@@ -58,9 +58,10 @@
 
 use std::time::Instant;
 
-use krishiv_bench::nexmark::{NEXMARK_TOTAL_QUERIES, NexmarkGenerator, SUPPORTED_QUERIES};
+use krishiv_bench::nexmark::{NEXMARK_TOTAL_QUERIES, NexmarkGenerator, RowsOut, SUPPORTED_QUERIES};
 use krishiv_dataflow::ContinuousWindowExecutor;
 use krishiv_dataflow::stream_driver::{StreamDriver, StreamingLoop};
+use krishiv_engines::StatelessBatchExecutor;
 use krishiv_sql::streaming_window_plan::compile_streaming_window_sql;
 
 /// Events per generated batch. Realistic micro-batch size for a push-driven
@@ -101,8 +102,65 @@ struct RunResult {
 const WARMUP_REPS: usize = 1;
 const MEASURED_REPS: usize = 5;
 
-/// Drive one query through the operator and measure it.
+/// Generate the whole input ahead of time (generation cost must not land in
+/// the timed region) and hand back the batches plus total rows.
+fn generate_input(query_name: &str) -> (Vec<arrow::record_batch::RecordBatch>, usize) {
+    let mut generator = NexmarkGenerator::new(0x4E45_584D, 1_000_000, 0, MAX_LATENESS_MS);
+    let batches: Vec<_> = (0..BATCHES)
+        .map(|_| {
+            generator
+                .next_bid_batch(BATCH_ROWS)
+                .unwrap_or_else(|e| panic!("{query_name} generator: {e}"))
+        })
+        .collect();
+    let rows_in = batches.iter().map(|b| b.num_rows()).sum();
+    (batches, rows_in)
+}
+
+/// Drive one query and measure it, routing on the SAME predicate the engine
+/// routes on (`find_window_tvf`): a query with no window TVF takes the
+/// stateless per-batch path, exactly as `StreamingEngine::run` would send it
+/// to `run_stateless_bounded`.
 fn measure(query_name: &str, sql: &str) -> RepResult {
+    if krishiv_sql::streaming_tvf::find_window_tvf(sql).is_none() {
+        return measure_stateless(query_name, sql);
+    }
+    measure_windowed(query_name, sql)
+}
+
+/// Stateless arm: the cached-context executor the production stateless loops
+/// use, driven per batch.
+fn measure_stateless(query_name: &str, sql: &str) -> RepResult {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| panic!("{query_name} runtime: {e}"));
+    let exec = StatelessBatchExecutor::new(sql, "bid");
+    let (batches, rows_in) = generate_input(query_name);
+
+    let mut per_batch_us: Vec<u128> = Vec::with_capacity(BATCHES);
+    let mut rows_out = 0usize;
+    let started = Instant::now();
+    for batch in batches {
+        let t0 = Instant::now();
+        let out = rt
+            .block_on(exec.on_batch(batch))
+            .unwrap_or_else(|e| panic!("{query_name} on_batch: {e}"));
+        per_batch_us.push(t0.elapsed().as_micros());
+        rows_out += out.iter().map(|b| b.num_rows()).sum::<usize>();
+    }
+    let elapsed = started.elapsed();
+
+    RepResult {
+        rows_in,
+        rows_out,
+        events_per_sec: rows_in as f64 / elapsed.as_secs_f64(),
+        per_batch_us,
+    }
+}
+
+/// Windowed arm.
+fn measure_windowed(query_name: &str, sql: &str) -> RepResult {
     let plan = compile_streaming_window_sql(sql)
         .unwrap_or_else(|e| panic!("{query_name} must compile: {e}"));
     let mut exec = ContinuousWindowExecutor::new(plan.spec)
@@ -117,17 +175,7 @@ fn measure(query_name: &str, sql: &str) -> RepResult {
     // that the driver would have coerced.
     let mut driver = StreamDriver::new(StreamingLoop::EmbeddedContinuous);
 
-    // Generate the WHOLE input first. Generation cost must not land inside the
-    // timed region — otherwise the benchmark partly measures its own harness.
-    let mut generator = NexmarkGenerator::new(0x4E45_584D, 1_000_000, 0, MAX_LATENESS_MS);
-    let batches: Vec<_> = (0..BATCHES)
-        .map(|_| {
-            generator
-                .next_bid_batch(BATCH_ROWS)
-                .unwrap_or_else(|e| panic!("{query_name} generator: {e}"))
-        })
-        .collect();
-    let rows_in: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let (batches, rows_in) = generate_input(query_name);
 
     let mut per_batch_us: Vec<u128> = Vec::with_capacity(BATCHES);
     let mut rows_out = 0usize;
@@ -231,8 +279,8 @@ fn main() {
     );
 
     let mut results = Vec::new();
-    for (name, sql) in SUPPORTED_QUERIES {
-        results.push(measure_repeated(name, sql));
+    for q in SUPPORTED_QUERIES {
+        results.push(measure_repeated(q.name, q.sql));
     }
 
     println!(
@@ -274,13 +322,22 @@ fn main() {
     // happen is zero: that means nothing closed, and a throughput number over
     // an engine that emitted nothing is the exact failure this gate exists for.
     let mut failures = Vec::new();
-    for r in &results {
-        if r.rows_out == 0 {
-            failures.push(format!(
+    for (r, q) in results.iter().zip(SUPPORTED_QUERIES) {
+        match q.expect {
+            RowsOut::NonZero if r.rows_out == 0 => failures.push(format!(
                 "{}: consumed {} rows and emitted NOTHING — the throughput figure \
                  above measures an engine that produced no answer",
                 r.query, r.rows_in
-            ));
+            )),
+            // A stateless unfiltered query must emit EVERY input row: an
+            // engine that silently drops rows would sail through a nonzero
+            // check looking fast.
+            RowsOut::ExactInput if r.rows_out != r.rows_in => failures.push(format!(
+                "{}: {} rows in but {} rows out — a passthrough query must \
+                 emit every input row",
+                r.query, r.rows_in, r.rows_out
+            )),
+            _ => {}
         }
         if r.rows_in == 0 {
             failures.push(format!("{}: generated no input", r.query));

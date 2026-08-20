@@ -5700,3 +5700,39 @@ global count + count-distinct). Pinned medians: q7 11.8M ev/sec (keyed
 stand-in was 10.0M), q15 12.1M (multi-key stand-in was 3.2M — one group
 instead of thousands). Coverage stays 8 of 22, but two of the eight are no
 longer approximations.
+
+## §55 — #141: stateless queries reach the harness through the production path, and that path got a cached context
+
+The engine already had stateless streaming (`run_stateless_bounded` /
+`run_stateless_continuous`) — but the harness could not drive it, and the
+loops rebuilt a fresh SessionContext, re-planned the SQL, and registered a
+new MemTable on EVERY batch (the exact shape IVM's G14 fixed with its cached
+tick context). Both are addressed by one new type, `StatelessBatchExecutor`:
+cached context, replace-register per batch (the IVM rule — register_table
+refuses duplicates rather than overwriting), used by both production loops
+and the new harness arm. The harness routes on the SAME predicate the engine
+routes on (`find_window_tvf`), so what it measures is the path production
+takes.
+
+Revert proof: removing the deregister line makes the second on_batch fail
+loudly ("table src already exists") — red, though by refusal rather than by
+silent duplication, because DataFusion happens to fail closed there. The
+test also pins batch isolation (batch N+1's output cannot carry batch N's
+rows) and 200,000 == 200,000 exact-row completeness for every unfiltered
+stateless query — a "rows_out > 0" gate cannot see an engine that drops 40%
+of rows.
+
+Five queries added: Q0 passthrough, Q10 projection, Q14 calc+filter, Q21
+channel id, Q22 SPLIT_PART. Deviations stated in the query list itself: Q10
+measures projection not the partitioned file sink; Q14 classifies by price
+band not hour; Q21 maps channels by CASE not URL regex. Coverage 8 → 13 of
+22. The supported-query test now EXECUTES stateless entries over a real
+generated batch — parsing alone would miss a column DataFusion lowercases
+away ("dateTime" must be quoted) or a function it lacks.
+
+Honest limit, recorded not hidden: stateless medians are 0.8M–4.0M ev/sec
+vs 8M–24M for the windowed operators, p50 up to ~1.1ms/batch — the cached
+context removed context construction, but ctx.sql() still parses and plans
+per batch. A cached-logical-plan step is the next lever if these numbers
+matter; it changes observable behavior not at all and was not smuggled into
+this change.

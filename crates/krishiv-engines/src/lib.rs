@@ -535,32 +535,67 @@ fn streaming_shape_unsupported(e: impl std::fmt::Display) -> EngineError {
     }
 }
 
-/// Apply a stateless SQL `query` to a single input `batch`, registering it as a
-/// temporary MemTable under `table_name`. Returns all output batches produced by
-/// the query over that single input batch.
-async fn apply_stateless_query(
-    query: &str,
-    table_name: &str,
-    batch: arrow::record_batch::RecordBatch,
-) -> EngineResult<Vec<arrow::record_batch::RecordBatch>> {
-    let ctx = batch_session_context();
-    let schema = batch.schema();
-    let table =
-        datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).map_err(df_err)?;
-    ctx.register_table(table_name, Arc::new(table))
-        .map_err(df_err)?;
-    let mut stream = ctx
-        .sql(query)
-        .await
-        .map_err(df_err)?
-        .execute_stream()
-        .await
-        .map_err(df_err)?;
-    let mut results = Vec::new();
-    while let Some(batch) = stream.next().await {
-        results.push(batch.map_err(df_err)?);
+/// Stateless per-batch SQL executor with a cached `SessionContext`.
+///
+/// The predecessor (`apply_stateless_query`) built a fresh context, planned
+/// the SQL, and registered a new MemTable on EVERY batch — full parse+plan on
+/// the hot path, the same shape that dominated IVM tick latency before its
+/// cached tick context (G14). This reuses one context across batches and
+/// replace-registers the input table per batch, which for a single-table
+/// stateless query is observationally identical to per-batch construction.
+pub struct StatelessBatchExecutor {
+    ctx: SessionContext,
+    query: String,
+    table_name: String,
+}
+
+impl StatelessBatchExecutor {
+    #[must_use]
+    pub fn new(query: impl Into<String>, table_name: impl Into<String>) -> Self {
+        Self {
+            ctx: batch_session_context(),
+            query: query.into(),
+            table_name: table_name.into(),
+        }
     }
-    Ok(results)
+
+    /// Run the query over exactly this batch.
+    ///
+    /// Output derives from THIS batch alone: the input table is
+    /// replace-registered, never appended, so a row from batch N can never
+    /// reappear in batch N+1's output.
+    pub async fn on_batch(
+        &self,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> EngineResult<Vec<arrow::record_batch::RecordBatch>> {
+        if batch.num_rows() == 0 {
+            return Ok(Vec::new());
+        }
+        let schema = batch.schema();
+        let table =
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).map_err(df_err)?;
+        // `register_table` errors on a duplicate name rather than overwriting
+        // (the IVM replace-register rule), so deregister first. The result is
+        // deliberately ignored: on the first batch there is nothing to remove,
+        // and that absence is not an error.
+        let _ = self.ctx.deregister_table(self.table_name.as_str());
+        self.ctx
+            .register_table(self.table_name.as_str(), Arc::new(table))
+            .map_err(df_err)?;
+        let mut stream = self
+            .ctx
+            .sql(&self.query)
+            .await
+            .map_err(df_err)?
+            .execute_stream()
+            .await
+            .map_err(df_err)?;
+        let mut results = Vec::new();
+        while let Some(batch) = stream.next().await {
+            results.push(batch.map_err(df_err)?);
+        }
+        Ok(results)
+    }
 }
 
 /// Bounded stateless streaming run: applies the query per-batch over the source,
@@ -572,12 +607,13 @@ async fn run_stateless_bounded(job: &CompiledJob, rt: &EngineRuntime) -> EngineR
     let table_name = source.name.clone();
     let mut reader = rt.sources.open(source).await?;
     let mut writers = open_writers(rt, &job.sinks).await?;
+    let executor = StatelessBatchExecutor::new(&job.query, &table_name);
 
     while let Some(batch) = reader.next().await? {
         if batch.num_rows() == 0 {
             continue;
         }
-        let outputs = apply_stateless_query(&job.query, &table_name, batch).await?;
+        let outputs = executor.on_batch(batch).await?;
         emit_to_writers(&mut writers, &outputs).await?;
     }
     for writer in &mut writers {
@@ -1115,6 +1151,7 @@ async fn run_stateless_continuous(
     let table_name = source.name.clone();
     let mut reader = rt.sources.open(source).await?;
     let mut writers = open_writers(&rt, &job.sinks).await?;
+    let executor = StatelessBatchExecutor::new(&job.query, &table_name);
     let idle_floor = std::time::Duration::from_micros(STREAMING_IDLE_FLOOR_US);
     let data_notify = reader.data_notify();
 
@@ -1131,7 +1168,7 @@ async fn run_stateless_continuous(
         if batch.num_rows() == 0 {
             continue;
         }
-        let outputs = apply_stateless_query(&job.query, &table_name, batch).await?;
+        let outputs = executor.on_batch(batch).await?;
         emit_to_writers(&mut writers, &outputs).await?;
     }
 
@@ -1386,6 +1423,41 @@ async fn run_streaming_continuous(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    /// Output of batch N+1 must derive from batch N+1 ALONE.
+    ///
+    /// The cached-context executor replace-registers the input table per
+    /// batch. If it appended instead, every batch's output would also carry
+    /// every earlier batch's rows — a duplication that "rows_out > 0" checks
+    /// cannot see. Reverting the deregister line makes the second on_batch
+    /// fail loudly (register_table refuses duplicates), which is this test's
+    /// red state.
+    #[tokio::test]
+    async fn stateless_executor_output_derives_from_the_current_batch_alone() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = |vals: Vec<i64>| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vals))]).unwrap()
+        };
+        let exec =
+            StatelessBatchExecutor::new("SELECT v * 2 AS doubled FROM src WHERE v > 10", "src");
+
+        let out1 = exec.on_batch(batch(vec![5, 20])).await.expect("batch 1");
+        let rows1: usize = out1.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows1, 1, "only v=20 passes the filter");
+
+        let out2 = exec.on_batch(batch(vec![100])).await.expect("batch 2");
+        let rows2: usize = out2.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            rows2, 1,
+            "batch 2's output must not carry batch 1's surviving row"
+        );
+        let doubled = out2
+            .iter()
+            .find(|b| b.num_rows() > 0)
+            .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
+            .map(|a| a.value(0));
+        assert_eq!(doubled, Some(200));
+    }
 
     use std::sync::Arc;
 

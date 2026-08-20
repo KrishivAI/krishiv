@@ -193,7 +193,15 @@ impl NexmarkGenerator {
                     .copied()
                     .unwrap_or("apple"),
             );
-            url.push("https://www.nexmark.com/item.htm");
+            // Varied path segments so Q22's SPLIT_PART works on real
+            // variety, mirroring the reference generator's random base-10
+            // directory names.
+            url.push(format!(
+                "https://www.nexmark.com/{:x}/{:x}/{:x}/item.htm",
+                self.next_in(4096),
+                self.next_in(4096),
+                self.next_in(4096),
+            ));
             date_time.push(self.event_time(id));
             extra.push("");
             self.event_id += 1;
@@ -230,86 +238,157 @@ impl NexmarkGenerator {
     }
 }
 
+/// What the completeness gate may assume about a query's output volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowsOut {
+    /// Windowed aggregation: output rows are closed windows — far fewer than
+    /// input, but zero means nothing closed and the number above it is a
+    /// measurement of an engine that produced no answer.
+    NonZero,
+    /// Stateless with no filter: every input row must come out. An engine
+    /// that silently drops rows would otherwise still pass a nonzero check.
+    ExactInput,
+}
+
+/// One benchmark query: name, SQL, and its completeness contract.
+pub struct BenchQuery {
+    pub name: &'static str,
+    pub sql: &'static str,
+    pub expect: RowsOut,
+}
+
 /// The NEXMark queries this engine's streaming path can currently express.
 ///
-/// Eight of twenty-two. Stated as data rather than prose so a report cannot
-/// quietly imply full coverage — the number is read from here.
+/// Thirteen of twenty-two. Stated as data rather than prose so a report
+/// cannot quietly imply full coverage — the number is read from here.
 ///
-/// The other fourteen need capabilities that do not exist yet: job-level
-/// routing of two-source joins plus person/auction generators (Q3/Q4/Q8/Q9/
-/// Q20), top-N/rank (Q19), dedup/row_number (Q18), and stateless or
-/// processing-time paths outside the window compiler (Q0/Q10/Q12–Q14/
-/// Q21/Q22). Q7 and Q15 run in their canonical global forms since global
-/// no-key aggregation landed (task #140).
-pub const SUPPORTED_QUERIES: &[(&str, &str)] = &[
-    (
+/// The other nine need capabilities that do not exist yet: job-level routing
+/// of two-source joins plus person/auction generators (Q3/Q4/Q8/Q9/Q20),
+/// top-N/rank (Q19), dedup/row_number (Q18), and processing-time / side-input
+/// semantics (Q12/Q13). Q7 and Q15 run in their canonical global forms
+/// (task #140); Q0/Q10/Q14/Q21/Q22 run through the stateless per-batch path
+/// (task #141). Documented deviations: Q10 measures the projection, not the
+/// partitioned file sink; Q14's bid-time classification is a price-band CASE
+/// (the reference classifies by hour of day); Q21 maps channel names by CASE
+/// rather than regex-extracting from the URL.
+pub const SUPPORTED_QUERIES: &[BenchQuery] = &[
+    BenchQuery {
         // Q1: currency conversion. Aggregates an EXPRESSION, which needs the
         // pre-window derived-column path — the aggregate argument is not a
         // column name.
-        "q1_currency_conversion",
-        "SELECT auction, SUM(price * 908 / 1000) AS total_euro \
+        name: "q1_currency_conversion",
+        sql: "SELECT auction, SUM(price * 908 / 1000) AS total_euro \
          FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
          GROUP BY auction, window_start, window_end",
-    ),
-    (
-        "q2_filtered_bids",
-        "SELECT auction, COUNT(*) AS c \
+        expect: RowsOut::NonZero,
+    },
+    BenchQuery {
+        name: "q2_filtered_bids",
+        sql: "SELECT auction, COUNT(*) AS c \
          FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
          WHERE price > 5000 \
          GROUP BY auction, window_start, window_end",
-    ),
-    (
-        "q5_hot_items",
-        "SELECT auction, COUNT(*) AS c \
+        expect: RowsOut::NonZero,
+    },
+    BenchQuery {
+        name: "q5_hot_items",
+        sql: "SELECT auction, COUNT(*) AS c \
          FROM HOP(TABLE bid, DESCRIPTOR(dateTime), 2000, 10000) \
          GROUP BY auction, window_start, window_end",
-    ),
-    (
+        expect: RowsOut::NonZero,
+    },
+    BenchQuery {
         // Q7: highest bid — the CANONICAL form, a global max with no
         // grouping key (task #140). The earlier keyed variant (`GROUP BY
         // auction`) was a stand-in from before global aggregation existed.
-        "q7_highest_bid",
-        "SELECT MAX(price) AS final \
+        name: "q7_highest_bid",
+        sql: "SELECT MAX(price) AS final \
          FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
          GROUP BY window_start, window_end",
-    ),
-    (
+        expect: RowsOut::NonZero,
+    },
+    BenchQuery {
         // Q16: channel statistics. Needs COUNT(DISTINCT) over two columns plus
         // min/max/avg in one query — the window IS the reporting period, so
         // NEXMark's GROUP BY day becomes GROUP BY channel + window.
-        "q16_channel_statistics",
-        "SELECT channel, COUNT(*) AS total_bids, COUNT(DISTINCT bidder) AS bidders, \
+        name: "q16_channel_statistics",
+        sql: "SELECT channel, COUNT(*) AS total_bids, COUNT(DISTINCT bidder) AS bidders, \
          COUNT(DISTINCT auction) AS auctions, MIN(price) AS lo, MAX(price) AS hi, \
          AVG(price) AS mean \
          FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
          GROUP BY channel, window_start, window_end",
-    ),
-    (
+        expect: RowsOut::NonZero,
+    },
+    BenchQuery {
         // Q17: auction statistics, same shape keyed by auction.
-        "q17_auction_statistics",
-        "SELECT auction, COUNT(*) AS total_bids, COUNT(DISTINCT bidder) AS bidders, \
+        name: "q17_auction_statistics",
+        sql: "SELECT auction, COUNT(*) AS total_bids, COUNT(DISTINCT bidder) AS bidders, \
          MIN(price) AS lo, MAX(price) AS hi, AVG(price) AS mean \
          FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
          GROUP BY auction, window_start, window_end",
-    ),
-    (
+        expect: RowsOut::NonZero,
+    },
+    BenchQuery {
         // A composite grouping key: (auction, channel) is two columns, encoded
         // into one internal key and expanded back on output.
         // Q15: bidding statistics — the CANONICAL form counts bids and
         // distinct bidders per reporting period with NO other key (the window
         // IS the day). Global aggregation (task #140) made this expressible;
         // the earlier variant added auction+channel keys as a stand-in.
-        "q15_bidding_statistics",
-        "SELECT COUNT(*) AS total_bids, COUNT(DISTINCT bidder) AS bidders \
+        name: "q15_bidding_statistics",
+        sql: "SELECT COUNT(*) AS total_bids, COUNT(DISTINCT bidder) AS bidders \
          FROM TUMBLE(TABLE bid, DESCRIPTOR(dateTime), 10000) \
          GROUP BY window_start, window_end",
-    ),
-    (
-        "q11_user_sessions",
-        "SELECT bidder, COUNT(*) AS c \
+        expect: RowsOut::NonZero,
+    },
+    BenchQuery {
+        name: "q11_user_sessions",
+        sql: "SELECT bidder, COUNT(*) AS c \
          FROM SESSION(TABLE bid, DESCRIPTOR(dateTime), 10000) \
          GROUP BY bidder, window_start, window_end",
-    ),
+        expect: RowsOut::NonZero,
+    },
+    // ── stateless queries (task #141): per-batch, no window state ──
+    BenchQuery {
+        // Q0: passthrough — the harness/engine overhead floor.
+        name: "q0_passthrough",
+        sql: "SELECT auction, bidder, price, channel, url, \"dateTime\", extra FROM bid",
+        expect: RowsOut::ExactInput,
+    },
+    BenchQuery {
+        // Q10: log projection. DEVIATION: the reference writes partitioned
+        // files; this measures the projection, not a file sink.
+        name: "q10_log_projection",
+        sql: "SELECT auction, bidder, price, \"dateTime\" FROM bid",
+        expect: RowsOut::ExactInput,
+    },
+    BenchQuery {
+        // Q14: calculation + filter. DEVIATION: bid-time classification is a
+        // price band (the reference uses hour-of-day).
+        name: "q14_calculation",
+        sql: "SELECT auction, bidder, price * 100 / 85 AS price_dol, \
+              CASE WHEN price > 8000 THEN 'hot' ELSE 'warm' END AS bid_class, \
+              \"dateTime\", extra FROM bid WHERE price > 5000",
+        expect: RowsOut::NonZero,
+    },
+    BenchQuery {
+        // Q21: channel id. DEVIATION: CASE over the four hot channels rather
+        // than regex extraction from the URL.
+        name: "q21_channel_id",
+        sql: "SELECT auction, bidder, price, channel, \
+              CASE WHEN channel = 'apple' THEN '0' WHEN channel = 'google' THEN '1' \
+                   WHEN channel = 'facebook' THEN '2' WHEN channel = 'baidu' THEN '3' \
+                   ELSE channel END AS channel_id FROM bid",
+        expect: RowsOut::ExactInput,
+    },
+    BenchQuery {
+        // Q22: URL directory split.
+        name: "q22_url_split",
+        sql: "SELECT auction, bidder, price, \
+              SPLIT_PART(url, '/', 4) AS dir1, SPLIT_PART(url, '/', 5) AS dir2, \
+              SPLIT_PART(url, '/', 6) AS dir3 FROM bid",
+        expect: RowsOut::ExactInput,
+    },
 ];
 
 /// Total NEXMark query count, for honest coverage reporting.
@@ -422,16 +501,51 @@ mod tests {
         );
     }
 
-    /// Every query this module claims support for really compiles.
+    /// Every query this module claims support for really runs on the path
+    /// the harness routes it to.
     ///
-    /// The list drives the harness AND the coverage number in the report, so a
-    /// stale entry would overstate what was measured.
+    /// The list drives the harness AND the coverage number in the report, so
+    /// a stale entry would overstate what was measured. Windowed queries must
+    /// compile; stateless queries must EXECUTE over a real generated batch —
+    /// merely parsing would not catch a column name DataFusion lowercases
+    /// away or a function it does not have.
     #[test]
-    fn every_supported_query_compiles_on_the_streaming_path() {
-        for (name, sql) in SUPPORTED_QUERIES {
-            krishiv_sql::streaming_window_plan::compile_streaming_window_sql(sql).unwrap_or_else(
-                |e| panic!("{name} is listed as supported but does not compile: {e}"),
-            );
+    fn every_supported_query_runs_on_its_routed_path() {
+        let mut generator = NexmarkGenerator::new(7, 1_000_000, 0, 0);
+        let batch = generator.next_bid_batch(64).expect("probe batch");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        for q in SUPPORTED_QUERIES {
+            if krishiv_sql::streaming_tvf::find_window_tvf(q.sql).is_some() {
+                krishiv_sql::streaming_window_plan::compile_streaming_window_sql(q.sql)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{} is listed as supported but does not compile: {e}",
+                            q.name
+                        )
+                    });
+            } else {
+                let exec = krishiv_engines::StatelessBatchExecutor::new(q.sql, "bid");
+                let out = rt
+                    .block_on(exec.on_batch(batch.clone()))
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{} is listed as supported but does not execute: {e}",
+                            q.name
+                        )
+                    });
+                if q.expect == RowsOut::ExactInput {
+                    let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+                    assert_eq!(
+                        rows,
+                        batch.num_rows(),
+                        "{}: a passthrough query must emit every input row",
+                        q.name
+                    );
+                }
+            }
         }
         assert!(
             SUPPORTED_QUERIES.len() < NEXMARK_TOTAL_QUERIES,
