@@ -398,9 +398,11 @@ mod tests {
 /// and the loop corpus could not have caught any of them, not by oversight but
 /// because it has no second dimension.
 ///
-/// This is that dimension. The assertion lives in `krishiv-sql`, which can
-/// reach the compiler; the data lives here beside the timing corpus so the two
-/// axes are visibly siblings.
+/// This is that dimension. The assertion is
+/// `krishiv-bench/tests/streaming_query_shapes.rs`, which can reach the
+/// compiler (krishiv-sql does not depend on this crate, so it cannot host the
+/// test); the data lives here beside the timing corpus so the two axes are
+/// visibly siblings.
 #[derive(Debug, Clone, Copy)]
 pub struct QueryShape {
     /// Stable identifier.
@@ -443,10 +445,10 @@ pub const QUERY_SHAPES: &[QueryShape] = &[
     QueryShape {
         name: "multi_column_group_by",
         sql: "SELECT k, k2, COUNT(*) AS c FROM TUMBLE(TABLE e, DESCRIPTOR(ts), 10000)               GROUP BY k, k2, window_start, window_end",
-        compiles: false,
-        spec_must_contain: None,
-        error_must_contain: Some("k2"),
-        why: "A composite key silently collapsed to the first column and               aggregated across the second. Refused until multi-key lands; the               error must NAME the dropped column.",
+        compiles: true,
+        spec_must_contain: Some("\"k2\""),
+        error_must_contain: None,
+        why: "A composite key once silently collapsed to the first column and               aggregated across the second. Multi-key landed (register §48);               the assertion now guards the opposite failure — the SECOND               column must REACH the spec, because a collapse back to one key               would still compile.",
     },
     QueryShape {
         name: "global_aggregate_no_key",

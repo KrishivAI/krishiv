@@ -5626,3 +5626,22 @@ paths (binary state_persistence.rs for tumbling/sliding/count, JSON in
 session.rs for sessions), and every field added to AggState must be added to
 BOTH BY HAND. Any future auxiliary state (the top-N heap task #142 is the
 next one) must touch both or repeat this defect exactly.
+
+## §52 — #133 closed: QUERY_SHAPES wired to the compiler it was written to check
+
+The corpus's doc claimed "the assertion lives in krishiv-sql"; no assertion
+existed anywhere, and the tripwire that was supposed to force deliberate
+corpus updates when the compiler moved was enforcing nothing. Proof it now
+enforces: the new test run against the untouched corpus went red on
+`multi_column_group_by` — stale since §48 (claims `compiles: false`;
+composite keys landed) — which is simultaneously the red proof for the test
+and the demonstration of the exact failure mode it guards. The entry was then
+flipped DELIBERATELY: it now asserts the second column REACHES the spec
+(`"k2"` in the spec debug form), because a silent collapse back to one key
+would still compile. `global_aggregate_no_key` stays pinned as a refusal;
+task #140 must flip that line knowingly. The doc now names the real assertion
+host (krishiv-bench — krishiv-sql cannot depend on krishiv-dataflow).
+
+Remaining blind axis from §41, still open under #133's original writ: the
+corpus is fixed on one column-type set (all Int64/Utf8 sources). Recorded,
+not silently dropped.
