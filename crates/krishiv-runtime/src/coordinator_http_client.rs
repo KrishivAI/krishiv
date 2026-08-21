@@ -1025,25 +1025,25 @@ mod tests {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContinuousRegisterOptions {
     /// `"cycle"` (default) or `"run-loop"`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     /// Run-loop subtask count. Values > 1 require `mode: "run-loop"`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallelism: Option<u32>,
     /// Registry connector sources the run-loop subtasks own directly.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<krishiv_scheduler::continuous_stream_http::ContinuousRegistrySource>,
     /// Barrier checkpoint interval for run-loop jobs (ms).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_interval_ms: Option<u64>,
     /// Checkpoint storage path for run-loop jobs.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_storage_path: Option<String>,
     /// Streaming sink (task #150 P2): Iceberg or any registered connector.
     /// Flattened into the register body as the top-level `sink` field the
     /// coordinator already reads; the ack echoes the armed kind and
     /// [`Self::verify_ack`] fails loudly if a coordinator dropped it.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sink: Option<krishiv_scheduler::continuous_stream_http::ContinuousSinkSpec>,
 }
 

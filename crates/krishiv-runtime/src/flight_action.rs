@@ -440,6 +440,29 @@ mod tests {
     }
 
     #[test]
+    /// Task #151 regression: a NON-default options body with its empty/None
+    /// fields skipped at serialize time must still DECODE — the first real
+    /// non-default Flight registration (the terminal benchmark) failed with
+    /// "missing field `sources`" because the options struct had
+    /// skip_serializing_if without serde(default) on every field.
+    fn round_trip_continuous_register_with_sparse_options() {
+        let mut options = crate::coordinator_http_client::ContinuousRegisterOptions::run_loop(2);
+        options.checkpoint_interval_ms = Some(1_000);
+        options.checkpoint_storage_path = Some("file:///ckpt".into());
+        let action = KrishivFlightAction::ContinuousRegister(Box::new(
+            ContinuousRegisterBody::with_options(
+                "sparse",
+                WindowExecutionSpec::tumbling("k", "ts", 10_000),
+                options,
+            ),
+        ));
+        let bytes = action.to_action_body().unwrap();
+        let decoded = KrishivFlightAction::from_action_body(&bytes)
+            .expect("sparse non-default options must decode");
+        assert_eq!(decoded, action);
+    }
+
+    #[test]
     fn round_trip_continuous_register() {
         let action = KrishivFlightAction::ContinuousRegister(Box::new(
             ContinuousRegisterBody::new("j1", WindowExecutionSpec::tumbling("k", "ts", 10_000)),

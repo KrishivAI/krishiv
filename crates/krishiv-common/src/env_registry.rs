@@ -1160,6 +1160,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "Checkpoint storage path the distributed NEXMark harness passes at registration when KRISHIV_BENCH_CHECKPOINT_INTERVAL_MS is non-zero.",
     ),
     rt(
+        "KRISHIV_FLIGHT_URL",
+        FlagKind::Text,
+        "http://127.0.0.1:27075",
+        "Coordinator Flight endpoint the terminal NEXMark harness (nexmark_terminal) builds its distributed Session against (task #151).",
+    ),
+    rt(
         "KRISHIV_BENCH_DIRECT_PUSH",
         FlagKind::Bool,
         "unset",
