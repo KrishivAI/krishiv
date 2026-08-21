@@ -77,3 +77,18 @@ P7. **Cleanup + docs (user decision 2026-08-21: REMOVE, don't
 
 Discipline: every phase lands as its own commit with revert-proven
 tests and full gates (fmt, clippy -D warnings, workspace tests).
+
+## Completion record (2026-08-21)
+
+All seven phases landed, each on a green full gate with revert-proven
+tests: P1 `b4e7489` (unified StreamingJob + the stop verb the trait
+never had + the embedded flush-over-input fix), P2 `7233cbd` (write()
+terminal + sink through the verified options echo), P3 `6fd4fa5`
+(update mode on both engines via per-job early fire), P4 `62de713`
+(complete mode as the sink-layer result table), P5 `65ea153` (Python as
+a thin binding), P6 `213a51c` (terminal arm in the S1 conformance
+matrix + embedded engine-sink bridge), P7 `147fbbb` (legacy Python
+surfaces REMOVED — 650 lines deleted, nothing lost).
+
+Follow-on: NEXMark benchmarked THROUGH the terminal on single-node and
+the k3s rig (requires --flight-addr on the coordinators).
