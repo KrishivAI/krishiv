@@ -183,3 +183,36 @@ own commit with fmt + clippy(-D warnings) + workspace tests green.
 
 The rig image predates this pass; a durable-mode re-benchmark needs a
 fresh image build/ship/roll.
+
+## Post-fix durable re-benchmark (2026-08-21, image fast-551d1ba) — ALL PASS
+
+Rebuilt and redeployed after the 12-fix pass; the re-run itself surfaced and
+fixed two more defects the fixes had been masking:
+
+- **EOS flush raced pending input** (9fdd8dc): flushing over the head of
+  queued-but-unapplied batches lost the windows they would have extended
+  (direct push made it a ~40% rows_out deficit). Now a distributed EOS
+  barrier: loops raise a busy count while applying taken input; executors
+  refuse to flush until buffers-empty + busy==0 (loud DeadlineExceeded on a
+  wedged loop); the coordinator runs two full quiesce rounds across all
+  executors before any flush (`stream-eos-quiesce` directive). Direct push
+  also gained the coordinator path's ResourceExhausted backoff envelope.
+- **Stale cancel tombstones across job incarnations** (551d1ba): only the
+  FIRST per-subtask cancel RPC of a teardown still found run-loop state, so
+  later RPCs skipped forget_job and their tombstones survived — a recreated
+  job reusing the deterministic ids had those subtasks insta-cancelled at
+  pickup (a 3-parallel job silently ran 2 subtasks; pre-quiesce its pushes
+  were silently discarded — likely the cause of historical cross-attempt
+  flakiness). The retirement gate now also fires on the `task-streaming[-N]`
+  id shape.
+
+Numbers (RocksDB + 1s checkpointing, 22/22 gate PASS everywhere):
+
+- Single node, coordinator push (attempt15): 28–73K ev/s.
+- Single node, DIRECT push (attempt16, same stack, full id reuse): windows
+  ≈parity (37–42K), join/pipeline classes +10–15% (q3 65K vs 57K, q20 64K
+  vs 58K) — the coordinator hop + base64 was the two-source ceiling.
+- 3-node rig (executors now properly 1/node incl. CPU-starved s3, ~1.3
+  cores free): 5.6–15.8K ev/s. Slower than the 08-21 morning run (10–23K)
+  whose executors happened to avoid s3 — placement, not regression; and
+  pipelines now pay for REAL 1s snapshots (fix 4).
