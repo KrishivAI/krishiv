@@ -248,3 +248,10 @@
 {"path": "tpcds_q6_sf1_p50", "value_ms": 41.842055349999995, "commit": "b16c221ed19b99037e70bd44c3e1d7946e13eb59", "date": "2026-08-20", "env": "ci-shared"}
 {"path": "tpcds_q12_sf1_p50", "value_ms": 171884.5095375, "commit": "b16c221ed19b99037e70bd44c3e1d7946e13eb59", "date": "2026-08-20", "env": "ci-shared"}
 {"path": "tpcds_q27_sf1_p50", "value_ms": 58.56781159166667, "commit": "b16c221ed19b99037e70bd44c3e1d7946e13eb59", "date": "2026-08-20", "env": "ci-shared"}
+{"path": "streaming_latency_embedded_p50", "value_ms": 0.09084004217171716, "commit": "08b20bda6dd3505ead458b42c49df7b220d46c85", "date": "2026-08-21", "env": "ci-shared"}
+{"path": "streaming_latency_single_node_p50", "value_ms": 0.09358458333333335, "commit": "08b20bda6dd3505ead458b42c49df7b220d46c85", "date": "2026-08-21", "env": "ci-shared"}
+{"path": "ivm_tick_p50_at_10m_rows", "value_ms": 17.362945, "commit": "08b20bda6dd3505ead458b42c49df7b220d46c85", "date": "2026-08-21", "env": "ci-shared"}
+{"path": "nexmark_q1_currency_conversion_100k_p50", "value_ms": 0.9008886543952412, "commit": "08b20bda6dd3505ead458b42c49df7b220d46c85", "date": "2026-08-21", "env": "ci-shared"}
+{"path": "nexmark_q2_auction_filter_100k_p50", "value_ms": 1.9428565823451909, "commit": "08b20bda6dd3505ead458b42c49df7b220d46c85", "date": "2026-08-21", "env": "ci-shared"}
+{"path": "nexmark_q5_auction_category_100k_p50", "value_ms": 2.230163401828884, "commit": "08b20bda6dd3505ead458b42c49df7b220d46c85", "date": "2026-08-21", "env": "ci-shared"}
+{"path": "nexmark_q8_person_region_100k_p50", "value_ms": 0.9177393627371273, "commit": "08b20bda6dd3505ead458b42c49df7b220d46c85", "date": "2026-08-21", "env": "ci-shared"}
