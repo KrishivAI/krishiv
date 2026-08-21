@@ -216,3 +216,15 @@ Numbers (RocksDB + 1s checkpointing, 22/22 gate PASS everywhere):
   cores free): 5.6–15.8K ev/s. Slower than the 08-21 morning run (10–23K)
   whose executors happened to avoid s3 — placement, not regression; and
   pipelines now pay for REAL 1s snapshots (fix 4).
+
+## q4 parallel (2026-08-21, commit 43ae03a)
+
+The last parallelism-1 holdout runs at N: split pipelines re-key once at
+the stage boundary (`parallel_plan()` → `#S` exchange → prestage EOS leg;
+see the commit for the full design). Verified live (attempt18, single-node
+durable): q4 registered at parallelism 3 (12 rpipe loop starts = 4 reps ×
+3 subtasks), gate PASS 22/22, q4 rows_out identical to parallelism-1
+(10), throughput ~71K ev/s (flat vs 72K at parallelism 1 on one machine —
+the win is distributing stage state and work across nodes, not single-box
+speed; the exchange costs ~3% locally). The rig image fast-551d1ba
+predates this commit; q4 runs at 1 there until the next roll.
