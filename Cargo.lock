@@ -4853,6 +4853,7 @@ name = "krishiv-bench"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "base64 0.22.1",
  "criterion",
  "datafusion",
  "futures",
