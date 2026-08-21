@@ -280,6 +280,68 @@ mod streaming_conformance_tests {
         render_sorted(&std::fs::read_to_string(&output).unwrap_or_default())
     }
 
+    /// Task #150 P6: the converged `write()` terminal + unified
+    /// `StreamingJob` handle is an ARM of the same one truth — the corpus
+    /// entry driven through it must produce exactly the whole-answer
+    /// expectation the other loops are certified against. Push, poll, and
+    /// flush travel the handle; the assertion is the corpus's, not this
+    /// test's own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_terminal_arm_matches_the_corpus_expectation() {
+        let entry = CORPUS
+            .iter()
+            .find(|e| e.name == "closed_window_plus_trailing_window")
+            .expect("the partial-loss fixture");
+
+        let session = crate::SessionBuilder::new().build().expect("session");
+        let job = session
+            .sql(format!(
+                "SELECT 'seed' AS {}, CAST(0 AS BIGINT) AS {}, CAST(0 AS BIGINT) AS {}",
+                krishiv_dataflow::streaming_corpus::KEY_COLUMN,
+                krishiv_dataflow::streaming_corpus::TIME_COLUMN,
+                krishiv_dataflow::streaming_corpus::AGG_INPUT,
+            ))
+            .expect("seed df")
+            .stream()
+            .with_event_time(krishiv_dataflow::streaming_corpus::TIME_COLUMN)
+            .key_by(krishiv_dataflow::streaming_corpus::KEY_COLUMN)
+            .tumbling_window(
+                u64::try_from(krishiv_dataflow::streaming_corpus::WINDOW_SIZE_MS).expect("size"),
+            )
+            .agg(vec![krishiv_dataflow::AggExpr {
+                function: krishiv_dataflow::AggFunction::Sum,
+                input_column: krishiv_dataflow::streaming_corpus::AGG_INPUT.to_owned(),
+                output_column: krishiv_dataflow::streaming_corpus::AGG_OUTPUT.to_owned(),
+                filter: None,
+            }])
+            .write()
+            .trigger("available_now", 0)
+            .start(&session, "terminal-arm")
+            .expect("terminal registers");
+
+        job.push(vec![entry.batch().expect("fixture")])
+            .await
+            .expect("push");
+        let mut totals = krishiv_dataflow::streaming_corpus::totals_from_batches(
+            &job.drain().await.expect("poll"),
+        )
+        .expect("polled totals");
+        totals.extend(
+            krishiv_dataflow::streaming_corpus::totals_from_batches(
+                &job.flush().await.expect("flush"),
+            )
+            .expect("flushed totals"),
+        );
+        totals.sort();
+        assert_eq!(
+            totals,
+            krishiv_dataflow::streaming_corpus::sorted_expectation(entry.expected),
+            "[{}] the write() terminal must be a faithful arm of the corpus truth",
+            entry.name
+        );
+        job.stop().await.expect("stop");
+    }
+
     /// Drive the same entry through the same loop, backed by a runtime with no
     /// flush — the method set `RemoteExecutionRuntime` actually has, and
     /// therefore the placement `ExecutionMode::Distributed` actually produces.

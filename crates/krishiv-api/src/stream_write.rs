@@ -7,6 +7,12 @@
 //! terminal serves every execution mode the session runs in; combinations a
 //! mode cannot honour are refused BY NAME at `start()`, never downgraded.
 
+// Sync-surface boundary module (async-contract): `start()` is the terminal
+// of a synchronous builder chain, called from sync tests and the pyo3
+// binding thread; the embedded-engine arm drives the query-start future
+// through the sanctioned bridge exactly as `session.rs` does.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::BTreeMap;
 
 use krishiv_runtime::ContinuousRegisterOptions;
@@ -201,6 +207,47 @@ impl StreamWriter {
         let complete_key = spec.key_column.clone();
         let sink = self.sink_spec()?;
         let job_name = job_name.into();
+
+        // Embedded sessions with an ENGINE sink route through the embedded
+        // structured-streaming engine, which owns kafka/parquet/iceberg/
+        // console/memory delivery in-process — the same pipeline spec, the
+        // same handle, a different executor. This is the convergence that
+        // lets the legacy write_stream() surface be REMOVED without losing
+        // embedded sink delivery (task #150 P6/P7).
+        let engine_sink = matches!(
+            self.format.as_deref().map(str::trim),
+            Some("kafka" | "parquet" | "iceberg" | "console" | "memory")
+        );
+        if session.mode() == crate::types::ExecutionMode::Embedded && engine_sink {
+            use crate::streaming_builder::{
+                DataStreamWriter, StreamingOutputMode, StreamingTrigger,
+            };
+            let mut writer = DataStreamWriter::for_streaming(self.df.clone())
+                .output_mode(match self.output_mode.as_str() {
+                    "update" => StreamingOutputMode::Update,
+                    "complete" => StreamingOutputMode::Complete,
+                    _ => StreamingOutputMode::Append,
+                })
+                .trigger(match self.trigger.as_str() {
+                    "once" => StreamingTrigger::Once,
+                    "available_now" => StreamingTrigger::AvailableNow,
+                    "processing_time" => StreamingTrigger::ProcessingTime(
+                        std::time::Duration::from_millis(self.trigger_interval_ms.max(1)),
+                    ),
+                    _ => StreamingTrigger::Continuous(std::time::Duration::from_millis(
+                        self.trigger_interval_ms.max(1),
+                    )),
+                })
+                .query_name(&job_name);
+            if let Some(format) = &self.format {
+                writer = writer.format(format);
+            }
+            for (key, value) in &self.options {
+                writer = writer.option(key, value.clone());
+            }
+            let query = krishiv_common::async_util::block_on(writer.start())?;
+            return Ok(StreamingJob::from_query(query));
+        }
 
         let needs_options =
             sink.is_some() || self.parallelism.is_some() || self.checkpoint_interval_ms.is_some();
@@ -504,6 +551,40 @@ mod complete_mode_tests {
             users.contains(&String::from("a")) && users.contains(&String::from("b")),
             "the complete table must retain the CLOSED key a alongside the open b: {users:?}"
         );
+        job.stop().await.expect("stop");
+    }
+}
+
+#[cfg(test)]
+mod embedded_engine_bridge_tests {
+    use super::*;
+
+    /// Embedded + engine sink routes through the structured-streaming
+    /// engine and returns a Query-backed handle: output goes to the SINK,
+    /// so drain refuses by name instead of half-working; stop() stops the
+    /// engine query. Pre-bridge, this combination refused entirely and the
+    /// legacy write_stream() surface could not be removed without losing
+    /// embedded sink delivery.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn embedded_engine_sink_routes_through_the_engine() {
+        let session = Session::builder().build().expect("session");
+        let job = session
+            .sql("SELECT 'seed' AS user_id, CAST(0 AS BIGINT) AS ts")
+            .expect("df")
+            .stream()
+            .with_event_time("ts")
+            .key_by("user_id")
+            .tumbling_window(1_000)
+            .write()
+            .format("memory")
+            .trigger("available_now", 0)
+            .start(&session, "bridge-mem")
+            .expect("engine-sink job starts");
+        assert!(!job.id().is_empty());
+        let Err(err) = job.drain().await else {
+            panic!("a sink-backed query must refuse drain by name");
+        };
+        assert!(err.to_string().contains("sink"), "{err}");
         job.stop().await.expect("stop");
     }
 }
