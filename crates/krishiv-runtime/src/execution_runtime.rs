@@ -296,6 +296,17 @@ pub trait ExecutionRuntime: Send + Sync {
     /// Drain newly emitted batches from a continuous streaming job.
     fn drain_continuous_stream(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>>;
 
+    /// Deregister a continuous streaming job: stop its loops, discard its
+    /// operator state and undrained egress, and free the id for a fresh
+    /// registration.
+    ///
+    /// Required (no default body), for the same reason as
+    /// [`flush_continuous_stream`](Self::flush_continuous_stream): a runtime
+    /// that cannot stop a job must say so at its own impl site instead of
+    /// inheriting silence — an unstoppable continuous job holds executor
+    /// slots and state forever.
+    fn deregister_continuous_stream(&self, job_id: &str) -> RuntimeResult<()>;
+
     /// Optional remote Flight URL (distributed / single-node daemon).
     fn flight_url(&self) -> Option<&str> {
         None
@@ -579,6 +590,10 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
 
     fn drain_continuous_stream(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
         self.cluster.drain_continuous_job(job_id)
+    }
+
+    fn deregister_continuous_stream(&self, job_id: &str) -> RuntimeResult<()> {
+        self.cluster.deregister_continuous_job(job_id)
     }
 }
 
@@ -1028,6 +1043,23 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
                     "the remote server does not implement continuous.flush, so job \
                      '{job_id}' cannot close the windows its watermark never reached; \
                      its trailing window will be missing from the output ({e})"
+                ))),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    fn deregister_continuous_stream(&self, job_id: &str) -> RuntimeResult<()> {
+        use crate::flight_action::{ContinuousDeregisterBody, KrishivFlightAction};
+        use krishiv_common::async_util::block_on;
+        let action = KrishivFlightAction::ContinuousDeregister(ContinuousDeregisterBody {
+            job_id: job_id.to_string(),
+        });
+        block_on(async {
+            match self.pool.do_action(&action).await {
+                Ok(_) => Ok(()),
+                Err(e) if is_server_unimplemented(&e) => Err(RuntimeError::unsupported(format!(
+                    "the remote server does not implement continuous deregister; the job                      '{job_id}' keeps running and holding its executor slots until the                      server is upgraded"
                 ))),
                 Err(e) => Err(e),
             }

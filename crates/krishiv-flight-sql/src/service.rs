@@ -1627,6 +1627,13 @@ impl KrishivFlightSqlService {
                     .map_err(KrishivActionError::Status)?;
                 Ok(Vec::new())
             }
+            A::ContinuousDeregister(body) => {
+                self.host
+                    .deregister_continuous_stream(&body.job_id)
+                    .await
+                    .map_err(KrishivActionError::Status)?;
+                Ok(Vec::new())
+            }
             A::ContinuousFlush(body) => {
                 // End-of-stream: close every window the watermark never
                 // reached. Distinct from a drain, which only emits what the

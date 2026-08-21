@@ -31,6 +31,7 @@ pub mod sql_job;
 pub mod stream;
 pub mod streaming_builder;
 pub mod streaming_dataframe;
+pub mod streaming_job;
 pub mod timers;
 pub mod types;
 pub mod window;
@@ -117,6 +118,7 @@ pub use streaming_builder::{
 pub use streaming_dataframe::{
     KrishivStream, NamedSideOutputStream, StreamingDataFrame, StreamingOutputStreams,
 };
+pub use streaming_job::StreamingJob;
 pub use types::{DeploymentTarget, ExecutionMode, QueryResult, StreamBatch, StreamMode};
 pub use window::{
     MultiSourceWatermarkSpec, SessionWindowedStream, SlidingWindowedStream, StateTtlConfig,

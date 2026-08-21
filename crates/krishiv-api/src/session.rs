@@ -1595,6 +1595,19 @@ impl Session {
     /// runtime cannot flush — in which case the answer is genuinely
     /// incomplete and the caller must decide what to do, rather than being told
     /// nothing.
+    /// Stop a continuous streaming job: its loops exit, operator state and
+    /// undrained egress are discarded, and the id becomes free for a fresh
+    /// registration. Routed through the execution runtime, so it reaches the
+    /// in-process registry on embedded sessions and the coordinator on
+    /// single-node/distributed ones.
+    pub fn stop_stream_job(&self, job_id: &str) -> Result<()> {
+        self.runtime
+            .deregister_continuous_stream(job_id)
+            .map_err(KrishivError::from)?;
+        self.stream_jobs.remove(job_id);
+        Ok(())
+    }
+
     pub fn flush_stream_job(&self, job_id: &str) -> Result<Vec<RecordBatch>> {
         self.runtime
             .flush_continuous_stream(job_id)

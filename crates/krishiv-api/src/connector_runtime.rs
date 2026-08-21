@@ -1462,6 +1462,10 @@ mod tests {
             Err(RuntimeError::unsupported("not used by this test"))
         }
 
+        fn deregister_continuous_stream(&self, _job_id: &str) -> RuntimeResult<()> {
+            Err(RuntimeError::unsupported("not used by this test"))
+        }
+
         fn flight_url(&self) -> Option<&str> {
             Some("memory://capturing-remote")
         }
@@ -1717,6 +1721,10 @@ mod tests {
                 Err(RuntimeError::unsupported("unused"))
             }
             fn drain_continuous_stream(&self, _job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
+                Err(RuntimeError::unsupported("unused"))
+            }
+
+            fn deregister_continuous_stream(&self, _job_id: &str) -> RuntimeResult<()> {
                 Err(RuntimeError::unsupported("unused"))
             }
         }
@@ -2203,6 +2211,7 @@ mod tests {
     enum SeamEvent {
         Push(usize),
         Drain,
+        Deregister,
     }
 
     /// Records the push/drain call sequence so a test can assert on the *shape*
@@ -2307,6 +2316,11 @@ mod tests {
             self.log.lock().unwrap().push(SeamEvent::Drain);
             Ok(Vec::new())
         }
+
+        fn deregister_continuous_stream(&self, _job_id: &str) -> RuntimeResult<()> {
+            self.log.lock().unwrap().push(SeamEvent::Deregister);
+            Ok(())
+        }
     }
 
     /// The bounded distributed streaming path must push and drain in bounded
@@ -2366,7 +2380,7 @@ mod tests {
             .iter()
             .filter_map(|e| match e {
                 SeamEvent::Push(n) => Some(*n),
-                SeamEvent::Drain => None,
+                SeamEvent::Drain | SeamEvent::Deregister => None,
             })
             .collect();
         let drains = log.iter().filter(|e| **e == SeamEvent::Drain).count();

@@ -100,6 +100,7 @@ pub use etcd_lease::{DEFAULT_CCP_LEADER_KEY, EtcdLeaseElection};
 pub use etcd_metadata::EtcdMetadataStore;
 pub use ivm::{IvmJob, IvmJobRegistry, SharedIvmJobRegistry};
 pub use ivm_http::{IvmRouterState, ivm_router};
+pub use krishiv_proto::{IdError, JobId};
 pub use result_spool::{TaskResultKey, TaskResultSpool};
 pub use unified_jobs_http::api_unified_submit;
 pub(crate) mod rocksdb_metadata;

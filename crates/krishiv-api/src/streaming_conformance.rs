@@ -182,6 +182,10 @@ mod streaming_conformance_tests {
             self.inner.drain_continuous_stream(job_id)
         }
 
+        fn deregister_continuous_stream(&self, job_id: &str) -> krishiv_runtime::RuntimeResult<()> {
+            self.inner.deregister_continuous_stream(job_id)
+        }
+
         /// Declines to flush. This refusal IS the test fixture.
         ///
         /// Until step 4 this method was simply ABSENT here, and the trait's

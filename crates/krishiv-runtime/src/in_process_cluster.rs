@@ -83,6 +83,12 @@ impl InProcessCluster {
         self.inner.push_continuous_input(job_id, batches)
     }
 
+    /// Deregister a continuous job: its operator state and buffered output
+    /// are discarded and the id becomes free for a fresh registration.
+    pub fn deregister_continuous_job(&self, job_id: &str) -> RuntimeResult<()> {
+        self.inner.continuous_registry().deregister_job(job_id)
+    }
+
     /// Drain a continuous job through the coordinator.
     pub fn drain_continuous_job(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
         self.inner.drain_continuous_job(job_id)

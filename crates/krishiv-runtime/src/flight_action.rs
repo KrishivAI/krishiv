@@ -41,6 +41,8 @@ pub mod tags {
     /// is over. Distinct from `continuous.drain`, which only emits what the
     /// watermark already closed.
     pub const CONTINUOUS_FLUSH: &str = "continuous.flush";
+    /// Deregister a continuous job: stop its loop, discard state, free the id.
+    pub const CONTINUOUS_DEREGISTER: &str = "continuous.deregister";
     pub const BOUNDED_WINDOW: &str = "bounded_window";
     pub const EXPLAIN: &str = "explain";
     pub const EXECUTE_PLAN: &str = "execute_plan";
@@ -128,6 +130,12 @@ pub struct ContinuousDrainBody {
 /// watermark has already closed, so a bounded source whose final events fall
 /// inside a window nothing later closes needs this to get a whole answer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContinuousDeregisterBody {
+    /// Continuous job to deregister.
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContinuousFlushBody {
     pub job_id: String,
 }
@@ -280,6 +288,7 @@ pub enum KrishivFlightAction {
     ContinuousPush(ContinuousPushBody),
     ContinuousDrain(ContinuousDrainBody),
     ContinuousFlush(ContinuousFlushBody),
+    ContinuousDeregister(ContinuousDeregisterBody),
     BoundedWindow(BoundedWindowBody),
     Explain(ExplainBody),
     ExecutePlan(ExecutePlanBody),
@@ -299,6 +308,7 @@ impl KrishivFlightAction {
             Self::ContinuousPush(_) => tags::CONTINUOUS_PUSH,
             Self::ContinuousDrain(_) => tags::CONTINUOUS_DRAIN,
             Self::ContinuousFlush(_) => tags::CONTINUOUS_FLUSH,
+            Self::ContinuousDeregister(_) => tags::CONTINUOUS_DEREGISTER,
             Self::BoundedWindow(_) => tags::BOUNDED_WINDOW,
             Self::Explain(_) => tags::EXPLAIN,
             Self::ExecutePlan(_) => tags::EXECUTE_PLAN,

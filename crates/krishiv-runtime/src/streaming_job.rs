@@ -73,6 +73,11 @@ impl RemoteStreamingJob {
         &self.job_id
     }
 
+    /// The coordinator HTTP base URL this handle talks to.
+    pub fn coordinator_http(&self) -> &str {
+        &self.coordinator_http
+    }
+
     /// Push input batches to the streaming job.
     pub async fn push(&self, batches: &[RecordBatch]) -> RuntimeResult<()> {
         execute_coordinator_continuous_push(&self.coordinator_http, &self.job_id, batches).await

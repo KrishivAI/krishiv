@@ -408,6 +408,38 @@ impl ContinuousStreamRegistry {
     /// caller (the embedded engine) and no route for anything driving the
     /// registry.
     pub fn flush_job(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
+        // Apply every pending pushed batch BEFORE flushing: flushing over the
+        // head of buffered input silently loses the windows that input would
+        // have extended — the exact defect the distributed EOS barrier closed
+        // (task #149), alive here in the embedded registry until the unified
+        // StreamingJob handle's lifecycle test caught it. Drain repeatedly:
+        // one drain pass is capped at DEFAULT_MAX_DRAIN_BATCHES of input.
+        let mut applied: Vec<RecordBatch> = Vec::new();
+        loop {
+            let out = self.drain_job(job_id)?;
+            let consumed = {
+                let entry =
+                    self.jobs
+                        .get(job_id)
+                        .ok_or_else(|| ContinuousStreamError::JobNotFound {
+                            job_id: job_id.to_owned(),
+                        })?;
+                let input =
+                    entry
+                        .input
+                        .lock()
+                        .map_err(|_| ContinuousStreamError::LockPoisoned {
+                            job_id: job_id.to_owned(),
+                            component: "input",
+                            operation: "flush_job",
+                        })?;
+                input.batches.is_empty()
+            };
+            applied.extend(out);
+            if consumed {
+                break;
+            }
+        }
         let entry = self
             .jobs
             .get(job_id)
@@ -422,12 +454,14 @@ impl ContinuousStreamRegistry {
                 component: "executor",
                 operation: "flush_job",
             })?;
-        exec.flush_all()
+        let flushed = exec
+            .flush_all()
             .map_err(|error| ContinuousStreamError::Execution {
                 job_id: job_id.to_owned(),
                 message: error.to_string(),
-            })
-            .map_err(Into::into)
+            })?;
+        applied.extend(flushed);
+        Ok(applied)
     }
 
     /// Borrow the window spec for coordinator fragment encoding.

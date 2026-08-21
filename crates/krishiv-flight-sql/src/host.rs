@@ -530,6 +530,27 @@ impl FlightExecutionHost {
         }
     }
 
+    /// Deregister a continuous job on whichever backend hosts it: stop its
+    /// loops, discard operator state and undrained egress, free the id.
+    pub async fn deregister_continuous_stream(&self, job_id: &str) -> Result<(), Status> {
+        match self.backend.as_ref() {
+            FlightHostBackend::InProcess(cluster) => {
+                let job_id = job_id.to_string();
+                let cluster = Arc::clone(cluster);
+                run_blocking(move || cluster.deregister_continuous_job(&job_id))
+            }
+            FlightHostBackend::Coordinator(coordinator) => {
+                let job_id = krishiv_scheduler::JobId::try_new(job_id).map_err(
+                    |e: krishiv_scheduler::IdError| Status::invalid_argument(e.to_string()),
+                )?;
+                coordinator
+                    .cancel_job_and_notify(&job_id)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))
+            }
+        }
+    }
+
     pub async fn drain_continuous_stream(&self, job_id: &str) -> Result<Vec<RecordBatch>, Status> {
         // Batches returned by an earlier taker that could not deliver them
         // (see `return_drained_batches`) are re-served first, ahead of any
