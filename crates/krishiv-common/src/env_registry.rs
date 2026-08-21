@@ -1130,6 +1130,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "Run-loop egress buffer cap in batches. The buffer drops its OLDEST batch on overflow, so this bounds how much computed output a slow drain consumer may lose before catching up; it is a per-JOB budget shared by co-located subtasks. 0 and unparseable values fall back to the default (a 0 cap would discard every batch).",
     ),
     rt(
+        "KRISHIV_RLOOP_INPUT_BUFFER_CAP",
+        FlagKind::UInt,
+        "64",
+        "Per-buffer cap on pending pushed batches for a run-loop subtask input key. Pushes beyond it are refused with backpressure (HTTP 429 via the coordinator); throughput is bounded by drain rate x this cap.",
+    ),
+    rt(
         "KRISHIV_ALLOW_UNFLUSHED_BOUNDED",
         FlagKind::Bool,
         "false",

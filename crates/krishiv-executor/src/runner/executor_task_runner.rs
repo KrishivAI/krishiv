@@ -972,7 +972,13 @@ impl ExecutorTaskRunner {
         )
         .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         let is_continuous_cycle = fragment_body.starts_with("stream:loop:");
-        let is_run_loop = fragment_body.starts_with(crate::fragment::run_loop::STREAM_RLOOP_PREFIX);
+        // The WHOLE run-loop family (task #149 fix 6): windows, joins,
+        // pipelines, stateless. Matching only the rloop prefix put the three
+        // classed loops on the timeout-bearing streaming arm (a wall-clock
+        // kill waiting for any job that outlives it) and made their
+        // cancellation exits report Succeeded instead of Cancelled — the
+        // "unknown_job for succeeded status" noise observed live.
+        let is_run_loop = crate::fragment::run_loop_classes::is_run_loop_family(&fragment_body);
 
         // B6 (review 2026-07-27): `assignment.memory_limit_bytes()` is populated
         // ONLY from a JobSpec namespace quota. Batch queries set none, so on

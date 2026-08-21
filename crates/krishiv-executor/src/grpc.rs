@@ -188,23 +188,16 @@ impl ExecutorTaskInboxService {
             return Ok(0);
         }
         let flushed = outputs.len();
-        let mut egress = self
-            .continuous_outputs
+        // Deliberately NOT capped (task #149 fix 3): the flush MOVES bytes
+        // from operator state (freed by flush_all) into the egress buffer, so
+        // staging all of it is memory-neutral — while truncating it destroyed
+        // computed final output (observed live: q9's whole result kept
+        // exactly cap batches). Drain is paged, so the consumer collects the
+        // full flush across successive calls without any oversized response.
+        self.continuous_outputs
             .entry(job_id.to_owned())
-            .or_default();
-        egress.extend(outputs);
-        let cap = krishiv_common::streaming_dials::rloop_egress_cap();
-        if egress.len() > cap {
-            let overflow = egress.len() - cap;
-            egress.drain(..overflow);
-            tracing::warn!(
-                job_id = %job_id,
-                dropped_batches = overflow,
-                cap,
-                "EOS flush overflowed the egress buffer; oldest batches dropped — drain \
-                 before flushing, or raise KRISHIV_RLOOP_EGRESS_CAP"
-            );
-        }
+            .or_default()
+            .extend(outputs);
         Ok(flushed)
     }
 
@@ -521,17 +514,19 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         };
 
         // Enforce per-buffer capacity to prevent unbounded memory growth (M1).
-        const MAX_PENDING_BATCHES: usize = 64;
+        // Dialable (task #149 fix 11): the hardcoded 64 pinned sustained
+        // push throughput at drain-rate x 64 with no operator recourse.
+        let cap = krishiv_common::streaming_dials::rloop_input_buffer_cap();
         {
             let mut entry = self
                 .continuous_inputs
                 .entry(buffer_key.clone())
                 .or_default();
-            if entry.len() + batches.len() > MAX_PENDING_BATCHES {
+            if entry.len() + batches.len() > cap {
                 return Err(tonic::Status::resource_exhausted(format!(
-                    "continuous input buffer for job {} exceeded capacity ({MAX_PENDING_BATCHES}); \
-                     slow down the producer or increase the drain rate",
-                    entry.len() + batches.len(),
+                    "continuous input buffer for job {job_id} exceeded capacity ({cap}); \
+                     slow down the producer, raise KRISHIV_RLOOP_INPUT_BUFFER_CAP, or \
+                     increase the drain rate"
                 )));
             }
             entry.extend(batches);
@@ -564,7 +559,15 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         // Phase 55: run-loop jobs emit into a per-job egress buffer as they
         // run — drain serves (and clears) it without driving any execution.
         if let Some(mut egress) = self.continuous_outputs.get_mut(job_id) {
-            let batches: Vec<RecordBatch> = egress.drain(..).collect();
+            // Paged (task #149 fix 3): one drain call returns at most a page
+            // and leaves the remainder for the next call, instead of encoding
+            // the entire buffer into a single gRPC response. Callers already
+            // poll drain in a loop; an EOS flush larger than one page now
+            // arrives across successive calls instead of being truncated by
+            // the ring cap (or blowing the gRPC message ceiling).
+            let page = krishiv_common::streaming_dials::rloop_egress_cap();
+            let take = egress.len().min(page);
+            let batches: Vec<RecordBatch> = egress.drain(..take).collect();
             drop(egress);
             let ipc_bytes = encode_ipc_batches(&batches).map_err(|e| {
                 krishiv_metrics::grpc::internal_status("encode continuous output", &e)
@@ -882,6 +885,64 @@ pub fn executor_task_grpc_server_with_run_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kv_batch(ts: &[i64]) -> RecordBatch {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(StringArray::from(vec!["a"; ts.len()])),
+                std::sync::Arc::new(Int64Array::from(ts.to_vec())),
+            ],
+        )
+        .expect("batch")
+    }
+
+    /// The EOS flush moves bytes from operator state into egress — memory
+    /// neutral — so it must NEVER be truncated by the ring cap. The old
+    /// drop-oldest at flush destroyed computed FINAL output (live: NEXMark
+    /// q9 kept exactly cap batches of its result). With egress pre-filled to
+    /// the cap, flushing one more open window must GROW the buffer, not
+    /// evict.
+    #[tokio::test]
+    async fn eos_flush_is_never_truncated_by_the_egress_cap() {
+        let service = ExecutorTaskInboxService::new(ExecutorAssignmentInbox::new_unbounded());
+        let spec = krishiv_plan::window::WindowExecutionSpec::tumbling("k", "ts", 60_000);
+        let mut exec =
+            krishiv_dataflow::ContinuousWindowExecutor::new(spec).expect("executor builds");
+        exec.drain(vec![kv_batch(&[1_000])]).expect("window opens");
+        service
+            .loop_executors
+            .insert("capjob#0".into(), Arc::new(Mutex::new(exec)));
+
+        let cap = krishiv_common::streaming_dials::rloop_egress_cap();
+        service
+            .continuous_outputs
+            .entry("capjob".into())
+            .or_default()
+            .extend(std::iter::repeat_with(|| kv_batch(&[2_000])).take(cap));
+
+        let flushed = service
+            .flush_run_loop_job("capjob")
+            .await
+            .expect("flush succeeds");
+        assert!(flushed >= 1, "the open window must flush something");
+        let egress_len = service
+            .continuous_outputs
+            .get("capjob")
+            .map(|e| e.len())
+            .unwrap_or(0);
+        assert_eq!(
+            egress_len,
+            cap + flushed,
+            "flush output must be APPENDED, never traded for evicted batches"
+        );
+    }
 
     fn service_with_auth(auth: ExecutorTaskAuthConfig) -> ExecutorTaskGrpcService {
         ExecutorTaskGrpcService::with_auth_config(ExecutorAssignmentInbox::new_unbounded(), auth)

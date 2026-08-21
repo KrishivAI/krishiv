@@ -611,8 +611,15 @@ impl JobRecord {
                     )
                     .with_input_partitions(input_partitions)
                     .with_key_group_range(key_group_range_for_task(task_index, stage_parallelism));
-                    if task_body.starts_with("stream:loop:")
-                        || task_body.starts_with("stream:rloop:")
+                    if [
+                        "stream:loop:",
+                        "stream:rloop:",
+                        "stream:rjoin:",
+                        "stream:rpipe:",
+                        "stream:rbatch:",
+                    ]
+                    .iter()
+                    .any(|p| task_body.starts_with(p))
                     {
                         assignment = assignment.with_requires_reattach(true);
                     }

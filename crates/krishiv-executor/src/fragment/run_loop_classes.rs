@@ -33,6 +33,23 @@ use crate::fragment::common::parse_registry_partition_specs;
 use crate::runner::{ExecutorTaskRunner, StreamingProgressSnapshot, TaskStateBinding};
 use crate::{ExecutorError, ExecutorResult, ExecutorTaskOutput};
 
+/// True for every run-loop-FAMILY fragment body: windows (`stream:rloop:`)
+/// and the three classed loops. The runner keys two decisions on this — the
+/// no-timeout dispatch arm (a run-loop exits only on cancellation; a
+/// wall-clock timeout would kill a healthy job) and the Cancelled terminal
+/// state on cancel (not Succeeded). A prefix missing here silently gets a
+/// batch task's lifecycle (task #149 fix 6).
+pub(crate) fn is_run_loop_family(fragment_body: &str) -> bool {
+    [
+        super::run_loop::STREAM_RLOOP_PREFIX,
+        STREAM_RJOIN_PREFIX,
+        STREAM_RPIPE_PREFIX,
+        STREAM_RBATCH_PREFIX,
+    ]
+    .iter()
+    .any(|prefix| fragment_body.starts_with(prefix))
+}
+
 pub(crate) const STREAM_RBATCH_PREFIX: &str = "stream:rbatch:";
 pub(crate) const STREAM_RPIPE_PREFIX: &str = "stream:rpipe:";
 pub(crate) const STREAM_RJOIN_PREFIX: &str = "stream:rjoin:";
@@ -846,5 +863,29 @@ mod rpipe_tests {
         // runner); the parallelism gate is its FIRST check, before any I/O,
         // so the parse-level premise plus the gate's placement is what this
         // pins alongside the integration test in commit 8.
+    }
+}
+
+#[cfg(test)]
+mod run_loop_family {
+    /// Every class's fragment prefix must be in the run-loop family: a class
+    /// left out gets the timeout-bearing batch lifecycle and reports
+    /// Succeeded on cancel (observed live as "unknown_job for succeeded
+    /// status" after every classed deregister).
+    #[test]
+    fn all_four_classes_are_run_loop_family() {
+        for body in [
+            "stream:rloop:j|spec",
+            "stream:rjoin:j|0/1|{}",
+            "stream:rpipe:j|0/1|{}",
+            "stream:rbatch:j|0/1|{}",
+        ] {
+            assert!(
+                super::is_run_loop_family(body),
+                "{body} must be run-loop family"
+            );
+        }
+        assert!(!super::is_run_loop_family("stream:loop:j|spec"));
+        assert!(!super::is_run_loop_family("sql:SELECT 1"));
     }
 }

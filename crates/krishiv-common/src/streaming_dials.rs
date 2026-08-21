@@ -67,6 +67,30 @@ pub fn rloop_egress_cap() -> usize {
     parse_rloop_egress_cap(std::env::var(RLOOP_EGRESS_CAP_ENV).ok().as_deref())
 }
 
+/// Env var naming the per-buffer continuous INPUT cap (pending pushed
+/// batches per `{job}#{task}` key before pushes are refused with
+/// backpressure).
+pub const RLOOP_INPUT_BUFFER_CAP_ENV: &str = "KRISHIV_RLOOP_INPUT_BUFFER_CAP";
+
+/// Default continuous input buffer cap, in batches (task #149 fix 11 — this
+/// used to be a hardcoded constant, so sustained throughput was pinned at
+/// drain-rate × 64 with no operator dial).
+pub const DEFAULT_RLOOP_INPUT_BUFFER_CAP: usize = 64;
+
+/// Parse the input buffer cap. Zero and unparseable values fall back to the
+/// default: a cap of 0 refuses every push and turns the job into a no-op
+/// nobody meant to configure.
+pub fn parse_rloop_input_buffer_cap(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_RLOOP_INPUT_BUFFER_CAP)
+}
+
+/// The configured continuous input buffer cap.
+pub fn rloop_input_buffer_cap() -> usize {
+    parse_rloop_input_buffer_cap(std::env::var(RLOOP_INPUT_BUFFER_CAP_ENV).ok().as_deref())
+}
+
 /// Parse an idle-tick interval, falling back to [`DEFAULT_IDLE_TICK_MS`].
 ///
 /// Unset, blank, or unparseable all mean "use the default" rather than "0",
@@ -392,5 +416,29 @@ impl EgressLoss {
     #[must_use]
     pub const fn drop_lost_output(has_durable_sink: bool) -> bool {
         !has_durable_sink
+    }
+}
+
+#[cfg(test)]
+mod input_buffer_cap_tests {
+    use super::*;
+
+    /// The input cap is a dial, not a constant (task #149 fix 11): set it,
+    /// get it; garbage and 0 (a job-killing no-op nobody means) fall back.
+    #[test]
+    fn input_buffer_cap_parses_and_falls_back() {
+        assert_eq!(parse_rloop_input_buffer_cap(Some("128")), 128);
+        assert_eq!(
+            parse_rloop_input_buffer_cap(None),
+            DEFAULT_RLOOP_INPUT_BUFFER_CAP
+        );
+        assert_eq!(
+            parse_rloop_input_buffer_cap(Some("0")),
+            DEFAULT_RLOOP_INPUT_BUFFER_CAP
+        );
+        assert_eq!(
+            parse_rloop_input_buffer_cap(Some("nope")),
+            DEFAULT_RLOOP_INPUT_BUFFER_CAP
+        );
     }
 }
