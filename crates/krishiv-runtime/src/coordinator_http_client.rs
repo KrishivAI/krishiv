@@ -491,6 +491,51 @@ pub async fn execute_coordinator_bounded_window(
 }
 
 #[cfg(test)]
+mod sink_echo_tests {
+    use super::*;
+
+    /// Task #150 P2: a requested sink the coordinator never echoes is a job
+    /// that drops every output batch while reporting success — verify_ack
+    /// must turn the missing echo into a hard error. Pre-fix behavior (no
+    /// sink arm in verify_ack): the ack passes and the drop is silent.
+    #[test]
+    fn requested_sink_without_echo_is_refused() {
+        let mut options = ContinuousRegisterOptions::run_loop(2);
+        options.sink = Some(
+            krishiv_scheduler::continuous_stream_http::ContinuousSinkSpec {
+                connector: Some("csv".into()),
+                options: Default::default(),
+                root: String::new(),
+                table: String::new(),
+                mode: "append".into(),
+                key_columns: Vec::new(),
+                op_column: None,
+                catalog: None,
+                namespace: None,
+            },
+        );
+        let ack = ContinuousRegisterAck {
+            sink: None,
+            class: Some("window".into()),
+            mode: Some("run-loop".into()),
+            parallelism: Some(2),
+            checkpointing: Some(false),
+            sources: Some(0),
+        };
+        let err = options
+            .verify_ack(&ack, "test seam")
+            .expect_err("missing sink echo must refuse");
+        assert!(err.to_string().contains("sink"), "{err}");
+
+        let mut echoed = ack;
+        echoed.sink = Some("csv".into());
+        options
+            .verify_ack(&echoed, "test seam")
+            .expect("matching echo passes");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         BatchSqlResponseBody, ContinuousRegisterAck, ContinuousRegisterOptions,
@@ -609,6 +654,7 @@ mod tests {
     fn an_echo_that_disagrees_with_the_request_is_an_error() {
         let requested = ContinuousRegisterOptions::run_loop(8);
         let downgraded = ContinuousRegisterAck {
+            sink: None,
             class: Some(String::from("window")),
             mode: Some(String::from("cycle-push")),
             parallelism: Some(1),
@@ -631,6 +677,7 @@ mod tests {
         // The matching echo is accepted — otherwise the check would be a
         // blanket refusal rather than a comparison.
         let honoured = ContinuousRegisterAck {
+            sink: None,
             class: Some(String::from("window")),
             mode: Some(String::from("run-loop")),
             parallelism: Some(8),
@@ -657,6 +704,7 @@ mod tests {
             },
         );
         let mode_and_parallelism_honoured = ContinuousRegisterAck {
+            sink: None,
             class: Some(String::from("window")),
             mode: Some(String::from("run-loop")),
             parallelism: Some(2),
@@ -685,6 +733,7 @@ mod tests {
                 ..Default::default()
             };
             let server_echo = ContinuousRegisterAck {
+                sink: None,
                 class: Some(String::from("window")),
                 mode: Some(String::from("run-loop")),
                 parallelism: Some(3),
@@ -990,6 +1039,12 @@ pub struct ContinuousRegisterOptions {
     /// Checkpoint storage path for run-loop jobs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint_storage_path: Option<String>,
+    /// Streaming sink (task #150 P2): Iceberg or any registered connector.
+    /// Flattened into the register body as the top-level `sink` field the
+    /// coordinator already reads; the ack echoes the armed kind and
+    /// [`Self::verify_ack`] fails loudly if a coordinator dropped it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sink: Option<krishiv_scheduler::continuous_stream_http::ContinuousSinkSpec>,
 }
 
 impl ContinuousRegisterOptions {
@@ -1106,6 +1161,21 @@ impl ContinuousRegisterOptions {
             )),
             None => {}
         }
+        // Sink echo (task #150 P2): a requested sink the coordinator never
+        // reports is a job that will drop every output batch on the floor
+        // while reporting success — the worst possible silent downgrade.
+        if let Some(requested) = &self.sink {
+            let requested_kind = requested.kind();
+            match ack.sink.as_deref() {
+                Some(applied) if applied == requested_kind => {}
+                Some(applied) => disagreements.push(format!(
+                    "sink: requested kind '{requested_kind}', coordinator armed '{applied}'"
+                )),
+                None => disagreements.push(format!(
+                    "sink: requested kind '{requested_kind}', not reported — the                      coordinator dropped the sink and the job writes nowhere"
+                )),
+            }
+        }
 
         if disagreements.is_empty() {
             Ok(())
@@ -1128,6 +1198,11 @@ impl ContinuousRegisterOptions {
 /// as a default.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContinuousRegisterAck {
+    /// Sink-kind echo (task #150 P2): the kind actually armed, absent when
+    /// no sink was registered. A requested sink with no echo means the
+    /// coordinator dropped it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sink: Option<String>,
     /// Class echo (task #147). A non-window registration whose ack lacks the
     /// class was handled by a coordinator that silently dropped stream_spec.
     #[serde(default)]
@@ -1147,6 +1222,7 @@ impl ContinuousRegisterAck {
     pub fn applied(applied: &krishiv_scheduler::AppliedContinuousRegistration) -> Self {
         Self {
             class: None,
+            sink: applied.sink.clone(),
             mode: Some(applied.mode.as_str().to_string()),
             parallelism: Some(applied.parallelism),
             checkpointing: Some(applied.checkpointing),

@@ -284,12 +284,12 @@ impl OperationProgressResponse {
 #[serde(tag = "kind")]
 pub enum KrishivFlightAction {
     RegisterParquet(RegisterParquetBody),
-    ContinuousRegister(ContinuousRegisterBody),
+    ContinuousRegister(Box<ContinuousRegisterBody>),
     ContinuousPush(ContinuousPushBody),
     ContinuousDrain(ContinuousDrainBody),
     ContinuousFlush(ContinuousFlushBody),
     ContinuousDeregister(ContinuousDeregisterBody),
-    BoundedWindow(BoundedWindowBody),
+    BoundedWindow(Box<BoundedWindowBody>),
     Explain(ExplainBody),
     ExecutePlan(ExecutePlanBody),
     BatchSql(BatchSqlBody),
@@ -441,9 +441,8 @@ mod tests {
 
     #[test]
     fn round_trip_continuous_register() {
-        let action = KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody::new(
-            "j1",
-            WindowExecutionSpec::tumbling("k", "ts", 10_000),
+        let action = KrishivFlightAction::ContinuousRegister(Box::new(
+            ContinuousRegisterBody::new("j1", WindowExecutionSpec::tumbling("k", "ts", 10_000)),
         ));
         let bytes = action.to_action_body().unwrap();
         let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
@@ -488,12 +487,12 @@ mod tests {
     fn round_trip_bounded_window() {
         let batch = test_batch();
         let batches_b64 = encode_batches(&[batch]).unwrap();
-        let action = KrishivFlightAction::BoundedWindow(BoundedWindowBody {
+        let action = KrishivFlightAction::BoundedWindow(Box::new(BoundedWindowBody {
             topic: "events".into(),
             spec: WindowExecutionSpec::tumbling("user_id", "ts", 5_000),
             batches_b64: batches_b64.clone(),
             response_watermark_ms: None,
-        });
+        }));
         let bytes = action.to_action_body().unwrap();
         let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
         match decoded {
@@ -611,9 +610,8 @@ mod tests {
         });
         assert_eq!(register.action_type(), "krishiv.v1.register_parquet");
 
-        let continuous_reg = KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody::new(
-            "j",
-            WindowExecutionSpec::tumbling("k", "ts", 1_000),
+        let continuous_reg = KrishivFlightAction::ContinuousRegister(Box::new(
+            ContinuousRegisterBody::new("j", WindowExecutionSpec::tumbling("k", "ts", 1_000)),
         ));
         assert_eq!(
             continuous_reg.action_type(),
@@ -630,12 +628,12 @@ mod tests {
             KrishivFlightAction::ContinuousDrain(ContinuousDrainBody { job_id: "j".into() });
         assert_eq!(drain.action_type(), "krishiv.v1.continuous.drain");
 
-        let bounded = KrishivFlightAction::BoundedWindow(BoundedWindowBody {
+        let bounded = KrishivFlightAction::BoundedWindow(Box::new(BoundedWindowBody {
             topic: "t".into(),
             spec: WindowExecutionSpec::tumbling("k", "ts", 1_000),
             batches_b64: String::new(),
             response_watermark_ms: None,
-        });
+        }));
         assert_eq!(bounded.action_type(), "krishiv.v1.bounded_window");
 
         let explain = KrishivFlightAction::Explain(ExplainBody {
@@ -715,9 +713,8 @@ mod tests {
             window_timezone: None,
             row_filter: None,
         };
-        let action = KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody::new(
-            "sliding-job",
-            spec,
+        let action = KrishivFlightAction::ContinuousRegister(Box::new(
+            ContinuousRegisterBody::new("sliding-job", spec),
         ));
         let bytes = action.to_action_body().unwrap();
         let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
@@ -760,12 +757,12 @@ mod tests {
             row_filter: None,
         };
         let batch = test_batch();
-        let action = KrishivFlightAction::BoundedWindow(BoundedWindowBody {
+        let action = KrishivFlightAction::BoundedWindow(Box::new(BoundedWindowBody {
             topic: "user-events".into(),
             spec,
             batches_b64: encode_batches(&[batch]).unwrap(),
             response_watermark_ms: None,
-        });
+        }));
         let bytes = action.to_action_body().unwrap();
         let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
         match decoded {
@@ -861,21 +858,21 @@ mod tests {
                 table: "t".into(),
                 path: "/t.parquet".into(),
             }),
-            KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody::new(
+            KrishivFlightAction::ContinuousRegister(Box::new(ContinuousRegisterBody::new(
                 "j",
                 WindowExecutionSpec::tumbling("k", "ts", 1_000),
-            )),
+            ))),
             KrishivFlightAction::ContinuousPush(ContinuousPushBody {
                 job_id: "j".into(),
                 batches_b64: String::new(),
             }),
             KrishivFlightAction::ContinuousDrain(ContinuousDrainBody { job_id: "j".into() }),
-            KrishivFlightAction::BoundedWindow(BoundedWindowBody {
+            KrishivFlightAction::BoundedWindow(Box::new(BoundedWindowBody {
                 topic: "t".into(),
                 spec: WindowExecutionSpec::tumbling("k", "ts", 1_000),
                 batches_b64: String::new(),
                 response_watermark_ms: None,
-            }),
+            })),
             KrishivFlightAction::Explain(ExplainBody {
                 sql: "SELECT 1".into(),
             }),

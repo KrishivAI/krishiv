@@ -747,12 +747,12 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         // The active coordinator owns partitioning and executor placement.
         // Flight pool alternates are failover coordinators, not data shards.
         let batches_b64 = encode_batches(&input_batches)?;
-        let action = KrishivFlightAction::BoundedWindow(BoundedWindowBody {
+        let action = KrishivFlightAction::BoundedWindow(Box::new(BoundedWindowBody {
             topic: topic.to_string(),
             spec: spec.to_plan_spec(),
             batches_b64,
             response_watermark_ms: None,
-        });
+        }));
         block_on(async {
             match self.pool.do_action(&action).await {
                 Ok(body) => {
@@ -922,10 +922,8 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         // real message instead of a transport-level one.
         options.expected_shape()?;
 
-        let action = KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody::with_options(
-            job_id,
-            spec.to_plan_spec(),
-            options.clone(),
+        let action = KrishivFlightAction::ContinuousRegister(Box::new(
+            ContinuousRegisterBody::with_options(job_id, spec.to_plan_spec(), options.clone()),
         ));
         block_on(async {
             match self.pool.do_action(&action).await {

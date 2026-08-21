@@ -924,12 +924,12 @@ pub async fn execute_remote_bounded_window(
 ) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
     use crate::flight_action::{BoundedWindowBody, KrishivFlightAction, encode_batches};
     let batches_b64 = encode_batches(&input_batches)?;
-    let action = KrishivFlightAction::BoundedWindow(BoundedWindowBody {
+    let action = KrishivFlightAction::BoundedWindow(Box::new(BoundedWindowBody {
         topic: topic.to_string(),
         spec: spec.to_plan_spec(),
         batches_b64,
         response_watermark_ms: None,
-    });
+    }));
     match pool.do_action(&action).await {
         Ok(body) => decode_ipc_response(&body),
         Err(e) if is_unimplemented(&e) => {

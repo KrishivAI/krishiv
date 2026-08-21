@@ -1595,6 +1595,25 @@ impl Session {
     /// runtime cannot flush — in which case the answer is genuinely
     /// incomplete and the caller must decide what to do, rather than being told
     /// nothing.
+    /// Register a continuous streaming job with execution-model options —
+    /// run-loop parallelism, checkpointing, and a sink (task #150 P2). The
+    /// options travel through the execution runtime's fail-closed seam: a
+    /// runtime that cannot honour them refuses by name, and remote
+    /// registrations verify the coordinator's echo of the applied shape.
+    pub fn submit_stream_job_with_options(
+        &self,
+        name: impl Into<String>,
+        spec: LocalWindowExecutionSpec,
+        options: &krishiv_runtime::ContinuousRegisterOptions,
+    ) -> Result<String> {
+        let name = name.into();
+        self.runtime
+            .register_continuous_stream_with_options(&name, &spec, options)
+            .map_err(KrishivError::from)?;
+        self.remember_stream_job(&name, None, spec);
+        Ok(name)
+    }
+
     /// Stop a continuous streaming job: its loops exit, operator state and
     /// undrained egress are discarded, and the id becomes free for a fresh
     /// registration. Routed through the execution runtime, so it reaches the

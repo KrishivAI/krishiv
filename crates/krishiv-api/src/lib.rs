@@ -29,6 +29,7 @@ pub mod query;
 pub mod session;
 pub mod sql_job;
 pub mod stream;
+pub mod stream_write;
 pub mod streaming_builder;
 pub mod streaming_dataframe;
 pub mod streaming_job;
@@ -111,6 +112,7 @@ pub use session::{
 };
 pub use sql_job::compile_sql_job;
 pub use stream::{KeyedStream, Stream};
+pub use stream_write::StreamWriter;
 pub use streaming_builder::{
     DataStreamReader, DataStreamWriter, ForeachBatchFn, KafkaTransactionalConfig,
     StreamingOutputMode, StreamingQuery, StreamingQueryProgress, StreamingTrigger,

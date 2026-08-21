@@ -406,6 +406,7 @@ impl FlightExecutionHost {
                 run_blocking(move || cluster.register_continuous_job(&job_id, &local))?;
                 Ok(krishiv_runtime::ContinuousRegisterAck {
                     class: Some(String::from("window")),
+                    sink: None,
                     mode: Some(String::from("cycle-push")),
                     parallelism: Some(1),
                     checkpointing: Some(false),
@@ -418,7 +419,11 @@ impl FlightExecutionHost {
                 // applied shape comes back from the one function that decides
                 // it, rather than being re-derived here where it could drift.
                 let scheduler_options = krishiv_scheduler::ContinuousRegistrationOptions {
-                    sink: None,
+                    // Threaded verbatim (task #150 P2): the ack echoes the
+                    // armed kind and the client verifies it, so a dropped
+                    // sink here would be caught — but not dropping it is
+                    // still better than catching the drop.
+                    sink: options.sink.clone(),
                     parallelism: options.parallelism,
                     mode: options.mode.clone(),
                     sources: options.sources.clone(),
@@ -1443,6 +1448,7 @@ mod tests {
     #[test]
     fn the_register_ack_survives_the_action_body_round_trip() {
         let ack = krishiv_runtime::ContinuousRegisterAck {
+            sink: None,
             class: Some(String::from("window")),
             mode: Some(String::from("run-loop")),
             parallelism: Some(6),

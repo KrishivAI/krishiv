@@ -166,7 +166,7 @@ impl ContinuousJobMode {
 ///   contract the executor opens through the connector registry. Delivery is
 ///   at-least-once (flushed per cycle, replayed cycles re-deliver), and the
 ///   driver must declare `resumable_flush` or the executor rejects it at open.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContinuousSinkSpec {
     /// Registered connector kind (`csv`, `elasticsearch`, `jdbc-sink`, …).
     /// When set, this is a registry-dispatched sink and the Iceberg fields are
@@ -210,6 +210,18 @@ fn default_sink_mode() -> String {
 }
 
 impl ContinuousSinkSpec {
+    /// The sink kind this spec arms — the connector kind for registry sinks,
+    /// `"iceberg"` otherwise. Echoed in the registration ack so a caller can
+    /// tell a dropped sink from an armed one.
+    #[must_use]
+    pub fn kind(&self) -> String {
+        self.connector
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map_or_else(|| String::from("iceberg"), ToOwned::to_owned)
+    }
+
     /// Build the validated string sink contract carried on the task spec —
     /// `registry-sink:<kind>|<base64-json>` when `connector` is set, otherwise
     /// `iceberg-sink:<root>|<table>|mode=...`.
@@ -2049,6 +2061,7 @@ pub async fn register_continuous_task_with_options(
         sources: options.sources.len(),
         checkpointing: options.checkpoint_interval_ms.is_some()
             && options.checkpoint_storage_path.is_some(),
+        sink: options.sink.as_ref().map(ContinuousSinkSpec::kind),
     })
 }
 
@@ -2063,7 +2076,7 @@ pub async fn register_continuous_task_with_options(
 /// request (because it predates the field, or because it took a different
 /// branch) would otherwise see a bare success and believe it got what it asked
 /// for. Every seam that can be driven from another process echoes this back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedContinuousRegistration {
     /// The execution model actually registered.
     pub mode: ContinuousJobMode,
@@ -2073,6 +2086,9 @@ pub struct AppliedContinuousRegistration {
     pub sources: usize,
     /// Whether barrier checkpointing was armed (needs BOTH knobs).
     pub checkpointing: bool,
+    /// The sink kind actually armed (`"iceberg"` or the connector kind);
+    /// `None` when the job has no sink and output travels through drain.
+    pub sink: Option<String>,
 }
 
 /// Assign, wire, and launch a freshly registered run-loop job's subtasks.
