@@ -545,6 +545,10 @@ pub enum CheckpointStateHandle {
     /// (Phase 55 / G5: the operator retains state across cycles and its
     /// barrier snapshots capture buffered join state).
     WindowJoin(Arc<std::sync::Mutex<krishiv_dataflow::WatermarkWindowJoinOperator>>),
+    /// Stateful join→aggregation pipeline owned by a `stream:rpipe:` job
+    /// (task #149 fix 4). Snapshot/restore run under `blocking_lock` — both
+    /// are invoked from the checkpoint runner's `spawn_blocking` context.
+    Pipeline(Arc<tokio::sync::Mutex<krishiv_dataflow::pipeline::JoinAggPipeline>>),
 }
 
 impl fmt::Debug for CheckpointStateHandle {
@@ -553,6 +557,7 @@ impl fmt::Debug for CheckpointStateHandle {
             Self::Backend(_) => f.write_str("CheckpointStateHandle::Backend"),
             Self::ContinuousWindow(_) => f.write_str("CheckpointStateHandle::ContinuousWindow"),
             Self::WindowJoin(_) => f.write_str("CheckpointStateHandle::WindowJoin"),
+            Self::Pipeline(_) => f.write_str("CheckpointStateHandle::Pipeline"),
         }
     }
 }
@@ -592,6 +597,12 @@ impl CheckpointStateHandle {
                     message: format!("window join snapshot: {e}"),
                     source: None,
                 }),
+            Self::Pipeline(pipe) => pipe.blocking_lock().snapshot_bytes().map_err(|e| {
+                krishiv_state::StateError::BackendUnavailable {
+                    message: format!("pipeline snapshot: {e}"),
+                    source: None,
+                }
+            }),
         }
     }
 
@@ -630,6 +641,14 @@ impl CheckpointStateHandle {
                 *guard = restored;
                 Ok(())
             }
+            Self::Pipeline(pipe) => {
+                pipe.blocking_lock()
+                    .restore_from_snapshot(bytes)
+                    .map_err(|e| krishiv_state::StateError::BackendUnavailable {
+                        message: format!("pipeline restore: {e}"),
+                        source: None,
+                    })
+            }
         }
     }
 
@@ -666,6 +685,12 @@ impl CheckpointStateHandle {
             // additive merge across snapshots has no defined semantics.
             Self::WindowJoin(_) => Err(krishiv_state::StateError::BackendUnavailable {
                 message: "window join state does not support additive snapshot merge".into(),
+                source: None,
+            }),
+            // The pipeline serializes join + stages as one snapshot; additive
+            // merge has no defined semantics, same as the join operator.
+            Self::Pipeline(_) => Err(krishiv_state::StateError::BackendUnavailable {
+                message: "pipeline state does not support additive snapshot merge".into(),
                 source: None,
             }),
         }

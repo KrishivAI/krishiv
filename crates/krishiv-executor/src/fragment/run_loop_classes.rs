@@ -607,6 +607,13 @@ pub(crate) async fn execute_rpipe_fragment(
     let left_key = format!("{job_id}#{task_id}#L");
     let right_key = format!("{job_id}#{task_id}#R");
 
+    // Barrier snapshots bind by task; the pipeline binding routes them to
+    // the per-subtask pipeline (task #149 fix 4 — without it a checkpointed
+    // pipeline job snapshotted the empty generic backend).
+    runner.task_state_bindings.insert(
+        task_id.clone(),
+        TaskStateBinding::Pipeline(state_key.clone()),
+    );
     let pipe_arc = {
         let entry = runner
             .pipeline_executors

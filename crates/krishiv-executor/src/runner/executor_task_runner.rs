@@ -69,6 +69,11 @@ pub enum TaskStateBinding {
     Window(String),
     /// `join_executors` key of a continuous two-input window join operator.
     Join(String),
+    /// `pipeline_executors` key of a join→aggregation pipeline (task #149
+    /// fix 4 — pipelines previously bound nothing, so a checkpointed
+    /// pipeline job snapshotted the empty generic backend and restored to
+    /// empty join and stage state).
+    Pipeline(String),
 }
 
 /// Dyn-erased coordinator client so long-lived fragments (the run-loop) can
@@ -1572,6 +1577,11 @@ impl ExecutorTaskRunner {
                 TaskStateBinding::Join(key) => {
                     if let Some(entry) = self.join_executors.get(key) {
                         return CheckpointStateHandle::WindowJoin(Arc::clone(entry.value()));
+                    }
+                }
+                TaskStateBinding::Pipeline(key) => {
+                    if let Some(entry) = self.pipeline_executors.get(key) {
+                        return CheckpointStateHandle::Pipeline(Arc::clone(entry.value()));
                     }
                 }
             }
