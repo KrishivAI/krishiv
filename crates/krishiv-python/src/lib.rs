@@ -36,6 +36,7 @@ mod sinks;
 mod sources;
 mod stream_bridges;
 mod stream_exec;
+mod stream_write_py;
 mod streaming;
 mod streaming_dataframe;
 mod udf;
@@ -202,6 +203,8 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<streaming_dataframe::PyDataStreamReader>()?;
     m.add_class::<streaming::PyStreamingQueryProgress>()?;
     m.add_class::<streaming::PyStreamingQuery>()?;
+    m.add_class::<stream_write_py::PyStreamWriter>()?;
+    m.add_class::<stream_write_py::PyUnifiedStreamingJob>()?;
     m.add_class::<streaming::PyStreamingQueryManager>()?;
     m.add_class::<streaming::PyDataStreamWriter>()?;
     m.add_class::<streaming::PyRemoteStreamingJob>()?;

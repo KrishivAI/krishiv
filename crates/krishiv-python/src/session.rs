@@ -187,6 +187,14 @@ pub struct PySession {
     pub(crate) state_migrations: SharedStateMigrationRegistry,
 }
 
+impl PySession {
+    /// Borrow the underlying engine session (crate-internal seam for the
+    /// converged streaming terminal).
+    pub(crate) fn engine(&self) -> &krishiv_api::Session {
+        &self.inner
+    }
+}
+
 #[pymethods]
 impl PySession {
     #[new]

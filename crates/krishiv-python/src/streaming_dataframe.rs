@@ -333,6 +333,14 @@ impl PyStreamingDataFrame {
         ))
     }
 
+    /// The converged write terminal (task #150): configure sink, output
+    /// mode, and trigger, then ``start(session, name)`` to get the unified
+    /// :class:`StreamingJob` handle. Executes on whatever mode the session
+    /// runs in.
+    pub fn write(&self) -> crate::stream_write_py::PyStreamWriter {
+        crate::stream_write_py::PyStreamWriter::new(self.engine().clone().write())
+    }
+
     pub fn write_stream(&self) -> PyResult<crate::streaming::PyDataStreamWriter> {
         // Rebuild from the streaming builder's underlying DataFrame via a fresh stream().
         Err(PyRuntimeError::new_err(
