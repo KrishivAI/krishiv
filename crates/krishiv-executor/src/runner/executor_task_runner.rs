@@ -189,6 +189,9 @@ pub struct ExecutorTaskRunner {
     /// batch has been APPLIED to its operator, closing the take-to-apply
     /// window the flush used to race.
     pub(crate) continuous_busy: crate::grpc::SharedContinuousBusy,
+    /// Split-pipeline EOS coordination — the `pipeline_prestage` member of
+    /// the shared class bundle (see `SharedClassExecutors`).
+    pub(crate) pipeline_prestage: Arc<DashMap<String, Arc<crate::grpc::PrestageFlushState>>>,
     /// Per-job/partition connector sources for `stream:loop:` registry inputs.
     ///
     /// These source instances retain connector-owned cursor state across
@@ -461,6 +464,7 @@ impl ExecutorTaskRunner {
             loop_executors: Arc::new(DashMap::new()),
             continuous_inputs: Arc::new(DashMap::new()),
             continuous_busy: Arc::new(DashMap::new()),
+            pipeline_prestage: Arc::new(DashMap::new()),
             continuous_connector_sources: Arc::new(DashMap::new()),
             rloop_connector_sinks: Arc::new(DashMap::new()),
             streaming_advisors: Arc::new(DashMap::new()),
@@ -931,6 +935,7 @@ impl ExecutorTaskRunner {
         self.join_executors = class_executors.join;
         self.pipeline_executors = class_executors.pipeline;
         self.stateless_executors = class_executors.stateless;
+        self.pipeline_prestage = class_executors.pipeline_prestage;
         self
     }
 

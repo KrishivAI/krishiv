@@ -47,6 +47,15 @@ pub const RUN_LOOP_EOS_TASK_ID: &str = "stream-eos";
 /// quiescence — no executor flushes while a peer still holds its rows.
 pub const RUN_LOOP_EOS_QUIESCE_TASK_ID: &str = "stream-eos-quiesce";
 
+/// Reserved pseudo-task id: phase one of the split-pipeline EOS flush. A
+/// parallel pipeline with a re-key point (q4: AVG per category after MAX per
+/// auction) holds join-co-located window state whose FLUSH OUTPUT belongs to
+/// other subtasks' post-split stages. This directive makes each pipeline
+/// loop flush its pre-split stages and route the output through the normal
+/// `#S` exchange; the coordinator then re-quiesces (the exchanged rows must
+/// be APPLIED) before the final `stream-eos` flushes the post-split state.
+pub const RUN_LOOP_EOS_PRESTAGE_TASK_ID: &str = "stream-eos-prestage";
+
 /// How long the EOS quiesce/flush legs wait for pending pushed input to be
 /// applied before failing loudly. Sized well under the coordinator's 10s
 /// run-loop RPC timeout; a full input buffer (cap 64) drains in well under a
@@ -74,6 +83,23 @@ pub struct SharedClassExecutors {
             Arc<tokio::sync::Mutex<krishiv_sql::stateless_exec::StatelessBatchExecutor>>,
         >,
     >,
+    /// Split-pipeline EOS coordination, keyed by JOB id: registered by every
+    /// rpipe loop whose spec has a re-key point, driven by the
+    /// `stream-eos-prestage` directive. Bundled here so it rides every seam
+    /// the class maps already share (the fix-6 lesson: class state left out
+    /// of the shared bundle is class state cancel cannot retire).
+    pub pipeline_prestage: Arc<DashMap<String, Arc<PrestageFlushState>>>,
+}
+
+/// Coordination record for one job's split-pipeline EOS flush.
+#[derive(Debug, Default)]
+pub struct PrestageFlushState {
+    /// Set by the `stream-eos-prestage` handler; each rpipe loop that
+    /// observes it flushes its pre-split stages through the `#S` exchange
+    /// and records itself in `done`.
+    pub requested: std::sync::atomic::AtomicBool,
+    /// Subtasks that completed their pre-split flush.
+    pub done: DashMap<usize, ()>,
 }
 
 /// Executor-side task assignment service backed by an in-memory inbox.
@@ -232,6 +258,55 @@ impl ExecutorTaskInboxService {
         }
     }
 
+    /// Drive the pre-split flush of every local split-pipeline subtask for
+    /// `job_id`: raise the request flag, wake the loops, and wait until each
+    /// has flushed its pre-split stages through the `#S` exchange. A job
+    /// with no re-key point has no entry and this is a no-op.
+    async fn run_prestage_flush(&self, job_id: &str) -> Result<(), tonic::Status> {
+        let Some(state) = self
+            .class_executors
+            .pipeline_prestage
+            .get(job_id)
+            .map(|e| Arc::clone(e.value()))
+        else {
+            return Ok(());
+        };
+        let prefix = format!("{job_id}#");
+        let expected = self
+            .class_executors
+            .pipeline
+            .iter()
+            .filter(|e| e.key().starts_with(&prefix))
+            .count();
+        state
+            .requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        for entry in self.input_notify.iter() {
+            if entry.key() == job_id || entry.key().starts_with(&prefix) {
+                entry.value().notify_waiters();
+            }
+        }
+        let deadline = tokio::time::Instant::now() + self.eos_quiesce_deadline;
+        loop {
+            if state.done.len() >= expected {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(tonic::Status::deadline_exceeded(format!(
+                    "pre-split pipeline flush for job {job_id} timed out: {}/{} subtasks                      flushed — a pipeline loop is wedged or already stopped",
+                    state.done.len(),
+                    expected
+                )));
+            }
+            for entry in self.input_notify.iter() {
+                if entry.key() == job_id || entry.key().starts_with(&prefix) {
+                    entry.value().notify_waiters();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     async fn flush_run_loop_job(&self, job_id: &str) -> Result<usize, tonic::Status> {
         // The flush leg re-verifies quiescence even though the coordinator
         // quiesces first: a single-executor deployment (or an old
@@ -239,6 +314,27 @@ impl ExecutorTaskInboxService {
         // complete there.
         self.await_run_loop_input_quiescence(job_id).await?;
         let prefix = format!("{job_id}#");
+        // A split pipeline's pre-split state must have crossed the `#S`
+        // exchange BEFORE this final flush — flushing it locally would feed
+        // rows into the WRONG subtasks' post-split stages (the scattered-key
+        // wrongness the re-key point exists to prevent). Fail closed: an old
+        // coordinator that never sends the prestage round must get an error,
+        // not a silently wrong aggregate.
+        if let Some(state) = self.class_executors.pipeline_prestage.get(job_id) {
+            let expected = self
+                .class_executors
+                .pipeline
+                .iter()
+                .filter(|e| e.key().starts_with(&prefix))
+                .count();
+            if state.done.len() < expected {
+                return Err(tonic::Status::failed_precondition(format!(
+                    "job {job_id} is a split pipeline: the stream-eos-prestage round must                      complete before stream-eos ({}/{} subtasks pre-flushed); is the                      coordinator too old to send it?",
+                    state.done.len(),
+                    expected
+                )));
+            }
+        }
         let mut outputs: Vec<RecordBatch> = Vec::new();
         for entry in self.loop_executors.iter() {
             if !(entry.key() == job_id || entry.key().starts_with(&prefix)) {
@@ -501,6 +597,9 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
             self.continuous_inputs
                 .retain(|k, _| !k.starts_with(&rloop_prefix));
             self.continuous_busy.remove(job_id.as_str());
+            self.class_executors
+                .pipeline_prestage
+                .remove(job_id.as_str());
             // Undrained egress is computed output that no consumer ever saw.
             // Destroying it is the right call — the job is gone and nothing
             // will ever drain it — but it used to be destroyed *silently*,
@@ -601,6 +700,13 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         // stages every open window into the egress buffer for the next
         // drain. Real subtask ids are `task-streaming-<n>`; "stream-eos"
         // cannot collide.
+        if req.task_id.as_str() == RUN_LOOP_EOS_PRESTAGE_TASK_ID {
+            self.await_run_loop_input_quiescence(&job_id).await?;
+            self.run_prestage_flush(&job_id).await?;
+            return Ok(tonic::Response::new(TaskStatusResponse::new(
+                TransportDisposition::Accepted,
+            )));
+        }
         if req.task_id.as_str() == RUN_LOOP_EOS_QUIESCE_TASK_ID {
             self.await_run_loop_input_quiescence(&job_id).await?;
             return Ok(tonic::Response::new(TaskStatusResponse::new(

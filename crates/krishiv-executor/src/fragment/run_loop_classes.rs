@@ -580,6 +580,56 @@ pub(crate) async fn execute_rjoin_fragment(
 /// A parallel pipeline needs an inter-stage exchange — a recorded follow-up,
 /// not a silent approximation. No checkpointing either (JoinAggPipeline has
 /// no snapshot yet), same recorded status as the stateless class.
+/// Route stage-input rows by the pipeline's re-key column: deliver each
+/// non-owned slice to its owner's `#S` buffer, return the owned slices.
+/// A NULL stage key is refused by name — the fused (parallelism-1) path
+/// would aggregate it, and diverging silently between the two is worse
+/// than failing loudly.
+async fn route_stage_exchange(
+    runner: &ExecutorTaskRunner,
+    job_id: &str,
+    peers: &[super::run_loop::RloopPeer],
+    parallelism: usize,
+    subtask: usize,
+    key_column: &str,
+    batches: Vec<RecordBatch>,
+) -> ExecutorResult<Vec<RecordBatch>> {
+    let mut owned: Vec<RecordBatch> = Vec::new();
+    let mut outbound: std::collections::BTreeMap<usize, Vec<RecordBatch>> = Default::default();
+    for batch in &batches {
+        let routed = route_batch_by_key_group(batch, key_column, parallelism, subtask)?;
+        if routed.null_key_rows > 0 {
+            return Err(local_err(format!(
+                "stream:rpipe NULL stage key in column '{key_column}' at the re-key                  point: refusing to route it silently"
+            )));
+        }
+        if let Some(own) = routed.owned {
+            owned.push(own);
+        }
+        for (peer_subtask, slice) in routed.routed {
+            outbound.entry(peer_subtask).or_default().push(slice);
+        }
+    }
+    for (peer_subtask, peer_batches) in outbound {
+        let Some(peer) = peers.iter().find(|p| p.subtask == peer_subtask) else {
+            return Err(ExecutorError::InvalidAssignment {
+                message: format!(
+                    "stream:rpipe stage exchange has rows for peer {peer_subtask} but no                      peer entry"
+                ),
+            });
+        };
+        crate::erased(super::run_loop::deliver_to_peer_suffixed(
+            runner,
+            job_id,
+            peer,
+            peer_batches,
+            "#S",
+        ))
+        .await?;
+    }
+    Ok(owned)
+}
+
 pub(crate) async fn execute_rpipe_fragment(
     runner: &ExecutorTaskRunner,
     assignment: &ExecutorTaskAssignment,
@@ -597,27 +647,44 @@ pub(crate) async fn execute_rpipe_fragment(
         .map_err(|e| ExecutorError::InvalidAssignment {
             message: format!("stream:rpipe spec: {e}"),
         })?;
-    // Parallel pipelines are allowed exactly when every stage groups by the
-    // join key (task #149 fix 10): the keyed exchange below co-locates each
-    // key's rows, so subtask-local stages are correct. The coordinator
-    // enforces the same predicate at registration; this is the sibling
-    // guard so a drifted coordinator cannot smuggle an unsafe shape in.
-    if parsed.parallelism != 1
-        && let Some(reason) = spec.parallel_unsafe_reason()
-    {
-        return Err(ExecutorError::InvalidAssignment {
-            message: format!(
-                "stream:rpipe parallelism {} is not supported for this pipeline: {reason}",
-                parsed.parallelism
-            ),
-        });
-    }
+    // Parallel pipelines (task #149 fix 10, extended): join-keyed stages run
+    // subtask-locally under the join-key exchange; a run of same-keyed
+    // non-join stages gets ONE re-key point — pre-split output is exchanged
+    // by the stage key (`#S` buffers) so the remainder is subtask-local too
+    // (the NEXMark q4 shape). Shapes a single exchange cannot co-locate are
+    // refused BY NAME; the coordinator enforces the same predicate at
+    // registration and this is the sibling guard.
+    let stage_split: Option<(usize, String)> = if parsed.parallelism > 1 {
+        match spec.parallel_plan() {
+            Ok(plan) => plan,
+            Err(reason) => {
+                return Err(ExecutorError::InvalidAssignment {
+                    message: format!(
+                        "stream:rpipe parallelism {} is not supported for this pipeline:                          {reason}",
+                        parsed.parallelism
+                    ),
+                });
+            }
+        }
+    } else {
+        None
+    };
     let join = spec.join.clone();
     let job_id = parsed.job_id.as_str();
     let task_id = assignment.task_id().as_str().to_owned();
     let state_key = rloop_state_key(job_id, parsed.subtask);
     let left_key = format!("{job_id}#{task_id}#L");
     let right_key = format!("{job_id}#{task_id}#R");
+    let stage_buf_key = format!("{job_id}#{task_id}#S");
+    if stage_split.is_some() {
+        // Registering the prestage record is what arms the split-flush leg
+        // of the EOS barrier AND makes the final flush fail closed if that
+        // leg never ran (an old coordinator).
+        runner
+            .pipeline_prestage
+            .entry(job_id.to_owned())
+            .or_default();
+    }
 
     // Barrier snapshots bind by task; the pipeline binding routes them to
     // the per-subtask pipeline (task #149 fix 4 — without it a checkpointed
@@ -644,6 +711,7 @@ pub(crate) async fn execute_rpipe_fragment(
 
     let own_left = runner.notify_handle(&left_key);
     let own_right = runner.notify_handle(&right_key);
+    let own_stage = runner.notify_handle(&stage_buf_key);
     let shared_notify = runner.notify_handle(job_id);
     let peers = parse_stream_peers(assignment.input_partitions())?;
     let all_specs = parse_registry_partition_specs(assignment.input_partitions())?;
@@ -732,6 +800,41 @@ pub(crate) async fn execute_rpipe_fragment(
             )
             .await?;
         }
+        let mut stage_in: Vec<RecordBatch> = if stage_split.is_some() {
+            take_pushed(runner, &stage_buf_key)
+        } else {
+            Vec::new()
+        };
+        // Split-flush leg of the EOS barrier: flush the pre-split stages and
+        // send their output through the SAME `#S` exchange as live rows —
+        // the coordinator re-quiesces before the final flush, so every
+        // exchanged row is applied before any post-split state is emitted.
+        if let Some((split, stage_key_column)) = &stage_split
+            && let Some(prestage) = runner
+                .pipeline_prestage
+                .get(job_id)
+                .map(|e| Arc::clone(e.value()))
+            && prestage.requested.load(std::sync::atomic::Ordering::SeqCst)
+            && !prestage.done.contains_key(&parsed.subtask)
+        {
+            let flushed = {
+                let mut pipe = pipe_arc.lock().await;
+                pipe.flush_pre_split(*split)
+                    .map_err(|e| local_err(format!("stream:rpipe pre-split flush: {e}")))?
+            };
+            let owned = route_stage_exchange(
+                runner,
+                job_id,
+                &peers,
+                parsed.parallelism,
+                parsed.subtask,
+                stage_key_column,
+                flushed,
+            )
+            .await?;
+            stage_in.extend(owned);
+            prestage.done.insert(parsed.subtask, ());
+        }
         // Keyed exchange, side preserved (task #149 fix 10): with
         // parallelism > 1 each side routes by ITS join key, exactly the
         // rjoin discipline — the join and every (join-keyed) stage then run
@@ -785,11 +888,12 @@ pub(crate) async fn execute_rpipe_fragment(
                 *batches = owned_batches;
             }
         }
-        if left_in.is_empty() && right_in.is_empty() {
+        if left_in.is_empty() && right_in.is_empty() && stage_in.is_empty() {
             drop(busy_iteration);
             tokio::select! {
                 _ = own_left.notified() => {}
                 _ = own_right.notified() => {}
+                _ = own_stage.notified() => {}
                 _ = shared_notify.notified() => {}
                 _ = tokio::time::sleep(idle_floor) => {}
             }
@@ -797,28 +901,84 @@ pub(crate) async fn execute_rpipe_fragment(
         }
 
         let mut outputs: Vec<RecordBatch> = Vec::new();
-        {
-            let mut pipe = pipe_arc.lock().await;
-            for b in &left_in {
-                if let Some(ts) = batch_max_event_time(b, &join.time_column) {
-                    left_wm.observe("#L", ts);
+        match &stage_split {
+            None => {
+                let mut pipe = pipe_arc.lock().await;
+                for b in &left_in {
+                    if let Some(ts) = batch_max_event_time(b, &join.time_column) {
+                        left_wm.observe("#L", ts);
+                    }
+                    outputs.extend(
+                        pipe.on_left(b)
+                            .map_err(|e| local_err(format!("stream:rpipe left: {e}")))?,
+                    );
                 }
-                outputs.extend(
-                    pipe.on_left(b)
-                        .map_err(|e| local_err(format!("stream:rpipe left: {e}")))?,
-                );
-            }
-            for b in &right_in {
-                if let Some(ts) = batch_max_event_time(b, &join.time_column) {
-                    right_wm.observe("#R", ts);
+                for b in &right_in {
+                    if let Some(ts) = batch_max_event_time(b, &join.time_column) {
+                        right_wm.observe("#R", ts);
+                    }
+                    outputs.extend(
+                        pipe.on_right(b)
+                            .map_err(|e| local_err(format!("stream:rpipe right: {e}")))?,
+                    );
                 }
-                outputs.extend(
-                    pipe.on_right(b)
-                        .map_err(|e| local_err(format!("stream:rpipe right: {e}")))?,
-                );
+                if let (Some(l), Some(r)) =
+                    (left_wm.combined(idleness), right_wm.combined(idleness))
+                {
+                    pipe.advance_watermark(l.min(r));
+                }
             }
-            if let (Some(l), Some(r)) = (left_wm.combined(idleness), right_wm.combined(idleness)) {
-                pipe.advance_watermark(l.min(r));
+            Some((split, stage_key_column)) => {
+                // Phase one: join + co-located stages, collecting the rows
+                // that must RE-KEY instead of feeding them onward locally.
+                let mut pre_out: Vec<RecordBatch> = Vec::new();
+                {
+                    let mut pipe = pipe_arc.lock().await;
+                    for b in &left_in {
+                        if let Some(ts) = batch_max_event_time(b, &join.time_column) {
+                            left_wm.observe("#L", ts);
+                        }
+                        pre_out.extend(
+                            pipe.on_left_pre_split(b, *split)
+                                .map_err(|e| local_err(format!("stream:rpipe left: {e}")))?,
+                        );
+                    }
+                    for b in &right_in {
+                        if let Some(ts) = batch_max_event_time(b, &join.time_column) {
+                            right_wm.observe("#R", ts);
+                        }
+                        pre_out.extend(
+                            pipe.on_right_pre_split(b, *split)
+                                .map_err(|e| local_err(format!("stream:rpipe right: {e}")))?,
+                        );
+                    }
+                    if let (Some(l), Some(r)) =
+                        (left_wm.combined(idleness), right_wm.combined(idleness))
+                    {
+                        pipe.advance_watermark(l.min(r));
+                    }
+                }
+                // Phase two: exchange by the stage key, then run the
+                // post-split stages over everything this subtask OWNS —
+                // freshly-owned rows plus whatever peers delivered to the
+                // `#S` buffer.
+                let owned = route_stage_exchange(
+                    runner,
+                    job_id,
+                    &peers,
+                    parsed.parallelism,
+                    parsed.subtask,
+                    stage_key_column,
+                    pre_out,
+                )
+                .await?;
+                stage_in.extend(owned);
+                if !stage_in.is_empty() {
+                    let mut pipe = pipe_arc.lock().await;
+                    outputs = pipe
+                        .on_stage_input(std::mem::take(&mut stage_in), *split)
+                        .map_err(|e| local_err(format!("stream:rpipe stage: {e}")))?;
+                }
             }
         }
         if !outputs.is_empty() {

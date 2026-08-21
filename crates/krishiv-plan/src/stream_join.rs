@@ -131,41 +131,73 @@ pub struct StreamingPipelineSpec {
 }
 
 impl StreamingPipelineSpec {
-    /// Why this pipeline canNOT run at parallelism > 1, or `None` when it can
-    /// (task #149 fix 10).
-    ///
-    /// The keyed exchange routes each side by ITS join key, so all rows for
-    /// one join key land on one subtask. A stage whose grouping key IS the
-    /// join key (as it appears in the joined output — collision-prefixed or
-    /// not) aggregates rows that are already co-located, so subtask-local
-    /// stages are correct. Any other stage key (NEXMark q4's category) would
-    /// need an inter-stage exchange, which remains the tracked follow-up;
-    /// those pipelines stay at parallelism 1, refused with this reason.
+    /// Why this pipeline canNOT run at parallelism > 1, or `None` when it
+    /// can — the thin gate over [`Self::parallel_plan`], kept for the
+    /// registration and executor guards that only need refuse-or-allow.
     #[must_use]
     pub fn parallel_unsafe_reason(&self) -> Option<String> {
-        let allowed = [
+        self.parallel_plan().err()
+    }
+
+    /// Where the parallel execution of this pipeline must RE-KEY, if
+    /// anywhere.
+    ///
+    /// `Ok(None)`: every stage's group key contains the join key, so
+    /// join-key routing co-locates every stage — subtask-local execution is
+    /// correct with no further exchange (fix 10's original safe case).
+    ///
+    /// `Ok(Some((split, key)))`: stages before `split` are join-key
+    /// co-located; every stage from `split` on groups by the single plain
+    /// column `key`, so ONE exchange of the stage input by `key` at the
+    /// split point makes the remainder subtask-local (the NEXMark q4 shape:
+    /// MAX per (auction, category) is auction-co-located, AVG per category
+    /// re-keys once).
+    ///
+    /// `Err(reason)`: no single re-key point exists (post-split stages with
+    /// differing, composite, or synthetic keys) — refused BY NAME; such a
+    /// shape must never silently run parallel.
+    ///
+    /// # Errors
+    /// The refusal reason, for surfacing verbatim at registration.
+    pub fn parallel_plan(&self) -> Result<Option<(usize, String)>, String> {
+        let join_keys = [
             self.join.left_key_column.clone(),
             format!("left_{}", self.join.left_key_column),
             self.join.right_key_column.clone(),
             format!("right_{}", self.join.right_key_column),
         ];
-        for (index, stage) in self.stages.iter().enumerate() {
+        // A stage whose group key CONTAINS the join key is co-located under
+        // join-key routing: all rows of one group share the join key value,
+        // whatever else the group key adds.
+        let colocated = |stage: &crate::window::WindowExecutionSpec| {
+            !stage.key_is_synthetic
+                && (join_keys.contains(&stage.key_column)
+                    || stage
+                        .key_parts
+                        .iter()
+                        .any(|part| join_keys.contains(&part.name)))
+        };
+        let Some(split) = self.stages.iter().position(|s| !colocated(s)) else {
+            return Ok(None);
+        };
+        let Some(split_stage) = self.stages.get(split) else {
+            return Ok(None);
+        };
+        let exchange_key = split_stage.key_column.clone();
+        for (index, stage) in self.stages.iter().enumerate().skip(split) {
             if stage.key_is_synthetic || !stage.key_parts.is_empty() {
-                return Some(format!(
-                    "stage {index} groups by a composite or synthetic key, which is not \
-                     a function of the join key"
+                return Err(format!(
+                    "stage {index} groups by a composite or synthetic key after the                      re-key point (stage {split}); a single exchange cannot co-locate it"
                 ));
             }
-            if !allowed.contains(&stage.key_column) {
-                return Some(format!(
-                    "stage {index} groups by '{}', which is not the join key (any of \
-                     {allowed:?}); rows for one '{}' value would be scattered across \
-                     subtasks",
-                    stage.key_column, stage.key_column
+            if stage.key_column != exchange_key {
+                return Err(format!(
+                    "stage {index} groups by '{}' but the re-key point (stage {split})                      exchanges by '{exchange_key}'; one exchange cannot serve both",
+                    stage.key_column
                 ));
             }
         }
-        None
+        Ok(Some((split, exchange_key)))
     }
 
     /// # Errors
@@ -221,24 +253,56 @@ mod parallel_safety {
         }
     }
 
-    /// The parallel gate (task #149 fix 10): join-keyed stages parallelize;
-    /// anything else is refused BY NAME — the q4 shape (a stage keyed on a
-    /// non-join column) must never silently run parallel and scatter one
-    /// key's rows across subtasks.
+    /// The parallel gate (task #149 fix 10, extended): join-keyed stages run
+    /// with no re-key; a run of same-keyed non-join stages gets ONE named
+    /// re-key point; anything a single exchange cannot co-locate is refused
+    /// BY NAME and must never silently run parallel.
     #[test]
-    fn join_keyed_stages_are_parallel_safe_and_others_are_named() {
-        assert!(base().parallel_unsafe_reason().is_none());
-        let mut q4_shape = base();
-        q4_shape.stages[0].key_column = "category".into();
-        let reason = q4_shape
-            .parallel_unsafe_reason()
-            .expect("non-join stage key must be refused");
-        assert!(reason.contains("category"));
+    fn parallel_plan_finds_the_single_rekey_point_or_refuses_by_name() {
+        // All stages join-keyed: no exchange needed.
+        assert_eq!(base().parallel_plan(), Ok(None));
+
+        // One stage keyed on a non-join column: re-key at stage 0.
+        let mut single = base();
+        single.stages[0].key_column = "category".into();
+        assert_eq!(single.parallel_plan(), Ok(Some((0, "category".into()))));
+        assert!(single.parallel_unsafe_reason().is_none());
+
+        // The REAL q4 shape: MAX per (auction, category) — co-located, its
+        // composite key contains the join key — then AVG per category:
+        // re-key at stage 1.
+        let mut q4 = base();
+        q4.stages[0].key_parts = vec![crate::window::KeyPart {
+            name: "category".into(),
+            type_tag: "utf8".into(),
+        }];
+        let mut avg = crate::window::WindowExecutionSpec::tumbling("category", "ts2", 10_000);
+        avg.watermark_lag_ms = 20_000;
+        q4.stages.push(avg);
+        assert_eq!(q4.parallel_plan(), Ok(Some((1, "category".into()))));
+
+        // Composite key AFTER the re-key point: one exchange cannot
+        // co-locate it — refused by name.
         let mut composite = base();
+        composite.stages[0].key_column = "category".into();
         composite.stages[0].key_parts = vec![crate::window::KeyPart {
             name: "x".into(),
             type_tag: "utf8".into(),
         }];
+        assert!(composite.parallel_plan().is_err());
         assert!(composite.parallel_unsafe_reason().is_some());
+
+        // Two post-split stages with DIFFERENT keys: no single exchange
+        // serves both — refused, naming both columns.
+        let mut differing = base();
+        differing.stages[0].key_column = "category".into();
+        let mut second = crate::window::WindowExecutionSpec::tumbling("channel", "ts2", 10_000);
+        second.watermark_lag_ms = 20_000;
+        differing.stages.push(second);
+        let reason = differing.parallel_plan().unwrap_err();
+        assert!(
+            reason.contains("channel") && reason.contains("category"),
+            "{reason}"
+        );
     }
 }

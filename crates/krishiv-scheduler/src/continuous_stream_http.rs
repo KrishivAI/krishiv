@@ -1228,6 +1228,14 @@ async fn push_run_loop_eos(
 /// every pushed batch for the job has been APPLIED by its loops and returns
 /// without flushing. See `flush_continuous_stream_coordinated` for why two
 /// full rounds across all executors precede the flush.
+async fn push_run_loop_eos_prestage(
+    channels: &crate::coordinator::task_assignment::ExecutorChannelMap,
+    job_id: &krishiv_proto::JobId,
+    endpoint: &str,
+) -> Result<(), ContinuousStreamError> {
+    push_run_loop_directive(channels, job_id, endpoint, "stream-eos-prestage").await
+}
+
 async fn push_run_loop_eos_quiesce(
     channels: &crate::coordinator::task_assignment::ExecutorChannelMap,
     job_id: &krishiv_proto::JobId,
@@ -2552,6 +2560,18 @@ pub async fn flush_continuous_stream_coordinated(
         // and a forwarded row is owned by its recipient (no cascade) — so
         // round one settles every sender, round two settles every recipient
         // of round one's forwards. Only then may anyone flush.
+        for _quiesce_round in 0..2 {
+            for endpoint in &endpoints {
+                push_run_loop_eos_quiesce(&channels, &job_id_typed, endpoint).await?;
+            }
+        }
+        // Split-pipeline leg: pipelines with a re-key point flush their
+        // pre-split stages THROUGH the `#S` exchange first (no-op for every
+        // other job shape), then a second quiesce ensures the exchanged rows
+        // were APPLIED before the final flush emits post-split state.
+        for endpoint in &endpoints {
+            push_run_loop_eos_prestage(&channels, &job_id_typed, endpoint).await?;
+        }
         for _quiesce_round in 0..2 {
             for endpoint in &endpoints {
                 push_run_loop_eos_quiesce(&channels, &job_id_typed, endpoint).await?;

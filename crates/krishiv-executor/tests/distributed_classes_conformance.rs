@@ -795,3 +795,202 @@ async fn parallel_pipeline_exchanges_keys_between_subtasks() {
          exchange failed to co-locate them"
     );
 }
+
+/// The q4 shape at parallelism > 1 (task #149 fix 10, extended): stage 0
+/// groups by (join key, cat) — co-located — and stage 1 groups by `cat`
+/// alone, which requires the re-key exchange at the split point plus the
+/// pre-stage EOS flush leg. Ground truth is the SAME job at parallelism 1;
+/// the parallel run must produce the identical per-cat aggregate rows.
+/// Without the `#S` exchange (or without the prestage flush round), cat
+/// groups fragment across subtasks and the row sets diverge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn split_pipeline_rekeys_stage_input_and_matches_parallelism_one() {
+    let rig = start_rig_with_loops("spipe", 4).await;
+
+    fn q4_spec() -> krishiv_plan::stream_join::StreamingPipelineSpec {
+        // Mirror the SQL compiler's multi-column GROUP BY encoding: ONE
+        // synthetic "__krishiv_key" column carrying the length-prefixed
+        // composite, with the parts listed for output expansion.
+        let mut stage0 =
+            krishiv_plan::window::WindowExecutionSpec::tumbling("__krishiv_key", "left_ts", 10_000);
+        stage0.watermark_lag_ms = 20_000;
+        stage0.key_parts = vec![
+            krishiv_plan::window::KeyPart {
+                name: "left_k".into(),
+                type_tag: "auto".into(),
+            },
+            krishiv_plan::window::KeyPart {
+                name: "cat".into(),
+                type_tag: "auto".into(),
+            },
+        ];
+        stage0.derived_columns = vec![krishiv_plan::window::DerivedColumn {
+            name: "__krishiv_key".into(),
+            expr: krishiv_plan::window::WindowScalarExpr::CompositeKey(vec![
+                "left_k".into(),
+                "cat".into(),
+            ]),
+        }];
+        stage0.agg_exprs = vec![krishiv_plan::window::WindowAgg {
+            kind: krishiv_plan::window::WindowAggKind::Count,
+            input_column: String::new(),
+            output_column: "n".into(),
+            filter: None,
+        }];
+        let mut stage1 =
+            krishiv_plan::window::WindowExecutionSpec::tumbling("cat", "window_start_ms", 10_000);
+        stage1.watermark_lag_ms = 20_000;
+        stage1.agg_exprs = vec![krishiv_plan::window::WindowAgg {
+            kind: krishiv_plan::window::WindowAggKind::Count,
+            input_column: String::new(),
+            output_column: "groups".into(),
+            filter: None,
+        }];
+        krishiv_plan::stream_join::StreamingPipelineSpec {
+            join: krishiv_plan::stream_join::StreamingJoinSpec {
+                left_source: "l".into(),
+                right_source: "r".into(),
+                time_column: "ts".into(),
+                left_key_column: "k".into(),
+                right_key_column: "k".into(),
+                window_ms: 10_000,
+            },
+            stages: vec![stage0, stage1],
+        }
+    }
+    assert_eq!(
+        q4_spec().parallel_plan(),
+        Ok(Some((1, "cat".into()))),
+        "the fixture must be the split shape this test exists for"
+    );
+
+    fn left_batch(k: &str, cat: &str, ts: i64) -> arrow::record_batch::RecordBatch {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("cat", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![k])),
+                Arc::new(StringArray::from(vec![cat])),
+                Arc::new(Int64Array::from(vec![ts])),
+            ],
+        )
+        .unwrap()
+    }
+    fn right_batch(k: &str, ts: i64) -> arrow::record_batch::RecordBatch {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![k])),
+                Arc::new(Int64Array::from(vec![ts])),
+            ],
+        )
+        .unwrap()
+    }
+
+    // 6 join keys spread over 3 cats: key-group hashing scatters both the
+    // join keys AND the cats across subtasks, so cat groups only reunite if
+    // the `#S` exchange runs.
+    let data: Vec<(&str, &str)> = vec![
+        ("a", "c1"),
+        ("b", "c2"),
+        ("c", "c3"),
+        ("d", "c1"),
+        ("e", "c2"),
+        ("f", "c3"),
+    ];
+
+    async fn run_job(
+        rig: &Rig,
+        job: &str,
+        parallelism: u32,
+        data: &[(&str, &str)],
+    ) -> Vec<(String, i64)> {
+        use krishiv_plan::stream_task::StreamingTaskSpec;
+        let task = StreamingTaskSpec::Pipeline(Box::new(q4_spec()));
+        let mut options = ContinuousRegistrationOptions::default();
+        options.mode = Some("run-loop".into());
+        options.parallelism = Some(parallelism);
+        krishiv_scheduler::register_continuous_task_with_options(
+            &rig.coordinator,
+            job,
+            &task,
+            &options,
+        )
+        .await
+        .expect("split pipeline registers");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for (k, cat) in data {
+            krishiv_scheduler::push_continuous_input_side_coordinated(
+                &rig.coordinator,
+                job,
+                "L",
+                ipc_bytes(&left_batch(k, cat, 1_000)),
+            )
+            .await
+            .expect("push L");
+            krishiv_scheduler::push_continuous_input_side_coordinated(
+                &rig.coordinator,
+                job,
+                "R",
+                ipc_bytes(&right_batch(k, 2_000)),
+            )
+            .await
+            .expect("push R");
+        }
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        krishiv_scheduler::flush_continuous_stream_coordinated(&rig.coordinator, job)
+            .await
+            .expect("EOS flush incl. prestage round");
+        let out = wait_drain(rig, job, 3, Duration::from_secs(10)).await;
+        // The RAW row multiset, not a per-cat sum: COUNT is decomposable, so
+        // summing fragments would equal the truth even when the exchange
+        // never ran and each cat's group split across subtasks. Fragmented
+        // output shows up here as MORE rows with SMALLER counts.
+        let mut rows: Vec<(String, i64)> = Vec::new();
+        for batch in &out {
+            let cats = batch
+                .column_by_name("cat")
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>())
+                .expect("cat column");
+            let counts = batch
+                .column_by_name("groups")
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>())
+                .expect("groups column");
+            for i in 0..batch.num_rows() {
+                rows.push((cats.value(i).to_owned(), counts.value(i)));
+            }
+        }
+        rows.sort();
+        rig.coordinator
+            .write()
+            .await
+            .push_cancel_job(&krishiv_proto::JobId::try_new(job).unwrap())
+            .await
+            .expect("deregister");
+        rows
+    }
+
+    let truth = run_job(&rig, "spipe-truth", 1, &data).await;
+    assert_eq!(
+        truth.len(),
+        3,
+        "exactly one row per cat at parallelism 1: {truth:?}"
+    );
+    let parallel = run_job(&rig, "spipe-par", 3, &data).await;
+    assert_eq!(
+        parallel, truth,
+        "parallel split-pipeline output must equal the parallelism-1 ground truth"
+    );
+}
