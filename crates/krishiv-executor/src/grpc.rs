@@ -482,7 +482,21 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         for key in &composite_keys {
             self.loop_executors.remove(key);
         }
-        if had_cycle_executor || had_rloop {
+        // Deregistration sends ONE cancel RPC per subtask, but only the FIRST
+        // one still finds run-loop state — it purges every composite key, so
+        // for the later RPCs `had_rloop` is false, the retirement block below
+        // is skipped, and the tombstones those RPCs set in `cancel_task()`
+        // above SURVIVE the teardown. A recreated job reusing the same
+        // deterministic ids then has those subtasks insta-cancelled at inbox
+        // pickup: a 3-parallel job silently runs 2 subtasks, the orphaned
+        // subtask's pushes sit unconsumed, and (pre-quiesce) the EOS flush
+        // discarded them without a word. Continuous task ids are
+        // deterministic (`task-streaming[-N]`), so gate the retirement on the
+        // ID SHAPE too — every RPC of the teardown then runs `forget_job`,
+        // and the LAST one leaves zero tombstones behind.
+        let is_continuous_task_id = request.task_id().as_str() == "task-streaming"
+            || request.task_id().as_str().starts_with("task-streaming-");
+        if had_cycle_executor || had_rloop || is_continuous_task_id {
             self.continuous_inputs.remove(job_id.as_str());
             self.continuous_inputs
                 .retain(|k, _| !k.starts_with(&rloop_prefix));
@@ -1161,6 +1175,57 @@ mod tests {
         assert!(
             err.message().contains("unapplied"),
             "the error must name the stall: {err}"
+        );
+    }
+
+    /// Deregistration sends one cancel RPC per subtask; only the first still
+    /// finds run-loop state. The later RPCs must STILL retire the job
+    /// identity, or the tombstones they set survive into the next incarnation
+    /// of the same deterministic job id, whose subtasks are then
+    /// insta-cancelled at inbox pickup (live: attempt14's q1 ran 2 of 3
+    /// subtasks and the EOS quiesce stalled on the orphan's unconsumed
+    /// pushes). Pre-fix: the second cancel's tombstone survives.
+    #[tokio::test]
+    async fn every_teardown_cancel_purges_its_own_tombstone_not_just_the_first() {
+        let service = ExecutorTaskInboxService::new(ExecutorAssignmentInbox::new_unbounded());
+        let job = krishiv_proto::JobId::try_new("reused-job").unwrap();
+        let spec = krishiv_plan::window::WindowExecutionSpec::tumbling("k", "ts", 60_000);
+        let exec = krishiv_dataflow::ContinuousWindowExecutor::new(spec).expect("executor builds");
+        service.loop_executors.insert(
+            "reused-job#task-streaming-0".into(),
+            Arc::new(Mutex::new(exec)),
+        );
+
+        let cancel = |task: &str| {
+            krishiv_proto::task::TaskCancellationRequest::new(krishiv_proto::TaskAttemptRef::new(
+                job.clone(),
+                krishiv_proto::StageId::try_new("stage-streaming").unwrap(),
+                krishiv_proto::TaskId::try_new(task).unwrap(),
+                krishiv_proto::AttemptId::try_new(1).unwrap(),
+            ))
+        };
+        use krishiv_proto::ExecutorTaskService as _;
+        // First cancel finds state and purges it (this always worked).
+        service
+            .cancel_task(tonic::Request::new(cancel("task-streaming-0")))
+            .await
+            .expect("first cancel");
+        // Second cancel arrives after the state is gone — the pre-fix gate
+        // skipped retirement here and its tombstone survived.
+        service
+            .cancel_task(tonic::Request::new(cancel("task-streaming-1")))
+            .await
+            .expect("second cancel");
+        let stale = service
+            .inbox
+            .is_task_cancelled(
+                &job,
+                &krishiv_proto::TaskId::try_new("task-streaming-1").unwrap(),
+            )
+            .unwrap();
+        assert!(
+            !stale,
+            "no tombstone may survive a continuous teardown — a recreated job              reusing the id would have this subtask insta-cancelled at pickup"
         );
     }
 
