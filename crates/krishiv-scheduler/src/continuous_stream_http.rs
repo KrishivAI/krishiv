@@ -870,6 +870,46 @@ pub async fn api_continuous_list(
     Ok(Json(ContinuousListResponse { streams }))
 }
 
+/// GET /api/v1/continuous/{job_id}/targets — a run-loop job's ingest
+/// targets: `(task_id, executor task-gRPC endpoint)` per subtask (task #149
+/// fix 7). Producers that can reach executor endpoints push DIRECTLY over
+/// gRPC — no coordinator HTTP hop, no base64/JSON re-encoding — with the
+/// coordinator serving only this discovery. Returns 404 for unknown jobs
+/// and 409 for jobs that are not run-loop.
+pub async fn api_continuous_targets(
+    State(coordinator): State<SharedCoordinator>,
+    Path(job_id): Path<String>,
+) -> Result<Json<ContinuousTargetsResponse>, (StatusCode, String)> {
+    let job_id = JobId::try_new(&job_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("invalid job id: {error}")))?;
+    let coord = coordinator.read().await;
+    let targets = run_loop_targets(&coord, &job_id)
+        .map_err(|error| scheduler_error_response(&error))?
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                format!("job {job_id} is not a run-loop job; direct ingest has no targets"),
+            )
+        })?;
+    Ok(Json(ContinuousTargetsResponse {
+        targets: targets
+            .into_iter()
+            .map(|(task_id, endpoint)| ContinuousTarget { task_id, endpoint })
+            .collect(),
+    }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContinuousTargetsResponse {
+    pub targets: Vec<ContinuousTarget>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContinuousTarget {
+    pub task_id: String,
+    pub endpoint: String,
+}
+
 pub async fn api_continuous_get(
     State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,

@@ -593,6 +593,10 @@ pub fn coordinator_http_router(
                 .delete(crate::continuous_stream_http::api_continuous_deregister),
         )
         .route(
+            "/api/v1/continuous/{job_id}/targets",
+            get(crate::continuous_stream_http::api_continuous_targets),
+        )
+        .route(
             "/api/v1/continuous-flush",
             post(crate::continuous_stream_http::api_continuous_flush),
         )

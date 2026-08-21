@@ -5274,6 +5274,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "arrow-flight",
+ "axum",
  "base64 0.22.1",
  "bytes",
  "dashmap",

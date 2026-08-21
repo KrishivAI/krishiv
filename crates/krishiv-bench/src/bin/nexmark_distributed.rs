@@ -182,6 +182,22 @@ async fn measure_rep(url: &str, name: &str, sql: &str, rep: usize) -> RepResult 
         .unwrap_or_else(|e| panic!("{name}: register: {e}"));
     tokio::time::sleep(Duration::from_millis(300)).await;
 
+    // Task #149 fix 7: with KRISHIV_BENCH_DIRECT_PUSH=1 the producer resolves
+    // the job's executor ingest endpoints once and pushes Arrow IPC straight
+    // to executor task gRPC, skipping the coordinator HTTP hop and the
+    // base64/JSON re-encode per chunk. Round-robin across targets mirrors the
+    // coordinator's own fan-out; subtasks re-route by key among themselves.
+    let direct_targets = if std::env::var("KRISHIV_BENCH_DIRECT_PUSH").as_deref() == Ok("1") {
+        let targets = krishiv_runtime::execute_coordinator_continuous_targets(url, &job)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: resolve direct-push targets: {e}"));
+        assert!(!targets.is_empty(), "{name}: no direct-push targets");
+        Some(targets)
+    } else {
+        None
+    };
+    let mut direct_cursor = 0usize;
+
     let started = Instant::now();
     let mut rows_in = 0usize;
     match &task {
@@ -194,12 +210,30 @@ async fn measure_rep(url: &str, name: &str, sql: &str, rep: usize) -> RepResult 
                 .map(|b| b.num_rows())
                 .sum::<usize>();
             for (l, r) in left.chunks(4).zip(right.chunks(4)) {
-                krishiv_runtime::execute_coordinator_continuous_push_side(url, &job, "R", r)
-                    .await
-                    .unwrap_or_else(|e| panic!("{name}: push R: {e}"));
-                krishiv_runtime::execute_coordinator_continuous_push_side(url, &job, "L", l)
-                    .await
-                    .unwrap_or_else(|e| panic!("{name}: push L: {e}"));
+                if let Some(targets) = &direct_targets {
+                    for (side, chunk) in [("R", r), ("L", l)] {
+                        let Some((task_id, endpoint)) = targets.get(direct_cursor % targets.len())
+                        else {
+                            panic!("{name}: direct-push target set is empty");
+                        };
+                        direct_cursor += 1;
+                        krishiv_runtime::push_continuous_direct(
+                            endpoint,
+                            &job,
+                            &format!("{task_id}#{side}"),
+                            chunk,
+                        )
+                        .await
+                        .unwrap_or_else(|e| panic!("{name}: direct push {side}: {e}"));
+                    }
+                } else {
+                    krishiv_runtime::execute_coordinator_continuous_push_side(url, &job, "R", r)
+                        .await
+                        .unwrap_or_else(|e| panic!("{name}: push R: {e}"));
+                    krishiv_runtime::execute_coordinator_continuous_push_side(url, &job, "L", l)
+                        .await
+                        .unwrap_or_else(|e| panic!("{name}: push L: {e}"));
+                }
             }
         }
         StreamingTaskSpec::Pipeline(p) => {
@@ -211,21 +245,50 @@ async fn measure_rep(url: &str, name: &str, sql: &str, rep: usize) -> RepResult 
                 .map(|b| b.num_rows())
                 .sum::<usize>();
             for (l, r) in left.chunks(4).zip(right.chunks(4)) {
-                krishiv_runtime::execute_coordinator_continuous_push_side(url, &job, "R", r)
-                    .await
-                    .unwrap_or_else(|e| panic!("{name}: push R: {e}"));
-                krishiv_runtime::execute_coordinator_continuous_push_side(url, &job, "L", l)
-                    .await
-                    .unwrap_or_else(|e| panic!("{name}: push L: {e}"));
+                if let Some(targets) = &direct_targets {
+                    for (side, chunk) in [("R", r), ("L", l)] {
+                        let Some((task_id, endpoint)) = targets.get(direct_cursor % targets.len())
+                        else {
+                            panic!("{name}: direct-push target set is empty");
+                        };
+                        direct_cursor += 1;
+                        krishiv_runtime::push_continuous_direct(
+                            endpoint,
+                            &job,
+                            &format!("{task_id}#{side}"),
+                            chunk,
+                        )
+                        .await
+                        .unwrap_or_else(|e| panic!("{name}: direct push {side}: {e}"));
+                    }
+                } else {
+                    krishiv_runtime::execute_coordinator_continuous_push_side(url, &job, "R", r)
+                        .await
+                        .unwrap_or_else(|e| panic!("{name}: push R: {e}"));
+                    krishiv_runtime::execute_coordinator_continuous_push_side(url, &job, "L", l)
+                        .await
+                        .unwrap_or_else(|e| panic!("{name}: push L: {e}"));
+                }
             }
         }
         _ => {
             let batches = side_batches("bid", BATCHES);
             rows_in += batches.iter().map(|b| b.num_rows()).sum::<usize>();
             for chunk in batches.chunks(4) {
-                krishiv_runtime::execute_coordinator_continuous_push(url, &job, chunk)
-                    .await
-                    .unwrap_or_else(|e| panic!("{name}: push: {e}"));
+                if let Some(targets) = &direct_targets {
+                    let Some((task_id, endpoint)) = targets.get(direct_cursor % targets.len())
+                    else {
+                        panic!("{name}: direct-push target set is empty");
+                    };
+                    direct_cursor += 1;
+                    krishiv_runtime::push_continuous_direct(endpoint, &job, task_id, chunk)
+                        .await
+                        .unwrap_or_else(|e| panic!("{name}: direct push: {e}"));
+                } else {
+                    krishiv_runtime::execute_coordinator_continuous_push(url, &job, chunk)
+                        .await
+                        .unwrap_or_else(|e| panic!("{name}: push: {e}"));
+                }
             }
         }
     }

@@ -1160,6 +1160,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "Checkpoint storage path the distributed NEXMark harness passes at registration when KRISHIV_BENCH_CHECKPOINT_INTERVAL_MS is non-zero.",
     ),
     rt(
+        "KRISHIV_BENCH_DIRECT_PUSH",
+        FlagKind::Bool,
+        "unset",
+        "Set to 1: the distributed NEXMark harness resolves executor ingest targets once per job (GET /api/v1/continuous/{job}/targets) and pushes Arrow IPC straight to executor task gRPC endpoints, bypassing the coordinator HTTP hop and base64/JSON re-encode (task #149 fix 7). Requires the producer to REACH executor endpoints: in-cluster or loopback single-node; pod IPs are unreachable through a coordinator-only tunnel.",
+    ),
+    rt(
         "KRISHIV_STREAM_EARLY_FIRE_MS",
         FlagKind::UInt,
         "unset",

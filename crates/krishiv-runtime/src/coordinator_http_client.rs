@@ -1436,6 +1436,126 @@ pub async fn execute_coordinator_continuous_drain_wait(
         })
 }
 
+/// A run-loop job's ingest targets — `(task_id, executor task-gRPC
+/// endpoint)` per subtask (task #149 fix 7). Producers that can REACH the
+/// executor endpoints (in-cluster, or loopback single-node) push directly
+/// with [`push_continuous_direct`], eliminating the coordinator HTTP hop and
+/// the base64/JSON re-encode per chunk.
+pub async fn execute_coordinator_continuous_targets(
+    coordinator_http: &str,
+    job_id: &str,
+) -> RuntimeResult<Vec<(String, String)>> {
+    #[derive(serde::Deserialize)]
+    struct Target {
+        task_id: String,
+        endpoint: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct TargetsResponse {
+        targets: Vec<Target>,
+    }
+    let base = normalize_http_base(coordinator_http)?;
+    let url = format!("{base}/api/v1/continuous/{}/targets", seg(job_id));
+    let client = coordinator_http_client()?;
+    let response = apply_coordinator_bearer(client.get(&url))
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("continuous-targets request failed: {e}")))?;
+    if !response.status().is_success() {
+        return Err(transport_error_with_body(
+            format!("continuous-targets HTTP {} from {url}", response.status()),
+            response,
+        )
+        .await);
+    }
+    let payload: TargetsResponse = response
+        .json()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("continuous-targets decode failed: {e}")))?;
+    Ok(payload
+        .targets
+        .into_iter()
+        .map(|t| (t.task_id, t.endpoint))
+        .collect())
+}
+
+/// Push batches STRAIGHT to one executor's task gRPC endpoint (task #149
+/// fix 7) — Arrow IPC over gRPC, no coordinator hop, no base64/JSON. The
+/// task id may carry a `#L`/`#R` side suffix for two-source jobs.
+/// Authenticates with KRISHIV_EXECUTOR_TASK_BEARER_TOKEN when set (required
+/// against durable-profile executors).
+fn encode_batches_ipc_bytes(
+    batches: &[arrow::record_batch::RecordBatch],
+) -> RuntimeResult<Vec<u8>> {
+    let Some(first) = batches.first() else {
+        return Err(RuntimeError::transport(
+            "direct push: empty batch set".to_owned(),
+        ));
+    };
+    let mut buffer = Vec::new();
+    {
+        let mut writer =
+            arrow::ipc::writer::StreamWriter::try_new(&mut buffer, first.schema().as_ref())
+                .map_err(|e| RuntimeError::transport(format!("direct push ipc encode: {e}")))?;
+        for batch in batches {
+            writer
+                .write(batch)
+                .map_err(|e| RuntimeError::transport(format!("direct push ipc write: {e}")))?;
+        }
+        writer
+            .finish()
+            .map_err(|e| RuntimeError::transport(format!("direct push ipc finish: {e}")))?;
+    }
+    Ok(buffer)
+}
+
+pub async fn push_continuous_direct(
+    executor_endpoint: &str,
+    job_id: &str,
+    task_id_with_side: &str,
+    input_batches: &[arrow::record_batch::RecordBatch],
+) -> RuntimeResult<()> {
+    use krishiv_proto::{TaskId, TransportVersion, wire};
+    let channel = tonic::transport::Endpoint::from_shared(executor_endpoint.to_owned())
+        .map_err(|e| RuntimeError::transport(format!("bad executor endpoint: {e}")))?
+        .connect()
+        .await
+        .map_err(|e| {
+            RuntimeError::transport(format!("connect to {executor_endpoint} failed: {e}"))
+        })?;
+    let max = krishiv_proto::max_grpc_message_bytes();
+    let mut client = wire::v1::executor_task_client::ExecutorTaskClient::new(channel)
+        .max_decoding_message_size(max)
+        .max_encoding_message_size(max);
+    let mut request = tonic::Request::new(wire::push_continuous_input_request_to_wire(
+        krishiv_proto::task::PushContinuousInputRequest {
+            version: TransportVersion::CURRENT,
+            job_id: krishiv_proto::JobId::try_new(job_id)
+                .map_err(|e| RuntimeError::transport(e.to_string()))?,
+            task_id: TaskId::try_new(task_id_with_side)
+                .map_err(|e| RuntimeError::transport(e.to_string()))?,
+            ipc_bytes: encode_batches_ipc_bytes(input_batches)?,
+        },
+    ));
+    if let Ok(token) = std::env::var("KRISHIV_EXECUTOR_TASK_BEARER_TOKEN") {
+        let token = token.trim();
+        if !token.is_empty()
+            && let Ok(value) = tonic::metadata::MetadataValue::try_from(format!("Bearer {token}"))
+        {
+            request.metadata_mut().insert("authorization", value);
+        }
+    }
+    client
+        .push_continuous_input(request)
+        .await
+        .map_err(|status| {
+            RuntimeError::transport(format!(
+                "direct push to {executor_endpoint} failed: {status}"
+            ))
+        })?;
+    Ok(())
+}
+
 /// Declare end-of-stream for a continuous job (bounded producers). Cycle
 /// jobs run a final flush cycle; run-loop jobs stage every open window into
 /// their egress buffers — call drain afterwards to collect the flushed rows.
