@@ -6,7 +6,12 @@
 //! to end, plus one update-mode and one complete-mode case to exercise the
 //! mitigated output modes on the wire.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::print_stdout)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout
+)]
 
 use std::time::{Duration, Instant};
 
@@ -27,11 +32,36 @@ struct Case {
 }
 
 const CASES: &[Case] = &[
-    Case { name: "t1_count_per_bidder", output_mode: "append", window_ms: 10_000, key: "bidder" },
-    Case { name: "t2_count_per_auction", output_mode: "append", window_ms: 10_000, key: "auction" },
-    Case { name: "t3_wide_window", output_mode: "append", window_ms: 60_000, key: "bidder" },
-    Case { name: "t4_update_mode", output_mode: "update", window_ms: 10_000, key: "auction" },
-    Case { name: "t5_complete_mode", output_mode: "complete", window_ms: 10_000, key: "bidder" },
+    Case {
+        name: "t1_count_per_bidder",
+        output_mode: "append",
+        window_ms: 10_000,
+        key: "bidder",
+    },
+    Case {
+        name: "t2_count_per_auction",
+        output_mode: "append",
+        window_ms: 10_000,
+        key: "auction",
+    },
+    Case {
+        name: "t3_wide_window",
+        output_mode: "append",
+        window_ms: 60_000,
+        key: "bidder",
+    },
+    Case {
+        name: "t4_update_mode",
+        output_mode: "update",
+        window_ms: 10_000,
+        key: "auction",
+    },
+    Case {
+        name: "t5_complete_mode",
+        output_mode: "complete",
+        window_ms: 10_000,
+        key: "bidder",
+    },
 ];
 
 fn bid_batches(batches: usize) -> Vec<RecordBatch> {
@@ -61,8 +91,10 @@ async fn drain_until_stable(job: &StreamingJob) -> usize {
 async fn run_case(session: &Session, case: &Case, rep: usize) -> (usize, usize, f64) {
     let job_name = format!("nexterm-{}-{rep}", case.name);
     let mut writer = session
-        .sql("SELECT CAST(0 AS BIGINT) AS auction, CAST(0 AS BIGINT) AS bidder, \
-              CAST(0 AS BIGINT) AS price, CAST(0 AS BIGINT) AS \"dateTime\"")
+        .sql(
+            "SELECT CAST(0 AS BIGINT) AS auction, CAST(0 AS BIGINT) AS bidder, \
+              CAST(0 AS BIGINT) AS price, CAST(0 AS BIGINT) AS \"dateTime\"",
+        )
         .expect("seed df")
         .stream()
         .with_event_time("dateTime")
@@ -74,12 +106,10 @@ async fn run_case(session: &Session, case: &Case, rep: usize) -> (usize, usize, 
     if let (Ok(interval), Ok(path)) = (
         std::env::var("KRISHIV_BENCH_CHECKPOINT_INTERVAL_MS"),
         std::env::var("KRISHIV_BENCH_CHECKPOINT_PATH"),
-    ) {
-        if let Ok(ms) = interval.parse::<u64>() {
-            if ms > 0 {
-                writer = writer.checkpoint(ms, path);
-            }
-        }
+    ) && let Ok(ms) = interval.parse::<u64>()
+        && ms > 0
+    {
+        writer = writer.checkpoint(ms, path);
     }
     let job = writer
         .start(session, &job_name)
@@ -94,7 +124,10 @@ async fn run_case(session: &Session, case: &Case, rep: usize) -> (usize, usize, 
             .await
             .unwrap_or_else(|e| panic!("{}: push: {e}", case.name));
     }
-    let flushed = job.flush().await.unwrap_or_else(|e| panic!("{}: flush: {e}", case.name));
+    let flushed = job
+        .flush()
+        .await
+        .unwrap_or_else(|e| panic!("{}: flush: {e}", case.name));
     let mut rows_out: usize = flushed.iter().map(RecordBatch::num_rows).sum();
     let drained = drain_until_stable(&job).await;
     if case.output_mode == "complete" {
@@ -104,7 +137,9 @@ async fn run_case(session: &Session, case: &Case, rep: usize) -> (usize, usize, 
         rows_out += drained;
     }
     let elapsed = started.elapsed();
-    job.stop().await.unwrap_or_else(|e| panic!("{}: stop: {e}", case.name));
+    job.stop()
+        .await
+        .unwrap_or_else(|e| panic!("{}: stop: {e}", case.name));
     let evs = rows_in as f64 / elapsed.as_secs_f64();
     (rows_in, rows_out, evs)
 }
@@ -128,7 +163,10 @@ async fn main() {
          batches, {REPS} reps, median)",
         CASES.len()
     );
-    println!("{:<24} {:>12} {:>10} {:>10}", "case", "ev/sec med", "rows in", "rows out");
+    println!(
+        "{:<24} {:>12} {:>10} {:>10}",
+        "case", "ev/sec med", "rows in", "rows out"
+    );
 
     let mut failures: Vec<String> = Vec::new();
     for case in CASES {
@@ -140,10 +178,16 @@ async fn main() {
             last = (rin, rout);
         }
         evs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let med = evs[evs.len() / 2];
-        println!("{:<24} {:>12.0} {:>10} {:>10}", case.name, med, last.0, last.1);
+        let med = evs.get(evs.len() / 2).copied().unwrap_or_default();
+        println!(
+            "{:<24} {:>12.0} {:>10} {:>10}",
+            case.name, med, last.0, last.1
+        );
         if last.1 == 0 {
-            failures.push(format!("{}: consumed {} rows and emitted NOTHING", case.name, last.0));
+            failures.push(format!(
+                "{}: consumed {} rows and emitted NOTHING",
+                case.name, last.0
+            ));
         }
     }
     if failures.is_empty() {
