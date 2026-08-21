@@ -994,3 +994,59 @@ async fn split_pipeline_rekeys_stage_input_and_matches_parallelism_one() {
         "parallel split-pipeline output must equal the parallelism-1 ground truth"
     );
 }
+
+/// Update-mode early fire on the RUN-LOOP engine (task #150 P3): the spec's
+/// `early_fire_interval_ms` makes the loop re-emit currently-OPEN tumbling
+/// windows as provisional upserts, on every deployment mode — not just the
+/// embedded loop's env flag. Rows land in a window the watermark never
+/// closes; without the fire the drain stays empty forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_loop_early_fire_surfaces_open_windows() {
+    use krishiv_plan::stream_task::StreamingTaskSpec;
+    let rig = start_rig("efire").await;
+    let job = "efire-j";
+    let mut spec = krishiv_plan::window::WindowExecutionSpec::tumbling("k", "ts", 3_600_000);
+    spec.watermark_lag_ms = 3_600_000;
+    spec.early_fire_interval_ms = Some(10);
+    let task = StreamingTaskSpec::Window(Box::new(spec));
+    let mut options = ContinuousRegistrationOptions::default();
+    options.mode = Some("run-loop".into());
+    options.parallelism = Some(1);
+    krishiv_scheduler::register_continuous_task_with_options(
+        &rig.coordinator,
+        job,
+        &task,
+        &options,
+    )
+    .await
+    .expect("early-fire job registers");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let batch = {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int64Array::from(vec![1_000i64, 2_000])),
+            ],
+        )
+        .unwrap()
+    };
+    krishiv_scheduler::push_continuous_input_coordinated(&rig.coordinator, job, ipc_bytes(&batch))
+        .await
+        .expect("push open-window rows");
+
+    let out = wait_drain(&rig, job, 2, Duration::from_secs(10)).await;
+    let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+    assert!(
+        rows >= 2,
+        "the open windows for keys a and b must surface as provisional upserts \
+         without the watermark ever closing them; got {rows} rows"
+    );
+}

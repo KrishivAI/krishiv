@@ -309,6 +309,15 @@ pub struct WindowExecutionSpec {
     pub key_column_type: String,
     pub event_time_column: String,
     pub watermark_lag_ms: u64,
+    /// Task #150 P3 (update output mode): when set, the executing loop
+    /// speculatively re-emits currently-OPEN tumbling windows every this
+    /// many milliseconds, as provisional upserts keyed on
+    /// `(key, window_start_ms)`. `None` (default) keeps append-on-close
+    /// semantics. A per-JOB registration field rather than the embedded
+    /// loop's process-global env flag, so it can ride the wire into any
+    /// deployment mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub early_fire_interval_ms: Option<u64>,
     pub window_kind: WindowKind,
     pub window_size_ms: u64,
     /// Slide step for sliding windows.
@@ -415,6 +424,7 @@ impl WindowExecutionSpec {
             key_column_type: default_key_type(),
             event_time_column: event_time_column.into(),
             watermark_lag_ms: 0,
+            early_fire_interval_ms: None,
             window_kind: WindowKind::Tumbling,
             window_size_ms,
             slide_ms: None,
@@ -483,6 +493,7 @@ pub fn decode_window_execution_spec(encoded: &str) -> Result<WindowExecutionSpec
         key_column_type: default_key_type(),
         event_time_column: parsed.time_col,
         watermark_lag_ms: parsed.lag_ms,
+        early_fire_interval_ms: None,
         window_kind: parsed.window_kind,
         window_size_ms: parsed.window_ms,
         slide_ms,
@@ -1114,6 +1125,7 @@ mod tests {
             key_column_type: super::default_key_type(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
+            early_fire_interval_ms: None,
             window_kind: super::WindowKind::Session,
             window_size_ms: 0,
             slide_ms: None,
@@ -1226,6 +1238,7 @@ mod tests {
             key_column_type: default_key_type(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 1000,
+            early_fire_interval_ms: None,
             window_kind: WindowKind::Tumbling,
             window_size_ms: 60_000,
             slide_ms: None,
@@ -1261,6 +1274,7 @@ mod tests {
             key_column_type: default_key_type(),
             event_time_column: String::from("event_ts"),
             watermark_lag_ms: 250,
+            early_fire_interval_ms: None,
             window_kind: WindowKind::Sliding,
             window_size_ms: 60_000,
             slide_ms: Some(5_000),
@@ -1361,6 +1375,7 @@ mod tests {
             key_column_type: default_key_type(),
             event_time_column: "event_ts".into(),
             watermark_lag_ms: 100,
+            early_fire_interval_ms: None,
             window_kind: WindowKind::Tumbling,
             window_size_ms: 60_000,
             slide_ms: None,
@@ -1418,6 +1433,7 @@ mod tests {
             key_column_type: default_key_type(),
             event_time_column: "ts:ms".into(),
             watermark_lag_ms: 100,
+            early_fire_interval_ms: None,
             window_kind: WindowKind::Tumbling,
             window_size_ms: 5_000,
             slide_ms: None,
@@ -1448,6 +1464,7 @@ mod tests {
             key_column_type: default_key_type(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
+            early_fire_interval_ms: None,
             window_kind: WindowKind::Tumbling,
             window_size_ms: 1_000,
             slide_ms: None,
@@ -1479,6 +1496,7 @@ mod tests {
             key_column_type: default_key_type(),
             event_time_column: "event_ts".into(),
             watermark_lag_ms: 100,
+            early_fire_interval_ms: None,
             window_kind: WindowKind::Tumbling,
             window_size_ms: 60_000,
             slide_ms: None,
@@ -1571,6 +1589,7 @@ mod tests {
                         key_column_type: default_key_type(),
                         event_time_column,
                         watermark_lag_ms,
+                        early_fire_interval_ms: None,
                         window_kind,
                         window_size_ms,
                         slide_ms,

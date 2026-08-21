@@ -834,6 +834,13 @@ pub(crate) async fn execute_run_loop_fragment(
     let source_cache = runner.shared_continuous_connector_sources();
 
     let idle_floor = Duration::from_micros(RLOOP_IDLE_FLOOR_US);
+    // Update-mode early fire (task #150 P3): a per-JOB registration field,
+    // not the embedded loop's process-global env flag — it rides the spec
+    // into every deployment mode.
+    let early_fire = window_spec
+        .early_fire_interval_ms
+        .map(Duration::from_millis);
+    let mut last_early_fire = Instant::now();
     // The idle-tick interval and its elapsed gate both live in the driver now.
     // `StreamingLoop::RunLoop` declares `IdleTick::WallClock`, which is the
     // record of what used to be an unwritten agreement between this loop and
@@ -959,6 +966,33 @@ pub(crate) async fn execute_run_loop_fragment(
                 },
             )
             .await?;
+        }
+
+        // Update-mode early fire (task #150 P3): speculatively re-emit the
+        // currently-OPEN tumbling windows as provisional upserts keyed on
+        // (key, window_start_ms). Read-only on operator state — the
+        // close-time flush stays the durable record; consumers in update
+        // mode overwrite by key. Session/sliding operators return None from
+        // the snapshot (refused upstream at write(); belt here).
+        if let Some(interval) = early_fire
+            && last_early_fire.elapsed() >= interval
+        {
+            last_early_fire = Instant::now();
+            let speculative = {
+                let exec = executor_arc
+                    .lock()
+                    .map_err(|_| ExecutorError::LocalExecution {
+                        message: format!("stream:rloop job '{job_id}' executor lock poisoned"),
+                    })?;
+                exec.emit_open_windows_speculative()
+            };
+            if let Some(batches) = speculative
+                && !batches.is_empty()
+            {
+                rows_emitted += batches.iter().map(|b| b.num_rows() as u64).sum::<u64>();
+                batches_emitted += batches.len() as u64;
+                crate::erased(runner.stage_rloop_outputs(job_id, assignment, &batches)).await?;
+            }
         }
 
         // ST-4 idle tick: close session windows whose inactivity gap elapsed.

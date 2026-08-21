@@ -147,14 +147,12 @@ impl StreamWriter {
     /// cannot honour them (the options seam's existing fail-closed echo).
     pub fn start(self, session: &Session, job_name: impl Into<String>) -> Result<StreamingJob> {
         match self.output_mode.as_str() {
-            "append" => {}
-            "update" | "complete" => {
+            "append" | "update" => {}
+            "complete" => {
                 return Err(KrishivError::InvalidConfig {
-                    message: format!(
-                        "output mode '{}' is staged behind task #150 P3/P4 and not yet \
-                         wired; 'append' is the supported mode",
-                        self.output_mode
-                    ),
+                    message: "output mode 'complete' is staged behind task #150 P4 and not \
+                              yet wired; 'append' and 'update' are the supported modes"
+                        .into(),
                 });
             }
             other => {
@@ -178,7 +176,7 @@ impl StreamWriter {
             });
         }
 
-        let spec = self
+        let mut spec = self
             .df
             .execution_spec()?
             .ok_or_else(|| KrishivError::InvalidConfig {
@@ -186,6 +184,27 @@ impl StreamWriter {
                       window before start()"
                     .into(),
             })?;
+        if self.output_mode == "update" {
+            // Update mode = speculative re-emission of OPEN windows as
+            // provisional upserts keyed on (key, window_start_ms). Only the
+            // tumbling operator supports the read-only open-window snapshot;
+            // session/sliding shapes are refused BY NAME rather than
+            // registering a job that silently behaves like append.
+            if !matches!(spec.window_kind, krishiv_runtime::LocalWindowKind::Tumbling) {
+                return Err(KrishivError::InvalidConfig {
+                    message: "output mode 'update' requires a tumbling window: the \
+                              speculative open-window snapshot that update mode is \
+                              built on exists only for the tumbling operator"
+                        .into(),
+                });
+            }
+            let interval = if self.trigger == "processing_time" {
+                self.trigger_interval_ms.max(1)
+            } else {
+                1_000
+            };
+            spec.early_fire_interval_ms = Some(interval);
+        }
         let sink = self.sink_spec()?;
         let job_name = job_name.into();
 
@@ -317,5 +336,90 @@ mod tests {
             text.contains("cannot honour") || text.contains("options"),
             "the refusal must name the options seam: {text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod update_mode_tests {
+    use std::sync::Arc;
+
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    use super::*;
+
+    fn batch(users: &[&str], ts: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(users.to_vec())) as _,
+                Arc::new(Int64Array::from(ts.to_vec())) as _,
+            ],
+        )
+        .expect("batch")
+    }
+
+    /// Update mode end to end on the embedded engine: rows land in a window
+    /// the watermark NEVER closes (huge lag), and a paced drain still
+    /// surfaces them as provisional upserts. Pre-fix behavior (no early-fire
+    /// promotion): the drain returns nothing until close or EOS, and this
+    /// test goes red on the emptiness assertion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_mode_surfaces_open_windows_between_closes() {
+        let session = Session::builder().build().expect("session");
+        let job = session
+            .sql("SELECT 'seed' AS user_id, CAST(0 AS BIGINT) AS ts")
+            .expect("df")
+            .stream()
+            .with_event_time("ts")
+            .key_by("user_id")
+            .tumbling_window(3_600_000)
+            .with_watermark_lag(3_600_000)
+            .write()
+            .output_mode("update")
+            .trigger("processing_time", 1)
+            .start(&session, "upd-open")
+            .expect("update job registers");
+        job.push(vec![batch(&["a", "a", "b"], &[1_000, 2_000, 3_000])])
+            .await
+            .expect("push");
+        // First drain applies input; the fire is paced at 1ms, so the next
+        // drain (after a beat) must surface the OPEN windows.
+        let _ = job.drain().await.expect("drain applies input");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let provisional = job.drain().await.expect("paced drain");
+        let rows: usize = provisional.iter().map(RecordBatch::num_rows).sum();
+        assert!(
+            rows >= 2,
+            "open windows for keys a and b must surface as provisional upserts, got {rows}"
+        );
+        job.stop().await.expect("stop");
+    }
+
+    /// Update mode on a session window is refused BY NAME — the speculative
+    /// snapshot only exists for the tumbling operator, and registering the
+    /// job anyway would silently behave like append.
+    #[test]
+    fn update_mode_refuses_non_tumbling_windows() {
+        let session = Session::builder().build().expect("session");
+        let Err(err) = session
+            .sql("SELECT 'seed' AS user_id, CAST(0 AS BIGINT) AS ts")
+            .expect("df")
+            .stream()
+            .with_event_time("ts")
+            .key_by("user_id")
+            .session_window(5_000)
+            .write()
+            .output_mode("update")
+            .start(&session, "upd-session")
+        else {
+            panic!("session-window update mode must refuse");
+        };
+        assert!(err.to_string().contains("tumbling"), "{err}");
     }
 }

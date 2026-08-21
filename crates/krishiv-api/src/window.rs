@@ -201,6 +201,7 @@ fn build_tumbling_spec(
         key_column_type: String::from("utf8"),
         event_time_column: event_time,
         watermark_lag_ms: lag,
+        early_fire_interval_ms: None,
         window_kind: LocalWindowKind::Tumbling,
         window_size_ms,
         agg_exprs,
@@ -382,6 +383,7 @@ impl SessionWindowedStream {
             key_column_type: String::from("utf8"),
             event_time_column: event_time,
             watermark_lag_ms: lag,
+            early_fire_interval_ms: None,
             window_kind: LocalWindowKind::Session {
                 gap_ms: self.session_gap_ms,
             },
@@ -418,6 +420,7 @@ impl SlidingWindowedStream {
             key_column_type: String::from("utf8"),
             event_time_column: event_time,
             watermark_lag_ms: lag,
+            early_fire_interval_ms: None,
             window_kind: LocalWindowKind::Sliding {
                 slide_ms: self.slide_ms,
             },

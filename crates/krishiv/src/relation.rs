@@ -90,6 +90,7 @@ impl StreamingChain {
             key_column,
             event_time_column,
             watermark_lag_ms: self.watermark_lag_ms,
+            early_fire_interval_ms: None,
             window_kind,
             window_size_ms,
             agg_exprs: self

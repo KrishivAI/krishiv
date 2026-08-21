@@ -67,6 +67,11 @@ struct ContinuousJobEntry {
     input: Mutex<ContinuousInputState>,
     /// Locked only during `drain_job` for the window computation itself.
     executor: Mutex<ContinuousWindowExecutor>,
+    /// Update-mode early fire (task #150 P3): wall-clock of the last
+    /// speculative open-window emission, so `drain_job` can pace it to the
+    /// spec's `early_fire_interval_ms` — the embedded twin of the run-loop's
+    /// per-iteration fire.
+    last_early_fire: Mutex<std::time::Instant>,
 }
 
 impl std::fmt::Debug for ContinuousJobEntry {
@@ -203,6 +208,7 @@ impl ContinuousStreamRegistry {
                 entry.insert(Arc::new(ContinuousJobEntry {
                     spec,
                     input: Mutex::new(ContinuousInputState::default()),
+                    last_early_fire: Mutex::new(std::time::Instant::now()),
                     executor: Mutex::new(executor),
                 }));
                 Ok(())
@@ -358,7 +364,11 @@ impl ContinuousStreamRegistry {
                 .collect()
         };
         if input.is_empty() {
-            return Ok(Vec::new());
+            // Update-mode early fire (task #150 P3), the embedded twin of the
+            // run-loop's per-iteration fire: with no closed windows to emit,
+            // a paced drain still surfaces the OPEN windows as provisional
+            // upserts keyed on (key, window_start_ms).
+            return Ok(self.early_fire_snapshot(&entry, &exec));
         }
         let consumed = input.len();
         let output =
@@ -383,7 +393,33 @@ impl ContinuousStreamRegistry {
         for _ in 0..consumed {
             let _ = queued.batches.pop_front();
         }
+        drop(queued);
+        let mut output = output;
+        output.extend(self.early_fire_snapshot(&entry, &exec));
         Ok(output)
+    }
+
+    /// One paced speculative emission of the OPEN windows, when the job's
+    /// spec asks for update-mode early fire. Empty when the interval has not
+    /// elapsed, the spec has no interval, or the operator holds no open
+    /// tumbling windows.
+    fn early_fire_snapshot(
+        &self,
+        entry: &ContinuousJobEntry,
+        exec: &ContinuousWindowExecutor,
+    ) -> Vec<RecordBatch> {
+        let Some(interval_ms) = entry.spec.early_fire_interval_ms else {
+            return Vec::new();
+        };
+        let interval = std::time::Duration::from_millis(interval_ms);
+        let Ok(mut last) = entry.last_early_fire.lock() else {
+            return Vec::new();
+        };
+        if last.elapsed() < interval {
+            return Vec::new();
+        }
+        *last = std::time::Instant::now();
+        exec.emit_open_windows_speculative().unwrap_or_default()
     }
 
     /// Drain up to [`DEFAULT_MAX_DRAIN_BATCHES`] batches through the operator.
@@ -580,6 +616,7 @@ impl ContinuousStreamRegistry {
                 entry.insert(Arc::new(ContinuousJobEntry {
                     spec,
                     input: Mutex::new(ContinuousInputState::default()),
+                    last_early_fire: Mutex::new(std::time::Instant::now()),
                     executor: Mutex::new(executor),
                 }));
                 Ok(())

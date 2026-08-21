@@ -184,6 +184,7 @@ mod tests {
             key_column_type: String::from("utf8"),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
+            early_fire_interval_ms: None,
             window_kind: LocalWindowKind::Tumbling,
             window_size_ms: 10_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),

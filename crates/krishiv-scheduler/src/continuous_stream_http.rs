@@ -3017,6 +3017,7 @@ mod tests {
             key_column_type: String::from("utf8"),
             event_time_column: "ts".to_string(),
             watermark_lag_ms: 0,
+            early_fire_interval_ms: None,
             window_kind: WindowKind::Tumbling,
             window_size_ms: 10_000,
             slide_ms: None,

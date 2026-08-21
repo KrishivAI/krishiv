@@ -1035,6 +1035,7 @@ mod output_mode_compat_tests {
                             key_column_type: "utf8".into(),
                             event_time_column: "ts".into(),
                             watermark_lag_ms: 0,
+                            early_fire_interval_ms: None,
                             window_size_ms: 1000,
                             slide_ms: None,
                             session_gap_ms: None,

@@ -169,6 +169,7 @@ pub fn compile_streaming_window_sql(sql: &str) -> SqlResult<StreamingWindowPlan>
         },
         event_time_column: window.event_time_column,
         watermark_lag_ms: 0,
+        early_fire_interval_ms: None,
         window_kind: window.kind,
         window_size_ms: window.window_size_ms,
         slide_ms: window.slide_ms,

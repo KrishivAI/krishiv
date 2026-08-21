@@ -47,6 +47,7 @@ fn streaming_window_preserves_float64_sum() {
         key_column_type: "utf8".into(),
         event_time_column: "ts".into(),
         watermark_lag_ms: 0,
+        early_fire_interval_ms: None,
         window_kind: WindowKind::Tumbling,
         window_size_ms: 10_000,
         slide_ms: None,

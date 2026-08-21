@@ -98,6 +98,7 @@ pub fn streaming_spec_from_plan(
         key_column_type,
         event_time_column,
         watermark_lag_ms,
+        early_fire_interval_ms: None,
         window_kind,
         window_size_ms,
         agg_exprs,
