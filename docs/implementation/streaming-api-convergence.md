@@ -65,8 +65,15 @@ P6. **Mode-matrix conformance.** The same pipeline + data through
     result multisets (extends the S1 cross-loop harness), including a
     sink round-trip and an update-mode and complete-mode case each.
 
-P7. **Deprecation + docs.** Old surfaces marked deprecated with the
-    replacement named; feature matrix updated to what the code DOES.
+P7. **Cleanup + docs (user decision 2026-08-21: REMOVE, don't
+    deprecate).** The superseded surfaces are DELETED once the converged
+    core covers them — `DataFrame::write_stream()`/`StreamingQuery` as a
+    public API (the engine loop stays as the embedded executor behind
+    the terminal), `RemoteStreamingJob` (folded into
+    `StreamingJob::attach`), and the bare `submit_stream_job`/
+    `push_stream_job_input`/`poll_stream_job` trio where the handle
+    covers them. Python drops the parallel classes the same way. Docs
+    and the feature matrix updated to what the code DOES.
 
 Discipline: every phase lands as its own commit with revert-proven
 tests and full gates (fmt, clippy -D warnings, workspace tests).
