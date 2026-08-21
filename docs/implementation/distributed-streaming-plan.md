@@ -109,3 +109,27 @@ ring cap (512) truncates large EOS flushes (q9 retained exactly cap batches)
 — drain-before-flush or raise KRISHIV_RLOOP_EGRESS_CAP; distributed rows_out
 for window queries under-reports vs embedded EOS-flush totals when watermark
 closes lag behind (documented, not a defect).
+
+## Durable-mode runs (2026-08-21, commit a6936ac) — BOTH PASS
+
+Re-ran with executors at `single-node-durable` (RocksDB state, batched-WAL
+fsync per checkpoint epoch) and 1s barrier checkpointing on every job
+(KRISHIV_BENCH_CHECKPOINT_INTERVAL_MS=1000). RocksDB SSTs + per-job
+checkpoint dirs verified on disk in both environments.
+
+- 3-node k3s rig (chart: durable executors + emptyDir at /var/lib/krishiv):
+  gate PASS 22/22 at 10.4–23.2K ev/s — ~10–20% under dev-local, the
+  RocksDB + checkpoint cost.
+- Single node (local clusterd + 1 executor, 12 slots, same profile, same
+  harness over loopback): gate PASS 22/22 at 82–164K ev/s.
+
+New follow-ups surfaced by durable mode (recorded, not fixed):
+- A fragment whose checkpoint storage cannot be created (mkdir EACCES)
+  kills the executor DAEMON, not the task — the process exits and the
+  coordinator sees Lost.
+- The durable executor auto-selects its checkpoint URI at startup and the
+  job registration's checkpoint_storage_path is silently ignored;
+  --checkpoint-uri is the only override. Registration should either honor
+  the job's path or refuse it loudly.
+- Stale-binary defense proved out live: the class-echo verify_ack refused a
+  week-old local clusterd that would have silently registered cycle jobs.
