@@ -31,9 +31,13 @@ def main():
         .tumbling_window(10000)  # 10 seconds tumbling window
     )
 
-    # 4. Submit the continuous job.
-    job_id = session.submit_stream_job("alerts_stream", windowed)
-    print(f"Submitted continuous stream job ID: {job_id}")
+    # 4. Start the continuous job through the ONE write terminal; the
+    # returned StreamingJob handle owns push/drain/flush/stop identically on
+    # embedded, single-node, and distributed sessions.
+    writer = windowed.write()
+    writer.trigger("continuous", 1000)
+    job = writer.start(session, "alerts_stream")
+    print(f"Started continuous stream job: {job.id}")
 
     # 5. Prepare and dynamically push a real-time record batch
     batch = pa.RecordBatch.from_pydict({
@@ -41,10 +45,10 @@ def main():
         "user_id": ["Alice", "Bob"],
     }, schema=schema)
 
-    session.push_stream_job_input(job_id, [ks.Batch(batch)])
+    job.push([ks.Batch(batch)])
 
     # 5. Poll for active window outputs emitted by the running job
-    results = session.poll_stream_job(job_id)
+    results = job.drain()
     print(f"Polled {len(results)} batches from continuous stream job")
 
     if results:

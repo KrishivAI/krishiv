@@ -340,14 +340,6 @@ impl PyStreamingDataFrame {
     pub fn write(&self) -> crate::stream_write_py::PyStreamWriter {
         crate::stream_write_py::PyStreamWriter::new(self.engine().clone().write())
     }
-
-    pub fn write_stream(&self) -> PyResult<crate::streaming::PyDataStreamWriter> {
-        // Rebuild from the streaming builder's underlying DataFrame via a fresh stream().
-        Err(PyRuntimeError::new_err(
-            "use DataFrame.write_stream() for structured streaming sinks; \
-             StreamingDataFrame.execute_stream_async() runs the pipeline",
-        ))
-    }
 }
 
 #[pyfunction]

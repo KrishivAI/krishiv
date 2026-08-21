@@ -546,21 +546,6 @@ impl PyDataFrame {
         py.detach(move || inner.num_rows().map_err(map_krishiv_error))
     }
 
-    /// Create a :class:`DataStreamWriter` for writing this DataFrame as a streaming sink.
-    ///
-    /// ## Example
-    ///
-    /// ```python
-    /// writer = df.write_stream()
-    /// writer.output_mode("append")
-    /// writer.trigger("processing_time", 1000)
-    /// query = writer.start()
-    /// query.await_termination(timeout_ms=30_000)
-    /// ```
-    pub fn write_stream(&self) -> crate::streaming::PyDataStreamWriter {
-        crate::streaming::PyDataStreamWriter::new(self.inner.clone())
-    }
-
     /// Convert this DataFrame into a :class:`StreamingDataFrame` builder.
     pub fn to_streaming(&self) -> crate::streaming_dataframe::PyStreamingDataFrame {
         crate::streaming_dataframe::PyStreamingDataFrame::new(self.inner.clone())

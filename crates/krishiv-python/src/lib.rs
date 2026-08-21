@@ -37,7 +37,6 @@ mod sources;
 mod stream_bridges;
 mod stream_exec;
 mod stream_write_py;
-mod streaming;
 mod streaming_dataframe;
 mod udf;
 
@@ -69,9 +68,6 @@ pub use sinks::{
     PyParquetSink,
 };
 pub use stream_bridges::PyBroadcastContext;
-pub use streaming::{
-    PyDataStreamWriter, PyRemoteStreamingJob, PyStreamingQuery, PyStreamingQueryProgress,
-};
 pub use streaming_dataframe::{PyDataStreamReader, PyStreamingDataFrame, interval_join};
 pub use udf::call_python_udf;
 pub use vector_sinks::{
@@ -201,13 +197,8 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_class::<streaming_dataframe::PyStreamingDataFrame>()?;
     m.add_class::<streaming_dataframe::PyDataStreamReader>()?;
-    m.add_class::<streaming::PyStreamingQueryProgress>()?;
-    m.add_class::<streaming::PyStreamingQuery>()?;
     m.add_class::<stream_write_py::PyStreamWriter>()?;
     m.add_class::<stream_write_py::PyUnifiedStreamingJob>()?;
-    m.add_class::<streaming::PyStreamingQueryManager>()?;
-    m.add_class::<streaming::PyDataStreamWriter>()?;
-    m.add_class::<streaming::PyRemoteStreamingJob>()?;
     m.add_function(wrap_pyfunction!(connect_streaming, m)?)?;
 
     // Process function / stateful operator (Phase G parity)
@@ -265,8 +256,8 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
 pub fn connect_streaming(
     coordinator_url: String,
     job_id: String,
-) -> streaming::PyRemoteStreamingJob {
-    streaming::PyRemoteStreamingJob::py_new(coordinator_url, job_id)
+) -> stream_write_py::PyUnifiedStreamingJob {
+    stream_write_py::PyUnifiedStreamingJob::attach(coordinator_url, job_id)
 }
 
 // ---------------------------------------------------------------------------
