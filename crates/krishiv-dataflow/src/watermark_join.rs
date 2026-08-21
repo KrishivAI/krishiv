@@ -259,7 +259,7 @@ impl WatermarkWindowJoinOperator {
             crate::ExecError::ColumnNotFound(format!("join key column '{key_col}'"))
         })?;
 
-        let mut out = Vec::new();
+        let mut pairs: Vec<(Arc<RecordBatch>, Arc<RecordBatch>)> = Vec::new();
         for row in 0..n {
             let time_ms = extract_i64(batch, time_idx, row).ok_or_else(|| {
                 crate::ExecError::UnsupportedType(format!(
@@ -277,25 +277,20 @@ impl WatermarkWindowJoinOperator {
             } else {
                 self.join.push_right(&key, time_ms, row_batch)
             };
-            for (l, r) in matches {
-                out.push(concat_row_batches(l.as_ref(), r.as_ref())?);
-            }
+            pairs.extend(matches);
         }
-        // Coalesce the per-match single-row batches into ONE batch per input
-        // batch. Every match in a call shares the joined schema (each side's
-        // batches share a schema), and emitting thousands of one-row batches
-        // made every downstream consumer — pipeline stages especially — pay
-        // full per-batch overhead per matched ROW.
-        if out.len() > 1 {
-            let schema = out
-                .first()
-                .map(RecordBatch::schema)
-                .ok_or_else(|| crate::ExecError::InvalidInput("empty coalesce".into()))?;
-            let merged = arrow::compute::concat_batches(&schema, out.iter())
-                .map_err(|e| crate::ExecError::Arrow(e.to_string()))?;
-            out = vec![merged];
+        // Batch-at-a-time output (task #149 fix 8): all matches from one
+        // input batch become ONE output batch, built columnar — the joined
+        // schema is computed once and each column is a single concat over
+        // the matched rows. The predecessor ran the schema collision
+        // analysis and a row-level concat PER MATCH and then concatenated
+        // the resulting one-row batches a second time.
+        if pairs.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        let merged =
+            join_pairs_to_batch(&pairs).map_err(|e| crate::ExecError::Arrow(e.to_string()))?;
+        Ok(vec![merged])
     }
 }
 
@@ -310,11 +305,39 @@ fn slice_batch(batch: &RecordBatch, row: usize) -> RecordBatch {
     batch.slice(row, 1)
 }
 
-/// Merge left and right single-row batches into one (left cols ∥ right cols).
+/// Merge matched (left, right) row pairs into ONE batch (left cols ∥ right
+/// cols), computing the joined schema once and concatenating each column
+/// across all pairs (task #149 fix 8).
 ///
 /// If a column name appears in both sides, prefix with `left_` / `right_` to
-/// prevent Arrow schema-uniqueness violations.
-fn concat_row_batches(left: &RecordBatch, right: &RecordBatch) -> Result<RecordBatch, ArrowError> {
+/// prevent Arrow schema-uniqueness violations — the same naming rule the
+/// per-match predecessor applied, so downstream stage specs keep resolving.
+fn join_pairs_to_batch(
+    pairs: &[(Arc<RecordBatch>, Arc<RecordBatch>)],
+) -> Result<RecordBatch, ArrowError> {
+    let (first_left, first_right) = pairs
+        .first()
+        .ok_or_else(|| ArrowError::InvalidArgumentError("empty join pair set".into()))?;
+    let schema = joined_schema(first_left, first_right);
+    let left_cols = first_left.num_columns();
+    let right_cols = first_right.num_columns();
+    let mut cols: Vec<arrow::array::ArrayRef> = Vec::with_capacity(left_cols + right_cols);
+    for idx in 0..left_cols {
+        let parts: Vec<&dyn arrow::array::Array> =
+            pairs.iter().map(|(l, _)| l.column(idx).as_ref()).collect();
+        cols.push(arrow::compute::concat(&parts)?);
+    }
+    for idx in 0..right_cols {
+        let parts: Vec<&dyn arrow::array::Array> =
+            pairs.iter().map(|(_, r)| r.column(idx).as_ref()).collect();
+        cols.push(arrow::compute::concat(&parts)?);
+    }
+    RecordBatch::try_new(schema, cols)
+}
+
+/// The joined output schema for one (left, right) pair — the naming rules of
+/// the original row-level merge, factored so they run once per input batch.
+fn joined_schema(left: &RecordBatch, right: &RecordBatch) -> Arc<Schema> {
     use arrow::datatypes::Field;
     let left_schema = left.schema();
     let right_schema = right.schema();
@@ -351,10 +374,7 @@ fn concat_row_batches(left: &RecordBatch, right: &RecordBatch) -> Result<RecordB
         .chain(right.schema().fields().iter().map(|f| rename(f, "right_")))
         .collect();
 
-    let schema = Arc::new(Schema::new(fields));
-    let mut cols = left.columns().to_vec();
-    cols.extend_from_slice(right.columns());
-    RecordBatch::try_new(schema, cols)
+    Arc::new(Schema::new(fields))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -364,6 +384,20 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+
+    /// All matches from one input batch arrive as ONE output batch (task
+    /// #149 fix 8): the per-match one-row-batch shape made every downstream
+    /// consumer pay full per-batch overhead per matched row.
+    #[test]
+    fn matches_from_one_input_batch_form_one_output_batch() {
+        let mut op = WatermarkWindowJoinOperator::new(make_spec(10_000));
+        let left = multi_row_batch(&["a", "b", "c"], &[1_000, 1_000, 1_000]);
+        assert!(op.process_left(&left).expect("left buffers").is_empty());
+        let right = multi_row_batch(&["a", "b", "c"], &[2_000, 2_000, 2_000]);
+        let out = op.process_right(&right).expect("right matches");
+        assert_eq!(out.len(), 1, "one output batch per input batch");
+        assert_eq!(out[0].num_rows(), 3, "carrying every match");
+    }
 
     fn make_spec(window_ms: u64) -> WatermarkWindowJoinSpec {
         WatermarkWindowJoinSpec {
