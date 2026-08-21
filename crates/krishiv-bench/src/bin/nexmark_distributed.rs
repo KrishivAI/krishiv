@@ -57,11 +57,52 @@ fn task_for(sql: &str, source_hint: &str) -> StreamingTaskSpec {
                 .spec,
         ))
     } else {
+        // Queries that JOIN the bounded reference table carry it in the spec
+        // — the wire-native form of what the embedded harness does by
+        // registering "side" on the executor before the stream starts.
+        let side_tables = if sql.contains(" side ") || sql.contains(" side\n") {
+            vec![side_table_spec()]
+        } else {
+            vec![]
+        };
         StreamingTaskSpec::Stateless(Box::new(StatelessQuerySpec {
             sql: sql.to_owned(),
             source: source_hint.to_owned(),
-            side_tables: vec![],
+            side_tables,
         }))
+    }
+}
+
+/// The q13 reference table (auction id % 1000 → label), wire-encoded. Same
+/// shape the embedded harness registers as "side".
+fn side_table_spec() -> krishiv_plan::stream_task::SideTableSpec {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use base64::Engine as _;
+    let schema = std::sync::Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, false),
+    ]));
+    let keys: Vec<i64> = (0..1000).collect();
+    let labels: Vec<String> = keys.iter().map(|k| format!("label-{k}")).collect();
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            std::sync::Arc::new(Int64Array::from(keys)),
+            std::sync::Arc::new(StringArray::from(labels)),
+        ],
+    )
+    .expect("side batch");
+    let mut sink = Vec::new();
+    {
+        let mut writer =
+            arrow::ipc::writer::StreamWriter::try_new(&mut sink, &schema).expect("ipc writer");
+        writer.write(&batch).expect("write side batch");
+        writer.finish().expect("finish side ipc");
+    }
+    krishiv_plan::stream_task::SideTableSpec {
+        name: String::from("side"),
+        ipc_base64: base64::engine::general_purpose::STANDARD.encode(sink),
     }
 }
 
@@ -170,6 +211,14 @@ async fn measure_rep(url: &str, name: &str, sql: &str, rep: usize) -> RepResult 
             }
         }
     }
+    // The workload is bounded; the run-loop surface is not. Declare
+    // end-of-stream so subtasks flush their open windows into egress —
+    // without this, a window the data's own event times never close (the
+    // whole stream can span less than one window) is silently unemitted and
+    // the drain below reports a pipeline that "produced nothing".
+    krishiv_runtime::execute_coordinator_continuous_flush(url, &job)
+        .await
+        .unwrap_or_else(|e| panic!("{name}: flush: {e}"));
     let rows_out = drain_until_stable(url, &job).await;
     let elapsed = started.elapsed();
     // Tear the job down before the next rep registers: a registered run-loop

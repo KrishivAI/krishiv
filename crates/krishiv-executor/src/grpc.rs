@@ -28,6 +28,11 @@ pub type SharedLoopExecutors = Arc<DashMap<String, Arc<Mutex<ContinuousWindowExe
 /// drains and processes them through the matching loop executor.
 pub type SharedContinuousInputs = Arc<DashMap<String, Vec<RecordBatch>>>;
 
+/// Reserved pseudo-task id carrying the run-loop end-of-stream directive
+/// through `push_continuous_input`. Real subtask ids are
+/// `task-streaming-<n>`, so this cannot collide with one.
+pub const RUN_LOOP_EOS_TASK_ID: &str = "stream-eos";
+
 /// The three class-specific run-loop state maps (task #147): two-source
 /// joins, join→agg pipelines, and stateless SQL executors. Bundled into one
 /// value so every seam that shares run-loop state shares ALL of it: the
@@ -145,6 +150,62 @@ impl ExecutorTaskInboxService {
     ) -> Self {
         self.continuous_connector_sources = sources;
         self
+    }
+
+    /// Flush every run-loop operator this process hosts for `job_id` into
+    /// the job's egress buffer: windows and pipelines emit their open state
+    /// as final. Serves the RUN_LOOP_EOS_TASK_ID directive; see the handler.
+    async fn flush_run_loop_job(&self, job_id: &str) -> Result<usize, tonic::Status> {
+        let prefix = format!("{job_id}#");
+        let mut outputs: Vec<RecordBatch> = Vec::new();
+        for entry in self.loop_executors.iter() {
+            if !(entry.key() == job_id || entry.key().starts_with(&prefix)) {
+                continue;
+            }
+            let mut exec = entry.value().lock().map_err(|_| {
+                tonic::Status::internal("run-loop window executor lock poisoned during EOS flush")
+            })?;
+            outputs.extend(exec.flush_all().map_err(|e| {
+                tonic::Status::internal(format!("EOS flush of window state failed: {e}"))
+            })?);
+        }
+        let pipelines: Vec<_> = self
+            .class_executors
+            .pipeline
+            .iter()
+            .filter(|e| e.key().starts_with(&prefix))
+            .map(|e| Arc::clone(e.value()))
+            .collect();
+        for pipe in pipelines {
+            let mut pipe = pipe.lock().await;
+            outputs.extend(pipe.flush_all().map_err(|e| {
+                tonic::Status::internal(format!("EOS flush of pipeline state failed: {e}"))
+            })?);
+        }
+        // Joins emit matches eagerly and the stateless class holds no window
+        // state — nothing to flush for those maps.
+        if outputs.is_empty() {
+            return Ok(0);
+        }
+        let flushed = outputs.len();
+        let mut egress = self
+            .continuous_outputs
+            .entry(job_id.to_owned())
+            .or_default();
+        egress.extend(outputs);
+        let cap = krishiv_common::streaming_dials::rloop_egress_cap();
+        if egress.len() > cap {
+            let overflow = egress.len() - cap;
+            egress.drain(..overflow);
+            tracing::warn!(
+                job_id = %job_id,
+                dropped_batches = overflow,
+                cap,
+                "EOS flush overflowed the egress buffer; oldest batches dropped — drain \
+                 before flushing, or raise KRISHIV_RLOOP_EGRESS_CAP"
+            );
+        }
+        Ok(flushed)
     }
 
     /// Share the class-specific run-loop state maps with the runner — see
@@ -422,6 +483,28 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
     ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
         let req = request.into_inner();
         let job_id = req.job_id.as_str().to_owned();
+
+        // Reserved task id: an end-of-stream directive for run-loop jobs
+        // (task #147). A bounded producer that has pushed its last batch is
+        // the ONLY party that can know the stream is over — the same
+        // principle as cycle mode's `stream-eos:` input partition, carried
+        // through the same channel a push already reaches this executor by.
+        // The flush locks each of the job's class operators (the loops hold
+        // the same locks while processing, so this serializes cleanly) and
+        // stages every open window into the egress buffer for the next
+        // drain. Real subtask ids are `task-streaming-<n>`; "stream-eos"
+        // cannot collide.
+        if req.task_id.as_str() == RUN_LOOP_EOS_TASK_ID {
+            let flushed = self.flush_run_loop_job(&job_id).await?;
+            tracing::info!(
+                job_id = %job_id,
+                flushed_batches = flushed,
+                "run-loop end-of-stream flush staged open windows into egress"
+            );
+            return Ok(tonic::Response::new(TaskStatusResponse::new(
+                TransportDisposition::Accepted,
+            )));
+        }
 
         // Decode Arrow IPC bytes into RecordBatches.
         let batches = decode_ipc_batches(&req.ipc_bytes)?;

@@ -751,17 +751,14 @@ pub(crate) async fn execute_rpipe_fragment(
         });
     }
 
-    // Stop = end of stream for a cancelled bounded-ish run: cascade-flush the
-    // stages so closed windows are not silently discarded with the task.
-    {
-        let mut pipe = pipe_arc.lock().await;
-        let out = pipe
-            .flush_all()
-            .map_err(|e| local_err(format!("stream:rpipe flush: {e}")))?;
-        if !out.is_empty() {
-            crate::erased(runner.stage_rloop_outputs(job_id, assignment, &out)).await?;
-        }
-    }
+    // A cancelled pipeline does NOT flush: its open windows are partial
+    // aggregates, and emitting them as though final would publish a wrong
+    // answer rather than lose a right one — the same stance the window
+    // run-loop takes on stop. A bounded producer that wants its trailing
+    // windows must declare end-of-stream (the RUN_LOOP_EOS_TASK_ID push
+    // directive) BEFORE deregistering; flushing here instead dumped
+    // thousands of batches into egress after the last drain, where teardown
+    // destroyed them unseen (observed live: NEXMark q9's whole output).
     let _ = runner
         .inbox
         .clear_cancelled_task(assignment.job_id(), assignment.task_id());

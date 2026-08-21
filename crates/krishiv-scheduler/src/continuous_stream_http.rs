@@ -923,6 +923,43 @@ pub async fn api_continuous_deregister(
     Ok(Json(ContinuousDeregisterResponse { cancelled: true }))
 }
 
+/// POST /api/v1/continuous-flush — relay a bounded producer's end-of-stream
+/// declaration. Cycle jobs run one final `stream-eos:` cycle and return its
+/// inline payloads; run-loop jobs flush every subtask's open window state
+/// into their egress buffers (drain to collect it) and return none.
+pub async fn api_continuous_flush(
+    State(coordinator): State<SharedCoordinator>,
+    Json(body): Json<ContinuousFlushRequest>,
+) -> Result<Json<ContinuousFlushResponse>, (StatusCode, String)> {
+    let payloads = flush_continuous_stream_coordinated(&coordinator, &body.job_id)
+        .await
+        .map_err(|error| match error {
+            ContinuousStreamError::Scheduler(e) => scheduler_error_response(&e),
+            other => (StatusCode::SERVICE_UNAVAILABLE, other.to_string()),
+        })?;
+    use base64::Engine as _;
+    Ok(Json(ContinuousFlushResponse {
+        success: true,
+        inline_record_batch_ipc_b64: payloads
+            .into_iter()
+            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+            .collect(),
+    }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ContinuousFlushRequest {
+    pub job_id: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct ContinuousFlushResponse {
+    pub success: bool,
+    /// Cycle-mode flush payloads (base64 Arrow IPC); empty for run-loop jobs,
+    /// whose flushed output is collected by the next drain.
+    pub inline_record_batch_ipc_b64: Vec<String>,
+}
+
 pub async fn api_continuous_checkpoint(
     State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
@@ -1130,6 +1167,58 @@ async fn push_run_loop_input(
                 "run-loop push to {endpoint} failed: {status}"
             ))
         }
+    })?;
+    Ok(())
+}
+
+/// Relay the end-of-stream directive to one executor hosting run-loop
+/// subtasks of `job_id`: a `push_continuous_input` with the reserved
+/// `stream-eos` task id and an empty payload. The executor flushes every
+/// local operator of the job into its egress buffer (see the executor's
+/// `RUN_LOOP_EOS_TASK_ID` handler).
+async fn push_run_loop_eos(
+    channels: &crate::coordinator::task_assignment::ExecutorChannelMap,
+    job_id: &krishiv_proto::JobId,
+    endpoint: &str,
+) -> Result<(), ContinuousStreamError> {
+    use krishiv_proto::{TaskId, TransportVersion, wire};
+    if crate::is_in_process_task_endpoint(endpoint) {
+        return Err(ContinuousStreamError::Unavailable(String::from(
+            "run-loop EOS flush cannot reach an in-process-only executor over gRPC",
+        )));
+    }
+    let channel = Coordinator::get_or_connect_channel_on_map(channels, endpoint)
+        .await
+        .map_err(ContinuousStreamError::Scheduler)?;
+    let max = krishiv_proto::max_grpc_message_bytes();
+    let mut client = wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
+        channel,
+        crate::coordinator::task_assignment::inject_executor_task_request_context
+            as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+    )
+    .max_decoding_message_size(max)
+    .max_encoding_message_size(max);
+    let request = krishiv_proto::task::PushContinuousInputRequest {
+        version: TransportVersion::CURRENT,
+        job_id: job_id.clone(),
+        task_id: TaskId::try_new("stream-eos").map_err(|e| invalid_registration(e.to_string()))?,
+        ipc_bytes: Vec::new(),
+    };
+    tokio::time::timeout(
+        RUN_LOOP_RPC_TIMEOUT,
+        client.push_continuous_input(wire::push_continuous_input_request_to_wire(request)),
+    )
+    .await
+    .map_err(|_| {
+        ContinuousStreamError::Unavailable(format!(
+            "run-loop EOS flush to {endpoint} timed out after {}s",
+            RUN_LOOP_RPC_TIMEOUT.as_secs()
+        ))
+    })?
+    .map_err(|status| {
+        ContinuousStreamError::Unavailable(format!(
+            "run-loop EOS flush to {endpoint} failed: {status}"
+        ))
     })?;
     Ok(())
 }
@@ -2350,21 +2439,33 @@ pub async fn flush_continuous_stream_coordinated(
     let job_id_typed =
         JobId::try_new(job_id).map_err(|e| invalid(format!("invalid job_id: {e}")))?;
 
-    // A run-loop job is long-lived and its source is never exhausted, so
-    // `StreamingLoop::RunLoop` declares `EndOfStream::NoFlush`. Forcing one
-    // would publish partial aggregates as final — a wrong answer in place of a
-    // missing one, which is worse. Registration already refuses bounded sources
-    // for run-loop jobs, so reaching here means the caller asked for something
-    // incoherent; say so rather than silently doing nothing.
+    // A run-loop job's SOURCE never exhausts itself — but a push-fed job's
+    // PRODUCER is exactly the party that can know the stream is over, the
+    // same principle behind cycle mode's `stream-eos:` partition below. So
+    // for run-loop jobs this relays the producer's end-of-stream declaration
+    // to every executor hosting a subtask (the reserved `stream-eos` task id
+    // on the push RPC); each executor flushes its local window/pipeline
+    // state into the job's egress buffer, and the caller drains it next.
+    // Returns no inline payloads — run-loop output travels through drain.
     let run_loop = {
         let coord = coordinator.read().await;
         run_loop_targets(&coord, &job_id_typed).map_err(ContinuousStreamError::Scheduler)?
     };
-    if run_loop.is_some() {
-        return Err(invalid(format!(
-            "job {job_id} runs in run-loop mode, whose source is never exhausted; it does \
-             not flush on stop, and forcing one would emit partial aggregates as final"
-        )));
+    if let Some(targets) = run_loop {
+        let mut endpoints: Vec<String> =
+            targets.into_iter().map(|(_, endpoint)| endpoint).collect();
+        endpoints.sort_unstable();
+        endpoints.dedup();
+        if endpoints.is_empty() {
+            return Err(ContinuousStreamError::Unavailable(format!(
+                "run-loop job {job_id} has no launched subtasks to flush"
+            )));
+        }
+        let channels = coordinator.read().await.executor_channels.clone();
+        for endpoint in endpoints {
+            push_run_loop_eos(&channels, &job_id_typed, &endpoint).await?;
+        }
+        return Ok(Vec::new());
     }
 
     {

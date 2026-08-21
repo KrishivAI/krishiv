@@ -591,3 +591,84 @@ async fn rloop_window_aggregates_a_pushed_unsigned_column() {
         "the first window must close and report MAX over the coerced u64 column"
     );
 }
+
+/// A bounded stream whose whole event-time span fits inside ONE window can
+/// never close it from data alone — the final window's own events are what
+/// set the watermark. The end-of-stream directive (continuous-flush) is how
+/// a bounded producer gets those windows out: every subtask flushes its open
+/// state into egress, and the next drain collects it. Without the directive
+/// the drain below returns nothing forever (observed live: NEXMark q9/q4
+/// emitted zero rows across the whole benchmark).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn eos_flush_emits_windows_the_data_cannot_close() {
+    use krishiv_plan::stream_task::StreamingTaskSpec;
+    use krishiv_plan::window::{WindowAgg, WindowAggKind, WindowExecutionSpec};
+    let rig = start_rig("eosflush").await;
+    let job = "eos-w";
+    let mut spec = WindowExecutionSpec::tumbling("k", "ts", 60_000);
+    spec.agg_exprs = vec![WindowAgg {
+        kind: WindowAggKind::Max,
+        input_column: "v".into(),
+        output_column: "max_v".into(),
+        filter: None,
+    }];
+    spec.watermark_lag_ms = 0;
+    let task = StreamingTaskSpec::Window(Box::new(spec));
+    let mut options = ContinuousRegistrationOptions::default();
+    options.mode = Some("run-loop".into());
+    options.parallelism = Some(1);
+    krishiv_scheduler::register_continuous_task_with_options(
+        &rig.coordinator,
+        job,
+        &task,
+        &options,
+    )
+    .await
+    .expect("window job registers");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // All rows inside one 60s window: no later event can ever close it.
+    krishiv_scheduler::push_continuous_input_coordinated(
+        &rig.coordinator,
+        job,
+        ipc_bytes(&{
+            use arrow::array::{Int64Array, StringArray};
+            use arrow::datatypes::{DataType, Field, Schema};
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Utf8, false),
+                Field::new("ts", DataType::Int64, false),
+                Field::new("v", DataType::Int64, false),
+            ]));
+            arrow::record_batch::RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["a", "a", "a"])),
+                    Arc::new(Int64Array::from(vec![1_000, 2_000, 3_000])),
+                    Arc::new(Int64Array::from(vec![7, 900, 3])),
+                ],
+            )
+            .unwrap()
+        }),
+    )
+    .await
+    .expect("push");
+    // Give the loop a moment to consume, then prove the window stays open.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let before = wait_drain(&rig, job, 1, Duration::from_secs(2)).await;
+    assert_eq!(
+        before.iter().map(|b| b.num_rows()).sum::<usize>(),
+        0,
+        "the single open window must NOT emit before end-of-stream is declared"
+    );
+
+    krishiv_scheduler::flush_continuous_stream_coordinated(&rig.coordinator, job)
+        .await
+        .expect("run-loop EOS flush");
+    let after = wait_drain(&rig, job, 1, Duration::from_secs(10)).await;
+    let max_v: Vec<i64> = after.iter().flat_map(|b| i64_col(b, "max_v")).collect();
+    assert_eq!(
+        max_v,
+        vec![900],
+        "the flush must emit the open window's aggregate"
+    );
+}

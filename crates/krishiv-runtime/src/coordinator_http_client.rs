@@ -1424,6 +1424,34 @@ pub async fn execute_coordinator_continuous_drain(
         })
 }
 
+/// Declare end-of-stream for a continuous job (bounded producers). Cycle
+/// jobs run a final flush cycle; run-loop jobs stage every open window into
+/// their egress buffers — call drain afterwards to collect the flushed rows.
+pub async fn execute_coordinator_continuous_flush(
+    coordinator_http: &str,
+    job_id: &str,
+) -> RuntimeResult<()> {
+    #[derive(serde::Serialize)]
+    struct FlushRequest<'a> {
+        job_id: &'a str,
+    }
+    let base = normalize_http_base(coordinator_http)?;
+    let url = format!("{base}/api/v1/continuous-flush");
+    let client = coordinator_http_client()?;
+    let response = apply_coordinator_bearer(client.post(&url).json(&FlushRequest { job_id }))
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("continuous-flush request failed: {e}")))?;
+    if !response.status().is_success() {
+        return Err(transport_error_with_body(
+            format!("continuous-flush HTTP {} from {url}", response.status()),
+            response,
+        )
+        .await);
+    }
+    Ok(())
+}
+
 /// Deregister (tear down) a continuous job: cancels its tasks on their
 /// executors, frees their slots, and clears the job's persisted snapshot so
 /// the id can be reused. Callers that register short-lived jobs in a loop
