@@ -147,14 +147,7 @@ impl StreamWriter {
     /// cannot honour them (the options seam's existing fail-closed echo).
     pub fn start(self, session: &Session, job_name: impl Into<String>) -> Result<StreamingJob> {
         match self.output_mode.as_str() {
-            "append" | "update" => {}
-            "complete" => {
-                return Err(KrishivError::InvalidConfig {
-                    message: "output mode 'complete' is staged behind task #150 P4 and not \
-                              yet wired; 'append' and 'update' are the supported modes"
-                        .into(),
-                });
-            }
+            "append" | "update" | "complete" => {}
             other => {
                 return Err(KrishivError::InvalidConfig {
                     message: format!(
@@ -184,7 +177,7 @@ impl StreamWriter {
                       window before start()"
                     .into(),
             })?;
-        if self.output_mode == "update" {
+        if matches!(self.output_mode.as_str(), "update" | "complete") {
             // Update mode = speculative re-emission of OPEN windows as
             // provisional upserts keyed on (key, window_start_ms). Only the
             // tumbling operator supports the read-only open-window snapshot;
@@ -205,6 +198,7 @@ impl StreamWriter {
             };
             spec.early_fire_interval_ms = Some(interval);
         }
+        let complete_key = spec.key_column.clone();
         let sink = self.sink_spec()?;
         let job_name = job_name.into();
 
@@ -223,7 +217,14 @@ impl StreamWriter {
         } else {
             session.submit_stream_job(&job_name, spec)?;
         }
-        Ok(StreamingJob::from_session_job(session.clone(), job_name))
+        let job = StreamingJob::from_session_job(session.clone(), job_name);
+        if self.output_mode == "complete" {
+            // The view keys on the group column plus the window identity —
+            // deltas (provisional early-fires AND final closes) fold by that
+            // pair, so each drain returns the maintained full table.
+            return Ok(job.with_complete_view(vec![complete_key, String::from("window_start_ms")]));
+        }
+        Ok(job)
     }
 }
 
@@ -292,21 +293,19 @@ mod tests {
         job.stop().await.expect("stop");
     }
 
-    /// update/complete are staged behind P3/P4 — refused BY NAME, never
-    /// silently registered as append.
+    /// complete is staged behind P4 — refused BY NAME, never silently
+    /// registered as append. (update graduated in P3 and registers.)
     #[test]
     fn staged_output_modes_are_refused_by_name() {
         let session = Session::builder().build().expect("session");
-        for mode in ["update", "complete"] {
-            let Err(err) = windowed(&session)
-                .write()
-                .output_mode(mode)
-                .start(&session, format!("m-{mode}"))
-            else {
-                panic!("staged mode '{mode}' must refuse");
-            };
-            assert!(err.to_string().contains(mode), "{err}");
-        }
+        let Err(err) = windowed(&session)
+            .write()
+            .output_mode("complete-typo")
+            .start(&session, "m-complete-typo")
+        else {
+            panic!("unknown mode must refuse");
+        };
+        assert!(err.to_string().contains("complete-typo"), "{err}");
         let Err(err) = windowed(&session)
             .write()
             .output_mode("bogus")
@@ -421,5 +420,90 @@ mod update_mode_tests {
             panic!("session-window update mode must refuse");
         };
         assert!(err.to_string().contains("tumbling"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod complete_mode_tests {
+    use std::sync::Arc;
+
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    use super::*;
+
+    fn batch(users: &[&str], ts: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(users.to_vec())) as _,
+                Arc::new(Int64Array::from(ts.to_vec())) as _,
+            ],
+        )
+        .expect("batch")
+    }
+
+    fn user_rows(batches: &[RecordBatch]) -> Vec<String> {
+        let mut out = Vec::new();
+        for b in batches {
+            let users = b
+                .column_by_name("user_id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .expect("user col");
+            for i in 0..b.num_rows() {
+                out.push(users.value(i).to_owned());
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Complete mode returns the FULL result table on every drain: a key
+    /// whose data stopped arriving must STILL appear in later drains. That
+    /// stale-key retention is exactly what the fold provides and what raw
+    /// delta drains cannot — pre-fix (no view), the second drain only
+    /// carries key b and the assertion on key a goes red.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn complete_mode_retains_stale_keys_across_drains() {
+        let session = Session::builder().build().expect("session");
+        let job = session
+            .sql("SELECT 'seed' AS user_id, CAST(0 AS BIGINT) AS ts")
+            .expect("df")
+            .stream()
+            .with_event_time("ts")
+            .key_by("user_id")
+            .tumbling_window(1_000)
+            .write()
+            .output_mode("complete")
+            .trigger("processing_time", 1)
+            .start(&session, "cmp-stale")
+            .expect("complete job registers");
+
+        // a's window [1000,2000) CLOSES when b@5000 advances the watermark:
+        // its final row is emitted exactly once and never again — early fire
+        // only re-emits OPEN windows. Raw delta drains therefore lose a
+        // after that; only the complete-mode fold retains it.
+        job.push(vec![batch(&["a"], &[1_000])])
+            .await
+            .expect("push a");
+        job.push(vec![batch(&["b"], &[5_000])])
+            .await
+            .expect("push b");
+        let _ = job.drain().await.expect("drain closes a");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // This drain's raw deltas are early-fires of b's OPEN window only;
+        // the FULL table must still carry the closed a.
+        let table = job.drain().await.expect("full table");
+        let users = user_rows(&table);
+        assert!(
+            users.contains(&String::from("a")) && users.contains(&String::from("b")),
+            "the complete table must retain the CLOSED key a alongside the open b: {users:?}"
+        );
+        job.stop().await.expect("stop");
     }
 }

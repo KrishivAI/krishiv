@@ -37,6 +37,87 @@ enum Backend {
 /// Unified streaming lifecycle handle. See the module docs.
 pub struct StreamingJob {
     backend: Backend,
+    /// Complete output mode (task #150 P4): a sink-layer materialized
+    /// result table. Deltas from every drain fold into it by
+    /// (group key, window_start_ms), and each drain returns the WHOLE
+    /// table — Spark's actual "complete" semantics (maintained state
+    /// re-output), implemented at the boundary so it never asks the engine
+    /// to re-emit distributed operator state and therefore behaves
+    /// identically in every deployment mode.
+    complete_view: Option<std::sync::Mutex<CompleteModeView>>,
+}
+
+/// Keyed fold of the delta stream into the full result table.
+pub struct CompleteModeView {
+    key_columns: Vec<String>,
+    rows: std::collections::BTreeMap<String, RecordBatch>,
+}
+
+impl CompleteModeView {
+    /// A view keyed by the given columns (the group key plus the window
+    /// identity column, typically `window_start_ms`).
+    #[must_use]
+    pub fn new(key_columns: Vec<String>) -> Self {
+        Self {
+            key_columns,
+            rows: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Fold delta batches in, later rows winning per key.
+    ///
+    /// # Errors
+    /// When a key column is missing from a delta batch — a schema drift the
+    /// fold must refuse rather than mis-attribute rows.
+    pub fn apply(&mut self, deltas: &[RecordBatch]) -> Result<()> {
+        use arrow::util::display::array_value_to_string;
+        for batch in deltas {
+            let key_arrays: Vec<_> = self
+                .key_columns
+                .iter()
+                .map(|name| {
+                    batch
+                        .column_by_name(name)
+                        .ok_or_else(|| KrishivError::InvalidConfig {
+                            message: format!(
+                                "complete-mode delta batch is missing key column '{name}'"
+                            ),
+                        })
+                })
+                .collect::<Result<_>>()?;
+            for row in 0..batch.num_rows() {
+                let mut key = String::new();
+                for array in &key_arrays {
+                    key.push_str(
+                        &array_value_to_string(array, row).unwrap_or_else(|_| String::from("?")),
+                    );
+                    key.push('\u{1f}');
+                }
+                self.rows.insert(key, batch.slice(row, 1));
+            }
+        }
+        Ok(())
+    }
+
+    /// The full result table.
+    ///
+    /// # Errors
+    /// When accumulated rows disagree on schema (upstream drift).
+    pub fn snapshot(&self) -> Result<Vec<RecordBatch>> {
+        if self.rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let slices: Vec<RecordBatch> = self.rows.values().cloned().collect();
+        let Some(first) = slices.first() else {
+            return Ok(Vec::new());
+        };
+        let schema = first.schema();
+        arrow::compute::concat_batches(&schema, &slices)
+            .map(|b| vec![b])
+            .map_err(|e| KrishivError::InvalidConfig {
+                message: format!("complete-mode snapshot failed to concatenate: {e}"),
+            })
+    }
 }
 
 impl StreamingJob {
@@ -45,6 +126,7 @@ impl StreamingJob {
     pub fn from_query(query: StreamingQuery) -> Self {
         Self {
             backend: Backend::Query(query),
+            complete_view: None,
         }
     }
 
@@ -56,6 +138,7 @@ impl StreamingJob {
                 session: Box::new(session),
                 job_id: job_id.into(),
             },
+            complete_view: None,
         }
     }
 
@@ -67,6 +150,7 @@ impl StreamingJob {
                 coordinator_http,
                 job_id,
             )),
+            complete_view: None,
         }
     }
 
@@ -99,12 +183,25 @@ impl StreamingJob {
         }
     }
 
+    /// Arm complete output mode: every subsequent [`drain`](Self::drain)
+    /// folds the deltas into a keyed result table and returns the WHOLE
+    /// table.
+    #[must_use]
+    pub fn with_complete_view(mut self, key_columns: Vec<String>) -> Self {
+        self.complete_view = Some(std::sync::Mutex::new(CompleteModeView::new(key_columns)));
+        self
+    }
+
     /// Drain newly emitted output batches.
     ///
     /// # Errors
     /// Refused by name for embedded structured queries (output goes to the
     /// configured sink); otherwise propagates the runtime/transport error.
     pub async fn drain(&self) -> Result<Vec<RecordBatch>> {
+        self.drain_with_view().await
+    }
+
+    async fn drain_raw(&self) -> Result<Vec<RecordBatch>> {
         match &self.backend {
             Backend::Query(_) => Err(KrishivError::InvalidConfig {
                 message: "this streaming job is an embedded structured query: its \
@@ -114,6 +211,19 @@ impl StreamingJob {
             Backend::Session { session, job_id } => session.poll_stream_job(job_id).await,
             Backend::Remote(job) => job.drain().await.map_err(KrishivError::from),
         }
+    }
+
+    /// Backend drain plus the complete-mode fold, when armed.
+    async fn drain_with_view(&self) -> Result<Vec<RecordBatch>> {
+        let deltas = self.drain_raw().await?;
+        let Some(view) = &self.complete_view else {
+            return Ok(deltas);
+        };
+        let mut view = view.lock().map_err(|_| KrishivError::InvalidConfig {
+            message: "complete-mode view lock poisoned".into(),
+        })?;
+        view.apply(&deltas)?;
+        view.snapshot()
     }
 
     /// Declare end-of-stream: close every window the watermark never reached
