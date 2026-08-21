@@ -51,3 +51,61 @@ options / :894 verify_ack; window-join: fragment (streaming.rs :242) is a
 producer-less cycle escape hatch — leave it, give it no new producer.
 Risks: rpipe checkpoint gap; launch wedge widens; Q13 side-table IPC size
 cap; grpc.rs input-key strings.
+
+## Live k3s run — RESULT (2026-08-21, commit 4ed77ea)
+
+Deployed the dedicated helm chart (`deploy/k8s/helm/krishiv`) into the fresh
+`krishiv-bench` namespace on the 3-node rig (s1 coordinator + 1 executor per
+node, image `localhost/krishiv:fast-<sha>` via ctr import; GA-soak CronJob,
+krishiv-platform, and ports 18086/32010 untouched). **Completeness gate:
+PASS — all 22 NEXMark query classes registered, pushed, executed, flushed,
+and drained end to end across the cluster** at 11k–20.6k ev/sec median
+(1000-row batches over the HTTP push path + ssh tunnel; measured end to end
+incl. registration and drain).
+
+Six defects the live rig surfaced, each fixed at the seam with a
+revert-proven test (commits a8045c2, 2b07881, 2d41988, 640d689, bed5833,
+4ed77ea):
+
+1. Harness never deregistered jobs → 3 jobs exhausted the 9 executor
+   slots. New `execute_coordinator_continuous_deregister`; harness tears
+   down per rep. Plus: coordinator-HTTP client errors now carry the
+   response body (the first failure reported only "HTTP 503" while the
+   reason sat in the dropped body).
+2. Backpressure surfaced as generic 503 → producers treated flow control
+   as fatal. Executor ResourceExhausted now maps to a Backpressure error
+   and HTTP 429; the push client retries with capped backoff.
+3. **Cancel never stopped run-loop fragments** (forget_job purges the
+   cancel tombstone before the loop can observe it) → every deregistered
+   job leaked its runner slot; each executor ran exactly `slots` jobs and
+   then never another. Loops now exit on Arc-identity liveness of their
+   own state entry; cancel retires ALL FOUR class state maps (the classed
+   maps weren't shared with the gRPC service at all — SharedClassExecutors
+   bundle). Helm chart: executor topologySpreadConstraints (a roll had
+   co-scheduled all executors onto one node).
+4. Pushed run-loop input skipped `coerce_batch_for_window` (owned-split
+   reads had it) → any window aggregating a pushed unsigned column died
+   with "pre-downcast: UInt64" (q7/q16).
+5. `encode_window_execution_spec` injected the legacy default-count into
+   top-N specs and then refused its own output → every compiled top-N spec
+   400'd at distributed registration (q18/q19; embedded never encodes).
+6. **No end-of-stream verb on the run-loop surface**: a bounded stream
+   whose event-time span fits inside one window can never close it from
+   data alone, so pipelines (q9/q4) emitted nothing and then dumped their
+   state into egress at deregister where teardown destroyed it. New EOS
+   directive (`POST /api/v1/continuous-flush` → reserved `stream-eos` task
+   id on the push RPC → executors flush window/pipeline operators into
+   egress), the run-loop sibling of cycle mode's `stream-eos:` partition.
+   rpipe's flush-at-cancel removed (partial aggregates are not final —
+   the window loop's stance, now uniform). q13: the harness now carries
+   the side table in the spec (`side_tables`), the wire-native form of the
+   embedded harness's out-of-band registration.
+
+Recorded follow-ups (unchanged): JoinAggPipeline snapshot/restore,
+parallel-pipeline inter-stage exchange, join projection from CTE SELECT
+list, grammar.rs placement-marker rewrite, batch-at-a-time join
+optimization, cached-logical-plan for stateless. New from this run: egress
+ring cap (512) truncates large EOS flushes (q9 retained exactly cap batches)
+— drain-before-flush or raise KRISHIV_RLOOP_EGRESS_CAP; distributed rows_out
+for window queries under-reports vs embedded EOS-flush totals when watermark
+closes lag behind (documented, not a defect).
