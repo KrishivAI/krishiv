@@ -16,6 +16,11 @@ message CheckpointBarrier {
   string checkpoint_id = 3;
   BarrierKind barrier_kind = 4;
   int64 timestamp_ms = 5;
+  // The job's registered checkpoint storage path (task #149 fix 2). Empty
+  // means "use the executor's configured default" — the pre-existing
+  // behavior, kept for jobs registered without an explicit path and for
+  // barriers from older coordinators.
+  string checkpoint_storage_path = 6;
 }
 
 message StateHandle {

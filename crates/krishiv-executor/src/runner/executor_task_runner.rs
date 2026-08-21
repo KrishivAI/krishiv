@@ -335,6 +335,12 @@ pub struct ExecutorTaskRunner {
     pub(crate) pipeline_executors:
         Arc<DashMap<String, Arc<tokio::sync::Mutex<krishiv_dataflow::pipeline::JoinAggPipeline>>>>,
 
+    /// Per-path checkpoint storages opened for jobs whose registration named
+    /// an explicit `checkpoint_storage_path` (task #149 fix 2). Keyed by the
+    /// path string; the daemon-default storage never enters this map.
+    pub(crate) job_checkpoint_storages:
+        Arc<DashMap<String, Arc<dyn krishiv_state::checkpoint::CheckpointStorage>>>,
+
     /// `stream:rbatch:` stateless executors, keyed by `rloop_state_key`
     /// (task #147).
     pub(crate) stateless_executors: Arc<
@@ -456,6 +462,7 @@ impl ExecutorTaskRunner {
             continuous_egress_dropped: Arc::new(DashMap::new()),
             continuous_null_key_rows: Arc::new(DashMap::new()),
             join_executors: Arc::new(DashMap::new()),
+            job_checkpoint_storages: Arc::new(DashMap::new()),
             stateless_executors: Arc::new(DashMap::new()),
             pipeline_executors: Arc::new(DashMap::new()),
             stream_exchange: crate::stream_exchange::StreamExchange::default(),
@@ -523,6 +530,32 @@ impl ExecutorTaskRunner {
     /// Drain pending barriers through the attached [`RunLoopBarrierContext`].
     /// Returns the number of barriers processed (0 when no context is wired —
     /// the CLI slot loop then remains the only barrier drainer).
+    /// Resolve the checkpoint storage a barrier's snapshot must land in.
+    ///
+    /// A non-empty `barrier_path` is the job's REGISTERED
+    /// `checkpoint_storage_path`, honored here (task #149 fix 2 — the
+    /// registration used to accept a path the executor silently ignored in
+    /// favor of its daemon default). Empty means "no path registered" (or an
+    /// older coordinator) and falls back to the daemon default. Opened
+    /// storages are cached per path.
+    pub(crate) fn checkpoint_storage_for_barrier(
+        &self,
+        barrier_path: &str,
+        default: &Arc<dyn CheckpointStorage>,
+    ) -> Result<Arc<dyn CheckpointStorage>, krishiv_state::checkpoint::CheckpointError> {
+        let barrier_path = barrier_path.trim();
+        if barrier_path.is_empty() {
+            return Ok(Arc::clone(default));
+        }
+        if let Some(open) = self.job_checkpoint_storages.get(barrier_path) {
+            return Ok(Arc::clone(open.value()));
+        }
+        let open = krishiv_state::checkpoint::open_checkpoint_storage_from_uri(barrier_path)?;
+        self.job_checkpoint_storages
+            .insert(barrier_path.to_owned(), Arc::clone(&open));
+        Ok(open)
+    }
+
     pub(crate) async fn drain_barriers_via_context(&self) -> usize {
         let Some(ctx) = self.barrier_context.clone() else {
             return 0;
@@ -2141,7 +2174,30 @@ impl ExecutorTaskRunner {
                 fencing_token,
             };
 
-            let s_clone = Arc::clone(&storage);
+            // Honor the job's REGISTERED checkpoint storage path when the
+            // barrier carries one (task #149 fix 2): registrations used to
+            // accept a path the executor then silently ignored in favor of
+            // its daemon default. Empty = no path registered = the default,
+            // which is also what barriers from older coordinators carry.
+            // A path that cannot be opened fails THIS barrier (the epoch
+            // times out coordinator-side with this warning to pair with) —
+            // never the daemon.
+            let s_clone: Arc<dyn CheckpointStorage> = match self
+                .checkpoint_storage_for_barrier(&barrier.checkpoint_storage_path, &storage)
+            {
+                Ok(open) => open,
+                Err(e) => {
+                    tracing::warn!(
+                        job_id = %barrier.job_id,
+                        epoch = barrier.epoch,
+                        storage_path = %barrier.checkpoint_storage_path,
+                        error = %e,
+                        "job's registered checkpoint storage cannot be opened; \
+                         this barrier is skipped and the epoch will time out"
+                    );
+                    continue;
+                }
+            };
             let coord_clone = coordinator.clone();
             if let Err(e) = self
                 .initiate_checkpoint_for_job(&req, fallback_state.clone(), s_clone, coord_clone)
@@ -2166,6 +2222,73 @@ impl ExecutorTaskRunner {
             }
         }
         processed
+    }
+}
+
+#[cfg(test)]
+mod barrier_storage_resolution {
+    use super::*;
+
+    /// A barrier stamped with the job's registered checkpoint path must
+    /// snapshot into THAT storage — the executor used to substitute its
+    /// daemon default silently, so a registration's checkpoint_storage_path
+    /// was accepted and then ignored (observed live on the single-node
+    /// durable run, where the "registered" scratch path stayed empty and the
+    /// default path was written instead).
+    #[tokio::test]
+    async fn barrier_path_overrides_the_daemon_default_storage() {
+        let runner = ExecutorTaskRunner::new(crate::ExecutorAssignmentInbox::new_unbounded());
+        let default_dir = tempfile::tempdir().expect("default dir");
+        let job_dir = tempfile::tempdir().expect("job dir");
+        let default: Arc<dyn CheckpointStorage> = Arc::new(
+            krishiv_state::checkpoint::LocalFsCheckpointStorage::new(default_dir.path())
+                .expect("default storage"),
+        );
+
+        let job_uri = format!("file://{}", job_dir.path().display());
+        let resolved = runner
+            .checkpoint_storage_for_barrier(&job_uri, &default)
+            .expect("job-path storage opens");
+        resolved
+            .write_bytes_async("probe/marker", b"x")
+            .await
+            .expect("write through resolved storage");
+        assert!(
+            job_dir.path().join("probe").join("marker").exists(),
+            "the snapshot must land in the job's REGISTERED storage path"
+        );
+        assert!(
+            !default_dir.path().join("probe").join("marker").exists(),
+            "and must NOT land in the daemon default"
+        );
+
+        // Empty path = no registration override = the daemon default.
+        let fallback = runner
+            .checkpoint_storage_for_barrier("", &default)
+            .expect("empty path resolves");
+        fallback
+            .write_bytes_async("fallback/marker", b"x")
+            .await
+            .expect("write through fallback");
+        assert!(default_dir.path().join("fallback").join("marker").exists());
+    }
+
+    /// An unopenable job path fails THIS resolution — the caller skips the
+    /// barrier — and must never panic or kill anything.
+    #[test]
+    fn unopenable_barrier_path_is_an_error_not_a_fatality() {
+        let runner = ExecutorTaskRunner::new(crate::ExecutorAssignmentInbox::new_unbounded());
+        let default_dir = tempfile::tempdir().expect("default dir");
+        let default: Arc<dyn CheckpointStorage> = Arc::new(
+            krishiv_state::checkpoint::LocalFsCheckpointStorage::new(default_dir.path())
+                .expect("default storage"),
+        );
+        let Err(err) = runner
+            .checkpoint_storage_for_barrier("file:///proc/definitely-not-writable/x", &default)
+        else {
+            panic!("an unwritable path must surface as an error");
+        };
+        assert!(err.to_string().contains("definitely-not-writable"));
     }
 }
 

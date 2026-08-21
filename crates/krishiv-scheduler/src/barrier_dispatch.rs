@@ -73,6 +73,10 @@ pub struct BarrierDispatchPlan {
     pub epoch: u64,
     pub fencing_token: FencingToken,
     pub targets: Vec<BarrierDispatchTarget>,
+    /// The job's registered checkpoint storage path, stamped onto every
+    /// barrier so executors snapshot into the storage the REGISTRATION named
+    /// rather than silently substituting their daemon default (task #149).
+    pub checkpoint_storage_path: Option<String>,
 }
 
 impl Coordinator {
@@ -129,6 +133,7 @@ impl Coordinator {
                 epoch,
                 fencing_token: coord.fencing_token,
                 targets,
+                checkpoint_storage_path: job.spec.checkpoint_storage_path().map(ToOwned::to_owned),
             });
         }
         plans
@@ -363,6 +368,7 @@ pub async fn dispatch_barrier_plan(
             checkpoint_id,
             barrier_kind: BarrierKind::Checkpoint as i32,
             timestamp_ms: 0,
+            checkpoint_storage_path: plan.checkpoint_storage_path.clone().unwrap_or_default(),
         };
         let task_id_str = target.task_id.as_str().to_owned();
         // FuturesUnordered drives all executor barriers concurrently; `timeout`

@@ -73,6 +73,7 @@ mod tests {
             checkpoint_id: "ckpt-1".to_owned(),
             barrier_kind: 1,
             timestamp_ms: 0,
+            checkpoint_storage_path: String::new(),
         }
     }
 

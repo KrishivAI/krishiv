@@ -76,6 +76,7 @@ async fn checkpoint_barrier_integration() {
         checkpoint_id: "cp-7".into(),
         barrier_kind: BarrierKind::Checkpoint as i32,
         timestamp_ms: 1,
+        checkpoint_storage_path: String::new(),
     };
     let ack = send_barrier_and_wait_ack(&mut client, barrier, Duration::from_secs(5))
         .await

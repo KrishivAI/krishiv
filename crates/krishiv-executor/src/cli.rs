@@ -419,6 +419,141 @@ async fn heartbeat_loop(
         readiness.mark_barrier_grpc_ready();
     }
 
+    // ── Pre-flight ── acquire every fallible startup resource BEFORE the
+    // first registration. A failure past registration presents to the
+    // coordinator as a healthy executor crashing: it registers, heartbeats,
+    // then vanishes (observed live on the k3s rig — an unwritable checkpoint
+    // directory and a shuffle-flight port collision each killed the daemon
+    // minutes after it had registered). Failing here is a clean startup
+    // refusal the operator sees immediately, and no phantom executor is ever
+    // visible to the scheduler.
+    // Checkpoint storage and state backend.
+    // The generic per-task state backend serves non-window stateful tasks;
+    // continuous window jobs snapshot/restore their per-job loop executors
+    // (selected in `ExecutorTaskRunner::checkpoint_state_for_job`).
+    let checkpoint_storage: Arc<dyn CheckpointStorage> =
+        open_checkpoint_storage_from_uri(&checkpoint_uri)
+            .map_err(|e| format!("checkpoint storage at {checkpoint_uri}: {e}"))?;
+    // Phase 56: KRISHIV_STATE_BACKEND=disaggregated puts the generic state
+    // backend DFS-primary with a local working cache (Flink 2.0 / ForSt
+    // model): checkpoint durability rides the DFS writes (metadata flip) and
+    // recovery is cache rehydration, not a state download-before-start.
+    // Window operators keep RocksDB working state (their SST checkpoints are
+    // the incremental path); DFS-primary window operators are Phase 57+.
+    let state_backend = match std::env::var("KRISHIV_STATE_BACKEND")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "disaggregated" => {
+            let dfs_root = std::env::var("KRISHIV_STATE_DFS_ROOT").map_err(|_| {
+                String::from("KRISHIV_STATE_BACKEND=disaggregated requires KRISHIV_STATE_DFS_ROOT")
+            })?;
+            let cache_dir = state_dir
+                .clone()
+                .unwrap_or_else(|| std::env::temp_dir().join("krishiv-state-cache"));
+            let config = krishiv_state::DisaggregatedConfig {
+                dfs_root: std::path::PathBuf::from(dfs_root),
+                local_cache_dir: cache_dir,
+                ..Default::default()
+            };
+            crate::runner::CheckpointStateHandle::from_backend(
+                krishiv_state::DisaggregatedStateBackend::new(config)
+                    .map_err(|e| format!("disaggregated state backend: {e}"))?,
+            )
+        }
+        _ => crate::runner::CheckpointStateHandle::from_backend(
+            RocksDbStateBackend::open_for_profile(durability_profile, state_dir.as_deref())
+                .map_err(|e| format!("state backend: {e}"))?,
+        ),
+    };
+
+    let mut gc_shuffle_dir: Option<std::path::PathBuf> = shuffle_dir.clone();
+    // Shuffle store opened and its flight server BOUND here, for the same
+    // reason. What the post-registration runner wiring needs travels in
+    // `ShufflePreflight`; the wiring itself stays with the runner builder.
+    enum ShufflePreflight {
+        Served {
+            backend: Arc<krishiv_shuffle::ShuffleBackend>,
+            flight_endpoint: String,
+            local_dir: std::path::PathBuf,
+        },
+        Unserved {
+            backend: Arc<krishiv_shuffle::ShuffleBackend>,
+            local_dir: std::path::PathBuf,
+        },
+        InMemoryOnly {
+            backend: Arc<krishiv_shuffle::ShuffleBackend>,
+        },
+    }
+    let preflight_shuffle: Option<ShufflePreflight> = if let Some(uri) = shuffle_uri {
+        // When both a local shuffle-dir and an s3:// URI are set, build a
+        // tiered backend: local disk for fast P2P reads, object store for
+        // durability — the preferred distributed-durable topology.
+        let backend =
+            if let (true, Some(local_dir)) = (uri.starts_with("s3://"), shuffle_dir.as_deref()) {
+                open_tiered_shuffle_backend(local_dir, &uri, durability_profile).map_err(|e| {
+                    format!(
+                        "tiered shuffle (local={} s3={uri}): {e}",
+                        local_dir.display()
+                    )
+                })?
+            } else {
+                open_shuffle_backend_from_uri(&uri, durability_profile)
+                    .map_err(|e| format!("shuffle URI {uri}: {e}"))?
+            };
+        match backend.as_ref() {
+            ShuffleBackend::Local(disk) => {
+                let (local_addr, _server_handle) =
+                    krishiv_shuffle::flight::serve(shuffle_flight_addr, Arc::clone(disk))
+                        .await
+                        .map_err(|e| format!("shuffle flight server: {e}"))?;
+                let endpoint = advertised_endpoint(local_addr, runtime.config().host());
+                println!(
+                    "Krishiv executor shuffle flight listening on {local_addr} (advertised {endpoint})"
+                );
+                let local_dir = local_shuffle_dir(shuffle_dir.as_deref(), &uri);
+                // Sweep the directory this store actually writes to, derived
+                // or explicit — see `gc_shuffle_dir`.
+                gc_shuffle_dir = Some(local_dir.clone());
+                Some(ShufflePreflight::Served {
+                    backend,
+                    flight_endpoint: endpoint,
+                    local_dir,
+                })
+            }
+            ShuffleBackend::Object(_) | ShuffleBackend::Tiered(_) => {
+                Some(ShufflePreflight::Unserved {
+                    local_dir: shuffle_dir.clone().unwrap_or_default(),
+                    backend,
+                })
+            }
+            ShuffleBackend::InMemory(_) => Some(ShufflePreflight::InMemoryOnly { backend }),
+        }
+    } else if let Some(dir) = &shuffle_dir {
+        let disk = Arc::new(
+            LocalDiskShuffleStore::new(dir)
+                .map_err(|e| format!("local shuffle store at {}: {e}", dir.display()))?,
+        );
+        let (local_addr, _server_handle) =
+            krishiv_shuffle::flight::serve(shuffle_flight_addr, Arc::clone(&disk))
+                .await
+                .map_err(|e| format!("shuffle flight server: {e}"))?;
+        let endpoint = advertised_endpoint(local_addr, runtime.config().host());
+        println!(
+            "Krishiv executor shuffle flight listening on {local_addr} (advertised {endpoint})"
+        );
+        let backend = Arc::new(krishiv_shuffle::ShuffleBackend::Local(disk));
+        Some(ShufflePreflight::Served {
+            backend,
+            flight_endpoint: endpoint,
+            local_dir: dir.clone(),
+        })
+    } else {
+        None
+    };
+
     // First register (now with task/barrier endpoints already populated).
     register_once(runtime).await?;
     readiness.mark_registered(true);
@@ -508,48 +643,6 @@ async fn heartbeat_loop(
         });
     }
 
-    // Checkpoint storage and state backend.
-    // The generic per-task state backend serves non-window stateful tasks;
-    // continuous window jobs snapshot/restore their per-job loop executors
-    // (selected in `ExecutorTaskRunner::checkpoint_state_for_job`).
-    let checkpoint_storage: Arc<dyn CheckpointStorage> =
-        open_checkpoint_storage_from_uri(&checkpoint_uri)
-            .map_err(|e| format!("checkpoint storage at {checkpoint_uri}: {e}"))?;
-    // Phase 56: KRISHIV_STATE_BACKEND=disaggregated puts the generic state
-    // backend DFS-primary with a local working cache (Flink 2.0 / ForSt
-    // model): checkpoint durability rides the DFS writes (metadata flip) and
-    // recovery is cache rehydration, not a state download-before-start.
-    // Window operators keep RocksDB working state (their SST checkpoints are
-    // the incremental path); DFS-primary window operators are Phase 57+.
-    let state_backend = match std::env::var("KRISHIV_STATE_BACKEND")
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "disaggregated" => {
-            let dfs_root = std::env::var("KRISHIV_STATE_DFS_ROOT").map_err(|_| {
-                String::from("KRISHIV_STATE_BACKEND=disaggregated requires KRISHIV_STATE_DFS_ROOT")
-            })?;
-            let cache_dir = state_dir
-                .clone()
-                .unwrap_or_else(|| std::env::temp_dir().join("krishiv-state-cache"));
-            let config = krishiv_state::DisaggregatedConfig {
-                dfs_root: std::path::PathBuf::from(dfs_root),
-                local_cache_dir: cache_dir,
-                ..Default::default()
-            };
-            crate::runner::CheckpointStateHandle::from_backend(
-                krishiv_state::DisaggregatedStateBackend::new(config)
-                    .map_err(|e| format!("disaggregated state backend: {e}"))?,
-            )
-        }
-        _ => crate::runner::CheckpointStateHandle::from_backend(
-            RocksDbStateBackend::open_for_profile(durability_profile, state_dir.as_deref())
-                .map_err(|e| format!("state backend: {e}"))?,
-        ),
-    };
-
     // Shuffle store: required for `shuffle-write:` fragments and for streaming
     // operators that exchange partitions between executors.
     let running_attempts: Arc<DashMap<String, TaskAttemptRef>> = Arc::new(DashMap::new());
@@ -586,118 +679,54 @@ async fn heartbeat_loop(
         Ok(false) => {}
         Err(error) => tracing::warn!(%error, "iceberg REST catalog registration from env failed"),
     }
-    // Whether a servable shuffle store (local dir or object/URI) was configured.
-    // When one is, its store is wired as BOTH the flight-served store and the
-    // `inmem_shuffle` store that typed dfplan shuffle writes target — they must
-    // be the same instance or a cross-node reduce fetch hits the served store
-    // and misses the write ("partition not found"). The unconditional in-memory
-    // fallback below is therefore gated on neither being set.
-    let has_configured_shuffle_store = shuffle_uri.is_some() || shuffle_dir.is_some();
-    // The directory the executor-local shuffle GC must sweep — the one partitions
-    // are actually written to, which is NOT always `shuffle_dir`.
-    //
-    // `--shuffle-uri file://<path>` with no `--shuffle-dir` is a supported
-    // configuration (`apply_shuffle_defaults` returns `(None, Some(uri))`, and
-    // `dev_local_allows_object_store_only_shuffle` asserts it): the local dir is
-    // then derived from the URI below. Keying the GC on `shuffle_dir` left that
-    // configuration writing shuffle output to disk and never reclaiming it —
-    // exactly the failure the GC exists for, and invisible because the sweep was
-    // simply never spawned.
-    let mut gc_shuffle_dir: Option<std::path::PathBuf> = shuffle_dir.clone();
-    if let Some(uri) = shuffle_uri {
-        // When both a local shuffle-dir and an s3:// URI are set, build a tiered
-        // backend: local disk for fast P2P reads, object store for durability.
-        // This is the preferred topology for distributed-durable deployments.
-        let backend =
-            if let (true, Some(local_dir)) = (uri.starts_with("s3://"), shuffle_dir.as_deref()) {
-                open_tiered_shuffle_backend(local_dir, &uri, durability_profile).map_err(|e| {
-                    format!(
-                        "tiered shuffle (local={} s3={uri}): {e}",
-                        local_dir.display()
-                    )
-                })?
-            } else {
-                open_shuffle_backend_from_uri(&uri, durability_profile)
-                    .map_err(|e| format!("shuffle URI {uri}: {e}"))?
-            };
-        match backend.as_ref() {
-            ShuffleBackend::Local(disk) => {
-                let (local_addr, _server_handle) =
-                    krishiv_shuffle::flight::serve(shuffle_flight_addr, Arc::clone(disk))
-                        .await
-                        .map_err(|e| format!("shuffle flight server: {e}"))?;
-                let endpoint = advertised_endpoint(local_addr, runtime.config().host());
-                println!(
-                    "Krishiv executor shuffle flight listening on {local_addr} (advertised {endpoint})"
-                );
-                let local_dir = local_shuffle_dir(shuffle_dir.as_deref(), &uri);
-                // Sweep the directory this store actually writes to, derived or
-                // explicit — see `gc_shuffle_dir`.
-                gc_shuffle_dir = Some(local_dir.clone());
-                runner_builder = runner_builder
-                    .with_shuffle(ShuffleContext {
-                        store: Arc::clone(&backend),
-                        local_dir,
-                        flight_endpoint: endpoint,
-                        ess_index: None,
-                        push_store: None,
-                    })
-                    .with_inmem_shuffle(backend);
-            }
-            ShuffleBackend::Object(_) | ShuffleBackend::Tiered(_) => {
-                runner_builder = runner_builder
-                    .with_shuffle(ShuffleContext {
-                        store: Arc::clone(&backend),
-                        local_dir: shuffle_dir.clone().unwrap_or_default(),
-                        flight_endpoint: String::new(),
-                        ess_index: None,
-                        push_store: None,
-                    })
-                    .with_inmem_shuffle(backend);
-            }
-            ShuffleBackend::InMemory(_) => {
-                runner_builder = runner_builder.with_inmem_shuffle(backend);
+    // Wire the pre-flight shuffle store into the runner. The flight server —
+    // when one exists — is already listening; this hands the runner the SAME
+    // store instance the server serves (they must match, or a cross-node
+    // reduce fetches from the flight server and misses partitions the write
+    // left in a separate store).
+    match preflight_shuffle {
+        Some(ShufflePreflight::Served {
+            backend,
+            flight_endpoint,
+            local_dir,
+        }) => {
+            runner_builder = runner_builder
+                .with_shuffle(ShuffleContext {
+                    store: Arc::clone(&backend),
+                    local_dir,
+                    flight_endpoint,
+                    ess_index: None,
+                    push_store: None,
+                })
+                .with_inmem_shuffle(backend);
+        }
+        Some(ShufflePreflight::Unserved { backend, local_dir }) => {
+            runner_builder = runner_builder
+                .with_shuffle(ShuffleContext {
+                    store: Arc::clone(&backend),
+                    local_dir,
+                    flight_endpoint: String::new(),
+                    ess_index: None,
+                    push_store: None,
+                })
+                .with_inmem_shuffle(backend);
+        }
+        Some(ShufflePreflight::InMemoryOnly { backend }) => {
+            runner_builder = runner_builder.with_inmem_shuffle(backend);
+        }
+        // Fallback in-memory shuffle store — ONLY when no dir/URI store was
+        // configured. When one was, it is already wired as both the
+        // flight-served store and `inmem_shuffle`; a fresh store here would
+        // clobber that and strand typed dfplan shuffle writes in an unserved
+        // store.
+        None => {
+            if krishiv_common::allows_unbounded_shuffle_store(durability_profile) {
+                let inmem_shuffle = Arc::new(krishiv_shuffle::ShuffleBackend::InMemory(Arc::new(
+                    InMemoryShuffleStore::new(),
+                )));
+                runner_builder = runner_builder.with_inmem_shuffle(inmem_shuffle);
             }
         }
-    } else if let Some(dir) = &shuffle_dir {
-        let disk = Arc::new(
-            LocalDiskShuffleStore::new(dir)
-                .map_err(|e| format!("local shuffle store at {}: {e}", dir.display()))?,
-        );
-        let (local_addr, _server_handle) =
-            krishiv_shuffle::flight::serve(shuffle_flight_addr, Arc::clone(&disk))
-                .await
-                .map_err(|e| format!("shuffle flight server: {e}"))?;
-        let endpoint = advertised_endpoint(local_addr, runtime.config().host());
-        println!(
-            "Krishiv executor shuffle flight listening on {local_addr} (advertised {endpoint})"
-        );
-        // The flight server above serves `disk`. Typed dfplan shuffle writes go
-        // to `inmem_shuffle`, so it must be the SAME disk-backed store — else a
-        // cross-node reduce fetches from the producer's flight server (serving
-        // `disk`) and misses partitions the write left in a separate store.
-        let backend = Arc::new(krishiv_shuffle::ShuffleBackend::Local(disk));
-        runner_builder = runner_builder
-            .with_shuffle(ShuffleContext {
-                store: Arc::clone(&backend),
-                local_dir: dir.clone(),
-                flight_endpoint: endpoint,
-                ess_index: None,
-                push_store: None,
-            })
-            .with_inmem_shuffle(backend);
-    }
-    // Fallback in-memory shuffle store — ONLY when no dir/URI store was
-    // configured. When one was, it is already wired as both the flight-served
-    // store and `inmem_shuffle`; a fresh store here would clobber that and
-    // strand typed dfplan shuffle writes in an unserved store.
-    if !has_configured_shuffle_store
-        && krishiv_common::allows_unbounded_shuffle_store(durability_profile)
-    {
-        let inmem_shuffle = Arc::new(krishiv_shuffle::ShuffleBackend::InMemory(Arc::new(
-            InMemoryShuffleStore::new(),
-        )));
-        runner_builder = runner_builder.with_inmem_shuffle(inmem_shuffle);
     }
 
     // Streaming progress buffer (GAP-OB-04): shared between runner tasks

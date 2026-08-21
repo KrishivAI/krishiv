@@ -169,6 +169,10 @@ pub fn make_checkpoint_barrier(job_id: &str, epoch: u64, checkpoint_id: &str) ->
         checkpoint_id: checkpoint_id.to_string(),
         barrier_kind: BarrierKind::Checkpoint as i32,
         timestamp_ms: krishiv_common::async_util::unix_now_ms(),
+        // Callers of this helper (tests, in-process paths) exercise the
+        // executor-default storage; the coordinator stamps a job's registered
+        // path when one exists.
+        checkpoint_storage_path: String::new(),
     }
 }
 
