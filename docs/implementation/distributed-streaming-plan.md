@@ -133,3 +133,53 @@ New follow-ups surfaced by durable mode (recorded, not fixed):
   the job's path or refuse it loudly.
 - Stale-binary defense proved out live: the class-echo verify_ack refused a
   week-old local clusterd that would have silently registered cycle jobs.
+
+## Streaming fix pass, task #149 (2026-08-21) — 12 issues, 11 fixed + 1 verified-not-a-defect
+
+The ranked issue list from the durable-mode runs, fixed in full. Every fix
+carries a test proven red against the pre-fix behavior; each landed as its
+own commit with fmt + clippy(-D warnings) + workspace tests green.
+
+1. **Daemon death on checkpoint-storage failure** (1c46c59): executor
+   start-up is now pre-flight — checkpoint storage, state backend, and
+   shuffle backend/flight bind are acquired BEFORE registration, so a
+   broken mount fails the process before the coordinator ever sees it
+   (no more register-then-vanish → Lost).
+2. **Registration's checkpoint_storage_path honored** (1c46c59):
+   CheckpointBarrier carries the job's storage path (proto field 6);
+   executors open/cache per-job storages and an unopenable path fails
+   that barrier only, never the daemon.
+3. **EOS flush uncapped + paged drain** (66b5840): the egress ring cap no
+   longer truncates flush output (q9's loss); drain pages at
+   KRISHIV_RLOOP_EGRESS_CAP per call.
+4. **JoinAggPipeline snapshot/restore** (7f279ed): pipelines actually
+   checkpoint (join + per-stage state, b64; stage-count drift refused).
+5. **Run-loop Running state**: verified NOT a defect — the earlier
+   0-running observation was the fix-6 slot-leak wedge; live probe shows
+   running_task_count 3/3.
+6. **Run-loop family lifecycle** (66b5840): is_run_loop_family() governs
+   dispatch and terminal states for all four class prefixes — classed
+   loops now report Cancelled on cancel, not Succeeded.
+7. **Direct-to-executor ingest** (380a7c1): coordinator serves target
+   discovery only (GET /api/v1/continuous/{job}/targets); producers push
+   Arrow IPC straight to executor task gRPC (bearer-authed, #L/#R side
+   suffix in the task id). Harness: KRISHIV_BENCH_DIRECT_PUSH=1. The
+   coordinator HTTP hop + base64/JSON re-encode is no longer the
+   distributed ingest ceiling. Reaching executor endpoints requires
+   in-cluster or loopback producers — not a coordinator-only tunnel.
+8. **Batch-at-a-time join output** (94e7ede): match pairs concat into one
+   output batch per input batch instead of per-match slice/concat.
+9. **Stateless plan caching** (e1cbdb5): the optimized LOGICAL plan is
+   compiled once per job (physical planning per batch — DataFusion
+   physical plans are single-execution); schema drift refused.
+10. **Parallel pipelines** (2e2c839): join-keyed pipelines run at N>1 —
+    rpipe gained the rjoin keyed exchange; stage re-keying cases are
+    refused by name via parallel_unsafe_reason().
+11. **Input buffer dial** (66b5840): KRISHIV_RLOOP_INPUT_BUFFER_CAP
+    (default 64), declared in the env registry.
+12. **Long-poll drain** (ae12163): DrainContinuousOutputRequest.wait_ms —
+    consumers park on the egress notify instead of busy-polling; the
+    coordinator grants the wait budget to the first executor only.
+
+The rig image predates this pass; a durable-mode re-benchmark needs a
+fresh image build/ship/roll.
