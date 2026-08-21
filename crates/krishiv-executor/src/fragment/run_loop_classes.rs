@@ -582,16 +582,6 @@ pub(crate) async fn execute_rpipe_fragment(
     use krishiv_plan::stream_join::StreamingPipelineSpec;
 
     let parsed = parse_classed_fragment(STREAM_RPIPE_PREFIX, fragment)?;
-    if parsed.parallelism != 1 {
-        return Err(ExecutorError::InvalidAssignment {
-            message: format!(
-                "stream:rpipe parallelism {} is not supported: pipeline stages re-key between \
-                 stages, so parallel subtasks would silently compute wrong per-key answers; \
-                 an inter-stage exchange is the tracked follow-up",
-                parsed.parallelism
-            ),
-        });
-    }
     let spec: StreamingPipelineSpec =
         serde_json::from_str(&parsed.payload).map_err(|e| ExecutorError::InvalidAssignment {
             message: format!("stream:rpipe invalid spec json: {e}"),
@@ -600,6 +590,21 @@ pub(crate) async fn execute_rpipe_fragment(
         .map_err(|e| ExecutorError::InvalidAssignment {
             message: format!("stream:rpipe spec: {e}"),
         })?;
+    // Parallel pipelines are allowed exactly when every stage groups by the
+    // join key (task #149 fix 10): the keyed exchange below co-locates each
+    // key's rows, so subtask-local stages are correct. The coordinator
+    // enforces the same predicate at registration; this is the sibling
+    // guard so a drifted coordinator cannot smuggle an unsafe shape in.
+    if parsed.parallelism != 1
+        && let Some(reason) = spec.parallel_unsafe_reason()
+    {
+        return Err(ExecutorError::InvalidAssignment {
+            message: format!(
+                "stream:rpipe parallelism {} is not supported for this pipeline: {reason}",
+                parsed.parallelism
+            ),
+        });
+    }
     let join = spec.join.clone();
     let job_id = parsed.job_id.as_str();
     let task_id = assignment.task_id().as_str().to_owned();
@@ -633,6 +638,7 @@ pub(crate) async fn execute_rpipe_fragment(
     let own_left = runner.notify_handle(&left_key);
     let own_right = runner.notify_handle(&right_key);
     let shared_notify = runner.notify_handle(job_id);
+    let peers = parse_stream_peers(assignment.input_partitions())?;
     let all_specs = parse_registry_partition_specs(assignment.input_partitions())?;
     let mut left_specs = Vec::new();
     let mut right_specs = Vec::new();
@@ -717,6 +723,59 @@ pub(crate) async fn execute_rpipe_fragment(
                 },
             )
             .await?;
+        }
+        // Keyed exchange, side preserved (task #149 fix 10): with
+        // parallelism > 1 each side routes by ITS join key, exactly the
+        // rjoin discipline — the join and every (join-keyed) stage then run
+        // subtask-locally over co-located keys.
+        if parsed.parallelism > 1 {
+            for (side_suffix, batches, key_column) in [
+                ("#L", &mut left_in, &join.left_key_column),
+                ("#R", &mut right_in, &join.right_key_column),
+            ] {
+                let mut owned_batches: Vec<RecordBatch> = Vec::new();
+                let mut outbound: std::collections::BTreeMap<usize, Vec<RecordBatch>> =
+                    Default::default();
+                for batch in batches.iter() {
+                    let routed = route_batch_by_key_group(
+                        batch,
+                        key_column,
+                        parsed.parallelism,
+                        parsed.subtask,
+                    )?;
+                    if routed.null_key_rows > 0 {
+                        return Err(local_err(format!(
+                            "stream:rpipe NULL join key in column '{key_column}': a row \
+                             that can never match is a data defect, not a droppable",
+                        )));
+                    }
+                    if let Some(own) = routed.owned {
+                        owned_batches.push(own);
+                    }
+                    for (peer_subtask, slice) in routed.routed {
+                        outbound.entry(peer_subtask).or_default().push(slice);
+                    }
+                }
+                for (peer_subtask, peer_batches) in outbound {
+                    let Some(peer) = peers.iter().find(|p| p.subtask == peer_subtask) else {
+                        return Err(ExecutorError::InvalidAssignment {
+                            message: format!(
+                                "stream:rpipe subtask {} has rows for peer {} but no peer entry",
+                                parsed.subtask, peer_subtask
+                            ),
+                        });
+                    };
+                    crate::erased(super::run_loop::deliver_to_peer_suffixed(
+                        runner,
+                        job_id,
+                        peer,
+                        peer_batches,
+                        side_suffix,
+                    ))
+                    .await?;
+                }
+                *batches = owned_batches;
+            }
         }
         if left_in.is_empty() && right_in.is_empty() {
             tokio::select! {

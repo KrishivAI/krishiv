@@ -41,6 +41,13 @@ struct Rig {
 }
 
 async fn start_rig(name: &str) -> Rig {
+    // One sequential runner slot — the shape the slot-freeing test relies on.
+    start_rig_with_loops(name, 1).await
+}
+
+/// Rig with `loops` concurrent runner slots (task #149 fix 10: parallel
+/// pipeline subtasks need one slot each to run simultaneously).
+async fn start_rig_with_loops(name: &str, loops: usize) -> Rig {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -129,22 +136,28 @@ async fn start_rig(name: &str) -> Rig {
         .with_shared_class_executors(class_executors.clone())
         .with_shared_egress_notify(Arc::clone(&egress_notify));
     let coord_endpoint = format!("http://{coord_addr}");
-    tokio::spawn(async move {
-        let service = GrpcCoordinatorService::new(coord_endpoint, LeaseGeneration::initial());
-        loop {
-            match runner.run_next_with(&service).await {
-                Ok(Some(_)) => {}
-                Ok(None) => tokio::time::sleep(Duration::from_millis(5)).await,
-                // Surfaced rather than swallowed: a runner that cannot report
-                // looks exactly like one that never ran, and chasing that
-                // distinction is what this loop's silence used to cost.
-                Err(error) => {
-                    eprintln!("[rig] run_next_with failed: {error}");
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+    let runner = Arc::new(runner);
+    for _ in 0..loops.max(1) {
+        let runner = Arc::clone(&runner);
+        let coord_endpoint = coord_endpoint.clone();
+        tokio::spawn(async move {
+            let service = GrpcCoordinatorService::new(coord_endpoint, LeaseGeneration::initial());
+            loop {
+                match runner.run_next_with(&service).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => tokio::time::sleep(Duration::from_millis(5)).await,
+                    // Surfaced rather than swallowed: a runner that cannot
+                    // report looks exactly like one that never ran, and
+                    // chasing that distinction is what this loop's silence
+                    // used to cost.
+                    Err(error) => {
+                        eprintln!("[rig] run_next_with failed: {error}");
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
                 }
             }
-        }
-    });
+        });
+    }
 
     coordinator
         .write()
@@ -674,5 +687,107 @@ async fn eos_flush_emits_windows_the_data_cannot_close() {
         max_v,
         vec![900],
         "the flush must emit the open window's aggregate"
+    );
+}
+
+/// A join-keyed pipeline runs at parallelism 2 and loses nothing (task #149
+/// fix 10): the coordinator round-robins side pushes across subtasks, so
+/// most rows land on a subtask that does NOT own their key — the new rpipe
+/// keyed exchange must re-route them, or those keys never join and their
+/// winners vanish. (This is exactly the wrong-answer mode the old blanket
+/// parallelism-1 refusal guarded against.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_pipeline_exchanges_keys_between_subtasks() {
+    use krishiv_plan::stream_task::StreamingTaskSpec;
+    let rig = start_rig_with_loops("ppipe", 3).await;
+    let job = "ppipe-j";
+    let mut stage =
+        krishiv_plan::window::WindowExecutionSpec::tumbling("left_k", "left_ts", 10_000);
+    stage.watermark_lag_ms = 20_000;
+    stage.agg_exprs = vec![krishiv_plan::window::WindowAgg {
+        kind: krishiv_plan::window::WindowAggKind::Count,
+        input_column: String::new(),
+        output_column: "n".into(),
+        filter: None,
+    }];
+    let spec = krishiv_plan::stream_join::StreamingPipelineSpec {
+        join: krishiv_plan::stream_join::StreamingJoinSpec {
+            left_source: "l".into(),
+            right_source: "r".into(),
+            time_column: "ts".into(),
+            left_key_column: "k".into(),
+            right_key_column: "k".into(),
+            window_ms: 10_000,
+        },
+        stages: vec![stage],
+    };
+    assert!(
+        spec.parallel_unsafe_reason().is_none(),
+        "this pipeline groups by the join key and must be parallel-safe"
+    );
+    let task = StreamingTaskSpec::Pipeline(Box::new(spec));
+    let mut options = ContinuousRegistrationOptions::default();
+    options.mode = Some("run-loop".into());
+    options.parallelism = Some(2);
+    krishiv_scheduler::register_continuous_task_with_options(
+        &rig.coordinator,
+        job,
+        &task,
+        &options,
+    )
+    .await
+    .expect("parallel join-keyed pipeline registers");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    fn keyed(keys: &[&str], ts: &[i64]) -> arrow::record_batch::RecordBatch {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(keys.to_vec())),
+                Arc::new(Int64Array::from(ts.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+    let keys: Vec<&str> = vec!["a", "b", "c", "d", "e", "f"];
+    // One chunk per key per side, so round-robin spreads keys across BOTH
+    // subtasks on both sides — without the exchange, misrouted keys never
+    // meet their partner.
+    for key in &keys {
+        krishiv_scheduler::push_continuous_input_side_coordinated(
+            &rig.coordinator,
+            job,
+            "L",
+            ipc_bytes(&keyed(&[key], &[1_000])),
+        )
+        .await
+        .expect("push L");
+        krishiv_scheduler::push_continuous_input_side_coordinated(
+            &rig.coordinator,
+            job,
+            "R",
+            ipc_bytes(&keyed(&[key], &[2_000])),
+        )
+        .await
+        .expect("push R");
+    }
+    // Let the loops route + join, then declare EOS and collect.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    krishiv_scheduler::flush_continuous_stream_coordinated(&rig.coordinator, job)
+        .await
+        .expect("EOS flush");
+    let out = wait_drain(&rig, job, keys.len(), Duration::from_secs(10)).await;
+    let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows,
+        keys.len(),
+        "every key must produce its window row; missing keys mean the \
+         exchange failed to co-locate them"
     );
 }

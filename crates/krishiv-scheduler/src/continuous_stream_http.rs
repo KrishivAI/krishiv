@@ -1852,12 +1852,15 @@ pub async fn register_continuous_task_with_options(
             task.class_name()
         )));
     }
-    if matches!(task, StreamingTaskSpec::Pipeline(_)) && parallelism != 1 {
+    if let StreamingTaskSpec::Pipeline(pipeline) = task
+        && parallelism != 1
+        && let Some(reason) = pipeline.parallel_unsafe_reason()
+    {
         return Err(invalid_registration(format!(
-            "pipeline parallelism {parallelism} is not supported: stages re-key between \
-             stages, so parallel subtask-local pipelines silently compute wrong per-key \
-             answers; register with parallelism 1 (the inter-stage exchange is the \
-             tracked follow-up)"
+            "pipeline parallelism {parallelism} is not supported for THIS pipeline: \
+             {reason}; register with parallelism 1 (the inter-stage exchange is the \
+             tracked follow-up). Pipelines whose stages all group by the join key \
+             parallelize."
         )));
     }
 

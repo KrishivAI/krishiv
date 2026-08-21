@@ -152,12 +152,16 @@ async fn drain_until_stable(url: &str, job: &str) -> usize {
 async fn measure_rep(url: &str, name: &str, sql: &str, rep: usize) -> RepResult {
     let job = format!("nexd-{name}-{rep}");
     let task = task_for(sql, "bid");
+    let env_parallelism: u32 = std::env::var("KRISHIV_BENCH_PARALLELISM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
     let parallelism: u32 = match &task {
-        StreamingTaskSpec::Pipeline(_) => 1,
-        _ => std::env::var("KRISHIV_BENCH_PARALLELISM")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3),
+        // Join-keyed pipelines parallelize (task #149 fix 10); stages keyed
+        // off the join key (q4's category) stay at 1 with the coordinator's
+        // named refusal.
+        StreamingTaskSpec::Pipeline(p) if p.parallel_unsafe_reason().is_some() => 1,
+        _ => env_parallelism,
     };
     let mut options = krishiv_runtime::ContinuousRegisterOptions::run_loop(parallelism);
     options.mode = Some(String::from("run-loop"));

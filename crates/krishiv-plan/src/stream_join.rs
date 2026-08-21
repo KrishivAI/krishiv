@@ -131,6 +131,43 @@ pub struct StreamingPipelineSpec {
 }
 
 impl StreamingPipelineSpec {
+    /// Why this pipeline canNOT run at parallelism > 1, or `None` when it can
+    /// (task #149 fix 10).
+    ///
+    /// The keyed exchange routes each side by ITS join key, so all rows for
+    /// one join key land on one subtask. A stage whose grouping key IS the
+    /// join key (as it appears in the joined output — collision-prefixed or
+    /// not) aggregates rows that are already co-located, so subtask-local
+    /// stages are correct. Any other stage key (NEXMark q4's category) would
+    /// need an inter-stage exchange, which remains the tracked follow-up;
+    /// those pipelines stay at parallelism 1, refused with this reason.
+    #[must_use]
+    pub fn parallel_unsafe_reason(&self) -> Option<String> {
+        let allowed = [
+            self.join.left_key_column.clone(),
+            format!("left_{}", self.join.left_key_column),
+            self.join.right_key_column.clone(),
+            format!("right_{}", self.join.right_key_column),
+        ];
+        for (index, stage) in self.stages.iter().enumerate() {
+            if stage.key_is_synthetic || !stage.key_parts.is_empty() {
+                return Some(format!(
+                    "stage {index} groups by a composite or synthetic key, which is not \
+                     a function of the join key"
+                ));
+            }
+            if !allowed.contains(&stage.key_column) {
+                return Some(format!(
+                    "stage {index} groups by '{}', which is not the join key (any of \
+                     {allowed:?}); rows for one '{}' value would be scattered across \
+                     subtasks",
+                    stage.key_column, stage.key_column
+                ));
+            }
+        }
+        None
+    }
+
     /// # Errors
     /// When the join is invalid, the stage list is empty, or a stage fails
     /// window validation.
@@ -161,5 +198,47 @@ impl StreamingPipelineSpec {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod parallel_safety {
+    use super::*;
+
+    fn base() -> StreamingPipelineSpec {
+        let mut stage = crate::window::WindowExecutionSpec::tumbling("left_a", "left_ts", 10_000);
+        stage.watermark_lag_ms = 20_000;
+        StreamingPipelineSpec {
+            join: StreamingJoinSpec {
+                left_source: "l".into(),
+                right_source: "r".into(),
+                time_column: "ts".into(),
+                left_key_column: "a".into(),
+                right_key_column: "a".into(),
+                window_ms: 10_000,
+            },
+            stages: vec![stage],
+        }
+    }
+
+    /// The parallel gate (task #149 fix 10): join-keyed stages parallelize;
+    /// anything else is refused BY NAME — the q4 shape (a stage keyed on a
+    /// non-join column) must never silently run parallel and scatter one
+    /// key's rows across subtasks.
+    #[test]
+    fn join_keyed_stages_are_parallel_safe_and_others_are_named() {
+        assert!(base().parallel_unsafe_reason().is_none());
+        let mut q4_shape = base();
+        q4_shape.stages[0].key_column = "category".into();
+        let reason = q4_shape
+            .parallel_unsafe_reason()
+            .expect("non-join stage key must be refused");
+        assert!(reason.contains("category"));
+        let mut composite = base();
+        composite.stages[0].key_parts = vec![crate::window::KeyPart {
+            name: "x".into(),
+            type_tag: "utf8".into(),
+        }];
+        assert!(composite.parallel_unsafe_reason().is_some());
     }
 }
