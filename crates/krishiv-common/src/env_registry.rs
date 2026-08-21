@@ -1142,6 +1142,18 @@ pub static FLAGS: &[FlagSpec] = &[
         "Run-loop subtask parallelism the distributed NEXMark harness (nexmark_distributed) requests per non-pipeline job. Pipelines are always registered at 1 (stage re-keying).",
     ),
     rt(
+        "KRISHIV_BENCH_CHECKPOINT_INTERVAL_MS",
+        FlagKind::UInt,
+        "0",
+        "Non-zero: the distributed NEXMark harness registers every job with barrier checkpointing at this interval (durable-mode benchmark). 0 (default): no checkpointing.",
+    ),
+    rt(
+        "KRISHIV_BENCH_CHECKPOINT_PATH",
+        FlagKind::Text,
+        "file:///var/lib/krishiv/checkpoints",
+        "Checkpoint storage path the distributed NEXMark harness passes at registration when KRISHIV_BENCH_CHECKPOINT_INTERVAL_MS is non-zero.",
+    ),
+    rt(
         "KRISHIV_STREAM_EARLY_FIRE_MS",
         FlagKind::UInt,
         "unset",

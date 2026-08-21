@@ -159,6 +159,18 @@ async fn measure_rep(url: &str, name: &str, sql: &str, rep: usize) -> RepResult 
     };
     let mut options = krishiv_runtime::ContinuousRegisterOptions::run_loop(parallelism);
     options.mode = Some(String::from("run-loop"));
+    // Durable mode: a non-zero interval registers every job with barrier
+    // checkpointing to the given storage path, so the run measures the
+    // RocksDB + checkpoint write path instead of dev-local in-memory state.
+    let ckpt_interval: u64 = std::env::var("KRISHIV_BENCH_CHECKPOINT_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if ckpt_interval > 0 {
+        let ckpt_path = std::env::var("KRISHIV_BENCH_CHECKPOINT_PATH")
+            .unwrap_or_else(|_| String::from("file:///var/lib/krishiv/checkpoints"));
+        options = options.with_checkpointing(ckpt_interval, ckpt_path);
+    }
     krishiv_runtime::execute_coordinator_continuous_register_task(url, &job, &task, &options)
         .await
         .unwrap_or_else(|e| panic!("{name}: register: {e}"));

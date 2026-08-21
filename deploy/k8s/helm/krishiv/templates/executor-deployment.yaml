@@ -131,3 +131,16 @@ spec:
               port: http
             initialDelaySeconds: 15
             periodSeconds: 30
+          {{- if .Values.executor.stateDir }}
+          # Durable profile: RocksDB state + checkpoints live under
+          # /var/lib/krishiv. An emptyDir keeps writes off the container
+          # overlayfs; swap for a PVC when restart-survival matters.
+          volumeMounts:
+            - name: krishiv-state
+              mountPath: /var/lib/krishiv
+          {{- end }}
+      {{- if .Values.executor.stateDir }}
+      volumes:
+        - name: krishiv-state
+          emptyDir: {}
+      {{- end }}
