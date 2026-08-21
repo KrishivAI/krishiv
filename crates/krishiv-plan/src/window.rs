@@ -441,10 +441,15 @@ pub const WINDOW_EXECUTION_SPEC_PREFIX: &str = "stream:spec:v1:";
 /// Validate and losslessly encode a window execution specification.
 ///
 /// An empty aggregate list retains the historical default-count behavior and
-/// is normalized to one `count` aggregate in the encoded representation.
+/// is normalized to one `count` aggregate in the encoded representation —
+/// EXCEPT for top-N specs, where an empty aggregate list is the required
+/// shape (ranking raw rows), not legacy shorthand. Injecting the default
+/// there manufactured exactly the top-N+aggregates combination that
+/// validation refuses, so every compiled top-N spec failed to encode (live
+/// k3s finding: NEXMark q18/q19 registered embedded but 400'd distributed).
 pub fn encode_window_execution_spec(spec: &WindowExecutionSpec) -> Result<String, PlanError> {
     let mut normalized = spec.clone();
-    if normalized.agg_exprs.is_empty() {
+    if normalized.agg_exprs.is_empty() && normalized.top_n.is_none() {
         normalized.agg_exprs = WindowExecutionSpec::default_count_agg();
     }
     validate_window_execution_spec(&normalized)?;
@@ -1296,6 +1301,27 @@ mod tests {
             decode_window_execution_spec(&encode_window_execution_spec(&spec).unwrap()).unwrap();
 
         assert_eq!(decoded.agg_exprs, WindowExecutionSpec::default_count_agg());
+    }
+
+    /// A top-N spec's empty aggregate list is its REQUIRED shape, not the
+    /// legacy "default count" shorthand. The encoder used to inject the
+    /// default count unconditionally and then refuse its own output ("top-N
+    /// and aggregates cannot be combined"), so no compiled top-N spec could
+    /// cross the wire.
+    #[test]
+    fn top_n_spec_encodes_without_default_count_injection() {
+        let mut spec = WindowExecutionSpec::tumbling("k", "ts", 1_000);
+        spec.agg_exprs.clear();
+        spec.top_n = Some(TopNSpec {
+            order_column: String::from("price"),
+            descending: true,
+            limit: 10,
+            carry_columns: vec![String::from("bidder")],
+        });
+        let encoded = encode_window_execution_spec(&spec).expect("a top-N spec must encode");
+        let decoded = decode_window_execution_spec(&encoded).expect("and round-trip");
+        assert!(decoded.agg_exprs.is_empty(), "no default count injected");
+        assert_eq!(decoded.top_n, spec.top_n);
     }
 
     #[test]
