@@ -694,6 +694,11 @@ message DrainContinuousOutputRequest {
   TransportVersion version = 1;
   string job_id = 2;
   string task_id = 3;
+  // Long-poll budget (task #149 fix 12): when the egress buffer is empty,
+  // the executor parks up to this many milliseconds for output to arrive
+  // instead of returning empty immediately. 0 (and older callers) keep the
+  // immediate-return behavior.
+  uint64 wait_ms = 4;
 }
 
 message DrainContinuousOutputResponse {

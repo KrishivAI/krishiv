@@ -1376,9 +1376,21 @@ pub async fn execute_coordinator_continuous_drain(
     coordinator_http: &str,
     job_id: &str,
 ) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
+    execute_coordinator_continuous_drain_wait(coordinator_http, job_id, 0).await
+}
+
+/// Drain with a long-poll budget (task #149 fix 12): when the job's egress
+/// is empty the coordinator relays the wait to the executors, which park on
+/// their egress notify instead of the caller busy-polling empty responses.
+pub async fn execute_coordinator_continuous_drain_wait(
+    coordinator_http: &str,
+    job_id: &str,
+    wait_ms: u64,
+) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
     #[derive(serde::Serialize)]
     struct ContinuousDrainRequest<'a> {
         job_id: &'a str,
+        wait_ms: u64,
     }
 
     #[derive(serde::Deserialize)]
@@ -1388,7 +1400,7 @@ pub async fn execute_coordinator_continuous_drain(
 
     let base = normalize_http_base(coordinator_http)?;
     let url = format!("{base}/api/v1/continuous-drain");
-    let body = ContinuousDrainRequest { job_id };
+    let body = ContinuousDrainRequest { job_id, wait_ms };
 
     let client = coordinator_http_client()?;
     let response = apply_coordinator_bearer(client.post(&url).json(&body))

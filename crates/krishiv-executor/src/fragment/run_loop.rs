@@ -1299,6 +1299,10 @@ impl ExecutorTaskRunner {
                 .entry(job_id.to_owned())
                 .or_default();
             egress.extend(outputs.iter().cloned());
+            // Wake a long-polling drain (task #149 fix 12).
+            if let Some(notify) = self.egress_notify.get(job_id) {
+                notify.notify_waiters();
+            }
             // The cap is a durability dial: it is how much computed output a
             // slow consumer may lose before catching up. It is also a per-JOB
             // budget shared by every co-located subtask, so effective headroom

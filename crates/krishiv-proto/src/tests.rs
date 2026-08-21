@@ -1435,7 +1435,12 @@ mod wire_fuzz {
             job_id in arb_string(),
             task_id in arb_string(),
         ) {
-            let wire = v1::DrainContinuousOutputRequest { version, job_id, task_id };
+            let wire = v1::DrainContinuousOutputRequest {
+                version,
+                job_id,
+                task_id,
+                wait_ms: 0,
+            };
             let _ = drain_continuous_output_request_from_wire(wire);
         }
 

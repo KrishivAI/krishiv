@@ -340,6 +340,10 @@ pub struct ExecutorTaskRunner {
     pub(crate) pipeline_executors:
         Arc<DashMap<String, Arc<tokio::sync::Mutex<krishiv_dataflow::pipeline::JoinAggPipeline>>>>,
 
+    /// Per-job egress notifies (task #149 fix 12) — shared with the gRPC
+    /// service so staged output wakes long-polling drains.
+    pub(crate) egress_notify: crate::runner::SharedContinuousNotify,
+
     /// Per-path checkpoint storages opened for jobs whose registration named
     /// an explicit `checkpoint_storage_path` (task #149 fix 2). Keyed by the
     /// path string; the daemon-default storage never enters this map.
@@ -468,6 +472,7 @@ impl ExecutorTaskRunner {
             continuous_null_key_rows: Arc::new(DashMap::new()),
             join_executors: Arc::new(DashMap::new()),
             job_checkpoint_storages: Arc::new(DashMap::new()),
+            egress_notify: Arc::new(DashMap::new()),
             stateless_executors: Arc::new(DashMap::new()),
             pipeline_executors: Arc::new(DashMap::new()),
             stream_exchange: crate::stream_exchange::StreamExchange::default(),
@@ -859,6 +864,17 @@ impl ExecutorTaskRunner {
         store: std::sync::Arc<krishiv_shuffle::ShuffleBackend>,
     ) -> Self {
         self.inmem_shuffle = Some(store);
+        self
+    }
+
+    /// Share the per-job egress notify map with the gRPC service (task #149
+    /// fix 12).
+    #[must_use]
+    pub fn with_shared_egress_notify(
+        mut self,
+        notify: crate::runner::SharedContinuousNotify,
+    ) -> Self {
+        self.egress_notify = notify;
         self
     }
 

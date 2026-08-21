@@ -1912,6 +1912,7 @@ pub fn drain_continuous_output_request_to_wire(
         version: Some(transport_version_to_wire(value.version)),
         job_id: value.job_id.as_str().to_owned(),
         task_id: value.task_id.as_str().to_owned(),
+        wait_ms: value.wait_ms,
     }
 }
 
@@ -1922,6 +1923,7 @@ pub fn drain_continuous_output_request_from_wire(
         version: transport_version_from_wire(required(value.version, "version")?)?,
         job_id: crate::ids::JobId::try_new(value.job_id).map_err(WireError::from_id)?,
         task_id: crate::ids::TaskId::try_new(value.task_id).map_err(WireError::from_id)?,
+        wait_ms: value.wait_ms,
     })
 }
 

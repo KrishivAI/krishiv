@@ -1240,6 +1240,7 @@ async fn drain_run_loop_output(
     coordinator: &SharedCoordinator,
     job_id: &JobId,
     targets: Vec<(String, String)>,
+    wait_ms: u64,
 ) -> Result<Vec<Vec<u8>>, ContinuousStreamError> {
     use krishiv_proto::{TaskId, TransportVersion, wire};
     let channels = coordinator.read().await.executor_channels.clone();
@@ -1270,13 +1271,24 @@ async fn drain_run_loop_output(
         )
         .max_decoding_message_size(max)
         .max_encoding_message_size(max);
+        // The long-poll budget goes to the FIRST executor only (task #149
+        // fix 12): the fan-out is sequential, so paying it per executor would
+        // multiply worst-case latency by the executor count; once the first
+        // wait returns, the remaining executors are checked immediately.
+        let this_wait =
+            if payloads.is_empty() && failed_endpoints.is_empty() && seen_endpoints.len() == 1 {
+                wait_ms
+            } else {
+                0
+            };
         let request = krishiv_proto::task::DrainContinuousOutputRequest {
             version: TransportVersion::CURRENT,
             job_id: job_id.clone(),
             task_id: TaskId::try_new(&task_id).map_err(|e| invalid_registration(e.to_string()))?,
+            wait_ms: this_wait,
         };
         let rpc = tokio::time::timeout(
-            RUN_LOOP_RPC_TIMEOUT,
+            RUN_LOOP_RPC_TIMEOUT + std::time::Duration::from_millis(this_wait),
             client.drain_continuous_output(wire::drain_continuous_output_request_to_wire(request)),
         )
         .await
@@ -1528,6 +1540,11 @@ pub async fn api_continuous_push(
 #[derive(Debug, Deserialize)]
 pub struct ContinuousDrainRequest {
     pub job_id: String,
+    /// Long-poll budget in milliseconds (task #149 fix 12): when the job's
+    /// egress is empty, the drain parks up to this long for output instead
+    /// of returning empty immediately. Absent/0 keeps the immediate return.
+    #[serde(default)]
+    pub wait_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1562,7 +1579,7 @@ pub async fn api_continuous_drain(
         run_loop_targets(&coord, &job_id).map_err(|error| scheduler_error_response(&error))?
     };
     if let Some(targets) = run_loop {
-        let payloads = drain_run_loop_output(&coordinator, &job_id, targets)
+        let payloads = drain_run_loop_output(&coordinator, &job_id, targets, body.wait_ms)
             .await
             .map_err(|error| match error {
                 ContinuousStreamError::Scheduler(e) => scheduler_error_response(&e),
@@ -2608,7 +2625,7 @@ pub async fn drain_continuous_stream_coordinated(
         run_loop_targets(&coord, &job_id_typed).map_err(ContinuousStreamError::Scheduler)?
     };
     if let Some(targets) = run_loop {
-        return drain_run_loop_output(coordinator, &job_id_typed, targets).await;
+        return drain_run_loop_output(coordinator, &job_id_typed, targets, 0).await;
     }
 
     let mut coord = coordinator.write().await;
@@ -3269,6 +3286,7 @@ mod tests {
         // Drain before any push — should return empty, not error.
         let drain_req = ContinuousDrainRequest {
             job_id: "cs-test-job".to_string(),
+            wait_ms: 0,
         };
         let drain_resp = api_continuous_drain(State(coordinator.clone()), Json(drain_req))
             .await
@@ -3869,6 +3887,7 @@ mod tests {
             State(coordinator),
             Json(ContinuousDrainRequest {
                 job_id: "missing-job".into(),
+                wait_ms: 0,
             }),
         )
         .await
@@ -4302,6 +4321,7 @@ mod tests {
             State(coordinator.clone()),
             Json(ContinuousDrainRequest {
                 job_id: "cs-explains-missing".into(),
+                wait_ms: 0,
             }),
         )
         .await

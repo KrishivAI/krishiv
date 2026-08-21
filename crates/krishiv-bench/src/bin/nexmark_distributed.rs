@@ -130,7 +130,9 @@ async fn drain_until_stable(url: &str, job: &str) -> usize {
     let mut total = 0usize;
     let mut stable = 0usize;
     loop {
-        let drained = krishiv_runtime::execute_coordinator_continuous_drain(url, job)
+        // Long-poll (task #149 fix 12): an empty egress parks server-side up
+        // to 500ms instead of this loop hammering empty responses.
+        let drained = krishiv_runtime::execute_coordinator_continuous_drain_wait(url, job, 500)
             .await
             .unwrap_or_default();
         let got: usize = drained.iter().map(|b| b.num_rows()).sum();

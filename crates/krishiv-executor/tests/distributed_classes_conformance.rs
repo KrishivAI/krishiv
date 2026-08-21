@@ -88,6 +88,7 @@ async fn start_rig(name: &str) -> Rig {
     let connector_sources: krishiv_executor::runner::SharedContinuousConnectorSources =
         Arc::new(DashMap::new());
     let class_executors = krishiv_executor::grpc::SharedClassExecutors::default();
+    let egress_notify: krishiv_executor::runner::SharedContinuousNotify = Arc::new(DashMap::new());
 
     {
         let inbox = inbox.clone();
@@ -97,6 +98,7 @@ async fn start_rig(name: &str) -> Rig {
         let input_notify = Arc::clone(&input_notify);
         let connector_sources = Arc::clone(&connector_sources);
         let class_executors = class_executors.clone();
+        let egress_notify = Arc::clone(&egress_notify);
         tokio::spawn(async move {
             // The run-loop server: shares egress buffers and input notifies
             // with the runner, which is what run-loop drain/push need — the
@@ -111,6 +113,7 @@ async fn start_rig(name: &str) -> Rig {
                 input_notify,
                 connector_sources,
                 class_executors,
+                egress_notify,
             )
             .await;
         });
@@ -123,7 +126,8 @@ async fn start_rig(name: &str) -> Rig {
         .with_shared_continuous_outputs(Arc::clone(&continuous_outputs))
         .with_shared_continuous_notify(Arc::clone(&input_notify))
         .with_shared_continuous_connector_sources(Arc::clone(&connector_sources))
-        .with_shared_class_executors(class_executors.clone());
+        .with_shared_class_executors(class_executors.clone())
+        .with_shared_egress_notify(Arc::clone(&egress_notify));
     let coord_endpoint = format!("http://{coord_addr}");
     tokio::spawn(async move {
         let service = GrpcCoordinatorService::new(coord_endpoint, LeaseGeneration::initial());

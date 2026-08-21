@@ -2187,6 +2187,9 @@ pub struct DrainContinuousOutputRequest {
     pub version: TransportVersion,
     pub job_id: JobId,
     pub task_id: TaskId,
+    /// Long-poll budget in milliseconds; 0 = return immediately (task #149
+    /// fix 12).
+    pub wait_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

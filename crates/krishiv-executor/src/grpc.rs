@@ -79,6 +79,9 @@ pub struct ExecutorTaskInboxService {
     /// the task runner so cancel retires EVERY class's state, not just
     /// windows.
     pub(crate) class_executors: SharedClassExecutors,
+    /// Per-job egress notifies (task #149 fix 12): staged run-loop output
+    /// wakes a long-polling drain instead of the caller busy-polling.
+    pub(crate) egress_notify: crate::runner::SharedContinuousNotify,
 }
 
 impl std::fmt::Debug for ExecutorTaskInboxService {
@@ -108,6 +111,7 @@ impl ExecutorTaskInboxService {
             input_notify: Arc::new(DashMap::new()),
             continuous_connector_sources: Arc::new(DashMap::new()),
             class_executors: SharedClassExecutors::default(),
+            egress_notify: Arc::new(DashMap::new()),
         }
     }
 
@@ -125,6 +129,7 @@ impl ExecutorTaskInboxService {
             input_notify: Arc::new(DashMap::new()),
             continuous_connector_sources: Arc::new(DashMap::new()),
             class_executors: SharedClassExecutors::default(),
+            egress_notify: Arc::new(DashMap::new()),
         }
     }
 
@@ -198,7 +203,18 @@ impl ExecutorTaskInboxService {
             .entry(job_id.to_owned())
             .or_default()
             .extend(outputs);
+        if let Some(notify) = self.egress_notify.get(job_id) {
+            notify.notify_waiters();
+        }
         Ok(flushed)
+    }
+
+    /// Share the per-job egress notify map with the runner, so staged output
+    /// wakes long-polling drains (task #149 fix 12).
+    #[must_use]
+    pub fn with_egress_notify(mut self, notify: crate::runner::SharedContinuousNotify) -> Self {
+        self.egress_notify = notify;
+        self
     }
 
     /// Share the class-specific run-loop state maps with the runner — see
@@ -556,6 +572,40 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         let req = request.into_inner();
         let job_id = req.job_id.as_str();
 
+        // Long-poll (task #149 fix 12): an empty egress buffer parks the
+        // drain on the job's egress notify up to `wait_ms` instead of
+        // returning empty for the caller to busy-poll. The notify is armed
+        // BEFORE the emptiness re-check so an append between check and park
+        // cannot be missed.
+        if req.wait_ms > 0 {
+            let empty = self
+                .continuous_outputs
+                .get(job_id)
+                .map(|e| e.is_empty())
+                .unwrap_or(true);
+            if empty {
+                let notify = self
+                    .egress_notify
+                    .entry(job_id.to_owned())
+                    .or_default()
+                    .clone();
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                let still_empty = self
+                    .continuous_outputs
+                    .get(job_id)
+                    .map(|e| e.is_empty())
+                    .unwrap_or(true);
+                if still_empty {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(req.wait_ms.min(60_000)),
+                        notified,
+                    )
+                    .await;
+                }
+            }
+        }
+
         // Phase 55: run-loop jobs emit into a per-job egress buffer as they
         // run — drain serves (and clears) it without driving any execution.
         if let Some(mut egress) = self.continuous_outputs.get_mut(job_id) {
@@ -841,6 +891,7 @@ pub fn executor_task_grpc_server_with_continuous(
         Arc::new(DashMap::new()),
         Arc::new(DashMap::new()),
         SharedClassExecutors::default(),
+        Arc::new(DashMap::new()),
         auth,
     )
 }
@@ -857,13 +908,15 @@ pub fn executor_task_grpc_server_with_run_loop(
     input_notify: crate::runner::SharedContinuousNotify,
     continuous_connector_sources: crate::runner::SharedContinuousConnectorSources,
     class_executors: SharedClassExecutors,
+    egress_notify: crate::runner::SharedContinuousNotify,
     auth: Option<ExecutorTaskAuthConfig>,
 ) -> wire::v1::executor_task_server::ExecutorTaskServer<ExecutorTaskGrpcService> {
     let inner =
         ExecutorTaskInboxService::new_with_continuous(inbox, loop_executors, continuous_inputs)
             .with_run_loop_state(continuous_outputs, input_notify)
             .with_continuous_connector_sources(continuous_connector_sources)
-            .with_class_executors(class_executors);
+            .with_class_executors(class_executors)
+            .with_egress_notify(egress_notify);
     let auth = auth.unwrap_or_else(ExecutorTaskAuthConfig::from_env);
     let auth_misconfiguration = (auth.require_auth() && !auth.has_bearer_token()).then(|| {
         format!(
@@ -901,6 +954,45 @@ mod tests {
             ],
         )
         .expect("batch")
+    }
+
+    /// A drain with a wait budget must PARK on an empty egress and return
+    /// data that arrives during the wait — the pre-fix behavior returned
+    /// empty immediately and every consumer busy-polled (task #149 fix 12).
+    #[tokio::test]
+    async fn drain_long_poll_returns_data_arriving_mid_wait() {
+        use krishiv_proto::task::DrainContinuousOutputRequest;
+        use krishiv_proto::{JobId, TaskId, TransportVersion};
+        let service = ExecutorTaskInboxService::new(ExecutorAssignmentInbox::new_unbounded());
+        let svc = service.clone();
+        let drain = tokio::spawn(async move {
+            svc.drain_continuous_output(tonic::Request::new(DrainContinuousOutputRequest {
+                version: TransportVersion::CURRENT,
+                job_id: JobId::try_new("lp-job").expect("job id"),
+                task_id: TaskId::try_new("t0").expect("task id"),
+                wait_ms: 5_000,
+            }))
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        service
+            .continuous_outputs
+            .entry("lp-job".into())
+            .or_default()
+            .push(kv_batch(&[1]));
+        if let Some(notify) = service.egress_notify.get("lp-job") {
+            notify.notify_waiters();
+        }
+        let started = std::time::Instant::now();
+        let response = drain.await.expect("join").expect("drain ok").into_inner();
+        assert!(
+            !response.ipc_bytes.is_empty(),
+            "the parked drain must return the batch that arrived mid-wait"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "and must wake on notify, not ride out the full wait"
+        );
     }
 
     /// The EOS flush moves bytes from operator state into egress — memory
