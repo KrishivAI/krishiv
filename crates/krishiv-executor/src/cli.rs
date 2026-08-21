@@ -588,6 +588,10 @@ async fn heartbeat_loop(
     // the same discipline as the maps above, extended to task #147's classes.
     let shared_class_executors = crate::grpc::SharedClassExecutors::default();
     let shared_egress_notify: crate::runner::SharedContinuousNotify = Arc::new(DashMap::new());
+    // EOS quiesce protocol: loops raise this while applying taken input; the
+    // gRPC service samples it (after the buffers) to prove pushed data was
+    // APPLIED before an end-of-stream flush.
+    let shared_continuous_busy: crate::grpc::SharedContinuousBusy = Arc::new(DashMap::new());
 
     // Now spawn the task and barrier servers.  No more re-registers required.
     if let Some(listener) = task_listener {
@@ -599,6 +603,7 @@ async fn heartbeat_loop(
         let grpc_connector_sources = Arc::clone(&shared_connector_sources);
         let grpc_class_executors = shared_class_executors.clone();
         let grpc_egress_notify = Arc::clone(&shared_egress_notify);
+        let grpc_continuous_busy = Arc::clone(&shared_continuous_busy);
         tokio::spawn(async move {
             use crate::transport::serve_executor_task_grpc_with_run_loop;
             if let Err(e) = serve_executor_task_grpc_with_run_loop(
@@ -611,6 +616,7 @@ async fn heartbeat_loop(
                 grpc_connector_sources,
                 grpc_class_executors,
                 grpc_egress_notify,
+                grpc_continuous_busy,
             )
             .await
             {
@@ -664,7 +670,8 @@ async fn heartbeat_loop(
         .with_shared_continuous_notify(shared_input_notify)
         .with_shared_continuous_connector_sources(shared_connector_sources)
         .with_shared_class_executors(shared_class_executors)
-        .with_shared_egress_notify(shared_egress_notify);
+        .with_shared_egress_notify(shared_egress_notify)
+        .with_shared_continuous_busy(Arc::clone(&shared_continuous_busy));
     // The run-loop short-circuits exchange deliveries to co-located peers by
     // matching the advertised task endpoint.
     if let Some(endpoint) = runtime.config().task_endpoint() {

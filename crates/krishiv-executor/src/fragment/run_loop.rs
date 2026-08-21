@@ -906,7 +906,11 @@ pub(crate) async fn execute_run_loop_fragment(
             }
         }
 
-        // Gather this iteration's input.
+        // Gather this iteration's input. Busy guard BEFORE the take: the
+        // EOS quiesce check samples buffers then busy, so pushed input is
+        // provably either still buffered or covered by a raised busy count
+        // until this iteration has applied it.
+        let busy_iteration = runner.enter_busy_iteration(job_id);
         let read_started = Instant::now();
         let mut input: Vec<RecordBatch> = Vec::new();
         // Pushed input (external producers AND peer-exchange deliveries) gets
@@ -1006,6 +1010,7 @@ pub(crate) async fn execute_run_loop_fragment(
         }
 
         if input.is_empty() {
+            drop(busy_iteration);
             // Wake on push notify (own key or the job's shared key) or the µs
             // safety floor — the embedded loop's wake discipline, promoted.
             //

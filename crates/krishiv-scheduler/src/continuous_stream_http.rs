@@ -1221,6 +1221,27 @@ async fn push_run_loop_eos(
     job_id: &krishiv_proto::JobId,
     endpoint: &str,
 ) -> Result<(), ContinuousStreamError> {
+    push_run_loop_directive(channels, job_id, endpoint, "stream-eos").await
+}
+
+/// Quiesce-only leg of the distributed EOS barrier: the executor waits until
+/// every pushed batch for the job has been APPLIED by its loops and returns
+/// without flushing. See `flush_continuous_stream_coordinated` for why two
+/// full rounds across all executors precede the flush.
+async fn push_run_loop_eos_quiesce(
+    channels: &crate::coordinator::task_assignment::ExecutorChannelMap,
+    job_id: &krishiv_proto::JobId,
+    endpoint: &str,
+) -> Result<(), ContinuousStreamError> {
+    push_run_loop_directive(channels, job_id, endpoint, "stream-eos-quiesce").await
+}
+
+async fn push_run_loop_directive(
+    channels: &crate::coordinator::task_assignment::ExecutorChannelMap,
+    job_id: &krishiv_proto::JobId,
+    endpoint: &str,
+    directive_task_id: &str,
+) -> Result<(), ContinuousStreamError> {
     use krishiv_proto::{TaskId, TransportVersion, wire};
     if crate::is_in_process_task_endpoint(endpoint) {
         return Err(ContinuousStreamError::Unavailable(String::from(
@@ -1241,7 +1262,8 @@ async fn push_run_loop_eos(
     let request = krishiv_proto::task::PushContinuousInputRequest {
         version: TransportVersion::CURRENT,
         job_id: job_id.clone(),
-        task_id: TaskId::try_new("stream-eos").map_err(|e| invalid_registration(e.to_string()))?,
+        task_id: TaskId::try_new(directive_task_id)
+            .map_err(|e| invalid_registration(e.to_string()))?,
         ipc_bytes: Vec::new(),
     };
     tokio::time::timeout(
@@ -2522,8 +2544,21 @@ pub async fn flush_continuous_stream_coordinated(
             )));
         }
         let channels = coordinator.read().await.executor_channels.clone();
-        for endpoint in endpoints {
-            push_run_loop_eos(&channels, &job_id_typed, &endpoint).await?;
+        // Distributed EOS barrier (task #149 fix 7 follow-up): flushing an
+        // executor while a peer is still processing input can forward rows
+        // INTO the already-flushed operator, where nothing ever flushes them
+        // again. Two full quiesce rounds prove global quiescence: forwards
+        // are delivered synchronously before the sending iteration completes,
+        // and a forwarded row is owned by its recipient (no cascade) — so
+        // round one settles every sender, round two settles every recipient
+        // of round one's forwards. Only then may anyone flush.
+        for _quiesce_round in 0..2 {
+            for endpoint in &endpoints {
+                push_run_loop_eos_quiesce(&channels, &job_id_typed, endpoint).await?;
+            }
+        }
+        for endpoint in &endpoints {
+            push_run_loop_eos(&channels, &job_id_typed, endpoint).await?;
         }
         return Ok(Vec::new());
     }

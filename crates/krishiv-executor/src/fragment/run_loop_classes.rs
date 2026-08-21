@@ -221,6 +221,10 @@ pub(crate) async fn execute_rbatch_fragment(
         if !state_alive {
             break;
         }
+        // Busy guard BEFORE the take: the EOS quiesce check samples buffers
+        // then busy, so input is provably either still buffered or covered by
+        // a raised busy count until this iteration has applied it.
+        let busy_iteration = runner.enter_busy_iteration(job_id);
         let mut input: Vec<RecordBatch> = Vec::new();
         input.extend(take_pushed(runner, &input_key));
         input.extend(take_pushed(runner, job_id));
@@ -241,6 +245,7 @@ pub(crate) async fn execute_rbatch_fragment(
         }
 
         if input.is_empty() {
+            drop(busy_iteration);
             tokio::select! {
                 _ = own_notify.notified() => {}
                 _ = shared_notify.notified() => {}
@@ -408,6 +413,7 @@ pub(crate) async fn execute_rjoin_fragment(
         }
         let _ = crate::erased(runner.drain_barriers_via_context()).await;
 
+        let busy_iteration = runner.enter_busy_iteration(job_id);
         let mut left_in: Vec<RecordBatch> = take_pushed(runner, &left_key);
         let mut right_in: Vec<RecordBatch> = take_pushed(runner, &right_key);
         for src in &left_specs {
@@ -442,6 +448,7 @@ pub(crate) async fn execute_rjoin_fragment(
         }
 
         if left_in.is_empty() && right_in.is_empty() {
+            drop(busy_iteration);
             tokio::select! {
                 _ = own_left.notified() => {}
                 _ = own_right.notified() => {}
@@ -692,6 +699,7 @@ pub(crate) async fn execute_rpipe_fragment(
         if !state_alive {
             break;
         }
+        let busy_iteration = runner.enter_busy_iteration(job_id);
         let mut left_in: Vec<RecordBatch> = take_pushed(runner, &left_key);
         let mut right_in: Vec<RecordBatch> = take_pushed(runner, &right_key);
         for src in &left_specs {
@@ -778,6 +786,7 @@ pub(crate) async fn execute_rpipe_fragment(
             }
         }
         if left_in.is_empty() && right_in.is_empty() {
+            drop(busy_iteration);
             tokio::select! {
                 _ = own_left.notified() => {}
                 _ = own_right.notified() => {}

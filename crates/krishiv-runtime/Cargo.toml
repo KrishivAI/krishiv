@@ -56,6 +56,7 @@ cloud = ["dep:object_store", "dep:bytes"]
 tokio = { workspace = true }
 # Serves the real coordinator HTTP router in the direct-push e2e test.
 axum = { workspace = true }
+tokio-stream = { workspace = true }
 tempfile = { workspace = true }
 # dev-only cycle (flight-sql depends on runtime); Cargo permits dev-dep cycles.
 # Gives the distributed Flight integration tests a live server to hit.

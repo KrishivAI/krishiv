@@ -183,6 +183,12 @@ pub struct ExecutorTaskRunner {
     /// them (as a fallback when `continuous_drainer` is absent) so the same executor
     /// state is shared with the network path.
     pub(crate) continuous_inputs: Arc<DashMap<String, Vec<RecordBatch>>>,
+    /// Per-job count of run-loop iterations currently mid-processing taken
+    /// input (task #149 fix 7 follow-up). Sampled by the EOS quiesce check
+    /// AFTER the input buffers: buffers-empty + busy==0 proves every pushed
+    /// batch has been APPLIED to its operator, closing the take-to-apply
+    /// window the flush used to race.
+    pub(crate) continuous_busy: crate::grpc::SharedContinuousBusy,
     /// Per-job/partition connector sources for `stream:loop:` registry inputs.
     ///
     /// These source instances retain connector-owned cursor state across
@@ -426,6 +432,18 @@ impl Drop for RunningAttemptGuard {
     }
 }
 
+/// Drop-guard for `ExecutorTaskRunner::enter_busy_iteration`.
+pub(crate) struct ContinuousBusyGuard {
+    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for ContinuousBusyGuard {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl ExecutorTaskRunner {
     /// Create a runner over an executor assignment inbox.
     pub fn new(inbox: ExecutorAssignmentInbox) -> Self {
@@ -442,6 +460,7 @@ impl ExecutorTaskRunner {
             continuous_drainer: None,
             loop_executors: Arc::new(DashMap::new()),
             continuous_inputs: Arc::new(DashMap::new()),
+            continuous_busy: Arc::new(DashMap::new()),
             continuous_connector_sources: Arc::new(DashMap::new()),
             rloop_connector_sinks: Arc::new(DashMap::new()),
             streaming_advisors: Arc::new(DashMap::new()),
@@ -493,6 +512,27 @@ impl ExecutorTaskRunner {
     pub fn with_shared_continuous_notify(mut self, notify: SharedContinuousNotify) -> Self {
         self.continuous_input_notify = notify;
         self
+    }
+
+    /// Shared busy-iteration counters for wiring with the gRPC service's EOS
+    /// quiesce check.
+    pub fn with_shared_continuous_busy(mut self, busy: crate::grpc::SharedContinuousBusy) -> Self {
+        self.continuous_busy = busy;
+        self
+    }
+
+    /// RAII marker for one run-loop iteration that took pushed input: holds
+    /// the job's busy count up while the input is applied, releases on drop
+    /// (including error unwinds). See `continuous_busy` for the protocol.
+    pub(crate) fn enter_busy_iteration(&self, job_id: &str) -> ContinuousBusyGuard {
+        let counter = std::sync::Arc::clone(
+            self.continuous_busy
+                .entry(job_id.to_owned())
+                .or_default()
+                .value(),
+        );
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ContinuousBusyGuard { counter }
     }
 
     /// Shared run-loop egress buffers for wiring with the gRPC service.
@@ -730,6 +770,7 @@ impl ExecutorTaskRunner {
         // one's drop count and report loss that never happened to it.
         self.continuous_egress_dropped.remove(job_id);
         self.continuous_null_key_rows.remove(job_id);
+        self.continuous_busy.remove(job_id);
     }
 
     /// Access the registered-parquet cache (keyed by `"table_name:path"`).

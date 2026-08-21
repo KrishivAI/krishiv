@@ -1527,7 +1527,7 @@ pub async fn push_continuous_direct(
     let mut client = wire::v1::executor_task_client::ExecutorTaskClient::new(channel)
         .max_decoding_message_size(max)
         .max_encoding_message_size(max);
-    let mut request = tonic::Request::new(wire::push_continuous_input_request_to_wire(
+    let wire_request = wire::push_continuous_input_request_to_wire(
         krishiv_proto::task::PushContinuousInputRequest {
             version: TransportVersion::CURRENT,
             job_id: krishiv_proto::JobId::try_new(job_id)
@@ -1536,24 +1536,47 @@ pub async fn push_continuous_direct(
                 .map_err(|e| RuntimeError::transport(e.to_string()))?,
             ipc_bytes: encode_batches_ipc_bytes(input_batches)?,
         },
-    ));
-    if let Ok(token) = std::env::var("KRISHIV_EXECUTOR_TASK_BEARER_TOKEN") {
-        let token = token.trim();
-        if !token.is_empty()
-            && let Ok(value) = tonic::metadata::MetadataValue::try_from(format!("Bearer {token}"))
-        {
+    );
+    let bearer = std::env::var("KRISHIV_EXECUTOR_TASK_BEARER_TOKEN")
+        .ok()
+        .and_then(|token| {
+            let token = token.trim().to_owned();
+            (!token.is_empty())
+                .then(|| tonic::metadata::MetadataValue::try_from(format!("Bearer {token}")).ok())
+                .flatten()
+        });
+    // Backpressure-aware retry, mirroring the coordinator push path's 429
+    // handling: ResourceExhausted from the executor means the run loop's
+    // input buffer is full — flow control, not failure — so back off and
+    // retry until the budget is spent. Without this the direct path dies the
+    // moment a producer outruns the loop (observed live: q9's two sides
+    // filled one subtask's buffer in under a second).
+    const BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(100);
+    const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(3_200);
+    const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+    let started = std::time::Instant::now();
+    let mut backoff = BACKOFF_START;
+    loop {
+        let mut request = tonic::Request::new(wire_request.clone());
+        if let Some(value) = bearer.clone() {
             request.metadata_mut().insert("authorization", value);
         }
+        match client.push_continuous_input(request).await {
+            Ok(_) => return Ok(()),
+            Err(status)
+                if status.code() == tonic::Code::ResourceExhausted
+                    && started.elapsed() < RETRY_BUDGET =>
+            {
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(BACKOFF_CAP);
+            }
+            Err(status) => {
+                return Err(RuntimeError::transport(format!(
+                    "direct push to {executor_endpoint} failed: {status}"
+                )));
+            }
+        }
     }
-    client
-        .push_continuous_input(request)
-        .await
-        .map_err(|status| {
-            RuntimeError::transport(format!(
-                "direct push to {executor_endpoint} failed: {status}"
-            ))
-        })?;
-    Ok(())
 }
 
 /// Declare end-of-stream for a continuous job (bounded producers). Cycle

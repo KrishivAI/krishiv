@@ -4,6 +4,7 @@ pub const EXECUTOR_TASK_BEARER_TOKEN_ENV: &str = "KRISHIV_EXECUTOR_TASK_BEARER_T
 pub const REQUIRE_EXECUTOR_TASK_AUTH_ENV: &str = "KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH";
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
@@ -27,11 +28,30 @@ pub type SharedLoopExecutors = Arc<DashMap<String, Arc<Mutex<ContinuousWindowExe
 /// `push_continuous_input` appends decoded batches here; `drain_continuous_output`
 /// drains and processes them through the matching loop executor.
 pub type SharedContinuousInputs = Arc<DashMap<String, Vec<RecordBatch>>>;
+/// Per-job count of run-loop iterations currently applying taken input.
+/// See `ExecutorTaskRunner::continuous_busy` for the quiesce protocol.
+pub type SharedContinuousBusy = Arc<DashMap<String, Arc<std::sync::atomic::AtomicUsize>>>;
 
 /// Reserved pseudo-task id carrying the run-loop end-of-stream directive
 /// through `push_continuous_input`. Real subtask ids are
 /// `task-streaming-<n>`, so this cannot collide with one.
 pub const RUN_LOOP_EOS_TASK_ID: &str = "stream-eos";
+
+/// Reserved pseudo-task id: quiesce-only leg of the distributed EOS barrier.
+/// The handler waits until every pushed batch for the job has been APPLIED
+/// by its run loop (buffers empty + no iteration mid-processing) and returns
+/// WITHOUT flushing. The coordinator runs two full quiesce rounds across all
+/// executors before sending `stream-eos`: forwards are delivered synchronously
+/// before an iteration completes and a forwarded row is owned by its
+/// recipient (no cascade), so two all-quiescent rounds prove global
+/// quiescence — no executor flushes while a peer still holds its rows.
+pub const RUN_LOOP_EOS_QUIESCE_TASK_ID: &str = "stream-eos-quiesce";
+
+/// How long the EOS quiesce/flush legs wait for pending pushed input to be
+/// applied before failing loudly. Sized well under the coordinator's 10s
+/// run-loop RPC timeout; a full input buffer (cap 64) drains in well under a
+/// second, so hitting this means the loop is wedged, not slow.
+const EOS_QUIESCE_DEADLINE: Duration = Duration::from_secs(8);
 
 /// The three class-specific run-loop state maps (task #147): two-source
 /// joins, join→agg pipelines, and stateless SQL executors. Bundled into one
@@ -82,6 +102,12 @@ pub struct ExecutorTaskInboxService {
     /// Per-job egress notifies (task #149 fix 12): staged run-loop output
     /// wakes a long-polling drain instead of the caller busy-polling.
     pub(crate) egress_notify: crate::runner::SharedContinuousNotify,
+    /// Per-job busy-iteration counters — shared with the runner's loops so
+    /// the EOS quiesce check can prove pushed input was applied, not merely
+    /// dequeued.
+    pub(crate) continuous_busy: SharedContinuousBusy,
+    /// Test override for the quiesce deadline (stall tests must not wait 8s).
+    pub(crate) eos_quiesce_deadline: Duration,
 }
 
 impl std::fmt::Debug for ExecutorTaskInboxService {
@@ -112,6 +138,8 @@ impl ExecutorTaskInboxService {
             continuous_connector_sources: Arc::new(DashMap::new()),
             class_executors: SharedClassExecutors::default(),
             egress_notify: Arc::new(DashMap::new()),
+            continuous_busy: Arc::new(DashMap::new()),
+            eos_quiesce_deadline: EOS_QUIESCE_DEADLINE,
         }
     }
 
@@ -130,6 +158,8 @@ impl ExecutorTaskInboxService {
             continuous_connector_sources: Arc::new(DashMap::new()),
             class_executors: SharedClassExecutors::default(),
             egress_notify: Arc::new(DashMap::new()),
+            continuous_busy: Arc::new(DashMap::new()),
+            eos_quiesce_deadline: EOS_QUIESCE_DEADLINE,
         }
     }
 
@@ -160,7 +190,54 @@ impl ExecutorTaskInboxService {
     /// Flush every run-loop operator this process hosts for `job_id` into
     /// the job's egress buffer: windows and pipelines emit their open state
     /// as final. Serves the RUN_LOOP_EOS_TASK_ID directive; see the handler.
+    /// One quiescence sample: TRUE iff every input buffer belonging to
+    /// `job_id` is empty AND no run-loop iteration is mid-processing taken
+    /// input. Sampled buffers-first: a batch taken between the two samples
+    /// leaves its loop's busy count raised, and a batch pushed between them
+    /// is caught by the caller's re-poll.
+    fn run_loop_input_quiescent(&self, job_id: &str) -> (bool, usize, usize) {
+        let prefix = format!("{job_id}#");
+        let pending: usize = self
+            .continuous_inputs
+            .iter()
+            .filter(|e| e.key() == job_id || e.key().starts_with(&prefix))
+            .map(|e| e.value().len())
+            .sum();
+        let busy = self
+            .continuous_busy
+            .get(job_id)
+            .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(0);
+        (pending == 0 && busy == 0, pending, busy)
+    }
+
+    /// Wait until the job's pushed input is fully APPLIED, or fail loudly.
+    /// Flushing over the head of queued input silently discarded the windows
+    /// that input would have extended (bounded producers deregister right
+    /// after the drain, so nothing ever re-flushes them) — observed live as
+    /// direct-push rows_out landing ~40% under the coordinator-push baseline.
+    async fn await_run_loop_input_quiescence(&self, job_id: &str) -> Result<(), tonic::Status> {
+        let deadline = tokio::time::Instant::now() + self.eos_quiesce_deadline;
+        loop {
+            let (quiescent, pending, busy) = self.run_loop_input_quiescent(job_id);
+            if quiescent {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(tonic::Status::deadline_exceeded(format!(
+                    "EOS quiesce for job {job_id} timed out: {pending} pushed batch(es)                      still unapplied, {busy} loop iteration(s) mid-processing — the run                      loop is wedged or the job has no live loop consuming its input"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     async fn flush_run_loop_job(&self, job_id: &str) -> Result<usize, tonic::Status> {
+        // The flush leg re-verifies quiescence even though the coordinator
+        // quiesces first: a single-executor deployment (or an old
+        // coordinator) sends only `stream-eos`, and local quiescence alone is
+        // complete there.
+        self.await_run_loop_input_quiescence(job_id).await?;
         let prefix = format!("{job_id}#");
         let mut outputs: Vec<RecordBatch> = Vec::new();
         for entry in self.loop_executors.iter() {
@@ -212,6 +289,12 @@ impl ExecutorTaskInboxService {
     /// Share the per-job egress notify map with the runner, so staged output
     /// wakes long-polling drains (task #149 fix 12).
     #[must_use]
+    /// Share the runner loops' busy-iteration counters (EOS quiesce).
+    pub fn with_continuous_busy(mut self, busy: SharedContinuousBusy) -> Self {
+        self.continuous_busy = busy;
+        self
+    }
+
     pub fn with_egress_notify(mut self, notify: crate::runner::SharedContinuousNotify) -> Self {
         self.egress_notify = notify;
         self
@@ -403,6 +486,7 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
             self.continuous_inputs.remove(job_id.as_str());
             self.continuous_inputs
                 .retain(|k, _| !k.starts_with(&rloop_prefix));
+            self.continuous_busy.remove(job_id.as_str());
             // Undrained egress is computed output that no consumer ever saw.
             // Destroying it is the right call — the job is gone and nothing
             // will ever drain it — but it used to be destroyed *silently*,
@@ -503,6 +587,12 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         // stages every open window into the egress buffer for the next
         // drain. Real subtask ids are `task-streaming-<n>`; "stream-eos"
         // cannot collide.
+        if req.task_id.as_str() == RUN_LOOP_EOS_QUIESCE_TASK_ID {
+            self.await_run_loop_input_quiescence(&job_id).await?;
+            return Ok(tonic::Response::new(TaskStatusResponse::new(
+                TransportDisposition::Accepted,
+            )));
+        }
         if req.task_id.as_str() == RUN_LOOP_EOS_TASK_ID {
             let flushed = self.flush_run_loop_job(&job_id).await?;
             tracing::info!(
@@ -892,6 +982,7 @@ pub fn executor_task_grpc_server_with_continuous(
         Arc::new(DashMap::new()),
         SharedClassExecutors::default(),
         Arc::new(DashMap::new()),
+        Arc::new(DashMap::new()),
         auth,
     )
 }
@@ -909,6 +1000,7 @@ pub fn executor_task_grpc_server_with_run_loop(
     continuous_connector_sources: crate::runner::SharedContinuousConnectorSources,
     class_executors: SharedClassExecutors,
     egress_notify: crate::runner::SharedContinuousNotify,
+    continuous_busy: SharedContinuousBusy,
     auth: Option<ExecutorTaskAuthConfig>,
 ) -> wire::v1::executor_task_server::ExecutorTaskServer<ExecutorTaskGrpcService> {
     let inner =
@@ -916,7 +1008,8 @@ pub fn executor_task_grpc_server_with_run_loop(
             .with_run_loop_state(continuous_outputs, input_notify)
             .with_continuous_connector_sources(continuous_connector_sources)
             .with_class_executors(class_executors)
-            .with_egress_notify(egress_notify);
+            .with_egress_notify(egress_notify)
+            .with_continuous_busy(continuous_busy);
     let auth = auth.unwrap_or_else(ExecutorTaskAuthConfig::from_env);
     let auth_misconfiguration = (auth.require_auth() && !auth.has_bearer_token()).then(|| {
         format!(
@@ -1033,6 +1126,41 @@ mod tests {
             egress_len,
             cap + flushed,
             "flush output must be APPENDED, never traded for evicted batches"
+        );
+    }
+
+    /// Task #149 fix 7 follow-up: an EOS flush must not run over the head of
+    /// pushed-but-unapplied input — the windows that input would have
+    /// extended are silently lost (bounded producers deregister right after
+    /// the drain, so nothing ever re-flushes them). With input queued and no
+    /// loop consuming it, the flush must FAIL LOUDLY instead of flushing.
+    /// Pre-fix behavior: the flush succeeded immediately.
+    #[tokio::test]
+    async fn eos_flush_refuses_to_run_over_pending_unapplied_input() {
+        let mut service = ExecutorTaskInboxService::new(ExecutorAssignmentInbox::new_unbounded());
+        service.eos_quiesce_deadline = Duration::from_millis(50);
+        let spec = krishiv_plan::window::WindowExecutionSpec::tumbling("k", "ts", 60_000);
+        let exec = krishiv_dataflow::ContinuousWindowExecutor::new(spec).expect("executor builds");
+        service
+            .loop_executors
+            .insert("stalljob#0".into(), Arc::new(Mutex::new(exec)));
+        // Input pushed but never applied: no loop is running in this test.
+        service
+            .continuous_inputs
+            .entry("stalljob#task-streaming-0".into())
+            .or_default()
+            .push(kv_batch(&[1_000]));
+
+        let err = match service.flush_run_loop_job("stalljob").await {
+            Ok(flushed) => panic!(
+                "flush must refuse while input is unapplied, but flushed {flushed} batch(es)"
+            ),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), tonic::Code::DeadlineExceeded, "{err}");
+        assert!(
+            err.message().contains("unapplied"),
+            "the error must name the stall: {err}"
         );
     }
 
