@@ -52,7 +52,7 @@ pub(crate) fn resolve_ui_token() -> Option<String> {
 /// `KRISHIV_UI_TOKEN_FILE` was set to an empty string, jumping over the
 /// production fail-closed check below. A deployment that renders that variable
 /// empty (an unset Helm value, `FOO=${MISSING}`) therefore served every
-/// `/api/v1/*` and `/ui/*` route anonymously in production. The empty path is
+/// `/api/v1/*` and `/console/*` route anonymously in production. The empty path is
 /// now treated as "no file configured", which falls through to the guard.
 ///
 /// Split from the environment reads so the matrix is testable: mutating process
@@ -97,7 +97,7 @@ pub(crate) fn resolve_ui_token_from(
 ///
 /// `KRISHIV_UI_TOKEN` (inline) or `KRISHIV_UI_TOKEN_FILE` (path) is
 /// consulted at router-construction time. When set, all `/api/v1/...`
-/// and `/ui/...` routes require a matching `Authorization: Bearer
+/// routes require a matching `Authorization: Bearer
 /// <token>` header. `/healthz`, `/readyz`, `/metrics`, `/assets/*`, and
 /// the root redirect stay anonymous so platform probes keep working
 /// without leaking snapshot data.
@@ -159,7 +159,7 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
 /// for embedding inside the coordinator HTTP server.
 ///
 /// Skips `/healthz`, `/readyz`, and `/metrics` — the coordinator already serves
-/// those. Includes `/assets/*`, `/`, `/ui*`, and `/api/v1/*` routes.
+/// those. Includes `/console/*`, `/`, and `/api/v1/*` routes.
 pub fn embedded_router(state: UiState) -> Router {
     let public = Router::new()
         .route("/api/v1/openapi.json", get(openapi_json))

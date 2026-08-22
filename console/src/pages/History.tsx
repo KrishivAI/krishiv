@@ -1,13 +1,7 @@
 import { useHistory } from "../api/queries";
 import { StateBadge } from "../components/StateBadge";
 import { ErrorText } from "../components/ui";
-
-function fmtBytes(n: number): string {
-  if (n >= 1 << 30) return `${(n / (1 << 30)).toFixed(1)} GiB`;
-  if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MiB`;
-  if (n >= 1 << 10) return `${(n / (1 << 10)).toFixed(1)} KiB`;
-  return `${n} B`;
-}
+import { fmtBytes } from "../lib/format";
 
 export function HistoryPage() {
   const { data, error } = useHistory();

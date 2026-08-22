@@ -19,6 +19,7 @@ import { JobDetailPage } from "./pages/JobDetail";
 import { JobsPage } from "./pages/Jobs";
 import { LoginPage } from "./pages/Login";
 import { SqlPage } from "./pages/Sql";
+import { StreamingDetailPage } from "./pages/StreamingDetail";
 import { StreamingPage } from "./pages/Streaming";
 
 const rootRoute = createRootRoute({ component: () => <Outlet /> });
@@ -61,6 +62,11 @@ const streamingRoute = createRoute({
   path: "/streaming",
   component: StreamingPage,
 });
+const streamingDetailRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "/streaming/$jobId",
+  component: StreamingDetailPage,
+});
 const executorsRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "/executors",
@@ -84,6 +90,7 @@ const routeTree = rootRoute.addChildren([
     jobsRoute,
     jobDetailRoute,
     streamingRoute,
+    streamingDetailRoute,
     executorsRoute,
     historyRoute,
     sqlRoute,

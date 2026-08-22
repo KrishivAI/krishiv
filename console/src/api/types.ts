@@ -1,6 +1,8 @@
 // Hand-maintained mirrors of the coordinator's JSON response structs
 // (crates/krishiv-scheduler/src/{coordinator_daemon,continuous_stream_http,
-// batch_sql_http}.rs). Follow-up: generate from an OpenAPI export instead.
+// batch_sql_http}.rs). Field names and semantics are verified against the
+// live API (goal: no fake values) — when the Rust structs change, change
+// these in the same commit.
 
 export interface LiveJobView {
   job_id: string;
@@ -18,6 +20,33 @@ export interface LiveJobsResponse {
   jobs: LiveJobView[];
 }
 
+export interface TaskTimingView {
+  task_id: string;
+  state: string;
+  executor_id: string | null;
+  attempt: number;
+  failure_count: number;
+  last_failure_reason: string | null;
+  completed_duration_ms: number | null;
+  last_watermark_ms: number | null;
+}
+export interface StageTimingView {
+  stage_id: string;
+  state: string;
+  task_count: number;
+  succeeded_task_count: number;
+  total_task_ms: number;
+  min_task_ms: number | null;
+  median_task_ms: number | null;
+  max_task_ms: number | null;
+  shuffle_bytes_written: number;
+  tasks: TaskTimingView[];
+}
+export interface StageTimingResponse {
+  job_id: string;
+  stages: StageTimingView[];
+}
+
 export interface LiveExecutorView {
   executor_id: string;
   host: string;
@@ -30,8 +59,18 @@ export interface LiveExecutorView {
 }
 export interface LiveExecutorsResponse {
   executors: LiveExecutorView[];
+  /** Coordinator heartbeat tick — the reference for heartbeat staleness. */
+  current_tick: number;
 }
 
+export interface ContinuousDeliveryView {
+  model: string;
+  parallelism: number;
+  sink?: string;
+  sink_guarantee?: string;
+  source_offsets_in_sink_transaction: boolean;
+  effective: string;
+}
 export interface ContinuousJobView {
   job_id: string;
   state: string;
@@ -44,10 +83,35 @@ export interface ContinuousJobView {
   persisted_watermark_ms: number | null;
   snapshot_available: boolean;
   cycle_in_flight: boolean;
-  delivery_guarantee?: string;
+  delivery: ContinuousDeliveryView;
+  class: string;
 }
 export interface ContinuousListResponse {
   streams: ContinuousJobView[];
+}
+export interface ContinuousTarget {
+  task_id: string;
+  endpoint: string;
+}
+export interface ContinuousTargetsResponse {
+  targets: ContinuousTarget[];
+}
+export interface ContinuousCheckpointResponse {
+  job_id: string;
+  snapshot_b64: string | null;
+  watermark_ms: number | null;
+  snapshot_available: boolean;
+  /** Present for run-loop jobs: why this endpoint reports no snapshot
+   *  (they checkpoint through the barrier pipeline instead). */
+  snapshot_source?: string;
+}
+export interface ContinuousStopWithSavepointResponse {
+  job_id: string;
+  savepoint_epoch: number;
+}
+export interface ContinuousFlushResponse {
+  success: boolean;
+  inline_record_batch_ipc_b64: string[];
 }
 
 export interface BatchSqlSubmitResponse {

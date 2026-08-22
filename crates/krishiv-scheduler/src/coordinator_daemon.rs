@@ -722,6 +722,10 @@ pub struct LiveJobView {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct LiveExecutorsResponse {
     executors: Vec<LiveExecutorView>,
+    /// The coordinator's current heartbeat tick — the reference point for
+    /// judging `last_heartbeat_tick` staleness. Without it a client can only
+    /// compare executors against each other, not against "now".
+    current_tick: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -786,6 +790,24 @@ async fn api_job_by_id(
     }
 }
 
+/// One task's placement and outcome — the per-task rows behind a stage.
+///
+/// Placement (`executor_id`) is the field the console's debugging story
+/// hangs on: skewed task placement after a rollout is invisible from the
+/// aggregated stage view alone.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TaskTimingView {
+    task_id: String,
+    state: String,
+    /// Executor currently (or last) assigned; `None` before first dispatch.
+    executor_id: Option<String>,
+    attempt: u32,
+    failure_count: u32,
+    last_failure_reason: Option<String>,
+    completed_duration_ms: Option<u64>,
+    last_watermark_ms: Option<i64>,
+}
+
 /// One stage's cost and its task-duration spread.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StageTimingView {
@@ -808,6 +830,8 @@ pub struct StageTimingView {
     /// Partition bytes this stage committed. Since `db34791c` this is the
     /// partition's own bytes, not shared view buffers.
     shuffle_bytes_written: u64,
+    /// Per-task placement and outcome rows (additive; older clients ignore).
+    tasks: Vec<TaskTimingView>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -855,6 +879,20 @@ async fn api_job_stages(
                 median_task_ms: durations.get(durations.len() / 2).copied(),
                 max_task_ms: durations.last().copied(),
                 shuffle_bytes_written: stage.shuffle_bytes_written(),
+                tasks: stage
+                    .tasks()
+                    .iter()
+                    .map(|task| TaskTimingView {
+                        task_id: task.task_id().to_string(),
+                        state: format!("{:?}", task.state()),
+                        executor_id: task.assigned_executor().map(|e| e.to_string()),
+                        attempt: task.attempt(),
+                        failure_count: task.failure_count(),
+                        last_failure_reason: task.last_failure_reason().map(|r| r.to_string()),
+                        completed_duration_ms: task.completed_duration_ms(),
+                        last_watermark_ms: task.last_watermark_ms,
+                    })
+                    .collect(),
             }
         })
         .collect();
@@ -938,9 +976,10 @@ async fn api_job_cancel(
 }
 
 async fn api_executors(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
-    let executors = {
+    let (executors, current_tick) = {
         let coord = coordinator.read().await;
-        coord
+        let current_tick = coord.executors().current_tick();
+        let executors = coord
             .executor_snapshots()
             .into_iter()
             .map(|record| {
@@ -956,9 +995,13 @@ async fn api_executors(State(coordinator): State<SharedCoordinator>) -> impl Int
                     consecutive_task_failures: record.consecutive_task_failures,
                 }
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (executors, current_tick)
     };
-    Json(LiveExecutorsResponse { executors })
+    Json(LiveExecutorsResponse {
+        executors,
+        current_tick,
+    })
 }
 
 /// Reset the circuit-breaker failure counter for one executor.
@@ -2821,6 +2864,93 @@ mod parse_tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(json["reset"], serde_json::json!(false));
+    }
+
+    /// The stages endpoint must carry per-task placement rows — the console's
+    /// debugging story hangs on "which executor ran which task". Revert-proof:
+    /// drop the `tasks` mapping in `api_job_stages` and the field disappears
+    /// from the JSON, turning this red.
+    #[tokio::test]
+    async fn job_stages_carry_per_task_placement_rows() {
+        use crate::CoordinatorDaemonConfig;
+        use crate::coordinator_http_router;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
+        use tower::ServiceExt;
+
+        let _ = crate::auth::set_allow_anonymous();
+        let coordinator = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-task-rows").unwrap(),
+        ));
+        let job_id = JobId::try_new("job-task-rows").unwrap();
+        let spec = JobSpec::new(job_id.clone(), "task-rows", JobKind::Batch).with_stage(
+            StageSpec::new(StageId::try_new("stage-task-rows").unwrap(), "stage").with_task(
+                TaskSpec::new(TaskId::try_new("task-task-rows").unwrap(), "window:rows"),
+            ),
+        );
+        coordinator.write().await.submit_job(spec).unwrap();
+
+        let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DevLocal);
+        let router = coordinator_http_router(coordinator, &config);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/jobs/{job_id}/stages"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let tasks = &json["stages"][0]["tasks"];
+        assert!(tasks.is_array(), "stages must carry per-task rows: {json}");
+        assert_eq!(tasks[0]["task_id"], "task-task-rows");
+        assert_eq!(tasks[0]["state"], "Pending");
+        // Not yet dispatched: placement is honestly null, never a fake value.
+        assert!(tasks[0]["executor_id"].is_null());
+        assert_eq!(tasks[0]["attempt"], 0);
+    }
+
+    /// `current_tick` gives clients the reference point for heartbeat
+    /// staleness. Revert-proof: drop the field from the response and the
+    /// assertion on its presence fails.
+    #[tokio::test]
+    async fn executors_response_carries_the_current_tick() {
+        use crate::CoordinatorDaemonConfig;
+        use crate::coordinator_http_router;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let _ = crate::auth::set_allow_anonymous();
+        let coordinator = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-tick").unwrap(),
+        ));
+        let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DevLocal);
+        let router = coordinator_http_router(coordinator, &config);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/executors")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["current_tick"].is_u64(),
+            "executors response must expose the coordinator tick: {json}"
+        );
     }
 
     /// Data-carrying routes must accept bodies past axum's 2 MiB default.

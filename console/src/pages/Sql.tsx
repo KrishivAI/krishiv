@@ -44,7 +44,7 @@ export function SqlPage() {
     setResult(null);
     cancelled.current = false;
     try {
-      const submit = await api.post<BatchSqlSubmitResponse>("/api/v1/batch-sql/submit", { sql });
+      const submit = await api.post<BatchSqlSubmitResponse>("/api/v1/batch-sql/submit", { query: sql });
       for (;;) {
         if (cancelled.current) return;
         const poll = await api.get<BatchSqlPollResponse>(

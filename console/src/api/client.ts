@@ -29,6 +29,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   get: <T>(path: string) => request<T>(path),
-  post: <T>(path: string, body?: unknown) =>
-    request<T>(path, { method: "POST", body: body === undefined ? undefined : JSON.stringify(body) }),
+  post: <T>(path: string, body?: unknown, method: "POST" | "DELETE" = "POST") =>
+    request<T>(path, { method, body: body === undefined ? undefined : JSON.stringify(body) }),
 };

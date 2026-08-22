@@ -137,7 +137,7 @@ cargo run -p krishiv -- local start --data-dir /tmp/krishiv-cluster
 #   gRPC:    http://127.0.0.1:9090
 #   HTTP:    http://127.0.0.1:18080
 #   Flight:  http://127.0.0.1:50051
-#   UI:      http://127.0.0.1:18080/ui
+#   UI:      http://127.0.0.1:18080/console
 
 # Check status
 cargo run -p krishiv -- local status --data-dir /tmp/krishiv-cluster
@@ -191,7 +191,7 @@ python3 crates/krishiv-python/examples/stream_state_ttl.py
 curl http://127.0.0.1:18080/api/v1/jobs | python3 -m json.tool
 
 # Web UI (coordinator dashboard)
-open http://127.0.0.1:18080/ui
+open http://127.0.0.1:18080/console
 ```
 
 ### Stop the cluster

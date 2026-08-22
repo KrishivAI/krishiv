@@ -7,6 +7,7 @@ import { Link, Outlet, useNavigate } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 
 import { session } from "../auth/session";
+import { HealthHeader } from "./HealthHeader";
 import { cx } from "./ui";
 
 const NAV: { to: string; label: string }[] = [
@@ -60,7 +61,10 @@ export function Shell({ children }: { children?: ReactNode }) {
           Reset token
         </button>
       </aside>
-      <main className="min-w-0 flex-1 bg-bg p-6">{children ?? <Outlet />}</main>
+      <main className="min-w-0 flex-1 bg-bg p-6">
+        <HealthHeader />
+        {children ?? <Outlet />}
+      </main>
     </div>
   );
 }
