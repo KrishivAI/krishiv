@@ -34,9 +34,7 @@ def main():
     # 4. Start the continuous job through the ONE write terminal; the
     # returned StreamingJob handle owns push/drain/flush/stop identically on
     # embedded, single-node, and distributed sessions.
-    writer = windowed.write()
-    writer.trigger("continuous", 1000)
-    job = writer.start(session, "alerts_stream")
+    job = windowed.write().trigger("continuous", 1000).start(session, "alerts_stream")
     print(f"Started continuous stream job: {job.id}")
 
     # 5. Prepare and dynamically push a real-time record batch

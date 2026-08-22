@@ -36,36 +36,66 @@ impl PyStreamWriter {
 #[pymethods]
 impl PyStreamWriter {
     /// Sink format: ``"iceberg"``, any registered connector kind, or omit
-    /// for a drain-driven job.
-    pub fn format(&mut self, name: String) -> PyResult<()> {
-        self.map(|w| w.format(name))
+    /// for a drain-driven job. Returns ``self`` for chaining, mirroring the
+    /// Rust builder: ``stream.write().format("iceberg").start(...)``.
+    pub fn format<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        name: String,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.map(|w| w.format(name))?;
+        Ok(slf)
     }
 
-    /// Sink-specific option.
-    pub fn option(&mut self, key: String, value: String) -> PyResult<()> {
-        self.map(|w| w.option(key, value))
+    /// Sink-specific option. Returns ``self`` for chaining.
+    pub fn option<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        key: String,
+        value: String,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.map(|w| w.option(key, value))?;
+        Ok(slf)
     }
 
     /// Output mode: ``"append"`` (default), ``"update"``, or ``"complete"``.
-    pub fn output_mode(&mut self, mode: String) -> PyResult<()> {
-        self.map(|w| w.output_mode(mode))
+    /// Returns ``self`` for chaining.
+    pub fn output_mode<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        mode: String,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.map(|w| w.output_mode(mode))?;
+        Ok(slf)
     }
 
     /// Trigger policy: ``"continuous"``, ``"processing_time"``, ``"once"``,
-    /// or ``"available_now"``.
+    /// or ``"available_now"``. Returns ``self`` for chaining.
     #[pyo3(signature = (trigger, interval_ms=1000))]
-    pub fn trigger(&mut self, trigger: String, interval_ms: u64) -> PyResult<()> {
-        self.map(|w| w.trigger(trigger, interval_ms))
+    pub fn trigger<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        trigger: String,
+        interval_ms: u64,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.map(|w| w.trigger(trigger, interval_ms))?;
+        Ok(slf)
     }
 
-    /// Run-loop subtask count (coordinator-backed session modes).
-    pub fn parallelism(&mut self, parallelism: u32) -> PyResult<()> {
-        self.map(|w| w.parallelism(parallelism))
+    /// Run-loop subtask count (coordinator-backed session modes). Returns
+    /// ``self`` for chaining.
+    pub fn parallelism<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        parallelism: u32,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.map(|w| w.parallelism(parallelism))?;
+        Ok(slf)
     }
 
-    /// Arm barrier checkpointing.
-    pub fn checkpoint(&mut self, interval_ms: u64, storage_path: String) -> PyResult<()> {
-        self.map(|w| w.checkpoint(interval_ms, storage_path))
+    /// Arm barrier checkpointing. Returns ``self`` for chaining.
+    pub fn checkpoint<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        interval_ms: u64,
+        storage_path: String,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.map(|w| w.checkpoint(interval_ms, storage_path))?;
+        Ok(slf)
     }
 
     /// Register the job on ``session`` and return a :class:`StreamingJob`.

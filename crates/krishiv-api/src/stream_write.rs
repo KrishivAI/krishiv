@@ -249,12 +249,22 @@ impl StreamWriter {
             return Ok(StreamingJob::from_query(query));
         }
 
-        let needs_options =
-            sink.is_some() || self.parallelism.is_some() || self.checkpoint_interval_ms.is_some();
+        // Coordinator-backed sessions ALWAYS register the run-loop model:
+        // it is the engine every #149/#150 capability lives in (parallel
+        // subtasks, keyed exchange, barrier checkpointing, the EOS barrier,
+        // update-mode early fire). Registering without a model fell back to
+        // the legacy single-subtask cycle path, whose fencing aborted the
+        // terminal's plain pushes — the two-model split is exactly what the
+        // convergence retires from the user's view.
+        let coordinator_backed = session.mode() != crate::types::ExecutionMode::Embedded;
+        let needs_options = coordinator_backed
+            || sink.is_some()
+            || self.parallelism.is_some()
+            || self.checkpoint_interval_ms.is_some();
         if needs_options {
             let options = ContinuousRegisterOptions {
-                mode: self.parallelism.map(|_| String::from("run-loop")),
-                parallelism: self.parallelism,
+                mode: Some(String::from("run-loop")),
+                parallelism: Some(self.parallelism.unwrap_or(1)),
                 sources: Vec::new(),
                 checkpoint_interval_ms: self.checkpoint_interval_ms,
                 checkpoint_storage_path: self.checkpoint_storage_path.clone(),
