@@ -121,3 +121,28 @@ confirmed live and still open: a run-loop task returned to Pending has
 no re-dispatcher (`launch_run_loop_job` runs only at registration), so
 a failed-then-retried streaming task churns Assigned→Pending forever —
 recorded in the KNOWN GAP comment at the launch call site.
+
+## Full-corpus terminal benchmark (2026-08-22, later)
+
+`nexmark_terminal` extended to ALL 22 NEXMark query classes through
+`Session::stream_sql` -> `write()` -> `StreamingJob` (commit `e98d059`:
+class-routed registration + side-tagged handle pushes), plus the
+update/complete mode duo. Both legs PASS 24/24, durable (RocksDB + 1s
+checkpoints):
+
+- **Single-node** (attempt27): 60-140K ev/s. Two-source classes
+  (q3/q4/q8/q9/q20) run 90-140K on 2x100k input.
+- **k3s rig** (attempt31, 3 executors 1/node, image `fast-1024dce`):
+  9.9-20.6K ev/s — consistent with the raw-harness rig band; s3's ~1.3
+  free cores remain the straggler bound.
+
+Getting the rig leg green surfaced two real distributed defects, both
+fixed with revert-proven tests: `e4bad4e` (stream-exchange treated
+receiver backpressure as fatal after ~150ms — a starved peer killed the
+sending pipeline loop mid-stream) with `9ce147b` composing the EOS
+deadline chain over the new 60s backpressure budget (exchange 60s <
+executor quiesce 90s < coordinator EOS RPC 120s, ordering pinned by
+test), and `1024dce` (a pre-split EOS flush emits ~1000 micro-batches
+and a single exchange push above the 64-batch receiver cap can NEVER be
+accepted — per-peer rows now coalesce into one batch before delivery;
+single-node had masked this because loopback delivery skips the cap).
