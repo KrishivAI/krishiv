@@ -34,8 +34,17 @@ impl IntervalJoinSpec {
 #[derive(Debug, Clone)]
 struct BufferedEvent {
     event_time_ms: i64,
+    /// The ORIGINAL input batch, shared by every event from that batch —
+    /// storing (batch, row) instead of a per-row 1-row slice removes one
+    /// RecordBatch allocation per input row from the join hot path
+    /// (2026-08-22 q3/q8 optimization; output assembly interleaves by these
+    /// indices, and the snapshot path slices lazily where it is cold).
     batch: Arc<RecordBatch>,
+    row: u32,
 }
+
+/// One matched pair: (left batch, left row, right batch, right row).
+pub type MatchedRows = (Arc<RecordBatch>, u32, Arc<RecordBatch>, u32);
 
 /// Per-key buffers for both join sides.
 #[derive(Debug)]
@@ -52,21 +61,23 @@ impl IntervalJoinBuffers {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_side(
         &mut self,
         is_left: bool,
         event_time_ms: i64,
-        batch: Arc<RecordBatch>,
+        batch: &Arc<RecordBatch>,
+        row: u32,
         lower_bound_ms: i64,
         upper_bound_ms: i64,
         max_buffer: usize,
-    ) -> Vec<(Arc<RecordBatch>, Arc<RecordBatch>)> {
+        matches: &mut Vec<MatchedRows>,
+    ) {
         let (this_buf, other_buf) = if is_left {
             (&mut self.left, &mut self.right)
         } else {
             (&mut self.right, &mut self.left)
         };
-        let mut matches = Vec::with_capacity(other_buf.len());
         for other in other_buf.iter() {
             let delta = if is_left {
                 other.event_time_ms - event_time_ms
@@ -75,21 +86,21 @@ impl IntervalJoinBuffers {
             };
             if delta >= lower_bound_ms && delta <= upper_bound_ms {
                 if is_left {
-                    matches.push((Arc::clone(&batch), Arc::clone(&other.batch)));
+                    matches.push((Arc::clone(batch), row, Arc::clone(&other.batch), other.row));
                 } else {
-                    matches.push((Arc::clone(&other.batch), Arc::clone(&batch)));
+                    matches.push((Arc::clone(&other.batch), other.row, Arc::clone(batch), row));
                 }
             }
         }
         this_buf.push_back(BufferedEvent {
             event_time_ms,
-            batch,
+            batch: Arc::clone(batch),
+            row,
         });
         // Enforce buffer limit by dropping the oldest events.
         while this_buf.len() > max_buffer {
             this_buf.pop_front();
         }
-        matches
     }
 
     fn evict_before(&mut self, watermark_ms: i64, bound: u64) {
@@ -129,6 +140,17 @@ impl PerKeyIntervalJoin {
     }
 
     fn touch_key(&mut self, key: &str) {
+        // Exact LRU reordering (remove + reinsert, one String alloc) is only
+        // load-bearing NEAR the key cap, where eviction order decides who
+        // dies. Below half the cap nothing can be evicted by a reorder, so a
+        // presence check suffices — this ran per input ROW on the join hot
+        // path (2026-08-22 q3/q8 optimization).
+        if self.access_order.len() * 2 < self.max_keys {
+            if !self.access_order.contains_key(key) {
+                self.access_order.insert(key.to_owned(), ());
+            }
+            return;
+        }
         self.access_order.shift_remove(key);
         self.access_order.insert(key.to_owned(), ());
     }
@@ -155,15 +177,19 @@ impl PerKeyIntervalJoin {
         for (key, buffers) in &self.states {
             for (side, buf) in [("l", &buffers.left), ("r", &buffers.right)] {
                 for event in buf {
+                    // Slice the single buffered ROW here, where it is cold —
+                    // the hot path stores (batch, row) without slicing. Wire
+                    // format is unchanged: one single-row IPC per event.
+                    let row_batch = event.batch.slice(event.row as usize, 1);
                     let mut ipc = Vec::new();
                     {
                         let mut writer = arrow::ipc::writer::StreamWriter::try_new(
                             &mut ipc,
-                            &event.batch.schema(),
+                            &row_batch.schema(),
                         )
                         .map_err(|e| format!("join snapshot IPC writer: {e}"))?;
                         writer
-                            .write(&event.batch)
+                            .write(&row_batch)
                             .map_err(|e| format!("join snapshot IPC write: {e}"))?;
                         writer
                             .finish()
@@ -227,6 +253,7 @@ impl PerKeyIntervalJoin {
                 target.push_back(BufferedEvent {
                     event_time_ms: ts,
                     batch: Arc::new(batch),
+                    row: 0,
                 });
             }
             self.access_order.insert(key, ());
@@ -243,22 +270,46 @@ impl PerKeyIntervalJoin {
         key: &str,
         event_time_ms: i64,
         batch: RecordBatch,
-    ) -> Vec<(Arc<RecordBatch>, Arc<RecordBatch>)> {
+    ) -> Vec<MatchedRows> {
+        let mut matches = Vec::new();
+        let arc = Arc::new(batch);
+        self.push_row(true, key, event_time_ms, &arc, 0, &mut matches);
+        matches
+    }
+
+    /// Push one ROW of `batch` (shared by reference — no per-row slice) onto
+    /// `side`, appending matches into `matches`. The hot-path entry: one
+    /// input batch's rows all share the same `Arc`.
+    pub fn push_row(
+        &mut self,
+        is_left: bool,
+        key: &str,
+        event_time_ms: i64,
+        batch: &Arc<RecordBatch>,
+        row: u32,
+        matches: &mut Vec<MatchedRows>,
+    ) {
         let max_buf = self.spec.max_buffer_per_side;
         self.touch_key(key);
         self.maybe_evict();
-        let state = self
-            .states
-            .entry(key.to_owned())
-            .or_insert_with(IntervalJoinBuffers::new);
+        // get_mut-then-insert: no String allocation on the (dominant) hit path.
+        if !self.states.contains_key(key) {
+            self.states
+                .insert(key.to_owned(), IntervalJoinBuffers::new());
+        }
+        let Some(state) = self.states.get_mut(key) else {
+            return;
+        };
         state.push_side(
-            true,
+            is_left,
             event_time_ms,
-            Arc::new(batch),
+            batch,
+            row,
             self.spec.lower_bound_ms,
             self.spec.upper_bound_ms,
             max_buf,
-        )
+            matches,
+        );
     }
 
     /// Push an event onto the right side for `key`.
@@ -270,22 +321,11 @@ impl PerKeyIntervalJoin {
         key: &str,
         event_time_ms: i64,
         batch: RecordBatch,
-    ) -> Vec<(Arc<RecordBatch>, Arc<RecordBatch>)> {
-        let max_buf = self.spec.max_buffer_per_side;
-        self.touch_key(key);
-        self.maybe_evict();
-        let state = self
-            .states
-            .entry(key.to_owned())
-            .or_insert_with(IntervalJoinBuffers::new);
-        state.push_side(
-            false,
-            event_time_ms,
-            Arc::new(batch),
-            self.spec.lower_bound_ms,
-            self.spec.upper_bound_ms,
-            max_buf,
-        )
+    ) -> Vec<MatchedRows> {
+        let mut matches = Vec::new();
+        let arc = Arc::new(batch);
+        self.push_row(false, key, event_time_ms, &arc, 0, &mut matches);
+        matches
     }
 
     /// Evict stale events across all keys.

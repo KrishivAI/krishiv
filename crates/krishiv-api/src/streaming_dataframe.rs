@@ -1196,22 +1196,29 @@ pub fn interval_join(
             Ok(out)
         };
 
+    let mut matches: Vec<krishiv_dataflow::interval_join::MatchedRows> = Vec::new();
     for batch in left_batches {
         let times = get_times_keys(batch, left_time_col, left_key_col)?;
+        let shared = Arc::new(batch.clone());
         for &(i, t, ref k) in &times {
-            let row = batch.slice(i, 1);
-            let matched = join.push_left(k, t, row);
-            pairs.extend(matched);
+            join.push_row(true, k, t, &shared, i as u32, &mut matches);
         }
     }
     for batch in right_batches {
         let times = get_times_keys(batch, right_time_col, right_key_col)?;
+        let shared = Arc::new(batch.clone());
         for &(i, t, ref k) in &times {
-            let row = batch.slice(i, 1);
-            let matched = join.push_right(k, t, row);
-            pairs.extend(matched);
+            join.push_row(false, k, t, &shared, i as u32, &mut matches);
         }
     }
+    // The buffered rows share their input batch (no per-row slice on the hot
+    // path); this facade's contract is 1-row pairs, so slice per MATCH here.
+    pairs.extend(matches.into_iter().map(|(l, lr, r, rr)| {
+        (
+            Arc::new(l.slice(lr as usize, 1)),
+            Arc::new(r.slice(rr as usize, 1)),
+        )
+    }));
     Ok(pairs)
 }
 

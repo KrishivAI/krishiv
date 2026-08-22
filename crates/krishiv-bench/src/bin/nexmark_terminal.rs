@@ -333,7 +333,17 @@ async fn main() {
 
     let mut failures: Vec<String> = Vec::new();
 
+    // KRISHIV_BENCH_CASE_FILTER=q3_local_items,q8_monitor_new_users runs a
+    // subset — for fast A/B iteration on one shape without the full sweep.
+    let case_filter: Vec<String> = std::env::var("KRISHIV_BENCH_CASE_FILTER")
+        .map(|v| v.split(',').map(|s| s.trim().to_owned()).collect())
+        .unwrap_or_default();
+    let selected = |name: &str| case_filter.is_empty() || case_filter.iter().any(|c| c == name);
+
     for q in SUPPORTED_QUERIES {
+        if !selected(q.name) {
+            continue;
+        }
         let _ = run_corpus_rep(&session, q, 1000).await;
         let mut evs: Vec<f64> = Vec::new();
         let mut last = (0usize, 0usize);
@@ -359,6 +369,9 @@ async fn main() {
     }
 
     for case in MODE_CASES {
+        if !selected(case.name) {
+            continue;
+        }
         let mut evs: Vec<f64> = Vec::new();
         let mut last = (0usize, 0usize);
         for rep in 0..REPS {

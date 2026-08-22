@@ -1344,7 +1344,7 @@ fn interval_join_schema_mismatch_still_joins() {
     assert_eq!(matches.len(), 1);
     // Verify schemas are preserved from each side
     assert_eq!(matches[0].0.schema(), left_schema);
-    assert_eq!(matches[0].1.schema(), right_schema);
+    assert_eq!(matches[0].2.schema(), right_schema);
 }
 
 // ── SchemaNormalizeOperator tests (in lib.rs) ───────────────────────────

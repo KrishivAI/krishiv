@@ -259,7 +259,15 @@ impl WatermarkWindowJoinOperator {
             crate::ExecError::ColumnNotFound(format!("join key column '{key_col}'"))
         })?;
 
-        let mut pairs: Vec<(Arc<RecordBatch>, Arc<RecordBatch>)> = Vec::new();
+        // Hot path (2026-08-22 q3/q8 optimization): the whole input batch is
+        // shared as ONE Arc across its rows — no per-row 1-row slice — and
+        // the key is formatted into a REUSED buffer instead of a fresh String
+        // per row. Matches carry (batch, row) indices; output assembly below
+        // interleaves by index instead of concatenating 1-row arrays.
+        use std::fmt::Write as _;
+        let shared = Arc::new(batch.clone());
+        let mut key_buf = String::with_capacity(24);
+        let mut pairs: Vec<crate::interval_join::MatchedRows> = Vec::new();
         for row in 0..n {
             let time_ms = extract_i64(batch, time_idx, row).ok_or_else(|| {
                 crate::ExecError::UnsupportedType(format!(
@@ -270,21 +278,20 @@ impl WatermarkWindowJoinOperator {
             // Typed key extraction (all integer widths, strings, bools).
             // NEVER a fallback: a row whose key cannot be read must fail the
             // batch, not silently become a positional pseudo-key that joins.
-            let key = crate::join::extract_agg_key(batch, key_idx, row)?.to_string();
-            let row_batch = slice_batch(batch, row);
-            let matches = if is_left {
-                self.join.push_left(&key, time_ms, row_batch)
-            } else {
-                self.join.push_right(&key, time_ms, row_batch)
-            };
-            pairs.extend(matches);
+            let key = crate::join::extract_agg_key(batch, key_idx, row)?;
+            key_buf.clear();
+            write!(key_buf, "{key}").map_err(|e| crate::ExecError::Arrow(e.to_string()))?;
+            self.join.push_row(
+                is_left,
+                &key_buf,
+                time_ms,
+                &shared,
+                u32::try_from(row).unwrap_or(u32::MAX),
+                &mut pairs,
+            );
         }
         // Batch-at-a-time output (task #149 fix 8): all matches from one
-        // input batch become ONE output batch, built columnar — the joined
-        // schema is computed once and each column is a single concat over
-        // the matched rows. The predecessor ran the schema collision
-        // analysis and a row-level concat PER MATCH and then concatenated
-        // the resulting one-row batches a second time.
+        // input batch become ONE output batch, built columnar.
         if pairs.is_empty() {
             return Ok(Vec::new());
         }
@@ -301,36 +308,73 @@ fn extract_i64(batch: &RecordBatch, col_idx: usize, row: usize) -> Option<i64> {
     col.as_any().downcast_ref::<Int64Array>()?.value(row).into()
 }
 
-fn slice_batch(batch: &RecordBatch, row: usize) -> RecordBatch {
-    batch.slice(row, 1)
-}
-
-/// Merge matched (left, right) row pairs into ONE batch (left cols ∥ right
-/// cols), computing the joined schema once and concatenating each column
-/// across all pairs (task #149 fix 8).
+/// Merge matched (left row, right row) pairs into ONE batch (left cols ∥
+/// right cols), computing the joined schema once and building each column
+/// with a single `interleave` over the distinct source batches (2026-08-22:
+/// the predecessor concatenated per-match 1-row arrays — thousands of parts
+/// per column).
 ///
 /// If a column name appears in both sides, prefix with `left_` / `right_` to
 /// prevent Arrow schema-uniqueness violations — the same naming rule the
 /// per-match predecessor applied, so downstream stage specs keep resolving.
 fn join_pairs_to_batch(
-    pairs: &[(Arc<RecordBatch>, Arc<RecordBatch>)],
+    pairs: &[crate::interval_join::MatchedRows],
 ) -> Result<RecordBatch, ArrowError> {
-    let (first_left, first_right) = pairs
+    let (first_left, _, first_right, _) = pairs
         .first()
         .ok_or_else(|| ArrowError::InvalidArgumentError("empty join pair set".into()))?;
     let schema = joined_schema(first_left, first_right);
     let left_cols = first_left.num_columns();
     let right_cols = first_right.num_columns();
+
+    // Distinct source batches per side (by Arc identity) + per-match
+    // (batch_index, row_index) pairs for `interleave`.
+    fn side_indices<'a>(
+        pairs: &'a [crate::interval_join::MatchedRows],
+        pick: impl Fn(&'a crate::interval_join::MatchedRows) -> (&'a Arc<RecordBatch>, u32),
+    ) -> (Vec<&'a Arc<RecordBatch>>, Vec<(usize, usize)>) {
+        let mut sources: Vec<&Arc<RecordBatch>> = Vec::new();
+        let mut indices = Vec::with_capacity(pairs.len());
+        let mut last: Option<(*const RecordBatch, usize)> = None;
+        for pair in pairs {
+            let (batch, row) = pick(pair);
+            let ptr = Arc::as_ptr(batch);
+            let source_idx = match last {
+                Some((p, idx)) if p == ptr => idx,
+                _ => {
+                    let idx = sources
+                        .iter()
+                        .position(|s| Arc::as_ptr(s) == ptr)
+                        .unwrap_or_else(|| {
+                            sources.push(batch);
+                            sources.len() - 1
+                        });
+                    last = Some((ptr, idx));
+                    idx
+                }
+            };
+            indices.push((source_idx, row as usize));
+        }
+        (sources, indices)
+    }
+
+    let (left_sources, left_indices) = side_indices(pairs, |(l, lr, _, _)| (l, *lr));
+    let (right_sources, right_indices) = side_indices(pairs, |(_, _, r, rr)| (r, *rr));
+
     let mut cols: Vec<arrow::array::ArrayRef> = Vec::with_capacity(left_cols + right_cols);
     for idx in 0..left_cols {
-        let parts: Vec<&dyn arrow::array::Array> =
-            pairs.iter().map(|(l, _)| l.column(idx).as_ref()).collect();
-        cols.push(arrow::compute::concat(&parts)?);
+        let parts: Vec<&dyn arrow::array::Array> = left_sources
+            .iter()
+            .map(|b| b.column(idx).as_ref())
+            .collect();
+        cols.push(arrow::compute::interleave(&parts, &left_indices)?);
     }
     for idx in 0..right_cols {
-        let parts: Vec<&dyn arrow::array::Array> =
-            pairs.iter().map(|(_, r)| r.column(idx).as_ref()).collect();
-        cols.push(arrow::compute::concat(&parts)?);
+        let parts: Vec<&dyn arrow::array::Array> = right_sources
+            .iter()
+            .map(|b| b.column(idx).as_ref())
+            .collect();
+        cols.push(arrow::compute::interleave(&parts, &right_indices)?);
     }
     RecordBatch::try_new(schema, cols)
 }
