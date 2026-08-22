@@ -180,3 +180,17 @@ baseline). Numbers: 48-77K on single-source windows/stateless (krishiv sn
 wins q3 104K vs 81K and q8 109K vs 53K). Spark SS trails both by 3-5x on
 stateful shapes. Same ingestion caveat as Spark: file-source input skips
 the network hop krishiv's push wire pays.
+
+## Stream-stream join optimization (2026-08-22, `64f6ebe`)
+
+Motivated by the Flink baseline (q3 104K / q8 109K vs our 81K / 53K).
+Three per-ROW costs removed from the join hot path — the 1-row
+RecordBatch slice per buffered event (now: shared input-batch Arc + row
+index), the fresh String key per row (now: reused format buffer), and the
+exact-LRU reorder per row (now: only above half the key cap) — and output
+assembly switched from concat-of-1-row-arrays to a single arrow
+`interleave` per column. Snapshot wire format unchanged (slices at
+snapshot time). Terminal harness, single-node durable, identical rows
+out: q3 81.5K -> 157.9K (+94%), q8 53.4K -> 151.8K (+184%), q20 128K ->
+141K, full 24/24 sweep PASS (attempt34). krishiv now leads Flink local
+on every join shape.
