@@ -146,3 +146,20 @@ test), and `1024dce` (a pre-split EOS flush emits ~1000 micro-batches
 and a single exchange push above the 64-batch receiver cap can NEVER be
 accepted — per-peer rows now coalesce into one batch before delivery;
 single-node had masked this because loopback delivery skips the cap).
+
+## Spark Structured Streaming baseline (2026-08-22)
+
+Same machine, same generator data (nexmark_dump, seed 0x4E45584D, CSV
+shards), Spark 4.0.0 in Docker, local[*], file source
+maxFilesPerTrigger=4, Trigger.AvailableNow, noop sink, median of 3 after
+a JVM warm-up (scratchpad/spark_nexmark.py + spark-nexmark*.log).
+Deviations: streaming COUNT(DISTINCT) is approx_count_distinct in SS;
+q4 (join->agg->agg) and q19 (top-N over a streaming agg) are NOT
+expressible in pure SS. Ingestion differs by construction: Spark reads
+local files, krishiv is pushed over its client wire — a bias in SPARK's
+favor. Headline: krishiv single-node leads Spark local[*] ~4-6x on
+windowed/stateful shapes (e.g. q1 74.6K vs 13.6K, q2 76.8K vs 15.5K,
+q9 118.9K vs 8.4K, q3 81.5K vs 11.3K), ~1.6x on stateless projections
+(63-71K vs 38-41K), and runs 24/24 vs Spark's 21 expressible. Rerun of
+both krishiv legs at aa44a5c (post gap-closure): sn 53-135K PASS 24/24
+(attempt32), rig 7.3-17K PASS 24/24 (attempt33).
