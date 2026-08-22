@@ -2098,6 +2098,21 @@ pub struct AppliedContinuousRegistration {
 /// (b) every registry source descriptor (the subtask filters to the splits it
 /// owns). The tasks launch once; from here on the coordinator is
 /// control-plane-only for this job.
+/// The first launch response whose executor deduped the assignment as a
+/// `(job, task, attempt)` it had already received — see the call site for why
+/// that is a collision with a prior incarnation, not idempotence.
+fn duplicate_run_loop_launch(
+    responses: &[(
+        krishiv_proto::ExecutorTaskAssignment,
+        krishiv_proto::TaskStatusResponse,
+    )],
+) -> Option<&krishiv_proto::TaskId> {
+    responses.iter().find_map(|(assignment, response)| {
+        (response.disposition() == krishiv_proto::TransportDisposition::Duplicate)
+            .then(|| assignment.task_id())
+    })
+}
+
 async fn launch_run_loop_job(
     coordinator: &SharedCoordinator,
     job_id: &krishiv_proto::JobId,
@@ -2234,6 +2249,23 @@ async fn launch_run_loop_job(
     let responses = Coordinator::deliver_assignment_targets_with_channels(channels, targets)
         .await
         .map_err(ContinuousStreamError::Scheduler)?;
+    // A `Duplicate` disposition on a run-loop LAUNCH is never idempotence: a
+    // fresh incarnation's attempts start at 1, so the executor's dedupe entry
+    // can only be a leftover identity from a prior incarnation whose
+    // retirement never reached it — and that incarnation's loop may still be
+    // running. The inbox swallowed this assignment, the subtask will never
+    // report Running, and every later push, flush, and checkpoint against the
+    // job stalls or fails. (Batch retries redeliver the SAME attempt, which is
+    // why the shared accounting in `apply_assignment_dispatch_responses`
+    // counts Duplicate as accepted; that reasoning does not transfer here.)
+    if let Some(task_id) = duplicate_run_loop_launch(&responses) {
+        return Err(ContinuousStreamError::Unavailable(format!(
+            "run-loop job {job_id}: the executor already holds task identity {task_id} for \
+             this job id — a prior incarnation was not fully retired and its loop may \
+             still be running. Deregister the job id and re-register, or register under \
+             a fresh id"
+        )));
+    }
     let mut coord = coordinator.write().await;
     let accepted = coord.apply_assignment_dispatch_responses(job_id, &responses);
     // Compare against the number of targets we RESOLVED, not the number of
@@ -2312,7 +2344,15 @@ async fn upsert_continuous_streaming_job(
         //      job non-terminal and evict a no-op.
         //   3. evict frees the registry slot; snapshot is cleared so the fresh job
         //      starts clean instead of inheriting a stale watermark/state.
-        let _ = coord.push_cancel_job(job_id).await;
+        if let Err(e) = coord.push_cancel_job(job_id).await {
+            tracing::warn!(
+                job_id = %job_id,
+                error = %e,
+                "retiring the prior continuous incarnation: push-cancel did not reach \
+                 every executor — a loop that survives will surface as a Duplicate \
+                 launch rejection on the fresh submit"
+            );
+        }
         let _ = coord.cancel_job(job_id);
         coord.evict_completed_job(job_id);
         coord.remove_continuous_snapshot(job_id.as_str());
@@ -3087,6 +3127,67 @@ mod tests {
         let mut assignments = coord.launch_assigned_task_assignments(&job_id).unwrap();
         assert_eq!(assignments.len(), 1);
         assignments.remove(0)
+    }
+
+    /// The 2026-08-22 wedge: a prior incarnation's loop survived a best-effort
+    /// push-cancel, so the fresh incarnation's launch dispatch came back
+    /// `Duplicate` — the executor inbox had swallowed it against the leftover
+    /// `(job, task, attempt)` identity. The shared dispatch accounting counts
+    /// Duplicate as accepted (correct for batch redelivery of the SAME
+    /// attempt), so registration returned Ok on a job whose subtask could
+    /// never report Running: checkpoints failed with "no running attempts",
+    /// the stall sweep killed the surviving ghost loop half an hour later, and
+    /// the retried task churned Assigned->Pending for two hours. The run-loop
+    /// launch path must treat Duplicate as the collision it is.
+    #[test]
+    fn duplicate_launch_disposition_is_a_collision_not_idempotence() {
+        use krishiv_proto::{
+            AttemptId, ExecutorId, LeaseGeneration, OutputContract, OutputContractKind,
+            PlanFragment, StageId, TaskAttemptRef, TaskId,
+        };
+        let assignment = |task: &str| {
+            ExecutorTaskAssignment::new(
+                TaskAttemptRef::new(
+                    krishiv_proto::JobId::try_new("dup-launch-job").unwrap(),
+                    StageId::try_new("stage-streaming").unwrap(),
+                    TaskId::try_new(task).unwrap(),
+                    AttemptId::try_new(1).unwrap(),
+                ),
+                ExecutorId::try_new("exec-1").unwrap(),
+                LeaseGeneration::initial(),
+                PlanFragment::new("stream:rloop:x"),
+                OutputContract::new(OutputContractKind::InlineRecordBatches, String::new()),
+            )
+        };
+
+        let all_accepted = vec![
+            (
+                assignment("task-streaming-0"),
+                TaskStatusResponse::new(TransportDisposition::Accepted),
+            ),
+            (
+                assignment("task-streaming-1"),
+                TaskStatusResponse::new(TransportDisposition::Accepted),
+            ),
+        ];
+        assert!(
+            duplicate_run_loop_launch(&all_accepted).is_none(),
+            "accepted launches must not be reported as collisions"
+        );
+
+        let with_duplicate = vec![
+            (
+                assignment("task-streaming-0"),
+                TaskStatusResponse::new(TransportDisposition::Accepted),
+            ),
+            (
+                assignment("task-streaming-1"),
+                TaskStatusResponse::new(TransportDisposition::Duplicate),
+            ),
+        ];
+        let collided = duplicate_run_loop_launch(&with_duplicate)
+            .expect("a Duplicate launch disposition must surface as a collision");
+        assert_eq!(collided.as_str(), "task-streaming-1");
     }
 
     #[tokio::test]

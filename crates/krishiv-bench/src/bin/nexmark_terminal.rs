@@ -89,7 +89,12 @@ async fn drain_until_stable(job: &StreamingJob) -> usize {
 }
 
 async fn run_case(session: &Session, case: &Case, rep: usize) -> (usize, usize, f64) {
-    let job_name = format!("nexterm-{}-{rep}", case.name);
+    // A per-process nonce keeps job ids unique across harness runs: a prior
+    // run killed mid-case leaves its continuous job live, and re-registering
+    // the same id collides with that incarnation (now a loud registration
+    // error; before 2026-08-22 it was a silent two-hour wedge).
+    let nonce = std::process::id();
+    let job_name = format!("nexterm-{}-{rep}-{nonce}", case.name);
     let mut writer = session
         .sql(
             "SELECT CAST(0 AS BIGINT) AS auction, CAST(0 AS BIGINT) AS bidder, \
