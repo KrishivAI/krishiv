@@ -92,3 +92,32 @@ surfaces REMOVED — 650 lines deleted, nothing lost).
 
 Follow-on: NEXMark benchmarked THROUGH the terminal on single-node and
 the k3s rig (requires --flight-addr on the coordinators).
+
+## Terminal benchmark record (2026-08-22)
+
+Single-node durable stack (clusterd + 1 executor, RocksDB state,
+1s checkpoints), NEXMark bids THROUGH `StreamingDataFrame.write()` +
+the unified `StreamingJob` handle over Flight IPC — 100k rows/case,
+median of 3 reps:
+
+| case                | mode     | ev/s   | rows out |
+|---------------------|----------|--------|----------|
+| t1_count_per_bidder | append   | 62,891 | 93       |
+| t2_count_per_auction| append   | 68,431 | 96       |
+| t3_wide_window      | append   | 69,280 | 93       |
+| t4_update_mode      | update   | 68,430 | 160      |
+| t5_complete_mode    | complete | 62,190 | 93 (full table) |
+
+Completeness gate PASS (5/5). These sit AT or ABOVE the raw
+direct-registration harness (28–73K on the same box): the terminal adds
+no measurable overhead, and Flight IPC beats the HTTP+base64 push path.
+
+Two defects surfaced getting here, both fixed with revert-proven tests:
+`10b1c35` (a run-loop launch whose dispatch is deduped against a prior
+incarnation's leftover identity now fails registration loudly instead
+of returning Ok on a job that can never run — the 2h silent wedge) and
+`c132d5f` (complete-mode drain stability in the harness). Known gap
+confirmed live and still open: a run-loop task returned to Pending has
+no re-dispatcher (`launch_run_loop_job` runs only at registration), so
+a failed-then-retried streaming task churns Assigned→Pending forever —
+recorded in the KNOWN GAP comment at the launch call site.
