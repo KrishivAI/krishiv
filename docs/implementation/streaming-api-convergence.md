@@ -163,3 +163,20 @@ q9 118.9K vs 8.4K, q3 81.5K vs 11.3K), ~1.6x on stateless projections
 (63-71K vs 38-41K), and runs 24/24 vs Spark's 21 expressible. Rerun of
 both krishiv legs at aa44a5c (post gap-closure): sn 53-135K PASS 24/24
 (attempt32), rig 7.3-17K PASS 24/24 (attempt33).
+
+## Apache Flink baseline (2026-08-22)
+
+Same machine and data (headerless CSV shards of the same generator dump),
+Flink 1.20 via PyFlink SQL in Docker, mini-cluster parallelism 8,
+filesystem source, blackhole sink, mini-batch enabled, median of 3 after a
+JVM warm-up (scratchpad/flink_nexmark.py + flink-nexmark*.log). Flink SQL
+expresses more than Spark SS: exact COUNT(DISTINCT), streaming top-N
+(q19 53.9K), dedup (q18 58.4K) all run; 21/24 attempted (q12 proctime
+inapplicable to a bounded file source; q4/q20 skipped as in the Spark
+baseline). Numbers: 48-77K on single-source windows/stateless (krishiv sn
+54-77K on the same shapes — roughly at parity, krishiv ahead on most),
+99-109K on the two-source joins (krishiv 53-135K: krishiv wins q9
+119K vs 100K and runs q4 at 135K which Flink's harness skipped; Flink
+wins q3 104K vs 81K and q8 109K vs 53K). Spark SS trails both by 3-5x on
+stateful shapes. Same ingestion caveat as Spark: file-source input skips
+the network hop krishiv's push wire pays.
