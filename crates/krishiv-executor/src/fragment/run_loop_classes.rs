@@ -611,6 +611,13 @@ async fn route_stage_exchange(
         }
     }
     for (peer_subtask, peer_batches) in outbound {
+        // One push must FIT the receiver's input-buffer cap: the cap counts
+        // batches, and a single rejected oversize push can never succeed no
+        // matter how patiently the exchange retries. A pre-split EOS flush
+        // emits ~one micro-batch per open window (observed ~1000 on NEXMark
+        // q4/q9), so coalesce each peer's rows into one batch before
+        // delivery — same rows, same target, bounded buffer occupancy.
+        let peer_batches = coalesce_exchange_batches(peer_batches)?;
         let Some(peer) = peers.iter().find(|p| p.subtask == peer_subtask) else {
             return Err(ExecutorError::InvalidAssignment {
                 message: format!(
@@ -628,6 +635,22 @@ async fn route_stage_exchange(
         .await?;
     }
     Ok(owned)
+}
+
+/// Concatenate same-schema exchange batches into one, so a push's batch
+/// count stays far under the receiver cap regardless of how many
+/// micro-batches the flush produced. See the call site.
+fn coalesce_exchange_batches(batches: Vec<RecordBatch>) -> ExecutorResult<Vec<RecordBatch>> {
+    let Some(first) = batches.first() else {
+        return Ok(batches);
+    };
+    if batches.len() == 1 {
+        return Ok(batches);
+    }
+    let schema = first.schema();
+    arrow::compute::concat_batches(&schema, &batches)
+        .map(|b| vec![b])
+        .map_err(|e| local_err(format!("stage exchange coalesce: {e}")))
 }
 
 pub(crate) async fn execute_rpipe_fragment(
@@ -1038,8 +1061,37 @@ fn decode_side_table(ipc_base64: &str) -> Result<Vec<RecordBatch>, String> {
 
 #[cfg(test)]
 mod tests {
+
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// A pre-split EOS flush can emit ~1000 micro-batches; the receiver's
+    /// input cap counts batches and rejects any single push above it
+    /// permanently. The exchange must therefore coalesce per-peer rows into
+    /// one batch (2026-08-22 rig failure: q4's flush push could never fit).
+    #[test]
+    fn exchange_coalesce_folds_micro_batches_into_one() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema =
+            std::sync::Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batches: Vec<RecordBatch> = (0..200)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![std::sync::Arc::new(Int64Array::from(vec![i]))],
+                )
+                .unwrap()
+            })
+            .collect();
+        let out = super::coalesce_exchange_batches(batches).unwrap();
+        assert_eq!(
+            out.len(),
+            1,
+            "one push-sized batch, not 200 cap-blowing ones"
+        );
+        assert_eq!(out[0].num_rows(), 200);
+    }
 
     #[test]
     fn classed_fragment_round_trips() {
