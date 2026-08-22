@@ -56,11 +56,14 @@ pub const RUN_LOOP_EOS_QUIESCE_TASK_ID: &str = "stream-eos-quiesce";
 /// be APPLIED) before the final `stream-eos` flushes the post-split state.
 pub const RUN_LOOP_EOS_PRESTAGE_TASK_ID: &str = "stream-eos-prestage";
 
-/// How long the EOS quiesce/flush legs wait for pending pushed input to be
-/// applied before failing loudly. Sized well under the coordinator's 10s
-/// run-loop RPC timeout; a full input buffer (cap 64) drains in well under a
-/// second, so hitting this means the loop is wedged, not slow.
-const EOS_QUIESCE_DEADLINE: Duration = Duration::from_secs(8);
+/// How long the EOS quiesce/prestage/flush legs wait for pending pushed
+/// input to be applied before failing loudly. Sized ABOVE the stream
+/// exchange's 60s backpressure budget and UNDER the coordinator's 120s EOS
+/// directive RPC timeout, so a pre-split flush whose sender is legitimately
+/// waiting out a starved receiver completes instead of being declared
+/// wedged (the 2026-08-22 parallel-q4 rig failure was this deadline at its
+/// old 8s value firing while the exchange backed off).
+const EOS_QUIESCE_DEADLINE: Duration = Duration::from_secs(90);
 
 /// The three class-specific run-loop state maps (task #147): two-source
 /// joins, join→agg pipelines, and stateless SQL executors. Bundled into one
@@ -1150,6 +1153,18 @@ pub fn executor_task_grpc_server_with_run_loop(
 
 #[cfg(test)]
 mod tests {
+    /// The EOS deadline chain must compose: a sender waiting out receiver
+    /// backpressure (its full budget) must still fit inside the quiesce/
+    /// prestage deadline, or a slow-but-healthy flush is declared wedged.
+    #[test]
+    fn eos_quiesce_deadline_exceeds_the_exchange_backpressure_budget() {
+        assert!(
+            super::EOS_QUIESCE_DEADLINE > crate::stream_exchange::EXCHANGE_BACKPRESSURE_BUDGET,
+            "EOS_QUIESCE_DEADLINE must exceed EXCHANGE_BACKPRESSURE_BUDGET; \
+             see the 2026-08-22 parallel-q4 rig failure"
+        );
+    }
+
     use super::*;
 
     fn kv_batch(ts: &[i64]) -> RecordBatch {

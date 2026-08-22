@@ -31,6 +31,17 @@ use crate::{Coordinator, SchedulerError, SharedCoordinator};
 /// a much slower and less precise failure signal than an explicit bound.
 const RUN_LOOP_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// EOS directives (quiesce / prestage / eos) move a job's WHOLE open state
+/// through the stage exchange, and a sender facing a full receiver now waits
+/// out backpressure on a 60s budget (stream_exchange, 2026-08-22). The
+/// deadline chain must compose: exchange backpressure (60s) < the executor's
+/// EOS_QUIESCE_DEADLINE (90s) < this directive RPC timeout — otherwise the
+/// layer above times out a leg that is legitimately waiting, and a slow but
+/// healthy cluster fails its flush (parallel q4 on the rig, 0/1 subtasks).
+/// Plain data pushes keep the tight 10s timeout above: their backpressure
+/// answer is an immediate ResourceExhausted the CLIENT retries.
+const RUN_LOOP_EOS_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Map a scheduler error to its HTTP status **and carry its message**.
 ///
 /// `scheduler_status` alone throws the message away, so every failure on this
@@ -1287,14 +1298,14 @@ async fn push_run_loop_directive(
         ipc_bytes: Vec::new(),
     };
     tokio::time::timeout(
-        RUN_LOOP_RPC_TIMEOUT,
+        RUN_LOOP_EOS_RPC_TIMEOUT,
         client.push_continuous_input(wire::push_continuous_input_request_to_wire(request)),
     )
     .await
     .map_err(|_| {
         ContinuousStreamError::Unavailable(format!(
             "run-loop EOS flush to {endpoint} timed out after {}s",
-            RUN_LOOP_RPC_TIMEOUT.as_secs()
+            RUN_LOOP_EOS_RPC_TIMEOUT.as_secs()
         ))
     })?
     .map_err(|status| {

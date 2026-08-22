@@ -64,7 +64,8 @@ const EXCHANGE_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// (observed live: parallel q4 on the rig, the s3 subtask fell behind and the
 /// s1 sender died, which then failed the whole job's EOS flush). Mirrors the
 /// client-push backpressure budget from task #149.
-const EXCHANGE_BACKPRESSURE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const EXCHANGE_BACKPRESSURE_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(60);
 
 impl StreamExchange {
     fn peer(&self, endpoint: &str) -> Arc<PeerChannel> {
