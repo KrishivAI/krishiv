@@ -3297,15 +3297,14 @@ impl Session {
     ///
     /// Returns a [`StreamJob::Embedded`](crate::StreamJob::Embedded) in
     /// embedded / single-node mode (push + drain against the in-process
-    /// cluster) and a [`StreamJob::Remote`](crate::StreamJob::Remote) in
-    /// distributed mode (push + drain against the coordinator over Flight).
-    /// Both variants expose the same `push` + `drain` surface, so the
-    /// caller does not branch on placement.
+    /// cluster) or the coordinator over Flight in distributed mode — either
+    /// way the unified [`crate::StreamingJob`] handle, so the caller never
+    /// branches on placement.
     pub fn stream(
         &self,
         name: impl Into<String> + Send,
         spec: LocalWindowExecutionSpec,
-    ) -> Result<crate::StreamJob> {
+    ) -> Result<crate::StreamingJob> {
         block_on(self.stream_async(name, spec))
     }
 
@@ -3319,7 +3318,7 @@ impl Session {
         &self,
         name: impl Into<String>,
         spec: LocalWindowExecutionSpec,
-    ) -> Result<crate::StreamJob> {
+    ) -> Result<crate::StreamingJob> {
         self.stream_with_options_async(name, spec, &Default::default())
             .await
     }
@@ -3342,7 +3341,7 @@ impl Session {
         name: impl Into<String>,
         spec: LocalWindowExecutionSpec,
         options: &krishiv_runtime::ContinuousRegisterOptions,
-    ) -> Result<crate::StreamJob> {
+    ) -> Result<crate::StreamingJob> {
         let name = name.into();
         match self.mode {
             ExecutionMode::Distributed => {
@@ -3367,7 +3366,7 @@ impl Session {
                 .await
                 .map_err(KrishivError::from)?;
                 self.remember_stream_job(&name, None, spec);
-                Ok(crate::StreamJob::Remote(remote))
+                Ok(crate::StreamingJob::from_remote(remote))
             }
             ExecutionMode::Embedded | ExecutionMode::SingleNode => {
                 // Fail closed rather than ignore. The in-process cluster has no
@@ -3383,9 +3382,7 @@ impl Session {
                     )));
                 }
                 let job_id = self.submit_stream_job(name, spec)?;
-                Ok(crate::StreamJob::Embedded(Box::new(
-                    crate::compute::EmbeddedStreamJob::new(self.clone(), job_id),
-                )))
+                Ok(crate::StreamingJob::from_session_job(self.clone(), job_id))
             }
         }
     }

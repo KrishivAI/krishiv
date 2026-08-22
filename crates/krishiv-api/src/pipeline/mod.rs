@@ -1,7 +1,7 @@
 //! Declarative pipeline layer (Tier 2) — `source → transform → sink`.
 //!
 //! A [`Pipeline`] is a thin **compiler to the imperative core** (Tier 1:
-//! [`IvmJob`](crate::IvmJob) / [`StreamJob`](crate::StreamJob) / batch SQL). It
+//! [`IvmJob`](crate::IvmJob) / `StreamingJob` / batch SQL). It
 //! owns connectors and a driver loop; it contains **no parallel execution
 //! logic** — the moment it reimplements `feed`/`step`, the unification we built
 //! is lost. The driver only calls existing Tier-1 methods.

@@ -123,7 +123,7 @@ impl CompleteModeView {
 impl StreamingJob {
     /// Wrap an embedded structured-streaming query.
     #[must_use]
-    pub fn from_query(query: StreamingQuery) -> Self {
+    pub(crate) fn from_query(query: StreamingQuery) -> Self {
         Self {
             backend: Backend::Query(query),
             complete_view: None,
@@ -138,6 +138,15 @@ impl StreamingJob {
                 session: Box::new(session),
                 job_id: job_id.into(),
             },
+            complete_view: None,
+        }
+    }
+
+    /// Wrap a runtime wire client directly (crate-internal translation
+    /// seam).
+    pub(crate) fn from_remote(job: krishiv_runtime::RemoteStreamingJob) -> Self {
+        Self {
+            backend: Backend::Remote(job),
             complete_view: None,
         }
     }

@@ -206,11 +206,22 @@ def _register_arrow_stream(self, job_name: str, async_gen):
     Register a Python async generator of PyArrow RecordBatches to continuously feed a running stream job.
     This bridges Python's async ecosystem directly into Rust's continuous stream pipeline.
     """
-    from .krishiv import Batch
+    from .krishiv import Batch, StreamingJob
+
+    job = StreamingJob.attach(self.coordinator_http_url(), job_name) if getattr(
+        self, "coordinator_http_url", None
+    ) and self.coordinator_http_url() else None
+
     async def _pump():
         try:
             async for pyarrow_batch in async_gen:
-                self.push_stream_job_input(job_name, [Batch(pyarrow_batch)])
+                if job is not None:
+                    job.push([Batch(pyarrow_batch)])
+                else:
+                    raise RuntimeError(
+                        "feed_stream_from_async requires a coordinator-backed session; "
+                        "use job.push() on the handle returned by write().start() instead"
+                    )
         except Exception as e:
             print(f"Error pumping stream {job_name}: {e}")
 

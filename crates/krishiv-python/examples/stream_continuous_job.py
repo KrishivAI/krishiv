@@ -9,14 +9,14 @@ def main():
     session = ks.Session.from_env()
 
     # 2. Register the source stream table up front so the job query can be
-    # planned; live rows are fed later via push_stream_job_input. (The unified
+    # planned; live rows are fed later via job.push() on the handle. (The unified
     # StreamingDataFrame plans its SQL eagerly, so the source must exist first.)
     schema = pa.schema([
         ("timestamp", pa.int64()),
         ("user_id", pa.string()),
     ])
     # A one-row placeholder just gives the source its schema so the query plans;
-    # submit_stream_job reads only the window spec, not these rows.
+    # the terminal reads only the window spec, not these rows.
     seed = pa.RecordBatch.from_pydict({"timestamp": [0], "user_id": ["_seed"]}, schema=schema)
     session.register_record_batches("alerts_stream", [ks.Batch(seed)])
 

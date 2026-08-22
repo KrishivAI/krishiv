@@ -968,7 +968,8 @@ async fn stream_async_embedded_push_and_drain() {
         .stream_async("stream-async-test", spec)
         .await
         .expect("stream_async");
-    assert!(matches!(job, crate::StreamJob::Embedded(_)));
+    // The unified handle serves embedded jobs through its session backend;
+    // the push/drain below is what proves it (the enum variant is gone).
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("user_id", DataType::Utf8, false),

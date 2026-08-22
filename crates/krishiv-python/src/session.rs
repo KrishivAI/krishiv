@@ -1225,54 +1225,6 @@ impl PySession {
         Ok(PyRelation::from_pipeline(pipeline))
     }
 
-    /// Submit a continuous streaming job. Returns the job id handle.
-    /// `stream` must be a windowed StreamingDataFrame (`key_by` + window + agg).
-    pub fn submit_stream_job(
-        &self,
-        name: String,
-        stream: &PyStreamingDataFrame,
-    ) -> PyResult<String> {
-        let spec = stream
-            .engine()
-            .execution_spec()
-            .map_err(map_krishiv_error)?
-            .ok_or_else(|| {
-                PyRuntimeError::new_err(
-                    "submit_stream_job requires a windowed StreamingDataFrame \
-                     (use .with_event_time(..).key_by(..).tumbling_window(..).agg(..))",
-                )
-            })?;
-        self.inner
-            .submit_stream_job(name, spec)
-            .map_err(map_krishiv_error)
-    }
-
-    /// Push input batches to a continuous streaming job.
-    pub fn push_stream_job_input(&self, job_id: String, batches: Vec<PyBatch>) -> PyResult<()> {
-        let record_batches: Vec<arrow::record_batch::RecordBatch> = batches
-            .into_iter()
-            .map(|b| b.record_batch().clone())
-            .collect();
-        self.inner
-            .push_stream_job_input(&job_id, record_batches)
-            .map_err(map_krishiv_error)
-    }
-
-    /// Drain newly emitted batches from a continuous streaming job.
-    pub fn poll_stream_job(&self, py: Python<'_>, job_id: String) -> PyResult<Vec<PyBatch>> {
-        let inner = self.inner.clone();
-        py.detach(move || {
-            block_on_async(async move { inner.poll_stream_job(&job_id).await })
-                .map(|batches| {
-                    batches
-                        .into_iter()
-                        .map(PyBatch::from_record_batch)
-                        .collect()
-                })
-                .map_err(map_krishiv_error)
-        })
-    }
-
     /// Close every window a continuous job still holds open, because its source
     /// is exhausted.
     ///

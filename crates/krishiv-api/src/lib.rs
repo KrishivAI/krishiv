@@ -56,8 +56,8 @@ pub use catalog::{
     ViewIdentifier,
 };
 pub use compute::{
-    Checkpointable, EmbeddedStreamJob, FeedableJob, IncrementalDataFrame, IvmJob, Job, JobKind,
-    StepReport, StreamJob, ViewError, ViewErrorKind,
+    Checkpointable, FeedableJob, IncrementalDataFrame, IvmJob, Job, JobKind, StepReport, ViewError,
+    ViewErrorKind,
 };
 pub use connector_runtime::{
     ConnectorSinkProvider, ConnectorSourceProvider, DebeziumCdcSourceProvider,
@@ -114,8 +114,8 @@ pub use sql_job::compile_sql_job;
 pub use stream::{KeyedStream, Stream};
 pub use stream_write::StreamWriter;
 pub use streaming_builder::{
-    DataStreamReader, DataStreamWriter, ForeachBatchFn, KafkaTransactionalConfig,
-    StreamingOutputMode, StreamingQuery, StreamingQueryProgress, StreamingTrigger,
+    DataStreamReader, ForeachBatchFn, KafkaTransactionalConfig, StreamingOutputMode,
+    StreamingQueryProgress, StreamingTrigger,
 };
 pub use streaming_dataframe::{
     KrishivStream, NamedSideOutputStream, StreamingDataFrame, StreamingOutputStreams,

@@ -6,7 +6,7 @@
 //!
 //! - [`Session::batch`](crate::Session::batch) → a one-shot `DataFrame` (collect).
 //! - [`Session::ivm`](crate::Session::ivm) → an [`IvmJob`] (feed / step / snapshot).
-//! - [`Session::stream`](crate::Session::stream) → a [`StreamJob`] (push / drain).
+//! - [`Session::stream`](crate::Session::stream) → the unified [`crate::StreamingJob`].
 //!
 //! Jobs share a small trait hierarchy: [`Job`] (identity), [`FeedableJob`]
 //! (the one `feed` + `step`/`snapshot`), and [`Checkpointable`] (durable state).
@@ -15,9 +15,7 @@
 mod incremental_df;
 mod ivm;
 pub mod job;
-mod stream;
 
 pub use incremental_df::IncrementalDataFrame;
 pub use ivm::IvmJob;
 pub use job::{Checkpointable, FeedableJob, Job, JobKind, StepReport, ViewError, ViewErrorKind};
-pub use stream::{EmbeddedStreamJob, StreamJob};
