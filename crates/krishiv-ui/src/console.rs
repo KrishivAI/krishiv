@@ -1,6 +1,6 @@
 //! The embedded TanStack web console (task #152).
 //!
-//! `console/dist` (the Vite production build) is compiled into the binary
+//! `console/dist` (the Vite production build, source in this crate's `console/`) is compiled into the binary
 //! in release builds and read from disk in debug builds (`rust-embed`
 //! semantics — an `npm run build` in `console/` is picked up without
 //! recompiling in dev). Served under `/console` with SPA fallback: any
@@ -17,7 +17,7 @@ use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 
 #[derive(rust_embed::Embed)]
-#[folder = "../../console/dist"]
+#[folder = "console/dist"]
 struct Assets;
 
 /// Serve a console asset or the SPA shell for `/console/...` paths.
