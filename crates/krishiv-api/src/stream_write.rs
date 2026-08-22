@@ -181,7 +181,23 @@ impl StreamWriter {
         // engine's own routing ladder decided. Update/complete modes are a
         // window-operator capability, so non-append is refused BY NAME here
         // rather than registering a job that silently appends.
-        if let Some(task) = self.df.task_override() {
+        // A window-class SQL stream on an EMBEDDED session bridges to the
+        // same local spec the builder produces, so `stream_sql` works in
+        // every execution mode for the window class — only the join/
+        // pipeline/stateless classes need a coordinator (their loops are
+        // subtask machinery an embedded session does not host).
+        let bridged_window: Option<krishiv_runtime::LocalWindowExecutionSpec> =
+            match self.df.task_override() {
+                Some(krishiv_plan::stream_task::StreamingTaskSpec::Window(w))
+                    if session.mode() == crate::types::ExecutionMode::Embedded =>
+                {
+                    Some(w.as_ref().into())
+                }
+                _ => None,
+            };
+        if let Some(task) = self.df.task_override()
+            && bridged_window.is_none()
+        {
             if self.output_mode != "append" {
                 return Err(KrishivError::InvalidConfig {
                     message: format!(
@@ -218,28 +234,37 @@ impl StreamWriter {
             return Ok(StreamingJob::from_session_job(session.clone(), job_name));
         }
 
-        let mut spec = self
-            .df
-            .execution_spec()?
-            .ok_or_else(|| KrishivError::InvalidConfig {
-                message: "write() needs a windowed pipeline: set with_event_time/key_by and a \
-                      window before start()"
-                    .into(),
-            })?;
-        if matches!(self.output_mode.as_str(), "update" | "complete") {
+        let mut spec = match bridged_window {
+            Some(spec) => spec,
+            None => self
+                .df
+                .execution_spec()?
+                .ok_or_else(|| KrishivError::InvalidConfig {
+                    message: "write() needs a windowed pipeline: set with_event_time/key_by \
+                          and a window before start()"
+                        .into(),
+                })?,
+        };
+        let tumbling = matches!(spec.window_kind, krishiv_runtime::LocalWindowKind::Tumbling);
+        if self.output_mode == "update" && !tumbling {
             // Update mode = speculative re-emission of OPEN windows as
             // provisional upserts keyed on (key, window_start_ms). Only the
             // tumbling operator supports the read-only open-window snapshot;
             // session/sliding shapes are refused BY NAME rather than
             // registering a job that silently behaves like append.
-            if !matches!(spec.window_kind, krishiv_runtime::LocalWindowKind::Tumbling) {
-                return Err(KrishivError::InvalidConfig {
-                    message: "output mode 'update' requires a tumbling window: the \
-                              speculative open-window snapshot that update mode is \
-                              built on exists only for the tumbling operator"
-                        .into(),
-                });
-            }
+            return Err(KrishivError::InvalidConfig {
+                message: "output mode 'update' requires a tumbling window: the \
+                          speculative open-window snapshot that update mode is \
+                          built on exists only for the tumbling operator"
+                    .into(),
+            });
+        }
+        if matches!(self.output_mode.as_str(), "update" | "complete") && tumbling {
+            // Early fire keeps the update stream (and a complete view fed by
+            // it) fresh while windows are still open. Complete mode WITHOUT
+            // tumbling skips this: the sink-layer fold works on any window
+            // shape, it just updates only when windows CLOSE — final results
+            // only, never provisional ones (task #151 gap closure).
             let interval = if self.trigger == "processing_time" {
                 self.trigger_interval_ms.max(1)
             } else {
@@ -604,6 +629,97 @@ mod complete_mode_tests {
             users.contains(&String::from("a")) && users.contains(&String::from("b")),
             "the complete table must retain the CLOSED key a alongside the open b: {users:?}"
         );
+        job.stop().await.expect("stop");
+    }
+
+    /// Complete mode is a sink-layer fold of FINAL window closes, which works
+    /// for any window shape — only UPDATE mode needs the tumbling operator's
+    /// open-window snapshot. A sliding-window complete job must be accepted
+    /// (pre-fix the shared tumbling gate refused it) and its fold must retain
+    /// closed windows across drains exactly like the tumbling case. (Session
+    /// windows are additionally accepted by this gate but the EMBEDDED
+    /// registry refuses them for its own wall-clock reason, so the embedded
+    /// fixture uses sliding; session-window complete runs on run-loop
+    /// registrations.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn complete_mode_accepts_sliding_windows_and_folds_final_closes() {
+        let session = Session::builder().build().expect("session");
+        let job = session
+            .sql("SELECT 'seed' AS user_id, CAST(0 AS BIGINT) AS ts")
+            .expect("df")
+            .stream()
+            .with_event_time("ts")
+            .key_by("user_id")
+            .sliding_window(1_000, 500)
+            .write()
+            .output_mode("complete")
+            .trigger("available_now", 0)
+            .start(&session, "cmp-sliding")
+            .expect("sliding-window complete job must register, not be refused");
+
+        // a's windows close once b@10_000 advances the watermark far past
+        // them; b's close at flush. The full table must carry both keys.
+        job.push(vec![batch(&["a"], &[1_000])])
+            .await
+            .expect("push a");
+        job.push(vec![batch(&["b"], &[10_000])])
+            .await
+            .expect("push b");
+        let _ = job.flush().await.expect("flush closes trailing sessions");
+        let table = job.drain().await.expect("full table");
+        let users = user_rows(&table);
+        assert!(
+            users.contains(&String::from("a")) && users.contains(&String::from("b")),
+            "the complete table must carry both closed sessions: {users:?}"
+        );
+        job.stop().await.expect("stop");
+    }
+}
+
+#[cfg(test)]
+mod stream_sql_embedded_tests {
+    use super::*;
+
+    /// Window-class streaming SQL through `Session::stream_sql` must run on
+    /// an EMBEDDED session by bridging to the same local spec the builder
+    /// produces (pre-fix, every class-routed job demanded a coordinator URL
+    /// and embedded callers were refused BY NAME even for plain windows).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn window_class_stream_sql_runs_embedded() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let session = Session::builder().build().expect("session");
+        let job = session
+            .stream_sql(
+                "SELECT user_id, COUNT(*) AS c \
+                 FROM TUMBLE(TABLE src, DESCRIPTOR(ts), 1000) \
+                 GROUP BY user_id, window_start, window_end",
+            )
+            .expect("compiles")
+            .write()
+            .trigger("available_now", 0)
+            .start(&session, "sqlw-embedded")
+            .expect("embedded window-class SQL stream must start");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a", "b"])) as _,
+                Arc::new(Int64Array::from(vec![100i64, 200, 300])) as _,
+            ],
+        )
+        .expect("batch");
+        job.push(vec![batch]).await.expect("push");
+        let flushed = job.flush().await.expect("flush");
+        let rows: usize = flushed.iter().map(RecordBatch::num_rows).sum();
+        assert!(rows > 0, "the flushed window closes must carry rows");
         job.stop().await.expect("stop");
     }
 }

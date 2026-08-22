@@ -273,6 +273,23 @@ impl StreamingJob {
     /// Refused by name for embedded structured queries (use the
     /// `available_now` trigger); otherwise propagates the error.
     pub async fn flush(&self) -> Result<Vec<RecordBatch>> {
+        let flushed = self.flush_raw().await?;
+        // Complete mode: flushed deltas are window CLOSES and must fold into
+        // the maintained table exactly like drained deltas do — an engine
+        // whose closes emit only at flush (the embedded registry) would
+        // otherwise leave the view permanently empty.
+        if let Some(view) = &self.complete_view
+            && !flushed.is_empty()
+        {
+            let mut view = view.lock().map_err(|_| KrishivError::InvalidConfig {
+                message: "complete-mode view lock poisoned".into(),
+            })?;
+            view.apply(&flushed)?;
+        }
+        Ok(flushed)
+    }
+
+    async fn flush_raw(&self) -> Result<Vec<RecordBatch>> {
         match &self.backend {
             Backend::Query(_) => Err(KrishivError::InvalidConfig {
                 message: "this streaming job is an embedded structured query: bounded \

@@ -218,7 +218,38 @@ impl JobCoordinator {
         // Streaming jobs get their first placement eagerly at submission
         // time (`submit_job`) and need nothing further from this loop.
         if job.spec.kind() == JobKind::Streaming {
-            return false;
+            // The exclusion above the match is CYCLE-model reasoning: for a
+            // `stream:loop:` task, "launch" means running one input cycle,
+            // and auto-dispatching an empty cycle here raced real pushes and
+            // consumed the seeded restore hint (the Phase-20 fault-loop
+            // intermittent). For the RUN-LOOP family, launch means STARTING
+            // THE LONG-LIVED LOOP — after executor loss the reassignment
+            // puts the task back in Assigned, and if this driver refuses to
+            // dispatch it, NOTHING does: the task churns Assigned->Pending
+            // under the stuck-Assigned reaper forever while the job reports
+            // Running with zero running tasks (reproduced live 2026-08-22
+            // by killing and restarting a single-node executor mid-job).
+            return job.stages().iter().any(|stage| {
+                stage.tasks().iter().any(|task| {
+                    if task.assigned_executor.is_none()
+                        || task.launch_in_flight
+                        || task.state() != TaskState::Assigned
+                    {
+                        return false;
+                    }
+                    let body =
+                        krishiv_plan::TypedTaskFragment::decode_or_legacy(task.spec.description())
+                            .body;
+                    [
+                        "stream:rloop:",
+                        "stream:rjoin:",
+                        "stream:rpipe:",
+                        "stream:rbatch:",
+                    ]
+                    .iter()
+                    .any(|p| body.starts_with(p))
+                })
+            });
         }
         job.stages().iter().any(|stage| {
             stage.tasks().iter().any(|task| {
@@ -295,6 +326,45 @@ mod tests {
         spec = spec.with_stage(stage);
         let record = JobRecord::from_spec(spec, 3);
         JobCoordinator::new(jid, record)
+    }
+
+    /// Reproduced live 2026-08-22: after executor loss + rejoin, a run-loop
+    /// task is reassigned to Assigned but the blanket Streaming exclusion in
+    /// `should_consider_for_launch` kept the generic launch driver from ever
+    /// dispatching it — the job reported Running with zero running tasks
+    /// while the stuck-Assigned reaper churned it Assigned->Pending forever.
+    /// A run-loop-family task sitting Assigned without a launch in flight
+    /// MUST make the job launch-eligible; a cycle-model task must NOT (its
+    /// launches are push-driven, and an auto-dispatched empty cycle consumed
+    /// the seeded restore hint in the Phase-20 fault loop).
+    #[test]
+    fn assigned_run_loop_task_is_launch_eligible_but_cycle_task_is_not() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for (body, expected) in [("stream:rloop:x", true), ("stream:loop:x", false)] {
+            let jid = JobId::try_new("rl-relaunch").unwrap();
+            let mut spec = JobSpec::new(jid.clone(), "test-rl-relaunch", JobKind::Streaming);
+            spec = spec.with_stage(
+                StageSpec::new(StageId::try_new("stage-streaming").unwrap(), "stage").with_task(
+                    TaskSpec::new(TaskId::try_new("task-streaming-0").unwrap(), body),
+                ),
+            );
+            let record = JobRecord::from_spec(spec, 3);
+            let jc = JobCoordinator::new(jid, record);
+            {
+                let mut record = jc.write_record();
+                record.state = krishiv_proto::JobState::Running;
+                let task = &mut record.stages_mut()[0].tasks_mut()[0];
+                task.state = krishiv_proto::TaskState::Assigned;
+                task.assigned_executor = Some(ExecutorId::try_new("exec-1").unwrap());
+            }
+            rt.block_on(async {
+                assert_eq!(
+                    jc.should_consider_for_launch().await,
+                    expected,
+                    "body {body}: launch eligibility must be {expected}"
+                );
+            });
+        }
     }
 
     #[test]
