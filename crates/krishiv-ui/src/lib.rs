@@ -6,6 +6,7 @@
 //! surface. It intentionally depends on the in-process R2 scheduler model
 //! rather than introducing Kubernetes clients or a separate frontend build.
 
+pub mod console;
 mod handlers;
 mod router;
 mod views;
@@ -85,9 +86,6 @@ pub enum UiError {
     /// Shared coordinator lock was poisoned.
     #[error("coordinator status lock was poisoned")]
     LockPoisoned,
-    /// Template rendering failed.
-    #[error("failed to render status page: {0}")]
-    Template(#[from] askama::Error),
 }
 
 impl From<krishiv_sql::SqlError> for UiError {
@@ -101,7 +99,7 @@ impl IntoResponse for UiError {
         let status = match self {
             Self::Scheduler(SchedulerError::UnknownJob { .. }) => StatusCode::NOT_FOUND,
             Self::Id(_) => StatusCode::BAD_REQUEST,
-            Self::Scheduler(_) | Self::LockPoisoned | Self::Template(_) | Self::Sql(_) => {
+            Self::Scheduler(_) | Self::LockPoisoned | Self::Sql(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         };
@@ -318,18 +316,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn ui_jobs_renders_html() {
+    async fn console_shell_is_served_at_console() {
+        // The embedded SPA shell replaces the askama pages: /console serves
+        // index.html (dist is built in this repo), and the root redirects to
+        // it instead of the deleted /ui.
         let response = router(demo_state().unwrap())
-            .oneshot(Request::builder().uri("/ui").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/console")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        let status = response.status();
+        assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<div id=\"root\">"));
 
-        assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("Krishiv"));
-        assert!(body.contains("job-demo"));
+        let redirect = router(demo_state().unwrap())
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(redirect.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            redirect
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok()),
+            Some("/console")
+        );
     }
 
     #[tokio::test]
@@ -517,13 +533,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn vendored_live_js_is_public_and_js() {
-        // The live-refresh helper must be served locally (no CDN) and reachable
-        // without a bearer token, like the stylesheet.
+    async fn console_assets_stay_public_when_bearer_is_configured() {
+        // The SPA shell and its hashed assets carry no data — they must be
+        // reachable without a token (auth lives in the SPA's /api calls),
+        // exactly like the old vendored assets were.
         let response = router_with_token(demo_state().unwrap(), Some("secret"))
             .oneshot(
                 Request::builder()
-                    .uri("/assets/krishiv-live.js")
+                    .uri("/console")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -536,35 +553,41 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_owned();
-        assert!(ct.contains("javascript"), "unexpected content-type: {ct}");
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("live-region"));
+        assert!(ct.contains("html"), "unexpected content-type: {ct}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn rendered_pages_have_no_cdn_script() {
-        // Regression: pages must not pull htmx (or anything) from an external CDN.
-        for uri in ["/ui", "/ui/health", "/ui/metrics", "/ui/submit"] {
-            let response = router(demo_state().unwrap())
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{uri}");
-            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            let body = String::from_utf8(body.to_vec()).unwrap();
-            assert!(!body.contains("unpkg.com"), "{uri} still references a CDN");
-            assert!(
-                body.contains("assets/krishiv-live.js"),
-                "{uri} missing vendored live script"
-            );
-        }
+    async fn console_shell_has_no_cdn_script() {
+        // Regression: the SPA must be fully self-hosted — its script tags
+        // resolve under /console/assets/, never an external CDN.
+        let response = router(demo_state().unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/console")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("unpkg.com") && !body.contains("cdn."));
+        assert!(
+            body.contains("/console/assets/"),
+            "SPA assets must be self-hosted"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn responses_carry_security_headers() {
         let response = router(demo_state().unwrap())
-            .oneshot(Request::builder().uri("/ui").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/console")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let headers = response.headers();

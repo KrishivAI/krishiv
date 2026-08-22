@@ -1,9 +1,5 @@
-use askama::Template;
 use krishiv_proto::ConnectorCapabilityFlags;
-use krishiv_scheduler::metrics::SchedulerMetrics;
-use krishiv_scheduler::{
-    JobHistoryRecord, NamespaceQuotaSnapshot, ResourceUsage, StabilityMetrics,
-};
+use krishiv_scheduler::{JobHistoryRecord, NamespaceQuotaSnapshot, ResourceUsage};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -251,151 +247,6 @@ pub struct ExecutorDetailResponse {
     pub executor: ExecutorView,
 }
 
-#[derive(Template)]
-#[template(path = "jobs.html")]
-pub(crate) struct JobsTemplate {
-    pub(crate) jobs: Vec<JobSummaryView>,
-    pub(crate) executors: Vec<ExecutorView>,
-    pub(crate) bearer_token: Option<String>,
-    pub(crate) cluster_total_slots: usize,
-    pub(crate) cluster_used_slots: usize,
-    pub(crate) cluster_memory_total_mb: u64,
-    pub(crate) cluster_memory_used_mb: u64,
-    pub(crate) healthy_executor_count: usize,
-}
-
-impl JobsTemplate {
-    fn running_tasks(&self) -> usize {
-        self.jobs.iter().map(|job| job.running_task_count).sum()
-    }
-
-    fn failed_tasks(&self) -> usize {
-        self.jobs.iter().map(|job| job.failed_task_count).sum()
-    }
-}
-
-#[derive(Template)]
-#[template(path = "job.html")]
-pub(crate) struct JobTemplate {
-    pub(crate) job: JobDetailView,
-    pub(crate) executors: Vec<ExecutorView>,
-    pub(crate) bearer_token: Option<String>,
-}
-
-#[derive(Template)]
-#[template(path = "executor.html")]
-pub(crate) struct ExecutorTemplate {
-    pub(crate) executor: ExecutorView,
-    pub(crate) bearer_token: Option<String>,
-}
-
-#[derive(Template)]
-#[template(path = "checkpoints.html")]
-pub(crate) struct CheckpointsTemplate {
-    pub(crate) job_id: String,
-    pub(crate) epochs: Vec<u64>,
-    pub(crate) latest_epoch: Option<u64>,
-    pub(crate) bearer_token: Option<String>,
-}
-
-impl CheckpointsTemplate {
-    fn is_latest(&self, epoch: &u64) -> bool {
-        self.latest_epoch.as_ref() == Some(epoch)
-    }
-}
-
-#[derive(Template)]
-#[template(path = "submit.html")]
-pub(crate) struct SubmitTemplate {
-    pub(crate) bearer_token: Option<String>,
-}
-
-#[derive(Template)]
-#[template(path = "health.html")]
-pub(crate) struct HealthTemplate {
-    pub(crate) executors: Vec<ExecutorView>,
-    pub(crate) jobs: Vec<JobSummaryView>,
-    pub(crate) bearer_token: Option<String>,
-}
-
-impl HealthTemplate {
-    fn healthy_executors(&self) -> usize {
-        self.executors
-            .iter()
-            .filter(|e| e.state == "healthy" || e.state == "active")
-            .count()
-    }
-    fn lost_executors(&self) -> usize {
-        self.executors.iter().filter(|e| e.state == "lost").count()
-    }
-    fn memory_used_pct(&self) -> f64 {
-        let used: u64 = self
-            .executors
-            .iter()
-            .filter_map(|e| e.memory_used_bytes)
-            .sum();
-        let limit: u64 = self
-            .executors
-            .iter()
-            .filter_map(|e| e.memory_limit_bytes)
-            .sum();
-        if limit > 0 {
-            used as f64 / limit as f64 * 100.0
-        } else {
-            0.0
-        }
-    }
-    fn memory_used_pct_int(&self) -> u64 {
-        self.memory_used_pct() as u64
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct GlobalMetricsView {
-    pub tasks_submitted: u64,
-    pub tasks_succeeded: u64,
-    pub tasks_failed: u64,
-    pub executor_lost: u64,
-    pub shuffle_bytes_written: u64,
-    pub job_queue_depth: u64,
-    pub spill_bytes_total: u64,
-    pub spill_files_total: u64,
-    pub watermark_entry_count: usize,
-    pub state_key_entry_count: usize,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct SystemMetricsView {
-    pub process_memory_bytes: u64,
-    pub process_cpu_usage_x100: u64,
-    pub process_virtual_memory_bytes: u64,
-    pub process_thread_count: u64,
-    pub system_total_memory_bytes: u64,
-    pub system_available_memory_bytes: u64,
-    pub system_cpu_usage_x100: u64,
-}
-
-#[derive(Template)]
-#[template(path = "metrics.html")]
-pub(crate) struct MetricsTemplate {
-    pub(crate) scheduler: SchedulerMetrics,
-    pub(crate) stability: StabilityMetrics,
-    pub(crate) jobs_count: usize,
-    pub(crate) executors_count: usize,
-    pub(crate) avg_duration_ms: u64,
-    pub(crate) global: GlobalMetricsView,
-    pub(crate) system: SystemMetricsView,
-    pub(crate) bearer_token: Option<String>,
-}
-
-#[derive(Template)]
-#[template(path = "job_diagnose.html")]
-pub(crate) struct JobDiagnoseTemplate {
-    pub(crate) job_id: String,
-    pub(crate) report_json: String,
-    pub(crate) bearer_token: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct JobHistoryView {
     pub job_id: String,
@@ -442,35 +293,6 @@ pub struct JobHistoryListResponse {
     pub offset: usize,
 }
 
-#[derive(Template)]
-#[template(path = "history.html")]
-pub(crate) struct HistoryTemplate {
-    pub(crate) records: Vec<JobHistoryView>,
-    pub(crate) total: usize,
-    pub(crate) limit: usize,
-    pub(crate) offset: usize,
-    pub(crate) bearer_token: Option<String>,
-}
-
-impl HistoryTemplate {
-    /// True when more archived records exist beyond this page.
-    fn has_more(&self) -> bool {
-        self.offset.saturating_add(self.records.len()) < self.total
-    }
-
-    /// Offset for the next page link.
-    fn next_offset(&self) -> usize {
-        self.offset.saturating_add(self.limit)
-    }
-}
-
-#[derive(Template)]
-#[template(path = "history_detail.html")]
-pub(crate) struct HistoryDetailTemplate {
-    pub(crate) record: JobHistoryView,
-    pub(crate) bearer_token: Option<String>,
-}
-
 #[derive(Serialize)]
 pub struct SqlQueryResponse {
     pub columns: Vec<String>,
@@ -483,18 +305,6 @@ pub struct SqlQueryResponse {
 #[derive(Debug, Deserialize)]
 pub struct SqlQueryRequest {
     pub query: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct JobsFilter {
-    pub state: Option<String>,
-    pub kind: Option<String>,
-}
-
-impl JobsFilter {
-    pub(crate) fn has_any(&self) -> bool {
-        self.state.is_some() || self.kind.is_some()
-    }
 }
 
 /// Page window for list endpoints. `limit` is clamped to `1..=MAX_PAGE_LIMIT`

@@ -42,3 +42,5 @@ operator.log
 stream_bench.log
 store_head.rs
 .stream_bench
+console/node_modules/
+console/tsconfig.tsbuildinfo

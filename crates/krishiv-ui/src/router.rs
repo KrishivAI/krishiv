@@ -10,10 +10,8 @@ use krishiv_scheduler::Coordinator;
 
 use crate::handlers::{
     api_executor_detail, api_executors, api_history, api_history_detail, api_job_checkpoints,
-    api_job_detail, api_job_diagnose, api_jobs, api_queues, api_sql_execute, auth_js, demo_job,
-    healthz, live_js, metrics, openapi_json, readyz, sql_js, stylesheet, ui_executor_detail,
-    ui_health, ui_history, ui_history_detail, ui_job_checkpoints_page, ui_job_detail,
-    ui_job_diagnose, ui_jobs, ui_metrics, ui_submit,
+    api_job_detail, api_job_diagnose, api_jobs, api_queues, api_sql_execute, demo_job, healthz,
+    metrics, openapi_json, readyz,
 };
 use crate::{UiError, UiResult, UiState};
 
@@ -115,21 +113,16 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
-        .route("/assets/krishiv.css", get(stylesheet))
-        .route("/assets/krishiv-auth.js", get(auth_js))
-        .route("/assets/krishiv-live.js", get(live_js))
-        .route("/assets/krishiv-sql.js", get(sql_js))
-        // Alias under /ui/assets/ so the paths work through a path-prefix reverse
-        // proxy (e.g. code-server /proxy/PORT/) where root-relative /assets/ URLs
-        // resolve outside the proxied subtree.
-        .route("/ui/assets/krishiv.css", get(stylesheet))
-        .route("/ui/assets/krishiv-auth.js", get(auth_js))
-        .route("/ui/assets/krishiv-live.js", get(live_js))
-        .route("/ui/assets/krishiv-sql.js", get(sql_js))
-        .route("/api/v1/openapi.json", get(openapi_json));
+        .route("/api/v1/openapi.json", get(openapi_json))
+        // The embedded TanStack console (SPA shell + hashed assets). Auth
+        // lives in the SPA: it stores a bearer and sends it on every /api
+        // call, which the coordinator's own middleware enforces — the static
+        // assets carry no data, so they stay public like /assets/*.
+        .route("/console", get(crate::console::serve))
+        .route("/console/{*path}", get(crate::console::serve));
 
     let protected = Router::new()
-        .route("/", get(|| async { Redirect::temporary("/ui") }))
+        .route("/", get(|| async { Redirect::temporary("/console") }))
         .route("/api/v1/jobs", get(api_jobs))
         .route("/api/v1/jobs/{job_id}", get(api_job_detail))
         .route(
@@ -143,19 +136,6 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
         .route("/api/v1/sql", post(api_sql_execute))
         .route("/api/v1/history", get(api_history))
         .route("/api/v1/history/{job_id}", get(api_history_detail))
-        .route("/ui", get(ui_jobs))
-        .route("/ui/jobs/{job_id}", get(ui_job_detail))
-        .route(
-            "/ui/jobs/{job_id}/checkpoints",
-            get(ui_job_checkpoints_page),
-        )
-        .route("/ui/jobs/{job_id}/diagnose", get(ui_job_diagnose))
-        .route("/ui/executors/{executor_id}", get(ui_executor_detail))
-        .route("/ui/submit", get(ui_submit))
-        .route("/ui/health", get(ui_health))
-        .route("/ui/metrics", get(ui_metrics))
-        .route("/ui/history", get(ui_history))
-        .route("/ui/history/{job_id}", get(ui_history_detail))
         .with_state(state.clone());
 
     let protected = if let Some(expected) = token {
@@ -182,40 +162,25 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
 /// those. Includes `/assets/*`, `/`, `/ui*`, and `/api/v1/*` routes.
 pub fn embedded_router(state: UiState) -> Router {
     let public = Router::new()
-        .route("/assets/krishiv.css", get(stylesheet))
-        .route("/assets/krishiv-auth.js", get(auth_js))
-        .route("/assets/krishiv-live.js", get(live_js))
-        .route("/assets/krishiv-sql.js", get(sql_js))
-        .route("/ui/assets/krishiv.css", get(stylesheet))
-        .route("/ui/assets/krishiv-auth.js", get(auth_js))
-        .route("/ui/assets/krishiv-live.js", get(live_js))
-        .route("/ui/assets/krishiv-sql.js", get(sql_js))
-        .route("/api/v1/openapi.json", get(openapi_json));
+        .route("/api/v1/openapi.json", get(openapi_json))
+        // The embedded TanStack console (SPA shell + hashed assets). Auth
+        // lives in the SPA: it stores a bearer and sends it on every /api
+        // call, which the coordinator's own middleware enforces — the static
+        // assets carry no data, so they stay public like /assets/*.
+        .route("/console", get(crate::console::serve))
+        .route("/console/{*path}", get(crate::console::serve));
 
     // NOTE: API routes (/api/v1/jobs, /api/v1/executors, etc.) are served by
     // the coordinator's own HTTP router. This embedded router only provides
     // UI pages and static assets to avoid duplicate-route panics when merged
     // via `extra_http_factory`.
     let protected = Router::new()
-        .route("/", get(|| async { Redirect::temporary("/ui") }))
+        .route("/", get(|| async { Redirect::temporary("/console") }))
         .route("/api/v1/jobs/{job_id}/diagnose", get(api_job_diagnose))
         .route("/api/v1/queues", get(api_queues))
         .route("/api/v1/sql", post(api_sql_execute))
         .route("/api/v1/history", get(api_history))
-        .route("/api/v1/history/{job_id}", get(api_history_detail))
-        .route("/ui", get(ui_jobs))
-        .route("/ui/jobs/{job_id}", get(ui_job_detail))
-        .route(
-            "/ui/jobs/{job_id}/checkpoints",
-            get(ui_job_checkpoints_page),
-        )
-        .route("/ui/jobs/{job_id}/diagnose", get(ui_job_diagnose))
-        .route("/ui/executors/{executor_id}", get(ui_executor_detail))
-        .route("/ui/submit", get(ui_submit))
-        .route("/ui/health", get(ui_health))
-        .route("/ui/metrics", get(ui_metrics))
-        .route("/ui/history", get(ui_history))
-        .route("/ui/history/{job_id}", get(ui_history_detail));
+        .route("/api/v1/history/{job_id}", get(api_history_detail));
 
     let protected = if let Some(expected) = ui_auth_token(&state).as_deref() {
         let expected = expected.to_string();

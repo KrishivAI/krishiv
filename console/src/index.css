@@ -1,0 +1,82 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Design tokens — "true-black" system (docs/ui-design.md).
+   Depth comes from a three-step surface ladder plus hairline borders,
+   never shadows. One accent (Krishiv orange), spent only on: active nav,
+   the page's single primary action, live indicators, and focus rings.
+   Status colors are reserved for status; chart series never use the
+   accent. Light is the same ladder inverted, not a naive inversion. */
+:root {
+  --bg: #fafafa;
+  --surface: #ffffff;
+  --surface-2: #f0f0f2;
+  --surface-3: #e9e9ec;
+  --border: #e4e4e9;
+  --border-strong: #d2d2da;
+  --text: #18181b;
+  --muted: #55555e;
+  --faint: #85858e;
+  --accent: #e86f10;
+  --accent-soft: rgba(232, 111, 16, 0.1);
+  --success: #1f8f57;
+  --running: #2d7fb8;
+  --failed: #c2493a;
+  --queued: #a3721a;
+  --chart-1: #3d7ab8;
+  --chart-2: #7a5cc0;
+  --chart-3: #2f9268;
+}
+
+.dark {
+  /* Perfect-black ground; text capped below pure white (OLED halo). */
+  --bg: #000000;
+  --surface: #0e0e10;
+  --surface-2: #18181b;
+  --surface-3: #1f1f23;
+  --border: #26262c;
+  --border-strong: #35353c;
+  --text: #efeff1;
+  --muted: #adadb8;
+  --faint: #71717a;
+  --accent: #ff8a2a;
+  --accent-soft: rgba(255, 138, 42, 0.12);
+  --success: #4fb87e;
+  --running: #58a6da;
+  --failed: #de6a5a;
+  --queued: #d9a13b;
+  --chart-1: #7aa7d9;
+  --chart-2: #a78bd9;
+  --chart-3: #6dbf9c;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-text: var(--text);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-success: var(--success);
+  --color-running: var(--running);
+  --color-failed: var(--failed);
+  --color-queued: var(--queued);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+}
+
+body {
+  @apply bg-bg text-text antialiased;
+}
+
+/* Metrics, durations, and timestamps line up in columns. */
+@utility tnum {
+  font-variant-numeric: tabular-nums;
+}

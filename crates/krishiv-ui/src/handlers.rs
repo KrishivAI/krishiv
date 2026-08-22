@@ -1,21 +1,16 @@
-use askama::Template;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
-use axum::response::{Html, IntoResponse};
+use axum::response::IntoResponse;
 use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
 use krishiv_scheduler::{ExecutorRecord, JobDetailSnapshot, JobSnapshot, StabilityMetrics};
 
-use crate::router::ui_auth_token;
 use crate::views::{
-    CheckpointsTemplate, ConnectorCapabilityView, ExecutorDetailResponse, ExecutorTemplate,
-    ExecutorView, ExecutorsResponse, GlobalMetricsView, HealthTemplate, HistoryDetailTemplate,
-    HistoryTemplate, JobCheckpointsResponse, JobDetailResponse, JobDetailView, JobDiagnoseTemplate,
-    JobHistoryListResponse, JobHistoryView, JobSummaryView, JobTemplate, JobsFilter, JobsResponse,
-    JobsTemplate, MetricsTemplate, NamespaceQuotaView, Pagination, QueuesResponse,
-    ResourceUsageView, SqlQueryRequest, SqlQueryResponse, StageView, SubmitTemplate,
-    SystemMetricsView, TaskView, hex_encode,
+    ConnectorCapabilityView, ExecutorDetailResponse, ExecutorView, ExecutorsResponse,
+    JobCheckpointsResponse, JobDetailResponse, JobDetailView, JobHistoryListResponse,
+    JobHistoryView, JobSummaryView, JobsResponse, NamespaceQuotaView, Pagination, QueuesResponse,
+    ResourceUsageView, SqlQueryRequest, SqlQueryResponse, StageView, TaskView, hex_encode,
 };
 use crate::{UiError, UiResult, UiState};
 
@@ -173,78 +168,6 @@ pub(crate) async fn api_queues(
     }))
 }
 
-pub(crate) async fn ui_submit(State(state): State<UiState>) -> Result<Html<String>, UiError> {
-    let template = SubmitTemplate {
-        bearer_token: ui_auth_token(&state),
-    };
-    Ok(Html(template.render()?))
-}
-
-pub(crate) async fn ui_health(State(state): State<UiState>) -> Result<Html<String>, UiError> {
-    let coordinator = state.coordinator.read().await;
-    let bearer_token = ui_auth_token(&state);
-    let tick = coordinator.executors().current_tick();
-    let template = HealthTemplate {
-        executors: coordinator
-            .executor_snapshots()
-            .iter()
-            .map(|r| ExecutorView::from_record(r, tick))
-            .collect(),
-        jobs: coordinator
-            .job_snapshots()
-            .iter()
-            .map(JobSummaryView::from_snapshot)
-            .collect(),
-        bearer_token,
-    };
-    Ok(Html(template.render()?))
-}
-
-pub(crate) async fn ui_metrics(State(state): State<UiState>) -> Result<Html<String>, UiError> {
-    let coordinator = state.coordinator.read().await;
-    let snapshot = status_snapshot_inner(&coordinator);
-    let scheduler = krishiv_scheduler::metrics::scheduler_metrics();
-    let stability = coordinator.stability_metrics();
-    let avg = scheduler
-        .task_assignment_duration_ms_sum
-        .checked_div(scheduler.tasks_assigned_total)
-        .unwrap_or(0);
-    let gm = krishiv_metrics::global_metrics();
-    let global = GlobalMetricsView {
-        tasks_submitted: gm.tasks_submitted(),
-        tasks_succeeded: gm.tasks_succeeded(),
-        tasks_failed: gm.tasks_failed(),
-        executor_lost: gm.executor_lost(),
-        shuffle_bytes_written: gm.shuffle_bytes_written(),
-        job_queue_depth: gm.job_queue_depth(),
-        spill_bytes_total: gm.spill_bytes_total(),
-        spill_files_total: gm.spill_files_total(),
-        watermark_entry_count: gm.watermark_entry_count(),
-        state_key_entry_count: gm.state_key_entry_count(),
-    };
-    let sm = krishiv_metrics::system::system_metrics();
-    let system = SystemMetricsView {
-        process_memory_bytes: sm.process_memory_bytes(),
-        process_cpu_usage_x100: sm.process_cpu_usage_x100(),
-        process_virtual_memory_bytes: sm.process_virtual_memory_bytes(),
-        process_thread_count: sm.process_thread_count(),
-        system_total_memory_bytes: sm.system_total_memory_bytes(),
-        system_available_memory_bytes: sm.system_available_memory_bytes(),
-        system_cpu_usage_x100: sm.system_cpu_usage_x100(),
-    };
-    let template = MetricsTemplate {
-        scheduler,
-        stability,
-        jobs_count: snapshot.jobs.len(),
-        executors_count: snapshot.executors.len(),
-        avg_duration_ms: avg,
-        global,
-        system,
-        bearer_token: ui_auth_token(&state),
-    };
-    Ok(Html(template.render()?))
-}
-
 pub(crate) async fn api_sql_execute(
     State(state): State<UiState>,
     Json(req): Json<SqlQueryRequest>,
@@ -316,78 +239,12 @@ pub(crate) async fn api_job_checkpoints(
     }))
 }
 
-pub(crate) async fn ui_jobs(
-    State(state): State<UiState>,
-    filter: Query<JobsFilter>,
-) -> Result<Html<String>, UiError> {
-    let snapshot = status_snapshot(&state).await?;
-    let jobs = if filter.has_any() {
-        filter_jobs(snapshot.jobs, &filter)
-    } else {
-        snapshot.jobs
-    };
-    let template = JobsTemplate {
-        jobs,
-        executors: snapshot.executors,
-        bearer_token: ui_auth_token(&state),
-        cluster_total_slots: snapshot.cluster_total_slots,
-        cluster_used_slots: snapshot.cluster_used_slots,
-        cluster_memory_total_mb: snapshot.cluster_memory_total_mb,
-        cluster_memory_used_mb: snapshot.cluster_memory_used_mb,
-        healthy_executor_count: snapshot.healthy_executor_count,
-    };
-    Ok(Html(template.render()?))
-}
-
-pub(crate) async fn ui_job_detail(
-    State(state): State<UiState>,
-    Path(job_id): Path<String>,
-) -> Result<Html<String>, UiError> {
-    let snapshot = status_snapshot(&state).await?;
-    let template = JobTemplate {
-        job: job_detail(&state, &job_id).await?,
-        executors: snapshot.executors,
-        bearer_token: ui_auth_token(&state),
-    };
-    Ok(Html(template.render()?))
-}
-
 pub(crate) async fn api_executor_detail(
     State(state): State<UiState>,
     Path(executor_id): Path<String>,
 ) -> Result<Json<ExecutorDetailResponse>, UiError> {
     let snapshot = api_executor_detail_inner(&state, &executor_id).await?;
     Ok(Json(ExecutorDetailResponse { executor: snapshot }))
-}
-
-pub(crate) async fn ui_executor_detail(
-    State(state): State<UiState>,
-    Path(executor_id): Path<String>,
-) -> Result<Html<String>, UiError> {
-    let executor = api_executor_detail_inner(&state, &executor_id).await?;
-    let template = ExecutorTemplate {
-        executor,
-        bearer_token: ui_auth_token(&state),
-    };
-    Ok(Html(template.render()?))
-}
-
-pub(crate) async fn ui_job_checkpoints_page(
-    State(state): State<UiState>,
-    Path(job_id): Path<String>,
-) -> Result<Html<String>, UiError> {
-    let coordinator = state.coordinator.read().await;
-    let jid = JobId::try_new(job_id.clone()).map_err(|e| UiError::Id(e.to_string()))?;
-    coordinator.job_detail_snapshot(&jid)?;
-    let epochs = coordinator.list_job_checkpoints(&jid)?;
-    let latest_epoch = epochs.last().copied();
-    let template = CheckpointsTemplate {
-        job_id: job_id.clone(),
-        epochs,
-        latest_epoch,
-        bearer_token: ui_auth_token(&state),
-    };
-    Ok(Html(template.render()?))
 }
 
 pub(crate) async fn api_job_diagnose(
@@ -403,26 +260,6 @@ pub(crate) async fn api_job_diagnose(
     let json =
         serde_json::to_value(&report).map_err(|e| UiError::Sql(format!("serialize error: {e}")))?;
     Ok(Json(json))
-}
-
-pub(crate) async fn ui_job_diagnose(
-    State(state): State<UiState>,
-    Path(job_id_str): Path<String>,
-) -> Result<Html<String>, UiError> {
-    let job_id = JobId::try_new(job_id_str.clone()).map_err(|e| UiError::Id(e.to_string()))?;
-    let coordinator = state.coordinator.read().await;
-    let report = krishiv_scheduler::coordinator::observability::build_observability_report(
-        &coordinator,
-        &job_id,
-    )?;
-    let report_json =
-        serde_json::to_string_pretty(&report).unwrap_or_else(|e| format!("serialize error: {e}"));
-    let template = JobDiagnoseTemplate {
-        job_id: job_id_str,
-        report_json,
-        bearer_token: ui_auth_token(&state),
-    };
-    Ok(Html(template.render()?))
 }
 
 pub(crate) async fn api_history(
@@ -463,51 +300,6 @@ pub(crate) async fn api_history_detail(
         })
 }
 
-pub(crate) async fn ui_history(
-    State(state): State<UiState>,
-    pagination: Query<Pagination>,
-) -> Result<Html<String>, UiError> {
-    let coordinator = state.coordinator.read().await;
-    let all = coordinator.list_job_history();
-    let (limit, offset) = pagination.resolved();
-    let total = all.len();
-    let records = all
-        .iter()
-        .skip(offset)
-        .take(limit)
-        .map(JobHistoryView::from_record)
-        .collect();
-    let template = HistoryTemplate {
-        records,
-        total,
-        limit,
-        offset,
-        bearer_token: ui_auth_token(&state),
-    };
-    Ok(Html(template.render()?))
-}
-
-pub(crate) async fn ui_history_detail(
-    State(state): State<UiState>,
-    Path(job_id): Path<String>,
-) -> Result<Html<String>, UiError> {
-    let coordinator = state.coordinator.read().await;
-    let record = coordinator
-        .get_job_history(&job_id)
-        .map(|r| JobHistoryView::from_record(&r))
-        .ok_or_else(|| {
-            UiError::Scheduler(krishiv_scheduler::SchedulerError::UnknownJob {
-                job_id: krishiv_proto::JobId::try_new(job_id)
-                    .unwrap_or_else(|_| krishiv_proto::JobId::new_validated("unknown")),
-            })
-        })?;
-    let template = HistoryDetailTemplate {
-        record,
-        bearer_token: ui_auth_token(&state),
-    };
-    Ok(Html(template.render()?))
-}
-
 pub(crate) async fn api_executor_detail_inner(
     state: &UiState,
     executor_id: &str,
@@ -526,38 +318,6 @@ pub(crate) async fn api_executor_detail_inner(
                 executor_id: eid.clone(),
             })
         })
-}
-
-pub(crate) async fn stylesheet() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../static/style.css"),
-    )
-}
-
-pub(crate) async fn auth_js() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../static/krishiv-auth.js"),
-    )
-}
-
-/// Vendored live-refresh helper (fragment polling + theme toggle). Replaces the
-/// former htmx CDN dependency so the UI works in air-gapped clusters and under
-/// a strict CSP.
-pub(crate) async fn live_js() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../static/krishiv-live.js"),
-    )
-}
-
-/// Vendored SQL-editor script (plain `fetch`, no htmx).
-pub(crate) async fn sql_js() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../static/krishiv-sql.js"),
-    )
 }
 
 /// Hand-maintained OpenAPI 3.1 description of the `/api/v1` surface, served so
@@ -612,24 +372,6 @@ fn status_snapshot_inner(coordinator: &krishiv_scheduler::Coordinator) -> Status
         cluster_memory_used_mb,
         healthy_executor_count,
     }
-}
-
-fn filter_jobs(jobs: Vec<JobSummaryView>, filter: &JobsFilter) -> Vec<JobSummaryView> {
-    jobs.into_iter()
-        .filter(|j| {
-            if let Some(ref state) = filter.state
-                && !j.state.eq_ignore_ascii_case(state)
-            {
-                return false;
-            }
-            if let Some(ref kind) = filter.kind
-                && !j.kind.eq_ignore_ascii_case(kind)
-            {
-                return false;
-            }
-            true
-        })
-        .collect()
 }
 
 fn extract_columns_and_rows(
