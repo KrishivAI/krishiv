@@ -192,6 +192,36 @@ impl StreamingJob {
         }
     }
 
+    /// Push input for ONE SIDE of a two-source job (a stream-stream join or
+    /// a join-to-aggregation pipeline): `side` is `"L"` or `"R"`, matching
+    /// the compiled spec's left/right sources. Single-source jobs take
+    /// [`push`](Self::push); the coordinator refuses side-tagged pushes for
+    /// them by name.
+    pub async fn push_side(&self, side: &str, batches: &[RecordBatch]) -> Result<()> {
+        match &self.backend {
+            Backend::Session { session, job_id } => {
+                let url =
+                    session
+                        .coordinator_http_url()
+                        .ok_or_else(|| KrishivError::InvalidConfig {
+                            message: "side-tagged pushes need a coordinator HTTP URL; this \
+                                  session has none (two-source jobs are coordinator-backed)"
+                                .into(),
+                        })?;
+                krishiv_runtime::execute_coordinator_continuous_push_side(
+                    url, job_id, side, batches,
+                )
+                .await
+                .map_err(KrishivError::from)
+            }
+            Backend::Query(_) | Backend::Remote(_) => Err(KrishivError::InvalidConfig {
+                message: "side-tagged pushes are only supported for coordinator-backed \
+                          session jobs"
+                    .into(),
+            }),
+        }
+    }
+
     /// Arm complete output mode: every subsequent [`drain`](Self::drain)
     /// folds the deltas into a keyed result table and returns the WHOLE
     /// table.

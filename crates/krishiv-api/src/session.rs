@@ -1614,6 +1614,64 @@ impl Session {
         Ok(name)
     }
 
+    /// Compile streaming SQL through the SAME class ladder the engine uses
+    /// (pipeline -> join -> window -> stateless) into a [`StreamingDataFrame`]
+    /// that carries the compiled task, so `write().start()` registers the
+    /// class-routed job instead of deriving a window spec from builder verbs.
+    /// This is the SQL door into the converged terminal: every NEXMark class
+    /// — two-source joins, join-to-aggregation pipelines, windows, stateless
+    /// projections — goes through the one `write()` surface (task #151).
+    ///
+    /// The optional `side_tables` are bounded reference tables a stateless
+    /// query joins against (e.g. NEXMark q13's id->label table), delivered in
+    /// the spec exactly as the wire-native registration does.
+    pub fn stream_sql_with_sides(
+        &self,
+        sql: &str,
+        side_tables: Vec<krishiv_plan::stream_task::SideTableSpec>,
+    ) -> Result<crate::streaming_dataframe::StreamingDataFrame> {
+        use krishiv_plan::stream_task::{StatelessQuerySpec, StreamingTaskSpec};
+        let task: StreamingTaskSpec =
+            if krishiv_sql::streaming_pipeline_plan::looks_like_streaming_pipeline(sql) {
+                StreamingTaskSpec::Pipeline(Box::new(
+                    krishiv_sql::streaming_pipeline_plan::compile_streaming_pipeline_sql(sql)
+                        .map_err(|e| KrishivError::unsupported(e.to_string()))?
+                        .spec,
+                ))
+            } else if krishiv_sql::streaming_join_plan::looks_like_streaming_join(sql) {
+                StreamingTaskSpec::Join(Box::new(
+                    krishiv_sql::streaming_join_plan::compile_streaming_join_sql(sql)
+                        .map_err(|e| KrishivError::unsupported(e.to_string()))?
+                        .spec,
+                ))
+            } else if krishiv_sql::streaming_tvf::find_window_tvf(sql).is_some() {
+                StreamingTaskSpec::Window(Box::new(
+                    krishiv_sql::streaming_window_plan::compile_streaming_window_sql(sql)
+                        .map_err(|e| KrishivError::unsupported(e.to_string()))?
+                        .spec,
+                ))
+            } else {
+                let source = stateless_source_table(sql).ok_or_else(|| {
+                    KrishivError::unsupported(
+                        "stream_sql: a stateless streaming query needs a FROM table to name \
+                         the input its pushes bind to",
+                    )
+                })?;
+                StreamingTaskSpec::Stateless(Box::new(StatelessQuerySpec {
+                    sql: sql.to_owned(),
+                    source,
+                    side_tables,
+                }))
+            };
+        let seed = self.sql("SELECT 1 AS seed")?;
+        Ok(seed.stream().with_task_override(task))
+    }
+
+    /// [`Session::stream_sql_with_sides`] without reference side tables.
+    pub fn stream_sql(&self, sql: &str) -> Result<crate::streaming_dataframe::StreamingDataFrame> {
+        self.stream_sql_with_sides(sql, Vec::new())
+    }
+
     /// Stop a continuous streaming job: its loops exit, operator state and
     /// undrained egress are discarded, and the id becomes free for a fresh
     /// registration. Routed through the execution runtime, so it reaches the
@@ -4230,6 +4288,20 @@ fn collect_pipeline_view_deps(
         ordered.push(view.to_string());
     }
     Ok(())
+}
+
+/// The table named in the first `FROM` clause, for binding a stateless
+/// streaming query's pushes to its input. Deliberately simple: streaming
+/// stateless queries read one source table by construction.
+fn stateless_source_table(sql: &str) -> Option<String> {
+    let lower = sql.to_lowercase();
+    let idx = lower.find(" from ")?;
+    let rest = sql[idx + 6..].trim_start();
+    let table: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    (!table.is_empty()).then_some(table)
 }
 
 #[cfg(test)]

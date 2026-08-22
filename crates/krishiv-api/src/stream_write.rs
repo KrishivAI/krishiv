@@ -175,6 +175,49 @@ impl StreamWriter {
             });
         }
 
+        // A compiled class task from `Session::stream_sql` overrides the
+        // builder-derived window spec: the job registers class-routed
+        // (pipeline/join/window/stateless) on the coordinator, exactly as the
+        // engine's own routing ladder decided. Update/complete modes are a
+        // window-operator capability, so non-append is refused BY NAME here
+        // rather than registering a job that silently appends.
+        if let Some(task) = self.df.task_override() {
+            if self.output_mode != "append" {
+                return Err(KrishivError::InvalidConfig {
+                    message: format!(
+                        "output mode '{}' is not supported for class-routed streaming SQL \
+                         jobs: update/complete are built on the tumbling window operator's \
+                         open-window snapshot. Use the builder form (with_event_time/key_by/\
+                         tumbling_window) for update or complete mode",
+                        self.output_mode
+                    ),
+                });
+            }
+            let url = session
+                .coordinator_http_url()
+                .ok_or_else(|| KrishivError::InvalidConfig {
+                    message: "class-routed streaming SQL registers on a coordinator; this \
+                              session has no coordinator HTTP URL (embedded sessions use \
+                              Session::stream for SQL streams)"
+                        .into(),
+                })?
+                .to_owned();
+            let job_name = job_name.into();
+            let mut options =
+                krishiv_runtime::ContinuousRegisterOptions::run_loop(self.parallelism.unwrap_or(1));
+            options.mode = Some(String::from("run-loop"));
+            options.checkpoint_interval_ms = self.checkpoint_interval_ms;
+            options.checkpoint_storage_path = self.checkpoint_storage_path.clone();
+            options.sink = self.sink_spec()?;
+            krishiv_common::async_util::block_on(
+                krishiv_runtime::execute_coordinator_continuous_register_task(
+                    &url, &job_name, task, &options,
+                ),
+            )
+            .map_err(KrishivError::from)?;
+            return Ok(StreamingJob::from_session_job(session.clone(), job_name));
+        }
+
         let mut spec = self
             .df
             .execution_spec()?

@@ -100,6 +100,12 @@ pub struct StreamingDataFrame {
     source_watermark_lags: HashMap<String, u64>,
     /// Column identifying the source when `source_watermark_lags` is set.
     source_id_column: Option<String>,
+    /// A pre-compiled streaming task (join/pipeline/window/stateless class)
+    /// that OVERRIDES the builder fields above. Set by
+    /// [`crate::Session::stream_sql`], which routes streaming SQL through the
+    /// same class ladder the engine uses; `write().start()` registers it
+    /// class-routed instead of deriving a window spec from the builder.
+    task_override: Option<krishiv_plan::stream_task::StreamingTaskSpec>,
 }
 
 impl StreamingDataFrame {
@@ -118,7 +124,22 @@ impl StreamingDataFrame {
             state_ttl_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            task_override: None,
         }
+    }
+
+    pub(crate) fn with_task_override(
+        mut self,
+        task: krishiv_plan::stream_task::StreamingTaskSpec,
+    ) -> Self {
+        self.task_override = Some(task);
+        self
+    }
+
+    /// The compiled class task this stream carries instead of builder-derived
+    /// window fields, if it came from [`crate::Session::stream_sql`].
+    pub fn task_override(&self) -> Option<&krishiv_plan::stream_task::StreamingTaskSpec> {
+        self.task_override.as_ref()
     }
 
     /// Configure the event time column.
