@@ -71,7 +71,28 @@ fn bid_batches(batches: usize) -> Vec<RecordBatch> {
         .collect()
 }
 
-async fn drain_until_stable(job: &StreamingJob) -> usize {
+async fn drain_until_stable(job: &StreamingJob, complete: bool) -> usize {
+    // Complete mode folds every delta into a view and returns the FULL table
+    // on every drain, so "a drain returned no rows" never happens once the
+    // first window fires — the delta criterion below loops forever there
+    // (attempt22/23's hang). Stable for complete = the table size unchanged
+    // across 4 consecutive drains; rows out = that final table size.
+    if complete {
+        let mut last = usize::MAX;
+        let mut quiet = 0;
+        while quiet < 4 {
+            let out = job.drain().await.expect("drain");
+            let rows: usize = out.iter().map(RecordBatch::num_rows).sum();
+            if rows == last {
+                quiet += 1;
+            } else {
+                quiet = 0;
+                last = rows;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        return last;
+    }
     let mut total = 0usize;
     let mut quiet = 0;
     while quiet < 4 {
@@ -134,7 +155,7 @@ async fn run_case(session: &Session, case: &Case, rep: usize) -> (usize, usize, 
         .await
         .unwrap_or_else(|e| panic!("{}: flush: {e}", case.name));
     let mut rows_out: usize = flushed.iter().map(RecordBatch::num_rows).sum();
-    let drained = drain_until_stable(&job).await;
+    let drained = drain_until_stable(&job, case.output_mode == "complete").await;
     if case.output_mode == "complete" {
         // The last full-table snapshot IS the answer.
         rows_out = drained.max(rows_out);
