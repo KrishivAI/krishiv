@@ -54,6 +54,18 @@ const EXCHANGE_MAX_RETRIES: u32 = 5;
 /// first attempt.
 const EXCHANGE_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a sender waits out a FULL receiver before giving up (2026-08-22).
+///
+/// `ResourceExhausted` from a peer is backpressure, not failure: the receiver
+/// cap (64 batches) is the authoritative limit and a CPU-starved subtask can
+/// legitimately hold its buffer full for many seconds. This used to share the
+/// dead-peer retry budget — 5 attempts at 10..80ms backoff, ~150ms total — so
+/// the first sustained stall KILLED the sending pipeline loop mid-stream
+/// (observed live: parallel q4 on the rig, the s3 subtask fell behind and the
+/// s1 sender died, which then failed the whole job's EOS flush). Mirrors the
+/// client-push backpressure budget from task #149.
+const EXCHANGE_BACKPRESSURE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl StreamExchange {
     fn peer(&self, endpoint: &str) -> Arc<PeerChannel> {
         self.peers
@@ -131,7 +143,10 @@ impl StreamExchange {
         };
         let wire_request = wire::push_continuous_input_request_to_wire(request);
 
-        for attempt in 0..EXCHANGE_MAX_RETRIES {
+        let mut attempt: u32 = 0;
+        let mut backpressure_attempt: u32 = 0;
+        let backpressure_deadline = tokio::time::Instant::now() + EXCHANGE_BACKPRESSURE_BUDGET;
+        while attempt < EXCHANGE_MAX_RETRIES {
             let channel = peer
                 .channel
                 .get_or_try_init(|| async {
@@ -186,16 +201,28 @@ impl StreamExchange {
                     };
                 }
                 Ok(Err(status))
+                    if status.code() == tonic::Code::ResourceExhausted
+                        && tokio::time::Instant::now() < backpressure_deadline =>
+                {
+                    // Receiver full is BACKPRESSURE: wait it out on its own
+                    // budget without consuming dead-peer attempts — the
+                    // receiver cap is the authoritative limit and the only
+                    // correct response is to slow down.
+                    let backoff_ms = 50u64
+                        .saturating_mul(1 << backpressure_attempt.min(6))
+                        .min(3_200);
+                    backpressure_attempt = backpressure_attempt.saturating_add(1);
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                }
+                Ok(Err(status))
                     if matches!(
                         status.code(),
-                        tonic::Code::ResourceExhausted
-                            | tonic::Code::Unavailable
-                            | tonic::Code::DeadlineExceeded
+                        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
                     ) && attempt + 1 < EXCHANGE_MAX_RETRIES =>
                 {
-                    // Receiver full or transient transport failure: back off
-                    // and retry — the receiver cap is the authoritative limit.
+                    // Transient transport failure: back off and retry.
                     let backoff_ms = 10u64.saturating_mul(1 << attempt.min(6));
+                    attempt += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 }
                 Ok(Err(status)) => {
@@ -204,6 +231,7 @@ impl StreamExchange {
                     });
                 }
                 Err(_elapsed) if attempt + 1 < EXCHANGE_MAX_RETRIES => {
+                    attempt += 1;
                     // Phase 58 #180: a dead/partitioned peer with no explicit
                     // bound could hang this call for the OS TCP retransmission
                     // timeout (minutes) instead of retrying within budget.
@@ -505,6 +533,30 @@ mod tests {
             .await
             .expect("must recover after a single transient failure");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// The 2026-08-22 rig failure: a CPU-starved peer held its input buffer
+    /// full for longer than the shared 5-attempt/~150ms budget, and the
+    /// SENDING pipeline loop died mid-stream — failing the whole job's EOS
+    /// flush. Backpressure now waits on its own 60s budget, so a receiver
+    /// that stays full past the old budget and then drains must succeed.
+    #[tokio::test]
+    async fn send_waits_out_sustained_backpressure_beyond_the_dead_peer_budget() {
+        let mut outcomes = vec![MockOutcome::Status(tonic::Code::ResourceExhausted); 6];
+        outcomes.push(MockOutcome::Disposition(TransportDisposition::Accepted));
+        assert!(outcomes.len() > EXCHANGE_MAX_RETRIES as usize);
+        let (addr, calls, ..) = spawn_mock_peer(outcomes).await;
+        let exchange = StreamExchange::default();
+        exchange
+            .send(
+                "job-bp",
+                "task-bp",
+                &format!("http://{addr}"),
+                vec![small_batch()],
+            )
+            .await
+            .expect("sustained receiver-full is backpressure, not failure");
+        assert_eq!(calls.load(Ordering::SeqCst), 7);
     }
 
     #[tokio::test]
