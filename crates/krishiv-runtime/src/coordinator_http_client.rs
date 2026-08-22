@@ -119,7 +119,7 @@ struct BatchSqlInlineTableJson {
 struct BatchSqlResponseBody {
     job_id: String,
     state: String,
-    #[serde(default)]
+    #[serde(default, with = "krishiv_proto::serde_ipc_b64")]
     inline_record_batch_ipc: Vec<Vec<u8>>,
     #[serde(default)]
     error: Option<String>,
@@ -448,6 +448,7 @@ pub async fn execute_coordinator_bounded_window(
 
     #[derive(serde::Deserialize)]
     struct BoundedWindowResponse {
+        #[serde(with = "krishiv_proto::serde_ipc_b64")]
         inline_record_batch_ipc: Vec<Vec<u8>>,
     }
 
@@ -859,6 +860,27 @@ mod tests {
         assert_eq!(super::seg("x?y=1"), "x%3Fy%3D1");
         let url = format!("http://h/api/v1/ivm/jobs/{}/step", super::seg("a/b c"));
         assert_eq!(url, "http://h/api/v1/ivm/jobs/a%2Fb%20c/step");
+    }
+
+    /// Revert-proof: drop the `serde_ipc_b64` attribute from
+    /// `BatchSqlResponseBody` and this base64 wire shape (what the
+    /// coordinator now sends) fails to deserialize at all.
+    #[test]
+    fn batch_sql_response_decodes_base64_wire_payloads() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(one_row_ipc());
+        let json = format!(
+            r#"{{"job_id":"job-b64","state":"Succeeded","inline_record_batch_ipc":["{b64}"]}}"#
+        );
+        let payload: BatchSqlResponseBody = serde_json::from_str(&json).expect("deserialize");
+        let result = batch_sql_job_result_from_payload(payload).expect("poll result");
+        match result {
+            CoordinatorBatchSqlJobResult::Succeeded { batches, .. } => {
+                assert_eq!(batches.len(), 1);
+                assert_eq!(batches[0].num_rows(), 1);
+            }
+            other => panic!("expected succeeded result, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1471,6 +1493,7 @@ pub async fn execute_coordinator_continuous_drain_wait(
 
     #[derive(serde::Deserialize)]
     struct ContinuousDrainResponse {
+        #[serde(with = "krishiv_proto::serde_ipc_b64")]
         inline_record_batch_ipc: Vec<Vec<u8>>,
     }
 

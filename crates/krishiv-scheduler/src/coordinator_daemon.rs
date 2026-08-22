@@ -547,6 +547,12 @@ pub async fn spawn_coordinator_sidecars(
     Ok(handles)
 }
 
+/// Request-body cap for every authenticated coordinator HTTP route.
+///
+/// One number shared with the IVM sub-router so the two surfaces cannot
+/// drift: both carry base64 Arrow IPC / state snapshots of real user data.
+pub(crate) const PROTECTED_HTTP_BODY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
+
 pub fn coordinator_http_router(
     coordinator: SharedCoordinator,
     config: &CoordinatorDaemonConfig,
@@ -650,6 +656,16 @@ pub fn coordinator_http_router(
     // leaving IVM submission and raw state reads reachable unauthenticated even
     // when HTTP auth was required.
     let protected = protected.merge(ivm_routes).merge(qs_routes);
+
+    // Data-carrying routes (continuous-push, continuous restore snapshots,
+    // batch-sql inline tables, bounded-window inputs) routinely exceed axum's
+    // 2 MiB default body cap. The IVM sub-router already raised its own limit;
+    // without this layer a state snapshot over 2 MiB could NEVER be restored
+    // through `/api/v1/continuous/{id}/restore` — the request died with 413
+    // before the handler ran.
+    let protected = protected.layer(axum::extract::DefaultBodyLimit::max(
+        PROTECTED_HTTP_BODY_LIMIT_BYTES,
+    ));
 
     let protected = if http_auth_required(config) {
         let tokens = resolve_http_bearer_tokens();
@@ -2805,5 +2821,65 @@ mod parse_tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(json["reset"], serde_json::json!(false));
+    }
+
+    /// Data-carrying routes must accept bodies past axum's 2 MiB default.
+    ///
+    /// Revert-proof: remove the `DefaultBodyLimit` layer from
+    /// `coordinator_http_router` and this request dies with 413 before the
+    /// handler runs — exactly the bug that made any >2 MiB state snapshot
+    /// impossible to restore through `/api/v1/continuous/{id}/restore`.
+    #[tokio::test]
+    async fn continuous_push_bodies_over_the_2mib_axum_default_reach_the_handler() {
+        use crate::CoordinatorDaemonConfig;
+        use crate::coordinator_http_router;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let _ = crate::auth::set_allow_anonymous();
+        let coordinator = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-big-body").unwrap(),
+        ));
+        let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DevLocal);
+        let router = coordinator_http_router(coordinator, &config);
+
+        // 3 MiB of valid base64 that is NOT valid Arrow IPC: the handler must
+        // be the one to reject it (400, "not a valid Arrow IPC stream"), which
+        // proves the body made it past the transport-level limit.
+        let payload = "A".repeat(3 * 1024 * 1024);
+        let body = serde_json::json!({
+            "job_id": "job-big-body",
+            "input_batches_b64": payload,
+        })
+        .to_string();
+        assert!(body.len() > 2 * 1024 * 1024);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/continuous-push")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a >2 MiB push body must reach the handler (400 bad IPC), not die \
+             at the transport with 413 Payload Too Large"
+        );
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            text.contains("Arrow IPC"),
+            "rejection must come from IPC validation, got: {text}"
+        );
     }
 }

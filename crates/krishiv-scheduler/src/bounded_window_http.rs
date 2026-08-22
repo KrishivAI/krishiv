@@ -25,6 +25,8 @@ pub struct BoundedWindowRequest {
 #[derive(Debug, Serialize)]
 pub struct BoundedWindowResponse {
     pub job_id: String,
+    /// Base64 strings on the JSON wire (see `krishiv_proto::serde_ipc_b64`).
+    #[serde(with = "krishiv_proto::serde_ipc_b64")]
     pub inline_record_batch_ipc: Vec<Vec<u8>>,
 }
 

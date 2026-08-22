@@ -194,3 +194,39 @@ snapshot time). Terminal harness, single-node durable, identical rows
 out: q3 81.5K -> 157.9K (+94%), q8 53.4K -> 151.8K (+184%), q20 128K ->
 141K, full 24/24 sweep PASS (attempt34). krishiv now leads Flink local
 on every join shape.
+
+## Coordinator HTTP endpoint-layer fixes (2026-08-22)
+
+An audit of the endpoint surface (prompted by "any bugs or optimizations
+with this") found one defect and two wire inefficiencies, all fixed:
+
+- **Body-limit defect.** Only the IVM sub-router raised axum's 2 MiB
+  default request cap; the continuous routes carried the same payload
+  class uncapped-fixed. Concretely, `POST /api/v1/continuous/{id}/restore`
+  could NEVER restore a state snapshot over 2 MiB — 413 before the
+  handler ran. All protected routes now share one 512 MiB
+  `DefaultBodyLimit` (`PROTECTED_HTTP_BODY_LIMIT_BYTES`, also referenced
+  by the IVM router so the two cannot drift). Revert-proven test: a 3 MiB
+  push body must reach the handler (400 bad IPC), not die 413.
+- **Push double-decode.** `api_continuous_push` fully Arrow-decoded every
+  pushed payload purely to answer "at least one batch?", discarded the
+  result, and forwarded the raw bytes for the executor to decode again.
+  Validation now decodes only the first IPC message; the executor stays
+  the decode authority.
+- **JSON integer-array payloads.** `Vec<Vec<u8>>` under serde_json
+  serialized one number per byte (~3.7x payload size) on the drain,
+  batch-sql poll, and bounded-window responses. All three now ship
+  base64 strings via the shared `krishiv_proto::serde_ipc_b64` adapter,
+  applied symmetrically on the coordinator structs and the
+  `coordinator_http_client` deserializers (version skew fails loudly as
+  a type error, never a silent misread). `scripts/phase58_chaos.sh`
+  accepts both shapes across a rolling upgrade;
+  `scripts/stream_restore_verify.py` already did.
+- The HTTP push/drain pair is now documented as the convenience surface;
+  the Flight verbs (`krishiv.v1.continuous.push/drain`), direct executor
+  targets (`GET /api/v1/continuous/{id}/targets`), and registered sinks
+  are the throughput paths.
+
+Not touched, verified fine: bearer middleware is fail-closed with
+constant-time comparison and covers the IVM/queryable-state merge; the
+run-loop push/drain path takes only coordinator read locks.

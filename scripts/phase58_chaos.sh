@@ -100,6 +100,7 @@ retry_http_post() {
 # occupies stdin.
 batch_digest_from_poll() {
   python3 - "$1" <<'PY'
+import base64
 import hashlib
 import json
 import sys
@@ -110,7 +111,10 @@ with open(sys.argv[1]) as f:
     resp = json.load(f)
 rows = []
 for stream in resp.get("inline_record_batch_ipc") or []:
-    table = ipc.open_stream(bytes(stream)).read_all()
+    # Payloads are base64 strings on the wire; older coordinators sent
+    # raw byte arrays. Accept both so the gate spans a rolling upgrade.
+    data = base64.b64decode(stream) if isinstance(stream, str) else bytes(stream)
+    table = ipc.open_stream(data).read_all()
     for row in table.to_pylist():
         rows.append(",".join(f"{k}={row[k]}" for k in sorted(row)))
 rows.sort()

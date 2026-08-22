@@ -1262,7 +1262,9 @@ pub fn ivm_router(state: IvmRouterState) -> Router<()> {
         // "413 Payload Too Large". Raise the cap to 512 MiB so realistic
         // incremental workloads and state checkpoints go through; this is a
         // data-plane router, not a control endpoint.
-        .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            crate::coordinator_daemon::PROTECTED_HTTP_BODY_LIMIT_BYTES,
+        ))
         .with_state(state)
 }
 

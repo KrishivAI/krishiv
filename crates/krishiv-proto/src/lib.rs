@@ -22,6 +22,8 @@ pub mod io;
 pub mod job;
 pub mod lifecycle;
 pub mod management;
+#[cfg(feature = "serde")]
+pub mod serde_ipc_b64;
 pub mod services;
 pub mod task;
 pub mod wire;

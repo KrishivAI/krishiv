@@ -5228,11 +5228,13 @@ name = "krishiv-proto"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "base64 0.22.1",
  "proptest",
  "prost 0.14.4",
  "prost-build 0.14.4",
  "protoc-bin-vendored",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tonic",
  "tonic-prost",

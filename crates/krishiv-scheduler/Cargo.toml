@@ -30,7 +30,7 @@ futures = { workspace = true }
 krishiv-state = { path = "../krishiv-state", version = "0.1.0" }
 krishiv-metrics = { path = "../krishiv-metrics", version = "0.1.0" }
 krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
-krishiv-proto = { path = "../krishiv-proto", version = "0.1.0" }
+krishiv-proto = { path = "../krishiv-proto", version = "0.1.0", features = ["serde"] }
 krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
 krishiv-shuffle = { path = "../krishiv-shuffle", version = "0.1.0" }
 # Compresses (and, above etcd's per-key limit, chunks) durable IVM snapshots

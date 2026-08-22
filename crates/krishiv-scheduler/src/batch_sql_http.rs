@@ -207,8 +207,12 @@ pub async fn api_batch_sql_submit(
 pub struct BatchSqlPollResponse {
     pub job_id: String,
     pub state: String,
-    /// Present when state == "Succeeded".
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Present when state == "Succeeded". Base64 strings on the JSON wire
+    /// (see `krishiv_proto::serde_ipc_b64`).
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        with = "krishiv_proto::serde_ipc_b64"
+    )]
     pub inline_record_batch_ipc: Vec<Vec<u8>>,
     /// Present when state == "Failed" or "Cancelled".
     #[serde(skip_serializing_if = "Option::is_none")]

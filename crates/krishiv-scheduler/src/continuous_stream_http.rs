@@ -1469,6 +1469,12 @@ pub async fn api_continuous_stop_with_savepoint(
 /// partition, and delivers a normal task assignment to the job's active
 /// executor. The executor reports cycle output through the existing task-result
 /// path.
+///
+/// **This is the convenience/control-plane surface, not the fast path.** Data
+/// rides JSON + base64 through a coordinator hop. High-throughput producers
+/// should use the coordinator Flight verb (`krishiv.v1.continuous.push`) or,
+/// for run-loop jobs, push straight to the executor task endpoints listed by
+/// `GET /api/v1/continuous/{job_id}/targets`.
 pub async fn api_continuous_push(
     State(coordinator): State<SharedCoordinator>,
     Json(body): Json<ContinuousPushRequest>,
@@ -1481,16 +1487,29 @@ pub async fn api_continuous_push(
     let ipc_bytes = base64::engine::general_purpose::STANDARD
         .decode(body.input_batches_b64.as_bytes())
         .map_err(|error| bad(&format!("input_batches_b64 is not valid base64: {error}")))?;
-    if ipc_bytes.is_empty()
-        || crate::batch_sql::decode_inline_record_batches(std::slice::from_ref(&ipc_bytes))
-            .map_err(|error| {
-                bad(&format!(
-                    "input_batches_b64 is not a valid Arrow IPC stream: {error}"
-                ))
-            })?
-            .is_empty()
+    // Validate by decoding only the FIRST batch of the stream. The old check
+    // ran `decode_inline_record_batches` over the whole payload — every pushed
+    // byte was Arrow-decoded here, discarded, and decoded again on the
+    // executor, purely to answer "is there at least one batch?". The executor
+    // remains the decode authority: a stream whose later batches are corrupt
+    // fails there and that error surfaces to this same caller.
     {
-        return Err(bad("continuous push carried no record batches"));
+        let mut reader =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(&ipc_bytes), None)
+                .map_err(|error| {
+                    bad(&format!(
+                        "input_batches_b64 is not a valid Arrow IPC stream: {error}"
+                    ))
+                })?;
+        match reader.next() {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => {
+                return Err(bad(&format!(
+                    "input_batches_b64 is not a valid Arrow IPC stream: {error}"
+                )));
+            }
+            None => return Err(bad("continuous push carried no record batches")),
+        }
     }
 
     let job_id = krishiv_proto::JobId::try_new(&body.job_id)
@@ -1642,6 +1661,11 @@ pub struct ContinuousDrainRequest {
 
 #[derive(Debug, Serialize)]
 pub struct ContinuousDrainResponse {
+    /// Arrow IPC stream payloads, base64-encoded on the JSON wire (see
+    /// `krishiv_proto::serde_ipc_b64`) — the raw `Vec<Vec<u8>>` shape
+    /// serialized as one JSON number per byte, ~3.7x the payload size on
+    /// the results hot path.
+    #[serde(with = "krishiv_proto::serde_ipc_b64")]
     pub inline_record_batch_ipc: Vec<Vec<u8>>,
 }
 
@@ -1655,6 +1679,11 @@ pub struct ContinuousDrainResponse {
 /// windows permanently (input already consumed). This holds even under a
 /// durable profile — see [`drain_continuous_stream_coordinated`] for the full
 /// note and the durable alternatives (transactional sink / queryable state).
+///
+/// Like [`api_continuous_push`], this is the convenience surface: results ride
+/// JSON (base64 IPC payloads). Throughput-sensitive consumers should drain via
+/// the Flight verb (`krishiv.v1.continuous.drain`) or attach a streaming sink
+/// at registration and skip the drain loop entirely.
 pub async fn api_continuous_drain(
     State(coordinator): State<SharedCoordinator>,
     Json(body): Json<ContinuousDrainRequest>,
@@ -4754,5 +4783,73 @@ mod tests {
         assert_eq!(shape.task.class_name(), "join", "class survives the wire");
         assert_eq!(shape.parallelism, 2);
         assert_eq!(shape.mode, ContinuousJobMode::RunLoop);
+    }
+
+    /// Revert-proof: drop the `serde_ipc_b64` attribute from
+    /// `ContinuousDrainResponse` and the payload serializes as a JSON array of
+    /// integers (one number per byte, ~3.7x the size) instead of base64.
+    #[test]
+    fn drain_response_serializes_ipc_payloads_as_base64_strings() {
+        let value = serde_json::to_value(ContinuousDrainResponse {
+            inline_record_batch_ipc: vec![vec![1, 2, 3]],
+        })
+        .expect("serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({ "inline_record_batch_ipc": ["AQID"] })
+        );
+    }
+
+    /// The push validation was rewritten to decode only the FIRST batch of the
+    /// stream (the old check decoded every batch and threw the result away).
+    /// These pin the semantics the rewrite must preserve: garbage is still a
+    /// 400 naming Arrow IPC, and a schema-only stream with zero batches is
+    /// still "carried no record batches".
+    #[tokio::test]
+    async fn push_validation_still_rejects_garbage_and_empty_ipc_streams() {
+        use base64::Engine as _;
+
+        let coordinator = SharedCoordinator::new(crate::Coordinator::active(
+            krishiv_proto::CoordinatorId::try_new("coord-push-validate").unwrap(),
+        ));
+
+        let garbage = base64::engine::general_purpose::STANDARD.encode(b"not an ipc stream");
+        let (status, message) = api_continuous_push(
+            State(coordinator.clone()),
+            Json(ContinuousPushRequest {
+                job_id: "job-push-validate".to_string(),
+                input_batches_b64: garbage,
+                side: None,
+            }),
+        )
+        .await
+        .expect_err("garbage bytes must be rejected");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(message.contains("Arrow IPC"), "got: {message}");
+
+        // A valid IPC stream containing a schema but zero record batches.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "user_id",
+            DataType::Utf8,
+            false,
+        )]));
+        let mut buf = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buf, &schema).unwrap();
+            writer.finish().unwrap();
+        }
+        let empty = base64::engine::general_purpose::STANDARD.encode(&buf);
+        let (status, message) = api_continuous_push(
+            State(coordinator),
+            Json(ContinuousPushRequest {
+                job_id: "job-push-validate".to_string(),
+                input_batches_b64: empty,
+                side: None,
+            }),
+        )
+        .await
+        .expect_err("a batchless stream must be rejected");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(message.contains("no record batches"), "got: {message}");
     }
 }
