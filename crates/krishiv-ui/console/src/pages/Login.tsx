@@ -33,9 +33,17 @@ export function LoginPage() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-bg">
       <Card className="w-96">
-        <div className="mb-4 flex items-center gap-2">
-          <span className="h-2 w-2 rounded-full bg-accent" />
-          <span className="text-sm font-semibold tracking-wide">krishiv engine console</span>
+        <div className="mb-4 flex items-center gap-2.5">
+          <span
+            aria-hidden
+            className="flex h-[26px] w-[26px] items-center justify-center rounded-md bg-accent text-[15px] font-extrabold text-black"
+          >
+            K
+          </span>
+          <span className="text-base font-bold tracking-tight">Krishiv</span>
+          <span className="rounded-full border border-border-strong px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted">
+            engine
+          </span>
         </div>
         <Label htmlFor="token">Coordinator bearer token</Label>
         <Input

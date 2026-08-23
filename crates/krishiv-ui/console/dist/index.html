@@ -3,9 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Krishiv Console</title>
-    <script type="module" crossorigin src="/console/assets/index-BuESAAKX.js"></script>
-    <link rel="stylesheet" crossorigin href="/console/assets/index-CbnsT1ud.css">
+    <title>Krishiv Engine</title>
+    <script>
+      // Apply the stored theme before first paint (no flash).
+      const t = localStorage.getItem("krishiv.theme");
+      if (t === "dark" || (!t && matchMedia("(prefers-color-scheme: dark)").matches)) {
+        document.documentElement.classList.add("dark");
+      }
+    </script>
+    <script type="module" crossorigin src="/console/assets/index-DiNaKDRc.js"></script>
+    <link rel="stylesheet" crossorigin href="/console/assets/index-CbmvAP9u.css">
   </head>
   <body>
     <div id="root"></div>

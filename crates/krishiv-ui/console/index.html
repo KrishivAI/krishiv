@@ -3,7 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Krishiv Console</title>
+    <title>Krishiv Engine</title>
+    <script>
+      // Apply the stored theme before first paint (no flash).
+      const t = localStorage.getItem("krishiv.theme");
+      if (t === "dark" || (!t && matchMedia("(prefers-color-scheme: dark)").matches)) {
+        document.documentElement.classList.add("dark");
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>
