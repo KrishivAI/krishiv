@@ -447,10 +447,22 @@ fn try_build_from_logical(
 ) -> Option<ViewPlan> {
     match plan {
         // Peel top-level projections transparently.
-        LogicalPlan::Projection(Projection { input, .. }) => {
+        LogicalPlan::Projection(Projection { input, expr, .. }) => {
+            // IVM-AUD-CORE-23: a SELECT's aggregate aliases live in this
+            // projection, not in the Aggregate below it — the Aggregate's own
+            // schema names them `sum(sales.amount)` / `count(*)`. Peeling the
+            // projection therefore threw away the only thing that says which
+            // aggregate feeds which declared output column, leaving the
+            // planner to pair them positionally.
+            if let LogicalPlan::Aggregate(agg) = input.as_ref() {
+                let aliases = aggregate_output_aliases(expr);
+                return build_agg_plan(agg, output_schema, available_schemas, &aliases);
+            }
             try_build_from_logical(input, output_schema, available_schemas, lateness)
         }
-        LogicalPlan::Aggregate(agg) => build_agg_plan(agg, output_schema, available_schemas),
+        LogicalPlan::Aggregate(agg) => {
+            build_agg_plan(agg, output_schema, available_schemas, &AHashMap::new())
+        }
         LogicalPlan::Join(join) => {
             // Only 2-source joins (source_of_plan returns None for multi-way joins
             // where one side is itself a Join node with 2 inputs).
@@ -495,10 +507,39 @@ fn try_build_from_logical(
 
 // ── Aggregate plan builder ────────────────────────────────────────────────────
 
+/// Map each projected column's *internal* name to the name the SELECT gives it.
+///
+/// `SELECT region, SUM(amount) AS total` projects `sum(sales.amount) AS total`,
+/// so this yields `{"sum(sales.amount)" -> "total"}`. Un-aliased columns map to
+/// themselves, which is what a `SELECT region, …` needs.
+fn aggregate_output_aliases(exprs: &[Expr]) -> AHashMap<String, String> {
+    let mut out = AHashMap::new();
+    for e in exprs {
+        // Alias chains nest: `COUNT(*) AS cnt` projects
+        // `Alias(Alias(Column("count(Int64(1))"), "count(*)"), "cnt")`, so the
+        // outermost name is the user's and the innermost column is the
+        // aggregate's internal name. Peel to the base column, keep the outer
+        // name.
+        let (mut inner, output_name) = match e {
+            Expr::Alias(alias) => (alias.expr.as_ref(), alias.name.clone()),
+            Expr::Column(col) => (e, col.name.clone()),
+            _ => continue,
+        };
+        while let Expr::Alias(next) = inner {
+            inner = next.expr.as_ref();
+        }
+        if let Expr::Column(col) = inner {
+            out.insert(col.name.clone(), output_name);
+        }
+    }
+    out
+}
+
 fn build_agg_plan(
     agg: &Aggregate,
     output_schema: &SchemaRef,
     available_schemas: &AHashMap<String, SchemaRef>,
+    output_aliases: &AHashMap<String, String>,
 ) -> Option<ViewPlan> {
     // AUD-1: resolve the source *and* any WHERE predicate between the aggregate
     // and it. A clean `Aggregate → [Filter…] → [SubqueryAlias] → Scan` chain
@@ -532,9 +573,49 @@ fn build_agg_plan(
         return None;
     }
 
+    // IVM-AUD-CORE-23: pair each aggregate with its declared output column by
+    // NAME. This used to zip the two lists positionally — `aggr_expr` in SELECT
+    // order against the declared schema's non-group columns in schema order —
+    // so a view whose declared schema listed its aggregate columns in a
+    // different order than the SELECT list transposed the aggregations
+    // (`SUM` computed into the `cnt` column and vice versa) while the arity
+    // check above still passed.
+    //
+    // The plan's own schema is [group fields…, aggregate fields…], so the
+    // aggregate at index i is named by field `group_expr.len() + i`.
+    let plan_agg_names: Vec<String> = (0..agg.aggr_expr.len())
+        .map(|i| {
+            let internal = agg.schema.field(agg.group_expr.len() + i).name();
+            output_aliases
+                .get(internal)
+                .cloned()
+                .unwrap_or_else(|| internal.to_string())
+        })
+        .collect();
+
+    let pair_by_name = plan_agg_names
+        .iter()
+        .all(|n| agg_output_cols.iter().any(|c| c.eq_ignore_ascii_case(n)));
+
     let mut aggregations: Vec<Aggregation> = Vec::new();
-    for (expr, out_col) in agg.aggr_expr.iter().zip(agg_output_cols.iter()) {
+    if pair_by_name {
+        for (expr, plan_name) in agg.aggr_expr.iter().zip(plan_agg_names.iter()) {
+            let out_col = agg_output_cols
+                .iter()
+                .find(|c| c.eq_ignore_ascii_case(plan_name))?;
+            aggregations.push(expr_to_aggregation(expr, out_col)?);
+        }
+    } else if agg.aggr_expr.len() == 1 {
+        // One aggregate renamed by the view's declared schema: the mapping is
+        // unambiguous even though the names differ.
+        let out_col = agg_output_cols.first()?;
+        let expr = agg.aggr_expr.first()?;
         aggregations.push(expr_to_aggregation(expr, out_col)?);
+    } else {
+        // Several aggregates whose names do not match the declared schema:
+        // there is no way to know which column each one feeds. Degrade to
+        // DiffBased (full recompute, right answer) rather than guess.
+        return None;
     }
 
     // AUD-3: honor the view's declared output column types (SUM(Int64)→Int64

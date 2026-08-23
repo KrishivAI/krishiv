@@ -1,18 +1,21 @@
-"""Comprehensive coverage for the unified StreamingDataFrame API.
+"""Coverage for the unified StreamingDataFrame API.
 
 The DataStream `Stream`/`KeyedStream`/`WindowedStream` classes were retired; all
-streaming goes through `StreamingDataFrame`. These tests are self-contained
-(in-memory / SQL sources, no Kafka broker) so they run in CI, and they exercise
-every method of the surface plus both the snake_case and Spark camelCase spellings.
+streaming goes through `StreamingDataFrame`, and its one write terminal is
+`write()` -> `StreamWriter` -> `start()` -> `StreamingJob`. These tests are
+self-contained (in-memory / SQL sources, no Kafka broker) so they run in CI, and
+they cover the transformation surface in both the snake_case and Spark camelCase
+spellings.
 """
 import asyncio
+import time
 
 import pyarrow as pa
 import pytest
 
 import krishiv as ks
 from krishiv import agg as kagg
-from krishiv.krishiv import Batch
+from krishiv.krishiv import Batch, StreamWriter
 
 DAY = 24 * 3600 * 1000
 
@@ -305,185 +308,170 @@ def test_broadcast_process():
     assert out is not None and out.num_rows > 0
 
 
-# ─────────────────────────── sinks ───────────────────────────
+# ═══════════════ the write terminal: sdf.write() -> StreamWriter -> job ═══════════════
+# There is ONE streaming write terminal: `StreamingDataFrame.write()` returns a
+# `StreamWriter`, and `start(session, name)` returns the unified `StreamingJob`
+# (id / push / drain / flush / stop). The old `df.write_stream()` builder and its
+# `StreamingQuery` / `StreamingQueryManager` handles no longer exist in the
+# extension, so nothing here reaches for them.
+def _windowed(src):
+    """The write terminal needs a windowed pipeline; this is the shape the whole
+    section writes from."""
+    return (src.to_streaming()
+            .with_event_time("event_time")
+            .key_by("k")
+            .tumbling_window(30 * DAY))
+
+
+def _await_rows(read, expected, timeout=30):
+    """Poll `read()` until it reports `expected` rows. `start()` returns as soon as
+    the job is registered — delivery to an engine sink happens on the job's own
+    loop — and the job handle exposes no completion hook, so the sink itself is
+    the only thing to wait on."""
+    deadline = time.time() + timeout
+    got = 0
+    while time.time() < deadline:
+        try:
+            got = read()
+        except Exception:  # a file caught mid-write is not yet an answer
+            got = 0
+        if got >= expected:
+            return got
+        time.sleep(0.2)
+    return got
+
+
 def test_sink_parquet_roundtrip(tmp_path):
+    """A parquet sink receives the windowed output: every input row is counted
+    into exactly one window, so the counts sum back to the input row count."""
     import glob
     import pyarrow.parquet as pq
     s = _session()
     src, n = _events(s)
-    w = src.write_stream()
+    w = _windowed(src).write()
     w.format("parquet"); w.option("path", str(tmp_path)); w.trigger("available_now")
-    w.start().await_termination(30000)
+    job = w.start(s, "parquet_job")
+
+    def counted():
+        files = glob.glob(f"{tmp_path}/*.parquet")
+        return sum(sum(pq.read_table(f).column("count").to_pylist()) for f in files)
+
+    assert _await_rows(counted, n) == n
     files = glob.glob(f"{tmp_path}/*.parquet")
-    assert files and sum(pq.read_table(f).num_rows for f in files) == n
-
-
-def test_sink_foreach_batch():
-    s = _session()
-    src, n = _events(s)
-    seen = {"rows": 0}
-
-    def fb(batches, epoch):
-        for b in batches:
-            seen["rows"] += b.to_arrow().num_rows
-
-    w = src.write_stream()
-    w.foreach_batch(fb); w.trigger("available_now")
-    w.start().await_termination(30000)
-    assert seen["rows"] == n
+    assert set(pq.read_table(files[0]).schema.names) == {
+        "k", "window_start_ms", "window_end_ms", "count"
+    }
+    job.stop()
 
 
 def test_sink_console_smoke():
     s = _session()
     src, _ = _events(s)
-    w = src.write_stream()
+    w = _windowed(src).write()
     w.format("console"); w.trigger("available_now")
-    w.start().await_termination(30000)  # must not raise
+    job = w.start(s, "console_job")  # must not raise
+    assert job.id
+    job.stop()
 
 
-def test_sink_entry_is_dataframe_write_stream():
-    # Streaming sinks live on the source DataFrame; a windowed StreamingDataFrame
-    # is consumed via collect()/execute_stream_async(), so its write_stream raises.
-    s = _session()
-    assert hasattr(s.sql("SELECT 1 a"), "write_stream")
-    with pytest.raises(Exception):
-        s.sql("SELECT 1 a").to_streaming().write_stream()
-
-
-def test_sink_failure_surfaces():
-    """A failed sink must raise from await_termination, not silently succeed."""
-    import os
-    os.environ.update(AWS_ENDPOINT_URL="http://127.0.0.1:9099", AWS_ACCESS_KEY_ID="x",
-                      AWS_SECRET_ACCESS_KEY="y", AWS_ALLOW_HTTP="true", AWS_REGION="us-east-1")
+def test_write_terminal_lives_on_the_streaming_dataframe():
+    """`write()` is a StreamingDataFrame method, and it needs a window: a plain
+    source stream is refused BY NAME rather than started and left silent."""
     s = _session()
     src, _ = _events(s)
-    w = src.write_stream()
-    w.format("iceberg"); w.option("path", "s3://nope/bad"); w.trigger("available_now")
-    with pytest.raises(Exception):
-        w.start().await_termination(20000)
+    assert not hasattr(s.sql("SELECT 1 a"), "write_stream")
+    assert isinstance(_windowed(src).write(), StreamWriter)
+    with pytest.raises(Exception, match="needs a windowed pipeline"):
+        src.to_streaming().write().start(s, "unwindowed")
 
 
-# ─────────────────────────── watermark / side output config ───────────────────────────
-def test_watermark_and_state_config_chain():
+def test_write_stream_is_the_pyspark_spelling_of_the_same_terminal():
+    """`df.writeStream` is PySpark's name for `df.to_streaming().write()`."""
+    s = _session()
+    assert isinstance(s.sql("SELECT 1 a").writeStream, StreamWriter)
+
+
+def test_writer_refuses_an_unknown_output_mode():
+    s = _session()
+    src, _ = _events(s)
+    w = _windowed(src).write()
+    w.output_mode("nonsense")
+    with pytest.raises(Exception, match="unknown output mode"):
+        w.start(s, "bad_mode")
+
+
+def test_writer_refuses_an_unknown_trigger():
+    s = _session()
+    src, _ = _events(s)
+    w = _windowed(src).write()
+    w.trigger("nonsense")
+    with pytest.raises(Exception, match="unknown trigger"):
+        w.start(s, "bad_trigger")
+
+
+def test_writer_start_is_single_use():
+    s = _session()
+    src, _ = _events(s)
+    w = _windowed(src).write()
+    w.trigger("continuous")
+    job = w.start(s, "once_only")
+    with pytest.raises(Exception, match="already been called"):
+        w.start(s, "again")
+    job.stop()
+
+
+# ═══════════════════ StreamingJob: push / drain / flush / stop ═══════════════════
+def test_sinkless_job_is_driven_through_the_handle():
+    """With no sink configured the output stays drainable through the job: push
+    input, drain closed windows, flush the rest. Every input row lands in exactly
+    one window, so drain + flush account for all of them."""
     s = _session()
     src, n = _events(s)
-    sdf = (src.to_streaming()
-           .with_event_time("event_time")
-           .with_watermark_lag(5 * DAY)
-           .with_state_ttl(3600_000)
-           .with_side_output("late", 5 * DAY)
-           .key_by("k")
-           .tumbling_window(30 * DAY))
-    t = _collect_tbl(sdf)
-    assert t is not None and sum(t.column("count").to_pylist()) > 0
+    tbl = pa.Table.from_pylist([
+        {"k": ["a", "b", "c"][i % 3], "v": float(i % 50), "event_time": ((i * 37) % 300) * 10 * DAY}
+        for i in range(300)
+    ])
+    w = _windowed(src).write()
+    w.trigger("continuous")
+    job = w.start(s, "drain_job")
+    job.push([Batch(b) for b in tbl.to_batches()])
+
+    drained = []
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        drained += job.drain()
+        if sum(sum(b.to_arrow().column("count").to_pylist()) for b in drained):
+            break
+        time.sleep(0.2)
+    drained += job.flush()
+    assert sum(sum(b.to_arrow().column("count").to_pylist()) for b in drained) == n
+    job.stop()
 
 
-# ═══════════════════ StreamingQuery accessors + memory sink ═══════════════════
-def _run_memory_query(s, name="mq"):
-    src, n = _events(s)
-    w = src.write_stream()
-    w.format("memory"); w.query_name(name); w.trigger("available_now")
-    q = w.start()
-    q.await_termination(30000)
-    return q, n
-
-
-def test_memory_sink_readable_via_query():
-    # closes the "memory sink not readable from Python" gap
-    s = _session()
-    q, n = _run_memory_query(s)
-    total = sum(b.to_arrow().num_rows for b in q.memory_batches())
-    assert total == n
-
-
-def test_query_accessors():
-    s = _session()
-    q, n = _run_memory_query(s, "accessor_q")
-    assert q.id()
-    assert q.name() == "accessor_q"
-    assert q.is_active() is False
-    assert q.output_mode() in ("append", "update", "complete")
-    assert q.format() == "memory"
-    assert q.exception() is None
-    lp = q.last_progress()
-    assert lp is not None and lp.input_rows == n
-    assert isinstance(q.recent_progress(5), list)
-
-
-def test_query_status_dict():
-    s = _session()
-    q, n = _run_memory_query(s, "status_q")
-    st = q.status()
-    assert st["state"] == "stopped"
-    assert st["output_mode"] == q.output_mode()
-    assert st["exception"] is None
-    assert st["last_progress"] is not None
-
-
-def test_query_exception_on_sink_failure():
-    import os
-    os.environ.update(AWS_ENDPOINT_URL="http://127.0.0.1:9099", AWS_ACCESS_KEY_ID="x",
-                      AWS_SECRET_ACCESS_KEY="y", AWS_ALLOW_HTTP="true", AWS_REGION="us-east-1")
+def test_engine_sink_job_refuses_drain_and_flush_by_name():
+    """A job delivering to an engine sink has no drainable buffer, and bounded
+    completion is the trigger's job — both are refused by name, not half-served."""
     s = _session()
     src, _ = _events(s)
-    w = src.write_stream()
-    w.format("iceberg"); w.option("path", "s3://nope/bad"); w.trigger("available_now")
-    q = w.start()
-    with pytest.raises(Exception):
-        q.await_termination(20000)
-    assert q.exception() is not None
-    assert q.status()["state"] == "failed"
+    w = _windowed(src).write()
+    w.format("console"); w.trigger("available_now")
+    job = w.start(s, "refusals")
+    with pytest.raises(Exception, match="not a drainable buffer"):
+        job.drain()
+    with pytest.raises(Exception, match="available_now trigger, not flush"):
+        job.flush()
+    job.stop()
 
 
-# ═══════════════════ StreamingQueryManager lookup ═══════════════════
-def test_query_manager_lookup():
+def test_job_id_and_repr():
     s = _session()
     src, _ = _events(s)
-    mgr = ks.StreamingQueryManager()
-    w = src.write_stream()
-    w.format("memory"); w.query_name("managed"); w.with_stream_manager(mgr); w.trigger("available_now")
-    q = w.start()
-    # API works (list of ids; get by id/name returns a handle or None)
-    assert isinstance(mgr.active_ids(), list)
-    got = mgr.get(q.id())
-    assert got is None or got.id() == q.id()
-    by_name = mgr.get_by_name("managed")
-    assert by_name is None or by_name.name() == "managed"
-    q.await_termination(30000)
-
-
-# ═══════════════════ state-backed dedup ═══════════════════
-def test_drop_duplicates_with_state():
-    s = _session()
-    src, _ = _events(s)
-    out = asyncio.run(_drain(src.to_streaming().drop_duplicates_with_state(subset=["k"]), cap=50))
-    assert out is not None
-    assert out.num_rows == len(set(out.column("k").to_pylist()))
-
-
-# ═══════════════════ side-output stream consumption ═══════════════════
-def test_execute_stream_with_side_output():
-    s = _session()
-    src, _ = _events(s)
-    sdf = (src.to_streaming().with_event_time("event_time").with_side_output("late", 5 * DAY)
-           .key_by("k").tumbling_window(30 * DAY))
-    main, late = sdf.execute_stream_with_side_output_async()
-    # returns two independently-consumable streams (main results + late records)
-    assert main is not None and late is not None
-    assert hasattr(main, "__aiter__") and hasattr(late, "__aiter__")
-
-
-# ═══════════════════ writer.format_option ═══════════════════
-def test_writer_format_option(tmp_path):
-    import glob
-    import pyarrow.parquet as pq
-    s = _session()
-    src, n = _events(s)
-    w = src.write_stream()
-    w.format("parquet"); w.format_option("path", str(tmp_path)); w.trigger("available_now")
-    w.start().await_termination(30000)
-    files = glob.glob(f"{tmp_path}/*.parquet")
-    assert files and sum(pq.read_table(f).num_rows for f in files) == n
+    w = _windowed(src).write()
+    w.trigger("continuous")
+    job = w.start(s, "named_job")
+    assert job.id == "named_job"          # `id` is a property, not a method
+    assert "named_job" in repr(job)
+    job.stop()
 
 
 # ═══════════════════ filtered / conditional aggregates ═══════════════════

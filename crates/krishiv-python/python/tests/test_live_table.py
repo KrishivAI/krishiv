@@ -5,7 +5,7 @@
   .ingest_row(id, "insert")    -> .insert(batch)
   .ingest_row(id, "delete")    -> .delete(batch)
   .refresh()                   -> .step()   (auto after apply)
-  .change_feed()               -> .changes() / .last_output()
+  .change_feed()               -> .next_change() / .last_output()
   .drop()                      -> handle lifecycle (the fresh per-view registry is
                                   freed when the IncrementalDataFrame is GC'd)
 """
@@ -39,11 +39,27 @@ def test_create_incremental_view_and_ingest():
     assert got[1] == 30 and got[2] == 5
 
 
+def _weights(delta):
+    """DeltaBatch -> {row tuple: weight}; +1 inserted the row, -1 retracted it."""
+    d = delta.to_batch().to_arrow().to_pydict()
+    weights = d.pop("_weight")
+    columns = list(d)
+    return {tuple(d[c][i] for c in columns): weights[i] for i in range(len(weights))}
+
+
 def test_change_feed_after_ingest():
+    # The retired LiveTable.change_feed yielded the rows that changed, so this
+    # asserts the rows — `is not None` would also pass on a stale delta left over
+    # from an earlier tick, which is exactly what the coalescing peek serves.
     s = _orders_session({"customer_id": [1], "amount": [0]})
     iv = s.sql(
         "SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id"
     ).to_incremental()
     iv.insert(pa.record_batch({"customer_id": [1], "amount": [10]}))
-    feed = iv.last_output()
-    assert feed is not None and feed.num_rows >= 1
+    assert _weights(iv.last_output()) == {(1, 10): 1}
+    change = iv.next_change()
+    assert change is not None and _weights(change) == {(1, 10): 1}
+
+    # ingest_row(id, "delete") -> .delete(batch): the feed carries the retraction.
+    iv.delete(pa.record_batch({"customer_id": [1], "amount": [10]}))
+    assert _weights(iv.next_change()) == {(1, 10): -1}

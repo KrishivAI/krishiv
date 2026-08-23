@@ -1049,7 +1049,11 @@ def _apply() -> None:
     # Structured-streaming name parity (Krishiv keeps its native streaming DSL,
     # which is exposed here under the PySpark spellings).
     Session.readStream = property(lambda self: self.read_stream())
-    DataFrame.writeStream = property(lambda self: self.write_stream())
+    # Krishiv's write terminal lives on the StreamingDataFrame
+    # (`df.to_streaming().write()`), so the PySpark spelling routes there. A
+    # pipeline that is not windowed is refused BY NAME at `start()`, which is
+    # the engine's own check, not a second one bolted on here.
+    DataFrame.writeStream = property(lambda self: self.to_streaming().write())
 
     # ── Streaming API unification (Phase 1) ──────────────────────────────────
     # One canonical, Spark-consistent naming across BOTH the DataStream
@@ -1077,17 +1081,18 @@ def _apply() -> None:
         _parse_duration_ms(size), _parse_duration_ms(slide)
     )
     _SDF.sessionWindow = lambda self, gap: self.session_window(_parse_duration_ms(gap))
-    # NB: no `_SDF.writeStream` alias — streaming sinks live on the source
-    # DataFrame (`df.write_stream()`); a windowed StreamingDataFrame is consumed
-    # via `.collect()` or `.execute_stream_async()`. Aliasing it here only
-    # produced a property that raised on access.
+    # NB: no `_SDF.writeStream` alias — the StreamingDataFrame's write terminal
+    # is spelled `.write()` (returning a `StreamWriter`), and a windowed
+    # StreamingDataFrame can also be consumed directly via `.collect()` or
+    # `.execute_stream_async()`.
 
     # ── Incremental (delta/IVM) surface — df.to_incremental() ────────────────
-    # The third mode of the unified DataFrame surface. The Rust core exposes
-    # apply / step / snapshot / last_output; the Z-set feed conveniences, the
-    # transaction() context manager, and the changes() async change-feed are
-    # pure Python here (evolve without a rebuild).
+    # The third mode of the unified DataFrame surface. The Rust core owns
+    # everything stateful (apply / step / snapshot / next_change / the
+    # transaction buffer); what lives here are the stateless Z-set spellings and
+    # the context-manager object, which need no rebuild to evolve.
     from .krishiv import (  # noqa: PLC0415
+        Batch as _Batch,
         IncrementalDataFrame as _IDF,
         DeltaBatch as _DB,
     )
@@ -1101,58 +1106,156 @@ def _apply() -> None:
     _IDF.update = lambda self, before, after, source=None: self.apply(
         _DB.from_update(before, after), source
     )
-    _IDF.apply_cdc = lambda self, event, source=None: self.apply(
-        _DB.from_cdc(event), source
-    )
+
+    def _idf_apply_cdc(self, *, before=None, after=None, source=None):
+        """Apply one CDC change event as a single atomic delta.
+
+        ``before``/``after`` are the row images the event carries, exactly as in
+        :meth:`DeltaBatch.from_cdc`: INSERT is ``after=`` only, DELETE is
+        ``before=`` only, UPDATE is both (retraction and insertion in one delta,
+        never split across ticks). Returns the tick's ``StepSummary`` (``None``
+        inside a ``transaction()``).
+
+        Keyword-only on purpose: an unlabelled row image is ambiguous, and the
+        one positional spelling this method used to have silently meant DELETE.
+
+        Both sides omitted is not a CDC event; it raises rather than quietly
+        doing nothing.
+        """
+        if before is None and after is None:
+            raise ValueError(
+                "apply_cdc() needs at least one row image: before=<batch> for a "
+                "DELETE, after=<batch> for an INSERT, or both for an UPDATE"
+            )
+        return self.apply(_DB.from_cdc(before, after), source)
+
+    _IDF.apply_cdc = _idf_apply_cdc
 
     class _IvmTransaction:
-        """Feeds buffer inside the block; one atomic tick fires on clean exit."""
+        """Atomic feed block.
+
+        Feeds issued inside the block are buffered in the handle and reach the
+        engine only when the block exits cleanly, where they land together under
+        exactly one tick. An exception discards them: the engine never saw them,
+        so no later tick can apply them. Nestable within one thread — only the
+        outermost block commits, and an inner block that aborts discards just its
+        own feeds.
+        """
+
+        __slots__ = ("_idf",)
 
         def __init__(self, idf):
             self._idf = idf
 
         def __enter__(self):
-            self._idf._set_defer_step(True)
+            self._idf._txn_enter()
             return self._idf
 
         def __exit__(self, exc_type, exc, tb):
-            self._idf._set_defer_step(False)
+            # Commit only on a clean exit; on an exception this drops the
+            # buffered feeds. Errors raised here (a rejected feed, a view that
+            # failed to evaluate) propagate — a commit must not fail quietly.
             if exc_type is None:
-                self._idf.step()
+                self._idf._txn_exit(True)
+                return False
+            # The block is already unwinding for the user's own reason. The
+            # abort still has to run, but its failure must not REPLACE that
+            # reason: a corrupted handle would surface "transaction() exited
+            # without a matching enter" and the real error would be gone. It is
+            # chained onto the original instead, so both are in the traceback
+            # and the user's exception is the one raised.
+            try:
+                self._idf._txn_exit(False)
+            except BaseException as abort_error:  # noqa: BLE001 - attached, not swallowed
+                note = f"aborting the transaction() block also failed: {abort_error!r}"
+                if hasattr(exc, "add_note"):  # Python 3.11+
+                    exc.add_note(note)
+                elif exc.__context__ is None:
+                    # No note API here, so the abort failure rides along as the
+                    # cause chain — but only when nothing is already there, so
+                    # the user's own chain is never overwritten.
+                    exc.__context__ = abort_error
             return False
 
     _IDF.transaction = lambda self: _IvmTransaction(self)
 
-    async def _idf_changes(self):
-        """Async change-feed ("update" output mode): yields the output delta from
-        the most recent tick. Iterate after each ``apply``/``step`` to consume the
-        incremental output; ``snapshot()`` gives the full ("complete") state."""
-        out = self.last_output()
-        if out is not None:
-            yield out
-
-    _IDF.changes = _idf_changes
-
-    # ── View-DAG composition — s.view(iv) ────────────────────────────────────
-    # Read an existing incremental view's output as a DataFrame, so
-    # `s.view(iv).groupBy(...).agg(...).to_incremental()` co-registers the derived
-    # view into iv's job — a feed to the base then cascades to it (topological
-    # multi-view IVM). The base view's schema is registered client-side (empty,
-    # schema-only) purely so the downstream query can be planned/unparsed; the
-    # engine resolves the real view.
+    # ── View-DAG composition / view read — s.view(iv) ─────────────────────────
     def _session_view(self, iv):
-        import os  # noqa: PLC0415
-        import tempfile  # noqa: PLC0415
+        """Read an incremental view as a DataFrame.
 
-        import pyarrow as pa  # noqa: PLC0415
-        import pyarrow.parquet as pq  # noqa: PLC0415
+        Two honest uses:
 
-        schema = iv.schema_batch().to_arrow().schema
-        d = tempfile.mkdtemp()
-        p = os.path.join(d, f"{iv.name}.parquet")
-        pq.write_table(pa.Table.from_batches([], schema=schema), p)
-        self.register_parquet(iv.name, p)
-        return self.sql(f"SELECT * FROM {iv.name}")._with_ivm_parent(iv)
+        * compose — ``s.view(iv).groupBy(...).agg(...).to_incremental()``
+          co-registers the derived view into ``iv``'s job, so a feed to the base
+          cascades to it (topological multi-view IVM);
+        * read — ``.collect()`` / ``.show()`` return the view's rows **as of this
+          call**. The DataFrame carries that snapshot; it is not a live handle,
+          so call ``s.view(iv)`` again for a later state.
+
+        Both pay the same price: every call materializes and casts the base
+        view's WHOLE snapshot, which is O(rows in the view) in time and memory.
+        The read path needs those rows. The compose path does not — once
+        ``to_incremental()`` re-registers the derived view into the base's job,
+        the engine feeds it and the client-side rows are dead weight; only the
+        schema was ever load-bearing. This function cannot tell the two apart,
+        because the caller picks the path afterwards. So composing on a large
+        view costs a full snapshot copy per ``s.view()`` call: hoist the call
+        out of any loop, and do not reach for it as a cheap schema accessor
+        (``iv.schema_batch()`` is that).
+
+        The view's rows are registered as a session table only for as long as it
+        takes to plan the query (the plan holds the data afterwards), so the
+        registration never outlives the call and cannot shadow a real table. A
+        session table that already carries the view's name is refused rather than
+        replaced: the derived view's SQL could not tell the two apart.
+        """
+        name = iv.name
+        if self.table_exists(name):
+            raise ValueError(
+                f"cannot read incremental view {name!r} as a DataFrame: this session "
+                f"already has a table named {name!r}, and the derived view's SQL "
+                f"cannot distinguish them. Rename the view (to_incremental(name)) "
+                f"or drop/rename the table."
+            )
+        # The table always carries the view's DECLARED output schema, whether or
+        # not it has rows yet, so a derived view is typed identically before and
+        # after the base has ticked. The engine materializes a snapshot in the
+        # equivalent storage types (`Utf8` where the plan says `Utf8View`), so
+        # the rows are cast onto the declared schema; a cast that fails is a real
+        # divergence and is raised, not papered over with an empty table.
+        #
+        # The cast goes through `Table.cast`, not `RecordBatch.cast`: the latter
+        # only arrived in pyarrow 16.0.0, and this package declares a
+        # `pyarrow>=14.0` floor. Casting preserves chunking, so the one-batch
+        # table this builds yields back one batch (none if it has no rows).
+        import pyarrow as _pa  # noqa: PLC0415
+
+        schema_batch = iv.schema_batch()
+        batches = [schema_batch]
+        snapshot = iv.snapshot()
+        if snapshot is not None:
+            schema = schema_batch.to_arrow().schema
+            try:
+                cast = _pa.Table.from_batches([snapshot.to_arrow()]).cast(schema)
+            # Only a genuine schema divergence is relabelled. A wider `except`
+            # would report an unrelated failure — a missing pyarrow method, a
+            # bug in this function — as the view's fault, which is a false
+            # diagnosis, so anything else propagates unchanged.
+            except (ValueError, TypeError, _pa.ArrowNotImplementedError) as exc:
+                raise TypeError(
+                    f"incremental view {name!r} materialized a snapshot that does not "
+                    f"fit its declared output schema {schema}: {exc}"
+                ) from exc
+            # An all-empty snapshot casts to zero batches; the schema-only batch
+            # already registered above is exactly the right table for that.
+            batches = [_Batch(b) for b in cast.to_batches()] or [schema_batch]
+        self.register_record_batches(name, batches)
+        try:
+            quoted = '"' + name.replace('"', '""') + '"'
+            df = self.sql(f"SELECT * FROM {quoted}")
+        finally:
+            self.deregister_table(name)
+        return df._with_ivm_parent(iv)
 
     Session.view = _session_view
 

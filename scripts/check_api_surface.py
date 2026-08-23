@@ -13,12 +13,49 @@ from pathlib import Path
 VALID_PHASE_STATUS = {"todo", "in_progress", "implemented", "blocked"}
 VALID_CAPABILITY_STATUS = {"todo", "partial", "implemented", "blocked", "not_applicable"}
 VALID_STABILITY = {"stable", "preview", "experimental", "internal"}
-PYCLASS_RE = re.compile(r'#\[pyclass(?:\(([^]]*)\))?\]\s*\npub struct\s+(\w+)', re.MULTILINE)
-PYCLASS_NAME_RE = re.compile(r'name\s*=\s*"([^"]+)"')
-PYMETHOD_RE = re.compile(
-    r'^\s*(?:pub\s+)?(?P<async>async\s+)?fn\s+(?P<name>[A-Za-z_]\w*)(?:<[^>]*>)?\s*\((?P<args>[^)]*)\)',
+# `#[pyclass]` and its `pub struct` are not always adjacent: a derive, a doc
+# comment, or a `#[doc = "..."]` may sit between them. Skipping those lines is
+# what keeps PyBatch/PyDeltaBatch/PyIvmJob/PyViewError/PyAggExpr/PySchema (all
+# `#[derive(Clone)]`) and the doc-commented sinks in the inventory instead of
+# invisible to it. `pub` is still required, so the private `#[pyclass]`
+# decorator helpers (udf.rs, migration.rs) — which are never module attributes —
+# stay out.
+PYCLASS_RE = re.compile(
+    r'#\[pyclass(?:\(([^]]*)\))?\]\s*\n'
+    r'(?:[ \t]*(?:#\[[^\n]*\]|///[^\n]*)\n)*'
+    r'pub struct\s+(\w+)',
     re.MULTILINE,
 )
+PYCLASS_NAME_RE = re.compile(r'name\s*=\s*"([^"]+)"')
+# The attribute lines above a `#[pymethods]` fn decide the name Python sees:
+# `#[new]` becomes `__init__`, `#[pyo3(name = "isNull")]` renames outright. The
+# Rust identifier is not the published name, so both are captured.
+PYMETHOD_RE = re.compile(
+    r'(?P<attrs>(?:^[ \t]*\#\[[^\n]*\]\n)*)'
+    r'^[ \t]*(?:pub\s+)?(?P<async>async\s+)?fn\s+(?P<name>[A-Za-z_]\w*)(?:<[^>]*>)?\s*\((?P<args>[^)]*)\)',
+    re.MULTILINE,
+)
+PYO3_NAME_RE = re.compile(r'\#\[pyo3\([^]]*?name\s*=\s*"([^"]+)"')
+PYO3_NEW_RE = re.compile(r'^[ \t]*\#\[new\]', re.MULTILINE)
+# `__richcmp__` is a pyo3 protocol hook, not a Python attribute: it fills the
+# six comparison slots and is itself unreachable from Python. Publishing it
+# would declare a member `hasattr` cannot find.
+PYMETHOD_NOT_AN_ATTRIBUTE = {"__richcmp__"}
+# `#[pyo3(get)]` on a struct field publishes a read-only property that no
+# `#[pymethods]` fn declares — StepSummary.tick and ViewError.kind reach Python
+# this way and were absent from the stub entirely.
+PYCLASS_GET_FIELD_RE = re.compile(
+    r'^[ \t]*\#\[pyo3\(get[^]]*\)\]\n[ \t]*(?:pub\s+)?(?P<name>\w+)\s*:',
+    re.MULTILINE,
+)
+
+
+def python_method_name(attrs: str, rust_name: str) -> str:
+    """The name Python sees for a `#[pymethods]` fn."""
+    if PYO3_NEW_RE.search(attrs):
+        return "__init__"
+    renamed = PYO3_NAME_RE.search(attrs)
+    return renamed.group(1) if renamed else rust_name
 PUBLIC_SIGNATURE_RE = re.compile(
     r'(?m)^(?P<attrs>(?:#\[[^\n]+\]\n)*)\s*pub\s+(?P<async>async\s+)?'
     r'(?P<kind>struct|enum|trait|type|fn)\s+(?P<name>\w+)(?P<tail>[^\n{;]*)'
@@ -92,6 +129,16 @@ def python_inventory(root: Path) -> dict[str, object]:
             item = metadata(path, root, text, match, public_name, "class")
             item["rust_type"] = rust_name
             item["methods"] = []
+            struct_open = text.find("{", match.end())
+            struct_body = (
+                text[struct_open + 1:matching_brace(text, struct_open)]
+                if struct_open != -1
+                else ""
+            )
+            item["get_fields"] = [
+                field.group("name")
+                for field in PYCLASS_GET_FIELD_RE.finditer(struct_body)
+            ]
             classes.append(item)
     by_rust = {item["rust_type"]: item for item in classes}
     impl_re = re.compile(r'#\[pymethods\]\s*impl\s+(\w+)\s*\{', re.MULTILINE)
@@ -106,7 +153,11 @@ def python_inventory(root: Path) -> dict[str, object]:
             base_offset = opening + 1
             methods = []
             for method_match in PYMETHOD_RE.finditer(body):
-                name = method_match.group("name")
+                name = python_method_name(
+                    method_match.group("attrs") or "", method_match.group("name")
+                )
+                if name in PYMETHOD_NOT_AN_ATTRIBUTE:
+                    continue
                 absolute_start = base_offset + method_match.start()
                 line = line_number(text, absolute_start)
                 methods.append({
@@ -119,7 +170,23 @@ def python_inventory(root: Path) -> dict[str, object]:
                     "deprecated": False,
                     "replacement": None,
                 })
-            by_rust[rust_name]["methods"] = sorted(methods, key=lambda item: item["name"])
+            by_rust[rust_name]["methods"] = methods
+    for item in classes:
+        declared = {str(method["name"]) for method in item["methods"]}
+        for field in item.pop("get_fields", []):
+            if field in declared:
+                continue
+            item["methods"].append({
+                "id": f"{item['name']}.{field}",
+                "name": field,
+                "async": False,
+                "kind": "attribute",
+                "stability": "preview",
+                "documentation": str(item["documentation"]),
+                "deprecated": False,
+                "replacement": None,
+            })
+        item["methods"] = sorted(item["methods"], key=lambda entry: entry["name"])
     functions: list[dict[str, object]] = []
     lib = texts.get(root / "crates/krishiv-python/src/lib.rs", "")
     for name in sorted(set(PYFUNCTION_REG_RE.findall(lib))):
@@ -221,8 +288,10 @@ STUB_HEADER = '''"""Generated preview type surface for the native ``krishiv`` mo
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator, Sequence
-from typing import Literal, TypeAlias
+from contextlib import AbstractContextManager
+from typing import Any, Literal, TypeAlias
 
+BatchLike: TypeAlias = "Batch | Any"  # krishiv Batch or pyarrow RecordBatch
 ColumnLike: TypeAlias = "Column | str | None | bool | int | float | bytes"
 ColumnOrName: TypeAlias = "Column | str"
 DataFormat: TypeAlias = Literal["parquet", "csv", "json", "ndjson"]
@@ -268,6 +337,130 @@ CLASS_METHOD_SIGNATURES: dict[tuple[str, str], list[str]] = {
     ("BlockingSession", "connect"): ["    @staticmethod", "    def connect(coordinator_url: str) -> BlockingSession: ..."],
     ("BlockingSession", "sql"): ["    def sql(self, query: str) -> QueryResult: ..."],
     ("BlockingSession", "collect"): ["    def collect(self, dataframe: DataFrame) -> QueryResult: ..."],
+    ("Batch", "py_new"): ["    def __init__(self, obj: object) -> None: ..."],
+    # ── IVM / delta surface ──
+    ("DeltaBatch", "from_inserts"): [
+        "    # A record batch carrying one integer weight per row in a trailing",
+        "    # `_weight` column: +1 inserts the row, -1 retracts it.",
+        "    @staticmethod",
+        "    def from_inserts(batch: BatchLike) -> DeltaBatch: ...",
+    ],
+    ("DeltaBatch", "from_deletes"): [
+        "    @staticmethod",
+        "    def from_deletes(batch: BatchLike) -> DeltaBatch: ...",
+    ],
+    ("DeltaBatch", "from_update"): [
+        "    @staticmethod",
+        "    def from_update(before: BatchLike, after: BatchLike) -> DeltaBatch: ...",
+    ],
+    ("DeltaBatch", "from_cdc"): [
+        "    # None only when both sides are omitted (an empty CDC event).",
+        "    @staticmethod",
+        "    def from_cdc(before: BatchLike | None = ..., after: BatchLike | None = ...) -> DeltaBatch | None: ...",
+    ],
+    ("DeltaBatch", "from_weighted"): [
+        "    @staticmethod",
+        "    def from_weighted(batch: BatchLike) -> DeltaBatch: ...",
+    ],
+    ("DeltaBatch", "deserialize"): [
+        "    @staticmethod",
+        "    def deserialize(data: bytes) -> DeltaBatch: ...",
+    ],
+    ("DeltaBatch", "to_batch"): ["    def to_batch(self) -> Batch: ..."],
+    ("DeltaBatch", "data_batch"): ["    def data_batch(self) -> Batch: ..."],
+    ("DeltaBatch", "filter_positive"): ["    def filter_positive(self) -> Batch: ..."],
+    ("DeltaBatch", "filter_negative"): ["    def filter_negative(self) -> Batch: ..."],
+    ("DeltaBatch", "negate"): ["    def negate(self) -> DeltaBatch: ..."],
+    ("DeltaBatch", "drop_zeros"): ["    def drop_zeros(self) -> DeltaBatch: ..."],
+    ("DeltaBatch", "is_empty"): ["    def is_empty(self) -> bool: ..."],
+    ("DeltaBatch", "is_insert_only"): ["    def is_insert_only(self) -> bool: ..."],
+    ("DeltaBatch", "serialize"): ["    def serialize(self) -> bytes: ..."],
+    ("DeltaBatch", "num_rows"): ["    @property", "    def num_rows(self) -> int: ..."],
+    ("DeltaBatch", "__repr__"): ["    def __repr__(self) -> str: ..."],
+    ("IncrementalDataFrame", "name"): ["    @property", "    def name(self) -> str: ..."],
+    ("IncrementalDataFrame", "source_names"): [
+        "    @property",
+        "    def source_names(self) -> list[str]: ...",
+    ],
+    ("IncrementalDataFrame", "schema_batch"): ["    def schema_batch(self) -> Batch: ..."],
+    ("IncrementalDataFrame", "apply"): [
+        "    # Returns the tick's summary, or None when buffered inside transaction().",
+        "    def apply(self, delta: DeltaBatch, source: str | None = ...) -> StepSummary | None: ...",
+    ],
+    ("IncrementalDataFrame", "step"): ["    def step(self) -> StepSummary: ..."],
+    ("IncrementalDataFrame", "snapshot"): ["    def snapshot(self) -> Batch | None: ..."],
+    ("IncrementalDataFrame", "next_change"): [
+        "    # Each published delta at most once; None if nothing new (coalescing).",
+        "    def next_change(self) -> DeltaBatch | None: ...",
+    ],
+    ("IncrementalDataFrame", "last_output"): [
+        "    # Non-consuming peek: repeats, and survives a tick that published nothing.",
+        "    def last_output(self) -> DeltaBatch | None: ...",
+    ],
+    ("IncrementalDataFrame", "_txn_enter"): ["    def _txn_enter(self) -> None: ..."],
+    ("IncrementalDataFrame", "_txn_exit"): [
+        "    def _txn_exit(self, commit: bool) -> StepSummary | None: ...",
+    ],
+    ("IncrementalDataFrame", "__repr__"): ["    def __repr__(self) -> str: ..."],
+    ("IvmJob", "job_id"): ["    @property", "    def job_id(self) -> str: ..."],
+    ("IvmJob", "register_view"): [
+        "    def register_view(",
+        "        self,",
+        "        name: str,",
+        "        body_sql: str,",
+        "        schema: type,",
+        "        is_materialized: bool = ...,",
+        "        is_recursive: bool = ...,",
+        "    ) -> None: ...",
+    ],
+    ("IvmJob", "register_view_with_lateness"): [
+        "    def register_view_with_lateness(",
+        "        self,",
+        "        name: str,",
+        "        body_sql: str,",
+        "        schema: type,",
+        "        lateness_ms: dict[str, int],",
+        "        is_materialized: bool = ...,",
+        "        is_recursive: bool = ...,",
+        "    ) -> None: ...",
+    ],
+    ("IvmJob", "feed"): ["    def feed(self, source: str, delta: DeltaBatch) -> None: ..."],
+    ("IvmJob", "feed_snapshot"): [
+        "    def feed_snapshot(self, source: str, batches: Sequence[Batch]) -> None: ...",
+    ],
+    ("IvmJob", "step"): ["    def step(self) -> StepSummary: ..."],
+    ("IvmJob", "feed_and_step"): [
+        "    def feed_and_step(self, source: str, delta: DeltaBatch) -> StepSummary: ...",
+    ],
+    ("IvmJob", "feed_inserts_and_step"): [
+        "    def feed_inserts_and_step(self, source: str, batch: Batch) -> StepSummary: ...",
+    ],
+    ("IvmJob", "snapshot"): ["    def snapshot(self, view: str) -> Batch | None: ..."],
+    ("IvmJob", "enable_delta_checkpoints"): ["    def enable_delta_checkpoints(self) -> None: ..."],
+    ("IvmJob", "enable_input_dedup"): ["    def enable_input_dedup(self) -> None: ..."],
+    ("IvmJob", "checkpoint"): ["    def checkpoint(self) -> bytes: ..."],
+    ("IvmJob", "restore"): ["    def restore(self, data: bytes) -> None: ..."],
+    ("IvmJob", "checkpoint_delta"): ["    def checkpoint_delta(self) -> bytes: ..."],
+    ("IvmJob", "restore_delta"): ["    def restore_delta(self, data: bytes) -> None: ..."],
+    ("IvmJob", "__repr__"): ["    def __repr__(self) -> str: ..."],
+    ("StepSummary", "total_output_rows"): ["    @property", "    def total_output_rows(self) -> int: ..."],
+    ("StepSummary", "active_views"): ["    @property", "    def active_views(self) -> int: ..."],
+    ("StepSummary", "tick"): ["    @property", "    def tick(self) -> int: ..."],
+    ("StepSummary", "degraded_views"): ["    @property", "    def degraded_views(self) -> list[str]: ..."],
+    ("StepSummary", "errored_views"): ["    @property", "    def errored_views(self) -> list[ViewError]: ..."],
+    ("StepSummary", "__repr__"): ["    def __repr__(self) -> str: ..."],
+    ("ViewError", "view"): ["    @property", "    def view(self) -> str: ..."],
+    ("ViewError", "kind"): [
+        "    # 'operator_apply' | 'view_sql' | 'publish'",
+        "    @property",
+        "    def kind(self) -> str: ...",
+    ],
+    ("ViewError", "message"): ["    @property", "    def message(self) -> str: ..."],
+    ("ViewError", "__repr__"): ["    def __repr__(self) -> str: ..."],
+    ("DataFrame", "to_incremental"): [
+        "    def to_incremental(self, name: str | None = ...) -> IncrementalDataFrame: ...",
+    ],
+    ("Session", "ivm"): ["    def ivm(self, name: str) -> IvmJob: ..."],
     ("Column", "alias"): ["    def alias(self, name: str) -> Column: ..."],
     ("Column", "asc"): ["    def asc(self) -> Column: ..."],
     ("Column", "cast"): ["    def cast(self, data_type: str) -> Column: ..."],
@@ -453,6 +646,116 @@ CLASS_METHOD_SIGNATURES: dict[tuple[str, str], list[str]] = {
 }
 
 
+EXTRA_CLASS_MEMBERS: dict[str, list[str]] = {
+    # Members that reach Python from pure Python, not from `#[pymethods]`:
+    # `krishiv/_pyspark.py` grafts the PySpark-compatible spellings and the
+    # stateless IVM conveniences onto the native classes at import. Nothing in
+    # `crates/krishiv-python/src` declares them, so they are declared here or
+    # they are absent from the published type surface entirely.
+    "Column": [],
+    "DataFrame": [
+        "    # ── grafted at import (see krishiv._pyspark) ──",
+        "    def selectExpr(self, *exprs: str) -> DataFrame: ...",
+        "    def where(self, condition: Column | str) -> DataFrame: ...",
+        "    def withColumn(self, name: str, column: ColumnLike) -> DataFrame: ...",
+        "    def withColumns(self, columns: dict) -> DataFrame: ...",
+        "    def withColumnRenamed(self, existing: str, new: str) -> DataFrame: ...",
+        "    def withColumnsRenamed(self, mapping: dict) -> DataFrame: ...",
+        "    def drop(self, *cols: ColumnLike) -> DataFrame: ...",
+        "    def groupBy(self, *cols: ColumnLike) -> GroupedDataFrame: ...",
+        "    def groupby(self, *cols: ColumnLike) -> GroupedDataFrame: ...",
+        "    def rollup(self, *cols: ColumnLike) -> Any: ...",
+        "    def cube(self, *cols: ColumnLike) -> Any: ...",
+        "    def agg(self, *exprs: ColumnLike, **named: ColumnLike) -> DataFrame: ...",
+        "    def orderBy(self, *cols: ColumnLike, ascending: object = ...) -> DataFrame: ...",
+        "    def dropDuplicates(self, subset: Sequence[str] | None = ...) -> DataFrame: ...",
+        "    def drop_duplicates(self, subset: Sequence[str] | None = ...) -> DataFrame: ...",
+        "    def unionByName(self, other: DataFrame, allowMissingColumns: bool = ...) -> DataFrame: ...",
+        "    def unionAll(self, other: DataFrame) -> DataFrame: ...",
+        "    def crossJoin(self, other: DataFrame) -> DataFrame: ...",
+        "    def subtract(self, other: DataFrame) -> DataFrame: ...",
+        "    def toDF(self, *names: str) -> DataFrame: ...",
+        "    def count(self) -> int: ...",
+        "    def head(self, n: int | None = ...) -> Any: ...",
+        "    def take(self, num: int) -> list: ...",
+        "    def first(self) -> Any: ...",
+        "    def tail(self, num: int) -> list: ...",
+        "    def collect_rows(self) -> list: ...",
+        "    def toPandas(self) -> Any: ...",
+        "    def toLocalIterator(self) -> Any: ...",
+        "    def isEmpty(self) -> bool: ...",
+        "    def printSchema(self) -> None: ...",
+        "    @property",
+        "    def dtypes(self) -> list: ...",
+        "    @property",
+        "    def na(self) -> Any: ...",
+        "    @property",
+        "    def stat(self) -> Any: ...",
+        "    @property",
+        "    def write(self) -> Any: ...",
+        "    # The PySpark spelling of the write terminal: `df.to_streaming().write()`.",
+        "    @property",
+        "    def writeStream(self) -> StreamWriter: ...",
+        "    def fillna(self, value: Any, subset: Sequence[str] | None = ...) -> DataFrame: ...",
+        "    def dropna(",
+        "        self,",
+        "        how: str = ...,",
+        "        thresh: int | None = ...,",
+        "        subset: Sequence[str] | None = ...,",
+        "    ) -> DataFrame: ...",
+    ],
+    "IncrementalDataFrame": [
+        "    # ── grafted at import (see krishiv._pyspark) ──",
+        "    def insert(self, batch: BatchLike, source: str | None = ...) -> StepSummary | None: ...",
+        "    def delete(self, batch: BatchLike, source: str | None = ...) -> StepSummary | None: ...",
+        "    def update(self, before: BatchLike, after: BatchLike, source: str | None = ...) -> StepSummary | None: ...",
+        "    def apply_cdc(",
+        "        self,",
+        "        *,",
+        "        before: BatchLike | None = ...,",
+        "        after: BatchLike | None = ...,",
+        "        source: str | None = ...,",
+        "    ) -> StepSummary | None: ...",
+        "    def transaction(self) -> AbstractContextManager[IncrementalDataFrame]: ...",
+    ],
+    "Session": [
+        "    # ── grafted at import (see krishiv._pyspark) ──",
+        "    def createDataFrame(self, data: Any, schema: Any = ...) -> DataFrame: ...",
+        "    def range(self, start: int, end: int | None = ..., step: int = ..., numPartitions: int | None = ...) -> DataFrame: ...",
+        "    def stop(self) -> None: ...",
+        "    @property",
+        "    def udf(self) -> Any: ...",
+        "    @property",
+        "    def catalog(self) -> Any: ...",
+        "    @property",
+        "    def read(self) -> Any: ...",
+        "    @property",
+        "    def readStream(self) -> DataStreamReader: ...",
+        "    # The view's rows as of this call, and the entry point for composing",
+        "    # a derived incremental view.",
+        "    def view(self, iv: IncrementalDataFrame) -> DataFrame: ...",
+        "    builder: Any",
+        "    def is_embedded(self) -> bool: ...",
+        "    def is_single_node(self) -> bool: ...",
+        "    def is_distributed(self) -> bool: ...",
+        "    def register_arrow_stream(self, job_name: str, async_gen: AsyncIterator[Any]) -> None: ...",
+    ],
+    "StreamingDataFrame": [
+        "    # ── grafted at import (see krishiv._pyspark) ──",
+        "    def withWatermark(self, eventTimeColumn: str, delayThreshold: str | int) -> StreamingDataFrame: ...",
+        "    def dropDuplicates(self, subset: Sequence[str] | None = ...) -> StreamingDataFrame: ...",
+        "    def keyBy(self, column: str) -> StreamingDataFrame: ...",
+        "    def tumblingWindow(self, duration: str | int) -> StreamingDataFrame: ...",
+        "    def slidingWindow(self, size: str | int, slide: str | int) -> StreamingDataFrame: ...",
+        "    def sessionWindow(self, gap: str | int) -> StreamingDataFrame: ...",
+        "    def where(self, condition: ColumnOrName) -> StreamingDataFrame: ...",
+        "    def withColumn(self, name: str, expr: ColumnOrName) -> StreamingDataFrame: ...",
+        "    def drop(self, *columns: str) -> StreamingDataFrame: ...",
+        "    def transformWithState(self, handler: object) -> StreamingDataFrame: ...",
+    ],
+}
+
+
 FUNCTION_SIGNATURES: dict[str, str] = {
     "avg": "def avg(column: Column) -> Column: ...",
     "call_function": "def call_function(name: str, arguments: Sequence[Column]) -> Column: ...",
@@ -495,9 +798,13 @@ def render_python_stub(inventory: dict[str, object]) -> str:
                 lines.extend(override)
             elif name == "new":
                 lines.append("    def __init__(self, *args: object, **kwargs: object) -> None: ...")
+            elif method.get("kind") == "attribute":
+                lines.append("    @property")
+                lines.append(f"    def {name}(self) -> object: ...")
             else:
                 async_prefix = "async " if method.get("async") else ""
                 lines.append(f"    {async_prefix}def {name}(self, *args: object, **kwargs: object) -> object: ...")
+        lines.extend(EXTRA_CLASS_MEMBERS.get(str(item["name"]), []))
         lines.append("")
     for function in inventory["functions"]:
         signature = FUNCTION_SIGNATURES.get(

@@ -3780,6 +3780,82 @@ mod integration_tests {
         RecordBatch::try_new(schema.clone(), cols).unwrap()
     }
 
+    /// IVM-AUD-CORE-23. The aggregate planner zipped `aggr_expr` (SELECT
+    /// order) against the declared schema's non-group columns (schema order),
+    /// so a view whose declared schema lists its aggregates in the other order
+    /// computed SUM into the COUNT column and COUNT into the SUM column — with
+    /// the arity check still passing, so nothing complained.
+    #[tokio::test]
+    async fn aggregates_follow_their_names_not_their_positions() {
+        let flow = IncrementalFlow::new();
+        // SELECT order: (SUM, COUNT). Declared order: (cnt, total).
+        flow.register_view(krishiv_delta::IncrementalViewSpec {
+            name: "by_region".into(),
+            body_sql: "SELECT region, SUM(amount) AS total, COUNT(*) AS cnt \
+                       FROM sales GROUP BY region"
+                .into(),
+            output_schema: Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, true),
+                Field::new("cnt", DataType::Int64, true),
+                Field::new("total", DataType::Float64, true),
+            ])),
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        })
+        .unwrap();
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, true),
+                Field::new("amount", DataType::Float64, true),
+            ])),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["us", "us", "us"])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0, 30.0])),
+            ],
+        )
+        .unwrap();
+        flow.feed("sales", DeltaBatch::from_inserts(batch).unwrap())
+            .unwrap();
+        flow.step_datafusion().await.unwrap();
+
+        let snap = flow
+            .snapshot("by_region")
+            .unwrap()
+            .expect("materialized snapshot must exist");
+        let cnt = snap
+            .column_by_name("cnt")
+            .expect("cnt column")
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("cnt is Int64")
+            .value(0);
+        let total = snap
+            .column_by_name("total")
+            .expect("total column")
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("total is Float64")
+            .value(0);
+        assert_eq!(cnt, 3, "COUNT(*) must land in `cnt`, not in `total`");
+        assert!(
+            (total - 60.0).abs() < 1e-9,
+            "SUM(amount) must land in `total`, got {total}"
+        );
+        // Correct *and* still incremental. Degrading this shape to DiffBased
+        // would also produce the right numbers, so without this the test
+        // cannot tell the name-pairing fix from a full-recompute fallback.
+        let (incremental, how) = flow
+            .view_plan_classification("by_region")
+            .unwrap()
+            .expect("the view is registered");
+        assert!(
+            incremental,
+            "the view must keep its O(delta) plan, not fall back to DiffBased: {how}"
+        );
+    }
+
     #[tokio::test]
     async fn take_step_output_returns_per_step_delta_then_none() {
         let flow = IncrementalFlow::new();

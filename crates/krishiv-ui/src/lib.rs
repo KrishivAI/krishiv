@@ -338,7 +338,12 @@ mod tests {
         // link normalizers produce "/console/", and axum's wildcard alone
         // does not cover it (revert the explicit route and this goes 404).
         let slash = router(demo_state().unwrap())
-            .oneshot(Request::builder().uri("/console/").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/console/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(slash.status(), StatusCode::OK);

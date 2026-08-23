@@ -146,6 +146,6 @@ def test_ivm_checkpoint_restore():
 
     assert snap2 is not None
     assert snap2.num_rows == snap1.num_rows
-    assert snap2.to_pydict() == snap1.to_pydict(), (
+    assert snap2.to_arrow().to_pydict() == snap1.to_arrow().to_pydict(), (
         "the rebuilt view must equal the pre-checkpoint view, not merely exist"
     )
