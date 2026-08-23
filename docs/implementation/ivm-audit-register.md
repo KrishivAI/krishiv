@@ -1,0 +1,226 @@
+# Delta-batch (IVM) mode audit register
+
+Source-to-sink review of delta-batch mode across embedded / single-node /
+distributed, and across the SQL, Python, Rust, CLI, HTTP and MCP surfaces
+(2026-08-23). Six parallel reviewers; every claim below was reported with
+file:line evidence, and the ten highest-severity ones were re-verified by
+hand against the source before this register was written.
+
+**The standing rule (inherited from the crate-audit register): every test
+added must be checked to FAIL against the pre-fix behaviour.** Revert the
+one production line the fix touches and watch the new test go red. A test
+that cannot distinguish correct from broken is worse than no test.
+
+**Status values:** OPEN | FIXED `<commit>` | WONTFIX (with reason) |
+DECIDED (product decision recorded, no code change).
+
+## Structural finding (the headline)
+
+There is **one** maintenance engine. SQL DDL (`CREATE INCREMENTAL VIEW` via
+`START PIPELINE`), `DataFrame::to_incremental`, `Session::ivm`, the CLI, the
+HTTP registry and MCP all converge on `krishiv_ivm::IncrementalFlow`. There
+is no duplicate implementation of incremental maintenance — the disease the
+streaming convergence (task #150) had to cure is absent here. The defects
+below are in the engine itself, in the transport into it, and in the
+honesty of the surfaces around it.
+
+---
+
+## T1 — Data corruption cores
+
+| ID | Sev | Where | Claim | Status |
+|---|---|---|---|---|
+| CORE-1 | CRIT | `krishiv-delta/src/operators/key_util.rs:117` | Decimal / Dictionary / List / Struct values all render to the same `<DataType>` key, so `consolidate_batch` cancels unrelated rows against each other (a `+1` on one value annihilates a `-1` on another). Comment claims it "avoids silent collisions"; it *is* one. Corrupts consolidate, `hash_row` dedup, and `apply_delta`. | OPEN |
+| API-F1 | CRIT | `krishiv-api/src/compute/incremental_df.rs:174` | `apply()`/`insert()` with an explicit-but-wrong source name is a silent no-op: the name is never validated against `self.sources`, `feed` accepts any key into `pending`, and `step` drains-and-drops unreferenced keys. A typo loses data forever, returning success. | OPEN |
+| CORE-14 | CRIT | `krishiv-delta/src/view.rs:95` | `publish_output` does `snap.take()` then returns `Err` on `apply_delta` failure — the whole materialized snapshot is destroyed, not "not updated" as the log claims. Next tick rebuilds the view from one delta. | OPEN |
+| CORE-15 | CRIT | `krishiv-delta/src/view.rs:272` | `apply_output_delta`: same take-then-`?` pattern twice (`full_output`, `snapshot`); a remote-tick mirror error leaves both permanently `None` after the tick counter already advanced. | OPEN |
+| PART-1 | CRIT | `krishiv-ivm/src/flow.rs:864`, `partitioned.rs:150`, `ivm_http.rs:583` | `step` drains `pending` before an awaited phase and never re-feeds on the central path. `try_join_all` drops sibling shard futures on first error; `central_step_with_timeout` drops the future at 300 s. Drained deltas are gone → permanent undercount for that shard's keys. | OPEN |
+| CORE-16 | HIGH | `krishiv-ivm/src/flow.rs:1634` | `restore` resets view baselines but does not clear `view_plans` (stale operator accumulators applied to replaced sources) and does not reset view snapshots (`full_output=None` + `snapshot=Some(old)` → next tick re-adds the whole result: doubled rows). `restore_full` does clear plans; `restore`/`restore_delta` never got the same treatment. | OPEN |
+| CORE-19 | HIGH | `krishiv-ivm/src/flow.rs:1140` | The tick clobbers `inner.source_snapshots` wholesale with a snapshot cloned before an unlocked async phase; any `restore*`/`apply_remote_tick`/concurrent `step_datafusion_with_ctx` landing in that window is silently lost. `step_datafusion_with_ctx` bypasses the `tick_ctx` mutex entirely. | OPEN |
+| CORE-17 | HIGH | `krishiv-ivm/src/flow.rs:1041` | A DiffBased view downstream of an *incremental* view reads stale (materialized) or missing (non-materialized → `tables.remove` → "table not found" → empty batch → full retraction) upstream state. Only the reverse chain is tested. | OPEN |
+| CORE-2 | HIGH | `krishiv-delta/src/operators/stream.rs:157` | Retraction of a never-inserted row is silently discarded (`filter_positive_expanded` clamps at 0), so snapshots are not a faithful Z-set: out-of-order CDC (DELETE before INSERT) leaves no memory and the later INSERT makes the row present. | OPEN |
+| CORE-22 | HIGH | `krishiv-ivm/src/plan.rs:812` | `DISTINCT`, `FILTER (WHERE …)`, `ORDER BY` and `null_treatment` modifiers on aggregate functions are never read, so `COUNT(DISTINCT x)` lowers to plain `COUNT` and `SUM(x) FILTER (WHERE …)` to unfiltered `SUM`. The MIN_BY/MAX_BY degradation guard was never generalized. | OPEN |
+| CORE-3 | MED | `consolidate.rs:75`, `flow.rs:105` | Unchecked `+=` on i64 weights (panic in debug / wrap in release); `filter_positive_expanded` materializes `w` copies with no cap → one hostile weight is an OOM. | OPEN |
+| CORE-23 | MED | `krishiv-ivm/src/plan.rs:519` | Aggregate outputs are paired to `aggr_expr` by positional zip against the declared output schema; a schema whose aggregate columns are ordered differently from the SELECT list transposes the aggregations, arity check still passing. | OPEN |
+| CORE-24 | MED | `flow.rs:997` vs `flow.rs:1280` | Dirty-bit detection lowercases both sides but the operator delta lookup does not; a source fed as `"Sales"` (or a view named `"Revenue"`) hits `continue` and never updates while the dirty bit says it did. | OPEN |
+| CORE-20 | MED | `krishiv-ivm/src/flow.rs:676` | `feed_coalesced` overwrites (not appends) `pending` for the source, skips the dedup filter, and skips `checkpoint_deltas` accumulation → delta checkpoints silently omit all coalesced input. | OPEN |
+| CORE-21 | LOW | `krishiv-ivm/src/flow.rs:571` | `feed_if_advanced` commits the source ordinal before calling `feed`; a `feed` error drops the batch permanently and makes retry at the same offset a no-op. | OPEN |
+
+## T2 — LATENESS is decorative end to end
+
+| ID | Sev | Where | Claim | Status |
+|---|---|---|---|---|
+| CORE-5 | HIGH | `krishiv-ivm/src/plan.rs:669` | Join traces are built with `IncrementalJoinOp::new`, never `new_with_lateness`, so `Trace::gc_below_watermark` early-returns on `lateness_col_idx = None`. `join.rs:83` documents this exact failure mode. | OPEN |
+| CORE-6 | HIGH | `aggregate.rs:586`, `distinct.rs:50` | Both `gc_watermark` implementations are literal `Ok(0)`. With CORE-5 that means **no IVM operator state is ever reclaimed by lateness**; `ViewPlan::gc_watermark`'s careful per-join min-watermark logic reaches only no-ops. | OPEN |
+| CORE-7 | HIGH | `krishiv-delta/src/lateness.rs:5` | Module contract says records with `ts < watermark` "are dropped at ingestion"; `WatermarkTracker::is_late` has zero production callers. A record three days late mutates the aggregate exactly like an on-time one. | OPEN |
+| CORE-9 | MED | `krishiv-ivm/src/flow.rs:479` | LATENESS on a multi-source view is warn-and-skip, so a join view — the only shape where trace GC matters — by construction never gets a tracker. | OPEN |
+| DDL-B1 | HIGH | `coordinator_http_client.rs:1994`, `ivm_http.rs:380` | The register-view wire struct has no `lateness` field and the server hardcodes `lateness: vec![]`, so LATENESS is silently dropped in Distributed mode: same SQL, different retention semantics per mode, no error. | OPEN |
+| DDL-B4 | HIGH | `krishiv-sql/src/incremental_view.rs:393` | `find_lateness_clause_start` scans raw bytes with no string-literal awareness: `SELECT lateness FROM t` (or `WHERE msg = 'LATENESS'`) truncates the view body to `"SELECT"` and returns `Ok`. A malformed clause (`tokens.len() < 4`) `break`s fail-OPEN while two sibling branches in the same function fail closed. Comment says "last occurrence"; code finds the first. | OPEN |
+| DDL-B3 | MED | `krishiv-sql/src/incremental_view.rs:199` | LATENESS on `DECLARE RECURSIVE VIEW` is parsed into `_lateness` and discarded; `execute_incremental_view_ddl` then hardcodes `lateness: vec![]`. | OPEN |
+| CORE-E4 | MED | `krishiv-ivm/src/flow.rs:451` | Re-registering a view with only LATENESS changed hits the `unchanged` early-return (lateness excluded from the comparison) and keeps the old tracker; `or_insert_with` never replaces one either. | OPEN |
+| CORE-8 | MED | `krishiv-ivm/src/flow.rs:2822` | `lateness_watermark_activates_and_advances` asserts only `watermark_for()` — a getter over the setter it just called. Cannot observe that GC and late-drop do nothing. | OPEN |
+
+## T3 — Distributed correctness: fencing, durability, delivery
+
+| ID | Sev | Where | Claim | Status |
+|---|---|---|---|---|
+| DIST-E1 | CRIT | `krishiv-scheduler/src/ivm_http.rs` (no `ensure_active` anywhere) | **Zero leader fencing on any IVM endpoint.** A demoted coordinator serves feed/step/restore/delete at 200, rehydrates the job, advances its own copy and persists over the new leader's snapshot: split-brain, last-writer-wins. The one fence that exists (job submit inside resident dispatch) is caught and downgraded to a successful local `central-fallback` compute. Streaming maps `InactiveCoordinator` → 503; IVM has no equivalent. | OPEN |
+| DIST-B1 | HIGH | `ivm_http.rs:418/456/1038/1094/363/394` | Only `/step` and `DELETE` take the per-job step lock. `/restore` during an in-flight resident tick lets `apply_remote_tick` apply input+output deltas on top of just-restored state — a rewind silently half-undone, answered `{"success": true}`. | OPEN |
+| DIST-C1 | HIGH | `ivm_http.rs` (no `enable_delta_checkpoints` call) | No HTTP handler ever enables delta accumulation and there is no request field for it, so `/checkpoint-delta` returns a well-formed **count=0** frame forever and `/restore-delta` composes nothing. An incremental-backup caller silently gets a backup missing everything since the full. | OPEN |
+| INT-F2 | HIGH | `krishiv-mcp/src/lib.rs:1515` | MCP `checkpoint(delta=true)` calls `enable_delta_checkpoints()` and then immediately `checkpoint_delta()` — accumulation starts after the call, so the blob is always empty while the response reports `"checkpoint_type": "delta"` and a byte length. | OPEN |
+| DIST-D3 | HIGH | feed paths | At-most-once with no sequence number, no idempotency key and no ack-of-applied: 200 is returned after `feed()` puts the delta in `pending`, before any step or persist. Crash between = permanent loss; client retry after timeout = double-apply (dedup unavailable, INT-F3). For `/stream-bridge` a dropped snapshot N makes N+1 diff against N−1: a **correct-looking but wrong** delta. | OPEN |
+| INT-F11 | HIGH | `krishiv-ivm/src/flow.rs:668` | No backpressure anywhere: `pending` is an unbounded `Vec` per source, the body cap is 512 MiB and there is no concurrency limiter, so a producer outrunning the stepper OOMs the coordinator while `/feed` answers `success: true`. | OPEN |
+| DIST-G1 | HIGH | `ivm_http.rs:1296`, `coordinator_daemon.rs:554` | Every IVM data route is JSON-with-base64 and `Json<T>` buffers whole: one 384 MiB delta peaks ≈1.4 GiB resident (raw body + String + decoded Vec + Arrow) before a row is applied, with no per-job or global cap. | OPEN |
+| DIST-G2 | HIGH | `krishiv-scheduler/src/ivm.rs:593` | `PersistedIvmJob.checkpoint_full` / `output_schema_ipc` are `Vec<u8>` with no `serde_bytes`/base64 attribute, so serde_json emits `[137,80,…]` — ~4× inflation of the entire flow state. | OPEN |
+| DIST-G3 | HIGH | `ivm_http.rs:561` | Every `/step` — even a one-row tick — calls `checkpoint_full()` over the whole flow, JSON-int-array encodes it and writes it synchronously **while holding the per-job step lock**. The "O(Δ) wire both directions" claim is false at the persistence layer. Store failure maps to 503 *after* the tick mutated memory. | OPEN |
+| DIST-A1 | HIGH | `ivm_http.rs:513`, `ivm.rs:515` | Executor-resident IVM requires `IvmJob::Single`, but any single-column-`GROUP BY` first view auto-partitions on a multi-core coordinator — so the canonical IVM workload is **permanently** `central-partitioned` and the resident path is dead code for it. Nothing tells the caller their `GROUP BY` opted them out of distribution. | OPEN |
+| DIST-A2 | HIGH | `ivm_http.rs:614` | Resident IVM fragments are submitted with no locality preference or executor pin, while the resident flow lives in a per-executor `DashMap`. With ≥2 executors each tick is a coin flip → hard error → re-attach (full `checkpoint_full` ship) possibly elsewhere: attach-thrash plus an orphaned resident flow leaked on every executor it ever touched. | OPEN |
+| INT-F10 | HIGH | `ivm_http.rs:760`, `:783` | Two resident-dispatch error paths skip the `refeed` guard: `invalidate_view_plans` (deltas simply gone) and `apply_remote_tick` (executor applied them, coordinator mirror did not → divergence surfaced later as a fence error). | OPEN |
+| DIST-C2 | MED | `krishiv-ivm/src/flow.rs:1985` | `restore_delta` is set-materializing (multiplicity collapse) and resets every view baseline, so delta-restore on top of a full restore is not equivalent to replaying the deltas. | OPEN |
+| DIST-C3 | MED | `ivm_http.rs:1106` | `/restore-delta` advances sources then persists a `checkpoint_full` whose view snapshots have not advanced; `/snap` in between reports stale views against advanced sources with no indication. | OPEN |
+| DIST-C4 | MED | `ivm_http.rs:279` | `api_ivm_list_jobs` fabricates `partitioned: false` for snapshot-only jobs instead of reading the persisted shape. | OPEN |
+| DIST-C5 | MED | `coordinator/mod.rs:514` | With no metadata store configured every "durable" IVM write is a silent no-op: `persist_ivm_job` reports success and `/restore` claims durability, and a restart loses everything with no warning. | OPEN |
+| INT-F12 | MED | `ivm_http.rs:435` | `/feed`, `/stream-delta` and `/stream-bridge` never persist; accepted deltas are not durable until someone calls `/step`. | OPEN |
+| DIST-B3 | MED | `ivm.rs:388`, `:648` | `IvmDispatchState` (attached/fence/last) is in-memory only and reset by `restore_durable_snapshot`; safety after a coordinator restart rests on `delta:attach:` happening to replace the executor map entry. | OPEN |
+| DIST-B2 | MED | `krishiv-ivm/src/flow.rs:1669` | `re_feed` appends, so re-fed (older) deltas sit after deltas fed during the failed dispatch; `observe_source_watermark` and input dedup already ran at original feed time and are not re-run. | OPEN |
+| DIST-H2 | MED | `ivm.rs:519`, `partitioned.rs:118` | Nothing validates that a partitioned job's *other* sources contain the partition key; a dimension source without it hard-errors at feed time as a bare 400, and the decision is irreversible. | OPEN |
+| DIST-H5 | LOW | `ivm_http.rs:90` | `ensure_ivm_job` rehydrates on any touch of any durable job id and rehydrated jobs are never evicted; a listing UI that fetches `/stats` per job pulls every historical flow into coordinator memory permanently. | OPEN |
+| DIST-H6 | LOW | `ivm.rs:560` | Step-after-delete burns a full tick then returns 400 (not 404/409), contradicting the "no-ops" comment. | OPEN |
+| DIST-B4 | LOW | `executor_task_runner.rs:1205` | A "timed out" tick is not cancelled on the executor and may still complete and advance `resident.fence`. | OPEN |
+| DIST-H7 | LOW | `ivm_http.rs:571` | `IVM_DISPATCH_TIMEOUT_SECS = 300` is hardcoded and also bounds how long `DELETE` blocks. | OPEN |
+| DIST-A3 | MED | tests | No test anywhere exercises `submit_resident_ivm_step` through `api_ivm_step`; the fence protocol, re-feed-on-failure, `apply_remote_tick` mirroring and re-attach are integration-untested. | OPEN |
+| DIST-H1 | MED | `ivm_http.rs:2188` | `delta_checkpoint_round_trips` asserts nothing (no content, not even non-emptiness) — passes on the 4-byte empty frame of DIST-C1. | OPEN |
+
+## T4 — Auto-partitioning judges unshardable shapes shardable
+
+| ID | Sev | Where | Claim | Status |
+|---|---|---|---|---|
+| PART-6 | CRIT | `krishiv-ivm/src/plan.rs:395` | `partition_key_from_sql` never inspects `LIMIT`, `ORDER BY` or `FROM`. Consequences: `LIMIT n` runs per shard → up to n×shards rows and a wrong top-N (**and `partitioned.rs:705` asserts this shape IS shardable — a test locking in a wrong answer**); ORDER BY destroyed by concat; joins co-located by the group key instead of the join key → silently lost matches (or hard feed errors); FROM-clause/scalar subqueries computed per shard → wrong denominators; alias shadowing routes on an unrelated column. | OPEN |
+| PART-2 | HIGH | `krishiv-scheduler/src/ivm.rs:519` | Only the *first* view drives the partition decision; every later view is registered on all shards unchecked. A second global-aggregate view yields N partial rows; a second view grouped by a different column splits each group across shards. `second_view_registers_on_already_partitioned_job` enshrines the gap. | OPEN |
+| PART-5 | HIGH | `krishiv-common/src/partition.rs:100` | The shard-key decision never consults the key's type or nullability: `GROUP BY` on Date32/Timestamp/UInt64/Dictionary/Decimal auto-partitions and then *every* feed fails "unsupported type"; a NULL group key is legal on a single flow and rejected once sharded. Auto-partitioning silently changes what data the engine accepts. | OPEN |
+| PART-12 | HIGH | `krishiv-scheduler/src/ivm.rs:196` | The AUD-9 "loud degradation" surface hardcodes `(true, "incremental — key-group partitioned aggregate")` for partitioned jobs without asking a shard how the view actually executes; a view that lowered to DiffBased per shard reports "incremental". | OPEN |
+| PART-13 | HIGH | `krishiv-ivm/src/spill.rs:38` | Each shard lazily builds its own `FairSpillPool` at 25 % of the *whole container*, so an 8-shard job (the default: `min(cores, 8)`) is licensed to use 200 % of the container — the exact OOM the module exists to prevent. | OPEN |
+| PART-4 | MED | `partition.rs:100` | `expected_key_type` consistency is checked only within a single `partition_record_batches_by_key` call; a source emitting `id` as Int32 in one batch and Int64 in another routes the same logical key to two shards. | OPEN |
+| PART-8 | MED | `partitioned.rs:368` | Restore validates shard count but not `key_column`, and `checkpoint`/`checkpoint_full`/`checkpoint_delta` share byte framing with no magic/version tag, so cross-feeding them is not reliably caught. | OPEN |
+| PART-10 | MED | `partitioned.rs:295` | `tick()` reports shard 0's counter, which diverges from siblings after a partial step failure — and that number is what `StepResponse.tick` and the dispatch fence record. | OPEN |
+| PART-11 | MED | `partitioned.rs:305` | `view_output_peek` concatenates per-shard watch values from possibly different ticks and serves them as "the latest delta" with no tick label. | OPEN |
+| PART-3 | MED | `partitioned.rs:154` | Merged `StepSummary` uses `max` for `active_views` (under-reports non-nested sets) and drops `degraded_views`/`errored_views` entirely, so a view that errored inside a shard is invisible. | OPEN |
+| PART-7 | LOW | `plan.rs:423` | Two partition-key detectors disagree (text vs logical-plan); production uses the weaker text one, and the logical one is reachable only from dead code. | OPEN |
+| PART-14 | MED | `krishiv-ivm/src/spill.rs` | No `with_temp_file_path`, no disk-usage cap, and `(limit/4).clamp(64 KiB, 10 MiB)` is not sanity-checked against `limit` (at 64 KiB every sort fails outright). | OPEN |
+| PART-15 | MED | `spill.rs:97` | `tiny_pool_spills_or_errors_instead_of_growing` measures no memory and asserts nothing on success; the two sibling tests pass with the spill code deleted. | OPEN |
+| PART-16 | LOW | `partitioned.rs:54` | `auto_for_view` / `recommended_shards` have zero non-test callers; the module doc's "unified sizing brain" claim is false for every job the system creates. | OPEN |
+
+## T5 — Vector sink and provenance
+
+| ID | Sev | Where | Claim | Status |
+|---|---|---|---|---|
+| PART-17 | CRIT | `krishiv-ivm/src/vector_sink.rs:124` | Upserts run before deletes, and a same-id update delta (`-1 old`, `+1 new`) puts the id in both lists — the delete removes the row the upsert just wrote. Every update to an indexed id silently drops it from the index. No test feeds a mixed-sign delta. | OPEN |
+| PART-18 | HIGH | `vector_sink.rs:182` | `extract_string_at` handles Utf8/LargeUtf8/Int64 but not `Utf8View`, which modern DataFusion emits for string columns (the partition module was fixed for exactly this and has a regression test); every row errors and PART-19 swallows it. | OPEN |
+| PART-19 | HIGH | `vector_sink.rs:109` | Sink errors are `warn`-and-drop with no retry, no counter, no health surface — one transient failure permanently diverges the index from the view. | OPEN |
+| PART-20 | HIGH | `vector_sink.rs:99` | `Lagged(n)` logs and `continue`s: the task keeps running against a now-corrupt index. There is no backpressure — the step engine never waits on the sink. | OPEN |
+| PART-22 | HIGH | `krishiv-ivm/src/provenance.rs:69` | The only production writer (`record_many`) never records epochs, so `gc_before_epoch` can never evict; `record_with_epoch`/`forget_many`/`gc_before_epoch` have zero non-test callers. Provenance, once enabled, grows for the process lifetime. | OPEN |
+| PART-23 | HIGH | `krishiv-ivm/src/flow.rs:1437` | Provenance records a complete bipartite input×output graph per tick: 10 k × 10 k rows = 10⁸ hash inserts — an OOM in one tick — while making `query_provenance` return the whole output set, i.e. the feature's purpose is unreachable and its cost fully paid. | OPEN |
+| PART-21 | MED | `partitioned.rs:328` | `spawn_vector_views` never checks `spec.id_column == self.key_column`; when they differ, two shards can upsert the same id into the shared sink (last-writer-wins). | OPEN |
+| PART-25 | MED | `partitioned.rs` | `enable_provenance_tracking` / `query_provenance` / `forget_provenance` are not forwarded by `PartitionedIncrementalFlow` or `IvmJob`, so provenance is silently impossible for any auto-partitioned job. | OPEN |
+| DIST-H3 | MED | `ivm_http.rs:1186` | `POST /vector-views` creates an `InMemoryVectorSink` inside the handler, moves it into detached tasks and drops the only `Arc` — nothing can ever read what was written. No dedup by view name (N calls = N×shards permanent tasks), and job deletion never stops them. | OPEN |
+| INT-F17 | MED | repo-wide | Phase 36 vector views have no Rust, CLI, Python or MCP surface at all — HTTP-only, `in_memory`-only, and `VectorSinkBridge` (the Qdrant/pgvector adapter) has exactly one caller: its own test. | OPEN |
+| PART-24 | LOW | `provenance.rs:90` | `gc_before_epoch` collects every key below the watermark on each call: O(index) per commit, not O(evicted). | OPEN |
+
+## T6 — API honesty and mode divergence
+
+| ID | Sev | Where | Claim | Status |
+|---|---|---|---|---|
+| API-B4 | HIGH | `_pyspark.py:1104` | `apply_cdc(event)` passes the event as `from_cdc`'s **`before`** positional, so every CDC event becomes a DELETE; `from_cdc(None)` returns `None` → `apply(None)` → `TypeError`. Zero test coverage. | OPEN |
+| API-B5 | HIGH | `krishiv-python/src/incremental_dataframe.rs:83` | Python `apply()` auto-steps and discards the `StepReport`, so a view that fails to evaluate (schema mismatch) returns `None`, raises nothing, and the snapshot silently never changes. | OPEN |
+| API-A5 | HIGH | `krishiv-api/src/compute/ivm.rs:146` | Distributed `step()` hardcodes `degraded_views: vec![]`, `errored_views: vec![]` — and those are the *only* view-level failure channel (they are not `Err`s), so distributed IVM has no failure signal through this API at all. | OPEN |
+| API-B1 | HIGH | `_pyspark.py:1126` | `changes()` is a single non-consuming peek at a coalescing `watch`: N ticks between iterations lose N−1 deltas, an empty tick leaves the previous delta in place (stale, indistinguishable from fresh), two calls yield the same delta twice, and distributed it is an empty loop. The lossless `broadcast` stream (`view_output_stream`) exists and is unwired. | OPEN |
+| API-B2 | HIGH | `_pyspark.py:1109` | `transaction()` does not roll back: feeds already executed inside an aborted block stay in `pending` and are applied by the *next* tick. `_set_defer_step` defers when the tick fires; it is not a transaction boundary. | OPEN |
+| API-D1 | HIGH | `incremental_df.rs:127` vs `incremental_dataframe.rs:71` | `apply()` means opposite things in the two languages (Rust: does not tick; Python: feeds and steps) and the argument order is inverted. | OPEN |
+| API-C1 | HIGH | `_pyspark.py:1143` | `Session.view(iv)` registers an **empty placeholder parquet** under the view's name: `s.view(iv).collect()/.show()/.count()` silently returns 0 rows, and the registration permanently shadows any real session table with that name. | OPEN |
+| API-A1 | HIGH | `ivm_http.rs:140` | Distributed `to_incremental` re-parses the output schema from type-name strings against a 16-type whitelist: Decimal128, timezoned Timestamp, Time32/64, List, Struct, Interval, Null, FixedSizeBinary all 400. The same DataFrame works embedded. | OPEN |
+| API-A2 / INT-F14 | HIGH | `incremental_df.rs:65`, `session.rs:3338` | `ExecutionMode::SingleNode` runs IVM **in the client process** with a private in-memory registry — no daemon visibility, no durable state, no restart-resume — while `Session::submit` for the same engine at SingleNode explicitly uses durable checkpoints and the session doc calls that "the single-node daemon's defining difference from embedded". | OPEN |
+| INT-F13 | HIGH | `krishiv-engines/src/lib.rs:421` | `IncrementalEngine::run` builds a fresh `IncrementalFlow` per run and never touches `rt.checkpoints`; the single-node "durable checkpoints" claim is false for the incremental engine, and the Certified matrix row rests on tests that never restart. | OPEN |
+| API-E2 | HIGH | `connector_runtime.rs:305` vs `krishiv-engines/src/lib.rs:367` | `krishiv ivm run` writes the per-tick consolidated changelog embedded, but only one final snapshot through a **non**-consolidating sink distributed — same command, `-c` flipped, different sink content, and the sink's `primary_key` upsert contract silently dropped. | OPEN |
+| API-E3 / INT-F22 | HIGH | `connector_runtime.rs:266` | The distributed CLI path re-opens every source after a schema probe — the exact data-loss bug `IncrementalEngine` fixed and documented ("its first batch was consumed for its schema and then silently never processed"). | OPEN |
+| API-F4 | MED | `incremental_df.rs:90` | `derive_on_job` does not check `is_partitioned()`; a derived view built on a partitioned parent (reachable via the `pub` `with_ivm_parent`) silently never receives data. | OPEN |
+| API-A7 | MED | `incremental_df.rs:77` | Distributed `IncrementalDataFrame` jobs are never deleted — no `drop`/`close`, `_registry: None` — so every remote handle leaks a coordinator job. | OPEN |
+| API-A6 / INT-F3 | MED | `compute/ivm.rs:57` | `enable_input_dedup()` and `enable_delta_checkpoints()` are `Ok(())` no-ops for remote jobs — the user asks for exactly-once input semantics and gets nothing, exactly where retries happen. | OPEN |
+| API-A3 | MED | `incremental_df.rs:70` vs `session.rs:3338` | `Session::ivm` auto-partitions and `to_incremental` never does, in the same session and mode — an undocumented performance cliff. | OPEN |
+| INT-F15 / API-D5 | MED | `incremental_df.rs:70` | `to_incremental` builds a **private** registry (`with_default_shards(1)`), invisible to `Session::ivm` and to `session.drop_ivm`; two calls with the same name yield two isolated views. | OPEN |
+| INT-F16 | MED | `compute/ivm.rs:41` | `to_incremental` (unpartitioned) and `Session::ivm` (partitioned) create coordinator jobs of different shapes under the same name; `partitioned` is consulted only when the job is genuinely new, so attaching to an existing partitioned job silently fails to cascade. | OPEN |
+| API-F2 | MED | `dataframe.rs:1908` | `df.cache().to_incremental()` succeeds and registers a view whose only feedable source is `_krishiv_cache_N`. | OPEN |
+| API-F7 | MED | `incremental_df.rs:190` | `extract_source_names` is heuristic string-scanning: lowercases identifiers, finds `from`/`join` inside string literals and comments, and treats CTE names as base sources — while `source_names()` is a `pub` getter users are told to trust and a phantom source breaks single-source defaulting. | OPEN |
+| API-F5 | MED | `incremental_df.rs:87` | The one-tick lag of a derived view over an incremental upstream is documented only in a Python test comment. | OPEN |
+| API-F6 | MED | `incremental_df.rs:145` | `step()`'s doc says "returning per-view output counts" and omits that it also returns the sole failure channel. | OPEN |
+| API-B3 | MED | `incremental_dataframe.rs:37` | `transaction()` is a bare `AtomicBool`: not nestable (inner `__exit__` fires a step and breaks the outer block) and not thread-safe. | OPEN |
+| API-D3 | MED | `krishiv.pyi` | The stub file has zero IVM surface — no `IncrementalDataFrame`, `DeltaBatch`, `to_incremental`; `Session.view` is the untyped catch-all. | OPEN |
+| API-D4 | MED | `docs/superpowers/plans/2026-07-24-incremental-dataframe.md:68` | Documented Python API that does not exist: `upsert`, `checkpoint`, `restore`, `drop`, `as_source`. | OPEN |
+| API-D2 | MED | `dataframe.rs:705` | The view-DAG entry point is Python-only in practice; a Rust user must hand-register a table named after the base view. | OPEN |
+| API-C2 | MED | `_pyspark.py:1145` | `Session.view` leaks a `mkdtemp` directory + parquet per call for the process lifetime. | OPEN |
+| API-E4 | MED | `connector_runtime.rs:268` | The distributed CLI silently skips empty sources (no schema contributed) where the embedded engine errors clearly. | OPEN |
+| API-E7 | MED | `ivm_cmd.rs:160` | "net view written to …" is printed unconditionally, even when the view produced no rows and no file was written. | OPEN |
+| API-E8 | MED | `ivm_cmd.rs:132` | `krishiv ivm run -c URL` sets both the Flight and HTTP coordinator URLs from one string, which are different ports; the help text points `-c` at HTTP, making the Flight URL wrong for everything else in that session. | OPEN |
+| API-E1 | MED | `ivm_cmd.rs:128` | The CLI can only reach Embedded and Distributed, so the one mode whose `submit` uses durable checkpoints (SingleNode) is unreachable; reruns always start from zero. | OPEN |
+| API-E5 / INT-CDC | MED | `connector_runtime.rs:294`, `driver.rs:260` | Multi-source runs drain source #1 fully before opening #2, so an incremental join emits a long run of empty/partial deltas and the emitted changelog is order-dependent on CLI flag order. Intra-tick insert+delete of the same row consolidates to weight 0 and emits nothing — correct DBSP, undocumented on the change-feed surface. | OPEN |
+| INT-F23 | MED | `connector_runtime.rs:296` | `run_incremental_job_via_ivm` steps after every batch, ignoring `RunPolicy` (the pipeline driver has a real pacer). | OPEN |
+| INT-F5 | HIGH | `ivm_http.rs:884` | `/output` is a coalescing watch peek with no `tick`/cursor (while `StepResponse` has one), so a consumer polling slower than `/step` silently loses deltas; the lossless broadcast stream is not exposed over HTTP at all. | OPEN |
+| INT-F6 | MED | `compute/ivm.rs:77` | `RemoteIvmJob` has no change feed: `last_output()` returns `Ok(None)` forever distributed, with no error, and `/stats` returns counters not deltas. | OPEN |
+| INT-F4 | MED | `cert_matrix.rs:157` | IVM has no sink contract, no delivery metadata and no row in the delivery matrix; `CompiledJob::delivery` is never read by any engine. Output is pull-only, best-effort. | OPEN |
+| INT-F9 | MED | `coordinator_http_client.rs:2328` | The stream-bridge client doc describes pushing "micro-batch snapshots" while the endpoint differentiates whole snapshots (a micro-batch retracts everything else), and it points at `feed_stream_output`, a function that does not exist. | OPEN |
+| API-C3 | MED | `_pyspark.py:1156` | `Session.view`'s placeholder registration replaces a real table of the same name for the rest of the session. | OPEN |
+| API-C4 | LOW | `_pyspark.py:1157` | View name is interpolated unquoted into SQL. | OPEN |
+| API-A4 | LOW | `incremental_df.rs:70` | Two different mechanisms express "pin single" (`with_default_shards(1)` vs `create_unpartitioned`); the embedded one bypasses `pinned_single` and is protected only by coincidence. | OPEN |
+| API-E6 | LOW | `ivm_cmd.rs:83` | Duplicate `--source` names are accepted silently. | OPEN |
+| API-F3 | LOW | `dataframe.rs:1925` | `ivm_parent` propagates through `cache()`. | OPEN |
+
+## T7 — Dead surfaces, tests that cannot fail, wire waste
+
+| ID | Sev | Where | Claim | Status |
+|---|---|---|---|---|
+| DDL-F1 | HIGH | `krishiv-sql/src/live_table.rs:155` | `CREATE LIVE TABLE` is an end-to-end no-op: `NodeOp::CreateLiveTable`/`RefreshLiveTable`/`DropLiveTable` have **zero handlers** repo-wide. DDL returns success, then `SELECT * FROM t` fails "table not found". `Session::create_live_table(Refresh::Incremental)` deliberately routes around it. | OPEN |
+| DDL-E3 | HIGH | `krishiv-sql/src/incremental_view.rs:16` | The documented "auto-DISTINCT" for `DECLARE RECURSIVE VIEW` does not exist anywhere; the doc's own transitive-closure example diverges on a cyclic graph, hits the iteration cap, and (with CORE-12) is served as a truncated answer with no signal. | OPEN |
+| CORE-12 | HIGH | `krishiv-ivm/src/flow.rs:1093` | Fixpoint non-convergence at `MAX_FIXPOINT_ITERS` publishes the 100th iterate as the view's value with no `ViewError` and no summary field — a divergence *cap*, not a guard. | OPEN |
+| CORE-11 | HIGH | `krishiv-ivm/src/flow.rs:1108` | The recursive branch never records a `ViewError` (the non-recursive branch does), so a recursive view whose SQL fails publishes an empty result — retracting the entire view — and reports a clean tick. | OPEN |
+| CORE-10 | HIGH | `krishiv-ivm/src/flow.rs:1090` | `differentiate(...).map(|d| d.is_empty()).unwrap_or(true)` treats a diff *error* as convergence, terminating the fixpoint at a non-fixed point. | OPEN |
+| CORE-13 | MED | `krishiv-ivm/src/flow.rs:1074` | Nothing verifies a recursive view's body is set-semantic; termination rests entirely on the iteration cap plus CORE-12. | OPEN |
+| DDL-B2 | MED | `krishiv-api/src/session.rs:2828` | `is_materialized` is parsed, stored, then overwritten with a literal `true`, making `CREATE INCREMENTAL VIEW` and `CREATE MATERIALIZED INCREMENTAL VIEW` byte-identical in behaviour. | OPEN |
+| DDL-B5 | MED | `krishiv-sql/src/incremental_view.rs:348` | `CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS …` registers under the name `"IF NOT EXISTS mv"` — and this is the branch advertised as the SQL-standard front door for JDBC/BI clients. | OPEN |
+| DDL-F2 | MED | `krishiv-sql/src/lib.rs:2728` | `REFRESH INCREMENTAL VIEW` is behaviourally identical to the fallthrough arm; the "sentinel so the caller knows to refresh" the comment describes does not exist. | OPEN |
+| DDL-C | MED | `krishiv-sql/src/incremental_view.rs:3` | The module front-page documents `CREATE INCREMENTAL VIEW` / `REFRESH` / `DROP` with no mention that nothing is maintained without `CREATE SOURCE` + `CREATE SINK` + `START PIPELINE`; there is no `INSERT INTO base` → view-maintenance path. | OPEN |
+| INT-F20 | MED | `krishiv-ivm/src/flow.rs:2459` | The stateless `delta:step:` dispatch path (plus `encode_ivm_ckpt_fragment`, `execute_ivm_fragment`, `encode_batch_map`/`decode_batch_map`) is test-only, yet costs ~800 lines of executor. | OPEN |
+| INT-F7 / DIST-D1 | LOW | `ivm_http.rs:472` | `/stream-delta` is byte-for-byte `/feed` and its client function has no caller; the doc advertises it as a distinct "fast path". | OPEN |
+| INT-F8 | MED | repo-wide | The streaming→IVM bridge is wired end to end but no `StreamingJob`/`drain()` output is ever piped into it — it is a manual user-code seam, not an integration. | OPEN |
+| INT-F19 | MED | `krishiv-ivm/src/flow.rs:2471` | The resident tick wire does base64-of-JSON-of-base64 through five encode/decode layers (~1.78× expansion plus a buffer copy per hop) for a path whose stated purpose is "O(Δ) wire". | OPEN |
+| CORE-25 | HIGH | `krishiv-ivm/src/flow.rs:184` | Eight per-source/per-view maps have no reclaim path (`seen_input_hashes`, `source_ordinals`, `streaming_prev_snapshots`, `checkpoint_deltas`, `watermark_trackers`, `view_delta_stats`, `source_snapshots`, `pending_plan_state`); there is no `drop_source`, and `drop_view` prunes only three of them. | OPEN |
+| CORE-27 | HIGH | `krishiv-ivm/src/flow.rs:1830` | `checkpoint_full`/`restore_full` do not reproduce exact state: tick resets to 0, `pending` is lost, `streaming_prev_snapshots` is lost (next `feed_snapshot` re-inserts the entire snapshot as insertions), dedup hashes, source ordinals, watermarks, delta accumulators and stats all reset. The round-trip test asserts only a SUM. | OPEN |
+| CORE-28 | MED | `krishiv-ivm/src/flow.rs:1838` | `checkpoint_full` writes `(name, snapshot)` and `(name, full_output)` pairs; `restore_full` discards the second name without validating it matches. | OPEN |
+| CORE-29 | MED | `krishiv-ivm/src/flow.rs:1961` | `restore_delta`'s multiplicity collapse is guarded only by a comment. | OPEN |
+| CORE-30 | LOW | `krishiv-ivm/src/flow.rs:1596` | `u32` length prefixes with `as` casts truncate silently above 4 GiB. | OPEN |
+| CORE-26 | LOW | `krishiv-ivm/src/flow.rs:604` | The dedup cap is checked once per `feed` before insertion, so one large batch overshoots by N with no bound. | OPEN |
+| CORE-18 | MED | `krishiv-delta/src/view.rs:86` | `publish_output` advances `full_output` only when materialized while `apply_output_delta` advances it unconditionally — divergent state contracts between the two publish paths. | OPEN |
+| API-G1 | HIGH | `test_incremental_dataframe.py:287` | `test_transaction_rollback_on_exception_does_not_tick` asserts only that the tick advanced by 1 — and its own assertion `step()` is what applies the "rolled back" data. The named invariant is unverified and false. | OPEN |
+| API-G2 | HIGH | `test_change_feed.py:38` | `assert iv.last_output() is not None` cannot fail after any prior successful tick (non-consuming watch peek). Three sites. | OPEN |
+| API-G3 | MED | `test_change_feed.py:35` | `assert len(drain()) >= 1` on a generator that yields at most 1 — structurally incapable of detecting API-B1. | OPEN |
+| API-G4 | LOW | `test_incremental_dataframe.py:271` | Bare `pytest.raises(Exception)` — any exception passes. | OPEN |
+| API-G5/G6/G7 | LOW | `incremental_df.rs:136`, `flow.rs:1522`, `incremental_df.rs:24` | Dead: `apply_and_step`, `view_output_latest` (the correct subscription `changes()` should have used), and the inert `_registry` field. | OPEN |
+| API-G8 | LOW | `incremental_df.rs:237` | `extract_source_names` tests cover only well-formed happy shapes. | OPEN |
+| DDL-F5 | MED | `live_table.rs:358`, `krishiv-api/src/tests.rs:2118`, `tests.rs:2311` | Tautological live-table test; a test that asserts registration and stops one line short of the defect; and **no e2e test anywhere asserts incrementality** — both `START PIPELINE` tests feed once and pass identically under full recompute. No test exercises `DECLARE RECURSIVE VIEW` beyond the parser. | OPEN |
+| DDL-F3/F4 | LOW | `session.rs:2821`, `incremental_view.rs:121` | Dead binding `let _ = &view_entry`; `IncrementalViewRegistry::view_names()` has zero consumers. | OPEN |
+| DIST-A1-doc | MED | `cert_matrix.rs:142` | The distributed-IVM `Preview` label is honest, but nothing discloses that the canonical `GROUP BY` workload never uses executors at all (DIST-A1). | OPEN |
+
+## Verified correct (do not "fix")
+
+Retraction atomicity (`from_update`/`from_cdc` emit `-1`/`+1` in one
+`DeltaBatch`, never splittable across ticks); Z-set consolidation
+order-independence; `differentiate`'s multiset matching via Arrow
+`RowConverter`; the partitioned `feed_snapshot` differentiate-before-route
+design (the obvious per-shard version is wrong and the code says so);
+checkpoint framing bounds-safety (`get(..)` + `slice_err` everywhere, with
+real corrupt-blob tests); `toposort_views`; `source_of_plan`'s refusal to
+peel filters (AUD-1); join-shape rejections (RIGHT/FULL/non-equi);
+MIN_BY/MAX_BY degradation; SEC-1 auth coverage of every IVM route with a
+live regression test; `ensure_ivm_job` rehydration applied uniformly;
+`pinned_single` round-trip trio; delete-waits-for-step-lock (a real test);
+per-job step-lock lifecycle; `drop_zeros` on every ingress; `Utf8View`
+acceptance in both schema parsers; percent-encoded URL segments; the
+batch-vs-incremental oracle tests; the three-level view-DAG cascade test.
