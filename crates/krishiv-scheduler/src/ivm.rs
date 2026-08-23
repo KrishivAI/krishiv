@@ -35,6 +35,7 @@ const IVM_DURABLE_SNAPSHOT_VERSION: u32 = 1;
 struct PersistedIvmViewSpec {
     name: String,
     body_sql: String,
+    #[serde(with = "byte_blob")]
     output_schema_ipc: Vec<u8>,
     is_materialized: bool,
     is_recursive: bool,
@@ -47,11 +48,57 @@ enum PersistedIvmShape {
     Partitioned { shards: usize, key_column: String },
 }
 
+/// Serialize `Vec<u8>` as base64 inside the JSON snapshot, accepting either
+/// base64 or the old array-of-numbers form on the way back in.
+///
+/// IVM-AUD-DIST-G2: `checkpoint_full` and `output_schema_ipc` are raw bytes
+/// with no byte-aware attribute, so `serde_json` wrote them as
+/// `[137,80,78,71,…]` — roughly 4 bytes of JSON per byte of state, applied to
+/// the *entire* flow snapshot on every persist. Base64 is ~1.37x instead.
+/// Deserialization stays permissive so snapshots already on disk still load;
+/// that is also why this is not a `version` bump (`restore_durable_snapshot`
+/// rejects unknown versions, which would make every persisted job unloadable).
+mod byte_blob {
+    use serde::de::{SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        use base64::Engine as _;
+        s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a base64 string or an array of byte values")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Vec<u8>, E> {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD
+                    .decode(v)
+                    .map_err(E::custom)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(b) = seq.next_element::<u8>()? {
+                    out.push(b);
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedIvmJob {
     version: u32,
     shape: PersistedIvmShape,
     views: Vec<PersistedIvmViewSpec>,
+    #[serde(with = "byte_blob")]
     checkpoint_full: Vec<u8>,
     /// Whether the job was created pinned to a single flow
     /// ([`IvmJobRegistry::create_unpartitioned`]).
@@ -194,19 +241,23 @@ impl IvmJob {
     }
 
     /// AUD-9 (loud degradation): classify how a view executes —
-    /// `(incremental, human_reason)`, `None` if not registered. A partitioned
-    /// job only ever exists because its view lowered to an incremental
-    /// key-group aggregate, so it reports incremental directly.
+    /// `(incremental, human_reason)`, `None` if not registered.
+    ///
+    /// IVM-AUD-PART-12: the partitioned arm used to return a hardcoded
+    /// `(true, "incremental — key-group partitioned aggregate")` without asking
+    /// a shard anything, reasoning that a job is only partitioned because its
+    /// first view was a key-group aggregate. That reasoning is about the shape
+    /// of the SQL and is settled before any tick runs; whether a view got an
+    /// O(Δ) plan is settled per shard on the first step and can come out
+    /// DiffBased (an aggregate the planner declines to lower — `COUNT(DISTINCT
+    /// …)`, `SUM(…) FILTER (…)` — a `ctx.sql` failure, a restore that cleared
+    /// the cached plans). So the one surface built to expose a silent
+    /// full-recompute fallback reported "incremental" straight through it.
+    /// Both arms now ask the flow.
     pub fn view_plan_classification(&self, view: &str) -> IvmResult<Option<(bool, String)>> {
         match self {
             IvmJob::Single(f) => f.view_plan_classification(view),
-            IvmJob::Partitioned(p) => Ok(p.view_spec(view)?.map(|_| {
-                (
-                    true,
-                    "incremental — key-group partitioned aggregate (one flow per shard)"
-                        .to_string(),
-                )
-            })),
+            IvmJob::Partitioned(p) => p.view_plan_classification(view),
         }
     }
 
@@ -237,21 +288,80 @@ impl IvmJob {
 
     /// Peek a view's latest output delta (merged across shards when partitioned).
     pub fn view_output_peek(&self, view: &str) -> IvmResult<Option<DeltaBatch>> {
+        Ok(self.view_output_peek_at_tick(view)?.map(|(_, delta)| delta))
+    }
+
+    /// [`view_output_peek`](Self::view_output_peek) with the tick the delta was
+    /// published at.
+    ///
+    /// IVM-AUD-PART-11: a partitioned job merges its shards' coalescing watch
+    /// values, and without the tick there was nothing to merge them *by* — a
+    /// shard that emitted this tick and one still holding a delta from five
+    /// ticks ago were concatenated and served as "the latest delta".
+    pub fn view_output_peek_at_tick(&self, view: &str) -> IvmResult<Option<(u64, DeltaBatch)>> {
         match self {
-            IvmJob::Single(f) => f.view_output_peek(view),
-            IvmJob::Partitioned(p) => p.view_output_peek(view),
+            IvmJob::Single(f) => Ok(match f.view_output_peek(view)? {
+                Some(delta) => f.view_output_tick(view)?.map(|tick| (tick, delta)),
+                None => None,
+            }),
+            IvmJob::Partitioned(p) => p.view_output_peek_at_tick(view),
         }
     }
 
     /// Spawn a vector-view background task (one per shard when partitioned, all
-    /// writing the shared sink). Returns the join handles.
+    /// writing the shared sink).
+    ///
+    /// The returned handles **own** the tasks: drop them and maintenance stops.
+    /// The caller must keep them (see `IvmJobRegistry::register_vector_view`).
     pub fn spawn_vector_views(
         &self,
         spec: krishiv_ivm::VectorViewSpec,
-    ) -> IvmResult<Vec<tokio::task::JoinHandle<()>>> {
+    ) -> IvmResult<Vec<krishiv_ivm::VectorViewHandle>> {
         match self {
             IvmJob::Single(f) => Ok(vec![krishiv_ivm::spawn_vector_view(f, spec)?]),
             IvmJob::Partitioned(p) => p.spawn_vector_views(spec),
+        }
+    }
+
+    /// Enable tick-granular provenance tracking (every shard when partitioned).
+    ///
+    /// IVM-AUD-PART-25: the three provenance calls stopped at `IncrementalFlow`
+    /// and were forwarded by neither `PartitionedIncrementalFlow` nor this enum,
+    /// so provenance was quietly unavailable to every auto-partitioned job.
+    ///
+    /// Note what it can record: provenance is written only for views that
+    /// execute on the **DiffBased** path, and a job is partitioned precisely
+    /// because its first view lowered to an incremental key-group aggregate —
+    /// so on a partitioned job it is the job's *other*, non-incremental views
+    /// that produce provenance, not the one that caused the partitioning.
+    pub fn enable_provenance_tracking(&self) -> IvmResult<()> {
+        match self {
+            IvmJob::Single(f) => f.enable_provenance_tracking(),
+            IvmJob::Partitioned(p) => p.enable_provenance_tracking(),
+        }
+    }
+
+    /// Output row hashes recorded for `input_hash` (unioned across shards).
+    ///
+    /// Returned sorted, as a `Vec`, because every caller above this line is a
+    /// serialization boundary.
+    pub fn query_provenance(&self, input_hash: u64) -> IvmResult<Option<Vec<u64>>> {
+        let hashes = match self {
+            IvmJob::Single(f) => f.query_provenance(input_hash)?,
+            IvmJob::Partitioned(p) => p.query_provenance(input_hash)?,
+        };
+        Ok(hashes.map(|set| {
+            let mut v: Vec<u64> = set.into_iter().collect();
+            v.sort_unstable();
+            v
+        }))
+    }
+
+    /// Drop the provenance mapping for `input_hash` (every shard when partitioned).
+    pub fn forget_provenance(&self, input_hash: u64) -> IvmResult<()> {
+        match self {
+            IvmJob::Single(f) => f.forget_provenance(input_hash),
+            IvmJob::Partitioned(p) => p.forget_provenance(input_hash),
         }
     }
 
@@ -395,6 +505,79 @@ pub struct IvmJobRegistry {
     step_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Phase 57: per-job resident dispatch state (fence, attach, last decision).
     dispatch: Mutex<HashMap<String, IvmDispatchState>>,
+    /// Vector views registered on each job: `job_id -> view_name -> view`.
+    ///
+    /// IVM-AUD-DIST-H3: `POST /vector-views` built an `InMemoryVectorSink`,
+    /// moved it into detached per-shard tasks and dropped the only `Arc` on the
+    /// way out of the handler — so nothing could ever read what the tasks
+    /// wrote, N calls with the same view name spawned N×shards permanent tasks,
+    /// and deleting the job stopped none of them. Registering here is what makes
+    /// the sink readable, the name unique, and the tasks stoppable.
+    vector_views: Mutex<HashMap<String, HashMap<String, RegisteredVectorView>>>,
+}
+
+/// One vector view registered on a job: its spec, its sink, and the maintenance
+/// tasks writing it.
+#[derive(Debug)]
+pub struct RegisteredVectorView {
+    pub view_name: String,
+    pub id_column: String,
+    pub vector_column: String,
+    pub sink_type: String,
+    /// The in-memory sink the maintenance tasks write.
+    ///
+    /// Held here because it is the **only** way to read what they wrote:
+    /// `IvmVectorSink` is a write-only trait, so a dropped `Arc` means the
+    /// contents are unreachable for the rest of the process's life.
+    sink: Arc<krishiv_ivm::InMemoryVectorSink>,
+    /// One maintenance handle per shard. Dropping them aborts the tasks, which
+    /// is how job deletion and view replacement stop maintenance.
+    handles: Vec<krishiv_ivm::VectorViewHandle>,
+}
+
+impl RegisteredVectorView {
+    pub fn new(
+        view_name: String,
+        id_column: String,
+        vector_column: String,
+        sink_type: String,
+        sink: Arc<krishiv_ivm::InMemoryVectorSink>,
+        handles: Vec<krishiv_ivm::VectorViewHandle>,
+    ) -> Self {
+        Self {
+            view_name,
+            id_column,
+            vector_column,
+            sink_type,
+            sink,
+            handles,
+        }
+    }
+
+    /// Number of shard maintenance tasks.
+    pub fn shards(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// Number of points currently in the sink.
+    pub fn points(&self) -> usize {
+        self.sink.len()
+    }
+
+    /// The vector stored for `id`, if any. The read path DIST-H3 was missing.
+    pub fn get(&self, id: &str) -> Option<Vec<f32>> {
+        self.sink.get(id)
+    }
+
+    /// Per-shard health of the maintenance tasks.
+    pub fn shard_status(&self) -> Vec<krishiv_ivm::VectorViewStatus> {
+        self.handles.iter().map(|h| h.health().status()).collect()
+    }
+
+    /// True when any shard's index is known to have diverged from the view.
+    pub fn diverged(&self) -> bool {
+        self.handles.iter().any(|h| h.health().is_diverged())
+    }
 }
 
 impl std::fmt::Debug for IvmJob {
@@ -414,6 +597,7 @@ impl Default for IvmJobRegistry {
             pinned_single: Mutex::new(std::collections::HashSet::new()),
             step_locks: Mutex::new(HashMap::new()),
             dispatch: Mutex::new(HashMap::new()),
+            vector_views: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -431,6 +615,7 @@ impl IvmJobRegistry {
             pinned_single: Mutex::new(std::collections::HashSet::new()),
             step_locks: Mutex::new(HashMap::new()),
             dispatch: Mutex::new(HashMap::new()),
+            vector_views: Mutex::new(HashMap::new()),
         }
     }
 
@@ -499,11 +684,31 @@ impl IvmJobRegistry {
     /// Register (or update) a view on a job, auto-partitioning when eligible.
     ///
     /// The partition decision is made here, on the **first** view of a job: if
-    /// the job is still a fresh single flow (no views yet) and the view is a
-    /// single-column `GROUP BY` aggregate, the job is upgraded in place to a
-    /// [`PartitionedIncrementalFlow`] keyed on that column, sized by
-    /// [`default_ivm_shards`]. All subsequent views register on the chosen
-    /// flow. Non-shardable first views leave the job single.
+    /// the job is still a fresh single flow (no views yet), the view is a
+    /// single-column `GROUP BY` aggregate ([`partition_key_from_sql`]) **and**
+    /// the key column is one the router can actually route, the job is upgraded
+    /// in place to a [`PartitionedIncrementalFlow`] keyed on that column, sized
+    /// by [`default_ivm_shards`]. Non-shardable first views leave the job
+    /// single.
+    ///
+    /// # Every later view is checked against the shape the first one chose
+    ///
+    /// IVM-AUD-PART-2: subsequent views used to register on all shards with no
+    /// check at all, which silently broke them in two distinct ways. A second
+    /// view with no `GROUP BY` (`SELECT SUM(amount) FROM orders`) computes a
+    /// *partial* aggregate per shard, so the job's answer for it is N rows
+    /// where one was asked for. A second view grouped by a different column
+    /// splits each of its groups across every shard that happens to hold one of
+    /// its rows, so each group appears N times with partial values. Both look
+    /// like a healthy job — no error, a plausible row count, wrong numbers.
+    /// A later view must now be shardable by the **same** key, or it is
+    /// rejected with an error naming the job's key.
+    ///
+    /// The alternative — silently keeping the job single by rebuilding it
+    /// unpartitioned — is not available: the job may already hold sharded state
+    /// and be mid-stream, and collapsing it would be a data move the caller
+    /// never asked for. Rejection leaves the caller a working choice (a
+    /// separate job, or a compatible `GROUP BY`).
     pub fn register_view(&self, job_id: &str, spec: IncrementalViewSpec) -> Result<(), IvmError> {
         let mut jobs = self
             .jobs
@@ -513,6 +718,13 @@ impl IvmJobRegistry {
             .get(job_id)
             .ok_or_else(|| IvmError::execution(format!("IVM job not found: {job_id}")))?
             .clone();
+
+        // A later view on an already-partitioned job must fit that job's
+        // partitioning (IVM-AUD-PART-2).
+        if let IvmJob::Partitioned(part) = &job {
+            check_view_fits_partitioning(part.key_column(), part.num_shards(), &spec)?;
+            return job.register_view(spec);
+        }
 
         // Only a fresh, unpartitioned, view-less job is a candidate for upgrade —
         // and never a job pinned single by a composition-capable caller.
@@ -526,6 +738,7 @@ impl IvmJobRegistry {
             && flow.view_names().map(|v| v.is_empty()).unwrap_or(false)
             && self.default_shards > 1
             && let Some(key) = partition_key_from_sql(&spec.body_sql)
+            && routable_key_type(&key, &spec).is_some()
         {
             let part = PartitionedIncrementalFlow::new(self.default_shards, key);
             part.register_view(spec)?;
@@ -553,7 +766,95 @@ impl IvmJobRegistry {
         let _ = self.pinned_single.lock().map(|mut p| p.remove(job_id));
         // Drop dispatch bookkeeping (a recreated job starts unattached).
         let _ = self.dispatch.lock().map(|mut d| d.remove(job_id));
+        // Stop this job's vector-view maintenance tasks (DIST-H3: they used to
+        // outlive the job forever, holding a flow that nothing else referenced).
+        // Dropping a `VectorViewHandle` aborts its task.
+        let _ = self
+            .vector_views
+            .lock()
+            .map(|mut v| v.remove(job_id))
+            .map(drop);
         removed
+    }
+
+    // ── vector views (IVM-AUD-DIST-H3) ────────────────────────────────────────
+
+    /// Register a vector view on `job_id`, keeping its sink and its per-shard
+    /// maintenance handles alive.
+    ///
+    /// Returns `Err` if a vector view of that name is already registered on the
+    /// job: re-registering used to spawn a second full set of shard tasks
+    /// against the same view, each with its own unreachable sink, and there was
+    /// no way to stop either set. Drop the view first if you mean to replace it.
+    pub fn register_vector_view(
+        &self,
+        job_id: &str,
+        view: RegisteredVectorView,
+    ) -> Result<(), IvmError> {
+        let mut all = match self.vector_views.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let per_job = all.entry(job_id.to_string()).or_default();
+        if per_job.contains_key(&view.view_name) {
+            return Err(IvmError::execution(format!(
+                "vector view '{}' is already registered on IVM job '{job_id}';                  delete it first to replace it",
+                view.view_name
+            )));
+        }
+        per_job.insert(view.view_name.clone(), view);
+        Ok(())
+    }
+
+    /// Read something from a job's vector view under the registry lock.
+    ///
+    /// `None` when the job or the view is unknown. The closure form keeps the
+    /// sink `Arc` inside the registry — handing it out would recreate exactly
+    /// the lifetime confusion DIST-H3 filed.
+    pub fn with_vector_view<R>(
+        &self,
+        job_id: &str,
+        view_name: &str,
+        f: impl FnOnce(&RegisteredVectorView) -> R,
+    ) -> Option<R> {
+        let all = match self.vector_views.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        all.get(job_id).and_then(|m| m.get(view_name)).map(f)
+    }
+
+    /// Apply `f` to every vector view registered on `job_id`.
+    pub fn map_vector_views<R>(
+        &self,
+        job_id: &str,
+        f: impl Fn(&RegisteredVectorView) -> R,
+    ) -> Vec<R> {
+        let all = match self.vector_views.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let Some(per_job) = all.get(job_id) else {
+            return Vec::new();
+        };
+        let mut names: Vec<&String> = per_job.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .filter_map(|n| per_job.get(n))
+            .map(f)
+            .collect()
+    }
+
+    /// Stop and forget a vector view. Returns `true` if it existed.
+    pub fn delete_vector_view(&self, job_id: &str, view_name: &str) -> bool {
+        let mut all = match self.vector_views.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        all.get_mut(job_id)
+            .and_then(|m| m.remove(view_name))
+            .is_some()
     }
 
     /// List all job IDs.
@@ -656,6 +957,64 @@ impl IvmJobRegistry {
         }
         self.update_dispatch(job_id, |dispatch| *dispatch = IvmDispatchState::default());
         Ok(())
+    }
+}
+
+/// The Arrow type `key` will be routed by, if the view's declared output
+/// schema names it and the keyed router supports it.
+///
+/// IVM-AUD-PART-5: the partition decision never consulted the key's type, so a
+/// `GROUP BY` on a `Date32`, `Timestamp`, `UInt64`, `Dictionary` or `Decimal`
+/// column auto-partitioned happily and then failed **every** feed with
+/// "unsupported partition key type" — auto-partitioning turned a working view
+/// into a job that cannot accept data, with no way back (the shape is decided
+/// once, at first registration).
+///
+/// The type consulted is the key column's declared *output* type, which is the
+/// only one that exists at registration time — views are registered before any
+/// source has arrived. For a plain-column `GROUP BY` that is by definition the
+/// input column's type, so a caller whose declaration disagrees with what it
+/// then feeds is already wrong about its own schema, and the router's own
+/// type check still catches it at feed time.
+///
+/// A key the output schema does not mention (`SELECT COUNT(*) FROM orders
+/// GROUP BY region`) is not partitioned: the shape is shardable, but there is
+/// nothing to check the routed type against, and committing to a shape that
+/// might reject every feed is exactly the failure above.
+fn routable_key_type(key: &str, spec: &IncrementalViewSpec) -> Option<arrow::datatypes::DataType> {
+    let field = spec
+        .output_schema
+        .fields()
+        .iter()
+        .find(|f| f.name().eq_ignore_ascii_case(key))?;
+    krishiv_common::partition::is_supported_partition_key_type(field.data_type())
+        .then(|| field.data_type().clone())
+}
+
+/// Reject a view that cannot be maintained correctly on a job already sharded
+/// by `key_column`. See [`IvmJobRegistry::register_view`] for why.
+fn check_view_fits_partitioning(
+    key_column: &str,
+    shards: usize,
+    spec: &IncrementalViewSpec,
+) -> Result<(), IvmError> {
+    let name = &spec.name;
+    match partition_key_from_sql(&spec.body_sql) {
+        Some(key) if key.eq_ignore_ascii_case(key_column) => Ok(()),
+        Some(key) => Err(IvmError::execution(format!(
+            "view '{name}' groups by '{key}' but this job is sharded by \
+             '{key_column}' across {shards} shards, so each of its groups would \
+             be split across shards and reported {shards} times with partial \
+             values. Register it on a separate job, or group it by \
+             '{key_column}'."
+        ))),
+        None => Err(IvmError::execution(format!(
+            "view '{name}' is not shardable by '{key_column}' (it is not a \
+             single-column GROUP BY on that column over one table), but this \
+             job is sharded by '{key_column}' across {shards} shards — it would \
+             be computed once per shard over that shard's rows only. Register \
+             it on a separate job."
+        ))),
     }
 }
 
@@ -951,6 +1310,52 @@ mod tests {
         assert!(restored.get("legacy").is_some());
     }
 
+    /// IVM-AUD-DIST-G2. `checkpoint_full` and `output_schema_ipc` are raw bytes
+    /// with no byte-aware serde attribute, so every persist wrote the entire
+    /// flow state as a JSON array of decimal numbers — roughly 4 bytes of JSON
+    /// per byte of state. Snapshots already on disk are in that form, so the
+    /// reader must still accept it.
+    #[tokio::test]
+    async fn a_snapshot_encodes_bytes_compactly_and_still_reads_the_old_array_form() {
+        let reg = IvmJobRegistry::with_default_shards(1);
+        reg.create("blob".into()).unwrap();
+        let snapshot = reg.durable_snapshot("blob").unwrap();
+
+        let value: serde_json::Value = serde_json::from_slice(&snapshot).unwrap();
+        assert!(
+            value.get("checkpoint_full").is_some_and(|v| v.is_string()),
+            "checkpoint_full must persist as a base64 string, not a number array"
+        );
+
+        // Rewrite it in the old array form and prove it still loads.
+        let mut legacy = value.clone();
+        let bytes: Vec<u8> = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(value["checkpoint_full"].as_str().unwrap())
+                .unwrap()
+        };
+        legacy["checkpoint_full"] = serde_json::Value::Array(
+            bytes
+                .iter()
+                .map(|b| serde_json::Value::from(*b))
+                .collect::<Vec<_>>(),
+        );
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        assert!(
+            legacy_bytes.len() > snapshot.len(),
+            "precondition: the array form is the bigger one ({} vs {})",
+            legacy_bytes.len(),
+            snapshot.len()
+        );
+
+        let restored = IvmJobRegistry::with_default_shards(1);
+        restored
+            .restore_durable_snapshot("blob", &legacy_bytes)
+            .expect("a snapshot in the old array form must still load");
+        assert!(restored.get("blob").is_some());
+    }
+
     // ── shard-count policy (escape hatch) ─────────────────────────────────────
 
     #[test]
@@ -1013,13 +1418,14 @@ mod tests {
         assert!(!reg.get("j").unwrap().is_partitioned());
     }
 
+    /// A later view that shards by the same key is fine — that is the whole
+    /// point of a partitioned job holding more than one view.
     #[test]
-    fn second_view_registers_on_already_partitioned_job() {
+    fn a_second_view_on_the_same_key_registers_on_a_partitioned_job() {
         let reg = IvmJobRegistry::with_default_shards(3);
         reg.create("j".into()).unwrap();
         reg.register_view("j", revenue_spec()).unwrap();
         assert!(reg.get("j").unwrap().is_partitioned());
-        // A second GROUP BY view on the partitioned job registers without error.
         let spec2 = IncrementalViewSpec {
             name: "revenue2".into(),
             body_sql: "SELECT region, COUNT(*) AS n FROM orders GROUP BY region".into(),
@@ -1032,7 +1438,217 @@ mod tests {
             lateness: vec![],
         };
         reg.register_view("j", spec2).unwrap();
+        assert_eq!(reg.get("j").unwrap().view_names().len(), 2);
+        // Re-registering the first view (an update) must not trip the check.
+        reg.register_view("j", revenue_spec()).unwrap();
+    }
+
+    /// IVM-AUD-PART-2: only the *first* view drove the partition decision, and
+    /// every later one was registered on all shards unchecked. This test used
+    /// to assert exactly that gap ("a second GROUP BY view registers without
+    /// error", with a view that happened to share the key), so it could not
+    /// distinguish "checked and compatible" from "never checked".
+    ///
+    /// Both incompatible shapes are checked here because they fail differently:
+    /// a global aggregate yields N partial rows where one was asked for, and a
+    /// differently-grouped view splits each group across every shard.
+    #[tokio::test]
+    async fn an_incompatible_later_view_is_rejected_from_a_partitioned_job() {
+        let reg = IvmJobRegistry::with_default_shards(3);
+        reg.create("j".into()).unwrap();
+        reg.register_view("j", revenue_spec()).unwrap();
         assert!(reg.get("j").unwrap().is_partitioned());
+
+        // (a) A second view with no GROUP BY: one row per shard, not one row.
+        let global = IncrementalViewSpec {
+            name: "grand_total".into(),
+            body_sql: "SELECT SUM(amount) AS total FROM orders".into(),
+            output_schema: Arc::new(Schema::new(vec![Field::new(
+                "total",
+                DataType::Float64,
+                true,
+            )])),
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        };
+        let err = reg
+            .register_view("j", global.clone())
+            .expect_err("a global aggregate cannot be maintained on a sharded job")
+            .to_string();
+        assert!(
+            err.contains("grand_total") && err.contains("region"),
+            "{err}"
+        );
+
+        // (b) A second view grouped by another column: each of its groups is
+        // split across every shard holding one of its rows.
+        let other_key = IncrementalViewSpec {
+            name: "by_amount".into(),
+            body_sql: "SELECT amount, COUNT(*) AS n FROM orders GROUP BY amount".into(),
+            output_schema: Arc::new(Schema::new(vec![
+                Field::new("amount", DataType::Int64, true),
+                Field::new("n", DataType::Int64, true),
+            ])),
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        };
+        let err = reg
+            .register_view("j", other_key)
+            .expect_err("a differently-grouped view splits its groups across shards")
+            .to_string();
+        assert!(err.contains("amount") && err.contains("region"), "{err}");
+
+        // Neither was registered, and the job is unchanged.
+        assert_eq!(
+            reg.get("j").unwrap().view_names(),
+            vec!["revenue".to_string()]
+        );
+
+        // The same global aggregate is perfectly fine on its own (single) job —
+        // it is the *combination* that is unmaintainable, and the message says
+        // so. This also shows what the caller's escape route actually is.
+        reg.create("g".into()).unwrap();
+        reg.register_view("g", global).unwrap();
+        let solo = reg.get("g").unwrap();
+        assert!(!solo.is_partitioned());
+        solo.feed(
+            "orders",
+            krishiv_ivm::DeltaBatch::from_inserts(orders(&["US", "EU"], &[10, 20])).unwrap(),
+        )
+        .unwrap();
+        solo.step_datafusion().await.unwrap();
+        assert_eq!(solo.snapshot("grand_total").unwrap().unwrap().num_rows(), 1);
+    }
+
+    /// IVM-AUD-PART-5: the partition decision never looked at the key's type,
+    /// so `GROUP BY` on a key the keyed router cannot hash auto-partitioned and
+    /// then failed *every* feed with "unsupported partition key type" — a view
+    /// that works unpartitioned turned into a job that accepts no data at all,
+    /// irreversibly (the shape is chosen once).
+    #[test]
+    fn a_key_the_router_cannot_hash_does_not_partition_the_job() {
+        use arrow::datatypes::TimeUnit;
+
+        let by_key = |name: &str, key_type: DataType| IncrementalViewSpec {
+            name: "daily".into(),
+            body_sql: format!("SELECT {name}, SUM(amount) AS total FROM events GROUP BY {name}"),
+            output_schema: Arc::new(Schema::new(vec![
+                Field::new(name, key_type, true),
+                Field::new("total", DataType::Float64, true),
+            ])),
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        };
+
+        let reg = IvmJobRegistry::with_default_shards(3);
+        for (name, key_type) in [
+            ("event_date", DataType::Date32),
+            ("event_ts", DataType::Timestamp(TimeUnit::Microsecond, None)),
+            ("big_id", DataType::UInt64),
+            ("price", DataType::Decimal128(10, 2)),
+            (
+                "tag",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            ),
+        ] {
+            let job_id = format!("j_{name}");
+            reg.create(job_id.clone()).unwrap();
+            reg.register_view(&job_id, by_key(name, key_type.clone()))
+                .unwrap();
+            assert!(
+                !reg.get(&job_id).unwrap().is_partitioned(),
+                "a {key_type} key must not auto-partition: every feed would fail"
+            );
+        }
+
+        // A routable key still partitions — the gate is about the type, not a
+        // blanket refusal.
+        reg.create("ok".into()).unwrap();
+        reg.register_view("ok", by_key("account", DataType::Int64))
+            .unwrap();
+        assert!(reg.get("ok").unwrap().is_partitioned());
+
+        // A key the output schema does not mention cannot be type-checked, so
+        // the job stays single rather than gambling on it.
+        reg.create("unprojected".into()).unwrap();
+        reg.register_view(
+            "unprojected",
+            IncrementalViewSpec {
+                name: "counts".into(),
+                body_sql: "SELECT COUNT(*) AS n FROM orders GROUP BY region".into(),
+                output_schema: Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)])),
+                is_materialized: true,
+                is_recursive: false,
+                lateness: vec![],
+            },
+        )
+        .unwrap();
+        assert!(!reg.get("unprojected").unwrap().is_partitioned());
+    }
+
+    /// IVM-AUD-PART-12: the "loud degradation" surface hardcoded `(true,
+    /// "incremental — key-group partitioned aggregate")` for every partitioned
+    /// job without asking a shard. `COUNT(DISTINCT …)` is a legitimately
+    /// shardable single-key aggregate that the planner will not lower, so every
+    /// shard runs it as a full recompute — and the surface built to expose
+    /// exactly that reported "incremental".
+    #[tokio::test]
+    async fn a_partitioned_view_reports_the_strategy_its_shards_actually_use() {
+        let reg = IvmJobRegistry::with_default_shards(3);
+        reg.create("d".into()).unwrap();
+        reg.register_view(
+            "d",
+            IncrementalViewSpec {
+                name: "distinct_amounts".into(),
+                body_sql: "SELECT region, COUNT(DISTINCT amount) AS n FROM orders GROUP BY region"
+                    .into(),
+                output_schema: Arc::new(Schema::new(vec![
+                    Field::new("region", DataType::Utf8, true),
+                    Field::new("n", DataType::Int64, true),
+                ])),
+                is_materialized: true,
+                is_recursive: false,
+                lateness: vec![],
+            },
+        )
+        .unwrap();
+        let job = reg.get("d").unwrap();
+        assert!(job.is_partitioned());
+        job.feed(
+            "orders",
+            krishiv_ivm::DeltaBatch::from_inserts(orders(&["US", "EU", "US"], &[1, 2, 1])).unwrap(),
+        )
+        .unwrap();
+        job.step_datafusion().await.unwrap();
+
+        let (incremental, why) = job
+            .view_plan_classification("distinct_amounts")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !incremental,
+            "a view every shard runs as a full recompute must not report incremental: {why}"
+        );
+
+        // A view that does lower still reports incremental, so the surface has
+        // not simply been made to say "no".
+        reg.create("i".into()).unwrap();
+        reg.register_view("i", revenue_spec()).unwrap();
+        let agg = reg.get("i").unwrap();
+        assert!(agg.is_partitioned());
+        agg.feed(
+            "orders",
+            krishiv_ivm::DeltaBatch::from_inserts(orders(&["US", "EU"], &[1, 2])).unwrap(),
+        )
+        .unwrap();
+        agg.step_datafusion().await.unwrap();
+        assert!(
+            agg.view_plan_classification("revenue").unwrap().unwrap().0,
+            "a key-group aggregate that did lower must still report incremental"
+        );
     }
 
     #[test]
@@ -1183,6 +1799,153 @@ mod tests {
         for h in handles {
             h.abort();
         }
+    }
+
+    /// A view whose output carries a string id and a `FixedSizeList<Float32>`
+    /// vector, so a vector view over it actually indexes something.
+    fn vec_view_spec() -> IncrementalViewSpec {
+        IncrementalViewSpec {
+            name: "docs".into(),
+            body_sql: "SELECT * FROM src".into(),
+            output_schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new(
+                    "v",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        2,
+                    ),
+                    false,
+                ),
+            ])),
+            is_materialized: false,
+            is_recursive: false,
+            lateness: vec![],
+        }
+    }
+
+    fn vec_delta(id: &str, v: [f32; 2]) -> DeltaBatch {
+        use arrow::array::{FixedSizeListArray, Float32Array};
+        let vectors = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            2,
+            Arc::new(Float32Array::from(v.to_vec())),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            vec_view_spec().output_schema,
+            vec![
+                Arc::new(StringArray::from(vec![id])) as _,
+                Arc::new(vectors) as _,
+            ],
+        )
+        .unwrap();
+        DeltaBatch::from_inserts(batch).unwrap()
+    }
+
+    /// IVM-AUD-DIST-H3: deleting a job must stop its vector-view maintenance.
+    ///
+    /// The tasks hold their own `Arc` to the flow, so before the registry kept
+    /// their handles nothing could ever stop them: deleting the job removed the
+    /// registry entry and the tasks went on indexing the flow forever.
+    #[tokio::test]
+    async fn deleting_a_job_stops_its_vector_view_tasks() {
+        use krishiv_ivm::{InMemoryVectorSink, VectorViewSpec};
+
+        let reg = IvmJobRegistry::with_default_shards(1);
+        reg.create_unpartitioned("v".into()).unwrap();
+        let job = reg.get("v").unwrap();
+        job.register_view(vec_view_spec()).unwrap();
+
+        let sink = InMemoryVectorSink::new();
+        let handles = job
+            .spawn_vector_views(VectorViewSpec {
+                view_name: "docs".into(),
+                id_column: "id".into(),
+                vector_column: "v".into(),
+                sink: Arc::clone(&sink) as Arc<dyn krishiv_ivm::IvmVectorSink>,
+            })
+            .unwrap();
+        reg.register_vector_view(
+            "v",
+            RegisteredVectorView::new(
+                "docs".into(),
+                "id".into(),
+                "v".into(),
+                "in_memory".into(),
+                Arc::clone(&sink),
+                handles,
+            ),
+        )
+        .unwrap();
+
+        // Keep the flow alive independently of the registry — exactly the way
+        // the detached tasks used to.
+        let IvmJob::Single(flow) = &job else {
+            panic!("expected a single flow");
+        };
+
+        let publish = |id: &str, v: [f32; 2]| {
+            flow.apply_remote_tick(
+                HashMap::new(),
+                HashMap::from([("docs".to_string(), vec_delta(id, v))]),
+            )
+            .unwrap();
+        };
+
+        publish("before", [1.0, 2.0]);
+        for _ in 0..2000 {
+            if sink.get("before").is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            sink.get("before").is_some(),
+            "the vector view must be indexing before the job is deleted"
+        );
+
+        assert!(reg.delete("v"));
+
+        publish("after", [3.0, 4.0]);
+        for _ in 0..2000 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            sink.get("after").is_none(),
+            "deleting the job must stop its vector-view maintenance; the task kept \
+             indexing a job that no longer exists"
+        );
+    }
+
+    /// A vector view name is unique per job: re-registering used to spawn a
+    /// second full set of shard tasks against the same view, each writing a
+    /// sink nobody held (IVM-AUD-DIST-H3).
+    #[tokio::test]
+    async fn a_vector_view_name_is_unique_per_job() {
+        use krishiv_ivm::InMemoryVectorSink;
+
+        let reg = IvmJobRegistry::with_default_shards(1);
+        reg.create("v".into()).unwrap();
+        let make = || {
+            RegisteredVectorView::new(
+                "docs".into(),
+                "id".into(),
+                "v".into(),
+                "in_memory".into(),
+                InMemoryVectorSink::new(),
+                Vec::new(),
+            )
+        };
+        reg.register_vector_view("v", make()).unwrap();
+        let err = reg
+            .register_vector_view("v", make())
+            .expect_err("the second registration of the same name must be refused");
+        assert!(err.to_string().contains("already registered"), "{err}");
+
+        assert!(reg.delete_vector_view("v", "docs"));
+        reg.register_vector_view("v", make())
+            .expect("after deleting it, the name is free again");
     }
 
     // ── per-job step lock ─────────────────────────────────────────────────────

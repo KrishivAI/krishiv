@@ -178,28 +178,32 @@ async fn corpus_results_are_non_trivial() {
 }
 
 #[tokio::test]
-async fn ivm_rejects_null_group_keys_is_a_documented_difference() {
-    // DOCUMENTED SEMANTIC DIFFERENCE (never silent): the batch planner groups a
-    // NULL key into its own group (ANSI SQL); Krishiv's hash-partitioned IVM
-    // engine rejects NULL partition keys. Surfaced by the differential corpus.
+async fn ivm_groups_a_null_key_exactly_as_batch_does() {
+    // This used to be `ivm_rejects_null_group_keys_is_a_documented_difference`,
+    // pinning a divergence: batch grouped a NULL key (ANSI SQL) while IVM
+    // refused it, because the hash partitioner had no way to route a NULL.
+    // IVM-AUD-PART-5 removed the divergence — NULL keys route to a single
+    // shard under an explicit policy — so the corpus now pins the parity
+    // instead. A differential corpus exists to shrink this list, and a test
+    // that still demanded the old refusal would block the fix that earned it.
     let query = "SELECT cat, SUM(amount) AS s FROM t GROUP BY cat";
 
-    // Batch groups the NULL key — succeeds with three groups (a, b, NULL).
     let batch = run_view_result(query, PipelineMode::Batch, fixture_with_null_key())
         .await
         .expect("batch groups NULL keys");
-    assert_eq!(
-        canonicalize(&batch).1.len(),
-        3,
-        "batch produces a NULL group alongside a and b"
-    );
-
-    // IVM rejects the NULL partition key — loudly, not silently.
-    let err = run_view_result(query, PipelineMode::Ivm, fixture_with_null_key())
+    let ivm = run_view_result(query, PipelineMode::Ivm, fixture_with_null_key())
         .await
-        .expect_err("IVM must reject NULL group keys rather than drop or miscount them");
-    assert!(
-        err.to_string().to_lowercase().contains("null"),
-        "the divergence must be a clear NULL-key error: {err}"
+        .expect("IVM groups NULL keys too, since PART-5");
+
+    let batch = canonicalize(&batch);
+    let ivm = canonicalize(&ivm);
+    assert_eq!(
+        batch.1.len(),
+        3,
+        "precondition: a, b and the NULL group: {batch:?}"
+    );
+    assert_eq!(
+        ivm, batch,
+        "IVM must produce the same groups as batch, NULL key included"
     );
 }

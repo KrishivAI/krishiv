@@ -79,7 +79,9 @@ Regenerate with:
 | `KRISHIV_INCREMENTAL_CHECKPOINTS` | bool | `true` | RocksDB-backed window state checkpoints SST deltas instead of full snapshots (Phase 56). |
 | `KRISHIV_INLINE_IPC_MAX_BYTES` | uint | `67108864` | Maximum inline base64 Arrow IPC payload accepted in batch SQL requests. |
 | `KRISHIV_INLINE_RESULT_MAX_BYTES` | uint | `8388608` | Result size above which executor task output spools to disk instead of inlining. |
-| `KRISHIV_IVM_SHARDS` | uint | `1` | Shard count for coordinator-resident IVM flows. |
+| `KRISHIV_IVM_SHARDS` | uint | `min(available_parallelism, 8)` | Shard count for an auto-partitioned coordinator-resident IVM flow; 1 disables auto-partitioning. Unset derives from CPU count, capped at 8 (`krishiv_scheduler::ivm::default_ivm_shards`), not 1. |
+| `KRISHIV_IVM_SPILL_DIR` | text | `OS temp directory` | Directory an IVM tick's DataFusion spill files are written to. |
+| `KRISHIV_IVM_SPILL_MAX_DISK_BYTES` | uint | `10737418240` | Ceiling on bytes an IVM tick's spill directory may hold; 0/unparseable falls back to the default. |
 | `KRISHIV_JCP_POLL_INTERVAL_SECS` | uint | `2` | Job-completion poll interval for job-mode coordinator runs. |
 | `KRISHIV_JOB_GC_GRACE_SECS` | uint | `30` | Grace window a terminal job stays queryable before the GC tick may evict it, so a slow consumer still observes its outcome + result. |
 | `KRISHIV_JOB_ID` | text | `unset` | Job ID for single-job (job-mode) coordinator/executor pods. |
@@ -165,6 +167,7 @@ Regenerate with:
 | `KRISHIV_BENCH_PARALLELISM` | uint | `3` | Run-loop subtask parallelism the distributed NEXMark harness (nexmark_distributed) requests per non-pipeline job. Pipelines are always registered at 1 (stage re-keying). |
 | `KRISHIV_BENCH_CHECKPOINT_INTERVAL_MS` | uint | `0` | Non-zero: the distributed NEXMark harness registers every job with barrier checkpointing at this interval (durable-mode benchmark). 0 (default): no checkpointing. |
 | `KRISHIV_BENCH_CHECKPOINT_PATH` | text | `file:///var/lib/krishiv/checkpoints` | Checkpoint storage path the distributed NEXMark harness passes at registration when KRISHIV_BENCH_CHECKPOINT_INTERVAL_MS is non-zero. |
+| `KRISHIV_BENCH_CASE_FILTER` | text | `` | Comma-separated NEXMark case names (e.g. q3_local_items,q8_monitor_new_users) that the streaming-terminal harness runs instead of the full sweep, for fast A/B iteration on one shape. Empty (default): run every case. |
 | `KRISHIV_FLIGHT_URL` | text | `http://127.0.0.1:27075` | Coordinator Flight endpoint the terminal NEXMark harness (nexmark_terminal) builds its distributed Session against (task #151). |
 | `KRISHIV_BENCH_DIRECT_PUSH` | bool | `unset` | Set to 1: the distributed NEXMark harness resolves executor ingest targets once per job (GET /api/v1/continuous/{job}/targets) and pushes Arrow IPC straight to executor task gRPC endpoints, bypassing the coordinator HTTP hop and base64/JSON re-encode (task #149 fix 7). Requires the producer to REACH executor endpoints: in-cluster or loopback single-node; pod IPs are unreachable through a coordinator-only tunnel. |
 | `KRISHIV_STREAM_EARLY_FIRE_MS` | uint | `unset` | Speculative early-fire interval for open windows (embedded loop only — the distributed stream:rloop: run-loop does not read this flag). |

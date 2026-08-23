@@ -7240,10 +7240,17 @@ spanning batch, streaming, and IVM, so end users never tune partitioning. See
     per-shard snapshots. Full surface: `feed`, `feed_snapshot` (top-level
     differentiate then route delta — correct drains), `drop_view`,
     `snapshot`/`source_snapshot`, `checkpoint`/`restore`/`checkpoint_delta`/
-    `restore_delta` (shard-count framed, mismatch-rejecting).
-  - Auto-rule: `partition_key_for_view` (planner) + `partition_key_from_sql`
-    (schema-free AST, for the coordinator) detect a single-column `GROUP BY`;
-    `auto_for_view` sizes via `recommended_shards` → AP-1.
+    `restore_delta` (magic + version + kind + key-column framed, so a blob of
+    the wrong kind or from a differently-keyed flow is named and refused;
+    untagged pre-IVM-AUD-PART-8 blobs still load with the shard-count check
+    they shipped with).
+  - Auto-rule: `partition_key_from_sql` (schema-free AST — the one detector;
+    the planner-based `partition_key_for_view` disagreed with it and was
+    reachable only from dead code, IVM-AUD-PART-7) detects a single-column
+    `GROUP BY` over one plain table with no LIMIT/ORDER BY/join/subquery, and
+    the coordinator sizes the job with `default_ivm_shards()` (CPU-derived,
+    capped at 8). The byte-sized `auto_for_view`/`recommended_shards` pair had
+    no non-test callers and is gone (IVM-AUD-PART-16).
   - **Coordinator wiring**: `IvmJobRegistry` (`krishiv-scheduler/src/ivm.rs`) now
     holds an `IvmJob` enum (`Single` | `Partitioned`), auto-upgrading a job at its
     first `register_view`. All IVM HTTP endpoints route through `IvmJob`. The

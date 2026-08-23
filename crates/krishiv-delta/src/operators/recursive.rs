@@ -6,11 +6,25 @@
 //! Each outer clock tick runs the view body iteratively until the output
 //! delta is empty (no new changes propagate).
 //!
-//! Recursive views are automatically DISTINCT to prevent infinite weight
-//! growth on cycles (matching Feldera's semantics).
+//! This operator applies DISTINCT between iterations to prevent infinite
+//! weight growth on cycles (matching Feldera's semantics), and returns
+//! `DeltaError::CycleLimitExceeded` if the delta is still non-empty after
+//! `max_iterations`.
 //!
-//! Safety guard: if after `max_iterations` the delta is still non-empty,
-//! the operator returns `DeltaError::CycleLimitExceeded`.
+//! **Nothing routes a recursive view through this operator today**
+//! (IVM-AUD-DDL-E3). `DECLARE RECURSIVE VIEW` is executed by the IVM tick as a
+//! plain fixpoint loop over the view's SQL (`IncrementalFlow::step_datafusion`,
+//! the `spec.is_recursive` branch), which does not de-duplicate between
+//! iterations and does not raise on hitting its cap — it publishes the last
+//! iterate as the view's value. So the DISTINCT and the cycle guard described
+//! above are properties of this type, NOT guarantees of the system: a
+//! `UNION ALL` recursion over a cyclic input still fails to converge, and the
+//! SQL-layer docs tell users to write the body set-semantically themselves.
+//!
+//! It is kept rather than deleted because it is the right vehicle for closing
+//! that gap (see CORE-10/11/12/13 in the audit register), but until it is
+//! wired, its doc must not read as a description of how recursive views
+//! behave.
 
 use crate::delta_batch::DeltaBatch;
 use crate::error::{DeltaError, DeltaResult};

@@ -101,17 +101,62 @@ impl PartitionError {
     }
 }
 
+/// The hash-equivalence class of a partition-key Arrow type, or `None` when
+/// the type cannot be routed at all.
+///
+/// This is the domain sub-tag [`digest_for_key`] mixes into the SHA-256, so two
+/// types share a class exactly when a value hashes identically under both. The
+/// three string encodings deliberately share `utf8`: a producer may emit `Utf8`
+/// in one batch and `Utf8View` in the next (DataFusion's default), and the same
+/// key must still land in the same shard.
+///
+/// Exposed so a *stateful* router can check the class across calls.
+/// [`partition_record_batches_by_key`] only sees the batches of one call, so on
+/// its own it cannot catch a source that emits `id` as `Int32` today and
+/// `Int64` tomorrow — a change that silently sends one logical key to two
+/// shards (IVM-AUD-PART-4).
+pub fn partition_key_hash_class(data_type: &DataType) -> Option<&'static str> {
+    match data_type {
+        DataType::Int32 => Some("i32"),
+        DataType::Int64 => Some("i64"),
+        DataType::Float64 => Some("f64"),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Some("utf8"),
+        DataType::Boolean => Some("bool"),
+        _ => None,
+    }
+}
+
+/// Whether a key of this Arrow type can be routed by the keyed partitioner.
+///
+/// Callers that *decide* whether to shard something must consult this before
+/// committing: auto-partitioning a `GROUP BY` on a `Date32`/`Timestamp`/
+/// `UInt64`/`Dictionary`/`Decimal` key produced a flow in which every feed
+/// failed "unsupported partition key type" (IVM-AUD-PART-5).
+pub fn is_supported_partition_key_type(data_type: &DataType) -> bool {
+    partition_key_hash_class(data_type).is_some()
+}
+
+/// What a router does with a NULL key value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NullKeyPolicy {
+    /// Reject the batch. The default, and the contract every non-IVM caller
+    /// has relied on: a NULL key in a shuffle/join key means the plan above is
+    /// wrong, and failing is better than silently grouping unrelated rows.
+    #[default]
+    Reject,
+    /// Route every NULL key to one shard, chosen by hashing a type-independent
+    /// null tag.
+    ///
+    /// This is what a `GROUP BY` needs: SQL puts all NULLs in one group, so a
+    /// NULL group key is legal on a single flow. Rejecting it once the same
+    /// view is auto-partitioned would make auto-partitioning change which data
+    /// the engine accepts (IVM-AUD-PART-5). The tag is independent of the key
+    /// column's type so NULLs of an `Int32` and a `Utf8` key land alike.
+    OwnShard,
+}
+
 fn supported_key_type(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int32
-            | DataType::Int64
-            | DataType::Float64
-            | DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Utf8View
-            | DataType::Boolean
-    )
+    is_supported_partition_key_type(data_type)
 }
 
 fn digest_for_key(array: &dyn Array, row: usize) -> Result<[u8; 32], PartitionError> {
@@ -220,12 +265,22 @@ fn digest_for_key(array: &dyn Array, row: usize) -> Result<[u8; 32], PartitionEr
     }
 }
 
+/// Digest for a NULL key under [`NullKeyPolicy::OwnShard`] — deliberately not
+/// derived from the key's Arrow type, so all NULLs share one shard.
+fn digest_for_null_key() -> [u8; 32] {
+    sha256_bytes_multi(&[PARTITION_KEY_HASH_DOMAIN, b"null\0"])
+}
+
 fn shard_index(
     array: &dyn Array,
     row: usize,
     shard_count: NonZeroUsize,
 ) -> Result<KeyedShard, PartitionError> {
-    let digest = digest_for_key(array, row)?;
+    let digest = if array.is_null(row) {
+        digest_for_null_key()
+    } else {
+        digest_for_key(array, row)?
+    };
     let hash = u64::from_le_bytes([
         digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
     ]);
@@ -238,12 +293,30 @@ fn shard_index(
 ///
 /// Every batch must contain `key_column` with the same supported data type.
 /// Each input row is assigned exactly once, preserving its schema and relative
-/// order within the source batch.
+/// order within the source batch. A NULL key is an error; use
+/// [`partition_record_batches_by_key_with_nulls`] to route NULLs to a shard of
+/// their own instead.
 #[must_use = "partitioned batches are discarded if the return value is ignored"]
 pub fn partition_record_batches_by_key(
     batches: &[RecordBatch],
     key_column: &str,
     shard_count: usize,
+) -> Result<Vec<Vec<RecordBatch>>, PartitionError> {
+    partition_record_batches_by_key_with_nulls(
+        batches,
+        key_column,
+        shard_count,
+        NullKeyPolicy::Reject,
+    )
+}
+
+/// [`partition_record_batches_by_key`] with an explicit [`NullKeyPolicy`].
+#[must_use = "partitioned batches are discarded if the return value is ignored"]
+pub fn partition_record_batches_by_key_with_nulls(
+    batches: &[RecordBatch],
+    key_column: &str,
+    shard_count: usize,
+    null_policy: NullKeyPolicy,
 ) -> Result<Vec<Vec<RecordBatch>>, PartitionError> {
     let shard_count = NonZeroUsize::new(shard_count)
         .ok_or_else(|| PartitionError::new("shard count must be greater than zero"))?;
@@ -297,7 +370,7 @@ pub fn partition_record_batches_by_key(
             .map(|_| Vec::with_capacity(hint.max(1)))
             .collect();
         for row in 0..batch.num_rows() {
-            if key_array.is_null(row) {
+            if key_array.is_null(row) && null_policy == NullKeyPolicy::Reject {
                 return Err(PartitionError::new(format!(
                     "batch {batch_idx} key column '{key_column}' contains null at row {row}"
                 )));
@@ -599,6 +672,142 @@ mod tests {
             shard_index(&positive, 0, shard_count).unwrap(),
             shard_index(&negative, 0, shard_count).unwrap(),
             "+0.0 and -0.0 must hash to the same shard"
+        );
+    }
+
+    /// IVM-AUD-PART-5: the routable key types, named. A caller that *decides*
+    /// whether to shard has to be able to ask before it commits, and the answer
+    /// has to match what `digest_for_key` will actually accept — the whole
+    /// defect was a decision made without asking.
+    #[test]
+    fn supported_key_types_match_what_the_digest_accepts() {
+        use arrow::datatypes::TimeUnit;
+
+        let one_row = |dt: &DataType| {
+            // `new_null_array` builds a one-row array of any type, which is all
+            // `digest_for_key` needs to reach its unsupported-type arm.
+            arrow::array::new_null_array(dt, 1)
+        };
+        let supported = [
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Utf8View,
+            DataType::Boolean,
+        ];
+        let unsupported = [
+            DataType::Date32,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::UInt64,
+            DataType::Decimal128(10, 2),
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        ];
+        for dt in &supported {
+            assert!(
+                is_supported_partition_key_type(dt),
+                "{dt} should be routable"
+            );
+            // A supported type must not be the one that errors as unsupported.
+            let err = digest_for_key(one_row(dt).as_ref(), 0).err();
+            assert!(
+                !err.is_some_and(|e| e.message().contains("unsupported partition key type")),
+                "{dt} claims support but the digest rejects it as unsupported"
+            );
+        }
+        for dt in &unsupported {
+            assert!(
+                !is_supported_partition_key_type(dt),
+                "{dt} must not be advertised as routable"
+            );
+            let err = digest_for_key(one_row(dt).as_ref(), 0).unwrap_err();
+            assert!(
+                err.message().contains("unsupported partition key type"),
+                "{dt}: {}",
+                err.message()
+            );
+        }
+    }
+
+    /// The three string encodings share a hash class (and therefore a shard);
+    /// the integer widths do not.
+    #[test]
+    fn hash_class_groups_the_string_encodings_only() {
+        assert_eq!(partition_key_hash_class(&DataType::Utf8), Some("utf8"));
+        assert_eq!(partition_key_hash_class(&DataType::LargeUtf8), Some("utf8"));
+        assert_eq!(partition_key_hash_class(&DataType::Utf8View), Some("utf8"));
+        assert_ne!(
+            partition_key_hash_class(&DataType::Int32),
+            partition_key_hash_class(&DataType::Int64),
+            "Int32 and Int64 hash under different tags, so a source that \
+             switches width routes the same logical key to two shards"
+        );
+        assert_eq!(partition_key_hash_class(&DataType::Date32), None);
+    }
+
+    /// IVM-AUD-PART-5: `GROUP BY` puts every NULL in one group, so a router
+    /// serving a `GROUP BY` must be able to place NULLs rather than reject the
+    /// batch — otherwise auto-partitioning changes which data the engine
+    /// accepts. All NULLs must land in ONE shard, or the group splits.
+    #[test]
+    fn null_keys_route_to_a_single_shard_under_own_shard_policy() {
+        let batch = batch_with_key(
+            "key",
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                None,
+                Some("b"),
+                None,
+                None,
+            ])) as ArrayRef,
+        );
+        let shards = partition_record_batches_by_key_with_nulls(
+            std::slice::from_ref(&batch),
+            "key",
+            7,
+            NullKeyPolicy::OwnShard,
+        )
+        .unwrap();
+        assert_eq!(
+            row_count(&shards),
+            5,
+            "every row must be placed exactly once"
+        );
+
+        let null_shards: Vec<usize> = shards
+            .iter()
+            .enumerate()
+            .filter(|(_, batches)| {
+                batches.iter().any(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .is_some_and(|a| (0..a.len()).any(|i| a.is_null(i)))
+                })
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+        assert_eq!(
+            null_shards.len(),
+            1,
+            "all NULL keys must share one shard, found {null_shards:?}"
+        );
+
+        // The default policy still rejects — every non-IVM caller depends on it.
+        assert!(partition_record_batches_by_key(&[batch], "key", 7).is_err());
+    }
+
+    /// The NULL shard is chosen from a type-independent tag, so a NULL `Int32`
+    /// key and a NULL `Utf8` key land in the same shard.
+    #[test]
+    fn null_key_shard_does_not_depend_on_the_key_type() {
+        let shard_count = NonZeroUsize::new(13).unwrap();
+        let as_string = StringArray::from(vec![Option::<&str>::None]);
+        let as_int = Int32Array::from(vec![Option::<i32>::None]);
+        assert_eq!(
+            shard_index(&as_string, 0, shard_count).unwrap(),
+            shard_index(&as_int, 0, shard_count).unwrap()
         );
     }
 }

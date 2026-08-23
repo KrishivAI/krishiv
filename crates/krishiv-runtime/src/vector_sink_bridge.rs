@@ -6,6 +6,16 @@
 //! Lets users plug any existing connector-level `VectorSink` (Qdrant, Pinecone,
 //! pgvector, LanceDB, …) directly into [`krishiv_ivm::spawn_vector_view`].
 //!
+//! # Maturity: unwired (IVM-AUD-INT-F17)
+//!
+//! Nothing in the repository constructs a `VectorSinkBridge` except the test at
+//! the bottom of this file. The only productised way to register a vector view
+//! is the coordinator's `/api/v1/ivm/jobs/{job}/vector-views` endpoint, and its
+//! only supported `sink_type` is `in_memory` — so the adapter below is a
+//! working piece with no route to a real Qdrant / pgvector deployment yet. The
+//! example is what a caller *would* write, not something a supported surface
+//! does today. See `krishiv_ivm::vector_sink` for the full statement.
+//!
 //! # Example
 //!
 //! ```rust,ignore

@@ -338,6 +338,14 @@ struct IncrementalFlowInner {
     // consume the O(Δ) changelog the flow already computed (`take_step_output`)
     // instead of re-materializing the full view and diffing snapshots.
     last_step_outputs: AHashMap<String, DeltaBatch>,
+    /// Flow tick at which each view last successfully published an output
+    /// delta — i.e. which tick the value behind `view_output_peek` came from.
+    ///
+    /// IVM-AUD-PART-11: a partitioned flow concatenates its shards' peeked
+    /// deltas, and without this there was no way to tell a shard that emitted
+    /// this tick from one that last emitted five ticks ago; the two were
+    /// merged and served as "the latest delta".
+    view_output_ticks: AHashMap<String, u64>,
     /// Per-view cumulative insert/retract counters (#94); keyed by view name.
     view_delta_stats: AHashMap<String, ViewDeltaStats>,
 
@@ -353,6 +361,18 @@ struct IncrementalFlowInner {
 
 /// Driver for an incremental computation pipeline.
 ///
+/// How a view executes, as far as the flow can tell at this moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewExecution {
+    /// Registered, but no tick has built a plan for it yet — a shard that owns
+    /// none of a view's keys stays here indefinitely.
+    NotYetPlanned,
+    /// An O(Δ) incremental plan is cached for it.
+    Incremental,
+    /// It is recomputed in full each tick it is dirty.
+    DiffBased,
+}
+
 /// Thread-safe and `Clone`-able: all clones share the same underlying state.
 #[derive(Clone)]
 pub struct IncrementalFlow {
@@ -362,6 +382,17 @@ pub struct IncrementalFlow {
     /// IVM-vs-recompute benchmark. Guarded by an async mutex so cached-path
     /// ticks serialize; `step_datafusion_with_ctx` callers are unaffected.
     tick_ctx: Arc<tokio::sync::Mutex<CachedTickContext>>,
+    /// Byte budget for this flow's tick `SessionContext` memory pool, resolved
+    /// once at construction; `None` means DataFusion's unbounded pool.
+    ///
+    /// IVM-AUD-PART-13: this used to be re-derived inside every flow from
+    /// `ivm_memory_limit_bytes()` — 25% of the *whole container* — at the
+    /// moment the flow first built its context. A partitioned job is N flows,
+    /// so an 8-shard job (`default_ivm_shards()` = `min(cores, 8)`) licensed
+    /// itself to 8 × 25% = 200% of the container: precisely the OOM the spill
+    /// module exists to prevent. `PartitionedIncrementalFlow::new` now divides
+    /// one budget across its shards and hands each shard its share.
+    tick_memory_limit: Option<usize>,
 }
 
 /// Cached tick execution context plus the table names currently registered in
@@ -435,6 +466,23 @@ impl IncrementalFlow {
     /// (e.g. the SQL engine). Views registered via SQL DDL (`CREATE INCREMENTAL
     /// VIEW`) are visible to this flow, and vice versa.
     pub fn with_registry(view_registry: IncrementalViewRegistry) -> Self {
+        Self::with_registry_and_memory_limit(view_registry, crate::spill::ivm_memory_limit_bytes())
+    }
+
+    /// A flow whose tick `SessionContext` is capped at `tick_memory_limit`
+    /// bytes instead of the process-wide default.
+    ///
+    /// This exists for `PartitionedIncrementalFlow`, which must divide one
+    /// container budget across its shards rather than give each shard the
+    /// whole thing (IVM-AUD-PART-13). `None` means unbounded.
+    pub fn with_memory_limit(tick_memory_limit: Option<usize>) -> Self {
+        Self::with_registry_and_memory_limit(IncrementalViewRegistry::new(), tick_memory_limit)
+    }
+
+    fn with_registry_and_memory_limit(
+        view_registry: IncrementalViewRegistry,
+        tick_memory_limit: Option<usize>,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(IncrementalFlowInner {
                 view_registry,
@@ -459,20 +507,42 @@ impl IncrementalFlow {
                 last_step_outputs: AHashMap::new(),
                 view_delta_stats: AHashMap::new(),
                 pending_plan_state: HashMap::new(),
+                view_output_ticks: AHashMap::new(),
             })),
             tick_ctx: Arc::new(tokio::sync::Mutex::new(CachedTickContext::default())),
+            tick_memory_limit,
         }
     }
 
-    /// Enable opt-in provenance tracking (input row hash → output row hashes).
+    /// Enable opt-in **tick-granular** provenance tracking.
     ///
-    /// Once enabled, each `step_datafusion` call records the mapping from every
-    /// input insertion hash to the output hashes produced that tick. Use
-    /// `query_provenance` to look up which output rows a given input row produced,
-    /// enabling automatic retraction without Z-set algebra.
+    /// Once enabled, each `step_datafusion` call records which input row hashes
+    /// arrived in the tick and which output row hashes the tick produced, for
+    /// views that run on the **DiffBased** path only. `query_provenance(h)` then
+    /// returns the output hashes of the tick that carried `h` — not the outputs
+    /// derived from `h`. Those coincide only when a tick carries one input row.
+    ///
+    /// This is deliberately narrower than the docs used to claim ("look up which
+    /// output rows a given input row produced, enabling automatic retraction
+    /// without Z-set algebra"): the recorded relation has always been
+    /// tick-granular, and no code path here can produce a finer one. See
+    /// [`crate::provenance`] and IVM-AUD-PART-23.
+    ///
+    /// Memory is bounded by
+    /// [`DEFAULT_RETENTION_TICKS`](crate::provenance::DEFAULT_RETENTION_TICKS);
+    /// use [`enable_provenance_tracking_with_retention`](Self::enable_provenance_tracking_with_retention)
+    /// to choose the window.
     pub fn enable_provenance_tracking(&self) -> IvmResult<()> {
+        self.enable_provenance_tracking_with_retention(crate::provenance::DEFAULT_RETENTION_TICKS)
+    }
+
+    /// [`enable_provenance_tracking`](Self::enable_provenance_tracking) with an
+    /// explicit retention window, in ticks (minimum 1).
+    pub fn enable_provenance_tracking_with_retention(&self, retention_ticks: u64) -> IvmResult<()> {
         let mut inner = self.inner.lock().map_err(lock_err)?;
-        inner.provenance = Some(crate::provenance::ProvenanceIndex::new());
+        inner.provenance = Some(crate::provenance::ProvenanceIndex::with_retention(
+            retention_ticks,
+        ));
         Ok(())
     }
 
@@ -486,7 +556,11 @@ impl IncrementalFlow {
         Ok(inner.declared_lateness.clone())
     }
 
-    /// Query the provenance index for output hashes derived from `input_hash`.
+    /// Output row hashes produced by the tick that carried `input_hash`.
+    ///
+    /// `None` when provenance is disabled, the hash was never recorded, or its
+    /// tick has aged out of the retention window. Tick-granular — see
+    /// [`enable_provenance_tracking`](Self::enable_provenance_tracking).
     pub fn query_provenance(&self, input_hash: u64) -> IvmResult<Option<AHashSet<u64>>> {
         let inner = self.inner.lock().map_err(lock_err)?;
         Ok(inner
@@ -496,7 +570,10 @@ impl IncrementalFlow {
             .cloned())
     }
 
-    /// Remove the provenance record for `input_hash` (call after retracting its outputs).
+    /// Drop the provenance mapping for `input_hash`.
+    ///
+    /// Only that input's own entry goes; the tick's output set is shared with
+    /// every other input row of the tick and ages out with the tick.
     pub fn forget_provenance(&self, input_hash: u64) -> IvmResult<()> {
         let mut inner = self.inner.lock().map_err(lock_err)?;
         if let Some(ref mut p) = inner.provenance {
@@ -627,6 +704,7 @@ impl IncrementalFlow {
         inner.view_deps.remove(name);
         inner.view_plans.remove(name);
         inner.view_plan_sqls.remove(name);
+        inner.view_output_ticks.remove(name);
         inner.view_registry.drop_view(name).map_err(delta_err)
     }
 
@@ -664,19 +742,38 @@ impl IncrementalFlow {
     /// lazily on the first tick, so before any step the view is reported as
     /// not-yet-planned (`incremental = false`, with an explanatory reason).
     pub fn view_plan_classification(&self, view: &str) -> IvmResult<Option<(bool, String)>> {
+        Ok(self
+            .view_execution(view)?
+            .map(|(execution, reason)| (matches!(execution, ViewExecution::Incremental), reason)))
+    }
+
+    /// How `view` executes right now, distinguishing "no plan has been built
+    /// yet" from "a plan was built and it is a full recompute".
+    ///
+    /// [`view_plan_classification`](Self::view_plan_classification) folds both
+    /// into `false`, which is the honest answer for one flow — neither is
+    /// incremental *yet*. A partitioned job cannot fold them: a shard that owns
+    /// none of the keys never builds a plan, so with three shards and two keys
+    /// one shard is permanently unplanned, and treating that as "not
+    /// incremental" would report every partitioned view as degraded
+    /// (IVM-AUD-PART-12).
+    pub fn view_execution(&self, view: &str) -> IvmResult<Option<(ViewExecution, String)>> {
         let inner = self.inner.lock().map_err(lock_err)?;
         if inner.view_registry.get(view).is_err() {
             return Ok(None);
         }
         Ok(Some(match inner.view_plans.get(view) {
             None => (
-                false,
+                ViewExecution::NotYetPlanned,
                 "not yet planned — no tick has executed; the O(Δ) plan is built lazily on \
                  the first step, after which this view will report its true strategy"
                     .to_string(),
             ),
             Some(plan) => (
-                matches!(plan.kind(), ViewPlanKind::Incremental),
+                match plan.kind() {
+                    ViewPlanKind::Incremental => ViewExecution::Incremental,
+                    _ => ViewExecution::DiffBased,
+                },
                 plan.describe().to_string(),
             ),
         }))
@@ -984,7 +1081,9 @@ impl IncrementalFlow {
         let mut cache = self.tick_ctx.lock().await;
         let ctx = cache
             .ctx
-            .get_or_insert_with(crate::spill::spill_session_context)
+            .get_or_insert_with(|| {
+                crate::spill::spill_session_context_with_limit(self.tick_memory_limit)
+            })
             .clone();
         let mut registered = std::mem::take(&mut cache.registered);
         let result = self
@@ -1411,6 +1510,10 @@ impl IncrementalFlow {
         let mut errored_views: Vec<ViewError> = pre_lock_view_errors;
         let mut degraded_views: Vec<String> = Vec::new();
 
+        // The tick this pass is publishing (already incremented above). Used to
+        // stamp provenance so it can age out (IVM-AUD-PART-22).
+        let current_tick = inner.tick;
+
         // Provenance: pre-compute weight-aware input hashes when enabled.
         // Each row is hashed with its weight encoded so rows that differ only
         // in multiplicity produce distinct provenance entries (G5 fix).
@@ -1689,19 +1792,23 @@ impl IncrementalFlow {
 
             // Provenance (DiffBased only).
             //
-            // IVM-7: This recording maps each input hash to ALL output hashes
-            // of the tick (a complete bipartite graph). This means
-            // `query_provenance(input)` returns the entire output set for any
-            // input, so targeted per-row retraction via provenance is not
-            // possible on the DiffBased path. True per-row provenance requires
-            // the incremental operators to emit input→output lineage.
+            // What is recorded is tick-granular, not row-granular: "these input
+            // rows arrived in tick N, and tick N produced these output rows".
+            // The DiffBased path runs the view SQL and differentiates the
+            // result, so there is no operator anywhere in it that could report
+            // which output row came from which input row — see the module docs
+            // on `provenance` and IVM-AUD-PART-23.
+            //
+            // It used to store that same tick-granular answer as a complete
+            // bipartite graph: every input hash → every output hash, i.e.
+            // O(inputs × outputs) hash inserts and the same again in memory
+            // (10 k in / 10 k out = 10^8 inserts in one tick). `record_tick`
+            // stores the relation once, in O(inputs + outputs), and ages it out.
             if plan_kind == ViewPlanKind::DiffBased
                 && let (Some(input_hs), Some(prov)) = (&input_hashes, &mut inner.provenance)
             {
                 let output_hs = crate::provenance::hash_all_rows(&output_delta.data_batch())?;
-                for &ih in input_hs {
-                    prov.record_many(ih, output_hs.iter().copied());
-                }
+                prov.record_tick(current_tick, input_hs.iter().copied(), output_hs);
             }
 
             // Propagate this view's output delta to downstream views.
@@ -1710,18 +1817,27 @@ impl IncrementalFlow {
             inner
                 .last_step_outputs
                 .insert(view_name.clone(), output_delta.clone());
-            if let Err(e) = view.publish_output(output_delta) {
-                tracing::warn!(
-                    view = %view_name,
-                    error = %e,
-                    is_materialized = view.spec.is_materialized,
-                    "publish_output failed"
-                );
-                errored_views.push(ViewError {
-                    view: view_name.clone(),
-                    kind: ViewErrorKind::Publish,
-                    message: e.to_string(),
-                });
+            match view.publish_output(output_delta) {
+                Ok(()) => {
+                    // Stamp the tick the watch value now holds (PART-11).
+                    let published_at = inner.tick;
+                    inner
+                        .view_output_ticks
+                        .insert(view_name.clone(), published_at);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        view = %view_name,
+                        error = %e,
+                        is_materialized = view.spec.is_materialized,
+                        "publish_output failed"
+                    );
+                    errored_views.push(ViewError {
+                        view: view_name.clone(),
+                        kind: ViewErrorKind::Publish,
+                        message: e.to_string(),
+                    });
+                }
             }
         }
 
@@ -1814,6 +1930,28 @@ impl IncrementalFlow {
         let rx = view.subscribe();
         let value = rx.borrow().clone();
         Ok(value)
+    }
+
+    /// The byte ceiling on this flow's tick `SessionContext` memory pool, or
+    /// `None` when it runs unbounded.
+    ///
+    /// Exposed so a caller that built several flows out of one budget can check
+    /// that the division actually reached them (IVM-AUD-PART-13).
+    pub fn tick_memory_limit(&self) -> Option<usize> {
+        self.tick_memory_limit
+    }
+
+    /// The flow tick the value behind [`view_output_peek`](Self::view_output_peek)
+    /// was published at, or `None` if this view has never emitted an output.
+    ///
+    /// The watch is coalescing and retains its value across quiet ticks, so
+    /// "there is a delta" and "there is a delta *from this tick*" are different
+    /// questions. A partitioned flow has to ask the second one before merging
+    /// its shards' peeks (IVM-AUD-PART-11).
+    pub fn view_output_tick(&self, name: &str) -> IvmResult<Option<u64>> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        inner.view_registry.get(name).map_err(delta_err)?;
+        Ok(inner.view_output_ticks.get(name).copied())
     }
 
     /// Whether `name` was registered as a materialized view.
@@ -2068,6 +2206,8 @@ impl IncrementalFlow {
                 stats.rows_retracted_total += retracts;
                 stats.last_tick_inserts = inserts;
                 stats.last_tick_retracts = retracts;
+                let published_at = inner.tick;
+                inner.view_output_ticks.insert(name.clone(), published_at);
                 inner.last_step_outputs.insert(name, delta);
             }
         }

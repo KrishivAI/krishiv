@@ -16,6 +16,13 @@
 //! | GET    | `/api/v1/ivm/jobs/{job_id}/views/{view}/snap`   | Current snapshot (Arrow IPC b64)  |
 //! | POST   | `/api/v1/ivm/jobs/{job_id}/checkpoint`          | Serialize state to bytes (b64)    |
 //! | POST   | `/api/v1/ivm/jobs/{job_id}/restore`             | Restore state from bytes (b64)    |
+//! | POST   | `/api/v1/ivm/jobs/{job_id}/vector-views`        | Register a vector view (preview)  |
+//! | GET    | `/api/v1/ivm/jobs/{job_id}/vector-views`        | List vector views + sink health   |
+//! | DELETE | `/api/v1/ivm/jobs/{job_id}/vector-views/{view}` | Stop a vector view                |
+//!
+//! Vector views are an **HTTP-only preview** (IVM-AUD-INT-F17): the only
+//! supported `sink_type` is `in_memory`, and there is no CLI, Python, MCP or
+//! SQL surface for them. See `krishiv_ivm::vector_sink` for the full statement.
 
 use axum::Json;
 use axum::extract::{FromRef, Path, State};
@@ -32,7 +39,7 @@ use krishiv_ivm::{
 use krishiv_proto::{JobId, JobKind, JobSpec, JobState, StageId, StageSpec, TaskId, TaskSpec};
 
 use crate::SharedCoordinator;
-use crate::ivm::SharedIvmJobRegistry;
+use crate::ivm::{RegisteredVectorView, SharedIvmJobRegistry};
 
 // ── combined router state ─────────────────────────────────────────────────────
 
@@ -87,6 +94,21 @@ fn ivm_not_found(job_id: &str) -> StatusCode {
 /// as missing — until an unrelated `/feed` or `/step` happened to resurrect the
 /// job. `/checkpoint`, the backup path, failed the same way, and `/restore`
 /// refused to restore into a job that demonstrably existed.
+/// Reject a mutating IVM request unless this coordinator is the active leader.
+///
+/// IVM-AUD-DIST-E1: there was no leader check on any IVM endpoint. A demoted
+/// coordinator served feed/step/restore/delete at 200, rehydrated the job from
+/// the store, advanced its own copy of the flow and persisted it back over the
+/// new leader's snapshot — split-brain, with both halves answering `success:
+/// true`. Reads are deliberately left unfenced (a stale read is not a
+/// divergence); everything that writes goes through here.
+async fn ensure_ivm_leader(coordinator: &SharedCoordinator) -> Result<(), StatusCode> {
+    coordinator.ensure_active_leader().await.map_err(|e| {
+        tracing::warn!("IVM request refused: {e}");
+        StatusCode::SERVICE_UNAVAILABLE
+    })
+}
+
 async fn ensure_ivm_job(
     registry: &SharedIvmJobRegistry,
     coordinator: &SharedCoordinator,
@@ -234,6 +256,7 @@ pub async fn api_ivm_create_job(
     State(coordinator): State<SharedCoordinator>,
     Json(body): Json<CreateJobRequest>,
 ) -> Result<Json<CreateJobResponse>, StatusCode> {
+    ensure_ivm_leader(&coordinator).await?;
     let job_id = body
         .job_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -307,7 +330,8 @@ pub async fn api_ivm_delete_job(
     State(registry): State<SharedIvmJobRegistry>,
     State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
-) -> Json<DeleteJobResponse> {
+) -> Result<Json<DeleteJobResponse>, StatusCode> {
+    ensure_ivm_leader(&coordinator).await?;
     // Serialize against any in-flight `/step` for this job by holding the same
     // per-job step lock a tick holds (#224 C). Without this, deletion races a
     // concurrent tick: the tick reads its snapshot, we remove it here, then the
@@ -337,9 +361,9 @@ pub async fn api_ivm_delete_job(
     if let Err(error) = coordinator.remove_ivm_snapshot(&job_id).await {
         tracing::error!(job_id, %error, "removing IVM snapshot failed");
     }
-    Json(DeleteJobResponse {
+    Ok(Json(DeleteJobResponse {
         deleted: registry.delete(&job_id),
-    })
+    }))
 }
 
 // ── POST /api/v1/ivm/jobs/{job_id}/views ─────────────────────────────────────
@@ -380,6 +404,7 @@ pub async fn api_ivm_register_view(
     Path(job_id): Path<String>,
     Json(body): Json<RegisterViewRequest>,
 ) -> Result<Json<RegisterViewResponse>, StatusCode> {
+    ensure_ivm_leader(&coordinator).await?;
     // Existence is enforced by the registry (which also decides, on the first
     // view, whether to auto-partition the job by a single-column GROUP BY key).
     ensure_ivm_job(&registry, &coordinator, &job_id).await?;
@@ -414,6 +439,7 @@ pub async fn api_ivm_drop_view(
     State(coordinator): State<SharedCoordinator>,
     Path((job_id, view_name)): Path<(String, String)>,
 ) -> Result<Json<DropViewResponse>, StatusCode> {
+    ensure_ivm_leader(&coordinator).await?;
     let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     let dropped = flow.drop_view(&view_name).map_err(ivm_err)?;
     persist_ivm_job(&registry, &coordinator, &job_id).await?;
@@ -439,6 +465,7 @@ pub async fn api_ivm_feed_source(
     Path((job_id, source_name)): Path<(String, String)>,
     Json(body): Json<FeedSourceRequest>,
 ) -> Result<Json<FeedSourceResponse>, StatusCode> {
+    ensure_ivm_leader(&coordinator).await?;
     let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     let ipc_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
@@ -477,6 +504,7 @@ pub async fn api_ivm_feed_stream_delta(
     Path((job_id, source_name)): Path<(String, String)>,
     Json(body): Json<FeedStreamDeltaRequest>,
 ) -> Result<Json<FeedStreamDeltaResponse>, StatusCode> {
+    ensure_ivm_leader(&coordinator).await?;
     let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     let ipc_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
@@ -507,6 +535,7 @@ pub async fn api_ivm_step(
     State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
 ) -> Result<Json<StepResponse>, StatusCode> {
+    ensure_ivm_leader(&coordinator).await?;
     let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
 
     // Serialize concurrent steps for this job so two simultaneous ticks cannot
@@ -897,6 +926,16 @@ pub struct ViewOutputResponse {
     /// Base64-encoded Arrow IPC of the latest delta (may be None if no output yet).
     pub delta_ipc_b64: Option<String>,
     pub num_rows: usize,
+    /// The flow tick this delta was published at; `None` when there is none.
+    ///
+    /// IVM-AUD-PART-11: this endpoint served a partitioned job's merged
+    /// per-shard deltas as "the latest delta" with nothing saying which tick
+    /// they belonged to — and the shards' coalescing watches meant they need
+    /// not have belonged to the same one. The merge now only combines shards
+    /// that published at the same tick, and this reports which. (It is a
+    /// label, not a cursor: a consumer polling slower than `/step` still
+    /// misses deltas — that is INT-F5, and it is still open.)
+    pub tick: Option<u64>,
 }
 
 pub async fn api_ivm_view_output(
@@ -905,19 +944,22 @@ pub async fn api_ivm_view_output(
     Path((job_id, view_name)): Path<(String, String)>,
 ) -> Result<Json<ViewOutputResponse>, StatusCode> {
     let job = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
-    // Peek the latest output delta (merged across shards for partitioned jobs).
-    match job.view_output_peek(&view_name).map_err(ivm_err)? {
+    // Peek the latest output delta (for a partitioned job, the shards that
+    // published at the newest tick — see `view_output_peek_at_tick`).
+    match job.view_output_peek_at_tick(&view_name).map_err(ivm_err)? {
         None => Ok(Json(ViewOutputResponse {
             delta_ipc_b64: None,
             num_rows: 0,
+            tick: None,
         })),
-        Some(delta) => {
+        Some((tick, delta)) => {
             let num_rows = delta.num_rows();
             let ipc = serialize_delta_batch(&delta).map_err(ivm_err)?;
             let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ipc);
             Ok(Json(ViewOutputResponse {
                 delta_ipc_b64: Some(b64),
                 num_rows,
+                tick: Some(tick),
             }))
         }
     }
@@ -1059,6 +1101,7 @@ pub async fn api_ivm_restore(
     Path(job_id): Path<String>,
     Json(body): Json<RestoreRequest>,
 ) -> Result<Json<RestoreResponse>, StatusCode> {
+    ensure_ivm_leader(&coordinator).await?;
     let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     let bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
@@ -1115,6 +1158,7 @@ pub async fn api_ivm_restore_delta(
     Path(job_id): Path<String>,
     Json(body): Json<RestoreDeltaRequest>,
 ) -> Result<Json<RestoreDeltaResponse>, StatusCode> {
+    ensure_ivm_leader(&coordinator).await?;
     let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     let bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
@@ -1146,6 +1190,7 @@ pub async fn api_ivm_stream_bridge(
     Path((job_id, source_name)): Path<(String, String)>,
     Json(body): Json<StreamBridgeRequest>,
 ) -> Result<Json<StreamBridgeResponse>, StatusCode> {
+    ensure_ivm_leader(&coordinator).await?;
     let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     let ipc_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
@@ -1189,14 +1234,27 @@ fn default_sink_type() -> String {
 pub struct RegisterVectorViewResponse {
     pub success: bool,
     pub view_name: String,
+    /// Number of maintenance tasks started (one per shard).
+    pub shards: usize,
 }
 
+/// Register a vector view on an IVM job.
+///
+/// IVM-AUD-DIST-H3: this used to build an `InMemoryVectorSink`, hand it to
+/// detached per-shard tasks and drop the only `Arc` before returning — so
+/// nothing could ever read what was written (`IvmVectorSink` is write-only),
+/// calling it N times with the same view name left N×shards permanent tasks
+/// with no way to stop any of them, and deleting the job stopped none. The
+/// sink and the task handles now live in the job registry, which makes the
+/// contents readable through `GET .../vector-views`, makes a duplicate name a
+/// 400 instead of a silent leak, and makes `DELETE /jobs/{id}` stop the tasks.
 pub async fn api_ivm_register_vector_view(
     State(registry): State<SharedIvmJobRegistry>,
     State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
     Json(body): Json<RegisterVectorViewRequest>,
 ) -> Result<Json<RegisterVectorViewResponse>, StatusCode> {
+    ensure_ivm_leader(&coordinator).await?;
     use krishiv_ivm::VectorViewSpec;
 
     let job = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
@@ -1208,21 +1266,109 @@ pub async fn api_ivm_register_vector_view(
         )));
     }
 
-    let sink: Arc<dyn krishiv_ivm::IvmVectorSink> = krishiv_ivm::InMemoryVectorSink::new();
+    let sink = krishiv_ivm::InMemoryVectorSink::new();
     let spec = VectorViewSpec {
         view_name: body.view_name.clone(),
         id_column: body.id_column.clone(),
         vector_column: body.vector_column.clone(),
-        sink,
+        sink: Arc::clone(&sink) as Arc<dyn krishiv_ivm::IvmVectorSink>,
     };
 
-    // Spawn and detach; one task per shard (partitioned jobs write a shared sink).
-    // Tasks run until the flow is dropped.
-    job.spawn_vector_views(spec).map_err(ivm_err)?;
+    // One maintenance task per shard, all writing the shared sink.
+    let handles = job.spawn_vector_views(spec).map_err(ivm_err)?;
+    let shards = handles.len();
+    registry
+        .register_vector_view(
+            &job_id,
+            RegisteredVectorView::new(
+                body.view_name.clone(),
+                body.id_column,
+                body.vector_column,
+                body.sink_type,
+                sink,
+                handles,
+            ),
+        )
+        .map_err(ivm_err)?;
 
     Ok(Json(RegisterVectorViewResponse {
         success: true,
         view_name: body.view_name,
+        shards,
+    }))
+}
+
+// ── GET /api/v1/ivm/jobs/{job_id}/vector-views ────────────────────────────────
+
+/// One registered vector view, with the health of its maintenance tasks.
+#[derive(Debug, Serialize)]
+pub struct VectorViewSummary {
+    pub view_name: String,
+    pub id_column: String,
+    pub vector_column: String,
+    pub sink_type: String,
+    /// Maintenance tasks (one per shard).
+    pub shards: usize,
+    /// Points currently in the sink.
+    pub points: usize,
+    /// True when any shard's index is known to no longer match the view — a
+    /// lost delta or a lagging subscriber. The index must be rebuilt.
+    pub diverged: bool,
+    /// Per-shard counters: applied / upserted / deleted / errors / missed, plus
+    /// the last error and the reason a stopped task stopped.
+    pub shard_status: Vec<krishiv_ivm::VectorViewStatus>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListVectorViewsResponse {
+    pub job_id: String,
+    pub vector_views: Vec<VectorViewSummary>,
+}
+
+/// List a job's vector views and the health of their maintenance tasks.
+///
+/// This is the operator-visible surface IVM-AUD-PART-19 / PART-20 / DIST-H3
+/// were missing: before it, a sink failure was a log line, a lagging
+/// subscriber was a log line, and the index contents were unreachable.
+pub async fn api_ivm_list_vector_views(
+    State(registry): State<SharedIvmJobRegistry>,
+    Path(job_id): Path<String>,
+) -> Result<Json<ListVectorViewsResponse>, StatusCode> {
+    if registry.get(&job_id).is_none() {
+        return Err(ivm_not_found(&job_id));
+    }
+    let vector_views = registry.map_vector_views(&job_id, |v| VectorViewSummary {
+        view_name: v.view_name.clone(),
+        id_column: v.id_column.clone(),
+        vector_column: v.vector_column.clone(),
+        sink_type: v.sink_type.clone(),
+        shards: v.shards(),
+        points: v.points(),
+        diverged: v.diverged(),
+        shard_status: v.shard_status(),
+    });
+    Ok(Json(ListVectorViewsResponse {
+        job_id,
+        vector_views,
+    }))
+}
+
+// ── DELETE /api/v1/ivm/jobs/{job_id}/vector-views/{view_name} ─────────────────
+
+#[derive(Debug, Serialize)]
+pub struct DeleteVectorViewResponse {
+    pub deleted: bool,
+}
+
+/// Stop a vector view's maintenance tasks and forget its sink.
+pub async fn api_ivm_delete_vector_view(
+    State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
+    Path((job_id, view_name)): Path<(String, String)>,
+) -> Result<Json<DeleteVectorViewResponse>, StatusCode> {
+    ensure_ivm_leader(&coordinator).await?;
+    Ok(Json(DeleteVectorViewResponse {
+        deleted: registry.delete_vector_view(&job_id, &view_name),
     }))
 }
 
@@ -1303,7 +1449,11 @@ pub fn ivm_router(state: IvmRouterState) -> Router<()> {
         )
         .route(
             "/api/v1/ivm/jobs/{job_id}/vector-views",
-            post(api_ivm_register_vector_view),
+            post(api_ivm_register_vector_view).get(api_ivm_list_vector_views),
+        )
+        .route(
+            "/api/v1/ivm/jobs/{job_id}/vector-views/{view_name}",
+            delete(api_ivm_delete_vector_view),
         )
         // IVM feed / checkpoint / restore / snapshot carry Arrow IPC batches of
         // real user data (base64), which routinely exceed axum's 2 MiB default
@@ -1385,6 +1535,16 @@ mod tests {
             std::sync::Arc::new(crate::ivm::IvmJobRegistry::with_default_shards(shards)),
             SharedCoordinator::new(Coordinator::active(
                 CoordinatorId::try_new("test-coord").unwrap(),
+            )),
+        )
+    }
+
+    /// A coordinator that lost leadership — the split-brain half.
+    fn standby_deps() -> (SharedIvmJobRegistry, SharedCoordinator) {
+        (
+            std::sync::Arc::new(crate::ivm::IvmJobRegistry::with_default_shards(1)),
+            SharedCoordinator::new(Coordinator::standby(
+                CoordinatorId::try_new("demoted-coord").unwrap(),
             )),
         )
     }
@@ -1547,7 +1707,7 @@ mod tests {
             Path("gone".into()),
         )
         .await;
-        assert!(first.deleted);
+        assert!(first.expect("leader delete must succeed").deleted);
 
         let second = api_ivm_delete_job(
             State(registry.clone()),
@@ -1555,7 +1715,10 @@ mod tests {
             Path("gone".into()),
         )
         .await;
-        assert!(!second.deleted, "second delete of the same job is a no-op");
+        assert!(
+            !second.expect("leader delete must succeed").deleted,
+            "second delete of the same job is a no-op"
+        );
         assert!(registry.get("gone").is_none());
     }
 
@@ -1627,7 +1790,7 @@ mod tests {
             column: "event_ts".into(),
             lateness_ms: 300_000,
         }];
-        api_ivm_register_view(
+        let resp = api_ivm_register_view(
             State(registry.clone()),
             State(coordinator.clone()),
             Path("j".into()),
@@ -1635,6 +1798,7 @@ mod tests {
         )
         .await
         .expect("register must succeed");
+        assert!(resp.0.success);
 
         let declared = registry
             .get("j")
@@ -1648,6 +1812,73 @@ mod tests {
         );
         assert_eq!(declared[0].column, "event_ts");
         assert_eq!(declared[0].lateness_ms, 300_000);
+    }
+
+    /// IVM-AUD-DIST-E1. No IVM endpoint had a leader check, so a demoted
+    /// coordinator answered every mutating call at 200: it rehydrated the job
+    /// from the store, advanced its own copy of the flow, and persisted that
+    /// back over the new leader's snapshot. Both halves reported success and
+    /// the two diverged silently.
+    #[tokio::test]
+    async fn a_demoted_coordinator_refuses_every_mutating_ivm_call() {
+        let (registry, coordinator) = standby_deps();
+        registry.create("j".into()).unwrap();
+
+        let created = api_ivm_create_job(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Json(CreateJobRequest {
+                job_id: Some("j2".into()),
+                partitioned: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.err(),
+            Some(StatusCode::SERVICE_UNAVAILABLE),
+            "create must be refused by a non-leader"
+        );
+
+        let registered = api_ivm_register_view(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+            Json(revenue_view_request()),
+        )
+        .await;
+        assert_eq!(
+            registered.err(),
+            Some(StatusCode::SERVICE_UNAVAILABLE),
+            "register-view must be refused by a non-leader"
+        );
+
+        let stepped = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await;
+        assert_eq!(
+            stepped.err(),
+            Some(StatusCode::SERVICE_UNAVAILABLE),
+            "step must be refused by a non-leader"
+        );
+
+        let deleted = api_ivm_delete_job(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await;
+        assert_eq!(
+            deleted.err(),
+            Some(StatusCode::SERVICE_UNAVAILABLE),
+            "delete must be refused by a non-leader"
+        );
+        assert!(
+            registry.get("j").is_some(),
+            "a refused delete must leave the job alone"
+        );
     }
 
     #[tokio::test]
@@ -2641,6 +2872,81 @@ mod tests {
         assert_eq!(err, StatusCode::BAD_REQUEST);
     }
 
+    /// IVM-AUD-DIST-H3: the handler used to build an `InMemoryVectorSink`, hand
+    /// it to detached tasks and drop the only `Arc` on the way out, so nothing
+    /// could read what was written and there was no record the view existed.
+    /// Registration must survive the handler and be listable, with health.
+    #[tokio::test]
+    async fn a_registered_vector_view_outlives_the_handler_and_is_listable() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+
+        let resp = api_ivm_register_vector_view(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+            Json(RegisterVectorViewRequest {
+                view_name: "revenue".into(),
+                id_column: "region".into(),
+                vector_column: "vec".into(),
+                sink_type: "in_memory".into(),
+            }),
+        )
+        .await
+        .expect("register vector view");
+        assert_eq!(resp.shards, 1);
+
+        let listed = api_ivm_list_vector_views(State(registry.clone()), Path("j".into()))
+            .await
+            .expect("list vector views");
+        assert_eq!(
+            listed.vector_views.len(),
+            1,
+            "the registration must outlive the handler that made it"
+        );
+        let v = &listed.vector_views[0];
+        assert_eq!(v.view_name, "revenue");
+        assert_eq!(v.sink_type, "in_memory");
+        assert_eq!(v.shards, 1);
+        assert_eq!(
+            v.shard_status.len(),
+            1,
+            "each shard's maintenance task must report health"
+        );
+        assert!(!v.diverged);
+
+        // Same name twice is refused rather than silently spawning a second
+        // set of tasks against a second unreachable sink.
+        let err = api_ivm_register_vector_view(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+            Json(RegisterVectorViewRequest {
+                view_name: "revenue".into(),
+                id_column: "region".into(),
+                vector_column: "vec".into(),
+                sink_type: "in_memory".into(),
+            }),
+        )
+        .await
+        .expect_err("duplicate vector view name");
+        assert_eq!(err, StatusCode::BAD_REQUEST);
+
+        // And it can be stopped.
+        let del = api_ivm_delete_vector_view(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("delete vector view");
+        assert!(del.deleted);
+        let listed = api_ivm_list_vector_views(State(registry.clone()), Path("j".into()))
+            .await
+            .expect("list vector views");
+        assert!(listed.vector_views.is_empty());
+    }
+
     // ── schema JSON parsing ───────────────────────────────────────────────────
 
     #[test]
@@ -2732,6 +3038,9 @@ mod tests {
             .await
             .expect("delete did not finish within 2s of lock release")
             .expect("delete task panicked");
-        assert!(resp.deleted, "job should have been reported deleted");
+        assert!(
+            resp.expect("leader delete must succeed").deleted,
+            "job should have been reported deleted"
+        );
     }
 }

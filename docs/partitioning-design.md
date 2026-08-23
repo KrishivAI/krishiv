@@ -333,21 +333,28 @@ routed by the **shared keyed hash** (`partition_record_batches_by_key`, SHA-256 
 the same family as streaming key groups), so every key's rows land in exactly one
 shard. For a `GROUP BY <key>` view sharded by `<key>`, each group lives entirely
 in one shard, so per-shard snapshots concatenate with no cross-shard merge.
-Shards step in parallel (`futures::future::try_join_all`), removing the
-single-core ceiling.
+Shards step in parallel (`futures::future::join_all` — `try_join_all` dropped
+the sibling futures on the first shard error, destroying deltas those shards
+had already drained, IVM-AUD-PART-1), removing the single-core ceiling.
 
-The **auto-rule** keeps it zero-config:
+The **auto-rule** keeps it zero-config. It lives in the coordinator's
+`IvmJobRegistry::register_view` (see below), not in this module:
 
-```rust
-PartitionedIncrementalFlow::auto_for_view(ctx, spec, total_bytes_hint, max_shards)
-```
-
-- `partition_key_for_view` inspects the view's logical plan: a **single-column
-  `GROUP BY` aggregate** over one source is provably shardable and returns its
-  key; multi-column `GROUP BY`, joins (two sources keyed independently), and
-  diff-based views return `None`.
-- Shardable views are sized by `recommended_shards` → `recommend_buckets`
-  (Phase 1's sizing brain); everything else falls back to a single flow.
+- `partition_key_from_sql` (`krishiv-ivm/src/plan.rs`) inspects the view's SQL:
+  a **single-column `GROUP BY` aggregate over exactly one plain table**, with no
+  `LIMIT`/`ORDER BY`/`FETCH`, no join, no subquery, no window function and no
+  projection alias shadowing the key, is provably shardable and returns its key;
+  everything else returns `None` and runs on a single flow.
+- The key's declared output type must be one the keyed router can hash
+  (`is_supported_partition_key_type`); a `Date32`/`Timestamp`/`UInt64`/
+  `Dictionary`/`Decimal` key stays single, because sharding it would make every
+  feed fail.
+- Shard count is `default_ivm_shards()` — `min(available_parallelism, 8)`,
+  overridable with `KRISHIV_IVM_SHARDS`. It is **core-derived, not
+  byte-derived**: views are registered before any data arrives, so there is no
+  byte count to size from. (`PartitionedIncrementalFlow::auto_for_view` and
+  `recommended_shards` used to offer a byte-sized alternative; both had zero
+  non-test callers and were removed — IVM-AUD-PART-16.)
 
 Correctness is locked in by `partitioned_group_by_matches_single_flow` (3 shards
 vs. 1 shard, identical per-region totals), `checkpoint_restore_round_trips_across_shards`,
@@ -384,17 +391,44 @@ restore, checkpoint-delta/restore-delta, drop-view, **vector-views**:
 - **Vector views** spawn one background task per shard, all writing the **same
   shared sink**. For a `GROUP BY <key>` view sharded by `<key>`, each id (the
   group key) lives in exactly one shard, so the shards push disjoint id sets with
-  no cross-shard conflict.
+  no cross-shard conflict. That disjointness is the entire safety argument, so
+  `spawn_vector_views` now **rejects** an `id_column` that is not the shard key
+  on a multi-shard flow (IVM-AUD-PART-21): with any other id column two shards
+  can hold rows for the same id and overwrite or delete each other's points,
+  last writer wins, silently. A single-shard flow accepts any id column.
+  Vector views themselves remain an HTTP-only preview — see the note below.
 - Checkpoints are shard-count framed and reject restores with a mismatched shard
   count.
+- **Provenance** (`enable_provenance_tracking` / `query_provenance` /
+  `forget_provenance`) is now forwarded to every shard, with `query_provenance`
+  unioning the shards' answers (IVM-AUD-PART-25 — before this it stopped at
+  `IncrementalFlow` and an auto-partitioned job could enable it, get `Ok(())`
+  and be told `None` forever). Note what it can record: provenance is written
+  only for views that execute on the **DiffBased** path, and a job is
+  partitioned precisely because its first view lowered to an incremental
+  key-group aggregate — so on a partitioned job it is the *other* views that
+  produce provenance, not the one that caused the partitioning.
+
+**Vector views are an HTTP-only preview** (IVM-AUD-INT-F17). The only surfaces
+are `krishiv_ivm::spawn_vector_view` /
+`PartitionedIncrementalFlow::spawn_vector_views` and the coordinator's
+`POST|GET|DELETE /api/v1/ivm/jobs/{job}/vector-views` endpoints, whose only
+supported `sink_type` is `in_memory`. There is no CLI, Python, MCP or SQL
+surface, `krishiv-ivm` is not in the stable public Rust API, and the
+`VectorSinkBridge` adapter that would connect a real Qdrant / pgvector store has
+no caller but its own test.
 
 Coverage: `partitioned_job_matches_single_job_end_to_end`,
 `register_view_auto_partitions_group_by`, `partitioned_job_checkpoint_restore`,
 `feed_snapshot_through_partitioned_registry_job`, `view_output_peek_through_partitioned_job`,
-`spawn_vector_views_fans_out_per_shard`, `resolve_ivm_shards_honours_env_and_caps`
+`spawn_vector_views_fans_out_per_shard`, `resolve_ivm_shards_honours_env_and_caps`,
+`deleting_a_job_stops_its_vector_view_tasks`, `a_vector_view_name_is_unique_per_job`,
+`a_registered_vector_view_outlives_the_handler_and_is_listable`
 (`krishiv-scheduler`); `embedded_group_by_view_auto_partitions`,
 `embedded_partitioned_feed_step_snapshot_matches_single` (`krishiv-runtime`); plus
-29 `PartitionedIncrementalFlow` edge-case tests (`krishiv-ivm`).
+`spawn_vector_views_rejects_an_id_column_that_is_not_the_shard_key` and
+`provenance_reaches_every_shard_of_a_partitioned_flow` plus the other
+`PartitionedIncrementalFlow` edge-case tests (`krishiv-ivm`).
 
 ---
 
@@ -454,10 +488,16 @@ pub fn recommend_buckets(bytes, min_buckets, max_buckets, target_bytes_per_parti
 pub fn recommend_buckets_default(bytes, min_buckets, max_buckets) -> u32; // uses TARGET_BYTES_PER_PARTITION
 ```
 
-`AutoPartitionRule` (batch AQE), `StreamingPartitionAdvisor` (streaming EMA),
-`bounded_window` shard sizing, and `PartitionedIncrementalFlow::recommended_shards`
-(IVM) all call it. The old duplicated `ceil(bytes / target).clamp(...)` formulas
-are gone — there is one place to change the sizing policy.
+`AutoPartitionRule` (batch AQE), `StreamingPartitionAdvisor` (streaming EMA) and
+`bounded_window` shard sizing all call it. The old duplicated
+`ceil(bytes / target).clamp(...)` formulas are gone — there is one place to
+change the sizing policy.
+
+IVM is the exception, and deliberately so: an incremental view is registered
+before any of its data exists, so there is no byte count to size it from. Its
+shard count comes from `default_ivm_shards()` (CPU-derived, capped at 8). The
+byte-sized IVM entry point that once appeared in this list had no callers at all
+(IVM-AUD-PART-16), which is why it is named here rather than quietly dropped.
 
 ---
 

@@ -15,19 +15,23 @@ pub mod vector_sink;
 
 pub use error::{IvmError, IvmResult};
 pub use flow::{
-    IncrementalFlow, StepSummary, ViewDeltaStats, ViewError, ViewErrorKind, coalesce_pending,
-    decode_batch_map, decode_delta_map, encode_batch_map, encode_delta_map,
+    IncrementalFlow, StepSummary, ViewDeltaStats, ViewError, ViewErrorKind, ViewExecution,
+    coalesce_pending, decode_batch_map, decode_delta_map, encode_batch_map, encode_delta_map,
     encode_ivm_attach_fragment, encode_ivm_ckpt_fragment, encode_ivm_detach_fragment,
     encode_ivm_step_fragment, encode_ivm_tick_fragment,
 };
 pub use partitioned::PartitionedIncrementalFlow;
-pub use plan::{
-    ViewPlan, ViewPlanKind, build_view_plan, partition_key_for_view, partition_key_from_sql,
-};
+pub use plan::{ViewPlan, ViewPlanKind, build_view_plan, partition_key_from_sql};
 pub use provenance::{ProvenanceIndex, hash_all_rows, hash_batch_row};
-pub use spill::{spill_session_context, spill_session_context_with_limit};
+pub use spill::{
+    ivm_memory_limit_bytes, shard_memory_limit_bytes, spill_session_context,
+    spill_session_context_with_limit,
+};
 pub use vector_sink::testing::InMemoryVectorSink;
-pub use vector_sink::{IvmVectorSink, VectorFuture, VectorViewSpec, spawn_vector_view};
+pub use vector_sink::{
+    IvmVectorSink, VectorFuture, VectorViewHandle, VectorViewHealth, VectorViewSpec,
+    VectorViewStatus, spawn_vector_view,
+};
 
 // Re-export the key delta types so callers need only `krishiv-ivm`.
 pub use krishiv_delta::{

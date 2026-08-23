@@ -2781,7 +2781,10 @@ impl Session {
             .ok_or_else(|| KrishivError::Runtime {
                 message: format!("START PIPELINE: sink '{sink_name}' is not declared"),
             })?;
-        let view_entry = view_reg
+        // Presence check, not a value: the sink's view must be declared before
+        // the pipeline is built. The entry itself is re-read per view below,
+        // in dependency order.
+        view_reg
             .get(&sink_spec.view)
             .map_err(KrishivError::from)?
             .ok_or_else(|| KrishivError::Runtime {
@@ -2816,15 +2819,31 @@ impl Session {
 
         // A view may reference upstream incremental views (not just sources), so
         // register the transitive view closure feeding the sink, in dependency
-        // order. All are materialized so downstream views can read their output
-        // and the sink can read its view's snapshot.
-        let _ = &view_entry;
+        // order.
+        //
+        // IVM-AUD-DDL-B2: every view in a pipeline is registered materialized,
+        // overriding whatever `CREATE INCREMENTAL VIEW` declared. That is not a
+        // stray literal — a non-materialized view keeps no snapshot
+        // (`IncrementalView::publish_output` skips it), and both a downstream
+        // view and the sink read exactly that snapshot, so an unmaterialized
+        // view in a pipeline would feed them nothing. What was wrong was doing
+        // it in silence: the flag is parsed, stored, and then contradicted with
+        // no word to the user. Say so when it actually overrides a choice.
         let mut ordered: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         collect_pipeline_view_deps(&sink_spec.view, view_reg, &mut ordered, &mut seen)
             .map_err(KrishivError::from)?;
         for vname in &ordered {
             if let Some(entry) = view_reg.get(vname).map_err(KrishivError::from)? {
+                if !entry.is_materialized {
+                    tracing::info!(
+                        view = %vname,
+                        pipeline_sink = %sink_spec.view,
+                        "view declared without MATERIALIZED is materialized anyway for this \
+                         pipeline: downstream views and the sink read its snapshot, which an \
+                         unmaterialized view does not keep"
+                    );
+                }
                 builder = builder.view_with_lateness(
                     vname.clone(),
                     entry.body_sql.clone(),

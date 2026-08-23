@@ -520,6 +520,17 @@ impl SharedCoordinator {
         guard.save_ivm_snapshot(job_id, snapshot)
     }
 
+    /// Reject the call unless this coordinator is the active leader.
+    ///
+    /// IVM-AUD-DIST-E1: no IVM endpoint had any leader check, so a demoted
+    /// coordinator answered feed/step/restore/delete at 200, rehydrated the
+    /// job from the store, advanced its own copy and persisted over the new
+    /// leader's snapshot — split-brain with both halves reporting success.
+    /// Every mutating IVM handler calls this first.
+    pub async fn ensure_active_leader(&self) -> SchedulerResult<()> {
+        self.inner.read().await.ensure_active()
+    }
+
     /// Load one persisted IVM job snapshot, if present.
     pub async fn load_ivm_snapshot(&self, job_id: &str) -> Option<Vec<u8>> {
         let store = { self.inner.read().await.store.clone() }?;

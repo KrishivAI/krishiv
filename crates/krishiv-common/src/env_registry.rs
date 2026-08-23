@@ -561,8 +561,23 @@ pub static FLAGS: &[FlagSpec] = &[
     rt(
         "KRISHIV_IVM_SHARDS",
         FlagKind::UInt,
-        "1",
-        "Shard count for coordinator-resident IVM flows.",
+        "min(available_parallelism, 8)",
+        "Shard count for an auto-partitioned coordinator-resident IVM flow; 1 \
+         disables auto-partitioning. Unset derives from CPU count, capped at 8 \
+         (`krishiv_scheduler::ivm::default_ivm_shards`), not 1.",
+    ),
+    rt(
+        "KRISHIV_IVM_SPILL_DIR",
+        FlagKind::Text,
+        "OS temp directory",
+        "Directory an IVM tick's DataFusion spill files are written to.",
+    ),
+    rt(
+        "KRISHIV_IVM_SPILL_MAX_DISK_BYTES",
+        FlagKind::UInt,
+        "10737418240",
+        "Ceiling on bytes an IVM tick's spill directory may hold; 0/unparseable \
+         falls back to the default.",
     ),
     rt(
         "KRISHIV_JCP_POLL_INTERVAL_SECS",
@@ -1158,6 +1173,12 @@ pub static FLAGS: &[FlagSpec] = &[
         FlagKind::Text,
         "file:///var/lib/krishiv/checkpoints",
         "Checkpoint storage path the distributed NEXMark harness passes at registration when KRISHIV_BENCH_CHECKPOINT_INTERVAL_MS is non-zero.",
+    ),
+    rt(
+        "KRISHIV_BENCH_CASE_FILTER",
+        FlagKind::Text,
+        "",
+        "Comma-separated NEXMark case names (e.g. q3_local_items,q8_monitor_new_users) that the streaming-terminal harness runs instead of the full sweep, for fast A/B iteration on one shape. Empty (default): run every case.",
     ),
     rt(
         "KRISHIV_FLIGHT_URL",

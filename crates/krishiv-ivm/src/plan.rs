@@ -370,32 +370,55 @@ pub async fn build_view_plan(
 /// Inspect a view's SQL and report the single column it can be safely sharded
 /// by, or `None` if no safe single-key sharding exists.
 ///
-/// A view is shardable when its output for any key value depends only on input
-/// rows carrying that key value. The conservative, provably-correct shape is a
-/// **single-column `GROUP BY` aggregate** over one source: every group lives
-/// entirely within one shard, so per-shard results concatenate with no
-/// cross-shard merge. Multi-column `GROUP BY`, joins (two sources keyed
-/// independently), and diff-based views return `None` and run on a single flow.
+/// # The rule this enforces
 ///
-/// This is the "auto" half of unified partitioning for IVM: the engine, not the
-/// user, decides whether and how to shard a keyed incremental view.
-pub async fn partition_key_for_view(ctx: &SessionContext, body_sql: &str) -> Option<String> {
-    let df = ctx.sql(body_sql).await.ok()?;
-    let plan = df.logical_plan().clone();
-    partition_key_from_logical(&plan)
-}
-
-/// Schema-free variant of [`partition_key_for_view`] that inspects the SQL text
-/// directly (no `SessionContext`, no source schemas needed).
+/// A view is shardable when, for every key value `k`, the view's output rows
+/// for `k` depend only on input rows carrying `k` **and** the whole view's
+/// output is the concatenation of those per-key results. The only shape this
+/// function is willing to prove is a **single-column `GROUP BY` aggregate over
+/// exactly one plain table**, with nothing above or beside the aggregation
+/// that can see across groups.
+///
+/// # What it refuses, and why (IVM-AUD-PART-6)
+///
+/// The predecessor of this function looked at `GROUP BY` and nothing else, so
+/// it declared these shardable and got each of them wrong:
+///
+/// * `LIMIT n` / `FETCH` — the limit is applied *inside every shard*, so an
+///   N-shard job returns up to `n × N` rows and, with `ORDER BY`, a top-N over
+///   the wrong candidate set.
+/// * `ORDER BY` — per-shard results are concatenated, which destroys the
+///   ordering the query asked for.
+/// * A join, or any second table in `FROM` — sharding by the group key
+///   co-locates rows by the *group* key, not the join key, so matching pairs
+///   land in different shards and silently disappear (or the dimension source
+///   hard-errors at feed time for lacking the key column at all).
+/// * Any subquery — a FROM-clause or scalar subquery is evaluated once per
+///   shard over that shard's rows, so a `(SELECT SUM(x) FROM t)` denominator
+///   becomes the shard's sum instead of the table's.
+/// * A projection alias that shadows the key (`SELECT other AS region … GROUP
+///   BY region`) — rows are routed by the *input* column named `region`, which
+///   is not the column the query groups on.
+/// * Window functions, `DISTINCT`, `QUALIFY`, `CLUSTER/DISTRIBUTE/SORT BY`,
+///   set operations, CTEs and multi-statement input — each can see across
+///   groups or across shards.
+///
+/// `WHERE`, `HAVING`, and any aggregate function are accepted: they are
+/// per-row or per-group, and a group lives entirely inside one shard.
+///
+/// # Why the SQL text and not a `LogicalPlan`
 ///
 /// The coordinator registers views **before** any data arrives, so source
-/// schemas are not yet known and `ctx.sql` cannot plan. This parses the SQL to
-/// an AST and applies the same conservative rule: a single top-level `SELECT`
-/// with exactly one plain-column `GROUP BY` expression returns that column;
-/// anything else (multi-column GROUP BY, joins, set ops, subqueries in the
-/// outer position) returns `None`.
+/// schemas are not yet known and `SessionContext::sql` cannot plan. This
+/// parses to a `sqlparser` AST instead. There used to be a second,
+/// logical-plan-based detector here that disagreed with this one in both
+/// directions (it caught `LIMIT`, because a `Limit` node sits above the
+/// `Aggregate`, but happily sharded a join, because it read the `Aggregate`'s
+/// group expression without ever looking at its input) — and it was reachable
+/// only from a function with no production callers. It is gone: one detector,
+/// used everywhere (IVM-AUD-PART-7).
 pub fn partition_key_from_sql(sql: &str) -> Option<String> {
-    use sqlparser::ast::{Expr as SqlExpr, GroupByExpr, SetExpr, Statement};
+    use sqlparser::ast::{Expr as SqlExpr, GroupByExpr, Query, SetExpr, Statement};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
@@ -406,35 +429,218 @@ pub fn partition_key_from_sql(sql: &str) -> Option<String> {
     let Statement::Query(query) = stmts.first()? else {
         return None;
     };
-    let SetExpr::Select(select) = query.body.as_ref() else {
+
+    // One `Query` node in the whole tree. Anything that introduces a second —
+    // a CTE, a derived table in FROM, a scalar/IN/EXISTS subquery anywhere —
+    // would be evaluated per shard over that shard's rows only.
+    if count_query_nodes(query.as_ref()) != 1 {
+        return None;
+    }
+
+    // Clauses that operate on the *result set* rather than on a group. Each of
+    // these would be applied independently inside every shard.
+    let Query {
+        with,
+        body,
+        order_by,
+        limit_clause,
+        fetch,
+        locks,
+        for_clause,
+        settings,
+        format_clause,
+        pipe_operators,
+    } = query.as_ref();
+    if with.is_some()
+        || order_by.is_some()
+        || limit_clause.is_some()
+        || fetch.is_some()
+        || !locks.is_empty()
+        || for_clause.is_some()
+        || settings.is_some()
+        || format_clause.is_some()
+        || !pipe_operators.is_empty()
+    {
+        return None;
+    }
+
+    let SetExpr::Select(select) = body.as_ref() else {
         return None;
     };
+
+    // Select-level modifiers that can see across groups or across shards.
+    if select.distinct.is_some()
+        || select.top.is_some()
+        || select.into.is_some()
+        || select.exclude.is_some()
+        || select.select_modifiers.is_some()
+        || !select.optimizer_hints.is_empty()
+        || !select.lateral_views.is_empty()
+        || select.prewhere.is_some()
+        || !select.connect_by.is_empty()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+        || select.value_table_mode.is_some()
+    {
+        return None;
+    }
+
+    // Exactly one plain table in FROM, no joins, no table-valued function.
+    let (table_idents, _) = single_plain_table(select)?;
+
+    // Exactly one plain-column GROUP BY expression, qualified (if at all) by
+    // that table or its alias.
     let GroupByExpr::Expressions(exprs, modifiers) = &select.group_by else {
         return None;
     };
     if exprs.len() != 1 || !modifiers.is_empty() {
         return None;
     }
-    match exprs.first()? {
-        SqlExpr::Identifier(ident) => Some(ident.value.clone()),
-        SqlExpr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
-        _ => None,
-    }
-}
-
-fn partition_key_from_logical(plan: &LogicalPlan) -> Option<String> {
-    match plan {
-        // Peel top-level projections transparently (same as the plan walker).
-        LogicalPlan::Projection(Projection { input, .. }) => partition_key_from_logical(input),
-        LogicalPlan::Aggregate(agg) => {
-            // Exactly one GROUP BY expression, resolvable to a base column.
-            if agg.group_expr.len() != 1 {
+    let key = match exprs.first()? {
+        SqlExpr::Identifier(ident) => ident.value.clone(),
+        SqlExpr::CompoundIdentifier(parts) => {
+            if parts.len() != 2 {
                 return None;
             }
-            expr_col_name(agg.group_expr.first()?)
+            let qualifier = parts.first()?.value.as_str();
+            if !table_idents
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(qualifier))
+            {
+                return None;
+            }
+            parts.last()?.value.clone()
         }
-        _ => None,
+        _ => return None,
+    };
+
+    // A window function anywhere in the projection ranks over its own
+    // partition, which need not be the shard key.
+    if projection_has_window_function(select) {
+        return None;
     }
+
+    // A projection alias equal to the key routes rows by an input column the
+    // query never groups on.
+    if projection_alias_shadows(select, &key) {
+        return None;
+    }
+
+    Some(key)
+}
+
+/// Number of `Query` nodes in the tree, including the root.
+fn count_query_nodes(query: &sqlparser::ast::Query) -> usize {
+    use core::ops::ControlFlow;
+    use sqlparser::ast::{Query, Visit, Visitor};
+
+    struct Counter(usize);
+    impl Visitor for Counter {
+        type Break = ();
+        fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<()> {
+            self.0 += 1;
+            ControlFlow::Continue(())
+        }
+    }
+    let mut counter = Counter(0);
+    let _ = query.visit(&mut counter);
+    counter.0
+}
+
+/// The `FROM` clause reduced to the one plain table it must be: returns the
+/// names that may qualify a column of it (the table's last identifier and its
+/// alias, if any) plus that table's bare name.
+fn single_plain_table(select: &sqlparser::ast::Select) -> Option<(Vec<String>, String)> {
+    use sqlparser::ast::TableFactor;
+
+    if select.from.len() != 1 {
+        return None;
+    }
+    let from = select.from.first()?;
+    if !from.joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table {
+        name,
+        alias,
+        args,
+        with_hints,
+        partitions,
+        json_path,
+        sample,
+        ..
+    } = &from.relation
+    else {
+        return None;
+    };
+    // A table-valued function, a MSSQL hint, a partition selector, a PartiQL
+    // path or a TABLESAMPLE all change what "the rows of this table" means.
+    if args.is_some()
+        || !with_hints.is_empty()
+        || !partitions.is_empty()
+        || json_path.is_some()
+        || sample.is_some()
+    {
+        return None;
+    }
+    let bare = name.0.last()?.as_ident()?.value.clone();
+    let mut idents = vec![bare.clone()];
+    if let Some(alias) = alias {
+        idents.push(alias.name.value.clone());
+    }
+    Some((idents, bare))
+}
+
+/// Whether any projected expression is a window function (`… OVER (…)`).
+fn projection_has_window_function(select: &sqlparser::ast::Select) -> bool {
+    use core::ops::ControlFlow;
+    use sqlparser::ast::{Expr as SqlExpr, Visit, Visitor};
+
+    struct WindowFinder(bool);
+    impl Visitor for WindowFinder {
+        type Break = ();
+        fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<()> {
+            if let SqlExpr::Function(func) = expr
+                && func.over.is_some()
+            {
+                self.0 = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut finder = WindowFinder(false);
+    let _ = select.projection.visit(&mut finder);
+    finder.0
+}
+
+/// Whether a projection aliases some *other* expression to the key's name.
+///
+/// `SELECT customer AS region, SUM(amount) FROM orders GROUP BY region` groups
+/// on the alias — i.e. on `customer` — while the router would shard the input
+/// on the column literally named `region`. Two different columns, one name.
+fn projection_alias_shadows(select: &sqlparser::ast::Select, key: &str) -> bool {
+    use sqlparser::ast::{Expr as SqlExpr, SelectItem};
+
+    let names_the_key = |expr: &SqlExpr| match expr {
+        SqlExpr::Identifier(ident) => ident.value.eq_ignore_ascii_case(key),
+        SqlExpr::CompoundIdentifier(parts) => parts
+            .last()
+            .is_some_and(|p| p.value.eq_ignore_ascii_case(key)),
+        _ => false,
+    };
+    select.projection.iter().any(|item| match item {
+        SelectItem::ExprWithAlias { expr, alias } => {
+            alias.value.eq_ignore_ascii_case(key) && !names_the_key(expr)
+        }
+        SelectItem::ExprWithAliases { expr, aliases } => {
+            aliases.iter().any(|a| a.value.eq_ignore_ascii_case(key)) && !names_the_key(expr)
+        }
+        _ => false,
+    })
 }
 
 // ── Plan walker ───────────────────────────────────────────────────────────────

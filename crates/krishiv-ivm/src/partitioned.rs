@@ -8,23 +8,38 @@
 //!
 //! This is correct for views whose output for a key depends only on rows with
 //! that key — per-key aggregates (`GROUP BY <key>`), filters, projections, and
-//! equi-joins on the shard key. The pipeline driver enables it only when it can
-//! prove that shape; everything else runs on a single flow. Shards step in
-//! parallel, removing the single-core ceiling on keyed incremental views.
+//! equi-joins on the shard key. Shards step in parallel, removing the
+//! single-core ceiling on keyed incremental views.
+//!
+//! # Who decides the shape, and how it is sized
+//!
+//! Nothing in this module decides anything. The one production caller is
+//! `krishiv_scheduler::ivm::IvmJobRegistry::register_view`: it asks
+//! [`partition_key_from_sql`](crate::partition_key_from_sql) whether the job's
+//! first view is a provably shardable single-key aggregate, and if so builds a
+//! flow with `default_ivm_shards()` shards — `min(available_parallelism, 8)`,
+//! overridable with `KRISHIV_IVM_SHARDS`.
+//!
+//! Shard count is therefore **core-derived, not byte-derived**. This module
+//! used to carry an `auto_for_view` constructor and a `recommended_shards`
+//! helper that sized shards from a `total_bytes_hint` via the shared
+//! `recommend_buckets` sizing brain, and the module doc claimed IVM sized
+//! itself that way. Neither had a single non-test caller (IVM-AUD-PART-16),
+//! and neither could have: views are registered before any data arrives, so
+//! the coordinator has no byte count to hand them. They were removed rather
+//! than left to imply a sizing policy the system does not apply.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use arrow::record_batch::RecordBatch;
-use datafusion::prelude::SessionContext;
-use krishiv_common::partition::{partition_record_batches_by_key, recommend_buckets_default};
+use krishiv_common::partition::{NullKeyPolicy, partition_record_batches_by_key_with_nulls};
 use krishiv_delta::{
     DeltaBatch, IncrementalViewSpec, deserialize_delta_batch, differentiate, serialize_delta_batch,
 };
 
 use crate::error::{IvmError, IvmResult};
 use crate::flow::{IncrementalFlow, StepSummary};
-use crate::plan::partition_key_for_view;
 
 /// An [`IncrementalFlow`] sharded by a key column across `N` partitions.
 pub struct PartitionedIncrementalFlow {
@@ -34,51 +49,62 @@ pub struct PartitionedIncrementalFlow {
     /// Held at the partitioned level so differentiation happens once, before
     /// routing — see that method for why. Participates in checkpoint/restore.
     streaming_prev: Mutex<HashMap<String, RecordBatch>>,
+    /// Hash class of the key type routed so far, and the Arrow type it was
+    /// first seen as.
+    ///
+    /// IVM-AUD-PART-4: `partition_record_batches_by_key` compares key types
+    /// only within the batches of **one** call, so a source emitting `id` as
+    /// `Int32` in one feed and `Int64` in the next routed the same logical key
+    /// to two different shards — the group silently splits and every consumer
+    /// sees two partial rows. Routing state is per-flow, so the check has to
+    /// live here. The comparison is on the hash *class*, not the exact type,
+    /// because the three string encodings deliberately hash alike (a producer
+    /// may switch `Utf8` → `Utf8View` between batches and must keep its shard).
+    ///
+    /// **Residual, deliberately not closed here:** this is in-process state and
+    /// is not carried in the checkpoint frame, so a restart clears it and the
+    /// first feed afterwards re-arms it with whatever type it carries. A source
+    /// that changes key width *across* a coordinator restart is therefore still
+    /// unguarded. Closing it means putting the class in the checkpoint header
+    /// and teaching the untagged-blob path to tolerate its absence; that is a
+    /// wider change than the defect warrants, and saying so is better than a
+    /// doc that implies the guard is total.
+    routed_key_type: Mutex<Option<(&'static str, String)>>,
 }
 
 impl PartitionedIncrementalFlow {
     /// Create a partitioned flow with `num_shards` shards keyed on `key_column`.
+    ///
+    /// The process tick-memory budget is **divided** across the shards, not
+    /// handed to each of them: every shard builds its own spill-capable
+    /// `SessionContext`, so replicating the budget let an N-shard job claim N
+    /// times the container's share (IVM-AUD-PART-13). See
+    /// [`shard_memory_limit_bytes`](crate::spill::shard_memory_limit_bytes).
     pub fn new(num_shards: usize, key_column: impl Into<String>) -> Self {
+        Self::new_with_budget(
+            num_shards,
+            key_column,
+            crate::spill::ivm_memory_limit_bytes(),
+        )
+    }
+
+    /// [`new`](Self::new) with the process budget supplied rather than read
+    /// from the environment, so the division across shards is testable.
+    fn new_with_budget(
+        num_shards: usize,
+        key_column: impl Into<String>,
+        total_memory_limit: Option<usize>,
+    ) -> Self {
         let n = num_shards.max(1);
+        let per_shard = crate::spill::shard_memory_limit_bytes(total_memory_limit, n);
         Self {
-            shards: (0..n).map(|_| IncrementalFlow::new()).collect(),
+            shards: (0..n)
+                .map(|_| IncrementalFlow::with_memory_limit(per_shard))
+                .collect(),
             key_column: key_column.into(),
             streaming_prev: Mutex::new(HashMap::new()),
+            routed_key_type: Mutex::new(None),
         }
-    }
-
-    /// Auto-size shard count for `total_bytes` of expected input, capped at
-    /// `max_shards`. Delegates to the unified sizing brain
-    /// ([`recommend_buckets`](krishiv_common::partition::recommend_buckets),
-    /// AP-1) so batch, streaming, and IVM all agree on bytes-per-shard.
-    pub fn recommended_shards(total_bytes: u64, max_shards: usize) -> usize {
-        let cap = u32::try_from(max_shards.max(1)).unwrap_or(u32::MAX);
-        recommend_buckets_default(total_bytes, 1, cap) as usize
-    }
-
-    /// Build a partitioned flow for a view, automatically — the zero-config IVM
-    /// entry point.
-    ///
-    /// Inspects `spec.body_sql` with [`partition_key_for_view`]: if the view is a
-    /// single-column `GROUP BY` aggregate, it shards by that key, sized by
-    /// `recommended_shards(total_bytes_hint, max_shards)`; otherwise it falls
-    /// back to a single flow. Either way the returned flow has the view
-    /// registered and is ready to `feed`.
-    pub async fn auto_for_view(
-        ctx: &SessionContext,
-        spec: IncrementalViewSpec,
-        total_bytes_hint: u64,
-        max_shards: usize,
-    ) -> IvmResult<Self> {
-        let flow = match partition_key_for_view(ctx, &spec.body_sql).await {
-            Some(key) => {
-                let shards = Self::recommended_shards(total_bytes_hint, max_shards);
-                Self::new(shards, key)
-            }
-            None => Self::new(1, String::new()),
-        };
-        flow.register_view(spec)?;
-        Ok(flow)
     }
 
     /// Number of shards.
@@ -115,6 +141,88 @@ impl PartitionedIncrementalFlow {
         Ok(())
     }
 
+    /// Enable tick-granular provenance tracking on every shard.
+    ///
+    /// IVM-AUD-PART-25: none of the three provenance calls were forwarded here,
+    /// so provenance was silently impossible for any auto-partitioned job — the
+    /// caller got no error, just an index that was never written and a
+    /// `query_provenance` that always answered `None`.
+    ///
+    /// Provenance is per shard because a row only ever reaches the shard that
+    /// owns its key; [`query_provenance`](Self::query_provenance) unions the
+    /// shards' answers so a caller sees one index. Note that shards tick
+    /// together, so a tick number means the same thing on each of them.
+    pub fn enable_provenance_tracking(&self) -> IvmResult<()> {
+        for shard in &self.shards {
+            shard.enable_provenance_tracking()?;
+        }
+        Ok(())
+    }
+
+    /// [`enable_provenance_tracking`](Self::enable_provenance_tracking) with an
+    /// explicit retention window, in ticks.
+    pub fn enable_provenance_tracking_with_retention(&self, retention_ticks: u64) -> IvmResult<()> {
+        for shard in &self.shards {
+            shard.enable_provenance_tracking_with_retention(retention_ticks)?;
+        }
+        Ok(())
+    }
+
+    /// Output hashes recorded for `input_hash`, unioned across shards.
+    ///
+    /// `None` when no shard has a record: the row lives on exactly one shard,
+    /// so at most one shard normally answers.
+    pub fn query_provenance(&self, input_hash: u64) -> IvmResult<Option<ahash::AHashSet<u64>>> {
+        let mut merged: Option<ahash::AHashSet<u64>> = None;
+        for shard in &self.shards {
+            if let Some(hashes) = shard.query_provenance(input_hash)? {
+                merged
+                    .get_or_insert_with(ahash::AHashSet::new)
+                    .extend(hashes);
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Drop the provenance mapping for `input_hash` on every shard.
+    pub fn forget_provenance(&self, input_hash: u64) -> IvmResult<()> {
+        for shard in &self.shards {
+            shard.forget_provenance(input_hash)?;
+        }
+        Ok(())
+    }
+
+    /// Remember the hash class of the key type the first routed feed used, and
+    /// reject a later feed that would hash the same logical key differently.
+    ///
+    /// See [`routed_key_type`](Self::routed_key_type) for why one call's worth
+    /// of consistency is not enough (IVM-AUD-PART-4).
+    fn check_routed_key_type(&self, batch: &RecordBatch) -> IvmResult<()> {
+        let Ok(idx) = batch.schema().index_of(&self.key_column) else {
+            // Missing column: let the partitioner produce its own message.
+            return Ok(());
+        };
+        let data_type = batch.schema().field(idx).data_type().clone();
+        let Some(class) = krishiv_common::partition::partition_key_hash_class(&data_type) else {
+            // Unsupported type: likewise the partitioner's error to report.
+            return Ok(());
+        };
+        let mut memo = self.routed_key_type.lock().map_err(|_| lock_err())?;
+        match memo.as_ref() {
+            Some((seen_class, seen_type)) if *seen_class != class => {
+                Err(IvmError::execution(format!(
+                    "key column '{}' was routed as {seen_type} and this feed carries                      {data_type}; the two hash differently, so the same key would land                      in two shards. Cast the source to one key type.",
+                    self.key_column
+                )))
+            }
+            Some(_) => Ok(()),
+            None => {
+                *memo = Some((class, data_type.to_string()));
+                Ok(())
+            }
+        }
+    }
+
     /// Feed a delta, routing each row to its shard by the key column.
     pub fn feed(&self, source: &str, delta: DeltaBatch) -> IvmResult<()> {
         if self.shards.len() == 1 {
@@ -127,8 +235,17 @@ impl PartitionedIncrementalFlow {
         // Split the weighted inner batch by the key column using the shared
         // keyed partitioner (`take` preserves the trailing `_weight` column).
         let inner = delta.inner().clone();
-        let routed = partition_record_batches_by_key(&[inner], &self.key_column, self.shards.len())
-            .map_err(|e| IvmError::execution(e.to_string()))?;
+        self.check_routed_key_type(&inner)?;
+        // A NULL group key is one legal group in SQL, so it must be one shard
+        // here too; rejecting it would make auto-partitioning change which data
+        // the engine accepts (IVM-AUD-PART-5).
+        let routed = partition_record_batches_by_key_with_nulls(
+            &[inner],
+            &self.key_column,
+            self.shards.len(),
+            NullKeyPolicy::OwnShard,
+        )
+        .map_err(|e| IvmError::execution(e.to_string()))?;
         for (shard_idx, batches) in routed.into_iter().enumerate() {
             for batch in batches {
                 if batch.num_rows() == 0 {
@@ -338,20 +455,75 @@ impl PartitionedIncrementalFlow {
         Ok(Some(merged))
     }
 
-    /// Current tick count (shards advance together).
+    /// The tick **every** shard has completed.
+    ///
+    /// IVM-AUD-PART-10: this reported shard 0's counter. Shards advance
+    /// together only while every step succeeds — `step_datafusion` deliberately
+    /// lets the healthy shards finish when one fails, so after a partial
+    /// failure the failed shard is a tick behind its siblings. Shard 0's number
+    /// then describes shard 0 and nothing else, and that number is what
+    /// `StepResponse.tick` returns and what the resident-dispatch fence
+    /// records — a fence claiming work that one shard has not done.
+    ///
+    /// The minimum is the only number true of the whole job: every shard has
+    /// completed at least this tick. It is still monotonic (a shard's counter
+    /// never decreases), and it catches up on its own once the failed shard's
+    /// reclaimed deltas are reprocessed. Use [`shard_ticks`](Self::shard_ticks)
+    /// to see the divergence itself.
     pub fn tick(&self) -> IvmResult<u64> {
-        self.shards.first().map(|s| s.tick()).unwrap_or(Ok(0))
+        let mut min: Option<u64> = None;
+        for shard in &self.shards {
+            let t = shard.tick()?;
+            min = Some(min.map_or(t, |m: u64| m.min(t)));
+        }
+        Ok(min.unwrap_or(0))
     }
 
-    /// Peek a view's latest output delta, merging the per-shard deltas.
+    /// Every shard's tick counter, in shard order. Equal across shards in
+    /// steady state; unequal after a partial step failure (see [`tick`](Self::tick)).
+    pub fn shard_ticks(&self) -> IvmResult<Vec<u64>> {
+        self.shards.iter().map(IncrementalFlow::tick).collect()
+    }
+
+    /// Peek a view's latest output delta, merging only the shards that emitted
+    /// it at the **same** tick.
     ///
-    /// Each shard emits the portion of the view output for the keys it owns;
-    /// concatenating the shards' current values gives the combined latest delta.
-    /// (For exact materialized state prefer [`snapshot`](Self::snapshot) — output
-    /// deltas are tick-relative, so a quiet shard may report an older tick.)
+    /// IVM-AUD-PART-11: each shard's watch is coalescing and keeps its last
+    /// value across quiet ticks, so this used to concatenate a shard's tick-9
+    /// rows with a neighbour's tick-3 rows and hand the result over as "the
+    /// latest delta". A consumer applying that to an external sink re-applies
+    /// the tick-3 rows it was already given six ticks earlier.
+    ///
+    /// The faithful analogue of the single-flow value — "the delta from the
+    /// most recent tick that produced one" — is the newest tick any shard
+    /// published at, restricted to the shards that published at it. Shards
+    /// still holding older values are excluded: their rows were the latest
+    /// delta when they were current, and were served then.
+    ///
+    /// For exact materialized state prefer [`snapshot`](Self::snapshot).
     pub fn view_output_peek(&self, view: &str) -> IvmResult<Option<DeltaBatch>> {
+        Ok(self.view_output_peek_at_tick(view)?.map(|(_, delta)| delta))
+    }
+
+    /// [`view_output_peek`](Self::view_output_peek) with the tick the delta
+    /// belongs to — the label whose absence made the merge above unsound.
+    pub fn view_output_peek_at_tick(&self, view: &str) -> IvmResult<Option<(u64, DeltaBatch)>> {
+        let mut newest: Option<u64> = None;
+        for shard in &self.shards {
+            // Errors (unregistered view) propagate exactly as before.
+            let at = shard.view_output_tick(view)?;
+            if let Some(at) = at {
+                newest = Some(newest.map_or(at, |n: u64| n.max(at)));
+            }
+        }
+        let Some(newest) = newest else {
+            return Ok(None);
+        };
         let mut parts: Vec<DeltaBatch> = Vec::new();
         for shard in &self.shards {
+            if shard.view_output_tick(view)? != Some(newest) {
+                continue;
+            }
             if let Some(d) = shard.view_output_peek(view)?
                 && !d.is_empty()
             {
@@ -362,7 +534,74 @@ impl PartitionedIncrementalFlow {
             return Ok(None);
         }
         let merged = DeltaBatch::concat(&parts).map_err(|e| IvmError::execution(e.to_string()))?;
-        Ok(Some(merged))
+        Ok(Some((newest, merged)))
+    }
+
+    /// AUD-9 (loud degradation): how this view actually executes on the shards
+    /// — `(incremental, human_reason)`, `None` if not registered.
+    ///
+    /// IVM-AUD-PART-12: the coordinator used to answer this for a partitioned
+    /// job with a hardcoded `(true, "incremental — key-group partitioned
+    /// aggregate")` on the reasoning that a job is only partitioned because its
+    /// view lowered to a key-group aggregate. That reasoning is about the
+    /// *shape of the SQL*, decided before any tick ran; whether the view got an
+    /// O(Δ) plan is decided per shard on the first step and can come out
+    /// `DiffBased` (an aggregate the planner will not lower, a `ctx.sql`
+    /// failure, a restore that cleared the cached plans). The surface whose
+    /// entire purpose is to expose a silent full-recompute fallback reported
+    /// "incremental" through exactly that fallback.
+    ///
+    /// A view is incremental here only when **every** shard says so; one shard
+    /// on the slow path makes the job's answer no.
+    pub fn view_plan_classification(&self, view: &str) -> IvmResult<Option<(bool, String)>> {
+        use crate::flow::ViewExecution;
+
+        let mut answers: Vec<(ViewExecution, String)> = Vec::new();
+        for shard in &self.shards {
+            match shard.view_execution(view)? {
+                Some(answer) => answers.push(answer),
+                None => return Ok(None),
+            }
+        }
+        if answers.is_empty() {
+            return Ok(None);
+        }
+        // A shard that owns none of this view's keys never builds a plan, so
+        // "not yet planned" is normal and permanent for it and cannot count as
+        // a degradation. Only shards that have actually planned can answer.
+        let planned: Vec<&(ViewExecution, String)> = answers
+            .iter()
+            .filter(|(execution, _)| *execution != ViewExecution::NotYetPlanned)
+            .collect();
+        let Some((_, first_reason)) = planned.first().copied() else {
+            let unplanned = answers
+                .first()
+                .map(|(_, why)| why.clone())
+                .unwrap_or_default();
+            return Ok(Some((false, unplanned)));
+        };
+        let degraded: Vec<&&(ViewExecution, String)> = planned
+            .iter()
+            .filter(|(execution, _)| *execution == ViewExecution::DiffBased)
+            .collect();
+        if let Some((_, why)) = degraded.first().copied() {
+            return Ok(Some((
+                false,
+                format!(
+                    "{} of {} planned shards are not incremental: {why}",
+                    degraded.len(),
+                    planned.len()
+                ),
+            )));
+        }
+        Ok(Some((
+            true,
+            format!(
+                "{first_reason} (key-group partitioned across {} shards, {} planned)",
+                self.shards.len(),
+                planned.len()
+            ),
+        )))
     }
 
     /// Spawn a vector-view background task on **every shard**, all writing to the
@@ -370,12 +609,33 @@ impl PartitionedIncrementalFlow {
     ///
     /// For a `GROUP BY <key>` view sharded by `<key>`, each id (the group key)
     /// lives in exactly one shard, so the shards push disjoint id sets to the
-    /// shared sink with no cross-shard conflict. Returns one join handle per
-    /// shard; drop them to stop the tasks.
+    /// shared sink with no cross-shard conflict.
+    ///
+    /// That disjointness is the whole safety argument, and it only holds when
+    /// the point id **is** the shard key — so (IVM-AUD-PART-21) a multi-shard
+    /// flow now rejects any other `id_column` instead of silently letting two
+    /// shards fight over the same id (last writer wins, and a delete from one
+    /// shard erasing a live row owned by another). A single-shard flow has
+    /// nothing to conflict with and accepts any id column.
+    ///
+    /// Returns one [`VectorViewHandle`](crate::vector_sink::VectorViewHandle)
+    /// per shard; **keep them alive** — dropping a handle aborts its task.
     pub fn spawn_vector_views(
         &self,
         spec: crate::vector_sink::VectorViewSpec,
-    ) -> IvmResult<Vec<tokio::task::JoinHandle<()>>> {
+    ) -> IvmResult<Vec<crate::vector_sink::VectorViewHandle>> {
+        if self.shards.len() > 1 && !spec.id_column.eq_ignore_ascii_case(&self.key_column) {
+            return Err(IvmError::execution(format!(
+                "vector view '{view}': id column '{id}' is not the shard key '{key}', so the \
+                 {n} shards would each own a different subset of rows for the same id and \
+                 overwrite one another in the shared sink. Shard the job by '{id}', or run it \
+                 unpartitioned (KRISHIV_IVM_SHARDS=1).",
+                view = spec.view_name,
+                id = spec.id_column,
+                key = self.key_column,
+                n = self.shards.len(),
+            )));
+        }
         let mut handles = Vec::with_capacity(self.shards.len());
         for shard in &self.shards {
             // One spec per shard, sharing the same sink (Arc clone).
@@ -392,10 +652,28 @@ impl PartitionedIncrementalFlow {
 
     // ── Checkpoint / restore ──────────────────────────────────────────────────
     //
-    // Format: `u32 num_shards || (u32 len || shard_checkpoint)* || streaming_prev`
+    // Format:
+    //   b"KIVP" || u16 version || u8 kind || u8 reserved
+    //          || u32 key_len || key_column
+    //          || u32 num_shards || (u32 len || shard_checkpoint)*
+    //          || streaming_prev
     // where streaming_prev = `u32 count || (u32 name_len||name || u32 len||ipc)*`.
-    // Restore validates the shard count matches the live flow (the registry
-    // re-creates the flow with its key/shape from the registered view first).
+    //
+    // IVM-AUD-PART-8: the three checkpoint kinds used to share byte framing
+    // with no magic and no discriminator — `u32 num_shards` and then payloads —
+    // so handing `restore_full` a `checkpoint_delta` blob (or either one a
+    // `checkpoint`) was caught only by luck: the shard count matched, and what
+    // failed afterwards was an Arrow IPC decode somewhere inside a shard, with
+    // an error message about neither the mix-up nor the caller. `key_column`
+    // was never checked at all, so a checkpoint taken from a flow sharded by
+    // `region` restored happily into one sharded by `customer_id`, silently
+    // placing every key in the wrong shard.
+    //
+    // Blobs written before this header exist in the wild — `PersistedIvmJob`
+    // embeds `checkpoint_full()` bytes and deliberately did not bump its
+    // version, so a coordinator upgrade must still load them. A blob that does
+    // not start with the magic is therefore read with the old framing (shard
+    // count only), which is exactly the guarantee it shipped with.
 
     /// The LATENESS bounds that reached the shards. Every shard is registered
     /// from the same spec, so the first shard's answer is the job's.
@@ -406,11 +684,86 @@ impl PartitionedIncrementalFlow {
         }
     }
 
+    /// Write the tagged frame header: magic, version, kind, key column, shards.
+    fn write_frame_header(&self, out: &mut Vec<u8>, kind: CheckpointKind) {
+        out.extend_from_slice(&CHECKPOINT_MAGIC);
+        out.extend_from_slice(&CHECKPOINT_FRAME_VERSION.to_le_bytes());
+        out.push(kind.tag());
+        out.push(0); // reserved
+        out.extend_from_slice(&(self.key_column.len() as u32).to_le_bytes());
+        out.extend_from_slice(self.key_column.as_bytes());
+        out.extend_from_slice(&(self.shards.len() as u32).to_le_bytes());
+    }
+
+    /// Read and validate the frame header, advancing `pos` past it.
+    ///
+    /// Accepts an untagged (pre-PART-8) blob, which carries only the shard
+    /// count and can therefore only be checked for that.
+    fn read_frame_header(
+        &self,
+        bytes: &[u8],
+        pos: &mut usize,
+        expected: CheckpointKind,
+    ) -> IvmResult<()> {
+        let tagged = bytes.get(0..4) == Some(&CHECKPOINT_MAGIC[..]);
+        if tagged {
+            *pos = 4;
+            let version = read_u16(bytes, pos)?;
+            if version != CHECKPOINT_FRAME_VERSION {
+                return Err(IvmError::execution(format!(
+                    "partitioned checkpoint frame version {version} is not supported \
+                     (this build writes and reads version {CHECKPOINT_FRAME_VERSION})"
+                )));
+            }
+            let tag = read_u8(bytes, pos)?;
+            let _reserved = read_u8(bytes, pos)?;
+            let kind = CheckpointKind::from_tag(tag).ok_or_else(|| {
+                IvmError::execution(format!("unknown partitioned checkpoint kind tag {tag}"))
+            })?;
+            if kind != expected {
+                return Err(IvmError::execution(format!(
+                    "this is a {} checkpoint; {} expects a {} one",
+                    kind.label(),
+                    expected.restore_fn(),
+                    expected.label()
+                )));
+            }
+            let key_len = read_u32(bytes, pos)? as usize;
+            let key = std::str::from_utf8(bytes.get(*pos..*pos + key_len).ok_or_else(slice_err)?)
+                .map_err(|e| IvmError::execution(e.to_string()))?
+                .to_string();
+            *pos += key_len;
+            if !key.eq_ignore_ascii_case(&self.key_column) {
+                return Err(IvmError::execution(format!(
+                    "checkpoint was sharded by key column '{key}' but this flow is \
+                     sharded by '{}'; every key would restore into the wrong shard",
+                    self.key_column
+                )));
+            }
+        } else {
+            *pos = 0;
+            tracing::debug!(
+                expected = expected.label(),
+                "restoring an untagged (pre-PART-8) partitioned checkpoint; only the \
+                 shard count can be validated"
+            );
+        }
+        let n = read_u32(bytes, pos)? as usize;
+        if n != self.shards.len() {
+            return Err(IvmError::execution(format!(
+                "{} checkpoint shard count {n} != live shard count {}",
+                expected.label(),
+                self.shards.len()
+            )));
+        }
+        Ok(())
+    }
+
     /// Full checkpoint: every shard's source snapshots plus the streaming-prev
     /// map, framed with the shard count for restore-time validation.
     pub fn checkpoint(&self) -> IvmResult<Vec<u8>> {
         let mut out = Vec::new();
-        out.extend_from_slice(&(self.shards.len() as u32).to_le_bytes());
+        self.write_frame_header(&mut out, CheckpointKind::Sources);
         for shard in &self.shards {
             let bytes = shard.checkpoint()?;
             out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -423,13 +776,7 @@ impl PartitionedIncrementalFlow {
     /// Restore from [`checkpoint`](Self::checkpoint) bytes.
     pub fn restore(&self, bytes: &[u8]) -> IvmResult<()> {
         let mut pos = 0usize;
-        let n = read_u32(bytes, &mut pos)? as usize;
-        if n != self.shards.len() {
-            return Err(IvmError::execution(format!(
-                "checkpoint shard count {n} != live shard count {}",
-                self.shards.len()
-            )));
-        }
+        self.read_frame_header(bytes, &mut pos, CheckpointKind::Sources)?;
         for shard in &self.shards {
             let len = read_u32(bytes, &mut pos)? as usize;
             let chunk = bytes.get(pos..pos + len).ok_or_else(slice_err)?;
@@ -446,10 +793,11 @@ impl PartitionedIncrementalFlow {
     /// captures shard *sources* only — this preserves each shard's view
     /// baselines, so a restore recomputes deltas against the right state and
     /// maintained views converge after a coordinator/executor restart (G6).
-    /// Same wire framing as `checkpoint`; only the per-shard payload differs.
+    /// Same wire framing as `checkpoint` apart from the kind tag; only the
+    /// per-shard payload differs.
     pub fn checkpoint_full(&self) -> IvmResult<Vec<u8>> {
         let mut out = Vec::new();
-        out.extend_from_slice(&(self.shards.len() as u32).to_le_bytes());
+        self.write_frame_header(&mut out, CheckpointKind::Full);
         for shard in &self.shards {
             let bytes = shard.checkpoint_full()?;
             out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -462,13 +810,7 @@ impl PartitionedIncrementalFlow {
     /// Restore from [`checkpoint_full`](Self::checkpoint_full) bytes.
     pub fn restore_full(&self, bytes: &[u8]) -> IvmResult<()> {
         let mut pos = 0usize;
-        let n = read_u32(bytes, &mut pos)? as usize;
-        if n != self.shards.len() {
-            return Err(IvmError::execution(format!(
-                "checkpoint shard count {n} != live shard count {}",
-                self.shards.len()
-            )));
-        }
+        self.read_frame_header(bytes, &mut pos, CheckpointKind::Full)?;
         for shard in &self.shards {
             let len = read_u32(bytes, &mut pos)? as usize;
             let chunk = bytes.get(pos..pos + len).ok_or_else(slice_err)?;
@@ -487,7 +829,7 @@ impl PartitionedIncrementalFlow {
     /// present in the materialized view).
     pub fn checkpoint_delta(&self) -> IvmResult<Vec<u8>> {
         let mut out = Vec::new();
-        out.extend_from_slice(&(self.shards.len() as u32).to_le_bytes());
+        self.write_frame_header(&mut out, CheckpointKind::Delta);
         for shard in &self.shards {
             let bytes = shard.checkpoint_delta()?;
             out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -500,13 +842,7 @@ impl PartitionedIncrementalFlow {
     /// Restore from [`checkpoint_delta`](Self::checkpoint_delta) bytes.
     pub fn restore_delta(&self, bytes: &[u8]) -> IvmResult<()> {
         let mut pos = 0usize;
-        let n = read_u32(bytes, &mut pos)? as usize;
-        if n != self.shards.len() {
-            return Err(IvmError::execution(format!(
-                "delta checkpoint shard count {n} != live shard count {}",
-                self.shards.len()
-            )));
-        }
+        self.read_frame_header(bytes, &mut pos, CheckpointKind::Delta)?;
         for shard in &self.shards {
             let len = read_u32(bytes, &mut pos)? as usize;
             let chunk = bytes.get(pos..pos + len).ok_or_else(slice_err)?;
@@ -558,12 +894,77 @@ impl PartitionedIncrementalFlow {
     }
 }
 
+/// Magic prefix of a tagged partitioned-checkpoint frame (IVM-AUD-PART-8).
+/// Chosen so it cannot be mistaken for the untagged framing's leading
+/// `u32 num_shards`: read little-endian it is 1_347_638_603 shards.
+const CHECKPOINT_MAGIC: [u8; 4] = *b"KIVP";
+const CHECKPOINT_FRAME_VERSION: u16 = 1;
+
+/// Which of the three checkpoint payloads a frame carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointKind {
+    /// [`PartitionedIncrementalFlow::checkpoint`] — source snapshots only.
+    Sources,
+    /// [`PartitionedIncrementalFlow::checkpoint_full`] — sources + view state.
+    Full,
+    /// [`PartitionedIncrementalFlow::checkpoint_delta`] — accumulated deltas.
+    Delta,
+}
+
+impl CheckpointKind {
+    fn tag(self) -> u8 {
+        match self {
+            CheckpointKind::Sources => 1,
+            CheckpointKind::Full => 2,
+            CheckpointKind::Delta => 3,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(CheckpointKind::Sources),
+            2 => Some(CheckpointKind::Full),
+            3 => Some(CheckpointKind::Delta),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            CheckpointKind::Sources => "source-only",
+            CheckpointKind::Full => "full-state",
+            CheckpointKind::Delta => "delta",
+        }
+    }
+
+    fn restore_fn(self) -> &'static str {
+        match self {
+            CheckpointKind::Sources => "restore",
+            CheckpointKind::Full => "restore_full",
+            CheckpointKind::Delta => "restore_delta",
+        }
+    }
+}
+
 fn lock_err() -> IvmError {
     IvmError::execution("partitioned flow lock poisoned")
 }
 
 fn slice_err() -> IvmError {
     IvmError::execution("checkpoint byte slice out of bounds")
+}
+
+fn read_u8(bytes: &[u8], pos: &mut usize) -> IvmResult<u8> {
+    let byte = *bytes.get(*pos).ok_or_else(slice_err)?;
+    *pos += 1;
+    Ok(byte)
+}
+
+fn read_u16(bytes: &[u8], pos: &mut usize) -> IvmResult<u16> {
+    let raw = bytes.get(*pos..*pos + 2).ok_or_else(slice_err)?;
+    *pos += 2;
+    let arr: [u8; 2] = raw.try_into().map_err(|_| slice_err())?;
+    Ok(u16::from_le_bytes(arr))
 }
 
 fn read_u32(bytes: &[u8], pos: &mut usize) -> IvmResult<u32> {
@@ -579,7 +980,6 @@ mod tests {
 
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::datasource::MemTable;
 
     use super::*;
 
@@ -652,77 +1052,6 @@ mod tests {
         assert_eq!(grand(&part_snap), 265.0); // 100+50+25+10+75+5
     }
 
-    /// `recommended_shards` reuses the AP-1 sizing brain: ~128 MiB/shard, ≥1,
-    /// clamped to `max_shards`.
-    #[test]
-    fn recommended_shards_sizes_and_clamps() {
-        // Tiny input → 1 shard.
-        assert_eq!(PartitionedIncrementalFlow::recommended_shards(1_024, 8), 1);
-        // ~5 * 128 MiB → 5 shards, under the cap.
-        let five = 5 * 128 * 1024 * 1024;
-        assert_eq!(PartitionedIncrementalFlow::recommended_shards(five, 16), 5);
-        // Same bytes, capped at 3.
-        assert_eq!(PartitionedIncrementalFlow::recommended_shards(five, 3), 3);
-    }
-
-    /// Register an empty `orders` table so view SQL is planner-resolvable.
-    fn ctx_with_orders() -> SessionContext {
-        let ctx = SessionContext::new();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, false),
-            Field::new("amount", DataType::Int64, false),
-        ]));
-        let table = MemTable::try_new(schema, vec![vec![]]).unwrap();
-        ctx.register_table("orders", Arc::new(table)).unwrap();
-        ctx
-    }
-
-    /// `auto_for_view` shards a single-column GROUP BY by its key, sized by bytes.
-    #[tokio::test]
-    async fn auto_for_view_shards_single_group_by() {
-        let ctx = ctx_with_orders();
-        let two = 2 * 128 * 1024 * 1024;
-        let flow = PartitionedIncrementalFlow::auto_for_view(&ctx, revenue_spec(), two, 8)
-            .await
-            .unwrap();
-        assert_eq!(flow.key_column(), "region");
-        assert_eq!(flow.num_shards(), 2);
-    }
-
-    /// A non-aggregate (pass-through) view is not shardable → single flow.
-    #[tokio::test]
-    async fn auto_for_view_falls_back_to_single_flow() {
-        let ctx = ctx_with_orders();
-        let spec = IncrementalViewSpec {
-            name: "passthrough".into(),
-            body_sql: "SELECT region, amount FROM orders".into(),
-            output_schema: Arc::new(Schema::new(vec![
-                Field::new("region", DataType::Utf8, true),
-                Field::new("amount", DataType::Int64, true),
-            ])),
-            is_materialized: true,
-            is_recursive: false,
-            lateness: vec![],
-        };
-        let huge = 100 * 128 * 1024 * 1024;
-        let flow = PartitionedIncrementalFlow::auto_for_view(&ctx, spec, huge, 8)
-            .await
-            .unwrap();
-        assert_eq!(flow.num_shards(), 1);
-    }
-
-    /// A two-column GROUP BY is not safely single-key shardable → single flow.
-    #[tokio::test]
-    async fn auto_for_view_multi_key_group_by_not_sharded() {
-        let ctx = ctx_with_orders();
-        let key = partition_key_for_view(
-            &ctx,
-            "SELECT region, amount, COUNT(*) AS n FROM orders GROUP BY region, amount",
-        )
-        .await;
-        assert_eq!(key, None);
-    }
-
     /// Schema-free key detection mirrors the planner-based rule.
     #[test]
     fn partition_key_from_sql_detects_single_group_by() {
@@ -753,14 +1082,23 @@ mod tests {
     }
 
     /// Exhaustive shape coverage for the schema-free key detector.
+    ///
+    /// IVM-AUD-PART-6: the first assertion in this test used to be that
+    /// `… GROUP BY region HAVING … ORDER BY t LIMIT 5` **is** shardable — a
+    /// test asserting a wrong answer, and the reason the defect survived
+    /// review. `LIMIT 5` on a 3-shard job returns up to 15 rows, and the
+    /// `ORDER BY` that picks which 5 is applied inside each shard over that
+    /// shard's groups only. The clauses are separated below so each is pinned
+    /// on its own rather than as one accept-everything blob.
     #[test]
     fn partition_key_from_sql_shape_coverage() {
         let key = crate::partition_key_from_sql;
 
-        // Accepts: GROUP BY survives HAVING / ORDER BY / LIMIT / WHERE.
+        // Accepts: WHERE and HAVING are per-row and per-group, and a group
+        // lives entirely inside one shard.
         assert_eq!(
             key("SELECT region, SUM(amount) t FROM orders WHERE amount > 0 \
-                 GROUP BY region HAVING SUM(amount) > 10 ORDER BY t LIMIT 5")
+                 GROUP BY region HAVING SUM(amount) > 10")
             .as_deref(),
             Some("region")
         );
@@ -768,6 +1106,125 @@ mod tests {
         assert_eq!(
             key("select Region, count(*) from orders group by Region").as_deref(),
             Some("Region")
+        );
+        // A qualifier that names the table, or its alias, resolves.
+        assert_eq!(
+            key("SELECT orders.region, COUNT(*) FROM orders GROUP BY orders.region").as_deref(),
+            Some("region")
+        );
+
+        // Rejects, result-set clauses: each is applied independently inside
+        // every shard and then the shards are concatenated.
+        assert_eq!(
+            key("SELECT region, SUM(amount) t FROM orders GROUP BY region LIMIT 5"),
+            None,
+            "LIMIT n per shard returns up to n x shards rows"
+        );
+        assert_eq!(
+            key("SELECT region, SUM(amount) t FROM orders GROUP BY region ORDER BY t"),
+            None,
+            "ORDER BY is destroyed by concatenating shards"
+        );
+        assert_eq!(
+            key("SELECT region, SUM(amount) t FROM orders GROUP BY region \
+                 ORDER BY t DESC LIMIT 5"),
+            None,
+            "a per-shard top-N is a top-N of the wrong candidate set"
+        );
+        assert_eq!(
+            key("SELECT region, SUM(amount) FROM orders GROUP BY region OFFSET 10"),
+            None
+        );
+        assert_eq!(
+            key("SELECT region, SUM(amount) FROM orders GROUP BY region \
+                 FETCH FIRST 5 ROWS ONLY"),
+            None
+        );
+
+        // Rejects, FROM shapes: sharding by the group key co-locates rows by
+        // the group key, not the join key, so matching pairs land apart.
+        assert_eq!(
+            key(
+                "SELECT o.region, SUM(o.amount) FROM orders o JOIN customers c \
+                 ON o.cust = c.id GROUP BY o.region"
+            ),
+            None,
+            "a join co-located by the group key silently loses matches"
+        );
+        assert_eq!(
+            key("SELECT o.region, SUM(o.amount) FROM orders o, customers c GROUP BY o.region"),
+            None
+        );
+        assert_eq!(
+            key("SELECT region, SUM(amount) FROM (SELECT * FROM orders) x GROUP BY region"),
+            None,
+            "a derived table is re-evaluated per shard"
+        );
+        assert_eq!(
+            key("SELECT region, COUNT(*) FROM generate_series(1, 3) GROUP BY region"),
+            None
+        );
+        // Grouping on a column the SELECT does not project is still a correct
+        // shape: each group lives in one shard and the shards concatenate. The
+        // scheduler declines it for a different reason — it cannot read the key
+        // column's type out of an output schema that has no such column — and
+        // that is its check to make, not this one's.
+        assert_eq!(
+            key("SELECT COUNT(*) AS n FROM orders GROUP BY region").as_deref(),
+            Some("region")
+        );
+
+        // Rejects, subqueries: evaluated per shard over that shard's rows, so a
+        // whole-table denominator becomes a per-shard one.
+        assert_eq!(
+            key(
+                "SELECT region, SUM(amount) / (SELECT SUM(amount) FROM orders) AS share \
+                 FROM orders GROUP BY region"
+            ),
+            None,
+            "a scalar subquery denominator becomes the shard's sum"
+        );
+        assert_eq!(
+            key("SELECT region, SUM(amount) FROM orders \
+                 WHERE cust IN (SELECT id FROM vips) GROUP BY region"),
+            None
+        );
+        assert_eq!(
+            key("SELECT region, SUM(amount) FROM orders o \
+                 WHERE EXISTS (SELECT 1 FROM vips v WHERE v.id = o.cust) GROUP BY region"),
+            None
+        );
+
+        // Rejects, alias shadowing: the query groups on `customer` but the
+        // router would shard the input on the column literally named `region`.
+        assert_eq!(
+            key("SELECT customer AS region, SUM(amount) FROM orders GROUP BY region"),
+            None,
+            "the alias and the routed column are different columns"
+        );
+        // The harmless case — aliasing the key to itself — still resolves.
+        assert_eq!(
+            key("SELECT region AS region, SUM(amount) FROM orders GROUP BY region").as_deref(),
+            Some("region")
+        );
+
+        // Rejects, cross-group operators.
+        assert_eq!(
+            key(
+                "SELECT region, SUM(amount) s, RANK() OVER (ORDER BY SUM(amount)) r \
+                 FROM orders GROUP BY region"
+            ),
+            None,
+            "a window function ranks over a partition that need not be the shard key"
+        );
+        assert_eq!(
+            key("SELECT DISTINCT region, SUM(amount) FROM orders GROUP BY region"),
+            None
+        );
+        assert_eq!(
+            key("SELECT region, SUM(amount) FROM orders GROUP BY region \
+                 QUALIFY ROW_NUMBER() OVER (ORDER BY region) = 1"),
+            None
         );
 
         // Rejects: multi-statement, set ops, CTEs (outer body isn't a Select),
@@ -957,22 +1414,6 @@ mod tests {
         assert_eq!(f.key_column(), "region");
     }
 
-    #[test]
-    fn recommended_shards_edge_caps() {
-        // Zero max_shards is coerced to 1.
-        assert_eq!(
-            PartitionedIncrementalFlow::recommended_shards(1 << 40, 0),
-            1
-        );
-        // Zero bytes → 1 shard regardless of cap.
-        assert_eq!(PartitionedIncrementalFlow::recommended_shards(0, 16), 1);
-        // Saturates at the cap, never overflows.
-        assert_eq!(
-            PartitionedIncrementalFlow::recommended_shards(u64::MAX, 4),
-            4
-        );
-    }
-
     // ── feed() routing edge cases ─────────────────────────────────────────────
 
     #[test]
@@ -1001,24 +1442,65 @@ mod tests {
         assert!(part.feed("orders", delta).is_err());
     }
 
-    #[test]
-    fn feed_null_key_errors_when_sharded() {
+    /// IVM-AUD-PART-5: a NULL group key is one legal group in SQL. It used to
+    /// be accepted on a single flow and rejected the moment the same view
+    /// auto-partitioned, so auto-partitioning silently changed which data the
+    /// engine accepts. The partitioned answer must now equal the single-flow
+    /// answer, NULL group and all.
+    #[tokio::test]
+    async fn a_null_group_key_is_accepted_exactly_as_on_a_single_flow() {
+        fn nullable_orders() -> RecordBatch {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, true),
+                Field::new("amount", DataType::Int64, false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(vec![Some("US"), None, Some("EU"), None])),
+                    Arc::new(Int64Array::from(vec![1, 2, 4, 8])),
+                ],
+            )
+            .unwrap()
+        }
+        fn grand_total(batch: &RecordBatch) -> f64 {
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap()
+                .iter()
+                .map(|v| v.unwrap_or(0.0))
+                .sum()
+        }
+
+        let single = PartitionedIncrementalFlow::new(1, "region");
+        single.register_view(revenue_spec()).unwrap();
+        single
+            .feed(
+                "orders",
+                DeltaBatch::from_inserts(nullable_orders()).unwrap(),
+            )
+            .unwrap();
+        single.step_datafusion().await.unwrap();
+        let reference = single.snapshot("revenue").unwrap().unwrap();
+
         let part = PartitionedIncrementalFlow::new(3, "region");
         part.register_view(revenue_spec()).unwrap();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, true),
-            Field::new("amount", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec![Some("US"), None])),
-                Arc::new(Int64Array::from(vec![1, 2])),
-            ],
+        part.feed(
+            "orders",
+            DeltaBatch::from_inserts(nullable_orders()).unwrap(),
         )
-        .unwrap();
-        let delta = DeltaBatch::from_inserts(batch).unwrap();
-        assert!(part.feed("orders", delta).is_err());
+        .expect("a NULL group key must route, not error");
+        part.step_datafusion().await.unwrap();
+        let sharded = part.snapshot("revenue").unwrap().unwrap();
+
+        // US, EU, and one NULL group — the same three rows either way, and the
+        // NULL group must not have been split across shards.
+        assert_eq!(reference.num_rows(), 3);
+        assert_eq!(sharded.num_rows(), reference.num_rows());
+        assert_eq!(grand_total(&sharded), grand_total(&reference));
+        assert_eq!(grand_total(&sharded), 15.0);
     }
 
     #[test]
@@ -1198,6 +1680,409 @@ mod tests {
         }
     }
 
+    // ── T4 regressions ────────────────────────────────────────────────────────
+
+    /// Which shard a `region` value routes to, using the same partitioner the
+    /// flow uses. Tests need this to place rows in a *named* shard.
+    fn shard_of(region: &str, shards: usize) -> usize {
+        let batch = orders(&[region], &[1]);
+        let routed =
+            krishiv_common::partition::partition_record_batches_by_key(&[batch], "region", shards)
+                .unwrap();
+        routed
+            .iter()
+            .position(|b| b.iter().any(|x| x.num_rows() > 0))
+            .unwrap()
+    }
+
+    /// Two region values that land in different shards of an `n`-shard flow.
+    fn two_regions_in_different_shards(n: usize) -> (String, String) {
+        let first = format!("r{}", 0);
+        let first_shard = shard_of(&first, n);
+        for i in 1..200 {
+            let candidate = format!("r{i}");
+            if shard_of(&candidate, n) != first_shard {
+                return (first, candidate);
+            }
+        }
+        panic!("no two of 200 keys landed in different shards of {n}");
+    }
+
+    fn id_keyed_spec() -> IncrementalViewSpec {
+        IncrementalViewSpec {
+            name: "by_id".into(),
+            body_sql: "SELECT id, SUM(amount) AS total FROM events GROUP BY id".into(),
+            output_schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("total", DataType::Float64, true),
+            ])),
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        }
+    }
+
+    fn id_batch(width: &DataType, ids: &[i64]) -> RecordBatch {
+        let key: arrow::array::ArrayRef = match width {
+            DataType::Int32 => Arc::new(arrow::array::Int32Array::from(
+                ids.iter().map(|v| *v as i32).collect::<Vec<_>>(),
+            )),
+            _ => Arc::new(Int64Array::from(ids.to_vec())),
+        };
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", width.clone(), false),
+                Field::new("amount", DataType::Int64, false),
+            ])),
+            vec![key, Arc::new(Int64Array::from(vec![1_i64; ids.len()]))],
+        )
+        .unwrap()
+    }
+
+    /// IVM-AUD-PART-4: key-type consistency was checked only *within* one
+    /// `partition_record_batches_by_key` call, so a source emitting `id` as
+    /// `Int32` in one feed and `Int64` in the next hashed the same logical key
+    /// under two different tags and split its group across two shards. The
+    /// second feed must be refused, naming both types.
+    #[test]
+    fn a_key_that_changes_width_between_feeds_is_refused() {
+        let part = PartitionedIncrementalFlow::new(3, "id");
+        part.register_view(id_keyed_spec()).unwrap();
+
+        part.feed(
+            "events",
+            DeltaBatch::from_inserts(id_batch(&DataType::Int32, &[1, 2, 3])).unwrap(),
+        )
+        .unwrap();
+        let err = part
+            .feed(
+                "events",
+                DeltaBatch::from_inserts(id_batch(&DataType::Int64, &[1, 2, 3])).unwrap(),
+            )
+            .expect_err("a key width change must not be silently routed");
+        let msg = err.to_string();
+        assert!(msg.contains("Int32") && msg.contains("Int64"), "{msg}");
+
+        // The three string encodings deliberately hash alike, so switching
+        // between them keeps every key in its shard and stays accepted.
+        let strings = PartitionedIncrementalFlow::new(3, "region");
+        strings.register_view(revenue_spec()).unwrap();
+        strings
+            .feed(
+                "orders",
+                DeltaBatch::from_inserts(orders(&["US"], &[1])).unwrap(),
+            )
+            .unwrap();
+        let view_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8View, false),
+                Field::new("amount", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(arrow::array::StringViewArray::from(vec!["US"])),
+                Arc::new(Int64Array::from(vec![2_i64])),
+            ],
+        )
+        .unwrap();
+        strings
+            .feed("orders", DeltaBatch::from_inserts(view_batch).unwrap())
+            .expect("Utf8 -> Utf8View keeps the same shard and must be accepted");
+    }
+
+    /// IVM-AUD-PART-13: each shard builds its own spill pool, so N shards must
+    /// divide one container budget, not each take the whole of it. Before this,
+    /// the default 8-shard job was licensed to use 200% of the container.
+    #[test]
+    fn shards_divide_the_memory_budget_instead_of_replicating_it() {
+        let total = 800 * 1024 * 1024;
+        let flow = PartitionedIncrementalFlow::new_with_budget(8, "region", Some(total));
+        let limits: Vec<Option<usize>> = flow
+            .shards
+            .iter()
+            .map(IncrementalFlow::tick_memory_limit)
+            .collect();
+        assert_eq!(
+            limits,
+            vec![Some(total / 8); 8],
+            "each shard's pool ceiling"
+        );
+        let licensed: usize = limits.iter().flatten().sum();
+        assert!(
+            licensed <= total,
+            "8 shards are licensed {licensed} bytes out of a {total}-byte budget"
+        );
+        // One shard is the whole budget; an unlimited process stays unlimited.
+        assert_eq!(
+            PartitionedIncrementalFlow::new_with_budget(1, "region", Some(total)).shards[0]
+                .tick_memory_limit(),
+            Some(total)
+        );
+        assert_eq!(
+            PartitionedIncrementalFlow::new_with_budget(4, "region", None).shards[0]
+                .tick_memory_limit(),
+            None
+        );
+    }
+
+    /// IVM-AUD-PART-10: `tick()` reported shard 0's counter. After a partial
+    /// step failure the failed shard is a tick behind, and shard 0's number
+    /// then describes shard 0 only — while it is what `StepResponse.tick`
+    /// returns and what the dispatch fence records.
+    #[tokio::test]
+    async fn tick_reports_the_tick_every_shard_completed() {
+        const SHARDS: usize = 3;
+        // Pick a key owned by a shard that is NOT shard 0, so a failure there
+        // leaves shard 0 ahead — the exact case the old getter could not see.
+        let victim = (0..200)
+            .map(|i| format!("r{i}"))
+            .find(|k| shard_of(k, SHARDS) != 0)
+            .expect("some key must live outside shard 0");
+        let victim_shard = shard_of(&victim, SHARDS);
+
+        let part = PartitionedIncrementalFlow::new(SHARDS, "region");
+        part.register_view(revenue_spec()).unwrap();
+
+        // Two feeds for the same source with incompatible non-key columns:
+        // the owning shard fails to coalesce them and never advances, while
+        // every other shard has nothing to do and advances cleanly.
+        part.feed(
+            "orders",
+            DeltaBatch::from_inserts(orders(&[victim.as_str()], &[1])).unwrap(),
+        )
+        .unwrap();
+        let odd_schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("amount", DataType::Utf8, false),
+        ]));
+        let odd = RecordBatch::try_new(
+            odd_schema,
+            vec![
+                Arc::new(StringArray::from(vec![victim.as_str()])),
+                Arc::new(StringArray::from(vec!["not-a-number"])),
+            ],
+        )
+        .unwrap();
+        part.feed("orders", DeltaBatch::from_inserts(odd).unwrap())
+            .unwrap();
+
+        assert!(
+            part.step_datafusion().await.is_err(),
+            "the owning shard must fail this tick"
+        );
+
+        let ticks = part.shard_ticks().unwrap();
+        assert_eq!(ticks[victim_shard], 0, "the failed shard did not advance");
+        assert!(
+            ticks.contains(&1),
+            "the healthy shards did advance: {ticks:?}"
+        );
+        assert_eq!(
+            part.tick().unwrap(),
+            0,
+            "tick() must report the tick EVERY shard completed, not shard 0's: {ticks:?}"
+        );
+    }
+
+    /// IVM-AUD-PART-11: the per-shard watch is coalescing, so a quiet shard
+    /// keeps serving an old delta. Concatenating it with a shard that emitted
+    /// this tick hands the caller rows from two different ticks labelled as one.
+    #[tokio::test]
+    async fn view_output_peek_serves_one_tick_not_a_mixture() {
+        const SHARDS: usize = 3;
+        let (early, late) = two_regions_in_different_shards(SHARDS);
+
+        let part = PartitionedIncrementalFlow::new(SHARDS, "region");
+        part.register_view(revenue_spec()).unwrap();
+
+        // Tick 1: only `early`'s shard emits.
+        part.feed(
+            "orders",
+            DeltaBatch::from_inserts(orders(&[early.as_str()], &[10])).unwrap(),
+        )
+        .unwrap();
+        part.step_datafusion().await.unwrap();
+        let (tick1, delta1) = part.view_output_peek_at_tick("revenue").unwrap().unwrap();
+        assert_eq!(tick1, 1);
+        assert_eq!(delta1.num_rows(), 1);
+
+        // Tick 2: only `late`'s shard emits. `early`'s shard still holds its
+        // tick-1 value on its watch.
+        part.feed(
+            "orders",
+            DeltaBatch::from_inserts(orders(&[late.as_str()], &[20])).unwrap(),
+        )
+        .unwrap();
+        part.step_datafusion().await.unwrap();
+
+        let (tick2, delta2) = part.view_output_peek_at_tick("revenue").unwrap().unwrap();
+        assert_eq!(tick2, 2, "the merged delta must be labelled with its tick");
+        assert_eq!(
+            delta2.num_rows(),
+            1,
+            "the tick-1 shard's stale delta must not be merged into the tick-2 one"
+        );
+        assert_eq!(
+            part.view_output_peek("revenue")
+                .unwrap()
+                .unwrap()
+                .num_rows(),
+            1
+        );
+    }
+
+    /// IVM-AUD-PART-8: the three checkpoint kinds shared byte framing with no
+    /// discriminator, so cross-feeding them failed (if at all) deep inside an
+    /// Arrow decode with a message about neither the mix-up nor the caller.
+    #[tokio::test]
+    async fn a_checkpoint_of_the_wrong_kind_is_named_and_refused() {
+        let src = PartitionedIncrementalFlow::new(3, "region");
+        src.enable_delta_checkpoints().unwrap();
+        src.register_view(revenue_spec()).unwrap();
+        src.feed(
+            "orders",
+            DeltaBatch::from_inserts(orders(&["US", "EU"], &[1, 2])).unwrap(),
+        )
+        .unwrap();
+        src.step_datafusion().await.unwrap();
+
+        let sources = src.checkpoint().unwrap();
+        let full = src.checkpoint_full().unwrap();
+        let delta = src.checkpoint_delta().unwrap();
+
+        let dst = PartitionedIncrementalFlow::new(3, "region");
+        dst.enable_delta_checkpoints().unwrap();
+        dst.register_view(revenue_spec()).unwrap();
+
+        let err = dst.restore_full(&sources).unwrap_err().to_string();
+        assert!(
+            err.contains("source-only") && err.contains("restore_full"),
+            "{err}"
+        );
+        let err = dst.restore_delta(&full).unwrap_err().to_string();
+        assert!(
+            err.contains("full-state") && err.contains("restore_delta"),
+            "{err}"
+        );
+        let err = dst.restore(&delta).unwrap_err().to_string();
+        assert!(err.contains("delta") && err.contains("restore"), "{err}");
+
+        // The matching kinds still round-trip.
+        dst.restore_full(&full).unwrap();
+    }
+
+    /// IVM-AUD-PART-8: restore validated the shard count but never the key
+    /// column, so a checkpoint sharded by `region` restored happily into a flow
+    /// sharded by `customer` — every key placed in the wrong shard, silently.
+    #[tokio::test]
+    async fn a_checkpoint_from_a_different_shard_key_is_refused() {
+        let src = PartitionedIncrementalFlow::new(3, "region");
+        src.register_view(revenue_spec()).unwrap();
+        src.feed(
+            "orders",
+            DeltaBatch::from_inserts(orders(&["US", "EU"], &[1, 2])).unwrap(),
+        )
+        .unwrap();
+        src.step_datafusion().await.unwrap();
+        let bytes = src.checkpoint().unwrap();
+
+        let wrong_key = PartitionedIncrementalFlow::new(3, "customer");
+        let err = wrong_key.restore(&bytes).unwrap_err().to_string();
+        assert!(
+            err.contains("region") && err.contains("customer"),
+            "the error must name both key columns: {err}"
+        );
+
+        // Same key, different spelling, is the same column in SQL.
+        let same_key = PartitionedIncrementalFlow::new(3, "REGION");
+        same_key.register_view(revenue_spec()).unwrap();
+        same_key.restore(&bytes).unwrap();
+    }
+
+    /// Blobs written before the tagged header exist in persisted coordinator
+    /// snapshots (`PersistedIvmJob` embeds `checkpoint_full()` bytes and
+    /// deliberately did not bump its version), so the untagged framing must
+    /// still load — with the shard-count check it always had.
+    #[tokio::test]
+    async fn an_untagged_pre_tag_checkpoint_still_restores() {
+        let src = PartitionedIncrementalFlow::new(3, "region");
+        src.register_view(revenue_spec()).unwrap();
+        src.feed(
+            "orders",
+            DeltaBatch::from_inserts(orders(&["US", "EU", "APAC"], &[1, 2, 3])).unwrap(),
+        )
+        .unwrap();
+        src.step_datafusion().await.unwrap();
+
+        // Strip the header this build writes, leaving exactly the old layout:
+        // `u32 num_shards || (u32 len || shard)* || streaming_prev`.
+        let tagged = src.checkpoint().unwrap();
+        let header = 4 + 2 + 1 + 1 + 4 + "region".len();
+        let legacy = tagged[header..].to_vec();
+        assert_ne!(legacy.get(0..4), Some(&CHECKPOINT_MAGIC[..]));
+
+        let dst = PartitionedIncrementalFlow::new(3, "region");
+        dst.register_view(revenue_spec()).unwrap();
+        dst.restore(&legacy).unwrap();
+        assert_eq!(
+            dst.source_snapshot("orders").unwrap().unwrap().num_rows(),
+            3
+        );
+
+        // The one check the old framing carried still applies.
+        let wrong_shape = PartitionedIncrementalFlow::new(2, "region");
+        assert!(wrong_shape.restore(&legacy).is_err());
+    }
+
+    /// IVM-AUD-PART-12: a partitioned view's execution strategy is decided per
+    /// shard on the first step, not by the shape check that made the job
+    /// partitioned. `COUNT(DISTINCT …)` is a legitimately shardable
+    /// single-key aggregate that the planner will not lower, so every shard
+    /// runs it DiffBased — and the classification must say so.
+    #[tokio::test]
+    async fn a_view_that_lowers_to_diff_based_per_shard_is_not_called_incremental() {
+        let spec = IncrementalViewSpec {
+            name: "distinct_amounts".into(),
+            body_sql: "SELECT region, COUNT(DISTINCT amount) AS n FROM orders GROUP BY region"
+                .into(),
+            output_schema: Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, true),
+                Field::new("n", DataType::Int64, true),
+            ])),
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        };
+        let part = PartitionedIncrementalFlow::new(3, "region");
+        part.register_view(spec).unwrap();
+        part.feed(
+            "orders",
+            DeltaBatch::from_inserts(orders(&["US", "EU", "US"], &[1, 2, 1])).unwrap(),
+        )
+        .unwrap();
+        part.step_datafusion().await.unwrap();
+
+        let (incremental, why) = part
+            .view_plan_classification("distinct_amounts")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !incremental,
+            "a per-shard DiffBased view must not report incremental: {why}"
+        );
+        assert!(part.view_plan_classification("nope").unwrap().is_none());
+
+        // A view that does lower still reports incremental.
+        let agg = PartitionedIncrementalFlow::new(3, "region");
+        agg.register_view(revenue_spec()).unwrap();
+        agg.feed(
+            "orders",
+            DeltaBatch::from_inserts(orders(&["US", "EU"], &[1, 2])).unwrap(),
+        )
+        .unwrap();
+        agg.step_datafusion().await.unwrap();
+        assert!(agg.view_plan_classification("revenue").unwrap().unwrap().0);
+    }
+
     #[tokio::test]
     async fn spawn_vector_views_errors_for_unregistered_view() {
         use crate::vector_sink::VectorViewSpec;
@@ -1211,5 +2096,125 @@ mod tests {
             sink: InMemoryVectorSink::new(),
         };
         assert!(part.spawn_vector_views(spec).is_err());
+    }
+
+    /// IVM-AUD-PART-21: the shared-sink fan-out is only safe when the point id
+    /// *is* the shard key, because that is what makes the shards' id sets
+    /// disjoint. With any other id column two shards can own rows for the same
+    /// id and overwrite (or delete) each other's points in the shared sink.
+    #[tokio::test]
+    async fn spawn_vector_views_rejects_an_id_column_that_is_not_the_shard_key() {
+        use crate::vector_sink::VectorViewSpec;
+        use crate::vector_sink::testing::InMemoryVectorSink;
+
+        let mismatched = |sink| VectorViewSpec {
+            view_name: "revenue".into(),
+            id_column: "total".into(), // not the shard key ("region")
+            vector_column: "v".into(),
+            sink,
+        };
+
+        let sharded = PartitionedIncrementalFlow::new(4, "region");
+        sharded.register_view(revenue_spec()).unwrap();
+        let err = sharded
+            .spawn_vector_views(mismatched(InMemoryVectorSink::new()))
+            .expect_err("a non-key id column across 4 shards must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("is not the shard key"),
+            "the error must name the mismatch: {msg}"
+        );
+
+        // One shard has nothing to conflict with, so any id column is fine.
+        let single = PartitionedIncrementalFlow::new(1, "region");
+        single.register_view(revenue_spec()).unwrap();
+        let handles = single
+            .spawn_vector_views(mismatched(InMemoryVectorSink::new()))
+            .expect("a single-shard flow cannot conflict with itself");
+        assert_eq!(handles.len(), 1);
+
+        // The key column itself is always accepted.
+        let ok = PartitionedIncrementalFlow::new(4, "region");
+        ok.register_view(revenue_spec()).unwrap();
+        assert!(
+            ok.spawn_vector_views(VectorViewSpec {
+                view_name: "revenue".into(),
+                id_column: "REGION".into(), // case-insensitive, like the rest of the flow
+                vector_column: "v".into(),
+                sink: InMemoryVectorSink::new(),
+            })
+            .is_ok()
+        );
+    }
+
+    // ── provenance forwarding (IVM-AUD-PART-25) ───────────────────────────────
+
+    /// A view that lowers to the DiffBased path — provenance is recorded there
+    /// and nowhere else. `COUNT(DISTINCT ...)` degrades to DiffBased (CORE-22).
+    fn diff_based_spec() -> IncrementalViewSpec {
+        IncrementalViewSpec {
+            name: "distinct_amounts".into(),
+            body_sql: "SELECT region, COUNT(DISTINCT amount) AS n FROM orders GROUP BY region"
+                .into(),
+            output_schema: Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, true),
+                Field::new("n", DataType::Int64, true),
+            ])),
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        }
+    }
+
+    /// The provenance hash the flow records for a `+1` row: the row hash with
+    /// its weight mixed in (`flow.rs`, "weight-aware input hashes").
+    fn provenance_hash_of_insert(batch: &RecordBatch, row: usize) -> u64 {
+        crate::provenance::hash_batch_row(batch, row)
+            .unwrap()
+            .wrapping_add(1u64.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+    }
+
+    /// IVM-AUD-PART-25: `enable_provenance_tracking` / `query_provenance` /
+    /// `forget_provenance` were not forwarded here at all, so an auto-partitioned
+    /// job could enable provenance, get `Ok(())`, and then always be told `None`.
+    #[tokio::test]
+    async fn provenance_reaches_every_shard_of_a_partitioned_flow() {
+        let part = PartitionedIncrementalFlow::new(3, "region");
+        part.register_view(diff_based_spec()).unwrap();
+        part.enable_provenance_tracking().unwrap();
+
+        // Enough distinct keys that they cannot all hash to one shard — with
+        // only three the test passed even when provenance reached shard 0 alone.
+        let regions: Vec<&str> = vec![
+            "US", "EU", "APAC", "LATAM", "MEA", "CN", "JP", "IN", "BR", "ZA", "AU", "CA",
+        ];
+        let amounts: Vec<i64> = (0..regions.len() as i64).collect();
+        let batch = orders(&regions, &amounts);
+        part.feed("orders", DeltaBatch::from_inserts(batch.clone()).unwrap())
+            .unwrap();
+        part.step_datafusion().await.unwrap();
+
+        for row in 0..batch.num_rows() {
+            let h = provenance_hash_of_insert(&batch, row);
+            assert!(
+                part.query_provenance(h).unwrap().is_some(),
+                "row {row} was fed to some shard; its provenance must be queryable                  through the partitioned flow"
+            );
+        }
+
+        // Forget every row, so the assertion covers every shard rather than
+        // whichever one happens to hold row 0.
+        for row in 0..batch.num_rows() {
+            part.forget_provenance(provenance_hash_of_insert(&batch, row))
+                .unwrap();
+        }
+        for row in 0..batch.num_rows() {
+            assert!(
+                part.query_provenance(provenance_hash_of_insert(&batch, row))
+                    .unwrap()
+                    .is_none(),
+                "forget must reach whichever shard holds row {row}"
+            );
+        }
     }
 }

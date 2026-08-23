@@ -65,7 +65,8 @@
 
 **Interfaces:**
 - Consumes: `krishiv_api::DataFrame::to_incremental`; existing `PyDeltaBatch` (`crate::incremental`), `PyBatch`.
-- Produces (Python): `df.to_incremental(name=None) -> IncrementalDataFrame`; methods `apply(delta, source=None)`, `insert(batch)`, `delete(batch)`, `upsert(batch, keys)`, `apply_cdc(event)`, `snapshot() -> Batch|None`, `next_change() -> DeltaBatch|None` (each published delta at most once), `last_output() -> DeltaBatch|None` (non-consuming peek), `checkpoint()`, `restore(bytes)`, `drop()`, `name` (property), `source_names -> list[str]`, `transaction()` (context manager).
+- Produces (Python): `df.to_incremental(name=None) -> IncrementalDataFrame`; methods `apply(delta, source=None)`, `insert(batch)`, `delete(batch)`, `apply_cdc(before, after)`, `snapshot() -> Batch|None`, `next_change() -> DeltaBatch|None` (each published delta at most once), `last_output() -> DeltaBatch|None` (non-consuming peek), `name` (property), `source_names -> list[str]`, `transaction()` (context manager).
+- **Not shipped** (IVM-AUD-API-D4 — this line used to list them as if they were): `upsert(batch, keys)`, `checkpoint()`, `restore(bytes)`, `drop()`, and `iv.as_source()`. None of them exist on the Python `IncrementalDataFrame`. Checkpoint/restore are reachable through the job handle (`Session.ivm(...)`), not through this one; `Session.view(iv)` is the shipped spelling of `as_source`.
 
 - [ ] **Step 1: Write the failing test** (`test_incremental_dataframe.py`): embedded session, register `src` with 3 rows, `iv = s.sql("SELECT k, SUM(v) AS total FROM src GROUP BY k").to_incremental()`, `iv.insert(batch); ` assert `iv.snapshot()` equals the batch `groupBy` oracle.
 - [ ] **Step 2: Run** `.venv/bin/python -m pytest python/tests/test_incremental_dataframe.py -q` → FAIL (import/attr error).
