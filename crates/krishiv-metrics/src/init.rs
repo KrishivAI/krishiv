@@ -200,6 +200,8 @@ pub fn init(config: MetricsConfig) -> Result<MetricsHandle, MetricsError> {
     let _ = tracing_subscriber::registry()
         .with(filter)
         .with(fmt_layer)
+        // Recent-history log ring served by the daemons' /logs endpoints.
+        .with(crate::log_ring::LogRingLayer)
         .with(tracing_opentelemetry::layer().with_tracer(tracer))
         .try_init();
 

@@ -4,6 +4,7 @@
 // current buffer (old entries evict under memory pressure).
 
 import { useEvents } from "../api/queries";
+import { LogTable } from "../components/LogTable";
 import { ErrorText } from "../components/ui";
 
 const KIND_TONE: Record<string, string> = {
@@ -61,6 +62,9 @@ export function EventsPage() {
             )}
           </tbody>
         </table>
+      </div>
+      <div className="mt-6">
+        <LogTable path="/api/v1/logs" title="Coordinator logs" />
       </div>
     </div>
   );

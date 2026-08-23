@@ -4,6 +4,7 @@
 //! OpenTelemetry metrics, traces, and structured log initialization for all Krishiv processes.
 
 pub mod grpc;
+pub mod log_ring;
 pub mod observability_report;
 pub mod system;
 

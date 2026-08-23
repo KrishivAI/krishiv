@@ -575,6 +575,11 @@ pub fn coordinator_http_router(
         .route("/api/v1/executors", get(api_executors))
         .route("/api/v1/metrics-snapshot", get(api_metrics_snapshot))
         .route("/api/v1/events", get(api_events))
+        .route("/api/v1/logs", get(api_daemon_logs))
+        .route(
+            "/api/v1/executors/{executor_id}/logs",
+            get(api_executor_logs),
+        )
         .route(
             "/api/v1/executors/{executor_id}/reset",
             post(api_executor_reset),
@@ -741,6 +746,11 @@ pub struct LiveExecutorView {
     last_heartbeat_tick: u64,
     /// Consecutive task failure count (circuit breaker input). Resets to 0 on success.
     consecutive_task_failures: u32,
+    /// The executor's advertised HTTP endpoint (probes/metrics/log ring);
+    /// `None` for executors that predate the field. The console uses this to
+    /// decide whether per-executor logs are fetchable.
+    #[serde(default)]
+    http_endpoint: Option<String>,
 }
 
 fn live_job_view(job: crate::JobSnapshot) -> LiveJobView {
@@ -1195,6 +1205,86 @@ async fn api_events(
     Json(serde_json::json!({ "events": events, "total": total }))
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct DaemonLogsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    level: Option<String>,
+}
+
+/// `GET /api/v1/logs?limit=&level=` — the coordinator's recent-history log
+/// ring (`krishiv_metrics::log_ring`): the WARN/ERROR narrative behind state
+/// transitions, with real capture-time timestamps. Recent history only — the
+/// ring holds the last ~2000 INFO+ events since process start; retention and
+/// search belong to stdout shipping, not this endpoint.
+async fn api_daemon_logs(
+    axum::extract::Query(query): axum::extract::Query<DaemonLogsQuery>,
+) -> impl IntoResponse {
+    let entries = krishiv_metrics::log_ring::recent(
+        query.limit.unwrap_or(200).min(1000),
+        query.level.as_deref(),
+    );
+    Json(serde_json::json!({ "entries": entries }))
+}
+
+/// `GET /api/v1/executors/{id}/logs` — proxy to the executor's own `/logs`
+/// ring via its advertised HTTP endpoint, so the console (which only talks
+/// to the coordinator's origin) can show per-executor logs.
+async fn api_executor_logs(
+    State(coordinator): State<SharedCoordinator>,
+    axum::extract::Path(executor_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<DaemonLogsQuery>,
+) -> impl IntoResponse {
+    let endpoint = {
+        let coord = coordinator.read().await;
+        coord
+            .executor_snapshots()
+            .into_iter()
+            .find(|r| r.executor_id().as_str() == executor_id)
+            .and_then(|r| r.descriptor().http_endpoint().map(str::to_owned))
+    };
+    let Some(endpoint) = endpoint else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "executor unknown or does not advertise an HTTP endpoint                           (older executor build?)",
+                "executor_id": executor_id,
+            })),
+        );
+    };
+    let url = format!(
+        "{}/logs?limit={}&level={}",
+        endpoint.trim_end_matches('/'),
+        query.limit.unwrap_or(200).min(1000),
+        query.level.as_deref().unwrap_or("info"),
+    );
+    match reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => match response.json().await {
+            Ok(body) => (axum::http::StatusCode::OK, Json(body)),
+            Err(e) => (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("executor logs decode failed: {e}")})),
+            ),
+        },
+        Ok(response) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": format!("executor logs returned HTTP {}", response.status())
+            })),
+        ),
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("executor logs unreachable: {e}")})),
+        ),
+    }
+}
+
 async fn api_executors(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
     let (executors, current_tick) = {
         let coord = coordinator.read().await;
@@ -1213,6 +1303,7 @@ async fn api_executors(State(coordinator): State<SharedCoordinator>) -> impl Int
                     running_task_count: record.running_tasks().len(),
                     last_heartbeat_tick: record.last_heartbeat_tick(),
                     consecutive_task_failures: record.consecutive_task_failures,
+                    http_endpoint: descriptor.http_endpoint().map(str::to_owned),
                 }
             })
             .collect::<Vec<_>>();
@@ -3263,6 +3354,52 @@ mod parse_tests {
             list.iter()
                 .any(|e| e["kind"] == "job_submitted" && e["job_id"] == "job-snapshot-feed"),
             "event feed must carry the submitted job: {json}"
+        );
+    }
+
+    /// `/api/v1/logs` must read the real log ring. Revert-proof: drop the
+    /// route (or the ring read) and this fails.
+    #[tokio::test]
+    async fn daemon_logs_endpoint_serves_ring_entries() {
+        use crate::CoordinatorDaemonConfig;
+        use crate::coordinator_http_router;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let _ = crate::auth::set_allow_anonymous();
+        krishiv_metrics::log_ring::push(krishiv_metrics::log_ring::LogEntry {
+            at_ms: 1,
+            level: "WARN".into(),
+            target: "test".into(),
+            message: "daemon-logs-endpoint-probe".into(),
+        });
+        let coordinator = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-logs").unwrap(),
+        ));
+        let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DevLocal);
+        let router = coordinator_http_router(coordinator, &config);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/logs?limit=2000&level=warn")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["message"] == "daemon-logs-endpoint-probe"),
+            "logs endpoint must serve the ring: {json}"
         );
     }
 

@@ -1161,6 +1161,7 @@ mod wire_fuzz {
                             barrier_endpoint,
                             rack_id,
                             incarnation_id,
+                            http_endpoint: String::new(),
                         }
                     },
                 ),

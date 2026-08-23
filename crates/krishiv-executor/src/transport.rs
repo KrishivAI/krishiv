@@ -76,6 +76,7 @@ pub struct ExecutorConfig {
     coordinator_endpoint: String,
     lease_generation: LeaseGeneration,
     task_endpoint: Option<String>,
+    http_endpoint: Option<String>,
     barrier_endpoint: Option<String>,
     progress_buffer: Option<Arc<dashmap::DashMap<String, krishiv_proto::StreamingProgressReport>>>,
 }
@@ -109,6 +110,7 @@ impl ExecutorConfig {
             coordinator_endpoint,
             lease_generation: LeaseGeneration::initial(),
             task_endpoint: None,
+            http_endpoint: None,
             barrier_endpoint: None,
             progress_buffer: None,
         })
@@ -196,6 +198,13 @@ impl ExecutorConfig {
         self.lease_generation = lease_generation;
     }
 
+    /// Advertise the executor's HTTP endpoint (probes, metrics, log ring).
+    #[must_use]
+    pub fn with_http_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.http_endpoint = Some(endpoint.into());
+        self
+    }
+
     /// Build an executor descriptor for registration.
     pub fn descriptor(&self) -> ExecutorDescriptor {
         let mut d =
@@ -206,6 +215,9 @@ impl ExecutorConfig {
         }
         if let Some(ep) = &self.barrier_endpoint {
             d = d.with_barrier_endpoint(ep);
+        }
+        if let Some(ep) = &self.http_endpoint {
+            d = d.with_http_endpoint(ep);
         }
         // Phase 53: advertise the rack for RACK_LOCAL placement. Node
         // identity is `host`; the rack comes from deployment topology.

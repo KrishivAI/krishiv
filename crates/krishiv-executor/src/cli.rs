@@ -141,6 +141,28 @@ fn executor_http_router(executor_id: String, slots: usize, readiness: ExecutorRe
             "/metrics",
             get(move || executor_metrics(executor_id.clone(), slots)),
         )
+        // Recent-history log ring (krishiv_metrics::log_ring) — the same
+        // surface the coordinator serves at /api/v1/logs, proxied per
+        // executor by the coordinator for the console.
+        .route("/logs", get(executor_logs))
+}
+
+#[derive(serde::Deserialize)]
+struct LogsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    level: Option<String>,
+}
+
+async fn executor_logs(
+    axum::extract::Query(query): axum::extract::Query<LogsQuery>,
+) -> axum::Json<serde_json::Value> {
+    let entries = krishiv_metrics::log_ring::recent(
+        query.limit.unwrap_or(200).min(1000),
+        query.level.as_deref(),
+    );
+    axum::Json(serde_json::json!({ "entries": entries }))
 }
 
 #[derive(Debug, Clone)]
@@ -1407,6 +1429,11 @@ impl ExecutorCliConfig {
         // call advertises real endpoints; the binary will rewrite them after
         // binding listeners (which use kernel-chosen ports if 0).  This avoids
         // the lease-bumping double-register race.
+        let http_endpoint = self
+            .http_addr
+            // Advertise the reachable form: the configured host with the HTTP
+            // port (the bind address is often 0.0.0.0).
+            .map(|addr| format!("http://{}:{}", self.host, addr.port()));
         let mut cfg = ExecutorConfig::new(
             self.executor_id,
             self.host,
@@ -1419,6 +1446,9 @@ impl ExecutorCliConfig {
         }
         if let Some(addr) = self.barrier_grpc_addr {
             cfg = cfg.with_barrier_endpoint(format!("http://{addr}"));
+        }
+        if let Some(endpoint) = http_endpoint {
+            cfg = cfg.with_http_endpoint(endpoint);
         }
         Ok(cfg)
     }

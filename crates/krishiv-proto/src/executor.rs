@@ -14,6 +14,9 @@ pub struct ExecutorDescriptor {
     barrier_endpoint: Option<String>,
     rack_id: Option<String>,
     incarnation_id: Option<String>,
+    /// HTTP endpoint serving `/healthz` `/metrics` `/logs`; `None` when the
+    /// executor does not advertise one (older executors).
+    http_endpoint: Option<String>,
 }
 
 impl ExecutorDescriptor {
@@ -27,6 +30,7 @@ impl ExecutorDescriptor {
             barrier_endpoint: None,
             rack_id: None,
             incarnation_id: None,
+            http_endpoint: None,
         }
     }
 
@@ -39,6 +43,21 @@ impl ExecutorDescriptor {
             return Err("executor slots must be greater than zero".into());
         }
         Ok(())
+    }
+
+    /// Attach the executor's HTTP endpoint (probes, metrics, log ring).
+    #[must_use]
+    pub fn with_http_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        let endpoint = endpoint.into();
+        if !endpoint.trim().is_empty() {
+            self.http_endpoint = Some(endpoint);
+        }
+        self
+    }
+
+    /// The executor's HTTP endpoint, if advertised.
+    pub fn http_endpoint(&self) -> Option<&str> {
+        self.http_endpoint.as_deref()
     }
 
     /// Attach the executor-owned task assignment endpoint.

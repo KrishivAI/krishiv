@@ -49,6 +49,8 @@ message ExecutorDescriptor {
   // peer does not advertise one. Distinguishes a restarted process behind a
   // stable executor_id from the same process refreshing a stale lease.
   string incarnation_id = 7;
+  // HTTP endpoint serving /healthz /metrics /logs; empty = not advertised.
+  string http_endpoint = 8;
 }
 
 message RegisterExecutorRequest {

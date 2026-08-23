@@ -48,6 +48,19 @@ fn main() {
         });
 
     let exit = rt.block_on(async {
+        // Install the tracing subscriber (fmt to stdout + the log ring the
+        // /logs endpoint serves). Without this the standalone executor binary
+        // dropped every tracing event on the floor — only eprintln! reached
+        // the operator.
+        let _metrics = krishiv_metrics::init(krishiv_metrics::MetricsConfig {
+            service_name: "krishiv-executor".into(),
+            otlp_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
+            ..Default::default()
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("warn: metrics init failed: {e}");
+            krishiv_metrics::MetricsHandle::noop()
+        });
         match krishiv_executor::cli::run_executor_cli(env::args().skip(1)).await {
             Ok(()) => 0,
             Err(error) => {

@@ -1,9 +1,13 @@
+import { useState } from "react";
+
 import { useExecutors, useResetExecutorBreaker } from "../api/queries";
+import { LogTable } from "../components/LogTable";
 import { Button, ErrorText } from "../components/ui";
 
 export function ExecutorsPage() {
   const { data, error } = useExecutors();
   const reset = useResetExecutorBreaker();
+  const [logsFor, setLogsFor] = useState<string | null>(null);
   return (
     <div>
       <h1 className="mb-4 text-lg font-semibold">Executors</h1>
@@ -40,6 +44,12 @@ export function ExecutorsPage() {
                   {e.consecutive_task_failures}
                 </td>
                 <td className="px-3 py-2 text-right">
+                  <Button
+                    variant="ghost"
+                    onClick={() => setLogsFor(logsFor === e.executor_id ? null : e.executor_id)}
+                  >
+                    {logsFor === e.executor_id ? "Hide logs" : "Logs"}
+                  </Button>
                   {e.consecutive_task_failures > 0 && (
                     <Button
                       variant="ghost"
@@ -58,6 +68,14 @@ export function ExecutorsPage() {
           </tbody>
         </table>
       </div>
+      {logsFor && (
+        <div className="mt-6">
+          <LogTable
+            path={`/api/v1/executors/${encodeURIComponent(logsFor)}/logs`}
+            title={`Executor logs · ${logsFor}`}
+          />
+        </div>
+      )}
     </div>
   );
 }
